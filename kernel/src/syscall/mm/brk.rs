@@ -1,13 +1,13 @@
 use axerrno::AxResult;
-use axhal::paging::{MappingFlags, PageSize};
+use axhal::paging::MappingFlags;
 use axtask::current;
 use linux_raw_sys::general::CAP_IPC_LOCK;
-use memory_addr::{PAGE_SIZE_4K, VirtAddr, align_up_4k};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, align_up_4k};
 
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
-    mm::{Backend, check_memory_overcommit},
+    mm::check_memory_overcommit,
     task::AsThread,
 };
 
@@ -66,25 +66,26 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             }
 
             let populate = locked && !aspace.locks_future_mappings_on_fault();
+            let Some((heap_lineage, heap_backend)) = expand_start
+                .checked_sub(1)
+                .and_then(|tail| aspace.find_area(tail))
+                .filter(|area| area.end() == expand_start && area.backend().is_private_anonymous())
+                .map(|area| (area.lineage(), area.backend().clone()))
+            else {
+                return Ok(current_top as isize);
+            };
             if aspace
-                .map_with_lock_state(
+                .map_with_existing_lineage(
                     expand_start,
                     expand_size,
                     MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                    false,
-                    Backend::new_alloc(expand_start, PageSize::Size4K),
+                    populate,
+                    heap_backend,
                     locked,
+                    heap_lineage,
                 )
                 .is_err()
             {
-                return Ok(current_top as isize);
-            }
-            if populate
-                && aspace
-                    .populate_area(expand_start, expand_size, MappingFlags::empty())
-                    .is_err()
-            {
-                let _ = aspace.unmap(expand_start, expand_size);
                 return Ok(current_top as isize);
             }
         }

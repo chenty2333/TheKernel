@@ -1284,7 +1284,7 @@ mod tests {
 
     use axfs_ng_vfs::{Location, Mountpoint, NodePermission, NodeType};
     use linux_raw_sys::general::F_SEAL_WRITE;
-    use memory_set::{MappingBackend, MemoryArea, MemorySet};
+    use memory_set::{MappingBackend, MappingLineage, MemoryArea, MemorySet};
 
     use super::*;
     use crate::{
@@ -1625,7 +1625,13 @@ mod tests {
         let mut page_table = ();
 
         set.map(
-            MemoryArea::new(base, 3 * PAGE_SIZE_4K, writable, backend),
+            MemoryArea::new_with_lineage(
+                base,
+                3 * PAGE_SIZE_4K,
+                writable,
+                backend,
+                MappingLineage::new(2).unwrap(),
+            ),
             &mut page_table,
             false,
         )

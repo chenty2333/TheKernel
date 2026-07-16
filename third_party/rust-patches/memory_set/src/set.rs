@@ -8,7 +8,7 @@ use core::{
 
 use memory_addr::{AddrRange, MemoryAddr};
 
-use crate::{MappingBackend, MappingError, MappingResult, MemoryArea};
+use crate::{MappingBackend, MappingError, MappingLineage, MappingResult, MemoryArea};
 
 struct ProtectAction<A, F> {
     area_start: A,
@@ -17,6 +17,7 @@ struct ProtectAction<A, F> {
     old_end: A,
     old_flags: F,
     new_flags: F,
+    lineage: MappingLineage,
 }
 
 /// A container that maintains memory mappings ([`MemoryArea`]).
@@ -25,6 +26,37 @@ pub struct MemorySet<B: MappingBackend> {
 }
 
 impl<B: MappingBackend> MemorySet<B> {
+    fn check_area_limit(count: usize, max_areas: usize) -> MappingResult {
+        if count > max_areas {
+            Err(MappingError::NoMemory)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns a conservative count of the VMA fragments that remain after
+    /// removing `range`.
+    ///
+    /// Adjacent fragments that the commit may subsequently merge are counted
+    /// separately. This makes the result suitable for capacity admission: it
+    /// can reject early, but it can never undercount a live tree node.
+    fn fragment_count_after_unmap(&self, range: AddrRange<B::Addr>) -> MappingResult<usize> {
+        let mut count = 0usize;
+        for area in self.areas.values() {
+            if !area.va_range().overlaps(range) {
+                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
+                continue;
+            }
+            if area.start() < range.start {
+                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
+            }
+            if area.end() > range.end {
+                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Creates a new memory set.
     pub const fn new() -> Self {
         Self {
@@ -78,6 +110,7 @@ impl<B: MappingBackend> MemorySet<B> {
             let curr = self.areas.get(&current_start).unwrap();
             prev.end() == curr.start()
                 && prev.flags() == curr.flags()
+                && prev.lineage() == curr.lineage()
                 && prev.backend().can_merge(curr.backend())
         };
         if !can_merge {
@@ -103,6 +136,7 @@ impl<B: MappingBackend> MemorySet<B> {
             let next = self.areas.get(&next_start).unwrap();
             curr.end() == next.start()
                 && curr.flags() == next.flags()
+                && curr.lineage() == next.lineage()
                 && curr.backend().can_merge(next.backend())
         };
         if !can_merge {
@@ -231,16 +265,38 @@ impl<B: MappingBackend> MemorySet<B> {
         page_table: &mut B::PageTable,
         unmap_overlap: bool,
     ) -> MappingResult {
+        self.map_with_limit(area, page_table, unmap_overlap, usize::MAX)
+    }
+
+    /// Adds a new mapping while bounding the peak number of live VMA
+    /// fragments.
+    ///
+    /// Capacity admission completes before an overlapping mapping is removed
+    /// or the backend/page table is changed. The ordinary [`Self::map`]
+    /// interface remains source-compatible and uses no effective limit.
+    pub fn map_with_limit(
+        &mut self,
+        area: MemoryArea<B>,
+        page_table: &mut B::PageTable,
+        unmap_overlap: bool,
+        max_areas: usize,
+    ) -> MappingResult {
         if area.va_range().is_empty() {
             return Err(MappingError::InvalidParam);
         }
 
         if self.overlaps(area.va_range()) {
             if unmap_overlap {
-                self.unmap(area.start(), area.size(), page_table)?;
+                let remaining = self.fragment_count_after_unmap(area.va_range())?;
+                let peak = remaining.checked_add(1).ok_or(MappingError::NoMemory)?;
+                Self::check_area_limit(self.len().max(peak), max_areas)?;
+                self.unmap_with_limit(area.start(), area.size(), page_table, max_areas)?;
             } else {
                 return Err(MappingError::AlreadyExists);
             }
+        } else {
+            let peak = self.len().checked_add(1).ok_or(MappingError::NoMemory)?;
+            Self::check_area_limit(peak, max_areas)?;
         }
 
         let area_start = area.start();
@@ -261,6 +317,21 @@ impl<B: MappingBackend> MemorySet<B> {
         start: B::Addr,
         size: usize,
         page_table: &mut B::PageTable,
+    ) -> MappingResult {
+        self.unmap_with_limit(start, size, page_table, usize::MAX)
+    }
+
+    /// Validates every backend touched by an unmap without changing the area
+    /// tree or page table.
+    ///
+    /// A caller that keeps the page table and mapping topology serialized may
+    /// use this to prepare a larger transaction. A later commit still checks
+    /// the same invariant defensively.
+    pub fn preflight_unmap(
+        &self,
+        start: B::Addr,
+        size: usize,
+        page_table: &B::PageTable,
     ) -> MappingResult {
         let range =
             AddrRange::try_from_start_size(start, size).ok_or(MappingError::InvalidParam)?;
@@ -295,14 +366,80 @@ impl<B: MappingBackend> MemorySet<B> {
             }
         }
 
-        // Unmap entire areas that are contained by the range.
-        let fully_covered: Vec<_> = self
+        Ok(())
+    }
+
+    /// Removes mappings while bounding the peak number of live VMA
+    /// fragments.
+    ///
+    /// A middle unmap can turn one area into two. The resulting node count and
+    /// every backend admission are checked before the first VMA/PTE mutation.
+    pub fn unmap_with_limit(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+        max_areas: usize,
+    ) -> MappingResult {
+        self.unmap_with_limit_inner(start, size, page_table, max_areas, true)
+    }
+
+    /// Commits an unmap whose backend admission has already succeeded while
+    /// the caller kept the page table and area topology serialized.
+    ///
+    /// Fragment-cap arithmetic and fallible side-vector staging are repeated
+    /// before mutation. Only backend [`MappingBackend::preflight_unmap`] calls
+    /// are skipped.
+    pub fn commit_preflighted_unmap_with_limit(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+        max_areas: usize,
+    ) -> MappingResult {
+        self.unmap_with_limit_inner(start, size, page_table, max_areas, false)
+    }
+
+    fn unmap_with_limit_inner(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+        max_areas: usize,
+        run_backend_preflight: bool,
+    ) -> MappingResult {
+        let range =
+            AddrRange::try_from_start_size(start, size).ok_or(MappingError::InvalidParam)?;
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        let remaining = self.fragment_count_after_unmap(range)?;
+        Self::check_area_limit(self.len().max(remaining), max_areas)?;
+
+        let fully_covered_count = self
             .areas
-            .range((Included(start), Excluded(end)))
-            .filter_map(|(&area_start, area)| {
-                area.va_range().contained_in(range).then_some(area_start)
-            })
-            .collect();
+            .range((Included(start), Excluded(range.end)))
+            .filter(|(_, area)| area.va_range().contained_in(range))
+            .count();
+        let mut fully_covered = Vec::new();
+        fully_covered
+            .try_reserve(fully_covered_count)
+            .map_err(|_| MappingError::NoMemory)?;
+        fully_covered.extend(
+            self.areas
+                .range((Included(start), Excluded(range.end)))
+                .filter_map(|(&area_start, area)| {
+                    area.va_range().contained_in(range).then_some(area_start)
+                }),
+        );
+        if run_backend_preflight {
+            self.preflight_unmap(start, size, page_table)?;
+        }
+
+        let end = range.end;
+
+        // Unmap entire areas that are contained by the range.
         for area_start in fully_covered {
             let area = self.areas.remove(&area_start).unwrap();
             area.unmap_area(page_table)
@@ -384,6 +521,22 @@ impl<B: MappingBackend> MemorySet<B> {
         update_flags: impl Fn(B::Flags) -> Option<B::Flags>,
         page_table: &mut B::PageTable,
     ) -> MappingResult {
+        self.protect_with_limit(start, size, update_flags, page_table, usize::MAX)
+    }
+
+    /// Changes mapping flags while bounding the peak number of live VMA
+    /// fragments.
+    ///
+    /// All left/middle/right split nodes are admitted before backend preflight
+    /// and before the first tree or PTE mutation.
+    pub fn protect_with_limit(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        update_flags: impl Fn(B::Flags) -> Option<B::Flags>,
+        page_table: &mut B::PageTable,
+        max_areas: usize,
+    ) -> MappingResult {
         let end = start.checked_add(size).ok_or(MappingError::InvalidParam)?;
         if start == end {
             return Ok(());
@@ -413,9 +566,18 @@ impl<B: MappingBackend> MemorySet<B> {
                     old_end: area_end,
                     old_flags: area.flags(),
                     new_flags,
+                    lineage: area.lineage(),
                 });
             }
         }
+
+        let mut peak = self.len();
+        for action in &actions {
+            let additional = usize::from(action.area_start < action.start)
+                + usize::from(action.end < action.old_end);
+            peak = peak.checked_add(additional).ok_or(MappingError::NoMemory)?;
+        }
+        Self::check_area_limit(peak, max_areas)?;
 
         // Complete every recoverable backend/PTE check before splitting the
         // first VMA. Once this succeeds, commit failures are consistency bugs:
@@ -453,20 +615,22 @@ impl<B: MappingBackend> MemorySet<B> {
                 .set_end(if has_left { action.start } else { action.end });
 
             if let Some(backend) = middle_backend {
-                let middle = MemoryArea::new(
+                let middle = MemoryArea::new_with_lineage(
                     action.start,
                     action.end.sub_addr(action.start),
                     action.new_flags,
                     backend,
+                    action.lineage,
                 );
                 assert!(self.areas.insert(middle.start(), middle).is_none());
             }
             if let Some(backend) = right_backend {
-                let right = MemoryArea::new(
+                let right = MemoryArea::new_with_lineage(
                     action.end,
                     action.old_end.sub_addr(action.end),
                     action.old_flags,
                     backend,
+                    action.lineage,
                 );
                 assert!(self.areas.insert(right.start(), right).is_none());
             }

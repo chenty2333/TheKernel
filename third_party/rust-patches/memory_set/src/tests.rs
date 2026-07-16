@@ -5,7 +5,7 @@ use std::sync::{
 
 use memory_addr::{MemoryAddr, VirtAddr, va_range};
 
-use crate::{MappingBackend, MappingError, MemoryArea, MemorySet};
+use crate::{MappingBackend, MappingError, MappingLineage, MemoryArea, MemorySet};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -40,6 +40,23 @@ struct FailingProtectCommitBackend;
 
 type MockMemorySet = MemorySet<MockBackend>;
 type MergeMemorySet = MemorySet<MergeBackend>;
+
+fn lineage(raw: u64) -> MappingLineage {
+    MappingLineage::new(raw).unwrap()
+}
+
+fn tracked_area<B>(start: VirtAddr, size: usize, flags: MockFlags, backend: B) -> MemoryArea<B>
+where
+    B: MappingBackend<Addr = VirtAddr, Flags = MockFlags>,
+{
+    MemoryArea::new_with_lineage(
+        start,
+        size,
+        flags,
+        backend,
+        lineage(start.as_usize() as u64 + 2),
+    )
+}
 
 impl MappingBackend for MockBackend {
     type Addr = VirtAddr;
@@ -290,7 +307,7 @@ fn test_map_unmap() {
     // Map [0, 0x1000), [0x2000, 0x3000), [0x4000, 0x5000), ...
     for start in (0..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 1, MockBackend),
+            tracked_area(start.into(), 0x1000, 1, MockBackend),
             &mut pt,
             false,
         ));
@@ -298,7 +315,7 @@ fn test_map_unmap() {
     // Map [0x1000, 0x2000), [0x3000, 0x4000), [0x5000, 0x6000), ...
     for start in (0x1000..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 2, MockBackend),
+            tracked_area(start.into(), 0x1000, 2, MockBackend),
             &mut pt,
             false,
         ));
@@ -319,7 +336,7 @@ fn test_map_unmap() {
     // The area [0x4000, 0x8000) is already mapped, map returns an error.
     assert_err!(
         set.map(
-            MemoryArea::new(0x4000.into(), 0x4000, 3, MockBackend),
+            tracked_area(0x4000.into(), 0x4000, 3, MockBackend),
             &mut pt,
             false
         ),
@@ -327,7 +344,7 @@ fn test_map_unmap() {
     );
     // Unmap overlapped areas before adding the new mapping [0x4000, 0x8000).
     assert_ok!(set.map(
-        MemoryArea::new(0x4000.into(), 0x4000, 3, MockBackend),
+        tracked_area(0x4000.into(), 0x4000, 3, MockBackend),
         &mut pt,
         true
     ));
@@ -362,7 +379,7 @@ fn test_unmap_split() {
     // Map [0, 0x1000), [0x2000, 0x3000), [0x4000, 0x5000), ...
     for start in (0..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 1, MockBackend),
+            tracked_area(start.into(), 0x1000, 1, MockBackend),
             &mut pt,
             false,
         ));
@@ -443,12 +460,12 @@ fn unmap_preflights_every_backend_before_mutating_any_area_or_pte() {
     let mut set = MemorySet::new();
     let mut pt = [0; MAX_ADDR];
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        tracked_area(0x1000.into(), 0x1000, 1, backend.clone()),
         &mut pt,
         false,
     ));
     assert_ok!(set.map(
-        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        tracked_area(0x3000.into(), 0x1000, 2, backend),
         &mut pt,
         false,
     ));
@@ -465,6 +482,88 @@ fn unmap_preflights_every_backend_before_mutating_any_area_or_pte() {
 }
 
 #[test]
+fn preflighted_unmap_commit_skips_only_the_already_completed_backend_admission() {
+    let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let unmap_calls = Arc::new(AtomicUsize::new(0));
+    let backend = RejectingUnmapBackend {
+        preflight_calls: preflight_calls.clone(),
+        unmap_calls: unmap_calls.clone(),
+        reject_start: 0x3000,
+    };
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x1000, 1, backend),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.preflight_unmap(0x1000.into(), 0x1000, &pt));
+    let calls_after_external_preflight = preflight_calls.load(Ordering::Relaxed);
+
+    assert_ok!(set.commit_preflighted_unmap_with_limit(0x1000.into(), 0x1000, &mut pt, 1,));
+
+    assert_eq!(
+        preflight_calls.load(Ordering::Relaxed),
+        calls_after_external_preflight
+    );
+    assert_eq!(unmap_calls.load(Ordering::Relaxed), 1);
+    assert!(set.is_empty());
+}
+
+#[test]
+fn bounded_map_rejects_before_mapping_or_growing_the_area_tree() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map_with_limit(
+        tracked_area(0x1000.into(), 0x1000, 1, MockBackend),
+        &mut pt,
+        false,
+        1,
+    ));
+    let pt_before = pt;
+
+    assert_err!(
+        set.map_with_limit(
+            tracked_area(0x3000.into(), 0x1000, 2, MockBackend),
+            &mut pt,
+            false,
+            1,
+        ),
+        NoMemory
+    );
+
+    assert_eq!(set.len(), 1);
+    assert!(set.find(0x3000.into()).is_none());
+    assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn bounded_unmap_rejects_middle_split_before_area_or_pte_mutation() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x3000, 1, MockBackend),
+        &mut pt,
+        false,
+    ));
+    let pt_before = pt;
+
+    assert_err!(
+        set.unmap_with_limit(0x2000.into(), 0x1000, &mut pt, 1),
+        NoMemory
+    );
+
+    assert_eq!(set.len(), 1);
+    let area = set.find(0x1000.into()).unwrap();
+    assert_eq!(area.start(), 0x1000.into());
+    assert_eq!(area.end(), 0x4000.into());
+    assert_eq!(pt, pt_before);
+
+    assert_ok!(set.unmap_with_limit(0x2000.into(), 0x1000, &mut pt, 2,));
+    assert_eq!(set.len(), 2);
+}
+
+#[test]
 fn clear_preflights_every_backend_before_mutating_any_pte() {
     let preflight_calls = Arc::new(AtomicUsize::new(0));
     let unmap_calls = Arc::new(AtomicUsize::new(0));
@@ -476,12 +575,12 @@ fn clear_preflights_every_backend_before_mutating_any_pte() {
     let mut set = MemorySet::new();
     let mut pt = [0; MAX_ADDR];
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        tracked_area(0x1000.into(), 0x1000, 1, backend.clone()),
         &mut pt,
         false,
     ));
     assert_ok!(set.map(
-        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        tracked_area(0x3000.into(), 0x1000, 2, backend),
         &mut pt,
         false,
     ));
@@ -500,7 +599,7 @@ fn backend_failure_after_successful_preflight_is_fail_stop() {
     let mut set = MemorySet::new();
     let mut pt = [0; MAX_ADDR];
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 1, FailingCommitBackend),
+        tracked_area(0x1000.into(), 0x1000, 1, FailingCommitBackend),
         &mut pt,
         false,
     ));
@@ -529,7 +628,7 @@ fn test_protect() {
     // Map [0, 0x1000), [0x2000, 0x3000), [0x4000, 0x5000), ...
     for start in (0..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 0x7, MockBackend),
+            tracked_area(start.into(), 0x1000, 0x7, MockBackend),
             &mut pt,
             false,
         ));
@@ -619,12 +718,12 @@ fn protect_preflights_every_backend_before_splitting_or_mutating_pte() {
     let mut pt = [0; MAX_ADDR];
 
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        tracked_area(0x1000.into(), 0x1000, 1, backend.clone()),
         &mut pt,
         false,
     ));
     assert_ok!(set.map(
-        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        tracked_area(0x3000.into(), 0x1000, 2, backend),
         &mut pt,
         false,
     ));
@@ -652,11 +751,38 @@ fn protect_preflights_every_backend_before_splitting_or_mutating_pte() {
 }
 
 #[test]
+fn bounded_protect_rejects_all_required_splits_before_pte_mutation() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x3000, 1, MockBackend),
+        &mut pt,
+        false,
+    ));
+    let pt_before = pt;
+
+    assert_err!(
+        set.protect_with_limit(0x2000.into(), 0x1000, |_| Some(3), &mut pt, 2),
+        NoMemory
+    );
+
+    assert_eq!(set.len(), 1);
+    let area = set.find(0x1000.into()).unwrap();
+    assert_eq!(area.start(), 0x1000.into());
+    assert_eq!(area.end(), 0x4000.into());
+    assert_eq!(area.flags(), 1);
+    assert_eq!(pt, pt_before);
+
+    assert_ok!(set.protect_with_limit(0x2000.into(), 0x1000, |_| Some(3), &mut pt, 3,));
+    assert_eq!(set.len(), 3);
+}
+
+#[test]
 fn protect_backend_failure_after_successful_preflight_is_fail_stop() {
     let mut set = MemorySet::new();
     let mut pt = [0; MAX_ADDR];
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 1, FailingProtectCommitBackend),
+        tracked_area(0x1000.into(), 0x1000, 1, FailingProtectCommitBackend),
         &mut pt,
         false,
     ));
@@ -669,17 +795,60 @@ fn protect_backend_failure_after_successful_preflight_is_fail_stop() {
 }
 
 #[test]
+fn tracked_lineage_cannot_alias_the_legacy_sentinel() {
+    assert!(MappingLineage::new(0).is_none());
+    assert!(MappingLineage::new(MappingLineage::UNTRACKED.get()).is_none());
+    assert_eq!(MappingLineage::UNTRACKED.get(), 1);
+    assert_eq!(lineage(2).get(), 2);
+}
+
+#[test]
+fn legacy_areas_merge_but_distinct_tracked_lineages_do_not() {
+    let mut legacy = MergeMemorySet::new();
+    let mut legacy_pt = [0; MAX_ADDR];
+    assert_ok!(legacy.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 0x3, MergeBackend),
+        &mut legacy_pt,
+        false,
+    ));
+    assert_ok!(legacy.map(
+        MemoryArea::new(0x2000.into(), 0x1000, 0x3, MergeBackend),
+        &mut legacy_pt,
+        false,
+    ));
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        legacy.find(0x1000.into()).unwrap().lineage(),
+        MappingLineage::UNTRACKED
+    );
+
+    let mut tracked = MergeMemorySet::new();
+    let mut tracked_pt = [0; MAX_ADDR];
+    assert_ok!(tracked.map(
+        MemoryArea::new_with_lineage(0x1000.into(), 0x1000, 0x3, MergeBackend, lineage(2),),
+        &mut tracked_pt,
+        false,
+    ));
+    assert_ok!(tracked.map(
+        MemoryArea::new_with_lineage(0x2000.into(), 0x1000, 0x3, MergeBackend, lineage(3),),
+        &mut tracked_pt,
+        false,
+    ));
+    assert_eq!(tracked.len(), 2);
+}
+
+#[test]
 fn test_map_merge_adjacent() {
     let mut set = MergeMemorySet::new();
     let mut pt = [0; MAX_ADDR];
 
     assert_ok!(set.map(
-        MemoryArea::new(0x1000.into(), 0x1000, 0x3, MergeBackend),
+        MemoryArea::new_with_lineage(0x1000.into(), 0x1000, 0x3, MergeBackend, lineage(0x55),),
         &mut pt,
         false,
     ));
     assert_ok!(set.map(
-        MemoryArea::new(0x2000.into(), 0x1000, 0x3, MergeBackend),
+        MemoryArea::new_with_lineage(0x2000.into(), 0x1000, 0x3, MergeBackend, lineage(0x55),),
         &mut pt,
         false,
     ));
@@ -690,9 +859,10 @@ fn test_map_merge_adjacent() {
 
     assert_ok!(set.unmap(0x1800.into(), 0x800, &mut pt));
     assert_eq!(set.len(), 2);
+    assert!(set.iter().all(|area| area.lineage() == lineage(0x55)));
 
     assert_ok!(set.map(
-        MemoryArea::new(0x1800.into(), 0x800, 0x3, MergeBackend),
+        MemoryArea::new_with_lineage(0x1800.into(), 0x800, 0x3, MergeBackend, lineage(0x55),),
         &mut pt,
         false,
     ));
@@ -710,7 +880,7 @@ fn test_find_free_area() {
     // Map [0, 0x1000), [0x2000, 0x3000), ..., [0xe000, 0xf000)
     for start in (0..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 1, MockBackend),
+            tracked_area(start.into(), 0x1000, 1, MockBackend),
             &mut pt,
             false,
         ));
@@ -750,7 +920,7 @@ fn test_find_append_area() {
 
     for start in (0..MAX_ADDR).step_by(0x2000) {
         assert_ok!(set.map(
-            MemoryArea::new(start.into(), 0x1000, 1, MockBackend),
+            tracked_area(start.into(), 0x1000, 1, MockBackend),
             &mut pt,
             false,
         ));

@@ -6290,7 +6290,7 @@ mod tests {
         MAP_ANONYMOUS, MAP_PRIVATE,
     };
     use memory_addr::VirtAddrRange;
-    use memory_set::MemoryArea;
+    use memory_set::{MappingLineage, MemoryArea};
 
     use super::*;
     use crate::{
@@ -11529,11 +11529,12 @@ mod tests {
         let initial = MappingFlags::USER | MappingFlags::READ;
         let requested_protect = MappingFlags::USER | MappingFlags::WRITE;
         let effective_protect = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
-        let area = MemoryArea::new(
+        let area = MemoryArea::new_with_lineage(
             start,
             0x1000,
             initial,
             Backend::new_alloc(start, PageSize::Size4K),
+            MappingLineage::new(2).unwrap(),
         );
         let segment =
             PreparedProtectSegment::for_test(&area, VirtAddrRange::new(start, start + 0x1000));
@@ -11610,11 +11611,12 @@ mod tests {
         );
         assert_eq!(CRED_STATE_MMAP_ADDR_TRACE.load(Ordering::SeqCst), 0);
 
-        let area = MemoryArea::new(
+        let area = MemoryArea::new_with_lineage(
             start,
             0x1000,
             MappingFlags::USER | MappingFlags::READ,
             Backend::new_alloc(start, PageSize::Size4K),
+            MappingLineage::new(2).unwrap(),
         );
         let segment =
             PreparedProtectSegment::for_test(&area, VirtAddrRange::new(start, start + 0x1000));

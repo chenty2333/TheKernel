@@ -8,6 +8,11 @@ Data structures and operations for managing memory mappings.
 
 It is useful to implement [`mmap`][1], [`munmap`][1] and [`mprotect`][2].
 
+The `*_with_limit` operations provide an explicit live-fragment quota and use
+fallible temporary `Vec` staging before metadata/PTE mutation. This bounds
+logical VMA growth; it does not make `alloc::collections::BTreeMap` node
+allocation recoverable because `alloc` has no fallible insertion API.
+
 [1]: https://man7.org/linux/man-pages/man2/mmap.2.html
 [2]: https://man7.org/linux/man-pages/man2/mprotect.2.html
 
@@ -15,7 +20,7 @@ It is useful to implement [`mmap`][1], [`munmap`][1] and [`mprotect`][2].
 
 ```rust
 use memory_addr::{va, va_range, VirtAddr};
-use memory_set::{MappingBackend, MemoryArea, MemorySet};
+use memory_set::{MappingBackend, MappingLineage, MemoryArea, MemorySet};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -33,7 +38,13 @@ let mut memory_set = MemorySet::<MockBackend>::new();
 
 // Map [0x1000..0x5000).
 memory_set.map(
-    /* area: */ MemoryArea::new(va!(0x1000), 0x4000, 1, MockBackend),
+    /* area: */ MemoryArea::new_with_lineage(
+        va!(0x1000),
+        0x4000,
+        1,
+        MockBackend,
+        MappingLineage::new(2).unwrap(),
+    ),
     /* page_table: */ &mut pt,
     /* unmap_overlap */ false,
 ).unwrap();

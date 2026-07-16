@@ -2,7 +2,7 @@ use core::fmt;
 
 use memory_addr::{AddrRange, MemoryAddr};
 
-use crate::{MappingBackend, MappingError, MappingResult};
+use crate::{MappingBackend, MappingError, MappingLineage, MappingResult};
 
 /// A memory area represents a continuous range of virtual memory with the same
 /// flags.
@@ -13,19 +13,40 @@ pub struct MemoryArea<B: MappingBackend> {
     va_range: AddrRange<B::Addr>,
     flags: B::Flags,
     backend: B,
+    lineage: MappingLineage,
 }
 
 impl<B: MappingBackend> MemoryArea<B> {
     /// Creates a new memory area.
     ///
+    /// This compatibility constructor uses [`MappingLineage::UNTRACKED`], so
+    /// compatible adjacent areas retain the crate's historical merge behavior.
+    /// Identity-aware consumers should use [`Self::new_with_lineage`].
+    ///
     /// # Panics
     ///
     /// Panics if `start + size` overflows.
     pub fn new(start: B::Addr, size: usize, flags: B::Flags, backend: B) -> Self {
+        Self::new_with_lineage(start, size, flags, backend, MappingLineage::UNTRACKED)
+    }
+
+    /// Creates a memory area with a caller-owned logical mapping lineage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start + size` overflows.
+    pub fn new_with_lineage(
+        start: B::Addr,
+        size: usize,
+        flags: B::Flags,
+        backend: B,
+        lineage: MappingLineage,
+    ) -> Self {
         Self {
             va_range: AddrRange::from_start_size(start, size),
             flags,
             backend,
+            lineage,
         }
     }
 
@@ -57,6 +78,11 @@ impl<B: MappingBackend> MemoryArea<B> {
     /// Returns the mapping backend of the memory area.
     pub const fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Returns the opaque lineage shared by fragments of this logical mapping.
+    pub const fn lineage(&self) -> MappingLineage {
+        self.lineage
     }
 }
 
@@ -150,13 +176,14 @@ impl<B: MappingBackend> MemoryArea<B> {
     /// of the parts is empty after splitting.
     pub(crate) fn split(&mut self, pos: B::Addr) -> Option<Self> {
         if self.start() < pos && pos < self.end() {
-            let new_area = Self::new(
+            let new_area = Self::new_with_lineage(
                 pos,
                 // Use wrapping_sub_addr to avoid overflow check. It is safe because
                 // `pos` is within the memory area.
                 self.end().wrapping_sub_addr(pos),
                 self.flags,
                 self.backend.clone(),
+                self.lineage,
             );
             self.va_range.end = pos;
             Some(new_area)
@@ -175,6 +202,7 @@ where
         f.debug_struct("MemoryArea")
             .field("va_range", &self.va_range)
             .field("flags", &self.flags)
+            .field("lineage", &self.lineage)
             .finish()
     }
 }

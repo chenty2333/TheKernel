@@ -20,7 +20,7 @@ use kspin::SpinNoIrq;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
-use memory_set::{MappingResult, MemoryArea, MemorySet};
+use memory_set::{MappingLineage, MappingResult, MemoryArea, MemorySet};
 use thekernel_linux_mm::{
     AddressSpaceId, ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess,
     MappingGeneration, MappingId, MappingKind, MappingSnapshot, MmError, PageRange, PinBudget,
@@ -58,6 +58,13 @@ fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> 
 const USER_IO_PIN_MAX_TOKENS: u64 = 64;
 const USER_IO_PIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const USER_IO_PIN_MAX_PAGES: u64 = USER_IO_PIN_MAX_BYTES / PAGE_SIZE_4K as u64;
+/// Internal live logical-mapping limit. Fragments sharing one lineage count
+/// once, so protection splits do not consume additional slots.
+const MAX_MAPPING_LINEAGES: usize = 65_536;
+/// Independent live VMA-fragment limit. One logical lineage may be split by
+/// protection, unmap, fork policy, or remap geometry, so bounding only the
+/// lineage sidecar does not bound the area tree itself.
+const MAX_VMA_FRAGMENTS: usize = 65_536;
 type UserIoPinRegistry = PinRegistry<1, { USER_IO_PIN_MAX_TOKENS as usize }>;
 type UserIoPinBudget = PinBudget<{ USER_IO_PIN_MAX_TOKENS as usize }>;
 type UserIoPolicy = (
@@ -68,7 +75,8 @@ type UserIoPolicy = (
 );
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_TOPOLOGY_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+// MappingLineage reserves raw value 1 for compatibility-only untracked areas.
+static NEXT_MAPPING_ID: AtomicU64 = AtomicU64::new(2);
 static USER_IO_PIN_BUDGET: SpinNoIrq<Option<UserIoPinBudget>> = SpinNoIrq::new(None);
 
 fn allocate_nonwrapping_id(sequence: &AtomicU64) -> AxResult<u64> {
@@ -109,11 +117,14 @@ fn mm_error(error: MmError) -> AxError {
     }
 }
 
+fn allocate_mapping_id() -> AxResult<MappingId> {
+    MappingId::new(allocate_nonwrapping_id(&NEXT_MAPPING_ID)?).map_err(mm_error)
+}
+
 fn new_user_io_policy() -> AxResult<UserIoPolicy> {
     let address_space_id =
         AddressSpaceId::new(allocate_nonwrapping_id(&NEXT_ADDRESS_SPACE_ID)?).map_err(mm_error)?;
-    let topology_mapping_id =
-        MappingId::new(allocate_nonwrapping_id(&NEXT_TOPOLOGY_MAPPING_ID)?).map_err(mm_error)?;
+    let topology_mapping_id = allocate_mapping_id()?;
     let topology_generation = MappingGeneration::new(1).map_err(mm_error)?;
     let pin_quota = PinQuota::new(
         USER_IO_PIN_MAX_PAGES,
@@ -132,6 +143,423 @@ fn new_user_io_policy() -> AxResult<UserIoPolicy> {
         topology_mapping_id,
         topology_generation,
         user_io_pins,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MappingIdentityState {
+    id: MappingId,
+    generation: MappingGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MappingIdentityEntry {
+    lineage: MappingLineage,
+    state: MappingIdentityState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MappingIdentityMutation {
+    Advance {
+        lineage: MappingLineage,
+        generation: MappingGeneration,
+    },
+    Retire {
+        lineage: MappingLineage,
+    },
+}
+
+impl MappingIdentityMutation {
+    const fn lineage(self) -> MappingLineage {
+        match self {
+            Self::Advance { lineage, .. } | Self::Retire { lineage } => lineage,
+        }
+    }
+}
+
+fn mapping_identity(
+    identities: &[MappingIdentityEntry],
+    lineage: MappingLineage,
+) -> AxResult<MappingIdentityState> {
+    identities
+        .binary_search_by_key(&lineage, |entry| entry.lineage)
+        .ok()
+        .map(|index| identities[index].state)
+        .ok_or(AxError::BadState)
+}
+
+fn reserve_mapping_identity_slot(
+    identities: &mut Vec<MappingIdentityEntry>,
+    limit: usize,
+) -> AxResult {
+    if identities.len() >= limit {
+        return Err(AxError::NoMemory);
+    }
+    identities.try_reserve(1).map_err(|_| AxError::NoMemory)
+}
+
+fn lineage_covers_range<B>(
+    areas: &MemorySet<B>,
+    lineage: MappingLineage,
+    mut start: VirtAddr,
+    size: usize,
+) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    while start < end {
+        let Some(area) = areas.find(start) else {
+            return false;
+        };
+        if area.start() > start || area.lineage() != lineage {
+            return false;
+        }
+        start = area.end().min(end);
+    }
+    true
+}
+
+fn range_is_fully_mapped<B>(areas: &MemorySet<B>, mut start: VirtAddr, size: usize) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    while start < end {
+        let Some(area) = areas.find(start) else {
+            return false;
+        };
+        if area.start() > start {
+            return false;
+        }
+        start = area.end().min(end);
+    }
+    true
+}
+
+fn lineage_is_contained_in_range<B>(
+    areas: &MemorySet<B>,
+    lineage: MappingLineage,
+    start: VirtAddr,
+    size: usize,
+) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    areas
+        .iter()
+        .all(|area| area.lineage() != lineage || (area.start() >= start && area.end() <= end))
+}
+
+fn lineage_exactly_covers_range<B>(
+    areas: &MemorySet<B>,
+    lineage: MappingLineage,
+    start: VirtAddr,
+    size: usize,
+) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    lineage_covers_range(areas, lineage, start, size)
+        && lineage_is_contained_in_range(areas, lineage, start, size)
+}
+
+fn range_is_empty<B>(areas: &MemorySet<B>, start: VirtAddr, size: usize) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    size != 0
+        && !areas
+            .iter()
+            .any(|area| area.start() < end && start < area.end())
+}
+
+fn range_is_owned_by_lineage<B>(
+    areas: &MemorySet<B>,
+    lineage: MappingLineage,
+    start: VirtAddr,
+    size: usize,
+) -> bool
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    size != 0
+        && lineage_is_contained_in_range(areas, lineage, start, size)
+        && areas
+            .iter()
+            .all(|area| area.end() <= start || area.start() >= end || area.lineage() == lineage)
+}
+
+fn projected_fragment_count_after_unmaps<B>(
+    areas: &MemorySet<B>,
+    ranges: &[VirtAddrRange],
+) -> AxResult<usize>
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    let mut sorted_ranges = Vec::new();
+    sorted_ranges
+        .try_reserve(ranges.len())
+        .map_err(|_| AxError::NoMemory)?;
+    sorted_ranges.extend_from_slice(ranges);
+    sorted_ranges.sort_unstable_by_key(|range| range.start);
+
+    let mut count = 0usize;
+    for area in areas.iter() {
+        let mut cursor = area.start();
+        for range in &sorted_ranges {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start >= area.end() {
+                break;
+            }
+            if cursor < range.start {
+                count = count.checked_add(1).ok_or(AxError::NoMemory)?;
+            }
+            cursor = cursor.max(range.end);
+            if cursor >= area.end() {
+                break;
+            }
+        }
+        if cursor < area.end() {
+            count = count.checked_add(1).ok_or(AxError::NoMemory)?;
+        }
+    }
+    Ok(count)
+}
+
+fn admit_staged_fragments_after_unmaps<B>(
+    areas: &MemorySet<B>,
+    ranges: &[VirtAddrRange],
+    staged_fragments: usize,
+    limit: usize,
+) -> AxResult
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    let remaining = projected_fragment_count_after_unmaps(areas, ranges)?;
+    let projected = remaining
+        .checked_add(staged_fragments)
+        .ok_or(AxError::NoMemory)?;
+    if areas.len().max(projected) > limit {
+        return Err(AxError::NoMemory);
+    }
+    Ok(())
+}
+
+fn prepare_mapping_generation_advances_for_range<B>(
+    areas: &MemorySet<B>,
+    identities: &[MappingIdentityEntry],
+    start: VirtAddr,
+    size: usize,
+) -> AxResult<Vec<MappingIdentityMutation>>
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+    let mut lineages = Vec::new();
+    lineages
+        .try_reserve(areas.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for area in areas.iter() {
+        if area.end() <= start {
+            continue;
+        }
+        if area.start() >= end {
+            break;
+        }
+        lineages.push(area.lineage());
+    }
+    lineages.sort_unstable();
+    lineages.dedup();
+
+    let mut mutations = Vec::new();
+    mutations
+        .try_reserve(lineages.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for lineage in lineages {
+        let generation = mapping_identity(identities, lineage)?
+            .generation
+            .next()
+            .map_err(mm_error)?;
+        mutations.push(MappingIdentityMutation::Advance {
+            lineage,
+            generation,
+        });
+    }
+    Ok(mutations)
+}
+
+#[derive(Clone, Copy)]
+struct UnmapLineageCoverage {
+    lineage: MappingLineage,
+    affected: bool,
+    survives: bool,
+}
+
+fn prepare_unmap_mapping_mutations<B>(
+    areas: &MemorySet<B>,
+    identities: &[MappingIdentityEntry],
+    start: VirtAddr,
+    size: usize,
+) -> AxResult<Vec<MappingIdentityMutation>>
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+    prepare_unmap_mapping_mutations_for_ranges(areas, identities, &[VirtAddrRange::new(start, end)])
+}
+
+fn prepare_unmap_mapping_mutations_for_ranges<B>(
+    areas: &MemorySet<B>,
+    identities: &[MappingIdentityEntry],
+    ranges: &[VirtAddrRange],
+) -> AxResult<Vec<MappingIdentityMutation>>
+where
+    B: memory_set::MappingBackend<Addr = VirtAddr>,
+{
+    let mut sorted_ranges = Vec::new();
+    sorted_ranges
+        .try_reserve(ranges.len())
+        .map_err(|_| AxError::NoMemory)?;
+    sorted_ranges.extend(ranges.iter().copied().filter(|range| !range.is_empty()));
+    if sorted_ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    sorted_ranges.sort_unstable_by_key(|range| range.start);
+
+    let mut coverage = Vec::new();
+    coverage
+        .try_reserve(areas.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for area in areas.iter() {
+        let affected = sorted_ranges
+            .iter()
+            .any(|range| area.start() < range.end && range.start < area.end());
+        let mut cursor = area.start();
+        for range in &sorted_ranges {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start > cursor || range.start >= area.end() {
+                break;
+            }
+            cursor = cursor.max(range.end);
+            if cursor >= area.end() {
+                break;
+            }
+        }
+        coverage.push(UnmapLineageCoverage {
+            lineage: area.lineage(),
+            affected,
+            survives: cursor < area.end(),
+        });
+    }
+    coverage.sort_unstable_by_key(|entry| entry.lineage);
+
+    let mut mutations = Vec::new();
+    mutations
+        .try_reserve(coverage.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut index = 0;
+    while index < coverage.len() {
+        let lineage = coverage[index].lineage;
+        let mut affected = false;
+        let mut survives = false;
+        while index < coverage.len() && coverage[index].lineage == lineage {
+            affected |= coverage[index].affected;
+            survives |= coverage[index].survives;
+            index += 1;
+        }
+        if !affected {
+            continue;
+        }
+        let identity = mapping_identity(identities, lineage)?;
+        if survives {
+            let generation = identity.generation.next().map_err(mm_error)?;
+            mutations.push(MappingIdentityMutation::Advance {
+                lineage,
+                generation,
+            });
+        } else {
+            mutations.push(MappingIdentityMutation::Retire { lineage });
+        }
+    }
+    Ok(mutations)
+}
+
+fn commit_mapping_identity_mutations(
+    identities: &mut Vec<MappingIdentityEntry>,
+    mutations: &[MappingIdentityMutation],
+) {
+    let mut mutation_index = 0;
+    identities.retain_mut(|entry| {
+        let Some(mutation) = mutations.get(mutation_index).copied() else {
+            return true;
+        };
+        if mutation.lineage() > entry.lineage {
+            return true;
+        }
+        assert_eq!(
+            mutation.lineage(),
+            entry.lineage,
+            "prepared mapping lineage disappeared before commit"
+        );
+        mutation_index += 1;
+        match mutation {
+            MappingIdentityMutation::Advance { generation, .. } => {
+                entry.state.generation = generation;
+                true
+            }
+            MappingIdentityMutation::Retire { .. } => false,
+        }
+    });
+    assert_eq!(
+        mutation_index,
+        mutations.len(),
+        "prepared mapping mutation was not committed"
+    );
+}
+
+fn allocate_mapping_identity() -> AxResult<(MappingLineage, MappingIdentityState)> {
+    let id = allocate_mapping_id()?;
+    let raw = id.get();
+    let lineage = MappingLineage::new(raw).ok_or(AxError::ResourceBusy)?;
+    Ok((
+        lineage,
+        MappingIdentityState {
+            id,
+            generation: MappingGeneration::new(1).map_err(mm_error)?,
+        },
     ))
 }
 
@@ -197,6 +625,7 @@ pub struct AddrSpace {
     topology_mapping_id: MappingId,
     topology_generation: MappingGeneration,
     areas: MemorySet<Backend>,
+    mapping_identities: Vec<MappingIdentityEntry>,
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
@@ -205,6 +634,8 @@ pub struct AddrSpace {
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
+    #[cfg(test)]
+    skip_transaction_backend_preflight: bool,
 }
 
 /// The generic, testable core of one linear protection transaction.
@@ -217,6 +648,7 @@ struct PreparedAreaProtect<'a, B: memory_set::MappingBackend> {
     start: B::Addr,
     end: B::Addr,
     flags: B::Flags,
+    max_areas: usize,
 }
 
 impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
@@ -237,8 +669,15 @@ impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
             start,
             end,
             flags,
+            max_areas,
         } = self;
-        areas.protect(start, end.sub_addr(start), |_| Some(flags), page_table)?;
+        areas.protect_with_limit(
+            start,
+            end.sub_addr(start),
+            |_| Some(flags),
+            page_table,
+            max_areas,
+        )?;
         Ok(areas)
     }
 }
@@ -307,7 +746,69 @@ pub(crate) struct PreparedProtect<'a> {
     growdown_starts: &'a mut BTreeSet<VirtAddr>,
     topology_generation: &'a mut MappingGeneration,
     next_topology_generation: MappingGeneration,
+    mapping_identities: &'a mut Vec<MappingIdentityEntry>,
+    mapping_mutations: Vec<MappingIdentityMutation>,
     synchronize_instruction_stream: bool,
+}
+
+enum RemapDestination {
+    Empty,
+    Replace,
+}
+
+/// Fixed-remap failure classification used by syscall glue to invalidate
+/// per-range policy only when replacement actually destroyed an old mapping.
+#[derive(Debug)]
+pub(crate) enum ReplaceMappingError {
+    DestinationPreserved(AxError),
+    DestinationDestroyed(AxError),
+}
+
+impl ReplaceMappingError {
+    pub(crate) const fn destination_destroyed(&self) -> bool {
+        matches!(self, Self::DestinationDestroyed(_))
+    }
+
+    pub(crate) fn into_error(self) -> AxError {
+        match self {
+            Self::DestinationPreserved(error) | Self::DestinationDestroyed(error) => error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MappingTransactionFailure {
+    error: AxError,
+    destination_destroyed: bool,
+}
+
+impl MappingTransactionFailure {
+    fn preserved(error: AxError) -> Self {
+        Self {
+            error,
+            destination_destroyed: false,
+        }
+    }
+
+    fn into_replace_error(self) -> ReplaceMappingError {
+        if self.destination_destroyed {
+            ReplaceMappingError::DestinationDestroyed(self.error)
+        } else {
+            ReplaceMappingError::DestinationPreserved(self.error)
+        }
+    }
+}
+
+struct RelativePolicyRange {
+    offset: usize,
+    size: usize,
+}
+
+struct RemapPolicyPlan {
+    growdown: bool,
+    wipe_on_fork: Vec<RelativePolicyRange>,
+    dontfork: Vec<RelativePolicyRange>,
+    locked: Vec<RelativePolicyRange>,
 }
 
 impl PreparedProtect<'_> {
@@ -332,6 +833,8 @@ impl PreparedProtect<'_> {
             growdown_starts,
             topology_generation,
             next_topology_generation,
+            mapping_identities,
+            mapping_mutations,
             synchronize_instruction_stream,
         } = self;
         let areas = transaction.commit();
@@ -340,6 +843,7 @@ impl PreparedProtect<'_> {
         }
         let areas = areas?;
         Self::refresh_growdown_starts(areas, growdown_starts);
+        commit_mapping_identity_mutations(mapping_identities, &mapping_mutations);
         *topology_generation = next_topology_generation;
         Ok(())
     }
@@ -407,6 +911,7 @@ impl AddrSpace {
             topology_mapping_id,
             topology_generation,
             areas: MemorySet::new(),
+            mapping_identities: Vec::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
@@ -415,7 +920,58 @@ impl AddrSpace {
             lock_future_mappings: false,
             lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
+            #[cfg(test)]
+            skip_transaction_backend_preflight: false,
         })
+    }
+
+    fn prepare_fresh_mapping_lineage(&mut self) -> AxResult<MappingLineage> {
+        reserve_mapping_identity_slot(&mut self.mapping_identities, MAX_MAPPING_LINEAGES)?;
+        let (lineage, identity) = allocate_mapping_identity()?;
+        debug_assert_eq!(lineage.get(), identity.id.get());
+        debug_assert_ne!(identity.id, self.topology_mapping_id);
+        if self
+            .mapping_identities
+            .last()
+            .is_some_and(|entry| entry.lineage >= lineage)
+        {
+            return Err(AxError::BadState);
+        }
+        self.mapping_identities.push(MappingIdentityEntry {
+            lineage,
+            state: identity,
+        });
+        Ok(lineage)
+    }
+
+    fn remove_mapping_lineage_if_unused(&mut self, lineage: MappingLineage) -> bool {
+        if self.areas.iter().any(|area| area.lineage() == lineage) {
+            return false;
+        }
+        let Ok(index) = self
+            .mapping_identities
+            .binary_search_by_key(&lineage, |entry| entry.lineage)
+        else {
+            return false;
+        };
+        self.mapping_identities.remove(index);
+        true
+    }
+
+    fn mapping_identity(&self, lineage: MappingLineage) -> AxResult<MappingIdentityState> {
+        mapping_identity(&self.mapping_identities, lineage)
+    }
+
+    fn commit_mapping_generation(
+        &mut self,
+        lineage: MappingLineage,
+        generation: MappingGeneration,
+    ) {
+        let index = self
+            .mapping_identities
+            .binary_search_by_key(&lineage, |entry| entry.lineage)
+            .expect("existing mapping lineage disappeared");
+        self.mapping_identities[index].state.generation = generation;
     }
 
     fn refresh_growdown_starts(&mut self) {
@@ -509,6 +1065,147 @@ impl AddrSpace {
         ranges
             .range(..end)
             .any(|(&range_start, &range_end)| range_end > start && range_start < end)
+    }
+
+    fn fork_fragment_count(&self) -> AxResult<usize> {
+        let mut count = 0usize;
+        for area in self.areas.iter() {
+            let mut cursor = area.start();
+            while cursor < area.end() {
+                if let Some(dontfork_end) =
+                    Self::interval_end_covering(&self.dontfork_ranges, cursor)
+                {
+                    cursor = dontfork_end.min(area.end());
+                    continue;
+                }
+
+                let mut segment_end = area.end();
+                if let Some(wipe_end) =
+                    Self::interval_end_covering(&self.wipe_on_fork_ranges, cursor)
+                {
+                    segment_end = segment_end.min(wipe_end);
+                } else if let Some(next_wipe) =
+                    Self::next_interval_start(&self.wipe_on_fork_ranges, cursor, area.end())
+                {
+                    segment_end = segment_end.min(next_wipe);
+                }
+                if let Some(next_dontfork) =
+                    Self::next_interval_start(&self.dontfork_ranges, cursor, area.end())
+                {
+                    segment_end = segment_end.min(next_dontfork);
+                }
+
+                if cursor >= segment_end {
+                    return Err(AxError::BadState);
+                }
+                count = count.checked_add(1).ok_or(AxError::NoMemory)?;
+                cursor = segment_end;
+            }
+        }
+        Ok(count)
+    }
+
+    fn collect_relative_policy_ranges(
+        ranges: &BTreeMap<VirtAddr, VirtAddr>,
+        source_start: VirtAddr,
+        preserve_size: usize,
+    ) -> AxResult<Vec<RelativePolicyRange>> {
+        let source_end = source_start
+            .checked_add(preserve_size)
+            .ok_or(AxError::InvalidInput)?;
+        let mut relative = Vec::new();
+        relative
+            .try_reserve(ranges.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (&range_start, &range_end) in ranges.range(..source_end) {
+            let start = range_start.max(source_start);
+            let end = range_end.min(source_end);
+            if start < end {
+                relative.push(RelativePolicyRange {
+                    offset: start.sub_addr(source_start),
+                    size: end.sub_addr(start),
+                });
+            }
+        }
+        Ok(relative)
+    }
+
+    fn prepare_remap_policy(
+        &self,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_size: usize,
+    ) -> AxResult<RemapPolicyPlan> {
+        let preserve_size = source_size.min(destination_size);
+        if preserve_size == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let source_end = source_start
+            .checked_add(source_size)
+            .ok_or(AxError::InvalidInput)?;
+        let mut wipe_on_fork = Self::collect_relative_policy_ranges(
+            &self.wipe_on_fork_ranges,
+            source_start,
+            preserve_size,
+        )?;
+        let mut dontfork = Self::collect_relative_policy_ranges(
+            &self.dontfork_ranges,
+            source_start,
+            preserve_size,
+        )?;
+        let mut locked =
+            Self::collect_relative_policy_ranges(&self.locked_ranges, source_start, preserve_size)?;
+
+        let growth = destination_size.saturating_sub(source_size);
+        if growth != 0 {
+            let last_source_byte = source_end - 1;
+            if Self::interval_end_covering(&self.wipe_on_fork_ranges, last_source_byte).is_some() {
+                wipe_on_fork.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                wipe_on_fork.push(RelativePolicyRange {
+                    offset: source_size,
+                    size: growth,
+                });
+            }
+            if Self::interval_end_covering(&self.dontfork_ranges, last_source_byte).is_some() {
+                dontfork.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                dontfork.push(RelativePolicyRange {
+                    offset: source_size,
+                    size: growth,
+                });
+            }
+            if self.range_is_fully_locked(source_start, source_size) {
+                locked.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                locked.push(RelativePolicyRange {
+                    offset: source_size,
+                    size: growth,
+                });
+            }
+        }
+
+        Ok(RemapPolicyPlan {
+            growdown: self.growdown_starts.contains(&source_start),
+            wipe_on_fork,
+            dontfork,
+            locked,
+        })
+    }
+
+    fn apply_remap_policy(&mut self, destination_start: VirtAddr, plan: &RemapPolicyPlan) {
+        if plan.growdown {
+            self.growdown_starts.insert(destination_start);
+        }
+        for range in &plan.wipe_on_fork {
+            let start = destination_start + range.offset;
+            Self::insert_interval(&mut self.wipe_on_fork_ranges, start, start + range.size);
+        }
+        for range in &plan.dontfork {
+            let start = destination_start + range.offset;
+            Self::insert_interval(&mut self.dontfork_ranges, start, start + range.size);
+        }
+        for range in &plan.locked {
+            let start = destination_start + range.offset;
+            self.insert_locked_range(start, start + range.size);
+        }
     }
 
     pub fn set_wipe_on_fork(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
@@ -752,10 +1449,6 @@ impl AddrSpace {
             .map_err(mm_error)
     }
 
-    pub(crate) fn admit_remap(&self, start: VirtAddr, size: usize) -> AxResult {
-        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Remap)
-    }
-
     fn snapshot_user_io_mappings(
         &self,
         range: PageRange,
@@ -787,12 +1480,13 @@ impl AddrSpace {
 
     fn mapping_snapshot(&self, area: &MemoryArea<Backend>) -> AxResult<MappingSnapshot> {
         let flags = area.flags();
+        let identity = self.mapping_identity(area.lineage())?;
         let range =
             PageRange::new(area.start().as_usize(), area.size(), PAGE_SIZE_4K).map_err(mm_error)?;
         Ok(MappingSnapshot::new(
             self.address_space_id,
-            self.topology_mapping_id,
-            self.topology_generation,
+            identity.id,
+            identity.generation,
             range,
             MappingAccess::new(
                 flags.contains(MappingFlags::READ),
@@ -989,18 +1683,29 @@ impl AddrSpace {
     ) -> AxResult {
         self.validate_region(start_vaddr, size)?;
         let next_generation = self.next_topology_generation()?;
+        let lineage = self.prepare_fresh_mapping_lineage()?;
 
         if !start_paddr.is_aligned_4k() {
+            let removed = self.remove_mapping_lineage_if_unused(lineage);
+            debug_assert!(removed);
             ax_bail!(InvalidInput, "address is not aligned");
         }
 
-        let area = MemoryArea::new(
+        let area = MemoryArea::new_with_lineage(
             start_vaddr,
             size,
             flags,
             Backend::new_linear(start_vaddr, start_paddr, size),
+            lineage,
         );
-        self.areas.map(area, &mut self.pt, false)?;
+        if let Err(error) = self
+            .areas
+            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)
+        {
+            let removed = self.remove_mapping_lineage_if_unused(lineage);
+            debug_assert!(removed);
+            return Err(error.into());
+        }
         self.commit_topology_generation(next_generation);
         Ok(())
     }
@@ -1034,9 +1739,17 @@ impl AddrSpace {
     ) -> AxResult {
         self.validate_region(start, size)?;
         let next_generation = self.next_topology_generation()?;
+        let lineage = self.prepare_fresh_mapping_lineage()?;
 
-        let area = MemoryArea::new(start, size, flags, backend);
-        self.areas.map(area, &mut self.pt, false)?;
+        let area = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
+        if let Err(error) = self
+            .areas
+            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)
+        {
+            let removed = self.remove_mapping_lineage_if_unused(lineage);
+            debug_assert!(removed);
+            return Err(error.into());
+        }
         // Population or its rollback may partially change resident state, so
         // publish the new topology generation as soon as the VMA is visible.
         self.commit_topology_generation(next_generation);
@@ -1044,7 +1757,10 @@ impl AddrSpace {
             self.insert_locked_range(start, start + size);
         }
         if populate && let Err(err) = self.populate_area(start, size, flags) {
-            if let Err(unmap_err) = self.areas.unmap(start, size, &mut self.pt) {
+            if let Err(unmap_err) =
+                self.areas
+                    .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
+            {
                 warn!(
                     "AddrSpace::map: failed to roll back {start:?}+{size:#x} after populate \
                      error: {unmap_err:?}"
@@ -1052,9 +1768,574 @@ impl AddrSpace {
             }
             self.refresh_growdown_starts();
             self.clear_locked_range(start, size);
+            // A fail-stop backend can leave the area visible after rollback
+            // failure. Keep its sidecar identity in that case; removing it
+            // would make later snapshots silently lose their lineage state.
+            self.remove_mapping_lineage_if_unused(lineage);
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Extends an already identified logical mapping.
+    ///
+    /// A successful extension publishes exactly one lineage generation. Multi-
+    /// fragment staging that must defer publication uses
+    /// [`Self::stage_mapping_fragment`] inside an explicit transaction instead.
+    pub(crate) fn map_with_existing_lineage(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        populate: bool,
+        backend: Backend,
+        locked: bool,
+        lineage: MappingLineage,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        let next_topology_generation = self.next_topology_generation()?;
+        // If population rollback fails and the new range remains visible,
+        // publishing a conservative generation is mandatory and must not
+        // introduce a new fallible step after mutation.
+        let next_mapping_generation = self
+            .mapping_identity(lineage)?
+            .generation
+            .next()
+            .map_err(mm_error)?;
+
+        let area = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
+        self.areas
+            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)?;
+        self.commit_topology_generation(next_topology_generation);
+        if locked {
+            self.insert_locked_range(start, start + size);
+        }
+        if populate && let Err(err) = self.populate_area(start, size, flags) {
+            if let Err(unmap_err) =
+                self.areas
+                    .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
+            {
+                warn!(
+                    "AddrSpace::map_with_existing_lineage: failed to roll back \
+                     {start:?}+{size:#x} after populate error: {unmap_err:?}"
+                );
+            }
+            self.refresh_growdown_starts();
+            self.clear_locked_range(start, size);
+            let end = start + size;
+            if self
+                .areas
+                .iter()
+                .any(|area| area.lineage() == lineage && area.start() < end && start < area.end())
+            {
+                self.commit_mapping_generation(lineage, next_mapping_generation);
+            }
+            return Err(err);
+        }
+        self.commit_mapping_generation(lineage, next_mapping_generation);
+        Ok(())
+    }
+
+    /// Stages one fragment under an already reserved lineage without
+    /// publishing topology or generation state. The caller must hold the
+    /// address-space lock and finish through one of the transaction helpers
+    /// below, which owns both commit and rollback.
+    pub(crate) fn stage_mapping_fragment(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        populate: bool,
+        backend: Backend,
+        locked: bool,
+        lineage: MappingLineage,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        self.mapping_identity(lineage)?;
+        let area = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
+        self.areas
+            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)?;
+        if locked {
+            self.insert_locked_range(start, start + size);
+        }
+        if populate {
+            // Leave the fragment visible on failure. The enclosing transaction
+            // owns rollback for the complete destination, including any prefix
+            // populated before the error.
+            self.populate_area(start, size, flags)?;
+        }
+        Ok(())
+    }
+
+    fn preflight_transaction_unmap(&self, start: VirtAddr, size: usize) -> AxResult {
+        #[cfg(test)]
+        if self.skip_transaction_backend_preflight {
+            return Ok(());
+        }
+        self.areas
+            .preflight_unmap(start, size, &self.pt)
+            .map_err(Into::into)
+    }
+
+    fn rollback_staged_mapping(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        lineage: MappingLineage,
+    ) -> AxResult {
+        if !range_is_owned_by_lineage(&self.areas, lineage, start, size) {
+            // Do not retire a sidecar while an out-of-transaction fragment is
+            // visible, or unmap a pre-existing mapping that the transaction
+            // never owned. The enclosing transaction publishes its prepared
+            // topology fence before returning this fail-closed result.
+            return Err(AxError::BadState);
+        }
+        #[cfg(test)]
+        let skip_preflight = self.skip_transaction_backend_preflight;
+        #[cfg(not(test))]
+        let skip_preflight = false;
+        let rollback = if skip_preflight {
+            self.areas.commit_preflighted_unmap_with_limit(
+                start,
+                size,
+                &mut self.pt,
+                MAX_VMA_FRAGMENTS,
+            )
+        } else {
+            self.areas
+                .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
+        };
+        if let Err(error) = rollback {
+            // The fresh mapping incarnation remains visible. Its generation 1
+            // sidecar remains valid; the caller must publish the topology
+            // fence before exposing the rollback failure.
+            return Err(error.into());
+        }
+        self.refresh_growdown_starts();
+        Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+        Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        self.clear_locked_range(start, size);
+        if !self.remove_mapping_lineage_if_unused(lineage) {
+            return Err(AxError::BadState);
+        }
+        Ok(())
+    }
+
+    fn destroy_remap_destination(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.areas.commit_preflighted_unmap_with_limit(
+            start,
+            size,
+            &mut self.pt,
+            MAX_VMA_FRAGMENTS,
+        )?;
+        self.refresh_growdown_starts();
+        Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+        Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        self.clear_locked_range(start, size);
+        Ok(())
+    }
+
+    fn finish_failed_mapping_transaction(
+        &mut self,
+        operation_error: AxError,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        destination_lineage: MappingLineage,
+        destination_mutations: &[MappingIdentityMutation],
+        destination_destroyed: bool,
+        next_topology_generation: MappingGeneration,
+    ) -> MappingTransactionFailure {
+        let rollback =
+            self.rollback_staged_mapping(destination_start, destination_size, destination_lineage);
+        if destination_destroyed {
+            commit_mapping_identity_mutations(&mut self.mapping_identities, destination_mutations);
+        }
+        let rollback_error = rollback.err();
+        let destructive_outcome = destination_destroyed || rollback_error.is_some();
+        if destructive_outcome {
+            self.commit_topology_generation(next_topology_generation);
+        }
+        MappingTransactionFailure {
+            error: rollback_error.unwrap_or(operation_error),
+            destination_destroyed: destructive_outcome,
+        }
+    }
+
+    fn duplicate_mapping_transaction<T>(
+        &mut self,
+        destination: RemapDestination,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        fragment_limit: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> Result<T, MappingTransactionFailure> {
+        self.validate_region(source_start, source_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        self.validate_region(destination_start, destination_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        if staged_fragments == 0 {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+        let source_range = VirtAddrRange::from_start_size(source_start, source_size);
+        let destination_range = VirtAddrRange::from_start_size(destination_start, destination_size);
+        if source_range.overlaps(destination_range) {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+        if !range_is_fully_mapped(&self.areas, source_start, source_size) {
+            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+        }
+
+        let replacing = matches!(destination, RemapDestination::Replace);
+        if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+        if replacing {
+            self.check_no_user_io_pin_overlap(
+                destination_start,
+                destination_size,
+                InvalidationReason::Remap,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+        }
+
+        let destination_mutations = if replacing {
+            prepare_unmap_mapping_mutations(
+                &self.areas,
+                &self.mapping_identities,
+                destination_start,
+                destination_size,
+            )
+            .map_err(MappingTransactionFailure::preserved)?
+        } else {
+            Vec::new()
+        };
+        let policy = self
+            .prepare_remap_policy(source_start, source_size, destination_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        let destination_unmaps = [destination_range];
+        let unmaps = if replacing {
+            destination_unmaps.as_slice()
+        } else {
+            &[]
+        };
+        admit_staged_fragments_after_unmaps(&self.areas, &unmaps, staged_fragments, fragment_limit)
+            .map_err(MappingTransactionFailure::preserved)?;
+        if replacing {
+            self.preflight_transaction_unmap(destination_start, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+        }
+        let next_topology_generation = self
+            .next_topology_generation()
+            .map_err(MappingTransactionFailure::preserved)?;
+        let destination_lineage = self
+            .prepare_fresh_mapping_lineage()
+            .map_err(MappingTransactionFailure::preserved)?;
+
+        let destination_destroyed = !destination_mutations.is_empty();
+        if replacing
+            && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
+        {
+            let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+            debug_assert!(removed);
+            return Err(MappingTransactionFailure::preserved(error));
+        }
+
+        let staged = stage(self, destination_lineage);
+        match staged {
+            Ok(value)
+                if lineage_exactly_covers_range(
+                    &self.areas,
+                    destination_lineage,
+                    destination_start,
+                    destination_size,
+                ) =>
+            {
+                self.apply_remap_policy(destination_start, &policy);
+                commit_mapping_identity_mutations(
+                    &mut self.mapping_identities,
+                    &destination_mutations,
+                );
+                self.commit_topology_generation(next_topology_generation);
+                Ok(value)
+            }
+            Ok(_) => Err(self.finish_failed_mapping_transaction(
+                AxError::BadState,
+                destination_start,
+                destination_size,
+                destination_lineage,
+                &destination_mutations,
+                destination_destroyed,
+                next_topology_generation,
+            )),
+            Err(operation_error) => Err(self.finish_failed_mapping_transaction(
+                operation_error,
+                destination_start,
+                destination_size,
+                destination_lineage,
+                &destination_mutations,
+                destination_destroyed,
+                next_topology_generation,
+            )),
+        }
+    }
+
+    fn move_mapping_transaction<T>(
+        &mut self,
+        destination: RemapDestination,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        fragment_limit: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> Result<T, MappingTransactionFailure> {
+        self.validate_region(source_start, source_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        self.validate_region(destination_start, destination_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        if staged_fragments == 0 {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+        self.check_no_user_io_pin_overlap(source_start, source_size, InvalidationReason::Remap)
+            .map_err(MappingTransactionFailure::preserved)?;
+        let source_range = VirtAddrRange::from_start_size(source_start, source_size);
+        let destination_range = VirtAddrRange::from_start_size(destination_start, destination_size);
+        if source_range.overlaps(destination_range) {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+
+        let replacing = matches!(destination, RemapDestination::Replace);
+        if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
+            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+        }
+        if replacing {
+            self.check_no_user_io_pin_overlap(
+                destination_start,
+                destination_size,
+                InvalidationReason::Remap,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+        }
+
+        if !range_is_fully_mapped(&self.areas, source_start, source_size) {
+            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+        }
+        let destination_mutations = if replacing {
+            prepare_unmap_mapping_mutations(
+                &self.areas,
+                &self.mapping_identities,
+                destination_start,
+                destination_size,
+            )
+            .map_err(MappingTransactionFailure::preserved)?
+        } else {
+            Vec::new()
+        };
+        let replacement_success_ranges = [destination_range, source_range];
+        let source_success_ranges = [source_range];
+        let success_ranges = if replacing {
+            replacement_success_ranges.as_slice()
+        } else {
+            source_success_ranges.as_slice()
+        };
+        let success_mutations = prepare_unmap_mapping_mutations_for_ranges(
+            &self.areas,
+            &self.mapping_identities,
+            success_ranges,
+        )
+        .map_err(MappingTransactionFailure::preserved)?;
+        if success_mutations.is_empty() {
+            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+        }
+
+        let policy = self
+            .prepare_remap_policy(source_start, source_size, destination_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        let replacement_destination_unmaps = [destination_range];
+        let destination_unmaps = if replacing {
+            replacement_destination_unmaps.as_slice()
+        } else {
+            &[]
+        };
+        admit_staged_fragments_after_unmaps(
+            &self.areas,
+            &destination_unmaps,
+            staged_fragments,
+            fragment_limit,
+        )
+        .map_err(MappingTransactionFailure::preserved)?;
+        admit_staged_fragments_after_unmaps(
+            &self.areas,
+            success_ranges,
+            staged_fragments,
+            fragment_limit,
+        )
+        .map_err(MappingTransactionFailure::preserved)?;
+        if replacing {
+            self.preflight_transaction_unmap(destination_start, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+        }
+        self.preflight_transaction_unmap(source_start, source_size)
+            .map_err(MappingTransactionFailure::preserved)?;
+        let next_topology_generation = self
+            .next_topology_generation()
+            .map_err(MappingTransactionFailure::preserved)?;
+        let destination_lineage = self
+            .prepare_fresh_mapping_lineage()
+            .map_err(MappingTransactionFailure::preserved)?;
+
+        let destination_destroyed = !destination_mutations.is_empty();
+        if replacing
+            && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
+        {
+            let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+            debug_assert!(removed);
+            return Err(MappingTransactionFailure::preserved(error));
+        }
+
+        let staged = stage(self, destination_lineage);
+        let operation: AxResult<T> = match staged {
+            Ok(value)
+                if lineage_exactly_covers_range(
+                    &self.areas,
+                    destination_lineage,
+                    destination_start,
+                    destination_size,
+                ) =>
+            {
+                self.apply_remap_policy(destination_start, &policy);
+                match self.areas.commit_preflighted_unmap_with_limit(
+                    source_start,
+                    source_size,
+                    &mut self.pt,
+                    MAX_VMA_FRAGMENTS,
+                ) {
+                    Ok(()) => {
+                        self.refresh_growdown_starts();
+                        Self::clear_interval(
+                            &mut self.wipe_on_fork_ranges,
+                            source_start,
+                            source_size,
+                        );
+                        Self::clear_interval(&mut self.dontfork_ranges, source_start, source_size);
+                        self.clear_locked_range(source_start, source_size);
+                        commit_mapping_identity_mutations(
+                            &mut self.mapping_identities,
+                            &success_mutations,
+                        );
+                        self.commit_topology_generation(next_topology_generation);
+                        return Ok(value);
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Ok(_) => Err(AxError::BadState),
+            Err(error) => Err(error),
+        };
+
+        Err(self.finish_failed_mapping_transaction(
+            operation
+                .err()
+                .expect("failed remap operation lost its error"),
+            destination_start,
+            destination_size,
+            destination_lineage,
+            &destination_mutations,
+            destination_destroyed,
+            next_topology_generation,
+        ))
+    }
+
+    pub(crate) fn duplicate_mapping_into_empty_transaction<T>(
+        &mut self,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.duplicate_mapping_transaction(
+            RemapDestination::Empty,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+            staged_fragments,
+            MAX_VMA_FRAGMENTS,
+            stage,
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn replace_and_duplicate_mapping_transaction<T>(
+        &mut self,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> Result<T, ReplaceMappingError> {
+        self.duplicate_mapping_transaction(
+            RemapDestination::Replace,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+            staged_fragments,
+            MAX_VMA_FRAGMENTS,
+            stage,
+        )
+        .map_err(MappingTransactionFailure::into_replace_error)
+    }
+
+    pub(crate) fn move_mapping_into_empty_transaction<T>(
+        &mut self,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.move_mapping_transaction(
+            RemapDestination::Empty,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+            staged_fragments,
+            MAX_VMA_FRAGMENTS,
+            stage,
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn replace_and_move_mapping_transaction<T>(
+        &mut self,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+        staged_fragments: usize,
+        stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
+    ) -> Result<T, ReplaceMappingError> {
+        self.move_mapping_transaction(
+            RemapDestination::Replace,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+            staged_fragments,
+            MAX_VMA_FRAGMENTS,
+            stage,
+        )
+        .map_err(MappingTransactionFailure::into_replace_error)
     }
 
     /// Populates the area with physical frames, returning false if the area
@@ -1102,8 +2383,9 @@ impl AddrSpace {
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
         let next_generation = self.next_topology_generation()?;
         // Backend discard can make partial progress before reporting a later
-        // hole or backend error. Advance first so every observable teardown of
-        // resident pages invalidates pre-operation snapshots.
+        // hole or backend error. Advance the legacy address-space admission
+        // fence first, but deliberately keep per-lineage VMA generations
+        // stable: residency is not a mapping-contract change.
         self.commit_topology_generation(next_generation);
         let end = start + size;
 
@@ -1191,14 +2473,21 @@ impl AddrSpace {
     /// aligned.
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
+        if size == 0 {
+            return Ok(());
+        }
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
         let next_generation = self.next_topology_generation()?;
+        let mapping_mutations =
+            prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
 
-        self.areas.unmap(start, size, &mut self.pt)?;
+        self.areas
+            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        commit_mapping_identity_mutations(&mut self.mapping_identities, &mapping_mutations);
         self.commit_topology_generation(next_generation);
         Ok(())
     }
@@ -1288,9 +2577,18 @@ impl AddrSpace {
         flags: MappingFlags,
     ) -> AxResult<PreparedProtect<'_>> {
         self.validate_region(start, size)?;
+        if size == 0 {
+            return Err(AxError::InvalidInput);
+        }
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Protect)?;
         self.check_protect_range(start, size, flags)?;
         let next_topology_generation = self.next_topology_generation()?;
+        let mapping_mutations = prepare_mapping_generation_advances_for_range(
+            &self.areas,
+            &self.mapping_identities,
+            start,
+            size,
+        )?;
 
         let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
 
@@ -1300,6 +2598,7 @@ impl AddrSpace {
             start,
             end,
             flags,
+            max_areas: MAX_VMA_FRAGMENTS,
         };
         let synchronize_instruction_stream = transaction
             .segments()
@@ -1310,6 +2609,8 @@ impl AddrSpace {
             growdown_starts: &mut self.growdown_starts,
             topology_generation: &mut self.topology_generation,
             next_topology_generation,
+            mapping_identities: &mut self.mapping_identities,
+            mapping_mutations,
             synchronize_instruction_stream,
         })
     }
@@ -1349,6 +2650,7 @@ impl AddrSpace {
         // image. A sequence-exhaustion failure therefore leaves it untouched.
         let new_policy = new_user_io_policy()?;
         self.areas.clear(&mut self.pt)?;
+        drop(core::mem::take(&mut self.mapping_identities));
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
         self.dontfork_ranges.clear();
@@ -1377,7 +2679,7 @@ impl AddrSpace {
         // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
         // page immediately below the current lowest mapped page and SP is still
         // within that guard page.
-        let Some((current_start, fault_page, page_size, flags)) = self
+        let Some((current_start, fault_page, page_size, flags, lineage)) = self
             .growdown_starts
             .iter()
             .copied()
@@ -1398,7 +2700,13 @@ impl AddrSpace {
                     return None;
                 }
                 match area.backend() {
-                    Backend::Cow(_) => Some((current_start, fault_page, page_size, area.flags())),
+                    Backend::Cow(_) => Some((
+                        current_start,
+                        fault_page,
+                        page_size,
+                        area.flags(),
+                        area.lineage(),
+                    )),
                     Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => None,
                 }
             })
@@ -1418,12 +2726,15 @@ impl AddrSpace {
             return PageFaultResult::Unhandled;
         }
 
-        if let Err(err) = self.map(
+        let locked = self.range_is_fully_locked(current_start, page_size as usize);
+        if let Err(err) = self.map_with_existing_lineage(
             fault_page,
             page_size as usize,
             flags,
             false,
             Backend::new_alloc(fault_page, page_size),
+            locked,
+            lineage,
         ) {
             warn!(
                 "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
@@ -1544,22 +2855,61 @@ impl AddrSpace {
         if self.user_io_pins.progress().total() != 0 {
             return Err(AxError::ResourceBusy);
         }
+        if self.fork_fragment_count()? > MAX_VMA_FRAGMENTS {
+            return Err(AxError::NoMemory);
+        }
 
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
-        // Fork may COW-protect parent pages before a later allocation fails.
-        // Advance conservatively before that fallible sequence so stale
-        // snapshots can never survive partial parent-side work.
-        let next_generation = self.next_topology_generation()?;
-        self.commit_topology_generation(next_generation);
+        let next_topology_generation = self.next_topology_generation()?;
         let new_aspace_clone = new_aspace.clone();
+        let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
+        let dontfork_ranges = self.dontfork_ranges.clone();
+
+        // Reserve every child identity before clone_map can COW-protect a
+        // parent PTE. Fork does not change the parent's VMA contract, so its
+        // per-lineage generation remains stable; the legacy topology
+        // generation below remains the conservative PTE/COW admission fence.
+        let mut child_parent_lineages = Vec::new();
+        child_parent_lineages
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            let mut cursor = area.start();
+            let mut has_child_segment = false;
+            while cursor < area.end() {
+                if let Some(dontfork_end) = Self::interval_end_covering(&dontfork_ranges, cursor) {
+                    cursor = dontfork_end.min(area.end());
+                } else {
+                    has_child_segment = true;
+                    break;
+                }
+            }
+            if has_child_segment {
+                child_parent_lineages.push(area.lineage());
+            }
+        }
+        child_parent_lineages.sort_unstable();
+        child_parent_lineages.dedup();
 
         let mut guard = new_aspace.lock();
         guard.growdown_starts = self.growdown_starts.clone();
+        let mut child_lineages = Vec::new();
+        child_lineages
+            .try_reserve(child_parent_lineages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for parent_lineage in child_parent_lineages {
+            let child_lineage = guard.prepare_fresh_mapping_lineage()?;
+            child_lineages.push((parent_lineage, child_lineage));
+        }
 
-        let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
-        let dontfork_ranges = self.dontfork_ranges.clone();
+        self.commit_topology_generation(next_topology_generation);
+
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
+            let child_lineage = child_lineages
+                .binary_search_by_key(&area.lineage(), |(parent, _)| *parent)
+                .ok()
+                .map(|index| child_lineages[index].1);
             let page_size = area.backend().page_size();
             let mut cursor = area.start();
             while cursor < area.end() {
@@ -1572,14 +2922,20 @@ impl AddrSpace {
                     let segment_end = wipe_end.min(area.end());
                     let wipe_size = segment_end.sub_addr(cursor);
                     debug_assert!(page_size.is_aligned(wipe_size));
-                    let new_area = MemoryArea::new(
+                    let new_area = MemoryArea::new_with_lineage(
                         cursor,
                         wipe_size,
                         area.flags(),
                         Backend::new_alloc(cursor, page_size),
+                        child_lineage.expect("included parent lineage was not prepared"),
                     );
                     let aspace = guard.deref_mut();
-                    aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                    aspace.areas.map_with_limit(
+                        new_area,
+                        &mut aspace.pt,
+                        false,
+                        MAX_VMA_FRAGMENTS,
+                    )?;
                     Self::insert_interval(&mut aspace.wipe_on_fork_ranges, cursor, segment_end);
                     cursor = segment_end;
                     continue;
@@ -1612,9 +2968,20 @@ impl AddrSpace {
                     // Fork keeps the segment at the same virtual address. In
                     // particular, a suffix after MADV_DONTFORK must retain the
                     // original backend origin and file-offset relation.
-                    let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
+                    let new_area = MemoryArea::new_with_lineage(
+                        cursor,
+                        segment_size,
+                        area.flags(),
+                        new_backend,
+                        child_lineage.expect("included parent lineage was not prepared"),
+                    );
                     let aspace = guard.deref_mut();
-                    aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                    aspace.areas.map_with_limit(
+                        new_area,
+                        &mut aspace.pt,
+                        false,
+                        MAX_VMA_FRAGMENTS,
+                    )?;
                     if Self::interval_overlaps(&wipe_on_fork_ranges, cursor, segment_end) {
                         Self::insert_interval(&mut aspace.wipe_on_fork_ranges, cursor, segment_end);
                     }
@@ -1625,6 +2992,13 @@ impl AddrSpace {
             }
         }
         guard.refresh_growdown_starts();
+        debug_assert!(
+            guard.areas.iter().all(|area| mapping_identity(
+                &guard.mapping_identities,
+                area.lineage()
+            )
+            .is_ok())
+        );
         drop(guard);
 
         Ok(new_aspace)
@@ -1663,10 +3037,782 @@ impl Drop for AddrSpace {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::{cell::Cell, mem::ManuallyDrop};
+
+    use axhal::paging::PageSize;
+    use thekernel_linux_mm::{PinAccess, PinDuration, PinUse};
 
     use super::*;
 
     const TEST_SPACE_SIZE: usize = 0x6000;
+
+    fn mock_lineage(raw: u64) -> MappingLineage {
+        MappingLineage::new(raw).unwrap()
+    }
+
+    fn mock_identity(raw: u64, generation: u64) -> MappingIdentityEntry {
+        MappingIdentityEntry {
+            lineage: mock_lineage(raw),
+            state: MappingIdentityState {
+                id: MappingId::new(raw).unwrap(),
+                generation: MappingGeneration::new(generation).unwrap(),
+            },
+        }
+    }
+
+    fn map_mock_area(
+        areas: &mut MemorySet<MockBackend>,
+        page_table: &mut Vec<u8>,
+        start: usize,
+        size: usize,
+        flags: u8,
+        backend: u8,
+        lineage: MappingLineage,
+    ) {
+        areas
+            .map(
+                MemoryArea::new_with_lineage(
+                    VirtAddr::from(start),
+                    size,
+                    flags,
+                    MockBackend(backend),
+                    lineage,
+                ),
+                page_table,
+                false,
+            )
+            .unwrap();
+    }
+
+    fn new_transaction_test_aspace() -> ManuallyDrop<AddrSpace> {
+        let base = VirtAddr::from(0x1000);
+        let va_range = VirtAddrRange::from_start_size(base, 0x10_000);
+        let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
+            new_user_io_policy().unwrap();
+        // SAFETY: host-test axhal intentionally provides no real page-table
+        // handler. A zero root address is structurally valid for `PageTable`;
+        // these tests use lazy anonymous backends whose commits never
+        // dereference it, bypass backend PTE preflight covered elsewhere, and
+        // keep the enclosing AddrSpace in ManuallyDrop so PageTable::drop can
+        // never observe it.
+        let pt = unsafe { core::mem::MaybeUninit::<PageTable>::zeroed().assume_init() };
+        ManuallyDrop::new(AddrSpace {
+            va_range,
+            address_space_id,
+            topology_mapping_id,
+            topology_generation,
+            areas: MemorySet::new(),
+            mapping_identities: Vec::new(),
+            growdown_starts: BTreeSet::new(),
+            wipe_on_fork_ranges: BTreeMap::new(),
+            dontfork_ranges: BTreeMap::new(),
+            locked_ranges: BTreeMap::new(),
+            user_io_pins,
+            lock_future_mappings: false,
+            lock_future_on_fault: false,
+            pt,
+            skip_transaction_backend_preflight: true,
+        })
+    }
+
+    fn map_transaction_test_area(
+        aspace: &mut AddrSpace,
+        start: VirtAddr,
+        size: usize,
+    ) -> MappingLineage {
+        aspace
+            .map(
+                start,
+                size,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(start, PageSize::Size4K),
+            )
+            .unwrap();
+        aspace.find_area(start).unwrap().lineage()
+    }
+
+    fn stage_transaction_test_area(
+        aspace: &mut AddrSpace,
+        start: VirtAddr,
+        size: usize,
+        lineage: MappingLineage,
+    ) -> AxResult {
+        aspace.stage_mapping_fragment(
+            start,
+            size,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            false,
+            Backend::new_alloc(start, PageSize::Size4K),
+            false,
+            lineage,
+        )
+    }
+
+    fn transaction_area_snapshot(aspace: &AddrSpace) -> Vec<(VirtAddr, VirtAddr, MappingLineage)> {
+        aspace
+            .areas
+            .iter()
+            .map(|area| (area.start(), area.end(), area.lineage()))
+            .collect()
+    }
+
+    #[test]
+    fn fixed_duplicate_replaces_once_with_fresh_identity_and_copies_vma_policy() {
+        let mut aspace = new_transaction_test_aspace();
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let size = 2 * PAGE_SIZE_4K;
+        let source_lineage = map_transaction_test_area(&mut aspace, source, size);
+        let old_destination_lineage = map_transaction_test_area(&mut aspace, destination, size);
+        aspace.mark_growdown(source);
+        aspace.set_wipe_on_fork(source, PAGE_SIZE_4K, true).unwrap();
+        aspace
+            .set_dontfork(source + PAGE_SIZE_4K, PAGE_SIZE_4K, true)
+            .unwrap();
+        aspace.set_locked(source, size, true).unwrap();
+        let source_identity = aspace.mapping_identity(source_lineage).unwrap();
+        let topology_before = aspace.topology_generation;
+
+        aspace
+            .replace_and_duplicate_mapping_transaction(
+                source,
+                size,
+                destination,
+                size,
+                1,
+                |aspace, lineage| stage_transaction_test_area(aspace, destination, size, lineage),
+            )
+            .unwrap();
+
+        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
+        assert_eq!(
+            aspace.mapping_identity(source_lineage).unwrap(),
+            source_identity
+        );
+        assert!(aspace.mapping_identity(old_destination_lineage).is_err());
+        let destination_lineage = aspace.find_area(destination).unwrap().lineage();
+        assert_ne!(destination_lineage, source_lineage);
+        assert_ne!(destination_lineage, old_destination_lineage);
+        assert_eq!(
+            aspace
+                .mapping_identity(destination_lineage)
+                .unwrap()
+                .generation
+                .get(),
+            1
+        );
+        assert!(aspace.growdown_starts.contains(&source));
+        assert!(aspace.growdown_starts.contains(&destination));
+        assert!(
+            AddrSpace::interval_end_covering(&aspace.wipe_on_fork_ranges, destination).is_some()
+        );
+        assert!(
+            AddrSpace::interval_end_covering(&aspace.dontfork_ranges, destination + PAGE_SIZE_4K)
+                .is_some()
+        );
+        assert!(aspace.range_is_fully_locked(destination, size));
+    }
+
+    #[test]
+    fn fixed_move_late_stage_failure_destroys_destination_but_preserves_source() {
+        let mut aspace = new_transaction_test_aspace();
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let size = PAGE_SIZE_4K;
+        let source_lineage = map_transaction_test_area(&mut aspace, source, size);
+        let old_destination_lineage = map_transaction_test_area(&mut aspace, destination, size);
+        aspace.set_wipe_on_fork(source, size, true).unwrap();
+        aspace.set_dontfork(destination, size, true).unwrap();
+        aspace.set_locked(destination, size, true).unwrap();
+        let source_identity = aspace.mapping_identity(source_lineage).unwrap();
+        let topology_before = aspace.topology_generation;
+
+        let error = aspace
+            .replace_and_move_mapping_transaction(
+                source,
+                size,
+                destination,
+                size,
+                1,
+                |aspace, lineage| {
+                    stage_transaction_test_area(aspace, destination, size, lineage)?;
+                    Err::<(), _>(AxError::NoMemory)
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReplaceMappingError::DestinationDestroyed(AxError::NoMemory)
+        ));
+        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
+        assert_eq!(aspace.find_area(source).unwrap().lineage(), source_lineage);
+        assert_eq!(
+            aspace.mapping_identity(source_lineage).unwrap(),
+            source_identity
+        );
+        assert!(aspace.find_area(destination).is_none());
+        assert!(aspace.mapping_identity(old_destination_lineage).is_err());
+        assert!(AddrSpace::interval_end_covering(&aspace.wipe_on_fork_ranges, source).is_some());
+        assert!(AddrSpace::interval_end_covering(&aspace.dontfork_ranges, destination).is_none());
+        assert!(!aspace.range_is_fully_locked(destination, size));
+    }
+
+    #[test]
+    fn fixed_move_combines_same_lineage_mutations_and_publishes_once() {
+        let mut aspace = new_transaction_test_aspace();
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let size = PAGE_SIZE_4K;
+        let old_lineage = map_transaction_test_area(&mut aspace, source, size);
+        aspace
+            .map_with_existing_lineage(
+                destination,
+                size,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(destination, PageSize::Size4K),
+                false,
+                old_lineage,
+            )
+            .unwrap();
+        let topology_before = aspace.topology_generation;
+
+        aspace
+            .replace_and_move_mapping_transaction(
+                source,
+                size,
+                destination,
+                size,
+                1,
+                |aspace, lineage| stage_transaction_test_area(aspace, destination, size, lineage),
+            )
+            .unwrap();
+
+        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
+        assert!(aspace.find_area(source).is_none());
+        let fresh_lineage = aspace.find_area(destination).unwrap().lineage();
+        assert_ne!(fresh_lineage, old_lineage);
+        assert!(aspace.mapping_identity(old_lineage).is_err());
+        assert_eq!(aspace.mapping_identities.len(), 1);
+    }
+
+    #[test]
+    fn partial_move_advances_surviving_source_lineage() {
+        let mut aspace = new_transaction_test_aspace();
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let source_lineage = map_transaction_test_area(&mut aspace, source, 2 * PAGE_SIZE_4K);
+        let source_generation = aspace.mapping_identity(source_lineage).unwrap().generation;
+        let topology_before = aspace.topology_generation;
+
+        aspace
+            .move_mapping_into_empty_transaction(
+                source,
+                PAGE_SIZE_4K,
+                destination,
+                PAGE_SIZE_4K,
+                1,
+                |aspace, lineage| {
+                    stage_transaction_test_area(aspace, destination, PAGE_SIZE_4K, lineage)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
+        assert!(aspace.find_area(source).is_none());
+        assert_eq!(
+            aspace.find_area(source + PAGE_SIZE_4K).unwrap().lineage(),
+            source_lineage
+        );
+        assert_eq!(
+            aspace.mapping_identity(source_lineage).unwrap().generation,
+            source_generation.next().unwrap()
+        );
+    }
+
+    #[test]
+    fn replacement_preflight_failures_leave_topology_areas_and_sidecars_unchanged() {
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let size = PAGE_SIZE_4K;
+
+        let mut exhausted = new_transaction_test_aspace();
+        map_transaction_test_area(&mut exhausted, source, size);
+        map_transaction_test_area(&mut exhausted, destination, size);
+        exhausted.topology_generation = MappingGeneration::new(u64::MAX).unwrap();
+        let exhausted_areas = transaction_area_snapshot(&exhausted);
+        let exhausted_identities = exhausted.mapping_identities.clone();
+        let stage_called = Cell::new(false);
+
+        let error = exhausted
+            .duplicate_mapping_transaction(
+                RemapDestination::Replace,
+                source,
+                size,
+                destination,
+                size,
+                1,
+                MAX_VMA_FRAGMENTS,
+                |_, _| {
+                    stage_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(!error.destination_destroyed);
+        assert_eq!(error.error, AxError::ResourceBusy);
+        assert!(!stage_called.get());
+        assert_eq!(transaction_area_snapshot(&exhausted), exhausted_areas);
+        assert_eq!(exhausted.mapping_identities, exhausted_identities);
+        assert_eq!(exhausted.topology_generation.get(), u64::MAX);
+
+        let mut capacity = new_transaction_test_aspace();
+        map_transaction_test_area(&mut capacity, source, size);
+        map_transaction_test_area(&mut capacity, destination, size);
+        let capacity_topology = capacity.topology_generation;
+        let capacity_areas = transaction_area_snapshot(&capacity);
+        let capacity_identities = capacity.mapping_identities.clone();
+        let stage_called = Cell::new(false);
+        let error = capacity
+            .duplicate_mapping_transaction(
+                RemapDestination::Replace,
+                source,
+                size,
+                destination,
+                size,
+                2,
+                2,
+                |_, _| {
+                    stage_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(!error.destination_destroyed);
+        assert_eq!(error.error, AxError::NoMemory);
+        assert!(!stage_called.get());
+        assert_eq!(transaction_area_snapshot(&capacity), capacity_areas);
+        assert_eq!(capacity.mapping_identities, capacity_identities);
+        assert_eq!(capacity.topology_generation, capacity_topology);
+    }
+
+    #[test]
+    fn pinned_source_rejects_fixed_move_before_destination_replacement() {
+        let mut aspace = new_transaction_test_aspace();
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x8000);
+        let size = PAGE_SIZE_4K;
+        map_transaction_test_area(&mut aspace, source, size);
+        map_transaction_test_area(&mut aspace, destination, size);
+        let request = PinRequest::from_raw(
+            source.as_usize(),
+            size,
+            PinAccess::Read,
+            PinDuration::AsyncIo,
+            PinUse::BlockIo,
+            aspace.user_io_pin_owner().get(),
+        )
+        .unwrap();
+        let (reservation, system_charge, expectations) = aspace.begin_user_io_pin(request).unwrap();
+        let token = aspace
+            .publish_user_io_pin(reservation, &expectations)
+            .unwrap();
+        let topology_before = aspace.topology_generation;
+        let areas_before = transaction_area_snapshot(&aspace);
+        let identities_before = aspace.mapping_identities.clone();
+        let stage_called = Cell::new(false);
+
+        let error = aspace
+            .replace_and_move_mapping_transaction(source, size, destination, size, 1, |_, _| {
+                stage_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReplaceMappingError::DestinationPreserved(AxError::ResourceBusy)
+        ));
+        assert!(!stage_called.get());
+        assert_eq!(transaction_area_snapshot(&aspace), areas_before);
+        assert_eq!(aspace.mapping_identities, identities_before);
+        assert_eq!(aspace.topology_generation, topology_before);
+        aspace.end_user_io_pin(token);
+        drop(system_charge);
+    }
+
+    #[test]
+    fn topology_and_area_mapping_ids_share_one_namespace() {
+        let (_, topology_mapping_id, topology_generation, _) = new_user_io_policy().unwrap();
+        let (lineage, area_identity) = allocate_mapping_identity().unwrap();
+        let (_, next_topology_mapping_id, ..) = new_user_io_policy().unwrap();
+
+        assert_ne!(topology_mapping_id, area_identity.id);
+        assert_ne!(area_identity.id, next_topology_mapping_id);
+        assert_ne!(topology_mapping_id, next_topology_mapping_id);
+        assert_eq!(lineage.get(), area_identity.id.get());
+        assert_eq!(topology_generation.get(), 1);
+        assert_eq!(area_identity.generation.get(), 1);
+    }
+
+    #[test]
+    fn fork_preparation_keeps_parent_identity_stable_and_allocates_child_identity() {
+        let parent = mock_identity(u64::MAX - 1, 17);
+        let parent_before = parent;
+        let (child_lineage, child) = allocate_mapping_identity().unwrap();
+
+        assert_eq!(parent, parent_before);
+        assert_ne!(child.id, parent.state.id);
+        assert_ne!(child_lineage, parent.lineage);
+        assert_eq!(child.generation.get(), 1);
+    }
+
+    #[test]
+    fn advancing_one_lineage_does_not_stale_an_unrelated_mapping() {
+        let lineage_a = mock_lineage(2);
+        let lineage_b = mock_lineage(3);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage_a);
+        map_mock_area(&mut areas, &mut page_table, 0x3000, 0x1000, 1, 2, lineage_b);
+        let mut identities = vec![mock_identity(2, 7), mock_identity(3, 11)];
+        let before_a = mapping_identity(&identities, lineage_a).unwrap();
+
+        let mutations = prepare_mapping_generation_advances_for_range(
+            &areas,
+            &identities,
+            VirtAddr::from(0x3000),
+            0x1000,
+        )
+        .unwrap();
+        assert_eq!(
+            mutations,
+            vec![MappingIdentityMutation::Advance {
+                lineage: lineage_b,
+                generation: MappingGeneration::new(12).unwrap(),
+            }]
+        );
+        commit_mapping_identity_mutations(&mut identities, &mutations);
+
+        assert_eq!(mapping_identity(&identities, lineage_a).unwrap(), before_a);
+        assert_eq!(
+            mapping_identity(&identities, lineage_b)
+                .unwrap()
+                .generation
+                .get(),
+            12
+        );
+    }
+
+    #[test]
+    fn resident_only_discard_keeps_mapping_identity_and_generation() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        let identities = vec![mock_identity(2, 9)];
+        let before = mapping_identity(&identities, lineage).unwrap();
+
+        // Model MADV_DONTNEED's residency-only PTE teardown: the VMA and its
+        // sidecar are deliberately untouched.
+        page_table[0x1000..0x2000].fill(0);
+
+        assert_eq!(mapping_identity(&identities, lineage).unwrap(), before);
+        assert_eq!(
+            areas.find(VirtAddr::from(0x1000)).unwrap().lineage(),
+            lineage
+        );
+    }
+
+    #[test]
+    fn protect_split_keeps_lineage_and_advances_once() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x3000, 1, 1, lineage);
+        let mut identities = vec![mock_identity(2, 1)];
+        let mutations = prepare_mapping_generation_advances_for_range(
+            &areas,
+            &identities,
+            VirtAddr::from(0x2000),
+            0x1000,
+        )
+        .unwrap();
+
+        areas
+            .protect(VirtAddr::from(0x2000), 0x1000, |_| Some(3), &mut page_table)
+            .unwrap();
+        commit_mapping_identity_mutations(&mut identities, &mutations);
+
+        assert_eq!(areas.len(), 3);
+        assert!(areas.iter().all(|area| area.lineage() == lineage));
+        assert_eq!(
+            mapping_identity(&identities, lineage)
+                .unwrap()
+                .generation
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn full_unmap_retires_max_generation_but_partial_unmap_is_preflight_rejected() {
+        let lineage = mock_lineage(2);
+        let mut full_areas = MemorySet::new();
+        let mut full_page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut full_areas,
+            &mut full_page_table,
+            0x1000,
+            0x3000,
+            1,
+            1,
+            lineage,
+        );
+        let mut full_identities = vec![mock_identity(2, u64::MAX)];
+        let retire = prepare_unmap_mapping_mutations(
+            &full_areas,
+            &full_identities,
+            VirtAddr::from(0x1000),
+            0x3000,
+        )
+        .unwrap();
+        assert_eq!(retire, vec![MappingIdentityMutation::Retire { lineage }]);
+        full_areas
+            .unmap(VirtAddr::from(0x1000), 0x3000, &mut full_page_table)
+            .unwrap();
+        commit_mapping_identity_mutations(&mut full_identities, &retire);
+        assert!(full_areas.is_empty());
+        assert!(full_identities.is_empty());
+
+        let mut partial_areas = MemorySet::new();
+        let mut partial_page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut partial_areas,
+            &mut partial_page_table,
+            0x1000,
+            0x3000,
+            1,
+            1,
+            lineage,
+        );
+        let partial_identities = vec![mock_identity(2, u64::MAX)];
+        let before_areas = area_snapshot(&partial_areas);
+        let before_page_table = partial_page_table.clone();
+        assert_eq!(
+            prepare_unmap_mapping_mutations(
+                &partial_areas,
+                &partial_identities,
+                VirtAddr::from(0x2000),
+                0x1000,
+            ),
+            Err(AxError::ResourceBusy)
+        );
+        assert_eq!(area_snapshot(&partial_areas), before_areas);
+        assert_eq!(partial_page_table, before_page_table);
+        assert_eq!(partial_identities, vec![mock_identity(2, u64::MAX)]);
+    }
+
+    #[test]
+    fn unmap_plan_is_deduplicated_and_validates_retired_sidecars_before_mutation() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        map_mock_area(&mut areas, &mut page_table, 0x3000, 0x1000, 3, 1, lineage);
+        let identities = vec![mock_identity(2, 4)];
+        let mutations =
+            prepare_unmap_mapping_mutations(&areas, &identities, VirtAddr::from(0x1000), 0x3000)
+                .unwrap();
+        assert_eq!(mutations, vec![MappingIdentityMutation::Retire { lineage }]);
+
+        let before_areas = area_snapshot(&areas);
+        let before_page_table = page_table.clone();
+        assert_eq!(
+            prepare_unmap_mapping_mutations(&areas, &[], VirtAddr::from(0x1000), 0x3000,),
+            Err(AxError::BadState)
+        );
+        assert_eq!(area_snapshot(&areas), before_areas);
+        assert_eq!(page_table, before_page_table);
+    }
+
+    #[test]
+    fn zero_length_plans_are_identity_noops() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        assert!(
+            prepare_mapping_generation_advances_for_range(&areas, &[], VirtAddr::from(0x1000), 0,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            prepare_unmap_mapping_mutations(&areas, &[], VirtAddr::from(0x1000), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn move_uses_fresh_destination_identity_and_rollback_preserves_source() {
+        let source = mock_lineage(2);
+        let destination = mock_lineage(3);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, source);
+        let source_state = mock_identity(2, 6);
+        let mut identities = vec![source_state, mock_identity(3, 1)];
+        let source_retire =
+            prepare_unmap_mapping_mutations(&areas, &identities, VirtAddr::from(0x1000), 0x1000)
+                .unwrap();
+        map_mock_area(
+            &mut areas,
+            &mut page_table,
+            0x3000,
+            0x1000,
+            1,
+            1,
+            destination,
+        );
+        areas
+            .unmap(VirtAddr::from(0x1000), 0x1000, &mut page_table)
+            .unwrap();
+        commit_mapping_identity_mutations(&mut identities, &source_retire);
+        assert!(mapping_identity(&identities, source).is_err());
+        assert_eq!(
+            mapping_identity(&identities, destination)
+                .unwrap()
+                .generation
+                .get(),
+            1
+        );
+
+        let mut rollback_areas = MemorySet::new();
+        let mut rollback_page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut rollback_areas,
+            &mut rollback_page_table,
+            0x1000,
+            0x1000,
+            1,
+            1,
+            source,
+        );
+        map_mock_area(
+            &mut rollback_areas,
+            &mut rollback_page_table,
+            0x3000,
+            0x1000,
+            1,
+            1,
+            destination,
+        );
+        let mut rollback_identities = vec![source_state, mock_identity(3, 1)];
+        let destination_retire = prepare_unmap_mapping_mutations(
+            &rollback_areas,
+            &rollback_identities,
+            VirtAddr::from(0x3000),
+            0x1000,
+        )
+        .unwrap();
+        rollback_areas
+            .unmap(VirtAddr::from(0x3000), 0x1000, &mut rollback_page_table)
+            .unwrap();
+        commit_mapping_identity_mutations(&mut rollback_identities, &destination_retire);
+        assert_eq!(
+            mapping_identity(&rollback_identities, source).unwrap(),
+            source_state.state
+        );
+        assert!(mapping_identity(&rollback_identities, destination).is_err());
+
+        // old_size == 0 duplication keeps the source and installs one fresh
+        // generation-1 destination incarnation.
+        let duplicate_identities = vec![source_state, mock_identity(3, 1)];
+        assert_eq!(
+            mapping_identity(&duplicate_identities, source).unwrap(),
+            source_state.state
+        );
+        assert_eq!(
+            mapping_identity(&duplicate_identities, destination)
+                .unwrap()
+                .generation
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn staged_coverage_mismatch_rolls_back_and_out_of_range_lineage_is_rejected() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        let mut identities = vec![mock_identity(2, 1)];
+        assert!(!lineage_exactly_covers_range(
+            &areas,
+            lineage,
+            VirtAddr::from(0x1000),
+            0x2000,
+        ));
+        assert!(lineage_is_contained_in_range(
+            &areas,
+            lineage,
+            VirtAddr::from(0x1000),
+            0x2000,
+        ));
+        let rollback =
+            prepare_unmap_mapping_mutations(&areas, &identities, VirtAddr::from(0x1000), 0x2000)
+                .unwrap();
+        areas
+            .unmap(VirtAddr::from(0x1000), 0x2000, &mut page_table)
+            .unwrap();
+        commit_mapping_identity_mutations(&mut identities, &rollback);
+        assert!(areas.is_empty());
+        assert!(identities.is_empty());
+
+        let mut outside = MemorySet::new();
+        let mut outside_page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut outside,
+            &mut outside_page_table,
+            0x3000,
+            0x1000,
+            1,
+            1,
+            lineage,
+        );
+        assert!(!lineage_is_contained_in_range(
+            &outside,
+            lineage,
+            VirtAddr::from(0x1000),
+            0x2000,
+        ));
+        assert!(!lineage_exactly_covers_range(
+            &outside,
+            lineage,
+            VirtAddr::from(0x1000),
+            0x2000,
+        ));
+    }
+
+    #[test]
+    fn mapping_lineage_limit_is_admitted_before_growth_and_exec_releases_capacity() {
+        let mut identities = vec![mock_identity(2, 1), mock_identity(3, 1)];
+        assert_eq!(
+            reserve_mapping_identity_slot(&mut identities, 2),
+            Err(AxError::NoMemory)
+        );
+        assert_eq!(identities.len(), 2);
+
+        identities.reserve(32);
+        assert!(identities.capacity() > 2);
+        drop(core::mem::take(&mut identities));
+        assert_eq!(identities.len(), 0);
+        assert_eq!(identities.capacity(), 0);
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct MockBackend(u8);
@@ -1739,14 +3885,26 @@ mod tests {
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         areas
             .map(
-                MemoryArea::new(VirtAddr::from(0x1000), 0x1000, 1, MockBackend(1)),
+                MemoryArea::new_with_lineage(
+                    VirtAddr::from(0x1000),
+                    0x1000,
+                    1,
+                    MockBackend(1),
+                    mock_lineage(2),
+                ),
                 &mut page_table,
                 false,
             )
             .unwrap();
         areas
             .map(
-                MemoryArea::new(VirtAddr::from(0x2000), 0x1000, 3, MockBackend(2)),
+                MemoryArea::new_with_lineage(
+                    VirtAddr::from(0x2000),
+                    0x1000,
+                    3,
+                    MockBackend(2),
+                    mock_lineage(3),
+                ),
                 &mut page_table,
                 false,
             )
@@ -1760,6 +3918,7 @@ mod tests {
             start: VirtAddr::from(0x1800),
             end: VirtAddr::from(0x2800),
             flags: 5,
+            max_areas: usize::MAX,
         };
         let segments: Vec<_> = plan
             .segments()
@@ -1794,7 +3953,13 @@ mod tests {
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         areas
             .map(
-                MemoryArea::new(VirtAddr::from(0x1000), 0x3000, 1, MockBackend(1)),
+                MemoryArea::new_with_lineage(
+                    VirtAddr::from(0x1000),
+                    0x3000,
+                    1,
+                    MockBackend(1),
+                    mock_lineage(2),
+                ),
                 &mut page_table,
                 false,
             )
@@ -1806,6 +3971,7 @@ mod tests {
             start: VirtAddr::from(0x2000),
             end: VirtAddr::from(0x3000),
             flags: 3,
+            max_areas: usize::MAX,
         }
         .commit()
         .unwrap();
@@ -1827,6 +3993,7 @@ mod tests {
             start: VirtAddr::from(0x2000),
             end: VirtAddr::from(0x3000),
             flags: 1,
+            max_areas: usize::MAX,
         }
         .commit()
         .unwrap();

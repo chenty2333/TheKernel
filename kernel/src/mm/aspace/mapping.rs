@@ -344,7 +344,7 @@ mod tests {
     use axhal::paging::MappingFlags;
     use axpoll::{IoEvents, Pollable};
     use memory_addr::{MemoryAddr, VirtAddr};
-    use memory_set::{MappingBackend, MemoryArea, MemorySet};
+    use memory_set::{MappingBackend, MappingLineage, MemoryArea, MemorySet};
 
     use super::{super::PreparedAreaProtect, *};
     use crate::{
@@ -550,7 +550,13 @@ mod tests {
         let mut page_table = vec![0; 0x6000];
         areas
             .map(
-                MemoryArea::new(base, 0x3000, 1, backend),
+                MemoryArea::new_with_lineage(
+                    base,
+                    0x3000,
+                    1,
+                    backend,
+                    MappingLineage::new(2).unwrap(),
+                ),
                 &mut page_table,
                 false,
             )
@@ -562,6 +568,7 @@ mod tests {
             start: base + 0x1000,
             end: base + 0x2000,
             flags: 3,
+            max_areas: usize::MAX,
         }
         .commit()
         .unwrap();
@@ -582,6 +589,7 @@ mod tests {
             start: base + 0x1000,
             end: base + 0x2000,
             flags: 1,
+            max_areas: usize::MAX,
         }
         .commit()
         .unwrap();
