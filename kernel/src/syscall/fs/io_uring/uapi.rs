@@ -282,9 +282,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_zeroes_unknown_records_and_marks_only_supported_operations() {
+    fn probe_overwrites_reused_buffer_and_marks_only_supported_operations() {
         let operations = PINNED_IORING_OP_LAST as usize;
-        let mut output = [0_u8;
+        let mut output = [0xa5_u8;
             size_of::<IoUringProbeHeader>()
                 + PINNED_IORING_OP_LAST as usize * size_of::<IoUringProbeOp>()];
         write_probe(&mut output, operations as u32);

@@ -138,9 +138,6 @@ fn register_probe(argument: u64, operations: u32) -> AxResult<()> {
         .ok_or(AxError::InvalidInput)?;
     let address = usize::try_from(argument).map_err(|_| AxError::BadAddress)?;
     let output = UserPtr::<u8>::from(address).get_as_mut_slice(bytes)?;
-    if output.iter().any(|byte| *byte != 0) {
-        return Err(AxError::InvalidInput);
-    }
     write_probe(output, operations);
     Ok(())
 }

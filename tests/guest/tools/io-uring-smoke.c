@@ -543,7 +543,8 @@ static int test_default_batch_stops_on_submission_failure(struct ring *ring) {
 
 static int test_probe(struct ring *ring) {
     struct io_uring_probe probe;
-    memset(&probe, 0, sizeof(probe));
+    /* REGISTER_PROBE is a pure output operation; reused storage need not be zero. */
+    memset(&probe, 0xa5, sizeof(probe));
     if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_PROBE,
                 &probe, IORING_PROBE_OPS) != 0) {
         return fail("register-probe");
