@@ -545,28 +545,44 @@ pub fn sys_clock_nanosleep(
 }
 
 pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) -> AxResult<isize> {
-    if cpusetsize * 8 < axhal::cpu_num() {
+    let cpu_count = axhal::cpu_num().max(1);
+    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
+    if cpusetsize < kernel_mask_bytes {
         return Err(AxError::InvalidInput);
     }
 
     let mask = sched_target(pid)?.cpumask();
-    let mask_bytes = mask.as_bytes();
+    let mut mask_bytes = Vec::new();
+    mask_bytes
+        .try_reserve_exact(kernel_mask_bytes)
+        .map_err(|_| AxError::NoMemory)?;
+    mask_bytes.resize(kernel_mask_bytes, 0);
+    for cpu in 0..cpu_count {
+        if mask.get(cpu) {
+            mask_bytes[cpu / u8::BITS as usize] |= 1 << (cpu % u8::BITS as usize);
+        }
+    }
 
-    vm_write_slice(user_mask, mask_bytes)?;
+    vm_write_slice(user_mask, &mask_bytes)?;
 
-    Ok(mask_bytes.len() as _)
+    Ok(kernel_mask_bytes as _)
+}
+
+fn linux_cpumask_bytes(cpu_count: usize) -> usize {
+    cpu_count.max(1).div_ceil(usize::BITS as usize) * size_of::<usize>()
 }
 
 pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) -> AxResult<isize> {
-    if cpusetsize == 0 {
+    let cpu_count = axhal::cpu_num().max(1);
+    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
+    if cpusetsize < kernel_mask_bytes {
         return Err(AxError::InvalidInput);
     }
 
-    let size = cpusetsize.min(axhal::cpu_num().div_ceil(8));
-    let user_mask = vm_load(user_mask, size)?;
+    let user_mask = vm_load(user_mask, kernel_mask_bytes)?;
     let mut cpu_mask = AxCpuMask::new();
 
-    for i in 0..(size * 8).min(axhal::cpu_num()) {
+    for i in 0..cpu_count {
         if user_mask[i / 8] & (1 << (i % 8)) != 0 {
             cpu_mask.set(i, true);
         }
@@ -879,6 +895,22 @@ mod tests {
     use core::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn linux_affinity_masks_are_native_word_aligned() {
+        assert_eq!(linux_cpumask_bytes(0), size_of::<usize>());
+        assert_eq!(linux_cpumask_bytes(1), size_of::<usize>());
+        assert_eq!(linux_cpumask_bytes(4), size_of::<usize>());
+        assert_eq!(linux_cpumask_bytes(8), size_of::<usize>());
+        assert_eq!(
+            linux_cpumask_bytes(usize::BITS as usize),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            linux_cpumask_bytes(usize::BITS as usize + 1),
+            size_of::<usize>() * 2
+        );
+    }
 
     #[test]
     fn clock_sleep_result_preserves_timer_registration_failure() {

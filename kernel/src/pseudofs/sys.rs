@@ -124,9 +124,38 @@ fn block_device_link(fs: Arc<SimpleFs>, dev_name: String) -> Arc<SimpleFile> {
 fn devices_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut devices = DirMapping::new();
     let mut system = DirMapping::new();
+    system.add("cpu", cpu_root_dir(fs.clone()));
     system.add("node", node_root_dir(fs.clone()));
     devices.add("system", SimpleDir::new_maker(fs.clone(), Arc::new(system)));
     SimpleDir::new_maker(fs, Arc::new(devices))
+}
+
+fn contiguous_index_list(count: usize) -> String {
+    match count.max(1) {
+        1 => "0\n".into(),
+        count => format!("0-{}\n", count - 1),
+    }
+}
+
+fn cpu_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    let mut cpu_root = DirMapping::new();
+    // TheKernel currently has no CPU hotplug: every configured CPU completes
+    // secondary initialization before userspace starts.  Keep the three Linux
+    // topology views identical until a real online/offline state machine is
+    // introduced, so libc can discover the runtime topology without guessing
+    // from unrelated procfs files.
+    let online = contiguous_index_list(axhal::cpu_num());
+    for name in ["online", "possible", "present"] {
+        cpu_root.add(
+            name,
+            SimpleFile::new_regular(fs.clone(), {
+                let online = online.clone();
+                move || Ok(online.clone())
+            }),
+        );
+    }
+
+    SimpleDir::new_maker(fs, Arc::new(cpu_root))
 }
 
 fn node_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -176,11 +205,7 @@ fn node_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 fn node_dir(fs: Arc<SimpleFs>, node: u32) -> crate::pseudofs::DirMaker {
     let mut dir = DirMapping::new();
     let cpu_count = axhal::cpu_num().max(1);
-    let cpu_list = if cpu_count == 1 {
-        "0\n".into()
-    } else {
-        format!("0-{}\n", cpu_count - 1)
-    };
+    let cpu_list = contiguous_index_list(cpu_count);
     let cpumap = if cpu_count >= usize::BITS as usize {
         usize::MAX
     } else {
@@ -322,4 +347,17 @@ fn uevent_file(fs: Arc<SimpleFs>, dev_name: String, dev_id: DeviceId) -> Arc<Sim
             dev_id.minor()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contiguous_index_list;
+
+    #[test]
+    fn cpu_topology_list_is_nonempty_and_tracks_all_configured_cpus() {
+        assert_eq!(contiguous_index_list(0), "0\n");
+        assert_eq!(contiguous_index_list(1), "0\n");
+        assert_eq!(contiguous_index_list(4), "0-3\n");
+        assert_eq!(contiguous_index_list(8), "0-7\n");
+    }
 }
