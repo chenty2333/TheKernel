@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import hashlib
 import json
 import shutil
@@ -164,6 +165,13 @@ def make_bundle(
     }
     if manifest_overrides:
         values.update(manifest_overrides)
+    timestamp_fraction = int(
+        hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12], 16
+    ) % 1_000_000
+    timestamps = {
+        "pre": f"2026-01-01T00:00:00.{timestamp_fraction:06d}+00:00",
+        "post": f"2026-01-01T00:00:01.{timestamp_fraction:06d}+00:00",
+    }
     iterations = int(values["iterations"])
     pin_iterations = int(values["pin_iterations"])
     pin_workers = int(values["pin_workers"])
@@ -197,7 +205,7 @@ def make_bundle(
             [
                 {"key": "schema", "value": "thekernel-mm-performance-host-diagnostics-v1"},
                 {"key": "phase", "value": phase},
-                {"key": "timestamp_utc", "value": "2026-01-01T00:00:00+00:00"},
+                {"key": "timestamp_utc", "value": timestamps[phase]},
                 {"key": "selected_cpu_set", "value": values["host_cpu_set"]},
                 {
                     "key": "host_cpu_selection",
@@ -261,6 +269,49 @@ def mutate_manifest(root: Path, mutator: Callable[[dict[str, str]], None]) -> No
     write_tsv(path, columns, rows)
 
 
+def clone_bundle(source: Path, destination: Path, marker: str) -> None:
+    shutil.copytree(source, destination, symlinks=True)
+    fraction = int(
+        hashlib.sha256(marker.encode("utf-8")).hexdigest()[:12], 16
+    ) % 1_000_000
+    start = dt.datetime(2026, 1, 1, tzinfo=dt.UTC).replace(microsecond=fraction)
+    set_capture_interval(destination, start, start + dt.timedelta(seconds=1))
+
+
+def set_capture_interval(root: Path, start: dt.datetime, end: dt.datetime) -> None:
+    updates: dict[str, str] = {}
+    for phase, timestamp in (("pre", start), ("post", end)):
+        diagnostics = root / "rv-4cpu" / f"host-{phase}.tsv"
+        columns, rows = read_tsv(diagnostics)
+        next(row for row in rows if row["key"] == "timestamp_utc")[
+            "value"
+        ] = timestamp.isoformat(timespec="microseconds")
+        write_tsv(diagnostics, columns, rows)
+        updates[f"host_diagnostics_{phase}_sha256"] = sha256(diagnostics)
+        updates[f"host_diagnostics_{phase}_size_bytes"] = str(
+            diagnostics.stat().st_size
+        )
+    mutate_manifest(root, lambda row: row.update(updates))
+
+
+def set_raw_capture_timestamp(root: Path, phase: str, value: str) -> None:
+    diagnostics = root / "rv-4cpu" / f"host-{phase}.tsv"
+    columns, rows = read_tsv(diagnostics)
+    next(row for row in rows if row["key"] == "timestamp_utc")["value"] = value
+    write_tsv(diagnostics, columns, rows)
+    mutate_manifest(
+        root,
+        lambda row: row.update(
+            {
+                f"host_diagnostics_{phase}_sha256": sha256(diagnostics),
+                f"host_diagnostics_{phase}_size_bytes": str(
+                    diagnostics.stat().st_size
+                ),
+            }
+        ),
+    )
+
+
 def mutate_metrics(
     root: Path,
     mutator: Callable[[list[dict[str, str]]], None],
@@ -300,6 +351,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
         shutil.copy2(DEFAULT_POLICY, self.policy)
         self.stability_policy = self.root / "stability-policy.json"
         shutil.copy2(DEFAULT_STABILITY_POLICY, self.stability_policy)
+        self.comparison_counter = 0
+        self.series_counter = 0
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -317,9 +370,29 @@ class CompareMmPerformanceTests(unittest.TestCase):
         policy: Path | None = None,
         repetitions: int = 3,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        self.comparison_counter += 1
+        series_root = self.root / f"comparison-{self.comparison_counter}"
+        series_root.mkdir()
+        baselines: list[Path] = []
+        candidates: list[Path] = []
+        for index in range(repetitions):
+            baseline_copy = series_root / f"baseline-{index}"
+            candidate_copy = series_root / f"candidate-{index}"
+            clone_bundle(
+                baseline,
+                baseline_copy,
+                f"comparison-{self.comparison_counter}-baseline-{index}",
+            )
+            clone_bundle(
+                candidate,
+                candidate_copy,
+                f"comparison-{self.comparison_counter}-candidate-{index}",
+            )
+            baselines.append(baseline_copy)
+            candidates.append(candidate_copy)
         return self.compare_series(
-            [baseline] * repetitions,
-            [candidate] * repetitions,
+            baselines,
+            candidates,
             policy=policy,
         )
 
@@ -330,7 +403,23 @@ class CompareMmPerformanceTests(unittest.TestCase):
         *,
         policy: Path | None = None,
         stability_policy: Path | None = None,
+        normalize_timestamps: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        self.series_counter += 1
+        if normalize_timestamps:
+            base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(
+                days=self.series_counter
+            )
+            for index, baseline in enumerate(baselines):
+                start = base + dt.timedelta(seconds=index * 4)
+                set_capture_interval(
+                    baseline, start, start + dt.timedelta(seconds=1)
+                )
+            for index, candidate in enumerate(candidates):
+                start = base + dt.timedelta(seconds=index * 4 + 2)
+                set_capture_interval(
+                    candidate, start, start + dt.timedelta(seconds=1)
+                )
         report = self.root / "report.tsv"
         report.unlink(missing_ok=True)
         arguments = [sys.executable, str(COMPARATOR)]
@@ -643,6 +732,17 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertEqual(row["pair_ratio_min_ppm"], "1000000")
         self.assertEqual(row["pair_ratio_max_ppm"], "1200000")
 
+        result, report = self.compare_series(
+            baselines, [candidates[1], candidates[0], candidates[2]]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(
+            row
+            for row in self.report_rows(report)
+            if row["metric"] == "vma_scale" and row["statistic"] == "p99_ns"
+        )
+        self.assertEqual(row["median_pair"], "1")
+
     def test_stable_median_regression_returns_one(self) -> None:
         baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
         candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
@@ -670,6 +770,90 @@ class CompareMmPerformanceTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("unstable paired series", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_missing_and_duplicate_pair_receipts_are_rejected(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+
+        result, report = self.compare_series(baselines, candidates[:2])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("length mismatch", result.stderr)
+        self.assertFalse(report.exists())
+
+        result, report = self.compare_series(
+            [baselines[0], baselines[0], baselines[2]], candidates
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("reuses one bundle receipt", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_hashed_capture_intervals_prove_actual_alternating_order(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        base = dt.datetime(2026, 3, 1, tzinfo=dt.UTC)
+        for index, (baseline, candidate) in enumerate(
+            zip(baselines, candidates, strict=True)
+        ):
+            pair_start = base + dt.timedelta(seconds=index * 4)
+            baseline_end = pair_start + dt.timedelta(seconds=1)
+            set_capture_interval(baseline, pair_start, baseline_end)
+            set_capture_interval(
+                candidate,
+                baseline_end + dt.timedelta(microseconds=1),
+                pair_start + dt.timedelta(seconds=3),
+            )
+
+        result, _ = self.compare_series(
+            baselines, candidates, normalize_timestamps=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        result, report = self.compare_series(
+            baselines,
+            [candidates[1], candidates[0], candidates[2]],
+            normalize_timestamps=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("strict alternating order", result.stderr)
+        self.assertFalse(report.exists())
+
+        set_capture_interval(
+            candidates[0],
+            base + dt.timedelta(seconds=1),
+            base + dt.timedelta(seconds=3),
+        )
+        result, report = self.compare_series(
+            baselines, candidates, normalize_timestamps=False
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("strict alternating order", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_capture_timestamp_and_interval_are_strictly_validated(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        self.compare_series(baselines, candidates)
+
+        set_raw_capture_timestamp(
+            baselines[0], "pre", "2026-01-01 00:00:00+00:00"
+        )
+        result, report = self.compare_series(
+            baselines, candidates, normalize_timestamps=False
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not strict RFC3339 UTC", result.stderr)
+        self.assertFalse(report.exists())
+
+        base = dt.datetime(2026, 4, 1, tzinfo=dt.UTC)
+        set_capture_interval(
+            baselines[0], base + dt.timedelta(seconds=1), base
+        )
+        result, report = self.compare_series(
+            baselines, candidates, normalize_timestamps=False
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("reversed or empty capture interval", result.stderr)
         self.assertFalse(report.exists())
 
     def test_each_side_requires_one_commit_and_kernel_hash(self) -> None:
@@ -738,24 +922,30 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("contains unsafe key", result.stderr)
         self.assertFalse(report.exists())
 
-    def test_v1_absolute_path_manifest_is_not_silently_upgraded(self) -> None:
+    def test_v1_and_v2_manifests_are_not_silently_upgraded(self) -> None:
         baseline = self.bundle("baseline")
-        candidate = self.bundle("candidate")
-        mutate_manifest(
-            candidate,
-            lambda row: row.update(
-                {
-                    "bundle_schema": "thekernel-mm-performance-bundle-v1",
-                    "kernel_artifact": "/workspace/rv-4cpu/kernel",
-                }
-            ),
-        )
+        for version in ("v1", "v2"):
+            with self.subTest(version=version):
+                candidate = self.bundle(f"candidate-{version}")
+                mutate_manifest(
+                    candidate,
+                    lambda row: row.update(
+                        {
+                            "bundle_schema": f"thekernel-mm-performance-bundle-{version}",
+                            "kernel_artifact": (
+                                "/workspace/rv-4cpu/kernel"
+                                if version == "v1"
+                                else row["kernel_artifact"]
+                            ),
+                        }
+                    ),
+                )
 
-        result, report = self.compare(baseline, candidate)
+                result, report = self.compare(baseline, candidate)
 
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("unsupported bundle_schema", result.stderr)
-        self.assertFalse(report.exists())
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsupported bundle_schema", result.stderr)
+                self.assertFalse(report.exists())
 
 
 if __name__ == "__main__":

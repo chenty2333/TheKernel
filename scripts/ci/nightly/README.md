@@ -135,6 +135,14 @@ TheKernel commit and per-run kernel hash. The comparator orders candidate over
 baseline ratios using integer cross multiplication and gates their exact median,
 without floating-point rounding.
 
+CLI order alone is not evidence of paired capture. Each hashed host diagnostic
+contains a strict UTC RFC3339 timestamp. The comparator forms a pre/post capture
+interval for every run, rejects reversed or overlapping intervals and duplicate
+bundle receipts, and requires the actual bundle intervals to satisfy
+`baseline-1 < candidate-1 < baseline-2 < candidate-2 ...`. Equal interval
+boundaries are rejected, so copied or concurrently captured inputs cannot count
+as independent alternating pairs.
+
 The repository regression policy gates every metric's median P99 at no more
 than 20 percent latency regression and requires both pin metrics to retain at
 least 90 percent of baseline throughput. A custom policy may be stricter, but

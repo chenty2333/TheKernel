@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import hashlib
 import json
 import os
@@ -33,6 +34,10 @@ HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 FINGERPRINT_RE = re.compile(r"^(?:auto|declared)-sha256:[0-9a-f]{64}$")
 CPU_CLASS_RE = re.compile(r"^package:[0-9]+,max_freq_khz:[1-9][0-9]*$")
+RFC3339_UTC_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+)
 HOST_DIAGNOSTIC_MAX_BYTES = 64 * 1024
 
 
@@ -44,6 +49,8 @@ class EvidenceError(ValueError):
 class ManifestRecord:
     key: tuple[str, int]
     values: dict[str, str]
+    capture_start: dt.datetime
+    capture_end: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,9 @@ class Bundle:
     root: Path
     manifest: dict[tuple[str, int], ManifestRecord]
     metrics: dict[tuple[str, int, str], MetricRecord]
+    receipt_sha256: str
+    capture_start: dt.datetime
+    capture_end: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -215,12 +225,25 @@ def validate_artifact(
     return path
 
 
+def parse_rfc3339_utc(value: str, context: str) -> dt.datetime:
+    if not RFC3339_UTC_RE.fullmatch(value):
+        raise EvidenceError(f"{context} is not strict RFC3339 UTC: {value!r}")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        result = dt.datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise EvidenceError(f"{context} has an invalid calendar time: {value!r}") from error
+    if result.tzinfo is None or result.utcoffset() != dt.timedelta(0):
+        raise EvidenceError(f"{context} is not UTC: {value!r}")
+    return result
+
+
 def validate_host_diagnostics(
     root: Path,
     values: dict[str, str],
     phase: str,
     context: str,
-) -> None:
+) -> dt.datetime:
     path = validate_artifact(
         root,
         values,
@@ -321,6 +344,10 @@ def validate_host_diagnostics(
             raise EvidenceError(
                 f"{context} host diagnostics {phase} lacks {current_key}"
             )
+    return parse_rfc3339_utc(
+        diagnostics["timestamp_utc"],
+        f"{context} host diagnostics {phase} timestamp_utc",
+    )
 
 
 def validate_manifest_row(
@@ -447,8 +474,13 @@ def validate_manifest_row(
         "qemu_log_size_bytes",
         context,
     )
-    validate_host_diagnostics(root, row, "pre", context)
-    validate_host_diagnostics(root, row, "post", context)
+    capture_start = validate_host_diagnostics(root, row, "pre", context)
+    capture_end = validate_host_diagnostics(root, row, "post", context)
+    if capture_start >= capture_end:
+        raise EvidenceError(
+            f"{context} has a reversed or empty capture interval: "
+            f"pre={capture_start.isoformat()} post={capture_end.isoformat()}"
+        )
     expected_command = (
         "/opt/thekernel-tests/bin/thekernel-mm-performance "
         f"--iterations {row['iterations']} --vmas {row['live_vmas']} "
@@ -461,7 +493,12 @@ def validate_manifest_row(
         raise EvidenceError(f"cannot read {context} command artifact: {error}") from error
     if command_text != expected_command:
         raise EvidenceError(f"{context} command artifact does not match its workload fields")
-    return ManifestRecord((arch, requested_cpus), row), metrics_path
+    return (
+        ManifestRecord(
+            (arch, requested_cpus), row, capture_start, capture_end
+        ),
+        metrics_path,
+    )
 
 
 def expected_metric_count(manifest: ManifestRecord, metric: str) -> int:
@@ -585,6 +622,15 @@ def load_bundle(path: Path) -> Bundle:
                 raise EvidenceError(f"bundle has duplicate metric key: {metric.key!r}")
             metrics[metric.key] = metric
 
+    capture_records = list(manifest.values())
+    for previous, current in zip(capture_records, capture_records[1:]):
+        if previous.capture_end >= current.capture_start:
+            raise EvidenceError(
+                "bundle run capture intervals overlap or are out of order: "
+                f"previous={previous.key!r} end={previous.capture_end.isoformat()} "
+                f"current={current.key!r} start={current.capture_start.isoformat()}"
+            )
+
     uniform_fields = (
         "bundle_schema",
         "thekernel_commit",
@@ -671,7 +717,14 @@ def load_bundle(path: Path) -> Bundle:
             "bundle metric matrix does not match per-run artifacts: "
             f"missing={missing!r} extra={extra!r} changed={changed!r}"
         )
-    return Bundle(root, manifest, metrics)
+    return Bundle(
+        root,
+        manifest,
+        metrics,
+        sha256_file(manifest_path),
+        capture_records[0].capture_start,
+        capture_records[-1].capture_end,
+    )
 
 
 def policy_percent(value: Any, field: str, metric: str, *, nullable: bool) -> int | None:
@@ -876,6 +929,29 @@ def validate_side_identity(label: str, bundles: list[Bundle]) -> None:
                     )
 
 
+def validate_alternating_capture_order(
+    baselines: list[Bundle], candidates: list[Bundle]
+) -> None:
+    sequence: list[tuple[str, int, Bundle]] = []
+    for index, (baseline, candidate) in enumerate(
+        zip(baselines, candidates, strict=True), start=1
+    ):
+        sequence.extend(
+            (("baseline", index, baseline), ("candidate", index, candidate))
+        )
+    for previous, current in zip(sequence, sequence[1:]):
+        previous_label, previous_index, previous_bundle = previous
+        current_label, current_index, current_bundle = current
+        if previous_bundle.capture_end >= current_bundle.capture_start:
+            raise EvidenceError(
+                "paired series was not captured in strict alternating order: "
+                f"{previous_label}[{previous_index}] "
+                f"end={previous_bundle.capture_end.isoformat()} must precede "
+                f"{current_label}[{current_index}] "
+                f"start={current_bundle.capture_start.isoformat()}"
+            )
+
+
 def ratio_compare(left: RatioSample, right: RatioSample) -> int:
     before = left.candidate * right.baseline
     after = right.candidate * left.baseline
@@ -989,6 +1065,18 @@ def compare_series(
             f"paired series count {pair_count} is outside stability policy "
             f"{stability.minimum_pairs}..{stability.maximum_pairs}"
         )
+    receipts: dict[str, tuple[str, int]] = {}
+    for label, bundles in (("baseline", baselines), ("candidate", candidates)):
+        for index, bundle in enumerate(bundles, start=1):
+            previous = receipts.get(bundle.receipt_sha256)
+            if previous is not None:
+                raise EvidenceError(
+                    "paired series reuses one bundle receipt: "
+                    f"first={previous!r} duplicate={(label, index)!r} "
+                    f"sha256={bundle.receipt_sha256}"
+                )
+            receipts[bundle.receipt_sha256] = (label, index)
+    validate_alternating_capture_order(baselines, candidates)
     validate_side_identity("baseline", baselines)
     validate_side_identity("candidate", candidates)
     for index, (baseline, candidate) in enumerate(
