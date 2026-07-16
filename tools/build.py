@@ -572,6 +572,7 @@ def rootfs_input_specs(_req: RootfsRequest) -> list[InputSpec]:
     return [
         InputSpec("file", "tools/build.py"),
         InputSpec("file", "scripts/build-rootfs.sh"),
+        InputSpec("file", "scripts/create-rootfs-image.sh"),
         InputSpec("file", "tests/rootfs/busybox-1.36.1.config"),
         InputSpec("file", "LICENSE"),
         InputSpec("file", "NOTICE"),

@@ -70,6 +70,9 @@ class BuildCacheTests(unittest.TestCase):
             (root / "scripts" / "build-rootfs.sh").write_text(
                 "#!/bin/sh\n", encoding="utf-8"
             )
+            (root / "scripts" / "create-rootfs-image.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
             (root / "tests" / "guest" / "shell-init.sh").write_text(
                 "#!/bin/sh\n", encoding="utf-8"
             )
@@ -251,6 +254,9 @@ class ProductBootBoundaryTests(unittest.TestCase):
     def test_rootfs_installs_a_real_system_init_after_busybox(self) -> None:
         root = repo_root()
         source = (root / "scripts" / "build-rootfs.sh").read_text(encoding="utf-8")
+        image_source = (root / "scripts" / "create-rootfs-image.sh").read_text(
+            encoding="utf-8"
+        )
         remove = source.index('rm -f "$STAGE/sbin/init"')
         compile_init = source.index('-o "$STAGE/sbin/init"')
         self.assertLess(remove, compile_init)
@@ -259,7 +265,9 @@ class ProductBootBoundaryTests(unittest.TestCase):
         self.assertIn("tests/rootfs/busybox-${BUSYBOX_VERSION}.config", source)
         self.assertIn("silentoldconfig", source)
         self.assertNotIn(" defconfig", source)
-        self.assertIn("mke2fs -q -F -t ext4 -b 4096", source)
+        self.assertIn('"$SCRIPT_DIR/create-rootfs-image.sh"', source)
+        self.assertIn("E2FSPROGS_FAKE_TIME", image_source)
+        self.assertIn("mke2fs -q -F -t ext4 -b 4096", image_source)
 
     def test_smoke_scripts_define_a_default_workdir(self) -> None:
         root = repo_root()

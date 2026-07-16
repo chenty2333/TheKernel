@@ -62,7 +62,8 @@ case "$SIZE_MB" in
 esac
 [ "$SIZE_MB" -ge 32 ] || { printf '%s\n' '--size-mb must be at least 32' >&2; exit 2; }
 
-for command in "${CROSS_COMPILE}gcc" curl fakeroot make mke2fs sha256sum tar truncate; do
+for command in "${CROSS_COMPILE}gcc" curl fakeroot find make mke2fs \
+    realpath sha256sum tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -164,17 +165,7 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
         "$STAGE/opt/thekernel-tests/bin/thekernel-nightly-${script##*/}"
 done
 
-truncate -s "${SIZE_MB}M" "$IMAGE"
-UUID_HEX=$(printf 'thekernel-test-rootfs-v1:%s' "$ARCH" | sha256sum | awk '{print $1}')
-FS_UUID=${UUID_HEX:0:8}-${UUID_HEX:8:4}-${UUID_HEX:12:4}-${UUID_HEX:16:4}-${UUID_HEX:20:12}
-# Keep the fixture aligned with the kernel's 4 KiB page and lwext4 mapped-I/O
-# contract instead of inheriting mke2fs's image-size-dependent default.
-fakeroot -- sh -c '
-    set -eu
-    chown -R 0:0 "$1"
-    mke2fs -q -F -t ext4 -b 4096 -d "$1" \
-        -E "no_copy_xattrs,root_owner=0:0,hash_seed=$3,lazy_itable_init=0,lazy_journal_init=0" \
-        -U "$3" -L THEKERNEL_ROOT "$2"
-' sh "$STAGE" "$IMAGE" "$FS_UUID"
+"$SCRIPT_DIR/create-rootfs-image.sh" \
+    --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB"
 mv -f "$IMAGE" "$OUTPUT"
 printf '%s\n' "$OUTPUT"

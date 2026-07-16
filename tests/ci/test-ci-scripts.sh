@@ -19,6 +19,7 @@ bash -n "$0"
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
 python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"
+python3 "$REPO_ROOT/tests/ci/test_rootfs_image_reproducibility.py"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
 
 # The developer container must see maintained sibling checkouts at the exact
