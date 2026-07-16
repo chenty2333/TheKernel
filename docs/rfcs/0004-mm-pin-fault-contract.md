@@ -273,9 +273,11 @@ or page-cache mechanisms into syscall code. The current consumer checkpoint:
   independent shards and each transaction covers at most 64 pages, rather than
   taking one system-wide lock once per page;
 - reserves the complete user range before lower pinning, then captures mapping
-  expectations, scans PTEs, and publishes lower pins in windows of at most 64
-  pages; allocation and deferred owner destruction stay outside both the
-  address-space lock and physical-registry shard locks;
+  expectations, scans PTEs, owns lower pages, and revalidates in windows of at
+  most 64 pages; the reservation is the overlapping-mutation fence between
+  windows and the final token publication is an O(1) state transition;
+  allocation and deferred owner destruction stay outside both the address-space
+  lock and physical-registry shard locks;
 - indexes logical mapping identity by lineage and invalidates sorted, coalesced
   ranges with one forward sweep, so unrelated VMA changes no longer invalidate
   every mapping through one address-space topology generation;
@@ -304,14 +306,13 @@ semantics. `userfaultfd` therefore remains unsupported and this RFC remains
 `draft`.
 
 The correctness checkpoint is not a claim that the direct-I/O pin path is
-performance-complete. The final full-range expectation revalidation and token
-publication still share one address-space topology serialization scope. Each
-64-page lower-pin window still performs bounded PTE, page-cache, and physical
-registry work while holding the address-space lock, and a pathological physical
-address distribution can exhaust one fixed shard before the aggregate logical
-pin budget, forcing the semantics-preserving copied fallback. Shared-mapping
-growth and file-registration paths also retain serialized preparation. The
-pinned async direct path remains default-off.
+performance-complete. Each 64-page lower-pin/revalidation window still performs
+bounded VMA, PTE, page-cache, and physical-registry work while holding the
+address-space lock, and a pathological physical address distribution can
+exhaust one fixed shard before the aggregate logical pin budget, forcing the
+semantics-preserving copied fallback. Shared-mapping growth and file-registration
+paths also retain serialized preparation. The pinned async direct path remains
+default-off.
 
 The repository-owned RISC-V/LoongArch 4/8-CPU matrix records VMA-scale,
 `mremap`, protect-and-touch, direct-pin throughput, and concurrent direct-pin
@@ -320,7 +321,7 @@ user-visible proxies and regression checkpoints: protect-and-touch is not a
 hardware TLB event counter, and direct-I/O latency does not isolate a single
 registry lock. A first clean baseline therefore closes the missing evidence
 checkpoint without justifying CortenMM-style RCU page tables, production tail
-latency claims, or removing the remaining serialized transaction boundary.
+latency claims, lock-free pinning, or production hardware scalability.
 
 ## Rejected alternatives
 

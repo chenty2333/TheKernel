@@ -1446,19 +1446,36 @@ impl AddrSpace {
         }
     }
 
-    /// Revalidates every frozen VMA expectation and publishes the lower pin in
-    /// one topology-serialization scope, as required by the linux-mm core
-    /// contract.
-    pub(crate) fn publish_user_io_pin(
+    /// Revalidates one caller-bounded window of a reserved user-I/O pin.
+    ///
+    /// The reservation was published before any expectation or lower owner was
+    /// collected, and every overlapping mapping mutation consults
+    /// `user_io_pins`. It is therefore the range mutation fence between these
+    /// short address-space lock acquisitions. `expectations` must begin at
+    /// `start`, remain inside this window, and cover it without a gap; the
+    /// return value tells the caller how many entries to remove from its
+    /// remaining prefix.
+    pub(crate) fn revalidate_user_io_pin_window(
         &mut self,
         reservation: PinReservation,
         expectations: &[UserIoMappingExpectation],
-    ) -> AxResult<PinToken> {
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<usize> {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut cursor = start;
+        let mut consumed = 0usize;
         for expectation in expectations {
-            let area = self
-                .areas
-                .find(VirtAddr::from(expectation.covered.start()))
-                .ok_or(AxError::BadAddress)?;
+            if VirtAddr::from(expectation.covered.start()) != cursor
+                || expectation.covered.end() > end.as_usize()
+            {
+                return Err(AxError::BadState);
+            }
+            let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
             let current = self.mapping_snapshot(area)?;
             self.user_io_pins
                 .revalidate_next(
@@ -1468,7 +1485,23 @@ impl AddrSpace {
                     expectation.covered,
                 )
                 .map_err(mm_error)?;
+            cursor = VirtAddr::from(expectation.covered.end());
+            consumed = consumed.checked_add(1).ok_or(AxError::NoMemory)?;
+            if cursor == end {
+                break;
+            }
         }
+        if cursor != end {
+            return Err(AxError::BadState);
+        }
+        Ok(consumed)
+    }
+
+    /// Turns a fully revalidated reservation into an active lease.
+    ///
+    /// Every per-VMA operation has already completed in bounded windows, so
+    /// this final address-space critical section is constant-time.
+    pub(crate) fn commit_user_io_pin(&mut self, reservation: PinReservation) -> AxResult<PinToken> {
         self.user_io_pins.commit(reservation).map_err(mm_error)
     }
 

@@ -1157,6 +1157,7 @@ fn prepare_user_io_pin(
     let mut cow_frame_pages = 0usize;
     let mut shared_frame_pages = 0usize;
     let mut frame_pin_attempted = false;
+    let mut validated_expectations = 0usize;
     let mut scan_cursor = page_start;
     while scan_cursor < page_end {
         let chunk_end = user_io_pin_scan_chunk_end(scan_cursor, page_end);
@@ -1300,6 +1301,34 @@ fn prepare_user_io_pin(
         if let Some(chunk_pin) = chunk_pin {
             preparation.frame_pins.push(chunk_pin);
         }
+
+        // Revalidate only after every lower owner for this window has been
+        // acquired. The live Reserved record rejects overlapping unmap,
+        // protect, remap, and discard publication between windows, so releasing
+        // AddrSpace here cannot make an earlier validated prefix stale.
+        let validation = {
+            let mut aspace = aspace_handle.lock();
+            aspace.revalidate_user_io_pin_window(
+                preparation.reservation(),
+                &preparation.expectations()[validated_expectations..],
+                scan_cursor,
+                chunk_end - scan_cursor,
+            )
+        };
+        let consumed = match validation {
+            Ok(consumed) => consumed,
+            Err(_) => {
+                reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                return None;
+            }
+        };
+        validated_expectations = match validated_expectations.checked_add(consumed) {
+            Some(validated) => validated,
+            None => {
+                reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                return None;
+            }
+        };
         scan_cursor = chunk_end;
     }
 
@@ -1328,17 +1357,18 @@ fn prepare_user_io_pin(
         .sum::<usize>();
     let page_cache_pin_pages = preparation.page_cache_pins.len();
     debug_assert_eq!(frame_pin_pages + page_cache_pin_pages, page_count);
+    if validated_expectations != preparation.expectations().len() {
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    }
 
-    // The linux-mm core currently requires one topology-serialization scope
-    // across the complete expectation sequence and commit. Keep this final
-    // publication lock intact; only the per-page lower-pin scan is chunked.
-    // Keep the lock guard in an explicit scope. A temporary guard used as the
-    // `match` scrutinee would live through its selected arm; an error return
-    // could then drop unpublished owners and recursively cancel the reservation
-    // while the same AddrSpace mutex was still held.
+    // All per-page and per-VMA work completed in bounded windows. The final
+    // policy publication is now only a constant-time Reserved -> Active state
+    // transition. Keep the guard in an explicit scope so an error cannot drop
+    // unpublished owners and recursively cancel while AddrSpace is still held.
     let publication = {
         let mut aspace = aspace_handle.lock();
-        aspace.publish_user_io_pin(preparation.reservation(), preparation.expectations())
+        aspace.commit_user_io_pin(preparation.reservation())
     };
     let token = match publication {
         Ok(token) => token,
