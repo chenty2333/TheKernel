@@ -79,6 +79,29 @@ impl<B: MappingBackend> MemorySet<B> {
         self.areas.values()
     }
 
+    /// Returns the memory areas that overlap `range`, in address order.
+    ///
+    /// The cursor starts at the one predecessor that may cross the lower
+    /// boundary and then walks only keys below the upper boundary. Adapters
+    /// can therefore plan range transactions without scanning every VMA that
+    /// precedes the target.
+    pub fn iter_overlapping(
+        &self,
+        range: AddrRange<B::Addr>,
+    ) -> impl Iterator<Item = &MemoryArea<B>> {
+        let first_start = self
+            .areas
+            .range(..=range.start)
+            .next_back()
+            .filter(|(_, area)| area.end() > range.start)
+            .map(|(&area_start, _)| area_start)
+            .unwrap_or(range.start);
+        self.areas
+            .range(first_start..range.end)
+            .map(|(_, area)| area)
+            .filter(move |area| area.va_range().overlaps(range))
+    }
+
     /// Returns whether the given address range overlaps with any existing area.
     pub fn overlaps(&self, range: AddrRange<B::Addr>) -> bool {
         if let Some((_, before)) = self.areas.range(..range.start).last() {

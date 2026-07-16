@@ -16,6 +16,7 @@ use axhal::{
     trap::PageFaultFlags,
 };
 use axsync::Mutex;
+use hashbrown::{HashMap, hash_map::Entry};
 use kspin::SpinNoIrq;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
@@ -152,10 +153,79 @@ struct MappingIdentityState {
     generation: MappingGeneration,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingIdentityEntry {
     lineage: MappingLineage,
     state: MappingIdentityState,
+}
+
+/// Bounded, fallibly-grown sidecar for logical mapping identities.
+///
+/// Mapping lineages are kernel-allocated monotonic values, so they are not an
+/// attacker-chosen hash input. Keeping them in a hash index avoids the linear
+/// compaction that the old ordered `Vec` paid whenever a mapping was retired,
+/// while `reserve_slot` preserves the pre-publication allocation boundary.
+#[derive(Debug, Default)]
+struct MappingIdentityIndex {
+    states: HashMap<MappingLineage, MappingIdentityState>,
+}
+
+impl MappingIdentityIndex {
+    fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.states.capacity()
+    }
+
+    fn reserve_slot(&mut self, limit: usize) -> AxResult {
+        if self.states.len() >= limit {
+            return Err(AxError::NoMemory);
+        }
+        self.states.try_reserve(1).map_err(|_| AxError::NoMemory)
+    }
+
+    /// Publishes one identity after `reserve_slot` has admitted its storage.
+    fn insert_reserved(
+        &mut self,
+        lineage: MappingLineage,
+        state: MappingIdentityState,
+    ) -> AxResult {
+        match self.states.entry(lineage) {
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(AxError::BadState),
+        }
+    }
+
+    fn get(&self, lineage: MappingLineage) -> Option<MappingIdentityState> {
+        self.states.get(&lineage).copied()
+    }
+
+    fn get_mut(&mut self, lineage: MappingLineage) -> Option<&mut MappingIdentityState> {
+        self.states.get_mut(&lineage)
+    }
+
+    fn remove(&mut self, lineage: MappingLineage) -> Option<MappingIdentityState> {
+        self.states.remove(&lineage)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,24 +248,14 @@ impl MappingIdentityMutation {
 }
 
 fn mapping_identity(
-    identities: &[MappingIdentityEntry],
+    identities: &MappingIdentityIndex,
     lineage: MappingLineage,
 ) -> AxResult<MappingIdentityState> {
-    identities
-        .binary_search_by_key(&lineage, |entry| entry.lineage)
-        .ok()
-        .map(|index| identities[index].state)
-        .ok_or(AxError::BadState)
+    identities.get(lineage).ok_or(AxError::BadState)
 }
 
-fn reserve_mapping_identity_slot(
-    identities: &mut Vec<MappingIdentityEntry>,
-    limit: usize,
-) -> AxResult {
-    if identities.len() >= limit {
-        return Err(AxError::NoMemory);
-    }
-    identities.try_reserve(1).map_err(|_| AxError::NoMemory)
+fn reserve_mapping_identity_slot(identities: &mut MappingIdentityIndex, limit: usize) -> AxResult {
+    identities.reserve_slot(limit)
 }
 
 fn lineage_covers_range<B>(
@@ -284,13 +344,10 @@ fn range_is_empty<B>(areas: &MemorySet<B>, start: VirtAddr, size: usize) -> bool
 where
     B: memory_set::MappingBackend<Addr = VirtAddr>,
 {
-    let Some(end) = start.checked_add(size) else {
+    let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
         return false;
     };
-    size != 0
-        && !areas
-            .iter()
-            .any(|area| area.start() < end && start < area.end())
+    !range.is_empty() && !areas.overlaps(range)
 }
 
 fn range_is_owned_by_lineage<B>(
@@ -312,6 +369,33 @@ where
             .all(|area| area.end() <= start || area.start() >= end || area.lineage() == lineage)
 }
 
+fn normalize_ranges(ranges: &[VirtAddrRange]) -> AxResult<Vec<VirtAddrRange>> {
+    let mut sorted_ranges = Vec::new();
+    sorted_ranges
+        .try_reserve(ranges.len())
+        .map_err(|_| AxError::NoMemory)?;
+    sorted_ranges.extend(ranges.iter().copied().filter(|range| !range.is_empty()));
+    sorted_ranges.sort_unstable_by_key(|range| range.start);
+
+    let mut normalized_len = 0usize;
+    for index in 0..sorted_ranges.len() {
+        let range = sorted_ranges[index];
+        if normalized_len != 0 {
+            let previous = &mut sorted_ranges[normalized_len - 1];
+            if range.start <= previous.end {
+                if range.end > previous.end {
+                    previous.end = range.end;
+                }
+                continue;
+            }
+        }
+        sorted_ranges[normalized_len] = range;
+        normalized_len += 1;
+    }
+    sorted_ranges.truncate(normalized_len);
+    Ok(sorted_ranges)
+}
+
 fn projected_fragment_count_after_unmaps<B>(
     areas: &MemorySet<B>,
     ranges: &[VirtAddrRange],
@@ -319,18 +403,19 @@ fn projected_fragment_count_after_unmaps<B>(
 where
     B: memory_set::MappingBackend<Addr = VirtAddr>,
 {
-    let mut sorted_ranges = Vec::new();
-    sorted_ranges
-        .try_reserve(ranges.len())
-        .map_err(|_| AxError::NoMemory)?;
-    sorted_ranges.extend_from_slice(ranges);
-    sorted_ranges.sort_unstable_by_key(|range| range.start);
+    let ranges = normalize_ranges(ranges)?;
 
     let mut count = 0usize;
+    let mut range_index = 0usize;
     for area in areas.iter() {
+        while range_index < ranges.len() && ranges[range_index].end <= area.start() {
+            range_index += 1;
+        }
         let mut cursor = area.start();
-        for range in &sorted_ranges {
+        let mut current_range = range_index;
+        while let Some(range) = ranges.get(current_range) {
             if range.end <= cursor {
+                current_range += 1;
                 continue;
             }
             if range.start >= area.end() {
@@ -343,6 +428,7 @@ where
             if cursor >= area.end() {
                 break;
             }
+            current_range += 1;
         }
         if cursor < area.end() {
             count = count.checked_add(1).ok_or(AxError::NoMemory)?;
@@ -372,7 +458,7 @@ where
 
 fn prepare_mapping_generation_advances_for_range<B>(
     areas: &MemorySet<B>,
-    identities: &[MappingIdentityEntry],
+    identities: &MappingIdentityIndex,
     start: VirtAddr,
     size: usize,
 ) -> AxResult<Vec<MappingIdentityMutation>>
@@ -387,13 +473,7 @@ where
     lineages
         .try_reserve(areas.len())
         .map_err(|_| AxError::NoMemory)?;
-    for area in areas.iter() {
-        if area.end() <= start {
-            continue;
-        }
-        if area.start() >= end {
-            break;
-        }
+    for area in areas.iter_overlapping(VirtAddrRange::new(start, end)) {
         lineages.push(area.lineage());
     }
     lineages.sort_unstable();
@@ -416,16 +496,48 @@ where
     Ok(mutations)
 }
 
-#[derive(Clone, Copy)]
+fn area_is_fully_covered_by_ranges(
+    start: VirtAddr,
+    end: VirtAddr,
+    ranges: &[VirtAddrRange],
+    range_index: &mut usize,
+) -> (bool, bool) {
+    while *range_index < ranges.len() && ranges[*range_index].end <= start {
+        *range_index += 1;
+    }
+
+    let mut cursor = start;
+    let mut affected = false;
+    let mut current_range = *range_index;
+    while let Some(range) = ranges.get(current_range) {
+        if range.end <= cursor {
+            current_range += 1;
+            continue;
+        }
+        if range.start >= end {
+            break;
+        }
+        affected = true;
+        if range.start > cursor {
+            break;
+        }
+        cursor = cursor.max(range.end.min(end));
+        if cursor >= end {
+            break;
+        }
+        current_range += 1;
+    }
+    (affected, affected && cursor >= end)
+}
+
+#[derive(Clone, Copy, Default)]
 struct UnmapLineageCoverage {
-    lineage: MappingLineage,
-    affected: bool,
     survives: bool,
 }
 
 fn prepare_unmap_mapping_mutations<B>(
     areas: &MemorySet<B>,
-    identities: &[MappingIdentityEntry],
+    identities: &MappingIdentityIndex,
     start: VirtAddr,
     size: usize,
 ) -> AxResult<Vec<MappingIdentityMutation>>
@@ -441,70 +553,52 @@ where
 
 fn prepare_unmap_mapping_mutations_for_ranges<B>(
     areas: &MemorySet<B>,
-    identities: &[MappingIdentityEntry],
+    identities: &MappingIdentityIndex,
     ranges: &[VirtAddrRange],
 ) -> AxResult<Vec<MappingIdentityMutation>>
 where
     B: memory_set::MappingBackend<Addr = VirtAddr>,
 {
-    let mut sorted_ranges = Vec::new();
-    sorted_ranges
-        .try_reserve(ranges.len())
-        .map_err(|_| AxError::NoMemory)?;
-    sorted_ranges.extend(ranges.iter().copied().filter(|range| !range.is_empty()));
-    if sorted_ranges.is_empty() {
+    let ranges = normalize_ranges(ranges)?;
+    if ranges.is_empty() {
         return Ok(Vec::new());
     }
-    sorted_ranges.sort_unstable_by_key(|range| range.start);
 
-    let mut coverage = Vec::new();
+    let mut coverage = HashMap::<MappingLineage, UnmapLineageCoverage>::new();
     coverage
-        .try_reserve(areas.len())
+        .try_reserve(ranges.len().min(areas.len()))
         .map_err(|_| AxError::NoMemory)?;
+    let mut range_index = 0usize;
     for area in areas.iter() {
-        let affected = sorted_ranges
-            .iter()
-            .any(|range| area.start() < range.end && range.start < area.end());
-        let mut cursor = area.start();
-        for range in &sorted_ranges {
-            if range.end <= cursor {
-                continue;
-            }
-            if range.start > cursor || range.start >= area.end() {
-                break;
-            }
-            cursor = cursor.max(range.end);
-            if cursor >= area.end() {
-                break;
-            }
+        let (affected, _) =
+            area_is_fully_covered_by_ranges(area.start(), area.end(), &ranges, &mut range_index);
+        if affected && !coverage.contains_key(&area.lineage()) {
+            coverage.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            coverage.insert(area.lineage(), UnmapLineageCoverage::default());
         }
-        coverage.push(UnmapLineageCoverage {
-            lineage: area.lineage(),
-            affected,
-            survives: cursor < area.end(),
-        });
     }
-    coverage.sort_unstable_by_key(|entry| entry.lineage);
+
+    // The first sweep discovers only affected lineages. A second linear sweep
+    // determines whether any fragment of those lineages survives, including a
+    // fragment outside the first/last invalidation range. This replaces the
+    // old full-VMA coverage allocation and lineage sort without reintroducing
+    // a VMA-by-range nested scan.
+    range_index = 0;
+    for area in areas.iter() {
+        let (_, fully_covered) =
+            area_is_fully_covered_by_ranges(area.start(), area.end(), &ranges, &mut range_index);
+        if let Some(entry) = coverage.get_mut(&area.lineage()) {
+            entry.survives |= !fully_covered;
+        }
+    }
 
     let mut mutations = Vec::new();
     mutations
         .try_reserve(coverage.len())
         .map_err(|_| AxError::NoMemory)?;
-    let mut index = 0;
-    while index < coverage.len() {
-        let lineage = coverage[index].lineage;
-        let mut affected = false;
-        let mut survives = false;
-        while index < coverage.len() && coverage[index].lineage == lineage {
-            affected |= coverage[index].affected;
-            survives |= coverage[index].survives;
-            index += 1;
-        }
-        if !affected {
-            continue;
-        }
+    for (lineage, entry) in coverage {
         let identity = mapping_identity(identities, lineage)?;
-        if survives {
+        if entry.survives {
             let generation = identity.generation.next().map_err(mm_error)?;
             mutations.push(MappingIdentityMutation::Advance {
                 lineage,
@@ -514,40 +608,32 @@ where
             mutations.push(MappingIdentityMutation::Retire { lineage });
         }
     }
+    mutations.sort_unstable_by_key(|mutation| mutation.lineage());
     Ok(mutations)
 }
 
 fn commit_mapping_identity_mutations(
-    identities: &mut Vec<MappingIdentityEntry>,
+    identities: &mut MappingIdentityIndex,
     mutations: &[MappingIdentityMutation],
 ) {
-    let mut mutation_index = 0;
-    identities.retain_mut(|entry| {
-        let Some(mutation) = mutations.get(mutation_index).copied() else {
-            return true;
-        };
-        if mutation.lineage() > entry.lineage {
-            return true;
-        }
-        assert_eq!(
-            mutation.lineage(),
-            entry.lineage,
-            "prepared mapping lineage disappeared before commit"
-        );
-        mutation_index += 1;
+    for mutation in mutations.iter().copied() {
         match mutation {
-            MappingIdentityMutation::Advance { generation, .. } => {
-                entry.state.generation = generation;
-                true
+            MappingIdentityMutation::Advance {
+                lineage,
+                generation,
+            } => {
+                identities
+                    .get_mut(lineage)
+                    .expect("prepared mapping lineage disappeared before commit")
+                    .generation = generation;
             }
-            MappingIdentityMutation::Retire { .. } => false,
+            MappingIdentityMutation::Retire { lineage } => {
+                identities
+                    .remove(lineage)
+                    .expect("prepared mapping lineage disappeared before commit");
+            }
         }
-    });
-    assert_eq!(
-        mutation_index,
-        mutations.len(),
-        "prepared mapping mutation was not committed"
-    );
+    }
 }
 
 fn allocate_mapping_identity() -> AxResult<(MappingLineage, MappingIdentityState)> {
@@ -625,7 +711,7 @@ pub struct AddrSpace {
     topology_mapping_id: MappingId,
     topology_generation: MappingGeneration,
     areas: MemorySet<Backend>,
-    mapping_identities: Vec<MappingIdentityEntry>,
+    mapping_identities: MappingIdentityIndex,
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
@@ -744,7 +830,7 @@ pub(crate) struct PreparedProtect<'a> {
     growdown_starts: &'a mut BTreeSet<VirtAddr>,
     topology_generation: &'a mut MappingGeneration,
     next_topology_generation: MappingGeneration,
-    mapping_identities: &'a mut Vec<MappingIdentityEntry>,
+    mapping_identities: &'a mut MappingIdentityIndex,
     mapping_mutations: Vec<MappingIdentityMutation>,
     synchronize_instruction_stream: bool,
 }
@@ -909,7 +995,7 @@ impl AddrSpace {
             topology_mapping_id,
             topology_generation,
             areas: MemorySet::new(),
-            mapping_identities: Vec::new(),
+            mapping_identities: MappingIdentityIndex::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
@@ -926,17 +1012,7 @@ impl AddrSpace {
         let (lineage, identity) = allocate_mapping_identity()?;
         debug_assert_eq!(lineage.get(), identity.id.get());
         debug_assert_ne!(identity.id, self.topology_mapping_id);
-        if self
-            .mapping_identities
-            .last()
-            .is_some_and(|entry| entry.lineage >= lineage)
-        {
-            return Err(AxError::BadState);
-        }
-        self.mapping_identities.push(MappingIdentityEntry {
-            lineage,
-            state: identity,
-        });
+        self.mapping_identities.insert_reserved(lineage, identity)?;
         Ok(lineage)
     }
 
@@ -944,14 +1020,7 @@ impl AddrSpace {
         if self.areas.iter().any(|area| area.lineage() == lineage) {
             return false;
         }
-        let Ok(index) = self
-            .mapping_identities
-            .binary_search_by_key(&lineage, |entry| entry.lineage)
-        else {
-            return false;
-        };
-        self.mapping_identities.remove(index);
-        true
+        self.mapping_identities.remove(lineage).is_some()
     }
 
     fn mapping_identity(&self, lineage: MappingLineage) -> AxResult<MappingIdentityState> {
@@ -963,11 +1032,10 @@ impl AddrSpace {
         lineage: MappingLineage,
         generation: MappingGeneration,
     ) {
-        let index = self
-            .mapping_identities
-            .binary_search_by_key(&lineage, |entry| entry.lineage)
-            .expect("existing mapping lineage disappeared");
-        self.mapping_identities[index].state.generation = generation;
+        self.mapping_identities
+            .get_mut(lineage)
+            .expect("existing mapping lineage disappeared")
+            .generation = generation;
     }
 
     fn refresh_growdown_starts(&mut self) {
@@ -3033,6 +3101,20 @@ mod tests {
         }
     }
 
+    fn mock_identities(
+        entries: impl IntoIterator<Item = MappingIdentityEntry>,
+    ) -> MappingIdentityIndex {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut identities = MappingIdentityIndex::new();
+        identities.states.reserve(entries.len());
+        for entry in entries {
+            identities
+                .insert_reserved(entry.lineage, entry.state)
+                .unwrap();
+        }
+        identities
+    }
+
     fn map_mock_area(
         areas: &mut MemorySet<MockBackend>,
         page_table: &mut Vec<u8>,
@@ -3091,7 +3173,7 @@ mod tests {
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage_a);
         map_mock_area(&mut areas, &mut page_table, 0x3000, 0x1000, 1, 2, lineage_b);
-        let mut identities = vec![mock_identity(2, 7), mock_identity(3, 11)];
+        let mut identities = mock_identities([mock_identity(2, 7), mock_identity(3, 11)]);
         let before_a = mapping_identity(&identities, lineage_a).unwrap();
 
         let mutations = prepare_mapping_generation_advances_for_range(
@@ -3126,7 +3208,7 @@ mod tests {
         let mut areas = MemorySet::new();
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
-        let identities = vec![mock_identity(2, 9)];
+        let identities = mock_identities([mock_identity(2, 9)]);
         let before = mapping_identity(&identities, lineage).unwrap();
 
         // Model MADV_DONTNEED's residency-only PTE teardown: the VMA and its
@@ -3146,7 +3228,7 @@ mod tests {
         let mut areas = MemorySet::new();
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x3000, 1, 1, lineage);
-        let mut identities = vec![mock_identity(2, 1)];
+        let mut identities = mock_identities([mock_identity(2, 1)]);
         let mutations = prepare_mapping_generation_advances_for_range(
             &areas,
             &identities,
@@ -3185,7 +3267,7 @@ mod tests {
             1,
             lineage,
         );
-        let mut full_identities = vec![mock_identity(2, u64::MAX)];
+        let mut full_identities = mock_identities([mock_identity(2, u64::MAX)]);
         let retire = prepare_unmap_mapping_mutations(
             &full_areas,
             &full_identities,
@@ -3212,7 +3294,7 @@ mod tests {
             1,
             lineage,
         );
-        let partial_identities = vec![mock_identity(2, u64::MAX)];
+        let partial_identities = mock_identities([mock_identity(2, u64::MAX)]);
         let before_areas = area_snapshot(&partial_areas);
         let before_page_table = partial_page_table.clone();
         assert_eq!(
@@ -3226,7 +3308,10 @@ mod tests {
         );
         assert_eq!(area_snapshot(&partial_areas), before_areas);
         assert_eq!(partial_page_table, before_page_table);
-        assert_eq!(partial_identities, vec![mock_identity(2, u64::MAX)]);
+        assert_eq!(
+            mapping_identity(&partial_identities, lineage).unwrap(),
+            mock_identity(2, u64::MAX).state
+        );
     }
 
     #[test]
@@ -3236,7 +3321,7 @@ mod tests {
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
         map_mock_area(&mut areas, &mut page_table, 0x3000, 0x1000, 3, 1, lineage);
-        let identities = vec![mock_identity(2, 4)];
+        let identities = mock_identities([mock_identity(2, 4)]);
         let mutations =
             prepare_unmap_mapping_mutations(&areas, &identities, VirtAddr::from(0x1000), 0x3000)
                 .unwrap();
@@ -3244,12 +3329,86 @@ mod tests {
 
         let before_areas = area_snapshot(&areas);
         let before_page_table = page_table.clone();
+        let no_identities = MappingIdentityIndex::new();
         assert_eq!(
-            prepare_unmap_mapping_mutations(&areas, &[], VirtAddr::from(0x1000), 0x3000,),
+            prepare_unmap_mapping_mutations(&areas, &no_identities, VirtAddr::from(0x1000), 0x3000,),
             Err(AxError::BadState)
         );
         assert_eq!(area_snapshot(&areas), before_areas);
         assert_eq!(page_table, before_page_table);
+    }
+
+    #[test]
+    fn unmap_plan_advances_a_lineage_that_survives_in_an_unaffected_fragment() {
+        let lineage = mock_lineage(2);
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        map_mock_area(&mut areas, &mut page_table, 0x4000, 0x1000, 3, 1, lineage);
+        let identities = mock_identities([mock_identity(2, 8)]);
+
+        let mutations = prepare_unmap_mapping_mutations_for_ranges(
+            &areas,
+            &identities,
+            &[
+                VirtAddrRange::new(VirtAddr::from(0x1800), VirtAddr::from(0x2000)),
+                VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x1900)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            mutations,
+            [MappingIdentityMutation::Advance {
+                lineage,
+                generation: MappingGeneration::new(9).unwrap(),
+            }]
+        );
+    }
+
+    #[test]
+    fn multi_range_planner_handles_thousands_of_vmas_without_nested_scans() {
+        const VMA_COUNT: usize = 2_048;
+        const STRIDE: usize = 0x2000;
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; (VMA_COUNT + 1) * STRIDE];
+        let mut identities = MappingIdentityIndex::new();
+        identities.states.reserve(VMA_COUNT);
+        let mut ranges = Vec::new();
+        ranges.reserve(VMA_COUNT / 64);
+
+        for index in 0..VMA_COUNT {
+            let start = index * STRIDE;
+            let lineage = mock_lineage(index as u64 + 2);
+            map_mock_area(
+                &mut areas,
+                &mut page_table,
+                start,
+                PAGE_SIZE_4K,
+                1,
+                1,
+                lineage,
+            );
+            identities
+                .insert_reserved(lineage, mock_identity(index as u64 + 2, 1).state)
+                .unwrap();
+            if index.is_multiple_of(64) {
+                ranges.push(VirtAddrRange::from_start_size(
+                    VirtAddr::from(start),
+                    PAGE_SIZE_4K,
+                ));
+            }
+        }
+        ranges.reverse();
+
+        let mutations =
+            prepare_unmap_mapping_mutations_for_ranges(&areas, &identities, &ranges).unwrap();
+        assert_eq!(mutations.len(), VMA_COUNT / 64);
+        assert!(
+            mutations
+                .iter()
+                .all(|mutation| matches!(mutation, MappingIdentityMutation::Retire { .. }))
+        );
     }
 
     #[test]
@@ -3258,13 +3417,19 @@ mod tests {
         let mut areas = MemorySet::new();
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
+        let no_identities = MappingIdentityIndex::new();
         assert!(
-            prepare_mapping_generation_advances_for_range(&areas, &[], VirtAddr::from(0x1000), 0,)
-                .unwrap()
-                .is_empty()
+            prepare_mapping_generation_advances_for_range(
+                &areas,
+                &no_identities,
+                VirtAddr::from(0x1000),
+                0,
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            prepare_unmap_mapping_mutations(&areas, &[], VirtAddr::from(0x1000), 0)
+            prepare_unmap_mapping_mutations(&areas, &no_identities, VirtAddr::from(0x1000), 0,)
                 .unwrap()
                 .is_empty()
         );
@@ -3278,7 +3443,7 @@ mod tests {
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, source);
         let source_state = mock_identity(2, 6);
-        let mut identities = vec![source_state, mock_identity(3, 1)];
+        let mut identities = mock_identities([source_state, mock_identity(3, 1)]);
         let source_retire =
             prepare_unmap_mapping_mutations(&areas, &identities, VirtAddr::from(0x1000), 0x1000)
                 .unwrap();
@@ -3324,7 +3489,7 @@ mod tests {
             1,
             destination,
         );
-        let mut rollback_identities = vec![source_state, mock_identity(3, 1)];
+        let mut rollback_identities = mock_identities([source_state, mock_identity(3, 1)]);
         let destination_retire = prepare_unmap_mapping_mutations(
             &rollback_areas,
             &rollback_identities,
@@ -3344,7 +3509,7 @@ mod tests {
 
         // old_size == 0 duplication keeps the source and installs one fresh
         // generation-1 destination incarnation.
-        let duplicate_identities = vec![source_state, mock_identity(3, 1)];
+        let duplicate_identities = mock_identities([source_state, mock_identity(3, 1)]);
         assert_eq!(
             mapping_identity(&duplicate_identities, source).unwrap(),
             source_state.state
@@ -3364,7 +3529,7 @@ mod tests {
         let mut areas = MemorySet::new();
         let mut page_table = vec![0; TEST_SPACE_SIZE];
         map_mock_area(&mut areas, &mut page_table, 0x1000, 0x1000, 1, 1, lineage);
-        let mut identities = vec![mock_identity(2, 1)];
+        let mut identities = mock_identities([mock_identity(2, 1)]);
         assert!(!lineage_exactly_covers_range(
             &areas,
             lineage,
@@ -3414,14 +3579,14 @@ mod tests {
 
     #[test]
     fn mapping_lineage_limit_is_admitted_before_growth_and_exec_releases_capacity() {
-        let mut identities = vec![mock_identity(2, 1), mock_identity(3, 1)];
+        let mut identities = mock_identities([mock_identity(2, 1), mock_identity(3, 1)]);
         assert_eq!(
             reserve_mapping_identity_slot(&mut identities, 2),
             Err(AxError::NoMemory)
         );
         assert_eq!(identities.len(), 2);
 
-        identities.reserve(32);
+        identities.states.reserve(32);
         assert!(identities.capacity() > 2);
         drop(core::mem::take(&mut identities));
         assert_eq!(identities.len(), 0);

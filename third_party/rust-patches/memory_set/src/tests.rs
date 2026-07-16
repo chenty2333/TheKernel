@@ -372,6 +372,26 @@ fn test_map_unmap() {
 }
 
 #[test]
+fn overlapping_iterator_includes_crossing_predecessor_and_stops_at_upper_bound() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    for start in [0x1000, 0x3000, 0x5000] {
+        assert_ok!(set.map(
+            tracked_area(start.into(), 0x1000, 1, MockBackend),
+            &mut pt,
+            false,
+        ));
+    }
+
+    let starts: Vec<_> = set
+        .iter_overlapping(va_range!(0x1800..0x4800))
+        .map(|area| area.start().as_usize())
+        .collect();
+    assert_eq!(starts, [0x1000, 0x3000]);
+    assert_eq!(set.iter_overlapping(va_range!(0x2000..0x3000)).count(), 0);
+}
+
+#[test]
 fn test_unmap_split() {
     let mut set = MockMemorySet::new();
     let mut pt = [0; MAX_ADDR];
