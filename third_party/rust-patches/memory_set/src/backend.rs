@@ -89,3 +89,31 @@ pub trait MappingBackend: Clone {
         false
     }
 }
+
+/// Optional extension for backends that must defer resource retirement until
+/// an external translation fence has completed.
+///
+/// [`MemorySet::unmap_deferred`](crate::MemorySet::unmap_deferred) and
+/// [`MemorySet::clear_deferred`](crate::MemorySet::clear_deferred) retain every
+/// returned [`Self::Retirement`] together with any fully removed
+/// [`MemoryArea`](crate::MemoryArea). The caller releases both explicitly after
+/// completing its architecture-specific fence. The original [`MappingBackend`]
+/// API remains available for callers whose unmap resources may be retired
+/// immediately.
+pub trait DeferredUnmapBackend: MappingBackend {
+    /// Backend-owned state that must survive until the caller's fence.
+    type Retirement;
+
+    /// Commits a previously admitted unmap and transfers its retirement state.
+    ///
+    /// This method follows the same fail-stop contract as
+    /// [`MappingBackend::unmap`]: after [`MappingBackend::preflight_unmap`]
+    /// succeeds under stable page-table and topology serialization, returning
+    /// [`None`] is an internal consistency failure.
+    fn unmap_deferred(
+        &self,
+        start: Self::Addr,
+        size: usize,
+        page_table: &mut Self::PageTable,
+    ) -> Option<Self::Retirement>;
+}

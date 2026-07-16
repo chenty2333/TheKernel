@@ -5,7 +5,9 @@ use std::sync::{
 
 use memory_addr::{MemoryAddr, VirtAddr, va_range};
 
-use crate::{MappingBackend, MappingError, MappingLineage, MemoryArea, MemorySet};
+use crate::{
+    DeferredUnmapBackend, MappingBackend, MappingError, MappingLineage, MemoryArea, MemorySet,
+};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -37,6 +39,61 @@ struct FailingCommitBackend;
 
 #[derive(Clone)]
 struct FailingProtectCommitBackend;
+
+#[derive(Default)]
+struct DeferredSignals {
+    preflight_calls: Arc<AtomicUsize>,
+    deferred_calls: Arc<AtomicUsize>,
+    live_retirements: Arc<AtomicUsize>,
+}
+
+impl DeferredSignals {
+    fn backend(&self, owner: Arc<()>, reject_start: Option<usize>) -> DeferredBackend {
+        DeferredBackend {
+            _area_owner: owner,
+            preflight_calls: self.preflight_calls.clone(),
+            deferred_calls: self.deferred_calls.clone(),
+            live_retirements: self.live_retirements.clone(),
+            reject_start,
+            fail_commit_start: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DeferredBackend {
+    _area_owner: Arc<()>,
+    preflight_calls: Arc<AtomicUsize>,
+    deferred_calls: Arc<AtomicUsize>,
+    live_retirements: Arc<AtomicUsize>,
+    reject_start: Option<usize>,
+    fail_commit_start: Option<usize>,
+}
+
+impl DeferredBackend {
+    fn fail_commit_at(mut self, start: usize) -> Self {
+        self.fail_commit_start = Some(start);
+        self
+    }
+}
+
+struct TrackedRetirement {
+    live_retirements: Arc<AtomicUsize>,
+}
+
+impl TrackedRetirement {
+    fn new(live_retirements: Arc<AtomicUsize>) -> Self {
+        live_retirements.fetch_add(1, Ordering::Relaxed);
+        Self { live_retirements }
+    }
+}
+
+impl Drop for TrackedRetirement {
+    fn drop(&mut self) {
+        let previous = self.live_retirements.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous > 0);
+    }
+}
 
 type MockMemorySet = MemorySet<MockBackend>;
 type MergeMemorySet = MemorySet<MergeBackend>;
@@ -273,6 +330,54 @@ impl MappingBackend for FailingProtectCommitBackend {
     }
 }
 
+impl MappingBackend for DeferredBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &MockPageTable) -> bool {
+        self.preflight_calls.fetch_add(1, Ordering::Relaxed);
+        self.reject_start != Some(start.as_usize()) && MockBackend.preflight_unmap(start, size, pt)
+    }
+
+    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        MockBackend.unmap(start, size, pt)
+    }
+
+    fn protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        new_flags: MockFlags,
+        pt: &mut MockPageTable,
+    ) -> bool {
+        MockBackend.protect(start, size, new_flags, pt)
+    }
+}
+
+impl DeferredUnmapBackend for DeferredBackend {
+    type Retirement = TrackedRetirement;
+
+    fn unmap_deferred(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        pt: &mut MockPageTable,
+    ) -> Option<Self::Retirement> {
+        self.deferred_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_commit_start == Some(start.as_usize()) {
+            return None;
+        }
+        MockBackend
+            .unmap(start, size, pt)
+            .then(|| TrackedRetirement::new(self.live_retirements.clone()))
+    }
+}
+
 macro_rules! assert_ok {
     ($expr:expr) => {
         assert!(($expr).is_ok())
@@ -295,7 +400,7 @@ fn dump_memory_set(set: &MockMemorySet) {
     let _lock = DUMP_LOCK.lock().unwrap();
     println!("Number of areas: {}", set.len());
     for area in set.iter() {
-        println!("{:?}", area);
+        println!("{area:?}");
     }
 }
 
@@ -628,6 +733,169 @@ fn clear_preflights_every_backend_before_mutating_any_pte() {
     assert_eq!(unmap_calls.load(Ordering::Relaxed), 0);
     assert_eq!(set.len(), 2);
     assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn deferred_unmap_holds_backend_retirement_and_complete_area_until_release() {
+    let signals = DeferredSignals::default();
+    let owner = Arc::new(());
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(
+            0x1000.into(),
+            0x1000,
+            1,
+            signals.backend(owner.clone(), None),
+        ),
+        &mut pt,
+        false,
+    ));
+    assert_eq!(Arc::strong_count(&owner), 2);
+
+    let retirement = set.unmap_deferred(0x1000.into(), 0x1000, &mut pt).unwrap();
+
+    assert!(set.is_empty());
+    assert_eq!(retirement.backend_retirements().len(), 1);
+    assert_eq!(retirement.retired_areas().len(), 1);
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 1);
+    assert_eq!(Arc::strong_count(&owner), 2);
+
+    // The caller performs its translation fence before this explicit release.
+    retirement.release();
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 0);
+    assert_eq!(Arc::strong_count(&owner), 1);
+}
+
+#[test]
+fn deferred_partial_unmap_retains_its_backend_token() {
+    let signals = DeferredSignals::default();
+    let owner = Arc::new(());
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(
+            0x1000.into(),
+            0x3000,
+            1,
+            signals.backend(owner.clone(), None),
+        ),
+        &mut pt,
+        false,
+    ));
+
+    let retirement = set.unmap_deferred(0x2000.into(), 0x1000, &mut pt).unwrap();
+
+    assert_eq!(set.len(), 2);
+    assert_eq!(retirement.backend_retirements().len(), 1);
+    assert!(retirement.retired_areas().is_empty());
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 1);
+    assert!(pt[0x2000..0x3000].iter().all(|&flags| flags == 0));
+
+    retirement.release();
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 0);
+    assert_eq!(Arc::strong_count(&owner), 3);
+}
+
+#[test]
+fn deferred_clear_retains_every_complete_area_owner() {
+    let signals = DeferredSignals::default();
+    let owner = Arc::new(());
+    let backend = signals.backend(owner.clone(), None);
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x1000, 1, backend.clone()),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(0x3000.into(), 0x1000, 2, backend),
+        &mut pt,
+        false,
+    ));
+    assert_eq!(Arc::strong_count(&owner), 3);
+
+    let retirement = set.clear_deferred(&mut pt).unwrap();
+
+    assert!(set.is_empty());
+    assert_eq!(retirement.backend_retirements().len(), 2);
+    assert_eq!(retirement.retired_areas().len(), 2);
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 2);
+    assert_eq!(Arc::strong_count(&owner), 3);
+
+    retirement.release();
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 0);
+    assert_eq!(Arc::strong_count(&owner), 1);
+}
+
+#[test]
+fn deferred_clear_preflight_failure_has_no_token_or_side_effect() {
+    let signals = DeferredSignals::default();
+    let owner = Arc::new(());
+    let backend = signals.backend(owner.clone(), Some(0x3000));
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x1000, 1, backend.clone()),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(0x3000.into(), 0x1000, 2, backend),
+        &mut pt,
+        false,
+    ));
+    let pt_before = pt;
+
+    assert_err!(set.clear_deferred(&mut pt), BadState);
+
+    assert_eq!(signals.preflight_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(signals.deferred_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 0);
+    assert_eq!(set.len(), 2);
+    assert_eq!(Arc::strong_count(&owner), 3);
+    assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn deferred_commit_invariant_failure_leaks_prior_retirement_and_area_owner() {
+    let signals = DeferredSignals::default();
+    let owner = Arc::new(());
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(
+            0x1000.into(),
+            0x1000,
+            1,
+            signals.backend(owner.clone(), None),
+        ),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(
+            0x3000.into(),
+            0x1000,
+            2,
+            signals.backend(owner.clone(), None).fail_commit_at(0x3000),
+        ),
+        &mut pt,
+        false,
+    ));
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = set.unmap_deferred(0x1000.into(), 0x3000, &mut pt);
+    }));
+
+    assert!(outcome.is_err());
+    assert_eq!(signals.deferred_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(signals.live_retirements.load(Ordering::Relaxed), 1);
+    assert_eq!(set.len(), 1);
+    assert_eq!(Arc::strong_count(&owner), 3);
+    assert!(pt[0x1000..0x2000].iter().all(|&flags| flags == 0));
+    assert!(pt[0x3000..0x4000].iter().all(|&flags| flags == 2));
 }
 
 #[test]

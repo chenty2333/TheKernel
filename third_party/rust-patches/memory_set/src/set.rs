@@ -2,13 +2,15 @@ use alloc::collections::BTreeMap;
 #[allow(unused_imports)] // this is a weird false alarm
 use alloc::vec::Vec;
 use core::{
-    fmt,
+    fmt, mem,
     ops::Bound::{Excluded, Included, Unbounded},
 };
 
 use memory_addr::{AddrRange, MemoryAddr};
 
-use crate::{MappingBackend, MappingError, MappingLineage, MappingResult, MemoryArea};
+use crate::{
+    DeferredUnmapBackend, MappingBackend, MappingError, MappingLineage, MappingResult, MemoryArea,
+};
 
 struct ProtectAction<A, F> {
     area_start: A,
@@ -18,6 +20,157 @@ struct ProtectAction<A, F> {
     old_flags: F,
     new_flags: F,
     lineage: MappingLineage,
+}
+
+/// Resources retired by a deferred unmap or clear operation.
+///
+/// The value owns every backend retirement token produced by the operation and
+/// every [`MemoryArea`] removed in full. It must remain alive until the caller
+/// has completed the architecture-specific translation fence.
+#[must_use = "retired mappings must be held until the translation fence completes"]
+pub struct UnmapRetirement<B: DeferredUnmapBackend> {
+    backend_retirements: Vec<B::Retirement>,
+    retired_areas: Vec<MemoryArea<B>>,
+}
+
+impl<B: DeferredUnmapBackend> UnmapRetirement<B> {
+    fn new() -> Self {
+        Self {
+            backend_retirements: Vec::new(),
+            retired_areas: Vec::new(),
+        }
+    }
+
+    fn try_reserve(&mut self, retirements: usize, areas: usize) -> MappingResult {
+        self.backend_retirements
+            .try_reserve(retirements)
+            .map_err(|_| MappingError::NoMemory)?;
+        self.retired_areas
+            .try_reserve(areas)
+            .map_err(|_| MappingError::NoMemory)?;
+        Ok(())
+    }
+
+    /// Returns whether the operation retired no backend or area resources.
+    pub fn is_empty(&self) -> bool {
+        self.backend_retirements.is_empty() && self.retired_areas.is_empty()
+    }
+
+    /// Returns the backend retirement tokens retained until release.
+    pub fn backend_retirements(&self) -> &[B::Retirement] {
+        &self.backend_retirements
+    }
+
+    /// Returns the fully removed memory areas retained until release.
+    pub fn retired_areas(&self) -> &[MemoryArea<B>] {
+        &self.retired_areas
+    }
+
+    /// Releases all retained resources after the caller's fence has completed.
+    pub fn release(self) {}
+}
+
+trait UnmapMode<B: MappingBackend> {
+    type Output;
+
+    fn try_reserve(&mut self, unmaps: usize, complete_areas: usize) -> MappingResult;
+
+    fn unmap(
+        &mut self,
+        backend: &B,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+    ) -> bool;
+
+    fn retire_area(&mut self, area: MemoryArea<B>);
+
+    fn finish(self) -> Self::Output;
+}
+
+struct ImmediateUnmap;
+
+impl<B: MappingBackend> UnmapMode<B> for ImmediateUnmap {
+    type Output = ();
+
+    fn try_reserve(&mut self, _unmaps: usize, _complete_areas: usize) -> MappingResult {
+        Ok(())
+    }
+
+    fn unmap(
+        &mut self,
+        backend: &B,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+    ) -> bool {
+        backend.unmap(start, size, page_table)
+    }
+
+    fn retire_area(&mut self, _area: MemoryArea<B>) {}
+
+    fn finish(self) {}
+}
+
+struct DeferredUnmap<B: DeferredUnmapBackend> {
+    retirement: Option<UnmapRetirement<B>>,
+}
+
+impl<B: DeferredUnmapBackend> DeferredUnmap<B> {
+    fn new() -> Self {
+        Self {
+            retirement: Some(UnmapRetirement::new()),
+        }
+    }
+
+    fn retirement_mut(&mut self) -> &mut UnmapRetirement<B> {
+        self.retirement
+            .as_mut()
+            .expect("deferred unmap retirement was already disarmed")
+    }
+
+    fn leak_retirement(&mut self) {
+        // A post-preflight backend failure is fail-stop, but host tests and a
+        // future unwinding kernel may still catch the panic. Never let stack
+        // unwinding release resources that earlier commits detached from their
+        // PTEs before the caller has established translation grace.
+        if let Some(retirement) = self.retirement.take() {
+            mem::forget(retirement);
+        }
+    }
+}
+
+impl<B: DeferredUnmapBackend> UnmapMode<B> for DeferredUnmap<B> {
+    type Output = UnmapRetirement<B>;
+
+    fn try_reserve(&mut self, unmaps: usize, complete_areas: usize) -> MappingResult {
+        self.retirement_mut().try_reserve(unmaps, complete_areas)
+    }
+
+    fn unmap(
+        &mut self,
+        backend: &B,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+    ) -> bool {
+        let Some(retirement) = backend.unmap_deferred(start, size, page_table) else {
+            self.leak_retirement();
+            return false;
+        };
+        self.retirement_mut().backend_retirements.push(retirement);
+        true
+    }
+
+    fn retire_area(&mut self, area: MemoryArea<B>) {
+        self.retirement_mut().retired_areas.push(area);
+    }
+
+    fn finish(mut self) -> Self::Output {
+        self.retirement
+            .take()
+            .expect("deferred unmap retirement was already disarmed")
+    }
 }
 
 /// A container that maintains memory mappings ([`MemoryArea`]).
@@ -411,34 +564,72 @@ impl<B: MappingBackend> MemorySet<B> {
         page_table: &mut B::PageTable,
         max_areas: usize,
     ) -> MappingResult {
-        self.unmap_with_limit_inner(start, size, page_table, max_areas)
+        self.unmap_with_limit_inner(start, size, page_table, max_areas, ImmediateUnmap)
     }
 
-    fn unmap_with_limit_inner(
+    /// Removes mappings while retaining backend and complete-area ownership.
+    ///
+    /// The returned value must remain alive until the caller completes the
+    /// translation fence that makes stale translations unreachable. Existing
+    /// [`Self::unmap`] behavior remains available for immediate retirement.
+    pub fn unmap_deferred(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+    ) -> MappingResult<UnmapRetirement<B>>
+    where
+        B: DeferredUnmapBackend,
+    {
+        self.unmap_deferred_with_limit(start, size, page_table, usize::MAX)
+    }
+
+    /// Deferred unmap with an explicit live-area quota.
+    ///
+    /// Capacity for the address plan, backend retirements, and complete area
+    /// owners is admitted before the first page-table or area-tree mutation.
+    pub fn unmap_deferred_with_limit(
         &mut self,
         start: B::Addr,
         size: usize,
         page_table: &mut B::PageTable,
         max_areas: usize,
-    ) -> MappingResult {
+    ) -> MappingResult<UnmapRetirement<B>>
+    where
+        B: DeferredUnmapBackend,
+    {
+        self.unmap_with_limit_inner(start, size, page_table, max_areas, DeferredUnmap::new())
+    }
+
+    fn unmap_with_limit_inner<M: UnmapMode<B>>(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        page_table: &mut B::PageTable,
+        max_areas: usize,
+        mut mode: M,
+    ) -> MappingResult<M::Output> {
         let range =
             AddrRange::try_from_start_size(start, size).ok_or(MappingError::InvalidParam)?;
         if range.is_empty() {
-            return Ok(());
+            mode.try_reserve(0, 0)?;
+            return Ok(mode.finish());
         }
 
         let remaining = self.fragment_count_after_unmap(range)?;
         Self::check_area_limit(self.len().max(remaining), max_areas)?;
 
-        let fully_covered_count = self
-            .areas
-            .range((Included(start), Excluded(range.end)))
-            .filter(|(_, area)| area.va_range().contained_in(range))
-            .count();
+        let mut unmap_count = 0;
+        let mut fully_covered_count = 0;
+        for area in self.iter_overlapping(range) {
+            unmap_count += 1;
+            fully_covered_count += usize::from(area.va_range().contained_in(range));
+        }
         let mut fully_covered = Vec::new();
         fully_covered
             .try_reserve(fully_covered_count)
             .map_err(|_| MappingError::NoMemory)?;
+        mode.try_reserve(unmap_count, fully_covered_count)?;
         fully_covered.extend(
             self.areas
                 .range((Included(start), Excluded(range.end)))
@@ -452,26 +643,45 @@ impl<B: MappingBackend> MemorySet<B> {
 
         // Unmap entire areas that are contained by the range.
         for area_start in fully_covered {
+            let area = self.areas.get(&area_start).unwrap();
+            assert!(
+                mode.unmap(area.backend(), area.start(), area.size(), page_table),
+                "mapping backend failed after successful unmap preflight"
+            );
             let area = self.areas.remove(&area_start).unwrap();
-            area.unmap_area(page_table)
-                .expect("mapping backend failed after successful unmap preflight");
+            mode.retire_area(area);
         }
 
         // Shrink right if the area intersects with the left boundary.
-        if let Some((&before_start, before)) = self.areas.range_mut(..start).last() {
+        if let Some((_, before)) = self.areas.range_mut(..start).last() {
             let before_end = before.end();
             if before_end > start {
                 if before_end <= end {
                     // the unmapped area is at the end of `before`.
-                    before
-                        .shrink_right(start.sub_addr(before_start), page_table)
-                        .expect("mapping backend failed after successful unmap preflight");
+                    assert!(
+                        mode.unmap(
+                            before.backend(),
+                            start,
+                            before_end.sub_addr(start),
+                            page_table
+                        ),
+                        "mapping backend failed after successful unmap preflight"
+                    );
+                    before.set_end(start);
                 } else {
                     // the unmapped area is in the middle `before`, need to split.
-                    let right_part = before.split(end).unwrap();
-                    before
-                        .shrink_right(start.sub_addr(before_start), page_table)
-                        .expect("mapping backend failed after successful unmap preflight");
+                    let right_part = MemoryArea::new_with_lineage(
+                        end,
+                        before_end.sub_addr(end),
+                        before.flags(),
+                        before.backend().clone(),
+                        before.lineage(),
+                    );
+                    assert!(
+                        mode.unmap(before.backend(), start, end.sub_addr(start), page_table),
+                        "mapping backend failed after successful unmap preflight"
+                    );
+                    before.set_end(start);
                     assert_eq!(right_part.start().into(), Into::<usize>::into(end));
                     self.areas.insert(end, right_part);
                 }
@@ -480,13 +690,19 @@ impl<B: MappingBackend> MemorySet<B> {
 
         // Shrink left if the area intersects with the right boundary.
         if let Some((&after_start, after)) = self.areas.range_mut(start..).next() {
-            let after_end = after.end();
             if after_start < end {
                 // the unmapped area is at the start of `after`.
-                let mut new_area = self.areas.remove(&after_start).unwrap();
-                new_area
-                    .shrink_left(after_end.sub_addr(end), page_table)
-                    .expect("mapping backend failed after successful unmap preflight");
+                assert!(
+                    mode.unmap(
+                        after.backend(),
+                        after_start,
+                        end.sub_addr(after_start),
+                        page_table
+                    ),
+                    "mapping backend failed after successful unmap preflight"
+                );
+                after.set_start(end);
+                let new_area = self.areas.remove(&after_start).unwrap();
                 assert_eq!(new_area.start().into(), Into::<usize>::into(end));
                 self.areas.insert(end, new_area);
             }
@@ -495,11 +711,22 @@ impl<B: MappingBackend> MemorySet<B> {
         self.merge_adjacent_at(start);
         self.merge_adjacent_at(end);
 
-        Ok(())
+        Ok(mode.finish())
     }
 
     /// Remove all memory areas and the underlying mappings.
     pub fn clear(&mut self, page_table: &mut B::PageTable) -> MappingResult {
+        self.clear_inner(page_table, ImmediateUnmap)
+    }
+
+    fn clear_inner<M: UnmapMode<B>>(
+        &mut self,
+        page_table: &mut B::PageTable,
+        mut mode: M,
+    ) -> MappingResult<M::Output> {
+        let area_count = self.len();
+        mode.try_reserve(area_count, area_count)?;
+
         for area in self.areas.values() {
             if !area
                 .backend()
@@ -508,12 +735,30 @@ impl<B: MappingBackend> MemorySet<B> {
                 return Err(MappingError::BadState);
             }
         }
-        for (_, area) in self.areas.iter() {
-            area.unmap_area(page_table)
-                .expect("mapping backend failed after successful clear preflight");
+        for area in self.areas.values() {
+            assert!(
+                mode.unmap(area.backend(), area.start(), area.size(), page_table),
+                "mapping backend failed after successful clear preflight"
+            );
         }
-        self.areas.clear();
-        Ok(())
+        for area in mem::take(&mut self.areas).into_values() {
+            mode.retire_area(area);
+        }
+        Ok(mode.finish())
+    }
+
+    /// Removes all mappings while retaining every backend token and area owner.
+    ///
+    /// Both output vectors reserve their complete capacity before backend
+    /// preflight and before the first page-table or area-tree mutation.
+    pub fn clear_deferred(
+        &mut self,
+        page_table: &mut B::PageTable,
+    ) -> MappingResult<UnmapRetirement<B>>
+    where
+        B: DeferredUnmapBackend,
+    {
+        self.clear_inner(page_table, DeferredUnmap::new())
     }
 
     /// Change the flags of memory mappings within the given address range.
