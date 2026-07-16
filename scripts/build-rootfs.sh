@@ -62,7 +62,7 @@ case "$SIZE_MB" in
 esac
 [ "$SIZE_MB" -ge 32 ] || { printf '%s\n' '--size-mb must be at least 32' >&2; exit 2; }
 
-for command in "${CROSS_COMPILE}gcc" curl fakeroot find make mke2fs \
+for command in "${CROSS_COMPILE}gcc" curl debugfs fakeroot find make mke2fs \
     realpath sha256sum tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2

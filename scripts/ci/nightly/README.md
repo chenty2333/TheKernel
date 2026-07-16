@@ -183,9 +183,11 @@ scripts/ci/check-rootfs-reproducibility.sh \
   --arch both --workdir .state/ci/rootfs-reproducibility
 ```
 
-The image helper normalizes every staged inode mtime, fixes UUID/hash seed and
-lazy initialization, and uses `E2FSPROGS_FAKE_TIME` for ext4 creation clocks.
-The gate requires equal full-image sizes, SHA-256 digests, and byte content.
+The image helper normalizes the staging tree, fixes UUID/hash seed and lazy
+initialization, uses `E2FSPROGS_FAKE_TIME` for ext4 creation clocks, then asks
+libext2fs to canonicalize every imported inode's atime, ctime, mtime, crtime,
+and checksum. The gate requires equal full-image sizes, SHA-256 digests, and
+byte content.
 
 `smp-tlb-shootdown.sh` applies the same clean-source rule to TheKernel,
 `thekernel-ax`, and `thekernel-linux-abi`, forces a topology-specific kernel and

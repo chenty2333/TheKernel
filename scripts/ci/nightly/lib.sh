@@ -97,8 +97,8 @@ nightly_require_arch_infrastructure() {
     command -v "$compiler" >/dev/null 2>&1 \
         || nightly_unsupported "missing $arch static Linux cross compiler: $compiler"
     for command in \
-        cargo curl fakeroot find make mke2fs readlink realpath rustc sha256sum \
-        stat tar touch truncate; do
+        cargo curl debugfs fakeroot find make mke2fs readlink realpath rustc \
+        sha256sum stat tar touch truncate; do
         command -v "$command" >/dev/null 2>&1 \
             || nightly_unsupported "missing rootfs build command: $command"
     done

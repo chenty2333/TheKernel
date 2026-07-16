@@ -7,6 +7,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class RootfsImageReproducibilityTests(unittest.TestCase):
             ("etc/value", b"fixture\n"),
             ("opt/tools/probe", b"#!/bin/sh\nexit 0\n"),
             ("usr/share/doc/readme", b"reproducible rootfs\n"),
+            ("var/lib/back\\slash", b"literal backslash\n"),
         )
         for relative, content in reversed(entries) if reverse else entries:
             path = stage / relative
@@ -78,6 +80,10 @@ class RootfsImageReproducibilityTests(unittest.TestCase):
             second = root / "outputs-b" / "rootfs.img"
 
             first_result = self.build(first_stage, first)
+            # Source ctime cannot be assigned with utime(2). Cross a whole
+            # filesystem timestamp tick so this test catches mke2fs -d leaking
+            # wall-clock source metadata into otherwise equal images.
+            time.sleep(1.1)
             second_result = self.build(second_stage, second)
 
             self.assertEqual(first_result.returncode, 0, first_result.stderr)
@@ -85,6 +91,20 @@ class RootfsImageReproducibilityTests(unittest.TestCase):
             self.assertEqual(first.stat().st_size, second.stat().st_size)
             self.assertEqual(digest(first), digest(second))
             self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_unrepresentable_debugfs_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            stage.mkdir()
+            (stage / 'unsupported"name').write_bytes(b"fixture\n")
+            output = root / "rootfs.img"
+
+            result = self.build(stage, output)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("cannot be represented by debugfs", result.stderr)
+            self.assertFalse(output.exists())
 
     def test_invalid_source_date_epoch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

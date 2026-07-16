@@ -268,6 +268,8 @@ class ProductBootBoundaryTests(unittest.TestCase):
         self.assertIn('"$SCRIPT_DIR/create-rootfs-image.sh"', source)
         self.assertIn("E2FSPROGS_FAKE_TIME", image_source)
         self.assertIn("mke2fs -q -F -t ext4 -b 4096", image_source)
+        self.assertIn("set_inode_field", image_source)
+        self.assertIn("debugfs -w -f", image_source)
 
     def test_smoke_scripts_define_a_default_workdir(self) -> None:
         root = repo_root()

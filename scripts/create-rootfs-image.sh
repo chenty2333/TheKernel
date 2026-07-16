@@ -62,7 +62,8 @@ case "$OWNER_MODE" in
     *) printf '%s\n' '--owner-mode must be root or preserve' >&2; exit 2 ;;
 esac
 
-for command in find mke2fs mkdir mktemp mv realpath sha256sum touch truncate; do
+for command in debugfs find grep mke2fs mkdir mktemp mv realpath sha256sum \
+    touch truncate wc; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -90,7 +91,12 @@ UUID_HEX=$(printf 'thekernel-test-rootfs-v1:%s' "$ARCH" \
     | sha256sum | awk '{print $1}')
 FS_UUID=${UUID_HEX:0:8}-${UUID_HEX:8:4}-${UUID_HEX:12:4}-${UUID_HEX:16:4}-${UUID_HEX:20:12}
 TEMP_IMAGE=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-image.XXXXXX")
-trap 'rm -f "$TEMP_IMAGE"' EXIT
+TEMP_COMMANDS=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-times.XXXXXX")
+TEMP_DEBUGFS_LOG=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-debugfs.XXXXXX")
+cleanup() {
+    rm -f -- "$TEMP_IMAGE" "$TEMP_COMMANDS" "$TEMP_DEBUGFS_LOG"
+}
+trap cleanup EXIT
 truncate -s "${SIZE_MB}M" "$TEMP_IMAGE"
 
 # E2FSPROGS_FAKE_TIME is the libext2fs clock contract. SOURCE_DATE_EPOCH alone
@@ -105,6 +111,47 @@ E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH "${owner_runner[@]}" sh -c '
         -U "$3" -L THEKERNEL_ROOT "$2"
 ' sh "$STAGE" "$TEMP_IMAGE" "$FS_UUID" "$OWNER_MODE"
 
+# mke2fs -d deliberately preserves source inode metadata. Its internal fake
+# clock fixes filesystem-created fields, but traversing the source tree still
+# refreshes directory/file atime and touch(1) necessarily gives source inodes a
+# wall-clock ctime. Normalize every path imported from the controlled staging
+# tree through libext2fs, which also recomputes each ext4 inode checksum.
+: >"$TEMP_COMMANDS"
+while IFS= read -r -d '' entry; do
+    relative=${entry#"$STAGE"}
+    if [ -z "$relative" ]; then
+        relative=/
+    fi
+    # The debugfs command parser treats backslashes literally inside quotes,
+    # but it has no representation for a literal double quote in a quoted
+    # filespec. Reject the latter (and command separators) instead of silently
+    # leaving one inode unnormalized.
+    case "$relative" in
+        *$'\n'*|*$'\r'*|*\"*)
+            printf 'rootfs path cannot be represented by debugfs: %q\n' \
+                "$relative" >&2
+            exit 1
+            ;;
+    esac
+    for field in atime ctime mtime crtime; do
+        printf 'set_inode_field "%s" %s @%s\n' \
+            "$relative" "$field" "$SOURCE_DATE_EPOCH" >>"$TEMP_COMMANDS"
+    done
+done < <(find "$STAGE" -xdev -print0)
+
+E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH \
+    debugfs -w -f "$TEMP_COMMANDS" "$TEMP_IMAGE" \
+    >/dev/null 2>"$TEMP_DEBUGFS_LOG"
+# debugfs returns success even when an individual command fails. A valid batch
+# writes only its one version banner to stderr; reject every additional line.
+if [ "$(wc -l <"$TEMP_DEBUGFS_LOG")" -ne 1 ] \
+    || ! grep -Eq '^debugfs [0-9]' "$TEMP_DEBUGFS_LOG"; then
+    printf '%s\n' 'debugfs inode-time normalization failed:' >&2
+    cat "$TEMP_DEBUGFS_LOG" >&2
+    exit 1
+fi
+
 mv -f "$TEMP_IMAGE" "$OUTPUT"
 trap - EXIT
+cleanup
 printf '%s\n' "$OUTPUT"
