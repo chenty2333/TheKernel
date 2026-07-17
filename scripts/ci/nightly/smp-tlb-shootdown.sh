@@ -28,7 +28,9 @@ done
 
 mkdir -p "$NIGHTLY_LOG_DIR"
 manifest="$NIGHTLY_LOG_DIR/smp-tlb-shootdown-manifest.tsv"
+provenance="$NIGHTLY_LOG_DIR/smp-tlb-shootdown-provenance.tsv"
 rm -f "$manifest"
+rm -f "$provenance"
 selected_arches=$(nightly_selected_arches) || exit $?
 
 repo_commit=$(git -C "$REPO_ROOT" rev-parse --verify HEAD) \
@@ -61,6 +63,13 @@ ax_commit=$(git -C "$ax_repo" rev-parse --verify HEAD) \
     || nightly_fail 'cannot resolve thekernel-ax HEAD'
 linux_abi_commit=$(git -C "$linux_abi_repo" rev-parse --verify HEAD) \
     || nightly_fail 'cannot resolve thekernel-linux-abi HEAD'
+
+printf '%s\t%s\t%s\t%s\n' \
+    phase thekernel_commit thekernel_ax_commit thekernel_linux_abi_commit \
+    >"$provenance"
+printf '%s\t%s\t%s\t%s\n' \
+    preflight "$repo_commit" "$ax_commit" "$linux_abi_commit" \
+    >>"$provenance"
 
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     thekernel_commit thekernel_ax_commit thekernel_linux_abi_commit \
@@ -145,5 +154,10 @@ for state in \
     [ -z "$(git -C "$dependency" status --porcelain --untracked-files=all)" ] \
         || nightly_fail "$label worktree changed during SMP TLB evidence capture"
 done
-printf 'nightly SMP TLB shootdown evidence: COMPLETE manifest=%s runs=%s\n' \
-    "$manifest" "$run_count"
+printf '%s\t%s\t%s\t%s\n' \
+    finalize "$repo_commit" "$ax_commit" "$linux_abi_commit" \
+    >>"$provenance"
+[ "$(awk 'END { print NR - 1 }' "$provenance")" -eq 2 ] \
+    || nightly_fail 'SMP TLB provenance phase-count drift'
+printf 'nightly SMP TLB shootdown evidence: COMPLETE manifest=%s provenance=%s runs=%s\n' \
+    "$manifest" "$provenance" "$run_count"

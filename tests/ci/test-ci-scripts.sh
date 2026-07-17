@@ -565,6 +565,10 @@ smp_tlb_log="$tmp/smp-tlb.log"
 printf '%s\n' \
     'SMP_TLB_TOPOLOGY online_cpus=2 control_cpu=0 worker_count=1 worker_cpus=1' \
     >"$smp_tlb_log"
+for window in 1 2 3; do
+    printf 'SMP_TLB_LIVENESS window=%s window_ns=1000000000 cpus=2 tasks_per_cpu=2 status=ok min_delta=1\n' \
+        "$window" >>"$smp_tlb_log"
+done
 for pages in 1 64; do
     for case_name in mprotect_revoke_write munmap_fixed_replace \
         mremap_fixed_old_alias fork_cow_snapshot; do
@@ -574,7 +578,7 @@ for pages in 1 64; do
 done
 printf '%s\n' 'SMP_TLB_GATE status=ok stale_count=0' >>"$smp_tlb_log"
 "$CI_DIR/validate-smp-tlb-log.sh" "$smp_tlb_log" 2 >/dev/null
-sed '0,/status=ok/{s/status=ok/status=stale/;}' \
+sed '0,/^SMP_TLB_CASE /{/^SMP_TLB_CASE /s/status=ok/status=stale/;}' \
     "$smp_tlb_log" >"$tmp/smp-tlb-stale.log"
 if "$CI_DIR/validate-smp-tlb-log.sh" \
     "$tmp/smp-tlb-stale.log" 2 >/dev/null 2>&1; then
@@ -586,6 +590,45 @@ sed '0,/^SMP_TLB_CASE /{/^SMP_TLB_CASE /d;}' \
 if "$CI_DIR/validate-smp-tlb-log.sh" \
     "$tmp/smp-tlb-incomplete.log" 2 >/dev/null 2>&1; then
     printf 'test-ci-scripts: SMP TLB parser accepted an incomplete matrix\n' >&2
+    exit 1
+fi
+sed '0,/^SMP_TLB_LIVENESS /{/^SMP_TLB_LIVENESS /d;}' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-incomplete-liveness.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-incomplete-liveness.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted incomplete liveness evidence\n' >&2
+    exit 1
+fi
+sed '0,/min_delta=1/{s/min_delta=1/min_delta=0/;}' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-stalled-liveness.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-stalled-liveness.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted a stalled spin task\n' >&2
+    exit 1
+fi
+sed \
+    -e '0,/status=ok stale_count=0/{s/status=ok stale_count=0/status=stale stale_count=1/;}' \
+    -e 's/^SMP_TLB_GATE status=ok stale_count=0$/SMP_TLB_GATE status=fail kind=stale stale_count=1/' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-mutation.log"
+"$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-mutation.log" 2 stale >/dev/null
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$smp_tlb_log" 2 stale >/dev/null 2>&1; then
+    printf 'test-ci-scripts: mutation parser accepted a clean positive log\n' >&2
+    exit 1
+fi
+sed 's/kind=stale stale_count=1/kind=stale stale_count=2/' \
+    "$tmp/smp-tlb-mutation.log" >"$tmp/smp-tlb-mutation-count-drift.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-mutation-count-drift.log" 2 stale >/dev/null 2>&1; then
+    printf 'test-ci-scripts: mutation parser accepted stale-count drift\n' >&2
+    exit 1
+fi
+sed 's/kind=stale stale_count=1/kind=operational stale_count=1/' \
+    "$tmp/smp-tlb-mutation.log" >"$tmp/smp-tlb-mutation-operational.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-mutation-operational.log" 2 stale >/dev/null 2>&1; then
+    printf 'test-ci-scripts: mutation parser accepted an operational failure\n' >&2
     exit 1
 fi
 

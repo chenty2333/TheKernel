@@ -32,6 +32,9 @@ enum {
     WAIT_TIMEOUT_SECONDS = 10,
     WAIT_PAUSE_NANOSECONDS = 1000000,
     CHILD_REPORT_MAGIC = 0x544c4247,
+    LIVENESS_TASKS_PER_CPU = 2,
+    LIVENESS_WINDOWS = 3,
+    LIVENESS_WINDOW_NANOSECONDS = 1000000000,
 };
 
 enum worker_phase {
@@ -68,6 +71,26 @@ struct child_report {
     uint32_t magic;
     uint32_t reserved;
     uint64_t stale_count;
+};
+
+enum liveness_phase {
+    LIVENESS_INIT = 0,
+    LIVENESS_READY = 1,
+    LIVENESS_DONE = 2,
+};
+
+struct liveness_control {
+    atomic_bool start;
+    atomic_bool stop;
+};
+
+struct liveness_context {
+    struct liveness_control *control;
+    atomic_int phase;
+    atomic_int error_number;
+    atomic_size_t heartbeat;
+    int cpu;
+    int actual_cpu;
 };
 
 static _Thread_local sigjmp_buf expected_fault_environment;
@@ -468,6 +491,231 @@ static int join_worker_bounded(pthread_t worker)
         }
         pause_before_retry();
     }
+}
+
+static void *liveness_worker(void *argument)
+{
+    struct liveness_context *context = argument;
+    size_t heartbeat = 0;
+    int error_number;
+
+    error_number = pin_current_thread(context->cpu);
+    if (error_number != 0) {
+        atomic_store_explicit(&context->error_number, error_number,
+                              memory_order_relaxed);
+        atomic_store_explicit(&context->phase, LIVENESS_DONE,
+                              memory_order_release);
+        return NULL;
+    }
+    errno = 0;
+    context->actual_cpu = sched_getcpu();
+    if (context->actual_cpu < 0 || context->actual_cpu != context->cpu) {
+        atomic_store_explicit(
+            &context->error_number,
+            context->actual_cpu < 0 ? (errno != 0 ? errno : EIO) : EXDEV,
+            memory_order_relaxed);
+        atomic_store_explicit(&context->phase, LIVENESS_DONE,
+                              memory_order_release);
+        return NULL;
+    }
+    atomic_store_explicit(&context->phase, LIVENESS_READY,
+                          memory_order_release);
+    while (!atomic_load_explicit(&context->control->start,
+                                 memory_order_acquire)) {
+        if (atomic_load_explicit(&context->control->stop,
+                                 memory_order_relaxed)) {
+            atomic_store_explicit(&context->phase, LIVENESS_DONE,
+                                  memory_order_release);
+            return NULL;
+        }
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+
+    /* No syscall or voluntary yield is permitted in the measured interval. */
+    while (!atomic_load_explicit(&context->control->stop,
+                                 memory_order_relaxed)) {
+        heartbeat += 1U;
+        if ((heartbeat & 0xffU) == 0) {
+            atomic_store_explicit(&context->heartbeat, heartbeat,
+                                  memory_order_relaxed);
+        }
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    atomic_store_explicit(&context->heartbeat, heartbeat,
+                          memory_order_release);
+    atomic_store_explicit(&context->phase, LIVENESS_DONE,
+                          memory_order_release);
+    return NULL;
+}
+
+static int wait_for_liveness_ready(struct liveness_context *contexts,
+                                   size_t task_count)
+{
+    uint64_t deadline;
+
+    if (monotonic_deadline(&deadline) != 0) {
+        return errno != 0 ? errno : EIO;
+    }
+    for (;;) {
+        bool all_ready = true;
+        size_t task;
+        uint64_t now;
+
+        for (task = 0; task < task_count; ++task) {
+            int phase = atomic_load_explicit(&contexts[task].phase,
+                                             memory_order_acquire);
+
+            if (phase == LIVENESS_DONE) {
+                int worker_error = atomic_load_explicit(
+                    &contexts[task].error_number, memory_order_relaxed);
+
+                return worker_error != 0 ? worker_error : EPROTO;
+            }
+            if (phase != LIVENESS_READY) {
+                all_ready = false;
+            }
+        }
+        if (all_ready) {
+            return 0;
+        }
+        if (monotonic_now(&now) != 0) {
+            return errno != 0 ? errno : EIO;
+        }
+        if (now >= deadline) {
+            return ETIMEDOUT;
+        }
+        pause_before_retry();
+    }
+}
+
+static int sleep_liveness_window(void)
+{
+    struct timespec remaining = {
+        .tv_sec = 1,
+        .tv_nsec = 0,
+    };
+
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) {
+            return errno != 0 ? errno : EIO;
+        }
+    }
+    return 0;
+}
+
+static void run_scheduler_liveness(int expected_cpus, int control_cpu,
+                                   const int worker_cpus[CPU_SETSIZE],
+                                   size_t worker_count)
+{
+    const size_t task_count =
+        (size_t)expected_cpus * (size_t)LIVENESS_TASKS_PER_CPU;
+    struct liveness_control control;
+    struct liveness_context *contexts;
+    pthread_t *threads;
+    size_t *before;
+    size_t window;
+    size_t task;
+
+    if (worker_count + 1U != (size_t)expected_cpus) {
+        operational_fail("scheduler_liveness", 0, "topology", EINVAL);
+    }
+    contexts = calloc(task_count, sizeof(*contexts));
+    threads = calloc(task_count, sizeof(*threads));
+    before = calloc(task_count, sizeof(*before));
+    if (contexts == NULL || threads == NULL || before == NULL) {
+        operational_fail("scheduler_liveness", 0, "allocate", ENOMEM);
+    }
+    atomic_init(&control.start, false);
+    atomic_init(&control.stop, false);
+    for (task = 0; task < task_count; ++task) {
+        const size_t cpu_index = task / (size_t)LIVENESS_TASKS_PER_CPU;
+        const int cpu = cpu_index == 0 ? control_cpu
+                                      : worker_cpus[cpu_index - 1U];
+        int result;
+
+        contexts[task].control = &control;
+        atomic_init(&contexts[task].phase, LIVENESS_INIT);
+        atomic_init(&contexts[task].error_number, 0);
+        atomic_init(&contexts[task].heartbeat, 0);
+        contexts[task].cpu = cpu;
+        contexts[task].actual_cpu = -1;
+        result = pthread_create(&threads[task], NULL, liveness_worker,
+                                &contexts[task]);
+        if (result != 0) {
+            atomic_store_explicit(&control.stop, true, memory_order_release);
+            operational_fail("scheduler_liveness", 0, "pthread_create",
+                             result);
+        }
+    }
+    {
+        int result = wait_for_liveness_ready(contexts, task_count);
+
+        if (result != 0) {
+            atomic_store_explicit(&control.stop, true, memory_order_release);
+            operational_fail("scheduler_liveness", 0, "ready", result);
+        }
+    }
+    atomic_store_explicit(&control.start, true, memory_order_release);
+
+    for (window = 1; window <= LIVENESS_WINDOWS; ++window) {
+        size_t min_delta = SIZE_MAX;
+        int result;
+
+        for (task = 0; task < task_count; ++task) {
+            before[task] = atomic_load_explicit(&contexts[task].heartbeat,
+                                                memory_order_relaxed);
+        }
+        result = sleep_liveness_window();
+        if (result != 0) {
+            atomic_store_explicit(&control.stop, true, memory_order_release);
+            operational_fail("scheduler_liveness", 0, "window_sleep",
+                             result);
+        }
+        for (task = 0; task < task_count; ++task) {
+            size_t after = atomic_load_explicit(&contexts[task].heartbeat,
+                                                memory_order_acquire);
+            size_t delta = after - before[task];
+
+            if (delta == 0) {
+                printf("SMP_TLB_LIVENESS window=%zu window_ns=%d cpus=%d"
+                       " tasks_per_cpu=%d status=fail cpu=%d task=%zu\n",
+                       window, LIVENESS_WINDOW_NANOSECONDS, expected_cpus,
+                       LIVENESS_TASKS_PER_CPU, contexts[task].cpu,
+                       task % (size_t)LIVENESS_TASKS_PER_CPU);
+                atomic_store_explicit(&control.stop, true,
+                                      memory_order_release);
+                operational_fail("scheduler_liveness", 0,
+                                 "window_progress", ETIMEDOUT);
+            }
+            if (delta < min_delta) {
+                min_delta = delta;
+            }
+        }
+        printf("SMP_TLB_LIVENESS window=%zu window_ns=%d cpus=%d"
+               " tasks_per_cpu=%d status=ok min_delta=%zu\n",
+               window, LIVENESS_WINDOW_NANOSECONDS, expected_cpus,
+               LIVENESS_TASKS_PER_CPU, min_delta);
+    }
+
+    atomic_store_explicit(&control.stop, true, memory_order_release);
+    for (task = 0; task < task_count; ++task) {
+        int result = join_worker_bounded(threads[task]);
+
+        if (result != 0) {
+            operational_fail("scheduler_liveness", 0, "pthread_join",
+                             result);
+        }
+        if (atomic_load_explicit(&contexts[task].phase,
+                                 memory_order_acquire) != LIVENESS_DONE ||
+            atomic_load_explicit(&contexts[task].error_number,
+                                 memory_order_relaxed) != 0 ||
+            contexts[task].actual_cpu != contexts[task].cpu) {
+            operational_fail("scheduler_liveness", 0, "completion", EPROTO);
+        }
+    }
+    free(before);
+    free(threads);
+    free(contexts);
 }
 
 static void initialize_worker(struct worker_context *context,
@@ -1122,6 +1370,8 @@ int main(int argc, char **argv)
                worker_cpus[worker_index]);
     }
     putchar('\n');
+    run_scheduler_liveness(expected_cpus, control_cpu, worker_cpus,
+                           worker_count);
     for (case_index = 0;
          case_index < sizeof(page_cases) / sizeof(page_cases[0]);
          ++case_index) {

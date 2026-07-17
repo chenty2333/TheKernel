@@ -22,12 +22,15 @@ The repository-owned adapters cover:
 - `nonloopback-network.sh`: a nonce-authenticated TCP exchange from the guest
   VirtIO NIC through QEMU user networking to a one-shot host peer;
 - `smp-tlb-shootdown.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs.
-  For every non-control CPU it warms translations remotely, keeps that worker
-  in a syscall-free heartbeat spin across the page-table mutation, verifies its
-  actual CPU before and after the critical accesses, and checks 1-page and
-  64-page `mprotect`, `munmap` plus fixed replacement, fixed `mremap`, and fork
-  COW transitions. Any stale access, incomplete CPU/case matrix, topology
-  mismatch, or operational failure rejects the run;
+  Before mutating page tables, it pins two syscall-free, non-yielding spin tasks
+  to every online CPU and requires both to advance in each of three consecutive
+  one-second windows. For every non-control CPU it then warms translations
+  remotely, keeps that worker in a syscall-free heartbeat spin across the
+  page-table mutation, verifies its actual CPU before and after the critical
+  accesses, and checks 1-page and 64-page `mprotect`, `munmap` plus fixed
+  replacement, fixed `mremap`, and fork COW transitions. Any stalled liveness
+  window, stale access, incomplete CPU/case matrix, topology mismatch, or
+  operational failure rejects the run;
 - `mm-performance.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs. It
   records VMA-scale mapping latency, `mremap` latency, an `mprotect` plus touch
   TLB-sensitive proxy, and regular-file direct-I/O pin latency, throughput, and
@@ -57,7 +60,10 @@ fault injection as a production default or accept a clean pass from the
 known-bad build. Timer preemption can still evict a translation naturally, so
 the matrix covers every remote CPU and both a single hot page and a range; the
 mutation run remains the proof that the workload can turn the intended defect
-red.
+red. Validate that expected-failure log with
+`validate-smp-tlb-log.sh LOG EXPECTED_CPUS stale`; this mode requires a complete
+case matrix, at least one actual stale case, and an exact aggregate stale marker.
+It rejects timeouts and operational failures.
 
 `THEKERNEL_NIGHTLY_ARCHES` accepts `rv`, `la`, or `both` (the default). Missing
 QEMU binaries, cross compilers, rootfs build tools, or filesystem tools cause
@@ -86,4 +92,6 @@ emitting the semantic-pass marker.
 content-addressed rootfs rebuild for every matrix cell, and rechecks all three
 repositories afterward. Its manifest records the three commits, requested and
 guest-observed topology, kernel/rootfs SHA-256 values, QEMU path/version, and
-per-run copies of the kernel, command stream, and complete console log.
+per-run copies of the kernel, command stream, and complete console log. A
+separate provenance receipt records the exact three repository commits at both
+preflight and finalize.
