@@ -40,16 +40,11 @@ struct WaiterEntry {
     waker: Option<Waker>,
 }
 
-struct WaitFuture<'a, F> {
-    queue: &'a WaitQueue,
-    owner: Weak<FutexEntry>,
-    bitset: u32,
-    timeout: Option<(AlarmClock, Duration)>,
-    condition: Option<F>,
-    waiter: Option<Arc<SpinNoIrq<WaiterEntry>>>,
+struct WaitFuture<'a> {
+    waiter: &'a Arc<SpinNoIrq<WaiterEntry>>,
 }
 
-impl<F> Unpin for WaitFuture<'_, F> {}
+impl Unpin for WaitFuture<'_> {}
 
 struct WaitRegistration {
     waiter: Option<Arc<SpinNoIrq<WaiterEntry>>>,
@@ -63,80 +58,36 @@ impl Drop for WaitRegistration {
     }
 }
 
-struct WaitAnyFuture {
-    waiters: Vec<WaitRegistration>,
-    _targets: Vec<FutexHandle>,
-    timeout: Option<(AlarmClock, Duration)>,
+struct WaitAnyFuture<'a> {
+    waiters: &'a [WaitRegistration],
 }
 
-impl Unpin for WaitAnyFuture {}
+impl Unpin for WaitAnyFuture<'_> {}
 
-impl Drop for WaitAnyFuture {
-    fn drop(&mut self) {
-        self.waiters.clear();
-        self._targets.clear();
-    }
-}
-
-impl<F> Drop for WaitFuture<'_, F> {
-    fn drop(&mut self) {
-        if let Some(waiter) = self.waiter.take() {
-            cancel_waiter(waiter);
-        }
-    }
-}
-
-impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
+impl Future for WaitFuture<'_> {
     type Output = AxResult<bool>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(waiter) = self.waiter.as_ref() {
-            let mut waiter = waiter.lock();
-            if waiter.awakened {
-                return Poll::Ready(Ok(true));
-            }
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut waiter = self.waiter.lock();
+        if waiter.awakened {
+            return Poll::Ready(Ok(true));
+        }
+        if waiter
+            .waker
+            .as_ref()
+            .is_none_or(|registered| !registered.will_wake(cx.waker()))
+        {
             waiter.waker = Some(cx.waker().clone());
-            return Poll::Pending;
         }
-
-        let Some(condition) = self.condition.take() else {
-            return Poll::Pending;
-        };
-        let _gate = self.queue.gate.lock();
-        if !condition()? {
-            return Poll::Ready(Ok(false));
-        }
-        if self
-            .timeout
-            .is_some_and(|(clock, deadline)| clock.now() >= deadline)
-        {
-            return Poll::Ready(Err(AxError::TimedOut));
-        }
-
-        let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
-            bitset: self.bitset,
-            awakened: false,
-            cancelled: false,
-            owner: self.owner.clone(),
-            task: Arc::downgrade(&current()),
-            waker: Some(cx.waker().clone()),
-        }));
-        self.queue.queue.lock().push_back(waiter.clone());
-        if let Some(task) = waiter.lock().task.upgrade()
-            && let Some(thread) = task.try_as_thread()
-        {
-            thread.set_proc_state_hint(ProcStateHint::Interruptible);
-        }
-        self.waiter = Some(waiter);
         Poll::Pending
     }
 }
 
-impl Future for WaitAnyFuture {
+impl Future for WaitAnyFuture<'_> {
     type Output = AxResult<usize>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        for (index, waiter) in self.waiters.iter_mut().enumerate() {
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        for (index, waiter) in self.waiters.iter().enumerate() {
             let Some(waiter) = waiter.waiter.as_ref() else {
                 continue;
             };
@@ -144,14 +95,13 @@ impl Future for WaitAnyFuture {
             if waiter.awakened {
                 return Poll::Ready(Ok(index));
             }
-            waiter.waker = Some(cx.waker().clone());
-        }
-
-        if self
-            .timeout
-            .is_some_and(|(clock, deadline)| clock.now() >= deadline)
-        {
-            return Poll::Ready(Err(AxError::TimedOut));
+            if waiter
+                .waker
+                .as_ref()
+                .is_none_or(|registered| !registered.will_wake(cx.waker()))
+            {
+                waiter.waker = Some(cx.waker().clone());
+            }
         }
 
         Poll::Pending
@@ -296,6 +246,40 @@ impl WaitQueue {
             .retain(|waiter| !Arc::ptr_eq(waiter, target));
     }
 
+    fn register_waiter_if(
+        &self,
+        owner: Weak<FutexEntry>,
+        bitset: u32,
+        timeout: Option<(AlarmClock, Duration)>,
+        condition: impl FnOnce() -> AxResult<bool>,
+    ) -> AxResult<Option<WaitRegistration>> {
+        let _gate = self.gate.lock();
+        if !condition()? {
+            return Ok(None);
+        }
+        if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) {
+            return Err(AxError::TimedOut);
+        }
+
+        let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset,
+            awakened: false,
+            cancelled: false,
+            owner,
+            task: Arc::downgrade(&current()),
+            waker: None,
+        }));
+        self.queue.lock().push_back(waiter.clone());
+        if let Some(task) = waiter.lock().task.upgrade()
+            && let Some(thread) = task.try_as_thread()
+        {
+            thread.set_proc_state_hint(ProcStateHint::Interruptible);
+        }
+        Ok(Some(WaitRegistration {
+            waiter: Some(waiter),
+        }))
+    }
+
     /// Waits if the given condition is met.
     ///
     /// Returns `false` if the condition is not met and no actual waiting
@@ -307,13 +291,17 @@ impl WaitQueue {
         timeout: Option<(AlarmClock, Duration)>,
         condition: impl FnOnce() -> AxResult<bool>,
     ) -> AxResult<bool> {
+        // Registration may fault while evaluating `condition` and therefore
+        // happens before the synchronous block session starts. From this point
+        // on, polling and wakeup touch only the waiter's IRQ-safe state.
+        let Some(registration) = self.register_waiter_if(owner, bitset, timeout, condition)? else {
+            return Ok(false);
+        };
         let wait = WaitFuture {
-            queue: self,
-            owner,
-            bitset,
-            timeout,
-            condition: Some(condition),
-            waiter: None,
+            waiter: registration
+                .waiter
+                .as_ref()
+                .expect("registered futex waiter"),
         };
         let wait = async {
             if let Some((clock, deadline)) = timeout {
@@ -470,7 +458,7 @@ pub fn wait_on_any_futex_if(
     timeout: Option<(AlarmClock, Duration)>,
     mut condition: impl FnMut(usize) -> AxResult<bool>,
 ) -> AxResult<usize> {
-    let mut targets = Vec::with_capacity(waiters.len());
+    let mut _targets = Vec::with_capacity(waiters.len());
     let mut registrations = Vec::with_capacity(waiters.len());
     for (index, (futex, bitset)) in waiters.into_iter().enumerate() {
         let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
@@ -500,13 +488,14 @@ pub fn wait_on_any_futex_if(
         registrations.push(WaitRegistration {
             waiter: Some(waiter),
         });
-        targets.push(futex);
+        _targets.push(futex);
     }
 
+    // Keep registrations and their strong futex targets outside the future.
+    // Their cancellation path may acquire a sleeping gate and must run only
+    // after `block_on` has closed the task's synchronous block session.
     let wait = WaitAnyFuture {
-        waiters: registrations,
-        _targets: targets,
-        timeout,
+        waiters: &registrations,
     };
     let wait = async {
         if let Some((clock, deadline)) = timeout {
@@ -564,6 +553,14 @@ mod tests {
         });
     }
 
+    fn register_test_waiter(entry: &Arc<FutexEntry>) -> WaitRegistration {
+        entry
+            .wq
+            .register_waiter_if(Arc::downgrade(entry), u32::MAX, None, || Ok(true))
+            .expect("waiter registration failed")
+            .expect("test condition rejected waiter")
+    }
+
     #[test]
     fn timer_registration_failure_is_not_reported_as_timeout() {
         assert_eq!(
@@ -585,28 +582,101 @@ mod tests {
         let dst = Arc::new(FutexEntry::new());
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let mut wait = core::pin::pin!(WaitFuture {
-            queue: &src.wq,
-            owner: Arc::downgrade(&src),
-            bitset: u32::MAX,
-            timeout: None,
-            condition: Some(|| Ok(true)),
-            waiter: None,
-        });
-
-        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        let registration = register_test_waiter(&src);
+        {
+            let mut wait = core::pin::pin!(WaitFuture {
+                waiter: registration.waiter.as_ref().unwrap(),
+            });
+            assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        }
         assert!(!src.wq.is_empty());
 
         assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 1);
         assert!(src.wq.is_empty());
         assert!(!dst.wq.is_empty());
 
-        drop(wait);
+        drop(registration);
         assert!(dst.wq.is_empty());
     }
 
     #[test]
+    fn registered_waiter_poll_never_reenters_sleeping_gate() {
+        init_scheduler();
+
+        let entry = Arc::new(FutexEntry::new());
+        let registration = register_test_waiter(&entry);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        {
+            let _gate = entry.wq.gate.lock();
+            let mut wait = core::pin::pin!(WaitFuture {
+                waiter: registration.waiter.as_ref().unwrap(),
+            });
+            assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        drop(registration);
+        assert!(entry.wq.is_empty());
+    }
+
+    #[test]
+    fn wake_before_first_poll_is_observed() {
+        init_scheduler();
+
+        let entry = Arc::new(FutexEntry::new());
+        let registration = register_test_waiter(&entry);
+        assert_eq!(entry.wq.wake(1, u32::MAX), 1);
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut wait = core::pin::pin!(WaitFuture {
+            waiter: registration.waiter.as_ref().unwrap(),
+        });
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        drop(wait);
+        drop(registration);
+        assert!(entry.wq.is_empty());
+    }
+
+    #[test]
+    fn rejected_or_expired_registration_never_enqueues() {
+        init_scheduler();
+
+        let entry = Arc::new(FutexEntry::new());
+        assert!(
+            entry
+                .wq
+                .register_waiter_if(Arc::downgrade(&entry), u32::MAX, None, || Ok(false))
+                .unwrap()
+                .is_none()
+        );
+        assert!(entry.wq.is_empty());
+
+        assert!(matches!(
+            entry
+                .wq
+                .register_waiter_if(Arc::downgrade(&entry), u32::MAX, None, || Err(
+                    AxError::BadAddress
+                ),),
+            Err(AxError::BadAddress)
+        ));
+        assert!(entry.wq.is_empty());
+
+        assert!(matches!(
+            entry.wq.register_waiter_if(
+                Arc::downgrade(&entry),
+                u32::MAX,
+                Some((AlarmClock::Monotonic, Duration::ZERO)),
+                || Ok(true),
+            ),
+            Err(AxError::TimedOut)
+        ));
+        assert!(entry.wq.is_empty());
+    }
+
+    #[test]
     fn requeue_skips_cancelled_waiters() {
+        init_scheduler();
+
         let src = Arc::new(FutexEntry::new());
         let dst = Arc::new(FutexEntry::new());
         src.wq
@@ -628,6 +698,8 @@ mod tests {
 
     #[test]
     fn wake_discards_cancelled_waiters() {
+        init_scheduler();
+
         let src = Arc::new(FutexEntry::new());
         src.wq
             .queue
@@ -647,6 +719,8 @@ mod tests {
 
     #[test]
     fn wake_and_requeue_keeps_remaining_waiters() {
+        init_scheduler();
+
         let src = Arc::new(FutexEntry::new());
         let dst = Arc::new(FutexEntry::new());
 
