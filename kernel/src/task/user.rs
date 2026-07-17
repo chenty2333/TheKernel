@@ -1,5 +1,6 @@
 use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
 use axtask::{TaskCreateError, TaskInner};
+use linux_raw_sys::general::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR};
 use starry_process::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
 use starry_signal::{SignalInfo, Signo};
 
@@ -7,7 +8,10 @@ use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit, has_pending_fatal_signal,
     raise_signal_fatal, set_timer_state, wait_if_stopped,
 };
-use crate::{mm::PageFaultResult, syscall::handle_syscall};
+use crate::{
+    mm::{PageFaultResult, SegmentationFaultReason},
+    syscall::handle_syscall,
+};
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
 /// arch-specific exception information.
@@ -35,13 +39,18 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
     Signo::SIGSEGV
 }
 
-fn deliver_fatal_user_signal(signo: Signo) {
-    if let Err(err) = raise_signal_fatal(SignalInfo::new_kernel(signo)) {
+fn deliver_fatal_user_signal_info(info: SignalInfo) {
+    let signo = info.signo();
+    if let Err(err) = raise_signal_fatal(info) {
         error!("Failed to deliver fatal user signal {signo:?}: {err:?}");
         if let Err(error) = do_exit(signo as i32, true) {
             fail_closed_exit(error);
         }
     }
+}
+
+fn deliver_fatal_user_signal(signo: Signo) {
+    deliver_fatal_user_signal_info(SignalInfo::new_kernel(signo));
 }
 
 /// Fallibly creates an unpublished user task.
@@ -96,12 +105,29 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                                 uctx.ip(),
                                 uctx.sp(),
                             );
-                            let signo = if result == PageFaultResult::SigBus {
-                                Signo::SIGBUS
-                            } else {
-                                Signo::SIGSEGV
+                            let info = match result {
+                                PageFaultResult::Handled => unreachable!(),
+                                PageFaultResult::SigBus => SignalInfo::new_fault(
+                                    Signo::SIGBUS,
+                                    BUS_ADRERR as i32,
+                                    addr.as_usize(),
+                                ),
+                                PageFaultResult::SegmentationFault(
+                                    SegmentationFaultReason::AddressNotMapped,
+                                ) => SignalInfo::new_fault(
+                                    Signo::SIGSEGV,
+                                    SEGV_MAPERR as i32,
+                                    addr.as_usize(),
+                                ),
+                                PageFaultResult::SegmentationFault(
+                                    SegmentationFaultReason::AccessDenied,
+                                ) => SignalInfo::new_fault(
+                                    Signo::SIGSEGV,
+                                    SEGV_ACCERR as i32,
+                                    addr.as_usize(),
+                                ),
                             };
-                            deliver_fatal_user_signal(signo);
+                            deliver_fatal_user_signal_info(info);
                         }
                     }
                     ReturnReason::Interrupt => {}

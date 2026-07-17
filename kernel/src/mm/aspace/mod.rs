@@ -40,7 +40,13 @@ pub(crate) use self::mapping::{FileLikeMappingLease, FileMappingLease, FileMappi
 pub enum PageFaultResult {
     Handled,
     SigBus,
-    Unhandled,
+    SegmentationFault(SegmentationFaultReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentationFaultReason {
+    AddressNotMapped,
+    AccessDenied,
 }
 
 #[inline]
@@ -2777,7 +2783,7 @@ impl AddrSpace {
         user_sp: Option<VirtAddr>,
     ) -> PageFaultResult {
         let Some(user_sp) = user_sp else {
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         };
 
         // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
@@ -2815,19 +2821,19 @@ impl AddrSpace {
                 }
             })
         else {
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         };
 
         let Some(gap_start) =
             current_start.checked_sub(page_size as usize * Self::STACK_GUARD_GAP_PAGES)
         else {
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         };
         if self.areas.overlaps(VirtAddrRange::from_start_size(
             gap_start,
             current_start.sub_addr(gap_start),
         )) {
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         }
 
         let locked = self.range_is_fully_locked(current_start, page_size as usize);
@@ -2844,7 +2850,7 @@ impl AddrSpace {
                 "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
                  {err}"
             );
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         }
         self.move_growdown_start(current_start, fault_page);
         self.handle_page_fault_result(vaddr, access_flags, Some(user_sp))
@@ -2897,7 +2903,7 @@ impl AddrSpace {
         user_sp: Option<VirtAddr>,
     ) -> PageFaultResult {
         if !self.va_range.contains(vaddr) {
-            return PageFaultResult::Unhandled;
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
         }
         if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
@@ -2926,17 +2932,22 @@ impl AddrSpace {
                     Ok(n) => {
                         if n == 0 {
                             warn!("No pages populated for {vaddr:?} ({flags:?})");
-                            PageFaultResult::Unhandled
+                            PageFaultResult::SegmentationFault(
+                                SegmentationFaultReason::AddressNotMapped,
+                            )
                         } else {
                             PageFaultResult::Handled
                         }
                     }
                     Err(err) => {
                         warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
-                        PageFaultResult::Unhandled
+                        PageFaultResult::SegmentationFault(
+                            SegmentationFaultReason::AddressNotMapped,
+                        )
                     }
                 };
             }
+            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AccessDenied);
         }
         self.try_handle_growdown_fault(vaddr, access_flags, user_sp)
     }

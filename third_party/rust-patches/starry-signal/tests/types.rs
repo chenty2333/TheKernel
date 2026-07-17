@@ -81,3 +81,12 @@ fn signalinfo_new_user() {
     );
     assert_eq!(si.errno(), 0);
 }
+
+#[test]
+fn signalinfo_fault_preserves_code_and_address() {
+    let si = SignalInfo::new_fault(Signo::SIGSEGV, 2, 0x1234_5000);
+    assert_eq!(si.signo(), Signo::SIGSEGV);
+    assert_eq!(si.code(), 2);
+    assert_eq!(si.fault_address(), 0x1234_5000);
+    assert_eq!(si.errno(), 0);
+}

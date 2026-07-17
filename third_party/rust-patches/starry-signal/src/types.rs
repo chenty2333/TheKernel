@@ -222,6 +222,17 @@ impl SignalInfo {
         result
     }
 
+    /// Builds a synchronous hardware-fault record with its exact user address.
+    pub fn new_fault(signo: Signo, code: i32, address: usize) -> Self {
+        // FIXME: Zeroable
+        let mut result: Self = unsafe { mem::zeroed() };
+        result.set_signo(signo);
+        result.set_code(code);
+        result.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigfault._addr =
+            address as *mut _;
+        result
+    }
+
     pub fn signo(&self) -> Signo {
         self.try_signo()
             .expect("kernel SignalInfo has a valid signo")
@@ -270,6 +281,20 @@ impl SignalInfo {
         // this layout, so it is safe to read the errno field through the
         // anonymous union.
         unsafe { self.0.__bindgen_anon_1.__bindgen_anon_1.si_errno }
+    }
+
+    /// Returns the user address carried by a synchronous fault record.
+    pub fn fault_address(&self) -> usize {
+        // SAFETY: callers use this accessor for records initialized through
+        // new_fault, whose active siginfo payload is _sigfault.
+        unsafe {
+            self.0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigfault
+                ._addr as usize
+        }
     }
 }
 
