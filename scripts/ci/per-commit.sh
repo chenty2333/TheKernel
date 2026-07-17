@@ -468,6 +468,10 @@ ci_run_step axpoll-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axpoll
+ci_run_step axtlb-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
+    -p thekernel-axtlb --all-targets
 ci_run_step axtask-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \

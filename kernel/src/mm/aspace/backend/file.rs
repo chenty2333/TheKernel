@@ -16,8 +16,8 @@ use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, PopulateOutcome,
-    page_table_flags, pages_in, preflight_sparse_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateCallback,
+    PopulateOutcome, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 use crate::file::{executable, memfd};
 
@@ -500,9 +500,13 @@ impl FileBackendInner {
             return true;
         }
 
-        let pt = aspace.page_table_mut();
-        match pt.cursor().unmap(vaddr) {
-            Ok(_) | Err(PagingError::NotMapped) => true,
+        let result = aspace.page_table_mut().cursor().unmap(vaddr);
+        match result {
+            Ok(_) => {
+                drop(crate::mm::synchronize_after_local_flush());
+                true
+            }
+            Err(PagingError::NotMapped) => true,
             Err(err) => {
                 warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
                 false
@@ -894,6 +898,8 @@ impl FileBackend {
             return Err(error.into());
         }
         if !writable {
+            pt.flush();
+            drop(crate::mm::synchronize_after_local_flush());
             self.deactivate_writable_segment()?;
         }
         Ok(())
@@ -1098,7 +1104,7 @@ impl BackendOps for FileBackend {
         Ok(())
     }
 
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         for addr in pages_in(range, PageSize::Size4K)? {
             match pt.unmap(addr) {
                 Ok(_) | Err(PagingError::NotMapped) => {}
@@ -1111,7 +1117,7 @@ impl BackendOps for FileBackend {
                 }
             }
         }
-        Ok(())
+        Ok(BackendRetirement::empty())
     }
 
     fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
@@ -1147,8 +1153,9 @@ impl BackendOps for FileBackend {
                 Err(error) => return PopulateOutcome::immediate(Err(error)),
             };
 
-        self.0.cache.with_direct_io_excluded(move || {
+        let (outcome, needs_tlb_sync) = self.0.cache.with_direct_io_excluded(|| {
             let owner = self.0.owner;
+            let mut needs_tlb_sync = false;
             let result = (|| {
                 let mut pages = 0;
                 let start_page = self.page_number_for(range.start)?;
@@ -1172,6 +1179,7 @@ impl BackendOps for FileBackend {
                                     }
                                     page.mark_dirty();
                                     pt.remap(addr, paddr, page_table_flags(flags))?;
+                                    needs_tlb_sync = true;
                                     pages += 1;
                                     AxResult::Ok(())
                                 })?;
@@ -1212,8 +1220,16 @@ impl BackendOps for FileBackend {
                 }
                 Ok(pages)
             })();
-            PopulateOutcome::new(result, deferred_evictions.into_callback())
-        })
+            (
+                PopulateOutcome::new(result, deferred_evictions.into_callback()),
+                needs_tlb_sync,
+            )
+        });
+        if needs_tlb_sync {
+            pt.flush();
+            drop(crate::mm::synchronize_after_local_flush());
+        }
+        outcome
     }
 
     fn clone_map(

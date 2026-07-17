@@ -533,9 +533,24 @@ pub fn sys_riscv_hwprobe(
     Ok(0)
 }
 
+#[cfg(any(test, target_arch = "riscv64"))]
+const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
+
+#[cfg(any(test, target_arch = "riscv64"))]
+fn riscv_flush_icache_is_local(flags: usize) -> AxResult<bool> {
+    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(flags & SYS_RISCV_FLUSH_ICACHE_LOCAL != 0)
+}
+
 #[cfg(target_arch = "riscv64")]
-pub fn sys_riscv_flush_icache() -> AxResult<isize> {
+pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> AxResult<isize> {
+    let local = riscv_flush_icache_is_local(flags)?;
     riscv::asm::fence_i();
+    if !local {
+        drop(crate::mm::synchronize_after_local_icache());
+    }
     Ok(0)
 }
 
@@ -567,6 +582,20 @@ mod tests {
             )
             .unwrap();
         child
+    }
+
+    #[test]
+    fn riscv_flush_icache_accepts_only_all_or_local_scope() {
+        assert!(!riscv_flush_icache_is_local(0).unwrap());
+        assert!(riscv_flush_icache_is_local(SYS_RISCV_FLUSH_ICACHE_LOCAL).unwrap());
+        assert_eq!(
+            riscv_flush_icache_is_local(2).unwrap_err(),
+            AxError::InvalidInput
+        );
+        assert_eq!(
+            riscv_flush_icache_is_local(usize::MAX).unwrap_err(),
+            AxError::InvalidInput
+        );
     }
 
     #[test]

@@ -895,7 +895,9 @@ pub(super) fn dispatch_syscall(sysno: Sysno, uctx: &mut UserContext) -> AxResult
             uctx.arg4() as _,
         ),
         #[cfg(target_arch = "riscv64")]
-        Sysno::riscv_flush_icache => sys_riscv_flush_icache(),
+        Sysno::riscv_flush_icache => {
+            sys_riscv_flush_icache(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
 
         // sync
         Sysno::membarrier => sys_membarrier(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),

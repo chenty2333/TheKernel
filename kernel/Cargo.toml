@@ -15,6 +15,7 @@ input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 test-io-control = ["axfs/test-io-control"]
 vsock = ["axfeat/vsock"]
+smp-tlb-shootdown = ["axhal/ipi"]
 
 [dependencies]
 axfeat = { workspace = true, features = [
@@ -60,6 +61,7 @@ thekernel-linux-cred.workspace = true
 thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true
 thekernel-linux-mm.workspace = true
+axtlb.workspace = true
 bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
 bytemuck = { version = "1.23", features = ["unsound_ptr_pod_impl", "derive"] }

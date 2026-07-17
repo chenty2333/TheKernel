@@ -20,6 +20,7 @@ members = []
 
 [workspace.dependencies]
 one = { path = "../source/one" }
+axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
@@ -31,14 +32,18 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --manifest "$tmp/rewrite/Cargo.toml" \
     --replace '../source/one=../artifacts/one-0.1.0' \
     --replace '../source/two=../artifacts/two-0.1.0' \
+    --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
     --replace '../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-0.1.0' \
     --replace '../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-0.1.0' \
     --forbid-text '../source/' \
+    --forbid-text '../thekernel-ax/' \
     --forbid-text '../thekernel-linux-abi/' \
     --record "$tmp/rewrite/record.tsv" >/dev/null
 grep -Fq 'path = "../artifacts/one-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-axtlb-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-mm-0.1.0"' \
@@ -237,6 +242,7 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axsched-0.1.0" \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
+    "$tmp/artifacts/thekernel-axtlb-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
     "$tmp/artifacts/thekernel-linux-mm-0.1.0" \
     "$tmp/artifacts/thekernel-linux-io-uring-0.1.0" \
@@ -255,6 +261,7 @@ release_names = [
     "thekernel-axsched",
     "thekernel-axpoll",
     "thekernel-axtask",
+    "thekernel-axtlb",
     "thekernel-linux-cred",
     "thekernel-linux-mm",
     "thekernel-linux-io-uring",
@@ -347,7 +354,7 @@ graph_args=(
     --release-source-root "$tmp/source-linux-abi"
 )
 for package in \
-    thekernel-axsched thekernel-axpoll thekernel-axtask \
+    thekernel-axsched thekernel-axpoll thekernel-axtask thekernel-axtlb \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-io-uring \
     thekernel-linux-process \
     thekernel-linux-vfs thekernel-linux-fd; do

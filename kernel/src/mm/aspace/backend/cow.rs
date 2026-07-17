@@ -16,8 +16,8 @@ use kspin::SpinNoIrq;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateOutcome, alloc_frame, dealloc_frame,
-    page_table_flags, pages_in, preflight_sparse_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateOutcome, alloc_frame,
+    dealloc_frame, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 
 struct FrameRefCnt(u32);
@@ -73,6 +73,24 @@ impl FrameTableRefCount {
 }
 
 static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
+
+/// Materialized COW leaves detached from a page table but not yet reclaimed.
+pub(super) struct CowUnmapRetirement {
+    leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+}
+
+impl Drop for CowUnmapRetirement {
+    fn drop(&mut self) {
+        for (_vaddr, frame, _flags, page_size) in self.leaves.drain(..) {
+            let frame_ref = { FRAME_TABLE.lock().get_frame_ref(frame) };
+            if let Some(frame_ref) = frame_ref {
+                frame_ref.lock().drop_frame(frame, page_size);
+            } else {
+                dealloc_frame(frame, page_size);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct CowClonePage {
@@ -463,17 +481,21 @@ impl CowBackend {
         pt: &mut PageTableCursor,
     ) -> AxResult {
         let frame = { FRAME_TABLE.lock().get_frame_ref(paddr) };
-        let Some(frame) = frame else {
+        let Some(frame_ref) = frame else {
             pt.protect(vaddr, page_table_flags(flags))?;
+            pt.flush();
+            drop(crate::mm::synchronize_after_local_flush());
             self.mark_materialized();
             return Ok(());
         };
-        let mut frame = frame.lock();
-        assert!(frame.0 > 0, "invalid frame reference count");
-        match frame.0 {
+        let references = frame_ref.lock().0;
+        assert!(references > 0, "invalid frame reference count");
+        match references {
             1 => {
                 // Only one reference, just upgrade the permissions.
                 pt.protect(vaddr, page_table_flags(flags))?;
+                pt.flush();
+                drop(crate::mm::synchronize_after_local_flush());
                 self.mark_materialized();
                 return Ok(());
             }
@@ -491,7 +513,9 @@ impl CowBackend {
                     dealloc_frame(new_frame, self.size);
                     return Err(err.into());
                 }
-                frame.drop_frame(paddr, self.size);
+                pt.flush();
+                drop(crate::mm::synchronize_after_local_flush());
+                frame_ref.lock().drop_frame(paddr, self.size);
             }
         }
 
@@ -966,24 +990,19 @@ impl BackendOps for CowBackend {
         Ok(())
     }
 
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         debug!("Cow::unmap: {range:?}");
         pages_in(range, self.size)?;
         if !self.is_materialized() {
-            return Ok(());
+            return Ok(BackendRetirement::empty());
         }
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
-        for (_addr, frame, _flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
-            let frame_ref = { FRAME_TABLE.lock().get_frame_ref(frame) };
-            if let Some(frame_ref) = frame_ref {
-                let mut frame_ref = frame_ref.lock();
-                frame_ref.drop_frame(frame, self.size);
-            } else {
-                dealloc_frame(frame, self.size);
-            }
+        for (_, _, _, page_size) in &materialized {
+            assert_eq!(*page_size, self.size);
         }
-        Ok(())
+        Ok(BackendRetirement::cow(CowUnmapRetirement {
+            leaves: materialized,
+        }))
     }
 
     fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {

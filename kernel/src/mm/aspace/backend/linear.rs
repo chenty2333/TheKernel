@@ -6,7 +6,8 @@ use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, page_table_flags, preflight_dense_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, page_table_flags,
+    preflight_dense_unmap,
 };
 
 /// Linear mapping backend.
@@ -125,13 +126,13 @@ impl BackendOps for LinearBackend {
         Ok(())
     }
 
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         self.check_range(range)?;
         let pa_range = PhysAddrRange::try_from_start_size(self.pa(range.start), range.size())
             .ok_or(AxError::InvalidInput)?;
         debug!("Linear::unmap: {range:?} -> {pa_range:?}");
         pt.unmap_region(range.start, range.size())?;
-        Ok(())
+        Ok(BackendRetirement::empty())
     }
 
     fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {

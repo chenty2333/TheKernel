@@ -30,6 +30,7 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-axsched": ("../thekernel-ax/crates/thekernel-axsched", "0.1.0"),
     "thekernel-axpoll": ("../thekernel-ax/crates/thekernel-axpoll", "0.1.0"),
     "thekernel-axtask": ("../thekernel-ax/crates/thekernel-axtask", "0.1.0"),
+    "thekernel-axtlb": ("../thekernel-ax/crates/thekernel-axtlb", "0.1.0"),
     "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
     "thekernel-linux-fd": ("../thekernel-linux-abi/crates/fd", "0.1.0"),
     "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
@@ -41,6 +42,7 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-axsched": ("ax", Path("crates/thekernel-axsched")),
     "thekernel-axpoll": ("ax", Path("crates/thekernel-axpoll")),
     "thekernel-axtask": ("ax", Path("crates/thekernel-axtask")),
+    "thekernel-axtlb": ("ax", Path("crates/thekernel-axtlb")),
     "thekernel-linux-vfs": ("linux-abi", Path("crates/vfs")),
     "thekernel-linux-fd": ("linux-abi", Path("crates/fd")),
     "thekernel-linux-process": ("linux-abi", Path("crates/process")),
@@ -49,10 +51,14 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-linux-io-uring": ("linux-abi", Path("crates/io-uring")),
 }
 MAINTAINED_WORKSPACE_DEPENDENCIES = {
+    "axtlb": ("thekernel-axtlb", "=0.1.0"),
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
     "thekernel-linux-mm": ("thekernel-linux-mm", "=0.1.0"),
     "thekernel-linux-io-uring": ("thekernel-linux-io-uring", "=0.1.0"),
+}
+MAINTAINED_SIBLING_LIB_NAMES = {
+    "thekernel-axtlb": "axtlb",
 }
 LOCAL_ADAPTER_PATCHES = {
     "axtask": ("crates/axtask-compat", "0.3.0-preview.2"),
@@ -211,6 +217,7 @@ def validate_non_vendor_patch(
     path: str,
     *,
     expected_version: str,
+    expected_lib_name: str | None = None,
     local_adapter: bool,
     crate_dir_override: Path | None = None,
     errors: list[str],
@@ -239,6 +246,19 @@ def validate_non_vendor_patch(
             f"{label}: {kind} version is {package.get('version')!r}, "
             f"expected {expected_version!r}"
         )
+    if expected_lib_name is not None:
+        try:
+            manifest = load_toml(crate_dir / "Cargo.toml")
+        except ValueError as exc:
+            errors.append(str(exc))
+            return
+        lib = manifest.get("lib")
+        actual_lib_name = lib.get("name") if isinstance(lib, Mapping) else None
+        if actual_lib_name != expected_lib_name:
+            errors.append(
+                f"{label}: {kind} lib name is {actual_lib_name!r}, "
+                f"expected {expected_lib_name!r}"
+            )
     if local_adapter:
         try:
             crate_dir.relative_to(root)
@@ -525,6 +545,7 @@ def validate_repository(
             patch_name,
             patch_path,
             expected_version=expected_version,
+            expected_lib_name=MAINTAINED_SIBLING_LIB_NAMES.get(patch_name),
             local_adapter=False,
             crate_dir_override=crate_dir_override,
             errors=errors,

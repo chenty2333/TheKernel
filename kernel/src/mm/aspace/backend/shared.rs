@@ -11,8 +11,8 @@ use axsync::Mutex;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateOutcome, alloc_frame, dealloc_frame,
-    divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateOutcome, alloc_frame,
+    dealloc_frame, divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 use crate::{
     file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
@@ -447,7 +447,7 @@ impl BackendOps for SharedBackend {
         preflight_sparse_unmap(range, self.pages.size, pt)
     }
 
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         debug!("Shared::unmap: {:?}", range);
         for vaddr in pages_in(range, self.pages.size)? {
             match pt.unmap(vaddr) {
@@ -455,7 +455,7 @@ impl BackendOps for SharedBackend {
                 Err(err) => return Err(err.into()),
             }
         }
-        Ok(())
+        Ok(BackendRetirement::empty())
     }
 
     fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
@@ -469,7 +469,7 @@ impl BackendOps for SharedBackend {
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> PopulateOutcome {
-        PopulateOutcome::immediate((|| {
+        let result = (|| {
             let offset = range
                 .start
                 .as_usize()
@@ -480,7 +480,9 @@ impl BackendOps for SharedBackend {
                 .checked_add(divide_page(offset, self.pages.size)?)
                 .ok_or(AxError::InvalidInput)?;
             let count = divide_page(range.size(), self.pages.size)?;
-            self.pages
+            let mut needs_tlb_sync = false;
+            let result = self
+                .pages
                 .with_pages_range(start_index, count, |physical_pages| {
                     let mut populated = 0;
                     for (vaddr, &paddr) in
@@ -495,6 +497,7 @@ impl BackendOps for SharedBackend {
                                     && !page_flags.contains(MappingFlags::WRITE)
                                 {
                                     pt.remap(vaddr, paddr, page_table_flags(flags))?;
+                                    needs_tlb_sync = true;
                                     populated += 1;
                                 } else if page_flags.contains(access_flags) {
                                     populated += 1;
@@ -508,8 +511,14 @@ impl BackendOps for SharedBackend {
                         }
                     }
                     Ok(populated)
-                })
-        })())
+                });
+            if needs_tlb_sync {
+                pt.flush();
+                drop(crate::mm::synchronize_after_local_flush());
+            }
+            result
+        })();
+        PopulateOutcome::immediate(result)
     }
 
     fn clone_map(

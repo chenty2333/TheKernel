@@ -3144,6 +3144,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axtlb"
+version = "0.1.0"
+
+[[package]]
 name = "thekernel-kernel"
 version = "0.2.0-preview.2"
 dependencies = [
@@ -3203,6 +3207,7 @@ dependencies = [
  "strum 0.28.0",
  "syscalls",
  "thekernel-axtask",
+ "thekernel-axtlb",
  "thekernel-linux-cred",
  "thekernel-linux-fd",
  "thekernel-linux-io-uring",

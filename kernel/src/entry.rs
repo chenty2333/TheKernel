@@ -28,6 +28,7 @@ use crate::{
 pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
+    crate::mm::init_tlb_shootdown();
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
         system_off();

@@ -12,7 +12,7 @@ use axhal::{
 use axsync::Mutex;
 use enum_dispatch::enum_dispatch;
 use memory_addr::{DynPageIter, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
-use memory_set::MappingBackend;
+use memory_set::{DeferredUnmapBackend, MappingBackend};
 use thekernel_linux_mm::MappingKind;
 
 mod cow;
@@ -165,7 +165,7 @@ pub trait BackendOps {
     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult;
 
     /// Unmap a memory region.
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult;
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement>;
 
     /// Validates every recoverable unmap condition without changing PTEs or
     /// backend-owned resources.
@@ -223,6 +223,24 @@ pub enum Backend {
     File(file::FileBackend),
 }
 
+/// Backend-owned resources detached from PTEs but retained until TLB grace.
+#[must_use = "detached mapping resources must remain live until TLB grace"]
+pub struct BackendRetirement {
+    _cow: Option<cow::CowUnmapRetirement>,
+}
+
+impl BackendRetirement {
+    const fn empty() -> Self {
+        Self { _cow: None }
+    }
+
+    fn cow(retirement: cow::CowUnmapRetirement) -> Self {
+        Self {
+            _cow: Some(retirement),
+        }
+    }
+}
+
 impl MappingBackend for Backend {
     type Addr = VirtAddr;
     type Flags = MappingFlags;
@@ -244,11 +262,18 @@ impl MappingBackend for Backend {
         let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
             return false;
         };
-        if let Err(err) = BackendOps::unmap(self, range, &mut pt.cursor()) {
-            warn!("Failed to unmap area: {:?}", err);
-            false
-        } else {
-            true
+        let mut cursor = pt.cursor();
+        let result = BackendOps::unmap(self, range, &mut cursor);
+        drop(cursor);
+        match result {
+            Ok(retired) => {
+                super::super::retire_after_local_flush(retired);
+                true
+            }
+            Err(err) => {
+                warn!("Failed to unmap area: {:?}", err);
+                false
+            }
         }
     }
 
@@ -307,6 +332,29 @@ impl MappingBackend for Backend {
 
     fn can_merge(&self, other: &Self) -> bool {
         self.mergeable_with(other)
+    }
+}
+
+impl DeferredUnmapBackend for Backend {
+    type Retirement = BackendRetirement;
+
+    fn unmap_deferred(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        pt: &mut PageTable,
+    ) -> Option<Self::Retirement> {
+        let range = VirtAddrRange::try_from_start_size(start, size)?;
+        let mut cursor = pt.cursor();
+        let result = BackendOps::unmap(self, range, &mut cursor);
+        drop(cursor);
+        match result {
+            Ok(retired) => Some(retired),
+            Err(err) => {
+                warn!("Failed to defer area unmap: {:?}", err);
+                None
+            }
+        }
     }
 }
 

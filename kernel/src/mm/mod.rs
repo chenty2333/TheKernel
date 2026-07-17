@@ -6,9 +6,16 @@ mod io;
 mod loader;
 mod remap;
 mod stats;
+mod tlb;
 
-pub(crate) use self::remap::remap_user_mapping;
 pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
+pub(crate) use self::{
+    remap::remap_user_mapping,
+    tlb::{
+        init as init_tlb_shootdown, retire_after_local_flush, synchronize_after_local_flush,
+        synchronize_after_local_icache, synchronize_after_local_tlb_and_icache,
+    },
+};
 
 pub(crate) fn checked_align_up(value: usize, align: usize) -> Option<usize> {
     if !align.is_power_of_two() {

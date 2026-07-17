@@ -46,9 +46,8 @@ pub enum PageFaultResult {
 #[inline]
 fn synchronize_executable_publication(flags: MappingFlags) {
     if flags.contains(MappingFlags::EXECUTE) {
-        // This publishes executable memory to the current CPU. SMP support
-        // additionally needs a HAL-level remote or generation-based sync.
         axhal::asm::flush_icache_all();
+        drop(super::synchronize_after_local_icache());
     }
 }
 
@@ -930,7 +929,10 @@ impl PreparedProtect<'_> {
         } = self;
         let areas = transaction.commit();
         if synchronize_instruction_stream {
-            synchronize_executable_publication(MappingFlags::EXECUTE);
+            axhal::asm::flush_icache_all();
+            drop(super::synchronize_after_local_tlb_and_icache());
+        } else {
+            drop(super::synchronize_after_local_flush());
         }
         let areas = areas?;
         Self::refresh_growdown_starts(areas, growdown_starts);
@@ -1861,10 +1863,7 @@ impl AddrSpace {
             self.insert_locked_range(start, start + size);
         }
         if populate && let Err(err) = self.populate_area(start, size, flags) {
-            if let Err(unmap_err) =
-                self.areas
-                    .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
-            {
+            if let Err(unmap_err) = self.unmap_areas_with_tlb_grace(start, size) {
                 warn!(
                     "AddrSpace::map: failed to roll back {start:?}+{size:#x} after populate \
                      error: {unmap_err:?}"
@@ -1915,10 +1914,7 @@ impl AddrSpace {
             self.insert_locked_range(start, start + size);
         }
         if populate && let Err(err) = self.populate_area(start, size, flags) {
-            if let Err(unmap_err) =
-                self.areas
-                    .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
-            {
+            if let Err(unmap_err) = self.unmap_areas_with_tlb_grace(start, size) {
                 warn!(
                     "AddrSpace::map_with_existing_lineage: failed to roll back \
                      {start:?}+{size:#x} after populate error: {unmap_err:?}"
@@ -1977,6 +1973,24 @@ impl AddrSpace {
             .map_err(Into::into)
     }
 
+    fn unmap_areas_with_tlb_grace(&mut self, start: VirtAddr, size: usize) -> MappingResult {
+        let retirement =
+            self.areas
+                .unmap_deferred_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
+        let grace = super::synchronize_after_local_flush();
+        retirement.release();
+        drop(grace);
+        Ok(())
+    }
+
+    fn clear_areas_with_tlb_grace(&mut self) -> MappingResult {
+        let retirement = self.areas.clear_deferred(&mut self.pt)?;
+        let grace = super::synchronize_after_local_flush();
+        retirement.release();
+        drop(grace);
+        Ok(())
+    }
+
     fn rollback_staged_mapping(
         &mut self,
         start: VirtAddr,
@@ -1990,9 +2004,7 @@ impl AddrSpace {
             // topology fence before returning this fail-closed result.
             return Err(AxError::BadState);
         }
-        let rollback = self
-            .areas
-            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS);
+        let rollback = self.unmap_areas_with_tlb_grace(start, size);
         if let Err(error) = rollback {
             // The fresh mapping incarnation remains visible. Its generation 1
             // sidecar remains valid; the caller must publish the topology
@@ -2010,8 +2022,7 @@ impl AddrSpace {
     }
 
     fn destroy_remap_destination(&mut self, start: VirtAddr, size: usize) -> AxResult {
-        self.areas
-            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
+        self.unmap_areas_with_tlb_grace(start, size)?;
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
@@ -2292,12 +2303,7 @@ impl AddrSpace {
                 ) =>
             {
                 self.apply_remap_policy(destination_start, &policy);
-                let source_commit = self.areas.unmap_with_limit(
-                    source_start,
-                    source_size,
-                    &mut self.pt,
-                    MAX_VMA_FRAGMENTS,
-                );
+                let source_commit = self.unmap_areas_with_tlb_grace(source_start, source_size);
                 match source_commit {
                     Ok(()) => {
                         self.refresh_growdown_starts();
@@ -2474,25 +2480,39 @@ impl AddrSpace {
         self.commit_topology_generation(next_generation);
         let end = start + size;
 
-        let mut modify = self.pt.cursor();
-        while let Some(area) = self.areas.find(start) {
-            if area.start() > start {
-                break;
-            }
+        let retirement_capacity = self
+            .areas
+            .iter_overlapping(VirtAddrRange::new(start, end))
+            .count();
+        let mut retired = Vec::new();
+        retired
+            .try_reserve_exact(retirement_capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        let result = {
+            let mut modify = self.pt.cursor();
+            (|| {
+                while let Some(area) = self.areas.find(start) {
+                    if area.start() > start {
+                        break;
+                    }
 
-            let range = VirtAddrRange::new(start, area.end().min(end));
-            area.backend().unmap(range, &mut modify)?;
-            start = range.end;
-            if start >= end {
-                break;
-            }
-        }
+                    let range = VirtAddrRange::new(start, area.end().min(end));
+                    retired.push(area.backend().unmap(range, &mut modify)?);
+                    start = range.end;
+                    if start >= end {
+                        break;
+                    }
+                }
 
-        if start < end {
-            ax_bail!(NoMemory);
-        }
+                if start < end {
+                    ax_bail!(NoMemory);
+                }
 
-        Ok(())
+                Ok(())
+            })()
+        };
+        super::retire_after_local_flush(retired);
+        result
     }
 
     /// Drops resident private anonymous pages while keeping the VMA layout.
@@ -2566,8 +2586,7 @@ impl AddrSpace {
         let mapping_mutations =
             prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
 
-        self.areas
-            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
+        self.unmap_areas_with_tlb_grace(start, size)?;
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
@@ -2734,7 +2753,7 @@ impl AddrSpace {
         // Reserve the replacement identity before destroying the current
         // image. A sequence-exhaustion failure therefore leaves it untouched.
         let new_policy = new_user_io_policy()?;
-        self.areas.clear(&mut self.pt)?;
+        self.clear_areas_with_tlb_grace()?;
         drop(core::mem::take(&mut self.mapping_identities));
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
@@ -3084,6 +3103,8 @@ impl AddrSpace {
             )
             .is_ok())
         );
+        drop(self_modify);
+        drop(super::synchronize_after_local_flush());
         drop(guard);
 
         Ok(new_aspace)
@@ -3120,7 +3141,7 @@ impl fmt::Debug for AddrSpace {
 impl Drop for AddrSpace {
     fn drop(&mut self) {
         debug_assert_eq!(self.user_io_pins.progress().total(), 0);
-        if let Err(err) = self.areas.clear(&mut self.pt) {
+        if let Err(err) = self.clear_areas_with_tlb_grace() {
             warn!("AddrSpace::drop: failed to unmap all areas: {err:?}");
         }
         let _ = self.user_io_pins.begin_teardown();
