@@ -58,6 +58,7 @@ struct worker_context {
     size_t pages;
     size_t page_size;
     int worker_cpu;
+    int expected_fault_code;
     int actual_cpu_before;
     int actual_cpu_after;
     volatile unsigned char sink;
@@ -71,6 +72,7 @@ struct child_report {
 
 static _Thread_local sigjmp_buf expected_fault_environment;
 static _Thread_local volatile sig_atomic_t expected_fault_active;
+static _Thread_local volatile sig_atomic_t expected_fault_code;
 static _Thread_local void *volatile expected_fault_address;
 
 static _Noreturn void operational_fail(const char *case_name, size_t pages,
@@ -144,8 +146,10 @@ static void expected_sigsegv_handler(int signal_number, siginfo_t *info,
 
     (void)context;
     if (signal_number == SIGSEGV && expected_fault_active != 0 &&
-        info != NULL && info->si_addr == expected_fault_address) {
+        info != NULL && info->si_addr == expected_fault_address &&
+        (expected_fault_code == 0 || info->si_code == expected_fault_code)) {
         expected_fault_active = 0;
+        expected_fault_code = 0;
         expected_fault_address = NULL;
         siglongjmp(expected_fault_environment, 1);
     }
@@ -174,38 +178,44 @@ static void install_signal_handlers(void)
     }
 }
 
-static bool guarded_read(volatile unsigned char *address,
-                         unsigned char *value)
+static bool guarded_read(volatile unsigned char *address, unsigned char *value,
+                         int fault_code)
 {
     if (sigsetjmp(expected_fault_environment, 1) != 0) {
         expected_fault_active = 0;
+        expected_fault_code = 0;
         expected_fault_address = NULL;
         return false;
     }
     expected_fault_address = (void *)address;
+    expected_fault_code = fault_code;
     expected_fault_active = 1;
     atomic_signal_fence(memory_order_seq_cst);
     *value = *address;
     atomic_signal_fence(memory_order_seq_cst);
     expected_fault_active = 0;
+    expected_fault_code = 0;
     expected_fault_address = NULL;
     return true;
 }
 
 static bool guarded_write(volatile unsigned char *address,
-                          unsigned char value)
+                          unsigned char value, int fault_code)
 {
     if (sigsetjmp(expected_fault_environment, 1) != 0) {
         expected_fault_active = 0;
+        expected_fault_code = 0;
         expected_fault_address = NULL;
         return false;
     }
     expected_fault_address = (void *)address;
+    expected_fault_code = fault_code;
     expected_fault_active = 1;
     atomic_signal_fence(memory_order_seq_cst);
     *address = value;
     atomic_signal_fence(memory_order_seq_cst);
     expected_fault_active = 0;
+    expected_fault_code = 0;
     expected_fault_address = NULL;
     return true;
 }
@@ -245,7 +255,7 @@ static bool page_sentinels_match(volatile unsigned char *mapping, size_t pages,
     for (page = 0; page < pages; ++page) {
         unsigned char value = 0;
 
-        if (!guarded_read(mapping + page * page_size, &value) ||
+        if (!guarded_read(mapping + page * page_size, &value, 0) ||
             value != pattern(page)) {
             return false;
         }
@@ -328,17 +338,19 @@ static size_t worker_run_transition(struct worker_context *context)
 
         switch (context->operation) {
         case WORKER_REVOKED_WRITE:
-            if (guarded_write(address, new_pattern(page))) {
+            if (guarded_write(address, new_pattern(page),
+                              context->expected_fault_code)) {
                 stale_count += 1U;
             }
             break;
         case WORKER_OLD_ALIAS_READ:
-            if (guarded_read(address, &value)) {
+            if (guarded_read(address, &value,
+                             context->expected_fault_code)) {
                 stale_count += 1U;
             }
             break;
         case WORKER_COW_WRITE:
-            if (!guarded_write(address, cow_parent_pattern(page))) {
+            if (!guarded_write(address, cow_parent_pattern(page), 0)) {
                 stale_count += 1U;
             }
             break;
@@ -461,7 +473,8 @@ static int join_worker_bounded(pthread_t worker)
 static void initialize_worker(struct worker_context *context,
                               enum worker_operation operation,
                               volatile unsigned char *mapping, size_t pages,
-                              size_t page_size, int worker_cpu)
+                              size_t page_size, int worker_cpu,
+                              int expected_code)
 {
     atomic_init(&context->phase, WORKER_INIT);
     atomic_init(&context->error_number, 0);
@@ -472,6 +485,7 @@ static void initialize_worker(struct worker_context *context,
     context->pages = pages;
     context->page_size = page_size;
     context->worker_cpu = worker_cpu;
+    context->expected_fault_code = expected_code;
     context->actual_cpu_before = -1;
     context->actual_cpu_after = -1;
     context->sink = 0;
@@ -590,7 +604,7 @@ static size_t run_mprotect_case(size_t pages, size_t page_size,
 
     fill_page_sentinels(mapping, pages, page_size, old_pattern);
     initialize_worker(&context, WORKER_REVOKED_WRITE, mapping, pages,
-                      page_size, worker_cpu);
+                      page_size, worker_cpu, SEGV_ACCERR);
     worker = start_worker(&context, case_name, pages);
     heartbeat_before = atomic_load_explicit(&context.spin_heartbeat,
                                             memory_order_relaxed);
@@ -633,7 +647,7 @@ static size_t run_munmap_replace_case(size_t pages, size_t page_size,
 
     fill_page_sentinels(mapping, pages, page_size, old_pattern);
     initialize_worker(&context, WORKER_OLD_ALIAS_READ, mapping, pages,
-                      page_size, worker_cpu);
+                      page_size, worker_cpu, SEGV_ACCERR);
     worker = start_worker(&context, case_name, pages);
     heartbeat_before = atomic_load_explicit(&context.spin_heartbeat,
                                             memory_order_relaxed);
@@ -688,7 +702,7 @@ static size_t run_mremap_case(size_t pages, size_t page_size, int worker_cpu)
     }
     fill_page_sentinels(source, pages, page_size, old_pattern);
     initialize_worker(&context, WORKER_OLD_ALIAS_READ, source, pages,
-                      page_size, worker_cpu);
+                      page_size, worker_cpu, SEGV_MAPERR);
     worker = start_worker(&context, case_name, pages);
     heartbeat_before = atomic_load_explicit(&context.spin_heartbeat,
                                             memory_order_relaxed);
@@ -883,7 +897,7 @@ static _Noreturn void run_cow_child(volatile unsigned char *mapping,
     for (page = 0; page < pages; ++page) {
         unsigned char value = 0;
 
-        if (!guarded_read(mapping + page * page_size, &value) ||
+        if (!guarded_read(mapping + page * page_size, &value, 0) ||
             value != old_pattern(page)) {
             report.stale_count += 1U;
         }
@@ -922,7 +936,7 @@ static size_t run_fork_cow_case(size_t pages, size_t page_size, int worker_cpu)
         operational_fail(case_name, pages, "pipe_report", errno);
     }
     initialize_worker(&context, WORKER_COW_WRITE, mapping, pages, page_size,
-                      worker_cpu);
+                      worker_cpu, 0);
     worker = start_worker(&context, case_name, pages);
     heartbeat_before = atomic_load_explicit(&context.spin_heartbeat,
                                             memory_order_relaxed);

@@ -39,14 +39,35 @@ pub(crate) use self::mapping::{FileLikeMappingLease, FileMappingLease, FileMappi
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
     Handled,
-    SigBus,
-    SegmentationFault(SegmentationFaultReason),
+    Failed(PageFaultFailure),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SegmentationFaultReason {
+pub enum PageFaultFailure {
     AddressNotMapped,
     AccessDenied,
+    BackingUnavailable,
+    InternalInconsistency,
+    OutOfMemory,
+}
+
+fn classify_page_population(result: AxResult<usize>) -> PageFaultResult {
+    match result {
+        Ok(0) => PageFaultResult::Failed(PageFaultFailure::InternalInconsistency),
+        Ok(_) => PageFaultResult::Handled,
+        Err(err) if err.canonicalize() == AxError::NoMemory => {
+            PageFaultResult::Failed(PageFaultFailure::OutOfMemory)
+        }
+        Err(err)
+            if matches!(
+                err.canonicalize(),
+                AxError::BadAddress | AxError::BadState | AxError::InvalidInput
+            ) =>
+        {
+            PageFaultResult::Failed(PageFaultFailure::InternalInconsistency)
+        }
+        Err(_) => PageFaultResult::Failed(PageFaultFailure::BackingUnavailable),
+    }
 }
 
 #[inline]
@@ -2783,7 +2804,7 @@ impl AddrSpace {
         user_sp: Option<VirtAddr>,
     ) -> PageFaultResult {
         let Some(user_sp) = user_sp else {
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         };
 
         // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
@@ -2806,9 +2827,6 @@ impl AddrSpace {
                 if !(user_sp >= fault_page && user_sp < current_start) {
                     return None;
                 }
-                if !area.flags().contains(access_flags) {
-                    return None;
-                }
                 match area.backend() {
                     Backend::Cow(_) => Some((
                         current_start,
@@ -2821,19 +2839,22 @@ impl AddrSpace {
                 }
             })
         else {
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         };
+        if !flags.contains(access_flags) {
+            return PageFaultResult::Failed(PageFaultFailure::AccessDenied);
+        }
 
         let Some(gap_start) =
             current_start.checked_sub(page_size as usize * Self::STACK_GUARD_GAP_PAGES)
         else {
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         };
         if self.areas.overlaps(VirtAddrRange::from_start_size(
             gap_start,
             current_start.sub_addr(gap_start),
         )) {
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         }
 
         let locked = self.range_is_fully_locked(current_start, page_size as usize);
@@ -2850,7 +2871,11 @@ impl AddrSpace {
                 "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
                  {err}"
             );
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return if err.canonicalize() == AxError::NoMemory {
+                PageFaultResult::Failed(PageFaultFailure::OutOfMemory)
+            } else {
+                PageFaultResult::Failed(PageFaultFailure::AddressNotMapped)
+            };
         }
         self.move_growdown_start(current_start, fault_page);
         self.handle_page_fault_result(vaddr, access_flags, Some(user_sp))
@@ -2903,7 +2928,7 @@ impl AddrSpace {
         user_sp: Option<VirtAddr>,
     ) -> PageFaultResult {
         if !self.va_range.contains(vaddr) {
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AddressNotMapped);
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         }
         if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
@@ -2911,7 +2936,7 @@ impl AddrSpace {
                 let page_size = area.backend().page_size();
                 let start = vaddr.align_down(page_size);
                 if area.backend().faults_with_sigbus(start) {
-                    return PageFaultResult::SigBus;
+                    return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
                 }
                 let fault_around = area.backend().fault_around_size(access_flags);
                 let len = area
@@ -2928,26 +2953,19 @@ impl AddrSpace {
                 // Synchronize even on error: a multi-page populate may have
                 // installed a valid executable prefix before the failure.
                 synchronize_executable_publication(flags);
-                return match populate_result {
+                match populate_result {
                     Ok(n) => {
                         if n == 0 {
                             warn!("No pages populated for {vaddr:?} ({flags:?})");
-                            PageFaultResult::SegmentationFault(
-                                SegmentationFaultReason::AddressNotMapped,
-                            )
-                        } else {
-                            PageFaultResult::Handled
                         }
                     }
                     Err(err) => {
                         warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
-                        PageFaultResult::SegmentationFault(
-                            SegmentationFaultReason::AddressNotMapped,
-                        )
                     }
-                };
+                }
+                return classify_page_population(populate_result);
             }
-            return PageFaultResult::SegmentationFault(SegmentationFaultReason::AccessDenied);
+            return PageFaultResult::Failed(PageFaultFailure::AccessDenied);
         }
         self.try_handle_growdown_fault(vaddr, access_flags, user_sp)
     }
@@ -3870,5 +3888,26 @@ mod tests {
         assert!(!adds_execute_permission(read_execute, read_execute));
         assert!(!adds_execute_permission(read_execute, read_write));
         assert!(!adds_execute_permission(read_write, read_write));
+    }
+
+    #[test]
+    fn page_population_failure_preserves_vma_failure_causes() {
+        assert_eq!(classify_page_population(Ok(1)), PageFaultResult::Handled);
+        assert_eq!(
+            classify_page_population(Ok(0)),
+            PageFaultResult::Failed(PageFaultFailure::InternalInconsistency)
+        );
+        assert_eq!(
+            classify_page_population(Err(AxError::NoMemory)),
+            PageFaultResult::Failed(PageFaultFailure::OutOfMemory)
+        );
+        assert_eq!(
+            classify_page_population(Err(AxError::BadAddress)),
+            PageFaultResult::Failed(PageFaultFailure::InternalInconsistency)
+        );
+        assert_eq!(
+            classify_page_population(Err(AxError::Io)),
+            PageFaultResult::Failed(PageFaultFailure::BackingUnavailable)
+        );
     }
 }

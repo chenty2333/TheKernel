@@ -5,11 +5,11 @@ use starry_process::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
 use starry_signal::{SignalInfo, Signo};
 
 use super::{
-    AsThread, TimerState, check_signals, do_exit, fail_closed_exit, has_pending_fatal_signal,
-    raise_signal_fatal, set_timer_state, wait_if_stopped,
+    AsThread, TimerState, check_signals, do_exit, fail_closed_exit, force_signal_current_thread,
+    has_pending_fatal_signal, set_timer_state, wait_if_stopped,
 };
 use crate::{
-    mm::{PageFaultResult, SegmentationFaultReason},
+    mm::{PageFaultFailure, PageFaultResult},
     syscall::handle_syscall,
 };
 
@@ -40,13 +40,7 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
 }
 
 fn deliver_fatal_user_signal_info(info: SignalInfo) {
-    let signo = info.signo();
-    if let Err(err) = raise_signal_fatal(info) {
-        error!("Failed to deliver fatal user signal {signo:?}: {err:?}");
-        if let Err(error) = do_exit(signo as i32, true) {
-            fail_closed_exit(error);
-        }
-    }
+    force_signal_current_thread(info);
 }
 
 fn deliver_fatal_user_signal(signo: Signo) {
@@ -84,7 +78,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                         if result != PageFaultResult::Handled {
                             #[cfg(target_arch = "riscv64")]
                             info!(
-                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, ra={:#x}, \
+                                "{:?}: user page fault at {:#x} {:?}, pc={:#x}, ra={:#x}, \
                                  sp={:#x}, a0={:#x}, a1={:#x}, tp={:#x}",
                                 thr.proc_data.proc,
                                 addr,
@@ -98,7 +92,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             );
                             #[cfg(not(target_arch = "riscv64"))]
                             info!(
-                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, sp={:#x}",
+                                "{:?}: user page fault at {:#x} {:?}, pc={:#x}, sp={:#x}",
                                 thr.proc_data.proc,
                                 addr,
                                 flags,
@@ -107,25 +101,31 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             );
                             let info = match result {
                                 PageFaultResult::Handled => unreachable!(),
-                                PageFaultResult::SigBus => SignalInfo::new_fault(
+                                PageFaultResult::Failed(PageFaultFailure::OutOfMemory) => {
+                                    SignalInfo::new_kernel(Signo::SIGKILL)
+                                }
+                                PageFaultResult::Failed(
+                                    PageFaultFailure::BackingUnavailable
+                                    | PageFaultFailure::InternalInconsistency,
+                                ) => SignalInfo::new_fault(
                                     Signo::SIGBUS,
                                     BUS_ADRERR as i32,
                                     addr.as_usize(),
                                 ),
-                                PageFaultResult::SegmentationFault(
-                                    SegmentationFaultReason::AddressNotMapped,
-                                ) => SignalInfo::new_fault(
-                                    Signo::SIGSEGV,
-                                    SEGV_MAPERR as i32,
-                                    addr.as_usize(),
-                                ),
-                                PageFaultResult::SegmentationFault(
-                                    SegmentationFaultReason::AccessDenied,
-                                ) => SignalInfo::new_fault(
-                                    Signo::SIGSEGV,
-                                    SEGV_ACCERR as i32,
-                                    addr.as_usize(),
-                                ),
+                                PageFaultResult::Failed(PageFaultFailure::AddressNotMapped) => {
+                                    SignalInfo::new_fault(
+                                        Signo::SIGSEGV,
+                                        SEGV_MAPERR as i32,
+                                        addr.as_usize(),
+                                    )
+                                }
+                                PageFaultResult::Failed(PageFaultFailure::AccessDenied) => {
+                                    SignalInfo::new_fault(
+                                        Signo::SIGSEGV,
+                                        SEGV_ACCERR as i32,
+                                        addr.as_usize(),
+                                    )
+                                }
                             };
                             deliver_fatal_user_signal_info(info);
                         }

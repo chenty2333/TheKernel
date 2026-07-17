@@ -802,25 +802,6 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
     Ok(())
 }
 
-/// Sends a fatal signal to the current process.
-pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-
-    let signo = sig.signo();
-    info!("Send fatal signal {signo:?} to the current process");
-    if let Some(tid) = proc_data.signal.send_unqueued_signal(sig)
-        && let Ok(task) = get_task(tid)
-    {
-        task.interrupt();
-    } else {
-        // No task wants to handle the signal, abort the task
-        do_exit(signo as i32, true)?;
-    }
-
-    Ok(())
-}
-
 /// Forces a synchronous signal onto the current thread.
 ///
 /// Linux forced signals cannot be suppressed by an ignored disposition or a
