@@ -451,6 +451,8 @@ def make_kernel_request(
     requested_cpus = requested_kernel_cpu_count()
     if requested_cpus is not None:
         make_args.append(f"SMP={requested_cpus}")
+        if requested_cpus > 1:
+            features = f"{features} smp"
     return KernelRequest(
         name=name,
         arch=full_arch,

@@ -179,11 +179,20 @@ class BuildKernelParamTests(unittest.TestCase):
         ):
             request = make_kernel_request("shell", "rv", root)
         self.assertIn("SMP=8", request.make_args)
+        self.assertIn("smp", request.app_features.split())
         self.assertIn("SMP=8", kernel_params(request)["make_args"])
 
         with patch.dict("os.environ", {"SMP": "4"}, clear=True):
             make_request = make_kernel_request("shell", "la", root)
         self.assertIn("SMP=4", make_request.make_args)
+        self.assertIn("smp", make_request.app_features.split())
+
+        with patch.dict(
+            "os.environ", {"THEKERNEL_KERNEL_CPUS": "1"}, clear=True
+        ):
+            single_cpu_request = make_kernel_request("shell", "rv", root)
+        self.assertIn("SMP=1", single_cpu_request.make_args)
+        self.assertNotIn("smp", single_cpu_request.app_features.split())
 
     def test_conflicting_kernel_cpu_inputs_are_rejected(self) -> None:
         root = repo_root()
