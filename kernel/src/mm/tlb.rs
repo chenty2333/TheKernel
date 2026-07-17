@@ -1,11 +1,87 @@
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     use axhal::irq::{IPI_IRQ, IpiTarget};
-    use axtlb::{CPU_MAINTENANCE_REASON, CpuMaintenance, ShootdownGrace, TlbShootdown};
+    use axtlb::{
+        CPU_MAINTENANCE_REASON, CpuMaintenance, ShootdownGrace, ShootdownRequest, TlbShootdown,
+    };
+    use kernel_guard::NoPreempt;
 
     const SHOOTDOWN_TIMEOUT_NS: u64 = 5_000_000_000;
+    const RETRY_INITIAL_NS: u64 = 1_000_000;
+    const RETRY_MAX_NS: u64 = 128_000_000;
+    const MAX_RETRY_ROUNDS: usize = 40;
+    const SELF_SERVICE_SPINS: usize = 64;
 
     static SHOOTDOWN: TlbShootdown<{ axconfig::plat::MAX_CPU_NUM }> = TlbShootdown::new();
+    static CPU_RUNTIME: [CpuRuntime; axconfig::plat::MAX_CPU_NUM] =
+        [const { CpuRuntime::new() }; axconfig::plat::MAX_CPU_NUM];
+
+    #[repr(align(64))]
+    struct CpuRuntime {
+        ipi_handler_entries: AtomicU64,
+        next_retry_ns: AtomicU64,
+        retry_interval_ns: AtomicU64,
+    }
+
+    impl CpuRuntime {
+        const fn new() -> Self {
+            Self {
+                ipi_handler_entries: AtomicU64::new(0),
+                next_retry_ns: AtomicU64::new(0),
+                retry_interval_ns: AtomicU64::new(RETRY_INITIAL_NS),
+            }
+        }
+
+        fn claim_retry(&self, now: u64) -> bool {
+            let mut observed = self.next_retry_ns.load(Ordering::Acquire);
+            loop {
+                if now < observed {
+                    return false;
+                }
+                let interval = self
+                    .retry_interval_ns
+                    .load(Ordering::Acquire)
+                    .clamp(RETRY_INITIAL_NS, RETRY_MAX_NS);
+                let replacement = now.saturating_add(interval);
+                match self.next_retry_ns.compare_exchange_weak(
+                    observed,
+                    replacement,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let _ = self.retry_interval_ns.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |current| Some(current.saturating_mul(2).min(RETRY_MAX_NS)),
+                        );
+                        return true;
+                    }
+                    Err(actual) => observed = actual,
+                }
+            }
+        }
+    }
+
+    struct ShootdownAttempts {
+        initial: [bool; axconfig::plat::MAX_CPU_NUM],
+        retries: [u8; axconfig::plat::MAX_CPU_NUM],
+        ipi_entries_before: [u64; axconfig::plat::MAX_CPU_NUM],
+        rounds: usize,
+    }
+
+    impl ShootdownAttempts {
+        const fn new() -> Self {
+            Self {
+                initial: [false; axconfig::plat::MAX_CPU_NUM],
+                retries: [0; axconfig::plat::MAX_CPU_NUM],
+                ipi_entries_before: [0; axconfig::plat::MAX_CPU_NUM],
+                rounds: 0,
+            }
+        }
+    }
 
     pub(crate) struct GlobalGrace {
         _grace: ShootdownGrace<'static, { axconfig::plat::MAX_CPU_NUM }>,
@@ -30,79 +106,162 @@ mod imp {
 
         // Validate the handler and every online mailbox before user mappings
         // can become shared across CPUs.
-        axhal::asm::flush_tlb(None);
-        axhal::asm::flush_icache_all();
-        drop(synchronize_after_local_maintenance(
-            CpuMaintenance::TLB_AND_ICACHE,
-        ));
+        drop(synchronize_cpu_maintenance(CpuMaintenance::TLB_AND_ICACHE));
     }
 
-    fn synchronize_after_local_maintenance(maintenance: CpuMaintenance) -> GlobalGrace {
-        let issuer_cpu = axhal::percpu::this_cpu_id();
-        let request = SHOOTDOWN
-            .issue_after_local_maintenance(issuer_cpu, maintenance)
-            .unwrap_or_else(|error| {
-                panic!("failed to issue {maintenance:?} shootdown from CPU {issuer_cpu}: {error:?}")
-            });
-
-        let cpu_count = axhal::cpu_num();
-        for cpu in 0..cpu_count {
-            if request.needs_kick(cpu) {
-                axhal::irq::send_ipi(IPI_IRQ, IpiTarget::Other { cpu_id: cpu });
-            }
+    fn maintain_local(maintenance: CpuMaintenance) {
+        if maintenance.needs_tlb() {
+            axhal::asm::flush_tlb(None);
         }
+        if maintenance.needs_icache() {
+            axhal::asm::flush_icache_all();
+        }
+    }
 
-        let deadline = axhal::time::monotonic_time_nanos().saturating_add(SHOOTDOWN_TIMEOUT_NS);
+    fn synchronize_cpu_maintenance(maintenance: CpuMaintenance) -> GlobalGrace {
+        // Page-table cursors may have flushed before reaching this adapter.
+        // Repeat one full local maintenance operation while migration is pinned,
+        // through issue. Waiting for remote grace remains preemptible; each
+        // self-service sample below pins only its own short CPU-local section.
+        let cpu_count = axhal::cpu_num();
+        let (issuer_cpu, request, mut attempts, started) = {
+            let _cpu_guard = NoPreempt::new();
+            let issuer_cpu = axhal::percpu::this_cpu_id();
+            let mut attempts = ShootdownAttempts::new();
+            for cpu in 0..cpu_count {
+                attempts.ipi_entries_before[cpu] =
+                    CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+            }
+            maintain_local(maintenance);
+            let request = SHOOTDOWN
+                .issue_after_local_maintenance(issuer_cpu, maintenance)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to issue {maintenance:?} shootdown from CPU {issuer_cpu}: \
+                         {error:?}"
+                    )
+                });
+            let started = axhal::time::monotonic_time_nanos();
+            for cpu in 0..cpu_count {
+                if request.needs_kick(cpu) {
+                    attempts.initial[cpu] = true;
+                    axhal::irq::send_ipi(IPI_IRQ, IpiTarget::Other { cpu_id: cpu });
+                }
+            }
+            (issuer_cpu, request, attempts, started)
+        };
+
+        let deadline = started.saturating_add(SHOOTDOWN_TIMEOUT_NS);
+        let mut retry_interval = RETRY_INITIAL_NS;
+        let mut next_retry = started.saturating_add(retry_interval);
         loop {
             // Two page-table writers may both enter with local IRQs disabled.
-            // Servicing this CPU's atomic mailbox here prevents a bilateral
-            // wait without acquiring any address-space or allocator lock.
-            service_cpu(issuer_cpu);
-            if let Some(grace) = request.try_complete() {
+            // One short no-migration batch services the actual current CPU and
+            // polls a fixed number of times. Dropping the guard between batches
+            // preserves scheduler progress while preventing a bilateral wait.
+            let grace = {
+                let _cpu_guard = NoPreempt::new();
+                service_cpu(axhal::percpu::this_cpu_id());
+                let mut grace = request.try_complete();
+                for _ in 1..SELF_SERVICE_SPINS {
+                    if grace.is_some() {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                    grace = request.try_complete();
+                }
+                grace
+            };
+            if let Some(grace) = grace {
                 return GlobalGrace { _grace: grace };
             }
-            if axhal::time::monotonic_time_nanos() >= deadline {
-                shootdown_timeout(request.epoch());
+            let now = axhal::time::monotonic_time_nanos();
+            if now >= deadline {
+                if let Some(grace) = request.try_complete() {
+                    return GlobalGrace { _grace: grace };
+                }
+                shootdown_timeout(&request, issuer_cpu, started, &attempts);
+            }
+            if now >= next_retry && attempts.rounds < MAX_RETRY_ROUNDS {
+                let mut retry_deadline_reached = false;
+                for cpu in 0..cpu_count {
+                    let sent = {
+                        let _cpu_guard = NoPreempt::new();
+                        let retry_now = axhal::time::monotonic_time_nanos();
+                        if retry_now >= deadline {
+                            retry_deadline_reached = true;
+                            false
+                        } else if request.target_pending(cpu) && claim_retry(cpu, retry_now) {
+                            axhal::irq::send_ipi(IPI_IRQ, IpiTarget::Other { cpu_id: cpu });
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if retry_deadline_reached {
+                        break;
+                    }
+                    if sent {
+                        attempts.retries[cpu] = attempts.retries[cpu].saturating_add(1);
+                    }
+                }
+                if retry_deadline_reached {
+                    if let Some(grace) = request.try_complete() {
+                        return GlobalGrace { _grace: grace };
+                    }
+                    shootdown_timeout(&request, issuer_cpu, started, &attempts);
+                }
+                attempts.rounds += 1;
+                retry_interval = retry_interval.saturating_mul(2).min(RETRY_MAX_NS);
+                next_retry = axhal::time::monotonic_time_nanos().saturating_add(retry_interval);
             }
             core::hint::spin_loop();
         }
     }
 
-    pub(crate) fn synchronize_after_local_flush() -> GlobalGrace {
-        synchronize_after_local_maintenance(CpuMaintenance::TLB)
+    pub(crate) fn synchronize_tlb() -> GlobalGrace {
+        synchronize_cpu_maintenance(CpuMaintenance::TLB)
     }
 
-    pub(crate) fn synchronize_after_local_icache() -> GlobalGrace {
-        synchronize_after_local_maintenance(CpuMaintenance::ICACHE)
+    pub(crate) fn synchronize_icache() -> GlobalGrace {
+        synchronize_cpu_maintenance(CpuMaintenance::ICACHE)
     }
 
-    pub(crate) fn synchronize_after_local_tlb_and_icache() -> GlobalGrace {
-        synchronize_after_local_maintenance(CpuMaintenance::TLB_AND_ICACHE)
+    pub(crate) fn synchronize_tlb_and_icache() -> GlobalGrace {
+        synchronize_cpu_maintenance(CpuMaintenance::TLB_AND_ICACHE)
     }
 
-    pub(crate) fn retire_after_local_flush<T>(retired: T) {
-        let grace = synchronize_after_local_flush();
+    pub(crate) fn retire_after_tlb_grace<T>(retired: T) {
+        let grace = synchronize_tlb();
         drop(retired);
         drop(grace);
     }
 
     fn ipi_handler() {
-        service_cpu(axhal::percpu::this_cpu_id());
+        let cpu = axhal::percpu::this_cpu_id();
+        CPU_RUNTIME[cpu]
+            .ipi_handler_entries
+            .fetch_add(1, Ordering::Relaxed);
+        service_cpu(cpu);
+    }
+
+    fn claim_retry(cpu: usize, now: u64) -> bool {
+        // The backoff belongs to the target, not one issuer. Concurrent and
+        // newly arriving requests therefore cannot restart recovery at 1 ms.
+        CPU_RUNTIME[cpu].claim_retry(now)
     }
 
     fn service_cpu(cpu: usize) {
         let reasons = SHOOTDOWN
             .take_pending_reasons(cpu)
             .unwrap_or_else(|_| axhal::power::system_off());
+        if reasons == 0 {
+            return;
+        }
         if reasons & CPU_MAINTENANCE_REASON.bit() != 0 {
             SHOOTDOWN
                 .service_maintenance(cpu, |maintenance| {
-                    if maintenance.needs_tlb() {
-                        axhal::asm::flush_tlb(None);
-                    }
-                    if maintenance.needs_icache() {
-                        axhal::asm::flush_icache_all();
-                    }
+                    maintain_local(maintenance);
                 })
                 .unwrap_or_else(|_| axhal::power::system_off());
         }
@@ -111,15 +270,43 @@ mod imp {
         }
     }
 
-    fn shootdown_timeout(epoch: u64) -> ! {
-        error!("TLB shootdown epoch {epoch} timed out; refusing to reclaim mapping resources");
+    fn shootdown_timeout(
+        request: &ShootdownRequest<'_, { axconfig::plat::MAX_CPU_NUM }>,
+        issuer_cpu: usize,
+        started: u64,
+        attempts: &ShootdownAttempts,
+    ) -> ! {
+        let now = axhal::time::monotonic_time_nanos();
+        let epoch = request.epoch();
+        error!(
+            "TLB shootdown epoch {epoch} timed out: maintenance={:?} issuer_cpu={} current_cpu={} \
+             elapsed_ns={} retry_rounds={}; refusing to reclaim mapping resources",
+            request.maintenance(),
+            issuer_cpu,
+            axhal::percpu::this_cpu_id(),
+            now.saturating_sub(started),
+            attempts.rounds,
+        );
         let mut first_incomplete = None;
         for cpu in 0..axhal::cpu_num() {
+            if !request.targets(cpu) {
+                continue;
+            }
             match SHOOTDOWN.cpu_snapshot(cpu) {
                 Ok(snapshot) => {
+                    let pending = request.target_pending(cpu);
+                    let ipi_entries = CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+                    let ipi_entries_delta =
+                        ipi_entries.saturating_sub(attempts.ipi_entries_before[cpu]);
                     error!(
-                        "shootdown CPU {cpu}: online={} draining={} admissions={} reasons={:#x} \
-                         tlb_requested={} tlb_completed={} icache_requested={} icache_completed={}",
+                        "shootdown target CPU {cpu}: request_pending={} initial_attempt={} \
+                         retry_attempts={} online={} draining={} admissions={} reasons={:#x} \
+                         tlb_requested={} tlb_completed={} icache_requested={} \
+                         icache_completed={} ipi_entries_before={} ipi_entries={} \
+                         ipi_entries_delta={}",
+                        pending,
+                        attempts.initial[cpu],
+                        attempts.retries[cpu],
                         snapshot.is_online(),
                         snapshot.is_draining(),
                         snapshot.admissions(),
@@ -128,12 +315,11 @@ mod imp {
                         snapshot.completed_tlb_epoch(),
                         snapshot.requested_icache_epoch(),
                         snapshot.completed_icache_epoch(),
+                        attempts.ipi_entries_before[cpu],
+                        ipi_entries,
+                        ipi_entries_delta,
                     );
-                    if first_incomplete.is_none()
-                        && (snapshot.completed_tlb_epoch() < snapshot.requested_tlb_epoch()
-                            || snapshot.completed_icache_epoch()
-                                < snapshot.requested_icache_epoch())
-                    {
+                    if first_incomplete.is_none() && pending {
                         first_incomplete = Some((cpu, snapshot));
                     }
                 }
@@ -141,19 +327,58 @@ mod imp {
             }
         }
         if let Some((cpu, snapshot)) = first_incomplete {
+            let ipi_entries = CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
             panic!(
-                "TLB shootdown epoch {epoch} did not reach grace: CPU {cpu} reasons={:#x} \
-                 TLB={}/{} I-cache={}/{}",
+                "TLB shootdown epoch {epoch} did not reach grace: maintenance={:?} target CPU \
+                 {cpu} reasons={:#x} TLB completed={} request={} latest={} I-cache completed={} \
+                 request={} latest={} initial_attempt={} retry_attempts={} ipi_entries_before={} \
+                 ipi_entries={} ipi_entries_delta={}",
+                request.maintenance(),
                 snapshot.pending_reasons(),
                 snapshot.completed_tlb_epoch(),
+                epoch,
                 snapshot.requested_tlb_epoch(),
                 snapshot.completed_icache_epoch(),
+                epoch,
                 snapshot.requested_icache_epoch(),
+                attempts.initial[cpu],
+                attempts.retries[cpu],
+                attempts.ipi_entries_before[cpu],
+                ipi_entries,
+                ipi_entries.saturating_sub(attempts.ipi_entries_before[cpu]),
             );
         }
         panic!(
             "TLB shootdown epoch {epoch} did not reach grace without an incomplete CPU snapshot"
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use core::mem::align_of;
+
+        use super::*;
+
+        #[test]
+        fn retry_gate_is_cacheline_isolated_and_exponentially_bounded() {
+            assert!(align_of::<CpuRuntime>() >= 64);
+            let runtime = CpuRuntime::new();
+            let mut now = 1_000_000_000;
+            let mut interval = RETRY_INITIAL_NS;
+
+            for _ in 0..16 {
+                assert!(runtime.claim_retry(now));
+                assert!(!runtime.claim_retry(now));
+                assert_eq!(
+                    runtime.next_retry_ns.load(Ordering::Acquire),
+                    now.saturating_add(interval)
+                );
+                interval = interval.saturating_mul(2).min(RETRY_MAX_NS);
+                assert_eq!(runtime.retry_interval_ns.load(Ordering::Acquire), interval);
+                now = runtime.next_retry_ns.load(Ordering::Acquire);
+            }
+            assert_eq!(interval, RETRY_MAX_NS);
+        }
     }
 }
 
@@ -161,26 +386,36 @@ mod imp {
 mod imp {
     pub(crate) struct GlobalGrace;
 
-    pub(crate) const fn init() {}
+    pub(crate) fn init() {
+        assert_eq!(
+            axhal::cpu_num(),
+            1,
+            "multi-CPU kernels require the smp-tlb-shootdown feature"
+        );
+    }
 
-    pub(crate) const fn synchronize_after_local_flush() -> GlobalGrace {
+    pub(crate) fn synchronize_tlb() -> GlobalGrace {
+        axhal::asm::flush_tlb(None);
         GlobalGrace
     }
 
-    pub(crate) const fn synchronize_after_local_icache() -> GlobalGrace {
+    pub(crate) fn synchronize_icache() -> GlobalGrace {
+        axhal::asm::flush_icache_all();
         GlobalGrace
     }
 
-    pub(crate) const fn synchronize_after_local_tlb_and_icache() -> GlobalGrace {
+    pub(crate) fn synchronize_tlb_and_icache() -> GlobalGrace {
+        axhal::asm::flush_tlb(None);
+        axhal::asm::flush_icache_all();
         GlobalGrace
     }
 
-    pub(crate) fn retire_after_local_flush<T>(retired: T) {
+    pub(crate) fn retire_after_tlb_grace<T>(retired: T) {
+        axhal::asm::flush_tlb(None);
         drop(retired);
     }
 }
 
 pub(crate) use imp::{
-    init, retire_after_local_flush, synchronize_after_local_flush, synchronize_after_local_icache,
-    synchronize_after_local_tlb_and_icache,
+    init, retire_after_tlb_grace, synchronize_icache, synchronize_tlb, synchronize_tlb_and_icache,
 };

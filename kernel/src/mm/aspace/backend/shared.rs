@@ -514,7 +514,7 @@ impl BackendOps for SharedBackend {
                 });
             if needs_tlb_sync {
                 pt.flush();
-                drop(crate::mm::synchronize_after_local_flush());
+                drop(crate::mm::synchronize_tlb());
             }
             result
         })();

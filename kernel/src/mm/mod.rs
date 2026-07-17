@@ -12,8 +12,8 @@ pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
 pub(crate) use self::{
     remap::remap_user_mapping,
     tlb::{
-        init as init_tlb_shootdown, retire_after_local_flush, synchronize_after_local_flush,
-        synchronize_after_local_icache, synchronize_after_local_tlb_and_icache,
+        init as init_tlb_shootdown, retire_after_tlb_grace, synchronize_icache, synchronize_tlb,
+        synchronize_tlb_and_icache,
     },
 };
 

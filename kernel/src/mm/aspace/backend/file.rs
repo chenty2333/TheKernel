@@ -503,7 +503,7 @@ impl FileBackendInner {
         let result = aspace.page_table_mut().cursor().unmap(vaddr);
         match result {
             Ok(_) => {
-                drop(crate::mm::synchronize_after_local_flush());
+                drop(crate::mm::synchronize_tlb());
                 true
             }
             Err(PagingError::NotMapped) => true,
@@ -899,7 +899,7 @@ impl FileBackend {
         }
         if !writable {
             pt.flush();
-            drop(crate::mm::synchronize_after_local_flush());
+            drop(crate::mm::synchronize_tlb());
             self.deactivate_writable_segment()?;
         }
         Ok(())
@@ -1227,7 +1227,7 @@ impl BackendOps for FileBackend {
         });
         if needs_tlb_sync {
             pt.flush();
-            drop(crate::mm::synchronize_after_local_flush());
+            drop(crate::mm::synchronize_tlb());
         }
         outcome
     }

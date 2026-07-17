@@ -546,11 +546,10 @@ fn riscv_flush_icache_is_local(flags: usize) -> AxResult<bool> {
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> AxResult<isize> {
-    let local = riscv_flush_icache_is_local(flags)?;
-    riscv::asm::fence_i();
-    if !local {
-        drop(crate::mm::synchronize_after_local_icache());
-    }
+    let _local = riscv_flush_icache_is_local(flags)?;
+    // Until address-space context switches carry a stale-hart generation,
+    // conservatively synchronize every online CPU even for LOCAL requests.
+    drop(crate::mm::synchronize_icache());
     Ok(0)
 }
 

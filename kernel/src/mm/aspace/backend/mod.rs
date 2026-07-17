@@ -267,7 +267,7 @@ impl MappingBackend for Backend {
         drop(cursor);
         match result {
             Ok(retired) => {
-                super::super::retire_after_local_flush(retired);
+                super::super::retire_after_tlb_grace(retired);
                 true
             }
             Err(err) => {

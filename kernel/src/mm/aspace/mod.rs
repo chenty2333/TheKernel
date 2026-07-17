@@ -73,8 +73,7 @@ fn classify_page_population(result: AxResult<usize>) -> PageFaultResult {
 #[inline]
 fn synchronize_executable_publication(flags: MappingFlags) {
     if flags.contains(MappingFlags::EXECUTE) {
-        axhal::asm::flush_icache_all();
-        drop(super::synchronize_after_local_icache());
+        drop(super::synchronize_icache());
     }
 }
 
@@ -956,10 +955,9 @@ impl PreparedProtect<'_> {
         } = self;
         let areas = transaction.commit();
         if synchronize_instruction_stream {
-            axhal::asm::flush_icache_all();
-            drop(super::synchronize_after_local_tlb_and_icache());
+            drop(super::synchronize_tlb_and_icache());
         } else {
-            drop(super::synchronize_after_local_flush());
+            drop(super::synchronize_tlb());
         }
         let areas = areas?;
         Self::refresh_growdown_starts(areas, growdown_starts);
@@ -2004,7 +2002,7 @@ impl AddrSpace {
         let retirement =
             self.areas
                 .unmap_deferred_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
-        let grace = super::synchronize_after_local_flush();
+        let grace = super::synchronize_tlb();
         retirement.release();
         drop(grace);
         Ok(())
@@ -2012,7 +2010,7 @@ impl AddrSpace {
 
     fn clear_areas_with_tlb_grace(&mut self) -> MappingResult {
         let retirement = self.areas.clear_deferred(&mut self.pt)?;
-        let grace = super::synchronize_after_local_flush();
+        let grace = super::synchronize_tlb();
         retirement.release();
         drop(grace);
         Ok(())
@@ -2538,7 +2536,7 @@ impl AddrSpace {
                 Ok(())
             })()
         };
-        super::retire_after_local_flush(retired);
+        super::retire_after_tlb_grace(retired);
         result
     }
 
@@ -3133,7 +3131,7 @@ impl AddrSpace {
             .is_ok())
         );
         drop(self_modify);
-        drop(super::synchronize_after_local_flush());
+        drop(super::synchronize_tlb());
         drop(guard);
 
         Ok(new_aspace)

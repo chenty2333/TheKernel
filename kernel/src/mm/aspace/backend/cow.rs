@@ -484,7 +484,7 @@ impl CowBackend {
         let Some(frame_ref) = frame else {
             pt.protect(vaddr, page_table_flags(flags))?;
             pt.flush();
-            drop(crate::mm::synchronize_after_local_flush());
+            drop(crate::mm::synchronize_tlb());
             self.mark_materialized();
             return Ok(());
         };
@@ -495,7 +495,7 @@ impl CowBackend {
                 // Only one reference, just upgrade the permissions.
                 pt.protect(vaddr, page_table_flags(flags))?;
                 pt.flush();
-                drop(crate::mm::synchronize_after_local_flush());
+                drop(crate::mm::synchronize_tlb());
                 self.mark_materialized();
                 return Ok(());
             }
@@ -514,7 +514,7 @@ impl CowBackend {
                     return Err(err.into());
                 }
                 pt.flush();
-                drop(crate::mm::synchronize_after_local_flush());
+                drop(crate::mm::synchronize_tlb());
                 frame_ref.lock().drop_frame(paddr, self.size);
             }
         }
