@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use axtask::{current, future::block_on, yield_now};
+use axtask::{can_block_current, current, future::block_on, yield_now};
 use event_listener::{Event, listener};
 
 /// A [`lock_api::RawMutex`] implementation.
@@ -136,6 +136,12 @@ unsafe impl lock_api::RawMutex for RawMutex {
                 continue;
             }
 
+            assert!(
+                can_block_current(),
+                "{} attempted to wait on a sleeping mutex from a non-blockable context",
+                current().id_name()
+            );
+
             if spin.spin() {
                 owner_id = self.owner_id.load(Ordering::Relaxed);
                 continue;
@@ -154,12 +160,9 @@ unsafe impl lock_api::RawMutex for RawMutex {
                 continue;
             }
 
-            // The maintained task runtime can reject a nested block session.
-            // In that case the listener is still dropped safely at the end of
-            // this iteration; yield once and retry instead of tight-spinning.
-            if block_on(listener).is_err() {
-                yield_now();
-            }
+            block_on(listener).unwrap_or_else(|error| {
+                panic!("sleeping mutex wait failed for {}: {error}", current().id_name())
+            });
             owner_id = self.owner_id.load(Ordering::Acquire);
         }
     }

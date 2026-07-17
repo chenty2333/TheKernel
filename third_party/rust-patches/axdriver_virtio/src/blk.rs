@@ -100,6 +100,7 @@ fn accepted_request_handles<'a>(
 fn wait_error_to_dev(error: WaitError) -> DevError {
     match error {
         WaitError::Block(BlockOnError::Busy) => DevError::ResourceBusy,
+        WaitError::Block(BlockOnError::CannotBlock) => DevError::Again,
         WaitError::Block(BlockOnError::GenerationExhausted | BlockOnError::StateLost) => {
             DevError::BadState
         }
