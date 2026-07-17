@@ -3,6 +3,7 @@ use axtask::{TaskCreateError, TaskInner};
 use linux_raw_sys::general::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR};
 use starry_process::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
 use starry_signal::{SignalInfo, Signo};
+use starry_vm::VmMutPtr;
 
 use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit, force_signal_current_thread,
@@ -57,6 +58,12 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
             let thr = curr.as_thread();
             let tid = linux_pid_from_task_id(curr.id().as_u64())
                 .unwrap_or_else(|error| fail_closed_exit(error));
+            let child_tid = thr.take_child_tid_address() as *mut Pid;
+            if !child_tid.is_null() {
+                // Linux publishes CLONE_CHILD_SETTID from schedule_tail() in
+                // the child context. A copy fault does not cancel the clone.
+                let _ = child_tid.vm_write(thr.tid());
+            }
             while !thr.pending_exit() {
                 #[cfg(target_arch = "loongarch64")]
                 super::restore_current_user_fpu_state();

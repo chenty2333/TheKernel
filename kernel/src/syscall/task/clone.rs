@@ -28,7 +28,7 @@ use crate::{
         ProcessAccessState, ProcessData, ProcessThreadAdmission, TaskParentChoice, Thread,
         get_process_data, linux_pid_from_task_id, lock_task_parent_publication,
         prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
-        try_tasks, vm_write_in_aspace,
+        try_tasks,
     },
 };
 
@@ -609,7 +609,9 @@ impl CloneArgs {
             TaskParentChoice::Caller(calling_thread.task_parent_node().clone())
         };
         thr.set_sched_reset_on_fork(child_reset_on_fork);
-        let child_aspace = new_proc_data.aspace();
+        if flags.contains(CloneFlags::CHILD_SETTID) {
+            thr.set_child_tid_address(child_tid);
+        }
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
         }
@@ -736,16 +738,12 @@ impl CloneArgs {
             );
         }
 
-        // Linux performs both TID stores only after child construction has
-        // succeeded, and neither copy fault cancels an otherwise successful
-        // clone. Keep them after every fallible admission so a failed clone
-        // cannot leave a TID for a child that was never published. The child
-        // is not runnable until `publish_prepared_task()` below.
+        // Linux performs PARENT_SETTID only after child construction succeeds,
+        // and a copy fault does not cancel an otherwise successful clone. The
+        // CHILD_SETTID address was attached to the private Thread above; the
+        // child consumes it before first entering user mode, after publication.
         if flags.contains(CloneFlags::PARENT_SETTID) {
             let _ = (parent_tid as *mut Pid).vm_write(tid);
-        }
-        if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
-            let _ = vm_write_in_aspace(&child_aspace, child_tid as *mut Pid, tid);
         }
         release_clone_lifecycle_then(fork_lifecycle, || {
             if let Some(publication) = credential_publication {

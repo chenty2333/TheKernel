@@ -590,7 +590,7 @@ fn do_execve(
 
     reset_exec_signal_state(thr);
 
-    // Clear set_child_tid after exec since the original address is no longer valid
+    // Clear clear_child_tid after exec since the original address is no longer valid.
     curr.as_thread().set_clear_child_tid(0);
     curr.as_thread().set_robust_list_head(0);
 

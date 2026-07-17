@@ -7,20 +7,19 @@ extern crate std;
 #[cfg(test)]
 use core::cell::Cell;
 use core::{
-    alloc::Layout,
     ffi::c_long,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
-use axhal::{paging::MappingFlags, power::system_off};
+use axhal::power::system_off;
 use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use hashbrown::{HashMap, HashSet};
 use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
+use memory_addr::PhysAddr;
 use spin::Lazy;
 use starry_process::{ExitOutcome, Pid, ProcessError};
 use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
@@ -835,47 +834,6 @@ pub fn set_current_user_page_table_root(root: PhysAddr) {
     install_current_user_page_table_root(curr_ptr, root);
 }
 
-/// Executes `f` with the current task temporarily bound to `root`.
-///
-/// Some kernel paths need to touch user memory on behalf of a freshly cloned or
-/// exiting task. Those writes must target the intended user page table instead
-/// of whichever root happens to be active at the moment.
-pub fn with_current_user_page_table_root<R>(root: PhysAddr, f: impl FnOnce() -> R) -> R {
-    let _guard = NoPreemptIrqSave::new();
-    let curr = current();
-    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
-    let old_root = axhal::asm::read_user_page_table();
-    install_current_user_page_table_root(curr_ptr, root);
-    let result = f();
-    install_current_user_page_table_root(curr_ptr, old_root);
-    result
-}
-
-/// Writes `value` into `ptr` within `aspace_handle`.
-///
-/// The caller may target a different process or a not-yet-running child, so we
-/// must both pre-populate the destination pages in that address space and then
-/// execute the copy under the matching user page table root.
-pub fn vm_write_in_aspace<T: Copy>(
-    aspace_handle: &Arc<Mutex<AddrSpace>>,
-    ptr: *mut T,
-    value: T,
-) -> AxResult<()> {
-    let layout = Layout::new::<T>();
-    let start = VirtAddr::from_usize(ptr.addr());
-    let root = {
-        let mut aspace = aspace_handle.lock();
-        if !aspace.can_access_range(start, layout.size(), MappingFlags::WRITE) {
-            return Err(AxError::BadAddress);
-        }
-        let page_start = start.align_down_4k();
-        let page_end = (start + layout.size()).align_up_4k();
-        aspace.populate_area(page_start, page_end - page_start, MappingFlags::WRITE)?;
-        aspace.page_table_root()
-    };
-    with_current_user_page_table_root(root, || ptr.vm_write(value)).map_err(Into::into)
-}
-
 struct ProcessPtraceExitRetirements {
     _traced_relationship: Option<PtraceRelationshipSnapshot>,
     _reverse_links: super::process::PtraceReverseLinkDrain,
@@ -1398,13 +1356,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     }
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
-    let aspace = thr.proc_data.aspace();
-    let clear_result = if clear_child_tid.is_null() {
-        Ok(())
-    } else {
-        vm_write_in_aspace(&aspace, clear_child_tid, 0u32)
-    };
-    if !clear_child_tid.is_null() && clear_result.is_ok() {
+    if !clear_child_tid.is_null() {
+        // Linux attempts FUTEX_WAKE even when clearing the user word faults.
+        // Both operations are best-effort during terminal task teardown.
+        let _ = clear_child_tid.vm_write(0u32);
         let key = FutexKey::new_current(clear_child_tid as usize);
         let table = futex_table_for(&key);
         let guard = table.get(&key);
@@ -1416,7 +1371,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     if !head.is_null() {
         exit_robust_list(head);
     }
-    drop(aspace);
 
     thr.proc_data
         .account_exited_thread(TaskUsage::from_thread(thr));

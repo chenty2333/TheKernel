@@ -726,6 +726,13 @@ pub struct Thread {
     /// blocked OFD operations at once.
     file_write_credentials: SpinNoIrq<Option<OpenCredentials>>,
 
+    /// Pending Linux `CLONE_CHILD_SETTID` publication.
+    ///
+    /// Clone installs this address while the task is still private. The child
+    /// consumes it exactly once in its own address space before first entering
+    /// user mode; the parent is not required to wait for that store.
+    set_child_tid: AtomicUsize,
+
     /// The clear thread tid field
     ///
     /// See <https://manpages.debian.org/unstable/manpages-dev/set_tid_address.2.en.html#clear_child_tid>
@@ -811,6 +818,7 @@ impl Thread {
             credential,
             file_operation_credential: SpinNoIrq::new(None),
             file_write_credentials: SpinNoIrq::new(None),
+            set_child_tid: AtomicUsize::new(0),
             clear_child_tid: AtomicUsize::new(0),
             visible_tid: AtomicU32::new(tid),
             kernel_tid: tid,
@@ -881,6 +889,16 @@ impl Thread {
     /// Get the clear child tid field.
     pub fn clear_child_tid(&self) -> usize {
         self.clear_child_tid.load(Ordering::Relaxed)
+    }
+
+    /// Installs the one-shot `CLONE_CHILD_SETTID` address before publication.
+    pub(crate) fn set_child_tid_address(&self, set_child_tid: usize) {
+        self.set_child_tid.store(set_child_tid, Ordering::Release);
+    }
+
+    /// Takes the one-shot child-TID publication action on first task entry.
+    pub(crate) fn take_child_tid_address(&self) -> usize {
+        self.set_child_tid.swap(0, Ordering::AcqRel)
     }
 
     /// Get the user-visible thread ID.
