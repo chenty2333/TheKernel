@@ -20,7 +20,14 @@ The repository-owned adapters cover:
   `SIGKILL` after an exact guest marker, a second recovery boot, clean unmount,
   and host `e2fsck` verification;
 - `nonloopback-network.sh`: a nonce-authenticated TCP exchange from the guest
-  VirtIO NIC through QEMU user networking to a one-shot host peer.
+  VirtIO NIC through QEMU user networking to a one-shot host peer;
+- `smp-tlb-shootdown.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs.
+  For every non-control CPU it warms translations remotely, keeps that worker
+  in a syscall-free heartbeat spin across the page-table mutation, verifies its
+  actual CPU before and after the critical accesses, and checks 1-page and
+  64-page `mprotect`, `munmap` plus fixed replacement, fixed `mremap`, and fork
+  COW transitions. Any stale access, incomplete CPU/case matrix, topology
+  mismatch, or operational failure rejects the run;
 - `mm-performance.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs. It
   records VMA-scale mapping latency, `mremap` latency, an `mprotect` plus touch
   TLB-sensitive proxy, and regular-file direct-I/O pin latency, throughput, and
@@ -41,6 +48,16 @@ Likewise, concurrent direct I/O is an end-to-end proxy that reaches the pin
 path; it does not isolate time spent in one particular spinlock. The standalone
 parser can still normalize an explicit `missing` record for diagnostic use,
 but the nightly adapter requires all five metrics to be present.
+
+The SMP TLB adapter is a semantic gate, not a hardware event counter. Its
+qualification must include a mutation run from a disposable build in which
+remote maintenance delivery is suppressed: at least one warmed remote access
+must produce a `status=stale` result and the adapter must fail. Do not add that
+fault injection as a production default or accept a clean pass from the
+known-bad build. Timer preemption can still evict a translation naturally, so
+the matrix covers every remote CPU and both a single hot page and a range; the
+mutation run remains the proof that the workload can turn the intended defect
+red.
 
 `THEKERNEL_NIGHTLY_ARCHES` accepts `rv`, `la`, or `both` (the default). Missing
 QEMU binaries, cross compilers, rootfs build tools, or filesystem tools cause
@@ -63,3 +80,10 @@ command, metrics, and log paths. It rechecks all three clean HEADs after the
 matrix. The guest also completes fixed-destination replacement, shared
 `old_size == 0` alias/coherence, and grow/shrink prefix-integrity checks before
 emitting the semantic-pass marker.
+
+`smp-tlb-shootdown.sh` applies the same clean-source rule to TheKernel,
+`thekernel-ax`, and `thekernel-linux-abi`, forces a topology-specific kernel and
+content-addressed rootfs rebuild for every matrix cell, and rechecks all three
+repositories afterward. Its manifest records the three commits, requested and
+guest-observed topology, kernel/rootfs SHA-256 values, QEMU path/version, and
+per-run copies of the kernel, command stream, and complete console log.

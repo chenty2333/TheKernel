@@ -336,7 +336,8 @@ if "$CI_DIR/validate-boot-log.sh" rv "$tmp/missing.log" >/dev/null 2>&1; then
     exit 1
 fi
 
-for category in pressure oom-failpoint fs-powercut nonloopback-network mm-performance; do
+for category in pressure oom-failpoint fs-powercut nonloopback-network \
+    smp-tlb-shootdown mm-performance; do
     "$CI_DIR/nightly-gate.sh" --list | grep -q "^${category}"
 done
 
@@ -362,10 +363,11 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_SMP_TLB_SHOOTDOWN_ENABLED=0 \
     THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly" >/dev/null
 
-[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 5 ]
+[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 6 ]
 
 # Configured adapters retain the same three-state contract as repository
 # adapters. In particular, exit 78 must remain unsupported and make the whole
@@ -376,6 +378,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_SMP_TLB_SHOOTDOWN_ENABLED=0 \
     THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-unsupported" >/dev/null
 status=$?
@@ -392,6 +395,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_SMP_TLB_SHOOTDOWN_ENABLED=0 \
     THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-fail" >/dev/null
 status=$?
@@ -407,6 +411,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_SMP_TLB_SHOOTDOWN_ENABLED=0 \
     THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-pass" >/dev/null
 grep -q $'^pressure\tpass\t' "$tmp/nightly-pass/nightly-status.tsv"
@@ -426,6 +431,15 @@ if grep -Fq 'UNSUPPORTED' "$tmp/invalid-arch.log"; then
     printf 'test-ci-scripts: invalid adapter architecture was misclassified as unsupported\n' >&2
     exit 1
 fi
+
+if THEKERNEL_SMP_TLB_CPUS=1 \
+    "$CI_DIR/nightly/smp-tlb-shootdown.sh" \
+    >"$tmp/invalid-smp-tlb-cpus.log" 2>&1; then
+    printf 'test-ci-scripts: SMP TLB adapter accepted a one-CPU matrix\n' >&2
+    exit 1
+fi
+grep -Fq 'THEKERNEL_SMP_TLB_CPUS must contain values from 2 to 64' \
+    "$tmp/invalid-smp-tlb-cpus.log"
 
 # Verify the shared runner records and enforces a real wall-clock timeout.
 # shellcheck source=../../scripts/ci/lib.sh
@@ -532,14 +546,47 @@ PY
 wait "$peer_pid"
 grep -Fq 'network-peer: validated guest request' "$tmp/peer.log"
 
-# Compile both project guest-helper modes on the host. The guest gate supplies the
+# Compile the project guest helpers on the host. The guest OOM gate supplies the
 # strict overcommit policy that makes its finite request fail deterministically.
 cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
     "$REPO_ROOT/tests/guest/tools/mm-performance.c" \
     -o "$tmp/mm-performance"
+cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
+    "$REPO_ROOT/tests/guest/tools/smp-tlb-shootdown.c" \
+    -o "$tmp/smp-tlb-shootdown"
 cc -O2 -std=c11 "$REPO_ROOT/tests/guest/tools/oom-admission.c" \
     -o "$tmp/nightly-oom-admission"
 "$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null
 "$tmp/nightly-oom-admission" --expect-failure 18446744073709551615 >/dev/null
+
+# The SMP TLB parser requires the complete per-CPU, per-page-size case matrix
+# and rejects a stale result even when a success marker remains in the log.
+smp_tlb_log="$tmp/smp-tlb.log"
+printf '%s\n' \
+    'SMP_TLB_TOPOLOGY online_cpus=2 control_cpu=0 worker_count=1 worker_cpus=1' \
+    >"$smp_tlb_log"
+for pages in 1 64; do
+    for case_name in mprotect_revoke_write munmap_fixed_replace \
+        mremap_fixed_old_alias fork_cow_snapshot; do
+        printf 'SMP_TLB_CASE case=%s pages=%s worker_cpu=1 status=ok stale_count=0\n' \
+            "$case_name" "$pages" >>"$smp_tlb_log"
+    done
+done
+printf '%s\n' 'SMP_TLB_GATE status=ok stale_count=0' >>"$smp_tlb_log"
+"$CI_DIR/validate-smp-tlb-log.sh" "$smp_tlb_log" 2 >/dev/null
+sed '0,/status=ok/{s/status=ok/status=stale/;}' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-stale.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-stale.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted a stale case\n' >&2
+    exit 1
+fi
+sed '0,/^SMP_TLB_CASE /{/^SMP_TLB_CASE /d;}' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-incomplete.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-incomplete.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted an incomplete matrix\n' >&2
+    exit 1
+fi
 
 printf 'test-ci-scripts: PASS\n'
