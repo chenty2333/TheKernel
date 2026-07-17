@@ -27,7 +27,11 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 - `e0a7cc1` aligned RISC-V runtime packaging and platform configuration.
 - `5641ef3` retained console/configuration changes needed by the generic runtime path.
-- Maintained delta: QEMU-virt platform configuration and console integration only.
+- TheKernel's SMP TLB integration acknowledges the current supervisor software
+  interrupt before dispatch so a concurrent IPI reasserts `SSIP` instead of
+  being cleared as part of the older delivery.
+- Maintained delta: QEMU-virt platform configuration, console integration, and
+  lossless concurrent software-interrupt dispatch.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

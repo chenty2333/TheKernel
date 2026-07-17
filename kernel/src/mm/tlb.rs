@@ -113,24 +113,47 @@ mod imp {
 
     fn shootdown_timeout(epoch: u64) -> ! {
         error!("TLB shootdown epoch {epoch} timed out; refusing to reclaim mapping resources");
+        let mut first_incomplete = None;
         for cpu in 0..axhal::cpu_num() {
             match SHOOTDOWN.cpu_snapshot(cpu) {
-                Ok(snapshot) => error!(
-                    "shootdown CPU {cpu}: online={} draining={} admissions={} reasons={:#x} \
-                     tlb_requested={} tlb_completed={} icache_requested={} icache_completed={}",
-                    snapshot.is_online(),
-                    snapshot.is_draining(),
-                    snapshot.admissions(),
-                    snapshot.pending_reasons(),
-                    snapshot.requested_tlb_epoch(),
-                    snapshot.completed_tlb_epoch(),
-                    snapshot.requested_icache_epoch(),
-                    snapshot.completed_icache_epoch(),
-                ),
+                Ok(snapshot) => {
+                    error!(
+                        "shootdown CPU {cpu}: online={} draining={} admissions={} reasons={:#x} \
+                         tlb_requested={} tlb_completed={} icache_requested={} icache_completed={}",
+                        snapshot.is_online(),
+                        snapshot.is_draining(),
+                        snapshot.admissions(),
+                        snapshot.pending_reasons(),
+                        snapshot.requested_tlb_epoch(),
+                        snapshot.completed_tlb_epoch(),
+                        snapshot.requested_icache_epoch(),
+                        snapshot.completed_icache_epoch(),
+                    );
+                    if first_incomplete.is_none()
+                        && (snapshot.completed_tlb_epoch() < snapshot.requested_tlb_epoch()
+                            || snapshot.completed_icache_epoch()
+                                < snapshot.requested_icache_epoch())
+                    {
+                        first_incomplete = Some((cpu, snapshot));
+                    }
+                }
                 Err(error) => error!("TLB CPU {cpu}: snapshot failed: {error:?}"),
             }
         }
-        panic!("TLB shootdown epoch {epoch} did not reach grace");
+        if let Some((cpu, snapshot)) = first_incomplete {
+            panic!(
+                "TLB shootdown epoch {epoch} did not reach grace: CPU {cpu} reasons={:#x} \
+                 TLB={}/{} I-cache={}/{}",
+                snapshot.pending_reasons(),
+                snapshot.completed_tlb_epoch(),
+                snapshot.requested_tlb_epoch(),
+                snapshot.completed_icache_epoch(),
+                snapshot.requested_icache_epoch(),
+            );
+        }
+        panic!(
+            "TLB shootdown epoch {epoch} did not reach grace without an incomplete CPU snapshot"
+        );
     }
 }
 

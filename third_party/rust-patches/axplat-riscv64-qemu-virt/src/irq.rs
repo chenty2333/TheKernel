@@ -194,13 +194,17 @@ impl IrqIf for IrqIfImpl {
             },
             @S_SOFT => {
                 trace!("IRQ: IPI");
+                // A new IPI may arrive while its callback drains a software
+                // mailbox. Acknowledge the current interrupt first so that a
+                // concurrent send reasserts SSIP instead of being cleared on
+                // return as part of this older delivery.
+                unsafe {
+                    riscv::register::sip::clear_ssoft();
+                }
                 let handler = IPI_HANDLER.load(Ordering::Acquire);
                 if !handler.is_null() {
                     // SAFETY: The handler is guaranteed to be a valid function pointer.
                     unsafe { core::mem::transmute::<*mut (), IrqHandler>(handler)() };
-                }
-                unsafe {
-                    riscv::register::sip::clear_ssoft();
                 }
                 Some(irq)
             },
