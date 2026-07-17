@@ -83,6 +83,7 @@ qemu = [
 smp = [
     "axfeat/smp",
     "thekernel-kernel/smp-tlb-shootdown",
+    "thekernel-kernel/irq-continuation-diagnostics",
     "axplat-riscv64-visionfive2?/smp",
 ]
 

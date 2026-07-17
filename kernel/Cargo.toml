@@ -16,6 +16,7 @@ memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 test-io-control = ["axfs/test-io-control"]
 vsock = ["axfeat/vsock"]
 smp-tlb-shootdown = ["axhal/ipi"]
+irq-continuation-diagnostics = ["axtask/irq-continuation-diagnostics"]
 
 [dependencies]
 axfeat = { workspace = true, features = [

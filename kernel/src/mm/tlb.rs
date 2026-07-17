@@ -69,6 +69,9 @@ mod imp {
         initial: [bool; axconfig::plat::MAX_CPU_NUM],
         retries: [u8; axconfig::plat::MAX_CPU_NUM],
         ipi_entries_before: [u64; axconfig::plat::MAX_CPU_NUM],
+        #[cfg(feature = "irq-continuation-diagnostics")]
+        irq_diagnostics_before:
+            [Option<axtask::IrqContinuationDiagnosticSnapshot>; axconfig::plat::MAX_CPU_NUM],
         rounds: usize,
     }
 
@@ -78,6 +81,8 @@ mod imp {
                 initial: [false; axconfig::plat::MAX_CPU_NUM],
                 retries: [0; axconfig::plat::MAX_CPU_NUM],
                 ipi_entries_before: [0; axconfig::plat::MAX_CPU_NUM],
+                #[cfg(feature = "irq-continuation-diagnostics")]
+                irq_diagnostics_before: [None; axconfig::plat::MAX_CPU_NUM],
                 rounds: 0,
             }
         }
@@ -131,6 +136,11 @@ mod imp {
             for cpu in 0..cpu_count {
                 attempts.ipi_entries_before[cpu] =
                     CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+                #[cfg(feature = "irq-continuation-diagnostics")]
+                {
+                    attempts.irq_diagnostics_before[cpu] =
+                        axtask::irq_continuation_diagnostic_snapshot(cpu);
+                }
             }
             maintain_local(maintenance);
             let request = SHOOTDOWN
@@ -322,6 +332,10 @@ mod imp {
                     if first_incomplete.is_none() && pending {
                         first_incomplete = Some((cpu, snapshot));
                     }
+                    #[cfg(feature = "irq-continuation-diagnostics")]
+                    if pending {
+                        log_irq_continuation_diagnostics(cpu, attempts.irq_diagnostics_before[cpu]);
+                    }
                 }
                 Err(error) => error!("TLB CPU {cpu}: snapshot failed: {error:?}"),
             }
@@ -351,6 +365,107 @@ mod imp {
         panic!(
             "TLB shootdown epoch {epoch} did not reach grace without an incomplete CPU snapshot"
         );
+    }
+
+    #[cfg(feature = "irq-continuation-diagnostics")]
+    fn log_irq_continuation_diagnostics(
+        cpu: usize,
+        before: Option<axtask::IrqContinuationDiagnosticSnapshot>,
+    ) {
+        let Some(after) = axtask::irq_continuation_diagnostic_snapshot(cpu) else {
+            error!("IRQ continuation diagnostics unavailable for CPU {cpu}");
+            return;
+        };
+        let before = before.unwrap_or(axtask::IrqContinuationDiagnosticSnapshot {
+            latest_sequence: 0,
+            timer_events: 0,
+            context_switches: 0,
+            context_switch_returns: 0,
+            irq_off_preempt_disables: 0,
+            irq_off_preempt_enables: 0,
+            irq_off_outermost_preempt_enables: 0,
+            irq_off_preempt_enable_returns: 0,
+            irq_off_preempt_checks: 0,
+            irq_off_preempt_check_returns: 0,
+            irq_off_yield_entries: 0,
+            irq_off_yield_returns: 0,
+            irq_off_idle_boundaries: 0,
+        });
+        error!(
+            "IRQ continuation CPU {cpu}: latest_sequence={} timer_events={} timer_delta={} \
+             switches={} switch_delta={} switch_returns={} switch_return_delta={} \
+             irq_off_disables={} irq_off_disable_delta={} irq_off_enables={} \
+             irq_off_enable_delta={} irq_off_outermost_enables={} \
+             irq_off_outermost_enable_delta={} irq_off_enable_returns={} \
+             irq_off_enable_return_delta={} irq_off_checks={} irq_off_check_delta={} \
+             irq_off_check_returns={} irq_off_check_return_delta={} irq_off_yield_entries={} \
+             irq_off_yield_entry_delta={} irq_off_yield_returns={} irq_off_yield_return_delta={} \
+             irq_off_idle_boundaries={} irq_off_idle_boundary_delta={} \
+             flags_bits=irq_enabled:0,idle:1,need_resched:2,resched_allowed:3,peer_idle:4",
+            after.latest_sequence,
+            after.timer_events,
+            after.timer_events.saturating_sub(before.timer_events),
+            after.context_switches,
+            after
+                .context_switches
+                .saturating_sub(before.context_switches),
+            after.context_switch_returns,
+            after
+                .context_switch_returns
+                .saturating_sub(before.context_switch_returns),
+            after.irq_off_preempt_disables,
+            after
+                .irq_off_preempt_disables
+                .saturating_sub(before.irq_off_preempt_disables),
+            after.irq_off_preempt_enables,
+            after
+                .irq_off_preempt_enables
+                .saturating_sub(before.irq_off_preempt_enables),
+            after.irq_off_outermost_preempt_enables,
+            after
+                .irq_off_outermost_preempt_enables
+                .saturating_sub(before.irq_off_outermost_preempt_enables),
+            after.irq_off_preempt_enable_returns,
+            after
+                .irq_off_preempt_enable_returns
+                .saturating_sub(before.irq_off_preempt_enable_returns),
+            after.irq_off_preempt_checks,
+            after
+                .irq_off_preempt_checks
+                .saturating_sub(before.irq_off_preempt_checks),
+            after.irq_off_preempt_check_returns,
+            after
+                .irq_off_preempt_check_returns
+                .saturating_sub(before.irq_off_preempt_check_returns),
+            after.irq_off_yield_entries,
+            after
+                .irq_off_yield_entries
+                .saturating_sub(before.irq_off_yield_entries),
+            after.irq_off_yield_returns,
+            after
+                .irq_off_yield_returns
+                .saturating_sub(before.irq_off_yield_returns),
+            after.irq_off_idle_boundaries,
+            after
+                .irq_off_idle_boundaries
+                .saturating_sub(before.irq_off_idle_boundaries),
+        );
+
+        let first_sequence = after.latest_sequence.saturating_sub(15).max(1);
+        for sequence in first_sequence..=after.latest_sequence {
+            if let Some(event) = axtask::irq_continuation_diagnostic_event(cpu, sequence) {
+                error!(
+                    "IRQ continuation CPU {cpu} event: sequence={} kind={} task_id={} \
+                     peer_task_id={} flags={:#x} preempt_disable_count={}",
+                    event.sequence,
+                    event.kind,
+                    event.task_id,
+                    event.peer_task_id,
+                    event.flags,
+                    event.preempt_disable_count,
+                );
+            }
+        }
     }
 
     #[cfg(test)]
