@@ -46,6 +46,23 @@ fn this_context() -> usize {
     hart_id * 2 + 1 // supervisor context
 }
 
+#[inline]
+fn require_ipi_send_success(target_cpu: usize, error: usize) {
+    if error != 0 {
+        // Continuing would let callers assume remote maintenance that never ran.
+        panic!(
+            "SBI send_ipi to CPU {target_cpu} failed with error {}",
+            error as isize
+        );
+    }
+}
+
+#[inline]
+fn send_ipi_to(cpu_id: usize) {
+    let res = sbi_rt::send_ipi(HartMask::from_mask_base(1 << cpu_id, 0));
+    require_ipi_send_success(cpu_id, res.error);
+}
+
 pub(super) fn init_percpu() {
     // enable soft interrupts, timer interrupts, and external interrupts
     unsafe {
@@ -229,27 +246,34 @@ impl IrqIf for IrqIfImpl {
     fn send_ipi(_irq_num: usize, target: IpiTarget) {
         match target {
             IpiTarget::Current { cpu_id } => {
-                let res = sbi_rt::send_ipi(HartMask::from_mask_base(1 << cpu_id, 0));
-                if res.is_err() {
-                    warn!("send_ipi failed: {res:?}");
-                }
+                send_ipi_to(cpu_id);
             }
             IpiTarget::Other { cpu_id } => {
-                let res = sbi_rt::send_ipi(HartMask::from_mask_base(1 << cpu_id, 0));
-                if res.is_err() {
-                    warn!("send_ipi failed: {res:?}");
-                }
+                send_ipi_to(cpu_id);
             }
             IpiTarget::AllExceptCurrent { cpu_id, cpu_num } => {
                 for i in 0..cpu_num {
                     if i != cpu_id {
-                        let res = sbi_rt::send_ipi(HartMask::from_mask_base(1 << i, 0));
-                        if res.is_err() {
-                            warn!("send_ipi_all_others failed: {res:?}");
-                        }
+                        send_ipi_to(i);
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_ipi_send_success;
+
+    #[test]
+    fn accepts_successful_sbi_ipi_result() {
+        require_ipi_send_success(2, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "SBI send_ipi to CPU 3 failed with error -3")]
+    fn rejects_failed_sbi_ipi_result() {
+        require_ipi_send_success(3, (-3isize) as usize);
     }
 }

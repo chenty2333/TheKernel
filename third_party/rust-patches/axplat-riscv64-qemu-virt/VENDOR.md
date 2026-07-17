@@ -30,8 +30,10 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - TheKernel's SMP TLB integration acknowledges the current supervisor software
   interrupt before dispatch so a concurrent IPI reasserts `SSIP` instead of
   being cleared as part of the older delivery.
+- Raw SBI IPI delivery enters fail-stop via panic when firmware rejects a send
+  instead of continuing without the requested cross-CPU maintenance.
 - Maintained delta: QEMU-virt platform configuration, console integration, and
-  lossless concurrent software-interrupt dispatch.
+  lossless concurrent software-interrupt dispatch with fail-stop send errors.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff
