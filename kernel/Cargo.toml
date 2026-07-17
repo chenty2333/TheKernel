@@ -135,3 +135,6 @@ riscv = "0.16"
 
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 page_table_multiarch = { version = "0.6", features = ["copy-from"] }
+
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+axcpu = { version = "=0.3.0-preview.8", features = ["host-test-context"] }

@@ -64,6 +64,7 @@ targets = [
 arm-el2 = ["page_table_entry/arm-el2"]
 default = []
 fp-simd = []
+host-test-context = []
 tls = []
 uspace = []
 

@@ -2,7 +2,9 @@
 
 use core::arch::asm;
 
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
+#[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
+use memory_addr::MemoryAddr;
+use memory_addr::{PhysAddr, VirtAddr};
 use x86::{controlregs, msr, tlb};
 use x86_64::instructions::interrupts;
 
@@ -61,7 +63,16 @@ pub fn halt() {
 /// Returns the physical address of the page table root.
 #[inline]
 pub fn read_user_page_table() -> PhysAddr {
-    pa!(unsafe { controlregs::cr3() } as usize).align_down_4k()
+    #[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
+    {
+        pa!(unsafe { controlregs::cr3() } as usize).align_down_4k()
+    }
+    #[cfg(all(not(target_os = "none"), feature = "host-test-context"))]
+    {
+        // The explicit host-test feature creates dummy task contexts that are
+        // never switched to and cannot read the privileged CR3 register.
+        pa!(0)
+    }
 }
 
 /// Reads the current page table root register for kernel space (`CR3`).

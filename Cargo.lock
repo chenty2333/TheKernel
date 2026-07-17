@@ -3154,6 +3154,7 @@ dependencies = [
  "axalloc",
  "axbacktrace",
  "axconfig",
+ "axcpu",
  "axdisplay",
  "axdriver",
  "axerrno 0.2.2",
