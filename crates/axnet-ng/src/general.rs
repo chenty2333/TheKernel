@@ -11,7 +11,7 @@ use axpoll::{
     IoEvents, NestedRegistrationError, PollRegistrationError, Pollable, PreparedPollRegistration,
     ReadinessWait, RegisterError,
 };
-use axtask::future::{TimeoutError, block_on, interruptible, timeout_at};
+use axtask::future::{DeadlineReservation, block_on, interruptible};
 
 use crate::{
     SocketTransferDirection,
@@ -64,6 +64,18 @@ const fn receive_timeout_error() -> AxError {
     // reserved for protocol-level timeout failures, not an exhausted receive
     // wait budget.
     AxError::WouldBlock
+}
+
+const fn send_timeout_error() -> AxError {
+    // SO_SNDTIMEO expiry is reported like a nonblocking data operation when
+    // no bytes were transferred, not as a protocol-level ETIMEDOUT.
+    AxError::WouldBlock
+}
+
+const fn connect_timeout_error() -> AxError {
+    // Linux reports SO_SNDTIMEO expiry from connect(2) as EINPROGRESS. A
+    // protocol-owned connection timeout remains free to report ETIMEDOUT.
+    AxError::InProgress
 }
 
 #[derive(Clone, Copy)]
@@ -217,7 +229,7 @@ impl GeneralOptions {
             IoEvents::WRITABLE,
             self.send_timeout(),
             PollBehavior {
-                timeout_error: AxError::TimedOut,
+                timeout_error: connect_timeout_error(),
                 effective_nonblocking: self.nonblocking(),
                 consume_pending_error: false,
             },
@@ -239,7 +251,7 @@ impl GeneralOptions {
             IoEvents::WRITABLE,
             self.send_timeout(),
             PollBehavior {
-                timeout_error: AxError::TimedOut,
+                timeout_error: send_timeout_error(),
                 effective_nonblocking,
                 consume_pending_error: true,
             },
@@ -331,6 +343,7 @@ impl GeneralOptions {
         mut f: F,
     ) -> AxResult<T> {
         let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
+        let mut deadline_reservation = None;
         let mut ready_retries = 0usize;
 
         loop {
@@ -348,7 +361,11 @@ impl GeneralOptions {
             // retry window preserves the common race-closing fast path; a
             // persistently ready source yields at a fixed budget.
             if deadline.is_some_and(|end| axhal::time::wall_time() >= end) {
-                return Err(behavior.timeout_error);
+                return resolve_wait_failure(
+                    self.completed_operation(behavior, false, &mut f),
+                    PollWaitFailure::Error(behavior.timeout_error),
+                )
+                .0;
             }
             let events = pollable.poll();
             if events.intersects(interest | IoEvents::ALWAYS) {
@@ -392,18 +409,49 @@ impl GeneralOptions {
                 continue;
             }
             if deadline.is_some_and(|end| axhal::time::wall_time() >= end) {
-                return Err(behavior.timeout_error);
+                return resolve_wait_failure(
+                    self.completed_operation(behavior, false, &mut f),
+                    PollWaitFailure::Error(behavior.timeout_error),
+                )
+                .0;
             }
 
-            // Only the already-published token, timer, and task-interrupt
-            // sources are polled inside the block session. Dropping any layer
-            // cancels the retained readiness topology and timer reservation.
-            let failure = match block_on(timeout_at(deadline, interruptible(wait))) {
-                Ok(Ok(Ok(()))) => continue,
-                Ok(Ok(Err(_))) => PollWaitFailure::Interrupted,
-                Ok(Err(TimeoutError::Elapsed(_))) => PollWaitFailure::Error(behavior.timeout_error),
-                Ok(Err(TimeoutError::Timer(error))) => PollWaitFailure::Error(error.into()),
-                Err(error) => PollWaitFailure::Error(error.into()),
+            // Only the already-published readiness token, task interrupt, and
+            // a previously admitted deadline are polled inside the block
+            // session. Reserve the absolute deadline lazily, after every
+            // authoritative operation recheck, and retain it across spurious
+            // readiness sessions. This keeps one socket call to one bounded
+            // timer admission without charging immediately completed calls.
+            let failure = if let Some(end) = deadline {
+                if deadline_reservation.is_none() {
+                    match DeadlineReservation::reserve(end) {
+                        Ok(reservation) => deadline_reservation = Some(reservation),
+                        Err(error) => {
+                            let completed = self.completed_operation(behavior, false, &mut f);
+                            return resolve_wait_failure(
+                                completed,
+                                PollWaitFailure::Error(error.into()),
+                            )
+                            .0;
+                        }
+                    }
+                }
+
+                let reservation = deadline_reservation
+                    .as_mut()
+                    .expect("deadline reservation was initialized above");
+                match block_on(reservation.race(interruptible(wait))) {
+                    Ok(Ok(Ok(()))) => continue,
+                    Ok(Ok(Err(_))) => PollWaitFailure::Interrupted,
+                    Ok(Err(_)) => PollWaitFailure::Error(behavior.timeout_error),
+                    Err(error) => PollWaitFailure::Error(error.into()),
+                }
+            } else {
+                match block_on(interruptible(wait)) {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => PollWaitFailure::Interrupted,
+                    Err(error) => PollWaitFailure::Error(error.into()),
+                }
             };
 
             // A completed operation wins a simultaneous interrupt, timeout,
@@ -610,6 +658,47 @@ mod tests {
             LinuxError::from(receive_timeout_error()),
             LinuxError::EAGAIN
         );
+    }
+
+    #[test]
+    fn send_timeout_maps_to_linux_eagain() {
+        assert_eq!(LinuxError::from(send_timeout_error()), LinuxError::EAGAIN);
+    }
+
+    #[test]
+    fn connect_timeout_maps_to_linux_einprogress() {
+        assert_eq!(
+            LinuxError::from(connect_timeout_error()),
+            LinuxError::EINPROGRESS
+        );
+    }
+
+    #[test]
+    fn operation_recheck_wins_an_already_elapsed_socket_timeout() {
+        let options = GeneralOptions::new();
+        let mut attempts = 0;
+
+        let result = options.run_poller(
+            &Ready,
+            IoEvents::WRITABLE,
+            Some(Duration::ZERO),
+            PollBehavior {
+                timeout_error: send_timeout_error(),
+                effective_nonblocking: false,
+                consume_pending_error: false,
+            },
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(AxError::WouldBlock)
+                } else {
+                    Ok(61usize)
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(61));
+        assert_eq!(attempts, 2);
     }
 
     #[test]
@@ -844,10 +933,13 @@ mod tests {
     }
 
     #[test]
-    fn wake_before_first_task_poll_retries_without_losing_a_token() {
+    fn nonzero_deadline_survives_repeated_wakes_and_refunds_readiness() {
         let _serial = TASK_SERIAL.lock().unwrap();
         init_task_runtime();
         let options = GeneralOptions::new();
+        options
+            .set_option(SetSocketOption::ReceiveTimeout(&Duration::from_secs(60)))
+            .unwrap();
         let pollable = ArmedPollable::new(true);
         let mut attempts = 0;
 
