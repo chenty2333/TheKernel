@@ -78,6 +78,12 @@ The current bounded-signal modernization slice additionally maintains:
   status, nested `SA_ONSTACK` frame placement below the active frame, and
   transactional handler-context publication after all userspace writes;
 - ABI flag and `SignalInfo` compatibility updates.
+- a synchronous-wait observation transaction which dequeues the selected set
+  first and excludes that set from the following asynchronous delivery scan;
+  a waited signal published in the dequeue-to-delivery gap therefore remains
+  pending and is accepted by the next observation instead of being turned into
+  a handler frame. Deterministic crate tests cover both that gap and selected
+  priority over an already-pending asynchronous signal.
 
 The bounded queue and low-resource behavior are compared against Linux commit
 `dd3210c47e8d3ac6b4e9141fc68acc03b38c0ba3`, primarily
@@ -134,6 +140,17 @@ report allocation failure. It does not expose a contention retry failure or
 silently perform a partial flush. TheKernel's real kernel targets explicitly
 enable `multitask`; featureless standalone builds retain axsync's SpinNoIrq
 fallback, and host kernel tests use the narrower `spin-action-update` override.
+
+This compatibility fork's synchronous-wait transaction assumes the existing
+single delivery consumer: only the owning current thread may select a pending
+signal or publish its userspace handler frame. Producers only publish through
+the pending/action locks and remain nonblocking. It therefore does not add a
+second delivery mutex. The canonical extracted `thekernel-linux-signal` core
+has an explicit per-thread delivery mutex so its reusable contract does not
+depend on this TheKernel embedding invariant. Until TheKernel consumes that
+core, changes to either copy must preserve the aligned observation API and the
+deterministic gap tests rather than treating the vendored backport as an
+independent signal design.
 
 When rebasing, use the verified crate archive as the pristine baseline and
 preserve the explicit registration/rollback contract. Do not infer safety or

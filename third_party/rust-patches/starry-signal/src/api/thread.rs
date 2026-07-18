@@ -108,6 +108,14 @@ pub struct DeliveredSignal {
     pub restartable_handler: bool,
 }
 
+/// One single-consumer observation made by a synchronous signal wait.
+#[must_use = "the caller must complete accepted or delivered signal ownership"]
+pub enum SignalWaitObservation {
+    Accepted(SignalInfo),
+    Delivered(DeliveredSignal),
+    None,
+}
+
 /// Thread-level signal manager.
 pub struct ThreadSignalManager {
     /// The process-level signal manager
@@ -469,9 +477,10 @@ impl ThreadSignalManager {
         &self,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
+        excluded: SignalSet,
     ) -> Option<DeliveredSignal> {
         let blocked = self.blocked.lock();
-        let mask = !*blocked;
+        let mask = !*blocked & !excluded;
         let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
         drop(blocked);
 
@@ -507,7 +516,66 @@ impl ThreadSignalManager {
         {
             return None;
         }
-        self.check_signals_slow(uctx, restore_blocked)
+        self.check_signals_slow(uctx, restore_blocked, SignalSet::default())
+    }
+
+    fn observe_signal_wait_inner(
+        &self,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        after_waited_scan: impl FnOnce(),
+    ) -> SignalWaitObservation {
+        // Handler-frame publication has one consumer: the owning current
+        // thread. Signal producers only publish through the pending/action
+        // locks and never execute this path for a target task, so no additional
+        // sleeping or IRQ-disabled delivery lock is required here.
+        if let Some(accepted) = self.dequeue_signal(waited) {
+            return SignalWaitObservation::Accepted(accepted);
+        }
+
+        // The production caller supplies an empty closure. Keeping this seam
+        // private lets the state-machine test publish deterministically in the
+        // otherwise tiny dequeue-to-delivery race window.
+        after_waited_scan();
+
+        if !self.possibly_has_signal.load(Ordering::Acquire)
+            && !self.proc.possibly_has_signal.load(Ordering::Acquire)
+        {
+            return SignalWaitObservation::None;
+        }
+
+        // Signals selected by the synchronous wait are never eligible for the
+        // async scan. A selected signal published after the first dequeue stays
+        // pending; its publication wake causes the owning task to re-observe it
+        // as Accepted instead of constructing an asynchronous handler frame.
+        self.check_signals_slow(uctx, Some(restore_blocked), *waited)
+            .map_or(
+                SignalWaitObservation::None,
+                SignalWaitObservation::Delivered,
+            )
+    }
+
+    /// Observes a synchronous wait's selected class before every other
+    /// asynchronously deliverable signal without exposing queue locks.
+    pub fn observe_signal_wait(
+        &self,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+    ) -> SignalWaitObservation {
+        self.observe_signal_wait_inner(uctx, waited, restore_blocked, || {})
+    }
+
+    #[cfg(test)]
+    fn observe_signal_wait_with_hook(
+        &self,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        after_waited_scan: impl FnOnce(),
+    ) -> SignalWaitObservation {
+        self.observe_signal_wait_inner(uctx, waited, restore_blocked, after_waited_scan)
     }
 
     /// Validates an owned signal frame without publishing any state.
@@ -779,5 +847,118 @@ impl ThreadSignalManager {
         if empty {
             self.possibly_has_signal.store(false, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_wait_tests {
+    use alloc::sync::Arc;
+    use core::mem::MaybeUninit;
+
+    use axcpu::uspace::UserContext;
+    use extern_trait::extern_trait;
+    use kspin::SpinNoIrq;
+    use starry_vm::{VmError, VmIo, VmResult};
+
+    use super::{SignalWaitObservation, ThreadSignalManager};
+    use crate::{
+        SignalInfo, SignalSet, Signo,
+        api::{ProcessSignalManager, SignalActions},
+    };
+
+    struct NoUserAccess;
+
+    // SAFETY: these state-machine tests use only default dispositions, so no
+    // handler frame may access user memory. The provider never dereferences an
+    // address and reports every accidental access as a fault.
+    #[extern_trait]
+    unsafe impl VmIo for NoUserAccess {
+        fn new() -> Self {
+            Self
+        }
+
+        fn read(&mut self, _start: usize, _buf: &mut [MaybeUninit<u8>]) -> VmResult {
+            Err(VmError::BadAddress)
+        }
+
+        fn write(&mut self, _start: usize, _buf: &[u8]) -> VmResult {
+            Err(VmError::BadAddress)
+        }
+    }
+
+    fn registered_thread() -> Arc<ThreadSignalManager> {
+        let process = Arc::new(ProcessSignalManager::new(
+            Arc::new(SpinNoIrq::new(SignalActions::default())),
+            0,
+        ));
+        let thread = ThreadSignalManager::try_new(process).unwrap();
+        thread.try_register(1).unwrap().commit().unwrap();
+        thread
+    }
+
+    #[test]
+    fn waited_arrival_in_dequeue_delivery_gap_stays_synchronous() {
+        let thread = registered_thread();
+        let mut waited = SignalSet::default();
+        waited.add(Signo::SIGUSR1);
+        let mut context = UserContext::new(0, 0.into(), 0);
+        let sender = Arc::clone(&thread);
+
+        let first = thread.observe_signal_wait_with_hook(
+            &mut context,
+            &waited,
+            SignalSet::default(),
+            move || {
+                assert!(sender.send_unqueued_signal(SignalInfo::new_user(
+                    Signo::SIGUSR1,
+                    1,
+                    1,
+                )));
+            },
+        );
+        assert!(matches!(first, SignalWaitObservation::None));
+        assert!(thread.pending().has(Signo::SIGUSR1));
+
+        let second =
+            thread.observe_signal_wait(&mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            second,
+            SignalWaitObservation::Accepted(info) if info.signo() == Signo::SIGUSR1
+        ));
+        assert!(!thread.pending().has(Signo::SIGUSR1));
+    }
+
+    #[test]
+    fn selected_signal_precedes_existing_async_delivery() {
+        let thread = registered_thread();
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(
+            Signo::SIGTERM,
+            1,
+            1,
+        )));
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(
+            Signo::SIGUSR1,
+            1,
+            1,
+        )));
+
+        let mut waited = SignalSet::default();
+        waited.add(Signo::SIGUSR1);
+        let mut context = UserContext::new(0, 0.into(), 0);
+
+        let selected =
+            thread.observe_signal_wait(&mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            selected,
+            SignalWaitObservation::Accepted(info) if info.signo() == Signo::SIGUSR1
+        ));
+
+        let delivered =
+            thread.observe_signal_wait(&mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            delivered,
+            SignalWaitObservation::Delivered(signal)
+                if signal.info.signo() == Signo::SIGTERM
+        ));
     }
 }

@@ -8,7 +8,8 @@ use linux_raw_sys::general::{RLIMIT_SIGPENDING, SI_TIMER};
 use starry_process::Pid;
 use starry_signal::{
     DefaultSignalAction, PreparedSignal, SignalDisposition, SignalInfo, SignalOSAction,
-    SignalQueueAccount, SignalSet, Signo, api::ThreadSignalManager,
+    SignalQueueAccount, SignalSet, Signo,
+    api::{DeliveredSignal, ThreadSignalManager},
 };
 
 use super::{
@@ -217,6 +218,20 @@ pub fn check_signals(
     let Some(delivered) = thr.signal.check_signals(uctx, restore_blocked) else {
         return false;
     };
+    complete_signal_delivery(thr, uctx, delivered);
+    true
+}
+
+/// Completes the kernel-owned effects of one signal-manager delivery.
+///
+/// The signal manager owns queue selection, disposition claiming, and handler
+/// frame publication. The embedding kernel remains the sole owner of process,
+/// job-control, timer, and restart state transitions.
+pub(crate) fn complete_signal_delivery(
+    thr: &Thread,
+    uctx: &mut UserContext,
+    delivered: DeliveredSignal,
+) {
     acknowledge_posix_timer_signal(&thr.proc_data, &delivered.info);
 
     let signo = delivered.info.signo();
@@ -250,7 +265,6 @@ pub fn check_signals(
             // do nothing
         }
     }
-    true
 }
 
 pub(crate) fn has_pending_syscall_signal(thr: &Thread) -> bool {

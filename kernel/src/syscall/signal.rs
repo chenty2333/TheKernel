@@ -17,7 +17,7 @@ use linux_raw_sys::general::{
 use starry_process::Pid;
 use starry_signal::{
     RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, Signo,
-    api::{SignalFrame, ThreadSignalManager},
+    api::{SignalFrame, SignalWaitObservation, ThreadSignalManager},
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -27,10 +27,11 @@ use crate::{
         SignalSecurityOperation, SignalSecuritySource, SignalTargetKind,
         acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
-        check_current_zombie_signal_access, check_signals, force_signal_current_thread,
-        generate_signal_for_exited_leader, get_process_data, get_process_group,
-        get_process_including_zombie, get_visible_task, process_domain, process_error,
-        send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
+        check_current_zombie_signal_access, check_signals, complete_signal_delivery,
+        force_signal_current_thread, generate_signal_for_exited_leader, get_process_data,
+        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
+        process_error, send_authorized_signal_thread_inner,
+        send_queued_signal_to_process_data_with_credential,
         send_signal_to_process_data_with_credential, with_proc_state_hint,
     },
     time::TimeValueLike,
@@ -1117,6 +1118,7 @@ enum SignalWaitWake {
     Initial,
     Interrupted,
     TimedOut,
+    Failed(AxError),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1125,6 +1127,7 @@ enum SignalWaitStep<T> {
     Delivered { handler_entered: bool },
     Block,
     TimedOut,
+    Failed(AxError),
 }
 
 /// Resolves one synchronous-signal-wait observation outside the task's block
@@ -1145,6 +1148,7 @@ fn signal_wait_step<T>(
     match wake {
         SignalWaitWake::Initial | SignalWaitWake::Interrupted => SignalWaitStep::Block,
         SignalWaitWake::TimedOut => SignalWaitStep::TimedOut,
+        SignalWaitWake::Failed(error) => SignalWaitStep::Failed(error),
     }
 }
 
@@ -1222,21 +1226,65 @@ fn signal_wait_deadline(
         .transpose()
 }
 
-/// Blocks only on the task interrupt token and the bounded timer registry.
-/// Signal dequeue, handler-frame publication, exit, and job-control work must
-/// stay in the caller, outside this synchronous block session.
-fn wait_for_signal_wakeup(deadline: Option<TimeValue>) -> AxResult<SignalWaitWake> {
-    match block_on(future::timeout_at(
-        deadline,
-        future::interruptible(pending::<()>()),
-    )) {
-        Err(error) => Err(error.into()),
-        Ok(Err(future::TimeoutError::Elapsed(_))) => Ok(SignalWaitWake::TimedOut),
-        Ok(Err(future::TimeoutError::Timer(error))) => Err(error.into()),
-        Ok(Ok(Err(_))) => Ok(SignalWaitWake::Interrupted),
-        // `pending()` cannot complete. Keep the impossible edge typed rather
-        // than turning a scheduler/future invariant failure into a spin.
-        Ok(Ok(Ok(()))) => Err(AxError::BadState),
+fn sanitize_synchronous_wait_set(mut set: SignalSet) -> SignalSet {
+    // Linux never lets SIGKILL or SIGSTOP become synchronously accepted.
+    set.remove(Signo::SIGKILL);
+    set.remove(Signo::SIGSTOP);
+    set
+}
+
+/// Reusable wait-only state for one synchronous signal syscall.
+///
+/// The absolute deadline is computed by the syscall, but its bounded timer
+/// slot is admitted lazily only after a signal observation found no work. One
+/// reservation is then reused by every stale-interrupt session. Each borrowed
+/// race disarms its waker automatically while retaining the timer slot until
+/// this owner is dropped or the deadline elapses.
+struct SignalWaitBlock {
+    deadline: Option<TimeValue>,
+    reservation: Option<future::DeadlineReservation>,
+}
+
+impl SignalWaitBlock {
+    const fn new(deadline: Option<TimeValue>) -> Self {
+        Self {
+            deadline,
+            reservation: None,
+        }
+    }
+
+    /// Blocks only on the task interrupt token and the optional bounded timer.
+    ///
+    /// Signal dequeue, handler-frame publication, exit, and job-control work
+    /// stay in the caller, outside this synchronous block session. Failures are
+    /// returned as observations too: the caller performs one final signal
+    /// transaction before allowing timer admission or scheduler state to win.
+    fn wait(&mut self) -> SignalWaitWake {
+        let Some(deadline) = self.deadline else {
+            return match block_on(future::interruptible(pending::<()>())) {
+                Err(error) => SignalWaitWake::Failed(error.into()),
+                Ok(Err(_)) => SignalWaitWake::Interrupted,
+                // `pending()` cannot complete. Keep the impossible edge typed
+                // rather than turning an invariant failure into a spin.
+                Ok(Ok(())) => SignalWaitWake::Failed(AxError::BadState),
+            };
+        };
+
+        if self.reservation.is_none() {
+            self.reservation = match future::DeadlineReservation::reserve(deadline) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => return SignalWaitWake::Failed(error.into()),
+            };
+        }
+        let Some(reservation) = self.reservation.as_mut() else {
+            return SignalWaitWake::Failed(AxError::BadState);
+        };
+        match block_on(reservation.race(future::interruptible(pending::<()>()))) {
+            Err(error) => SignalWaitWake::Failed(error.into()),
+            Ok(Err(future::Elapsed)) => SignalWaitWake::TimedOut,
+            Ok(Ok(Err(_))) => SignalWaitWake::Interrupted,
+            Ok(Ok(Ok(()))) => SignalWaitWake::Failed(AxError::BadState),
+        }
     }
 }
 
@@ -1249,7 +1297,7 @@ pub fn sys_rt_sigtimedwait(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let set = unsafe { set.vm_read_uninit()?.assume_init() };
+    let set = sanitize_synchronous_wait_set(unsafe { set.vm_read_uninit()?.assume_init() });
 
     let timeout = if let Some(ts) = timeout.nullable() {
         let ts = unsafe { ts.vm_read_uninit()?.assume_init() };
@@ -1273,43 +1321,42 @@ pub fn sys_rt_sigtimedwait(
 
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let sig = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        let mut block = SignalWaitBlock::new(deadline);
         let mut wake = SignalWaitWake::Initial;
         loop {
-            let step = signal_wait_step(
-                wake,
-                || signal.dequeue_signal(&set),
-                || {
-                    if thr.pending_exit() {
-                        return Some(false);
-                    }
-                    let handler_depth = thr.signal_handler_depth();
-                    check_signals(thr, uctx, Some(temporary_mask.old_blocked()))
-                        .then(|| thr.signal_handler_depth() > handler_depth)
-                },
-            );
-            match step {
-                SignalWaitStep::Accepted(sig) => {
+            match signal.observe_signal_wait(uctx, &set, temporary_mask.old_blocked()) {
+                SignalWaitObservation::Accepted(sig) => {
                     temporary_mask.restore();
-                    return Ok(Some(sig));
+                    return Ok(sig);
                 }
-                SignalWaitStep::Delivered { handler_entered } => {
+                SignalWaitObservation::Delivered(delivered) => {
+                    let handler_depth = thr.signal_handler_depth();
+                    complete_signal_delivery(thr, uctx, delivered);
+                    let handler_entered = thr.signal_handler_depth() > handler_depth;
                     temporary_mask.finish_delivery(handler_entered);
-                    return Ok(None);
+                    // The handler frame owns EINTR when one was published; a
+                    // stop/continue delivery returns EINTR directly. Terminal
+                    // delivery has published exit state and must not reblock.
+                    return Err(AxError::Interrupted);
                 }
-                SignalWaitStep::TimedOut => {
+                SignalWaitObservation::None if thr.pending_exit() => {
+                    temporary_mask.restore();
+                    return Err(AxError::Interrupted);
+                }
+                SignalWaitObservation::None if wake == SignalWaitWake::TimedOut => {
                     temporary_mask.restore();
                     return Err(AxError::WouldBlock);
                 }
-                SignalWaitStep::Block => {
-                    wake = wait_for_signal_wakeup(deadline)?;
+                SignalWaitObservation::None => {
+                    if let SignalWaitWake::Failed(error) = wake {
+                        temporary_mask.restore();
+                        return Err(error);
+                    }
+                    wake = block.wait();
                 }
             }
         }
     })?;
-    let Some(sig) = sig else {
-        // Interrupted
-        return Ok(0);
-    };
     acknowledge_posix_timer_signal(&thr.proc_data, &sig);
 
     if let Some(info) = info.nullable() {
@@ -1338,6 +1385,7 @@ pub fn sys_rt_sigsuspend(
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
 
     with_proc_state_hint(ProcStateHint::Interruptible, || {
+        let mut block = SignalWaitBlock::new(None);
         let mut wake = SignalWaitWake::Initial;
         loop {
             let step = signal_wait_step(
@@ -1372,8 +1420,12 @@ pub fn sys_rt_sigsuspend(
                     // Default stop/continue actions do not complete
                     // sigsuspend. After a stop is resumed, keep waiting with
                     // the temporary mask until a handler is actually entered.
-                    wake = wait_for_signal_wakeup(None)?;
+                    if let SignalWaitWake::Failed(error) = wake {
+                        return Err(error);
+                    }
+                    wake = block.wait();
                 }
+                SignalWaitStep::Failed(error) => return Err(error),
                 SignalWaitStep::Accepted(()) | SignalWaitStep::TimedOut => {
                     return Err(AxError::BadState);
                 }
@@ -1452,14 +1504,14 @@ mod tests {
     use axerrno::AxError;
     use axtask::future::TimerRegistrationError;
     use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_DISABLE, SS_ONSTACK};
-    use starry_signal::{SignalInfo, SignalStack, Signo};
+    use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
 
     use super::{
         ProcessSignalPostHook, SignalTargetAggregation, SignalTargetAuthorizationError,
         SignalTargetResultReducer, SignalWaitStep, SignalWaitWake, complete_specific_thread_signal,
         exited_leader_identity_matches, parse_signo, prepare_sigaltstack_update,
         process_signal_post_hook, queued_signal_required, reduce_process_signal_delivery_result,
-        signal_wait_deadline, signal_wait_step,
+        sanitize_synchronous_wait_set, signal_wait_deadline, signal_wait_step,
     };
 
     fn reduce_target_results(
@@ -1481,6 +1533,19 @@ mod tests {
         assert!(parse_signo(65).is_err());
         assert!(parse_signo(257).is_err());
         assert!(parse_signo(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn synchronous_wait_set_never_selects_kill_or_stop() {
+        let mut requested = SignalSet::default();
+        requested.add(Signo::SIGKILL);
+        requested.add(Signo::SIGSTOP);
+        requested.add(Signo::SIGUSR1);
+
+        let sanitized = sanitize_synchronous_wait_set(requested);
+        assert!(!sanitized.has(Signo::SIGKILL));
+        assert!(!sanitized.has(Signo::SIGSTOP));
+        assert!(sanitized.has(Signo::SIGUSR1));
     }
 
     #[test]
@@ -1506,6 +1571,36 @@ mod tests {
             SignalWaitStep::Delivered {
                 handler_entered: true,
             }
+        );
+    }
+
+    #[test]
+    fn final_signal_observation_wins_over_internal_wait_failure() {
+        assert_eq!(
+            signal_wait_step(
+                SignalWaitWake::Failed(AxError::ResourceBusy),
+                || Some(23_u8),
+                || Some(true),
+            ),
+            SignalWaitStep::Accepted(23)
+        );
+        assert_eq!(
+            signal_wait_step(
+                SignalWaitWake::Failed(AxError::BadState),
+                || None::<u8>,
+                || Some(false),
+            ),
+            SignalWaitStep::Delivered {
+                handler_entered: false,
+            }
+        );
+        assert_eq!(
+            signal_wait_step(
+                SignalWaitWake::Failed(AxError::ResourceBusy),
+                || None::<u8>,
+                || None,
+            ),
+            SignalWaitStep::Failed(AxError::ResourceBusy)
         );
     }
 
