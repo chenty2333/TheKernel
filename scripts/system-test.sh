@@ -95,6 +95,8 @@ for marker in \
     THEKERNEL_SYSTEM_TEST_PROCESS_OK \
     THEKERNEL_EXEC_SMOKE_OK \
     THEKERNEL_SYSTEM_TEST_EXEC_OK \
+    CI_SIGNAL_WAIT_BOUNDARY_PASS \
+    THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK \
     THEKERNEL_IO_URING_OK \
     THEKERNEL_SYSTEM_TEST_IO_URING_OK \
     THEKERNEL_SYSTEM_TEST_PASS
@@ -105,7 +107,7 @@ do
     }
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|THEKERNEL_IO_URING_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi
