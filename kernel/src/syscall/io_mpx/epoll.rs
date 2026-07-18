@@ -4,7 +4,6 @@ use core::{mem::size_of, time::Duration};
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLONESHOT, epoll_event,
@@ -13,7 +12,7 @@ use linux_raw_sys::general::{
 use starry_signal::SignalSet;
 use starry_vm::VmMutPtr;
 
-use super::{flatten_blocked_timeout, io_to_linux_epoll, linux_epoll_events, wait_io_result};
+use super::{io_to_linux_epoll, linux_epoll_events, wait_io_result};
 use crate::{
     file::{
         FileLike,
@@ -131,50 +130,43 @@ fn do_epoll_wait(
     let sigmask = nullable!(sigmask.get_as_ref())?.copied();
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut wait_once = || {
-        flatten_blocked_timeout(block_on(future::timeout(
-            deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            async {
-                crate::readiness::interruptible_poll_io(
-                    epoll.as_ref(),
-                    IoEvents::READABLE,
-                    false,
-                    || {
-                        let batch = epoll.prepare_events(maxevents as usize)?;
-                        let events_base = events.address().as_usize();
-                        let mut copied = 0;
-                        while copied < batch.len() {
-                            let Some(source) = batch.event(copied) else {
-                                return if copied == 0 {
-                                    Err(AxError::BadState)
-                                } else {
-                                    Ok(batch.complete_prefix(copied))
-                                };
-                            };
-                            let event = epoll_event {
-                                events: io_to_linux_epoll(source.events),
-                                data: source.user_data,
-                            };
-                            let copy_result = checked_epoll_event_ptr(events_base, copied)
-                                .and_then(|destination| {
-                                    destination.vm_write(event).map_err(AxError::from)
-                                });
-                            if let Err(error) = copy_result {
-                                return if copied == 0 {
-                                    let _ = batch.complete_prefix(0);
-                                    Err(error)
-                                } else {
-                                    Ok(batch.complete_prefix(copied))
-                                };
-                            }
-                            copied += 1;
-                        }
-                        Ok(batch.complete_prefix(copied))
-                    },
-                )
-                .await
-                .map(|n| n as isize)
+        crate::readiness::block_on_poll_io_until(
+            epoll.as_ref(),
+            IoEvents::READABLE,
+            false,
+            deadline,
+            || {
+                let batch = epoll.prepare_events(maxevents as usize)?;
+                let events_base = events.address().as_usize();
+                let mut copied = 0;
+                while copied < batch.len() {
+                    let Some(source) = batch.event(copied) else {
+                        return if copied == 0 {
+                            Err(AxError::BadState)
+                        } else {
+                            Ok(batch.complete_prefix(copied))
+                        };
+                    };
+                    let event = epoll_event {
+                        events: io_to_linux_epoll(source.events),
+                        data: source.user_data,
+                    };
+                    let copy_result = checked_epoll_event_ptr(events_base, copied)
+                        .and_then(|destination| destination.vm_write(event).map_err(AxError::from));
+                    if let Err(error) = copy_result {
+                        return if copied == 0 {
+                            let _ = batch.complete_prefix(0);
+                            Err(error)
+                        } else {
+                            Ok(batch.complete_prefix(copied))
+                        };
+                    }
+                    copied += 1;
+                }
+                Ok(batch.complete_prefix(copied))
             },
-        )))
+        )
+        .map(|result| result.map(|count| count as isize))
     };
 
     wait_io_result(uctx, sigmask, &mut wait_once)

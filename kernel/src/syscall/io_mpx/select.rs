@@ -4,7 +4,6 @@ use core::{fmt, time::Duration};
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::*,
@@ -12,7 +11,7 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::{FdPollSet, flatten_blocked_timeout, wait_io_result, wait_signal_only};
+use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -174,18 +173,13 @@ fn do_select(
 
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut select_once = || {
-        flatten_blocked_timeout(block_on(future::timeout(
-            deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            async {
-                crate::readiness::interruptible_poll_io(
-                    &fds,
-                    IoEvents::empty(),
-                    false,
-                    &mut poll_once,
-                )
-                .await
-            },
-        )))
+        crate::readiness::block_on_poll_io_until(
+            &fds,
+            IoEvents::empty(),
+            false,
+            deadline,
+            &mut poll_once,
+        )
     };
 
     wait_io_result(uctx, sigmask.copied(), &mut select_once)

@@ -14,7 +14,8 @@ use alloc::sync::Arc;
 use core::{
     convert::Infallible,
     fmt,
-    future::poll_fn,
+    future::{Future, poll_fn},
+    pin::Pin,
     task::{Context, Poll},
 };
 
@@ -448,6 +449,62 @@ impl<'a> PollRegistration<'a> {
     }
 }
 
+/// One already-armed readiness wait whose future performs no object operation.
+///
+/// [`arm`](Self::arm) installs the complete bounded registration with a no-op
+/// waker.  A source wake drains that registration, so a later executor-waker
+/// update detects a wake that happened between arming and the first poll.  This
+/// lets a synchronous consumer execute its potentially sleeping object
+/// operation outside its task executor while retaining the usual
+/// `check -> arm -> check -> wait` lost-wake protocol.
+///
+/// Returning `Ready` or dropping this value synchronously cancels every
+/// still-live sibling registration and refunds its bounded topology charge.
+#[must_use = "dropping an armed wait immediately cancels its readiness registration"]
+pub struct ReadinessWait<'a> {
+    registration: PollRegistration<'a>,
+    has_sources: bool,
+}
+
+impl<'a> ReadinessWait<'a> {
+    /// Arms every readiness source without depending on an active task block
+    /// session.
+    ///
+    /// The no-op waker is deliberate: source wake consumes the registration,
+    /// and the first future poll observes that consumption through the failed
+    /// waker update.  Permanently-unready objects may publish an empty
+    /// registration; those waits remain pending until an outer interruption or
+    /// timeout policy terminates them.
+    pub fn arm<P>(pollable: &'a P, events: IoEvents) -> Result<Self, PollRegistrationError>
+    where
+        P: Pollable + ?Sized,
+    {
+        let mut context = Context::from_waker(core::task::Waker::noop());
+        let registration = pollable.register(&mut context, events)?;
+        let has_sources = registration.source_count() != 0;
+        Ok(Self {
+            registration,
+            has_sources,
+        })
+    }
+}
+
+impl Future for ReadinessWait<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.has_sources {
+            return Poll::Pending;
+        }
+        if self.registration.update(context.waker()).is_err() {
+            self.registration.cancel();
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 impl Drop for PollRegistration<'_> {
     fn drop(&mut self) {
         self.cancel();
@@ -468,7 +525,7 @@ pub trait Pollable {
     ) -> Result<PollRegistration<'a>, PollRegistrationError>;
 }
 
-/// Typed failure from [`poll_io`].
+/// Typed failure from [`poll_io_nonblocking`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PollIoError {
@@ -495,7 +552,14 @@ impl fmt::Display for PollIoError {
 /// and cancels it on every completion or drop path. Interruption, timeout, and
 /// the final errno mapping remain caller policy and therefore wrap this future
 /// outside the adapter.
-pub async fn poll_io<P, F, T>(
+///
+/// Because `operation` is invoked from [`Future::poll`], it must be a truly
+/// non-blocking attempt: it may return [`AxError::WouldBlock`], but it must not
+/// acquire a sleeping lock or enter a synchronous task block session.  A
+/// synchronous consumer with a potentially sleeping operation should execute
+/// its attempts outside the executor and use [`ReadinessWait`] for the armed
+/// wait phase.
+pub async fn poll_io_nonblocking<P, F, T>(
     pollable: &P,
     events: IoEvents,
     nonblocking: bool,
@@ -528,7 +592,13 @@ where
             let retained = match pollable.register(context, events) {
                 Ok(retained) => retained,
                 Err(error) => {
-                    return Poll::Ready(Err(PollIoError::Registration(error)));
+                    return match operation() {
+                        Ok(value) => Poll::Ready(Ok(value)),
+                        Err(operation_error) if operation_error != AxError::WouldBlock => {
+                            Poll::Ready(Err(PollIoError::Operation(operation_error)))
+                        }
+                        Err(_) => Poll::Ready(Err(PollIoError::Registration(error))),
+                    };
                 }
             };
             registration = Some(retained);
@@ -571,6 +641,27 @@ mod tests {
         source: &'a PollSet<CAPACITY>,
     }
 
+    struct TwoSourcePollable<'a> {
+        first: &'a PollSet<1>,
+        second: &'a PollSet<1>,
+    }
+
+    struct EmptyPollable;
+
+    impl Pollable for EmptyPollable {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
+    }
+
     impl<'source, const CAPACITY: usize> Pollable for TestPollable<'source, CAPACITY> {
         fn poll(&self) -> IoEvents {
             IoEvents::empty()
@@ -583,6 +674,99 @@ mod tests {
         ) -> Result<PollRegistration<'a>, PollRegistrationError> {
             PollRegistration::single(self.source, context.waker())
         }
+    }
+
+    impl Pollable for TwoSourcePollable<'_> {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            let mut prepared = PreparedPollRegistration::try_new(2)?;
+            prepared.arm(self.first, context.waker())?;
+            prepared.arm(self.second, context.waker())?;
+            prepared.commit()
+        }
+    }
+
+    #[test]
+    fn readiness_wait_observes_a_wake_before_its_first_task_poll() {
+        let source = PollSet::<1>::new();
+        let pollable = TestPollable { source: &source };
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(ReadinessWait::arm(&pollable, IoEvents::READABLE).unwrap());
+
+        assert_eq!(source.len(), 1);
+        assert_eq!(source.wake(), 1);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+        assert!(source.is_empty());
+    }
+
+    #[test]
+    fn readiness_wait_updates_the_executor_waker_then_completes_on_wake() {
+        let source = PollSet::<1>::new();
+        let pollable = TestPollable { source: &source };
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(ReadinessWait::arm(&pollable, IoEvents::READABLE).unwrap());
+
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(source.wake(), 1);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+        assert!(source.is_empty());
+    }
+
+    #[test]
+    fn readiness_wait_cancels_sibling_sources_before_returning_ready() {
+        let first = PollSet::<1>::new();
+        let second = PollSet::<1>::new();
+        let pollable = TwoSourcePollable {
+            first: &first,
+            second: &second,
+        };
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter);
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(ReadinessWait::arm(&pollable, IoEvents::READABLE).unwrap());
+
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(first.wake(), 1);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(wait.registration.source_count(), 0);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn empty_readiness_wait_remains_pending_for_outer_policy() {
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter);
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(ReadinessWait::arm(&EmptyPollable, IoEvents::empty()).unwrap());
+
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+    }
+
+    #[test]
+    fn dropping_readiness_wait_cancels_its_registration() {
+        let source = PollSet::<1>::new();
+        let pollable = TestPollable { source: &source };
+
+        let wait = ReadinessWait::arm(&pollable, IoEvents::READABLE).unwrap();
+        assert_eq!(source.len(), 1);
+        drop(wait);
+        assert!(source.is_empty());
     }
 
     #[test]
@@ -650,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_io_retains_one_token_updates_waker_and_cancels_on_drop() {
+    fn poll_io_nonblocking_retains_one_token_updates_waker_and_cancels_on_drop() {
         let source = PollSet::<2>::new();
         let pollable = TestPollable { source: &source };
         let ready = AtomicBool::new(false);
@@ -660,13 +844,18 @@ mod tests {
         let second_waker = Waker::from(second_counter.clone());
 
         {
-            let mut future = pin!(poll_io(&pollable, IoEvents::READABLE, false, || {
-                if ready.load(Ordering::Acquire) {
-                    Ok(7_u32)
-                } else {
-                    Err(AxError::WouldBlock)
-                }
-            },));
+            let mut future = pin!(poll_io_nonblocking(
+                &pollable,
+                IoEvents::READABLE,
+                false,
+                || {
+                    if ready.load(Ordering::Acquire) {
+                        Ok(7_u32)
+                    } else {
+                        Err(AxError::WouldBlock)
+                    }
+                },
+            ));
             let mut first_context = Context::from_waker(&first_waker);
             assert_eq!(future.as_mut().poll(&mut first_context), Poll::Pending);
             assert_eq!(source.len(), 1);
@@ -688,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_io_closes_arm_race_with_a_second_operation_check() {
+    fn poll_io_nonblocking_closes_arm_race_with_a_second_operation_check() {
         let source = PollSet::<1>::new();
         let pollable = TestPollable { source: &source };
         let calls = AtomicUsize::new(0);
@@ -696,13 +885,18 @@ mod tests {
         let waker = Waker::from(counter);
 
         {
-            let mut future = pin!(poll_io(&pollable, IoEvents::READABLE, false, || {
-                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                    Err(AxError::WouldBlock)
-                } else {
-                    Ok(11_u32)
-                }
-            },));
+            let mut future = pin!(poll_io_nonblocking(
+                &pollable,
+                IoEvents::READABLE,
+                false,
+                || {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        Err(AxError::WouldBlock)
+                    } else {
+                        Ok(11_u32)
+                    }
+                },
+            ));
             let mut context = Context::from_waker(&waker);
             assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(11)));
             assert_eq!(calls.load(Ordering::Acquire), 2);
@@ -711,19 +905,19 @@ mod tests {
     }
 
     #[test]
-    fn poll_io_reports_source_capacity_instead_of_overwriting_a_waiter() {
+    fn poll_io_nonblocking_reports_source_capacity_instead_of_overwriting_a_waiter() {
         let source = PollSet::<1>::new();
         let pollable = TestPollable { source: &source };
         let counter = Arc::new(Counter(AtomicUsize::new(0)));
         let waker = Waker::from(counter);
         let occupied = source.register(&waker).unwrap();
 
-        let mut future = pin!(poll_io(&pollable, IoEvents::READABLE, false, || Err::<
-            u32,
-            _,
-        >(
-            AxError::WouldBlock
-        ),));
+        let mut future = pin!(poll_io_nonblocking(
+            &pollable,
+            IoEvents::READABLE,
+            false,
+            || Err::<u32, _>(AxError::WouldBlock),
+        ));
         let mut context = Context::from_waker(&waker);
         assert_eq!(
             future.as_mut().poll(&mut context),
@@ -736,5 +930,30 @@ mod tests {
         );
         assert_eq!(source.len(), 1);
         assert!(source.cancel(occupied));
+    }
+
+    #[test]
+    fn poll_io_nonblocking_rechecks_the_operation_when_a_source_closes_before_arm() {
+        let source = PollSet::<1>::new();
+        let pollable = TestPollable { source: &source };
+        let calls = AtomicUsize::new(0);
+        let mut future = pin!(poll_io_nonblocking(
+            &pollable,
+            IoEvents::READABLE,
+            false,
+            || match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    source.close();
+                    Err(AxError::WouldBlock)
+                }
+                _ => Ok(41_u32),
+            },
+        ));
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter);
+        let mut context = Context::from_waker(&waker);
+
+        assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(41)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

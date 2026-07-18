@@ -7,17 +7,11 @@ use axhal::{
     uspace::UserContext,
 };
 use axpoll::IoEvents;
-use axtask::{
-    current,
-    future::{self, block_on},
-};
+use axtask::current;
 use linux_raw_sys::general::{POLLNVAL, RLIMIT_NOFILE, pollfd, timespec};
 use starry_signal::SignalSet;
 
-use super::{
-    FdPollSet, flatten_blocked_timeout, io_to_linux_poll, linux_poll_events, wait_io_result,
-    wait_signal_only,
-};
+use super::{FdPollSet, io_to_linux_poll, linux_poll_events, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -119,18 +113,13 @@ fn do_poll(
     };
 
     let mut wait_once = || {
-        flatten_blocked_timeout(block_on(future::timeout(
-            deadline.map(|end| end.saturating_sub(wall_time())),
-            async {
-                crate::readiness::interruptible_poll_io(
-                    &fds,
-                    IoEvents::empty(),
-                    false,
-                    &mut poll_once,
-                )
-                .await
-            },
-        )))
+        crate::readiness::block_on_poll_io_until(
+            &fds,
+            IoEvents::empty(),
+            false,
+            deadline,
+            &mut poll_once,
+        )
     };
 
     wait_io_result(uctx, sigmask, &mut wait_once)

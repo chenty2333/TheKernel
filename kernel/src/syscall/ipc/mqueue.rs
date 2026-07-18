@@ -13,7 +13,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axpoll::{IoEvents, PollSet, Pollable, poll_io};
+use axpoll::{IoEvents, PollSet, Pollable};
 #[cfg(not(test))]
 use axsync::Mutex;
 use axtask::current;
@@ -37,6 +37,7 @@ use crate::{
         get_typed_file,
     },
     mm::vm_load_string,
+    readiness::block_on_poll_io_until,
     syscall::RawSigevent,
     task::{
         AsThread, Kgid, Kuid, ProcStateHint, ProcessData, prepare_queued_signal_for_process,
@@ -557,15 +558,8 @@ fn wait_mq_operation<T>(
     operation: impl FnMut() -> AxResult<T>,
 ) -> AxResult<T> {
     with_proc_state_hint(ProcStateHint::Interruptible, || {
-        let result =
-            axtask::future::block_on(axtask::future::interruptible(axtask::future::timeout_at(
-                deadline,
-                poll_io(file, events, file.is_nonblocking(), operation),
-            )))
-            .map_err(AxError::from)?
-            .map_err(AxError::from)?;
-        let result = result.map_err(AxError::from)?;
-        result.map_err(crate::readiness::poll_io_error)
+        block_on_poll_io_until(file, events, file.is_nonblocking(), deadline, operation)
+            .map_err(|_| AxError::TimedOut)?
     })
 }
 

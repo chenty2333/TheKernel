@@ -7,10 +7,7 @@ use axfs_ng_vfs::{Location, NodeType};
 use axhal::time::wall_time;
 use axpoll::PollSet;
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{block_on, interruptible, timeout_at},
-};
+use axtask::current;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{
@@ -20,7 +17,7 @@ use starry_signal::{SignalInfo, Signo};
 
 use super::File;
 use crate::{
-    readiness::{poll_io_error, poll_set_io},
+    readiness::block_on_poll_set_until,
     task::{AsThread, Kuid, send_signal_to_process},
 };
 
@@ -266,26 +263,19 @@ fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
         let _ = send_signal_to_process(holder_pid, Some(SignalInfo::new_kernel(Signo::SIGIO)));
     }
 
-    match block_on(interruptible(timeout_at(Some(deadline), async {
-        poll_set_io(&LEASE_WAITERS, || {
-            if conflict_cleared(id, breaker_pid, conflict) {
-                Ok(())
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
-        .await
-        .map_err(poll_io_error)
-    }))) {
-        Err(error) => Err(error.into()),
-        Ok(Err(_)) => Err(AxError::Interrupted),
-        Ok(Ok(Ok(Ok(())))) => Ok(()),
-        Ok(Ok(Ok(Err(error)))) => Err(error),
-        Ok(Ok(Err(axtask::future::TimeoutError::Elapsed(_)))) => {
+    match block_on_poll_set_until(&LEASE_WAITERS, Some(deadline), || {
+        if conflict_cleared(id, breaker_pid, conflict) {
+            Ok(())
+        } else {
+            Err(AxError::WouldBlock)
+        }
+    }) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
             force_break_lease(id);
             Ok(())
         }
-        Ok(Ok(Err(axtask::future::TimeoutError::Timer(error)))) => Err(error.into()),
     }
 }
 

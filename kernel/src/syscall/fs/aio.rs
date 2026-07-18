@@ -8,14 +8,18 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axhal::time::wall_time;
 use axpoll::PollSet;
+#[cfg(not(test))]
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{self, block_on, interruptible},
-};
+use axtask::current;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::__kernel_off_t;
+// These accounting tests do not initialize a scheduler/current task. Runtime
+// sleeping-lock and wake behavior is exercised by guest tests; host tests use
+// the same critical sections with a spin mutex.
+#[cfg(test)]
+use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::SignalSet;
 use starry_vm::{VmMutPtr, VmPtr};
@@ -24,7 +28,7 @@ use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys
 use crate::{
     file::{FileHandle, event::EventFd, get_typed_file},
     mm::IoVec,
-    readiness::{block_on_poll_set_uninterruptible, poll_io_error, poll_set_io},
+    readiness::{block_on_poll_set_uninterruptible, block_on_poll_set_until},
     task::{AsThread, with_blocked_signals},
 };
 
@@ -543,24 +547,21 @@ pub fn sys_io_getevents(
     let wait_result = if min_nr == 0 || enough_events() {
         WaitResult::Ready
     } else {
-        let wait = async {
-            poll_set_io(&context.waiters, || {
-                let state = context.state.lock();
-                if state.events.len() >= min_nr || !state.accepting {
-                    Ok(())
-                } else {
-                    Err(AxError::WouldBlock)
-                }
-            })
-            .await
-            .map_err(poll_io_error)
-        };
-        match block_on(future::timeout(timeout, interruptible(wait))).map_err(AxError::from)? {
-            Ok(Ok(Ok(()))) => WaitResult::Ready,
-            Ok(Ok(Err(error))) => return Err(error),
-            Ok(Err(_)) => WaitResult::Interrupted,
-            Err(future::TimeoutError::Elapsed(_)) => WaitResult::TimedOut,
-            Err(future::TimeoutError::Timer(error)) => return Err(error.into()),
+        let deadline = timeout
+            .map(|duration| wall_time().checked_add(duration).ok_or(AxError::OutOfRange))
+            .transpose()?;
+        match block_on_poll_set_until(&context.waiters, deadline, || {
+            let state = context.state.lock();
+            if state.events.len() >= min_nr || !state.accepting {
+                Ok(())
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        }) {
+            Ok(Ok(())) => WaitResult::Ready,
+            Ok(Err(AxError::Interrupted)) => WaitResult::Interrupted,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => WaitResult::TimedOut,
         }
     };
 
