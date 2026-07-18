@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .command import CommandError
+from .evidence import EvidenceError
 from .images import ImageError
 from .model import INTENTIONAL_STOP_RETURN_CODE, Interaction, RunLimits
 from .process import ProcessError
@@ -57,6 +58,7 @@ def run_cmd(args: argparse.Namespace) -> int:
         memory=args.memory,
         cpus=args.cpus,
         qemu_binary=args.qemu_binary,
+        receipt_path=Path(args.receipt) if args.receipt else None,
     )
     result = run(config)
     print(
@@ -140,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--memory", default="1G")
     run_parser.add_argument("--cpus", type=int, default=1)
     run_parser.add_argument("--qemu-binary", help="explicit QEMU executable")
+    run_parser.add_argument(
+        "--receipt",
+        help="write an atomic JSON receipt before launch and after completion",
+    )
     run_parser.set_defaults(func=run_cmd)
     return parser
 
@@ -152,6 +158,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
-    except (RunnerError, ImageError, CommandError, ProcessError, OSError) as error:
+    except (
+        RunnerError,
+        EvidenceError,
+        ImageError,
+        CommandError,
+        ProcessError,
+        OSError,
+    ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

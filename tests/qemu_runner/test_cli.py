@@ -48,6 +48,8 @@ class CliTests(unittest.TestCase):
                         str(extra_block),
                         "--extra-block-mode",
                         "readonly",
+                        "--receipt",
+                        str(root / "receipt.json"),
                     ]
                 )
             self.assertEqual(status, 0)
@@ -58,6 +60,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(config.rootfs_mode, "readonly")
             self.assertEqual(config.extra_block, extra_block)
             self.assertEqual(config.extra_block_mode, "readonly")
+            self.assertEqual(config.receipt_path, root / "receipt.json")
 
     def test_input_marker_requires_interactive_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

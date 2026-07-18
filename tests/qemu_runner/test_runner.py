@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import gzip
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +32,8 @@ class RunnerTests(unittest.TestCase):
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=root / "run" / "receipt.json",
             )
             expected = RunResult(
                 arch="rv",
@@ -38,7 +43,11 @@ class RunnerTests(unittest.TestCase):
                 log_path=config.log_path,
                 workdir=config.workdir,
             )
-            with patch("tools.qemu_runner.runner.run_process", return_value=expected) as mocked:
+            def complete_run(**kwargs):
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run) as mocked:
                 result = run(config)
             self.assertIs(result, expected)
             command = " ".join(mocked.call_args.kwargs["command"])
@@ -46,6 +55,256 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("writable-images/extra-extra.img", command)
             self.assertIn("bus=virtio-mmio-bus.1", command)
             self.assertNotIn(str((root / "cache").resolve()) + ",if=none", command)
+            receipt = json.loads(config.receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "complete")
+            self.assertEqual(receipt["returncode"], 0)
+            self.assertEqual(receipt["command"][0], str(Path(sys.executable).resolve()))
+            self.assertEqual(
+                receipt["kernel"]["sha256"],
+                "6923dd1bc0460082c5d55a831908c24a282860b7f1cd6c2b79cf1bc8857c639c",
+            )
+            self.assertEqual(list(config.receipt_path.parent.glob(".receipt.json.*.tmp")), [])
+
+            validator = Path(__file__).resolve().parents[2] / "scripts/ci/validate-qemu-receipt.py"
+            validator_args = [
+                sys.executable,
+                str(validator),
+                "--receipt",
+                str(config.receipt_path),
+                "--arch",
+                "rv",
+                "--cpus",
+                "1",
+                "--kernel",
+                str(kernel),
+                "--rootfs",
+                str(rootfs),
+                "--rootfs-mode",
+                config.rootfs_mode,
+                "--extra-block",
+                str(extra),
+                "--extra-block-mode",
+                config.extra_block_mode,
+                "--log",
+                str(config.log_path),
+                "--qemu-binary",
+                sys.executable,
+            ]
+            self.assertEqual(subprocess.run(validator_args, check=False).returncode, 0)
+
+            wrong_mode_args = validator_args.copy()
+            wrong_mode_args[wrong_mode_args.index("--rootfs-mode") + 1] = "readonly"
+            self.assertNotEqual(subprocess.run(wrong_mode_args, check=False).returncode, 0)
+
+            wrong_qemu_args = validator_args.copy()
+            wrong_qemu_args[wrong_qemu_args.index("--qemu-binary") + 1] = "/bin/sh"
+            self.assertNotEqual(subprocess.run(wrong_qemu_args, check=False).returncode, 0)
+
+            original_receipt = config.receipt_path.read_text(encoding="utf-8")
+            tampered = json.loads(original_receipt)
+            tampered["command"][tampered["command"].index("-smp") + 1] = "2"
+            config.receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+            self.assertNotEqual(subprocess.run(validator_args, check=False).returncode, 0)
+            config.receipt_path.write_text(original_receipt, encoding="utf-8")
+
+            config.log_path.write_bytes(b"tampered console\n")
+            self.assertNotEqual(subprocess.run(validator_args, check=False).returncode, 0)
+
+    def test_validator_accepts_recorded_in_place_writable_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            extra = root / "extra.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs-before")
+            extra.write_bytes(b"extra-before")
+            config = RunConfig(
+                arch="la",
+                kernel=kernel,
+                rootfs=rootfs,
+                rootfs_mode="rw",
+                extra_block=extra,
+                extra_block_mode="rw",
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=root / "run" / "receipt.json",
+            )
+            expected = RunResult(
+                arch="la",
+                command=("qemu",),
+                returncode=0,
+                duration_ms=1,
+                log_path=config.log_path,
+                workdir=config.workdir,
+            )
+
+            def complete_run(**kwargs):
+                rootfs.write_bytes(b"rootfs-after")
+                extra.write_bytes(b"extra-after")
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
+                run(config)
+
+            validator = Path(__file__).resolve().parents[2] / "scripts/ci/validate-qemu-receipt.py"
+            validator_args = [
+                sys.executable,
+                str(validator),
+                "--receipt",
+                str(config.receipt_path),
+                "--arch",
+                "la",
+                "--cpus",
+                "1",
+                "--kernel",
+                str(kernel),
+                "--rootfs",
+                str(rootfs),
+                "--rootfs-mode",
+                "rw",
+                "--extra-block",
+                str(extra),
+                "--extra-block-mode",
+                "rw",
+                "--log",
+                str(config.log_path),
+                "--qemu-binary",
+                sys.executable,
+            ]
+            self.assertEqual(subprocess.run(validator_args, check=False).returncode, 0)
+
+            tampered = json.loads(config.receipt_path.read_text(encoding="utf-8"))
+            for key in (
+                "rootfs_source",
+                "rootfs_runtime_before",
+                "extra_block_source",
+                "extra_block_runtime_before",
+            ):
+                tampered[key] = {"path": tampered[key]["path"]}
+            config.receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+            self.assertNotEqual(subprocess.run(validator_args, check=False).returncode, 0)
+
+    def test_prepared_receipt_survives_an_unexpected_runner_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            receipt_path = root / "run" / "receipt.json"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="la",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=receipt_path,
+            )
+            with patch(
+                "tools.qemu_runner.runner.run_process",
+                side_effect=RuntimeError("injected runner failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected runner failure"):
+                    run(config)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "prepared")
+            self.assertNotIn("returncode", receipt)
+
+    def test_receipt_must_not_alias_a_run_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="rv",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=kernel,
+            )
+            with self.assertRaisesRegex(RunnerError, "receipt aliases"):
+                run(config)
+            self.assertEqual(kernel.read_bytes(), b"kernel")
+
+    def test_receipt_must_not_hardlink_a_run_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            receipt_path = root / "receipt.json"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            receipt_path.hardlink_to(kernel)
+            config = RunConfig(
+                arch="rv",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=receipt_path,
+            )
+            with self.assertRaisesRegex(RunnerError, "receipt aliases"):
+                run(config)
+            self.assertEqual(kernel.read_bytes(), b"kernel")
+
+    def test_log_must_not_alias_a_run_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="rv",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=rootfs,
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+            )
+            with patch("tools.qemu_runner.runner.run_process") as mocked:
+                with self.assertRaisesRegex(RunnerError, "log aliases"):
+                    run(config)
+            mocked.assert_not_called()
+            self.assertEqual(rootfs.read_bytes(), b"rootfs")
+
+    def test_log_must_not_hardlink_a_run_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            log_path = root / "console.log"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            log_path.hardlink_to(kernel)
+            config = RunConfig(
+                arch="la",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=log_path,
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+            )
+            with patch("tools.qemu_runner.runner.run_process") as mocked:
+                with self.assertRaisesRegex(RunnerError, "log aliases"):
+                    run(config)
+            mocked.assert_not_called()
+            self.assertEqual(kernel.read_bytes(), b"kernel")
 
     def test_missing_kernel_is_rejected_before_image_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

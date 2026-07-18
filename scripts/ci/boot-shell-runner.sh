@@ -40,6 +40,7 @@ runner_args=(
     --timeout "$timeout_secs"
     --workdir "$workdir"
     --log "$workdir/qemu.log"
+    --receipt "$workdir/qemu-runner-receipt.json"
     --interactive
     --input-after-marker "$ready_marker"
     --ready-timeout "$ready_timeout_secs"
