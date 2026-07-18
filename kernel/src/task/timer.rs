@@ -2,7 +2,7 @@
 
 use alloc::{
     borrow::ToOwned,
-    collections::{BTreeMap, binary_heap::BinaryHeap},
+    collections::binary_heap::BinaryHeap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -245,85 +245,246 @@ impl Ord for Entry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TimerKey {
-    deadline: Duration,
-    key: u64,
+const CLOCK_TIMER_CAPACITY: usize = 256;
+// The alarm owner drives timerfd/POSIX/interval timers for the whole kernel.
+// Keep one dedicated slot per clock domain so user futex/nanosleep pressure
+// cannot make that owner exit when the general admission budget is full.
+const CLOCK_TIMER_SYSTEM_RESERVE: usize = 1;
+const CLOCK_TIMER_GENERAL_CAPACITY: usize = CLOCK_TIMER_CAPACITY - CLOCK_TIMER_SYSTEM_RESERVE;
+const CLOCK_TIMER_WAKE_BATCH: usize = 16;
+const CLOCK_TIMER_WAKE_BATCHES: usize = CLOCK_TIMER_CAPACITY.div_ceil(CLOCK_TIMER_WAKE_BATCH);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockTimerAdmission {
+    General,
+    System,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerKey {
+    slot: usize,
+    generation: u64,
+}
+
+struct ClockTimerSlot {
+    deadline: Duration,
+    generation: u64,
+    occupied: bool,
+    waker: Option<Waker>,
+}
+
+impl ClockTimerSlot {
+    const fn new() -> Self {
+        Self {
+            deadline: Duration::ZERO,
+            generation: 0,
+            occupied: false,
+            waker: None,
+        }
+    }
+}
+
 struct ClockTimerRuntime {
-    next_key: u64,
-    wheel: BTreeMap<TimerKey, Waker>,
+    slots: [ClockTimerSlot; CLOCK_TIMER_CAPACITY],
+    next_general: usize,
+    len: usize,
 }
 
 impl ClockTimerRuntime {
-    fn add(&mut self, now: Duration, deadline: Duration) -> Option<TimerKey> {
+    const fn new() -> Self {
+        Self {
+            slots: [const { ClockTimerSlot::new() }; CLOCK_TIMER_CAPACITY],
+            next_general: CLOCK_TIMER_SYSTEM_RESERVE,
+            len: 0,
+        }
+    }
+
+    fn reserve(&mut self, now: Duration, deadline: Duration) -> AxResult<Option<TimerKey>> {
+        self.reserve_with_admission(now, deadline, ClockTimerAdmission::General)
+    }
+
+    fn reserve_system(&mut self, now: Duration, deadline: Duration) -> AxResult<Option<TimerKey>> {
+        self.reserve_with_admission(now, deadline, ClockTimerAdmission::System)
+    }
+
+    fn reserve_with_admission(
+        &mut self,
+        now: Duration,
+        deadline: Duration,
+        admission: ClockTimerAdmission,
+    ) -> AxResult<Option<TimerKey>> {
         if deadline <= now {
-            return None;
+            return Ok(None);
         }
 
-        let key = TimerKey {
-            deadline,
-            key: self.next_key,
+        let slot = match admission {
+            ClockTimerAdmission::System => {
+                let slots = &self.slots[..CLOCK_TIMER_SYSTEM_RESERVE];
+                if let Some(slot) = slots
+                    .iter()
+                    .position(|entry| !entry.occupied && entry.generation < u64::MAX)
+                {
+                    slot
+                } else if slots.iter().all(|entry| entry.occupied) {
+                    return Err(AxError::ResourceBusy);
+                } else {
+                    return Err(AxError::OutOfRange);
+                }
+            }
+            ClockTimerAdmission::General => {
+                let start = self.next_general - CLOCK_TIMER_SYSTEM_RESERVE;
+                let mut reusable = None;
+                let mut has_free = false;
+                for offset in 0..CLOCK_TIMER_GENERAL_CAPACITY {
+                    let slot = CLOCK_TIMER_SYSTEM_RESERVE
+                        + (start + offset) % CLOCK_TIMER_GENERAL_CAPACITY;
+                    let entry = &self.slots[slot];
+                    if !entry.occupied {
+                        has_free = true;
+                        if entry.generation < u64::MAX {
+                            reusable = Some(slot);
+                            break;
+                        }
+                    }
+                }
+                match reusable {
+                    Some(slot) => slot,
+                    None if has_free => return Err(AxError::OutOfRange),
+                    None => return Err(AxError::ResourceBusy),
+                }
+            }
         };
-        self.wheel.insert(key, Waker::noop().clone());
-        self.next_key += 1;
-        Some(key)
+
+        let entry = &mut self.slots[slot];
+        entry.generation += 1;
+        entry.deadline = deadline;
+        entry.occupied = true;
+        self.len += 1;
+        if admission == ClockTimerAdmission::General {
+            self.next_general = if slot + 1 == CLOCK_TIMER_CAPACITY {
+                CLOCK_TIMER_SYSTEM_RESERVE
+            } else {
+                slot + 1
+            };
+        }
+        let key = TimerKey {
+            slot,
+            generation: entry.generation,
+        };
+        Ok(Some(key))
+    }
+
+    fn is_live(&self, key: TimerKey) -> bool {
+        self.slots
+            .get(key.slot)
+            .is_some_and(|entry| entry.occupied && entry.generation == key.generation)
     }
 
     fn next_deadline(&self) -> Option<Duration> {
-        self.wheel.first_key_value().map(|(key, _)| key.deadline)
+        self.slots
+            .iter()
+            .filter(|entry| entry.occupied)
+            .map(|entry| entry.deadline)
+            .min()
     }
 
-    fn poll(&mut self, key: &TimerKey, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(waker) = self.wheel.get_mut(key) {
-            *waker = cx.waker().clone();
-            Poll::Pending
+    fn poll(
+        &mut self,
+        key: TimerKey,
+        candidate: &Waker,
+        owned: Waker,
+    ) -> (Poll<()>, Option<Waker>) {
+        if !self.is_live(key) {
+            return (Poll::Ready(()), Some(owned));
+        }
+
+        let entry = &mut self.slots[key.slot];
+        if entry
+            .waker
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(candidate))
+        {
+            (Poll::Pending, Some(owned))
         } else {
-            Poll::Ready(())
+            (Poll::Pending, entry.waker.replace(owned))
         }
     }
 
-    fn cancel(&mut self, key: &TimerKey) {
-        self.wheel.remove(key);
+    fn cancel(&mut self, key: TimerKey) -> Option<Waker> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let entry = &mut self.slots[key.slot];
+        entry.occupied = false;
+        self.len -= 1;
+        if key.slot >= CLOCK_TIMER_SYSTEM_RESERVE {
+            self.next_general = key.slot;
+        }
+        entry.waker.take()
     }
 
-    fn wake(&mut self, now: Duration) -> bool {
-        if self.wheel.is_empty() {
-            return false;
+    fn drain_expired_batch(
+        &mut self,
+        now: Duration,
+        pending: &mut [Option<Waker>; CLOCK_TIMER_WAKE_BATCH],
+    ) -> usize {
+        let mut count = 0;
+        let mut first_general_refund = None;
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            if entry.occupied && entry.deadline <= now {
+                entry.occupied = false;
+                self.len -= 1;
+                pending[count] = entry.waker.take();
+                if slot >= CLOCK_TIMER_SYSTEM_RESERVE && first_general_refund.is_none() {
+                    first_general_refund = Some(slot);
+                }
+                count += 1;
+                if count == CLOCK_TIMER_WAKE_BATCH {
+                    break;
+                }
+            }
         }
-
-        let pending = self.wheel.split_off(&TimerKey {
-            deadline: now,
-            key: u64::MAX,
-        });
-        let expired = mem::replace(&mut self.wheel, pending);
-        let woke = !expired.is_empty();
-        for (_, waker) in expired {
-            waker.wake();
+        if let Some(slot) = first_general_refund {
+            self.next_general = slot;
         }
-        woke
+        count
     }
 }
 
-struct ClockTimerFuture {
+/// An admitted clock sleep whose polling path only touches bounded IRQ-safe
+/// timer and waker state.
+#[must_use = "a prepared clock sleep must be polled or dropped to cancel it"]
+pub(crate) struct PreparedClockSleep {
     clock: AlarmClock,
-    key: TimerKey,
+    key: Option<TimerKey>,
 }
 
-impl Future for ClockTimerFuture {
+impl Future for PreparedClockSleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        timer_runtime(self.clock).lock().poll(&self.key, cx)
+        let Some(key) = self.key else {
+            return Poll::Ready(());
+        };
+
+        // Clone and release wakers outside the IRQ-safe registry lock. The
+        // locked section performs only a bounded slot lookup and replacement.
+        let owned = cx.waker().clone();
+        let (result, deferred) = timer_runtime(self.clock)
+            .lock()
+            .poll(key, cx.waker(), owned);
+        drop(deferred);
+        result
     }
 }
 
-impl Drop for ClockTimerFuture {
+impl Drop for PreparedClockSleep {
     fn drop(&mut self) {
-        timer_runtime(self.clock).lock().cancel(&self.key);
-        update_clock_timer_deadline();
+        if let Some(key) = self.key.take() {
+            let deferred = timer_runtime(self.clock).lock().cancel(key);
+            drop(deferred);
+            update_clock_timer_deadline();
+        }
     }
 }
 
@@ -333,9 +494,9 @@ lazy_static! {
     static ref REALTIME_ALARM_EVENT: Event = Event::new();
     static ref MONOTONIC_ALARM_EVENT: Event = Event::new();
     static ref REALTIME_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
-        SpinNoIrq::new(ClockTimerRuntime::default());
+        SpinNoIrq::new(ClockTimerRuntime::new());
     static ref MONOTONIC_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
-        SpinNoIrq::new(ClockTimerRuntime::default());
+        SpinNoIrq::new(ClockTimerRuntime::new());
 }
 
 static CLOCK_TIMER_CALLBACK_TOKENS: [SpinNoIrq<Option<TimerCallbackToken>>;
@@ -651,7 +812,11 @@ fn alarm_task(clock: AlarmClock) -> Result<AxResult<()>, BlockOnError> {
             continue;
         };
 
-        match block_on(wait_until_or_alarm(clock, deadline, listener)) {
+        let mut sleeper = match prepare_alarm_clock_sleep(clock, deadline) {
+            Ok(sleeper) => sleeper,
+            Err(error) => return Ok(Err(error)),
+        };
+        match block_on(wait_until_or_alarm(&mut sleeper, listener)) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => return Ok(Err(error)),
             Err(error) => return Err(error),
@@ -768,6 +933,8 @@ fn ensure_clock_timer_runtime() -> AxResult<()> {
 
 #[cfg(test)]
 mod clock_timer_callback_tests {
+    use core::task::Waker;
+
     use super::*;
 
     #[test]
@@ -794,10 +961,147 @@ mod clock_timer_callback_tests {
             AxError::OutOfRange
         );
     }
+
+    #[test]
+    fn elapsed_clock_sleep_never_consumes_a_slot() {
+        let mut runtime = ClockTimerRuntime::new();
+        assert_eq!(
+            runtime.reserve(Duration::from_secs(5), Duration::from_secs(5)),
+            Ok(None)
+        );
+        assert_eq!(runtime.len, 0);
+        assert_eq!(runtime.next_deadline(), None);
+    }
+
+    #[test]
+    fn cancelling_clock_sleep_refunds_exactly_one_slot() {
+        let mut runtime = ClockTimerRuntime::new();
+        let key = runtime
+            .reserve(Duration::ZERO, Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.len, 1);
+
+        assert!(runtime.cancel(key).is_none());
+        assert_eq!(runtime.len, 0);
+        assert!(runtime.cancel(key).is_none());
+        assert_eq!(runtime.len, 0);
+
+        assert!(
+            runtime
+                .reserve(Duration::ZERO, Duration::from_secs(2))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(runtime.len, 1);
+    }
+
+    #[test]
+    fn clock_sleep_admission_is_bounded_and_refundable() {
+        let mut runtime = ClockTimerRuntime::new();
+        let mut first = None;
+        for index in 0..CLOCK_TIMER_GENERAL_CAPACITY {
+            let key = runtime
+                .reserve(Duration::ZERO, Duration::from_secs(index as u64 + 1))
+                .unwrap()
+                .unwrap();
+            first.get_or_insert(key);
+        }
+        assert!(matches!(
+            runtime.reserve(Duration::ZERO, Duration::from_secs(u64::MAX)),
+            Err(AxError::ResourceBusy)
+        ));
+
+        let system = runtime
+            .reserve_system(Duration::ZERO, Duration::from_secs(u64::MAX))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            runtime.reserve_system(Duration::ZERO, Duration::from_secs(u64::MAX)),
+            Err(AxError::ResourceBusy)
+        ));
+        assert_eq!(runtime.len, CLOCK_TIMER_CAPACITY);
+
+        runtime.cancel(first.unwrap());
+        assert!(
+            runtime
+                .reserve(Duration::ZERO, Duration::from_secs(u64::MAX))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(runtime.len, CLOCK_TIMER_CAPACITY);
+        assert!(runtime.is_live(system));
+    }
+
+    #[test]
+    fn expired_slots_release_wakers_outside_the_runtime() {
+        let mut runtime = ClockTimerRuntime::new();
+        let key = runtime
+            .reserve(Duration::ZERO, Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let waker = Waker::noop().clone();
+        assert_eq!(runtime.poll(key, Waker::noop(), waker).0, Poll::Pending);
+
+        let mut pending = [const { None }; CLOCK_TIMER_WAKE_BATCH];
+        assert_eq!(
+            runtime.drain_expired_batch(Duration::from_secs(1), &mut pending),
+            0
+        );
+        assert_eq!(
+            runtime.drain_expired_batch(Duration::from_secs(2), &mut pending),
+            1
+        );
+        assert_eq!(runtime.len, 0);
+        assert_eq!(pending.into_iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn expired_clock_sleeps_drain_in_fixed_irq_batches() {
+        let mut runtime = ClockTimerRuntime::new();
+        for _ in 0..CLOCK_TIMER_WAKE_BATCH + 1 {
+            runtime
+                .reserve(Duration::ZERO, Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+
+        let mut first = [const { None }; CLOCK_TIMER_WAKE_BATCH];
+        assert_eq!(
+            runtime.drain_expired_batch(Duration::from_secs(1), &mut first),
+            CLOCK_TIMER_WAKE_BATCH
+        );
+        assert_eq!(runtime.len, 1);
+
+        let mut second = [const { None }; CLOCK_TIMER_WAKE_BATCH];
+        assert_eq!(
+            runtime.drain_expired_batch(Duration::from_secs(1), &mut second),
+            1
+        );
+        assert_eq!(runtime.len, 0);
+    }
 }
 
 fn wake_clock_timers(clock: AlarmClock) {
-    if timer_runtime(clock).lock().wake(clock.now()) {
+    let now = clock.now();
+    let mut woke = false;
+    for _ in 0..CLOCK_TIMER_WAKE_BATCHES {
+        let mut pending = [const { None }; CLOCK_TIMER_WAKE_BATCH];
+        let count = timer_runtime(clock)
+            .lock()
+            .drain_expired_batch(now, &mut pending);
+        if count == 0 {
+            break;
+        }
+        woke = true;
+        for waker in pending.into_iter().flatten() {
+            waker.wake();
+        }
+        if count < CLOCK_TIMER_WAKE_BATCH {
+            break;
+        }
+    }
+    if woke {
         axtask::request_resched_current();
     }
     update_clock_timer_deadline();
@@ -1213,37 +1517,75 @@ fn process_due(clock: AlarmClock) -> bool {
 }
 
 async fn wait_until_or_alarm<L>(
-    clock: AlarmClock,
-    deadline: Duration,
+    sleeper: &mut PreparedClockSleep,
     mut listener: L,
 ) -> AxResult<AlarmWait>
 where
     L: Future<Output = ()> + Unpin,
 {
-    let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
     poll_fn(|cx| {
         if Pin::new(&mut listener).poll(cx).is_ready() {
             return Poll::Ready(Ok(AlarmWait::NewTimer));
         }
-        match sleeper.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(AlarmWait::DeadlineReached)),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        match Pin::new(&mut *sleeper).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Ok(AlarmWait::DeadlineReached)),
             Poll::Pending => Poll::Pending,
         }
     })
     .await
 }
 
-pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) -> AxResult<()> {
+/// Admits a clock-domain sleep before a synchronous block session starts.
+///
+/// Callback registration, bounded slot admission, and hardware deadline
+/// publication may fail or touch non-wait state, so they deliberately happen
+/// here rather than in [`Future::poll`]. The returned future only updates its
+/// pre-admitted IRQ-safe slot and can be borrowed by `block_on` callers.
+pub(crate) fn prepare_clock_sleep(
+    clock: AlarmClock,
+    deadline: Duration,
+) -> AxResult<PreparedClockSleep> {
+    prepare_clock_sleep_with_admission(clock, deadline, ClockTimerAdmission::General)
+}
+
+fn prepare_alarm_clock_sleep(
+    clock: AlarmClock,
+    deadline: Duration,
+) -> AxResult<PreparedClockSleep> {
+    prepare_clock_sleep_with_admission(clock, deadline, ClockTimerAdmission::System)
+}
+
+fn prepare_clock_sleep_with_admission(
+    clock: AlarmClock,
+    deadline: Duration,
+    admission: ClockTimerAdmission,
+) -> AxResult<PreparedClockSleep> {
     let now = clock.now();
     if deadline <= now {
-        return Ok(());
+        return Ok(PreparedClockSleep { clock, key: None });
     }
-    ensure_clock_timer_runtime()?;
-    let key = timer_runtime(clock).lock().add(clock.now(), deadline);
+    if let Err(error) = ensure_clock_timer_runtime() {
+        // Completion wins if the deadline elapsed while callback admission was
+        // attempted. Otherwise preserve the exact construction failure.
+        if deadline <= clock.now() {
+            return Ok(PreparedClockSleep { clock, key: None });
+        }
+        return Err(error);
+    }
+
+    let now = clock.now();
+    let reservation = {
+        let mut runtime = timer_runtime(clock).lock();
+        match admission {
+            ClockTimerAdmission::General => runtime.reserve(now, deadline),
+            ClockTimerAdmission::System => runtime.reserve_system(now, deadline),
+        }
+    };
+    let key = match reservation {
+        Ok(key) => key,
+        Err(_) if deadline <= clock.now() => None,
+        Err(error) => return Err(error),
+    };
     update_clock_timer_deadline();
-    if let Some(key) = key {
-        ClockTimerFuture { clock, key }.await;
-    }
-    Ok(())
+    Ok(PreparedClockSleep { clock, key })
 }

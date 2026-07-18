@@ -8,6 +8,7 @@ use alloc::{
 use core::{
     future::{Future, poll_fn},
     ops::Deref,
+    pin::Pin,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -21,7 +22,7 @@ use memory_addr::VirtAddr;
 
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
-    task::{AlarmClock, AsThread, ProcStateHint, sleep_until_clock},
+    task::{AlarmClock, AsThread, PreparedClockSleep, ProcStateHint, prepare_clock_sleep},
 };
 
 /// Wait queue used by futex.
@@ -166,12 +167,33 @@ fn setup_error_or_wake(registrations: &[WaitRegistration], err: AxError) -> AxRe
     }
 }
 
-fn clock_timeout_error(result: Poll<AxResult<()>>) -> Option<AxError> {
-    match result {
-        Poll::Ready(Ok(())) => Some(AxError::TimedOut),
-        Poll::Ready(Err(error)) => Some(error),
-        Poll::Pending => None,
-    }
+async fn wait_with_prepared_clock_timeout<F, T>(
+    wait: F,
+    mut sleeper: Option<&mut PreparedClockSleep>,
+) -> AxResult<T>
+where
+    F: Future<Output = AxResult<T>>,
+{
+    let mut wait = core::pin::pin!(wait);
+    poll_fn(|cx| {
+        if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        let Some(sleeper) = sleeper.as_mut() else {
+            return Poll::Pending;
+        };
+        if Pin::new(&mut **sleeper).poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+
+        // A futex wake that linearized in the same observation window wins
+        // over the timeout, matching the completion-first interrupt path.
+        match wait.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => Poll::Ready(Err(AxError::TimedOut)),
+        }
+    })
+    .await
 }
 
 impl WaitQueue {
@@ -303,39 +325,40 @@ impl WaitQueue {
                 .as_ref()
                 .expect("registered futex waiter"),
         };
-        let wait = async {
-            if let Some((clock, deadline)) = timeout {
-                let mut wait = core::pin::pin!(wait);
-                let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
-                poll_fn(|cx| {
-                    if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-                        return Poll::Ready(result);
+        let mut sleeper = match timeout {
+            Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
+                Ok(sleeper) => Some(sleeper),
+                Err(error) => {
+                    if registration
+                        .waiter
+                        .as_ref()
+                        .is_some_and(|waiter| waiter.lock().awakened)
+                    {
+                        return Ok(true);
                     }
-                    if let Some(error) = clock_timeout_error(sleeper.as_mut().poll(cx)) {
-                        return Poll::Ready(Err(error));
-                    }
-                    Poll::Pending
-                })
-                .await
-            } else {
-                wait.await
-            }
+                    return Err(error);
+                }
+            },
+            None => None,
         };
-        let curr = current();
-        let mut wait = core::pin::pin!(wait);
-        block_on(poll_fn(|cx| {
-            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-                return Poll::Ready(result);
-            }
-            if curr.poll_interrupt(cx).is_ready() {
-                return Poll::Ready(Err(AxError::Interrupted));
-            }
-            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-                return Poll::Ready(result);
-            }
-            Poll::Pending
-        }))
-        .map_err(AxError::from)?
+        let result = {
+            let wait = wait_with_prepared_clock_timeout(wait, sleeper.as_mut());
+            let curr = current();
+            let mut wait = core::pin::pin!(wait);
+            block_on(poll_fn(|cx| {
+                if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                    return Poll::Ready(result);
+                }
+                if curr.poll_interrupt(cx).is_ready() {
+                    return Poll::Ready(Err(AxError::Interrupted));
+                }
+                if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                    return Poll::Ready(result);
+                }
+                Poll::Pending
+            }))
+        };
+        result.map_err(AxError::from)?
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
@@ -497,39 +520,31 @@ pub fn wait_on_any_futex_if(
     let wait = WaitAnyFuture {
         waiters: &registrations,
     };
-    let wait = async {
-        if let Some((clock, deadline)) = timeout {
-            let mut wait = core::pin::pin!(wait);
-            let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
-            poll_fn(|cx| {
-                if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-                    return Poll::Ready(result);
-                }
-                if let Some(error) = clock_timeout_error(sleeper.as_mut().poll(cx)) {
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Pending
-            })
-            .await
-        } else {
-            wait.await
-        }
+    let mut sleeper = match timeout {
+        Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
+            Ok(sleeper) => Some(sleeper),
+            Err(error) => return setup_error_or_wake(&registrations, error),
+        },
+        None => None,
     };
-    let curr = current();
-    let mut wait = core::pin::pin!(wait);
-    block_on(poll_fn(|cx| {
-        if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-            return Poll::Ready(result);
-        }
-        if curr.poll_interrupt(cx).is_ready() {
-            return Poll::Ready(Err(AxError::Interrupted));
-        }
-        if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-            return Poll::Ready(result);
-        }
-        Poll::Pending
-    }))
-    .map_err(AxError::from)?
+    let result = {
+        let wait = wait_with_prepared_clock_timeout(wait, sleeper.as_mut());
+        let curr = current();
+        let mut wait = core::pin::pin!(wait);
+        block_on(poll_fn(|cx| {
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if curr.poll_interrupt(cx).is_ready() {
+                return Poll::Ready(Err(AxError::Interrupted));
+            }
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            Poll::Pending
+        }))
+    };
+    result.map_err(AxError::from)?
 }
 
 #[cfg(test)]
@@ -559,19 +574,6 @@ mod tests {
             .register_waiter_if(Arc::downgrade(entry), u32::MAX, None, || Ok(true))
             .expect("waiter registration failed")
             .expect("test condition rejected waiter")
-    }
-
-    #[test]
-    fn timer_registration_failure_is_not_reported_as_timeout() {
-        assert_eq!(
-            clock_timeout_error(Poll::Ready(Err(AxError::NoMemory))),
-            Some(AxError::NoMemory)
-        );
-        assert_eq!(
-            clock_timeout_error(Poll::Ready(Ok(()))),
-            Some(AxError::TimedOut)
-        );
-        assert_eq!(clock_timeout_error(Poll::Pending), None);
     }
 
     #[test]

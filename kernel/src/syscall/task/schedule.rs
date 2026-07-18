@@ -24,9 +24,10 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, Cred, ProcStateHint, get_process_group, get_task, process_domain,
+        AlarmClock, AsThread, Cred, ProcStateHint, get_process_group, get_task,
+        prepare_clock_sleep, process_domain,
         security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
-        sleep_until_clock, try_tasks, with_proc_state_hint,
+        try_tasks, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -421,13 +422,12 @@ enum ClockSleepOutcome {
 }
 
 fn flatten_clock_sleep_result(
-    result: Result<Result<AxResult<()>, Interrupted>, BlockOnError>,
+    result: Result<Result<(), Interrupted>, BlockOnError>,
 ) -> AxResult<ClockSleepOutcome> {
     match result {
         Err(error) => Err(error.into()),
         Ok(Err(_)) => Ok(ClockSleepOutcome::Interrupted),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Ok(Ok(()))) => Ok(ClockSleepOutcome::Completed),
+        Ok(Ok(())) => Ok(ClockSleepOutcome::Completed),
     }
 }
 
@@ -439,13 +439,11 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
     }
     let start = AlarmClock::Monotonic.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
+    let mut sleeper = prepare_clock_sleep(AlarmClock::Monotonic, deadline)?;
 
     // We detect EINTR manually if the slept time is not enough.
     let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on(interruptible(sleep_until_clock(
-            AlarmClock::Monotonic,
-            deadline,
-        )))
+        block_on(interruptible(&mut sleeper))
     });
     let _ = flatten_clock_sleep_result(result)?;
 
@@ -455,8 +453,9 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
 fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<bool> {
     debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
 
+    let mut sleeper = prepare_clock_sleep(clock, deadline)?;
     let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on(interruptible(sleep_until_clock(clock, deadline)))
+        block_on(interruptible(&mut sleeper))
     });
     let _ = flatten_clock_sleep_result(result)?;
     Ok(clock.now() >= deadline)
@@ -913,21 +912,13 @@ mod tests {
     }
 
     #[test]
-    fn clock_sleep_result_preserves_timer_registration_failure() {
-        assert_eq!(
-            flatten_clock_sleep_result(Ok(Ok(Err(AxError::NoMemory)))),
-            Err(AxError::NoMemory)
-        );
-    }
-
-    #[test]
     fn clock_sleep_result_distinguishes_interrupt_from_completion() {
         assert_eq!(
             flatten_clock_sleep_result(Ok(Err(Interrupted))),
             Ok(ClockSleepOutcome::Interrupted)
         );
         assert_eq!(
-            flatten_clock_sleep_result(Ok(Ok(Ok(())))),
+            flatten_clock_sleep_result(Ok(Ok(()))),
             Ok(ClockSleepOutcome::Completed)
         );
     }
