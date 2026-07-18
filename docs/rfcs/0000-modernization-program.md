@@ -95,6 +95,44 @@ A module may move into a long-lived public crate only when:
 Until then, public surfaces remain 0.x, sealed where practical, and
 `pub(crate)` by default.
 
+## Synchronous wait checkpoint
+
+Kernel waits prepare every fallible or sleepable resource before entering a
+synchronous `block_on` session. Polling may inspect only the waiter's bounded
+IRQ-safe state; it may not acquire an operation mutex, copy user memory,
+perform fallible admission or allocation, register a callback, or publish a
+hardware deadline. Timeout, interruption, and setup failure are finalized only
+after the block session has closed.
+
+Futex wake and terminal cancellation share one waiter-state linearization
+point. A wake that owns the waiter removes it and contributes to the wake
+count; otherwise cancellation marks it terminal before queue removal and a
+later wake does not count it. This applies equally to a waiter that was
+requeued and to every member of a wait-vector registration.
+
+This terminal ordering was checked on 2026-07-19 against Linux revision
+`2687c848e578`: single wait calls
+[`futex_unqueue`](https://codebrowser.dev/linux/linux/kernel/futex/waitwake.c.html#689)
+before testing timeout or signal state, and wait-vector calls
+[`futex_unqueue_multiple`](https://codebrowser.dev/linux/linux/kernel/futex/waitwake.c.html#558)
+before the same errors. The GPL source is used only as an observable semantic
+reference; no implementation code is copied.
+
+Clock sleeps use fixed per-CPU, per-clock shards. The current implementation
+admits 256 slots per shard: one is reserved for the kernel alarm owner and 255
+are ordinary slots. Tokens retain owner CPU, slot, and generation, so a
+migrated task polls or cancels through the owning shard's spin lock. A timer
+callback drains only its local shard in fixed batches. Remote cancellation may
+leave a harmless early hardware interrupt on the owner CPU, but it must never
+delay a live deadline or cause a late wake.
+
+Ordinary shard or callback-capacity exhaustion is a temporary admission
+failure and reaches Linux callers as `EAGAIN`; it is not reported as `EBUSY`
+and never falls back to polling or unbounded allocation. The system-reserved
+admission class remains distinct. Per-process fairness and aggregate admission
+across CPU migration are not claimed by this checkpoint and require workload
+evidence before they become policy.
+
 ## Checkpoint discipline
 
 Branding, provenance, CI infrastructure, semantic changes, performance

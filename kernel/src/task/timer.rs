@@ -247,8 +247,9 @@ impl Ord for Entry {
 
 const CLOCK_TIMER_CAPACITY: usize = 256;
 // The alarm owner drives timerfd/POSIX/interval timers for the whole kernel.
-// Keep one dedicated slot per clock domain so user futex/nanosleep pressure
-// cannot make that owner exit when the general admission budget is full.
+// Keep one dedicated slot in every per-CPU clock shard so user
+// futex/nanosleep pressure cannot make that owner exit when a shard's general
+// admission budget is full.
 const CLOCK_TIMER_SYSTEM_RESERVE: usize = 1;
 const CLOCK_TIMER_GENERAL_CAPACITY: usize = CLOCK_TIMER_CAPACITY - CLOCK_TIMER_SYSTEM_RESERVE;
 const CLOCK_TIMER_WAKE_BATCH: usize = 16;
@@ -261,9 +262,15 @@ enum ClockTimerAdmission {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TimerKey {
+struct TimerSlotKey {
     slot: usize,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockTimerToken {
+    owner_cpu: usize,
+    key: TimerSlotKey,
 }
 
 struct ClockTimerSlot {
@@ -299,11 +306,15 @@ impl ClockTimerRuntime {
         }
     }
 
-    fn reserve(&mut self, now: Duration, deadline: Duration) -> AxResult<Option<TimerKey>> {
+    fn reserve(&mut self, now: Duration, deadline: Duration) -> AxResult<Option<TimerSlotKey>> {
         self.reserve_with_admission(now, deadline, ClockTimerAdmission::General)
     }
 
-    fn reserve_system(&mut self, now: Duration, deadline: Duration) -> AxResult<Option<TimerKey>> {
+    fn reserve_system(
+        &mut self,
+        now: Duration,
+        deadline: Duration,
+    ) -> AxResult<Option<TimerSlotKey>> {
         self.reserve_with_admission(now, deadline, ClockTimerAdmission::System)
     }
 
@@ -312,7 +323,7 @@ impl ClockTimerRuntime {
         now: Duration,
         deadline: Duration,
         admission: ClockTimerAdmission,
-    ) -> AxResult<Option<TimerKey>> {
+    ) -> AxResult<Option<TimerSlotKey>> {
         if deadline <= now {
             return Ok(None);
         }
@@ -367,14 +378,14 @@ impl ClockTimerRuntime {
                 slot + 1
             };
         }
-        let key = TimerKey {
+        let key = TimerSlotKey {
             slot,
             generation: entry.generation,
         };
         Ok(Some(key))
     }
 
-    fn is_live(&self, key: TimerKey) -> bool {
+    fn is_live(&self, key: TimerSlotKey) -> bool {
         self.slots
             .get(key.slot)
             .is_some_and(|entry| entry.occupied && entry.generation == key.generation)
@@ -390,7 +401,7 @@ impl ClockTimerRuntime {
 
     fn poll(
         &mut self,
-        key: TimerKey,
+        key: TimerSlotKey,
         candidate: &Waker,
         owned: Waker,
     ) -> (Poll<()>, Option<Waker>) {
@@ -410,7 +421,7 @@ impl ClockTimerRuntime {
         }
     }
 
-    fn cancel(&mut self, key: TimerKey) -> Option<Waker> {
+    fn cancel(&mut self, key: TimerSlotKey) -> Option<Waker> {
         if !self.is_live(key) {
             return None;
         }
@@ -456,23 +467,24 @@ impl ClockTimerRuntime {
 #[must_use = "a prepared clock sleep must be polled or dropped to cancel it"]
 pub(crate) struct PreparedClockSleep {
     clock: AlarmClock,
-    key: Option<TimerKey>,
+    token: Option<ClockTimerToken>,
 }
 
 impl Future for PreparedClockSleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Some(key) = self.key else {
+        let Some(token) = self.token else {
             return Poll::Ready(());
         };
 
         // Clone and release wakers outside the IRQ-safe registry lock. The
         // locked section performs only a bounded slot lookup and replacement.
         let owned = cx.waker().clone();
-        let (result, deferred) = timer_runtime(self.clock)
-            .lock()
-            .poll(key, cx.waker(), owned);
+        let (result, deferred) =
+            timer_runtime(self.clock, token.owner_cpu)
+                .lock()
+                .poll(token.key, cx.waker(), owned);
         drop(deferred);
         result
     }
@@ -480,10 +492,21 @@ impl Future for PreparedClockSleep {
 
 impl Drop for PreparedClockSleep {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            let deferred = timer_runtime(self.clock).lock().cancel(key);
+        if let Some(token) = self.token.take() {
+            // Cancellation is safe from a migrated task: the token routes to
+            // the owning CPU's shard and that shard's spin lock serializes
+            // with its timer callback. Only the owning CPU may reprogram its
+            // local hardware deadline. A remote cancellation can leave one
+            // stale early interrupt, but cannot delay a later live deadline.
+            let _cpu_guard = NoPreempt::new();
+            let current_cpu = axhal::percpu::this_cpu_id();
+            let deferred = timer_runtime(self.clock, token.owner_cpu)
+                .lock()
+                .cancel(token.key);
             drop(deferred);
-            update_clock_timer_deadline();
+            if current_cpu == token.owner_cpu {
+                update_clock_timer_deadline(token.owner_cpu);
+            }
         }
     }
 }
@@ -493,11 +516,12 @@ lazy_static! {
     static ref MONOTONIC_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
     static ref REALTIME_ALARM_EVENT: Event = Event::new();
     static ref MONOTONIC_ALARM_EVENT: Event = Event::new();
-    static ref REALTIME_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
-        SpinNoIrq::new(ClockTimerRuntime::new());
-    static ref MONOTONIC_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
-        SpinNoIrq::new(ClockTimerRuntime::new());
 }
+
+static REALTIME_TIMER_RUNTIMES: [SpinNoIrq<ClockTimerRuntime>; axconfig::plat::MAX_CPU_NUM] =
+    [const { SpinNoIrq::new(ClockTimerRuntime::new()) }; axconfig::plat::MAX_CPU_NUM];
+static MONOTONIC_TIMER_RUNTIMES: [SpinNoIrq<ClockTimerRuntime>; axconfig::plat::MAX_CPU_NUM] =
+    [const { SpinNoIrq::new(ClockTimerRuntime::new()) }; axconfig::plat::MAX_CPU_NUM];
 
 static CLOCK_TIMER_CALLBACK_TOKENS: [SpinNoIrq<Option<TimerCallbackToken>>;
     axconfig::plat::MAX_CPU_NUM] = [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
@@ -867,10 +891,10 @@ fn alarm_event(clock: AlarmClock) -> &'static Event {
     }
 }
 
-fn timer_runtime(clock: AlarmClock) -> &'static SpinNoIrq<ClockTimerRuntime> {
+fn timer_runtime(clock: AlarmClock, owner_cpu: usize) -> &'static SpinNoIrq<ClockTimerRuntime> {
     match clock {
-        AlarmClock::Realtime => &REALTIME_TIMER_RUNTIME,
-        AlarmClock::Monotonic => &MONOTONIC_TIMER_RUNTIME,
+        AlarmClock::Realtime => &REALTIME_TIMER_RUNTIMES[owner_cpu],
+        AlarmClock::Monotonic => &MONOTONIC_TIMER_RUNTIMES[owner_cpu],
     }
 }
 
@@ -879,6 +903,17 @@ fn map_timer_callback_register_error(error: TimerCallbackRegisterError) -> AxErr
         TimerCallbackRegisterError::NoMemory => AxError::NoMemory,
         TimerCallbackRegisterError::CapacityExhausted => AxError::ResourceBusy,
         TimerCallbackRegisterError::TokenSpaceExhausted => AxError::OutOfRange,
+    }
+}
+
+fn map_clock_sleep_admission_error(admission: ClockTimerAdmission, error: AxError) -> AxError {
+    if admission == ClockTimerAdmission::General && error == AxError::ResourceBusy {
+        // A bounded user-facing wait registry being temporarily full is an
+        // admission boundary, not object contention. The Linux adapter maps
+        // WouldBlock to EAGAIN so callers may back off explicitly.
+        AxError::WouldBlock
+    } else {
+        error
     }
 }
 
@@ -892,18 +927,24 @@ fn retain_first_callback_token<T>(slot: &mut Option<T>, token: T) -> Option<T> {
 }
 
 fn ensure_clock_timer_runtime() -> AxResult<()> {
-    // Keep the outer per-CPU token slot and axtask's internally sampled owner
-    // CPU identical even if this task's affinity changes concurrently.
     let _cpu_guard = NoPreempt::new();
     let cpu_id = axhal::percpu::this_cpu_id();
+    ensure_clock_timer_runtime_on_cpu(cpu_id)
+}
+
+/// Ensures the callback for `cpu_id` while the caller is pinned to that CPU.
+fn ensure_clock_timer_runtime_on_cpu(cpu_id: usize) -> AxResult<()> {
+    debug_assert_eq!(cpu_id, axhal::percpu::this_cpu_id());
     let owner = &CLOCK_TIMER_CALLBACK_TOKENS[cpu_id];
     if owner.lock().is_some() {
         return Ok(());
     }
 
-    let token = match register_timer_callback(|_| {
-        wake_clock_timers(AlarmClock::Realtime);
-        wake_clock_timers(AlarmClock::Monotonic);
+    let token = match register_timer_callback(move |_| {
+        // Timer callback registries are per CPU; retaining the admitted owner
+        // explicitly avoids accidentally draining another CPU's wait shard.
+        wake_clock_timers(AlarmClock::Realtime, cpu_id);
+        wake_clock_timers(AlarmClock::Monotonic, cpu_id);
     }) {
         Ok(token) => token,
         Err(error) => {
@@ -959,6 +1000,16 @@ mod clock_timer_callback_tests {
         assert_eq!(
             map_timer_callback_register_error(TimerCallbackRegisterError::TokenSpaceExhausted),
             AxError::OutOfRange
+        );
+        let user_capacity_error = map_clock_sleep_admission_error(
+            ClockTimerAdmission::General,
+            map_timer_callback_register_error(TimerCallbackRegisterError::CapacityExhausted),
+        );
+        assert_eq!(user_capacity_error, AxError::WouldBlock);
+        assert_eq!(LinuxError::from(user_capacity_error), LinuxError::EAGAIN);
+        assert_eq!(
+            map_clock_sleep_admission_error(ClockTimerAdmission::System, AxError::ResourceBusy,),
+            AxError::ResourceBusy
         );
     }
 
@@ -1034,6 +1085,107 @@ mod clock_timer_callback_tests {
     }
 
     #[test]
+    fn per_cpu_clock_shards_isolate_capacity_and_route_refunds() {
+        let mut shards = [ClockTimerRuntime::new(), ClockTimerRuntime::new()];
+        let mut first_cpu_zero = None;
+        for index in 0..CLOCK_TIMER_GENERAL_CAPACITY {
+            let key = shards[0]
+                .reserve(Duration::ZERO, Duration::from_secs(index as u64 + 1))
+                .unwrap()
+                .unwrap();
+            first_cpu_zero.get_or_insert(key);
+        }
+        assert_eq!(
+            shards[0].reserve(Duration::ZERO, Duration::MAX),
+            Err(AxError::ResourceBusy)
+        );
+        let cpu_zero_system = shards[0]
+            .reserve_system(Duration::ZERO, Duration::MAX)
+            .unwrap()
+            .unwrap();
+        let cpu_one_system = shards[1]
+            .reserve_system(Duration::ZERO, Duration::MAX)
+            .unwrap()
+            .unwrap();
+
+        let cpu_one_key = shards[1]
+            .reserve(Duration::ZERO, Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let cpu_one_token = ClockTimerToken {
+            owner_cpu: 1,
+            key: cpu_one_key,
+        };
+        assert_eq!(shards[0].len, CLOCK_TIMER_CAPACITY);
+        assert_eq!(shards[1].len, CLOCK_TIMER_SYSTEM_RESERVE + 1);
+        assert!(shards[0].is_live(cpu_zero_system));
+        assert!(shards[1].is_live(cpu_one_system));
+
+        // A migrated owner routes cancellation by the retained CPU ID. The
+        // unrelated full shard remains untouched.
+        assert!(
+            shards[cpu_one_token.owner_cpu]
+                .cancel(cpu_one_token.key)
+                .is_none()
+        );
+        assert_eq!(shards[0].len, CLOCK_TIMER_CAPACITY);
+        assert_eq!(shards[1].len, CLOCK_TIMER_SYSTEM_RESERVE);
+
+        let cpu_one_replacement = shards[1]
+            .reserve(Duration::ZERO, Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_ne!(cpu_one_replacement.generation, cpu_one_token.key.generation);
+        assert!(
+            shards[cpu_one_token.owner_cpu]
+                .cancel(cpu_one_token.key)
+                .is_none()
+        );
+        assert!(shards[1].is_live(cpu_one_replacement));
+        assert!(shards[1].cancel(cpu_one_replacement).is_none());
+
+        let cpu_zero_token = ClockTimerToken {
+            owner_cpu: 0,
+            key: first_cpu_zero.unwrap(),
+        };
+        assert!(
+            shards[cpu_zero_token.owner_cpu]
+                .cancel(cpu_zero_token.key)
+                .is_none()
+        );
+        assert!(
+            shards[0]
+                .reserve(Duration::ZERO, Duration::MAX)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(shards[0].len, CLOCK_TIMER_CAPACITY);
+    }
+
+    #[test]
+    fn per_cpu_clock_shard_expiry_never_drains_a_peer() {
+        let mut shards = [ClockTimerRuntime::new(), ClockTimerRuntime::new()];
+        let cpu_zero = shards[0]
+            .reserve(Duration::ZERO, Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let cpu_one = shards[1]
+            .reserve(Duration::ZERO, Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut pending = [const { None }; CLOCK_TIMER_WAKE_BATCH];
+
+        assert_eq!(
+            shards[1].drain_expired_batch(Duration::from_secs(1), &mut pending),
+            1
+        );
+        assert!(shards[0].is_live(cpu_zero));
+        assert!(!shards[1].is_live(cpu_one));
+        assert_eq!(shards[0].len, 1);
+        assert_eq!(shards[1].len, 0);
+    }
+
+    #[test]
     fn expired_slots_release_wakers_outside_the_runtime() {
         let mut runtime = ClockTimerRuntime::new();
         let key = runtime
@@ -1082,12 +1234,13 @@ mod clock_timer_callback_tests {
     }
 }
 
-fn wake_clock_timers(clock: AlarmClock) {
+fn wake_clock_timers(clock: AlarmClock, owner_cpu: usize) {
+    debug_assert_eq!(owner_cpu, axhal::percpu::this_cpu_id());
     let now = clock.now();
     let mut woke = false;
     for _ in 0..CLOCK_TIMER_WAKE_BATCHES {
         let mut pending = [const { None }; CLOCK_TIMER_WAKE_BATCH];
-        let count = timer_runtime(clock)
+        let count = timer_runtime(clock, owner_cpu)
             .lock()
             .drain_expired_batch(now, &mut pending);
         if count == 0 {
@@ -1104,7 +1257,7 @@ fn wake_clock_timers(clock: AlarmClock) {
     if woke {
         axtask::request_resched_current();
     }
-    update_clock_timer_deadline();
+    update_clock_timer_deadline(owner_cpu);
 }
 
 fn realtime_deadline_as_monotonic(deadline: Duration) -> Duration {
@@ -1119,12 +1272,16 @@ fn realtime_deadline_as_monotonic(deadline: Duration) -> Duration {
     }
 }
 
-fn update_clock_timer_deadline() {
-    let realtime_deadline = REALTIME_TIMER_RUNTIME
+/// Publishes the next deadline for the current CPU's clock shards.
+fn update_clock_timer_deadline(owner_cpu: usize) {
+    debug_assert_eq!(owner_cpu, axhal::percpu::this_cpu_id());
+    let realtime_deadline = timer_runtime(AlarmClock::Realtime, owner_cpu)
         .lock()
         .next_deadline()
         .map(realtime_deadline_as_monotonic);
-    let monotonic_deadline = MONOTONIC_TIMER_RUNTIME.lock().next_deadline();
+    let monotonic_deadline = timer_runtime(AlarmClock::Monotonic, owner_cpu)
+        .lock()
+        .next_deadline();
     let deadline = match (realtime_deadline, monotonic_deadline) {
         (Some(real), Some(mono)) => Some(real.min(mono)),
         (Some(real), None) => Some(real),
@@ -1562,20 +1719,26 @@ fn prepare_clock_sleep_with_admission(
 ) -> AxResult<PreparedClockSleep> {
     let now = clock.now();
     if deadline <= now {
-        return Ok(PreparedClockSleep { clock, key: None });
+        return Ok(PreparedClockSleep { clock, token: None });
     }
-    if let Err(error) = ensure_clock_timer_runtime() {
+
+    // Callback ownership, shard selection, reservation, and the first hardware
+    // deadline publication must observe one CPU. The resulting token remains
+    // remotely pollable/cancellable after this guard is released.
+    let _cpu_guard = NoPreempt::new();
+    let owner_cpu = axhal::percpu::this_cpu_id();
+    if let Err(error) = ensure_clock_timer_runtime_on_cpu(owner_cpu) {
         // Completion wins if the deadline elapsed while callback admission was
         // attempted. Otherwise preserve the exact construction failure.
         if deadline <= clock.now() {
-            return Ok(PreparedClockSleep { clock, key: None });
+            return Ok(PreparedClockSleep { clock, token: None });
         }
-        return Err(error);
+        return Err(map_clock_sleep_admission_error(admission, error));
     }
 
     let now = clock.now();
     let reservation = {
-        let mut runtime = timer_runtime(clock).lock();
+        let mut runtime = timer_runtime(clock, owner_cpu).lock();
         match admission {
             ClockTimerAdmission::General => runtime.reserve(now, deadline),
             ClockTimerAdmission::System => runtime.reserve_system(now, deadline),
@@ -1584,8 +1747,11 @@ fn prepare_clock_sleep_with_admission(
     let key = match reservation {
         Ok(key) => key,
         Err(_) if deadline <= clock.now() => None,
-        Err(error) => return Err(error),
+        Err(error) => return Err(map_clock_sleep_admission_error(admission, error)),
     };
-    update_clock_timer_deadline();
-    Ok(PreparedClockSleep { clock, key })
+    update_clock_timer_deadline(owner_cpu);
+    Ok(PreparedClockSleep {
+        clock,
+        token: key.map(|key| ClockTimerToken { owner_cpu, key }),
+    })
 }
