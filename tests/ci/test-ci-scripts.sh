@@ -578,6 +578,23 @@ for pages in 1 64; do
 done
 printf '%s\n' 'SMP_TLB_GATE status=ok stale_count=0' >>"$smp_tlb_log"
 "$CI_DIR/validate-smp-tlb-log.sh" "$smp_tlb_log" 2 >/dev/null
+sed \
+    -e 's/control_cpu=0/control_cpu=2/' \
+    -e 's/worker_cpus=1/worker_cpus=3/' \
+    -e 's/worker_cpu=1/worker_cpu=3/g' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-out-of-range-topology.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-out-of-range-topology.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted out-of-range CPU IDs\n' >&2
+    exit 1
+fi
+sed 's/worker_cpus=1/worker_cpus=1,/' \
+    "$smp_tlb_log" >"$tmp/smp-tlb-trailing-worker.log"
+if "$CI_DIR/validate-smp-tlb-log.sh" \
+    "$tmp/smp-tlb-trailing-worker.log" 2 >/dev/null 2>&1; then
+    printf 'test-ci-scripts: SMP TLB parser accepted a trailing worker token\n' >&2
+    exit 1
+fi
 sed '0,/^SMP_TLB_CASE /{/^SMP_TLB_CASE /s/status=ok/status=stale/;}' \
     "$smp_tlb_log" >"$tmp/smp-tlb-stale.log"
 if "$CI_DIR/validate-smp-tlb-log.sh" \

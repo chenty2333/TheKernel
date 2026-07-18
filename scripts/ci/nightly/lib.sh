@@ -96,10 +96,25 @@ nightly_require_arch_infrastructure() {
     command -v "$qemu" >/dev/null 2>&1 || nightly_unsupported "missing $qemu"
     command -v "$compiler" >/dev/null 2>&1 \
         || nightly_unsupported "missing $arch static Linux cross compiler: $compiler"
-    for command in curl fakeroot make mke2fs sha256sum tar truncate; do
+    for command in cargo curl fakeroot make mke2fs readlink rustc sha256sum stat tar truncate; do
         command -v "$command" >/dev/null 2>&1 \
             || nightly_unsupported "missing rootfs build command: $command"
     done
+}
+
+nightly_command_identity() {
+    "$@" 2>&1 | awk '
+        {
+            gsub(/\t/, " ")
+            sub(/^[[:space:]]+/, "")
+            sub(/[[:space:]]+$/, "")
+            if (NR > 1) {
+                printf "; "
+            }
+            printf "%s", $0
+        }
+        END { printf "\n" }
+    '
 }
 
 nightly_ensure_shell_kernel() {
@@ -140,18 +155,78 @@ nightly_run_guest() {
     local run_dir=$3
     local extra_block_image=${4:-}
     local stop_marker=${5:-}
-    local rootfs kernel
+    local rootfs kernel staged_commands staged_kernel
+    local qemu compiler qemu_path compiler_path rustc_path cargo_path
+    local kernel_sha commands_sha rootfs_sha qemu_sha compiler_sha
+    local qemu_version compiler_version rustc_version cargo_version
+
+    rm -rf "$run_dir"
+    mkdir -p "$run_dir"
+    [ -f "$commands" ] || nightly_fail "missing guest command stream: $commands"
+    staged_commands="$run_dir/commands"
+    cp -- "$commands" "$staged_commands"
 
     nightly_require_arch_infrastructure "$arch"
     kernel=$(nightly_ensure_shell_kernel "$arch")
     rootfs=$(nightly_ensure_rootfs "$arch")
-    rm -rf "$run_dir"
-    mkdir -p "$run_dir"
+    staged_kernel="$run_dir/kernel"
+    cp -- "$kernel" "$staged_kernel"
+
+    qemu=$(nightly_qemu_binary "$arch") || nightly_fail "invalid architecture: $arch"
+    compiler=$(nightly_cross_compiler "$arch") || nightly_fail "invalid architecture: $arch"
+    qemu_path=$(readlink -f -- "$(command -v "$qemu")")
+    compiler_path=$(readlink -f -- "$(command -v "$compiler")")
+    # Keep the rustup proxy names intact: invoking a resolved `rustup` binary
+    # directly would record the manager version instead of the pinned tools.
+    rustc_path=$(command -v rustc)
+    cargo_path=$(command -v cargo)
+    kernel_sha=$(sha256sum "$staged_kernel" | awk '{ print $1 }')
+    commands_sha=$(sha256sum "$staged_commands" | awk '{ print $1 }')
+    rootfs_sha=$(sha256sum "$rootfs" | awk '{ print $1 }')
+    qemu_sha=$(sha256sum "$qemu_path" | awk '{ print $1 }')
+    compiler_sha=$(sha256sum "$compiler_path" | awk '{ print $1 }')
+    qemu_version=$(nightly_command_identity "$qemu_path" --version)
+    compiler_version=$(nightly_command_identity "$compiler_path" --version)
+    rustc_version=$(
+        cd "$REPO_ROOT"
+        nightly_command_identity "$rustc_path" --version --verbose
+    )
+    cargo_version=$(
+        cd "$REPO_ROOT"
+        nightly_command_identity "$cargo_path" --version --verbose
+    )
+
+    {
+        printf 'schema_version\t1\n'
+        printf 'arch\t%s\n' "$arch"
+        printf 'requested_cpus\t%s\n' "${THEKERNEL_QEMU_CPUS:-1}"
+        printf 'kernel_path\t%s\n' "$staged_kernel"
+        printf 'kernel_size_bytes\t%s\n' "$(stat -c %s "$staged_kernel")"
+        printf 'kernel_sha256\t%s\n' "$kernel_sha"
+        printf 'commands_path\t%s\n' "$staged_commands"
+        printf 'commands_size_bytes\t%s\n' "$(stat -c %s "$staged_commands")"
+        printf 'commands_sha256\t%s\n' "$commands_sha"
+        printf 'rootfs_source\t%s\n' "$rootfs"
+        printf 'rootfs_size_bytes\t%s\n' "$(stat -c %s "$rootfs")"
+        printf 'rootfs_sha256\t%s\n' "$rootfs_sha"
+        printf 'qemu_binary\t%s\n' "$qemu_path"
+        printf 'qemu_sha256\t%s\n' "$qemu_sha"
+        printf 'qemu_version\t%s\n' "$qemu_version"
+        printf 'cross_compiler\t%s\n' "$compiler_path"
+        printf 'cross_compiler_sha256\t%s\n' "$compiler_sha"
+        printf 'cross_compiler_version\t%s\n' "$compiler_version"
+        printf 'rustc_binary\t%s\n' "$rustc_path"
+        printf 'rustc_version\t%s\n' "$rustc_version"
+        printf 'cargo_binary\t%s\n' "$cargo_path"
+        printf 'cargo_version\t%s\n' "$cargo_version"
+    } >"$run_dir/guest-inputs.tsv.tmp"
+    mv -f -- "$run_dir/guest-inputs.tsv.tmp" "$run_dir/guest-inputs.tsv"
+    printf '%s  %s\n' "$rootfs_sha" "$rootfs" >"$run_dir/rootfs.sha256"
 
     (
         cd "$REPO_ROOT"
         "$CI_SCRIPT_DIR/boot-shell-runner.sh" \
-            "$arch" "$kernel" "$rootfs" "$run_dir" "$commands" \
+            "$arch" "$staged_kernel" "$rootfs" "$run_dir" "$staged_commands" \
             "$NIGHTLY_GUEST_TIMEOUT_SECS" "$NIGHTLY_READY_TIMEOUT_SECS" \
             "$NIGHTLY_LINE_DELAY_SECS" "$extra_block_image" "$stop_marker"
     )

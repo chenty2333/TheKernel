@@ -90,8 +90,16 @@ emitting the semantic-pass marker.
 `smp-tlb-shootdown.sh` applies the same clean-source rule to TheKernel,
 `thekernel-ax`, and `thekernel-linux-abi`, forces a topology-specific kernel and
 content-addressed rootfs rebuild for every matrix cell, and rechecks all three
-repositories afterward. Its manifest records the three commits, requested and
-guest-observed topology, kernel/rootfs SHA-256 values, QEMU path/version, and
-per-run copies of the kernel, command stream, and complete console log. A
-separate provenance receipt records the exact three repository commits at both
-preflight and finalize.
+repositories afterward. Before QEMU starts, every attempted cell stages the
+exact kernel and command stream, a rootfs digest sidecar, and a structured input
+receipt containing artifact sizes and hashes plus QEMU, cross-compiler, Rust,
+and Cargo identities. The shared QEMU runner atomically records its resolved
+binary, complete argument vector, input hashes, lifecycle result, duration, and
+error in JSON. These per-cell receipts survive boot failures; the matrix
+manifest remains stricter and contains only semantically validated cells. A
+complete manifest records the three commits, requested and guest-observed
+topology, the staged artifact and tool hashes, and paths to every receipt and
+console log. A separate provenance receipt records the exact three repository
+commits at both preflight and finalize. The rootfs sidecar is a digest receipt
+for the content-addressed, repository-built image, not an embedded copy of the
+96 MiB sparse filesystem.

@@ -49,18 +49,25 @@ awk -v expected_cpus="$expected_cpus" -v expected_result="$expected_result" '
         worker_count = field($4, "worker_count")
         worker_list = field($5, "worker_cpus")
         if (!decimal(online) || online + 0 != expected_cpus ||
-            !decimal(control) || !decimal(worker_count) ||
+            !decimal(control) || control + 0 >= expected_cpus ||
+            !decimal(worker_count) ||
             worker_count + 0 != expected_cpus - 1) {
             invalid = 1
             next
         }
-        split(worker_list, listed_workers, ",")
+        present[control] = 1
+        listed_count = split(worker_list, listed_workers, ",")
+        if (listed_count != worker_count) {
+            invalid = 1
+        }
         for (worker_index = 1; worker_index <= worker_count; ++worker_index) {
             cpu = listed_workers[worker_index]
-            if (!decimal(cpu) || cpu == control || worker[cpu]) {
+            if (!decimal(cpu) || cpu + 0 >= expected_cpus ||
+                cpu == control || worker[cpu]) {
                 invalid = 1
             }
             worker[cpu] = 1
+            present[cpu] = 1
         }
         if (listed_workers[worker_count + 1] != "") {
             invalid = 1
@@ -151,6 +158,11 @@ awk -v expected_cpus="$expected_cpus" -v expected_result="$expected_result" '
         }
         for (window = 1; window <= 3; ++window) {
             if (!seen_liveness[window]) {
+                exit 1
+            }
+        }
+        for (cpu = 0; cpu < expected_cpus; ++cpu) {
+            if (!present[cpu]) {
                 exit 1
             }
         }

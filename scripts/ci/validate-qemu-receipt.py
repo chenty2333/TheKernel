@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Validate a completed QEMU receipt against the exact guest inputs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.qemu_runner.command import build_qemu_command  # noqa: E402
+from tools.qemu_runner.evidence import file_evidence  # noqa: E402
+from tools.qemu_runner.model import Drive  # noqa: E402
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def evidence_record(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"missing {label} evidence")
+    path = value.get("path")
+    size = value.get("size_bytes")
+    digest = value.get("sha256")
+    require(isinstance(path, str) and path != "", f"invalid {label} path")
+    require(path == str(Path(path).expanduser().resolve()), f"non-canonical {label} path")
+    require(type(size) is int and size >= 0, f"invalid {label} size")
+    require(
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest),
+        f"invalid {label} SHA-256",
+    )
+    return value
+
+
+def validate(args: argparse.Namespace) -> None:
+    receipt_path = Path(args.receipt).expanduser().resolve()
+    with receipt_path.open(encoding="utf-8") as source:
+        loaded: Any = json.load(source)
+    require(isinstance(loaded, dict), "QEMU receipt must be a JSON object")
+    receipt: dict[str, Any] = loaded
+
+    require(
+        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        "unsupported receipt schema",
+    )
+    require(receipt.get("state") == "complete", "QEMU receipt is not complete")
+    require(receipt.get("arch") == args.arch, "receipt architecture mismatch")
+    require(
+        type(receipt.get("cpus")) is int and receipt["cpus"] == args.cpus,
+        "receipt CPU count mismatch",
+    )
+    require(
+        type(receipt.get("returncode")) is int and receipt["returncode"] == 0,
+        "QEMU receipt is not successful",
+    )
+    require(receipt.get("memory") == args.memory, "receipt memory mismatch")
+    require(receipt.get("error_message") is None, "successful receipt contains an error")
+    require(receipt.get("timed_out") is False, "successful receipt is marked timed out")
+    require(receipt.get("interrupted") is False, "successful receipt is marked interrupted")
+    require(
+        receipt.get("intentionally_stopped") is False,
+        "successful receipt is marked intentionally stopped",
+    )
+    require(
+        type(receipt.get("duration_ms")) is int and receipt["duration_ms"] >= 0,
+        "invalid QEMU duration",
+    )
+
+    kernel = file_evidence(Path(args.kernel))
+    require(receipt.get("kernel") == kernel, "kernel evidence mismatch")
+    rootfs_source = evidence_record(receipt.get("rootfs_source"), "rootfs source")
+    expected_rootfs_path = str(Path(args.rootfs).expanduser().resolve())
+    require(rootfs_source.get("path") == expected_rootfs_path, "rootfs path mismatch")
+    rootfs_runtime_before = receipt.get("rootfs_runtime_before")
+    rootfs_runtime_after = receipt.get("rootfs_runtime_after")
+    rootfs_runtime_before = evidence_record(rootfs_runtime_before, "pre-run rootfs")
+    rootfs_runtime_after = evidence_record(rootfs_runtime_after, "post-run rootfs")
+    rootfs_runtime_path = rootfs_runtime_before.get("path")
+    require(isinstance(rootfs_runtime_path, str), "missing runtime rootfs path")
+    require(
+        rootfs_runtime_after == file_evidence(Path(rootfs_runtime_path)),
+        "post-run rootfs evidence mismatch",
+    )
+    rootfs_mode = receipt.get("rootfs_mode")
+    require(rootfs_mode == args.rootfs_mode, "rootfs mode mismatch")
+    if rootfs_mode != "rw" or rootfs_runtime_path != expected_rootfs_path:
+        require(
+            rootfs_source == file_evidence(Path(expected_rootfs_path)),
+            "rootfs source evidence mismatch",
+        )
+    else:
+        require(
+            rootfs_source == rootfs_runtime_before,
+            "in-place writable rootfs has inconsistent pre-run evidence",
+        )
+    if rootfs_mode != "rw":
+        require(
+            rootfs_runtime_before == rootfs_runtime_after,
+            "read-only runtime rootfs changed during QEMU",
+        )
+
+    qemu = evidence_record(receipt.get("qemu"), "QEMU")
+    qemu_path = qemu.get("path")
+    require(isinstance(qemu_path, str), "missing resolved QEMU path")
+    expected_qemu = file_evidence(Path(args.qemu_binary))
+    require(qemu_path == expected_qemu["path"], "QEMU path mismatch")
+    require(
+        qemu.get("size_bytes") == expected_qemu["size_bytes"],
+        "QEMU size mismatch",
+    )
+    require(qemu.get("sha256") == expected_qemu["sha256"], "QEMU hash mismatch")
+
+    extra_block = None
+    extra_source = receipt.get("extra_block_source")
+    extra_before = receipt.get("extra_block_runtime_before")
+    extra_after = receipt.get("extra_block_runtime_after")
+    receipt_has_extra = any(value is not None for value in (extra_source, extra_before, extra_after))
+    expected_has_extra = args.extra_block is not None
+    require(receipt_has_extra == expected_has_extra, "extra-block presence mismatch")
+    if expected_has_extra:
+        extra_source = evidence_record(extra_source, "extra-block source")
+        extra_before = evidence_record(extra_before, "pre-run extra block")
+        extra_after = evidence_record(extra_after, "post-run extra block")
+        extra_source_path = extra_source.get("path")
+        extra_runtime_path = extra_before.get("path")
+        require(isinstance(extra_source_path, str), "missing extra-block source path")
+        require(isinstance(extra_runtime_path, str), "missing runtime extra-block path")
+        expected_extra_path = str(Path(args.extra_block).expanduser().resolve())
+        require(extra_source_path == expected_extra_path, "extra-block source path mismatch")
+        require(
+            extra_after == file_evidence(Path(extra_runtime_path)),
+            "post-run extra-block evidence mismatch",
+        )
+        extra_mode = receipt.get("extra_block_mode")
+        require(extra_mode == args.extra_block_mode, "extra-block mode mismatch")
+        if extra_mode != "rw" or extra_runtime_path != expected_extra_path:
+            require(
+                extra_source == file_evidence(Path(expected_extra_path)),
+                "extra-block source evidence mismatch",
+            )
+        else:
+            require(
+                extra_source == extra_before,
+                "in-place writable extra block has inconsistent pre-run evidence",
+            )
+        if extra_mode != "rw":
+            require(extra_before == extra_after, "read-only extra block changed during QEMU")
+        extra_block = Drive(Path(extra_runtime_path), extra_mode)
+
+    expected_command = list(
+        build_qemu_command(
+            arch=args.arch,
+            kernel=Path(str(kernel["path"])),
+            rootfs=Drive(Path(rootfs_runtime_path), args.rootfs_mode),
+            extra_block=extra_block,
+            memory=args.memory,
+            cpus=args.cpus,
+            qemu_binary=qemu_path,
+        )
+    )
+    command = receipt.get("command")
+    require(command == expected_command, "QEMU command does not match the recorded inputs")
+    log = file_evidence(Path(args.log))
+    require(receipt.get("log_path") == log["path"], "log path mismatch")
+    require(evidence_record(receipt.get("log"), "QEMU log") == log, "QEMU log evidence mismatch")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--receipt", required=True)
+    parser.add_argument("--arch", choices=("rv", "la"), required=True)
+    parser.add_argument("--cpus", type=int, required=True)
+    parser.add_argument("--kernel", required=True)
+    parser.add_argument("--rootfs", required=True)
+    parser.add_argument(
+        "--rootfs-mode",
+        choices=("snapshot", "readonly", "rw"),
+        required=True,
+    )
+    parser.add_argument("--extra-block")
+    parser.add_argument(
+        "--extra-block-mode",
+        choices=("snapshot", "readonly", "rw"),
+        default="rw",
+    )
+    parser.add_argument("--log", required=True)
+    parser.add_argument("--qemu-binary", required=True)
+    parser.add_argument("--memory", default="1G")
+    args = parser.parse_args()
+    try:
+        validate(args)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(f"QEMU receipt: PASS receipt={Path(args.receipt).resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

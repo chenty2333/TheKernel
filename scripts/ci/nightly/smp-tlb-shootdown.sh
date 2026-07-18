@@ -7,6 +7,31 @@ source "$SCRIPT_DIR/lib.sh"
 
 [ "$#" -eq 0 ] || nightly_fail 'smp-tlb-shootdown adapter takes no arguments'
 
+guest_input_value() {
+    local receipt=$1
+    local key=$2
+    awk -F '\t' -v expected="$key" '
+        $1 == expected {
+            count += 1
+            value = $2
+        }
+        END {
+            if (count != 1 || value == "") {
+                exit 1
+            }
+            print value
+        }
+    ' "$receipt"
+}
+
+write_tsv_row() {
+    [ "$#" -gt 0 ] || nightly_fail 'cannot write an empty TSV row'
+    printf '%s' "$1"
+    shift
+    printf '\t%s' "$@"
+    printf '\n'
+}
+
 SMP_TLB_CPUS=${THEKERNEL_SMP_TLB_CPUS:-"4 8"}
 
 read -r -a cpu_counts <<<"$SMP_TLB_CPUS"
@@ -71,11 +96,13 @@ printf '%s\t%s\t%s\t%s\n' \
     preflight "$repo_commit" "$ax_commit" "$linux_abi_commit" \
     >>"$provenance"
 
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+write_tsv_row \
     thekernel_commit thekernel_ax_commit thekernel_linux_abi_commit \
     arch requested_cpus online_cpus control_cpu worker_count worker_cpus \
-    kernel_sha256 rootfs_sha256 qemu_binary qemu_version kernel_artifact \
-    commands_artifact qemu_log >"$manifest"
+    kernel_sha256 commands_sha256 rootfs_sha256 qemu_binary qemu_sha256 \
+    qemu_version cross_compiler cross_compiler_sha256 cross_compiler_version \
+    rustc_version cargo_version kernel_artifact commands_artifact \
+    rootfs_digest_artifact inputs_artifact qemu_receipt qemu_log >"$manifest"
 
 run_count=0
 while IFS= read -r arch; do
@@ -116,26 +143,71 @@ while IFS= read -r arch; do
         worker_count=${worker_count_field#worker_count=}
         worker_cpus=${worker_cpus_field#worker_cpus=}
 
-        kernel=$(nightly_kernel_path "$arch") \
-            || nightly_fail "invalid architecture after run: $arch"
         rootfs=$(nightly_rootfs_path "$arch") \
             || nightly_fail "invalid architecture after run: $arch"
-        qemu=$(nightly_qemu_binary "$arch") \
-            || nightly_fail "invalid QEMU architecture after run: $arch"
         kernel_artifact="$run_dir/kernel"
         commands_artifact="$run_dir/commands"
-        cp -- "$kernel" "$kernel_artifact"
-        cp -- "$commands" "$commands_artifact"
-        kernel_sha256=$(sha256sum "$kernel_artifact" | awk '{ print $1 }')
-        rootfs_sha256=$(sha256sum "$rootfs" | awk '{ print $1 }')
-        qemu_version=$("$qemu" --version | sed -n '1{s/[[:space:]]\+/ /g;p;}')
-        qemu_version=${qemu_version//$'\t'/ }
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        rootfs_digest_artifact="$run_dir/rootfs.sha256"
+        inputs_artifact="$run_dir/guest-inputs.tsv"
+        qemu_receipt="$run_dir/qemu-runner-receipt.json"
+        for artifact in \
+            "$kernel_artifact" "$commands_artifact" "$rootfs_digest_artifact" \
+            "$inputs_artifact" "$qemu_receipt"; do
+            [ -s "$artifact" ] || nightly_fail "missing pre-run evidence artifact: $artifact"
+        done
+
+        kernel_sha256=$(guest_input_value "$inputs_artifact" kernel_sha256) \
+            || nightly_fail "invalid kernel receipt: $inputs_artifact"
+        commands_sha256=$(guest_input_value "$inputs_artifact" commands_sha256) \
+            || nightly_fail "invalid commands receipt: $inputs_artifact"
+        rootfs_sha256=$(guest_input_value "$inputs_artifact" rootfs_sha256) \
+            || nightly_fail "invalid rootfs receipt: $inputs_artifact"
+        qemu_binary=$(guest_input_value "$inputs_artifact" qemu_binary) \
+            || nightly_fail "invalid QEMU receipt input: $inputs_artifact"
+        qemu_sha256=$(guest_input_value "$inputs_artifact" qemu_sha256) \
+            || nightly_fail "invalid QEMU hash receipt: $inputs_artifact"
+        qemu_version=$(guest_input_value "$inputs_artifact" qemu_version) \
+            || nightly_fail "invalid QEMU version receipt: $inputs_artifact"
+        cross_compiler=$(guest_input_value "$inputs_artifact" cross_compiler) \
+            || nightly_fail "invalid compiler receipt: $inputs_artifact"
+        cross_compiler_sha256=$(guest_input_value "$inputs_artifact" cross_compiler_sha256) \
+            || nightly_fail "invalid compiler hash receipt: $inputs_artifact"
+        cross_compiler_version=$(guest_input_value "$inputs_artifact" cross_compiler_version) \
+            || nightly_fail "invalid compiler version receipt: $inputs_artifact"
+        rustc_version=$(guest_input_value "$inputs_artifact" rustc_version) \
+            || nightly_fail "invalid rustc receipt: $inputs_artifact"
+        cargo_version=$(guest_input_value "$inputs_artifact" cargo_version) \
+            || nightly_fail "invalid cargo receipt: $inputs_artifact"
+
+        [ "$(sha256sum "$kernel_artifact" | awk '{ print $1 }')" = "$kernel_sha256" ] \
+            || nightly_fail "staged kernel hash drift: $kernel_artifact"
+        [ "$(sha256sum "$commands_artifact" | awk '{ print $1 }')" = "$commands_sha256" ] \
+            || nightly_fail "staged command hash drift: $commands_artifact"
+        [ "$(sha256sum "$rootfs" | awk '{ print $1 }')" = "$rootfs_sha256" ] \
+            || nightly_fail "rootfs hash drift after guest run: $rootfs"
+        [ "$(sha256sum "$qemu_binary" | awk '{ print $1 }')" = "$qemu_sha256" ] \
+            || nightly_fail "QEMU binary hash drift: $qemu_binary"
+        [ "$(sha256sum "$cross_compiler" | awk '{ print $1 }')" = "$cross_compiler_sha256" ] \
+            || nightly_fail "cross compiler hash drift: $cross_compiler"
+        [ "$(awk '{ print $1; exit }' "$rootfs_digest_artifact")" = "$rootfs_sha256" ] \
+            || nightly_fail "rootfs digest sidecar drift: $rootfs_digest_artifact"
+        python3 "$CI_SCRIPT_DIR/validate-qemu-receipt.py" \
+            --receipt "$qemu_receipt" --arch "$arch" --cpus "$cpus" \
+            --kernel "$kernel_artifact" --rootfs "$rootfs" \
+            --rootfs-mode snapshot --log "$run_dir/qemu.log" \
+            --qemu-binary "$qemu_binary" >/dev/null \
+            || nightly_fail "invalid QEMU lifecycle receipt: $qemu_receipt"
+
+        write_tsv_row \
             "$repo_commit" "$ax_commit" "$linux_abi_commit" \
             "$arch" "$cpus" "$online_cpus" "$control_cpu" \
             "$worker_count" "$worker_cpus" "$kernel_sha256" \
-            "$rootfs_sha256" "$(command -v "$qemu")" "$qemu_version" \
-            "$kernel_artifact" "$commands_artifact" "$run_dir/qemu.log" \
+            "$commands_sha256" "$rootfs_sha256" "$qemu_binary" \
+            "$qemu_sha256" "$qemu_version" "$cross_compiler" \
+            "$cross_compiler_sha256" "$cross_compiler_version" \
+            "$rustc_version" "$cargo_version" "$kernel_artifact" \
+            "$commands_artifact" "$rootfs_digest_artifact" "$inputs_artifact" \
+            "$qemu_receipt" "$run_dir/qemu.log" \
             >>"$manifest"
         run_count=$((run_count + 1))
     done
@@ -144,6 +216,8 @@ done <<<"$selected_arches"
 manifest_rows=$(awk 'END { print NR - 1 }' "$manifest")
 [ "$manifest_rows" -eq "$run_count" ] \
     || nightly_fail "SMP TLB manifest row-count drift: $manifest_rows"
+awk -F '\t' 'NF != 26 { exit 1 }' "$manifest" \
+    || nightly_fail 'SMP TLB manifest column-count drift'
 for state in \
     "$REPO_ROOT:$repo_commit:TheKernel" \
     "$ax_repo:$ax_commit:thekernel-ax" \
