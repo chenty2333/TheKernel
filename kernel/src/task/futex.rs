@@ -905,6 +905,32 @@ mod tests {
         assert_eq!(dst.wq.wake(usize::MAX, u32::MAX), 500);
         assert!(dst.wq.is_empty());
     }
+
+    #[test]
+    fn idle_cleanup_rechecks_a_lookup_acquired_after_the_old_precheck_window() {
+        let table = FutexTable::new();
+        let key = FutexKey::new_private(0x1000);
+        let retiring = table.get_or_insert(&key);
+
+        // The old Drop path could observe exactly these two references outside
+        // the table lock and decide that removal was safe.
+        assert_eq!(Arc::strong_count(&retiring.inner), 2);
+
+        // Model a lookup which wins the table lock after that observation but
+        // before the old unconditional remove. Cleanup must recheck this live
+        // reference while holding the same lock used by lookup.
+        let concurrent = table.get(&key).expect("mapped futex entry");
+        assert_eq!(Arc::strong_count(&retiring.inner), 3);
+        table.try_remove_idle(key.as_usize(), &retiring.inner);
+        assert!(Arc::ptr_eq(
+            table.0.lock().get(&key.as_usize()).unwrap(),
+            &concurrent.inner,
+        ));
+
+        drop(concurrent);
+        drop(retiring);
+        assert!(table.is_empty());
+    }
 }
 
 /// A key that uniquely identifies a futex in the system.
@@ -1041,6 +1067,24 @@ impl FutexTable {
             inner: entry.clone(),
         }
     }
+
+    /// Opportunistically removes an idle entry without splitting one futex
+    /// identity into two independently wakeable queues.
+    ///
+    /// Both the map identity and the strong-reference count must be observed
+    /// while the table is locked. Otherwise a concurrent lookup can clone the
+    /// mapped entry after an out-of-lock liveness check but before removal,
+    /// leaving that lookup attached to an entry which future wakers can no
+    /// longer find through the table.
+    fn try_remove_idle(&self, key: usize, entry: &Arc<FutexEntry>) {
+        let mut table = self.0.lock();
+        let Some(mapped) = table.get(&key) else {
+            return;
+        };
+        if Arc::ptr_eq(mapped, entry) && Arc::strong_count(entry) == 2 && entry.wq.is_empty() {
+            table.remove(&key);
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -1075,17 +1119,13 @@ impl Deref for FutexHandle {
 
 impl Drop for FutexHandle {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) <= 2 && self.inner.wq.is_empty() {
-            self.table.0.lock().remove(&self.key);
-        }
+        self.table.try_remove_idle(self.key, &self.inner);
     }
 }
 
 impl Drop for FutexGuard<'_> {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) <= 2 && self.inner.wq.is_empty() {
-            self.table.0.lock().remove(&self.key);
-        }
+        self.table.try_remove_idle(self.key, &self.inner);
     }
 }
 

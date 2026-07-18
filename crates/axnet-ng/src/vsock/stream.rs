@@ -46,8 +46,12 @@ impl VsockAcceptReservation {
             .prepared
             .take()
             .expect("active vsock accept reservation");
-        if !VSOCK_CONN_MANAGER.lock().commit_accept(&prepared) {
-            return Err(AxError::InvalidInput);
+        let next_accept = {
+            let mut manager = VSOCK_CONN_MANAGER.lock();
+            manager.commit_accept(&prepared)?
+        };
+        if let Some(accept_poll) = next_accept {
+            accept_poll.wake();
         }
         let peer_addr = prepared.peer_addr;
         let new_transport = VsockStreamTransport {
@@ -66,7 +70,13 @@ impl Drop for VsockAcceptReservation {
         let Some(prepared) = self.prepared.take() else {
             return;
         };
-        VSOCK_CONN_MANAGER.lock().restore_accept(&prepared);
+        let accept_poll = {
+            let mut manager = VSOCK_CONN_MANAGER.lock();
+            manager.restore_accept(&prepared)
+        };
+        if let Some(accept_poll) = accept_poll {
+            accept_poll.wake();
+        }
     }
 }
 
@@ -268,6 +278,7 @@ impl VsockTransportOps for VsockStreamTransport {
         }
         self.general.consume_pending_error()?;
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
+        let conn_id = self.conn_id.lock().ok_or(AxError::NotConnected)?;
         let conn = self.get_connection()?;
         let conn_guard = conn.lock();
 
@@ -279,7 +290,6 @@ impl VsockTransportOps for VsockStreamTransport {
             return Err(AxError::NotConnected);
         }
 
-        let conn_id = self.conn_id.lock().ok_or(AxError::NotConnected)?;
         drop(conn_guard);
 
         // now virtio-driver only support non-blocking send
@@ -323,16 +333,25 @@ impl VsockTransportOps for VsockStreamTransport {
                 if count >= left.len() && !right.is_empty() {
                     count += dst.write(right)?;
                 }
-                if !options.flags.contains(RecvFlags::PEEK) {
+                let released_capacity = if !options.flags.contains(RecvFlags::PEEK) {
                     conn_guard.advance_rx_read(count);
+                    count != 0
+                } else {
+                    false
+                };
+
+                let buffer_remaining = conn_guard.rx_buffer_used();
+                drop(conn_guard);
+                if released_capacity {
+                    // Capacity publication may interrupt the event worker. It
+                    // must never run while the connection lock is held.
+                    notify_vsock_rx_capacity();
                 }
 
                 if count > 0 {
                     trace!(
                         "Recv {} bytes from connection (buffer_remaining={}/{})",
-                        count,
-                        conn_guard.rx_buffer_used(),
-                        VSOCK_RX_BUFFER_SIZE
+                        count, buffer_remaining, VSOCK_RX_BUFFER_SIZE
                     );
                     Ok(count)
                 } else {
@@ -342,32 +361,43 @@ impl VsockTransportOps for VsockStreamTransport {
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
+        let conn_id = *self.conn_id.lock();
         let conn = self.get_connection()?;
-        let mut conn = conn.lock();
+        let (previous_state, local_port, rx_poll, connect_poll) = {
+            let mut connection = conn.lock();
 
-        if how.has_read() {
-            conn.set_rx_closed(true);
-        }
-
-        if how.has_write() {
-            conn.set_tx_closed(true);
-        }
-
-        if let Some(conn_id) = *self.conn_id.lock() {
-            if conn.state() == ConnectionState::Connected {
-                vsock_disconnect(conn_id)?;
-            } else if conn.state() == ConnectionState::Listening {
-                VSOCK_CONN_MANAGER.lock().unlisten(conn_id.local_port);
+            if how.has_read() {
+                connection.set_rx_closed(true);
             }
-        }
-        conn.set_state(ConnectionState::Closed);
-        let rx_poll = conn.rx_poll_source();
-        let connect_poll = conn.connect_poll_source();
-        drop(conn);
+
+            if how.has_write() {
+                connection.set_tx_closed(true);
+            }
+
+            let snapshot = (
+                connection.state(),
+                connection.local_addr().port,
+                connection.rx_poll_source(),
+                connection.connect_poll_source(),
+            );
+            connection.set_state(ConnectionState::Closed);
+            snapshot
+        };
+
+        // External device/manager operations follow the connection commit;
+        // none of them execute while the connection lock is held.
+        let result = match (previous_state, conn_id) {
+            (ConnectionState::Connected, Some(conn_id)) => vsock_disconnect(conn_id),
+            (ConnectionState::Listening, _) => {
+                VSOCK_CONN_MANAGER.lock().unlisten(local_port);
+                Ok(())
+            }
+            _ => Ok(()),
+        };
         rx_poll.wake();
         connect_poll.wake();
         self.poll_state.wake();
-        Ok(())
+        result
     }
 
     fn local_addr(&self) -> AxResult<Option<VsockAddr>> {
@@ -391,36 +421,38 @@ impl Pollable for VsockStreamTransport {
             return self.general.add_pending_error_event(IoEvents::empty());
         };
 
-        let conn = conn.lock();
+        let (state, local_port, rx_buffer_used, rx_closed, tx_closed) = {
+            let conn = conn.lock();
+            (
+                conn.state(),
+                conn.local_addr().port,
+                conn.rx_buffer_used(),
+                conn.rx_closed(),
+                conn.tx_closed(),
+            )
+        };
         let mut events = IoEvents::empty();
 
-        match conn.state() {
+        match state {
             ConnectionState::Listening => {
                 // if there is a pending connection, set IN
-                if let Some(conn_id) = *self.conn_id.lock() {
-                    events.set(
-                        IoEvents::READABLE,
-                        VSOCK_CONN_MANAGER.lock().can_accept(conn_id.local_port),
-                    );
-                }
-            }
-            ConnectionState::Connected | ConnectionState::Closed => {
                 events.set(
                     IoEvents::READABLE,
-                    conn.rx_buffer_used() > 0 || conn.rx_closed(),
+                    VSOCK_CONN_MANAGER.lock().can_accept(local_port),
                 );
-                events.set(IoEvents::WRITABLE, !conn.tx_closed());
+            }
+            ConnectionState::Connected | ConnectionState::Closed => {
+                events.set(IoEvents::READABLE, rx_buffer_used > 0 || rx_closed);
+                events.set(IoEvents::WRITABLE, !tx_closed);
             }
             ConnectionState::Connecting => {
-                // if connected, set OUT
-                events.set(
-                    IoEvents::WRITABLE,
-                    conn.state() == ConnectionState::Connected,
-                );
+                // Completion changes the connection state and wakes the
+                // connect source; this snapshot remains non-writable.
+                events.set(IoEvents::WRITABLE, false);
             }
             _ => {}
         }
-        events.set(IoEvents::READ_HANGUP, conn.rx_closed());
+        events.set(IoEvents::READ_HANGUP, rx_closed);
         self.general.add_pending_error_event(events)
     }
 

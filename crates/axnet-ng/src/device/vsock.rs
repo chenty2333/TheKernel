@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 use core::{
     future::poll_fn,
     sync::atomic::{AtomicBool, Ordering},
@@ -7,14 +7,17 @@ use core::{
 
 use axdriver::prelude::*;
 use axerrno::{AxError, AxResult, ax_bail};
-use axpoll::{RegisterError, UpdateError};
+use axpoll::{PollSet, RegisterError, UpdateError};
 use axsync::Mutex;
-use axtask::future::{
-    IrqWakerRegisterError, IrqWakerToken, IrqWakerUpdateError, block_on, cancel_irq_waker,
-    interruptible, register_irq_waker, update_irq_waker,
+use axtask::{
+    WaitQueue,
+    future::{
+        IrqWakerRegisterError, IrqWakerToken, IrqWakerUpdateError, block_on, cancel_irq_waker,
+        interruptible, register_irq_waker, update_irq_waker,
+    },
 };
 
-use crate::vsock::connection_manager::VSOCK_CONN_MANAGER;
+use crate::vsock::connection_manager::{VSOCK_CONN_MANAGER, VsockConnectionManager};
 
 // we need a global and static only one vsock device
 static VSOCK_DEVICE: Mutex<Option<AxVsockDevice>> = Mutex::new(None);
@@ -65,6 +68,76 @@ impl PendingEvents {
 static PENDING_EVENTS: Mutex<PendingEvents> = Mutex::new(PendingEvents::new());
 
 const VSOCK_RX_TMPBUF_SIZE: usize = 0x1000; // 4KiB buffer for vsock receive
+
+/// Stable wake handles produced by one event transaction. State mutation is
+/// complete before these handles are published, and publication happens only
+/// after both the device and connection-manager locks have been released.
+#[derive(Default)]
+struct DeferredNotifications {
+    accept_poll: Option<Arc<PollSet>>,
+    rx_poll: Option<Arc<PollSet>>,
+    connect_poll: Option<Arc<PollSet>>,
+    tx_wait: Option<Arc<WaitQueue>>,
+}
+
+impl DeferredNotifications {
+    fn publish(self) {
+        if let Some(source) = self.accept_poll {
+            source.wake();
+        }
+        if let Some(source) = self.rx_poll {
+            source.wake();
+        }
+        if let Some(source) = self.connect_poll {
+            source.wake();
+        }
+        if let Some(wait_queue) = self.tx_wait {
+            // WaitQueue notification may yield when rescheduling is requested;
+            // it therefore belongs strictly outside every vsock state lock.
+            wait_queue.notify_all(true);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventProgress {
+    Progress,
+    Deferred,
+}
+
+struct EventOutcome {
+    progress: EventProgress,
+    notifications: DeferredNotifications,
+}
+
+impl EventOutcome {
+    fn progress() -> Self {
+        Self {
+            progress: EventProgress::Progress,
+            notifications: DeferredNotifications::default(),
+        }
+    }
+
+    fn deferred() -> Self {
+        Self {
+            progress: EventProgress::Deferred,
+            notifications: DeferredNotifications::default(),
+        }
+    }
+
+    fn received(read_len: usize, remaining: usize) -> Self {
+        if read_len == 0 && remaining != 0 {
+            Self::deferred()
+        } else {
+            Self::progress()
+        }
+    }
+}
+
+fn publish_event_outcome(made_progress: &mut bool, outcome: EventOutcome) {
+    *made_progress |= outcome.progress == EventProgress::Progress;
+    outcome.notifications.publish();
+}
 
 /// Registers a vsock device. Only one vsock device can be registered.
 pub fn register_vsock_device(dev: AxVsockDevice) -> AxResult {
@@ -254,48 +327,90 @@ fn map_irq_wait_error(error: IrqWakerRegisterError) -> AxError {
 }
 
 fn poll_vsock_interfaces() -> AxResult<bool> {
-    let mut guard = VSOCK_DEVICE.lock();
-    let dev = guard.as_mut().ok_or(AxError::NotFound)?;
-    let mut event_count = 0;
+    if VSOCK_DEVICE.lock().is_none() {
+        return Err(AxError::NotFound);
+    }
+    let mut made_progress = false;
     let mut buf = [0; VSOCK_RX_TMPBUF_SIZE];
 
     // Process at most the fixed pending capacity before polling fresh device
     // events. Events requeued for backpressure are deferred to the next
     // bounded worker iteration.
     let pending_budget = PENDING_EVENTS.lock().len();
-    event_count += pending_budget;
     for _ in 0..pending_budget {
         let Some(event) = PENDING_EVENTS.lock().pop_front() else {
             break;
         };
-        handle_vsock_event(event, dev, &mut buf);
+        let outcome = {
+            let mut guard = VSOCK_DEVICE.lock();
+            let dev = guard.as_mut().ok_or(AxError::NotFound)?;
+            handle_vsock_event(event, dev, &mut buf)
+        };
+        publish_event_outcome(&mut made_progress, outcome);
     }
 
     const DRIVER_EVENT_BUDGET: usize = 256;
     for _ in 0..DRIVER_EVENT_BUDGET {
-        match dev.poll_event() {
-            Ok(None) => break, // no more events
-            Ok(Some(event)) => {
-                event_count += 1;
-                handle_vsock_event(event, dev, &mut buf);
-            }
-            Err(e) => {
-                return Err(map_dev_err(e));
-            }
-        }
+        let outcome = {
+            let mut guard = VSOCK_DEVICE.lock();
+            let dev = guard.as_mut().ok_or(AxError::NotFound)?;
+            dev.poll_event()
+                .map_err(map_dev_err)?
+                .map(|event| handle_vsock_event(event, dev, &mut buf))
+        };
+        let Some(outcome) = outcome else {
+            break;
+        };
+        publish_event_outcome(&mut made_progress, outcome);
     }
-    Ok(event_count > 0)
+    Ok(made_progress)
 }
 
-fn handle_vsock_event(event: VsockDriverEvent, dev: &mut AxVsockDevice, buf: &mut [u8]) {
+fn abort_overflowed_connection(
+    dev: &mut AxVsockDevice,
+    manager: &mut VsockConnectionManager,
+    conn_id: crate::vsock::VsockConnId,
+    outcome: &mut EventOutcome,
+) {
+    outcome.progress = EventProgress::Progress;
+    if let Err(error) = dev.abort(conn_id) {
+        warn!("failed to abort overflowed vsock connection: {error:?}");
+    }
+    match manager.on_disconnected(conn_id) {
+        Ok((rx_poll, connect_poll)) => {
+            outcome.notifications.rx_poll = rx_poll;
+            outcome.notifications.connect_poll = connect_poll;
+        }
+        Err(error) => warn!("failed to publish overflow disconnect: {error:?}"),
+    }
+}
+
+fn handle_vsock_event(
+    event: VsockDriverEvent,
+    dev: &mut AxVsockDevice,
+    buf: &mut [u8],
+) -> EventOutcome {
     let mut manager = VSOCK_CONN_MANAGER.lock();
     debug!("Handling vsock event: {event:?}");
 
     match event {
         VsockDriverEvent::ConnectionRequest(conn_id) => {
-            if let Err(e) = manager.on_connection_request(conn_id) {
-                info!("Connection request failed: {conn_id:?}, error={e:?}");
+            let mut outcome = EventOutcome::progress();
+            match manager.on_connection_request(conn_id) {
+                Ok(accept_poll) => outcome.notifications.accept_poll = accept_poll,
+                Err(e) => {
+                    info!("Connection request failed: {conn_id:?}, error={e:?}");
+                    // The VirtIO layer has already sent its acceptance before
+                    // publishing ConnectionRequest. Finish the upper-state
+                    // rollback, release its lock, and explicitly reject the
+                    // lower connection so the two layers cannot diverge.
+                    drop(manager);
+                    if let Err(error) = dev.abort(conn_id) {
+                        warn!("failed to abort rejected vsock connection: {error:?}");
+                    }
+                }
             }
+            outcome
         }
 
         VsockDriverEvent::Received(conn_id, len) => {
@@ -303,7 +418,7 @@ fn handle_vsock_event(event: VsockDriverEvent, dev: &mut AxVsockDevice, buf: &mu
                 conn.lock().rx_buffer_free()
             } else {
                 info!("Received data for unknown connection: {conn_id:?}");
-                return;
+                return EventOutcome::progress();
             };
 
             if free_space == 0 {
@@ -313,65 +428,81 @@ fn handle_vsock_event(event: VsockDriverEvent, dev: &mut AxVsockDevice, buf: &mu
                     .is_err()
                 {
                     warn!("bounded vsock deferred-event queue is full; aborting {conn_id:?}");
-                    if let Err(error) = dev.abort(conn_id) {
-                        warn!("failed to abort overflowed vsock connection: {error:?}");
-                    }
-                    if let Err(error) = manager.on_disconnected(conn_id) {
-                        warn!("failed to publish overflow disconnect: {error:?}");
-                    }
+                    let mut outcome = EventOutcome::progress();
+                    abort_overflowed_connection(dev, &mut manager, conn_id, &mut outcome);
+                    return outcome;
                 }
-                return;
+                return EventOutcome::deferred();
             }
 
             let max_read = free_space.min(buf.len()).min(len);
             match dev.recv(conn_id, &mut buf[..max_read]) {
                 Ok(read_len) => {
-                    if let Err(e) = manager.on_data_received(conn_id, &buf[..read_len]) {
-                        info!("Failed to handle received data: conn_id={conn_id:?}, error={e:?}",);
+                    let remaining = len.saturating_sub(read_len);
+                    let mut outcome = EventOutcome::received(read_len, remaining);
+                    match manager.on_data_received(conn_id, &buf[..read_len]) {
+                        Ok(rx_poll) => outcome.notifications.rx_poll = rx_poll,
+                        Err(e) => info!(
+                            "Failed to handle received data: conn_id={conn_id:?}, error={e:?}",
+                        ),
                     }
-                    if read_len < len
+                    if remaining != 0
                         && PENDING_EVENTS
                             .lock()
-                            .push_back(VsockDriverEvent::Received(conn_id, len - read_len))
+                            .push_back(VsockDriverEvent::Received(conn_id, remaining))
                             .is_err()
                     {
                         warn!(
                             "bounded vsock deferred-event queue overflowed a partial receive; \
                              aborting {conn_id:?}"
                         );
-                        if let Err(error) = dev.abort(conn_id) {
-                            warn!("failed to abort overflowed vsock connection: {error:?}");
-                        }
-                        if let Err(error) = manager.on_disconnected(conn_id) {
-                            warn!("failed to publish overflow disconnect: {error:?}");
-                        }
+                        abort_overflowed_connection(dev, &mut manager, conn_id, &mut outcome);
                     }
+                    outcome
                 }
                 Err(e) => {
                     info!("Failed to receive vsock data: conn_id={conn_id:?}, error={e:?}",);
+                    EventOutcome::progress()
                 }
             }
         }
 
         VsockDriverEvent::Disconnected(conn_id) => {
-            if let Err(e) = manager.on_disconnected(conn_id) {
-                info!("Failed to handle disconnection: {conn_id:?}, error={e:?}",);
+            let mut outcome = EventOutcome::progress();
+            match manager.on_disconnected(conn_id) {
+                Ok((rx_poll, connect_poll)) => {
+                    outcome.notifications.rx_poll = rx_poll;
+                    outcome.notifications.connect_poll = connect_poll;
+                }
+                Err(e) => info!("Failed to handle disconnection: {conn_id:?}, error={e:?}",),
             }
+            outcome
         }
 
         VsockDriverEvent::Connected(conn_id) => {
-            if let Err(e) = manager.on_connected(conn_id) {
-                info!("Failed to handle connection established: {conn_id:?}, error={e:?}",);
+            let mut outcome = EventOutcome::progress();
+            match manager.on_connected(conn_id) {
+                Ok(connect_poll) => outcome.notifications.connect_poll = connect_poll,
+                Err(e) => {
+                    info!("Failed to handle connection established: {conn_id:?}, error={e:?}",)
+                }
             }
+            outcome
         }
 
         VsockDriverEvent::CreditUpdate(conn_id) => {
-            if let Err(e) = manager.on_credit_update(conn_id) {
-                warn!("Failed to handle credit update: {conn_id:?}, error={e:?}");
+            let mut outcome = EventOutcome::progress();
+            match manager.on_credit_update(conn_id) {
+                Ok(tx_wait) => outcome.notifications.tx_wait = tx_wait,
+                Err(e) => warn!("Failed to handle credit update: {conn_id:?}, error={e:?}"),
             }
+            outcome
         }
 
-        VsockDriverEvent::Unknown => warn!("Received unknown vsock event"),
+        VsockDriverEvent::Unknown => {
+            warn!("Received unknown vsock event");
+            EventOutcome::progress()
+        }
     }
 }
 
@@ -451,5 +582,27 @@ mod tests {
         let mut empty = 0;
         assert_eq!(rollback_poll_charge(&mut empty), Err(AxError::BadState));
         assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn deferred_receive_needs_external_capacity_before_busy_retry() {
+        assert_eq!(
+            EventOutcome::received(0, 1).progress,
+            EventProgress::Deferred
+        );
+        assert_eq!(
+            EventOutcome::received(1, 1).progress,
+            EventProgress::Progress
+        );
+        assert_eq!(
+            EventOutcome::received(0, 0).progress,
+            EventProgress::Progress
+        );
+
+        let mut made_progress = false;
+        publish_event_outcome(&mut made_progress, EventOutcome::deferred());
+        assert!(!made_progress);
+        publish_event_outcome(&mut made_progress, EventOutcome::progress());
+        assert!(made_progress);
     }
 }
