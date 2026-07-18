@@ -78,13 +78,17 @@ struct FixScreenInfo {
     pub reserved: [u16; 2], // Reserved for future compatibility
 }
 
-async fn refresh_task() -> AxResult<()> {
+fn refresh_task() -> Result<AxResult<()>, axtask::future::BlockOnError> {
     let delay = core::time::Duration::from_secs_f32(1. / 60.);
     loop {
         if !axdisplay::framebuffer_flush() {
             warn!("Failed to refresh framebuffer");
         }
-        axtask::future::sleep(delay).await.map_err(AxError::from)?;
+        match axtask::future::block_on(axtask::future::sleep(delay)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Ok(Err(AxError::from(error))),
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -95,7 +99,7 @@ pub struct FrameBuffer {
 impl FrameBuffer {
     pub fn try_new() -> Result<Self, AxError> {
         axtask::spawn_with_name(
-            || match axtask::future::block_on(refresh_task()) {
+            || match refresh_task() {
                 Ok(Ok(())) => error!("Framebuffer refresh worker ended unexpectedly"),
                 Ok(Err(error)) => {
                     error!("Framebuffer refresh timer stopped: {error}")

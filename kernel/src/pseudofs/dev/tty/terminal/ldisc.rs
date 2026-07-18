@@ -604,24 +604,20 @@ impl Drop for WorkerExit {
     }
 }
 
-fn poll_external_input<R: TtyRead, W: TtyWrite>(
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ExternalInputAction {
+    Stop,
+    Yield,
+    Wait,
+}
+
+fn drive_external_input<R: TtyRead, W: TtyWrite>(
     reader: &mut InputReader<R, W>,
     readable: &Arc<PollSet>,
-    capacity: &Arc<PollSet>,
     control: &Arc<WorkerControl>,
-    register: &ExternalRegister,
-    registration: &mut Option<WorkerRegistrations>,
-    cx: &mut Context<'_>,
-) -> Poll<()> {
-    if registration
-        .as_mut()
-        .is_some_and(|registration| registration.update(cx.waker()).is_err())
-    {
-        drop(registration.take());
-    }
+) -> ExternalInputAction {
     if control.cancelled.load(Ordering::Acquire) {
-        drop(registration.take());
-        return Poll::Ready(());
+        return ExternalInputAction::Stop;
     }
 
     let mut budget = EXTERNAL_PROGRESS_BUDGET;
@@ -633,17 +629,24 @@ fn poll_external_input<R: TtyRead, W: TtyWrite>(
         readable.wake();
     }
     if control.cancelled.load(Ordering::Acquire) {
-        drop(registration.take());
-        return Poll::Ready(());
+        return ExternalInputAction::Stop;
     }
     if budget == 0 {
-        // A continuously replenished source must not turn one task poll into
-        // an unbounded busy loop or delay final-OFD cancellation indefinitely.
-        // Requeue this task and yield through the executor before continuing.
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
+        // A continuously replenished source must not turn one operation phase
+        // into an unbounded loop or delay final-OFD cancellation indefinitely.
+        return ExternalInputAction::Yield;
     }
 
+    ExternalInputAction::Wait
+}
+
+fn arm_external_input<R: TtyRead, W: TtyWrite>(
+    reader: &InputReader<R, W>,
+    capacity: &Arc<PollSet>,
+    control: &Arc<WorkerControl>,
+    register: &ExternalRegister,
+    registration: &mut Option<WorkerRegistrations>,
+) -> Result<bool, AxError> {
     if registration.is_none()
         || (reader.echo_waiting()
             && registration
@@ -651,46 +654,71 @@ fn poll_external_input<R: TtyRead, W: TtyWrite>(
                 .is_some_and(|registration| !registration.includes_echo()))
     {
         drop(registration.take());
-        match WorkerRegistrations::register(reader, capacity, control, register, cx.waker()) {
-            Ok(armed) => *registration = Some(armed),
+        *registration = Some(WorkerRegistrations::register(
+            reader,
+            capacity,
+            control,
+            register,
+            Waker::noop(),
+        )?);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn poll_external_input_wait(
+    control: &Arc<WorkerControl>,
+    registration: &mut Option<WorkerRegistrations>,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    if control.cancelled.load(Ordering::Acquire) {
+        return Poll::Ready(());
+    }
+    if registration
+        .as_mut()
+        .is_none_or(|registration| registration.update(cx.waker()).is_err())
+    {
+        return Poll::Ready(());
+    }
+    Poll::Pending
+}
+
+fn run_external_input<R: TtyRead, W: TtyWrite>(
+    mut reader: InputReader<R, W>,
+    readable: Arc<PollSet>,
+    capacity: Arc<PollSet>,
+    control: Arc<WorkerControl>,
+    register: ExternalRegister,
+) -> Result<(), axtask::future::BlockOnError> {
+    let _exit = WorkerExit(control.clone());
+    let mut registration = None;
+    loop {
+        match drive_external_input(&mut reader, &readable, &control) {
+            ExternalInputAction::Stop => return Ok(()),
+            ExternalInputAction::Yield => {
+                axtask::yield_now();
+                continue;
+            }
+            ExternalInputAction::Wait => {}
+        }
+
+        match arm_external_input(&reader, &capacity, &control, &register, &mut registration) {
+            // Complete the check-arm-check sequence outside the block session.
+            Ok(true) => continue,
+            Ok(false) => {}
             Err(error) => {
                 control.record_failure(error);
                 readable.wake();
-                return Poll::Ready(());
+                return Ok(());
             }
         }
-    }
 
-    while budget != 0
-        && !control.cancelled.load(Ordering::Acquire)
-        && matches!(reader.poll(), Ok(true))
-    {
-        budget -= 1;
-        readable.wake();
-    }
-    if control.cancelled.load(Ordering::Acquire) {
+        block_on(poll_fn(|cx| {
+            poll_external_input_wait(&control, &mut registration, cx)
+        }))?;
+        // Cancellation and destruction of owned registrations belong to the
+        // operation phase, after the block session has ended.
         drop(registration.take());
-        Poll::Ready(())
-    } else if budget == 0 {
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    } else {
-        if reader.echo_waiting()
-            && registration
-                .as_ref()
-                .is_some_and(|registration| !registration.includes_echo())
-        {
-            drop(registration.take());
-            match WorkerRegistrations::register(reader, capacity, control, register, cx.waker()) {
-                Ok(armed) => *registration = Some(armed),
-                Err(error) => {
-                    control.record_failure(error);
-                    readable.wake();
-                    return Poll::Ready(());
-                }
-            }
-        }
-        Poll::Pending
     }
 }
 
@@ -748,7 +776,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         echo_buf
             .try_reserve_exact(ECHO_BUF_SIZE)
             .map_err(|_| AxError::NoMemory)?;
-        let mut reader = InputReader {
+        let reader = InputReader {
             terminal: terminal.clone(),
             reader: config.reader,
             writer: config.writer,
@@ -778,21 +806,15 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 let task_poll_tx = poll_tx.clone();
                 let task_control = control.clone();
                 let task = axtask::try_spawn_with_name(
-                    move || {
-                        let _exit = WorkerExit(task_control.clone());
-                        let mut registration = None;
-                        let result = block_on(poll_fn(|cx| {
-                            poll_external_input(
-                                &mut reader,
-                                &task_poll_rx,
-                                &task_poll_tx,
-                                &task_control,
-                                &register,
-                                &mut registration,
-                                cx,
-                            )
-                        }));
-                        if let Err(error) = result {
+                    move || match run_external_input(
+                        reader,
+                        task_poll_rx.clone(),
+                        task_poll_tx,
+                        task_control.clone(),
+                        register,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) => {
                             task_control.record_failure(error.into());
                             task_poll_rx.wake();
                         }
@@ -1099,46 +1121,18 @@ mod tests {
             source_drained: Arc::try_new(AtomicBool::new(false)).unwrap(),
         };
         let readable = Arc::new(PollSet::new());
-        let capacity = Arc::new(PollSet::new());
         let control = Arc::new(WorkerControl::try_new().unwrap());
-        let source = Arc::new(PollSet::new());
-        let register_source = Arc::clone(&source);
-        let register: ExternalRegister = Box::try_new(move |waker: &Waker| {
-            ExternalRegistration::poll(Arc::clone(&register_source), waker)
-        })
-        .unwrap();
-        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
-        let waker = Waker::from(wake.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut registration = None;
 
         assert_eq!(
-            poll_external_input(
-                &mut reader,
-                &readable,
-                &capacity,
-                &control,
-                &register,
-                &mut registration,
-                &mut cx,
-            ),
-            Poll::Pending
+            drive_external_input(&mut reader, &readable, &control),
+            ExternalInputAction::Yield
         );
         assert_eq!(reads.load(Ordering::Relaxed), EXTERNAL_PROGRESS_BUDGET);
-        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
 
         control.cancel();
         assert_eq!(
-            poll_external_input(
-                &mut reader,
-                &readable,
-                &capacity,
-                &control,
-                &register,
-                &mut registration,
-                &mut cx,
-            ),
-            Poll::Ready(())
+            drive_external_input(&mut reader, &readable, &control),
+            ExternalInputAction::Stop
         );
         assert_eq!(reads.load(Ordering::Relaxed), EXTERNAL_PROGRESS_BUDGET);
     }
@@ -1191,19 +1185,31 @@ mod tests {
             let mut cx = Context::from_waker(&waker);
             let mut registration = None;
             loop {
-                match poll_external_input(
-                    &mut reader,
-                    &task_readable,
-                    &poll_tx,
-                    &task_control,
-                    &register,
-                    &mut registration,
-                    &mut cx,
-                ) {
-                    Poll::Ready(()) => break,
-                    Poll::Pending => {
-                        armed_tx.send(()).unwrap();
-                        thread::park();
+                match drive_external_input(&mut reader, &task_readable, &task_control) {
+                    ExternalInputAction::Stop => break,
+                    ExternalInputAction::Yield => thread::yield_now(),
+                    ExternalInputAction::Wait => {
+                        match arm_external_input(
+                            &reader,
+                            &poll_tx,
+                            &task_control,
+                            &register,
+                            &mut registration,
+                        ) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => panic!("failed to arm external input: {error}"),
+                        }
+                        match poll_external_input_wait(&task_control, &mut registration, &mut cx) {
+                            Poll::Ready(()) => {
+                                drop(registration.take());
+                                continue;
+                            }
+                            Poll::Pending => {
+                                armed_tx.send(()).unwrap();
+                                thread::park();
+                            }
+                        }
                     }
                 }
             }

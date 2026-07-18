@@ -20,7 +20,8 @@ use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{
     TimerCallbackRegisterError, TimerCallbackToken, WeakAxTaskRef, cancel_timer_callback, current,
-    future::block_on, register_timer_callback,
+    future::{BlockOnError, block_on},
+    register_timer_callback,
 };
 use event_listener::{Event, listener};
 use kernel_guard::NoPreempt;
@@ -634,7 +635,7 @@ enum AlarmWait {
     NewTimer,
 }
 
-async fn alarm_task(clock: AlarmClock) -> AxResult<()> {
+fn alarm_task(clock: AlarmClock) -> Result<AxResult<()>, BlockOnError> {
     loop {
         // Register before inspecting the queues so a newly inserted earlier
         // deadline cannot race past us and get delayed until a stale timeout.
@@ -646,11 +647,15 @@ async fn alarm_task(clock: AlarmClock) -> AxResult<()> {
         }
 
         let Some(deadline) = queue_deadline(clock) else {
-            listener.await;
+            block_on(listener)?;
             continue;
         };
 
-        let _ = wait_until_or_alarm(clock, deadline, listener).await?;
+        match block_on(wait_until_or_alarm(clock, deadline, listener)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Ok(Err(error)),
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -659,7 +664,7 @@ pub fn spawn_alarm_task() -> Result<(), axerrno::AxError> {
     info!("Initialize alarm...");
     ensure_clock_timer_runtime()?;
     axtask::spawn_raw(
-        || match block_on(alarm_task(AlarmClock::Realtime)) {
+        || match alarm_task(AlarmClock::Realtime) {
             Ok(Ok(())) => error!("Realtime alarm worker ended unexpectedly"),
             Ok(Err(error)) => error!("Realtime alarm timer stopped: {error}"),
             Err(error) => {
@@ -670,7 +675,7 @@ pub fn spawn_alarm_task() -> Result<(), axerrno::AxError> {
         axconfig::TASK_STACK_SIZE,
     )?;
     axtask::spawn_raw(
-        || match block_on(alarm_task(AlarmClock::Monotonic)) {
+        || match alarm_task(AlarmClock::Monotonic) {
             Ok(Ok(())) => error!("Monotonic alarm worker ended unexpectedly"),
             Ok(Err(error)) => error!("Monotonic alarm timer stopped: {error}"),
             Err(error) => {
