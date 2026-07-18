@@ -403,9 +403,10 @@ impl CloneArgs {
         }
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
-        // the local CPU. Free them before allocating another child so later
-        // fork bursts do not inherit stale task-stack and address-space
-        // pressure.
+        // this CPU. Nudge its pinned recycler before allocating another child
+        // so fork bursts provide an explicit progress edge for retained
+        // task-stack and address-space pressure. This is request-only: it is
+        // neither a local drain nor a destructor-completion barrier.
         reclaim_exited_tasks();
         check_rlimit_nproc(calling_thread)?;
 
