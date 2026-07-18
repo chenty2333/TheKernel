@@ -1115,7 +1115,6 @@ pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SignalWaitWake {
-    Initial,
     Interrupted,
     TimedOut,
     Failed(AxError),
@@ -1124,53 +1123,102 @@ enum SignalWaitWake {
 #[derive(Debug, Eq, PartialEq)]
 enum SignalWaitStep<T> {
     Accepted(T),
-    Delivered { handler_entered: bool },
+    Delivered,
     Block,
     TimedOut,
     Failed(AxError),
 }
 
-/// Resolves one synchronous-signal-wait observation outside the task's block
-/// session. A signal selected by `rt_sigtimedwait` wins over an asynchronously
-/// delivered signal, and both win over an elapsed timer observed by the
-/// previous wait-only session.
-fn signal_wait_step<T>(
+/// Resolves the observation after one `rt_sigtimedwait` block session.
+///
+/// Linux performs the final dequeue of the selected set regardless of why the
+/// scheduler returned. Only a genuine signal interruption may then run the
+/// asynchronous-delivery path. In particular, an unrelated signal published
+/// after the timer elapsed cannot turn `EAGAIN` into `EINTR`.
+fn sigtimedwait_post_wait_step<T>(
     wake: SignalWaitWake,
-    accept: impl FnOnce() -> Option<T>,
-    deliver: impl FnOnce() -> Option<bool>,
+    accept_selected: impl FnOnce() -> Option<T>,
+    observe_interrupted: impl FnOnce() -> SignalWaitStep<T>,
 ) -> SignalWaitStep<T> {
-    if let Some(value) = accept() {
-        return SignalWaitStep::Accepted(value);
-    }
-    if let Some(handler_entered) = deliver() {
-        return SignalWaitStep::Delivered { handler_entered };
-    }
     match wake {
-        SignalWaitWake::Initial | SignalWaitWake::Interrupted => SignalWaitStep::Block,
-        SignalWaitWake::TimedOut => SignalWaitStep::TimedOut,
-        SignalWaitWake::Failed(error) => SignalWaitStep::Failed(error),
+        SignalWaitWake::Interrupted => observe_interrupted(),
+        SignalWaitWake::TimedOut => accept_selected()
+            .map(SignalWaitStep::Accepted)
+            .unwrap_or(SignalWaitStep::TimedOut),
+        SignalWaitWake::Failed(error) => accept_selected()
+            .map(SignalWaitStep::Accepted)
+            .unwrap_or(SignalWaitStep::Failed(error)),
     }
 }
 
-/// Owns restoration of the mask temporarily replaced by a synchronous signal
-/// wait. A successfully installed handler takes that ownership through its
-/// signal frame; every other return path restores the old mask here.
-struct TemporarySignalMask<'a> {
+/// Owns Linux's `real_blocked` transaction for one `rt_sigtimedwait`.
+///
+/// Each wait session temporarily unblocks the selected set. The owner restores
+/// the real mask before the final selected dequeue and before any unrelated
+/// handler frame is published, matching `do_sigtimedwait()`'s lock ordering.
+struct SigtimedwaitMask<'a> {
+    signal: &'a ThreadSignalManager,
+    old_blocked: SignalSet,
+    waited: SignalSet,
+    active: bool,
+}
+
+impl<'a> SigtimedwaitMask<'a> {
+    fn new(signal: &'a ThreadSignalManager, waited: SignalSet) -> Self {
+        Self {
+            signal,
+            old_blocked: signal.blocked(),
+            waited,
+            active: false,
+        }
+    }
+
+    fn old_blocked(&self) -> SignalSet {
+        self.old_blocked
+    }
+
+    fn activate(&mut self) {
+        debug_assert!(!self.active);
+        // Preserve the real mask before exposing the temporary one so an
+        // ignored selected signal which was originally blocked remains
+        // queueable while the synchronous wait is active.
+        self.signal.set_real_blocked(Some(self.old_blocked));
+        self.signal.set_blocked(self.old_blocked & !self.waited);
+        self.active = true;
+    }
+
+    fn restore(&mut self) {
+        if self.active {
+            // Restore the visible mask before removing the original-mask
+            // sidecar, closing the inverse race of `activate` above.
+            self.signal.set_blocked(self.old_blocked);
+            self.signal.set_real_blocked(None);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for SigtimedwaitMask<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Owns the saved-mask handoff for one `rt_sigsuspend`.
+///
+/// Unlike `rt_sigtimedwait`, Linux does not populate `real_blocked` here: an
+/// ignored signal unblocked by the temporary suspend mask must remain ignored.
+/// A caught handler inherits the temporary visible mask and owns restoration
+/// of `old_blocked` through its userspace signal frame.
+struct SigsuspendMask<'a> {
     signal: &'a ThreadSignalManager,
     old_blocked: SignalSet,
     restore_on_drop: bool,
 }
 
-impl<'a> TemporarySignalMask<'a> {
-    fn replace(
-        signal: &'a ThreadSignalManager,
-        old_blocked: SignalSet,
-        temporary: SignalSet,
-    ) -> Self {
-        // Preserve the real mask before exposing the temporary one so an
-        // ignored signal which was originally blocked remains queueable.
-        signal.set_real_blocked(Some(old_blocked));
-        signal.set_blocked(temporary);
+impl<'a> SigsuspendMask<'a> {
+    fn install(signal: &'a ThreadSignalManager, temporary: SignalSet) -> Self {
+        let old_blocked = signal.set_blocked(temporary);
         Self {
             signal,
             old_blocked,
@@ -1182,33 +1230,19 @@ impl<'a> TemporarySignalMask<'a> {
         self.old_blocked
     }
 
+    fn hand_off_to_handler(&mut self) {
+        self.restore_on_drop = false;
+    }
+
     fn restore(&mut self) {
         if self.restore_on_drop {
-            // Restore the visible mask before removing the original-mask
-            // sidecar, closing the inverse race of `replace` above.
             self.signal.set_blocked(self.old_blocked);
-            self.signal.set_real_blocked(None);
             self.restore_on_drop = false;
-        }
-    }
-
-    fn hand_off_to_handler(&mut self) {
-        if self.restore_on_drop {
-            self.signal.set_real_blocked(None);
-            self.restore_on_drop = false;
-        }
-    }
-
-    fn finish_delivery(&mut self, handler_entered: bool) {
-        if handler_entered {
-            self.hand_off_to_handler();
-        } else {
-            self.restore();
         }
     }
 }
 
-impl Drop for TemporarySignalMask<'_> {
+impl Drop for SigsuspendMask<'_> {
     fn drop(&mut self) {
         self.restore();
     }
@@ -1316,47 +1350,66 @@ pub fn sys_rt_sigtimedwait(
     // or concurrent wakeups must never extend the caller's relative timeout.
     let deadline = signal_wait_deadline(wall_time(), timeout).map_err(AxError::from)?;
 
-    let old_blocked = signal.blocked();
-    let mut temporary_mask = TemporarySignalMask::replace(signal, old_blocked, old_blocked & !set);
+    // Linux checks the selected queue before installing `real_blocked`. A zero
+    // timeout is a pure nonblocking dequeue: unrelated pending signals neither
+    // acquire a handler frame here nor change EAGAIN into EINTR.
+    let sig = if let Some(sig) = signal.dequeue_signal(&set) {
+        sig
+    } else if timeout.is_some_and(|duration| duration.is_zero()) {
+        return Err(AxError::WouldBlock);
+    } else {
+        uctx.set_retval(-LinuxError::EINTR.code() as usize);
+        with_proc_state_hint(ProcStateHint::Interruptible, || {
+            let mut mask = SigtimedwaitMask::new(signal, set);
+            let mut block = SignalWaitBlock::new(deadline);
+            loop {
+                mask.activate();
 
-    uctx.set_retval(-LinuxError::EINTR.code() as usize);
-    let sig = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        let mut block = SignalWaitBlock::new(deadline);
-        let mut wake = SignalWaitWake::Initial;
-        loop {
-            match signal.observe_signal_wait(uctx, &set, temporary_mask.old_blocked()) {
-                SignalWaitObservation::Accepted(sig) => {
-                    temporary_mask.restore();
+                // Close the initial-dequeue-to-unblock gap and every later
+                // restore-to-reactivate gap. A selected signal published while
+                // the old mask was visible may not have requested a wake.
+                if let Some(sig) = signal.dequeue_signal(&set) {
+                    mask.restore();
                     return Ok(sig);
                 }
-                SignalWaitObservation::Delivered(delivered) => {
-                    let handler_depth = thr.signal_handler_depth();
-                    complete_signal_delivery(thr, uctx, delivered);
-                    let handler_entered = thr.signal_handler_depth() > handler_depth;
-                    temporary_mask.finish_delivery(handler_entered);
-                    // The handler frame owns EINTR when one was published; a
-                    // stop/continue delivery returns EINTR directly. Terminal
-                    // delivery has published exit state and must not reblock.
-                    return Err(AxError::Interrupted);
-                }
-                SignalWaitObservation::None if thr.pending_exit() => {
-                    temporary_mask.restore();
-                    return Err(AxError::Interrupted);
-                }
-                SignalWaitObservation::None if wake == SignalWaitWake::TimedOut => {
-                    temporary_mask.restore();
-                    return Err(AxError::WouldBlock);
-                }
-                SignalWaitObservation::None => {
-                    if let SignalWaitWake::Failed(error) = wake {
-                        temporary_mask.restore();
-                        return Err(error);
+
+                let wake = block.wait();
+                // Linux restores the real mask before its final selected
+                // dequeue. This also makes an unrelated handler's visible mask
+                // derive from old_blocked rather than the temporary wait mask.
+                mask.restore();
+
+                let step = sigtimedwait_post_wait_step(
+                    wake,
+                    || signal.dequeue_signal(&set),
+                    || match signal.observe_signal_wait(uctx, &set, mask.old_blocked()) {
+                        SignalWaitObservation::Accepted(sig) => SignalWaitStep::Accepted(sig),
+                        SignalWaitObservation::Delivered(delivered) => {
+                            complete_signal_delivery(thr, uctx, delivered);
+                            SignalWaitStep::Delivered
+                        }
+                        SignalWaitObservation::None => SignalWaitStep::Block,
+                    },
+                );
+                match step {
+                    SignalWaitStep::Accepted(sig) => return Ok(sig),
+                    SignalWaitStep::Delivered => {
+                        // A handler frame owns EINTR when one was published; a
+                        // stop/continue delivery returns EINTR directly.
+                        // Terminal delivery has published exit state and must
+                        // not reblock.
+                        return Err(AxError::Interrupted);
                     }
-                    wake = block.wait();
+                    SignalWaitStep::Block if thr.pending_exit() => {
+                        return Err(AxError::Interrupted);
+                    }
+                    SignalWaitStep::Block => {}
+                    SignalWaitStep::TimedOut => return Err(AxError::WouldBlock),
+                    SignalWaitStep::Failed(error) => return Err(error),
                 }
             }
-        }
-    })?;
+        })?
+    };
     acknowledge_posix_timer_signal(&thr.proc_data, &sig);
 
     if let Some(info) = info.nullable() {
@@ -1377,8 +1430,7 @@ pub fn sys_rt_sigsuspend(
     let thr = curr.as_thread();
 
     let set = unsafe { set.vm_read_uninit()?.assume_init() };
-    let old_blocked = thr.signal.blocked();
-    let mut temporary_mask = TemporarySignalMask::replace(&thr.signal, old_blocked, set);
+    let mut suspended_mask = SigsuspendMask::install(&thr.signal, set);
 
     // sigsuspend always returns -EINTR when a signal is caught
     // We set this in uctx before check_signals so it's saved in SignalFrame
@@ -1386,49 +1438,30 @@ pub fn sys_rt_sigsuspend(
 
     with_proc_state_hint(ProcStateHint::Interruptible, || {
         let mut block = SignalWaitBlock::new(None);
-        let mut wake = SignalWaitWake::Initial;
         loop {
-            let step = signal_wait_step(
-                wake,
-                || None::<()>,
-                || {
-                    if thr.pending_exit() {
-                        return Some(false);
-                    }
-                    let handler_depth = thr.signal_handler_depth();
-                    check_signals(thr, uctx, Some(temporary_mask.old_blocked()))
-                        .then(|| thr.signal_handler_depth() > handler_depth)
-                },
-            );
-            match step {
-                SignalWaitStep::Delivered {
-                    handler_entered: true,
-                } => {
-                    temporary_mask.hand_off_to_handler();
+            if thr.pending_exit() {
+                return Ok(());
+            }
+
+            let handler_depth = thr.signal_handler_depth();
+            if check_signals(thr, uctx, Some(suspended_mask.old_blocked())) {
+                if thr.signal_handler_depth() > handler_depth {
+                    suspended_mask.hand_off_to_handler();
                     return Ok(());
                 }
-                SignalWaitStep::Delivered {
-                    handler_entered: false,
-                } if thr.pending_exit() => {
-                    temporary_mask.restore();
+                if thr.pending_exit() {
                     return Ok(());
                 }
-                SignalWaitStep::Delivered {
-                    handler_entered: false,
-                }
-                | SignalWaitStep::Block => {
-                    // Default stop/continue actions do not complete
-                    // sigsuspend. After a stop is resumed, keep waiting with
-                    // the temporary mask until a handler is actually entered.
-                    if let SignalWaitWake::Failed(error) = wake {
-                        return Err(error);
-                    }
-                    wake = block.wait();
-                }
-                SignalWaitStep::Failed(error) => return Err(error),
-                SignalWaitStep::Accepted(()) | SignalWaitStep::TimedOut => {
-                    return Err(AxError::BadState);
-                }
+                // Default stop/continue actions do not complete sigsuspend.
+                // After a stop is resumed, keep waiting with the temporary
+                // visible mask until a handler is actually entered.
+                continue;
+            }
+
+            match block.wait() {
+                SignalWaitWake::Interrupted => {}
+                SignalWaitWake::Failed(error) => return Err(error),
+                SignalWaitWake::TimedOut => return Err(AxError::BadState),
             }
         }
     })?;
@@ -1511,7 +1544,7 @@ mod tests {
         SignalTargetResultReducer, SignalWaitStep, SignalWaitWake, complete_specific_thread_signal,
         exited_leader_identity_matches, parse_signo, prepare_sigaltstack_update,
         process_signal_post_hook, queued_signal_required, reduce_process_signal_delivery_result,
-        sanitize_synchronous_wait_set, signal_wait_deadline, signal_wait_step,
+        sanitize_synchronous_wait_set, signal_wait_deadline, sigtimedwait_post_wait_step,
     };
 
     fn reduce_target_results(
@@ -1549,69 +1582,91 @@ mod tests {
     }
 
     #[test]
-    fn synchronous_signal_acceptance_wins_over_delivery_and_timeout() {
-        let delivery_checked = Cell::new(false);
-        let step = signal_wait_step(
+    fn final_selected_signal_wins_over_elapsed_timeout() {
+        let interrupted_observation_checked = Cell::new(false);
+        let step = sigtimedwait_post_wait_step(
             SignalWaitWake::TimedOut,
             || Some(17),
             || {
-                delivery_checked.set(true);
-                Some(true)
+                interrupted_observation_checked.set(true);
+                SignalWaitStep::Delivered
             },
         );
 
         assert_eq!(step, SignalWaitStep::Accepted(17));
-        assert!(!delivery_checked.get());
+        assert!(!interrupted_observation_checked.get());
     }
 
     #[test]
-    fn asynchronous_delivery_wins_over_an_elapsed_timeout() {
+    fn elapsed_timeout_never_observes_unrelated_async_delivery() {
+        let interrupted_observation_checked = Cell::new(false);
         assert_eq!(
-            signal_wait_step(SignalWaitWake::TimedOut, || None::<u8>, || Some(true),),
-            SignalWaitStep::Delivered {
-                handler_entered: true,
-            }
+            sigtimedwait_post_wait_step(
+                SignalWaitWake::TimedOut,
+                || None::<u8>,
+                || {
+                    interrupted_observation_checked.set(true);
+                    SignalWaitStep::Delivered
+                },
+            ),
+            SignalWaitStep::TimedOut
         );
+        assert!(!interrupted_observation_checked.get());
     }
 
     #[test]
-    fn final_signal_observation_wins_over_internal_wait_failure() {
+    fn final_selected_observation_wins_over_internal_wait_failure() {
+        let interrupted_observation_checked = Cell::new(false);
         assert_eq!(
-            signal_wait_step(
+            sigtimedwait_post_wait_step(
                 SignalWaitWake::Failed(AxError::ResourceBusy),
                 || Some(23_u8),
-                || Some(true),
+                || {
+                    interrupted_observation_checked.set(true);
+                    SignalWaitStep::Delivered
+                },
             ),
             SignalWaitStep::Accepted(23)
         );
+        assert!(!interrupted_observation_checked.get());
         assert_eq!(
-            signal_wait_step(
-                SignalWaitWake::Failed(AxError::BadState),
-                || None::<u8>,
-                || Some(false),
-            ),
-            SignalWaitStep::Delivered {
-                handler_entered: false,
-            }
-        );
-        assert_eq!(
-            signal_wait_step(
+            sigtimedwait_post_wait_step(
                 SignalWaitWake::Failed(AxError::ResourceBusy),
                 || None::<u8>,
-                || None,
+                || SignalWaitStep::Delivered,
             ),
             SignalWaitStep::Failed(AxError::ResourceBusy)
         );
     }
 
     #[test]
-    fn stale_interrupt_rearms_but_final_empty_recheck_times_out() {
+    fn genuine_interrupt_uses_combined_selected_first_observation() {
         assert_eq!(
-            signal_wait_step(SignalWaitWake::Interrupted, || None::<u8>, || None,),
-            SignalWaitStep::Block
+            sigtimedwait_post_wait_step(
+                SignalWaitWake::Interrupted,
+                || panic!("interrupted waits must use the combined observation"),
+                || SignalWaitStep::Accepted(31_u8),
+            ),
+            SignalWaitStep::Accepted(31)
         );
         assert_eq!(
-            signal_wait_step(SignalWaitWake::TimedOut, || None::<u8>, || None),
+            sigtimedwait_post_wait_step(
+                SignalWaitWake::Interrupted,
+                || panic!("interrupted waits must use the combined observation"),
+                || SignalWaitStep::<u8>::Block,
+            ),
+            SignalWaitStep::Block
+        );
+    }
+
+    #[test]
+    fn empty_final_recheck_times_out() {
+        assert_eq!(
+            sigtimedwait_post_wait_step(
+                SignalWaitWake::TimedOut,
+                || None::<u8>,
+                || SignalWaitStep::Delivered,
+            ),
             SignalWaitStep::TimedOut
         );
     }

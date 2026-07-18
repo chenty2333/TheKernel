@@ -10,13 +10,23 @@
 
 static volatile sig_atomic_t usr1_seen;
 static volatile sig_atomic_t usr2_seen;
+static volatile sig_atomic_t usr2_saw_usr1_blocked;
 
 static void handler(int signo)
 {
     if (signo == SIGUSR1)
         usr1_seen++;
-    if (signo == SIGUSR2)
+    if (signo == SIGUSR2) {
+        sigset_t current;
+        int saved_errno = errno;
+
         usr2_seen++;
+        if (sigprocmask(SIG_SETMASK, NULL, &current) != 0)
+            usr2_saw_usr1_blocked = -1;
+        else
+            usr2_saw_usr1_blocked = sigismember(&current, SIGUSR1);
+        errno = saved_errno;
+    }
 }
 
 static int fail(const char *stage)
@@ -147,14 +157,17 @@ int main(void)
     async_timeout.tv_sec = 1;
     async_timeout.tv_nsec = 0;
     usr2_seen = 0;
+    usr2_saw_usr1_blocked = 0;
     errno = 0;
     result = sigtimedwait(&waited, NULL, &async_timeout);
     saved_errno = errno;
     if (timer_delete(async_timer) != 0)
         return fail("async-timer-delete");
-    if (result != -1 || saved_errno != EINTR || usr2_seen != 1) {
-        printf("CI_SIGNAL_WAIT_BOUNDARY_DIAG nonselected result=%d saved_errno=%d seen=%d\n",
-               result, saved_errno, (int)usr2_seen);
+    if (result != -1 || saved_errno != EINTR || usr2_seen != 1 ||
+        usr2_saw_usr1_blocked != 1) {
+        printf("CI_SIGNAL_WAIT_BOUNDARY_DIAG nonselected result=%d saved_errno=%d seen=%d waited_blocked_in_handler=%d\n",
+               result, saved_errno, (int)usr2_seen,
+               (int)usr2_saw_usr1_blocked);
         errno = saved_errno;
         return fail("nonselected-eintr");
     }
