@@ -66,9 +66,6 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
         axhal::power::system_off();
     }
 
-    #[cfg(feature = "ipi")]
-    axipi::init();
-
     info!("Secondary CPU {cpu_id:x} init OK.");
     super::INITED_CPUS.fetch_add(1, Ordering::Release);
 

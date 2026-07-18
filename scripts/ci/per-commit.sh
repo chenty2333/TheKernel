@@ -524,6 +524,15 @@ ci_run_step readiness-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-readiness-adapter
 ci_run_step process-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-linux-process-adapter
+ci_run_step axhal-ipi-broker-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axhal/Cargo.toml \
+    --features ipi -- --test-threads=1
+ci_run_step axruntime-ipi-feature-check "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axruntime/Cargo.toml \
+    --no-run --features ipi,multitask,smp
+ci_run_step axfeat-ipi-feature-check "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfeat/Cargo.toml \
+    --no-run --features ipi,smp
 ci_run_step axsync-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axsync/Cargo.toml \
     --features multitask -- --test-threads=1

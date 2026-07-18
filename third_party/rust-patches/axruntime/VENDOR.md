@@ -31,6 +31,12 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - Maintained delta: per-CPU periodic/early deadline selection, generic runtime
   initialization, and the consumer-side provider for the explicit outermost
   IRQ-exit scheduler boundary; Linux timer ABI policy remains above this crate.
+- The optional `ipi` feature initializes the maintained typed `axhal` broker
+  with the immutable runtime CPU topology and implies IRQ support. It no longer
+  links the upstream allocation-backed `axipi` callback queue; a future
+  call-function consumer must satisfy an explicit bounded-work contract.
+- Timer IRQ registration is fail-fast rather than allowing boot to continue
+  after a handler-slot conflict.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

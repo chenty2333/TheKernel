@@ -460,25 +460,30 @@ fn init_allocator() {
 
 #[cfg(feature = "irq")]
 fn init_interrupt() {
-    axhal::irq::register(axhal::time::irq_num(), || {
-        let now_ns = axhal::time::monotonic_time_nanos();
-        let periodic_due = advance_periodic_deadline(now_ns);
-        let early_due = consume_early_deadline(now_ns);
-
-        #[cfg(feature = "multitask")]
-        if periodic_due {
-            axtask::on_timer_tick();
-        } else if early_due {
-            axtask::on_timer_event();
-        }
-
-        rearm_timer(axhal::time::monotonic_time_nanos());
-    });
-
     #[cfg(feature = "ipi")]
-    axhal::irq::register(axhal::irq::IPI_IRQ, || {
-        axipi::ipi_handler();
-    });
+    axhal::irq::init_ipi_broker(axhal::cpu_num())
+        .unwrap_or_else(|error| panic!("failed to initialize the raw IPI broker: {error:?}"));
+
+    assert!(
+        axhal::irq::register(axhal::time::irq_num(), || {
+            let now_ns = axhal::time::monotonic_time_nanos();
+            let periodic_due = advance_periodic_deadline(now_ns);
+            let early_due = consume_early_deadline(now_ns);
+
+            #[cfg(not(feature = "multitask"))]
+            let _ = (periodic_due, early_due);
+
+            #[cfg(feature = "multitask")]
+            if periodic_due {
+                axtask::on_timer_tick();
+            } else if early_due {
+                axtask::on_timer_event();
+            }
+
+            rearm_timer(axhal::time::monotonic_time_nanos());
+        }),
+        "failed to register the timer IRQ handler"
+    );
 
     // Kick the per-CPU timer chain explicitly instead of depending on platform
     // reset state to generate the first interrupt.

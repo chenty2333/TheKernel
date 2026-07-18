@@ -77,7 +77,6 @@ input = [
 ]
 ipi = [
     "irq",
-    "dep:axipi",
     "axhal/ipi",
     "axruntime/ipi",
 ]
@@ -183,7 +182,6 @@ axfs = { version = "=0.3.0-preview.2", optional = true }
 axfs-ng = { version = "=0.3.0-preview.2", optional = true }
 axhal = { version = "=0.3.0-preview.2" }
 axinput = { version = "=0.3.0-preview.2", optional = true }
-axipi = { version = "=0.3.0-preview.2", optional = true }
 axlog = { version = "=0.3.0-preview.2" }
 axnet = { version = "=0.3.0-preview.2", optional = true }
 axruntime = { version = "=0.3.0-preview.2" }

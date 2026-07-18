@@ -35,11 +35,20 @@ linkable on a host without changing the bare-metal feature graph.
 - Exposes a one-owner `register_irq_exit_hook` and `in_irq_context` contract to
   the generic scheduler. The callback runs after the platform `NoPreempt` guard
   is released while local interrupts remain masked.
+- Owns the single raw IPI vector through an allocation-free, fixed three-reason
+  namespace for CPU maintenance plus reserved reschedule and bounded
+  call-function consumers. Initialization admits one immutable CPU topology;
+  target identity and topology are checked before publication. Per-CPU atomic
+  mailboxes coalesce work while every send may still re-kick a delayed target.
+  The maintained `axhal` API exposes no raw numeric send or raw-vector constant,
+  does not export raw dispatch, and generic enable/register/unregister reject
+  the broker-owned vector.
 - This patch does not change platform IRQ acknowledgement or the existing
   device hook; Linux ABI and scheduler policy remain above this crate.
 
 ## Rebase rule
 
-Start from the verified registry archive and reapply the IRQ-boundary ledger.
+Start from the verified registry archive and reapply the IRQ-boundary and IPI
+broker ledger.
 Do not treat the patch as a lockless scheduler or infer that an IRQ hook is a
 substitute for platform interrupt acknowledgement.

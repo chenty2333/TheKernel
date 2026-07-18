@@ -54,10 +54,12 @@ but the nightly adapter requires all five metrics to be present.
 
 The SMP TLB adapter is a semantic gate, not a hardware event counter. Its
 qualification must include a mutation run from a disposable build in which
-remote maintenance delivery is suppressed: at least one warmed remote access
-must produce a `status=stale` result and the adapter must fail. Do not add that
-fault injection as a production default or accept a clean pass from the
-known-bad build. Timer preemption can still evict a translation naturally, so
+the target still receives the IPI, consumes the maintenance reason, and
+publishes its completion epoch, but deliberately omits only the local TLB
+invalidation: at least one warmed remote access must produce a `status=stale`
+result and the adapter must fail. Do not add that fault injection as a
+production default or accept a clean pass from the known-bad build. Timer
+preemption can still evict a translation naturally, so
 the matrix covers every remote CPU and both a single hot page and a range; the
 mutation run remains the proof that the workload can turn the intended defect
 red. Validate that expected-failure log with

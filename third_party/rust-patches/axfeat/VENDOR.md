@@ -27,6 +27,8 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 - `2aee666` aligned architecture/device feature bundles.
 - `96df7d9` wired the shared/async block mechanism without placing benchmark policy in the feature crate.
+- Maintained `ipi` selects the fixed typed HAL broker and IRQ support without
+  linking the upstream allocation-backed generic callback queue.
 - Maintained delta: Cargo feature composition only; runtime and Linux-visible policy remain in their owning layers.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

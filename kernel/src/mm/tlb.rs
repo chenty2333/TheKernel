@@ -2,7 +2,7 @@
 mod imp {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use axhal::irq::{IPI_IRQ, IpiTarget};
+    use axhal::irq::{IpiReason, IpiTarget};
     use axtlb::{
         CPU_MAINTENANCE_REASON, CpuMaintenance, ShootdownGrace, ShootdownRequest, TlbShootdown,
     };
@@ -100,8 +100,8 @@ mod imp {
             axconfig::plat::MAX_CPU_NUM
         );
         assert!(
-            axhal::irq::register(IPI_IRQ, ipi_handler),
-            "failed to reserve the raw IPI IRQ for TLB shootdown"
+            axhal::irq::register_ipi_reason(IpiReason::CpuMaintenance, maintenance_ipi_handler),
+            "failed to register the CPU-maintenance IPI reason"
         );
         for cpu in 0..cpu_count {
             SHOOTDOWN.publish_online(cpu).unwrap_or_else(|error| {
@@ -155,7 +155,7 @@ mod imp {
             for cpu in 0..cpu_count {
                 if request.needs_kick(cpu) {
                     attempts.initial[cpu] = true;
-                    axhal::irq::send_ipi(IPI_IRQ, IpiTarget::Other { cpu_id: cpu });
+                    send_maintenance_ipi(cpu);
                 }
             }
             (issuer_cpu, request, attempts, started)
@@ -202,7 +202,7 @@ mod imp {
                             retry_deadline_reached = true;
                             false
                         } else if request.target_pending(cpu) && claim_retry(cpu, retry_now) {
-                            axhal::irq::send_ipi(IPI_IRQ, IpiTarget::Other { cpu_id: cpu });
+                            send_maintenance_ipi(cpu);
                             true
                         } else {
                             false
@@ -247,7 +247,14 @@ mod imp {
         drop(grace);
     }
 
-    fn ipi_handler() {
+    fn send_maintenance_ipi(cpu: usize) {
+        axhal::irq::send_ipi_reason(IpiReason::CpuMaintenance, IpiTarget::Other { cpu_id: cpu })
+            .unwrap_or_else(|error| {
+                panic!("failed to publish CPU-maintenance IPI to CPU {cpu}: {error:?}")
+            });
+    }
+
+    fn maintenance_ipi_handler() {
         let cpu = axhal::percpu::this_cpu_id();
         CPU_RUNTIME[cpu]
             .ipi_handler_entries

@@ -10,6 +10,7 @@
 //! - `riscv64-qemu-virt`: QEMU virt machine with RISC-V ISA.
 //! - `aarch64-qemu-virt`: QEMU virt machine with AArch64 ISA.
 //! - `aarch64-raspi`: Raspberry Pi with AArch64 ISA.
+//! - `loongarch64-qemu-virt`: QEMU virt machine with LoongArch64 ISA.
 //! - `dummy`: If none of the above platform is selected, the dummy platform
 //!   will be used. In this platform, most of the operations are no-op or
 //!   `unimplemented!()`. This platform is mainly used for [cargo test].
@@ -20,6 +21,7 @@
 //! - `fp-simd`: Enable floating-point and SIMD support.
 //! - `paging`: Enable page table manipulation.
 //! - `irq`: Enable interrupt handling support.
+//! - `ipi`: Enable the typed inter-processor interrupt reason broker.
 //! - `tls`: Enable kernel space thread-local storage support.
 //! - `rtc`: Enable real-time clock support.
 //! - `uspace`: Enable user space support.
@@ -29,6 +31,9 @@
 
 #![no_std]
 #![feature(doc_cfg)]
+
+#[cfg(test)]
+extern crate std;
 
 #[allow(unused_imports)]
 #[macro_use]

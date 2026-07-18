@@ -48,7 +48,10 @@ input = [
     "axdriver",
     "dep:axinput",
 ]
-ipi = ["dep:axipi"]
+ipi = [
+    "irq",
+    "axhal/ipi",
+]
 irq = [
     "axhal/irq",
     "axtask?/irq",
@@ -125,10 +128,6 @@ optional = true
 version = "=0.3.0-preview.2"
 
 [dependencies.axinput]
-version = "=0.3.0-preview.2"
-optional = true
-
-[dependencies.axipi]
 version = "=0.3.0-preview.2"
 optional = true
 
