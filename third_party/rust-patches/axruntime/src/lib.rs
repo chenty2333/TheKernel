@@ -66,6 +66,21 @@ unsafe extern "C" {
 
 struct LogIfImpl;
 
+#[cfg(feature = "irq-exit")]
+struct IrqExitIfImpl;
+
+#[cfg(feature = "irq-exit")]
+#[crate_interface::impl_interface]
+impl axtask::IrqExitIf for IrqExitIfImpl {
+    fn register_irq_exit_hook(hook: fn()) -> bool {
+        axhal::irq::register_irq_exit_hook(hook)
+    }
+
+    fn in_irq_context() -> bool {
+        axhal::irq::in_irq_context()
+    }
+}
+
 #[crate_interface::impl_interface]
 impl axlog::LogIf for LogIfImpl {
     fn console_write_str(s: &str) {

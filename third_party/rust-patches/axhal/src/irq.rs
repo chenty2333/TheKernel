@@ -22,9 +22,6 @@ static IRQ_EXIT_HOOK: AtomicUsize = AtomicUsize::new(0);
 #[def_percpu]
 static IRQ_DEPTH: usize = 0;
 
-#[def_percpu]
-static IRQ_EXIT_PHASE: bool = false;
-
 #[inline]
 fn enter_irq_depth(depth: &mut usize) {
     *depth = depth.checked_add(1).expect("IRQ nesting depth overflow");
@@ -49,9 +46,6 @@ fn irq_boundary(boundary: IrqBoundary) {
                 leave_irq_depth(depth)
             };
             if next {
-                // Do not keep a mutable reference across the callback: the
-                // scheduler may context-switch while consuming the hook.
-                unsafe { *IRQ_EXIT_PHASE.current_ref_mut_raw() = true };
                 let hook = IRQ_EXIT_HOOK.load(Ordering::Acquire);
                 if hook != 0 {
                     // SAFETY: the slot only accepts a function pointer and is
@@ -59,7 +53,6 @@ fn irq_boundary(boundary: IrqBoundary) {
                     let hook = unsafe { core::mem::transmute::<usize, fn()>(hook) };
                     hook();
                 }
-                unsafe { *IRQ_EXIT_PHASE.current_ref_mut_raw() = false };
             }
         }
     }
@@ -100,23 +93,17 @@ pub fn register_irq_exit_hook(hook: fn()) -> bool {
     }
 }
 
-/// Returns whether the current CPU is inside a hardware IRQ dispatch.
+/// Returns whether the current CPU is inside a hardware IRQ handler.
 ///
-/// Callers must already hold a preemption-disabled or IRQ-disabled guard so
-/// the current CPU cannot migrate while the per-CPU value is read.
+/// The outermost exit hook runs after this depth reaches zero. It must not be
+/// represented as IRQ context: the hook may switch tasks before it returns,
+/// and a per-CPU phase bit would then leak into the newly scheduled task.
 #[inline]
 pub fn in_irq_context() -> bool {
-    unsafe { *IRQ_DEPTH.current_ref_raw() != 0 || *IRQ_EXIT_PHASE.current_ref_raw() }
-}
-
-/// Returns whether the current CPU is running the outermost IRQ-exit hook.
-///
-/// This is a narrower state than [`in_irq_context`]. The scheduler uses it to
-/// allow its one exit-phase check while still suppressing recursive
-/// rescheduling from guards dropped inside that check.
-#[inline]
-pub fn in_irq_exit_phase() -> bool {
-    unsafe { *IRQ_EXIT_PHASE.current_ref_raw() }
+    // The public accessor is safe, so it must stabilize the current CPU rather
+    // than exporting `percpu::current_ref_raw`'s precondition to every caller.
+    let _guard = kernel_guard::IrqSave::new();
+    unsafe { *IRQ_DEPTH.current_ref_raw() != 0 }
 }
 
 /// Register a hook function called after an IRQ is handled.

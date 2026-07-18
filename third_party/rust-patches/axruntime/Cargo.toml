@@ -54,6 +54,11 @@ irq = [
     "axtask?/irq",
     "dep:percpu",
 ]
+irq-exit = [
+    "multitask",
+    "irq",
+    "axtask/irq-exit",
+]
 multitask = ["axtask/multitask"]
 net = [
     "axdriver",

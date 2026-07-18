@@ -28,7 +28,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `24e5768` added early monotonic timer deadline programming.
 - `2aee666` stabilized architecture/runtime boot integration.
 - `96df7d9` hardened timer rearming and task-event ownership.
-- Maintained delta: per-CPU periodic/early deadline selection and generic runtime initialization; Linux timer ABI policy remains above this crate.
+- Maintained delta: per-CPU periodic/early deadline selection, generic runtime
+  initialization, and the consumer-side provider for the explicit outermost
+  IRQ-exit scheduler boundary; Linux timer ABI policy remains above this crate.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

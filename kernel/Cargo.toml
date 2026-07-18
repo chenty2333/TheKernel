@@ -49,9 +49,9 @@ axinput = { workspace = true, optional = true }
 axlog.workspace = true
 axmm.workspace = true
 axnet.workspace = true
-axruntime.workspace = true
+axruntime = { workspace = true, features = ["irq-exit"] }
 axsync.workspace = true
-axtask = { workspace = true, features = ["irq-exit"] }
+axtask.workspace = true
 
 axbacktrace = "0.1"
 axerrno = "0.2"

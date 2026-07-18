@@ -29,7 +29,9 @@ linkable on a host without changing the bare-metal feature graph.
   fork.
 - Pins `axcpu` to the exact published `0.3.0-preview.8` baseline so Cargo cannot
   silently select a newer registry implementation that lacks this transport.
-- Tracks per-CPU IRQ nesting and a short outermost-exit phase in `axhal`.
+- Tracks per-CPU IRQ nesting in `axhal` and invokes the scheduler hook only
+  after the outermost depth reaches zero; its safe context accessor stabilizes
+  the per-CPU read with a local IRQ-save guard.
 - Exposes a one-owner `register_irq_exit_hook` and `in_irq_context` contract to
   the generic scheduler. The callback runs after the platform `NoPreempt` guard
   is released while local interrupts remain masked.
