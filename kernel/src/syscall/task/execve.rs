@@ -523,6 +523,18 @@ fn do_execve(
 
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());
 
+    // POSIX timers created by timer_create(2) belong to the old process
+    // image and do not survive a successful exec.  We are already beyond the
+    // recoverable exec boundary here, so detach the complete table under its
+    // owner lock and retire timer/alarm leases only after releasing that lock.
+    // Timerfd objects deliberately remain in the file table unless CLOEXEC
+    // selected them above; setitimer state is also preserved separately.
+    let retired_posix_timers = {
+        let mut timers = proc_data.posix_timers.lock();
+        mem::take(&mut *timers)
+    };
+    drop(retired_posix_timers);
+
     // This is the Linux bprm_committing_creds analogue. Sibling teardown,
     // CLOEXEC, and AIO cleanup have crossed the point of no return; the hook is
     // infallible and the resulting typestate is the only value accepted by

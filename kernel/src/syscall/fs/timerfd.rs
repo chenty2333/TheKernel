@@ -52,7 +52,7 @@ pub fn sys_timerfd_create(clockid: i32, flags: u32) -> AxResult<isize> {
     let clock = validate_clockid(clockid)?;
     let flags = TimerFdCreateFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
-    let tfd = TimerFd::new(clock);
+    let tfd = TimerFd::try_new(clock)?;
     tfd.set_nonblocking(flags.contains(TimerFdCreateFlags::NONBLOCK))?;
     add_file_like(tfd as _, flags.contains(TimerFdCreateFlags::CLOEXEC)).map(|fd| fd as _)
 }
@@ -70,12 +70,13 @@ pub fn sys_timerfd_settime(
         return Err(AxError::InvalidInput);
     }
     let absolute = (flags & TFD_TIMER_ABSTIME) != 0;
+    let cancel_on_set = (flags & TFD_TIMER_CANCEL_ON_SET) != 0;
 
     let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
     let (interval, value) = itimerspec_to_durations(&new_value)?;
 
     let tfd = TimerFd::from_fd(fd)?;
-    let (old_interval, old_value_dur) = tfd.settime(absolute, interval, value);
+    let (old_interval, old_value_dur) = tfd.settime(absolute, cancel_on_set, interval, value)?;
 
     if let Some(old_value) = old_value.nullable() {
         old_value.vm_write(itimerspec {

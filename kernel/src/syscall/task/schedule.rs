@@ -450,15 +450,39 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
     Ok(AlarmClock::Monotonic.now() - start)
 }
 
-fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<bool> {
+fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
     debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
 
     let mut sleeper = prepare_clock_sleep(clock, deadline)?;
     let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
         block_on(interruptible(&mut sleeper))
     });
-    let _ = flatten_clock_sleep_result(result)?;
-    Ok(clock.now() >= deadline)
+    flatten_clock_sleep_result(result)
+}
+
+fn clock_nanosleep_is_absolute(flags: u32) -> AxResult<bool> {
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(flags & TIMER_ABSTIME != 0)
+}
+
+fn finish_absolute_clock_sleep(
+    outcome: ClockSleepOutcome,
+    now: TimeValue,
+    deadline: TimeValue,
+) -> AxResult<isize> {
+    match outcome {
+        // Once the timer owns completion, a later backward wall-clock step
+        // must not turn that completed operation into EINTR.
+        ClockSleepOutcome::Completed => Ok(0),
+        // An interrupt can race with a forward wall-clock step before the
+        // periodic timer callback drains the slot.  In that case the absolute
+        // deadline already owns completion even though the future was still
+        // pending at the interrupt boundary.
+        ClockSleepOutcome::Interrupted if now >= deadline => Ok(0),
+        ClockSleepOutcome::Interrupted => Err(AxError::Interrupted),
+    }
 }
 
 fn remaining_relative_sleep(req: TimeValue, actual: TimeValue) -> Option<TimeValue> {
@@ -494,6 +518,7 @@ pub fn sys_clock_nanosleep(
     req: *const timespec,
     rem: *mut timespec,
 ) -> AxResult<isize> {
+    let absolute = clock_nanosleep_is_absolute(flags)?;
     let clock = match clock_id as u32 {
         CLOCK_REALTIME => AlarmClock::Realtime,
         CLOCK_MONOTONIC | CLOCK_BOOTTIME => AlarmClock::Monotonic,
@@ -509,7 +534,7 @@ pub fn sys_clock_nanosleep(
     let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
-    if flags & TIMER_ABSTIME != 0 {
+    if absolute {
         let deadline = match clock_id as u32 {
             CLOCK_MONOTONIC => current()
                 .as_thread()
@@ -523,11 +548,8 @@ pub fn sys_clock_nanosleep(
                 .host_boottime_deadline(req),
             _ => req,
         };
-        if sleep_absolute(clock, deadline)? {
-            Ok(0)
-        } else {
-            Err(AxError::Interrupted)
-        }
+        let outcome = sleep_absolute(clock, deadline)?;
+        finish_absolute_clock_sleep(outcome, clock.now(), deadline)
     } else {
         let actual = sleep_relative(req)?;
 
@@ -928,6 +950,46 @@ mod tests {
         assert_eq!(
             flatten_clock_sleep_result(Err(BlockOnError::Busy)),
             Err(AxError::ResourceBusy)
+        );
+    }
+
+    #[test]
+    fn clock_nanosleep_rejects_unknown_flags() {
+        assert_eq!(clock_nanosleep_is_absolute(0), Ok(false));
+        assert_eq!(clock_nanosleep_is_absolute(TIMER_ABSTIME), Ok(true));
+        assert_eq!(
+            clock_nanosleep_is_absolute(TIMER_ABSTIME | 0x8000_0000),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn absolute_sleep_preserves_explicit_completion_ownership() {
+        let deadline = Duration::from_secs(10);
+
+        assert_eq!(
+            finish_absolute_clock_sleep(
+                ClockSleepOutcome::Completed,
+                Duration::from_secs(1),
+                deadline,
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            finish_absolute_clock_sleep(
+                ClockSleepOutcome::Interrupted,
+                Duration::from_secs(11),
+                deadline,
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            finish_absolute_clock_sleep(
+                ClockSleepOutcome::Interrupted,
+                Duration::from_secs(9),
+                deadline,
+            ),
+            Err(AxError::Interrupted)
         );
     }
 

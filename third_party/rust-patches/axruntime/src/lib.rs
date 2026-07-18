@@ -121,6 +121,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Number of CPUs that have completed initialization.
 static INITED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
+const CALL_FUNCTION_TIMER_EVENT_RETRIGGER: usize = 1 << 0;
+
+#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
+static CALL_FUNCTION_WORK: [AtomicUsize; axconfig::plat::MAX_CPU_NUM] =
+    [const { AtomicUsize::new(0) }; axconfig::plat::MAX_CPU_NUM];
+
 fn is_init_ok() -> bool {
     INITED_CPUS.load(Ordering::Acquire) == axhal::cpu_num()
 }
@@ -209,6 +216,60 @@ pub fn set_early_timer_deadline(deadline: Option<axhal::time::TimeValue>) {
     // Safety: `IrqSave` pins us to the current CPU while updating its local timer state.
     unsafe { EARLY_DEADLINE.write_current_raw(deadline_ns) };
     rearm_timer(axhal::time::monotonic_time_nanos());
+}
+
+#[cfg(all(feature = "irq", feature = "multitask"))]
+fn retrigger_local_timer_events() {
+    axtask::on_timer_event();
+    rearm_timer(axhal::time::monotonic_time_nanos());
+}
+
+#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
+fn call_function_ipi_handler() {
+    let cpu = axhal::percpu::this_cpu_id();
+    let pending = CALL_FUNCTION_WORK[cpu].swap(0, Ordering::AcqRel);
+    if pending & CALL_FUNCTION_TIMER_EVENT_RETRIGGER != 0 {
+        retrigger_local_timer_events();
+    }
+    let unknown = pending & !CALL_FUNCTION_TIMER_EVENT_RETRIGGER;
+    assert_eq!(unknown, 0, "unknown bounded call-function work: {unknown:#x}");
+}
+
+/// Retriggers the ordinary timer-event callback chain on every online CPU.
+///
+/// Remote requests use one coalescible, allocation-free work bit. Each target
+/// CPU re-evaluates its own timer callbacks and reprograms its local hardware
+/// deadline; no caller writes another CPU's per-CPU timer state directly.
+#[cfg(all(feature = "irq", feature = "multitask"))]
+pub fn retrigger_timer_events_all() {
+    let _guard = kernel_guard::NoPreemptIrqSave::new();
+
+    #[cfg(feature = "ipi")]
+    let (current_cpu, cpu_num) = {
+        let current_cpu = axhal::percpu::this_cpu_id();
+        let cpu_num = axhal::cpu_num();
+        for cpu in 0..cpu_num {
+            if cpu != current_cpu {
+                CALL_FUNCTION_WORK[cpu]
+                    .fetch_or(CALL_FUNCTION_TIMER_EVENT_RETRIGGER, Ordering::Release);
+            }
+        }
+        (current_cpu, cpu_num)
+    };
+
+    retrigger_local_timer_events();
+
+    #[cfg(feature = "ipi")]
+    if cpu_num > 1 {
+        axhal::irq::send_ipi_reason(
+            axhal::irq::IpiReason::CallFunction,
+            axhal::irq::IpiTarget::AllExceptCurrent {
+                cpu_id: current_cpu,
+                cpu_num,
+            },
+        )
+        .unwrap_or_else(|error| panic!("failed to retrigger remote timer events: {error:?}"));
+    }
 }
 
 /// The main entry point of the ArceOS runtime.
@@ -463,6 +524,15 @@ fn init_interrupt() {
     #[cfg(feature = "ipi")]
     axhal::irq::init_ipi_broker(axhal::cpu_num())
         .unwrap_or_else(|error| panic!("failed to initialize the raw IPI broker: {error:?}"));
+
+    #[cfg(all(feature = "ipi", feature = "multitask"))]
+    assert!(
+        axhal::irq::register_ipi_reason(
+            axhal::irq::IpiReason::CallFunction,
+            call_function_ipi_handler,
+        ),
+        "failed to register the bounded call-function IPI consumer"
+    );
 
     assert!(
         axhal::irq::register(axhal::time::irq_num(), || {

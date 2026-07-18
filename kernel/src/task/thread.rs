@@ -26,7 +26,7 @@ use super::{
     accounting::{AtomicTaskUsage, TaskUsage},
     creds::{Cred, CredentialSlot, CredentialSnapshotGuard},
     restart::RestartTracker,
-    timer::TimeManager,
+    timer::{TimeManager, charge_process_itimers},
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
@@ -812,6 +812,7 @@ impl Thread {
         let restart = RestartTracker::try_new().map_err(|_| AxError::NoMemory)?;
         let task_parent =
             TaskParentNode::try_new(tid, Arc::downgrade(&proc_data), Arc::downgrade(&credential))?;
+        let time = TimeManager::new();
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
@@ -824,7 +825,7 @@ impl Thread {
             kernel_tid: tid,
             task_parent,
             robust_list_head: AtomicUsize::new(0),
-            time: AssumeSync(RefCell::new(TimeManager::new())),
+            time: AssumeSync(RefCell::new(time)),
             live_usage: AtomicTaskUsage::new(),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             sched_reset_on_fork: AtomicBool::new(false),
@@ -1131,19 +1132,21 @@ impl Thread {
 
     fn pause_cpu_accounting_for_switch(&self, task: &TaskInner) {
         let mut signals = Vec::new();
-        let usage = {
+        let (usage, timer_charge) = {
             let Ok(mut time) = self.time.try_borrow_mut() else {
                 return;
             };
-            time.pause_for_switch(&mut signals);
+            let timer_charge = time.pause_for_switch(&mut signals);
             let (utime, stime) = time.output();
-            TaskUsage::from_time_values(utime, stime)
+            (TaskUsage::from_time_values(utime, stime), timer_charge)
         };
         self.store_usage_snapshot(usage);
+        charge_process_itimers(&self.proc_data, timer_charge);
         for signo in signals {
-            // TimeManager emits only fixed standard signals (SIGALRM,
-            // SIGVTALRM, SIGPROF, SIGXCPU, or SIGKILL), so no queued RT record
-            // or RLIMIT_SIGPENDING charge is possible here.
+            // TimeManager emits only fixed RLIMIT_CPU signals (SIGXCPU or
+            // SIGKILL), so no queued RT record or RLIMIT_SIGPENDING charge is
+            // possible here. Process interval-timer signals were published
+            // above after releasing the task-local accounting borrow.
             if self
                 .signal
                 .send_unqueued_signal(SignalInfo::new_kernel(signo))
@@ -1151,6 +1154,37 @@ impl Thread {
                 task.interrupt();
             }
         }
+    }
+
+    fn poll_cpu_accounting_for_tick(&self) -> bool {
+        let (usage, timer_charge) = {
+            let Ok(mut time) = self.time.try_borrow_mut() else {
+                // An IRQ may interrupt one of the short task-context
+                // accounting publications. That owner will account the whole
+                // elapsed interval when it releases the borrow.
+                let work_pending = self
+                    .proc_data
+                    .process_itimer_work_queued
+                    .load(Ordering::Acquire);
+                if work_pending {
+                    crate::deferred_work::wake_process_timer_worker();
+                }
+                return work_pending;
+            };
+            let timer_charge = time.poll_timer_tick();
+            let (utime, stime) = time.output();
+            (TaskUsage::from_time_values(utime, stime), timer_charge)
+        };
+        self.store_usage_snapshot(usage);
+        let work_pending = charge_process_itimers(&self.proc_data, timer_charge)
+            || self
+                .proc_data
+                .process_itimer_work_queued
+                .load(Ordering::Acquire);
+        if work_pending {
+            crate::deferred_work::wake_process_timer_worker();
+        }
+        work_pending
     }
 
     fn resume_cpu_accounting_after_switch(&self) {
@@ -1215,6 +1249,10 @@ impl TaskExt for Box<Thread> {
         self.pause_cpu_accounting_for_switch(task);
         ActiveScope::set_global();
         self.release_active_scope_read();
+    }
+
+    fn on_timer_tick(&self, _task: &TaskInner) -> bool {
+        self.poll_cpu_accounting_for_tick()
     }
 }
 

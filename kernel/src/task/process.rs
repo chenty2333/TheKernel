@@ -10,7 +10,8 @@ extern crate std;
 #[cfg(test)]
 use core::cell::Cell;
 use core::{
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -123,7 +124,7 @@ use super::{
     resources::Rlimits,
     signal::PtraceSignalRecord,
     thread::{TaskParentPublicationGuard, lock_task_parent_publication},
-    timer::PosixTimer,
+    timer::{PosixTimer, ProcessITimers},
 };
 use crate::{
     file::{
@@ -1697,6 +1698,20 @@ pub struct ProcessData {
     timerslack_default_ns: AtomicUsize,
     /// POSIX interval timers created by this process.
     pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
+    /// Process-wide `setitimer(2)` state. Real-time alarm actions and CPU-time
+    /// charges are serialized here; no thread-local `RefCell` is accessed by
+    /// an alarm worker.
+    pub(crate) process_itimers: SpinNoIrq<ProcessITimers>,
+    /// Lock-free fast-path publication for process CPU timers. Accounting
+    /// avoids the shared timer lock while neither VIRTUAL nor PROF is armed.
+    pub(crate) process_itimer_cpu_armed: AtomicU8,
+    /// Standard timer signals awaiting a scheduler-safe task-context drain.
+    pub(crate) process_itimer_pending: AtomicU8,
+    /// Intrusive single-consumer work node used to defer process-timer signal
+    /// publication out of IRQ-off context-switch accounting.
+    pub(crate) process_itimer_work_queued: AtomicBool,
+    pub(crate) process_itimer_work_next: AtomicPtr<ProcessData>,
+    pub(crate) process_itimer_work_owner: SpinNoIrq<Option<Arc<ProcessData>>>,
 
     /// CPU time accumulated from sibling threads that have already exited.
     pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
@@ -2133,6 +2148,12 @@ impl ProcessData {
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
             posix_timers: SpinNoIrq::new(Vec::new()),
+            process_itimers: SpinNoIrq::new(ProcessITimers::new()),
+            process_itimer_cpu_armed: AtomicU8::new(0),
+            process_itimer_pending: AtomicU8::new(0),
+            process_itimer_work_queued: AtomicBool::new(false),
+            process_itimer_work_next: AtomicPtr::new(ptr::null_mut()),
+            process_itimer_work_owner: SpinNoIrq::new(None),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             maxrss_kb: AtomicU64::new(0),

@@ -195,7 +195,12 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 }
 
                 thr.finish_signal_resume(&mut uctx);
-                set_timer_state(&curr, TimerState::User);
+                if set_timer_state(&curr, TimerState::User) {
+                    // The CPU-timer worker became runnable after the earlier
+                    // user-return safe point. Consume that wake before leaving
+                    // the kernel so a pure CPU loop cannot defer publication.
+                    axtask::resched_if_needed();
+                }
                 curr.clear_interrupt();
             }
         },

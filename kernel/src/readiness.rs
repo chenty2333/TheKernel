@@ -9,9 +9,9 @@ use axpoll::{
     ReadinessWait, RegisterError,
 };
 
-struct PollSetSource<'a>(&'a PollSet);
+struct PollSetSource<'a, const CAPACITY: usize>(&'a PollSet<CAPACITY>);
 
-impl Pollable for PollSetSource<'_> {
+impl<const CAPACITY: usize> Pollable for PollSetSource<'_, CAPACITY> {
     fn poll(&self) -> IoEvents {
         IoEvents::empty()
     }
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn closed_registration_rechecks_condition_before_returning_an_error() {
-        let source = PollSet::new();
+        let source: PollSet = PollSet::new();
         let calls = Cell::new(0);
 
         let result = block_on_poll_set(&source, || {
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn nonblocking_attempt_never_arms_a_readiness_source() {
-        let source = PollSet::new();
+        let source: PollSet = PollSet::new();
         let calls = Cell::new(0);
 
         let result = block_on_poll_io(&PollSetSource(&source), IoEvents::empty(), true, || {
@@ -363,8 +363,8 @@ where
 
 /// Non-interruptible synchronous wait for kernel lifecycle handshakes such as
 /// vfork publication. Typed block and registration failures still propagate.
-pub(crate) fn block_on_poll_set_uninterruptible<F, T>(
-    source: &PollSet,
+pub(crate) fn block_on_poll_set_uninterruptible<const CAPACITY: usize, F, T>(
+    source: &PollSet<CAPACITY>,
     mut operation: F,
 ) -> Result<T, AxError>
 where

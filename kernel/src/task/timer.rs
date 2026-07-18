@@ -2,15 +2,14 @@
 
 use alloc::{
     borrow::ToOwned,
-    collections::binary_heap::BinaryHeap,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{
     future::{Future, poll_fn},
-    mem,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -19,7 +18,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{
-    TimerCallbackRegisterError, TimerCallbackToken, WeakAxTaskRef, cancel_timer_callback, current,
+    TimerCallbackRegisterError, TimerCallbackToken, cancel_timer_callback, current,
     future::{BlockOnError, block_on},
     register_timer_callback,
 };
@@ -28,14 +27,13 @@ use kernel_guard::NoPreempt;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
-use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
 use super::{
-    AsThread, ProcessData, poll_itimer_alarm, send_queued_signal_to_process_data,
-    send_queued_signal_to_visible_thread,
+    AsThread, ProcessData, send_queued_signal_to_process_data,
+    send_queued_signal_to_visible_thread, send_signal_to_process_data,
 };
 use crate::time::wall_time;
 
@@ -66,15 +64,13 @@ pub(crate) enum PosixTimerClock {
     Realtime,
     Monotonic,
     Tai,
-    ProcessCpu,
-    ThreadCpu,
 }
 
 impl PosixTimerClock {
-    pub(crate) fn alarm_clock(self) -> AlarmClock {
+    pub(crate) fn absolute_alarm_clock(self) -> AlarmClock {
         match self {
             Self::Realtime | Self::Tai => AlarmClock::Realtime,
-            Self::Monotonic | Self::ProcessCpu | Self::ThreadCpu => AlarmClock::Monotonic,
+            Self::Monotonic => AlarmClock::Monotonic,
         }
     }
 }
@@ -90,9 +86,16 @@ pub(crate) enum PosixTimerNotify {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PosixTimer {
+    /// A timer ID is reserved before it is copied to userspace.  Other
+    /// threads must not operate on that slot until the successful copy has
+    /// published it.
+    published: bool,
+    /// Clock advertised by `timer_create(2)`.
     pub clock: PosixTimerClock,
+    /// Clock basis of the currently armed host deadline.
+    pub effective_clock: AlarmClock,
     pub notify: PosixTimerNotify,
     pub interval: Duration,
     pub deadline: Option<Duration>,
@@ -101,12 +104,24 @@ pub(crate) struct PosixTimer {
     signal_pending: bool,
     signal_retry_pending: bool,
     signal_token: u32,
+    main_alarm: AlarmToken,
+    retry_alarm: Option<AlarmToken>,
 }
 
 impl PosixTimer {
-    pub(crate) fn new(clock: PosixTimerClock, notify: PosixTimerNotify) -> Self {
-        Self {
+    pub(crate) fn try_new(
+        clock: PosixTimerClock,
+        notify: PosixTimerNotify,
+    ) -> Result<Self, AlarmTokenReserveError> {
+        let main_alarm = AlarmToken::try_new()?;
+        let retry_alarm = match notify {
+            PosixTimerNotify::None => None,
+            PosixTimerNotify::Signal { .. } => Some(AlarmToken::try_new()?),
+        };
+        Ok(Self {
+            published: false,
             clock,
+            effective_clock: clock.absolute_alarm_clock(),
             notify,
             interval: Duration::ZERO,
             deadline: None,
@@ -115,7 +130,18 @@ impl PosixTimer {
             signal_pending: false,
             signal_retry_pending: false,
             signal_token: 0,
-        }
+            main_alarm,
+            retry_alarm,
+        })
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published
+    }
+
+    pub(crate) fn publish(&mut self) {
+        debug_assert!(!self.published, "POSIX timer published twice");
+        self.published = true;
     }
 
     fn begin_signal_delivery(&mut self, expirations: u128) -> Option<TimerSignalDelivery> {
@@ -185,11 +211,71 @@ impl PosixTimer {
         true
     }
 
-    pub(crate) fn reset_signal_delivery(&mut self) {
+    pub(crate) fn reset_signal_delivery(&mut self) -> AlarmPublication {
         self.overrun = 0;
         self.signal_pending = false;
         self.signal_retry_pending = false;
         self.signal_token = 0;
+        self.retry_alarm
+            .as_ref()
+            .map_or_else(AlarmPublication::empty, AlarmToken::prepare_disarm)
+    }
+
+    pub(crate) fn prepare_main_alarm(
+        &self,
+        proc_data: &Arc<ProcessData>,
+        timerid: usize,
+        clock: AlarmClock,
+        deadline: Duration,
+        sequence: u64,
+    ) -> AlarmPublication {
+        self.main_alarm.prepare_arm(
+            clock,
+            deadline,
+            AlarmAction::PosixTimer {
+                proc: Arc::downgrade(proc_data),
+                timerid,
+                sequence,
+            },
+        )
+    }
+
+    pub(crate) fn prepare_main_disarm(&self) -> AlarmPublication {
+        self.main_alarm.prepare_disarm()
+    }
+
+    fn main_alarm_matches(&self, owner: AlarmSlotKey) -> bool {
+        self.main_alarm.matches(owner)
+    }
+
+    fn retry_alarm_matches(&self, owner: AlarmSlotKey) -> bool {
+        self.retry_alarm
+            .as_ref()
+            .is_some_and(|alarm| alarm.matches(owner))
+    }
+
+    fn prepare_retry_alarm(
+        &self,
+        proc_data: &Arc<ProcessData>,
+        timerid: usize,
+        token: u32,
+        backoff: Duration,
+    ) -> Option<AlarmPublication> {
+        let alarm = self.retry_alarm.as_ref()?;
+        let deadline = AlarmClock::Monotonic
+            .now()
+            .checked_add(backoff)
+            .unwrap_or(Duration::MAX);
+        Some(alarm.prepare_arm(
+            AlarmClock::Monotonic,
+            deadline,
+            AlarmAction::PosixTimerRetry {
+                proc: Arc::downgrade(proc_data),
+                timerid,
+                token,
+                backoff,
+            },
+        ))
     }
 }
 
@@ -201,10 +287,9 @@ struct TimerSignalDelivery {
 
 /// The action to take when an alarm fires.
 enum AlarmAction {
-    /// Interrupt a task and poll an itimer if the queued generation is current.
-    PollITimer {
-        task: WeakAxTaskRef,
-        ty: ITimerType,
+    /// Complete the process-wide real interval timer if this arm is current.
+    ProcessITimerReal {
+        proc: Weak<ProcessData>,
         sequence: u64,
     },
     /// Wake a PollSet (used by timerfd).
@@ -224,24 +309,566 @@ enum AlarmAction {
     },
 }
 
-struct Entry {
+const ALARM_TOKEN_CAPACITY: usize = 4096;
+const ALARM_HEAP_INDEX_NONE: usize = usize::MAX;
+const ALARM_DISPATCH_BATCH: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlarmSlotKey {
+    slot: usize,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlarmTokenReserveError {
+    CapacityExhausted,
+    TokenSpaceExhausted,
+}
+
+struct AlarmSlot {
+    generation: u64,
+    leased: bool,
+    active: bool,
+    clock: AlarmClock,
     deadline: Duration,
+    action: Option<AlarmAction>,
+    heap_index: usize,
+}
+
+impl AlarmSlot {
+    const fn new() -> Self {
+        Self {
+            generation: 0,
+            leased: false,
+            active: false,
+            clock: AlarmClock::Monotonic,
+            deadline: Duration::ZERO,
+            action: None,
+            heap_index: ALARM_HEAP_INDEX_NONE,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AlarmHeapNode {
+    slot: usize,
+    deadline: Duration,
+}
+
+impl AlarmHeapNode {
+    const EMPTY: Self = Self {
+        slot: 0,
+        deadline: Duration::ZERO,
+    };
+
+    fn precedes(self, other: Self) -> bool {
+        self.deadline < other.deadline
+            || (self.deadline == other.deadline && self.slot < other.slot)
+    }
+}
+
+/// A fixed-capacity indexed min-heap. Slot back-pointers make cancellation and
+/// rearm `O(log N)` without leaving lazy tombstones behind.
+struct AlarmHeap<const CAPACITY: usize> {
+    nodes: [AlarmHeapNode; CAPACITY],
+    len: usize,
+}
+
+impl<const CAPACITY: usize> AlarmHeap<CAPACITY> {
+    const fn new() -> Self {
+        Self {
+            nodes: [AlarmHeapNode::EMPTY; CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn peek_deadline(&self) -> Option<Duration> {
+        (self.len != 0).then_some(self.nodes[0].deadline)
+    }
+
+    fn swap_nodes(&mut self, left: usize, right: usize, slots: &mut [AlarmSlot]) {
+        self.nodes.swap(left, right);
+        slots[self.nodes[left].slot].heap_index = left;
+        slots[self.nodes[right].slot].heap_index = right;
+    }
+
+    fn sift_up(&mut self, mut index: usize, slots: &mut [AlarmSlot]) {
+        while index != 0 {
+            let parent = (index - 1) / 2;
+            if !self.nodes[index].precedes(self.nodes[parent]) {
+                break;
+            }
+            self.swap_nodes(index, parent, slots);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut index: usize, slots: &mut [AlarmSlot]) {
+        loop {
+            let left = index * 2 + 1;
+            if left >= self.len {
+                break;
+            }
+            let right = left + 1;
+            let next = if right < self.len && self.nodes[right].precedes(self.nodes[left]) {
+                right
+            } else {
+                left
+            };
+            if !self.nodes[next].precedes(self.nodes[index]) {
+                break;
+            }
+            self.swap_nodes(index, next, slots);
+            index = next;
+        }
+    }
+
+    fn insert(&mut self, slot: usize, deadline: Duration, slots: &mut [AlarmSlot]) {
+        debug_assert!(self.len < CAPACITY);
+        debug_assert_eq!(slots[slot].heap_index, ALARM_HEAP_INDEX_NONE);
+        let index = self.len;
+        self.len += 1;
+        self.nodes[index] = AlarmHeapNode { slot, deadline };
+        slots[slot].heap_index = index;
+        self.sift_up(index, slots);
+    }
+
+    fn remove_at(&mut self, index: usize, slots: &mut [AlarmSlot]) -> usize {
+        debug_assert!(index < self.len);
+        let removed = self.nodes[index].slot;
+        self.len -= 1;
+        if index != self.len {
+            self.nodes[index] = self.nodes[self.len];
+            slots[self.nodes[index].slot].heap_index = index;
+            if index != 0 && self.nodes[index].precedes(self.nodes[(index - 1) / 2]) {
+                self.sift_up(index, slots);
+            } else {
+                self.sift_down(index, slots);
+            }
+        }
+        self.nodes[self.len] = AlarmHeapNode::EMPTY;
+        slots[removed].heap_index = ALARM_HEAP_INDEX_NONE;
+        removed
+    }
+
+    fn pop_min(&mut self, slots: &mut [AlarmSlot]) -> Option<usize> {
+        (self.len != 0).then(|| self.remove_at(0, slots))
+    }
+}
+
+struct AlarmDispatch {
+    owner: AlarmSlotKey,
     action: AlarmAction,
 }
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline
+
+struct AlarmRegistry<const CAPACITY: usize> {
+    slots: [AlarmSlot; CAPACITY],
+    realtime: AlarmHeap<CAPACITY>,
+    monotonic: AlarmHeap<CAPACITY>,
+    next_free: usize,
+}
+
+impl<const CAPACITY: usize> AlarmRegistry<CAPACITY> {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AlarmSlot::new() }; CAPACITY],
+            realtime: AlarmHeap::new(),
+            monotonic: AlarmHeap::new(),
+            next_free: 0,
+        }
+    }
+
+    fn heap(&self, clock: AlarmClock) -> &AlarmHeap<CAPACITY> {
+        match clock {
+            AlarmClock::Realtime => &self.realtime,
+            AlarmClock::Monotonic => &self.monotonic,
+        }
+    }
+
+    fn heap_mut(&mut self, clock: AlarmClock) -> (&mut AlarmHeap<CAPACITY>, &mut [AlarmSlot]) {
+        match clock {
+            AlarmClock::Realtime => (&mut self.realtime, &mut self.slots),
+            AlarmClock::Monotonic => (&mut self.monotonic, &mut self.slots),
+        }
+    }
+
+    fn is_live(&self, key: AlarmSlotKey) -> bool {
+        self.slots
+            .get(key.slot)
+            .is_some_and(|slot| slot.leased && slot.generation == key.generation)
+    }
+
+    fn reserve(&mut self) -> Result<AlarmSlotKey, AlarmTokenReserveError> {
+        let mut saw_retired_slot = false;
+        for offset in 0..CAPACITY {
+            let slot_index = (self.next_free + offset) % CAPACITY;
+            let slot = &mut self.slots[slot_index];
+            if slot.leased {
+                continue;
+            }
+            if slot.generation == u64::MAX {
+                saw_retired_slot = true;
+                continue;
+            }
+
+            slot.generation += 1;
+            slot.leased = true;
+            slot.active = false;
+            slot.action = None;
+            slot.heap_index = ALARM_HEAP_INDEX_NONE;
+            self.next_free = (slot_index + 1) % CAPACITY;
+            return Ok(AlarmSlotKey {
+                slot: slot_index,
+                generation: slot.generation,
+            });
+        }
+
+        if saw_retired_slot {
+            Err(AlarmTokenReserveError::TokenSpaceExhausted)
+        } else {
+            Err(AlarmTokenReserveError::CapacityExhausted)
+        }
+    }
+
+    fn remove_active(&mut self, slot_index: usize) -> Option<AlarmAction> {
+        if !self.slots[slot_index].active {
+            return None;
+        }
+        let clock = self.slots[slot_index].clock;
+        let heap_index = self.slots[slot_index].heap_index;
+        let (heap, slots) = self.heap_mut(clock);
+        debug_assert_eq!(heap.remove_at(heap_index, slots), slot_index);
+        let slot = &mut self.slots[slot_index];
+        slot.active = false;
+        slot.action.take()
+    }
+
+    fn arm(
+        &mut self,
+        key: AlarmSlotKey,
+        clock: AlarmClock,
+        deadline: Duration,
+        action: AlarmAction,
+    ) -> Result<(Option<AlarmAction>, bool), AlarmAction> {
+        if !self.is_live(key) {
+            return Err(action);
+        }
+
+        let prior_deadline = self.heap(clock).peek_deadline();
+        let retired = self.remove_active(key.slot);
+        {
+            let slot = &mut self.slots[key.slot];
+            slot.clock = clock;
+            slot.deadline = deadline;
+            slot.action = Some(action);
+            slot.active = true;
+        }
+        let (heap, slots) = self.heap_mut(clock);
+        heap.insert(key.slot, deadline, slots);
+        Ok((retired, prior_deadline.is_none_or(|prior| deadline < prior)))
+    }
+
+    fn disarm(&mut self, key: AlarmSlotKey) -> Option<AlarmAction> {
+        self.is_live(key)
+            .then(|| self.remove_active(key.slot))
+            .flatten()
+    }
+
+    fn release(&mut self, key: AlarmSlotKey) -> Option<AlarmAction> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let retired = self.remove_active(key.slot);
+        let slot = &mut self.slots[key.slot];
+        slot.leased = false;
+        slot.active = false;
+        slot.action = None;
+        slot.heap_index = ALARM_HEAP_INDEX_NONE;
+        self.next_free = key.slot;
+        retired
+    }
+
+    fn next_deadline(&self, clock: AlarmClock) -> Option<Duration> {
+        self.heap(clock).peek_deadline()
+    }
+
+    fn take_due_batch(
+        &mut self,
+        clock: AlarmClock,
+        now: Duration,
+        pending: &mut [Option<AlarmDispatch>; ALARM_DISPATCH_BATCH],
+    ) -> usize {
+        let mut count = 0;
+        while count < pending.len()
+            && self
+                .heap(clock)
+                .peek_deadline()
+                .is_some_and(|deadline| deadline <= now)
+        {
+            let Some(slot_index) = ({
+                let (heap, slots) = self.heap_mut(clock);
+                heap.pop_min(slots)
+            }) else {
+                debug_assert!(false, "alarm heap lost its published root");
+                break;
+            };
+            let slot = &mut self.slots[slot_index];
+            slot.active = false;
+            let Some(action) = slot.action.take() else {
+                debug_assert!(false, "active alarm heap slot has no action");
+                continue;
+            };
+            pending[count] = Some(AlarmDispatch {
+                owner: AlarmSlotKey {
+                    slot: slot_index,
+                    generation: slot.generation,
+                },
+                action,
+            });
+            count += 1;
+        }
+        count
     }
 }
-impl Eq for Entry {}
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
+
+static ALARM_REGISTRY: SpinNoIrq<AlarmRegistry<ALARM_TOKEN_CAPACITY>> =
+    SpinNoIrq::new(AlarmRegistry::new());
+
+/// Persistent ownership of one bounded alarm slot. Rearm never performs a new
+/// admission, so an already-created periodic timer cannot lose its next event
+/// merely because unrelated timers filled the registry.
+#[derive(Debug)]
+pub(crate) struct AlarmToken {
+    key: AlarmSlotKey,
+}
+
+impl AlarmToken {
+    pub(crate) fn try_new() -> Result<Self, AlarmTokenReserveError> {
+        ALARM_REGISTRY.lock().reserve().map(|key| Self { key })
+    }
+
+    fn matches(&self, key: AlarmSlotKey) -> bool {
+        self.key == key
+    }
+
+    fn prepare_arm(
+        &self,
+        clock: AlarmClock,
+        deadline: Duration,
+        action: AlarmAction,
+    ) -> AlarmPublication {
+        let result = ALARM_REGISTRY.lock().arm(self.key, clock, deadline, action);
+        match result {
+            Ok((retired, should_notify)) => AlarmPublication {
+                retired,
+                notify: should_notify.then_some(clock),
+            },
+            Err(action) => {
+                debug_assert!(false, "live AlarmToken lost its registry slot");
+                AlarmPublication {
+                    retired: Some(action),
+                    notify: None,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn prepare_disarm(&self) -> AlarmPublication {
+        let retired = ALARM_REGISTRY.lock().disarm(self.key);
+        AlarmPublication {
+            retired,
+            notify: None,
+        }
     }
 }
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        other.deadline.cmp(&self.deadline)
+
+impl Drop for AlarmToken {
+    fn drop(&mut self) {
+        // Move the action out while locked, but release its Arc/Weak payload
+        // only after the IRQ-safe registry guard is gone.
+        let retired = ALARM_REGISTRY.lock().release(self.key);
+        drop(retired);
+    }
+}
+
+/// Deferred side effects of an alarm mutation. Callers may update the bounded
+/// registry while holding their owner lock, then publish only after that lock
+/// is released. Registry code itself never drops actions or wakes consumers.
+#[must_use = "alarm mutations must be published after releasing owner locks"]
+pub(crate) struct AlarmPublication {
+    retired: Option<AlarmAction>,
+    notify: Option<AlarmClock>,
+}
+
+impl AlarmPublication {
+    const fn empty() -> Self {
+        Self {
+            retired: None,
+            notify: None,
+        }
+    }
+
+    pub(crate) fn publish(mut self) {
+        let retired = self.retired.take();
+        let notify = self.notify.take();
+        drop(retired);
+        if let Some(clock) = notify {
+            alarm_event(clock).notify(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod alarm_registry_tests {
+    use super::*;
+
+    fn wake_action(source: &Arc<PollSet>) -> AlarmAction {
+        AlarmAction::WakePollSet(source.clone())
+    }
+
+    #[test]
+    fn admission_refunds_slots_and_never_reuses_a_generation() {
+        let mut registry = AlarmRegistry::<2>::new();
+        let first = registry.reserve().unwrap();
+        let second = registry.reserve().unwrap();
+        assert_eq!(
+            registry.reserve(),
+            Err(AlarmTokenReserveError::CapacityExhausted)
+        );
+
+        assert!(registry.release(first).is_none());
+        let replacement = registry.reserve().unwrap();
+        assert_eq!(replacement.slot, first.slot);
+        assert!(replacement.generation > first.generation);
+        assert!(!registry.is_live(first));
+        assert!(registry.is_live(replacement));
+
+        assert!(registry.release(second).is_none());
+        assert!(registry.release(replacement).is_none());
+    }
+
+    #[test]
+    fn exhausted_generation_retires_the_slot_instead_of_wrapping() {
+        let mut registry = AlarmRegistry::<1>::new();
+        registry.slots[0].generation = u64::MAX;
+        assert_eq!(
+            registry.reserve(),
+            Err(AlarmTokenReserveError::TokenSpaceExhausted)
+        );
+        assert!(!registry.slots[0].leased);
+    }
+
+    #[test]
+    fn far_future_rearm_stays_one_node_and_moves_between_clock_heaps() {
+        let mut registry = AlarmRegistry::<2>::new();
+        let owner = registry.reserve().unwrap();
+        let blocker = registry.reserve().unwrap();
+        let source = Arc::new(PollSet::new());
+        assert_eq!(
+            registry.reserve(),
+            Err(AlarmTokenReserveError::CapacityExhausted)
+        );
+
+        for iteration in 0..100_000_u64 {
+            let clock = if iteration & 1 == 0 {
+                AlarmClock::Realtime
+            } else {
+                AlarmClock::Monotonic
+            };
+            let deadline = Duration::from_secs(1_000_000 + iteration);
+            let (retired, _) = registry
+                .arm(owner, clock, deadline, wake_action(&source))
+                .unwrap_or_else(|_| panic!("live lease rejected rearm"));
+            drop(retired);
+            assert_eq!(registry.realtime.len + registry.monotonic.len, 1);
+            assert_eq!(registry.next_deadline(clock), Some(deadline));
+        }
+
+        let retired = registry.disarm(owner);
+        assert!(retired.is_some());
+        drop(retired);
+        assert_eq!(registry.realtime.len + registry.monotonic.len, 0);
+        assert!(registry.release(owner).is_none());
+        assert!(registry.release(blocker).is_none());
+        assert_eq!(Arc::strong_count(&source), 1);
+    }
+
+    #[test]
+    fn due_dispatch_identity_cannot_cross_delete_and_slot_reuse() {
+        let mut registry = AlarmRegistry::<1>::new();
+        let old_owner = registry.reserve().unwrap();
+        let source = Arc::new(PollSet::new());
+        registry
+            .arm(
+                old_owner,
+                AlarmClock::Monotonic,
+                Duration::from_secs(1),
+                wake_action(&source),
+            )
+            .unwrap_or_else(|_| panic!("live lease rejected arm"));
+
+        let mut pending = [const { None }; ALARM_DISPATCH_BATCH];
+        assert_eq!(
+            registry.take_due_batch(AlarmClock::Monotonic, Duration::from_secs(1), &mut pending,),
+            1
+        );
+        let dispatch = pending[0].take().unwrap();
+        assert_eq!(dispatch.owner, old_owner);
+
+        assert!(registry.release(old_owner).is_none());
+        let new_owner = registry.reserve().unwrap();
+        assert_eq!(new_owner.slot, old_owner.slot);
+        assert_ne!(new_owner.generation, old_owner.generation);
+        assert!(!registry.is_live(dispatch.owner));
+        assert!(registry.is_live(new_owner));
+
+        drop(dispatch);
+        assert!(registry.release(new_owner).is_none());
+        assert_eq!(Arc::strong_count(&source), 1);
+    }
+
+    #[test]
+    fn due_dispatch_stops_after_one_fixed_batch() {
+        const COUNT: usize = ALARM_DISPATCH_BATCH + 1;
+        let mut registry = AlarmRegistry::<COUNT>::new();
+        let source = Arc::new(PollSet::new());
+        let mut owners = Vec::new();
+        for _ in 0..COUNT {
+            let owner = registry.reserve().unwrap();
+            registry
+                .arm(
+                    owner,
+                    AlarmClock::Monotonic,
+                    Duration::from_secs(1),
+                    wake_action(&source),
+                )
+                .unwrap_or_else(|_| panic!("live lease rejected arm"));
+            owners.push(owner);
+        }
+
+        let mut first = [const { None }; ALARM_DISPATCH_BATCH];
+        assert_eq!(
+            registry.take_due_batch(AlarmClock::Monotonic, Duration::from_secs(1), &mut first),
+            ALARM_DISPATCH_BATCH
+        );
+        assert_eq!(
+            registry.next_deadline(AlarmClock::Monotonic),
+            Some(Duration::from_secs(1))
+        );
+
+        let mut second = [const { None }; ALARM_DISPATCH_BATCH];
+        assert_eq!(
+            registry.take_due_batch(AlarmClock::Monotonic, Duration::from_secs(1), &mut second),
+            1
+        );
+        assert_eq!(registry.next_deadline(AlarmClock::Monotonic), None);
+
+        drop(first);
+        drop(second);
+        for owner in owners {
+            assert!(registry.release(owner).is_none());
+        }
+        assert_eq!(Arc::strong_count(&source), 1);
     }
 }
 
@@ -512,8 +1139,6 @@ impl Drop for PreparedClockSleep {
 }
 
 lazy_static! {
-    static ref REALTIME_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
-    static ref MONOTONIC_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
     static ref REALTIME_ALARM_EVENT: Event = Event::new();
     static ref MONOTONIC_ALARM_EVENT: Event = Event::new();
 }
@@ -572,11 +1197,571 @@ impl ITimerType {
     }
 }
 
-#[derive(Default)]
-struct ITimer {
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct ProcessTimerCharge {
+    user_ns: usize,
+    system_ns: usize,
+}
+
+const PROCESS_ITIMER_VIRTUAL_PENDING: u8 = 1 << 0;
+const PROCESS_ITIMER_PROF_PENDING: u8 = 1 << 1;
+const PROCESS_ITIMER_CPU_ARMED_MASK: u8 =
+    PROCESS_ITIMER_VIRTUAL_PENDING | PROCESS_ITIMER_PROF_PENDING;
+const PROCESS_ITIMER_WORK_BATCH: usize = 16;
+static PROCESS_ITIMER_WORK_HEAD: AtomicPtr<ProcessData> = AtomicPtr::new(ptr::null_mut());
+
+#[derive(Debug)]
+struct ProcessITimer {
     interval_ns: usize,
-    remained_ns: usize,
+    remaining_ns: usize,
     sequence: u64,
+}
+
+impl ProcessITimer {
+    const fn new() -> Self {
+        Self {
+            interval_ns: 0,
+            remaining_ns: 0,
+            sequence: 0,
+        }
+    }
+
+    fn charge_cpu(&mut self, delta_ns: usize) -> bool {
+        if self.remaining_ns == 0 || delta_ns == 0 {
+            return false;
+        }
+        if delta_ns < self.remaining_ns {
+            self.remaining_ns -= delta_ns;
+            return false;
+        }
+
+        if self.interval_ns == 0 {
+            self.remaining_ns = 0;
+        } else {
+            let overshoot = (delta_ns - self.remaining_ns) % self.interval_ns;
+            self.remaining_ns = if overshoot == 0 {
+                self.interval_ns
+            } else {
+                self.interval_ns - overshoot
+            };
+        }
+        true
+    }
+}
+
+/// Linux interval timers are shared by a thread group. The real timer lazily
+/// admits one alarm lease on its first arm and then retains that lease until
+/// process teardown; virtual/profiling timers consume aggregate per-thread
+/// CPU-accounting deltas and never occupy a wall-clock alarm slot.
+pub(crate) struct ProcessITimers {
+    timers: [ProcessITimer; 3],
+    real_deadline: Option<Duration>,
+    real_alarm: Option<AlarmToken>,
+}
+
+impl ProcessITimers {
+    pub(crate) const fn new() -> Self {
+        Self {
+            timers: [
+                ProcessITimer::new(),
+                ProcessITimer::new(),
+                ProcessITimer::new(),
+            ],
+            real_deadline: None,
+            real_alarm: None,
+        }
+    }
+
+    fn get(&self, ty: ITimerType) -> (TimeValue, TimeValue) {
+        let timer = &self.timers[ty as usize];
+        let remaining_ns = if ty == ITimerType::Real {
+            self.real_deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_sub(AlarmClock::Monotonic.now())
+                        .as_nanos()
+                        .min(usize::MAX as u128) as usize
+                })
+                .unwrap_or(0)
+        } else {
+            timer.remaining_ns
+        };
+        (
+            time_value_from_nanos(timer.interval_ns),
+            time_value_from_nanos(remaining_ns),
+        )
+    }
+
+    fn try_set(
+        &mut self,
+        owner: &Arc<ProcessData>,
+        ty: ITimerType,
+        interval_ns: usize,
+        remaining_ns: usize,
+        admitted_alarm: &mut Option<AlarmToken>,
+    ) -> Result<ProcessITimerSetOutcome, ProcessITimerSetAttemptError> {
+        let index = ty as usize;
+        let old = self.get(ty);
+        let sequence = self.timers[index]
+            .sequence
+            .checked_add(1)
+            .ok_or(ProcessITimerSetAttemptError::Kernel(AxError::OutOfRange))?;
+
+        if ty == ITimerType::Real && remaining_ns != 0 && self.real_alarm.is_none() {
+            let Some(alarm) = admitted_alarm.take() else {
+                return Err(ProcessITimerSetAttemptError::NeedAlarmToken);
+            };
+            self.real_alarm = Some(alarm);
+        }
+
+        let timer = &mut self.timers[index];
+        timer.interval_ns = interval_ns;
+        timer.remaining_ns = remaining_ns;
+        timer.sequence = sequence;
+        owner
+            .process_itimer_cpu_armed
+            .store(self.cpu_armed_mask(), Ordering::Release);
+
+        let publication = if ty != ITimerType::Real {
+            AlarmPublication::empty()
+        } else if remaining_ns == 0 {
+            self.real_deadline = None;
+            self.real_alarm
+                .as_ref()
+                .map_or_else(AlarmPublication::empty, AlarmToken::prepare_disarm)
+        } else {
+            let deadline = AlarmClock::Monotonic
+                .now()
+                .checked_add(Duration::from_nanos(remaining_ns as u64))
+                .unwrap_or(Duration::MAX);
+            self.real_deadline = Some(deadline);
+            self.real_alarm
+                .as_ref()
+                .expect("armed process itimer owns an alarm lease")
+                .prepare_arm(
+                    AlarmClock::Monotonic,
+                    deadline,
+                    AlarmAction::ProcessITimerReal {
+                        proc: Arc::downgrade(owner),
+                        sequence,
+                    },
+                )
+        };
+
+        Ok(ProcessITimerSetOutcome { old, publication })
+    }
+
+    fn cpu_armed_mask(&self) -> u8 {
+        let mut mask = 0;
+        if self.timers[ITimerType::Virtual as usize].remaining_ns != 0 {
+            mask |= PROCESS_ITIMER_VIRTUAL_PENDING;
+        }
+        if self.timers[ITimerType::Prof as usize].remaining_ns != 0 {
+            mask |= PROCESS_ITIMER_PROF_PENDING;
+        }
+        mask
+    }
+
+    fn charge_cpu(&mut self, charge: ProcessTimerCharge) -> ProcessITimerSignals {
+        ProcessITimerSignals {
+            virtual_expired: self.timers[ITimerType::Virtual as usize].charge_cpu(charge.user_ns),
+            prof_expired: self.timers[ITimerType::Prof as usize]
+                .charge_cpu(charge.user_ns.saturating_add(charge.system_ns)),
+        }
+    }
+
+    fn prepare_real_fire(
+        &mut self,
+        owner: &Arc<ProcessData>,
+        alarm_owner: AlarmSlotKey,
+        sequence: u64,
+    ) -> Option<ProcessITimerFireOutcome> {
+        let alarm = self.real_alarm.as_ref()?;
+        let timer = &mut self.timers[ITimerType::Real as usize];
+        if !alarm.matches(alarm_owner) || timer.sequence != sequence {
+            return None;
+        }
+        let deadline = self.real_deadline?;
+        let now = AlarmClock::Monotonic.now();
+        if now < deadline {
+            return None;
+        }
+
+        if timer.interval_ns == 0 {
+            timer.remaining_ns = 0;
+            self.real_deadline = None;
+            return Some(ProcessITimerFireOutcome {
+                publication: AlarmPublication::empty(),
+            });
+        }
+
+        let interval = Duration::from_nanos(timer.interval_ns as u64);
+        let elapsed = now.saturating_sub(deadline).as_nanos();
+        let expirations = 1_u128.saturating_add(elapsed / interval.as_nanos().max(1));
+        let next_deadline = deadline
+            .checked_add(saturating_duration_mul(interval, expirations))
+            .unwrap_or(Duration::MAX);
+        timer.remaining_ns = timer.interval_ns;
+        self.real_deadline = Some(next_deadline);
+        let publication = self
+            .real_alarm
+            .as_ref()
+            .expect("periodic process itimer retains its alarm lease")
+            .prepare_arm(
+                AlarmClock::Monotonic,
+                next_deadline,
+                AlarmAction::ProcessITimerReal {
+                    proc: Arc::downgrade(owner),
+                    sequence,
+                },
+            );
+        Some(ProcessITimerFireOutcome { publication })
+    }
+}
+
+#[cfg(test)]
+mod process_itimer_tests {
+    use super::*;
+
+    fn arm_cpu_timer(
+        timers: &mut ProcessITimers,
+        ty: ITimerType,
+        interval: usize,
+        remaining: usize,
+    ) {
+        let timer = &mut timers.timers[ty as usize];
+        timer.interval_ns = interval;
+        timer.remaining_ns = remaining;
+    }
+
+    #[test]
+    fn virtual_consumes_only_user_time_and_prof_consumes_both() {
+        let mut timers = ProcessITimers::new();
+        arm_cpu_timer(&mut timers, ITimerType::Virtual, 0, 5);
+        arm_cpu_timer(&mut timers, ITimerType::Prof, 0, 5);
+
+        let signals = timers.charge_cpu(ProcessTimerCharge {
+            user_ns: 0,
+            system_ns: 5,
+        });
+        assert_eq!(
+            signals,
+            ProcessITimerSignals {
+                virtual_expired: false,
+                prof_expired: true,
+            }
+        );
+        assert_eq!(timers.timers[ITimerType::Virtual as usize].remaining_ns, 5);
+        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 0);
+
+        let signals = timers.charge_cpu(ProcessTimerCharge {
+            user_ns: 5,
+            system_ns: 0,
+        });
+        assert_eq!(
+            signals,
+            ProcessITimerSignals {
+                virtual_expired: true,
+                prof_expired: false,
+            }
+        );
+        assert_eq!(timers.cpu_armed_mask(), 0);
+    }
+
+    #[test]
+    fn periodic_cpu_timer_carries_overshoot_into_one_future_period() {
+        let mut timers = ProcessITimers::new();
+        arm_cpu_timer(&mut timers, ITimerType::Virtual, 10, 4);
+
+        let signals = timers.charge_cpu(ProcessTimerCharge {
+            user_ns: 27,
+            system_ns: 0,
+        });
+        assert!(signals.virtual_expired);
+        assert!(!signals.prof_expired);
+        assert_eq!(timers.timers[ITimerType::Virtual as usize].remaining_ns, 7);
+        assert_eq!(timers.cpu_armed_mask(), PROCESS_ITIMER_VIRTUAL_PENDING);
+    }
+
+    #[test]
+    fn cpu_timer_one_shot_disarms_after_exact_threshold() {
+        let mut timers = ProcessITimers::new();
+        arm_cpu_timer(&mut timers, ITimerType::Prof, 0, 8);
+
+        assert!(
+            !timers
+                .charge_cpu(ProcessTimerCharge {
+                    user_ns: 3,
+                    system_ns: 4,
+                })
+                .prof_expired
+        );
+        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 1);
+        assert!(
+            timers
+                .charge_cpu(ProcessTimerCharge {
+                    user_ns: 0,
+                    system_ns: 1,
+                })
+                .prof_expired
+        );
+        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 0);
+        assert!(
+            !timers
+                .charge_cpu(ProcessTimerCharge {
+                    user_ns: usize::MAX,
+                    system_ns: usize::MAX,
+                })
+                .prof_expired
+        );
+    }
+}
+
+enum ProcessITimerSetAttemptError {
+    NeedAlarmToken,
+    Kernel(AxError),
+}
+
+struct ProcessITimerSetOutcome {
+    old: (TimeValue, TimeValue),
+    publication: AlarmPublication,
+}
+
+struct ProcessITimerFireOutcome {
+    publication: AlarmPublication,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ProcessITimerSignals {
+    virtual_expired: bool,
+    prof_expired: bool,
+}
+
+pub(crate) fn get_process_itimer(
+    proc_data: &ProcessData,
+    ty: ITimerType,
+) -> (TimeValue, TimeValue) {
+    proc_data.process_itimers.lock().get(ty)
+}
+
+pub(crate) fn set_process_itimer(
+    proc_data: &Arc<ProcessData>,
+    ty: ITimerType,
+    interval_ns: usize,
+    remaining_ns: usize,
+) -> AxResult<(TimeValue, TimeValue)> {
+    let mut admitted_alarm = None;
+    loop {
+        let attempt = proc_data.process_itimers.lock().try_set(
+            proc_data,
+            ty,
+            interval_ns,
+            remaining_ns,
+            &mut admitted_alarm,
+        );
+        match attempt {
+            Ok(outcome) => {
+                outcome.publication.publish();
+                drop(admitted_alarm);
+                return Ok(outcome.old);
+            }
+            Err(ProcessITimerSetAttemptError::NeedAlarmToken) => {
+                debug_assert!(admitted_alarm.is_none());
+                admitted_alarm = Some(AlarmToken::try_new().map_err(|error| match error {
+                    AlarmTokenReserveError::CapacityExhausted => AxError::WouldBlock,
+                    AlarmTokenReserveError::TokenSpaceExhausted => AxError::OutOfRange,
+                })?);
+            }
+            Err(ProcessITimerSetAttemptError::Kernel(error)) => {
+                drop(admitted_alarm);
+                return Err(error);
+            }
+        }
+    }
+}
+
+pub(crate) fn charge_process_itimers(
+    proc_data: &Arc<ProcessData>,
+    charge: ProcessTimerCharge,
+) -> bool {
+    if charge == ProcessTimerCharge::default()
+        || proc_data.process_itimer_cpu_armed.load(Ordering::Acquire) == 0
+    {
+        return false;
+    }
+    let signals = {
+        let mut timers = proc_data.process_itimers.lock();
+        let signals = timers.charge_cpu(charge);
+        // Publish the fast-path mask while still holding the state owner lock.
+        // set_process_itimer() uses the same lock, so a later arm/disarm cannot
+        // be overwritten by an older accounting snapshot after lock release.
+        proc_data
+            .process_itimer_cpu_armed
+            .store(timers.cpu_armed_mask(), Ordering::Release);
+        signals
+    };
+    let mut pending = 0;
+    if signals.virtual_expired {
+        pending |= PROCESS_ITIMER_VIRTUAL_PENDING;
+    }
+    if signals.prof_expired {
+        pending |= PROCESS_ITIMER_PROF_PENDING;
+    }
+    if pending != 0 {
+        proc_data
+            .process_itimer_pending
+            .fetch_or(pending, Ordering::Release);
+        publish_process_itimer_work(proc_data);
+        true
+    } else {
+        false
+    }
+}
+
+fn publish_process_itimer_work(proc_data: &Arc<ProcessData>) {
+    if proc_data
+        .process_itimer_work_queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let retained = proc_data.clone();
+    let replaced = proc_data.process_itimer_work_owner.lock().replace(retained);
+    assert!(
+        replaced.is_none(),
+        "process timer work owner published twice"
+    );
+    drop(replaced);
+
+    let node = Arc::as_ptr(proc_data).cast_mut();
+    let mut head = PROCESS_ITIMER_WORK_HEAD.load(Ordering::Acquire);
+    loop {
+        proc_data
+            .process_itimer_work_next
+            .store(head, Ordering::Relaxed);
+        match PROCESS_ITIMER_WORK_HEAD.compare_exchange_weak(
+            head,
+            node,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(observed) => head = observed,
+        }
+    }
+}
+
+pub(crate) fn has_deferred_process_itimer_work() -> bool {
+    !PROCESS_ITIMER_WORK_HEAD.load(Ordering::Acquire).is_null()
+}
+
+/// Single-consumer state for the process-timer ingress stack. Detaching and
+/// reversing one producer snapshot gives FIFO service: a hot process may
+/// republish only into the next ingress snapshot and therefore cannot jump in
+/// front of older nodes retained in `backlog`.
+pub(crate) struct ProcessITimerWorkConsumer {
+    backlog: *mut ProcessData,
+}
+
+impl ProcessITimerWorkConsumer {
+    pub(crate) const fn new() -> Self {
+        Self {
+            backlog: ptr::null_mut(),
+        }
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.backlog.is_null() || has_deferred_process_itimer_work()
+    }
+
+    fn refill(&mut self) {
+        if !self.backlog.is_null() {
+            return;
+        }
+
+        let mut ingress = PROCESS_ITIMER_WORK_HEAD.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut fifo = ptr::null_mut();
+        while !ingress.is_null() {
+            // SAFETY: each published node retains a self Arc and remains
+            // `queued`. Producers can only prepend to the global ingress and
+            // cannot republish a detached node. This dedicated consumer owns
+            // every `next` link in the detached snapshot.
+            let node = unsafe { &*ingress };
+            let next = node.process_itimer_work_next.load(Ordering::Relaxed);
+            node.process_itimer_work_next.store(fifo, Ordering::Relaxed);
+            fifo = ingress;
+            ingress = next;
+        }
+        self.backlog = fifo;
+    }
+
+    fn pop(&mut self) -> Option<Arc<ProcessData>> {
+        self.refill();
+        let head = self.backlog;
+        if head.is_null() {
+            return None;
+        }
+
+        // SAFETY: `refill` detached this FIFO snapshot from all producers.
+        // The queued node's self Arc keeps it alive until the owner is taken.
+        let node = unsafe { &*head };
+        self.backlog = node.process_itimer_work_next.load(Ordering::Relaxed);
+        node.process_itimer_work_next
+            .store(ptr::null_mut(), Ordering::Relaxed);
+        Some(
+            node.process_itimer_work_owner
+                .lock()
+                .take()
+                .expect("queued process timer work lost its self owner"),
+        )
+    }
+
+    pub(crate) fn drain_batch(&mut self) -> usize {
+        let mut drained = 0;
+        while drained < PROCESS_ITIMER_WORK_BATCH {
+            let Some(proc_data) = self.pop() else {
+                break;
+            };
+            let pending = proc_data.process_itimer_pending.swap(0, Ordering::AcqRel);
+            proc_data
+                .process_itimer_work_queued
+                .store(false, Ordering::Release);
+            if proc_data.process_itimer_pending.load(Ordering::Acquire) != 0 {
+                publish_process_itimer_work(&proc_data);
+            }
+
+            if pending & PROCESS_ITIMER_VIRTUAL_PENDING != 0 {
+                let _ = send_signal_to_process_data(
+                    &proc_data,
+                    Some(SignalInfo::new_kernel(ITimerType::Virtual.signo())),
+                );
+            }
+            if pending & PROCESS_ITIMER_PROF_PENDING != 0 {
+                let _ = send_signal_to_process_data(
+                    &proc_data,
+                    Some(SignalInfo::new_kernel(ITimerType::Prof.signo())),
+                );
+            }
+            debug_assert_eq!(pending & !PROCESS_ITIMER_CPU_ARMED_MASK, 0);
+            drained += 1;
+        }
+        drained
+    }
+}
+
+fn fire_process_itimer_real(proc_data: Arc<ProcessData>, alarm_owner: AlarmSlotKey, sequence: u64) {
+    let Some(outcome) =
+        proc_data
+            .process_itimers
+            .lock()
+            .prepare_real_fire(&proc_data, alarm_owner, sequence)
+    else {
+        return;
+    };
+    outcome.publication.publish();
+    let _ = send_signal_to_process_data(&proc_data, Some(SignalInfo::new_kernel(Signo::SIGALRM)));
 }
 
 #[derive(Debug, Default)]
@@ -602,47 +1787,6 @@ fn secs_to_nanos(secs: u64) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-impl ITimer {
-    pub fn new(interval_ns: usize, remained_ns: usize, sequence: u64) -> Self {
-        Self {
-            interval_ns,
-            remained_ns,
-            sequence,
-        }
-    }
-
-    pub fn update(&mut self, ty: ITimerType, delta: usize) -> bool {
-        if self.remained_ns == 0 {
-            return false;
-        }
-        if self.remained_ns > delta {
-            self.remained_ns -= delta;
-            false
-        } else {
-            self.remained_ns = self.interval_ns;
-            self.renew_timer(ty);
-            true
-        }
-    }
-
-    pub fn renew_timer(&self, ty: ITimerType) {
-        if self.remained_ns > 0 {
-            let deadline = wall_time()
-                .checked_add(Duration::from_nanos(self.remained_ns as u64))
-                .unwrap_or(Duration::MAX);
-            register_alarm(
-                AlarmClock::Realtime,
-                deadline,
-                AlarmAction::PollITimer {
-                    task: Arc::downgrade(&current()),
-                    ty,
-                    sequence: self.sequence,
-                },
-            );
-        }
-    }
-}
-
 /// Represents the state of the timer.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TimerState {
@@ -660,17 +1804,9 @@ pub struct TimeManager {
     utime_ns: usize,
     stime_ns: usize,
     last_cpu_ns: usize,
-    last_wall_ns: usize,
     state: TimerState,
     paused_state: TimerState,
-    itimers: [ITimer; 3],
     cpu_limit: CpuLimitState,
-}
-
-impl Default for TimeManager {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl TimeManager {
@@ -679,10 +1815,8 @@ impl TimeManager {
             utime_ns: 0,
             stime_ns: 0,
             last_cpu_ns: 0,
-            last_wall_ns: 0,
             state: TimerState::None,
             paused_state: TimerState::None,
-            itimers: Default::default(),
             cpu_limit: CpuLimitState::default(),
         }
     }
@@ -694,28 +1828,44 @@ impl TimeManager {
         (utime, stime)
     }
 
-    /// Polls the time manager to update the timers and emit signals if
-    /// necessary.
-    pub fn poll(&mut self, signals: &mut Vec<Signo>) {
+    fn account_elapsed(&mut self) -> ProcessTimerCharge {
         let now_ns = monotonic_time_nanos() as usize;
-        let wall_delta = now_ns.saturating_sub(self.last_wall_ns);
         let cpu_delta = now_ns.saturating_sub(self.last_cpu_ns);
-        match self.state {
+        let charge = match self.state {
             TimerState::User => {
                 self.utime_ns += cpu_delta;
-                self.update_itimer(ITimerType::Virtual, cpu_delta, signals);
-                self.update_itimer(ITimerType::Prof, cpu_delta, signals);
+                ProcessTimerCharge {
+                    user_ns: cpu_delta,
+                    system_ns: 0,
+                }
             }
             TimerState::Kernel => {
                 self.stime_ns += cpu_delta;
-                self.update_itimer(ITimerType::Prof, cpu_delta, signals);
+                ProcessTimerCharge {
+                    user_ns: 0,
+                    system_ns: cpu_delta,
+                }
             }
-            TimerState::None => {}
-        }
-        self.update_itimer(ITimerType::Real, wall_delta, signals);
-        self.update_rlimit_cpu(signals);
+            TimerState::None => ProcessTimerCharge::default(),
+        };
         self.last_cpu_ns = now_ns;
-        self.last_wall_ns = now_ns;
+        charge
+    }
+
+    /// Polls the time manager to update the timers and emit signals if
+    /// necessary.
+    pub(crate) fn poll(&mut self, signals: &mut Vec<Signo>) -> ProcessTimerCharge {
+        let charge = self.account_elapsed();
+        self.update_rlimit_cpu(signals);
+        charge
+    }
+
+    /// Accounts the interrupted current task from the periodic timer IRQ.
+    /// RLIMIT policy remains at the ordinary user-return/context-switch
+    /// boundary; the trap path immediately observes the updated total without
+    /// allocating or publishing signals from IRQ context.
+    pub(crate) fn poll_timer_tick(&mut self) -> ProcessTimerCharge {
+        self.account_elapsed()
     }
 
     /// Updates the timer state.
@@ -725,10 +1875,11 @@ impl TimeManager {
     }
 
     /// Pauses CPU-time accounting while this thread is not running.
-    pub fn pause_for_switch(&mut self, signals: &mut Vec<Signo>) {
-        self.poll(signals);
+    pub(crate) fn pause_for_switch(&mut self, signals: &mut Vec<Signo>) -> ProcessTimerCharge {
+        let charge = self.poll(signals);
         self.paused_state = self.state;
         self.set_state(TimerState::None);
+        charge
     }
 
     /// Resumes the CPU-time accounting state that was active before switch-out.
@@ -736,46 +1887,6 @@ impl TimeManager {
         let state = self.paused_state;
         self.paused_state = TimerState::None;
         self.set_state(state);
-    }
-
-    /// Sets the interval timer of the specified type with the given interval
-    /// and remaining time.
-    pub fn set_itimer(
-        &mut self,
-        ty: ITimerType,
-        interval_ns: usize,
-        remained_ns: usize,
-    ) -> (TimeValue, TimeValue) {
-        let index = ty as usize;
-        let sequence = self.itimers[index].sequence.wrapping_add(1);
-        let old = mem::replace(
-            &mut self.itimers[index],
-            ITimer::new(interval_ns, remained_ns, sequence),
-        );
-        self.itimers[index].renew_timer(ty);
-        (
-            time_value_from_nanos(old.interval_ns),
-            time_value_from_nanos(old.remained_ns),
-        )
-    }
-
-    /// Gets the current interval and remaining time.
-    pub fn get_itimer(&self, ty: ITimerType) -> (TimeValue, TimeValue) {
-        let itimer = &self.itimers[ty as usize];
-        (
-            time_value_from_nanos(itimer.interval_ns),
-            time_value_from_nanos(itimer.remained_ns),
-        )
-    }
-
-    fn update_itimer(&mut self, ty: ITimerType, delta: usize, signals: &mut Vec<Signo>) {
-        if self.itimers[ty as usize].update(ty, delta) {
-            signals.push(ty.signo());
-        }
-    }
-
-    pub fn itimer_sequence_matches(&self, ty: ITimerType, sequence: u64) -> bool {
-        self.itimers[ty as usize].sequence == sequence
     }
 
     fn update_rlimit_cpu(&mut self, signals: &mut Vec<Signo>) {
@@ -827,7 +1938,10 @@ fn alarm_task(clock: AlarmClock) -> Result<AxResult<()>, BlockOnError> {
         listener!(alarm_event(clock) => listener);
 
         if process_due(clock) {
-            axtask::resched_if_needed();
+            // One scheduling turn owns at most one fixed dispatch batch. A
+            // sub-tick periodic timer must not monopolize this worker merely
+            // because it is due again by the next clock sample.
+            axtask::yield_now();
             continue;
         }
 
@@ -877,18 +1991,19 @@ pub fn spawn_alarm_task() -> Result<(), axerrno::AxError> {
     Ok(())
 }
 
-fn alarm_list(clock: AlarmClock) -> &'static Mutex<BinaryHeap<Entry>> {
-    match clock {
-        AlarmClock::Realtime => &REALTIME_ALARM_LIST,
-        AlarmClock::Monotonic => &MONOTONIC_ALARM_LIST,
-    }
-}
-
 fn alarm_event(clock: AlarmClock) -> &'static Event {
     match clock {
         AlarmClock::Realtime => &REALTIME_ALARM_EVENT,
         AlarmClock::Monotonic => &MONOTONIC_ALARM_EVENT,
     }
+}
+
+/// Re-evaluates every realtime wait after a discontinuous wall-clock update.
+/// Global alarm objects use the event worker; synchronous clock/futex waits
+/// live in per-CPU shards and are retriggered on their owning CPUs.
+pub(crate) fn notify_realtime_clock_change() {
+    alarm_event(AlarmClock::Realtime).notify(1);
+    axruntime::retrigger_timer_events_all();
 }
 
 fn timer_runtime(clock: AlarmClock, owner_cpu: usize) -> &'static SpinNoIrq<ClockTimerRuntime> {
@@ -1291,40 +2406,16 @@ fn update_clock_timer_deadline(owner_cpu: usize) {
     axruntime::set_early_timer_deadline(deadline);
 }
 
-fn register_alarm(clock: AlarmClock, deadline: Duration, action: AlarmAction) {
-    let list = alarm_list(clock);
-    let mut guard = list.lock();
-    let should_wake = guard.peek().is_none_or(|it| it.deadline > deadline);
-    guard.push(Entry { deadline, action });
-    drop(guard);
-    if should_wake {
-        alarm_event(clock).notify(1);
-    }
-}
-
-/// Registers a one-shot alarm that wakes the given [`PollSet`] at the specified
-/// deadline in the selected clock domain. Used by timerfd to get notified when
-/// the timer expires.
-pub fn register_pollset_alarm(clock: AlarmClock, deadline: Duration, poll_set: Arc<PollSet>) {
-    register_alarm(clock, deadline, AlarmAction::WakePollSet(poll_set));
-}
-
-pub(crate) fn register_posix_timer_alarm(
-    proc_data: &Arc<ProcessData>,
-    timerid: usize,
+/// Prepares an alarm update for a timerfd-owned token. The caller must retain
+/// the token for the complete open-file-description lifetime and publish the
+/// returned side effects after releasing the timerfd state lock.
+pub(crate) fn prepare_pollset_alarm(
+    token: &AlarmToken,
     clock: AlarmClock,
     deadline: Duration,
-    sequence: u64,
-) {
-    register_alarm(
-        clock,
-        deadline,
-        AlarmAction::PosixTimer {
-            proc: Arc::downgrade(proc_data),
-            timerid,
-            sequence,
-        },
-    );
+    poll_set: Arc<PollSet>,
+) -> AlarmPublication {
+    token.prepare_arm(clock, deadline, AlarmAction::WakePollSet(poll_set))
 }
 
 fn saturating_duration_mul(duration: Duration, count: u128) -> Duration {
@@ -1372,15 +2463,29 @@ pub(crate) fn acknowledge_posix_timer_signal(proc_data: &ProcessData, sig: &Sign
     let Some(Some(timer)) = timers.get_mut(timerid) else {
         return;
     };
+    if !timer.is_published() {
+        return;
+    }
     timer.acknowledge_signal_delivery(token);
 }
 
-fn fail_posix_timer_signal(proc_data: &ProcessData, timerid: usize, token: u32) -> bool {
+fn fail_posix_timer_signal(
+    proc_data: &Arc<ProcessData>,
+    timerid: usize,
+    token: u32,
+    backoff: Duration,
+) -> Option<AlarmPublication> {
     let mut timers = proc_data.posix_timers.lock();
     let Some(Some(timer)) = timers.get_mut(timerid) else {
-        return false;
+        return None;
     };
-    timer.fail_signal_delivery(token)
+    if !timer.is_published() {
+        return None;
+    }
+    timer
+        .fail_signal_delivery(token)
+        .then(|| timer.prepare_retry_alarm(proc_data, timerid, token, backoff))
+        .flatten()
 }
 
 fn abandon_posix_timer_signal(proc_data: &ProcessData, timerid: usize, token: u32) {
@@ -1388,29 +2493,10 @@ fn abandon_posix_timer_signal(proc_data: &ProcessData, timerid: usize, token: u3
     let Some(Some(timer)) = timers.get_mut(timerid) else {
         return;
     };
+    if !timer.is_published() {
+        return;
+    }
     timer.abandon_signal_delivery(token);
-}
-
-fn register_posix_timer_retry(
-    proc_data: &Arc<ProcessData>,
-    timerid: usize,
-    token: u32,
-    backoff: Duration,
-) {
-    let deadline = AlarmClock::Monotonic
-        .now()
-        .checked_add(backoff)
-        .unwrap_or(Duration::MAX);
-    register_alarm(
-        AlarmClock::Monotonic,
-        deadline,
-        AlarmAction::PosixTimerRetry {
-            proc: Arc::downgrade(proc_data),
-            timerid,
-            token,
-            backoff,
-        },
-    );
 }
 
 fn next_posix_timer_retry_backoff(backoff: Duration) -> Duration {
@@ -1457,8 +2543,10 @@ fn deliver_posix_timer_signal(
             // Admission/allocation failure retains the exact timer event and
             // schedules one sleeping retry. Periodic expiries merge their
             // overruns into that generation; rearm/delete invalidate it.
-            if fail_posix_timer_signal(proc_data, timerid, delivery.token) {
-                register_posix_timer_retry(proc_data, timerid, delivery.token, retry_backoff);
+            if let Some(publication) =
+                fail_posix_timer_signal(proc_data, timerid, delivery.token, retry_backoff)
+            {
+                publication.publish();
             }
             if linux_error != LinuxError::EAGAIN {
                 warn!("failed to deliver POSIX timer signal: {err:?}");
@@ -1470,6 +2558,7 @@ fn deliver_posix_timer_signal(
 fn retry_posix_timer_signal(
     proc_data: Arc<ProcessData>,
     timerid: usize,
+    owner: AlarmSlotKey,
     token: u32,
     backoff: Duration,
 ) {
@@ -1478,6 +2567,12 @@ fn retry_posix_timer_signal(
         let Some(Some(timer)) = timers.get_mut(timerid) else {
             return;
         };
+        if !timer.is_published() {
+            return;
+        }
+        if !timer.retry_alarm_matches(owner) {
+            return;
+        }
         let notify = timer.notify;
         let Some(delivery) = timer.retry_signal_delivery(token) else {
             return;
@@ -1493,20 +2588,28 @@ fn retry_posix_timer_signal(
     );
 }
 
-fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) {
+fn fire_posix_timer(
+    proc_data: Arc<ProcessData>,
+    timerid: usize,
+    owner: AlarmSlotKey,
+    sequence: u64,
+) {
     let (notify, delivery, next) = {
         let mut timers = proc_data.posix_timers.lock();
         let Some(Some(timer)) = timers.get_mut(timerid) else {
             return;
         };
-        if timer.sequence != sequence {
+        if !timer.is_published() {
+            return;
+        }
+        if !timer.main_alarm_matches(owner) || timer.sequence != sequence {
             return;
         }
         let Some(deadline) = timer.deadline else {
             return;
         };
 
-        let now = timer.clock.alarm_clock().now();
+        let now = timer.effective_clock.now();
         if now < deadline {
             return;
         }
@@ -1526,21 +2629,25 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
 
         let next = if timer.interval.is_zero() {
             timer.deadline = None;
-            timer.sequence = timer.sequence.wrapping_add(1);
             None
         } else {
             let next_deadline = deadline
                 .checked_add(saturating_duration_mul(timer.interval, expirations))
                 .unwrap_or(Duration::MAX);
             timer.deadline = Some(next_deadline);
-            timer.sequence = timer.sequence.wrapping_add(1);
-            Some((timer.clock.alarm_clock(), next_deadline, timer.sequence))
+            Some(timer.prepare_main_alarm(
+                &proc_data,
+                timerid,
+                timer.effective_clock,
+                next_deadline,
+                timer.sequence,
+            ))
         };
         (notify, delivery, next)
     };
 
-    if let Some((clock, deadline, next_sequence)) = next {
-        register_posix_timer_alarm(&proc_data, timerid, clock, deadline, next_sequence);
+    if let Some(publication) = next {
+        publication.publish();
     }
 
     let Some(delivery) = delivery else { return };
@@ -1559,7 +2666,7 @@ mod posix_timer_signal_tests {
     use super::*;
 
     fn timer() -> PosixTimer {
-        PosixTimer::new(
+        PosixTimer::try_new(
             PosixTimerClock::Monotonic,
             PosixTimerNotify::Signal {
                 signo: Signo::SIGRTMIN,
@@ -1567,6 +2674,7 @@ mod posix_timer_signal_tests {
                 value: Some(7),
             },
         )
+        .unwrap()
     }
 
     #[test]
@@ -1612,7 +2720,7 @@ mod posix_timer_signal_tests {
         let first = timer.begin_signal_delivery(1).unwrap();
         assert!(timer.fail_signal_delivery(first.token));
 
-        timer.reset_signal_delivery();
+        timer.reset_signal_delivery().publish();
         assert!(timer.retry_signal_delivery(first.token).is_none());
         assert!(!timer.signal_pending);
         assert!(!timer.signal_retry_pending);
@@ -1620,30 +2728,19 @@ mod posix_timer_signal_tests {
 }
 
 fn queue_deadline(clock: AlarmClock) -> Option<Duration> {
-    let list = alarm_list(clock);
-    let guard = list.lock();
-    Some(guard.peek()?.deadline)
-}
-
-fn pop_due(clock: AlarmClock) -> Option<AlarmAction> {
-    let list = alarm_list(clock);
-    let mut guard = list.lock();
-    let now = clock.now();
-    if guard.peek().is_some_and(|entry| entry.deadline <= now) {
-        guard.pop().map(|entry| entry.action)
-    } else {
-        None
-    }
+    ALARM_REGISTRY.lock().next_deadline(clock)
 }
 
 fn process_due(clock: AlarmClock) -> bool {
-    let mut progressed = false;
-    while let Some(action) = pop_due(clock) {
-        progressed = true;
+    let mut pending = [const { None }; ALARM_DISPATCH_BATCH];
+    let count = ALARM_REGISTRY
+        .lock()
+        .take_due_batch(clock, clock.now(), &mut pending);
+    for AlarmDispatch { owner, action } in pending.into_iter().flatten() {
         match action {
-            AlarmAction::PollITimer { task, ty, sequence } => {
-                if let Some(task) = task.upgrade() {
-                    poll_itimer_alarm(&task, ty, sequence);
+            AlarmAction::ProcessITimerReal { proc, sequence } => {
+                if let Some(proc_data) = proc.upgrade() {
+                    fire_process_itimer_real(proc_data, owner, sequence);
                 }
             }
             AlarmAction::WakePollSet(poll_set) => {
@@ -1655,7 +2752,7 @@ fn process_due(clock: AlarmClock) -> bool {
                 sequence,
             } => {
                 if let Some(proc_data) = proc.upgrade() {
-                    fire_posix_timer(proc_data, timerid, sequence);
+                    fire_posix_timer(proc_data, timerid, owner, sequence);
                 }
             }
             AlarmAction::PosixTimerRetry {
@@ -1665,12 +2762,12 @@ fn process_due(clock: AlarmClock) -> bool {
                 backoff,
             } => {
                 if let Some(proc_data) = proc.upgrade() {
-                    retry_posix_timer_signal(proc_data, timerid, token, backoff);
+                    retry_posix_timer_signal(proc_data, timerid, owner, token, backoff);
                 }
             }
         }
     }
-    progressed
+    count != 0
 }
 
 async fn wait_until_or_alarm<L>(

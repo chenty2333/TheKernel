@@ -27,9 +27,9 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
-    ITimerType, ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup,
-    ProcessReparentBatch, PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread,
-    ThreadExitTransition, TimerState, futex_table_for, lock_task_parent_publication,
+    ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
+    PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
+    TimerState, charge_process_itimers, futex_table_for, lock_task_parent_publication,
     process_domain, reap_process, send_signal_thread_inner, send_signal_to_process,
     send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
 };
@@ -936,63 +936,49 @@ pub fn poll_timer(task: &TaskInner) {
         return;
     };
     let mut signals = Vec::new();
-    let usage = {
+    let (usage, timer_charge) = {
         let Ok(mut time) = thr.time.try_borrow_mut() else {
             // reentrant borrow, likely IRQ
             return;
         };
-        time.poll(&mut signals);
+        let timer_charge = time.poll(&mut signals);
         let (utime, stime) = time.output();
-        TaskUsage::from_time_values(utime, stime)
+        (TaskUsage::from_time_values(utime, stime), timer_charge)
     };
     thr.store_usage_snapshot(usage);
-    for signo in signals {
-        send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
+    if charge_process_itimers(&thr.proc_data, timer_charge) {
+        crate::deferred_work::wake_process_timer_worker();
     }
-}
-
-pub fn poll_itimer_alarm(task: &TaskInner, ty: ITimerType, sequence: u64) {
-    let Some(thr) = task.try_as_thread() else {
-        return;
-    };
-    let mut signals = Vec::new();
-    let usage = {
-        let Ok(mut time) = thr.time.try_borrow_mut() else {
-            return;
-        };
-        if !time.itimer_sequence_matches(ty, sequence) {
-            return;
-        }
-        time.poll(&mut signals);
-        let (utime, stime) = time.output();
-        TaskUsage::from_time_values(utime, stime)
-    };
-    thr.store_usage_snapshot(usage);
     for signo in signals {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
     }
 }
 
 /// Sets the timer state.
-pub fn set_timer_state(task: &TaskInner, state: TimerState) {
+pub fn set_timer_state(task: &TaskInner, state: TimerState) -> bool {
     let Some(thr) = task.try_as_thread() else {
-        return;
+        return false;
     };
     let mut signals = Vec::new();
-    let usage = {
+    let (usage, timer_charge) = {
         let Ok(mut time) = thr.time.try_borrow_mut() else {
             // reentrant borrow, likely IRQ
-            return;
+            return false;
         };
-        time.poll(&mut signals);
+        let timer_charge = time.poll(&mut signals);
         time.set_state(state);
         let (utime, stime) = time.output();
-        TaskUsage::from_time_values(utime, stime)
+        (TaskUsage::from_time_values(utime, stime), timer_charge)
     };
     thr.store_usage_snapshot(usage);
+    let timer_work_published = charge_process_itimers(&thr.proc_data, timer_charge);
+    if timer_work_published {
+        crate::deferred_work::wake_process_timer_worker();
+    }
     for signo in signals {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
     }
+    timer_work_published
 }
 
 #[repr(C)]

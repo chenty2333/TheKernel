@@ -62,6 +62,8 @@ impl DeferredWorkAccount {
 // allocation-free task-context boundary.
 static POLICY_WORKER_WAKE: PollSet = PollSet::new();
 static FINALIZER_WORKER_WAKE: PollSet = PollSet::new();
+// Exactly one dedicated consumer owns process-timer signal publication.
+static PROCESS_TIMER_WORKER_WAKE: PollSet<1> = PollSet::new();
 static FILESYSTEM_FINALIZER_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 fn policy_work_pending() -> bool {
@@ -79,7 +81,21 @@ fn finalizer_work_pending() -> bool {
         || axfs::has_deferred_filesystem_finalizer_work()
 }
 
-fn wait_for_worker(wake: &PollSet, mut pending: impl FnMut() -> bool) -> AxResult<()> {
+fn process_timer_work_pending() -> bool {
+    crate::task::has_deferred_process_itimer_work()
+}
+
+/// Makes the dedicated process-timer worker runnable after an IRQ-side
+/// accounting threshold crossing. `PollSet::wake` consumes only an already
+/// registered task waker; Linux signal policy remains in the worker itself.
+pub(crate) fn wake_process_timer_worker() {
+    PROCESS_TIMER_WORKER_WAKE.wake();
+}
+
+fn wait_for_worker<const CAPACITY: usize>(
+    wake: &PollSet<CAPACITY>,
+    mut pending: impl FnMut() -> bool,
+) -> AxResult<()> {
     block_on_poll_set_uninterruptible(wake, || {
         if pending() {
             Ok(())
@@ -128,14 +144,30 @@ fn filesystem_finalizer_worker() {
     }
 }
 
+fn process_timer_worker() {
+    let mut consumer = crate::task::ProcessITimerWorkConsumer::new();
+    loop {
+        if let Err(error) = wait_for_worker(&PROCESS_TIMER_WORKER_WAKE, || consumer.has_pending()) {
+            error!("process timer deferred-work worker stopped: {error}");
+            return;
+        }
+        while consumer.drain_batch() != 0 {
+            if consumer.has_pending() {
+                axtask::yield_now();
+            }
+        }
+    }
+}
+
 /// Called from the ext4 final-Arc Drop path. It deliberately does not wake or
 /// lock a task; a later scheduler safe point observes this atomic publication.
 fn note_filesystem_finalizer_work() {
     FILESYSTEM_FINALIZER_PUBLISHED.store(true, Ordering::Release);
 }
 
-/// Registers the kernel's allocation-free task-context dispatcher and the two
-/// workers that own subsystem policy and blocking filesystem teardown.
+/// Registers the kernel's allocation-free task-context dispatcher and the
+/// workers that own subsystem policy, process-timer signals, and blocking
+/// filesystem teardown.
 pub(crate) fn init() {
     assert!(
         axtask::set_deferred_work_dispatcher(dispatch),
@@ -155,7 +187,14 @@ pub(crate) fn init() {
         .try_reserve_exact("fs-finalizer".len())
         .expect("failed to allocate fs-finalizer name");
     finalizer_name.push_str("fs-finalizer");
+    let mut process_timer_name = String::new();
+    process_timer_name
+        .try_reserve_exact("process-timer-worker".len())
+        .expect("failed to allocate process-timer-worker name");
+    process_timer_name.push_str("process-timer-worker");
     axtask::try_spawn_with_name(policy_worker, policy_name).expect("failed to start policy worker");
+    axtask::try_spawn_with_name(process_timer_worker, process_timer_name)
+        .expect("failed to start process-timer worker");
     axtask::try_spawn_with_name(filesystem_finalizer_worker, finalizer_name)
         .expect("failed to start filesystem-finalizer worker");
 }
@@ -169,5 +208,8 @@ fn dispatch() {
     }
     if finalizer_work_pending() {
         FINALIZER_WORKER_WAKE.wake();
+    }
+    if process_timer_work_pending() {
+        PROCESS_TIMER_WORKER_WAKE.wake();
     }
 }

@@ -1,6 +1,6 @@
 use core::time::Duration;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos};
 use axtask::current;
 use kspin::SpinNoIrq;
@@ -17,8 +17,9 @@ use starry_vm::{VmMutPtr, VmPtr};
 use crate::{
     syscall::RawSigevent,
     task::{
-        AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify, TaskUsage,
-        get_task, nanos_to_clock_ticks, poll_timer, register_posix_timer_alarm,
+        AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, nanos_to_clock_ticks,
+        poll_timer, set_process_itimer,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -482,9 +483,21 @@ fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> 
     match clock_domain(clock_id)? {
         ClockDomain::Realtime | ClockDomain::RealtimeCoarse => Ok(PosixTimerClock::Realtime),
         ClockDomain::Monotonic | ClockDomain::MonotonicCoarse => Ok(PosixTimerClock::Monotonic),
-        ClockDomain::ProcessCpu => Ok(PosixTimerClock::ProcessCpu),
-        ClockDomain::ThreadCpu => Ok(PosixTimerClock::ThreadCpu),
+        // CPU-clock POSIX timers need an accounting-threshold owner, not a
+        // wall-monotonic alarm. Reject them honestly until that reusable
+        // mechanism exists instead of firing while the target is asleep.
+        ClockDomain::ProcessCpu | ClockDomain::ThreadCpu => Err(AxError::InvalidInput),
         ClockDomain::Tai => Ok(PosixTimerClock::Tai),
+    }
+}
+
+fn map_posix_timer_admission_error(error: AlarmTokenReserveError) -> AxError {
+    match error {
+        // timer_create(2) defines temporary kernel timer-resource exhaustion
+        // as EAGAIN. Admission happens here, so every later rearm is
+        // allocation-free with respect to the alarm registry.
+        AlarmTokenReserveError::CapacityExhausted => LinuxError::EAGAIN.into(),
+        AlarmTokenReserveError::TokenSpaceExhausted => AxError::OutOfRange,
     }
 }
 
@@ -556,33 +569,36 @@ fn decode_sigevent_signo(raw: i32) -> AxResult<Signo> {
     Signo::from_repr(raw).ok_or(AxError::InvalidInput)
 }
 
-fn timer_absolute_deadline(
-    clock: PosixTimerClock,
-    clock_id: __kernel_clockid_t,
-    value: Duration,
-) -> AxResult<Duration> {
+fn timer_absolute_deadline(clock: PosixTimerClock, value: Duration) -> AxResult<Duration> {
     Ok(match clock {
         PosixTimerClock::Realtime => value,
         PosixTimerClock::Tai => {
             saturating_sub_duration(value, duration_from_secs(DEFAULT_TAI_OFFSET_SECS))
         }
-        PosixTimerClock::Monotonic => value,
-        PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu => {
-            let now_clock = clock_now(clock_id)?;
-            let delta = saturating_sub_duration(value, now_clock);
-            saturating_add_duration(AlarmClock::Monotonic.now(), delta)
-        }
+        PosixTimerClock::Monotonic => current()
+            .as_thread()
+            .proc_data
+            .time_ns()
+            .host_monotonic_deadline(value),
     })
 }
 
-fn timer_relative_deadline(clock: PosixTimerClock, value: Duration) -> Duration {
-    saturating_add_duration(clock.alarm_clock().now(), value)
+fn timer_effective_alarm_clock(clock: PosixTimerClock, absolute: bool) -> AlarmClock {
+    if absolute {
+        clock.absolute_alarm_clock()
+    } else {
+        AlarmClock::Monotonic
+    }
+}
+
+fn timer_relative_deadline(value: Duration) -> Duration {
+    saturating_add_duration(AlarmClock::Monotonic.now(), value)
 }
 
 fn timer_remaining(timer: &PosixTimer) -> Duration {
     timer
         .deadline
-        .map(|deadline| saturating_sub_duration(deadline, timer.clock.alarm_clock().now()))
+        .map(|deadline| saturating_sub_duration(deadline, timer.effective_clock.now()))
         .unwrap_or(Duration::ZERO)
 }
 
@@ -603,6 +619,10 @@ pub fn sys_timer_create(
     };
 
     let proc_data = current().as_thread().proc_data.clone();
+    // Main and optional signal-retry alarm leases are acquired atomically
+    // before the timer ID becomes visible.  A published timer therefore never
+    // needs a fallible alarm allocation during settime or periodic rearm.
+    let candidate = PosixTimer::try_new(clock, notify).map_err(map_posix_timer_admission_error)?;
     let timerid = {
         let mut timers = proc_data.posix_timers.lock();
         if let Some((idx, slot)) = timers
@@ -610,15 +630,38 @@ pub fn sys_timer_create(
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(PosixTimer::new(clock, notify));
+            *slot = Some(candidate);
             idx
         } else {
-            timers.push(Some(PosixTimer::new(clock, notify)));
+            timers.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            timers.push(Some(candidate));
             timers.len() - 1
         }
     };
 
-    timerid_ptr.vm_write(timerid as i32)?;
+    if let Err(error) = timerid_ptr.vm_write(timerid as i32) {
+        // The slot remains deliberately unpublished while copyout may fault.
+        // Other threads reject operations on it, so rollback cannot delete a
+        // timer that another thread has observed or recreated.
+        let retired = {
+            let mut timers = proc_data.posix_timers.lock();
+            let slot = timers
+                .get_mut(timerid)
+                .expect("reserved POSIX timer slot disappeared during copyout");
+            debug_assert!(slot.as_ref().is_some_and(|timer| !timer.is_published()));
+            slot.take()
+        };
+        drop(retired);
+        return Err(error.into());
+    }
+    {
+        let mut timers = proc_data.posix_timers.lock();
+        let timer = timers
+            .get_mut(timerid)
+            .and_then(Option::as_mut)
+            .ok_or(AxError::BadState)?;
+        timer.publish();
+    }
     Ok(0)
 }
 
@@ -645,42 +688,51 @@ pub fn sys_timer_settime(
     let thr = curr.as_thread();
     let proc_data = thr.proc_data.clone();
 
-    let (old_interval, old_remaining) = {
+    let (old_interval, old_remaining, retry_publication, main_publication) = {
         let mut timers = proc_data.posix_timers.lock();
         let timer = timers
             .get_mut(timerid as usize)
             .and_then(Option::as_mut)
+            .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?;
         let old_interval = timer.interval;
         let old_remaining = timer_remaining(timer);
-
-        timer.interval = interval;
-        timer.reset_signal_delivery();
-        timer.sequence = timer.sequence.wrapping_add(1);
-        timer.deadline = if value.is_zero() {
+        let sequence = timer.sequence.checked_add(1).ok_or(AxError::OutOfRange)?;
+        let effective_clock = timer_effective_alarm_clock(timer.clock, absolute);
+        let deadline = if value.is_zero() {
             None
         } else if absolute {
-            Some(timer_absolute_deadline(
-                timer.clock,
-                clock_id_for_timer(timer.clock),
-                value,
-            )?)
+            Some(timer_absolute_deadline(timer.clock, value)?)
         } else {
-            Some(timer_relative_deadline(timer.clock, value))
+            Some(timer_relative_deadline(value))
         };
 
-        if let Some(deadline) = timer.deadline {
-            register_posix_timer_alarm(
+        let retry_publication = timer.reset_signal_delivery();
+        timer.interval = interval;
+        timer.sequence = sequence;
+        timer.effective_clock = effective_clock;
+        timer.deadline = deadline;
+        let main_publication = if let Some(deadline) = deadline {
+            timer.prepare_main_alarm(
                 &proc_data,
                 timerid as usize,
-                timer.clock.alarm_clock(),
+                effective_clock,
                 deadline,
-                timer.sequence,
-            );
-        }
-
-        (old_interval, old_remaining)
+                sequence,
+            )
+        } else {
+            timer.prepare_main_disarm()
+        };
+        (
+            old_interval,
+            old_remaining,
+            retry_publication,
+            main_publication,
+        )
     };
+
+    retry_publication.publish();
+    main_publication.publish();
 
     if let Some(old_value) = old_value.nullable() {
         old_value.vm_write(itimerspec {
@@ -703,6 +755,7 @@ pub fn sys_timer_gettime(timerid: i32, curr_value: *mut itimerspec) -> AxResult<
         let timer = timers
             .get(timerid as usize)
             .and_then(Option::as_ref)
+            .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?;
         (timer.interval, timer_remaining(timer))
     };
@@ -725,6 +778,7 @@ pub fn sys_timer_getoverrun(timerid: i32) -> AxResult<isize> {
         timers
             .get(timerid as usize)
             .and_then(Option::as_ref)
+            .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?
             .overrun
     };
@@ -737,25 +791,20 @@ pub fn sys_timer_delete(timerid: i32) -> AxResult<isize> {
     }
 
     let proc_data = current().as_thread().proc_data.clone();
-    let mut timers = proc_data.posix_timers.lock();
-    let slot = timers
-        .get_mut(timerid as usize)
-        .ok_or(AxError::InvalidInput)?;
-    if slot.is_none() {
-        return Err(AxError::InvalidInput);
-    }
-    *slot = None;
+    let retired = {
+        let mut timers = proc_data.posix_timers.lock();
+        let slot = timers
+            .get_mut(timerid as usize)
+            .ok_or(AxError::InvalidInput)?;
+        if !slot.as_ref().is_some_and(PosixTimer::is_published) {
+            return Err(AxError::InvalidInput);
+        }
+        slot.take()
+    };
+    // Token drop removes both main and retry deadlines.  Keep all action
+    // destruction outside the per-process timer owner lock.
+    drop(retired);
     Ok(0)
-}
-
-fn clock_id_for_timer(clock: PosixTimerClock) -> __kernel_clockid_t {
-    match clock {
-        PosixTimerClock::Realtime => CLOCK_REALTIME as _,
-        PosixTimerClock::Monotonic => CLOCK_MONOTONIC as _,
-        PosixTimerClock::Tai => CLOCK_TAI as _,
-        PosixTimerClock::ProcessCpu => CLOCK_PROCESS_CPUTIME_ID as _,
-        PosixTimerClock::ThreadCpu => CLOCK_THREAD_CPUTIME_ID as _,
-    }
 }
 
 pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxResult<isize> {
@@ -803,7 +852,7 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
     }
 
     if let Some(ts) = ts {
-        set_wall_time(ts);
+        set_wall_time(ts)?;
     }
     Ok(0)
 }
@@ -823,7 +872,7 @@ pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> A
             if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
                 return Err(AxError::OperationNotPermitted);
             }
-            set_wall_time(ts);
+            set_wall_time(ts)?;
             Ok(0)
         }
         _ => Err(AxError::InvalidInput),
@@ -981,6 +1030,36 @@ mod tests {
         assert_eq!(decode_sigevent_signo(257), Err(AxError::InvalidInput));
         assert_eq!(decode_sigevent_signo(-1), Err(AxError::InvalidInput));
     }
+
+    #[test]
+    fn relative_posix_timers_use_a_monotonic_effective_basis() {
+        for clock in [
+            PosixTimerClock::Realtime,
+            PosixTimerClock::Monotonic,
+            PosixTimerClock::Tai,
+        ] {
+            assert_eq!(
+                timer_effective_alarm_clock(clock, false),
+                AlarmClock::Monotonic
+            );
+        }
+        assert_eq!(
+            timer_effective_alarm_clock(PosixTimerClock::Realtime, true),
+            AlarmClock::Realtime
+        );
+        assert_eq!(
+            timer_effective_alarm_clock(PosixTimerClock::Tai, true),
+            AlarmClock::Realtime
+        );
+        assert_eq!(
+            posix_timer_clock(CLOCK_PROCESS_CPUTIME_ID as _),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            posix_timer_clock(CLOCK_THREAD_CPUTIME_ID as _),
+            Err(AxError::InvalidInput)
+        );
+    }
 }
 
 #[repr(C)]
@@ -1015,7 +1094,7 @@ pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {
     let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
     let curr = current();
     poll_timer(&curr);
-    let (it_interval, it_value) = curr.as_thread().time.borrow().get_itimer(ty);
+    let (it_interval, it_value) = get_process_itimer(&curr.as_thread().proc_data, ty);
 
     value.vm_write(itimerval {
         it_interval: timeval::from_time_value(it_interval),
@@ -1036,10 +1115,11 @@ pub fn sys_setitimer(
         Some(new_value) => {
             // FIXME: AnyBitPattern
             let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
-            (
-                new_value.it_interval.try_into_time_value()?.as_nanos() as usize,
-                new_value.it_value.try_into_time_value()?.as_nanos() as usize,
-            )
+            let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
+                .map_err(|_| AxError::OutOfRange)?;
+            let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
+                .map_err(|_| AxError::OutOfRange)?;
+            (interval, remaining)
         }
         None => (0, 0),
     };
@@ -1047,16 +1127,13 @@ pub fn sys_setitimer(
     debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
 
     poll_timer(&curr);
-    let old = curr
-        .as_thread()
-        .time
-        .borrow_mut()
-        .set_itimer(ty, interval, remained);
+    let (old_interval, old_remaining) =
+        set_process_itimer(&curr.as_thread().proc_data, ty, interval, remained)?;
 
     if let Some(old_value) = old_value.nullable() {
         old_value.vm_write(itimerval {
-            it_interval: timeval::from_time_value(old.0),
-            it_value: timeval::from_time_value(old.1),
+            it_interval: timeval::from_time_value(old_interval),
+            it_value: timeval::from_time_value(old_remaining),
         })?;
     }
     Ok(0)
