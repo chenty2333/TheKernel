@@ -33,9 +33,6 @@ vsock = ["axdriver/vsock"]
 name = "axnet_ng"
 path = "src/lib.rs"
 
-[dependencies.async-trait]
-version = "0.1"
-
 [dependencies.axconfig]
 version = "=0.3.0-preview.2"
 

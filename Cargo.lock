@@ -685,7 +685,6 @@ dependencies = [
 name = "axnet-ng"
 version = "0.3.0-preview.2"
 dependencies = [
- "async-trait",
  "axconfig",
  "axdriver",
  "axerrno 0.2.2",

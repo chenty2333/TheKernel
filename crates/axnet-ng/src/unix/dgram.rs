@@ -6,7 +6,6 @@ use core::{
     task::Context,
 };
 
-use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
 use axpoll::{
@@ -23,7 +22,7 @@ use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     socket::SocketFilter,
     unix::{
-        BindSlot, Transport, TransportOps, UnixSocketAddr,
+        BindSlot, TransportOps, UnixSocketAddr,
         queue::{
             PermitSendError, Receiver, ReserveError, SendPermit, Sender, TryRecvError, try_bounded,
         },
@@ -907,7 +906,6 @@ impl Configurable for DgramTransport {
         Ok(true)
     }
 }
-#[async_trait]
 impl TransportOps for DgramTransport {
     fn set_pending_error(&self, error: LinuxError) {
         self.general.set_pending_error(error);
@@ -967,10 +965,6 @@ impl TransportOps for DgramTransport {
         drop(retired);
         self.poll_state.wake();
         Ok(())
-    }
-
-    async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
-        Err(AxError::InvalidInput)
     }
 
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {

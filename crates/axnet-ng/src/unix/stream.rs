@@ -6,7 +6,6 @@ use core::{
     task::Context,
 };
 
-use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
 use axpoll::{
@@ -736,7 +735,6 @@ impl Configurable for StreamTransport {
         Ok(false)
     }
 }
-#[async_trait]
 impl TransportOps for StreamTransport {
     fn set_pending_error(&self, error: LinuxError) {
         self.general.set_pending_error(error);
@@ -791,11 +789,6 @@ impl TransportOps for StreamTransport {
     ) -> AxResult<()> {
         self.prepare_connect(slot, local_addr, credentials)?
             .commit()
-    }
-
-    async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
-        let mut prepared = self.prepare_accept()?;
-        prepared.wait().await?.commit()
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {

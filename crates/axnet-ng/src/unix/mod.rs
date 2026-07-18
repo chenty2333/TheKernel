@@ -10,7 +10,6 @@ use core::{
     task::Context,
 };
 
-use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
@@ -50,7 +49,6 @@ pub enum UnixSocketAddr {
 }
 
 /// Abstract transport trait for Unix sockets.
-#[async_trait]
 #[enum_dispatch]
 pub trait TransportOps: Configurable + Pollable + Send + Sync {
     /// Stores a deferred socket error.
@@ -68,9 +66,6 @@ pub trait TransportOps: Configurable + Pollable + Send + Sync {
     fn listen(&self, _slot: &BindSlot, _backlog: usize, _credentials: UnixCredentials) -> AxResult {
         Err(AxError::OperationNotSupported)
     }
-
-    /// Accept an incoming connection, returning the new transport and peer address.
-    async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)>;
 
     /// Send data through the transport.
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize>;
