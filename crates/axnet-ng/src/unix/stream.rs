@@ -279,6 +279,30 @@ pub(super) struct StreamAcceptReservation {
     drop_cleanup: Option<Box<DeferredStreamCleanup>>,
 }
 
+/// Synchronously prepared listener state for one accept wait.
+///
+/// Acquiring the listener's sleeping endpoint lock and reserving teardown
+/// storage happen when this value is constructed. Its async wait phase only
+/// touches the bounded queue's non-sleeping state and poll source.
+pub(super) struct PreparedStreamAccept {
+    receiver: Receiver<ConnRequest>,
+    drop_cleanup: Option<Box<DeferredStreamCleanup>>,
+}
+
+impl PreparedStreamAccept {
+    pub(super) async fn wait(&mut self) -> AxResult<StreamAcceptReservation> {
+        if self.drop_cleanup.is_none() {
+            return Err(AxError::BadState);
+        }
+        let request = self.receiver.reserve().await?;
+        let drop_cleanup = self.drop_cleanup.take().ok_or(AxError::BadState)?;
+        Ok(StreamAcceptReservation {
+            request: Some(request),
+            drop_cleanup: Some(drop_cleanup),
+        })
+    }
+}
+
 impl StreamAcceptReservation {
     pub(super) fn accepted_identity(&self) -> usize {
         self.request
@@ -653,14 +677,13 @@ impl StreamTransport {
         result
     }
 
-    pub(super) async fn prepare_accept(&self) -> AxResult<StreamAcceptReservation> {
+    pub(super) fn prepare_accept(&self) -> AxResult<PreparedStreamAccept> {
         let drop_cleanup = DeferredStreamCleanup::try_new()?;
         let Some(rx) = self.conn_rx.lock().clone() else {
             return Err(AxError::NotConnected);
         };
-        let request = rx.reserve().await?;
-        Ok(StreamAcceptReservation {
-            request: Some(request),
+        Ok(PreparedStreamAccept {
+            receiver: rx,
             drop_cleanup: Some(drop_cleanup),
         })
     }
@@ -771,7 +794,8 @@ impl TransportOps for StreamTransport {
     }
 
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
-        self.prepare_accept().await?.commit()
+        let mut prepared = self.prepare_accept()?;
+        prepared.wait().await?.commit()
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
@@ -1004,6 +1028,8 @@ impl Drop for StreamTransport {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+
     use super::*;
     use crate::SendFlags;
 
@@ -1431,6 +1457,48 @@ mod tests {
 
         let restored = receiver.try_recv().unwrap();
         assert_eq!(restored.identity(), identity);
+    }
+
+    #[test]
+    fn prepared_accept_wait_does_not_reenter_the_endpoint_mutex() {
+        use core::task::Waker;
+
+        let _cleanup_guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-prepared-accept-wait",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+
+        let mut prepared = listener.prepare_accept().unwrap();
+        let readers = prepared.receiver.read_poll_source();
+        let endpoint_guard = listener.conn_rx.lock();
+        let mut context = Context::from_waker(Waker::noop());
+        {
+            let mut wait = core::pin::pin!(prepared.wait());
+
+            // The old async preparation tried to acquire conn_rx here and
+            // could enter a nested synchronous block session. Preparation now
+            // happened before this future existed, so its first poll reaches
+            // only queue state and the bounded reader PollSet.
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            assert_eq!(readers.len(), 1);
+        }
+        assert!(readers.is_empty());
+        drop(endpoint_guard);
+        drop(prepared);
+        drop(listener);
+
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
     }
 
     #[test]

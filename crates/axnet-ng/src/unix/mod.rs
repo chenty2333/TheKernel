@@ -853,7 +853,11 @@ impl UnixSocket {
         let Transport::Stream(stream) = &self.transport else {
             return Err(AxError::InvalidInput);
         };
-        let inner = block_on(interruptible(stream.prepare_accept()))???;
+        // Endpoint lookup and cleanup admission may acquire sleeping locks or
+        // allocate. Complete them before the task block session; the future
+        // retained below polls only the bounded listener queue.
+        let mut prepared = stream.prepare_accept()?;
+        let inner = block_on(interruptible(prepared.wait()))???;
         Ok(UnixAcceptReservation {
             listener: self,
             inner: Some(inner),

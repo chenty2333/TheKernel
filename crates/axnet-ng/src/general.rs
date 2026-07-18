@@ -1,14 +1,15 @@
 use core::{
-    future::poll_fn,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
-    task::{Poll, Waker},
+    task::Waker,
     time::Duration,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+#[cfg(test)]
+use axpoll::PollRegistration;
 use axpoll::{
-    IoEvents, NestedRegistrationError, PollRegistration, PollRegistrationError, Pollable,
-    PreparedPollRegistration, RegisterError,
+    IoEvents, NestedRegistrationError, PollRegistrationError, Pollable, PreparedPollRegistration,
+    ReadinessWait, RegisterError,
 };
 use axtask::future::{TimeoutError, block_on, interruptible, timeout_at};
 
@@ -70,6 +71,31 @@ struct PollBehavior {
     timeout_error: AxError,
     effective_nonblocking: bool,
     consume_pending_error: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PollWaitFailure {
+    Interrupted,
+    Error(AxError),
+}
+
+impl PollWaitFailure {
+    const fn error(self) -> AxError {
+        match self {
+            Self::Interrupted => AxError::Interrupted,
+            Self::Error(error) => error,
+        }
+    }
+}
+
+fn resolve_wait_failure<T>(
+    completed: Option<AxResult<T>>,
+    failure: PollWaitFailure,
+) -> (AxResult<T>, bool) {
+    match completed {
+        Some(result) => (result, matches!(failure, PollWaitFailure::Interrupted)),
+        None => (Err(failure.error()), false),
+    }
 }
 
 /// General options for all sockets.
@@ -278,6 +304,24 @@ impl GeneralOptions {
         }
     }
 
+    fn completed_operation<F: FnMut() -> AxResult<T>, T>(
+        &self,
+        behavior: PollBehavior,
+        nonblocking: bool,
+        operation: &mut F,
+    ) -> Option<AxResult<T>> {
+        if behavior.consume_pending_error
+            && let Err(error) = self.consume_pending_error()
+        {
+            return Some(Err(error));
+        }
+        match operation() {
+            Ok(value) => Some(Ok(value)),
+            Err(error) if error != AxError::WouldBlock || nonblocking => Some(Err(error)),
+            Err(_) => None,
+        }
+    }
+
     fn run_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
         &self,
         pollable: &P,
@@ -290,16 +334,13 @@ impl GeneralOptions {
         let mut ready_retries = 0usize;
 
         loop {
-            // Check on every retry, not only at entry. Another thread sharing
-            // the socket can defer an error while this operation is blocked;
-            // its ERR readiness must terminate the operation rather than make
-            // the ALWAYS_POLL retry path spin forever.
-            if behavior.consume_pending_error {
-                self.consume_pending_error()?;
-            }
-            match f() {
-                Err(AxError::WouldBlock) if !behavior.effective_nonblocking => {}
-                other => return other,
+            // Object operations and deferred-error consumption can acquire
+            // sleeping socket/backend locks. Keep every attempt outside the
+            // synchronous task block session.
+            if let Some(result) =
+                self.completed_operation(behavior, behavior.effective_nonblocking, &mut f)
+            {
+                return result;
             }
 
             // A stale or overly broad readiness indication must neither hide
@@ -320,48 +361,61 @@ impl GeneralOptions {
             }
             ready_retries = 0;
 
-            let mut registration: Option<PollRegistration<'_>> = None;
-            match block_on(timeout_at(
-                deadline,
-                interruptible(poll_fn(|cx| {
-                    if pollable.poll().intersects(interest | IoEvents::ALWAYS) {
-                        registration.take();
-                        return Poll::Ready(Ok(()));
-                    }
+            // Publish the complete bounded topology with a no-op waker before
+            // entering block_on. ReadinessWait's first executor-waker update
+            // detects a wake in either check/arm gap without re-entering the
+            // Pollable object graph from Future::poll.
+            let wait = match ReadinessWait::arm(pollable, interest) {
+                Ok(wait) => wait,
+                Err(error) => {
+                    let completed = self.completed_operation(behavior, false, &mut f);
+                    return resolve_wait_failure(
+                        completed,
+                        PollWaitFailure::Error(poll_registration_error(error)),
+                    )
+                    .0;
+                }
+            };
 
-                    let needs_registration = if let Some(retained) = registration.as_mut() {
-                        if retained.update(cx.waker()).is_ok() {
-                            false
-                        } else {
-                            retained.cancel();
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    if needs_registration {
-                        match pollable.register(cx, interest) {
-                            Ok(retained) => registration = Some(retained),
-                            Err(error) => {
-                                return Poll::Ready(Err(poll_registration_error(error)));
-                            }
-                        }
-                    }
-                    if pollable.poll().intersects(interest | IoEvents::ALWAYS) {
-                        registration.take();
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    }
-                })),
-            )) {
-                Ok(Ok(Ok(Ok(())))) => {}
-                Ok(Ok(Ok(Err(error)))) => return Err(error),
-                Ok(Ok(Err(_))) => return Err(AxError::Interrupted),
-                Ok(Err(TimeoutError::Elapsed(_))) => return Err(behavior.timeout_error),
-                Ok(Err(TimeoutError::Timer(error))) => return Err(error.into()),
-                Err(error) => return Err(error.into()),
+            // Complete check -> arm -> check with the authoritative operation,
+            // not merely a potentially stale readiness bit.
+            if let Some(result) = self.completed_operation(behavior, false, &mut f) {
+                return result;
             }
+            if pollable.poll().intersects(interest | IoEvents::ALWAYS) {
+                drop(wait);
+                ready_retries += 1;
+                if ready_retries >= READY_RETRY_BUDGET {
+                    axtask::yield_now();
+                    ready_retries = 0;
+                }
+                continue;
+            }
+            if deadline.is_some_and(|end| axhal::time::wall_time() >= end) {
+                return Err(behavior.timeout_error);
+            }
+
+            // Only the already-published token, timer, and task-interrupt
+            // sources are polled inside the block session. Dropping any layer
+            // cancels the retained readiness topology and timer reservation.
+            let failure = match block_on(timeout_at(deadline, interruptible(wait))) {
+                Ok(Ok(Ok(()))) => continue,
+                Ok(Ok(Err(_))) => PollWaitFailure::Interrupted,
+                Ok(Err(TimeoutError::Elapsed(_))) => PollWaitFailure::Error(behavior.timeout_error),
+                Ok(Err(TimeoutError::Timer(error))) => PollWaitFailure::Error(error.into()),
+                Err(error) => PollWaitFailure::Error(error.into()),
+            };
+
+            // A completed operation wins a simultaneous interrupt, timeout,
+            // timer-admission failure, or block-session failure. When it wins
+            // an interrupt race, preserve that interrupt for the caller's next
+            // interruption boundary.
+            let completed = self.completed_operation(behavior, false, &mut f);
+            let (result, restore_interrupt) = resolve_wait_failure(completed, failure);
+            if restore_interrupt {
+                axtask::current().interrupt();
+            }
+            return result;
         }
     }
 }
@@ -426,8 +480,23 @@ impl Configurable for GeneralOptions {
 
 #[cfg(test)]
 mod tests {
+    use core::{
+        sync::atomic::{AtomicBool, AtomicUsize},
+        task::Context,
+    };
+    use std::sync::{Mutex, Once};
+
+    use axpoll::PollSet;
+
     use super::*;
     use crate::options::{Configurable, GetSocketOption, SetSocketOption};
+
+    static TASK_INIT: Once = Once::new();
+    static TASK_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn init_task_runtime() {
+        TASK_INIT.call_once(|| axtask::init_scheduler().unwrap());
+    }
 
     struct Ready;
 
@@ -439,6 +508,79 @@ mod tests {
         fn register<'a>(
             &'a self,
             _context: &mut core::task::Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
+    }
+
+    struct ArmedPollable {
+        source: PollSet<2>,
+        armed: AtomicBool,
+        wake_while_arming: bool,
+    }
+
+    impl ArmedPollable {
+        const fn new(wake_while_arming: bool) -> Self {
+            Self {
+                source: PollSet::new(),
+                armed: AtomicBool::new(false),
+                wake_while_arming,
+            }
+        }
+    }
+
+    impl Pollable for ArmedPollable {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            let registration = PollRegistration::single(&self.source, context.waker())?;
+            self.armed.store(true, Ordering::Release);
+            if self.wake_while_arming {
+                self.source.wake();
+            }
+            Ok(registration)
+        }
+    }
+
+    struct RejectingPollable;
+
+    impl Pollable for RejectingPollable {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            Err(PollRegistrationError::NoMemory)
+        }
+    }
+
+    struct OneSpuriousReady {
+        polls: AtomicUsize,
+    }
+
+    impl Pollable for OneSpuriousReady {
+        fn poll(&self) -> IoEvents {
+            if self.polls.fetch_add(1, Ordering::AcqRel) == 0 {
+                IoEvents::WRITABLE
+            } else {
+                IoEvents::empty()
+            }
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
             _events: IoEvents,
         ) -> Result<PollRegistration<'a>, PollRegistrationError> {
             PollRegistration::empty()
@@ -536,6 +678,191 @@ mod tests {
 
         assert_eq!(LinuxError::from(error), LinuxError::ECONNREFUSED);
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn armed_wait_is_rechecked_and_refunded_before_task_blocking() {
+        let options = GeneralOptions::new();
+        let pollable = ArmedPollable::new(false);
+        let mut attempts = 0;
+
+        let result = options.send_poller_with_effective_nonblocking(&pollable, false, || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(AxError::WouldBlock);
+            }
+            assert!(pollable.armed.load(Ordering::Acquire));
+            assert_eq!(pollable.source.len(), 1);
+            Ok(17usize)
+        });
+
+        assert_eq!(result, Ok(17));
+        assert_eq!(attempts, 2);
+        assert!(pollable.source.is_empty());
+    }
+
+    #[test]
+    fn wake_during_arm_cannot_lose_the_final_operation() {
+        let options = GeneralOptions::new();
+        let pollable = ArmedPollable::new(true);
+        let mut attempts = 0;
+
+        let result = options.recv_poller(&pollable, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(AxError::WouldBlock)
+            } else {
+                Ok(23usize)
+            }
+        });
+
+        assert_eq!(result, Ok(23));
+        assert_eq!(attempts, 2);
+        assert!(pollable.source.is_empty());
+    }
+
+    #[test]
+    fn final_operation_beats_registration_failure() {
+        let options = GeneralOptions::new();
+        let mut attempts = 0;
+
+        let result = options.recv_poller(&RejectingPollable, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(AxError::WouldBlock)
+            } else {
+                Ok(29usize)
+            }
+        });
+
+        assert_eq!(result, Ok(29));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn one_spurious_ready_edge_retries_without_extending_the_operation() {
+        let options = GeneralOptions::new();
+        let pollable = OneSpuriousReady {
+            polls: AtomicUsize::new(0),
+        };
+        let mut attempts = 0;
+
+        let result = options.send_poller_with_effective_nonblocking(&pollable, false, || {
+            attempts += 1;
+            if attempts < 2 {
+                Err(AxError::WouldBlock)
+            } else {
+                Ok(31usize)
+            }
+        });
+
+        assert_eq!(result, Ok(31));
+        assert_eq!(attempts, 2);
+        assert_eq!(pollable.polls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn terminal_recheck_precedes_interrupt_timeout_and_block_errors() {
+        for failure in [
+            PollWaitFailure::Interrupted,
+            PollWaitFailure::Error(AxError::TimedOut),
+            PollWaitFailure::Error(AxError::BadState),
+        ] {
+            let (result, restore_interrupt) = resolve_wait_failure(Some(Ok(37usize)), failure);
+            assert_eq!(result, Ok(37));
+            assert_eq!(
+                restore_interrupt,
+                matches!(failure, PollWaitFailure::Interrupted)
+            );
+
+            let (result, restore_interrupt) =
+                resolve_wait_failure(Some(Err::<usize, _>(AxError::BrokenPipe)), failure);
+            assert_eq!(result, Err(AxError::BrokenPipe));
+            assert_eq!(
+                restore_interrupt,
+                matches!(failure, PollWaitFailure::Interrupted)
+            );
+        }
+
+        assert_eq!(
+            resolve_wait_failure::<usize>(None, PollWaitFailure::Interrupted),
+            (Err(AxError::Interrupted), false)
+        );
+        assert_eq!(
+            resolve_wait_failure::<usize>(None, PollWaitFailure::Error(AxError::ResourceBusy)),
+            (Err(AxError::ResourceBusy), false)
+        );
+    }
+
+    #[test]
+    fn socket_operations_can_start_their_own_block_session() {
+        let _serial = TASK_SERIAL.lock().unwrap();
+        init_task_runtime();
+        let options = GeneralOptions::new();
+        let pollable = ArmedPollable::new(false);
+        let mut attempts = 0;
+
+        let result = options.recv_poller(&pollable, || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(AxError::WouldBlock);
+            }
+            assert_eq!(axtask::future::block_on(async { 41usize }), Ok(41));
+            Ok(43usize)
+        });
+
+        assert_eq!(result, Ok(43));
+        assert_eq!(attempts, 2);
+        assert!(pollable.source.is_empty());
+    }
+
+    #[test]
+    fn completed_operation_wins_interrupt_and_restores_it() {
+        let _serial = TASK_SERIAL.lock().unwrap();
+        init_task_runtime();
+        let current = axtask::current();
+        current.clear_interrupt();
+        current.interrupt();
+        let options = GeneralOptions::new();
+        let pollable = ArmedPollable::new(false);
+        let mut attempts = 0;
+
+        let result = options.recv_poller(&pollable, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(AxError::WouldBlock)
+            } else {
+                Ok(47usize)
+            }
+        });
+
+        assert_eq!(result, Ok(47));
+        assert_eq!(attempts, 3);
+        assert!(current.is_interrupted());
+        current.clear_interrupt();
+        assert!(pollable.source.is_empty());
+    }
+
+    #[test]
+    fn wake_before_first_task_poll_retries_without_losing_a_token() {
+        let _serial = TASK_SERIAL.lock().unwrap();
+        init_task_runtime();
+        let options = GeneralOptions::new();
+        let pollable = ArmedPollable::new(true);
+        let mut attempts = 0;
+
+        let result = options.recv_poller(&pollable, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(AxError::WouldBlock)
+            } else {
+                Ok(53usize)
+            }
+        });
+
+        assert_eq!(result, Ok(53));
+        assert_eq!(attempts, 3);
+        assert!(pollable.source.is_empty());
     }
 
     #[test]
