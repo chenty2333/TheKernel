@@ -111,7 +111,8 @@ while IFS= read -r arch; do
         commands="$NIGHTLY_LOG_DIR/$run_name.commands.input"
         run_dir="$NIGHTLY_LOG_DIR/$run_name"
 
-        printf '%s --expect-cpus %s; exit\n' \
+        printf '%s --expect-cpus %s && %s --expect-cpus %s; exit\n' \
+            /opt/thekernel-tests/bin/thekernel-wait-boundary "$cpus" \
             /opt/thekernel-tests/bin/thekernel-smp-tlb-shootdown "$cpus" \
             >"$commands"
         (
@@ -124,6 +125,14 @@ while IFS= read -r arch; do
         )
         nightly_validate_guest_log \
             "$run_dir/qemu.log" clean \
+            "CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$cpus" \
+            'CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK' \
+            'CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK min_hits=3' \
+            'CI_WAIT_BOUNDARY_ITIMER_CPU_OK no_syscall_loop=1' \
+            'CI_WAIT_BOUNDARY_FUTEX_WAKE_OK' \
+            'CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK' \
+            'CI_WAIT_BOUNDARY_FUTEX_WAITV_OK' \
+            'CI_WAIT_BOUNDARY_PASS' \
             'SMP_TLB_GATE status=ok stale_count=0'
         if grep -Eq \
             '^SMP_TLB_GATE status=fail|^SMP_TLB_CASE .* status=stale |^SMP_TLB_GATE .*stale_count=[1-9]' \

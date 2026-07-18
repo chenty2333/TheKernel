@@ -117,6 +117,27 @@ ci_run_step kernel-futex-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
     task::futex::tests -- --test-threads=1
 
+ci_run_step kernel-task-timer-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
+    task::timer:: -- --test-threads=1
+
+ci_run_step kernel-timerfd-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
+    file::timerfd::tests -- --test-threads=1
+
+ci_run_step kernel-time-publication-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
+    time::publication_tests -- --test-threads=1
+
 ci_run_step kernel-mm-transaction-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -138,13 +159,12 @@ ci_run_step kernel-raw-sigevent-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     syscall::usercopy::tests -- --test-threads=1
 
-ci_run_step kernel-sigevent-signo-tests "$STEP_TIMEOUT_SECS" \
+ci_run_step kernel-time-syscall-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
     cargo test --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
-    syscall::time::tests::sigevent_signo_does_not_wrap_before_validation \
-    -- --test-threads=1
+    syscall::time::tests -- --test-threads=1
 
 ci_run_step kernel-thread-credential-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \

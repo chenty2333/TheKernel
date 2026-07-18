@@ -277,6 +277,15 @@ THEKERNEL_EXEC_SMOKE_OK
 THEKERNEL_SYSTEM_TEST_EXEC_OK
 CI_SIGNAL_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK
+CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=1
+CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK
+CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK min_hits=3
+CI_WAIT_BOUNDARY_ITIMER_CPU_OK no_syscall_loop=1
+CI_WAIT_BOUNDARY_FUTEX_WAKE_OK
+CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK
+CI_WAIT_BOUNDARY_FUTEX_WAITV_OK
+CI_WAIT_BOUNDARY_PASS
+THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK
 THEKERNEL_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_PASS
@@ -320,6 +329,23 @@ cp "$tmp/pass.log" "$tmp/fail.log"
 printf 'CI_BOOT_GATE_FAIL injected\n' >>"$tmp/fail.log"
 if "$CI_DIR/validate-boot-log.sh" la "$tmp/fail.log" >/dev/null 2>&1; then
     printf 'test-ci-scripts: failure marker was accepted\n' >&2
+    exit 1
+fi
+
+# Nightly guest validation must reject an explicit subsystem failure even if
+# every expected success marker is also present later in the same log.
+cat >"$tmp/nightly-wait-fail.log" <<'EOF'
+CI_WAIT_BOUNDARY_FAIL injected errno=5 (Input/output error)
+CI_WAIT_BOUNDARY_PASS
+System is shutting down
+EOF
+if (
+    # shellcheck source=../../scripts/ci/nightly/lib.sh
+    source "$CI_DIR/nightly/lib.sh"
+    nightly_validate_guest_log \
+        "$tmp/nightly-wait-fail.log" clean CI_WAIT_BOUNDARY_PASS
+) >/dev/null 2>&1; then
+    printf 'test-ci-scripts: nightly validator accepted a wait-boundary failure marker\n' >&2
     exit 1
 fi
 
@@ -556,6 +582,9 @@ cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
 cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
     "$REPO_ROOT/tests/guest/tools/smp-tlb-shootdown.c" \
     -o "$tmp/smp-tlb-shootdown"
+cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
+    "$REPO_ROOT/tests/guest/tools/wait-boundary.c" \
+    -o "$tmp/wait-boundary"
 cc -O2 -std=c11 "$REPO_ROOT/tests/guest/tools/oom-admission.c" \
     -o "$tmp/nightly-oom-admission"
 "$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null

@@ -253,7 +253,7 @@ nightly_validate_guest_log() {
     [ -f "$log" ] || nightly_fail "missing guest log: $log"
 
     if grep -Eq \
-        '^[[:space:]]*CI_NIGHTLY_[A-Z0-9_]*FAIL([[:space:]].*)?$|Kernel panic|panicked at|BUG:|Oops:' \
+        '^[[:space:]]*CI_[A-Z0-9_]*FAIL([[:space:]].*)?$|Kernel panic|panicked at|BUG:|Oops:' \
         "$log"; then
         nightly_fail "failure marker or kernel fault found in $log"
     fi
