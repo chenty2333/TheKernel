@@ -53,6 +53,32 @@ vendor_record = "VENDOR.md"
 patch_ledger = "VENDOR.md"
 
 [[package]]
+patch = "axhal"
+path = "third_party/rust-patches/axhal"
+name = "axhal"
+version = "0.3.0-preview.2"
+source = "crates.io"
+archive = "axhal-0.3.0-preview.2.crate"
+archive_url = "https://static.crates.io/crates/axhal/axhal-0.3.0-preview.2.crate"
+archive_sha256 = "2b721414abb9554522acdc0495cef83eadfc7d47257fe3c979e655c982d79588"
+repository = "https://github.com/arceos-org/arceos/tree/main/modules/axhal"
+upstream_tag = "not-recorded-in-published-archive"
+source_commit = "6c6765c05df0550e31edb0ca82d468199f108b3f"
+source_commit_kind = "exact"
+vcs_dirty = false
+original_manifest = "Cargo.toml.orig"
+original_manifest_sha256 = "b57d3209e36677ff8b7ab1189f76dfb208227e55ba8965c6b9a55ebeafe35341"
+cargo_vcs_info = ".cargo_vcs_info.json"
+cargo_vcs_info_sha256 = "a661d68074ac32ea46a39a9a9648c0dc12100dfa7a9a32f097937f9dd523a341"
+license_expression = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+license_status = "declared-only"
+license_files = []
+upstream_tests_status = "none-published"
+upstream_test_files = []
+vendor_record = "VENDOR.md"
+patch_ledger = "VENDOR.md"
+
+[[package]]
 patch = "axdriver"
 path = "third_party/rust-patches/axdriver"
 name = "axdriver"

@@ -598,8 +598,6 @@ dependencies = [
 [[package]]
 name = "axhal"
 version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b721414abb9554522acdc0495cef83eadfc7d47257fe3c979e655c982d79588"
 dependencies = [
  "axalloc",
  "axconfig",

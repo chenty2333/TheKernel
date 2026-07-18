@@ -32,6 +32,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
   primitive: LoongArch issues `dbar` plus `ibar`, RISC-V issues `fence.i`, and
   x86 records its coherent-cache no-op. This is not a remote-CPU shootdown
   contract.
+- Adds a fixed-capacity `IrqBoundary` transport around the existing
+  `handle_trap!(IRQ, ...)` dispatch. It reports enter/exit only; platform IRQ
+  acknowledgement and scheduler policy remain in `axhal`/higher layers.
 - Maintained delta: LoongArch user-copy assembly, unaligned access handling,
   architecture initialization, and current-CPU instruction-cache publication
   primitives only; Linux user-copy policy remains above this crate.
