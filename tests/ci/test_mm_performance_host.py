@@ -159,11 +159,14 @@ class RunnerContractTests(unittest.TestCase):
             "scripts/ci/capture-mm-performance-host.py",
             "scripts/ci/select-mm-performance-cpus.py",
             "scripts/ci/compare-mm-performance.py",
+            "scripts/ci/nightly/mm-performance-boundary.sh",
             "scripts/ci/nightly/mm-performance-regression-policy.json",
             "scripts/ci/nightly/mm-performance-stability-policy.json",
             "scripts/create-rootfs-image.sh",
         ):
             self.assertIn(relative, source)
+        self.assertIn("mm_perf_settle_seconds=%s", source)
+        self.assertIn('"$MM_PERF_SETTLE_SECS"', source)
 
 
 if __name__ == "__main__":

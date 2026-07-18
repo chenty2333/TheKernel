@@ -147,16 +147,12 @@ nightly_ensure_rootfs() {
     printf '%s\n' "$rootfs"
 }
 
-nightly_run_guest() {
-    if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
-        nightly_fail 'nightly_run_guest requires ARCH COMMANDS RUN_DIR [EXTRA_BLOCK] [STOP_MARKER]'
-    fi
-
+nightly_prepare_guest_run() {
+    [ "$#" -eq 3 ] \
+        || nightly_fail 'nightly_prepare_guest_run requires ARCH COMMANDS RUN_DIR'
     local arch=$1
     local commands=$2
     local run_dir=$3
-    local extra_block_image=${4:-}
-    local stop_marker=${5:-}
     local rootfs kernel staged_commands staged_kernel
     local qemu compiler qemu_path compiler_path rustc_path cargo_path
     local kernel_sha commands_sha rootfs_sha qemu_sha compiler_sha
@@ -225,6 +221,34 @@ nightly_run_guest() {
     mv -f -- "$run_dir/guest-inputs.tsv.tmp" "$run_dir/guest-inputs.tsv"
     printf '%s  %s\n' "$rootfs_sha" "$rootfs" >"$run_dir/rootfs.sha256"
 
+    NIGHTLY_PREPARED_KERNEL=$staged_kernel
+    NIGHTLY_PREPARED_ROOTFS=$rootfs
+}
+
+nightly_execute_prepared_guest() {
+    if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
+        nightly_fail \
+            'nightly_execute_prepared_guest requires ARCH ROOTFS RUN_DIR [EXTRA_BLOCK] [STOP_MARKER]'
+    fi
+
+    local arch=$1
+    local rootfs=$2
+    local run_dir=$3
+    local extra_block_image=${4:-}
+    local stop_marker=${5:-}
+    local staged_commands="$run_dir/commands"
+    local staged_kernel="$run_dir/kernel"
+
+    [ -s "$staged_kernel" ] \
+        || nightly_fail "prepared guest kernel is missing: $staged_kernel"
+    [ -s "$rootfs" ] || nightly_fail "prepared guest rootfs is missing: $rootfs"
+    [ -f "$staged_commands" ] \
+        || nightly_fail "prepared guest command stream is missing: $staged_commands"
+    [ -f "$run_dir/guest-inputs.tsv" ] \
+        || nightly_fail "prepared guest input receipt is missing: $run_dir/guest-inputs.tsv"
+    [ -f "$run_dir/rootfs.sha256" ] \
+        || nightly_fail "prepared rootfs receipt is missing: $run_dir/rootfs.sha256"
+
     (
         cd "$REPO_ROOT"
         "$CI_SCRIPT_DIR/boot-shell-runner.sh" \
@@ -232,6 +256,23 @@ nightly_run_guest() {
             "$NIGHTLY_GUEST_TIMEOUT_SECS" "$NIGHTLY_READY_TIMEOUT_SECS" \
             "$NIGHTLY_LINE_DELAY_SECS" "$extra_block_image" "$stop_marker"
     )
+}
+
+nightly_run_guest() {
+    if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
+        nightly_fail 'nightly_run_guest requires ARCH COMMANDS RUN_DIR [EXTRA_BLOCK] [STOP_MARKER]'
+    fi
+
+    local arch=$1
+    local commands=$2
+    local run_dir=$3
+    local extra_block_image=${4:-}
+    local stop_marker=${5:-}
+
+    nightly_prepare_guest_run "$arch" "$commands" "$run_dir"
+    nightly_execute_prepared_guest \
+        "$arch" "$NIGHTLY_PREPARED_ROOTFS" "$run_dir" \
+        "$extra_block_image" "$stop_marker"
 }
 
 nightly_log_has_exact_line() {

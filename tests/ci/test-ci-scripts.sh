@@ -21,6 +21,7 @@ python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
 python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_host.py"
 python3 "$REPO_ROOT/tests/ci/test_rootfs_image_reproducibility.py"
+"$REPO_ROOT/tests/ci/test-mm-performance-boundary.sh"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
 
 # The developer container must see maintained sibling checkouts at the exact

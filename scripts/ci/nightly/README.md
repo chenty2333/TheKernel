@@ -169,6 +169,18 @@ set `THEKERNEL_MM_PERF_RUNNER_ID` to a durable declared identity, but doing so
 is an operator assertion that the underlying performance environment remains
 equivalent, not a general bypass for comparing unrelated machines.
 
+Each architecture/CPU cell finishes its content-addressed kernel and rootfs
+build before the host capture interval. The rootfs identity covers the guest
+helper sources and compiler identity, so fixing the rootfs digest also fixes
+the compiled MM helper consumed by that cell. The adapter stages the kernel,
+command stream, and input receipts, then waits a bounded quiet period before
+capturing `host-pre.tsv`. `THEKERNEL_MM_PERF_SETTLE_SECS` defaults to 5 seconds,
+accepts integers from 0 through 60, and participates in the runner-contract
+digest; unit tests may set it to zero. The measured executor only consumes the
+prepared artifacts with both rebuild flags disabled. After `host-post.tsv` is
+captured, the adapter fail-stops if the staged kernel, source rootfs, or their
+input receipt hashes drifted.
+
 It returns `0` when every enabled gate passes, `1` for a measured regression,
 and `2` when an input is invalid or not comparable, or when the paired series
 is noisy. This is a repeatable QEMU

@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=mm-performance-boundary.sh
+source "$SCRIPT_DIR/mm-performance-boundary.sh"
 
 [ "$#" -eq 0 ] || nightly_fail 'mm-performance adapter takes no arguments'
 
@@ -12,6 +14,7 @@ MM_PERF_ITERATIONS=${THEKERNEL_MM_PERF_ITERATIONS:-256}
 MM_PERF_VMAS=${THEKERNEL_MM_PERF_VMAS:-512}
 MM_PERF_PIN_ITERATIONS=${THEKERNEL_MM_PERF_PIN_ITERATIONS:-64}
 MM_PERF_HOST_CPUS=${THEKERNEL_MM_PERF_HOST_CPUS:-}
+MM_PERF_SETTLE_SECS=${THEKERNEL_MM_PERF_SETTLE_SECS:-5}
 
 ci_require_positive_int mm_perf_iterations "$MM_PERF_ITERATIONS"
 ci_require_positive_int mm_perf_vmas "$MM_PERF_VMAS"
@@ -22,6 +25,9 @@ ci_require_positive_int mm_perf_pin_iterations "$MM_PERF_PIN_ITERATIONS"
     || nightly_fail 'THEKERNEL_MM_PERF_VMAS must not exceed 16384'
 [ "$MM_PERF_PIN_ITERATIONS" -le 10000 ] \
     || nightly_fail 'THEKERNEL_MM_PERF_PIN_ITERATIONS must not exceed 10000'
+mm_perf_validate_settle_seconds "$MM_PERF_SETTLE_SECS" \
+    || nightly_fail \
+        "THEKERNEL_MM_PERF_SETTLE_SECS must be an integer from 0 to $MM_PERF_MAX_SETTLE_SECS"
 
 read -r -a cpu_counts <<<"$MM_PERF_CPUS"
 [ "${#cpu_counts[@]}" -gt 0 ] || nightly_fail 'THEKERNEL_MM_PERF_CPUS is empty'
@@ -68,29 +74,33 @@ esac
 
 runner_contract_sha256=$(
     {
-        printf '%s\n' \
-            scripts/ci/boot-shell-runner.sh \
-            scripts/ci/nightly/mm-performance.sh \
-            scripts/ci/mm_performance_host.py \
-            scripts/ci/mm_performance_schema.py \
-            scripts/ci/capture-mm-performance-host.py \
-            scripts/ci/compare-mm-performance.py \
-            scripts/ci/nightly/lib.sh \
-            scripts/ci/parse-mm-performance.py \
-            scripts/ci/select-mm-performance-cpus.py \
-            scripts/ci/nightly/mm-performance-regression-policy.json \
-            scripts/ci/nightly/mm-performance-stability-policy.json \
-            scripts/build-rootfs.sh \
-            scripts/create-rootfs-image.sh \
-            tests/guest/tools/mm-performance.c
-        find "$REPO_ROOT/tools/qemu_runner" -maxdepth 1 -type f -name '*.py' \
-            -printf 'tools/qemu_runner/%f\n'
-    } | sort -u | while IFS= read -r relative; do
-        [ -f "$REPO_ROOT/$relative" ] \
-            || nightly_fail "runner contract input is missing: $relative"
-        printf '%s\t%s\n' "$relative" \
-            "$(sha256sum "$REPO_ROOT/$relative" | awk '{ print $1 }')"
-    done | sha256sum | awk '{ print $1 }'
+        {
+            printf '%s\n' \
+                scripts/ci/boot-shell-runner.sh \
+                scripts/ci/nightly/mm-performance.sh \
+                scripts/ci/nightly/mm-performance-boundary.sh \
+                scripts/ci/mm_performance_host.py \
+                scripts/ci/mm_performance_schema.py \
+                scripts/ci/capture-mm-performance-host.py \
+                scripts/ci/compare-mm-performance.py \
+                scripts/ci/nightly/lib.sh \
+                scripts/ci/parse-mm-performance.py \
+                scripts/ci/select-mm-performance-cpus.py \
+                scripts/ci/nightly/mm-performance-regression-policy.json \
+                scripts/ci/nightly/mm-performance-stability-policy.json \
+                scripts/build-rootfs.sh \
+                scripts/create-rootfs-image.sh \
+                tests/guest/tools/mm-performance.c
+            find "$REPO_ROOT/tools/qemu_runner" -maxdepth 1 -type f -name '*.py' \
+                -printf 'tools/qemu_runner/%f\n'
+        } | sort -u | while IFS= read -r relative; do
+            [ -f "$REPO_ROOT/$relative" ] \
+                || nightly_fail "runner contract input is missing: $relative"
+            printf '%s\t%s\n' "$relative" \
+                "$(sha256sum "$REPO_ROOT/$relative" | awk '{ print $1 }')"
+        done
+        printf 'setting\tmm_perf_settle_seconds=%s\n' "$MM_PERF_SETTLE_SECS"
+    } | sha256sum | awk '{ print $1 }'
 )
 
 runner_id=${THEKERNEL_MM_PERF_RUNNER_ID:-}
@@ -233,9 +243,6 @@ while IFS= read -r arch; do
             host_cpu_selection host_cpu_class <<<"$selection_row"
         [ "$selected_count" = "$cpus" ] \
             || nightly_fail "host CPU selection count drift for $run_name"
-        host_pre_temporary="$NIGHTLY_LOG_DIR/.$run_name.host-pre.tsv"
-        rm -f "$host_pre_temporary"
-
         printf '%s %s %s %s %s %s %s %s %s; exit\n' \
             /opt/thekernel-tests/bin/thekernel-mm-performance \
             --iterations "$MM_PERF_ITERATIONS" \
@@ -247,24 +254,10 @@ while IFS= read -r arch; do
         (
             taskset --pid --cpu-list "$host_cpu_set" "$BASHPID" >/dev/null \
                 || nightly_fail "cannot apply host CPU affinity $host_cpu_set"
-            python3 "$CI_SCRIPT_DIR/capture-mm-performance-host.py" \
-                --phase pre --cpuset "$host_cpu_set" \
-                --selection "$host_cpu_selection" --cpu-class "$host_cpu_class" \
-                --output "$host_pre_temporary"
-            export THEKERNEL_QEMU_CPUS=$cpus
-            export THEKERNEL_KERNEL_CPUS=$cpus
-            export SMP=$cpus
-            export THEKERNEL_NIGHTLY_REBUILD_KERNELS=1
-            # The helper binary is part of the evidence contract. Re-enter the
-            # content-addressed rootfs builder instead of trusting a materialized
-            # image left by an older checkout.
-            export THEKERNEL_NIGHTLY_REBUILD_ROOTFS=1
-            nightly_run_guest "$arch" "$commands" "$run_dir"
-            mv -f "$host_pre_temporary" "$run_dir/host-pre.tsv"
-            python3 "$CI_SCRIPT_DIR/capture-mm-performance-host.py" \
-                --phase post --cpuset "$host_cpu_set" \
-                --selection "$host_cpu_selection" --cpu-class "$host_cpu_class" \
-                --output "$run_dir/host-post.tsv"
+            mm_perf_capture_prepared_run \
+                "$arch" "$cpus" "$commands" "$run_dir" \
+                "$host_cpu_set" "$host_cpu_selection" "$host_cpu_class" \
+                "$MM_PERF_SETTLE_SECS"
         )
         nightly_validate_guest_log \
             "$run_dir/qemu.log" clean \
@@ -284,22 +277,19 @@ while IFS= read -r arch; do
             tail -n +2 "$artifact" >>"$matrix"
         fi
 
-        kernel=$(nightly_kernel_path "$arch") \
-            || nightly_fail "invalid architecture after run: $arch"
-        rootfs=$(nightly_rootfs_path "$arch") \
-            || nightly_fail "invalid architecture after run: $arch"
         qemu_binary=$(nightly_qemu_binary "$arch") \
             || nightly_fail "invalid QEMU architecture after run: $arch"
         qemu=$(command -v "$qemu_binary") \
             || nightly_fail "QEMU binary disappeared after run: $qemu_binary"
         kernel_artifact="$run_dir/kernel"
-        cp -- "$kernel" "$kernel_artifact"
         online_cpus=$(awk -F '\t' 'NR == 2 { print $3 }' "$artifact")
         [ "$online_cpus" = "$cpus" ] \
             || nightly_fail "parsed topology drift for $run_name: $online_cpus"
         kernel_sha256=$(sha256sum "$kernel_artifact" | awk '{ print $1 }')
         kernel_size_bytes=$(stat -c '%s' "$kernel_artifact")
-        rootfs_sha256=$(sha256sum "$rootfs" | awk '{ print $1 }')
+        rootfs_sha256=$(mm_perf_receipt_value \
+            "$run_dir/guest-inputs.tsv" rootfs_sha256) \
+            || nightly_fail "missing prepared rootfs receipt for $run_name"
         qemu_sha256=$(sha256sum "$qemu" | awk '{ print $1 }')
         qemu_version=$("$qemu" --version | sed -n '1{s/[[:space:]]\+/ /g;p;}')
         qemu_version=${qemu_version//$'\t'/ }
