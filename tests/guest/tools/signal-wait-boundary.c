@@ -141,9 +141,11 @@ int main(void)
     if (raw_result != -1 || errno != EAGAIN)
         return fail("kill-stop-excluded");
 
-    /* A caught signal outside the selected set owns EINTR. A one-shot POSIX
-     * timer publishes it after this task has entered the wait, exercising a
-     * real timer-to-signal wake without depending on helper-task scheduling. */
+    /* A caught signal outside the selected set owns EINTR at the Linux syscall
+     * ABI. Use the raw syscall here because libc policy is not uniform: musl's
+     * sigtimedwait() deliberately retries EINTR while glibc exposes it. A
+     * one-shot POSIX timer publishes the signal after this task has entered the
+     * wait, exercising a real timer-to-signal wake without helper scheduling. */
     memset(&async_event, 0, sizeof(async_event));
     async_event.sigev_notify = SIGEV_SIGNAL;
     async_event.sigev_signo = SIGUSR2;
@@ -159,7 +161,8 @@ int main(void)
     usr2_seen = 0;
     usr2_saw_usr1_blocked = 0;
     errno = 0;
-    result = sigtimedwait(&waited, NULL, &async_timeout);
+    result = (int)syscall(SYS_rt_sigtimedwait, &waited, NULL, &async_timeout,
+                          sizeof(unsigned long));
     saved_errno = errno;
     if (timer_delete(async_timer) != 0)
         return fail("async-timer-delete");
