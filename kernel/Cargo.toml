@@ -51,7 +51,7 @@ axmm.workspace = true
 axnet.workspace = true
 axruntime.workspace = true
 axsync.workspace = true
-axtask.workspace = true
+axtask = { workspace = true, features = ["irq-exit"] }
 
 axbacktrace = "0.1"
 axerrno = "0.2"
