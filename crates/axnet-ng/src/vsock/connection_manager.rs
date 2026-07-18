@@ -130,14 +130,6 @@ impl Connection {
     }
 
     #[inline]
-    pub fn wait_for_tx(&self) -> AxResult<()> {
-        self.tx_wait_queue
-            .wait_timeout(core::time::Duration::from_millis(10))
-            .map(|_| ())
-            .map_err(Into::into)
-    }
-
-    #[inline]
     pub fn tx_wait_source(&self) -> Arc<WaitQueue> {
         self.tx_wait_queue.clone()
     }

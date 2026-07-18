@@ -195,6 +195,10 @@ impl VsockTransportOps for VsockStreamTransport {
         })?;
 
         guard.transit(State::Connecting, || {
+            // The event worker uses device -> manager -> connection ordering.
+            // Snapshot the device-owned CID before acquiring the manager so
+            // connect cannot form the inverse manager -> device edge.
+            let guest_cid = vsock_guest_cid()?;
             let mut manager = VSOCK_CONN_MANAGER.lock();
             let existing_conn = self.connection.lock();
 
@@ -217,7 +221,7 @@ impl VsockTransportOps for VsockStreamTransport {
             drop(existing_conn);
 
             let local_addr = VsockAddr {
-                cid: vsock_guest_cid()?,
+                cid: guest_cid,
                 port: local_port,
             };
 

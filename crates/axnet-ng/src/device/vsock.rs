@@ -1,9 +1,8 @@
 use alloc::string::String;
 use core::{
-    future::Future,
-    pin::Pin,
+    future::poll_fn,
     sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use axdriver::prelude::*;
@@ -151,9 +150,35 @@ fn vsock_poll_loop() {
         POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
         return;
     };
+    let mut irq_registration = VsockIrqRegistration::new(irq);
     loop {
-        match block_on(interruptible(VsockEventWait::new(irq))) {
-            Ok(Ok(Ok(()))) => axtask::yield_now(),
+        if let Err(error) = irq_registration.arm() {
+            warn!("vsock IRQ registration failed: {error:?}");
+            break;
+        }
+
+        match poll_vsock_interfaces() {
+            Ok(true) => {
+                irq_registration.cancel();
+                axtask::yield_now();
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                irq_registration.cancel();
+                warn!("vsock device poll failed: {error:?}");
+                break;
+            }
+        }
+
+        let waited = block_on(interruptible(poll_fn(|context| {
+            irq_registration.poll_wait(context)
+        })));
+        // The wait phase only updates the already-published IRQ registration.
+        // Cancellation and driver/manager work remain outside the block session.
+        irq_registration.cancel();
+        match waited {
+            Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => {
                 warn!("vsock IRQ wait failed: {error:?}");
                 break;
@@ -171,14 +196,22 @@ fn vsock_poll_loop() {
     POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
 }
 
-struct VsockEventWait {
+struct VsockIrqRegistration {
     irq: usize,
     token: Option<IrqWakerToken>,
 }
 
-impl VsockEventWait {
+impl VsockIrqRegistration {
     const fn new(irq: usize) -> Self {
         Self { irq, token: None }
+    }
+
+    fn arm(&mut self) -> AxResult<()> {
+        if self.token.is_none() {
+            self.token =
+                Some(register_irq_waker(self.irq, Waker::noop()).map_err(map_irq_wait_error)?);
+        }
+        Ok(())
     }
 
     fn cancel(&mut self) {
@@ -186,49 +219,24 @@ impl VsockEventWait {
             cancel_irq_waker(token);
         }
     }
-}
 
-impl Future for VsockEventWait {
-    type Output = AxResult<()>;
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let irq_consumed = if let Some(token) = self.token {
-            match update_irq_waker(token, context.waker()) {
-                Ok(()) => false,
-                Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
-                    self.token = None;
-                    true
-                }
-                Err(IrqWakerUpdateError::Registration(UpdateError::Closed))
-                | Err(IrqWakerUpdateError::InvalidSource) => {
-                    self.cancel();
-                    return Poll::Ready(Err(AxError::BadState));
-                }
-            }
-        } else {
-            match register_irq_waker(self.irq, context.waker()) {
-                Ok(token) => self.token = Some(token),
-                Err(error) => return Poll::Ready(Err(map_irq_wait_error(error))),
-            }
-            false
+    fn poll_wait(&mut self, context: &mut Context<'_>) -> Poll<AxResult<()>> {
+        let Some(token) = self.token else {
+            return Poll::Ready(Err(AxError::BadState));
         };
-
-        match poll_vsock_interfaces() {
-            Ok(true) => {
-                self.cancel();
+        match update_irq_waker(token, context.waker()) {
+            Ok(()) => Poll::Pending,
+            Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
+                self.token = None;
                 Poll::Ready(Ok(()))
             }
-            Ok(false) if irq_consumed => Poll::Ready(Ok(())),
-            Ok(false) => Poll::Pending,
-            Err(error) => {
-                self.cancel();
-                Poll::Ready(Err(error))
-            }
+            Err(IrqWakerUpdateError::Registration(UpdateError::Closed))
+            | Err(IrqWakerUpdateError::InvalidSource) => Poll::Ready(Err(AxError::BadState)),
         }
     }
 }
 
-impl Drop for VsockEventWait {
+impl Drop for VsockIrqRegistration {
     fn drop(&mut self) {
         self.cancel();
     }
@@ -404,10 +412,12 @@ pub fn vsock_send(conn_id: VsockConnId, buf: &[u8]) -> AxResult<usize> {
         match result {
             Ok(len) => return Ok(len),
             Err(DevError::Again) => {
-                let manager = VSOCK_CONN_MANAGER.lock();
-                if let Some(conn) = manager.get_connection(conn_id) {
-                    drop(manager);
-                    conn.lock().wait_for_tx()?;
+                let connection = VSOCK_CONN_MANAGER.lock().get_connection(conn_id);
+                let tx_wait = connection.map(|conn| conn.lock().tx_wait_source());
+                if let Some(tx_wait) = tx_wait {
+                    tx_wait
+                        .wait_timeout(core::time::Duration::from_millis(10))
+                        .map_err(AxError::from)?;
                 };
             }
             Err(e) => return Err(map_dev_err(e)),
