@@ -51,10 +51,30 @@ struct WaitRegistration {
     waiter: Option<Arc<SpinNoIrq<WaiterEntry>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitTerminalOwnership {
+    Woken,
+    Cancelled,
+}
+
+impl WaitRegistration {
+    /// Resolves the waiter's terminal owner before a timeout, interruption, or
+    /// setup error escapes to the Linux adapter.
+    ///
+    /// Wake and cancellation both linearize under `WaiterEntry`'s IRQ-safe
+    /// lock. Once cancellation is published, requeue observes it and can no
+    /// longer move this waiter, so queue cleanup needs only the captured owner
+    /// rather than an unbounded owner-chasing retry loop.
+    fn resolve_terminal(&mut self) -> WaitTerminalOwnership {
+        let waiter = self.waiter.take().expect("live futex registration");
+        resolve_waiter_terminal(waiter)
+    }
+}
+
 impl Drop for WaitRegistration {
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
-            cancel_waiter(waiter);
+            let _ = resolve_waiter_terminal(waiter);
         }
     }
 }
@@ -117,53 +137,69 @@ fn clear_waiter_proc_state(waiter: &WaiterEntry) {
     }
 }
 
-fn cancel_waiter(waiter: Arc<SpinNoIrq<WaiterEntry>>) {
-    // Mark the waiter as cancelled first so future requeues can no longer keep
-    // moving it between futex queues.
-    let mut owner = {
+fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> WaitTerminalOwnership {
+    // Mark the waiter as cancelled first so a concurrent wake either already
+    // owns completion or observes cancellation and does not count this waiter.
+    // Requeue tests `cancelled` while holding the same waiter lock, so the
+    // captured owner cannot change after this point.
+    let owner = {
         let mut waiter = waiter.lock();
         if waiter.awakened {
-            return;
+            return WaitTerminalOwnership::Woken;
         }
         waiter.cancelled = true;
         clear_waiter_proc_state(&waiter);
         waiter.owner.clone()
     };
 
-    loop {
-        let Some(owner_entry) = owner.upgrade() else {
-            return;
-        };
-
+    if let Some(owner_entry) = owner.upgrade() {
         let _gate = owner_entry.wq.gate.lock();
-        owner = {
+        // No requeue can change `owner` after `cancelled` was published. A
+        // requeue that already held both queue gates will instead discard the
+        // cancelled waiter before this gate is acquired, making removal a
+        // harmless no-op.
+        debug_assert!({
             let waiter_entry = waiter.lock();
-            if waiter_entry.awakened {
-                return;
-            }
-            if Weak::ptr_eq(&waiter_entry.owner, &Arc::downgrade(&owner_entry)) {
-                owner_entry.wq.remove_waiter_locked(&waiter);
-                return;
-            }
-            waiter_entry.owner.clone()
-        };
+            waiter_entry.cancelled
+                && Weak::ptr_eq(&waiter_entry.owner, &Arc::downgrade(&owner_entry))
+        });
+        owner_entry.wq.remove_waiter_locked(&waiter);
+    }
+
+    WaitTerminalOwnership::Cancelled
+}
+
+fn resolve_single_wait(
+    registration: &mut WaitRegistration,
+    result: AxResult<bool>,
+) -> AxResult<bool> {
+    match registration.resolve_terminal() {
+        WaitTerminalOwnership::Woken => Ok(true),
+        WaitTerminalOwnership::Cancelled => result,
     }
 }
 
-fn awakened_registration_index(registrations: &[WaitRegistration]) -> Option<usize> {
-    registrations.iter().position(|registration| {
-        registration
-            .waiter
-            .as_ref()
-            .is_some_and(|waiter| waiter.lock().awakened)
-    })
-}
+fn resolve_wait_any(
+    registrations: &mut [WaitRegistration],
+    result: AxResult<usize>,
+) -> AxResult<usize> {
+    let proposed = result.as_ref().ok().copied();
+    let mut first_woken = None;
+    let mut proposed_woken = false;
 
-fn setup_error_or_wake(registrations: &[WaitRegistration], err: AxError) -> AxResult<usize> {
-    if let Some(index) = awakened_registration_index(registrations) {
+    for (index, registration) in registrations.iter_mut().enumerate() {
+        if registration.resolve_terminal() == WaitTerminalOwnership::Woken {
+            first_woken.get_or_insert(index);
+            proposed_woken |= proposed == Some(index);
+        }
+    }
+
+    if proposed_woken {
+        Ok(proposed.expect("proposed futex waitv winner"))
+    } else if let Some(index) = first_woken {
         Ok(index)
     } else {
-        Err(err)
+        result
     }
 }
 
@@ -316,7 +352,8 @@ impl WaitQueue {
         // Registration may fault while evaluating `condition` and therefore
         // happens before the synchronous block session starts. From this point
         // on, polling and wakeup touch only the waiter's IRQ-safe state.
-        let Some(registration) = self.register_waiter_if(owner, bitset, timeout, condition)? else {
+        let Some(mut registration) = self.register_waiter_if(owner, bitset, timeout, condition)?
+        else {
             return Ok(false);
         };
         let wait = WaitFuture {
@@ -329,14 +366,7 @@ impl WaitQueue {
             Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
                 Ok(sleeper) => Some(sleeper),
                 Err(error) => {
-                    if registration
-                        .waiter
-                        .as_ref()
-                        .is_some_and(|waiter| waiter.lock().awakened)
-                    {
-                        return Ok(true);
-                    }
-                    return Err(error);
+                    return resolve_single_wait(&mut registration, Err(error));
                 }
             },
             None => None,
@@ -358,7 +388,11 @@ impl WaitQueue {
                 Poll::Pending
             }))
         };
-        result.map_err(AxError::from)?
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => Err(AxError::from(error)),
+        };
+        resolve_single_wait(&mut registration, result)
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
@@ -492,21 +526,26 @@ pub fn wait_on_any_futex_if(
             task: Arc::downgrade(&current()),
             waker: None,
         }));
-        {
+        let setup = {
             let _gate = futex.inner.wq.gate.lock();
-            let matches = match condition(index) {
-                Ok(matches) => matches,
-                Err(err) => return setup_error_or_wake(&registrations, err),
-            };
-            if !matches {
-                return setup_error_or_wake(&registrations, AxError::WouldBlock);
+            match condition(index) {
+                Ok(true) => {
+                    futex.inner.wq.queue.lock().push_back(waiter.clone());
+                    if let Some(task) = waiter.lock().task.upgrade()
+                        && let Some(thread) = task.try_as_thread()
+                    {
+                        thread.set_proc_state_hint(ProcStateHint::Interruptible);
+                    }
+                    Ok(())
+                }
+                Ok(false) => Err(AxError::WouldBlock),
+                Err(error) => Err(error),
             }
-            futex.inner.wq.queue.lock().push_back(waiter.clone());
-            if let Some(task) = waiter.lock().task.upgrade()
-                && let Some(thread) = task.try_as_thread()
-            {
-                thread.set_proc_state_hint(ProcStateHint::Interruptible);
-            }
+        };
+        if let Err(error) = setup {
+            // Queue gates and user-value validation are complete before this
+            // finalizer acquires any prior registration's sleeping gate.
+            return resolve_wait_any(&mut registrations, Err(error));
         }
         registrations.push(WaitRegistration {
             waiter: Some(waiter),
@@ -523,7 +562,7 @@ pub fn wait_on_any_futex_if(
     let mut sleeper = match timeout {
         Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
             Ok(sleeper) => Some(sleeper),
-            Err(error) => return setup_error_or_wake(&registrations, error),
+            Err(error) => return resolve_wait_any(&mut registrations, Err(error)),
         },
         None => None,
     };
@@ -544,11 +583,16 @@ pub fn wait_on_any_futex_if(
             Poll::Pending
         }))
     };
-    result.map_err(AxError::from)?
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(AxError::from(error)),
+    };
+    resolve_wait_any(&mut registrations, result)
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use core::task::{Context, Poll, Waker};
 
     use spin::Once;
@@ -637,6 +681,116 @@ mod tests {
         drop(wait);
         drop(registration);
         assert!(entry.wq.is_empty());
+    }
+
+    #[test]
+    fn single_wait_terminal_owner_is_wake_or_error_never_both() {
+        init_scheduler();
+
+        let wake_first = Arc::new(FutexEntry::new());
+        let mut registration = register_test_waiter(&wake_first);
+        assert_eq!(wake_first.wq.wake(1, u32::MAX), 1);
+        assert_eq!(
+            resolve_single_wait(&mut registration, Err(AxError::Interrupted)),
+            Ok(true)
+        );
+        assert!(wake_first.wq.is_empty());
+
+        let error_first = Arc::new(FutexEntry::new());
+        let mut registration = register_test_waiter(&error_first);
+        assert_eq!(
+            resolve_single_wait(&mut registration, Err(AxError::TimedOut)),
+            Err(AxError::TimedOut)
+        );
+        assert_eq!(error_first.wq.wake(1, u32::MAX), 0);
+        assert!(error_first.wq.is_empty());
+    }
+
+    #[test]
+    fn requeued_wait_terminal_owner_is_wake_or_error_never_both() {
+        init_scheduler();
+
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let mut registration = register_test_waiter(&src);
+        assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 1);
+        assert_eq!(dst.wq.wake(1, u32::MAX), 1);
+        assert_eq!(
+            resolve_single_wait(&mut registration, Err(AxError::Interrupted)),
+            Ok(true)
+        );
+
+        let mut registration = register_test_waiter(&src);
+        assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 1);
+        assert_eq!(
+            resolve_single_wait(&mut registration, Err(AxError::TimedOut)),
+            Err(AxError::TimedOut)
+        );
+        assert_eq!(dst.wq.wake(1, u32::MAX), 0);
+        assert!(src.wq.is_empty());
+        assert!(dst.wq.is_empty());
+    }
+
+    #[test]
+    fn waitv_terminal_owner_is_wake_index_or_error_never_both() {
+        init_scheduler();
+
+        let first = Arc::new(FutexEntry::new());
+        let second = Arc::new(FutexEntry::new());
+        let mut registrations = [register_test_waiter(&first), register_test_waiter(&second)];
+        assert_eq!(second.wq.wake(1, u32::MAX), 1);
+        assert_eq!(
+            resolve_wait_any(&mut registrations, Err(AxError::Interrupted)),
+            Ok(1)
+        );
+        assert_eq!(first.wq.wake(1, u32::MAX), 0);
+
+        let mut registrations = [register_test_waiter(&first), register_test_waiter(&second)];
+        assert_eq!(
+            resolve_wait_any(&mut registrations, Err(AxError::TimedOut)),
+            Err(AxError::TimedOut)
+        );
+        assert_eq!(first.wq.wake(1, u32::MAX), 0);
+        assert_eq!(second.wq.wake(1, u32::MAX), 0);
+        assert!(first.wq.is_empty());
+        assert!(second.wq.is_empty());
+    }
+
+    #[test]
+    fn partially_published_waitv_prefers_wake_or_unqueues_before_error() {
+        init_scheduler();
+
+        let table = Arc::new(FutexTable::new());
+        let first = table.get_or_insert_owned(&FutexKey::new_private(0x1000));
+        let second = table.get_or_insert_owned(&FutexKey::new_private(0x2000));
+        let first_entry = first.inner.clone();
+        let result =
+            wait_on_any_futex_if(vec![(first, u32::MAX), (second, u32::MAX)], None, |index| {
+                if index == 0 {
+                    Ok(true)
+                } else {
+                    assert_eq!(first_entry.wq.wake(1, u32::MAX), 1);
+                    Err(AxError::BadAddress)
+                }
+            });
+        assert_eq!(result, Ok(0));
+        assert!(first_entry.wq.is_empty());
+
+        let table = Arc::new(FutexTable::new());
+        let first = table.get_or_insert_owned(&FutexKey::new_private(0x3000));
+        let second = table.get_or_insert_owned(&FutexKey::new_private(0x4000));
+        let first_entry = first.inner.clone();
+        let result =
+            wait_on_any_futex_if(vec![(first, u32::MAX), (second, u32::MAX)], None, |index| {
+                if index == 0 {
+                    Ok(true)
+                } else {
+                    Err(AxError::BadAddress)
+                }
+            });
+        assert_eq!(result, Err(AxError::BadAddress));
+        assert_eq!(first_entry.wq.wake(1, u32::MAX), 0);
+        assert!(first_entry.wq.is_empty());
     }
 
     #[test]
