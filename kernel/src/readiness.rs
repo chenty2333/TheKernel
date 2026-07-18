@@ -116,6 +116,7 @@ where
     P: Pollable + ?Sized,
     F: FnMut() -> AxResult<T>,
 {
+    let mut deadline_reservation = None;
     loop {
         if let Some(result) = completed_operation(operation(), nonblocking) {
             return Ok(result);
@@ -132,23 +133,35 @@ where
             return Ok(result);
         }
 
-        let waited = match axtask::future::block_on(axtask::future::timeout_at(
-            deadline,
-            axtask::future::interruptible(wait),
-        )) {
-            Err(error) => return Ok(Err(error.into())),
-            Ok(Err(axtask::future::TimeoutError::Elapsed(elapsed))) => {
-                return match completed_operation(operation(), false) {
-                    Some(result) => Ok(result),
-                    None => Err(elapsed),
-                };
+        let waited = if let Some(end) = deadline {
+            if deadline_reservation.is_none() {
+                match axtask::future::DeadlineReservation::reserve(end) {
+                    Ok(reservation) => deadline_reservation = Some(reservation),
+                    Err(error) => {
+                        return Ok(completed_operation(operation(), false)
+                            .unwrap_or_else(|| Err(error.into())));
+                    }
+                }
             }
-            Ok(Err(axtask::future::TimeoutError::Timer(error))) => {
-                return Ok(
-                    completed_operation(operation(), false).unwrap_or_else(|| Err(error.into()))
-                );
+
+            let reservation = deadline_reservation
+                .as_mut()
+                .expect("deadline reservation was initialized above");
+            match axtask::future::block_on(reservation.race(axtask::future::interruptible(wait))) {
+                Err(error) => return Ok(Err(error.into())),
+                Ok(Err(elapsed)) => {
+                    return match completed_operation(operation(), false) {
+                        Some(result) => Ok(result),
+                        None => Err(elapsed),
+                    };
+                }
+                Ok(Ok(waited)) => waited,
             }
-            Ok(Ok(waited)) => waited,
+        } else {
+            match axtask::future::block_on(axtask::future::interruptible(wait)) {
+                Err(error) => return Ok(Err(error.into())),
+                Ok(waited) => waited,
+            }
         };
 
         match waited {
