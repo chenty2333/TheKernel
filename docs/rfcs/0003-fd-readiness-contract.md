@@ -128,6 +128,20 @@ Every blocking operation follows:
 4. sleep only if the second check still blocks;
 5. detach or rearm with a generation change before consuming a wake.
 
+Object operations, usercopy, allocation, and sleepable-lock acquisition belong
+to the check/prepare phases outside the task's synchronous block session. The
+session itself may poll only already-published bounded readiness, interrupt,
+and timer tokens. An object callback or a lazy future must not smuggle an
+operation back into that session.
+
+A logical call computes one absolute deadline and lazily admits at most one
+bounded timer reservation. The reservation survives spurious readiness and
+consecutive wait sessions without extending the timeout or repeating timer
+admission; each session removes its task waker on completion or cancellation,
+and final reservation destruction refunds the slot exactly once. After any
+wake, interrupt, expiry, admission failure, or block failure, one final
+authoritative operation attempt decides whether completed work wins.
+
 Wake callbacks only publish a bounded token/hint and wake tasks. They do not
 allocate, copy to userspace, take sleepable locks, or invoke destructors while
 holding source locks. A delayed callback carries a generation and cannot
