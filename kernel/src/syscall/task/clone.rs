@@ -592,7 +592,15 @@ impl CloneArgs {
                 time_ns,
             )?;
             proc_data.set_umask(old_proc_data.umask());
-            *proc_data.rlim.write() = old_proc_data.rlim.read().clone();
+            let inherited_rlimits = old_proc_data.rlim.read().clone();
+            let inherited_cpu_limit_active = inherited_rlimits[linux_raw_sys::general::RLIMIT_CPU]
+                .current
+                != linux_raw_sys::general::RLIM_INFINITY as i64 as u64;
+            *proc_data.rlim.write() = inherited_rlimits;
+            proc_data.process_rlimit_cpu_active.store(
+                inherited_cpu_limit_active,
+                core::sync::atomic::Ordering::Release,
+            );
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);

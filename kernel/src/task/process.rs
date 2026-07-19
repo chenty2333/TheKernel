@@ -10,8 +10,7 @@ extern crate std;
 #[cfg(test)]
 use core::cell::Cell;
 use core::{
-    ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -124,7 +123,7 @@ use super::{
     resources::Rlimits,
     signal::PtraceSignalRecord,
     thread::{TaskParentPublicationGuard, lock_task_parent_publication},
-    timer::{PosixTimer, ProcessITimers},
+    timer::{PosixTimer, ProcessITimerWorkNode, ProcessITimers},
 };
 use crate::{
     file::{
@@ -1702,16 +1701,34 @@ pub struct ProcessData {
     /// charges are serialized here; no thread-local `RefCell` is accessed by
     /// an alarm worker.
     pub(crate) process_itimers: SpinNoIrq<ProcessITimers>,
+    /// Monotonic thread-group CPU clock. Writers publish each task-local
+    /// user/system interval exactly once; RLIMIT_CPU consumes this lifetime
+    /// total, while armed VIRTUAL/PROF timers use the eligible clocks below.
+    pub(crate) process_cpu_total_ns: AtomicU64,
+    /// Durable fail-closed marker if any process CPU clock saturates instead
+    /// of wrapping into a reused accounting domain.
+    pub(crate) process_cpu_accounting_overflowed: AtomicBool,
+    /// Independently rebased eligible clocks for ITIMER_VIRTUAL/PROF. Even
+    /// epochs are stable; odd epochs fence an arm transition while the owner
+    /// waits for already-admitted IRQ writers to retire.
+    pub(crate) process_itimer_virtual_epoch: AtomicU64,
+    pub(crate) process_itimer_virtual_writers: AtomicUsize,
+    pub(crate) process_itimer_virtual_clock_ns: AtomicU64,
+    pub(crate) process_itimer_prof_epoch: AtomicU64,
+    pub(crate) process_itimer_prof_writers: AtomicUsize,
+    pub(crate) process_itimer_prof_clock_ns: AtomicU64,
     /// Lock-free fast-path publication for process CPU timers. Accounting
     /// avoids the shared timer lock while neither VIRTUAL nor PROF is armed.
     pub(crate) process_itimer_cpu_armed: AtomicU8,
+    /// True while the canonical RLIMIT_CPU soft limit is finite. The timer IRQ
+    /// uses this only to request a later task-context policy boundary.
+    pub(crate) process_rlimit_cpu_active: AtomicBool,
     /// Standard timer signals awaiting a scheduler-safe task-context drain.
     pub(crate) process_itimer_pending: AtomicU8,
     /// Intrusive single-consumer work node used to defer process-timer signal
     /// publication out of IRQ-off context-switch accounting.
     pub(crate) process_itimer_work_queued: AtomicBool,
-    pub(crate) process_itimer_work_next: AtomicPtr<ProcessData>,
-    pub(crate) process_itimer_work_owner: SpinNoIrq<Option<Arc<ProcessData>>>,
+    pub(crate) process_itimer_work_node: ProcessITimerWorkNode,
 
     /// CPU time accumulated from sibling threads that have already exited.
     pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
@@ -2149,11 +2166,19 @@ impl ProcessData {
             timerslack_default_ns: AtomicUsize::new(50_000),
             posix_timers: SpinNoIrq::new(Vec::new()),
             process_itimers: SpinNoIrq::new(ProcessITimers::new()),
+            process_cpu_total_ns: AtomicU64::new(0),
+            process_cpu_accounting_overflowed: AtomicBool::new(false),
+            process_itimer_virtual_epoch: AtomicU64::new(0),
+            process_itimer_virtual_writers: AtomicUsize::new(0),
+            process_itimer_virtual_clock_ns: AtomicU64::new(0),
+            process_itimer_prof_epoch: AtomicU64::new(0),
+            process_itimer_prof_writers: AtomicUsize::new(0),
+            process_itimer_prof_clock_ns: AtomicU64::new(0),
             process_itimer_cpu_armed: AtomicU8::new(0),
+            process_rlimit_cpu_active: AtomicBool::new(false),
             process_itimer_pending: AtomicU8::new(0),
             process_itimer_work_queued: AtomicBool::new(false),
-            process_itimer_work_next: AtomicPtr::new(ptr::null_mut()),
-            process_itimer_work_owner: SpinNoIrq::new(None),
+            process_itimer_work_node: ProcessITimerWorkNode::new(),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             maxrss_kb: AtomicU64::new(0),

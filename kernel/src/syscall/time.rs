@@ -3,6 +3,7 @@ use core::time::Duration;
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos};
 use axtask::current;
+use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
@@ -1108,9 +1109,9 @@ pub fn sys_setitimer(
     new_value: *const itimerval,
     old_value: *mut itimerval,
 ) -> AxResult<isize> {
-    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
-    let curr = current();
-
+    // Linux copies and validates the replacement before dispatching `which`.
+    // Preserve EFAULT/EINVAL precedence for combined bad-pointer/bad-selector
+    // calls instead of rejecting the selector before touching userspace.
     let (interval, remained) = match new_value.nullable() {
         Some(new_value) => {
             // FIXME: AnyBitPattern
@@ -1123,12 +1124,26 @@ pub fn sys_setitimer(
         }
         None => (0, 0),
     };
+    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
+    let curr = current();
 
     debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
 
     poll_timer(&curr);
-    let (old_interval, old_remaining) =
+    let ((old_interval, old_remaining), cpu_epoch) =
         set_process_itimer(&curr.as_thread().proc_data, ty, interval, remained)?;
+    if let Some(epoch) = cpu_epoch {
+        // The interval that began at the pre-arm poll crosses the exact arm
+        // cutoff. Account it to the lifetime total while the old local epoch
+        // conservatively omits it from the newly armed eligible clock, then
+        // start the next interval in the returned (or a newer) generation.
+        poll_timer(&curr);
+        let _guard = NoPreemptIrqSave::new();
+        curr.as_thread()
+            .time
+            .borrow_mut()
+            .sync_process_cpu_timer_epoch(ty, epoch);
+    }
 
     if let Some(old_value) = old_value.nullable() {
         old_value.vm_write(itimerval {

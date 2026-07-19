@@ -101,6 +101,11 @@ for marker in \
     CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK \
     CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK\ min_hits=3 \
     CI_WAIT_BOUNDARY_ITIMER_CPU_OK\ no_syscall_loop=1 \
+    CI_WAIT_BOUNDARY_RLIMIT_CPU_ESCALATION_OK\ soft_after_signal=2\ hard_signal=SIGKILL \
+    CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK\ signal=SIGKILL\ sigxcpu=0 \
+    CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK\ bad_new=EFAULT\ bad_pid_before_resource=ESRCH \
+    CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK\ old_new=atomic\ invalid=rollback\ copyout_fault=committed \
+    CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK\ setrlimit_bad_new=EFAULT\ setitimer_bad_new=EFAULT \
     CI_WAIT_BOUNDARY_FUTEX_WAKE_OK \
     CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK \
     CI_WAIT_BOUNDARY_FUTEX_WAITV_OK \

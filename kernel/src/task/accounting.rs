@@ -49,15 +49,10 @@ impl TaskUsage {
 
     /// Collects usage from a live thread.
     pub fn from_thread(thread: &Thread) -> Self {
-        let usage = match thread.time.try_borrow() {
-            Ok(time) => {
-                let (utime, stime) = time.output();
-                Self::from_time_values(utime, stime)
-            }
-            Err(_) => thread.usage_snapshot(),
-        };
-        thread.store_usage_snapshot(usage);
-        usage
+        // `TimeManager` is task-local and may be updated by that task's timer
+        // IRQ on another CPU. Cross-task readers consume only the atomic
+        // publication, never the interior RefCell itself.
+        thread.usage_snapshot()
     }
 
     /// Creates usage from [`TimeValue`]s.

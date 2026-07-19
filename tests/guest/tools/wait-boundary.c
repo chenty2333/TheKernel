@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <limits.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <poll.h>
@@ -11,9 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,6 +43,7 @@
 
 #define MAX_CPUS 64
 #define CASE_TIMEOUT_NS 3000000000LL
+#define RLIMIT_CASE_TIMEOUT_NS 10000000000LL
 #define MIN_TIMER_PROGRESS_NS 10000000LL
 #define RELATIVE_TIMER_NS 500000000LL
 
@@ -77,6 +81,8 @@ struct futex_waitv_case {
 };
 
 static volatile sig_atomic_t itimer_hits;
+static volatile sig_atomic_t rlimit_cpu_hits;
+static volatile sig_atomic_t rlimit_cpu_signal_fd = -1;
 static volatile sig_atomic_t cpu_itimer_virtual_hits;
 static volatile sig_atomic_t cpu_itimer_prof_hits;
 static volatile sig_atomic_t cpu_itimer_watchdog_hits;
@@ -672,6 +678,430 @@ static int test_cpu_itimers_without_syscall_edges(void)
     return 0;
 }
 
+struct rlimit_cpu_report {
+    rlim_t soft;
+    rlim_t hard;
+    sig_atomic_t signal_hits;
+};
+
+struct rlimit_cpu_burner_state {
+    _Atomic int ready;
+    _Atomic int start;
+    int error;
+};
+
+static void rlimit_cpu_handler(int signal_number)
+{
+    if (signal_number != SIGXCPU) {
+        return;
+    }
+
+    int saved_errno = errno;
+    rlimit_cpu_hits++;
+    if (rlimit_cpu_signal_fd >= 0) {
+        const unsigned char marker = 1;
+        (void)write((int)rlimit_cpu_signal_fd, &marker, sizeof(marker));
+    }
+    errno = saved_errno;
+}
+
+static _Noreturn void burn_cpu_forever(void)
+{
+    volatile uint64_t value = UINT64_C(0x9e3779b97f4a7c15);
+
+    for (;;) {
+        value ^= value << 7;
+        value ^= value >> 9;
+        value += UINT64_C(0x9e3779b97f4a7c15);
+    }
+}
+
+static void *rlimit_cpu_burner(void *opaque)
+{
+    struct rlimit_cpu_burner_state *state = opaque;
+    sigset_t blocked;
+
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGXCPU);
+    int result = pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    if (result != 0) {
+        state->error = result;
+        atomic_store_explicit(&state->ready, 1, memory_order_release);
+        return NULL;
+    }
+
+    atomic_store_explicit(&state->ready, 1, memory_order_release);
+    while (atomic_load_explicit(&state->start, memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    burn_cpu_forever();
+}
+
+static int waitpid_bounded(pid_t child, int *status)
+{
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        return -1;
+    }
+
+    for (;;) {
+        pid_t result = waitpid(child, status, WNOHANG);
+        if (result == child) {
+            return 0;
+        }
+        if (result < 0 && errno != EINTR) {
+            return -1;
+        }
+
+        int64_t now = monotonic_ns();
+        if (now < 0) {
+            return -1;
+        }
+        if (now - start >= RLIMIT_CASE_TIMEOUT_NS) {
+            (void)kill(child, SIGKILL);
+            do {
+                result = waitpid(child, status, 0);
+            } while (result < 0 && errno == EINTR);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = 5000000,
+        };
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+        }
+    }
+}
+
+static int read_rlimit_cpu_report(int fd, struct rlimit_cpu_report *report)
+{
+    size_t received = 0;
+
+    while (received < sizeof(*report)) {
+        ssize_t result = read(fd, (unsigned char *)report + received,
+                              sizeof(*report) - received);
+        if (result > 0) {
+            received += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result < 0) {
+            return -1;
+        }
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static _Noreturn void run_rlimit_cpu_escalation_child(int report_fd)
+{
+    struct sigaction action = {
+        .sa_handler = rlimit_cpu_handler,
+    };
+    struct rlimit_cpu_burner_state state = {0};
+    const struct rlimit limit = {
+        .rlim_cur = 1,
+        .rlim_max = 3,
+    };
+    sigset_t cpu_signal;
+    pthread_t burner;
+
+    rlimit_cpu_hits = 0;
+    rlimit_cpu_signal_fd = -1;
+    sigemptyset(&action.sa_mask);
+    sigemptyset(&cpu_signal);
+    sigaddset(&cpu_signal, SIGXCPU);
+    if (sigaction(SIGXCPU, &action, NULL) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &cpu_signal, NULL) != 0) {
+        _Exit(90);
+    }
+
+    int result = pthread_create(&burner, NULL, rlimit_cpu_burner, &state);
+    if (result != 0 || wait_until_ready(&state.ready) != 0 || state.error != 0) {
+        _Exit(91);
+    }
+    if (setrlimit(RLIMIT_CPU, &limit) != 0 ||
+        pthread_sigmask(SIG_UNBLOCK, &cpu_signal, NULL) != 0) {
+        _Exit(92);
+    }
+    atomic_store_explicit(&state.start, 1, memory_order_release);
+
+    while (rlimit_cpu_hits == 0) {
+        struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = 5000000,
+        };
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR &&
+               rlimit_cpu_hits == 0) {
+        }
+    }
+
+    struct rlimit observed;
+    if (getrlimit(RLIMIT_CPU, &observed) != 0) {
+        _Exit(93);
+    }
+    const struct rlimit_cpu_report report = {
+        .soft = observed.rlim_cur,
+        .hard = observed.rlim_max,
+        .signal_hits = rlimit_cpu_hits,
+    };
+    ssize_t written;
+    do {
+        written = write(report_fd, &report, sizeof(report));
+    } while (written < 0 && errno == EINTR);
+    if (written != (ssize_t)sizeof(report)) {
+        _Exit(94);
+    }
+
+    for (;;) {
+        pause();
+    }
+}
+
+static int test_rlimit_cpu_escalation(void)
+{
+    int report_pipe[2];
+    if (pipe(report_pipe) != 0) {
+        return fail("rlimit-cpu-escalation-pipe");
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(report_pipe[0]);
+        close(report_pipe[1]);
+        return fail("rlimit-cpu-escalation-fork");
+    }
+    if (child == 0) {
+        close(report_pipe[0]);
+        run_rlimit_cpu_escalation_child(report_pipe[1]);
+    }
+
+    close(report_pipe[1]);
+    int status = 0;
+    if (waitpid_bounded(child, &status) != 0) {
+        close(report_pipe[0]);
+        return fail("rlimit-cpu-escalation-timeout");
+    }
+
+    struct rlimit_cpu_report report;
+    if (read_rlimit_cpu_report(report_pipe[0], &report) != 0) {
+        close(report_pipe[0]);
+        return fail("rlimit-cpu-escalation-report");
+    }
+    close(report_pipe[0]);
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL ||
+        report.soft != 2 || report.hard != 3 || report.signal_hits < 1) {
+        errno = EIO;
+        return fail("rlimit-cpu-escalation-result");
+    }
+
+    puts("CI_WAIT_BOUNDARY_RLIMIT_CPU_ESCALATION_OK soft_after_signal=2 "
+         "hard_signal=SIGKILL");
+    return 0;
+}
+
+static _Noreturn void run_rlimit_cpu_hard_only_child(int signal_fd)
+{
+    struct sigaction action = {
+        .sa_handler = rlimit_cpu_handler,
+    };
+    const struct rlimit limit = {
+        .rlim_cur = 1,
+        .rlim_max = 1,
+    };
+    sigset_t cpu_signal;
+
+    rlimit_cpu_hits = 0;
+    rlimit_cpu_signal_fd = signal_fd;
+    sigemptyset(&action.sa_mask);
+    sigemptyset(&cpu_signal);
+    sigaddset(&cpu_signal, SIGXCPU);
+    if (sigaction(SIGXCPU, &action, NULL) != 0 ||
+        pthread_sigmask(SIG_UNBLOCK, &cpu_signal, NULL) != 0 ||
+        setrlimit(RLIMIT_CPU, &limit) != 0) {
+        _Exit(95);
+    }
+    burn_cpu_forever();
+}
+
+static int test_rlimit_cpu_hard_only(void)
+{
+    int signal_pipe[2];
+    if (pipe(signal_pipe) != 0) {
+        return fail("rlimit-cpu-hard-only-pipe");
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(signal_pipe[0]);
+        close(signal_pipe[1]);
+        return fail("rlimit-cpu-hard-only-fork");
+    }
+    if (child == 0) {
+        close(signal_pipe[0]);
+        run_rlimit_cpu_hard_only_child(signal_pipe[1]);
+    }
+
+    close(signal_pipe[1]);
+    int status = 0;
+    if (waitpid_bounded(child, &status) != 0) {
+        close(signal_pipe[0]);
+        return fail("rlimit-cpu-hard-only-timeout");
+    }
+
+    unsigned char marker;
+    ssize_t read_result;
+    do {
+        read_result = read(signal_pipe[0], &marker, sizeof(marker));
+    } while (read_result < 0 && errno == EINTR);
+    close(signal_pipe[0]);
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL ||
+        read_result != 0) {
+        errno = EIO;
+        return fail("rlimit-cpu-hard-only-result");
+    }
+
+    puts("CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK signal=SIGKILL sigxcpu=0");
+    return 0;
+}
+
+static int expect_prlimit64_error(pid_t pid, unsigned int resource,
+                                  const struct rlimit *new_limit,
+                                  int expected_errno)
+{
+    errno = 0;
+    long result = syscall(SYS_prlimit64, pid, resource, new_limit, NULL);
+    if (result != -1 || errno != expected_errno) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_prlimit64_error_precedence(void)
+{
+    const struct rlimit *bad_limit = (const struct rlimit *)(uintptr_t)1;
+
+    if (expect_prlimit64_error(INT_MAX, UINT_MAX, bad_limit, EFAULT) != 0 ||
+        expect_prlimit64_error(0, UINT_MAX, bad_limit, EFAULT) != 0 ||
+        expect_prlimit64_error(INT_MAX, UINT_MAX, NULL, ESRCH) != 0) {
+        return fail("prlimit64-error-precedence");
+    }
+
+    puts("CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK bad_new=EFAULT "
+         "bad_pid_before_resource=ESRCH");
+    return 0;
+}
+
+static int run_prlimit64_transaction_child(void)
+{
+    struct rlimit initial;
+    if (getrlimit(RLIMIT_NOFILE, &initial) != 0 ||
+        initial.rlim_cur < 4 || initial.rlim_max < 4) {
+        return fail("prlimit64-transaction-initial");
+    }
+
+    struct rlimit replacement = {
+        .rlim_cur = initial.rlim_cur - 1,
+        .rlim_max = initial.rlim_max,
+    };
+    struct rlimit observed_old = {0};
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &replacement,
+                &observed_old) != 0 ||
+        observed_old.rlim_cur != initial.rlim_cur ||
+        observed_old.rlim_max != initial.rlim_max) {
+        return fail("prlimit64-transaction-old-new");
+    }
+
+    struct rlimit observed;
+    if (getrlimit(RLIMIT_NOFILE, &observed) != 0 ||
+        observed.rlim_cur != replacement.rlim_cur ||
+        observed.rlim_max != replacement.rlim_max) {
+        return fail("prlimit64-transaction-installed");
+    }
+
+    struct rlimit invalid = {
+        .rlim_cur = replacement.rlim_max,
+        .rlim_max = replacement.rlim_max - 1,
+    };
+    errno = 0;
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &invalid, NULL) != -1 ||
+        errno != EINVAL || getrlimit(RLIMIT_NOFILE, &observed) != 0 ||
+        observed.rlim_cur != replacement.rlim_cur ||
+        observed.rlim_max != replacement.rlim_max) {
+        errno = EIO;
+        return fail("prlimit64-transaction-rollback");
+    }
+
+    struct rlimit committed_before_fault = {
+        .rlim_cur = replacement.rlim_cur - 1,
+        .rlim_max = replacement.rlim_max,
+    };
+    errno = 0;
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &committed_before_fault,
+                (struct rlimit *)(uintptr_t)1) != -1 ||
+        errno != EFAULT || getrlimit(RLIMIT_NOFILE, &observed) != 0 ||
+        observed.rlim_cur != committed_before_fault.rlim_cur ||
+        observed.rlim_max != committed_before_fault.rlim_max) {
+        errno = EIO;
+        return fail("prlimit64-transaction-copyout");
+    }
+
+    return 0;
+}
+
+static int test_prlimit64_owner_transaction(void)
+{
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("prlimit64-transaction-fork");
+    }
+    if (child == 0) {
+        _exit(run_prlimit64_transaction_child() == 0 ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid_bounded(child, &status) != 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        errno = EIO;
+        return fail("prlimit64-transaction-child");
+    }
+
+    puts("CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK old_new=atomic "
+         "invalid=rollback copyout_fault=committed");
+    return 0;
+}
+
+static int test_legacy_limit_timer_error_precedence(void)
+{
+    const struct rlimit *bad_limit = (const struct rlimit *)(uintptr_t)1;
+    const struct itimerval *bad_timer =
+        (const struct itimerval *)(uintptr_t)1;
+
+    errno = 0;
+    if (syscall(SYS_setrlimit, UINT_MAX, bad_limit) != -1 ||
+        errno != EFAULT) {
+        errno = EIO;
+        return fail("setrlimit-error-precedence");
+    }
+
+    errno = 0;
+    if (syscall(SYS_setitimer, INT_MAX, bad_timer, NULL) != -1 ||
+        errno != EFAULT) {
+        errno = EIO;
+        return fail("setitimer-error-precedence");
+    }
+
+    puts("CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK "
+         "setrlimit_bad_new=EFAULT setitimer_bad_new=EFAULT");
+    return 0;
+}
+
 static long raw_futex(_Atomic uint32_t *word, int operation, uint32_t value,
                       const struct timespec *timeout)
 {
@@ -893,6 +1323,11 @@ int main(int argc, char **argv)
         test_timerfd_clock_step() != 0 ||
         test_itimer_periodic() != 0 ||
         test_cpu_itimers_without_syscall_edges() != 0 ||
+        test_rlimit_cpu_escalation() != 0 ||
+        test_rlimit_cpu_hard_only() != 0 ||
+        test_prlimit64_error_precedence() != 0 ||
+        test_prlimit64_owner_transaction() != 0 ||
+        test_legacy_limit_timer_error_precedence() != 0 ||
         test_futex_wake() != 0 ||
         test_futex_timeout() != 0 ||
         test_futex_waitv() != 0) {

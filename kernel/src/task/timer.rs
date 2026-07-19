@@ -1,15 +1,16 @@
 //! Time management module.
 
+#[cfg(test)]
+use alloc::vec::Vec;
 use alloc::{
     borrow::ToOwned,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
     future::{Future, poll_fn},
     pin::Pin,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -18,7 +19,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{
-    TimerCallbackRegisterError, TimerCallbackToken, cancel_timer_callback, current,
+    TimerCallbackRegisterError, TimerCallbackToken, cancel_timer_callback,
     future::{BlockOnError, block_on},
     register_timer_callback,
 };
@@ -32,8 +33,8 @@ use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
 use super::{
-    AsThread, ProcessData, send_queued_signal_to_process_data,
-    send_queued_signal_to_visible_thread, send_signal_to_process_data,
+    ProcessData, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
+    send_signal_to_process_data,
 };
 use crate::time::wall_time;
 
@@ -1169,10 +1170,6 @@ fn next_posix_timer_signal_token() -> u32 {
     }
 }
 
-// Set (sticky) when any process sets RLIMIT_CPU to a finite value, so the
-// per-fault/per-syscall update_rlimit_cpu can skip the current()+rlim path.
-pub static ANY_RLIMIT_CPU_SET: AtomicBool = AtomicBool::new(false);
-
 /// The type of interval timer.
 #[repr(i32)]
 #[allow(non_camel_case_types)]
@@ -1195,6 +1192,14 @@ impl ITimerType {
             ITimerType::Prof => Signo::SIGPROF,
         }
     }
+
+    fn process_cpu_now(self, usage: ProcessCpuUsage) -> Option<u64> {
+        match self {
+            ITimerType::Real => None,
+            ITimerType::Virtual => Some(usage.virtual_ns),
+            ITimerType::Prof => Some(usage.prof_ns),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1203,17 +1208,222 @@ pub(crate) struct ProcessTimerCharge {
     system_ns: usize,
 }
 
+impl ProcessTimerCharge {
+    fn total_ns(self) -> usize {
+        self.user_ns.saturating_add(self.system_ns)
+    }
+
+    fn is_empty(self) -> bool {
+        self.user_ns == 0 && self.system_ns == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ProcessCpuUsage {
+    virtual_ns: u64,
+    prof_ns: u64,
+    total_ns: u64,
+}
+
+fn add_process_cpu_nonwrapping(
+    counter: &core::sync::atomic::AtomicU64,
+    overflowed: &core::sync::atomic::AtomicBool,
+    delta: usize,
+) {
+    let delta = u64::try_from(delta).unwrap_or(u64::MAX);
+    if delta == 0 {
+        return;
+    }
+    if overflowed.load(Ordering::Acquire) {
+        return;
+    }
+
+    // One fixed atomic operation keeps the timer-IRQ producer bounded. The
+    // physical word may wrap at the overflow edge, but the durable marker is
+    // the logical high bit: every reader maps the whole clock domain to MAX
+    // after observing it, so no generation is ever reused.
+    let previous = counter.fetch_add(delta, Ordering::AcqRel);
+    if previous.checked_add(delta).is_none() {
+        overflowed.store(true, Ordering::Release);
+    }
+}
+
+fn account_eligible_process_cpu(
+    epoch: &core::sync::atomic::AtomicU64,
+    writers: &core::sync::atomic::AtomicUsize,
+    clock_ns: &core::sync::atomic::AtomicU64,
+    overflowed: &core::sync::atomic::AtomicBool,
+    local_epoch: &mut u64,
+    delta_ns: usize,
+) {
+    if delta_ns == 0 {
+        return;
+    }
+    let observed = epoch.load(Ordering::SeqCst);
+    if observed & 1 != 0 {
+        // An arm transition owns the cutoff. Conservatively omit this
+        // crossing interval; CPU timers may be late, but never consume time
+        // that began before their new generation.
+        return;
+    }
+
+    // Epoch and writer admission are separate words. These four crossing
+    // operations deliberately share the SeqCst order with the arming side so
+    // the writer and armer cannot both miss one another (store buffering).
+    writers.fetch_add(1, Ordering::SeqCst);
+    let stable = epoch.load(Ordering::SeqCst);
+    if stable == observed && stable & 1 == 0 {
+        if *local_epoch == stable {
+            add_process_cpu_nonwrapping(clock_ns, overflowed, delta_ns);
+        } else {
+            // The interval began under an older generation. Rebase the local
+            // cursor without charging it to the newly armed timer.
+            *local_epoch = stable;
+        }
+    }
+    writers.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn account_process_cpu(
+    proc_data: &ProcessData,
+    charge: ProcessTimerCharge,
+    virtual_epoch: &mut u64,
+    prof_epoch: &mut u64,
+) {
+    if charge.is_empty() {
+        return;
+    }
+
+    add_process_cpu_nonwrapping(
+        &proc_data.process_cpu_total_ns,
+        &proc_data.process_cpu_accounting_overflowed,
+        charge.total_ns(),
+    );
+    let armed = proc_data.process_itimer_cpu_armed.load(Ordering::Acquire);
+    if armed & PROCESS_ITIMER_VIRTUAL_PENDING != 0 {
+        account_eligible_process_cpu(
+            &proc_data.process_itimer_virtual_epoch,
+            &proc_data.process_itimer_virtual_writers,
+            &proc_data.process_itimer_virtual_clock_ns,
+            &proc_data.process_cpu_accounting_overflowed,
+            virtual_epoch,
+            charge.user_ns,
+        );
+    }
+    if armed & PROCESS_ITIMER_PROF_PENDING != 0 {
+        account_eligible_process_cpu(
+            &proc_data.process_itimer_prof_epoch,
+            &proc_data.process_itimer_prof_writers,
+            &proc_data.process_itimer_prof_clock_ns,
+            &proc_data.process_cpu_accounting_overflowed,
+            prof_epoch,
+            charge.total_ns(),
+        );
+    }
+}
+
+fn process_cpu_usage(proc_data: &ProcessData) -> ProcessCpuUsage {
+    if proc_data
+        .process_cpu_accounting_overflowed
+        .load(Ordering::Acquire)
+    {
+        return ProcessCpuUsage {
+            virtual_ns: u64::MAX,
+            prof_ns: u64::MAX,
+            total_ns: u64::MAX,
+        };
+    }
+    ProcessCpuUsage {
+        virtual_ns: proc_data
+            .process_itimer_virtual_clock_ns
+            .load(Ordering::Acquire),
+        prof_ns: proc_data
+            .process_itimer_prof_clock_ns
+            .load(Ordering::Acquire),
+        total_ns: proc_data.process_cpu_total_ns.load(Ordering::Relaxed),
+    }
+}
+
 const PROCESS_ITIMER_VIRTUAL_PENDING: u8 = 1 << 0;
 const PROCESS_ITIMER_PROF_PENDING: u8 = 1 << 1;
+const PROCESS_RLIMIT_CPU_SOFT_PENDING: u8 = 1 << 2;
+const PROCESS_RLIMIT_CPU_HARD_PENDING: u8 = 1 << 3;
+const PROCESS_CPU_EVALUATE_PENDING: u8 = 1 << 4;
 const PROCESS_ITIMER_CPU_ARMED_MASK: u8 =
     PROCESS_ITIMER_VIRTUAL_PENDING | PROCESS_ITIMER_PROF_PENDING;
+const PROCESS_CPU_POLICY_PENDING_MASK: u8 = PROCESS_ITIMER_CPU_ARMED_MASK
+    | PROCESS_RLIMIT_CPU_SOFT_PENDING
+    | PROCESS_RLIMIT_CPU_HARD_PENDING
+    | PROCESS_CPU_EVALUATE_PENDING;
 const PROCESS_ITIMER_WORK_BATCH: usize = 16;
-static PROCESS_ITIMER_WORK_HEAD: AtomicPtr<ProcessData> = AtomicPtr::new(ptr::null_mut());
+/// Intrusive node for the bounded process-timer MPSC ingress. A queued process
+/// retains one strong `Arc` in `owner`; the single consumer converts that raw
+/// strong reference back into an `Arc` after fully unlinking the node. The
+/// permanent stub has a null owner.
+pub(crate) struct ProcessITimerWorkNode {
+    next: AtomicPtr<ProcessITimerWorkNode>,
+    owner: AtomicPtr<ProcessData>,
+}
+
+impl ProcessITimerWorkNode {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next: AtomicPtr::new(ptr::null_mut()),
+            owner: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+
+static PROCESS_ITIMER_WORK_STUB: ProcessITimerWorkNode = ProcessITimerWorkNode::new();
+static PROCESS_ITIMER_WORK_TAIL: AtomicPtr<ProcessITimerWorkNode> = AtomicPtr::new(
+    &PROCESS_ITIMER_WORK_STUB as *const ProcessITimerWorkNode as *mut ProcessITimerWorkNode,
+);
+
+fn rebase_process_cpu_timer_clock(
+    owner: &ProcessData,
+    ty: ITimerType,
+) -> Result<(u64, u64), ProcessITimerSetAttemptError> {
+    let (epoch, writers, clock_ns) = match ty {
+        ITimerType::Real => return Ok((0, 0)),
+        ITimerType::Virtual => (
+            &owner.process_itimer_virtual_epoch,
+            &owner.process_itimer_virtual_writers,
+            &owner.process_itimer_virtual_clock_ns,
+        ),
+        ITimerType::Prof => (
+            &owner.process_itimer_prof_epoch,
+            &owner.process_itimer_prof_writers,
+            &owner.process_itimer_prof_clock_ns,
+        ),
+    };
+
+    let current = epoch.load(Ordering::SeqCst);
+    debug_assert_eq!(
+        current & 1,
+        0,
+        "CPU timer epoch owner observed a transition"
+    );
+    let next = current
+        .checked_add(2)
+        .ok_or(ProcessITimerSetAttemptError::Kernel(AxError::OutOfRange))?;
+
+    // The odd epoch closes admission for new IRQ writers. Writers already
+    // admitted under `current` retire in a fixed, allocation-free section;
+    // after they drain, the sampled clock is an exact arm cutoff.
+    epoch.store(current + 1, Ordering::SeqCst);
+    while writers.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
+    let baseline_ns = clock_ns.load(Ordering::Acquire);
+    epoch.store(next, Ordering::SeqCst);
+    Ok((baseline_ns, next))
+}
 
 #[derive(Debug)]
 struct ProcessITimer {
     interval_ns: usize,
     remaining_ns: usize,
+    cpu_deadline_ns: Option<u64>,
     sequence: u64,
 }
 
@@ -1222,28 +1432,29 @@ impl ProcessITimer {
         Self {
             interval_ns: 0,
             remaining_ns: 0,
+            cpu_deadline_ns: None,
             sequence: 0,
         }
     }
 
-    fn charge_cpu(&mut self, delta_ns: usize) -> bool {
-        if self.remaining_ns == 0 || delta_ns == 0 {
+    fn evaluate_cpu(&mut self, now_ns: u64) -> bool {
+        let Some(deadline_ns) = self.cpu_deadline_ns else {
             return false;
-        }
-        if delta_ns < self.remaining_ns {
-            self.remaining_ns -= delta_ns;
+        };
+        if now_ns < deadline_ns {
             return false;
         }
 
         if self.interval_ns == 0 {
-            self.remaining_ns = 0;
+            self.cpu_deadline_ns = None;
         } else {
-            let overshoot = (delta_ns - self.remaining_ns) % self.interval_ns;
-            self.remaining_ns = if overshoot == 0 {
-                self.interval_ns
-            } else {
-                self.interval_ns - overshoot
-            };
+            let interval_ns = self.interval_ns as u64;
+            let expirations = now_ns
+                .saturating_sub(deadline_ns)
+                .saturating_div(interval_ns.max(1))
+                .saturating_add(1);
+            self.cpu_deadline_ns =
+                Some(deadline_ns.saturating_add(interval_ns.saturating_mul(expirations)));
         }
         true
     }
@@ -1272,7 +1483,31 @@ impl ProcessITimers {
         }
     }
 
-    fn get(&self, ty: ITimerType) -> (TimeValue, TimeValue) {
+    fn cpu_remaining_at(timer: &ProcessITimer, now_ns: u64) -> usize {
+        timer
+            .cpu_deadline_ns
+            .map(|deadline_ns| {
+                if deadline_ns <= now_ns {
+                    // Linux keeps an expired-but-not-yet-consumed CPU timer
+                    // visibly armed by returning TICK_NSEC rather than zero.
+                    (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64).max(1)
+                } else {
+                    deadline_ns - now_ns
+                }
+            })
+            .unwrap_or(0)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn cpu_value_at(&self, ty: ITimerType, now_ns: u64) -> (TimeValue, TimeValue) {
+        let timer = &self.timers[ty as usize];
+        (
+            time_value_from_nanos(timer.interval_ns),
+            time_value_from_nanos(Self::cpu_remaining_at(timer, now_ns)),
+        )
+    }
+
+    fn get(&self, owner: &ProcessData, ty: ITimerType) -> (TimeValue, TimeValue) {
         let timer = &self.timers[ty as usize];
         let remaining_ns = if ty == ITimerType::Real {
             self.real_deadline
@@ -1284,7 +1519,10 @@ impl ProcessITimers {
                 })
                 .unwrap_or(0)
         } else {
-            timer.remaining_ns
+            let now_ns = ty
+                .process_cpu_now(process_cpu_usage(owner))
+                .expect("CPU timer has a process CPU clock");
+            Self::cpu_remaining_at(timer, now_ns)
         };
         (
             time_value_from_nanos(timer.interval_ns),
@@ -1301,11 +1539,20 @@ impl ProcessITimers {
         admitted_alarm: &mut Option<AlarmToken>,
     ) -> Result<ProcessITimerSetOutcome, ProcessITimerSetAttemptError> {
         let index = ty as usize;
-        let old = self.get(ty);
         let sequence = self.timers[index]
             .sequence
             .checked_add(1)
             .ok_or(ProcessITimerSetAttemptError::Kernel(AxError::OutOfRange))?;
+        let (old, cpu_deadline_ns, cpu_epoch) = if ty == ITimerType::Real {
+            (self.get(owner, ty), None, None)
+        } else {
+            let requested_ns = u64::try_from(remaining_ns)
+                .map_err(|_| ProcessITimerSetAttemptError::Kernel(AxError::OutOfRange))?;
+            let (baseline_ns, epoch) = rebase_process_cpu_timer_clock(owner, ty)?;
+            let old = self.cpu_value_at(ty, baseline_ns);
+            let deadline = (remaining_ns != 0).then(|| baseline_ns.saturating_add(requested_ns));
+            (old, deadline, Some(epoch))
+        };
 
         if ty == ITimerType::Real && remaining_ns != 0 && self.real_alarm.is_none() {
             let Some(alarm) = admitted_alarm.take() else {
@@ -1317,6 +1564,7 @@ impl ProcessITimers {
         let timer = &mut self.timers[index];
         timer.interval_ns = interval_ns;
         timer.remaining_ns = remaining_ns;
+        timer.cpu_deadline_ns = cpu_deadline_ns;
         timer.sequence = sequence;
         owner
             .process_itimer_cpu_armed
@@ -1348,25 +1596,35 @@ impl ProcessITimers {
                 )
         };
 
-        Ok(ProcessITimerSetOutcome { old, publication })
+        Ok(ProcessITimerSetOutcome {
+            old,
+            publication,
+            cpu_epoch,
+        })
     }
 
     fn cpu_armed_mask(&self) -> u8 {
         let mut mask = 0;
-        if self.timers[ITimerType::Virtual as usize].remaining_ns != 0 {
+        if self.timers[ITimerType::Virtual as usize]
+            .cpu_deadline_ns
+            .is_some()
+        {
             mask |= PROCESS_ITIMER_VIRTUAL_PENDING;
         }
-        if self.timers[ITimerType::Prof as usize].remaining_ns != 0 {
+        if self.timers[ITimerType::Prof as usize]
+            .cpu_deadline_ns
+            .is_some()
+        {
             mask |= PROCESS_ITIMER_PROF_PENDING;
         }
         mask
     }
 
-    fn charge_cpu(&mut self, charge: ProcessTimerCharge) -> ProcessITimerSignals {
+    fn evaluate_cpu(&mut self, usage: ProcessCpuUsage) -> ProcessITimerSignals {
         ProcessITimerSignals {
-            virtual_expired: self.timers[ITimerType::Virtual as usize].charge_cpu(charge.user_ns),
-            prof_expired: self.timers[ITimerType::Prof as usize]
-                .charge_cpu(charge.user_ns.saturating_add(charge.system_ns)),
+            virtual_expired: self.timers[ITimerType::Virtual as usize]
+                .evaluate_cpu(usage.virtual_ns),
+            prof_expired: self.timers[ITimerType::Prof as usize].evaluate_cpu(usage.prof_ns),
         }
     }
 
@@ -1423,15 +1681,10 @@ impl ProcessITimers {
 mod process_itimer_tests {
     use super::*;
 
-    fn arm_cpu_timer(
-        timers: &mut ProcessITimers,
-        ty: ITimerType,
-        interval: usize,
-        remaining: usize,
-    ) {
+    fn arm_cpu_timer(timers: &mut ProcessITimers, ty: ITimerType, interval: usize, deadline: u64) {
         let timer = &mut timers.timers[ty as usize];
         timer.interval_ns = interval;
-        timer.remaining_ns = remaining;
+        timer.cpu_deadline_ns = Some(deadline);
     }
 
     #[test]
@@ -1440,9 +1693,10 @@ mod process_itimer_tests {
         arm_cpu_timer(&mut timers, ITimerType::Virtual, 0, 5);
         arm_cpu_timer(&mut timers, ITimerType::Prof, 0, 5);
 
-        let signals = timers.charge_cpu(ProcessTimerCharge {
-            user_ns: 0,
-            system_ns: 5,
+        let signals = timers.evaluate_cpu(ProcessCpuUsage {
+            virtual_ns: 0,
+            prof_ns: 5,
+            total_ns: 5,
         });
         assert_eq!(
             signals,
@@ -1451,12 +1705,19 @@ mod process_itimer_tests {
                 prof_expired: true,
             }
         );
-        assert_eq!(timers.timers[ITimerType::Virtual as usize].remaining_ns, 5);
-        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 0);
+        assert_eq!(
+            timers.timers[ITimerType::Virtual as usize].cpu_deadline_ns,
+            Some(5)
+        );
+        assert_eq!(
+            timers.timers[ITimerType::Prof as usize].cpu_deadline_ns,
+            None
+        );
 
-        let signals = timers.charge_cpu(ProcessTimerCharge {
-            user_ns: 5,
-            system_ns: 0,
+        let signals = timers.evaluate_cpu(ProcessCpuUsage {
+            virtual_ns: 5,
+            prof_ns: 10,
+            total_ns: 10,
         });
         assert_eq!(
             signals,
@@ -1473,13 +1734,17 @@ mod process_itimer_tests {
         let mut timers = ProcessITimers::new();
         arm_cpu_timer(&mut timers, ITimerType::Virtual, 10, 4);
 
-        let signals = timers.charge_cpu(ProcessTimerCharge {
-            user_ns: 27,
-            system_ns: 0,
+        let signals = timers.evaluate_cpu(ProcessCpuUsage {
+            virtual_ns: 27,
+            prof_ns: 27,
+            total_ns: 27,
         });
         assert!(signals.virtual_expired);
         assert!(!signals.prof_expired);
-        assert_eq!(timers.timers[ITimerType::Virtual as usize].remaining_ns, 7);
+        assert_eq!(
+            timers.timers[ITimerType::Virtual as usize].cpu_deadline_ns,
+            Some(34)
+        );
         assert_eq!(timers.cpu_armed_mask(), PROCESS_ITIMER_VIRTUAL_PENDING);
     }
 
@@ -1490,29 +1755,405 @@ mod process_itimer_tests {
 
         assert!(
             !timers
-                .charge_cpu(ProcessTimerCharge {
-                    user_ns: 3,
-                    system_ns: 4,
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: 3,
+                    prof_ns: 7,
+                    total_ns: 7,
                 })
                 .prof_expired
         );
-        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 1);
+        assert_eq!(
+            timers.timers[ITimerType::Prof as usize].cpu_deadline_ns,
+            Some(8)
+        );
         assert!(
             timers
-                .charge_cpu(ProcessTimerCharge {
-                    user_ns: 0,
-                    system_ns: 1,
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: 3,
+                    prof_ns: 8,
+                    total_ns: 8,
                 })
                 .prof_expired
         );
-        assert_eq!(timers.timers[ITimerType::Prof as usize].remaining_ns, 0);
+        assert_eq!(
+            timers.timers[ITimerType::Prof as usize].cpu_deadline_ns,
+            None
+        );
         assert!(
             !timers
-                .charge_cpu(ProcessTimerCharge {
-                    user_ns: usize::MAX,
-                    system_ns: usize::MAX,
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: u64::MAX,
+                    prof_ns: u64::MAX,
+                    total_ns: u64::MAX,
                 })
                 .prof_expired
+        );
+    }
+
+    #[test]
+    fn absolute_cpu_deadline_does_not_consume_pre_arm_usage() {
+        let mut timers = ProcessITimers::new();
+        arm_cpu_timer(&mut timers, ITimerType::Virtual, 0, 105);
+
+        assert!(
+            !timers
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: 104,
+                    prof_ns: 104,
+                    total_ns: 104,
+                })
+                .virtual_expired
+        );
+        assert!(
+            timers
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: 105,
+                    prof_ns: 105,
+                    total_ns: 105,
+                })
+                .virtual_expired
+        );
+    }
+
+    #[test]
+    fn eligible_clock_rebases_the_first_cross_generation_interval() {
+        let epoch = core::sync::atomic::AtomicU64::new(0);
+        let writers = core::sync::atomic::AtomicUsize::new(0);
+        let clock_ns = core::sync::atomic::AtomicU64::new(0);
+        let overflowed = core::sync::atomic::AtomicBool::new(false);
+        let mut local_epoch = 0;
+
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &clock_ns,
+            &overflowed,
+            &mut local_epoch,
+            5,
+        );
+        assert_eq!(clock_ns.load(Ordering::Relaxed), 5);
+
+        epoch.store(2, Ordering::Release);
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &clock_ns,
+            &overflowed,
+            &mut local_epoch,
+            7,
+        );
+        assert_eq!(local_epoch, 2);
+        assert_eq!(clock_ns.load(Ordering::Relaxed), 5);
+
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &clock_ns,
+            &overflowed,
+            &mut local_epoch,
+            3,
+        );
+        assert_eq!(clock_ns.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn two_poll_arm_cutoff_charges_lifetime_without_consuming_new_prof_timer() {
+        let epoch = core::sync::atomic::AtomicU64::new(0);
+        let writers = core::sync::atomic::AtomicUsize::new(0);
+        let eligible_ns = core::sync::atomic::AtomicU64::new(0);
+        let lifetime_ns = core::sync::atomic::AtomicU64::new(0);
+        let overflowed = core::sync::atomic::AtomicBool::new(false);
+        let mut local_epoch = 0;
+
+        // The pre-arm poll closes the interval that began before the syscall.
+        add_process_cpu_nonwrapping(&lifetime_ns, &overflowed, 5);
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &eligible_ns,
+            &overflowed,
+            &mut local_epoch,
+            5,
+        );
+
+        // Arming publishes a fresh stable generation. The second poll still
+        // charges lifetime CPU, but rebases its local cursor instead of
+        // relabeling the crossing interval as newly eligible PROF time.
+        epoch.store(2, Ordering::SeqCst);
+        add_process_cpu_nonwrapping(&lifetime_ns, &overflowed, 7);
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &eligible_ns,
+            &overflowed,
+            &mut local_epoch,
+            7,
+        );
+        assert_eq!(lifetime_ns.load(Ordering::Relaxed), 12);
+        assert_eq!(eligible_ns.load(Ordering::Relaxed), 5);
+        assert_eq!(local_epoch, 2);
+
+        // Only the next interval belongs to the newly armed generation.
+        add_process_cpu_nonwrapping(&lifetime_ns, &overflowed, 3);
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &eligible_ns,
+            &overflowed,
+            &mut local_epoch,
+            3,
+        );
+        assert_eq!(lifetime_ns.load(Ordering::Relaxed), 15);
+        assert_eq!(eligible_ns.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn odd_arm_epoch_closes_writer_admission_without_relabeling_debt() {
+        let epoch = core::sync::atomic::AtomicU64::new(1);
+        let writers = core::sync::atomic::AtomicUsize::new(0);
+        let clock_ns = core::sync::atomic::AtomicU64::new(0);
+        let overflowed = core::sync::atomic::AtomicBool::new(false);
+        let mut local_epoch = 0;
+
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &clock_ns,
+            &overflowed,
+            &mut local_epoch,
+            7,
+        );
+        assert_eq!(local_epoch, 0);
+        assert_eq!(clock_ns.load(Ordering::Relaxed), 0);
+
+        epoch.store(2, Ordering::Release);
+        account_eligible_process_cpu(
+            &epoch,
+            &writers,
+            &clock_ns,
+            &overflowed,
+            &mut local_epoch,
+            7,
+        );
+        assert_eq!(local_epoch, 2);
+        assert_eq!(clock_ns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn seq_cst_arm_gate_excludes_every_old_writer_interleaving() {
+        #[derive(Clone, Copy)]
+        struct Model {
+            epoch: u64,
+            writers: usize,
+            writer_observed: u64,
+            local_epoch: u64,
+            baseline_taken: bool,
+            writer_step: u8,
+            armer_step: u8,
+        }
+
+        fn explore(model: Model, completed: &mut usize) {
+            if model.writer_step == 4 && model.armer_step == 4 {
+                *completed += 1;
+                return;
+            }
+
+            if model.writer_step < 4 {
+                let mut next = model;
+                match next.writer_step {
+                    0 => next.writer_observed = next.epoch,
+                    1 => next.writers += 1,
+                    2 => {
+                        if next.epoch == next.writer_observed
+                            && next.epoch & 1 == 0
+                            && next.local_epoch == next.epoch
+                        {
+                            assert!(
+                                !next.baseline_taken,
+                                "an old-generation writer published after the arm baseline"
+                            );
+                        } else if next.epoch & 1 == 0 {
+                            next.local_epoch = next.epoch;
+                        }
+                    }
+                    3 => next.writers -= 1,
+                    _ => unreachable!(),
+                }
+                next.writer_step += 1;
+                explore(next, completed);
+            }
+
+            if model.armer_step < 4 && (model.armer_step != 1 || model.writers == 0) {
+                let mut next = model;
+                match next.armer_step {
+                    0 => next.epoch = 1,
+                    1 => {}
+                    2 => next.baseline_taken = true,
+                    3 => next.epoch = 2,
+                    _ => unreachable!(),
+                }
+                next.armer_step += 1;
+                explore(next, completed);
+            }
+        }
+
+        let mut completed = 0;
+        explore(
+            Model {
+                epoch: 0,
+                writers: 0,
+                writer_observed: 0,
+                local_epoch: 0,
+                baseline_taken: false,
+                writer_step: 0,
+                armer_step: 0,
+            },
+            &mut completed,
+        );
+        assert!(completed != 0);
+    }
+
+    #[test]
+    fn expired_cpu_timer_stays_visibly_armed_until_worker_consumes_it() {
+        let mut timers = ProcessITimers::new();
+        arm_cpu_timer(&mut timers, ITimerType::Prof, 0, 8);
+        let (_, remaining) = timers.cpu_value_at(ITimerType::Prof, 8);
+        assert_eq!(
+            remaining.as_nanos(),
+            (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64).max(1) as u128
+        );
+
+        assert!(
+            timers
+                .evaluate_cpu(ProcessCpuUsage {
+                    virtual_ns: 0,
+                    prof_ns: 8,
+                    total_ns: 8,
+                })
+                .prof_expired
+        );
+        let (_, remaining) = timers.cpu_value_at(ITimerType::Prof, 8);
+        assert_eq!(remaining.as_nanos(), 0);
+    }
+
+    #[test]
+    fn seq_cst_pending_handoff_never_strands_the_last_request() {
+        #[derive(Clone, Copy)]
+        struct Model {
+            pending: bool,
+            queued: bool,
+            consumer_observed_pending: bool,
+            producer_step: u8,
+            consumer_step: u8,
+        }
+
+        fn explore(model: Model, completed: &mut usize) {
+            if model.producer_step == 2 && model.consumer_step == 3 {
+                *completed += 1;
+                assert!(
+                    !model.pending || model.queued,
+                    "a published CPU-policy request was left without a queue owner"
+                );
+                return;
+            }
+
+            if model.producer_step < 2 {
+                let mut next = model;
+                match next.producer_step {
+                    // pending.fetch_or(..., SeqCst)
+                    0 => next.pending = true,
+                    // queued.compare_exchange(..., SeqCst, SeqCst)
+                    1 if !next.queued => next.queued = true,
+                    1 => {}
+                    _ => unreachable!(),
+                }
+                next.producer_step += 1;
+                explore(next, completed);
+            }
+
+            if model.consumer_step < 3 {
+                let mut next = model;
+                match next.consumer_step {
+                    // queued.store(false, SeqCst)
+                    0 => next.queued = false,
+                    // pending.load(SeqCst)
+                    1 => next.consumer_observed_pending = next.pending,
+                    // publish_process_itimer_work() after a positive recheck
+                    2 if next.consumer_observed_pending && !next.queued => next.queued = true,
+                    2 => {}
+                    _ => unreachable!(),
+                }
+                next.consumer_step += 1;
+                explore(next, completed);
+            }
+        }
+
+        let mut completed = 0;
+        explore(
+            Model {
+                // The worker already popped the old queue node and swapped its
+                // old pending bits. A concurrent producer now races the final
+                // queued=false / pending recheck handoff.
+                pending: false,
+                queued: true,
+                consumer_observed_pending: false,
+                producer_step: 0,
+                consumer_step: 0,
+            },
+            &mut completed,
+        );
+        assert_eq!(completed, 10);
+    }
+
+    #[test]
+    fn process_cpu_overflow_marker_closes_the_logical_clock_domain() {
+        let counter = core::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        let overflowed = core::sync::atomic::AtomicBool::new(false);
+        add_process_cpu_nonwrapping(&counter, &overflowed, 2);
+        assert!(overflowed.load(Ordering::Acquire));
+        let wrapped = counter.load(Ordering::Relaxed);
+        add_process_cpu_nonwrapping(&counter, &overflowed, 7);
+        assert_eq!(counter.load(Ordering::Relaxed), wrapped);
+    }
+
+    #[test]
+    fn rlimit_soft_transition_is_visible_and_repeats_each_cpu_second() {
+        let infinity = RLIM_INFINITY as i64 as u64;
+        assert_eq!(
+            process_cpu_limit_transition(NANOS_PER_SEC - 1, 1, 4),
+            ProcessCpuLimitTransition::None
+        );
+        assert_eq!(
+            process_cpu_limit_transition(NANOS_PER_SEC, 1, 4),
+            ProcessCpuLimitTransition::Soft { next_limit: 2 }
+        );
+        assert_eq!(
+            process_cpu_limit_transition(2 * NANOS_PER_SEC, 2, 4),
+            ProcessCpuLimitTransition::Soft { next_limit: 3 }
+        );
+        assert_eq!(
+            process_cpu_limit_transition(u64::MAX, infinity, infinity),
+            ProcessCpuLimitTransition::None
+        );
+    }
+
+    #[test]
+    fn rlimit_hard_transition_has_priority_and_large_soft_steps_stay_bounded() {
+        assert_eq!(
+            process_cpu_limit_transition(NANOS_PER_SEC, 1, 1),
+            ProcessCpuLimitTransition::Hard
+        );
+        assert_eq!(
+            process_cpu_limit_transition(3 * NANOS_PER_SEC, 1, 4),
+            ProcessCpuLimitTransition::Soft { next_limit: 2 }
+        );
+        assert_eq!(
+            process_cpu_limit_transition(0, 0, 2),
+            ProcessCpuLimitTransition::Soft { next_limit: 1 }
+        );
+        assert_eq!(
+            process_cpu_limit_transition(0, 0, 0),
+            ProcessCpuLimitTransition::Hard
         );
     }
 }
@@ -1525,6 +2166,7 @@ enum ProcessITimerSetAttemptError {
 struct ProcessITimerSetOutcome {
     old: (TimeValue, TimeValue),
     publication: AlarmPublication,
+    cpu_epoch: Option<u64>,
 }
 
 struct ProcessITimerFireOutcome {
@@ -1541,7 +2183,7 @@ pub(crate) fn get_process_itimer(
     proc_data: &ProcessData,
     ty: ITimerType,
 ) -> (TimeValue, TimeValue) {
-    proc_data.process_itimers.lock().get(ty)
+    proc_data.process_itimers.lock().get(proc_data, ty)
 }
 
 pub(crate) fn set_process_itimer(
@@ -1549,7 +2191,7 @@ pub(crate) fn set_process_itimer(
     ty: ITimerType,
     interval_ns: usize,
     remaining_ns: usize,
-) -> AxResult<(TimeValue, TimeValue)> {
+) -> AxResult<((TimeValue, TimeValue), Option<u64>)> {
     let mut admitted_alarm = None;
     loop {
         let attempt = proc_data.process_itimers.lock().try_set(
@@ -1563,7 +2205,7 @@ pub(crate) fn set_process_itimer(
             Ok(outcome) => {
                 outcome.publication.publish();
                 drop(admitted_alarm);
-                return Ok(outcome.old);
+                return Ok((outcome.old, outcome.cpu_epoch));
             }
             Err(ProcessITimerSetAttemptError::NeedAlarmToken) => {
                 debug_assert!(admitted_alarm.is_none());
@@ -1580,18 +2222,48 @@ pub(crate) fn set_process_itimer(
     }
 }
 
-pub(crate) fn charge_process_itimers(
-    proc_data: &Arc<ProcessData>,
-    charge: ProcessTimerCharge,
-) -> bool {
-    if charge == ProcessTimerCharge::default()
-        || proc_data.process_itimer_cpu_armed.load(Ordering::Acquire) == 0
-    {
-        return false;
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ProcessCpuPolicyEvaluation {
+    signals: u8,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProcessCpuLimitTransition {
+    None,
+    Soft { next_limit: u64 },
+    Hard,
+}
+
+fn process_cpu_limit_transition(
+    total_ns: u64,
+    soft_limit: u64,
+    hard_limit: u64,
+) -> ProcessCpuLimitTransition {
+    if hard_limit != RLIM_INFINITY as i64 as u64 && total_ns >= cpu_limit_threshold_ns(hard_limit) {
+        return ProcessCpuLimitTransition::Hard;
     }
-    let signals = {
+    if soft_limit == RLIM_INFINITY as i64 as u64 || total_ns < cpu_limit_threshold_ns(soft_limit) {
+        return ProcessCpuLimitTransition::None;
+    }
+
+    let next_limit = soft_limit
+        .checked_add(1)
+        .unwrap_or(RLIM_INFINITY as i64 as u64)
+        .min(hard_limit);
+    ProcessCpuLimitTransition::Soft { next_limit }
+}
+
+fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicyEvaluation {
+    let timer_armed = proc_data.process_itimer_cpu_armed.load(Ordering::Acquire) != 0;
+    let rlimit_active = proc_data.process_rlimit_cpu_active.load(Ordering::Acquire);
+    if !timer_armed && !rlimit_active {
+        return ProcessCpuPolicyEvaluation::default();
+    }
+
+    let usage = process_cpu_usage(proc_data);
+    let signals = if timer_armed {
         let mut timers = proc_data.process_itimers.lock();
-        let signals = timers.charge_cpu(charge);
+        let signals = timers.evaluate_cpu(usage);
         // Publish the fast-path mask while still holding the state owner lock.
         // set_process_itimer() uses the same lock, so a later arm/disarm cannot
         // be overwritten by an older accounting snapshot after lock release.
@@ -1599,7 +2271,10 @@ pub(crate) fn charge_process_itimers(
             .process_itimer_cpu_armed
             .store(timers.cpu_armed_mask(), Ordering::Release);
         signals
+    } else {
+        ProcessITimerSignals::default()
     };
+
     let mut pending = 0;
     if signals.virtual_expired {
         pending |= PROCESS_ITIMER_VIRTUAL_PENDING;
@@ -1607,115 +2282,176 @@ pub(crate) fn charge_process_itimers(
     if signals.prof_expired {
         pending |= PROCESS_ITIMER_PROF_PENDING;
     }
-    if pending != 0 {
+
+    if rlimit_active {
+        let mut limits = proc_data.rlim.write();
+        let limit = &mut limits[RLIMIT_CPU];
+        let soft_limit = limit.current;
+        let hard_limit = limit.max;
+        match process_cpu_limit_transition(usage.total_ns, soft_limit, hard_limit) {
+            ProcessCpuLimitTransition::Hard => {
+                // SIGKILL is a terminal process-directed publication. Disable
+                // further evaluations before releasing the canonical rlimit
+                // owner so concurrent accounting boundaries cannot duplicate its
+                // ownership.
+                proc_data
+                    .process_rlimit_cpu_active
+                    .store(false, Ordering::Release);
+                pending |= PROCESS_RLIMIT_CPU_HARD_PENDING;
+            }
+            ProcessCpuLimitTransition::None => {
+                if soft_limit == RLIM_INFINITY as i64 as u64 {
+                    proc_data
+                        .process_rlimit_cpu_active
+                        .store(false, Ordering::Release);
+                }
+            }
+            ProcessCpuLimitTransition::Soft { next_limit } => {
+                // Linux exposes this transition through getrlimit(2): after each
+                // soft crossing, rlim_cur itself advances by one CPU second and
+                // remains the single canonical threshold for the next crossing.
+                limit.current = next_limit;
+                pending |= PROCESS_RLIMIT_CPU_SOFT_PENDING;
+            }
+        }
+    }
+
+    ProcessCpuPolicyEvaluation { signals: pending }
+}
+
+/// Publishes a coalescible evaluation request after CPU-clock counters have
+/// advanced. The producer path is allocation-free and contains no Linux
+/// signal or rlimit policy; the dedicated worker is the only evaluator.
+pub(crate) fn request_process_cpu_evaluation(proc_data: &Arc<ProcessData>) -> bool {
+    if proc_data.process_itimer_cpu_armed.load(Ordering::Acquire) != 0
+        || proc_data.process_rlimit_cpu_active.load(Ordering::Acquire)
+    {
+        // Pending publication and queue ownership share the worker's SeqCst
+        // handoff order; either side must observe responsibility for the last
+        // request even though the state lives in two atomic words.
         proc_data
             .process_itimer_pending
-            .fetch_or(pending, Ordering::Release);
+            .fetch_or(PROCESS_CPU_EVALUATE_PENDING, Ordering::SeqCst);
         publish_process_itimer_work(proc_data);
         true
     } else {
-        false
+        proc_data.process_itimer_work_queued.load(Ordering::Acquire)
     }
 }
 
 fn publish_process_itimer_work(proc_data: &Arc<ProcessData>) {
     if proc_data
         .process_itimer_work_queued
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
     }
 
-    let retained = proc_data.clone();
-    let replaced = proc_data.process_itimer_work_owner.lock().replace(retained);
-    assert!(
-        replaced.is_none(),
-        "process timer work owner published twice"
-    );
-    drop(replaced);
+    // Prevent a task-context producer from being descheduled inside the
+    // two-instruction MPSC link publication. IRQ callers are already in this
+    // state. No lock, allocation, or retry loop is used here.
+    let _guard = NoPreempt::new();
+    // Arc cloning is one bounded refcount operation and allocates nothing.
+    // The raw strong reference is transferred to the queue and reconstructed
+    // exactly once by the single consumer.
+    let owner = Arc::into_raw(proc_data.clone()).cast_mut();
 
-    let node = Arc::as_ptr(proc_data).cast_mut();
-    let mut head = PROCESS_ITIMER_WORK_HEAD.load(Ordering::Acquire);
-    loop {
-        proc_data
-            .process_itimer_work_next
-            .store(head, Ordering::Relaxed);
-        match PROCESS_ITIMER_WORK_HEAD.compare_exchange_weak(
-            head,
-            node,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return,
-            Err(observed) => head = observed,
-        }
-    }
+    let node = &proc_data.process_itimer_work_node;
+    node.owner.store(owner, Ordering::Relaxed);
+    node.next.store(ptr::null_mut(), Ordering::Relaxed);
+    let node = ptr::from_ref(node).cast_mut();
+    let previous = PROCESS_ITIMER_WORK_TAIL.swap(node, Ordering::AcqRel);
+    // Release is the publication point. The caller wakes the worker only after
+    // this store, so the consumer may return NotReady on the transient tail
+    // gap without losing progress.
+    unsafe { &*previous }.next.store(node, Ordering::Release);
 }
 
 pub(crate) fn has_deferred_process_itimer_work() -> bool {
-    !PROCESS_ITIMER_WORK_HEAD.load(Ordering::Acquire).is_null()
+    let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+    let tail = PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire);
+    tail != stub
+        || !PROCESS_ITIMER_WORK_STUB
+            .next
+            .load(Ordering::Acquire)
+            .is_null()
 }
 
-/// Single-consumer state for the process-timer ingress stack. Detaching and
-/// reversing one producer snapshot gives FIFO service: a hot process may
-/// republish only into the next ingress snapshot and therefore cannot jump in
-/// front of older nodes retained in `backlog`.
+/// Single-consumer state for the bounded FIFO process-timer MPSC ingress.
 pub(crate) struct ProcessITimerWorkConsumer {
-    backlog: *mut ProcessData,
+    head: *mut ProcessITimerWorkNode,
 }
 
 impl ProcessITimerWorkConsumer {
     pub(crate) const fn new() -> Self {
         Self {
-            backlog: ptr::null_mut(),
+            head: &PROCESS_ITIMER_WORK_STUB as *const ProcessITimerWorkNode
+                as *mut ProcessITimerWorkNode,
         }
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        !self.backlog.is_null() || has_deferred_process_itimer_work()
+        let tail = PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire);
+        // SAFETY: `head` is either the permanent stub or a process node whose
+        // queue-owned Arc remains retained until pop advances past it.
+        let next = unsafe { &*self.head }.next.load(Ordering::Acquire);
+        if !next.is_null() {
+            return true;
+        }
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+        // `head != tail && next == null` is the bounded producer link gap.
+        // Report NotReady and rely on the producer's post-link wake; the
+        // register-then-check worker wait closes the wake-before-sleep race.
+        self.head != stub && self.head == tail
     }
 
-    fn refill(&mut self) {
-        if !self.backlog.is_null() {
-            return;
-        }
-
-        let mut ingress = PROCESS_ITIMER_WORK_HEAD.swap(ptr::null_mut(), Ordering::AcqRel);
-        let mut fifo = ptr::null_mut();
-        while !ingress.is_null() {
-            // SAFETY: each published node retains a self Arc and remains
-            // `queued`. Producers can only prepend to the global ingress and
-            // cannot republish a detached node. This dedicated consumer owns
-            // every `next` link in the detached snapshot.
-            let node = unsafe { &*ingress };
-            let next = node.process_itimer_work_next.load(Ordering::Relaxed);
-            node.process_itimer_work_next.store(fifo, Ordering::Relaxed);
-            fifo = ingress;
-            ingress = next;
-        }
-        self.backlog = fifo;
+    fn push_stub(&self) {
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+        PROCESS_ITIMER_WORK_STUB
+            .next
+            .store(ptr::null_mut(), Ordering::Relaxed);
+        let previous = PROCESS_ITIMER_WORK_TAIL.swap(stub, Ordering::AcqRel);
+        // SAFETY: the single consumer injects the stub only while `previous`
+        // is its current head and therefore still retained.
+        unsafe { &*previous }.next.store(stub, Ordering::Release);
     }
 
     fn pop(&mut self) -> Option<Arc<ProcessData>> {
-        self.refill();
-        let head = self.backlog;
-        if head.is_null() {
-            return None;
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+        let mut head = self.head;
+        // SAFETY: see `has_pending`; the single consumer owns `head` updates.
+        let mut next = unsafe { &*head }.next.load(Ordering::Acquire);
+        if head == stub {
+            if next.is_null() {
+                return None;
+            }
+            self.head = next;
+            head = next;
+            next = unsafe { &*head }.next.load(Ordering::Acquire);
         }
 
-        // SAFETY: `refill` detached this FIFO snapshot from all producers.
-        // The queued node's self Arc keeps it alive until the owner is taken.
-        let node = unsafe { &*head };
-        self.backlog = node.process_itimer_work_next.load(Ordering::Relaxed);
-        node.process_itimer_work_next
-            .store(ptr::null_mut(), Ordering::Relaxed);
-        Some(
-            node.process_itimer_work_owner
-                .lock()
-                .take()
-                .expect("queued process timer work lost its self owner"),
-        )
+        if next.is_null() {
+            if head != PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire) {
+                // A producer has swapped the tail but has not yet linked its
+                // predecessor. It will publish next with Release and wake us.
+                return None;
+            }
+            self.push_stub();
+            next = unsafe { &*head }.next.load(Ordering::Acquire);
+            if next.is_null() {
+                return None;
+            }
+        }
+
+        self.head = next;
+        let owner = unsafe { &*head }
+            .owner
+            .swap(ptr::null_mut(), Ordering::AcqRel);
+        assert!(!owner.is_null(), "process timer queue node lost its owner");
+        // SAFETY: publish transferred exactly one strong count into `owner`,
+        // and advancing `head` has now fully unlinked this reusable node.
+        Some(unsafe { Arc::from_raw(owner) })
     }
 
     pub(crate) fn drain_batch(&mut self) -> usize {
@@ -1724,14 +2460,36 @@ impl ProcessITimerWorkConsumer {
             let Some(proc_data) = self.pop() else {
                 break;
             };
-            let pending = proc_data.process_itimer_pending.swap(0, Ordering::AcqRel);
+            let mut pending = proc_data.process_itimer_pending.swap(0, Ordering::SeqCst);
+            if pending & PROCESS_CPU_EVALUATE_PENDING != 0 {
+                let evaluation = evaluate_process_cpu_policy(&proc_data);
+                pending = (pending & !PROCESS_CPU_EVALUATE_PENDING) | evaluation.signals;
+            }
+            if pending & PROCESS_RLIMIT_CPU_HARD_PENDING != 0 {
+                // A terminal hard crossing owns this worker pass. Do not
+                // publish a soft signal prepared from the same aggregate
+                // snapshot.
+                pending &= !PROCESS_RLIMIT_CPU_SOFT_PENDING;
+            }
             proc_data
                 .process_itimer_work_queued
-                .store(false, Ordering::Release);
-            if proc_data.process_itimer_pending.load(Ordering::Acquire) != 0 {
+                .store(false, Ordering::SeqCst);
+            // These two words form one linearized handoff with the producer's
+            // SeqCst pending publication and queued CAS. Either this recheck
+            // republishes the process, or the producer observes queued=false
+            // and owns publication itself; the last request cannot be stranded.
+            if proc_data.process_itimer_pending.load(Ordering::SeqCst) != 0 {
                 publish_process_itimer_work(&proc_data);
             }
 
+            if pending & PROCESS_RLIMIT_CPU_HARD_PENDING != 0 {
+                // Publish the terminal process-directed signal before any
+                // catchable timer signal from the same aggregate snapshot.
+                let _ = send_signal_to_process_data(
+                    &proc_data,
+                    Some(SignalInfo::new_kernel(Signo::SIGKILL)),
+                );
+            }
             if pending & PROCESS_ITIMER_VIRTUAL_PENDING != 0 {
                 let _ = send_signal_to_process_data(
                     &proc_data,
@@ -1744,7 +2502,13 @@ impl ProcessITimerWorkConsumer {
                     Some(SignalInfo::new_kernel(ITimerType::Prof.signo())),
                 );
             }
-            debug_assert_eq!(pending & !PROCESS_ITIMER_CPU_ARMED_MASK, 0);
+            if pending & PROCESS_RLIMIT_CPU_SOFT_PENDING != 0 {
+                let _ = send_signal_to_process_data(
+                    &proc_data,
+                    Some(SignalInfo::new_kernel(Signo::SIGXCPU)),
+                );
+            }
+            debug_assert_eq!(pending & !PROCESS_CPU_POLICY_PENDING_MASK, 0);
             drained += 1;
         }
         drained
@@ -1764,27 +2528,8 @@ fn fire_process_itimer_real(proc_data: Arc<ProcessData>, alarm_owner: AlarmSlotK
     let _ = send_signal_to_process_data(&proc_data, Some(SignalInfo::new_kernel(Signo::SIGALRM)));
 }
 
-#[derive(Debug, Default)]
-struct CpuLimitState {
-    soft_signal_sent: bool,
-}
-
-impl CpuLimitState {
-    fn reset_if_below_soft(&mut self, total_cpu_ns: usize, soft_secs: u64) {
-        if soft_secs == RLIM_INFINITY as i64 as u64 {
-            self.soft_signal_sent = false;
-            return;
-        }
-        if total_cpu_ns < secs_to_nanos(soft_secs) {
-            self.soft_signal_sent = false;
-        }
-    }
-}
-
-fn secs_to_nanos(secs: u64) -> usize {
+fn cpu_limit_threshold_ns(secs: u64) -> u64 {
     secs.saturating_mul(NANOS_PER_SEC)
-        .try_into()
-        .unwrap_or(usize::MAX)
 }
 
 /// Represents the state of the timer.
@@ -1806,18 +2551,22 @@ pub struct TimeManager {
     last_cpu_ns: usize,
     state: TimerState,
     paused_state: TimerState,
-    cpu_limit: CpuLimitState,
+    virtual_epoch: u64,
+    prof_epoch: u64,
 }
 
 impl TimeManager {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(proc_data: &ProcessData) -> Self {
         Self {
             utime_ns: 0,
             stime_ns: 0,
             last_cpu_ns: 0,
             state: TimerState::None,
             paused_state: TimerState::None,
-            cpu_limit: CpuLimitState::default(),
+            virtual_epoch: proc_data
+                .process_itimer_virtual_epoch
+                .load(Ordering::Acquire),
+            prof_epoch: proc_data.process_itimer_prof_epoch.load(Ordering::Acquire),
         }
     }
 
@@ -1828,19 +2577,19 @@ impl TimeManager {
         (utime, stime)
     }
 
-    fn account_elapsed(&mut self) -> ProcessTimerCharge {
+    fn account_and_publish(&mut self, proc_data: &ProcessData) {
         let now_ns = monotonic_time_nanos() as usize;
         let cpu_delta = now_ns.saturating_sub(self.last_cpu_ns);
         let charge = match self.state {
             TimerState::User => {
-                self.utime_ns += cpu_delta;
+                self.utime_ns = self.utime_ns.saturating_add(cpu_delta);
                 ProcessTimerCharge {
                     user_ns: cpu_delta,
                     system_ns: 0,
                 }
             }
             TimerState::Kernel => {
-                self.stime_ns += cpu_delta;
+                self.stime_ns = self.stime_ns.saturating_add(cpu_delta);
                 ProcessTimerCharge {
                     user_ns: 0,
                     system_ns: cpu_delta,
@@ -1849,23 +2598,24 @@ impl TimeManager {
             TimerState::None => ProcessTimerCharge::default(),
         };
         self.last_cpu_ns = now_ns;
-        charge
+        account_process_cpu(
+            proc_data,
+            charge,
+            &mut self.virtual_epoch,
+            &mut self.prof_epoch,
+        );
     }
 
-    /// Polls the time manager to update the timers and emit signals if
-    /// necessary.
-    pub(crate) fn poll(&mut self, signals: &mut Vec<Signo>) -> ProcessTimerCharge {
-        let charge = self.account_elapsed();
-        self.update_rlimit_cpu(signals);
-        charge
+    /// Accounts the current interval and publishes it to the process clocks.
+    pub(crate) fn poll(&mut self, proc_data: &ProcessData) {
+        self.account_and_publish(proc_data);
     }
 
     /// Accounts the interrupted current task from the periodic timer IRQ.
-    /// RLIMIT policy remains at the ordinary user-return/context-switch
-    /// boundary; the trap path immediately observes the updated total without
-    /// allocating or publishing signals from IRQ context.
-    pub(crate) fn poll_timer_tick(&mut self) -> ProcessTimerCharge {
-        self.account_elapsed()
+    /// The caller may publish only the bounded worker wake after this returns;
+    /// Linux timer/rlimit policy remains in the dedicated task-context worker.
+    pub(crate) fn poll_timer_tick(&mut self, proc_data: &ProcessData) {
+        self.account_and_publish(proc_data);
     }
 
     /// Updates the timer state.
@@ -1875,53 +2625,41 @@ impl TimeManager {
     }
 
     /// Pauses CPU-time accounting while this thread is not running.
-    pub(crate) fn pause_for_switch(&mut self, signals: &mut Vec<Signo>) -> ProcessTimerCharge {
-        let charge = self.poll(signals);
+    pub(crate) fn pause_for_switch(&mut self, proc_data: &ProcessData) {
+        self.poll(proc_data);
         self.paused_state = self.state;
         self.set_state(TimerState::None);
-        charge
     }
 
-    /// Resumes the CPU-time accounting state that was active before switch-out.
-    pub fn resume_after_switch(&mut self) {
+    /// Resumes the CPU-time accounting state that was active before switch-out
+    /// and adopts generations that became stable while this task slept.
+    pub fn resume_after_switch(&mut self, proc_data: &ProcessData) {
+        let armed = proc_data.process_itimer_cpu_armed.load(Ordering::Acquire);
+        if armed & PROCESS_ITIMER_VIRTUAL_PENDING != 0 {
+            let epoch = proc_data
+                .process_itimer_virtual_epoch
+                .load(Ordering::SeqCst);
+            if epoch & 1 == 0 {
+                self.virtual_epoch = self.virtual_epoch.max(epoch);
+            }
+        }
+        if armed & PROCESS_ITIMER_PROF_PENDING != 0 {
+            let epoch = proc_data.process_itimer_prof_epoch.load(Ordering::SeqCst);
+            if epoch & 1 == 0 {
+                self.prof_epoch = self.prof_epoch.max(epoch);
+            }
+        }
         let state = self.paused_state;
         self.paused_state = TimerState::None;
         self.set_state(state);
     }
 
-    fn update_rlimit_cpu(&mut self, signals: &mut Vec<Signo>) {
-        // Common case: no process has ever set RLIMIT_CPU to a finite value, so
-        // there is nothing to check. Skip the current() + proc_data.clone() +
-        // rlim.read() path that would otherwise run twice per fault/syscall via
-        // set_timer_state. The flag is sticky (once a CPU limit is set, always
-        // check) so rlimit users stay correct.
-        if !ANY_RLIMIT_CPU_SET.load(Ordering::Relaxed) {
-            return;
-        }
-        let curr = current();
-        let Some(thread) = curr.try_as_thread() else {
-            return;
-        };
-        let proc_data = thread.proc_data.clone();
-        let (soft_limit, hard_limit) = {
-            let limits = proc_data.rlim.read();
-            let limit = &limits[RLIMIT_CPU];
-            (limit.current, limit.max)
-        };
-        let total = self.utime_ns.saturating_add(self.stime_ns);
-
-        self.cpu_limit.reset_if_below_soft(total, soft_limit);
-
-        if hard_limit != RLIM_INFINITY as i64 as u64 && total >= secs_to_nanos(hard_limit) {
-            signals.push(Signo::SIGKILL);
-            return;
-        }
-        if soft_limit != RLIM_INFINITY as i64 as u64
-            && total >= secs_to_nanos(soft_limit)
-            && !self.cpu_limit.soft_signal_sent
-        {
-            self.cpu_limit.soft_signal_sent = true;
-            signals.push(Signo::SIGXCPU);
+    pub(crate) fn sync_process_cpu_timer_epoch(&mut self, ty: ITimerType, epoch: u64) {
+        debug_assert_eq!(epoch & 1, 0);
+        match ty {
+            ITimerType::Real => {}
+            ITimerType::Virtual => self.virtual_epoch = self.virtual_epoch.max(epoch),
+            ITimerType::Prof => self.prof_epoch = self.prof_epoch.max(epoch),
         }
     }
 }

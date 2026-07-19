@@ -1,7 +1,6 @@
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
     cell::RefCell,
@@ -16,17 +15,14 @@ use axtask::{TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use starry_process::Pid;
-use starry_signal::{
-    SignalInfo,
-    api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration},
-};
+use starry_signal::api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration};
 
 use super::{
     ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
     creds::{Cred, CredentialSlot, CredentialSnapshotGuard},
     restart::RestartTracker,
-    timer::{TimeManager, charge_process_itimers},
+    timer::{TimeManager, request_process_cpu_evaluation},
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
@@ -812,7 +808,7 @@ impl Thread {
         let restart = RestartTracker::try_new().map_err(|_| AxError::NoMemory)?;
         let task_parent =
             TaskParentNode::try_new(tid, Arc::downgrade(&proc_data), Arc::downgrade(&credential))?;
-        let time = TimeManager::new();
+        let time = TimeManager::new(&proc_data);
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
@@ -1130,57 +1126,32 @@ impl Thread {
         self.proc_state_hint.store(hint as u8, Ordering::Release);
     }
 
-    fn pause_cpu_accounting_for_switch(&self, task: &TaskInner) {
-        let mut signals = Vec::new();
-        let (usage, timer_charge) = {
-            let Ok(mut time) = self.time.try_borrow_mut() else {
-                return;
-            };
-            let timer_charge = time.pause_for_switch(&mut signals);
+    fn pause_cpu_accounting_for_switch(&self) {
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
+        let usage = {
+            let mut time = self.time.borrow_mut();
+            time.pause_for_switch(&self.proc_data);
             let (utime, stime) = time.output();
-            (TaskUsage::from_time_values(utime, stime), timer_charge)
+            TaskUsage::from_time_values(utime, stime)
         };
         self.store_usage_snapshot(usage);
-        charge_process_itimers(&self.proc_data, timer_charge);
-        for signo in signals {
-            // TimeManager emits only fixed RLIMIT_CPU signals (SIGXCPU or
-            // SIGKILL), so no queued RT record or RLIMIT_SIGPENDING charge is
-            // possible here. Process interval-timer signals were published
-            // above after releasing the task-local accounting borrow.
-            if self
-                .signal
-                .send_unqueued_signal(SignalInfo::new_kernel(signo))
-            {
-                task.interrupt();
-            }
+        if request_process_cpu_evaluation(&self.proc_data) {
+            crate::deferred_work::wake_process_timer_worker();
         }
     }
 
     fn poll_cpu_accounting_for_tick(&self) -> bool {
-        let (usage, timer_charge) = {
-            let Ok(mut time) = self.time.try_borrow_mut() else {
-                // An IRQ may interrupt one of the short task-context
-                // accounting publications. That owner will account the whole
-                // elapsed interval when it releases the borrow.
-                let work_pending = self
-                    .proc_data
-                    .process_itimer_work_queued
-                    .load(Ordering::Acquire);
-                if work_pending {
-                    crate::deferred_work::wake_process_timer_worker();
-                }
-                return work_pending;
-            };
-            let timer_charge = time.poll_timer_tick();
+        let usage = {
+            // The timer IRQ and scheduler hooks already run IRQ-off. Every
+            // task-context accounting borrow uses the same guard, so this
+            // RefCell cannot be reentered or carried across a switch.
+            let mut time = self.time.borrow_mut();
+            time.poll_timer_tick(&self.proc_data);
             let (utime, stime) = time.output();
-            (TaskUsage::from_time_values(utime, stime), timer_charge)
+            TaskUsage::from_time_values(utime, stime)
         };
         self.store_usage_snapshot(usage);
-        let work_pending = charge_process_itimers(&self.proc_data, timer_charge)
-            || self
-                .proc_data
-                .process_itimer_work_queued
-                .load(Ordering::Acquire);
+        let work_pending = request_process_cpu_evaluation(&self.proc_data);
         if work_pending {
             crate::deferred_work::wake_process_timer_worker();
         }
@@ -1188,10 +1159,9 @@ impl Thread {
     }
 
     fn resume_cpu_accounting_after_switch(&self) {
-        let Ok(mut time) = self.time.try_borrow_mut() else {
-            return;
-        };
-        time.resume_after_switch();
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
+        let mut time = self.time.borrow_mut();
+        time.resume_after_switch(&self.proc_data);
         let (utime, stime) = time.output();
         self.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
     }
@@ -1246,7 +1216,8 @@ impl TaskExt for Box<Thread> {
     }
 
     fn on_leave(&self, task: &TaskInner) {
-        self.pause_cpu_accounting_for_switch(task);
+        let _ = task;
+        self.pause_cpu_accounting_for_switch();
         ActiveScope::set_global();
         self.release_active_scope_read();
     }
