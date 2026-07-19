@@ -40,6 +40,13 @@ grep -Fq 'ci_run_step seccomp-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-linux-seccomp' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-seccomp-adapter-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- 'seccomp::tests -- --test-threads=1' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step kernel-packet-adapter-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'packet -- --test-threads=1' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step packet-core-tests' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step packet-core-check' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-linux-packet --all-targets' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-linux-packet --no-default-features' \
+    "$CI_DIR/per-commit.sh"
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \
