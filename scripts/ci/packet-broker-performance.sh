@@ -131,6 +131,7 @@ printf '%s\n' \
     'Per-call Instant sampling and assertion work perturb the measured path.' \
     'The single/multi cases measure stage+drain+consume; saturation measures stage calls.' \
     'The concurrent throughput window is end-to-end while percentiles cover producer stage calls.' \
+    'charged_shared_bytes is the broker accounting charge, not allocator-total memory.' \
     'The broker is not claimed to be lockless, allocation-free, or high performance.' \
     >"$WORKDIR/limitations.txt"
 
@@ -140,8 +141,8 @@ validate_run() {
     local metrics=$3
     local signature=$4
 
-    grep '^THEKERNEL_PACKET_BROKER_PERF schema=1 ' "$log" >"$metrics"
-    grep -Fqx 'THEKERNEL_PACKET_BROKER_PERF_OK schema=1 cases=5' "$log"
+    grep '^THEKERNEL_PACKET_BROKER_PERF schema=2 ' "$log" >"$metrics"
+    grep -Fqx 'THEKERNEL_PACKET_BROKER_PERF_OK schema=2 cases=5' "$log"
     awk -v expected_run="$run" '
         BEGIN {
             expected[1] = "zero_subscriber"
@@ -161,15 +162,15 @@ validate_run() {
                 if (key in field) exit 12
                 field[key] = value
             }
-            required = "schema run case subscribers count elapsed_ns throughput_per_sec latency_scope p50_ns p99_ns p999_ns expected_events packet_events received stage_errors drops unattributed_drops retained_bytes invariant"
+            required = "schema run case subscribers count elapsed_ns throughput_per_sec latency_scope p50_ns p99_ns p999_ns expected_events packet_events received stage_errors drops unattributed_drops charged_shared_bytes invariant"
             split(required, names, " ")
             for (required_index = 1; required_index <= 19; required_index++) {
                 if (!(names[required_index] in field)) exit 13
             }
-            if (field["schema"] != "1" || field["run"] != expected_run) exit 14
+            if (field["schema"] != "2" || field["run"] != expected_run) exit 14
             if (field["case"] != expected[NR] || field["invariant"] != "ok") exit 15
-            if (field["retained_bytes"] != "0") exit 16
-            numeric = "subscribers count elapsed_ns throughput_per_sec p50_ns p99_ns p999_ns expected_events packet_events received stage_errors drops unattributed_drops retained_bytes"
+            if (field["charged_shared_bytes"] != "0") exit 16
+            numeric = "subscribers count elapsed_ns throughput_per_sec p50_ns p99_ns p999_ns expected_events packet_events received stage_errors drops unattributed_drops charged_shared_bytes"
             split(numeric, numbers, " ")
             for (numeric_index = 1; numeric_index <= 14; numeric_index++) {
                 if (field[numbers[numeric_index]] !~ /^[0-9]+$/) exit 17
@@ -215,7 +216,7 @@ done
 diff -u "$WORKDIR/run1-schema.txt" "$WORKDIR/run2-schema.txt" \
     >"$WORKDIR/schema-diff.txt"
 printf '%s\n' \
-    $'schema\tpacket-broker-performance-receipt-v1' \
+    $'schema\tpacket-broker-performance-receipt-v2' \
     "source_head"$'\t'"$source_head" \
     $'runs\t2' \
     $'portable_thresholds\tnone' \
