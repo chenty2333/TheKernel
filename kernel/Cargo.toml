@@ -58,6 +58,7 @@ axerrno = "0.2"
 axfs-ng-vfs = "0.1"
 axio = "0.3.0-pre.1"
 axpoll.workspace = true
+axfault.workspace = true
 thekernel-linux-cred.workspace = true
 thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true

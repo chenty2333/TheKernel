@@ -41,6 +41,7 @@ axnet = { path = "crates/axnet-ng", package = "axnet-ng" }
 axruntime = { version = "0.3.0-preview.2" }
 axsync = { version = "0.3.0-preview.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
+axfault = { package = "thekernel-axfault", version = "=0.1.0" }
 axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
 thekernel-linux-cred = { version = "=0.1.0", default-features = false }
@@ -133,6 +134,7 @@ axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongar
 axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qemu-virt" }
 thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
+thekernel-axfault = { path = "../thekernel-ax/crates/thekernel-axfault" }
 thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
 thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }

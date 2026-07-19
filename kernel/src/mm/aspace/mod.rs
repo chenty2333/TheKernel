@@ -1,4 +1,5 @@
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
     vec::Vec,
@@ -749,6 +750,7 @@ pub struct AddrSpace {
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
     user_io_pins: UserIoPinRegistry,
+    pub(super) uffd: Option<Box<super::userfaultfd::UffdAddressSpaceState>>,
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
@@ -1035,6 +1037,7 @@ impl AddrSpace {
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
             user_io_pins,
+            uffd: None,
             lock_future_mappings: false,
             lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,

@@ -7,6 +7,7 @@ mod loader;
 mod remap;
 mod stats;
 mod tlb;
+mod userfaultfd;
 
 pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
 pub(crate) use self::{
@@ -15,6 +16,7 @@ pub(crate) use self::{
         init as init_tlb_shootdown, retire_after_tlb_grace, synchronize_icache, synchronize_tlb,
         synchronize_tlb_and_icache,
     },
+    userfaultfd::*,
 };
 
 pub(crate) fn checked_align_up(value: usize, align: usize) -> Option<usize> {

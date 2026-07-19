@@ -24,6 +24,7 @@ pub(crate) mod privilege_metadata;
 pub mod signalfd;
 pub mod timerfd;
 pub(crate) mod unix_socket;
+pub(crate) mod userfaultfd;
 pub(crate) mod xattr_provider;
 
 mod desc;

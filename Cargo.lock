@@ -3100,6 +3100,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axfault"
+version = "0.1.0"
+
+[[package]]
 name = "thekernel-axpoll"
 version = "0.1.0"
 dependencies = [
@@ -3204,6 +3208,7 @@ dependencies = [
  "starry-vm",
  "strum 0.28.0",
  "syscalls",
+ "thekernel-axfault",
  "thekernel-axtask",
  "thekernel-axtlb",
  "thekernel-linux-cred",
