@@ -491,6 +491,17 @@ builds. It does not boot those packaged-consumer kernels. The source-workspace
 RV/LA kernels booted below are therefore a separate evidence path, not runtime
 validation of the packaged artifacts.
 
+Before the first registry publication, Cargo cannot normalize the seccomp and
+signal package locks by resolving axcbpf and usercopy from crates.io. The gate
+therefore packages dependency roots first, vendors the locked registry graph,
+and safely extracts both already-audited archives into a temporary Cargo
+directory source with their exact archive checksums. It then assembles the
+remaining Linux-ABI packages offline. The normalized archives must still
+contain registry-only dependencies and crates.io lock entries whose checksums
+match those coordinated archives. This models dependency order; the workspace
+package command names crates.io explicitly as its eventual publication target,
+but it is not evidence that any crate is already published.
+
 ### RISC-V and LoongArch guest gates
 
 The direct semantic commands are:

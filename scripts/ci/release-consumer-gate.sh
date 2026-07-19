@@ -300,13 +300,73 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
             -p thekernel-axtlb
 )
 
+# `cargo package --no-verify` still resolves registry dependencies while it
+# normalizes release locks.  On the first coordinated release, dependent
+# packages therefore cannot be assembled from crates.io until their exact
+# sibling archives have been published.  Package dependency roots first, then
+# build a temporary Cargo directory source containing all locked registry
+# inputs plus those audited archives.  This source exists only to model the
+# dependency-order boundary before publication: normalized manifests and locks
+# still name crates.io, and their checksums are checked against these archives
+# below.
+prepublish_source="$work_dir/prepublish-directory-source"
+prepublish_source_config="$work_dir/prepublish-directory-source.config.toml"
+axcbpf_archive="$archive_root/ax/package/thekernel-axcbpf-$VERSION.crate"
+[ -f "$axcbpf_archive" ] \
+    || ci_die "thekernel-axcbpf package archive is missing before dependent packaging"
+
+printf '[release-consumer] package Linux-ABI dependency roots at %.12s\n' \
+    "$LINUX_ABI_HEAD"
+(
+    cd "$linux_abi_package_repo"
+    CARGO_TARGET_DIR="$archive_root/linux-abi" \
+        cargo "+$PACKAGE_TOOLCHAIN" package \
+            --locked --no-verify \
+            -p thekernel-linux-usercopy
+)
+usercopy_archive="$archive_root/linux-abi/package/thekernel-linux-usercopy-$VERSION.crate"
+[ -f "$usercopy_archive" ] \
+    || ci_die "thekernel-linux-usercopy package archive is missing before dependent packaging"
+
+cargo "+$PACKAGE_TOOLCHAIN" vendor \
+    --manifest-path "$linux_abi_package_repo/Cargo.toml" \
+    --locked \
+    --versioned-dirs \
+    "$prepublish_source" >"$prepublish_source_config"
+
+stage_prepublish_archive() {
+    local archive=$1
+    local package=$2
+    local repo_head=$3
+    local repository=$4
+
+    python3 "$SCRIPT_DIR/release-consumer-artifact.py" \
+        --archive "$archive" \
+        --extract-root "$prepublish_source" \
+        --package "$package" \
+        --version "$VERSION" \
+        --repo-head "$repo_head" \
+        --repository "$repository" \
+        --directory-source-checksum >/dev/null
+}
+
+stage_prepublish_archive \
+    "$axcbpf_archive" thekernel-axcbpf "$AX_HEAD" "$AX_REPOSITORY"
+stage_prepublish_archive \
+    "$usercopy_archive" thekernel-linux-usercopy \
+    "$LINUX_ABI_HEAD" "$LINUX_ABI_REPOSITORY"
+prepublish_cargo_config=(
+    --config
+    "$prepublish_source_config"
+)
+
 printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
     "$LINUX_ABI_HEAD"
 (
     cd "$linux_abi_package_repo"
     CARGO_TARGET_DIR="$archive_root/linux-abi" \
         cargo "+$PACKAGE_TOOLCHAIN" -Z package-workspace package \
-            --locked --no-verify \
+            --locked --offline --no-verify --registry crates-io \
             -p thekernel-linux-usercopy \
             -p thekernel-linux-cred \
             -p thekernel-linux-mm \
@@ -315,7 +375,8 @@ printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
             -p thekernel-linux-process \
             -p thekernel-linux-signal \
             -p thekernel-linux-vfs \
-            -p thekernel-linux-fd
+            -p thekernel-linux-fd \
+            "${prepublish_cargo_config[@]}"
 )
 
 declare -A ARTIFACT_DIRS=()

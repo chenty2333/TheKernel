@@ -24,6 +24,12 @@ grep -Fq \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq 'stage_prepublish_archive' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"$usercopy_archive" thekernel-linux-usercopy \' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '--locked --offline --no-verify --registry crates-io \' \
+    "$CI_DIR/release-consumer-gate.sh"
 
 # The temporary-manifest rewrite is exact and refuses to proceed if an anchor
 # disappeared or became ambiguous.
@@ -161,6 +167,31 @@ artifact_record=$(python3 "$CI_DIR/release-consumer-artifact.py" \
     --repository https://github.com/chenty2333/thekernel-ax)
 artifact_checksum=$(printf '%s\n' "$artifact_record" | cut -f3)
 [[ "$artifact_checksum" =~ ^[0-9a-f]{64}$ ]]
+directory_record=$(python3 "$CI_DIR/release-consumer-artifact.py" \
+    --archive "$tmp/valid.crate" \
+    --extract-root "$tmp/directory-source" \
+    --package thekernel-test \
+    --version 0.1.0 \
+    --repo-head "$fake_head" \
+    --repository https://github.com/chenty2333/thekernel-ax \
+    --directory-source-checksum)
+directory_checksum=$(printf '%s\n' "$directory_record" | cut -f3)
+python3 - \
+    "$tmp/directory-source/thekernel-test-0.1.0/.cargo-checksum.json" \
+    "$directory_checksum" <<'PY'
+import json
+import pathlib
+import sys
+
+record = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if record.get("package") != sys.argv[2]:
+    raise SystemExit("directory-source package checksum does not bind the archive")
+files = record.get("files")
+if not isinstance(files, dict) or "Cargo.toml" not in files or "src/lib.rs" not in files:
+    raise SystemExit("directory-source checksum does not cover packaged files")
+if ".cargo-checksum.json" in files:
+    raise SystemExit("directory-source checksum recursively covers itself")
+PY
 cat >"$tmp/Cargo.lock" <<EOF
 version = 4
 

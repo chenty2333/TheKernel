@@ -44,6 +44,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def write_directory_source_checksum(package_dir: Path, archive_sha256: str) -> None:
+    """Make an audited archive extraction usable as a Cargo directory source."""
+    checksum_path = package_dir / ".cargo-checksum.json"
+    if checksum_path.exists():
+        fail(f"{checksum_path}: directory-source checksum already exists")
+    files = {
+        path.relative_to(package_dir).as_posix(): sha256_file(path)
+        for path in sorted(package_dir.rglob("*"))
+        if path.is_file() and path != checksum_path
+    }
+    checksum_path.write_text(
+        json.dumps(
+            {"files": files, "package": archive_sha256},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
 def audit_dependencies(scope: str, table: Any) -> None:
     if table is None:
         return
@@ -175,6 +195,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repository")
     parser.add_argument("--expected-sha256")
     parser.add_argument(
+        "--directory-source-checksum",
+        action="store_true",
+        help=(
+            "write Cargo directory-source checksum metadata after the exact "
+            "archive has passed all audits"
+        ),
+    )
+    parser.add_argument(
         "--max-archive-bytes", type=int, default=DEFAULT_MAX_ARCHIVE_BYTES
     )
     parser.add_argument(
@@ -234,6 +262,9 @@ def main() -> None:
         repository=args.repository,
     )
     audit_vcs_info(package_dir / ".cargo_vcs_info.json", args.repo_head)
+
+    if args.directory_source_checksum:
+        write_directory_source_checksum(package_dir, archive_sha256)
 
     # Detect archive replacement between validation and extraction.
     final_sha256 = sha256_file(archive_path)
