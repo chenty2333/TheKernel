@@ -27,7 +27,10 @@ pub use self::{
 #[cfg(any(target_pointer_width = "64", doc, docsrs))]
 pub use self::{
     arch::*,
-    bits64::{PageTable64, PageTable64Cursor},
+    bits64::{
+        MAX_PREPARED_TABLE_FRAMES_64, PageTable64, PageTable64Cursor, PrepareTableFramesError,
+        PreparedMapCommit, PreparedMapError, PreparedPageTableFrames,
+    },
 };
 
 /// The error type for page table operation failures.

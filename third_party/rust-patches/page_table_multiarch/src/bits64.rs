@@ -1,5 +1,10 @@
 use alloc::vec::Vec;
-use core::{marker::PhantomData, ops::Deref};
+use core::{
+    fmt,
+    marker::PhantomData,
+    ops::Deref,
+    sync::atomic::{Ordering, compiler_fence, fence},
+};
 
 use arrayvec::ArrayVec;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr};
@@ -10,6 +15,166 @@ use crate::{
 };
 
 const ENTRY_COUNT: usize = 512;
+
+/// Maximum number of intermediate table frames needed to install one leaf in
+/// a supported 64-bit page table.
+///
+/// A four-level page table needs at most three frames below its root. A
+/// three-level page table needs at most two, so one fixed-capacity reservation
+/// serves both layouts without heap allocation.
+pub const MAX_PREPARED_TABLE_FRAMES_64: usize = 3;
+
+/// Failure while allocating an out-of-lock page-table frame reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareTableFramesError {
+    /// The requested reservation exceeds the fixed 64-bit path bound.
+    TooMany {
+        /// Number of frames requested by the caller.
+        requested: usize,
+        /// Maximum number of frames a reservation can contain.
+        maximum: usize,
+    },
+    /// The paging handler could not allocate another frame.
+    NoMemory,
+}
+
+/// Failure while committing a leaf with preallocated page-table frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PreparedMapError {
+    /// The path changed and now requires more frames than were reserved.
+    NeedMore {
+        /// Number of intermediate frames required by the rechecked path.
+        required: usize,
+        /// Number of frames retained by the reservation.
+        available: usize,
+    },
+    /// A regular page-table error detected before publication.
+    Paging(PagingError),
+}
+
+impl From<PagingError> for PreparedMapError {
+    fn from(error: PagingError) -> Self {
+        Self::Paging(error)
+    }
+}
+
+/// Result of one successful prepared mapping commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedMapCommit {
+    consumed_frames: usize,
+}
+
+impl PreparedMapCommit {
+    /// Number of reserved intermediate table frames consumed by this commit.
+    pub const fn consumed_frames(self) -> usize {
+        self.consumed_frames
+    }
+}
+
+/// Preallocated and pre-zeroed frames for one 64-bit page-table path.
+///
+/// Allocate this value before entering a page-table critical section, pass it
+/// by mutable reference to [`PageTable64Cursor::map_prepared`], and move/drop
+/// it only after leaving that critical section. Failed commits retain every
+/// frame. Successful commits remove only frames made reachable from the page
+/// table; unused frames remain owned by this reservation.
+pub struct PreparedPageTableFrames<H: PagingHandler> {
+    frames: ArrayVec<PhysAddr, MAX_PREPARED_TABLE_FRAMES_64>,
+    _handler: PhantomData<H>,
+}
+
+impl<H: PagingHandler> PreparedPageTableFrames<H> {
+    /// Allocates and zeroes exactly `frame_count` table frames.
+    ///
+    /// If allocation fails, already allocated frames are reclaimed before the
+    /// error is returned. Callers must invoke this outside page-table locks.
+    pub fn try_new(frame_count: usize) -> Result<Self, PrepareTableFramesError> {
+        if frame_count > MAX_PREPARED_TABLE_FRAMES_64 {
+            return Err(PrepareTableFramesError::TooMany {
+                requested: frame_count,
+                maximum: MAX_PREPARED_TABLE_FRAMES_64,
+            });
+        }
+
+        let mut prepared = Self {
+            frames: ArrayVec::new(),
+            _handler: PhantomData,
+        };
+        for _ in 0..frame_count {
+            let frame =
+                alloc_zeroed_table_frame::<H>().map_err(|_| PrepareTableFramesError::NoMemory)?;
+            prepared
+                .frames
+                .try_push(frame)
+                .expect("validated prepared-frame capacity");
+        }
+        Ok(prepared)
+    }
+
+    /// Allocates the maximum reservation needed by any supported 64-bit path.
+    pub fn try_max() -> Result<Self, PrepareTableFramesError> {
+        Self::try_new(MAX_PREPARED_TABLE_FRAMES_64)
+    }
+
+    /// Number of frames currently retained by this reservation.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Returns whether this reservation retains no frames.
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+impl<H: PagingHandler> fmt::Debug for PreparedPageTableFrames<H> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedPageTableFrames")
+            .field("frame_count", &self.frames.len())
+            .finish()
+    }
+}
+
+impl<H: PagingHandler> Drop for PreparedPageTableFrames<H> {
+    fn drop(&mut self) {
+        while let Some(frame) = self.frames.pop() {
+            H::dealloc_frame(frame);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedMapPath {
+    publish_table: PhysAddr,
+    publish_index: usize,
+    publish_level: usize,
+    target_level: usize,
+    missing_tables: usize,
+}
+
+fn alloc_zeroed_table_frame<H: PagingHandler>() -> PagingResult<PhysAddr> {
+    let paddr = H::alloc_frame().ok_or(PagingError::NoMemory)?;
+    let ptr = H::phys_to_virt(paddr).as_mut_ptr() as *mut u64;
+    // u64 store loop instead of write_bytes: under QEMU TCG the emitted
+    // memset for write_bytes is ~4x slower here (it issues ~4x more stores).
+    for i in 0..(PAGE_SIZE_4K / 8) {
+        unsafe { *ptr.add(i) = 0 };
+    }
+    Ok(paddr)
+}
+
+fn publish_prepared_entry<PTE: GenericPTE>(entry: &mut PTE, value: PTE) {
+    // Child tables, leaf data, and caller-prepared metadata must all become
+    // observable before the live page-table entry. Linux's equivalent
+    // table-install path uses a write barrier for the same pointer-chasing
+    // publication contract.
+    fence(Ordering::Release);
+    unsafe { core::ptr::write_volatile(entry, value) };
+    // Keep subsequent ownership bookkeeping after the externally visible
+    // store even though it only mutates the reservation object.
+    compiler_fence(Ordering::SeqCst);
+}
 
 const fn p4_index(vaddr: usize) -> usize {
     (vaddr >> (12 + 27)) & (ENTRY_COUNT - 1)
@@ -71,6 +236,21 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         }
         let off = size.align_offset(vaddr.into());
         Ok((entry.paddr().add(off), entry.flags(), size))
+    }
+
+    /// Returns the number of intermediate table frames currently needed to
+    /// install a mapping at `vaddr`.
+    ///
+    /// This is an advisory, read-only planning query. A caller may release its
+    /// address-space lock, allocate that many [`PreparedPageTableFrames`], and
+    /// later call [`PageTable64Cursor::map_prepared`]. The commit rechecks the
+    /// path and reports [`PreparedMapError::NeedMore`] if it changed.
+    pub fn required_prepared_frames(
+        &self,
+        vaddr: M::VirtAddr,
+        page_size: PageSize,
+    ) -> PagingResult<usize> {
+        Ok(self.prepared_map_path(vaddr, page_size)?.missing_tables)
     }
 
     /// Collects present leaf mappings within the given virtual range.
@@ -159,18 +339,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
 // Private implements.
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H> {
     fn alloc_table() -> PagingResult<PhysAddr> {
-        if let Some(paddr) = H::alloc_frame() {
-            let ptr = H::phys_to_virt(paddr).as_mut_ptr() as *mut u64;
-            // u64 store loop instead of write_bytes: under QEMU TCG the emitted
-            // memset for write_bytes is ~4x slower here (it issues ~4x more
-            // stores), and this runs on every freshly allocated page-table page.
-            for i in 0..(PAGE_SIZE_4K / 8) {
-                unsafe { *ptr.add(i) = 0 };
-            }
-            Ok(paddr)
-        } else {
-            Err(PagingError::NoMemory)
-        }
+        alloc_zeroed_table_frame::<H>()
     }
 
     fn table_of<'a>(&self, paddr: PhysAddr) -> &'a [PTE] {
@@ -296,6 +465,129 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let p1 = self.next_table_mut_or_create(p2e)?;
         let p1e = &mut p1[p1_index(vaddr)];
         Ok(p1e)
+    }
+
+    fn prepared_target_level(page_size: PageSize) -> PagingResult<usize> {
+        assert!(
+            matches!(M::LEVELS, 3 | 4),
+            "PageTable64 only supports three or four levels"
+        );
+        match page_size {
+            PageSize::Size1G => Ok(M::LEVELS - 3),
+            PageSize::Size2M => Ok(M::LEVELS - 2),
+            PageSize::Size4K => Ok(M::LEVELS - 1),
+            // Preserve the existing `map()` behavior for this page size even
+            // though current 64-bit architecture aliases do not use 1 MiB
+            // leaves: it selects the last-level entry and sets the huge bit.
+            PageSize::Size1M => Ok(M::LEVELS - 1),
+        }
+    }
+
+    const fn index_at_level(vaddr: usize, level: usize) -> usize {
+        let shift = 12 + (M::LEVELS - 1 - level) * 9;
+        (vaddr >> shift) & (ENTRY_COUNT - 1)
+    }
+
+    fn prepared_map_path(
+        &self,
+        vaddr: M::VirtAddr,
+        page_size: PageSize,
+    ) -> PagingResult<PreparedMapPath> {
+        let target_level = Self::prepared_target_level(page_size)?;
+        let vaddr: usize = vaddr.into();
+        let mut table_paddr = self.root_paddr();
+
+        for level in 0..=target_level {
+            let index = Self::index_at_level(vaddr, level);
+            let entry = &self.table_of(table_paddr)[index];
+            if level == target_level {
+                if !entry.is_unused() {
+                    return Err(PagingError::AlreadyMapped);
+                }
+                return Ok(PreparedMapPath {
+                    publish_table: table_paddr,
+                    publish_index: index,
+                    publish_level: level,
+                    target_level,
+                    missing_tables: 0,
+                });
+            }
+            if entry.is_unused() {
+                return Ok(PreparedMapPath {
+                    publish_table: table_paddr,
+                    publish_index: index,
+                    publish_level: level,
+                    target_level,
+                    missing_tables: target_level - level,
+                });
+            }
+            if entry.is_huge() {
+                return Err(PagingError::MappedToHugePage);
+            }
+            if entry.paddr().as_usize() == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            table_paddr = entry.paddr();
+        }
+        unreachable!("target page-table level must terminate the path walk")
+    }
+
+    fn commit_prepared_map(
+        &mut self,
+        vaddr: M::VirtAddr,
+        target: PhysAddr,
+        page_size: PageSize,
+        flags: MappingFlags,
+        prepared: &mut PreparedPageTableFrames<H>,
+    ) -> Result<PreparedMapCommit, PreparedMapError> {
+        let path = self.prepared_map_path(vaddr, page_size)?;
+        let available = prepared.frames.len();
+        if path.missing_tables > available {
+            return Err(PreparedMapError::NeedMore {
+                required: path.missing_tables,
+                available,
+            });
+        }
+
+        let page_entry = PTE::new_page(target.align_down(page_size), flags, page_size.is_huge());
+        if path.missing_tables == 0 {
+            let table = self.table_of_mut(path.publish_table);
+            let entry = &mut table[path.publish_index];
+            debug_assert!(entry.is_unused());
+            publish_prepared_entry(entry, page_entry);
+            return Ok(PreparedMapCommit { consumed_frames: 0 });
+        }
+
+        let first_reserved = available - path.missing_tables;
+        let selected = &prepared.frames[first_reserved..];
+        for (offset, table_paddr) in selected.iter().copied().enumerate() {
+            let level = path.publish_level + 1 + offset;
+            let index = Self::index_at_level(vaddr.into(), level);
+            let table = self.table_of_mut(table_paddr);
+            let entry = &mut table[index];
+            debug_assert!(entry.is_unused());
+            if level == path.target_level {
+                *entry = page_entry;
+            } else {
+                *entry = PTE::new_table(selected[offset + 1]);
+            }
+        }
+
+        let publish_entry = PTE::new_table(selected[0]);
+        let table = self.table_of_mut(path.publish_table);
+        let entry = &mut table[path.publish_index];
+        debug_assert!(entry.is_unused());
+        publish_prepared_entry(entry, publish_entry);
+        unsafe {
+            // This is the commit's only post-publication ownership operation.
+            // The exact tail has already been validated and made reachable;
+            // shortening ArrayVec's initialized prefix is non-fallible and
+            // ensures its Drop cannot reclaim published table frames.
+            prepared.frames.set_len(first_reserved);
+        }
+        Ok(PreparedMapCommit {
+            consumed_frames: path.missing_tables,
+        })
     }
 
     fn walk_recursive<F>(
@@ -656,6 +948,35 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         // before the kernel populates the PTE, so flush only those faulted user
         // VAs while keeping the RV/non-user fresh-map optimization.
         Ok(())
+    }
+
+    /// Maps one leaf using table frames allocated and zeroed before entering
+    /// the current page-table critical section.
+    ///
+    /// The path is rechecked before any mutation. If part of the path is
+    /// absent, its complete child subtree is built in unreachable reserved
+    /// frames and then made visible with one topmost entry publication. This
+    /// method never allocates or deallocates. Every error leaves the live page
+    /// table unchanged and retains all frames in `prepared`.
+    ///
+    /// The caller should move or drop `prepared` only after leaving the
+    /// critical section so unused frames are reclaimed lock-external.
+    pub fn map_prepared(
+        &mut self,
+        vaddr: M::VirtAddr,
+        target: PhysAddr,
+        page_size: PageSize,
+        flags: MappingFlags,
+        prepared: &mut PreparedPageTableFrames<H>,
+    ) -> Result<PreparedMapCommit, PreparedMapError> {
+        let committed = self
+            .inner
+            .commit_prepared_map(vaddr, target, page_size, flags, prepared)?;
+        #[cfg(target_arch = "loongarch64")]
+        if flags.contains(MappingFlags::USER) {
+            self.push(vaddr);
+        }
+        Ok(committed)
     }
 
     /// Remaps the mapping starting at `vaddr`, updates both the physical

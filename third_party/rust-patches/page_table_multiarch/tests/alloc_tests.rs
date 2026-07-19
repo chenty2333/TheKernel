@@ -4,12 +4,19 @@ use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
     ptr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, SyncSender},
+    },
+    time::Duration,
 };
 
-use memory_addr::{PhysAddr, VirtAddr};
+use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use page_table_entry::{GenericPTE, MappingFlags};
 use page_table_multiarch::{
     PageSize, PageTable64, PagingError, PagingHandler, PagingMetaData, PagingResult,
+    PrepareTableFramesError, PreparedMapError, PreparedPageTableFrames,
 };
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
@@ -35,7 +42,37 @@ thread_local! {
     static HEAP_ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     static FAIL_FRAME_ALLOCATION_AT: Cell<Option<usize>> = const { Cell::new(None) };
     static FRAME_ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FRAME_DEALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     static CORRUPT_TABLE_PTR_FLAGS: Cell<bool> = const { Cell::new(false) };
+    static NEW_TABLE_HOOK: RefCell<Option<Arc<NewTableHook>>> = const { RefCell::new(None) };
+    static NEW_PAGE_HOOK: RefCell<Option<Arc<NewTableHook>>> = const { RefCell::new(None) };
+}
+
+struct NewTableHook {
+    trigger_at: usize,
+    calls: AtomicUsize,
+    paddrs: [AtomicUsize; 3],
+    ready: SyncSender<()>,
+    resume: Mutex<Receiver<()>>,
+}
+
+impl NewTableHook {
+    fn observe(&self, paddr: PhysAddr) {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(slot) = self.paddrs.get(call) {
+            slot.store(paddr.as_usize(), Ordering::SeqCst);
+        }
+        if call + 1 == self.trigger_at {
+            self.ready
+                .send(())
+                .expect("prepared publish observer disappeared");
+            self.resume
+                .lock()
+                .expect("prepared publish resume lock poisoned")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("prepared publish observer did not resume commit");
+        }
+    }
 }
 
 struct TestAllocator;
@@ -115,6 +152,19 @@ fn clear_frame_allocation_failure() {
     FRAME_ALLOCATION_COUNT.with(|count| count.set(0));
 }
 
+fn frame_allocation_count() -> usize {
+    FRAME_ALLOCATION_COUNT.with(Cell::get)
+}
+
+fn frame_deallocation_count() -> usize {
+    FRAME_DEALLOCATION_COUNT.with(Cell::get)
+}
+
+fn reset_frame_activity_counts() {
+    FRAME_ALLOCATION_COUNT.with(|count| count.set(0));
+    FRAME_DEALLOCATION_COUNT.with(|count| count.set(0));
+}
+
 fn frame_allocation_should_fail() -> bool {
     let attempt = FRAME_ALLOCATION_COUNT.with(|count| {
         let attempt = count.get() + 1;
@@ -159,6 +209,7 @@ impl<M: PagingMetaData> PagingHandler for TrackPagingHandler<M> {
     }
 
     fn dealloc_frame(paddr: PhysAddr) {
+        FRAME_DEALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
         let ptr = paddr.as_usize();
         ALLOCATED.with_borrow_mut(|it| {
             assert!(it.remove(&ptr), "dealloc a frame that was not allocated");
@@ -195,6 +246,30 @@ impl<M: PagingMetaData> PagingHandler for TrackPagingHandler<M> {
 struct TablePtrMeta;
 
 impl PagingMetaData for TablePtrMeta {
+    const LEVELS: usize = 4;
+    const PA_MAX_BITS: usize = 48;
+    const VA_MAX_BITS: usize = 48;
+
+    type VirtAddr = VirtAddr;
+
+    fn flush_tlb(_vaddr: Option<Self::VirtAddr>) {}
+}
+
+struct PreparedMeta3;
+
+impl PagingMetaData for PreparedMeta3 {
+    const LEVELS: usize = 3;
+    const PA_MAX_BITS: usize = 48;
+    const VA_MAX_BITS: usize = 39;
+
+    type VirtAddr = VirtAddr;
+
+    fn flush_tlb(_vaddr: Option<Self::VirtAddr>) {}
+}
+
+struct PreparedMeta4;
+
+impl PagingMetaData for PreparedMeta4 {
     const LEVELS: usize = 4;
     const PA_MAX_BITS: usize = 48;
     const VA_MAX_BITS: usize = 48;
@@ -267,6 +342,11 @@ impl TablePtrPte {
 
 impl GenericPTE for TablePtrPte {
     fn new_page(paddr: PhysAddr, flags: MappingFlags, is_huge: bool) -> Self {
+        NEW_PAGE_HOOK.with_borrow(|hook| {
+            if let Some(hook) = hook {
+                hook.observe(paddr);
+            }
+        });
         let mut bits = Self::PRESENT | Self::bits_from_flags(flags);
         if is_huge {
             bits |= Self::HUGE;
@@ -275,6 +355,11 @@ impl GenericPTE for TablePtrPte {
     }
 
     fn new_table(paddr: PhysAddr) -> Self {
+        NEW_TABLE_HOOK.with_borrow(|hook| {
+            if let Some(hook) = hook {
+                hook.observe(paddr);
+            }
+        });
         Self((paddr.as_usize() as u64) & Self::PHYS_ADDR_MASK)
     }
 
@@ -1049,4 +1134,630 @@ fn test_dealloc_loongarch64() -> PagingResult<()> {
         page_table_entry::loongarch64::LA64PTE,
     >()?;
     Ok(())
+}
+
+type PreparedTable<M> = PageTable64<M, TablePtrPte, TrackPagingHandler<M>>;
+type PreparedFrames<M> = PreparedPageTableFrames<TrackPagingHandler<M>>;
+
+fn reset_prepared_test_state() {
+    ALLOCATED.with_borrow_mut(|allocated| allocated.clear());
+    clear_frame_allocation_failure();
+    reset_frame_activity_counts();
+    NEW_TABLE_HOOK.with_borrow_mut(|hook| *hook = None);
+    NEW_PAGE_HOOK.with_borrow_mut(|hook| *hook = None);
+}
+
+fn assert_prepared_test_frames_reclaimed() {
+    assert_eq!(
+        ALLOCATED.with_borrow(|allocated| allocated.len()),
+        0,
+        "prepared page-table test leaked frames"
+    );
+}
+
+fn run_prepared_path_matrix<M>()
+where
+    M: PagingMetaData<VirtAddr = VirtAddr>,
+{
+    const TARGET_PAGE: usize = 0x1234_5000;
+    const TARGET_OFFSET: usize = 0x321;
+    const FLAGS: MappingFlags = MappingFlags::READ.union(MappingFlags::WRITE);
+
+    // A completely absent 4K path consumes every intermediate level below
+    // the root and performs no allocation or deallocation during commit.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(TARGET_PAGE + TARGET_OFFSET);
+    let target = PhysAddr::from_usize(0x4000_0123);
+    let required = M::LEVELS - 1;
+    assert_eq!(
+        table
+            .required_prepared_frames(vaddr, PageSize::Size4K)
+            .unwrap(),
+        required
+    );
+    let mut prepared = PreparedFrames::<M>::try_new(required).unwrap();
+    let allocations_before = frame_allocation_count();
+    let deallocations_before = frame_deallocation_count();
+    start_heap_allocation_tracking();
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(vaddr, target, PageSize::Size4K, FLAGS, &mut prepared)
+        .unwrap();
+    let heap_allocations = stop_heap_allocation_tracking();
+    assert_eq!(heap_allocations, 0);
+    assert_eq!(frame_allocation_count(), allocations_before);
+    assert_eq!(frame_deallocation_count(), deallocations_before);
+    assert_eq!(commit.consumed_frames(), required);
+    assert!(prepared.is_empty());
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (
+            PhysAddr::from_usize(0x4000_0000 + TARGET_OFFSET),
+            FLAGS,
+            PageSize::Size4K,
+        )
+    );
+    let deallocations_before_reservation_drop = frame_deallocation_count();
+    drop(prepared);
+    assert_eq!(
+        frame_deallocation_count(),
+        deallocations_before_reservation_drop,
+        "reservation Drop reclaimed a published table frame"
+    );
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+
+    // One live top-level branch plus an absent lower branch exercises a
+    // partially missing path on both three- and four-level metadata.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let level_one_shift = 12 + (M::LEVELS - 2) * 9;
+    let sibling = VirtAddr::from_usize(TARGET_PAGE ^ (1 << level_one_shift));
+    table
+        .cursor_no_flush()
+        .map(
+            sibling,
+            PhysAddr::from_usize(0x5000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )
+        .unwrap();
+    let vaddr = VirtAddr::from_usize(TARGET_PAGE);
+    let required = M::LEVELS - 2;
+    assert_eq!(
+        table
+            .required_prepared_frames(vaddr, PageSize::Size4K)
+            .unwrap(),
+        required
+    );
+    let mut prepared = PreparedFrames::<M>::try_max().unwrap();
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(
+            vaddr,
+            PhysAddr::from_usize(0x5100_0000),
+            PageSize::Size4K,
+            FLAGS,
+            &mut prepared,
+        )
+        .unwrap();
+    assert_eq!(commit.consumed_frames(), required);
+    assert_eq!(prepared.len(), 3 - required);
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (PhysAddr::from_usize(0x5100_0000), FLAGS, PageSize::Size4K,)
+    );
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+
+    // Unmapping leaves intermediate tables in place, so remapping the same
+    // leaf consumes no reserved frame and preserves the whole reservation.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(TARGET_PAGE);
+    table
+        .cursor_no_flush()
+        .map(
+            vaddr,
+            PhysAddr::from_usize(0x5200_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )
+        .unwrap();
+    table.cursor_no_flush().unmap(vaddr).unwrap();
+    assert_eq!(
+        table
+            .required_prepared_frames(vaddr, PageSize::Size4K)
+            .unwrap(),
+        0
+    );
+    let mut prepared = PreparedFrames::<M>::try_max().unwrap();
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(
+            vaddr,
+            PhysAddr::from_usize(0x5300_0000),
+            PageSize::Size4K,
+            FLAGS,
+            &mut prepared,
+        )
+        .unwrap();
+    assert_eq!(commit.consumed_frames(), 0);
+    assert_eq!(prepared.len(), 3);
+    drop(prepared);
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (PhysAddr::from_usize(0x5300_0000), FLAGS, PageSize::Size4K,)
+    );
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+#[test]
+fn test_prepared_paths_meta3() {
+    run_prepared_path_matrix::<PreparedMeta3>();
+}
+
+#[test]
+fn test_prepared_paths_meta4() {
+    run_prepared_path_matrix::<PreparedMeta4>();
+}
+
+fn run_prepared_error_matrix<M>()
+where
+    M: PagingMetaData<VirtAddr = VirtAddr>,
+{
+    const VADDR: usize = 0x2000_0000;
+
+    // A conflicting live leaf is detected before publication and retains the
+    // reservation in full.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(VADDR);
+    let old_target = PhysAddr::from_usize(0x6000_0000);
+    table
+        .cursor_no_flush()
+        .map(vaddr, old_target, PageSize::Size4K, MappingFlags::READ)
+        .unwrap();
+    let mut prepared = PreparedFrames::<M>::try_max().unwrap();
+    let allocations_before = frame_allocation_count();
+    let deallocations_before = frame_deallocation_count();
+    assert_eq!(
+        table.cursor_no_flush().map_prepared(
+            vaddr,
+            PhysAddr::from_usize(0x6100_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+            &mut prepared,
+        ),
+        Err(PreparedMapError::Paging(PagingError::AlreadyMapped))
+    );
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(frame_allocation_count(), allocations_before);
+    assert_eq!(frame_deallocation_count(), deallocations_before);
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (old_target, MappingFlags::READ, PageSize::Size4K)
+    );
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+
+    // A huge mapping blocks a lower-level prepared leaf without modifying the
+    // huge entry or consuming the reservation.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let huge_base = VirtAddr::from_usize(0x4000_0000);
+    let huge_target = PhysAddr::from_usize(0x8000_0000);
+    table
+        .cursor_no_flush()
+        .map(huge_base, huge_target, PageSize::Size1G, MappingFlags::READ)
+        .unwrap();
+    let lower = VirtAddr::from_usize(0x4000_1000);
+    assert_eq!(
+        table.required_prepared_frames(lower, PageSize::Size4K),
+        Err(PagingError::MappedToHugePage)
+    );
+    let mut prepared = PreparedFrames::<M>::try_max().unwrap();
+    assert_eq!(
+        table.cursor_no_flush().map_prepared(
+            lower,
+            PhysAddr::from_usize(0x9000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+            &mut prepared,
+        ),
+        Err(PreparedMapError::Paging(PagingError::MappedToHugePage))
+    );
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(
+        table.query(lower).unwrap(),
+        (
+            huge_target.add(0x1000),
+            MappingFlags::READ,
+            PageSize::Size1G,
+        )
+    );
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+
+    // An undersized reservation reports an exact retry requirement and leaves
+    // both the live tree and reservation untouched.
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<M>::try_new().unwrap();
+    let required = M::LEVELS - 1;
+    let available = required - 1;
+    let mut prepared = PreparedFrames::<M>::try_new(available).unwrap();
+    assert_eq!(
+        table.cursor_no_flush().map_prepared(
+            vaddr,
+            PhysAddr::from_usize(0xa000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+            &mut prepared,
+        ),
+        Err(PreparedMapError::NeedMore {
+            required,
+            available,
+        })
+    );
+    assert_eq!(prepared.len(), available);
+    assert_eq!(table.query(vaddr), Err(PagingError::NotMapped));
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+#[test]
+fn test_prepared_errors_meta3() {
+    run_prepared_error_matrix::<PreparedMeta3>();
+}
+
+#[test]
+fn test_prepared_errors_meta4() {
+    run_prepared_error_matrix::<PreparedMeta4>();
+}
+
+#[test]
+fn test_prepared_reservation_allocation_failure_is_atomic() {
+    reset_prepared_test_state();
+    let table = PreparedTable::<PreparedMeta4>::try_new().unwrap();
+    assert_eq!(ALLOCATED.with_borrow(|allocated| allocated.len()), 1);
+
+    fail_frame_allocation_at(2);
+    assert!(matches!(
+        PreparedFrames::<PreparedMeta4>::try_new(3),
+        Err(PrepareTableFramesError::NoMemory)
+    ));
+    clear_frame_allocation_failure();
+    assert_eq!(
+        ALLOCATED.with_borrow(|allocated| allocated.len()),
+        1,
+        "partial reservation survived allocation failure"
+    );
+    assert_eq!(
+        PreparedFrames::<PreparedMeta4>::try_new(4).unwrap_err(),
+        PrepareTableFramesError::TooMany {
+            requested: 4,
+            maximum: 3,
+        }
+    );
+
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+#[test]
+fn test_prepared_commit_drops_only_unused_frames_after_unlock() {
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<PreparedMeta4>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(0x3456_7000);
+    // Differing at the final intermediate index creates exactly one missing
+    // table frame for `vaddr`.
+    table
+        .cursor_no_flush()
+        .map(
+            VirtAddr::from_usize(vaddr.as_usize() ^ (1 << 21)),
+            PhysAddr::from_usize(0xb000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )
+        .unwrap();
+    assert_eq!(
+        table
+            .required_prepared_frames(vaddr, PageSize::Size4K)
+            .unwrap(),
+        1
+    );
+
+    let mut prepared = PreparedFrames::<PreparedMeta4>::try_max().unwrap();
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(
+            vaddr,
+            PhysAddr::from_usize(0xb100_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+            &mut prepared,
+        )
+        .unwrap();
+    assert_eq!(commit.consumed_frames(), 1);
+    assert_eq!(prepared.len(), 2);
+    let allocated_before_drop = ALLOCATED.with_borrow(|allocated| allocated.len());
+    let deallocations_before_drop = frame_deallocation_count();
+    drop(prepared);
+    assert_eq!(
+        ALLOCATED.with_borrow(|allocated| allocated.len()),
+        allocated_before_drop - 2
+    );
+    assert_eq!(frame_deallocation_count(), deallocations_before_drop + 2);
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (
+            PhysAddr::from_usize(0xb100_0000),
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size4K,
+        )
+    );
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+fn run_prepared_huge_matrix<M>()
+where
+    M: PagingMetaData<VirtAddr = VirtAddr>,
+{
+    for (vaddr, target, page_size, required) in [
+        (
+            0x4000_1234usize,
+            0xc123_4567usize,
+            PageSize::Size1G,
+            M::LEVELS - 3,
+        ),
+        (
+            0x200_1234usize,
+            0xd023_4567usize,
+            PageSize::Size2M,
+            M::LEVELS - 2,
+        ),
+    ] {
+        reset_prepared_test_state();
+        let mut table = PreparedTable::<M>::try_new().unwrap();
+        let vaddr = VirtAddr::from_usize(vaddr);
+        let target = PhysAddr::from_usize(target);
+        assert_eq!(
+            table.required_prepared_frames(vaddr, page_size).unwrap(),
+            required
+        );
+        let mut prepared = PreparedFrames::<M>::try_max().unwrap();
+        let commit = table
+            .cursor_no_flush()
+            .map_prepared(vaddr, target, page_size, MappingFlags::READ, &mut prepared)
+            .unwrap();
+        assert_eq!(commit.consumed_frames(), required);
+        assert_eq!(prepared.len(), 3 - required);
+        assert_eq!(
+            table.query(vaddr).unwrap(),
+            (
+                target
+                    .align_down(page_size)
+                    .add(page_size.align_offset(vaddr.as_usize())),
+                MappingFlags::READ,
+                page_size,
+            )
+        );
+        drop(prepared);
+        drop(table);
+        assert_prepared_test_frames_reclaimed();
+    }
+}
+
+#[test]
+fn test_prepared_huge_paths_meta3() {
+    run_prepared_huge_matrix::<PreparedMeta3>();
+}
+
+#[test]
+fn test_prepared_huge_paths_meta4() {
+    run_prepared_huge_matrix::<PreparedMeta4>();
+}
+
+#[test]
+fn test_prepared_subtree_is_invisible_until_single_parent_publish() {
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<PreparedMeta4>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(0x1234_5000);
+    let target = PhysAddr::from_usize(0xe000_0000);
+    let mut prepared = PreparedFrames::<PreparedMeta4>::try_max().unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = Arc::new(NewTableHook {
+        trigger_at: 3,
+        calls: AtomicUsize::new(0),
+        paddrs: core::array::from_fn(|_| AtomicUsize::new(0)),
+        ready: ready_tx,
+        resume: Mutex::new(resume_rx),
+    });
+    NEW_TABLE_HOOK.with_borrow_mut(|slot| *slot = Some(Arc::clone(&hook)));
+
+    let root = table.root_paddr().as_usize();
+    let vaddr_usize = vaddr.as_usize();
+    let observer_hook = Arc::clone(&hook);
+    let observer = std::thread::spawn(move || {
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prepared commit did not reach its final publication");
+
+        let table_at =
+            |paddr: usize| unsafe { core::slice::from_raw_parts(paddr as *const TablePtrPte, 512) };
+        let index_at = |level: usize| {
+            let shift = 12 + (PreparedMeta4::LEVELS - 1 - level) * 9;
+            (vaddr_usize >> shift) & 511
+        };
+
+        let root_entry = table_at(root)[index_at(0)];
+        assert!(
+            root_entry.is_unused(),
+            "prepared subtree became reachable before final parent publish"
+        );
+
+        // `new_table` calls 0 and 1 built the two offline links; call 2
+        // constructed the still-unpublished root pointer.
+        let first = observer_hook.paddrs[2].load(Ordering::SeqCst);
+        let second = observer_hook.paddrs[0].load(Ordering::SeqCst);
+        let third = observer_hook.paddrs[1].load(Ordering::SeqCst);
+        let first_entry = table_at(first)[index_at(1)];
+        let second_entry = table_at(second)[index_at(2)];
+        let leaf = table_at(third)[index_at(3)];
+        assert_eq!(first_entry.paddr().as_usize(), second);
+        assert_eq!(second_entry.paddr().as_usize(), third);
+        assert!(leaf.is_present());
+        assert_eq!(leaf.paddr(), target);
+
+        resume_tx
+            .send(())
+            .expect("prepared commit disappeared before publication");
+    });
+
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(
+            vaddr,
+            target,
+            PageSize::Size4K,
+            MappingFlags::READ,
+            &mut prepared,
+        )
+        .unwrap();
+    NEW_TABLE_HOOK.with_borrow_mut(|slot| *slot = None);
+    observer
+        .join()
+        .expect("prepared publication observer failed");
+
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(commit.consumed_frames(), 3);
+    assert!(prepared.is_empty());
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (target, MappingFlags::READ, PageSize::Size4K)
+    );
+
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+#[test]
+fn test_prepared_existing_path_leaf_is_release_published_once() {
+    reset_prepared_test_state();
+    let mut table = PreparedTable::<PreparedMeta4>::try_new().unwrap();
+    let vaddr = VirtAddr::from_usize(0x2345_6000);
+
+    // Seed and clear a leaf so every intermediate table already exists.
+    table
+        .cursor_no_flush()
+        .map(
+            vaddr,
+            PhysAddr::from_usize(0xf000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )
+        .unwrap();
+    table.cursor_no_flush().unmap(vaddr).unwrap();
+    assert_eq!(
+        table
+            .required_prepared_frames(vaddr, PageSize::Size4K)
+            .unwrap(),
+        0
+    );
+
+    let target = TrackPagingHandler::<PreparedMeta4>::alloc_frame().unwrap();
+    const DATA_MARKER: u64 = 0xfeed_cafe_1234_5678;
+    unsafe {
+        *(TrackPagingHandler::<PreparedMeta4>::phys_to_virt(target).as_mut_ptr() as *mut u64) =
+            DATA_MARKER;
+    }
+    let mut prepared = PreparedFrames::<PreparedMeta4>::try_new(0).unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = Arc::new(NewTableHook {
+        trigger_at: 1,
+        calls: AtomicUsize::new(0),
+        paddrs: core::array::from_fn(|_| AtomicUsize::new(0)),
+        ready: ready_tx,
+        resume: Mutex::new(resume_rx),
+    });
+    NEW_PAGE_HOOK.with_borrow_mut(|slot| *slot = Some(Arc::clone(&hook)));
+
+    let root = table.root_paddr().as_usize();
+    let vaddr_usize = vaddr.as_usize();
+    let observer = std::thread::spawn(move || {
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prepared leaf commit did not reach publication");
+        let table_at =
+            |paddr: usize| unsafe { core::slice::from_raw_parts(paddr as *const TablePtrPte, 512) };
+        let index_at = |level: usize| {
+            let shift = 12 + (PreparedMeta4::LEVELS - 1 - level) * 9;
+            (vaddr_usize >> shift) & 511
+        };
+
+        let mut table_paddr = root;
+        for level in 0..PreparedMeta4::LEVELS {
+            let entry = table_at(table_paddr)[index_at(level)];
+            if level == PreparedMeta4::LEVELS - 1 {
+                assert!(
+                    entry.is_unused(),
+                    "existing-path leaf became visible before release publication"
+                );
+            } else {
+                assert!(!entry.is_unused());
+                table_paddr = entry.paddr().as_usize();
+            }
+        }
+        assert_eq!(
+            unsafe { *(target.as_usize() as *const u64) },
+            DATA_MARKER,
+            "prepared data was not initialized before leaf publication"
+        );
+        resume_tx
+            .send(())
+            .expect("prepared leaf commit disappeared before publication");
+    });
+
+    let commit = table
+        .cursor_no_flush()
+        .map_prepared(
+            vaddr,
+            target,
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+            &mut prepared,
+        )
+        .unwrap();
+    NEW_PAGE_HOOK.with_borrow_mut(|slot| *slot = None);
+    observer.join().expect("prepared leaf observer failed");
+
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(commit.consumed_frames(), 0);
+    assert!(prepared.is_empty());
+    assert_eq!(
+        table.query(vaddr).unwrap(),
+        (
+            target,
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size4K,
+        )
+    );
+
+    table.cursor_no_flush().unmap(vaddr).unwrap();
+    TrackPagingHandler::<PreparedMeta4>::dealloc_frame(target);
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
 }
