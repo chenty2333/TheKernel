@@ -77,7 +77,12 @@ The current bounded-signal modernization slice additionally maintains:
 - overflow-safe alternate-stack bounds, dynamically derived `SS_ONSTACK`
   status, nested `SA_ONSTACK` frame placement below the active frame, and
   transactional handler-context publication after all userspace writes;
-- ABI flag and `SignalInfo` compatibility updates.
+- ABI flag and `SignalInfo` compatibility updates, including an exact
+  `SIGSYS`/`SYS_SECCOMP` constructor for the `_sigsys` errno, call-address,
+  raw-syscall, and audit-architecture payload. Architecture identification
+  and seccomp action policy remain caller-owned; host tests pin the Linux
+  64-bit field offsets while RISC-V and LoongArch no-std checks exercise the
+  generated target layouts.
 - a synchronous-wait observation transaction which dequeues the selected set
   first and excludes that set from the following asynchronous delivery scan;
   a waited signal published in the dequeue-to-delivery gap therefore remains

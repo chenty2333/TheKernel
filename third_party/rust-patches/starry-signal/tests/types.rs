@@ -90,3 +90,41 @@ fn signalinfo_fault_preserves_code_and_address() {
     assert_eq!(si.fault_address(), 0x1234_5000);
     assert_eq!(si.errno(), 0);
 }
+
+#[test]
+fn signalinfo_sigsys_preserves_seccomp_trap_fields() {
+    const AUDIT_ARCH_RISCV64: u32 = 0xc000_00f3;
+
+    let si = SignalInfo::new_sigsys(0x5a5a, 0x1234_5678_9abc, -17, AUDIT_ARCH_RISCV64);
+
+    assert_eq!(si.signo(), Signo::SIGSYS);
+    assert_eq!(si.code(), 1); // SYS_SECCOMP
+    assert_eq!(si.errno(), 0x5a5a);
+    assert_eq!(si.sigsys_call_address(), 0x1234_5678_9abc);
+    assert_eq!(si.sigsys_syscall(), -17);
+    assert_eq!(si.sigsys_arch(), AUDIT_ARCH_RISCV64);
+
+    let raw = unsafe { si.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigsys };
+    assert_eq!(raw._call_addr as usize, 0x1234_5678_9abc);
+    assert_eq!(raw._syscall, -17);
+    assert_eq!(raw._arch, AUDIT_ARCH_RISCV64);
+}
+
+#[test]
+fn signalinfo_sigsys_matches_linux_64_bit_abi_layout() {
+    use core::mem::{align_of, size_of};
+
+    let si = SignalInfo::new_sigsys(0x1122_3344, 0x1234_5678, 0x5566_7788, 0x99aa_bbcc);
+    let base = core::ptr::addr_of!(si.0) as usize;
+    let common = unsafe { &si.0.__bindgen_anon_1.__bindgen_anon_1 };
+    let sigsys = unsafe { &common._sifields._sigsys };
+
+    assert_eq!(size_of::<SignalInfo>(), 128);
+    assert_eq!(align_of::<SignalInfo>(), align_of::<usize>());
+    assert_eq!(core::ptr::addr_of!(common.si_signo) as usize - base, 0);
+    assert_eq!(core::ptr::addr_of!(common.si_errno) as usize - base, 4);
+    assert_eq!(core::ptr::addr_of!(common.si_code) as usize - base, 8);
+    assert_eq!(core::ptr::addr_of!(sigsys._call_addr) as usize - base, 16);
+    assert_eq!(core::ptr::addr_of!(sigsys._syscall) as usize - base, 24);
+    assert_eq!(core::ptr::addr_of!(sigsys._arch) as usize - base, 28);
+}

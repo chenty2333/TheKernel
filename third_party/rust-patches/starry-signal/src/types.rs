@@ -1,7 +1,9 @@
 use core::{fmt, mem};
 
 use derive_more::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
-use linux_raw_sys::general::{SI_KERNEL, SS_DISABLE, SS_ONSTACK, kernel_sigset_t, siginfo_t};
+use linux_raw_sys::general::{
+    SI_KERNEL, SS_DISABLE, SS_ONSTACK, SYS_SECCOMP, kernel_sigset_t, siginfo_t,
+};
 use strum::{EnumIter, FromRepr, IntoEnumIterator};
 
 use crate::DefaultSignalAction;
@@ -228,8 +230,50 @@ impl SignalInfo {
         let mut result: Self = unsafe { mem::zeroed() };
         result.set_signo(signo);
         result.set_code(code);
-        result.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigfault._addr =
-            address as *mut _;
+        result
+            .0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigfault
+            ._addr = address as *mut _;
+        result
+    }
+
+    /// Builds the `SIGSYS` record Linux exposes for a seccomp trap.
+    ///
+    /// `syscall` is the raw signed syscall number evaluated by the filter,
+    /// `call_address` is the userspace instruction address reported by the
+    /// architecture's syscall entry path, and `arch` is the corresponding
+    /// Linux audit architecture identifier. The caller supplies the low
+    /// 16-bit seccomp return data as `errno` after applying its own policy.
+    pub fn new_sigsys(errno: i32, call_address: usize, syscall: i32, arch: u32) -> Self {
+        // FIXME: Zeroable
+        let mut result: Self = unsafe { mem::zeroed() };
+        result.set_signo(Signo::SIGSYS);
+        result.0.__bindgen_anon_1.__bindgen_anon_1.si_errno = errno;
+        result.set_code(SYS_SECCOMP as _);
+        result
+            .0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigsys
+            ._call_addr = call_address as *mut _;
+        result
+            .0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigsys
+            ._syscall = syscall;
+        result
+            .0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigsys
+            ._arch = arch;
         result
     }
 
@@ -294,6 +338,47 @@ impl SignalInfo {
                 ._sifields
                 ._sigfault
                 ._addr as usize
+        }
+    }
+
+    /// Returns the userspace instruction address carried by a `SIGSYS`
+    /// record.
+    pub fn sigsys_call_address(&self) -> usize {
+        // SAFETY: callers use this accessor for records whose active siginfo
+        // payload is `_sigsys`, including records built by `new_sigsys`.
+        unsafe {
+            self.0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._call_addr as usize
+        }
+    }
+
+    /// Returns the raw syscall number carried by a `SIGSYS` record.
+    pub fn sigsys_syscall(&self) -> i32 {
+        // SAFETY: see `sigsys_call_address`.
+        unsafe {
+            self.0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._syscall
+        }
+    }
+
+    /// Returns the Linux audit architecture carried by a `SIGSYS` record.
+    pub fn sigsys_arch(&self) -> u32 {
+        // SAFETY: see `sigsys_call_address`.
+        unsafe {
+            self.0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._arch
         }
     }
 }
