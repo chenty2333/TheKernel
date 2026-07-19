@@ -123,6 +123,17 @@ while IFS= read -r arch; do
             export THEKERNEL_NIGHTLY_REBUILD_ROOTFS=1
             nightly_run_guest "$arch" "$commands" "$run_dir"
         )
+        case "$arch" in
+            rv)
+                setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT'
+                ;;
+            la)
+                setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent'
+                ;;
+            *)
+                nightly_fail "unsupported architecture in wait-boundary gate: $arch"
+                ;;
+        esac
         nightly_validate_guest_log \
             "$run_dir/qemu.log" clean \
             "CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$cpus" \
@@ -133,7 +144,8 @@ while IFS= read -r arch; do
             'CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK signal=SIGKILL sigxcpu=0' \
             'CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK bad_new=EFAULT bad_pid_before_resource=ESRCH' \
             'CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK old_new=atomic invalid=rollback copyout_fault=committed' \
-            'CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK setrlimit_bad_new=EFAULT setitimer_bad_new=EFAULT' \
+            "$setrlimit_precedence_marker" \
+            'CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT' \
             'CI_WAIT_BOUNDARY_FUTEX_WAKE_OK' \
             'CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK' \
             'CI_WAIT_BOUNDARY_FUTEX_WAITV_OK' \

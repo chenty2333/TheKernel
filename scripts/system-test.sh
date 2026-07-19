@@ -84,6 +84,15 @@ log_has_exact_line() {
     grep -Fqx -- "$expected" "$LOG" || grep -Fqx -- "${expected}"$'\r' "$LOG"
 }
 
+case "$ARCH" in
+    rv)
+        setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT'
+        ;;
+    la)
+        setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent'
+        ;;
+esac
+
 for marker in \
     THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK \
     THEKERNEL_SYSTEM_TEST_INIT_EXEC_2_OK \
@@ -105,7 +114,8 @@ for marker in \
     CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK\ signal=SIGKILL\ sigxcpu=0 \
     CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK\ bad_new=EFAULT\ bad_pid_before_resource=ESRCH \
     CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK\ old_new=atomic\ invalid=rollback\ copyout_fault=committed \
-    CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK\ setrlimit_bad_new=EFAULT\ setitimer_bad_new=EFAULT \
+    "$setrlimit_precedence_marker" \
+    CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK\ bad_new=EFAULT \
     CI_WAIT_BOUNDARY_FUTEX_WAKE_OK \
     CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK \
     CI_WAIT_BOUNDARY_FUTEX_WAITV_OK \

@@ -1079,16 +1079,23 @@ static int test_prlimit64_owner_transaction(void)
 
 static int test_legacy_limit_timer_error_precedence(void)
 {
+#ifdef SYS_setrlimit
     const struct rlimit *bad_limit = (const struct rlimit *)(uintptr_t)1;
+#endif
     const struct itimerval *bad_timer =
         (const struct itimerval *)(uintptr_t)1;
 
+#ifdef SYS_setrlimit
     errno = 0;
     if (syscall(SYS_setrlimit, UINT_MAX, bad_limit) != -1 ||
         errno != EFAULT) {
         errno = EIO;
         return fail("setrlimit-error-precedence");
     }
+    puts("CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT");
+#else
+    puts("CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent");
+#endif
 
     errno = 0;
     if (syscall(SYS_setitimer, INT_MAX, bad_timer, NULL) != -1 ||
@@ -1097,8 +1104,7 @@ static int test_legacy_limit_timer_error_precedence(void)
         return fail("setitimer-error-precedence");
     }
 
-    puts("CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK "
-         "setrlimit_bad_new=EFAULT setitimer_bad_new=EFAULT");
+    puts("CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT");
     return 0;
 }
 

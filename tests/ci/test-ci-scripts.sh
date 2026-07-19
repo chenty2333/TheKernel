@@ -250,21 +250,26 @@ mkdir -p \
     "$system_fixture/.state/rootfs"
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
 printf fixture >"$system_fixture/kernel-rv"
+printf fixture >"$system_fixture/kernel-la"
 printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
+printf fixture >"$system_fixture/.state/rootfs/rootfs-la.img"
 cat >"$system_fixture/fake-bin/python3" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" >"$FAKE_SYSTEM_RUNNER_ARGS"
 workdir=
+arch=
 while (($#)); do
     case "$1" in
+        --arch) arch=${2:-}; shift 2 ;;
         --workdir) workdir=${2:-}; shift 2 ;;
         *) shift ;;
     esac
 done
 [ -n "$workdir" ]
+[ -n "$arch" ]
 mkdir -p "$workdir"
-cat >"$workdir/console.log" <<'MARKERS'
+cat >"$workdir/console.log" <<'MARKERS_BEFORE_SETRLIMIT'
 THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK
 THEKERNEL_SYSTEM_TEST_INIT_EXEC_2_OK
 THEKERNEL_SYSTEM_TEST_START
@@ -285,7 +290,14 @@ CI_WAIT_BOUNDARY_RLIMIT_CPU_ESCALATION_OK soft_after_signal=2 hard_signal=SIGKIL
 CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK signal=SIGKILL sigxcpu=0
 CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK bad_new=EFAULT bad_pid_before_resource=ESRCH
 CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK old_new=atomic invalid=rollback copyout_fault=committed
-CI_WAIT_BOUNDARY_LEGACY_PRECEDENCE_OK setrlimit_bad_new=EFAULT setitimer_bad_new=EFAULT
+MARKERS_BEFORE_SETRLIMIT
+case "$arch" in
+    rv) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT' ;;
+    la) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent' ;;
+    *) exit 2 ;;
+esac >>"$workdir/console.log"
+cat >>"$workdir/console.log" <<'MARKERS_AFTER_SETRLIMIT'
+CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT
 CI_WAIT_BOUNDARY_FUTEX_WAKE_OK
 CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK
 CI_WAIT_BOUNDARY_FUTEX_WAITV_OK
@@ -294,7 +306,7 @@ THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK
 THEKERNEL_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_PASS
-MARKERS
+MARKERS_AFTER_SETRLIMIT
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$system_fixture/fake-bin/python3"
@@ -306,6 +318,13 @@ env PATH="$system_fixture/fake-bin:$PATH" \
     --arch rv --skip-build --workdir "$tmp/system-run" >/dev/null
 grep -Fxq -- '--stop-after-marker' "$system_args"
 grep -Fxq -- 'THEKERNEL_SYSTEM_TEST_PASS' "$system_args"
+system_args_la="$tmp/system-runner-la.args"
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$system_args_la" \
+    FAKE_SYSTEM_RUNNER_STATUS=75 \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch la --skip-build --workdir "$tmp/system-run-la" >/dev/null
+grep -Fxq -- 'la' "$system_args_la"
 set +e
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
