@@ -2,7 +2,8 @@
 //!
 //! The public syscall remains unavailable until registration, fault waiting,
 //! resolution, lifecycle races, and cross-architecture contracts close.  This
-//! module establishes only the bounded OFD/API/readiness shell.
+//! module establishes the bounded OFD/API/readiness shell plus dormant
+//! REGISTER/UNREGISTER ioctls; it does not route or resolve page faults.
 
 use alloc::{
     borrow::Cow,
@@ -19,15 +20,23 @@ use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex as BlockingMutex;
 use bytemuck::{Pod, Zeroable, pod_read_unaligned};
 use linux_raw_sys::{
-    general::{UFFD_EVENT_PAGEFAULT, UFFD_PAGEFAULT_FLAG_WRITE, uffdio_api},
-    ioctl::UFFDIO_API as UFFDIO_API_CMD,
+    general::{
+        UFFD_EVENT_PAGEFAULT, UFFD_PAGEFAULT_FLAG_WRITE, uffdio_api, uffdio_range, uffdio_register,
+    },
+    ioctl::{
+        UFFDIO_API as UFFDIO_API_CMD, UFFDIO_REGISTER as UFFDIO_REGISTER_CMD,
+        UFFDIO_UNREGISTER as UFFDIO_UNREGISTER_CMD,
+    },
 };
+use memory_addr::PAGE_SIZE_4K;
 use starry_vm::{VmMutPtr, VmPtr};
 use thekernel_linux_mm::{
-    FaultAccess, FaultHandlerId, MmError, UffdApiNegotiation, UffdApiState, UffdCreateFlags,
+    FaultAccess, FaultHandlerId, MmError, PageRange, UffdApiNegotiation, UffdApiState,
+    UffdCreateFlags, UffdIoctls, UffdRegisterMode,
 };
 
 use crate::{
+    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     file::{FileLike, IoDst, Kstat, anon_inode_stat},
     mm::{AddrSpace, DeliveredUffdEvent, UffdAddressSpaceState, UffdPollSet, uffd_policy_error},
     readiness::block_on_poll_io,
@@ -49,6 +58,46 @@ const _: [(); mem::align_of::<uffdio_api>()] = [(); mem::align_of::<UffdApiRaw>(
 const _: [(); mem::offset_of!(uffdio_api, api)] = [(); mem::offset_of!(UffdApiRaw, api)];
 const _: [(); mem::offset_of!(uffdio_api, features)] = [(); mem::offset_of!(UffdApiRaw, features)];
 const _: [(); mem::offset_of!(uffdio_api, ioctls)] = [(); mem::offset_of!(UffdApiRaw, ioctls)];
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdRangeRaw {
+    start: u64,
+    len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdRegisterInputRaw {
+    range: UffdRangeRaw,
+    mode: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdRegisterRaw {
+    range: UffdRangeRaw,
+    mode: u64,
+    ioctls: u64,
+}
+
+const UFFD_RANGE_SIZE: usize = mem::size_of::<UffdRangeRaw>();
+const UFFD_REGISTER_INPUT_SIZE: usize = mem::size_of::<UffdRegisterInputRaw>();
+const UFFD_REGISTER_IOCTLS_OFFSET: usize = mem::offset_of!(UffdRegisterRaw, ioctls);
+
+const _: [(); mem::size_of::<uffdio_range>()] = [(); mem::size_of::<UffdRangeRaw>()];
+const _: [(); mem::align_of::<uffdio_range>()] = [(); mem::align_of::<UffdRangeRaw>()];
+const _: [(); mem::offset_of!(uffdio_range, start)] = [(); mem::offset_of!(UffdRangeRaw, start)];
+const _: [(); mem::offset_of!(uffdio_range, len)] = [(); mem::offset_of!(UffdRangeRaw, len)];
+const _: [(); mem::size_of::<uffdio_register>()] = [(); mem::size_of::<UffdRegisterRaw>()];
+const _: [(); mem::align_of::<uffdio_register>()] = [(); mem::align_of::<UffdRegisterRaw>()];
+const _: [(); mem::offset_of!(uffdio_register, range)] =
+    [(); mem::offset_of!(UffdRegisterRaw, range)];
+const _: [(); mem::offset_of!(uffdio_register, mode)] =
+    [(); mem::offset_of!(UffdRegisterRaw, mode)];
+const _: [(); mem::offset_of!(uffdio_register, ioctls)] =
+    [(); mem::offset_of!(UffdRegisterRaw, ioctls)];
+const _: [(); UFFD_REGISTER_INPUT_SIZE] = [(); UFFD_REGISTER_IOCTLS_OFFSET];
 
 enum UffdHandlerBinding {
     // Linux keeps the userfaultfd context but not the old image's live VMA
@@ -108,6 +157,54 @@ impl AttachedUffdHandler {
             }
         }
     }
+
+    fn register_range(
+        &self,
+        api: &UffdApiState,
+        range: PageRange,
+        mode: UffdRegisterMode,
+    ) -> AxResult<UffdIoctls> {
+        match &self.binding {
+            UffdHandlerBinding::AddressSpace(aspace) => {
+                // Linux reports ENOMEM when mmget_not_zero() cannot retain the
+                // old mm for REGISTER/UNREGISTER.
+                let aspace = aspace.upgrade().ok_or(AxError::NoMemory)?;
+                let result = aspace
+                    .lock()
+                    .register_uffd_range(api, self.handler, range, mode);
+                result
+            }
+            #[cfg(test)]
+            UffdHandlerBinding::Standalone(state) => {
+                let state = state.upgrade().ok_or(AxError::NoMemory)?;
+                let result = state
+                    .lock()
+                    .register_test_range(api, self.handler, range, mode);
+                result
+            }
+        }
+    }
+
+    fn unregister_range(&self, api: &UffdApiState, range: PageRange) -> AxResult {
+        let deferred = match &self.binding {
+            UffdHandlerBinding::AddressSpace(aspace) => {
+                let aspace = aspace.upgrade().ok_or(AxError::NoMemory)?;
+                let result = aspace.lock().unregister_uffd_range(api, range);
+                result?
+            }
+            #[cfg(test)]
+            UffdHandlerBinding::Standalone(state) => {
+                let state = state.upgrade().ok_or(AxError::NoMemory)?;
+                let result = state.lock().unregister_test_range(api, range);
+                result?
+            }
+        };
+        // Fault waiters and fd poll registrations may re-enter the address
+        // space. Their wake ownership is therefore consumed only after the
+        // address-space/state guard above has been dropped.
+        deferred.finish();
+        Ok(())
+    }
 }
 
 impl Drop for AttachedUffdHandler {
@@ -131,10 +228,10 @@ impl Drop for AttachedUffdHandler {
                 let Some(state) = state.upgrade() else {
                     return;
                 };
-                let readiness = state.lock().detach_handler(self.handler);
-                match readiness {
-                    Ok(readiness) => {
-                        readiness.wake();
+                let deferred = state.lock().detach_handler(self.handler);
+                match deferred {
+                    Ok(deferred) => {
+                        deferred.finish();
                     }
                     Err(error) => warn!("userfaultfd test detach failed: {error:?}"),
                 }
@@ -204,23 +301,31 @@ impl UserfaultFile {
     fn try_new_for_test(
         flags: UffdCreateFlags,
     ) -> AxResult<(Arc<BlockingMutex<UffdAddressSpaceState>>, Arc<Self>)> {
-        let readiness = Arc::try_new(UffdPollSet::new()).map_err(|_| AxError::NoMemory)?;
         let state = Arc::try_new(BlockingMutex::new(*UffdAddressSpaceState::try_new_boxed()?))
             .map_err(|_| AxError::NoMemory)?;
+        let file = Self::try_new_for_test_in_state(&state, flags)?;
+        Ok((state, file))
+    }
+
+    #[cfg(test)]
+    fn try_new_for_test_in_state(
+        state: &Arc<BlockingMutex<UffdAddressSpaceState>>,
+        flags: UffdCreateFlags,
+    ) -> AxResult<Arc<Self>> {
+        let readiness = Arc::try_new(UffdPollSet::new()).map_err(|_| AxError::NoMemory)?;
         let handler = state.lock().attach_handler(readiness.clone())?;
         let binding = AttachedUffdHandler {
-            binding: UffdHandlerBinding::Standalone(Arc::downgrade(&state)),
+            binding: UffdHandlerBinding::Standalone(Arc::downgrade(state)),
             handler,
         };
-        let file = Arc::try_new(Self {
+        Arc::try_new(Self {
             binding,
             api: BlockingMutex::new(UffdApiState::new()),
             api_initialized: AtomicBool::new(false),
             nonblocking: AtomicBool::new(flags.nonblocking()),
             readiness,
         })
-        .map_err(|_| AxError::NoMemory)?;
-        Ok((state, file))
+        .map_err(|_| AxError::NoMemory)
     }
 
     fn initialized(&self) -> bool {
@@ -271,6 +376,85 @@ impl UserfaultFile {
             return Err(uffd_policy_error(error));
         }
         Ok(0)
+    }
+
+    fn api_snapshot(&self) -> AxResult<UffdApiState> {
+        if !self.initialized() {
+            return Err(AxError::InvalidInput);
+        }
+        // Clone under the OFD mutex, then release it before acquiring the
+        // address-space mutex. API state is one-way after initialization.
+        Ok(self.api.lock().clone())
+    }
+
+    fn checked_range(raw: UffdRangeRaw) -> AxResult<PageRange> {
+        let start = usize::try_from(raw.start).map_err(|_| AxError::InvalidInput)?;
+        let length = usize::try_from(raw.len).map_err(|_| AxError::InvalidInput)?;
+        let range = PageRange::new(start, length, PAGE_SIZE_4K).map_err(uffd_policy_error)?;
+        let user_end = USER_SPACE_BASE
+            .checked_add(USER_SPACE_SIZE)
+            .ok_or(AxError::InvalidInput)?;
+        // Linux validate_unaligned_range() rejects ranges below mmap_min_addr
+        // and ranges that cross TASK_SIZE before retaining the old mm.  This
+        // keeps invalid geometry ahead of a retired-mm ENOMEM.
+        if range.start() < USER_SPACE_BASE || range.end() > user_end {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(range)
+    }
+
+    fn register_with_usercopy(
+        &self,
+        copyin: impl FnOnce() -> AxResult<UffdRegisterInputRaw>,
+        copyout: impl FnOnce(u64) -> AxResult,
+    ) -> AxResult<usize> {
+        // Linux rejects every non-API ioctl on an uninitialized context before
+        // touching its command-specific user pointer.
+        let api = self.api_snapshot()?;
+        let request = copyin()?;
+        let mode = UffdRegisterMode::from_bits(request.mode).map_err(uffd_policy_error)?;
+        let range = Self::checked_range(request.range)?;
+        let ioctls = self.binding.register_range(&api, range, mode)?;
+        // Linux commits the registration before this lone 8-byte copyout.
+        // EFAULT is returned without rolling the table back.
+        copyout(ioctls.bits())?;
+        Ok(0)
+    }
+
+    fn ioctl_register(&self, arg: usize) -> AxResult<usize> {
+        self.register_with_usercopy(
+            || {
+                let input = arg as *const [u8; UFFD_REGISTER_INPUT_SIZE];
+                Ok(pod_read_unaligned(&input.vm_read()?))
+            },
+            |ioctls| {
+                let output = arg
+                    .checked_add(UFFD_REGISTER_IOCTLS_OFFSET)
+                    .ok_or(AxError::BadAddress)?
+                    as *mut [u8; mem::size_of::<u64>()];
+                Ok(output.vm_write(ioctls.to_ne_bytes())?)
+            },
+        )
+    }
+
+    fn unregister_with_usercopy(
+        &self,
+        copyin: impl FnOnce() -> AxResult<UffdRangeRaw>,
+    ) -> AxResult<usize> {
+        // Keep the initialization gate ahead of the command-specific copyin,
+        // matching userfaultfd_ioctl() ordering.
+        let api = self.api_snapshot()?;
+        let request = copyin()?;
+        let range = Self::checked_range(request)?;
+        self.binding.unregister_range(&api, range)?;
+        Ok(0)
+    }
+
+    fn ioctl_unregister(&self, arg: usize) -> AxResult<usize> {
+        self.unregister_with_usercopy(|| {
+            let input = arg as *const [u8; UFFD_RANGE_SIZE];
+            Ok(pod_read_unaligned(&input.vm_read()?))
+        })
     }
 
     fn encode_pagefault(event: DeliveredUffdEvent) -> [u8; UFFD_MSG_SIZE] {
@@ -359,12 +543,13 @@ impl FileLike for UserfaultFile {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        if cmd == UFFDIO_API_CMD {
-            self.ioctl_api(arg)
-        } else {
+        match cmd {
+            UFFDIO_API_CMD => self.ioctl_api(arg),
+            UFFDIO_REGISTER_CMD => self.ioctl_register(arg),
+            UFFDIO_UNREGISTER_CMD => self.ioctl_unregister(arg),
             // Linux v6.12 returns EINVAL both before initialization and for an
             // unsupported command after initialization.
-            Err(AxError::InvalidInput)
+            _ => Err(AxError::InvalidInput),
         }
     }
 
@@ -412,14 +597,18 @@ impl Pollable for UserfaultFile {
 mod tests {
     extern crate std;
 
-    use alloc::sync::Arc;
-    use std::sync::{Mutex, MutexGuard, Once};
+    use alloc::sync::{Arc, Weak as ArcWeak};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        sync::{Mutex, MutexGuard, Once},
+        task::{Wake, Waker},
+    };
 
     use axio::{IoBufMut, Write};
     use linux_raw_sys::general::{O_NONBLOCK, O_RDONLY};
     use thekernel_linux_mm::{
-        FaultKey, FaultRequest, FaultType, MappingAccess, MappingKind, MappingSnapshot, UFFD_API,
-        UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY,
+        FaultDisposition, FaultKey, FaultRequest, FaultType, MappingAccess, MappingKind,
+        MappingSnapshot, UFFD_API, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY,
     };
 
     use super::*;
@@ -508,25 +697,82 @@ mod tests {
         file.commit_api(negotiation).unwrap();
     }
 
-    fn request(handler: FaultHandlerId, page: usize) -> FaultRequest {
-        let snapshot = MappingSnapshot::from_raw(
+    fn snapshot(start: usize, length: usize) -> MappingSnapshot {
+        MappingSnapshot::from_raw(
             1,
             2,
             1,
-            page,
-            4096,
-            4096,
+            start,
+            length,
+            PAGE_SIZE_4K,
             MappingAccess::new(true, true, false).bits(),
             MappingKind::AnonymousPrivate,
             true,
             false,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn request(handler: FaultHandlerId, page: usize) -> FaultRequest {
         FaultRequest::new(
-            FaultKey::from_address(snapshot, page, FaultAccess::Read).unwrap(),
+            FaultKey::from_address(snapshot(page, PAGE_SIZE_4K), page, FaultAccess::Read).unwrap(),
             handler,
             FaultType::Missing,
         )
+    }
+
+    fn register_input(start: usize, length: usize) -> UffdRegisterInputRaw {
+        UffdRegisterInputRaw {
+            range: UffdRangeRaw {
+                start: start as u64,
+                len: length as u64,
+            },
+            mode: UffdRegisterMode::MISSING.bits(),
+        }
+    }
+
+    fn range(start: usize, length: usize) -> UffdRangeRaw {
+        UffdRangeRaw {
+            start: start as u64,
+            len: length as u64,
+        }
+    }
+
+    struct StateLockWakeProbe {
+        state: ArcWeak<BlockingMutex<UffdAddressSpaceState>>,
+        calls: AtomicUsize,
+        all_lock_external: AtomicBool,
+    }
+
+    impl StateLockWakeProbe {
+        fn new(state: &Arc<BlockingMutex<UffdAddressSpaceState>>) -> Self {
+            Self {
+                state: Arc::downgrade(state),
+                calls: AtomicUsize::new(0),
+                all_lock_external: AtomicBool::new(true),
+            }
+        }
+
+        fn observe(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let lock_external = self
+                .state
+                .upgrade()
+                .is_none_or(|state| state.try_lock().is_some());
+            if !lock_external {
+                self.all_lock_external.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl Wake for StateLockWakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
     }
 
     #[test]
@@ -605,6 +851,221 @@ mod tests {
         let mut retry = TestDst::success(UFFD_MSG_SIZE);
         assert_eq!(file.read_ready(&mut retry), Err(AxError::WouldBlock));
         assert!(retry.bytes.is_empty());
+    }
+
+    #[test]
+    fn range_ioctls_reject_uninitialized_context_before_usercopy() {
+        let _context = test_context();
+        let (_state, file) = new_file(true);
+
+        assert_eq!(
+            file.ioctl(UFFDIO_REGISTER_CMD, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.ioctl(UFFDIO_UNREGISTER_CMD, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn register_reads_only_input_prefix_and_overwrites_reused_output() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        state
+            .lock()
+            .set_test_snapshots(&[snapshot(0x1000, 0x3000)])
+            .unwrap();
+
+        let mut reused_output = u64::MAX;
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0x1000, 0x3000)),
+                |ioctls| {
+                    reused_output = ioctls;
+                    Ok(())
+                },
+            ),
+            Ok(0)
+        );
+        assert_eq!(reused_output, UffdIoctls::MISSING_RANGE_PROFILE.bits());
+        assert_eq!(UFFD_REGISTER_INPUT_SIZE, 24);
+        assert_eq!(UFFD_REGISTER_IOCTLS_OFFSET, 24);
+        assert_eq!(state.lock().registrations.len(), 1);
+    }
+
+    #[test]
+    fn register_copyout_fault_does_not_roll_back_committed_registration() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        state
+            .lock()
+            .set_test_snapshots(&[snapshot(0x2000, 0x2000)])
+            .unwrap();
+
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0x2000, 0x2000)),
+                |_| Err(AxError::BadAddress),
+            ),
+            Err(AxError::BadAddress)
+        );
+        let locked = state.lock();
+        assert_eq!(locked.registrations.len(), 1);
+        assert_eq!(
+            locked.registrations.iter().next().unwrap().range(),
+            PageRange::new(0x2000, 0x2000, PAGE_SIZE_4K).unwrap()
+        );
+    }
+
+    #[test]
+    fn unregister_is_address_space_wide_across_userfaultfd_ofds() {
+        let _context = test_context();
+        let (state, first) = new_file(true);
+        let second = UserfaultFile::try_new_for_test_in_state(&state, flags(true)).unwrap();
+        initialize(&first);
+        initialize(&second);
+        state
+            .lock()
+            .set_test_snapshots(&[snapshot(0x3000, 0x3000)])
+            .unwrap();
+
+        first
+            .register_with_usercopy(|| Ok(register_input(0x3000, 0x3000)), |_| Ok(()))
+            .unwrap();
+        assert_ne!(first.binding.handler(), second.binding.handler());
+        assert_eq!(
+            second.unregister_with_usercopy(|| Ok(range(0x3000, 0x3000))),
+            Ok(0)
+        );
+        assert!(state.lock().registrations.is_empty());
+    }
+
+    #[test]
+    fn register_and_unregister_report_enomem_after_old_mm_retirement() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        drop(state);
+
+        let task_size = USER_SPACE_BASE + USER_SPACE_SIZE;
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(task_size, PAGE_SIZE_4K)),
+                |_| panic!("copyout must not run for an invalid range"),
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.unregister_with_usercopy(|| Ok(range(task_size, PAGE_SIZE_4K))),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0, PAGE_SIZE_4K)),
+                |_| panic!("copyout must not run for an invalid range"),
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.unregister_with_usercopy(|| Ok(range(0, PAGE_SIZE_4K))),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0x1000, PAGE_SIZE_4K)),
+                |_| panic!("copyout must not run for a retired address space"),
+            ),
+            Err(AxError::NoMemory)
+        );
+        assert_eq!(
+            file.unregister_with_usercopy(|| Ok(range(0x1000, PAGE_SIZE_4K))),
+            Err(AxError::NoMemory)
+        );
+    }
+
+    #[test]
+    fn unregister_wakes_fault_completion_after_releasing_state_lock() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        let handler = file.binding.handler();
+        let mapping = snapshot(0x4000, 0x2000);
+        state.lock().set_test_snapshots(&[mapping]).unwrap();
+        file.register_with_usercopy(|| Ok(register_input(0x4000, 0x2000)), |_| Ok(()))
+            .unwrap();
+        let admission = state
+            .lock()
+            .admit_test_request(handler, request(handler, 0x4000));
+
+        let completion = state.lock().fault_completion_for_test();
+        let probe = Arc::new(StateLockWakeProbe::new(&state));
+        let waker = Waker::from(probe.clone());
+        completion.register(&waker).unwrap();
+
+        assert_eq!(
+            file.unregister_with_usercopy(|| Ok(range(0x4000, 0x2000))),
+            Ok(0)
+        );
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        assert!(probe.all_lock_external.load(Ordering::Relaxed));
+        assert_eq!(
+            state
+                .lock()
+                .observe_test_waiter(admission.waiter())
+                .unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
+        );
+    }
+
+    #[test]
+    fn final_ofd_detach_wakes_fault_completion_after_releasing_state_lock() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        let handler = file.binding.handler();
+        let admission = state
+            .lock()
+            .admit_test_request(handler, request(handler, 0x7000));
+        let completion = state.lock().fault_completion_for_test();
+        let probe = Arc::new(StateLockWakeProbe::new(&state));
+        let waker = Waker::from(probe.clone());
+        completion.register(&waker).unwrap();
+
+        drop(file);
+
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        assert!(probe.all_lock_external.load(Ordering::Relaxed));
+        assert_eq!(
+            state
+                .lock()
+                .observe_test_waiter(admission.waiter())
+                .unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::HandlerDetached)
+        );
+    }
+
+    #[test]
+    fn old_mm_retirement_wakes_fault_completion_waiters() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        let handler = file.binding.handler();
+        state
+            .lock()
+            .admit_test_request(handler, request(handler, 0x8000));
+        let completion = state.lock().fault_completion_for_test();
+        let probe = Arc::new(StateLockWakeProbe::new(&state));
+        let waker = Waker::from(probe.clone());
+        completion.register(&waker).unwrap();
+
+        drop(state);
+
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        assert!(probe.all_lock_external.load(Ordering::Relaxed));
+        assert_eq!(file.poll(), IoEvents::empty());
     }
 
     #[test]

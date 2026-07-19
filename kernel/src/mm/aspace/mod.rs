@@ -1633,6 +1633,34 @@ impl AddrSpace {
         ))
     }
 
+    /// Appends every mapped VMA intersecting a userfaultfd ioctl range.
+    ///
+    /// Holes are deliberately skipped. The caller owns a fixed-capacity
+    /// scratch vector prepared before this address-space lock was acquired;
+    /// this scan never grows it. Compatibility and registration ownership are
+    /// validated by the Linux-MM policy layer after the complete scan.
+    pub(super) fn append_uffd_mapping_snapshots(
+        &self,
+        range: PageRange,
+        snapshots: &mut Vec<MappingSnapshot>,
+    ) -> AxResult {
+        let start = VirtAddr::from(range.start());
+        let end = VirtAddr::from(range.end());
+        if !self.contains_range(start, range.len()) {
+            return Err(AxError::InvalidInput);
+        }
+        for area in self.areas.iter_overlapping(VirtAddrRange::new(start, end)) {
+            if snapshots.len() == snapshots.capacity() {
+                return Err(AxError::NoMemory);
+            }
+            snapshots.push(self.mapping_snapshot(area)?);
+        }
+        if snapshots.is_empty() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(())
+    }
+
     fn topology_snapshot(&self) -> AxResult<MappingSnapshot> {
         let range =
             PageRange::new(self.base().as_usize(), self.size(), PAGE_SIZE_4K).map_err(mm_error)?;
