@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn closed_registration_recheck_is_bounded_when_condition_stays_blocked() {
-        let source = PollSet::new();
+        let source: PollSet = PollSet::new();
         source.close();
         let calls = Cell::new(0);
 
@@ -336,7 +336,10 @@ mod tests {
 }
 
 /// Interruptible synchronous wait for one raw generic source.
-pub(crate) fn block_on_poll_set<F, T>(source: &PollSet, operation: F) -> Result<T, AxError>
+pub(crate) fn block_on_poll_set<const CAPACITY: usize, F, T>(
+    source: &PollSet<CAPACITY>,
+    operation: F,
+) -> Result<T, AxError>
 where
     F: FnMut() -> Result<T, AxError>,
 {
@@ -397,8 +400,8 @@ where
 
 /// Waits on one source while consuming task interrupts only when the caller's
 /// Linux-visible predicate says that interrupt should terminate the syscall.
-pub(crate) fn block_on_poll_set_interruptible_if<F, I, T>(
-    source: &PollSet,
+pub(crate) fn block_on_poll_set_interruptible_if<const CAPACITY: usize, F, I, T>(
+    source: &PollSet<CAPACITY>,
     operation: F,
     should_interrupt: I,
 ) -> Result<T, AxError>
