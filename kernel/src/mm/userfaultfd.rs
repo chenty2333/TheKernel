@@ -150,6 +150,41 @@ pub(crate) enum OptionalUffdPlan {
     Armed(UffdPlanToken),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UffdRemapKind {
+    Duplicate,
+    Move,
+}
+
+/// Copy-only sidecar authority frozen before one remap transaction mutates
+/// its VMA/PTE state.
+///
+/// This value is deliberately move-only even though its leaf tokens are Copy.
+/// The enclosing address-space transaction must resolve every alternative
+/// exactly once; duplicating the set would permit a stale token to consume a
+/// bounded slot twice.
+#[must_use = "a prepared remap sidecar must be resolved exactly once"]
+pub(crate) enum PreparedRemapUffd {
+    None,
+    FixedDuplicate {
+        destination: OptionalUffdPlan,
+    },
+    FixedMove {
+        on_failure: OptionalUffdPlan,
+        on_success: OptionalUffdPlan,
+    },
+    NonfixedMove {
+        on_success: OptionalUffdPlan,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemapUffdOutcome {
+    Preserved,
+    DestructiveFailure,
+    Committed,
+}
+
 #[derive(Clone, Copy)]
 struct ArmedUffdPlan {
     nonce: u64,
@@ -499,16 +534,17 @@ impl UffdAddressSpaceState {
         }
     }
 
-    /// Preflights pure mapping retirement for `munmap`-style operations.
+    /// Preflights pure mapping retirement for one or two bounded ranges.
     ///
-    /// Intersecting records are removed and left/right survivors are refreshed
-    /// in the same all-or-none table plan. This path deliberately does not
-    /// inspect or complete the fault broker: ordinary mapping teardown does not
-    /// acquire userfaultfd wake ownership.
-    pub(crate) fn preflight_unmap<F>(
+    /// The ranges are normalized without allocation. Intersecting records are
+    /// removed and up to three survivors are refreshed in the same all-or-none
+    /// table plan. This path deliberately does not inspect or complete the
+    /// fault broker: ordinary mapping teardown does not acquire userfaultfd
+    /// wake ownership.
+    pub(crate) fn preflight_unmap_ranges<F>(
         &mut self,
         slot_index: usize,
-        range: PageRange,
+        ranges: [Option<PageRange>; 2],
         mut current: F,
     ) -> AxResult<OptionalUffdPlan>
     where
@@ -516,6 +552,46 @@ impl UffdAddressSpaceState {
     {
         self.reset_unarmed_plan_slot(slot_index)?;
         let result = (|| {
+            let mut normalized = [None, None];
+            let mut count = 0usize;
+            for range in ranges.into_iter().flatten() {
+                if count == 0 {
+                    normalized[0] = Some(range);
+                    count = 1;
+                    continue;
+                }
+                let first = normalized[0].expect("first UFFD retirement range disappeared");
+                if range.page_size() != first.page_size() {
+                    return Err(AxError::InvalidInput);
+                }
+                if range.start() < first.start() {
+                    normalized[1] = normalized[0];
+                    normalized[0] = Some(range);
+                } else {
+                    normalized[1] = Some(range);
+                }
+                count = 2;
+            }
+            if count == 2 {
+                let first = normalized[0].expect("first UFFD retirement range disappeared");
+                let second = normalized[1].expect("second UFFD retirement range disappeared");
+                if second.start() <= first.end() {
+                    normalized[0] = Some(
+                        PageRange::with_page_size(
+                            first.start(),
+                            first
+                                .end()
+                                .max(second.end())
+                                .checked_sub(first.start())
+                                .ok_or(AxError::BadState)?,
+                            first.page_size(),
+                        )
+                        .map_err(uffd_policy_error)?,
+                    );
+                    normalized[1] = None;
+                }
+            }
+
             let Self {
                 registrations,
                 plan_slots,
@@ -525,25 +601,40 @@ impl UffdAddressSpaceState {
 
             for registration in registrations.iter() {
                 let registered = registration.range();
-                if registered.end() <= range.start() || range.end() <= registered.start() {
+                let mut survivors = [(0usize, 0usize); 3];
+                let mut survivor_count = 0usize;
+                let mut cursor = registered.start();
+                let mut intersects = false;
+                for retirement in normalized.into_iter().flatten() {
+                    if retirement.end() <= cursor || registered.end() <= retirement.start() {
+                        continue;
+                    }
+                    intersects = true;
+                    let survivor_end = registered.end().min(retirement.start());
+                    if cursor < survivor_end {
+                        survivors[survivor_count] = (cursor, survivor_end);
+                        survivor_count += 1;
+                    }
+                    cursor = cursor.max(retirement.end().min(registered.end()));
+                    if cursor == registered.end() {
+                        break;
+                    }
+                }
+                if !intersects {
                     continue;
+                }
+                if cursor < registered.end() {
+                    survivors[survivor_count] = (cursor, registered.end());
+                    survivor_count += 1;
                 }
                 slot.push_removed(registration.id())?;
 
-                let survivors = [
-                    (registered.start(), registered.end().min(range.start())),
-                    (registered.start().max(range.end()), registered.end()),
-                ];
-                let has_survivor = survivors.iter().any(|(start, end)| start < end);
-                let snapshot = if has_survivor {
+                let snapshot = if survivor_count != 0 {
                     Some(current(registration)?)
                 } else {
                     None
                 };
-                for (start, end) in survivors {
-                    if start >= end {
-                        continue;
-                    }
+                for (start, end) in survivors[..survivor_count].iter().copied() {
                     let survivor = PageRange::with_page_size(
                         start,
                         end.checked_sub(start).ok_or(AxError::BadState)?,
@@ -575,6 +666,104 @@ impl UffdAddressSpaceState {
         match result {
             Ok(plan) => self.finish_plan_preflight(slot_index, plan),
             Err(error) => self.fail_plan_preflight(slot_index, error),
+        }
+    }
+
+    /// One-range compatibility wrapper used by ordinary `munmap`.
+    pub(crate) fn preflight_unmap<F>(
+        &mut self,
+        slot_index: usize,
+        range: PageRange,
+        current: F,
+    ) -> AxResult<OptionalUffdPlan>
+    where
+        F: FnMut(UffdRegistration) -> AxResult<MappingSnapshot>,
+    {
+        self.preflight_unmap_ranges(slot_index, [Some(range), None], current)
+    }
+
+    /// Freezes every mapping-sidecar outcome that one remap transaction may
+    /// publish. Both fixed-move alternatives observe the same unchanged table
+    /// revision; failure to arm the second releases the first immediately.
+    pub(crate) fn preflight_remap<F>(
+        &mut self,
+        kind: UffdRemapKind,
+        fixed: bool,
+        source: PageRange,
+        destination: PageRange,
+        mut current: F,
+    ) -> AxResult<PreparedRemapUffd>
+    where
+        F: FnMut(UffdRegistration) -> AxResult<MappingSnapshot>,
+    {
+        match (kind, fixed) {
+            (UffdRemapKind::Duplicate, false) => Ok(PreparedRemapUffd::None),
+            (UffdRemapKind::Duplicate, true) => {
+                let destination =
+                    self.preflight_unmap_ranges(0, [Some(destination), None], &mut current)?;
+                Ok(PreparedRemapUffd::FixedDuplicate { destination })
+            }
+            (UffdRemapKind::Move, false) => {
+                let on_success =
+                    self.preflight_unmap_ranges(0, [Some(source), None], &mut current)?;
+                Ok(PreparedRemapUffd::NonfixedMove { on_success })
+            }
+            (UffdRemapKind::Move, true) => {
+                let on_failure =
+                    self.preflight_unmap_ranges(0, [Some(destination), None], &mut current)?;
+                let on_success = match self.preflight_unmap_ranges(
+                    1,
+                    [Some(destination), Some(source)],
+                    &mut current,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        self.abort_plan(on_failure);
+                        return Err(error);
+                    }
+                };
+                Ok(PreparedRemapUffd::FixedMove {
+                    on_failure,
+                    on_success,
+                })
+            }
+        }
+    }
+
+    /// Consumes every token owned by a remap plan-set. The unchosen
+    /// alternative is always released before the chosen table commit.
+    pub(crate) fn resolve_remap(&mut self, prepared: PreparedRemapUffd, outcome: RemapUffdOutcome) {
+        match prepared {
+            PreparedRemapUffd::None => {}
+            PreparedRemapUffd::FixedDuplicate { destination } => match outcome {
+                RemapUffdOutcome::Preserved => self.abort_plan(destination),
+                RemapUffdOutcome::DestructiveFailure | RemapUffdOutcome::Committed => {
+                    self.commit_plan(destination);
+                }
+            },
+            PreparedRemapUffd::FixedMove {
+                on_failure,
+                on_success,
+            } => match outcome {
+                RemapUffdOutcome::Preserved => {
+                    self.abort_plan(on_failure);
+                    self.abort_plan(on_success);
+                }
+                RemapUffdOutcome::DestructiveFailure => {
+                    self.abort_plan(on_success);
+                    self.commit_plan(on_failure);
+                }
+                RemapUffdOutcome::Committed => {
+                    self.abort_plan(on_failure);
+                    self.commit_plan(on_success);
+                }
+            },
+            PreparedRemapUffd::NonfixedMove { on_success } => match outcome {
+                RemapUffdOutcome::Committed => self.commit_plan(on_success),
+                RemapUffdOutcome::Preserved | RemapUffdOutcome::DestructiveFailure => {
+                    self.abort_plan(on_success);
+                }
+            },
         }
     }
 
@@ -1232,6 +1421,8 @@ impl AddrSpace {
 mod tests {
     extern crate std;
 
+    use alloc::vec;
+
     use memory_addr::PAGE_SIZE_4K;
     use thekernel_linux_mm::{
         FaultAccess, FaultKey, FaultType, MappingAccess, MappingKind, MappingSnapshot, UFFD_API,
@@ -1283,6 +1474,40 @@ mod tests {
         let negotiation = api.prepare_raw(UFFD_API, 0).unwrap();
         api.commit(negotiation).unwrap();
         api
+    }
+
+    fn registered_remap_state() -> (UffdAddressSpaceState, MappingSnapshot, MappingSnapshot) {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let source_handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let destination_handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let source = snapshot(
+            2,
+            61,
+            0x1000,
+            2 * PAGE_SIZE_4K,
+            MappingKind::AnonymousPrivate,
+        );
+        let destination = snapshot(
+            3,
+            67,
+            0x5000,
+            2 * PAGE_SIZE_4K,
+            MappingKind::AnonymousPrivate,
+        );
+        for (handler, mapping) in [(source_handler, source), (destination_handler, destination)] {
+            let mut current = [mapping];
+            state
+                .register_range(
+                    &api,
+                    handler,
+                    mapping.range(),
+                    UffdRegisterMode::MISSING,
+                    &mut current,
+                )
+                .unwrap();
+        }
+        (state, source, destination)
     }
 
     fn request_for(
@@ -1917,6 +2142,270 @@ mod tests {
         assert_eq!(after_suffix[0].handler(), handler);
         assert_eq!(after_suffix[0].mapping(), mapping.mapping());
         assert_eq!(after_suffix[0].generation().get(), 30);
+    }
+
+    #[test]
+    fn two_retirement_ranges_produce_three_epoch_preserving_survivors() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 71, 0x1000, 0x9000, MappingKind::AnonymousPrivate);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                mapping.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        let plan = state
+            .preflight_unmap_ranges(
+                0,
+                [
+                    Some(page_range(0x3000, PAGE_SIZE_4K)),
+                    Some(page_range(0x6000, 0x2000)),
+                ],
+                |_| Ok(mapping),
+            )
+            .unwrap();
+        state.commit_plan(plan);
+
+        let mut survivors: Vec<_> = state.registrations.iter().collect();
+        survivors.sort_by_key(|registration| registration.range().start());
+        assert_eq!(survivors.len(), 3);
+        assert_eq!(survivors[0].range(), page_range(0x1000, 0x2000));
+        assert_eq!(survivors[1].range(), page_range(0x4000, 0x2000));
+        assert_eq!(survivors[2].range(), page_range(0x8000, 0x2000));
+        assert!(survivors.iter().all(|registration| {
+            registration.handler() == handler
+                && registration.mapping() == mapping.mapping()
+                && registration.generation().get() == 71
+        }));
+    }
+
+    #[test]
+    fn two_retirement_ranges_normalize_reverse_touching_union() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 73, 0x1000, 0x8000, MappingKind::AnonymousPrivate);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                mapping.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        let plan = state
+            .preflight_unmap_ranges(
+                0,
+                [
+                    Some(page_range(0x5000, 0x2000)),
+                    Some(page_range(0x3000, 0x2000)),
+                ],
+                |_| Ok(mapping),
+            )
+            .unwrap();
+        state.commit_plan(plan);
+
+        let mut survivors: Vec<_> = state.registrations.iter().collect();
+        survivors.sort_by_key(|registration| registration.range().start());
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(survivors[0].range(), page_range(0x1000, 0x2000));
+        assert_eq!(survivors[1].range(), page_range(0x7000, 0x2000));
+    }
+
+    #[test]
+    fn fixed_move_resolves_both_alternatives_and_releases_bounded_slots() {
+        for (outcome, expected_ranges) in [
+            (
+                RemapUffdOutcome::Preserved,
+                [
+                    Some(page_range(0x1000, 0x2000)),
+                    Some(page_range(0x5000, 0x2000)),
+                ],
+            ),
+            (
+                RemapUffdOutcome::DestructiveFailure,
+                [Some(page_range(0x1000, 0x2000)), None],
+            ),
+            (RemapUffdOutcome::Committed, [None, None]),
+        ] {
+            let (mut state, source, destination) = registered_remap_state();
+            let prepared = state
+                .preflight_remap(
+                    UffdRemapKind::Move,
+                    true,
+                    source.range(),
+                    destination.range(),
+                    |_| panic!("fully retired remap records need no survivor snapshot"),
+                )
+                .unwrap();
+            assert!(state.plan_slots.iter().all(|slot| slot.armed.is_some()));
+
+            state.resolve_remap(prepared, outcome);
+
+            let mut ranges: Vec<_> = state
+                .registrations
+                .iter()
+                .map(UffdRegistration::range)
+                .collect();
+            ranges.sort_by_key(|range| range.start());
+            let expected: Vec<_> = expected_ranges.into_iter().flatten().collect();
+            assert_eq!(ranges, expected);
+            assert!(state.plan_slots.iter().all(|slot| {
+                slot.armed.is_none() && slot.removed.is_empty() && slot.replacements.is_empty()
+            }));
+        }
+    }
+
+    #[test]
+    fn duplicate_and_nonfixed_move_resolve_only_their_owned_delta() {
+        for outcome in [
+            RemapUffdOutcome::Preserved,
+            RemapUffdOutcome::DestructiveFailure,
+            RemapUffdOutcome::Committed,
+        ] {
+            let (mut duplicate, source, destination) = registered_remap_state();
+            let prepared = duplicate
+                .preflight_remap(
+                    UffdRemapKind::Duplicate,
+                    true,
+                    source.range(),
+                    destination.range(),
+                    |_| panic!("fully retired destination needs no survivor snapshot"),
+                )
+                .unwrap();
+            assert!(duplicate.plan_slots[0].armed.is_some());
+            assert!(duplicate.plan_slots[1].armed.is_none());
+            duplicate.resolve_remap(prepared, outcome);
+            let mut duplicate_ranges: Vec<_> = duplicate
+                .registrations
+                .iter()
+                .map(UffdRegistration::range)
+                .collect();
+            duplicate_ranges.sort_by_key(|range| range.start());
+            let expected = if outcome == RemapUffdOutcome::Preserved {
+                vec![source.range(), destination.range()]
+            } else {
+                vec![source.range()]
+            };
+            assert_eq!(duplicate_ranges, expected);
+            assert!(duplicate.plan_slots.iter().all(|slot| slot.armed.is_none()));
+        }
+
+        let mut moved = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = moved.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let source = snapshot(2, 83, 0x1000, 0x2000, MappingKind::AnonymousPrivate);
+        let destination = page_range(0x5000, 0x2000);
+        let mut current = [source];
+        moved
+            .register_range(
+                &api,
+                handler,
+                source.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        let prepared = moved
+            .preflight_remap(
+                UffdRemapKind::Move,
+                false,
+                source.range(),
+                destination,
+                |_| panic!("fully retired source needs no survivor snapshot"),
+            )
+            .unwrap();
+        moved.resolve_remap(prepared, RemapUffdOutcome::DestructiveFailure);
+        assert_eq!(moved.registrations.len(), 1);
+        let retry = moved
+            .preflight_remap(
+                UffdRemapKind::Move,
+                false,
+                source.range(),
+                destination,
+                |_| panic!("fully retired source needs no survivor snapshot"),
+            )
+            .unwrap();
+        moved.resolve_remap(retry, RemapUffdOutcome::Committed);
+        assert!(moved.registrations.is_empty());
+
+        let nonce = moved.next_plan_nonce;
+        let duplicate = moved
+            .preflight_remap(
+                UffdRemapKind::Duplicate,
+                false,
+                source.range(),
+                destination,
+                |_| panic!("nonfixed duplicate must not inspect registrations"),
+            )
+            .unwrap();
+        assert!(matches!(duplicate, PreparedRemapUffd::None));
+        assert_eq!(moved.next_plan_nonce, nonce);
+        moved.resolve_remap(duplicate, RemapUffdOutcome::Committed);
+    }
+
+    #[test]
+    fn failed_second_fixed_move_alternative_releases_first_slot() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let spanning = snapshot(2, 79, 0x1000, 0x9000, MappingKind::AnonymousPrivate);
+        let mut current = [spanning];
+        state
+            .register_range(
+                &api,
+                handler,
+                spanning.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        for index in 0..(UFFD_MAX_REGISTRATIONS - 2) {
+            let mapping = snapshot(
+                3 + index as u64,
+                80 + index as u64,
+                0x10000 + index * 0x2000,
+                PAGE_SIZE_4K,
+                MappingKind::AnonymousPrivate,
+            );
+            let mut current = [mapping];
+            state
+                .register_range(
+                    &api,
+                    handler,
+                    mapping.range(),
+                    UffdRegisterMode::MISSING,
+                    &mut current,
+                )
+                .unwrap();
+        }
+        assert_eq!(state.registrations.len(), UFFD_MAX_REGISTRATIONS - 1);
+        let before: Vec<_> = state.registrations.iter().collect();
+
+        assert!(matches!(
+            state.preflight_remap(
+                UffdRemapKind::Move,
+                true,
+                page_range(0x3000, PAGE_SIZE_4K),
+                page_range(0x6000, PAGE_SIZE_4K),
+                |_| Ok(spanning),
+            ),
+            Err(AxError::NoMemory)
+        ));
+        assert_eq!(state.registrations.iter().collect::<Vec<_>>(), before);
+        assert!(state.plan_slots.iter().all(|slot| {
+            slot.armed.is_none() && slot.removed.is_empty() && slot.replacements.is_empty()
+        }));
     }
 
     #[test]

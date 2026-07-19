@@ -867,7 +867,7 @@ fn commit_locked_remap(
                         },
                     )
                     .map_err(|error| {
-                        if error.destination_destroyed() {
+                        if error.mapping_changed() {
                             proc_data
                                 .clear_mempolicy_range(destination.as_usize(), request.new_size);
                         }
@@ -988,7 +988,7 @@ fn commit_locked_remap(
                         },
                     )
                     .map_err(|error| {
-                        if error.destination_destroyed() {
+                        if error.mapping_changed() {
                             proc_data
                                 .clear_mempolicy_range(destination.as_usize(), request.new_size);
                         }

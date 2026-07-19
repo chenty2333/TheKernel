@@ -30,7 +30,10 @@ use thekernel_linux_mm::{
     UffdRegistration,
 };
 
-use super::{OptionalUffdPlan, PreparedUffdMutation, checked_align_up_4k};
+use super::{
+    OptionalUffdPlan, PreparedRemapUffd, PreparedUffdMutation, RemapUffdOutcome, UffdRemapKind,
+    checked_align_up_4k,
+};
 
 mod backend;
 mod mapping;
@@ -951,44 +954,64 @@ enum RemapDestination {
 }
 
 /// Fixed-remap failure classification used by syscall glue to invalidate
-/// per-range policy only when replacement actually destroyed an old mapping.
+/// per-range policy only when the transaction changed visible mappings.
 #[derive(Debug)]
 pub(crate) enum ReplaceMappingError {
-    DestinationPreserved(AxError),
-    DestinationDestroyed(AxError),
+    AddressSpacePreserved(AxError),
+    AddressSpaceChanged(AxError),
 }
 
 impl ReplaceMappingError {
-    pub(crate) const fn destination_destroyed(&self) -> bool {
-        matches!(self, Self::DestinationDestroyed(_))
+    pub(crate) const fn mapping_changed(&self) -> bool {
+        matches!(self, Self::AddressSpaceChanged(_))
     }
 
     pub(crate) fn into_error(self) -> AxError {
         match self {
-            Self::DestinationPreserved(error) | Self::DestinationDestroyed(error) => error,
+            Self::AddressSpacePreserved(error) | Self::AddressSpaceChanged(error) => error,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemapTransactionEffect {
+    Preserved,
+    Destructive,
+}
+
+const fn classify_failed_remap_effect(
+    destination_changed: bool,
+    rollback_failed: bool,
+) -> RemapTransactionEffect {
+    if destination_changed || rollback_failed {
+        RemapTransactionEffect::Destructive
+    } else {
+        RemapTransactionEffect::Preserved
     }
 }
 
 #[derive(Debug)]
 struct MappingTransactionFailure {
     error: AxError,
-    destination_destroyed: bool,
+    effect: RemapTransactionEffect,
 }
 
 impl MappingTransactionFailure {
     fn preserved(error: AxError) -> Self {
         Self {
             error,
-            destination_destroyed: false,
+            effect: RemapTransactionEffect::Preserved,
         }
     }
 
     fn into_replace_error(self) -> ReplaceMappingError {
-        if self.destination_destroyed {
-            ReplaceMappingError::DestinationDestroyed(self.error)
-        } else {
-            ReplaceMappingError::DestinationPreserved(self.error)
+        match self.effect {
+            RemapTransactionEffect::Preserved => {
+                ReplaceMappingError::AddressSpacePreserved(self.error)
+            }
+            RemapTransactionEffect::Destructive => {
+                ReplaceMappingError::AddressSpaceChanged(self.error)
+            }
         }
     }
 }
@@ -2346,6 +2369,52 @@ impl AddrSpace {
         Ok(())
     }
 
+    fn preflight_remap_uffd(
+        &mut self,
+        kind: UffdRemapKind,
+        fixed: bool,
+        source_start: VirtAddr,
+        source_size: usize,
+        destination_start: VirtAddr,
+        destination_size: usize,
+    ) -> AxResult<PreparedRemapUffd> {
+        let source =
+            PageRange::new(source_start.as_usize(), source_size, PAGE_SIZE_4K).map_err(mm_error)?;
+        let destination =
+            PageRange::new(destination_start.as_usize(), destination_size, PAGE_SIZE_4K)
+                .map_err(mm_error)?;
+        let AddrSpace {
+            address_space_id,
+            areas,
+            mapping_identities,
+            uffd,
+            ..
+        } = self;
+        let Some(state) = uffd.as_deref_mut() else {
+            return Ok(PreparedRemapUffd::None);
+        };
+        let address_space_id = *address_space_id;
+        state.preflight_remap(kind, fixed, source, destination, |registration| {
+            Self::uffd_snapshot_for_registration(
+                address_space_id,
+                areas,
+                mapping_identities,
+                registration,
+            )
+        })
+    }
+
+    fn resolve_remap_uffd(&mut self, prepared: PreparedRemapUffd, outcome: RemapUffdOutcome) {
+        if let Some(state) = self.uffd.as_deref_mut() {
+            state.resolve_remap(prepared, outcome);
+        } else {
+            assert!(
+                matches!(prepared, PreparedRemapUffd::None),
+                "armed UFFD remap plan lost its address-space state"
+            );
+        }
+    }
+
     fn finish_failed_mapping_transaction(
         &mut self,
         operation_error: AxError,
@@ -2353,22 +2422,30 @@ impl AddrSpace {
         destination_size: usize,
         destination_lineage: MappingLineage,
         destination_mutations: &[MappingIdentityMutation],
-        destination_destroyed: bool,
+        destination_changed: bool,
         next_topology_generation: MappingGeneration,
+        uffd_plan: PreparedRemapUffd,
     ) -> MappingTransactionFailure {
         let rollback =
             self.rollback_staged_mapping(destination_start, destination_size, destination_lineage);
-        if destination_destroyed {
+        let rollback_error = rollback.err();
+        let effect = classify_failed_remap_effect(destination_changed, rollback_error.is_some());
+        self.resolve_remap_uffd(
+            uffd_plan,
+            match effect {
+                RemapTransactionEffect::Preserved => RemapUffdOutcome::Preserved,
+                RemapTransactionEffect::Destructive => RemapUffdOutcome::DestructiveFailure,
+            },
+        );
+        if destination_changed {
             commit_mapping_identity_mutations(&mut self.mapping_identities, destination_mutations);
         }
-        let rollback_error = rollback.err();
-        let destructive_outcome = destination_destroyed || rollback_error.is_some();
-        if destructive_outcome {
+        if effect == RemapTransactionEffect::Destructive {
             self.commit_topology_generation(next_topology_generation);
         }
         MappingTransactionFailure {
             error: rollback_error.unwrap_or(operation_error),
-            destination_destroyed: destructive_outcome,
+            effect,
         }
     }
 
@@ -2444,13 +2521,29 @@ impl AddrSpace {
         let destination_lineage = self
             .prepare_fresh_mapping_lineage()
             .map_err(MappingTransactionFailure::preserved)?;
+        let uffd_plan = match self.preflight_remap_uffd(
+            UffdRemapKind::Duplicate,
+            replacing,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                debug_assert!(removed);
+                return Err(MappingTransactionFailure::preserved(error));
+            }
+        };
 
-        let destination_destroyed = !destination_mutations.is_empty();
+        let destination_changed = !destination_mutations.is_empty();
         if replacing
             && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
         {
             let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
             debug_assert!(removed);
+            self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved);
             return Err(MappingTransactionFailure::preserved(error));
         }
 
@@ -2465,6 +2558,7 @@ impl AddrSpace {
                 ) =>
             {
                 self.apply_remap_policy(destination_start, &policy);
+                self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed);
                 commit_mapping_identity_mutations(
                     &mut self.mapping_identities,
                     &destination_mutations,
@@ -2478,8 +2572,9 @@ impl AddrSpace {
                 destination_size,
                 destination_lineage,
                 &destination_mutations,
-                destination_destroyed,
+                destination_changed,
                 next_topology_generation,
+                uffd_plan,
             )),
             Err(operation_error) => Err(self.finish_failed_mapping_transaction(
                 operation_error,
@@ -2487,8 +2582,9 @@ impl AddrSpace {
                 destination_size,
                 destination_lineage,
                 &destination_mutations,
-                destination_destroyed,
+                destination_changed,
                 next_topology_generation,
+                uffd_plan,
             )),
         }
     }
@@ -2598,13 +2694,29 @@ impl AddrSpace {
         let destination_lineage = self
             .prepare_fresh_mapping_lineage()
             .map_err(MappingTransactionFailure::preserved)?;
+        let uffd_plan = match self.preflight_remap_uffd(
+            UffdRemapKind::Move,
+            replacing,
+            source_start,
+            source_size,
+            destination_start,
+            destination_size,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                debug_assert!(removed);
+                return Err(MappingTransactionFailure::preserved(error));
+            }
+        };
 
-        let destination_destroyed = !destination_mutations.is_empty();
+        let destination_changed = !destination_mutations.is_empty();
         if replacing
             && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
         {
             let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
             debug_assert!(removed);
+            self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved);
             return Err(MappingTransactionFailure::preserved(error));
         }
 
@@ -2630,6 +2742,7 @@ impl AddrSpace {
                         );
                         Self::clear_interval(&mut self.dontfork_ranges, source_start, source_size);
                         self.clear_locked_range(source_start, source_size);
+                        self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed);
                         commit_mapping_identity_mutations(
                             &mut self.mapping_identities,
                             &success_mutations,
@@ -2652,8 +2765,9 @@ impl AddrSpace {
             destination_size,
             destination_lineage,
             &destination_mutations,
-            destination_destroyed,
+            destination_changed,
             next_topology_generation,
+            uffd_plan,
         ))
     }
 
@@ -3663,6 +3777,20 @@ mod tests {
             ),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn failed_remap_effect_marks_visible_destination_residue_as_changed() {
+        assert_eq!(
+            classify_failed_remap_effect(false, false),
+            RemapTransactionEffect::Preserved
+        );
+        for (destination_changed, rollback_failed) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                classify_failed_remap_effect(destination_changed, rollback_failed),
+                RemapTransactionEffect::Destructive
+            );
+        }
     }
 
     #[test]
