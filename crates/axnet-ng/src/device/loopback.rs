@@ -11,7 +11,9 @@ use smoltcp::{
 
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
-    device::{Device, DevicePollBridge, DeviceStats, InterfaceKind},
+    device::{
+        Device, DevicePollBridge, DeviceStats, InterfaceKind, classify_ethernet_ingress_protocol,
+    },
     packet::{
         LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
         PacketEndpointId, PacketMetadata, PacketSendRequest,
@@ -32,7 +34,6 @@ pub struct LoopbackDevice {
 #[derive(Clone, Copy)]
 struct LoopbackPacketMetadata {
     origin: Option<PacketEndpointId>,
-    protocol: u16,
     header: [u8; LOOPBACK_HEADER_LEN],
 }
 
@@ -142,7 +143,6 @@ impl LoopbackDevice {
                 payload.len(),
                 LoopbackPacketMetadata {
                     origin: context.origin(),
-                    protocol,
                     header,
                 },
             )
@@ -213,7 +213,10 @@ impl Device for LoopbackDevice {
         };
         Self::stage_packet(
             ingress_context,
-            metadata.protocol,
+            classify_ethernet_ingress_protocol(
+                u16::from_be_bytes([metadata.header[12], metadata.header[13]]),
+                rx_buf,
+            ),
             Self::packet_type(&metadata.header),
             &metadata.header,
             rx_buf,
@@ -257,11 +260,10 @@ impl Device for LoopbackDevice {
         _timestamp: Instant,
     ) -> AxResult<()> {
         let (protocol, header, payload) = match request {
-            PacketSendRequest::Raw { frame } => {
+            PacketSendRequest::Raw { protocol, frame } => {
                 if frame.len() < LOOPBACK_HEADER_LEN {
                     return Err(AxError::InvalidInput);
                 }
-                let protocol = u16::from_be_bytes([frame[12], frame[13]]);
                 let header = frame[..LOOPBACK_HEADER_LEN]
                     .try_into()
                     .map_err(|_| AxError::InvalidInput)?;
@@ -384,7 +386,10 @@ mod tests {
         device
             .send_packet(
                 inject,
-                PacketSendRequest::Raw { frame: &frame },
+                PacketSendRequest::Raw {
+                    protocol: 0x88b5,
+                    frame: &frame,
+                },
                 Instant::ZERO,
             )
             .unwrap();
@@ -397,6 +402,7 @@ mod tests {
         let outgoing = observer.try_receive(false).unwrap();
         assert_eq!(outgoing.data(), frame);
         assert_eq!(outgoing.metadata().packet_type, LinkPacketType::Outgoing);
+        assert_eq!(outgoing.metadata().protocol, 0x88b5);
         assert_eq!(&outgoing.metadata().address[..6], &frame[6..12]);
 
         let mut ip_ingress = PacketBuffer::new(
@@ -411,6 +417,7 @@ mod tests {
         for host in [&source_host, &observer_host] {
             assert_eq!(host.data(), frame);
             assert_eq!(host.metadata().packet_type, LinkPacketType::OtherHost);
+            assert_eq!(host.metadata().protocol, ETH_P_IP);
             assert_eq!(&host.metadata().address[..6], &frame[6..12]);
         }
         let (_, payload) = ip_ingress.dequeue().unwrap();
@@ -418,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn cooked_injection_constructs_the_observed_loopback_header() {
+    fn cooked_zero_protocol_is_reclassified_only_on_loopback_ingress() {
         let broker = PacketBroker::try_new().unwrap();
         let endpoint = broker
             .subscribe(PacketSelector::new(
@@ -430,9 +437,9 @@ mod tests {
             .unwrap();
         let mut device = LoopbackDevice::try_new().unwrap();
         let context = PacketDeviceContext::new(1, &broker, None);
-        let destination = [7, 8, 9, 10, 11, 12];
+        let destination = [2, 8, 9, 10, 11, 12];
         let payload = b"non-IP payload";
-        let protocol = 0x88b5;
+        let protocol = 0;
 
         device
             .send_packet(
@@ -455,5 +462,15 @@ mod tests {
         assert_eq!(outgoing.metadata().protocol, protocol);
         assert_eq!(outgoing.metadata().packet_type, LinkPacketType::Outgoing);
         assert_eq!(&outgoing.metadata().address[..6], &[0; 6]);
+
+        let mut ingress =
+            PacketBuffer::new(vec![SmolPacketMetadata::EMPTY; 1], vec![0u8; payload.len()]);
+        assert!(device.recv(context, &mut ingress, Instant::ZERO));
+        broker.drain_staged();
+
+        let host = endpoint.try_receive(false).unwrap();
+        assert_eq!(host.data(), outgoing.data());
+        assert_eq!(host.metadata().packet_type, LinkPacketType::OtherHost);
+        assert_eq!(host.metadata().protocol, 0x0004);
     }
 }

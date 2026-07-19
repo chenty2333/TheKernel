@@ -193,6 +193,12 @@ impl PacketDeviceCapabilities {
 pub enum PacketSendRequest<'a> {
     /// Transmit an already constructed link frame.
     Raw {
+        /// Host-order link protocol associated with this transmission.
+        ///
+        /// This value is deliberately independent of the protocol field in
+        /// `frame`: the frame bytes are transmitted unchanged, while outgoing
+        /// observers receive the caller-supplied protocol metadata.
+        protocol: u16,
         /// Complete link frame, including its header.
         frame: &'a [u8],
     },

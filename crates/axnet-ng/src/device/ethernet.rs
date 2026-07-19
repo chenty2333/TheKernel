@@ -21,7 +21,7 @@ use smoltcp::{
 
 use crate::{
     consts::{ETHERNET_MAX_PENDING_PACKETS, STANDARD_MTU},
-    device::{Device, DeviceStats, InterfaceKind},
+    device::{Device, DeviceStats, InterfaceKind, classify_ethernet_ingress_protocol},
     packet::{
         LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
         PacketMetadata, PacketSendRequest,
@@ -111,6 +111,7 @@ impl EthernetDevice {
         context: &PacketDeviceContext<'_>,
         frame: &EthernetFrame<&[u8]>,
         repr: &EthernetRepr,
+        protocol: u16,
         packet_type: LinkPacketType,
         address: EthernetAddress,
     ) {
@@ -120,7 +121,7 @@ impl EthernetDevice {
         link_address[..address.0.len()].copy_from_slice(&address.0);
         let metadata = PacketMetadata {
             interface_index: context.interface_index(),
-            protocol: u16::from(repr.ethertype),
+            protocol,
             hardware_type: LinkHardwareType::Ethernet,
             packet_type,
             link_header_len: header_len as u16,
@@ -152,6 +153,7 @@ impl EthernetDevice {
         stats: &mut DeviceStats,
         context: &PacketDeviceContext<'_>,
         frame_len: usize,
+        capture_protocol: u16,
         build: F,
     ) -> AxResult<()>
     where
@@ -177,6 +179,7 @@ impl EthernetDevice {
             context,
             &frame,
             &repr,
+            capture_protocol,
             LinkPacketType::Outgoing,
             repr.src_addr,
         );
@@ -217,12 +220,19 @@ impl EthernetDevice {
             dst_addr: dst,
             ethertype: proto,
         };
-        Self::transmit_frame(inner, stats, context, repr.buffer_len() + size, |buffer| {
-            let mut frame = EthernetFrame::new_unchecked(buffer);
-            repr.emit(&mut frame);
-            f(frame.payload_mut());
-            repr
-        })
+        Self::transmit_frame(
+            inner,
+            stats,
+            context,
+            repr.buffer_len() + size,
+            u16::from(proto),
+            |buffer| {
+                let mut frame = EthernetFrame::new_unchecked(buffer);
+                repr.emit(&mut frame);
+                f(frame.payload_mut());
+                repr
+            },
+        )
     }
 
     fn handle_frame(
@@ -244,6 +254,7 @@ impl EthernetDevice {
             context,
             &frame,
             &repr,
+            classify_ethernet_ingress_protocol(u16::from(repr.ethertype), frame.payload()),
             Self::packet_type(repr.dst_addr, self.hardware_address()),
             repr.src_addr,
         );
@@ -535,7 +546,7 @@ impl Device for EthernetDevice {
         _timestamp: Instant,
     ) -> AxResult<()> {
         match request {
-            PacketSendRequest::Raw { frame } => {
+            PacketSendRequest::Raw { protocol, frame } => {
                 let header_len = EthernetFrame::<&[u8]>::header_len();
                 if frame.len() < header_len || frame.len() > STANDARD_MTU + header_len {
                     return Err(AxError::InvalidInput);
@@ -549,6 +560,7 @@ impl Device for EthernetDevice {
                     &mut self.stats,
                     &context,
                     frame.len(),
+                    protocol,
                     |buffer| {
                         buffer.copy_from_slice(frame);
                         repr
@@ -623,5 +635,47 @@ impl Drop for EthernetDevice {
         if let Some(irq) = self.irq {
             axhal::irq::set_enable(irq, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{PacketBroker, PacketProtocol, PacketSelector, PacketView};
+
+    #[test]
+    fn raw_outgoing_capture_preserves_frame_and_uses_request_protocol() {
+        let broker = PacketBroker::try_new().unwrap();
+        let selector = PacketSelector::new(PacketProtocol::All, Some(1), PacketView::Raw, true);
+        let source = broker.subscribe(selector).unwrap();
+        let observer = broker.subscribe(selector).unwrap();
+        let context = PacketDeviceContext::new(1, &broker, Some(source.id()));
+        let bytes = [
+            2, 1, 2, 3, 4, 5, // destination
+            0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, // source
+            0x08, 0x00, // frame protocol
+            0x45, 0, // payload prefix
+        ];
+        let frame = EthernetFrame::new_checked(bytes.as_slice()).unwrap();
+        let repr = EthernetRepr::parse(&frame).unwrap();
+
+        EthernetDevice::stage_frame(
+            &context,
+            &frame,
+            &repr,
+            0x88b5,
+            LinkPacketType::Outgoing,
+            repr.src_addr,
+        );
+        broker.drain_staged();
+
+        assert!(matches!(
+            source.try_receive(false),
+            Err(AxError::WouldBlock)
+        ));
+        let outgoing = observer.try_receive(false).unwrap();
+        assert_eq!(outgoing.data(), bytes);
+        assert_eq!(outgoing.metadata().protocol, 0x88b5);
+        assert_eq!(outgoing.metadata().packet_type, LinkPacketType::Outgoing);
     }
 }

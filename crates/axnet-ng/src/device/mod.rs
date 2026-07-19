@@ -26,6 +26,26 @@ pub use veth::*;
 #[cfg(feature = "vsock")]
 pub use vsock::*;
 
+const ETHERNET_TYPE_MIN: u16 = 0x0600;
+const ETHERNET_802_3_PROTOCOL: u16 = 0x0001;
+const ETHERNET_802_2_PROTOCOL: u16 = 0x0004;
+
+/// Classifies a received Ethernet frame independently of transmit metadata.
+///
+/// Values below the Ethernet-II type range are length fields.  A leading
+/// `0xffff` payload denotes the raw 802.3 form; other payloads use the 802.2
+/// LLC protocol class.  Short payloads cannot carry that marker and therefore
+/// also fall into the 802.2 class.
+pub(crate) fn classify_ethernet_ingress_protocol(header_protocol: u16, payload: &[u8]) -> u16 {
+    if header_protocol >= ETHERNET_TYPE_MIN {
+        header_protocol
+    } else if payload.starts_with(&[0xff, 0xff]) {
+        ETHERNET_802_3_PROTOCOL
+    } else {
+        ETHERNET_802_2_PROTOCOL
+    }
+}
+
 /// Retains exactly one bridge registration from a device-local wake source to
 /// the stack-wide readiness source. A consumed one-shot token is replaced on
 /// the next check/arm pass; an unchanged live token is updated in place.
@@ -202,4 +222,37 @@ pub trait Device: Send + Sync {
     /// Refreshes the retained bridge from this device's wake source to the
     /// stack readiness source.
     fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_protocol_preserves_ethernet_ii_types() {
+        assert_eq!(
+            classify_ethernet_ingress_protocol(0x0800, &[0x45, 0]),
+            0x0800
+        );
+        assert_eq!(
+            classify_ethernet_ingress_protocol(ETHERNET_TYPE_MIN, &[]),
+            ETHERNET_TYPE_MIN
+        );
+    }
+
+    #[test]
+    fn ingress_protocol_classifies_length_frames_from_payload() {
+        assert_eq!(
+            classify_ethernet_ingress_protocol(0, &[0x01, 0x02]),
+            ETHERNET_802_2_PROTOCOL
+        );
+        assert_eq!(
+            classify_ethernet_ingress_protocol(1500, &[]),
+            ETHERNET_802_2_PROTOCOL
+        );
+        assert_eq!(
+            classify_ethernet_ingress_protocol(42, &[0xff, 0xff, 0x03]),
+            ETHERNET_802_3_PROTOCOL
+        );
+    }
 }
