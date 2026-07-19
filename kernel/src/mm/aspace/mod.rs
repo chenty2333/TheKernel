@@ -83,6 +83,25 @@ fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> 
     new_flags.contains(MappingFlags::EXECUTE) && !old_flags.contains(MappingFlags::EXECUTE)
 }
 
+/// Clamps one userfaultfd ioctl range to the address space that may contain
+/// live VMAs. Current Linux permits the raw range to begin below
+/// `mmap_min_addr`; only actual VMA intersections reach registration policy.
+fn uffd_vma_scan_range(
+    range: PageRange,
+    address_space_start: VirtAddr,
+    address_space_end: VirtAddr,
+) -> AxResult<VirtAddrRange> {
+    let start = range.start().max(address_space_start.as_usize());
+    let end = range.end().min(address_space_end.as_usize());
+    if start >= end {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(VirtAddrRange::new(
+        VirtAddr::from(start),
+        VirtAddr::from(end),
+    ))
+}
+
 const USER_IO_PIN_MAX_TOKENS: u64 = 64;
 const USER_IO_PIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const USER_IO_PIN_MAX_PAGES: u64 = USER_IO_PIN_MAX_BYTES / PAGE_SIZE_4K as u64;
@@ -1889,12 +1908,8 @@ impl AddrSpace {
         range: PageRange,
         snapshots: &mut Vec<MappingSnapshot>,
     ) -> AxResult {
-        let start = VirtAddr::from(range.start());
-        let end = VirtAddr::from(range.end());
-        if !self.contains_range(start, range.len()) {
-            return Err(AxError::InvalidInput);
-        }
-        for area in self.areas.iter_overlapping(VirtAddrRange::new(start, end)) {
+        let scan_range = uffd_vma_scan_range(range, self.base(), self.end())?;
+        for area in self.areas.iter_overlapping(scan_range) {
             if snapshots.len() == snapshots.capacity() {
                 return Err(AxError::NoMemory);
             }
@@ -3625,6 +3640,29 @@ mod tests {
             mapping.long_term_pinnable(),
             mapping.writable_file_pin_supported(),
         )
+    }
+
+    #[test]
+    fn uffd_vma_scan_clamps_a_low_leading_hole_to_the_address_space() {
+        let range = PageRange::new(0, 0x4000, PAGE_SIZE_4K).unwrap();
+        let scan = uffd_vma_scan_range(
+            range,
+            VirtAddr::from(0x1000),
+            VirtAddr::from(TEST_SPACE_SIZE),
+        )
+        .unwrap();
+        assert_eq!(scan.start, VirtAddr::from(0x1000));
+        assert_eq!(scan.end, VirtAddr::from(0x4000));
+
+        let wholly_below = PageRange::new(0, 0x1000, PAGE_SIZE_4K).unwrap();
+        assert_eq!(
+            uffd_vma_scan_range(
+                wholly_below,
+                VirtAddr::from(0x1000),
+                VirtAddr::from(TEST_SPACE_SIZE),
+            ),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]

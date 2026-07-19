@@ -394,10 +394,11 @@ impl UserfaultFile {
         let user_end = USER_SPACE_BASE
             .checked_add(USER_SPACE_SIZE)
             .ok_or(AxError::InvalidInput)?;
-        // Linux validate_unaligned_range() rejects ranges below mmap_min_addr
-        // and ranges that cross TASK_SIZE before retaining the old mm.  This
-        // keeps invalid geometry ahead of a retired-mm ENOMEM.
-        if range.start() < USER_SPACE_BASE || range.end() > user_end {
+        // Current Linux 6.12.y accepts a geometrically valid range beginning
+        // below mmap_min_addr.  The later VMA scan publishes only mapped
+        // intersections, so this gate owns page geometry and TASK_SIZE only.
+        // Keep those failures ahead of a retired-mm ENOMEM.
+        if range.end() > user_end {
             return Err(AxError::InvalidInput);
         }
         Ok(range)
@@ -907,7 +908,7 @@ mod tests {
 
         assert_eq!(
             file.register_with_usercopy(
-                || Ok(register_input(0x2000, 0x2000)),
+                || Ok(register_input(0, 0x4000)),
                 |_| Err(AxError::BadAddress),
             ),
             Err(AxError::BadAddress)
@@ -917,6 +918,31 @@ mod tests {
         assert_eq!(
             locked.registrations.iter().next().unwrap().range(),
             PageRange::new(0x2000, 0x2000, PAGE_SIZE_4K).unwrap()
+        );
+    }
+
+    #[test]
+    fn register_accepts_a_low_leading_hole_without_registering_it() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        state
+            .lock()
+            .set_test_snapshots(&[snapshot(USER_SPACE_BASE, PAGE_SIZE_4K)])
+            .unwrap();
+
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0, USER_SPACE_BASE + PAGE_SIZE_4K)),
+                |_| Ok(()),
+            ),
+            Ok(0)
+        );
+        let locked = state.lock();
+        let registration = locked.registrations.iter().next().unwrap();
+        assert_eq!(
+            registration.range(),
+            PageRange::new(USER_SPACE_BASE, PAGE_SIZE_4K, PAGE_SIZE_4K).unwrap()
         );
     }
 
@@ -944,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn register_and_unregister_report_enomem_after_old_mm_retirement() {
+    fn range_geometry_is_validated_before_old_mm_retirement() {
         let _context = test_context();
         let (state, file) = new_file(true);
         initialize(&file);
@@ -964,24 +990,37 @@ mod tests {
         );
         assert_eq!(
             file.register_with_usercopy(
-                || Ok(register_input(0, PAGE_SIZE_4K)),
+                || Ok(register_input(1, PAGE_SIZE_4K)),
                 |_| panic!("copyout must not run for an invalid range"),
             ),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.unregister_with_usercopy(|| Ok(range(0, PAGE_SIZE_4K))),
+            file.unregister_with_usercopy(|| Ok(range(1, PAGE_SIZE_4K))),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
             file.register_with_usercopy(
-                || Ok(register_input(0x1000, PAGE_SIZE_4K)),
+                || Ok(register_input(usize::MAX - PAGE_SIZE_4K + 1, PAGE_SIZE_4K)),
+                |_| panic!("copyout must not run for an overflowing range"),
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.unregister_with_usercopy(|| {
+                Ok(range(usize::MAX - PAGE_SIZE_4K + 1, PAGE_SIZE_4K))
+            }),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.register_with_usercopy(
+                || Ok(register_input(0, PAGE_SIZE_4K)),
                 |_| panic!("copyout must not run for a retired address space"),
             ),
             Err(AxError::NoMemory)
         );
         assert_eq!(
-            file.unregister_with_usercopy(|| Ok(range(0x1000, PAGE_SIZE_4K))),
+            file.unregister_with_usercopy(|| Ok(range(0, PAGE_SIZE_4K))),
             Err(AxError::NoMemory)
         );
     }
