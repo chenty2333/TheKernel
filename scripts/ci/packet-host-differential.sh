@@ -159,6 +159,8 @@ for ((run = 1; run <= RUNS; ++run)); do
     if [ "$(grep -c '^THEKERNEL_PACKET_SEND_BOUNDARY ' "$log" || true)" -ne 3 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_NAME_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_OPTION_BOUNDARY ' "$log" || true)" -ne 1 ] ||
+        [ "$(grep -c '^THEKERNEL_PACKET_SOL_SOCKET_BOUNDARY ' "$log" || true)" -ne 1 ] ||
+        [ "$(grep -c '^THEKERNEL_PACKET_ZERO_LENGTH_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_CONTROL_BOUNDARY ' "$log" || true)" -ne 1 ]; then
         printf 'packet-host-differential: run %s boundary evidence incomplete\n' \
             "$run" >&2

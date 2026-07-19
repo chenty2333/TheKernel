@@ -6,6 +6,7 @@
 #include <linux/capability.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
+#include <limits.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <poll.h>
@@ -35,6 +36,14 @@
 
 #ifndef PACKET_IGNORE_OUTGOING
 #define PACKET_IGNORE_OUTGOING 23
+#endif
+
+#ifndef SO_PROTOCOL
+#define SO_PROTOCOL 38
+#endif
+
+#ifndef SO_DOMAIN
+#define SO_DOMAIN 39
 #endif
 
 #define CUSTOM_PROTOCOL 0x88b5U
@@ -336,6 +345,22 @@ static void expect_socket_error(int type, unsigned int protocol,
     }
 }
 
+static void expect_socketpair_error(int type, unsigned int protocol,
+                                    int expected_errno, const char *stage) {
+    int descriptors[2] = {-1, -1};
+    errno = 0;
+    int result = socketpair(AF_PACKET, type, htons((uint16_t)protocol),
+                            descriptors);
+    if (result == 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        fail_value(stage, result, -1);
+    }
+    if (errno != expected_errno) {
+        fail_value(stage, errno, expected_errno);
+    }
+}
+
 static void require_call_error(int result, int expected_errno,
                                const char *stage) {
     if (result != -1 || errno != expected_errno) {
@@ -344,6 +369,13 @@ static void require_call_error(int result, int expected_errno,
 }
 
 static void test_control_errors(void) {
+    expect_socketpair_error(SOCK_RAW, ETH_P_IP, EOPNOTSUPP,
+                            "control-socketpair-raw");
+    expect_socketpair_error(SOCK_DGRAM, ETH_P_IP, EOPNOTSUPP,
+                            "control-socketpair-dgram");
+    expect_socketpair_error(SOCK_STREAM, ETH_P_IP, ESOCKTNOSUPPORT,
+                            "control-socketpair-stream");
+
     int fd = packet_socket(SOCK_RAW, 0);
     struct sockaddr_ll address;
     memset(&address, 0, sizeof(address));
@@ -369,6 +401,17 @@ static void test_control_errors(void) {
                        "control-accept");
 
     address.sll_family = AF_PACKET;
+    address.sll_ifindex = -1;
+    errno = 0;
+    require_call_error(bind(fd, (const struct sockaddr *)&address,
+                            sizeof(address)),
+                       ENODEV, "control-bind-negative-ifindex");
+    address.sll_ifindex = INT_MAX;
+    errno = 0;
+    require_call_error(bind(fd, (const struct sockaddr *)&address,
+                            sizeof(address)),
+                       ENODEV, "control-bind-missing-ifindex");
+    address.sll_ifindex = (int)loopback_index;
     errno = 0;
     require_call_error(bind(fd, (const struct sockaddr *)&address,
                             sizeof(address) - 1),
@@ -387,6 +430,29 @@ static void test_control_errors(void) {
     address.sll_family = AF_PACKET;
     address.sll_protocol = htons(CUSTOM_PROTOCOL);
     address.sll_ifindex = (int)loopback_index;
+    address.sll_halen = 6;
+
+    void *inaccessible = mmap(NULL, 4096, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (inaccessible == MAP_FAILED) {
+        fail_message("control-send-order", "mmap");
+    }
+    address.sll_ifindex = INT_MAX;
+    errno = 0;
+    require_call_error((int)sendto(fd, inaccessible, sizeof(token), 0,
+                                   (const struct sockaddr *)&address,
+                                   sizeof(address)),
+                       ENXIO, "control-send-ifindex-before-payload-fault");
+    address.sll_ifindex = (int)loopback_index;
+    errno = 0;
+    require_call_error((int)sendto(fd, inaccessible, sizeof(token), 0,
+                                   (const struct sockaddr *)&address,
+                                   sizeof(address)),
+                       EFAULT, "control-send-valid-ifindex-payload-fault");
+    if (munmap(inaccessible, 4096) != 0) {
+        fail_message("control-send-order", "munmap");
+    }
+
     errno = 0;
     require_call_error((int)sendto(fd, token, sizeof(token), 0,
                                    (const struct sockaddr *)&address,
@@ -400,8 +466,10 @@ static void test_control_errors(void) {
         fail_value("control-send-family-ignored", sent, (long)sizeof(token));
     }
     printf("THEKERNEL_PACKET_CONTROL_BOUNDARY bind_wrong_family_errno=%d "
-           "send_wrong_family_accepted=1 short_name_errno=%d\n",
-           EINVAL, EINVAL);
+           "bind_missing_ifindex_errno=%d send_wrong_family_accepted=1 "
+           "short_name_errno=%d send_ifindex_before_fault_errno=%d "
+           "socketpair_errno=%d\n",
+           EINVAL, ENODEV, EINVAL, ENXIO, EOPNOTSUPP);
     fflush(stdout);
     close_checked(fd, "control-send-close");
 }
@@ -433,6 +501,12 @@ static void test_create(void) {
                                 "create-dgram-without-capability");
             expect_socket_error(SOCK_STREAM, ETH_P_IP, EPERM,
                                 "create-stream-without-capability");
+            expect_socketpair_error(0x7f, ETH_P_IP, EINVAL,
+                                    "socketpair-invalid-type-without-capability");
+            expect_socketpair_error(SOCK_RAW, ETH_P_IP, EPERM,
+                                    "socketpair-raw-without-capability");
+            expect_socketpair_error(SOCK_STREAM, ETH_P_IP, EPERM,
+                                    "socketpair-stream-without-capability");
             _exit(EXIT_SUCCESS);
         }
         int status = 0;
@@ -654,6 +728,31 @@ static void test_truncation(void) {
 static void test_receive(void) {
     test_receive_and_bind();
     test_truncation();
+
+    struct udp_pair udp;
+    udp_pair_open(&udp);
+    unsigned char token[16];
+    unsigned char byte = 0;
+    struct packet_record record[1];
+
+    int fd = fresh_udp_packet(&udp, token, 5);
+    ssize_t result = read(fd, &byte, 0);
+    require_true(result == 0, "zero-read-result");
+    require_true(poll_once(fd, POLLIN, 0) & POLLIN,
+                 "zero-read-retains-record");
+    collect_records(fd, token, sizeof(token), record, 1);
+    require_empty_nonblocking(fd, "zero-read-followup-consumed");
+    close_checked(fd, "zero-read-close");
+
+    fd = fresh_udp_packet(&udp, token, 6);
+    result = recv(fd, &byte, 0, MSG_DONTWAIT);
+    require_true(result == 0, "zero-recv-result");
+    require_empty_nonblocking(fd, "zero-recv-consumes-record");
+    close_checked(fd, "zero-recv-close");
+    udp_pair_close(&udp);
+
+    printf("THEKERNEL_PACKET_ZERO_LENGTH_BOUNDARY read_retains=1 recv_consumes=1\n");
+    fflush(stdout);
     marker("THEKERNEL_PACKET_RECEIVE_OK");
 }
 
@@ -941,6 +1040,56 @@ static void test_send(void) {
 
 static void test_packet_options(void) {
     int fd = bound_packet_socket(SOCK_RAW, ETH_P_ALL, loopback_index);
+
+    static const struct {
+        int option;
+        int expected;
+    } introspection[] = {
+        {SO_TYPE, SOCK_RAW},
+        {SO_ERROR, 0},
+        {SO_DOMAIN, AF_PACKET},
+        {SO_PROTOCOL, 0},
+    };
+    for (size_t option_index = 0;
+         option_index < sizeof(introspection) / sizeof(introspection[0]);
+         ++option_index) {
+        unsigned char expected_bytes[sizeof(int)];
+        memcpy(expected_bytes, &introspection[option_index].expected,
+               sizeof(expected_bytes));
+        for (socklen_t requested = 0; requested <= sizeof(int); ++requested) {
+            unsigned char output[sizeof(int) + 4];
+            memset(output, 0xa5, sizeof(output));
+            socklen_t output_length = requested;
+            if (getsockopt(fd, SOL_SOCKET, introspection[option_index].option,
+                           output, &output_length) != 0 ||
+                output_length != requested ||
+                memcmp(output, expected_bytes, requested) != 0) {
+                fail_message("option-sol-socket", "short-introspection");
+            }
+            for (size_t tail = requested; tail < sizeof(output); ++tail) {
+                require_true(output[tail] == 0xa5,
+                             "option-sol-socket-short-tail");
+            }
+        }
+        unsigned char output[sizeof(int) + 4];
+        memset(output, 0xa5, sizeof(output));
+        socklen_t output_length = sizeof(output);
+        if (getsockopt(fd, SOL_SOCKET, introspection[option_index].option,
+                       output, &output_length) != 0 ||
+            output_length != sizeof(int) ||
+            memcmp(output, expected_bytes, sizeof(expected_bytes)) != 0) {
+            fail_message("option-sol-socket", "full-introspection");
+        }
+        for (size_t tail = sizeof(int); tail < sizeof(output); ++tail) {
+            require_true(output[tail] == 0xa5,
+                         "option-sol-socket-full-tail");
+        }
+    }
+    printf("THEKERNEL_PACKET_SOL_SOCKET_BOUNDARY type=%d error=0 domain=%d "
+           "protocol=0 short_copy=1\n",
+           SOCK_RAW, AF_PACKET);
+    fflush(stdout);
+
     int value = 0;
     socklen_t value_length = sizeof(value);
     if (getsockopt(fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &value,
