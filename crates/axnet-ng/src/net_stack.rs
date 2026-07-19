@@ -16,6 +16,10 @@ use smoltcp::{
 use crate::{
     device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice},
     listen_table::ListenTable,
+    packet::{
+        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketEndpointId, PacketSelector,
+        PacketSendRequest,
+    },
     router::{RouteInfo, Router, Rule},
     service::Service,
     unix::UnixNamespace,
@@ -33,6 +37,7 @@ use crate::{
 /// while the socket set is still alive.
 pub struct NetStack {
     unix_namespace: Arc<UnixNamespace>,
+    packet_broker: Arc<PacketBroker>,
     pub(crate) listen_table: Arc<ListenTable>,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     pub(crate) service: Mutex<Service>,
@@ -60,27 +65,20 @@ const PORT_START: u16 = 0xc000;
 const PORT_END: u16 = 0xffff;
 
 impl NetStack {
-    /// Create a new `NetStack` from pre-built components.
-    pub(crate) fn new(
-        listen_table: Arc<ListenTable>,
-        socket_set: Arc<SocketSetWrapper<'static>>,
-        service: Service,
-    ) -> Arc<Self> {
-        Self::try_new(listen_table, socket_set, service).expect("failed to allocate network stack")
-    }
-
     pub(crate) fn try_new(
         listen_table: Arc<ListenTable>,
         socket_set: Arc<SocketSetWrapper<'static>>,
         service: Service,
     ) -> AxResult<Arc<Self>> {
         let unix_namespace = UnixNamespace::try_new()?;
+        let packet_broker = service.router.packet_broker();
         let poll_source = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let poll_wake =
             Arc::try_new(NetPollWake(poll_source.clone())).map_err(|_| AxError::NoMemory)?;
         let poll_waker = Waker::from(poll_wake);
         Arc::try_new(Self {
             unix_namespace,
+            packet_broker,
             listen_table,
             socket_set,
             service: Mutex::new(service),
@@ -159,6 +157,41 @@ impl NetStack {
         self.service.lock().router.add_device(device)
     }
 
+    /// Subscribes a bounded link-packet endpoint to this network namespace.
+    pub fn subscribe_packets(&self, selector: PacketSelector) -> AxResult<Arc<PacketEndpoint>> {
+        self.packet_broker.subscribe(selector)
+    }
+
+    /// Returns the packet I/O capabilities of one one-based interface index.
+    pub fn packet_device_capabilities(
+        &self,
+        interface_index: u32,
+    ) -> Option<PacketDeviceCapabilities> {
+        self.service
+            .lock()
+            .router
+            .packet_device_capabilities(interface_index)
+    }
+
+    /// Sends one raw or cooked packet through an interface.
+    ///
+    /// Outgoing capture delivery is drained only after the service mutex is
+    /// released.  `origin` prevents a packet endpoint from receiving its own
+    /// injection while allowing other endpoints to observe it.
+    pub fn send_packet(
+        &self,
+        interface_index: u32,
+        origin: PacketEndpointId,
+        request: PacketSendRequest<'_>,
+    ) -> AxResult<()> {
+        let result = self
+            .service
+            .lock()
+            .send_packet(interface_index, origin, request);
+        self.packet_broker.drain_staged();
+        result
+    }
+
     /// Add a routing rule to this stack.
     pub fn add_route(&self, rule: Rule) {
         self.service.lock().router.add_rule(rule);
@@ -177,7 +210,13 @@ impl NetStack {
 
     /// Poll all network interfaces owned by this stack.
     pub fn poll_interfaces(&self) {
-        while self.service.lock().poll(&mut self.socket_set.inner.lock()) {}
+        loop {
+            let progressed = self.service.lock().poll(&mut self.socket_set.inner.lock());
+            self.packet_broker.drain_staged();
+            if !progressed {
+                break;
+            }
+        }
     }
 
     /// Snapshot per-interface packet and byte counters for this namespace.

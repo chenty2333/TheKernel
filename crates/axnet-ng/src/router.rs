@@ -13,6 +13,10 @@ use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
     device::{Device, DeviceStats, InterfaceInfo},
     listen_table::ListenTable,
+    packet::{
+        PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpointId,
+        PacketSendRequest,
+    },
 };
 
 #[derive(Debug)]
@@ -76,6 +80,7 @@ pub struct Router {
     rx_buffer: PacketBuffer,
     tx_buffer: PacketBuffer,
     mtu: usize,
+    packet_broker: Arc<PacketBroker>,
     pub(crate) devices: Vec<Box<dyn Device>>,
     pub(crate) table: RouteTable,
     pub(crate) listen_table: Arc<ListenTable>,
@@ -126,10 +131,12 @@ impl Router {
             .map_err(|_| AxError::NoMemory)?;
         tx_storage.resize(mtu.saturating_mul(PACKET_QUEUE_LEN), 0);
         let tx_buffer = PacketBuffer::new(tx_metadata, tx_storage);
+        let packet_broker = PacketBroker::try_new()?;
         Ok(Self {
             rx_buffer,
             tx_buffer,
             mtu,
+            packet_broker,
             devices: Vec::new(),
             table: RouteTable::new(),
             listen_table,
@@ -143,6 +150,39 @@ impl Router {
     pub fn add_device(&mut self, device: Box<dyn Device>) -> usize {
         self.devices.push(device);
         self.devices.len() - 1
+    }
+
+    pub(crate) fn packet_broker(&self) -> Arc<PacketBroker> {
+        Arc::clone(&self.packet_broker)
+    }
+
+    pub(crate) fn packet_device_capabilities(
+        &self,
+        interface_index: u32,
+    ) -> Option<PacketDeviceCapabilities> {
+        let index = usize::try_from(interface_index.checked_sub(1)?).ok()?;
+        self.devices
+            .get(index)
+            .map(|device| device.packet_capabilities())
+    }
+
+    pub(crate) fn send_packet(
+        &mut self,
+        interface_index: u32,
+        origin: PacketEndpointId,
+        request: PacketSendRequest<'_>,
+        timestamp: Instant,
+    ) -> AxResult<()> {
+        let index = usize::try_from(
+            interface_index
+                .checked_sub(1)
+                .ok_or(AxError::InvalidInput)?,
+        )
+        .map_err(|_| AxError::InvalidInput)?;
+        let device = self.devices.get_mut(index).ok_or(AxError::NotFound)?;
+        let context =
+            PacketDeviceContext::new(interface_index, self.packet_broker.as_ref(), Some(origin));
+        device.send_packet(context, request, timestamp)
     }
 
     pub(crate) fn device_stats(&self) -> Vec<(String, DeviceStats)> {
@@ -181,8 +221,10 @@ impl Router {
     }
 
     pub fn poll(&mut self, timestamp: Instant) {
-        for dev in &mut self.devices {
-            while !self.rx_buffer.is_full() && dev.recv(&mut self.rx_buffer, timestamp) {}
+        for (index, dev) in self.devices.iter_mut().enumerate() {
+            let context =
+                PacketDeviceContext::new(index as u32 + 1, self.packet_broker.as_ref(), None);
+            while !self.rx_buffer.is_full() && dev.recv(context, &mut self.rx_buffer, timestamp) {}
         }
     }
 
@@ -202,8 +244,13 @@ impl Router {
                     let dst_addr = IpAddress::Ipv4(packet.dst_addr());
                     if packet.dst_addr().is_broadcast() {
                         let buf = packet.into_inner();
-                        for dev in &mut self.devices {
-                            poll_next |= dev.send(dst_addr, buf, timestamp);
+                        for (index, dev) in self.devices.iter_mut().enumerate() {
+                            let context = PacketDeviceContext::new(
+                                index as u32 + 1,
+                                self.packet_broker.as_ref(),
+                                None,
+                            );
+                            poll_next |= dev.send(context, dst_addr, buf, timestamp);
                         }
                     } else {
                         let Some(rule) = self.table.lookup(&dst_addr) else {
@@ -225,7 +272,12 @@ impl Router {
                             warn!("Dropping IPv4 packet for missing route device {}", rule.dev);
                             continue;
                         };
-                        poll_next |= dev.send(next_hop, packet.into_inner(), timestamp);
+                        let context = PacketDeviceContext::new(
+                            rule.dev as u32 + 1,
+                            self.packet_broker.as_ref(),
+                            None,
+                        );
+                        poll_next |= dev.send(context, next_hop, packet.into_inner(), timestamp);
                     }
                 }
                 IpVersion::Ipv6 => {
@@ -236,8 +288,13 @@ impl Router {
                     let dst_addr = IpAddress::Ipv6(packet.dst_addr());
                     if packet.dst_addr().is_multicast() {
                         let buf = packet.into_inner();
-                        for dev in &mut self.devices {
-                            poll_next |= dev.send(dst_addr, buf, timestamp);
+                        for (index, dev) in self.devices.iter_mut().enumerate() {
+                            let context = PacketDeviceContext::new(
+                                index as u32 + 1,
+                                self.packet_broker.as_ref(),
+                                None,
+                            );
+                            poll_next |= dev.send(context, dst_addr, buf, timestamp);
                         }
                     } else {
                         let Some(rule) = self.table.lookup(&dst_addr) else {
@@ -259,7 +316,12 @@ impl Router {
                             warn!("Dropping IPv6 packet for missing route device {}", rule.dev);
                             continue;
                         };
-                        poll_next |= dev.send(next_hop, packet.into_inner(), timestamp);
+                        let context = PacketDeviceContext::new(
+                            rule.dev as u32 + 1,
+                            self.packet_broker.as_ref(),
+                            None,
+                        );
+                        poll_next |= dev.send(context, next_hop, packet.into_inner(), timestamp);
                     }
                 }
             }

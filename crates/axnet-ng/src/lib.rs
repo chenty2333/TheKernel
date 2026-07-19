@@ -29,6 +29,8 @@ mod listen_table;
 pub mod net_stack;
 /// Socket option types and the [`Configurable`](options::Configurable) trait.
 pub mod options;
+/// Bounded namespace-local link-layer packet capture and injection primitives.
+pub mod packet;
 mod router;
 mod service;
 mod socket;

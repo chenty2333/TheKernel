@@ -16,6 +16,7 @@ use smoltcp::{
 };
 
 use crate::{
+    packet::{PacketEndpointId, PacketSendRequest},
     router::{Router, Rule},
     wrapper::SocketSetWrapper,
 };
@@ -64,6 +65,16 @@ impl Service {
         self.router.poll(timestamp);
         self.iface.poll(timestamp, &mut self.router, sockets);
         self.router.dispatch(timestamp)
+    }
+
+    pub(crate) fn send_packet(
+        &mut self,
+        interface_index: u32,
+        origin: PacketEndpointId,
+        request: PacketSendRequest<'_>,
+    ) -> AxResult<()> {
+        self.router
+            .send_packet(interface_index, origin, request, now())
     }
 
     fn route_for(&self, dst_addr: &IpAddress) -> AxResult<&Rule> {
