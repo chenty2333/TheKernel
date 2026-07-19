@@ -871,6 +871,8 @@ static void test_dgram_send_boundaries(void) {
                        sizeof(token));
     require_true(ntohs(observed[0].address.sll_protocol) == 0,
                  "send-zero-outgoing-protocol");
+    require_true(ntohs(observed[1].address.sll_protocol) == ETH_P_802_2,
+                 "send-zero-ingress-protocol");
     print_send_boundary("sendto-zero-protocol", observed);
     close_checked(sender, "send-zero-source-close");
     close_checked(observer, "send-zero-observer-close");
@@ -1016,30 +1018,18 @@ static void test_packet_options(void) {
         fail_message("option-statistics", "munmap");
     }
 
-    errno = 0;
     value = 0;
     value_length = sizeof(value);
     int unsupported = getsockopt(fd, SOL_PACKET, PACKET_RX_RING, &value,
                                  &value_length);
     int unsupported_errno = errno;
-    if (linux_host_mode) {
-        require_true(unsupported == -1 && unsupported_errno == ENOPROTOOPT,
-                     "option-known-unsupported-linux");
-    } else {
-        require_true(unsupported == -1 && unsupported_errno == EOPNOTSUPP,
-                     "option-known-unsupported-guest");
-    }
-    errno = 0;
+    require_true(unsupported == -1 && unsupported_errno == ENOPROTOOPT,
+                 "option-known-unsupported");
     value_length = sizeof(value);
     int unknown = getsockopt(fd, SOL_PACKET, 0x7fff, &value, &value_length);
     int unknown_errno = errno;
-    if (linux_host_mode) {
-        require_true(unknown == -1 && unknown_errno == ENOPROTOOPT,
-                     "option-unknown-linux");
-    } else {
-        require_true(unknown == -1 && unknown_errno == EOPNOTSUPP,
-                     "option-unknown-guest");
-    }
+    require_true(unknown == -1 && unknown_errno == ENOPROTOOPT,
+                 "option-unknown");
     printf("THEKERNEL_PACKET_OPTION_BOUNDARY known_get_errno=%d "
            "unknown_get_errno=%d stats_zero_short_fault_reset=1\n",
            unsupported_errno, unknown_errno);
