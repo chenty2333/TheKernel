@@ -8,8 +8,9 @@ use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use linux_raw_sys::general::{
-    __kernel_off_t, IN_ACCESS, IN_ATTRIB, IN_MODIFY, O_APPEND, O_DSYNC, O_SYNC, W_OK,
+use linux_raw_sys::{
+    general::{__kernel_off_t, IN_ACCESS, IN_ATTRIB, IN_MODIFY, O_APPEND, O_DSYNC, O_SYNC, W_OK},
+    net::MSG_DONTWAIT,
 };
 use spin::Lazy;
 use starry_vm::{VmMutPtr, VmPtr};
@@ -18,8 +19,9 @@ use syscalls::Sysno;
 use crate::{
     file::{
         Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst, IoSrc,
-        OfdIoStatus, PidFd, Pipe, Socket, allowed_write_len, check_resize_limit, executable, flock,
-        get_file_like, get_typed_file, inode_flags,
+        OfdIoStatus, PidFd, PinnedSocketDescription, Pipe, PreparedSocketMessage, Socket,
+        allowed_write_len, check_resize_limit, executable, flock, get_file_like, get_typed_file,
+        inode_flags,
         inotify::{
             notify_exact, notify_parent, notify_read, notify_read_file, notify_write,
             notify_write_file,
@@ -46,7 +48,10 @@ use crate::{
     mounts,
     pseudofs::tmp,
     readiness::block_on_poll_io,
-    task::AsThread,
+    task::{
+        AsThread,
+        security::{SocketSecurityContext, dispatch_socket},
+    },
     time::wall_time,
 };
 
@@ -82,6 +87,88 @@ static TRANSFER_ATTEMPT_LOCKS: Lazy<[Mutex<()>; TRANSFER_ATTEMPT_LOCK_COUNT]> =
 fn current_vfs_security() -> VfsSecurityContext {
     let current = axtask::current();
     VfsSecurityContext::new(current.as_thread().current_cred())
+}
+
+const fn generic_socket_message_flags(status: OfdIoStatus) -> u32 {
+    if status.nonblocking() {
+        MSG_DONTWAIT
+    } else {
+        0
+    }
+}
+
+fn dispatch_generic_socket_receive(
+    socket: &PinnedSocketDescription,
+    status: OfdIoStatus,
+    iov_count: usize,
+    len: usize,
+) -> AxResult<()> {
+    let security = current_vfs_security();
+    let flags = generic_socket_message_flags(status);
+    let message = PreparedSocketMessage::new(flags, iov_count, 0, 0, 0);
+    let socket_ref = socket.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::receive_message(
+        security.actor(),
+        &socket_ref,
+        &message,
+        len,
+        flags as i32,
+    ))
+}
+
+fn dispatch_generic_socket_send(
+    security: &VfsSecurityContext,
+    socket: &PinnedSocketDescription,
+    status: OfdIoStatus,
+    iov_count: usize,
+    len: usize,
+) -> AxResult<()> {
+    let flags = generic_socket_message_flags(status);
+    let message = PreparedSocketMessage::new(flags, iov_count, 0, 0, 0);
+    let socket_ref = socket.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::send_message(
+        security.actor(),
+        &socket_ref,
+        &message,
+        len,
+    ))
+}
+
+/// Applies generic read/readv socket policy without changing non-socket I/O.
+///
+/// Linux ordinary `read(2)` with a zero total length does not enter the socket
+/// receive path and therefore cannot claim an AF_PACKET queue record. A
+/// nonzero socket read is authorized before its backend can write payload or
+/// consume queue ownership.
+fn generic_read_after_socket_policy<T>(
+    socket: Option<&PinnedSocketDescription>,
+    len: usize,
+    authorize: impl FnOnce(&PinnedSocketDescription) -> AxResult<()>,
+    read: impl FnOnce() -> AxResult<T>,
+) -> AxResult<Option<T>> {
+    if let Some(socket) = socket {
+        if len == 0 {
+            return Ok(None);
+        }
+        authorize(socket)?;
+    }
+    read().map(Some)
+}
+
+/// Applies generic write/writev socket policy before any payload access.
+///
+/// Unlike generic reads, a zero-length socket write still reaches Linux's
+/// send-message security hook. Keeping authorization outside the backend
+/// closure also makes a denial precede packet allocation and submission.
+fn generic_write_after_socket_policy<T>(
+    socket: Option<&PinnedSocketDescription>,
+    authorize: impl FnOnce(&PinnedSocketDescription) -> AxResult<()>,
+    write: impl FnOnce() -> AxResult<T>,
+) -> AxResult<T> {
+    if let Some(socket) = socket {
+        authorize(socket)?;
+    }
+    write()
 }
 
 fn begin_inode_content_write(
@@ -923,37 +1010,61 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     let f = get_file_like(fd)?;
     let status = f.io_status_snapshot();
     f.check_io_status(status)?;
-    if len != 0 {
-        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+    let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
+    if socket.is_some() && len == 0 {
+        return Ok(0);
     }
-    f.with_read_credentials(|| {
-        let read = if let Some(file) = f.downcast_ref::<File>()
-            && file_has_current_position(file.inner())
-        {
-            with_current_position_io(file, len, |offset| {
-                validate_direct_io(file, buf as usize, len, offset)?;
-                let fast_read = match try_regular_file_read_user_slice(file, buf, len, offset)? {
-                    Some(read) => Some(read),
-                    None => try_regular_file_read_user_segments(file, buf, len, offset)?,
-                };
-                let read = if let Some(read) = fast_read {
-                    read
+    if len != 0 {
+        crate::file::fanotify::permission_check_file_like(
+            &f,
+            crate::file::fanotify::FAN_ACCESS_PERM,
+        )?;
+    }
+    generic_read_after_socket_policy(
+        socket.as_ref(),
+        len,
+        |socket| dispatch_generic_socket_receive(socket, status, 1, len),
+        || {
+            f.with_read_credentials(|| {
+                let read = if let Some(file) = f.downcast_ref::<File>()
+                    && file_has_current_position(file.inner())
+                {
+                    with_current_position_io(file, len, |offset| {
+                        validate_direct_io(file, buf as usize, len, offset)?;
+                        let fast_read =
+                            match try_regular_file_read_user_slice(file, buf, len, offset)? {
+                                Some(read) => Some(read),
+                                None => {
+                                    try_regular_file_read_user_segments(file, buf, len, offset)?
+                                }
+                            };
+                        let read = if let Some(read) = fast_read {
+                            read
+                        } else {
+                            if len >= USER_COPY_PREFAULT_MIN {
+                                prefault_regular_file_read_fallback(file, buf, len, offset)?;
+                            }
+                            file.read_at_with_status(
+                                status,
+                                &mut VmBytesMut::new(buf, len),
+                                offset,
+                            )?
+                        };
+                        Ok((read, read))
+                    })?
                 } else {
-                    if len >= USER_COPY_PREFAULT_MIN {
-                        prefault_regular_file_read_fallback(file, buf, len, offset)?;
-                    }
-                    file.read_at_with_status(status, &mut VmBytesMut::new(buf, len), offset)?
-                };
-                Ok((read, read))
-            })?
-        } else {
-            read_file_like_with_status(&f, status, &mut VmBytesMut::new(buf, len))?
-        } as isize;
-        if read > 0 {
-            notify_read(fd);
-        }
-        Ok(read)
-    })
+                    read_file_like_with_status(&f, status, &mut VmBytesMut::new(buf, len))?
+                } as isize;
+                if read > 0
+                    && let Some(file) = f.downcast_ref::<File>()
+                {
+                    notify_read_file(file);
+                }
+                Ok(read)
+            })
+        },
+    )
+    .map(|read| read.unwrap_or(0))
 }
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
@@ -961,32 +1072,52 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     let f = get_file_like(fd)?;
     let status = f.io_status_snapshot();
     f.check_io_status(status)?;
-    if iovcnt != 0 {
-        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
-    }
+    let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    f.with_read_credentials(|| {
-        let read = if let Some(file) = f.downcast_ref::<File>()
-            && file_has_current_position(file.inner())
-        {
-            with_current_position_io(file, iov.len(), |offset| {
-                validate_direct_iov(file, &iov, offset)?;
-                let read =
-                    if let Some(read) = try_regular_file_readv_user_segments(file, &iov, offset)? {
-                        read
-                    } else {
-                        file.read_at_with_status(status, &mut iov.into_io(), offset)?
-                    };
-                Ok((read, read))
-            })?
-        } else {
-            read_file_like_with_status(&f, status, &mut iov.into_io())?
-        } as isize;
-        if read > 0 {
-            notify_read(fd);
-        }
-        Ok(read)
-    })
+    let len = iov.len();
+    let imported_iov_count = iov.iovcnt();
+    if socket.is_some() && len == 0 {
+        return Ok(0);
+    }
+    if iovcnt != 0 {
+        crate::file::fanotify::permission_check_file_like(
+            &f,
+            crate::file::fanotify::FAN_ACCESS_PERM,
+        )?;
+    }
+    generic_read_after_socket_policy(
+        socket.as_ref(),
+        len,
+        |socket| dispatch_generic_socket_receive(socket, status, imported_iov_count, len),
+        || {
+            f.with_read_credentials(|| {
+                let read = if let Some(file) = f.downcast_ref::<File>()
+                    && file_has_current_position(file.inner())
+                {
+                    with_current_position_io(file, iov.len(), |offset| {
+                        validate_direct_iov(file, &iov, offset)?;
+                        let read = if let Some(read) =
+                            try_regular_file_readv_user_segments(file, &iov, offset)?
+                        {
+                            read
+                        } else {
+                            file.read_at_with_status(status, &mut iov.into_io(), offset)?
+                        };
+                        Ok((read, read))
+                    })?
+                } else {
+                    read_file_like_with_status(&f, status, &mut iov.into_io())?
+                } as isize;
+                if read > 0
+                    && let Some(file) = f.downcast_ref::<File>()
+                {
+                    notify_read_file(file);
+                }
+                Ok(read)
+            })
+        },
+    )
+    .map(|read| read.unwrap_or(0))
 }
 
 /// Write data to the file indicated by `fd`.
@@ -996,71 +1127,85 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let security = current_vfs_security();
     let f = get_file_like(fd)?;
-    let (written, status) = f.with_write_credentials(|status| {
-        let regular_file = if let Some(file) = f.downcast_ref::<File>() {
-            file.inner().access(FileFlags::WRITE)?;
-            if len != 0 {
-                check_writable_mount(file.inner().location())?;
-            }
-            Some(file)
-        } else {
-            None
-        };
-        if let Some(file) = regular_file {
-            if write_uses_current_position(file.inner(), status) {
-                return with_current_position_io(file, len, |offset| {
-                    let allowed = allowed_write_len(offset, len)?;
-                    if let Some(written) = try_regular_file_write_user_slice(
-                        file,
-                        status,
-                        &security,
-                        buf as *const u8,
-                        len,
-                        offset,
-                    )? {
-                        return Ok(((written, status), written));
+    let status = f.io_status_snapshot();
+    let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
+    let (written, status) = generic_write_after_socket_policy(
+        socket.as_ref(),
+        |socket| dispatch_generic_socket_send(&security, socket, status, 1, len),
+        || {
+            f.with_write_credentials_for_status(status, || {
+                let regular_file = if let Some(file) = f.downcast_ref::<File>() {
+                    file.inner().access(FileFlags::WRITE)?;
+                    if len != 0 {
+                        check_writable_mount(file.inner().location())?;
                     }
-                    if let Some(written) = try_regular_file_write_user_segments(
-                        file,
-                        status,
-                        &security,
-                        buf as *const u8,
-                        len,
-                        offset,
-                    )? {
-                        return Ok(((written, status), written));
+                    Some(file)
+                } else {
+                    None
+                };
+                if let Some(file) = regular_file {
+                    if write_uses_current_position(file.inner(), status) {
+                        return with_current_position_io(file, len, |offset| {
+                            let allowed = allowed_write_len(offset, len)?;
+                            if let Some(written) = try_regular_file_write_user_slice(
+                                file,
+                                status,
+                                &security,
+                                buf as *const u8,
+                                len,
+                                offset,
+                            )? {
+                                return Ok(((written, status), written));
+                            }
+                            if let Some(written) = try_regular_file_write_user_segments(
+                                file,
+                                status,
+                                &security,
+                                buf as *const u8,
+                                len,
+                                offset,
+                            )? {
+                                return Ok(((written, status), written));
+                            }
+                            if len >= USER_COPY_PREFAULT_MIN {
+                                prefault_regular_file_write_fallback(
+                                    file,
+                                    buf as *const u8,
+                                    allowed,
+                                )?;
+                            }
+                            let written = file.write_at_with_status_and_direct_validation(
+                                status,
+                                &mut VmBytes::new(buf, len),
+                                offset,
+                                &security,
+                                |write_offset, write_len| {
+                                    validate_direct_io(file, buf as usize, write_len, write_offset)
+                                },
+                            )?;
+                            Ok(((written, status), written))
+                        });
                     }
-                    if len >= USER_COPY_PREFAULT_MIN {
-                        prefault_regular_file_write_fallback(file, buf as *const u8, allowed)?;
-                    }
-                    let written = file.write_at_with_status_and_direct_validation(
+
+                    let written = file.write_with_status_and_direct_validation(
                         status,
                         &mut VmBytes::new(buf, len),
-                        offset,
                         &security,
-                        |write_offset, write_len| {
-                            validate_direct_io(file, buf as usize, write_len, write_offset)
-                        },
+                        |offset, allowed| validate_direct_io(file, buf as usize, allowed, offset),
                     )?;
-                    Ok(((written, status), written))
-                });
-            }
-
-            let written = file.write_with_status_and_direct_validation(
-                status,
-                &mut VmBytes::new(buf, len),
-                &security,
-                |offset, allowed| validate_direct_io(file, buf as usize, allowed, offset),
-            )?;
-            return Ok((written, status));
-        }
-        write_file_like_with_status(&f, status, &mut VmBytes::new(buf, len), &security)
-            .map(|written| (written, status))
-    })?;
+                    return Ok((written, status));
+                }
+                write_file_like_with_status(&f, status, &mut VmBytes::new(buf, len), &security)
+                    .map(|written| (written, status))
+            })
+        },
+    )?;
     let written = written as isize;
     if written > 0 {
         sync_file_like_after_status_write(status, &f)?;
-        notify_write(fd);
+        if let Some(file) = f.downcast_ref::<File>() {
+            notify_write_file(file);
+        }
     }
     Ok(written)
 }
@@ -1069,76 +1214,89 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let security = current_vfs_security();
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    let written = if let Ok(file) = get_typed_file::<File>(fd) {
-        let (written, status) = file.with_write_credentials(|status| {
-            iov.check_readable()?;
-            file.inner().access(FileFlags::WRITE)?;
-            if iov.len() != 0 {
-                check_writable_mount(file.inner().location())?;
-            }
-            let direct_alignment_limit = direct_iov_alignment_limit(file.as_ref(), &iov)?;
-            if write_uses_current_position(file.inner(), status) {
-                return with_current_position_io(file.as_ref(), iov.len(), |offset| {
-                    if let Some(written) = try_regular_file_writev_user_segments(
-                        file.as_ref(),
-                        status,
-                        &security,
-                        &iov,
-                        offset,
-                    )? {
-                        return Ok(((written, status), written));
+    let len = iov.len();
+    let imported_iov_count = iov.iovcnt();
+    let f = get_file_like(fd)?;
+    let status = f.io_status_snapshot();
+    let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
+    let written = generic_write_after_socket_policy(
+        socket.as_ref(),
+        |socket| dispatch_generic_socket_send(&security, socket, status, imported_iov_count, len),
+        || {
+            if f.downcast_ref::<File>().is_some() {
+                let file = f.downcast::<File>()?;
+                let (written, status) = file.with_write_credentials_for_status(status, || {
+                    iov.check_readable()?;
+                    file.inner().access(FileFlags::WRITE)?;
+                    if iov.len() != 0 {
+                        check_writable_mount(file.inner().location())?;
                     }
-                    let written = file.write_at_with_status_and_direct_validation(
+                    let direct_alignment_limit = direct_iov_alignment_limit(file.as_ref(), &iov)?;
+                    if write_uses_current_position(file.inner(), status) {
+                        return with_current_position_io(file.as_ref(), iov.len(), |offset| {
+                            if let Some(written) = try_regular_file_writev_user_segments(
+                                file.as_ref(),
+                                status,
+                                &security,
+                                &iov,
+                                offset,
+                            )? {
+                                return Ok(((written, status), written));
+                            }
+                            let written = file.write_at_with_status_and_direct_validation(
+                                status,
+                                &mut iov.into_io(),
+                                offset,
+                                &security,
+                                |write_offset, write_len| {
+                                    validate_direct_iov_prefix_limit(
+                                        file.as_ref(),
+                                        write_offset,
+                                        write_len,
+                                        direct_alignment_limit,
+                                    )
+                                },
+                            )?;
+                            Ok(((written, status), written))
+                        });
+                    }
+
+                    file.write_with_status_and_direct_validation(
                         status,
                         &mut iov.into_io(),
-                        offset,
                         &security,
-                        |write_offset, write_len| {
+                        |offset, allowed| {
                             validate_direct_iov_prefix_limit(
                                 file.as_ref(),
-                                write_offset,
-                                write_len,
+                                offset,
+                                allowed,
                                 direct_alignment_limit,
                             )
                         },
-                    )?;
-                    Ok(((written, status), written))
-                });
-            }
-
-            file.write_with_status_and_direct_validation(
-                status,
-                &mut iov.into_io(),
-                &security,
-                |offset, allowed| {
-                    validate_direct_iov_prefix_limit(
-                        file.as_ref(),
-                        offset,
-                        allowed,
-                        direct_alignment_limit,
                     )
-                },
-            )
-            .map(|written| (written, status))
-        })?;
-        if written > 0 {
-            sync_file_after_status_write(status, &file)?;
-        }
-        written
-    } else {
-        let f = get_file_like(fd)?;
-        let (written, status) = f.with_write_credentials(|status| {
-            write_file_like_with_status(&f, status, &mut iov.into_io(), &security)
-                .map(|written| (written, status))
-        })?;
-        if written > 0 {
-            sync_file_like_after_status_write(status, &f)?;
-        }
-        written
-    };
+                    .map(|written| (written, status))
+                })?;
+                if written > 0 {
+                    sync_file_after_status_write(status, &file)?;
+                }
+                Ok(written)
+            } else {
+                let (written, status) = f.with_write_credentials_for_status(status, || {
+                    write_file_like_with_status(&f, status, &mut iov.into_io(), &security)
+                        .map(|written| (written, status))
+                })?;
+                if written > 0 {
+                    sync_file_like_after_status_write(status, &f)?;
+                }
+                Ok(written)
+            }
+        },
+    )?;
     let written = written as isize;
-    if written > 0 {
-        notify_write(fd);
+    if written > 0
+        && let Some(file) = f.downcast_ref::<File>()
+    {
+        notify_write_file(file);
     }
     Ok(written)
 }
@@ -4015,6 +4173,7 @@ mod tests {
     use alloc::sync::{Arc, Weak};
     use core::{
         any::Any,
+        cell::Cell,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::Context,
         time::Duration,
@@ -4029,8 +4188,233 @@ mod tests {
         Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError, VfsResult,
         XattrProvider, XattrSetMode,
     };
+    use axio::{IoBuf, Read};
+    use thekernel_linux_packet::{
+        PacketSendAddress, PacketSocketType, ProtocolSelector, ReceiveFlags,
+    };
 
     use super::*;
+    use crate::{
+        file::{PacketSocket, packet_socket::packet_test_context},
+        task::{NetworkNamespace, UserNamespace},
+    };
+
+    struct CountingPacketSource<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+        reads: &'a Cell<usize>,
+    }
+
+    impl Read for CountingPacketSource<'_> {
+        fn read(&mut self, output: &mut [u8]) -> AxResult<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let source = &self.bytes[self.offset..];
+            let copied = source.len().min(output.len());
+            output[..copied].copy_from_slice(&source[..copied]);
+            self.offset += copied;
+            Ok(copied)
+        }
+    }
+
+    impl IoBuf for CountingPacketSource<'_> {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.offset
+        }
+    }
+
+    fn packet_test_namespace() -> Arc<NetworkNamespace> {
+        NetworkNamespace::try_new_loopback_only(UserNamespace::try_new_root().unwrap()).unwrap()
+    }
+
+    fn raw_ipv4_packet() -> [u8; 34] {
+        let mut frame = [0_u8; 34];
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&20_u16.to_be_bytes());
+        frame[22] = 64;
+        frame
+    }
+
+    fn loopback_packet_destination() -> PacketSendAddress {
+        PacketSendAddress::try_from_network_order_fields(0x0800_u16.to_be(), 1, 6, [0; 8]).unwrap()
+    }
+
+    fn pinned_packet(socket: Arc<PacketSocket>) -> PinnedSocketDescription {
+        let file: Arc<dyn FileLike> = socket;
+        let description = FileDescription::new(file).unwrap();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description);
+        let status = handle.io_status_snapshot();
+        let pinned = PinnedSocketDescription::from_file_handle(&handle, status)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pinned.security_ref().unwrap().ofd_identity(),
+            handle.open_file_description_key()
+        );
+        pinned
+    }
+
+    fn enqueue_outgoing_packet(sender: &PacketSocket, frame: &[u8]) {
+        let plan = sender
+            .prepare_send(frame.len(), Some(loopback_packet_destination()))
+            .unwrap();
+        assert_eq!(sender.send_prepared(plan, frame), Ok(frame.len()));
+    }
+
+    #[test]
+    fn denied_generic_packet_read_preserves_payload_and_queue_ownership() {
+        let _context = packet_test_context();
+        let namespace = packet_test_namespace();
+        let receiver = PacketSocket::try_new(
+            PacketSocketType::Raw,
+            ProtocolSelector::All,
+            namespace.clone(),
+        )
+        .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
+        let pinned = pinned_packet(receiver.clone());
+        let frame = raw_ipv4_packet();
+        enqueue_outgoing_packet(&sender, &frame);
+        assert!(receiver.poll().contains(IoEvents::READABLE));
+
+        let authorize_calls = Cell::new(0);
+        let backend_calls = Cell::new(0);
+        let mut output = [0xa5_u8; 34];
+        let output_len = output.len();
+        let result = generic_read_after_socket_policy(
+            Some(&pinned),
+            output_len,
+            |_| {
+                authorize_calls.set(authorize_calls.get() + 1);
+                Err(AxError::PermissionDenied)
+            },
+            || {
+                backend_calls.set(backend_calls.get() + 1);
+                let mut destination = &mut output[..];
+                receiver
+                    .recv_with_nonblocking(&mut destination, ReceiveFlags::EMPTY, true)
+                    .map(|outcome| outcome.returned_len())
+            },
+        );
+
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        assert_eq!(authorize_calls.get(), 1);
+        assert_eq!(backend_calls.get(), 0);
+        assert_eq!(output, [0xa5; 34]);
+        assert!(receiver.poll().contains(IoEvents::READABLE));
+
+        let mut drained = [0_u8; 34];
+        let mut destination = &mut drained[..];
+        let outcome = receiver
+            .recv_with_nonblocking(&mut destination, ReceiveFlags::EMPTY, true)
+            .unwrap();
+        assert_eq!(outcome.returned_len(), frame.len());
+        assert_eq!(drained, frame);
+        assert!(!receiver.poll().contains(IoEvents::READABLE));
+    }
+
+    #[test]
+    fn denied_generic_packet_write_reads_no_payload_and_submits_no_frame() {
+        let _context = packet_test_context();
+        let namespace = packet_test_namespace();
+        let observer = PacketSocket::try_new(
+            PacketSocketType::Raw,
+            ProtocolSelector::All,
+            namespace.clone(),
+        )
+        .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
+        let pinned = pinned_packet(sender.clone());
+        let frame = raw_ipv4_packet();
+        let reads = Cell::new(0);
+        let backend_calls = Cell::new(0);
+        let authorize_calls = Cell::new(0);
+        let mut source = CountingPacketSource {
+            bytes: &frame,
+            offset: 0,
+            reads: &reads,
+        };
+
+        let result = generic_write_after_socket_policy(
+            Some(&pinned),
+            |_| {
+                authorize_calls.set(authorize_calls.get() + 1);
+                Err(AxError::PermissionDenied)
+            },
+            || {
+                backend_calls.set(backend_calls.get() + 1);
+                sender.write(&mut source)
+            },
+        );
+
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        assert_eq!(authorize_calls.get(), 1);
+        assert_eq!(backend_calls.get(), 0);
+        assert_eq!(reads.get(), 0);
+        assert!(!observer.poll().contains(IoEvents::READABLE));
+    }
+
+    #[test]
+    fn zero_length_packet_read_skips_hook_but_write_still_dispatches() {
+        let _context = packet_test_context();
+        let namespace = packet_test_namespace();
+        let receiver = PacketSocket::try_new(
+            PacketSocketType::Raw,
+            ProtocolSelector::All,
+            namespace.clone(),
+        )
+        .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
+        let pinned = pinned_packet(receiver.clone());
+        enqueue_outgoing_packet(&sender, &raw_ipv4_packet());
+
+        let receive_hooks = Cell::new(0);
+        let receive_calls = Cell::new(0);
+        let result = generic_read_after_socket_policy(
+            Some(&pinned),
+            0,
+            |_| {
+                receive_hooks.set(receive_hooks.get() + 1);
+                Ok(())
+            },
+            || {
+                receive_calls.set(receive_calls.get() + 1);
+                Ok(0usize)
+            },
+        );
+        assert_eq!(result, Ok(None));
+        assert_eq!(receive_hooks.get(), 0);
+        assert_eq!(receive_calls.get(), 0);
+        assert!(receiver.poll().contains(IoEvents::READABLE));
+
+        let send_hooks = Cell::new(0);
+        let send_calls = Cell::new(0);
+        let empty_reads = Cell::new(0);
+        let mut empty = CountingPacketSource {
+            bytes: &[],
+            offset: 0,
+            reads: &empty_reads,
+        };
+        let result = generic_write_after_socket_policy(
+            Some(&pinned),
+            |_| {
+                send_hooks.set(send_hooks.get() + 1);
+                Err(AxError::PermissionDenied)
+            },
+            || {
+                send_calls.set(send_calls.get() + 1);
+                receiver.write(&mut empty)
+            },
+        );
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        assert_eq!(send_hooks.get(), 1);
+        assert_eq!(send_calls.get(), 0);
+        assert_eq!(empty_reads.get(), 0);
+        assert!(receiver.poll().contains(IoEvents::READABLE));
+    }
 
     struct IoContractFs {
         this: Weak<Self>,
