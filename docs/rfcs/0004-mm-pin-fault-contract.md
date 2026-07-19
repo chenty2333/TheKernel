@@ -311,7 +311,33 @@ or page-cache mechanisms into syscall code. The current consumer checkpoint:
   permission restore canonically folds compatible fragments back to one in a
   single mixed-owner transaction. Different handlers, fault epochs, modes,
   holes, page geometry, or actual post-VMA boundaries remain separate, and a
-  partial source projection fails closed.
+  partial source projection fails closed;
+- freezes both fixed-`mremap` sidecar outcomes before destroying a destination.
+  A fixed move owns a destination-only failure plan and a destination-plus-
+  source success plan in two bounded slots; the transaction aborts the
+  unchosen plan before committing the chosen plan. A fixed duplicate retires
+  only destination authority, a nonfixed move retires source authority only
+  after commit, and a nonfixed duplicate changes no registration. Moved or
+  duplicated destinations remain unregistered because this checkpoint does not
+  advertise `UFFD_FEATURE_EVENT_REMAP`; and
+- extends a boundary registration only when the same logical mapping grows in
+  place or through `MAP_GROWSDOWN`. The extension preserves the registration
+  fault epoch and is published before a growdown fault retry. A `brk` tail is
+  deliberately unregistered even when MemorySet merges it into the same VMA
+  and backend. Population rollback reports whether the new range was preserved
+  or remains published, so registration authority and the Linux-visible break
+  never describe a range different from the concrete VMA state.
+
+Linux v6.12 fixed `mremap` unmaps the replacement destination and, for
+`old_size > new_size`, the old source tail before later move validation can
+fail. TheKernel currently completes its destination staging transaction before
+retiring any source byte, so such a failure preserves the complete source while
+still possibly retiring the old destination. The two preflighted sidecar plans
+intentionally follow TheKernel's concrete MM outcome: the failure plan removes
+only destination authority. This is a stronger rollback guarantee, not a claim
+of exact Linux failure-state parity. Source-tail authority must not be retired
+on failure unless the main VMA transaction is first changed to publish that
+same effect and its typed outcome is extended accordingly.
 
 The current address-space consumer also has two independent, per-address-space
 resource ceilings: 65,536 live logical mapping lineages and 65,536 live VMA

@@ -10,7 +10,7 @@ use memory_set::MappingLineage;
 use thekernel_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
-    mm::{AddrSpace, Backend, BackendOps},
+    mm::{AddrSpace, Backend, BackendOps, ExistingLineageMapError},
     task::ProcessData,
 };
 
@@ -366,6 +366,14 @@ fn mremap_locked_growth_allowed(
         MemlockLimit::Limited(limit),
     )
     .is_ok()
+}
+
+fn accept_published_lineage_growth(result: Result<(), ExistingLineageMapError>) -> AxResult {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.published() => Ok(()),
+        Err(error) => Err(error.into_error()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -752,7 +760,7 @@ fn commit_prepared_remap(
             if grow_locked {
                 check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, grow)?;
             }
-            aspace.map_with_existing_lineage(
+            accept_published_lineage_growth(aspace.extend_mapping_tail_with_existing_lineage(
                 request.addr + request.old_size,
                 grow,
                 primary.flags,
@@ -760,7 +768,7 @@ fn commit_prepared_remap(
                 tail_backend,
                 grow_locked,
                 primary.lineage,
-            )?;
+            ))?;
             Ok(request.addr.as_usize() as isize)
         }
         PreparedRemapPlan::Move {
@@ -915,7 +923,7 @@ fn commit_locked_remap(
                 primary
                     .backend
                     .relocate(request.addr, request.addr, aspace_handle)?;
-            aspace.map_with_existing_lineage(
+            accept_published_lineage_growth(aspace.extend_mapping_tail_with_existing_lineage(
                 request.addr + request.old_size,
                 grow,
                 primary.flags,
@@ -923,7 +931,7 @@ fn commit_locked_remap(
                 tail_backend,
                 grow_locked,
                 primary.lineage,
-            )?;
+            ))?;
             Ok(request.addr.as_usize() as isize)
         }
         RemapPlan::Move {

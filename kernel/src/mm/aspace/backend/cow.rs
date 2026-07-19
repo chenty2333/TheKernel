@@ -706,6 +706,23 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn materialized_growdown_must_clone_backend_identity_to_remerge() {
+        let Backend::Cow(original) = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K)
+        else {
+            unreachable!()
+        };
+        let cloned = original.clone();
+        let Backend::Cow(fresh) = Backend::new_alloc(VirtAddr::from(0x3000), PageSize::Size4K)
+        else {
+            unreachable!()
+        };
+
+        original.mark_materialized();
+        assert!(original.mergeable_with(&cloned));
+        assert!(!original.mergeable_with(&fresh));
+    }
+
     struct MockCowCloneOps {
         parents: BTreeMap<VirtAddr, (MappingFlags, PageSize)>,
         children: BTreeMap<VirtAddr, (PhysAddr, MappingFlags, PageSize)>,

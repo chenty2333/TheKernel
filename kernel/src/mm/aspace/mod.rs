@@ -973,6 +973,35 @@ impl ReplaceMappingError {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExistingLineageMapError {
+    Preserved(AxError),
+    Published(AxError),
+}
+
+impl ExistingLineageMapError {
+    pub(crate) const fn published(self) -> bool {
+        matches!(self, Self::Published(_))
+    }
+
+    pub(crate) const fn into_error(self) -> AxError {
+        match self {
+            Self::Preserved(error) | Self::Published(error) => error,
+        }
+    }
+}
+
+const fn classify_existing_lineage_population_failure(
+    error: AxError,
+    rollback_failed: bool,
+) -> ExistingLineageMapError {
+    if rollback_failed {
+        ExistingLineageMapError::Published(error)
+    } else {
+        ExistingLineageMapError::Preserved(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemapTransactionEffect {
     Preserved,
@@ -2219,11 +2248,147 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Extends an already identified logical mapping.
-    ///
-    /// A successful extension publishes exactly one lineage generation. Multi-
-    /// fragment staging that must defer publication uses
-    /// [`Self::stage_mapping_fragment`] inside an explicit transaction instead.
+    fn preflight_existing_lineage_tail_uffd(
+        &mut self,
+        lineage: MappingLineage,
+        old_end: VirtAddr,
+        new_end: VirtAddr,
+    ) -> Result<Option<OptionalUffdPlan>, ExistingLineageMapError> {
+        let identity = self
+            .mapping_identity(lineage)
+            .map_err(ExistingLineageMapError::Preserved)?;
+        let Some(state) = self.uffd.as_deref_mut() else {
+            return Ok(None);
+        };
+        state
+            .preflight_tail_extension(
+                0,
+                self.address_space_id,
+                identity.id,
+                old_end.as_usize(),
+                new_end.as_usize(),
+            )
+            .map(Some)
+            .map_err(ExistingLineageMapError::Preserved)
+    }
+
+    fn preflight_existing_lineage_head_uffd(
+        &mut self,
+        lineage: MappingLineage,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+    ) -> Result<Option<OptionalUffdPlan>, ExistingLineageMapError> {
+        let identity = self
+            .mapping_identity(lineage)
+            .map_err(ExistingLineageMapError::Preserved)?;
+        let Some(state) = self.uffd.as_deref_mut() else {
+            return Ok(None);
+        };
+        state
+            .preflight_head_extension(
+                0,
+                self.address_space_id,
+                identity.id,
+                old_start.as_usize(),
+                new_start.as_usize(),
+            )
+            .map(Some)
+            .map_err(ExistingLineageMapError::Preserved)
+    }
+
+    fn resolve_existing_lineage_uffd(&mut self, plan: Option<OptionalUffdPlan>, published: bool) {
+        let Some(plan) = plan else {
+            return;
+        };
+        let state = self
+            .uffd
+            .as_deref_mut()
+            .expect("armed UFFD lineage-extension plan lost its address-space state");
+        if published {
+            state.commit_plan(plan);
+        } else {
+            state.abort_plan(plan);
+        }
+    }
+
+    fn map_with_existing_lineage_transaction(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        populate: bool,
+        backend: Backend,
+        locked: bool,
+        lineage: MappingLineage,
+        uffd_plan: Option<OptionalUffdPlan>,
+    ) -> Result<(), ExistingLineageMapError> {
+        if let Err(error) = self.validate_region(start, size) {
+            self.resolve_existing_lineage_uffd(uffd_plan, false);
+            return Err(ExistingLineageMapError::Preserved(error));
+        }
+        let next_topology_generation = match self.next_topology_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.resolve_existing_lineage_uffd(uffd_plan, false);
+                return Err(ExistingLineageMapError::Preserved(error));
+            }
+        };
+        // If population rollback fails and the new range remains visible,
+        // publishing a conservative generation is mandatory and must not
+        // introduce a new fallible step after mutation.
+        let next_mapping_generation = match self.mapping_identity(lineage) {
+            Ok(identity) => identity.generation.next().map_err(mm_error),
+            Err(error) => Err(error),
+        };
+        let next_mapping_generation = match next_mapping_generation {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.resolve_existing_lineage_uffd(uffd_plan, false);
+                return Err(ExistingLineageMapError::Preserved(error));
+            }
+        };
+
+        let area = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
+        if let Err(error) = self
+            .areas
+            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)
+        {
+            self.resolve_existing_lineage_uffd(uffd_plan, false);
+            return Err(ExistingLineageMapError::Preserved(error.into()));
+        }
+        if locked {
+            self.insert_locked_range(start, start + size);
+        }
+        if populate && let Err(err) = self.populate_area(start, size, flags) {
+            let rollback = self.unmap_areas_with_tlb_grace(start, size);
+            self.refresh_growdown_starts();
+            match rollback {
+                Ok(()) => {
+                    self.clear_locked_range(start, size);
+                    self.resolve_existing_lineage_uffd(uffd_plan, false);
+                    return Err(classify_existing_lineage_population_failure(err, false));
+                }
+                Err(unmap_err) => {
+                    warn!(
+                        "AddrSpace::map_with_existing_lineage: failed to roll back \
+                         {start:?}+{size:#x} after populate error: {unmap_err:?}"
+                    );
+                    self.resolve_existing_lineage_uffd(uffd_plan, true);
+                    self.commit_mapping_generation(lineage, next_mapping_generation);
+                    self.commit_topology_generation(next_topology_generation);
+                    return Err(classify_existing_lineage_population_failure(err, true));
+                }
+            }
+        }
+        self.resolve_existing_lineage_uffd(uffd_plan, true);
+        self.commit_mapping_generation(lineage, next_mapping_generation);
+        self.commit_topology_generation(next_topology_generation);
+        Ok(())
+    }
+
+    /// Extends an already identified logical mapping without extending any
+    /// userfaultfd registration. `brk` uses this deliberately: a VMA/backend
+    /// merge must not grant the new heap tail old range authority.
     pub(crate) fn map_with_existing_lineage(
         &mut self,
         start: VirtAddr,
@@ -2233,46 +2398,45 @@ impl AddrSpace {
         backend: Backend,
         locked: bool,
         lineage: MappingLineage,
-    ) -> AxResult {
-        self.validate_region(start, size)?;
-        let next_topology_generation = self.next_topology_generation()?;
-        // If population rollback fails and the new range remains visible,
-        // publishing a conservative generation is mandatory and must not
-        // introduce a new fallible step after mutation.
-        let next_mapping_generation = self
-            .mapping_identity(lineage)?
-            .generation
-            .next()
-            .map_err(mm_error)?;
+    ) -> Result<(), ExistingLineageMapError> {
+        self.map_with_existing_lineage_transaction(
+            start, size, flags, populate, backend, locked, lineage, None,
+        )
+    }
 
-        let area = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
-        self.areas
-            .map_with_limit(area, &mut self.pt, false, MAX_VMA_FRAGMENTS)?;
-        self.commit_topology_generation(next_topology_generation);
-        if locked {
-            self.insert_locked_range(start, start + size);
-        }
-        if populate && let Err(err) = self.populate_area(start, size, flags) {
-            if let Err(unmap_err) = self.unmap_areas_with_tlb_grace(start, size) {
-                warn!(
-                    "AddrSpace::map_with_existing_lineage: failed to roll back \
-                     {start:?}+{size:#x} after populate error: {unmap_err:?}"
-                );
-            }
-            self.refresh_growdown_starts();
-            self.clear_locked_range(start, size);
-            let end = start + size;
-            if self
-                .areas
-                .iter()
-                .any(|area| area.lineage() == lineage && area.start() < end && start < area.end())
-            {
-                self.commit_mapping_generation(lineage, next_mapping_generation);
-            }
-            return Err(err);
-        }
-        self.commit_mapping_generation(lineage, next_mapping_generation);
-        Ok(())
+    pub(crate) fn extend_mapping_tail_with_existing_lineage(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        populate: bool,
+        backend: Backend,
+        locked: bool,
+        lineage: MappingLineage,
+    ) -> Result<(), ExistingLineageMapError> {
+        let new_end = start
+            .checked_add(size)
+            .ok_or(ExistingLineageMapError::Preserved(AxError::InvalidInput))?;
+        let uffd_plan = self.preflight_existing_lineage_tail_uffd(lineage, start, new_end)?;
+        self.map_with_existing_lineage_transaction(
+            start, size, flags, populate, backend, locked, lineage, uffd_plan,
+        )
+    }
+
+    fn extend_mapping_head_with_existing_lineage(
+        &mut self,
+        old_start: VirtAddr,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        backend: Backend,
+        locked: bool,
+        lineage: MappingLineage,
+    ) -> Result<(), ExistingLineageMapError> {
+        let uffd_plan = self.preflight_existing_lineage_head_uffd(lineage, old_start, start)?;
+        self.map_with_existing_lineage_transaction(
+            start, size, flags, false, backend, locked, lineage, uffd_plan,
+        )
     }
 
     /// Stages one fragment under an already reserved lineage without
@@ -3288,7 +3452,7 @@ impl AddrSpace {
         // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
         // page immediately below the current lowest mapped page and SP is still
         // within that guard page.
-        let Some((current_start, fault_page, page_size, flags, lineage)) = self
+        let Some((current_start, fault_page, page_size, flags, lineage, backend)) = self
             .growdown_starts
             .iter()
             .copied()
@@ -3312,6 +3476,7 @@ impl AddrSpace {
                         page_size,
                         area.flags(),
                         area.lineage(),
+                        area.backend().clone(),
                     )),
                     Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => None,
                 }
@@ -3336,15 +3501,20 @@ impl AddrSpace {
         }
 
         let locked = self.range_is_fully_locked(current_start, page_size as usize);
-        if let Err(err) = self.map_with_existing_lineage(
+        if let Err(error) = self.extend_mapping_head_with_existing_lineage(
+            current_start,
             fault_page,
             page_size as usize,
             flags,
-            false,
-            Backend::new_alloc(fault_page, page_size),
+            backend,
             locked,
             lineage,
         ) {
+            if error.published() {
+                self.move_growdown_start(current_start, fault_page);
+                return self.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
+            }
+            let err = error.into_error();
             warn!(
                 "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
                  {err}"
@@ -3791,6 +3961,17 @@ mod tests {
                 RemapTransactionEffect::Destructive
             );
         }
+    }
+
+    #[test]
+    fn existing_lineage_population_failure_reports_visible_residue_as_published() {
+        let preserved = classify_existing_lineage_population_failure(AxError::NoMemory, false);
+        assert!(!preserved.published());
+        assert_eq!(preserved.into_error(), AxError::NoMemory);
+
+        let published = classify_existing_lineage_population_failure(AxError::NoMemory, true);
+        assert!(published.published());
+        assert_eq!(published.into_error(), AxError::NoMemory);
     }
 
     #[test]

@@ -730,6 +730,121 @@ impl UffdAddressSpaceState {
         }
     }
 
+    fn preflight_boundary_extension(
+        &mut self,
+        slot_index: usize,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+        old_boundary: usize,
+        new_boundary: usize,
+        head: bool,
+    ) -> AxResult<OptionalUffdPlan> {
+        self.reset_unarmed_plan_slot(slot_index)?;
+        let result = (|| {
+            let Self {
+                registrations,
+                plan_slots,
+                ..
+            } = self;
+            let slot = &mut plan_slots[slot_index];
+            for registration in registrations.iter() {
+                if registration.address_space() != address_space
+                    || registration.mapping() != mapping
+                {
+                    continue;
+                }
+                let range = registration.range();
+                let reaches_boundary = if head {
+                    range.start() == old_boundary
+                } else {
+                    range.end() == old_boundary
+                };
+                if !reaches_boundary {
+                    continue;
+                }
+                if !slot.removed.is_empty() {
+                    return Err(AxError::BadState);
+                }
+                let new_range = if head {
+                    PageRange::with_page_size(
+                        new_boundary,
+                        range
+                            .end()
+                            .checked_sub(new_boundary)
+                            .ok_or(AxError::InvalidInput)?,
+                        range.page_size(),
+                    )
+                } else {
+                    PageRange::with_page_size(
+                        range.start(),
+                        new_boundary
+                            .checked_sub(range.start())
+                            .ok_or(AxError::InvalidInput)?,
+                        range.page_size(),
+                    )
+                }
+                .map_err(uffd_policy_error)?;
+                let replacement = if head {
+                    registration.head_extension_replacement(address_space, mapping, new_range)
+                } else {
+                    registration.tail_extension_replacement(address_space, mapping, new_range)
+                }
+                .map_err(uffd_policy_error)?;
+                slot.push_removed(registration.id())?;
+                slot.push_replacement(replacement)?;
+            }
+
+            if slot.removed.is_empty() {
+                return Ok(None);
+            }
+            registrations
+                .preflight_mapping_replace(&slot.removed, &slot.replacements)
+                .map(Some)
+                .map_err(uffd_policy_error)
+        })();
+
+        match result {
+            Ok(plan) => self.finish_plan_preflight(slot_index, plan),
+            Err(error) => self.fail_plan_preflight(slot_index, error),
+        }
+    }
+
+    pub(crate) fn preflight_tail_extension(
+        &mut self,
+        slot_index: usize,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+        old_end: usize,
+        new_end: usize,
+    ) -> AxResult<OptionalUffdPlan> {
+        self.preflight_boundary_extension(
+            slot_index,
+            address_space,
+            mapping,
+            old_end,
+            new_end,
+            false,
+        )
+    }
+
+    pub(crate) fn preflight_head_extension(
+        &mut self,
+        slot_index: usize,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+        old_start: usize,
+        new_start: usize,
+    ) -> AxResult<OptionalUffdPlan> {
+        self.preflight_boundary_extension(
+            slot_index,
+            address_space,
+            mapping,
+            old_start,
+            new_start,
+            true,
+        )
+    }
+
     /// Consumes every token owned by a remap plan-set. The unchosen
     /// alternative is always released before the chosen table commit.
     pub(crate) fn resolve_remap(&mut self, prepared: PreparedRemapUffd, outcome: RemapUffdOutcome) {
@@ -2406,6 +2521,119 @@ mod tests {
         assert!(state.plan_slots.iter().all(|slot| {
             slot.armed.is_none() && slot.removed.is_empty() && slot.replacements.is_empty()
         }));
+    }
+
+    #[test]
+    fn lineage_boundary_extensions_preserve_fault_epoch() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 89, 0x2000, 0x4000, MappingKind::AnonymousPrivate);
+        let tail_registration = page_range(0x3000, 0x3000);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                tail_registration,
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        let tail = state
+            .preflight_tail_extension(
+                0,
+                mapping.address_space(),
+                mapping.mapping(),
+                mapping.range().end(),
+                0x8000,
+            )
+            .unwrap();
+        state.commit_plan(tail);
+        let extended = state.registrations.iter().next().unwrap();
+        assert_eq!(extended.range(), page_range(0x3000, 0x5000));
+        assert_eq!(extended.generation().get(), 89);
+        assert_eq!(extended.handler(), handler);
+
+        let remove = state
+            .preflight_unmap(0, page_range(0x3000, 0x5000), |_| {
+                panic!("fully removed extension needs no snapshot")
+            })
+            .unwrap();
+        state.commit_plan(remove);
+        let head_registration = page_range(0x2000, 0x3000);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                head_registration,
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        let head = state
+            .preflight_head_extension(
+                0,
+                mapping.address_space(),
+                mapping.mapping(),
+                mapping.range().start(),
+                0x1000,
+            )
+            .unwrap();
+        state.commit_plan(head);
+        let extended = state.registrations.iter().next().unwrap();
+        assert_eq!(extended.range(), page_range(0x1000, 0x4000));
+        assert_eq!(extended.generation().get(), 89);
+        assert_eq!(extended.handler(), handler);
+    }
+
+    #[test]
+    fn nonboundary_growth_does_not_extend_userfaultfd_authority() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 97, 0x2000, 0x5000, MappingKind::AnonymousPrivate);
+        let registered = page_range(0x3000, 0x3000);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                registered,
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        let nonce = state.next_plan_nonce;
+
+        let tail = state
+            .preflight_tail_extension(
+                0,
+                mapping.address_space(),
+                mapping.mapping(),
+                mapping.range().end(),
+                0x8000,
+            )
+            .unwrap();
+        assert_eq!(tail, OptionalUffdPlan::Noop);
+        let head = state
+            .preflight_head_extension(
+                0,
+                mapping.address_space(),
+                mapping.mapping(),
+                mapping.range().start(),
+                0x1000,
+            )
+            .unwrap();
+        assert_eq!(head, OptionalUffdPlan::Noop);
+        assert_eq!(state.next_plan_nonce, nonce);
+        assert_eq!(
+            state.registrations.iter().next().unwrap().range(),
+            registered
+        );
+        assert!(state.plan_slots[0].armed.is_none());
     }
 
     #[test]

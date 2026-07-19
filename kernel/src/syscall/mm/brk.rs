@@ -74,17 +74,17 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             else {
                 return Ok(current_top as isize);
             };
-            if aspace
-                .map_with_existing_lineage(
-                    expand_start,
-                    expand_size,
-                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                    populate,
-                    heap_backend,
-                    locked,
-                    heap_lineage,
-                )
-                .is_err()
+            let growth = aspace.map_with_existing_lineage(
+                expand_start,
+                expand_size,
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                populate,
+                heap_backend,
+                locked,
+                heap_lineage,
+            );
+            if let Err(error) = growth
+                && !error.published()
             {
                 return Ok(current_top as isize);
             }
