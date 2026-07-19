@@ -17,8 +17,8 @@ use crate::{
     device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice},
     listen_table::ListenTable,
     packet::{
-        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketEndpointId, PacketSelector,
-        PacketSendRequest,
+        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketEndpointId, PacketResult,
+        PacketSelector, PacketSendRequest,
     },
     router::{RouteInfo, Router, Rule},
     service::Service,
@@ -158,7 +158,7 @@ impl NetStack {
     }
 
     /// Subscribes a bounded link-packet endpoint to this network namespace.
-    pub fn subscribe_packets(&self, selector: PacketSelector) -> AxResult<Arc<PacketEndpoint>> {
+    pub fn subscribe_packets(&self, selector: PacketSelector) -> PacketResult<Arc<PacketEndpoint>> {
         self.packet_broker.subscribe(selector)
     }
 

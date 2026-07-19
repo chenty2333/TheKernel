@@ -14,7 +14,7 @@ use crate::{
     device::{Device, DeviceStats, InterfaceInfo},
     listen_table::ListenTable,
     packet::{
-        PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpointId,
+        PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpointId, PacketError,
         PacketSendRequest,
     },
 };
@@ -131,7 +131,7 @@ impl Router {
             .map_err(|_| AxError::NoMemory)?;
         tx_storage.resize(mtu.saturating_mul(PACKET_QUEUE_LEN), 0);
         let tx_buffer = PacketBuffer::new(tx_metadata, tx_storage);
-        let packet_broker = PacketBroker::try_new()?;
+        let packet_broker = PacketBroker::try_new().map_err(map_packet_error)?;
         Ok(Self {
             rx_buffer,
             tx_buffer,
@@ -327,6 +327,16 @@ impl Router {
             }
         }
         poll_next
+    }
+}
+
+fn map_packet_error(error: PacketError) -> AxError {
+    match error {
+        PacketError::Allocation => AxError::NoMemory,
+        PacketError::InvalidInput => AxError::InvalidInput,
+        PacketError::Detached => AxError::BadState,
+        PacketError::SequenceExhausted => AxError::OutOfRange,
+        PacketError::Capacity(_) => AxError::ResourceBusy,
     }
 }
 

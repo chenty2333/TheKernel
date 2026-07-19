@@ -17,7 +17,7 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use axsync::Mutex;
 
@@ -37,10 +37,43 @@ pub const MAX_PACKET_QUEUE_FRAMES: usize = 256;
 pub const DEFAULT_PACKET_QUEUE_BYTES: usize = 256 * 1024;
 /// Maximum retained-byte budget accepted from an adapter.
 pub const MAX_PACKET_QUEUE_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum bytes retained by all captures in one network stack.
+/// Maximum accounted shared-frame bytes charged in one network stack.
 pub const MAX_PACKET_BROKER_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum complete link frame accepted by the generic capture path.
 pub const MAX_PACKET_FRAME_BYTES: usize = 64 * 1024;
+
+/// The bounded resource that rejected a packet mechanism operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketCapacity {
+    /// The per-stack endpoint registry is full.
+    EndpointRegistry,
+    /// The lock-external capture staging queue is full.
+    CaptureBacklog,
+    /// The per-stack accounted shared-frame byte budget is exhausted.
+    SharedByteBudget,
+    /// The endpoint's capture-time selector history is full.
+    SelectorEpochs,
+    /// The endpoint's capture-time filter history is full.
+    FilterEpochs,
+}
+
+/// Typed failures reported by the generic packet mechanism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketError {
+    /// Backing storage could not be allocated.
+    Allocation,
+    /// The supplied frame metadata, range, or budget is invalid.
+    InvalidInput,
+    /// The endpoint is detached from its owning packet broker.
+    Detached,
+    /// A stable endpoint or capture sequence cannot advance further.
+    SequenceExhausted,
+    /// A named bounded mechanism resource is full.
+    Capacity(PacketCapacity),
+}
+
+/// Result returned by packet mechanism admission and mutation operations.
+pub type PacketResult<T> = Result<T, PacketError>;
 
 /// Stable identity used to suppress delivery back to an injecting endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,7 +313,7 @@ impl<'a> PacketDeviceContext<'a> {
         mut metadata: PacketMetadata,
         header: &[u8],
         payload: &[u8],
-    ) -> AxResult<()> {
+    ) -> PacketResult<()> {
         metadata.interface_index = self.interface_index;
         self.broker
             .stage_parts_from(metadata, header, payload, self.origin)
@@ -294,20 +327,20 @@ pub trait PacketFilter: Send + Sync {
 }
 
 struct PacketPoolBudget {
-    retained_bytes: AtomicUsize,
+    charged_shared_bytes: AtomicUsize,
 }
 
 impl PacketPoolBudget {
-    fn try_charge(&self, charge: usize) -> AxResult<()> {
-        let mut current = self.retained_bytes.load(Ordering::Acquire);
+    fn try_charge(&self, charge: usize) -> PacketResult<()> {
+        let mut current = self.charged_shared_bytes.load(Ordering::Acquire);
         loop {
             let Some(next) = current.checked_add(charge) else {
-                return Err(AxError::NoMemory);
+                return Err(PacketError::Capacity(PacketCapacity::SharedByteBudget));
             };
             if next > MAX_PACKET_BROKER_BYTES {
-                return Err(LinuxError::ENOBUFS.into());
+                return Err(PacketError::Capacity(PacketCapacity::SharedByteBudget));
             }
-            match self.retained_bytes.compare_exchange_weak(
+            match self.charged_shared_bytes.compare_exchange_weak(
                 current,
                 next,
                 Ordering::AcqRel,
@@ -320,7 +353,9 @@ impl PacketPoolBudget {
     }
 
     fn release(&self, charge: usize) {
-        let previous = self.retained_bytes.fetch_sub(charge, Ordering::AcqRel);
+        let previous = self
+            .charged_shared_bytes
+            .fetch_sub(charge, Ordering::AcqRel);
         debug_assert!(previous >= charge, "packet pool charge underflow");
     }
 }
@@ -412,15 +447,15 @@ impl PacketEndpoint {
         broker: Weak<PacketBroker>,
         starts_at: u64,
         selector: PacketSelector,
-    ) -> AxResult<Arc<Self>> {
+    ) -> PacketResult<Arc<Self>> {
         let mut queue = VecDeque::new();
         queue
             .try_reserve_exact(MAX_PACKET_QUEUE_FRAMES)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         let mut selectors = VecDeque::new();
         selectors
             .try_reserve_exact(MAX_PACKET_SELECTOR_EPOCHS)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         selectors.push_back(SelectorEpoch {
             starts_at,
             selector,
@@ -428,7 +463,7 @@ impl PacketEndpoint {
         let mut filters = VecDeque::new();
         filters
             .try_reserve_exact(MAX_PACKET_FILTER_EPOCHS)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         filters.push_back(FilterEpoch {
             starts_at,
             filter: None,
@@ -446,7 +481,7 @@ impl PacketEndpoint {
             }),
             readiness: PollSet::new(),
         })
-        .map_err(|_| AxError::NoMemory)
+        .map_err(|_| PacketError::Allocation)
     }
 
     fn selector_for(&self, metadata: PacketMetadata, sequence: u64) -> Option<PacketSelector> {
@@ -538,9 +573,12 @@ impl PacketEndpoint {
     ///
     /// A bounded history preserves the selector that was active when an
     /// already staged frame crossed the capture point. Rapid rebind churn can
-    /// therefore return `ENOBUFS` instead of silently reclassifying packets.
-    pub fn set_selector(&self, selector: PacketSelector) -> AxResult<()> {
-        let broker = self.broker.upgrade().ok_or(AxError::BadState)?;
+    /// therefore report [`PacketCapacity::SelectorEpochs`] instead of silently
+    /// reclassifying packets.
+    ///
+    /// Returns [`PacketError::Detached`] after the owning broker is gone.
+    pub fn set_selector(&self, selector: PacketSelector) -> PacketResult<()> {
+        let broker = self.broker.upgrade().ok_or(PacketError::Detached)?;
         broker.drain_staged();
         let quiescent = broker.capture_is_quiescent();
         let mut state = self.state.lock();
@@ -552,7 +590,11 @@ impl PacketEndpoint {
             return Ok(());
         }
         if quiescent {
-            let current = state.selectors.back().copied().ok_or(AxError::BadState)?;
+            let current = state
+                .selectors
+                .back()
+                .copied()
+                .expect("packet endpoint always retains one selector");
             state.selectors.clear();
             state.selectors.push_back(SelectorEpoch {
                 starts_at: 0,
@@ -567,7 +609,7 @@ impl PacketEndpoint {
             return Ok(());
         }
         if state.selectors.len() >= MAX_PACKET_SELECTOR_EPOCHS {
-            return Err(LinuxError::ENOBUFS.into());
+            return Err(PacketError::Capacity(PacketCapacity::SelectorEpochs));
         }
         state.selectors.push_back(SelectorEpoch {
             starts_at,
@@ -592,8 +634,12 @@ impl PacketEndpoint {
     }
 
     /// Publishes an endpoint-local filter transition for future captures.
-    pub fn set_filter(&self, filter: Option<Arc<dyn PacketFilter>>) -> AxResult<()> {
-        let broker = self.broker.upgrade().ok_or(AxError::BadState)?;
+    ///
+    /// Returns [`PacketError::Detached`] after the owning broker is gone, or
+    /// [`PacketCapacity::FilterEpochs`] while in-flight captures still require
+    /// every retained filter generation.
+    pub fn set_filter(&self, filter: Option<Arc<dyn PacketFilter>>) -> PacketResult<()> {
+        let broker = self.broker.upgrade().ok_or(PacketError::Detached)?;
         broker.drain_staged();
         let quiescent = broker.capture_is_quiescent();
         let mut state = self.state.lock();
@@ -601,7 +647,7 @@ impl PacketEndpoint {
             let current = state
                 .filters
                 .back()
-                .ok_or(AxError::BadState)?
+                .expect("packet endpoint always retains one filter epoch")
                 .filter
                 .clone();
             state.filters.clear();
@@ -618,16 +664,19 @@ impl PacketEndpoint {
             return Ok(());
         }
         if state.filters.len() >= MAX_PACKET_FILTER_EPOCHS {
-            return Err(LinuxError::ENOBUFS.into());
+            return Err(PacketError::Capacity(PacketCapacity::FilterEpochs));
         }
         state.filters.push_back(FilterEpoch { starts_at, filter });
         Ok(())
     }
 
     /// Sets the future receive byte budget.
-    pub fn set_receive_budget(&self, bytes: usize) -> AxResult<()> {
+    ///
+    /// Values outside the public nonzero range return
+    /// [`PacketError::InvalidInput`].
+    pub fn set_receive_budget(&self, bytes: usize) -> PacketResult<()> {
         if !(1..=MAX_PACKET_QUEUE_BYTES).contains(&bytes) {
-            return Err(AxError::InvalidInput);
+            return Err(PacketError::InvalidInput);
         }
         self.state.lock().byte_budget = bytes;
         Ok(())
@@ -738,23 +787,26 @@ pub struct PacketBroker {
 
 impl PacketBroker {
     /// Creates a broker with all registry storage preallocated.
-    pub fn try_new() -> AxResult<Arc<Self>> {
+    ///
+    /// Returns [`PacketError::Allocation`] if any fixed backing allocation
+    /// cannot be established.
+    pub fn try_new() -> PacketResult<Arc<Self>> {
         let mut endpoints = Vec::new();
         endpoints
             .try_reserve_exact(MAX_PACKET_ENDPOINTS)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         let mut pending = VecDeque::new();
         pending
             .try_reserve_exact(MAX_PACKET_CAPTURE_BACKLOG)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         let mut drops = VecDeque::new();
         drops
             .try_reserve_exact(MAX_PACKET_DROP_BACKLOG)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| PacketError::Allocation)?;
         let pool = Arc::try_new(PacketPoolBudget {
-            retained_bytes: AtomicUsize::new(0),
+            charged_shared_bytes: AtomicUsize::new(0),
         })
-        .map_err(|_| AxError::NoMemory)?;
+        .map_err(|_| PacketError::Allocation)?;
         Arc::try_new(Self {
             state: Mutex::new(BrokerState {
                 next_id: 1,
@@ -771,17 +823,26 @@ impl PacketBroker {
             unattributed_drops: AtomicU64::new(0),
             next_sequence: AtomicU64::new(1),
         })
-        .map_err(|_| AxError::NoMemory)
+        .map_err(|_| PacketError::Allocation)
     }
 
     /// Registers one bounded endpoint in this broker.
-    pub fn subscribe(self: &Arc<Self>, selector: PacketSelector) -> AxResult<Arc<PacketEndpoint>> {
+    ///
+    /// Preserves allocation, endpoint-registry capacity, and stable-identity
+    /// exhaustion as distinct [`PacketError`] values.
+    pub fn subscribe(
+        self: &Arc<Self>,
+        selector: PacketSelector,
+    ) -> PacketResult<Arc<PacketEndpoint>> {
         let mut state = self.state.lock();
         if state.endpoints.len() >= MAX_PACKET_ENDPOINTS {
-            return Err(LinuxError::ENOBUFS.into());
+            return Err(PacketError::Capacity(PacketCapacity::EndpointRegistry));
         }
         let id = PacketEndpointId(state.next_id);
-        state.next_id = state.next_id.checked_add(1).ok_or(AxError::BadState)?;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(PacketError::SequenceExhausted)?;
         let starts_at = self.next_sequence.load(Ordering::Acquire);
         let endpoint = PacketEndpoint::try_new(id, Arc::downgrade(self), starts_at, selector)?;
         state.endpoints.push((id, Arc::downgrade(&endpoint)));
@@ -801,15 +862,15 @@ impl PacketBroker {
         }
     }
 
-    fn reserve_capture_slot(&self) -> AxResult<()> {
+    fn reserve_capture_slot(&self) -> PacketResult<()> {
         let mut capture = self.capture.lock();
         let occupied = capture
             .pending
             .len()
             .checked_add(capture.reserved)
-            .ok_or(AxError::BadState)?;
+            .ok_or(PacketError::Capacity(PacketCapacity::CaptureBacklog))?;
         if occupied >= MAX_PACKET_CAPTURE_BACKLOG {
-            return Err(LinuxError::ENOBUFS.into());
+            return Err(PacketError::Capacity(PacketCapacity::CaptureBacklog));
         }
         capture.reserved += 1;
         Ok(())
@@ -871,33 +932,36 @@ impl PacketBroker {
     /// This method never filters, mutates endpoint queues, or wakes tasks.  A
     /// caller holding a broader network-service lock must invoke
     /// [`drain_staged`](Self::drain_staged) only after releasing that lock.
-    /// At most one allocation is retained and shared by every subscriber.
+    /// One immutable frame object and its byte buffer are shared by every
+    /// matching subscriber instead of copying bytes per endpoint.
+    /// Invalid metadata, sequence exhaustion, capture backlog, accounted
+    /// shared-byte pressure, and allocation failure remain distinguishable.
     pub fn stage_parts_from(
         &self,
         metadata: PacketMetadata,
         header: &[u8],
         payload: &[u8],
         origin: Option<PacketEndpointId>,
-    ) -> AxResult<()> {
+    ) -> PacketResult<()> {
         if self.endpoint_count.load(Ordering::Acquire) == 0 {
             return Ok(());
         }
         let total_len = header
             .len()
             .checked_add(payload.len())
-            .ok_or(AxError::InvalidInput)?;
+            .ok_or(PacketError::InvalidInput)?;
         if total_len > MAX_PACKET_FRAME_BYTES
             || usize::from(metadata.link_header_len) > total_len
             || usize::from(metadata.address_len) > metadata.address.len()
         {
-            return Err(AxError::InvalidInput);
+            return Err(PacketError::InvalidInput);
         }
         let sequence = self
             .next_sequence
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
-            .map_err(|_| AxError::BadState)?;
+            .map_err(|_| PacketError::SequenceExhausted)?;
 
         if let Err(error) = self.reserve_capture_slot() {
             self.stage_drop(metadata, origin, sequence);
@@ -908,7 +972,7 @@ impl PacketBroker {
             None => {
                 self.cancel_capture_slot();
                 self.stage_drop(metadata, origin, sequence);
-                return Err(AxError::NoMemory);
+                return Err(PacketError::Allocation);
             }
         };
         if let Err(error) = self.pool.try_charge(reserved_charge) {
@@ -921,7 +985,7 @@ impl PacketBroker {
             self.pool.release(reserved_charge);
             self.cancel_capture_slot();
             self.stage_drop(metadata, origin, sequence);
-            return Err(AxError::NoMemory);
+            return Err(PacketError::Allocation);
         }
         let charge = match bytes.capacity().checked_add(size_of::<SharedPacketFrame>()) {
             Some(charge) => charge,
@@ -929,7 +993,7 @@ impl PacketBroker {
                 self.pool.release(reserved_charge);
                 self.cancel_capture_slot();
                 self.stage_drop(metadata, origin, sequence);
-                return Err(AxError::NoMemory);
+                return Err(PacketError::Allocation);
             }
         };
         if charge > reserved_charge {
@@ -955,7 +1019,7 @@ impl PacketBroker {
                 // `SharedPacketFrame::drop` releases the pool charge.
                 self.cancel_capture_slot();
                 self.stage_drop(metadata, origin, sequence);
-                return Err(AxError::NoMemory);
+                return Err(PacketError::Allocation);
             }
         };
         let mut capture = self.capture.lock();
@@ -976,7 +1040,7 @@ impl PacketBroker {
         metadata: PacketMetadata,
         header: &[u8],
         payload: &[u8],
-    ) -> AxResult<()> {
+    ) -> PacketResult<()> {
         self.stage_parts_from(metadata, header, payload, None)
     }
 
@@ -1052,9 +1116,13 @@ impl PacketBroker {
         }
     }
 
-    /// Returns actual shared frame bytes retained by staging and endpoints.
-    pub fn retained_bytes(&self) -> usize {
-        self.pool.retained_bytes.load(Ordering::Acquire)
+    /// Returns the accounted shared-frame charge held by staging and endpoints.
+    ///
+    /// The charge covers `Vec` capacity plus [`SharedPacketFrame`] storage. It
+    /// deliberately does not claim allocator metadata, `Arc` control blocks,
+    /// or the broker's fixed preallocated queue and registry backing.
+    pub fn charged_shared_bytes(&self) -> usize {
+        self.pool.charged_shared_bytes.load(Ordering::Acquire)
     }
 
     /// Returns capture failures that overflowed the bounded accounting ledger.
@@ -1168,10 +1236,11 @@ mod tests {
         assert_eq!(record.wire_len(), payload.len());
         assert_eq!(endpoint.take_stats().packets, 1);
         assert_eq!(endpoint.take_stats(), PacketEndpointStats::default());
-        assert!(
+        assert_eq!(
             endpoint
                 .set_receive_budget(MAX_PACKET_QUEUE_BYTES + 1)
-                .is_err()
+                .unwrap_err(),
+            PacketError::InvalidInput
         );
     }
 
@@ -1191,6 +1260,134 @@ mod tests {
         }
         assert_eq!(broker.state.lock().endpoints.len(), 0);
         assert_eq!(broker.endpoint_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn endpoint_registry_and_detachment_keep_typed_reasons() {
+        let broker = PacketBroker::try_new().unwrap();
+        let selector = PacketSelector::new(PacketProtocol::All, None, PacketView::Raw, true);
+        let mut endpoints = Vec::new();
+        for _ in 0..MAX_PACKET_ENDPOINTS {
+            endpoints.push(broker.subscribe(selector).unwrap());
+        }
+        assert!(matches!(
+            broker.subscribe(selector),
+            Err(PacketError::Capacity(PacketCapacity::EndpointRegistry))
+        ));
+
+        let detached = endpoints.pop().unwrap();
+        drop(endpoints);
+        drop(broker);
+        assert_eq!(detached.set_selector(selector), Err(PacketError::Detached));
+        assert_eq!(detached.set_filter(None), Err(PacketError::Detached));
+    }
+
+    #[test]
+    fn selector_and_filter_histories_report_their_own_capacity() {
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        broker.reserve_capture_slot().unwrap();
+        for transition in 0..MAX_PACKET_SELECTOR_EPOCHS - 1 {
+            broker
+                .stage_parts(
+                    metadata(0x0800, LinkPacketType::Host),
+                    &[0; 14],
+                    &[transition as u8],
+                )
+                .unwrap();
+            endpoint
+                .set_selector(PacketSelector::new(
+                    PacketProtocol::Exact(0x1000 + transition as u16),
+                    None,
+                    PacketView::Raw,
+                    true,
+                ))
+                .unwrap();
+        }
+        broker
+            .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[0xff])
+            .unwrap();
+        assert_eq!(
+            endpoint.set_selector(PacketSelector::new(
+                PacketProtocol::Exact(0x2000),
+                None,
+                PacketView::Raw,
+                true,
+            )),
+            Err(PacketError::Capacity(PacketCapacity::SelectorEpochs))
+        );
+        broker.cancel_capture_slot();
+
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        broker.reserve_capture_slot().unwrap();
+        for transition in 0..MAX_PACKET_FILTER_EPOCHS - 1 {
+            broker
+                .stage_parts(
+                    metadata(0x0800, LinkPacketType::Host),
+                    &[0; 14],
+                    &[transition as u8],
+                )
+                .unwrap();
+            endpoint
+                .set_filter(Some(Arc::new(Snaplen(transition + 1))))
+                .unwrap();
+        }
+        broker
+            .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[0xff])
+            .unwrap();
+        assert_eq!(
+            endpoint.set_filter(Some(Arc::new(Snaplen(1)))),
+            Err(PacketError::Capacity(PacketCapacity::FilterEpochs))
+        );
+        broker.cancel_capture_slot();
+    }
+
+    #[test]
+    fn staging_reports_sequence_and_shared_byte_budget_exhaustion() {
+        let broker = PacketBroker::try_new().unwrap();
+        let _endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        broker.next_sequence.store(u64::MAX, Ordering::Release);
+        assert_eq!(
+            broker.stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[1]),
+            Err(PacketError::SequenceExhausted)
+        );
+
+        let budget = PacketPoolBudget {
+            charged_shared_bytes: AtomicUsize::new(MAX_PACKET_BROKER_BYTES),
+        };
+        assert_eq!(
+            budget.try_charge(1),
+            Err(PacketError::Capacity(PacketCapacity::SharedByteBudget))
+        );
+        budget
+            .charged_shared_bytes
+            .store(usize::MAX, Ordering::Release);
+        assert_eq!(
+            budget.try_charge(1),
+            Err(PacketError::Capacity(PacketCapacity::SharedByteBudget))
+        );
     }
 
     #[test]
@@ -1315,12 +1512,12 @@ mod tests {
                 .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[1])
                 .unwrap();
         }
-        assert!(broker.retained_bytes() > 0);
+        assert!(broker.charged_shared_bytes() > 0);
         assert_eq!(
             broker
                 .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[1])
                 .unwrap_err(),
-            AxError::from(LinuxError::ENOBUFS)
+            PacketError::Capacity(PacketCapacity::CaptureBacklog)
         );
         assert_eq!(endpoint.take_stats().drops, 0);
 
@@ -1328,7 +1525,7 @@ mod tests {
         assert_eq!(endpoint.queue_usage().0, MAX_PACKET_CAPTURE_BACKLOG);
         assert_eq!(endpoint.take_stats().drops, 1);
         drop(endpoint);
-        assert_eq!(broker.retained_bytes(), 0);
+        assert_eq!(broker.charged_shared_bytes(), 0);
     }
 
     #[test]
@@ -1347,10 +1544,10 @@ mod tests {
             broker
                 .stage_parts(metadata(0x0800, LinkPacketType::Host), &[], &oversized)
                 .unwrap_err(),
-            AxError::InvalidInput
+            PacketError::InvalidInput
         );
         assert_eq!(broker.capture.lock().reserved, 0);
-        assert_eq!(broker.retained_bytes(), 0);
+        assert_eq!(broker.charged_shared_bytes(), 0);
     }
 
     const PERF_WARMUP_ITERATIONS: usize = 2_000;
@@ -1373,7 +1570,7 @@ mod tests {
         stage_errors: u64,
         drops: u64,
         unattributed_drops: u64,
-        retained_bytes: usize,
+        charged_shared_bytes: usize,
     }
 
     fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -1400,7 +1597,7 @@ mod tests {
 
     fn emit_performance_observation(mut observation: PerfObservation) {
         assert_eq!(observation.latencies_ns.len() as u64, observation.count);
-        assert_eq!(observation.retained_bytes, 0);
+        assert_eq!(observation.charged_shared_bytes, 0);
         assert_eq!(
             observation
                 .packet_events
@@ -1419,10 +1616,10 @@ mod tests {
         let throughput_per_sec =
             u128::from(observation.count) * 1_000_000_000u128 / u128::from(elapsed_ns);
         std::println!(
-            "THEKERNEL_PACKET_BROKER_PERF schema=1 run={} case={} subscribers={} count={} \
+            "THEKERNEL_PACKET_BROKER_PERF schema=2 run={} case={} subscribers={} count={} \
              elapsed_ns={} throughput_per_sec={} latency_scope={} p50_ns={} p99_ns={} p999_ns={} \
              expected_events={} packet_events={} received={} stage_errors={} drops={} \
-             unattributed_drops={} retained_bytes={} invariant=ok",
+             unattributed_drops={} charged_shared_bytes={} invariant=ok",
             performance_run_id(),
             observation.case,
             observation.subscribers,
@@ -1439,7 +1636,7 @@ mod tests {
             observation.stage_errors,
             observation.drops,
             observation.unattributed_drops,
-            observation.retained_bytes,
+            observation.charged_shared_bytes,
         );
     }
 
@@ -1469,7 +1666,7 @@ mod tests {
             assert_eq!(stats.packets, iterations as u64);
             assert_eq!(stats.drops, 0);
         }
-        assert_eq!(broker.retained_bytes(), 0);
+        assert_eq!(broker.charged_shared_bytes(), 0);
     }
 
     fn benchmark_zero_subscriber() -> PerfObservation {
@@ -1506,7 +1703,7 @@ mod tests {
             stage_errors: 0,
             drops: 0,
             unattributed_drops: broker.unattributed_drops(),
-            retained_bytes: broker.retained_bytes(),
+            charged_shared_bytes: broker.charged_shared_bytes(),
         }
     }
 
@@ -1565,7 +1762,7 @@ mod tests {
             stage_errors: 0,
             drops,
             unattributed_drops: broker.unattributed_drops(),
-            retained_bytes: broker.retained_bytes(),
+            charged_shared_bytes: broker.charged_shared_bytes(),
         }
     }
 
@@ -1592,7 +1789,7 @@ mod tests {
             match broker.stage_parts(packet_metadata, &header, &payload) {
                 Ok(()) => {}
                 Err(error) => {
-                    assert_eq!(error, AxError::from(LinuxError::ENOBUFS));
+                    assert_eq!(error, PacketError::Capacity(PacketCapacity::CaptureBacklog));
                     stage_errors += 1;
                 }
             }
@@ -1624,7 +1821,7 @@ mod tests {
             stage_errors,
             drops: stats.drops,
             unattributed_drops: broker.unattributed_drops(),
-            retained_bytes: broker.retained_bytes(),
+            charged_shared_bytes: broker.charged_shared_bytes(),
         }
     }
 
@@ -1662,7 +1859,10 @@ mod tests {
                     match broker.stage_parts(packet_metadata, &header, &payload) {
                         Ok(()) => {}
                         Err(error) => {
-                            assert_eq!(error, AxError::from(LinuxError::ENOBUFS));
+                            assert_eq!(
+                                error,
+                                PacketError::Capacity(PacketCapacity::CaptureBacklog)
+                            );
                             stage_errors += 1;
                         }
                     }
@@ -1750,7 +1950,7 @@ mod tests {
             stage_errors,
             drops: stats.drops,
             unattributed_drops,
-            retained_bytes: broker.retained_bytes(),
+            charged_shared_bytes: broker.charged_shared_bytes(),
         }
     }
 
@@ -1773,6 +1973,6 @@ mod tests {
         ));
         emit_performance_observation(benchmark_saturation_accounting());
         emit_performance_observation(benchmark_concurrent_pipeline());
-        std::println!("THEKERNEL_PACKET_BROKER_PERF_OK schema=1 cases=5");
+        std::println!("THEKERNEL_PACKET_BROKER_PERF_OK schema=2 cases=5");
     }
 }
