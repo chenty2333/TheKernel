@@ -364,6 +364,9 @@ static void test_control_errors(void) {
     errno = 0;
     require_call_error(getpeername(fd, (struct sockaddr *)&address, &length),
                        EOPNOTSUPP, "control-getpeername");
+    errno = 0;
+    require_call_error(accept(fd, NULL, NULL), EOPNOTSUPP,
+                       "control-accept");
 
     address.sll_family = AF_PACKET;
     errno = 0;
