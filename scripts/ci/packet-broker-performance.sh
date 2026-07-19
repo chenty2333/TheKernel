@@ -49,6 +49,22 @@ command -v timeout >/dev/null 2>&1 || {
     exit 1
 }
 
+BUILD_SOURCE_PATHS=(
+    .cargo
+    Cargo.toml
+    Cargo.lock
+    Makefile
+    build.rs
+    configs
+    crates
+    kernel
+    modules
+    platforms
+    rust-toolchain
+    rust-toolchain.toml
+    scripts/ci
+    third_party
+)
 for repo in "$REPO_ROOT" "$AX_REPO" "$LINUX_ABI_REPO"; do
     git -C "$repo" diff --quiet HEAD -- || {
         printf 'packet-broker-performance: tracked source is dirty: %s\n' "$repo" >&2
@@ -58,6 +74,13 @@ for repo in "$REPO_ROOT" "$AX_REPO" "$LINUX_ABI_REPO"; do
         printf 'packet-broker-performance: staged source is dirty: %s\n' "$repo" >&2
         exit 1
     }
+    untracked_source=$(git -C "$repo" ls-files --others --exclude-standard -- \
+        "${BUILD_SOURCE_PATHS[@]}")
+    if [ -n "$untracked_source" ]; then
+        printf 'packet-broker-performance: untracked build source in %s:\n%s\n' \
+            "$repo" "$untracked_source" >&2
+        exit 1
+    fi
 done
 
 if [ -d "$WORKDIR" ] && find "$WORKDIR" -mindepth 1 -print -quit | grep -q .; then
@@ -196,6 +219,7 @@ printf '%s\n' \
     "source_head"$'\t'"$source_head" \
     $'runs\t2' \
     $'portable_thresholds\tnone' \
+    $'untracked_build_inputs\tabsent' \
     $'invariants\tPASS' \
     $'schema_diff\tPASS' \
     $'result\tPASS' \
