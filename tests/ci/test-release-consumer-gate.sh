@@ -20,8 +20,10 @@ grep -Fq -- \
     '--replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq \
-    'thekernel-axsched|thekernel-axpoll|thekernel-axfault|thekernel-axtask|thekernel-axtlb)' \
+    'thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axtask|thekernel-axtlb)' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
 
 # The temporary-manifest rewrite is exact and refuses to proceed if an anchor
 # disappeared or became ambiguous.
@@ -33,10 +35,12 @@ members = []
 [workspace.dependencies]
 one = { path = "../source/one" }
 axfault = { package = "thekernel-axfault", path = "../thekernel-ax/crates/thekernel-axfault" }
+axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf" }
 axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
+thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp" }
 
 [patch.crates-io]
 two = { path = "../source/two" }
@@ -46,10 +50,12 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../source/one=../artifacts/one-0.1.0' \
     --replace '../source/two=../artifacts/two-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-0.1.0' \
+    --replace '../thekernel-ax/crates/thekernel-axcbpf=../artifacts/thekernel-axcbpf-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
     --replace '../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-0.1.0' \
     --replace '../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-0.1.0' \
     --forbid-text '../source/' \
     --forbid-text '../thekernel-ax/' \
     --forbid-text '../thekernel-linux-abi/' \
@@ -58,6 +64,8 @@ grep -Fq 'path = "../artifacts/one-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axfault-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-axcbpf-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axtlb-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
@@ -65,6 +73,8 @@ grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
 grep -Fq 'path = "../artifacts/thekernel-linux-mm-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-io-uring-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-seccomp-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -q $'^before_sha256\t[0-9a-f]\{64\}$' "$tmp/rewrite/record.tsv"
 if python3 "$CI_DIR/rewrite-release-consumer.py" \
@@ -257,12 +267,14 @@ mkdir -p \
     "$tmp/consumer/crates/process-adapter" \
     "$tmp/artifacts/thekernel-axsched-0.1.0" \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
+    "$tmp/artifacts/thekernel-axcbpf-0.1.0" \
     "$tmp/artifacts/thekernel-axfault-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
     "$tmp/artifacts/thekernel-linux-mm-0.1.0" \
     "$tmp/artifacts/thekernel-linux-io-uring-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-seccomp-0.1.0" \
     "$tmp/artifacts/thekernel-linux-process-0.1.0" \
     "$tmp/artifacts/thekernel-linux-vfs-0.1.0" \
     "$tmp/artifacts/thekernel-linux-fd-0.1.0" \
@@ -277,12 +289,14 @@ root = pathlib.Path(sys.argv[1]).resolve()
 release_names = [
     "thekernel-axsched",
     "thekernel-axpoll",
+    "thekernel-axcbpf",
     "thekernel-axfault",
     "thekernel-axtask",
     "thekernel-axtlb",
     "thekernel-linux-cred",
     "thekernel-linux-mm",
     "thekernel-linux-io-uring",
+    "thekernel-linux-seccomp",
     "thekernel-linux-process",
     "thekernel-linux-vfs",
     "thekernel-linux-fd",
@@ -372,9 +386,10 @@ graph_args=(
     --release-source-root "$tmp/source-linux-abi"
 )
 for package in \
-    thekernel-axsched thekernel-axpoll thekernel-axfault \
+    thekernel-axsched thekernel-axpoll thekernel-axcbpf thekernel-axfault \
     thekernel-axtask thekernel-axtlb \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-io-uring \
+    thekernel-linux-seccomp \
     thekernel-linux-process \
     thekernel-linux-vfs thekernel-linux-fd; do
     graph_args+=(--expect "$package=$tmp/artifacts/$package-0.1.0")

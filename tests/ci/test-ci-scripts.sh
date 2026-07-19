@@ -34,6 +34,12 @@ grep -Fq \
     "$REPO_ROOT/dev-env/compose.yaml"
 grep -Fq 'ci_run_step axfault-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-axfault' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step axcbpf-core-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-axcbpf' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step seccomp-core-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-linux-seccomp' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step kernel-seccomp-adapter-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'seccomp::tests -- --test-threads=1' "$CI_DIR/per-commit.sh"
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \
@@ -353,6 +359,35 @@ THEKERNEL_USERFAULTFD_COPYOUT_FAULT_OK
 THEKERNEL_USERFAULTFD_EXEC_COPY_OK
 THEKERNEL_USERFAULTFD_OK
 THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK
+THEKERNEL_SECCOMP_API_OK
+THEKERNEL_SECCOMP_FILTER_ERRORS_OK
+THEKERNEL_SECCOMP_UNALIGNED_OK
+THEKERNEL_SECCOMP_FILTER_OK
+THEKERNEL_SECCOMP_ERRNO_OK
+THEKERNEL_SECCOMP_FASTPATH_OK
+THEKERNEL_SECCOMP_UNKNOWN_OK
+THEKERNEL_SECCOMP_ERRNO_ZERO_OK
+THEKERNEL_SECCOMP_LOG_OK
+THEKERNEL_SECCOMP_TRAP_OK
+THEKERNEL_SECCOMP_TRAP_ROLLBACK_OK
+THEKERNEL_SECCOMP_INHERIT_OK
+THEKERNEL_SECCOMP_THREAD_APPEND_ISOLATION_OK
+THEKERNEL_SECCOMP_FORK_APPEND_ISOLATION_OK
+THEKERNEL_SECCOMP_PROC_OK
+THEKERNEL_SECCOMP_EXEC_OK
+THEKERNEL_SECCOMP_STRICT_OK
+THEKERNEL_SECCOMP_PRCTL_STRICT_OK
+THEKERNEL_SECCOMP_STRICT_KILL_OK
+THEKERNEL_SECCOMP_UNSUPPORTED_OK
+THEKERNEL_SECCOMP_KILL_THREAD_OK
+THEKERNEL_SECCOMP_KILL_PROCESS_OK
+THEKERNEL_SECCOMP_KILL_UNKNOWN_OK
+THEKERNEL_SECCOMP_KILL_SCOPE_OK
+THEKERNEL_SECCOMP_EXIT_RECLAIM_OK
+THEKERNEL_SECCOMP_RESOURCE_OK
+THEKERNEL_SECCOMP_RESOURCE_ROLLBACK_OK
+THEKERNEL_SECCOMP_OK
+THEKERNEL_SYSTEM_TEST_SECCOMP_OK
 THEKERNEL_SYSTEM_TEST_PASS
 MARKERS_AFTER_SETRLIMIT
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
@@ -657,6 +692,11 @@ cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
 cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
     "$REPO_ROOT/tests/guest/tools/wait-boundary.c" \
     -o "$tmp/wait-boundary"
+"$CI_DIR/seccomp-host-differential.sh" \
+    --workdir "$tmp/seccomp-host-differential" \
+    --allow-inherited-profile >"$tmp/seccomp-host-differential.out"
+grep -Eq '^seccomp-host-differential: (PASS|SKIP) ' \
+    "$tmp/seccomp-host-differential.out"
 cc -O2 -std=c11 "$REPO_ROOT/tests/guest/tools/oom-admission.c" \
     -o "$tmp/nightly-oom-admission"
 "$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null

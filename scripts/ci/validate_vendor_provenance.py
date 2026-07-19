@@ -29,6 +29,7 @@ COMMIT_KINDS = {"exact", "context"}
 MAINTAINED_SIBLING_PATCHES = {
     "thekernel-axsched": ("../thekernel-ax/crates/thekernel-axsched", "0.1.0"),
     "thekernel-axpoll": ("../thekernel-ax/crates/thekernel-axpoll", "0.1.0"),
+    "thekernel-axcbpf": ("../thekernel-ax/crates/thekernel-axcbpf", "0.1.0"),
     "thekernel-axfault": ("../thekernel-ax/crates/thekernel-axfault", "0.1.0"),
     "thekernel-axtask": ("../thekernel-ax/crates/thekernel-axtask", "0.1.0"),
     "thekernel-axtlb": ("../thekernel-ax/crates/thekernel-axtlb", "0.1.0"),
@@ -38,10 +39,12 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-linux-cred": ("../thekernel-linux-abi/crates/cred", "0.1.0"),
     "thekernel-linux-mm": ("../thekernel-linux-abi/crates/mm", "0.1.0"),
     "thekernel-linux-io-uring": ("../thekernel-linux-abi/crates/io-uring", "0.1.0"),
+    "thekernel-linux-seccomp": ("../thekernel-linux-abi/crates/seccomp", "0.1.0"),
 }
 MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-axsched": ("ax", Path("crates/thekernel-axsched")),
     "thekernel-axpoll": ("ax", Path("crates/thekernel-axpoll")),
+    "thekernel-axcbpf": ("ax", Path("crates/thekernel-axcbpf")),
     "thekernel-axfault": ("ax", Path("crates/thekernel-axfault")),
     "thekernel-axtask": ("ax", Path("crates/thekernel-axtask")),
     "thekernel-axtlb": ("ax", Path("crates/thekernel-axtlb")),
@@ -51,16 +54,20 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-linux-cred": ("linux-abi", Path("crates/cred")),
     "thekernel-linux-mm": ("linux-abi", Path("crates/mm")),
     "thekernel-linux-io-uring": ("linux-abi", Path("crates/io-uring")),
+    "thekernel-linux-seccomp": ("linux-abi", Path("crates/seccomp")),
 }
 MAINTAINED_WORKSPACE_DEPENDENCIES = {
+    "axcbpf": ("thekernel-axcbpf", "=0.1.0"),
     "axfault": ("thekernel-axfault", "=0.1.0"),
     "axtlb": ("thekernel-axtlb", "=0.1.0"),
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
     "thekernel-linux-mm": ("thekernel-linux-mm", "=0.1.0"),
     "thekernel-linux-io-uring": ("thekernel-linux-io-uring", "=0.1.0"),
+    "thekernel-linux-seccomp": ("thekernel-linux-seccomp", "=0.1.0"),
 }
 MAINTAINED_SIBLING_LIB_NAMES = {
+    "thekernel-axcbpf": "axcbpf",
     "thekernel-axfault": "axfault",
     "thekernel-axtlb": "axtlb",
 }

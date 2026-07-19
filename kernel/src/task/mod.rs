@@ -11,6 +11,7 @@ mod ops;
 mod process;
 mod resources;
 mod restart;
+mod seccomp;
 pub(crate) mod security;
 mod signal;
 mod stat;
@@ -59,6 +60,7 @@ pub(crate) use self::{
         process_error, reap_process,
     },
     restart::*,
+    seccomp::{init_seccomp_filter_budget, seccomp_filter_budget},
     security::{PendingCredentialPublication, SignalTargetKind},
     thread::{
         ProcStateHint, TaskParentChoice, TaskParentCredentialPin, TaskParentNode,

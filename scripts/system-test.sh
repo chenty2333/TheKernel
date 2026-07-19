@@ -19,9 +19,9 @@ Options:
   --skip-build    Reuse existing kernel and rootfs artifacts
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
-program to complete rootfs, tmpfs, procfs, process, pipe, and raw io_uring ABI
-checks. QEMU stops after the final success marker; platform shutdown is tested
-separately from this semantic gate.
+program to complete rootfs, tmpfs, procfs, process, pipe, raw io_uring,
+userfaultfd, and seccomp ABI checks. QEMU stops after the final success marker;
+platform shutdown is tested separately from this semantic gate.
 EOF
 }
 
@@ -135,6 +135,35 @@ for marker in \
     THEKERNEL_USERFAULTFD_EXEC_COPY_OK \
     THEKERNEL_USERFAULTFD_OK \
     THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK \
+    THEKERNEL_SECCOMP_API_OK \
+    THEKERNEL_SECCOMP_FILTER_ERRORS_OK \
+    THEKERNEL_SECCOMP_UNALIGNED_OK \
+    THEKERNEL_SECCOMP_FILTER_OK \
+    THEKERNEL_SECCOMP_ERRNO_OK \
+    THEKERNEL_SECCOMP_FASTPATH_OK \
+    THEKERNEL_SECCOMP_UNKNOWN_OK \
+    THEKERNEL_SECCOMP_ERRNO_ZERO_OK \
+    THEKERNEL_SECCOMP_LOG_OK \
+    THEKERNEL_SECCOMP_TRAP_OK \
+    THEKERNEL_SECCOMP_TRAP_ROLLBACK_OK \
+    THEKERNEL_SECCOMP_INHERIT_OK \
+    THEKERNEL_SECCOMP_THREAD_APPEND_ISOLATION_OK \
+    THEKERNEL_SECCOMP_FORK_APPEND_ISOLATION_OK \
+    THEKERNEL_SECCOMP_PROC_OK \
+    THEKERNEL_SECCOMP_EXEC_OK \
+    THEKERNEL_SECCOMP_STRICT_OK \
+    THEKERNEL_SECCOMP_PRCTL_STRICT_OK \
+    THEKERNEL_SECCOMP_STRICT_KILL_OK \
+    THEKERNEL_SECCOMP_UNSUPPORTED_OK \
+    THEKERNEL_SECCOMP_KILL_THREAD_OK \
+    THEKERNEL_SECCOMP_KILL_PROCESS_OK \
+    THEKERNEL_SECCOMP_KILL_UNKNOWN_OK \
+    THEKERNEL_SECCOMP_KILL_SCOPE_OK \
+    THEKERNEL_SECCOMP_EXIT_RECLAIM_OK \
+    THEKERNEL_SECCOMP_RESOURCE_OK \
+    THEKERNEL_SECCOMP_RESOURCE_ROLLBACK_OK \
+    THEKERNEL_SECCOMP_OK \
+    THEKERNEL_SYSTEM_TEST_SECCOMP_OK \
     THEKERNEL_SYSTEM_TEST_PASS
 do
     log_has_exact_line "$marker" || {
@@ -143,7 +172,7 @@ do
     }
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

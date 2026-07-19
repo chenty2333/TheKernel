@@ -1029,6 +1029,16 @@ pub fn sys_prctl(
             }
             return Ok(current().as_thread().no_new_privs() as isize);
         }
+        PR_GET_SECCOMP => {
+            // Linux ignores the unused arguments for PR_GET_SECCOMP.
+            return Ok(current().as_thread().seccomp_mode() as isize);
+        }
+        PR_SET_SECCOMP => {
+            // Unlike PR_SET_NO_NEW_PRIVS, Linux treats arg4/arg5 as unused.
+            // The common adapter maps the prctl mode values to seccomp(2)
+            // operations and applies the exact same install transaction.
+            return crate::syscall::sys_prctl_set_seccomp(arg2, arg3 as *const ());
+        }
         PR_GET_KEEPCAPS => {
             return Ok(current().as_thread().keep_caps() as isize);
         }
@@ -1038,7 +1048,7 @@ pub fn sys_prctl(
             }
             current().as_thread().set_keep_caps(arg2 != 0)?;
         }
-        PR_GET_SECCOMP | PR_SET_SECCOMP | PR_MCE_KILL | PR_SET_THP_DISABLE | PR_GET_THP_DISABLE => {
+        PR_MCE_KILL | PR_SET_THP_DISABLE | PR_GET_THP_DISABLE => {
             return Err(AxError::InvalidInput);
         }
         PR_CAP_AMBIENT => {

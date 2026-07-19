@@ -370,6 +370,7 @@ impl CloneArgs {
 
         let curr = current();
         let calling_thread = curr.as_thread();
+        let inherited_seccomp = calling_thread.seccomp_snapshot();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         let old_proc_data = &calling_thread.proc_data;
         let credential_publication_kind = clone_credential_publication_kind(flags);
@@ -607,8 +608,12 @@ impl CloneArgs {
             let thread_admission = proc_data.prepare_initial_thread(process_admission)?;
             (proc_data, CloneThreadPublication::Initial(thread_admission))
         };
-        let (thr, signal_registration) =
-            Thread::try_new(tid, new_proc_data.clone(), child_credential)?;
+        let (thr, signal_registration) = Thread::try_new(
+            tid,
+            new_proc_data.clone(),
+            child_credential,
+            inherited_seccomp,
+        )?;
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
         }

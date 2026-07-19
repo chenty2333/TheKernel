@@ -7,6 +7,7 @@ mod ipc;
 mod mm;
 mod net;
 mod resources;
+mod seccomp;
 mod signal;
 mod sync;
 mod sys;
@@ -28,8 +29,8 @@ use syscalls::Sysno;
 pub(crate) use usercopy::RawSigevent;
 
 pub use self::{
-    fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
-    time::*,
+    fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, seccomp::*, signal::*, sync::*, sys::*,
+    task::*, time::*,
 };
 use crate::{
     file::{FileLike, Socket},
@@ -136,6 +137,13 @@ fn fast_path_getter(sysno: Sysno) -> Option<AxResult<isize>> {
 }
 
 pub fn handle_syscall(uctx: &mut UserContext) {
+    // Seccomp observes the raw syscall register before generic decoding and
+    // before every scalar/time fast path. This ordering is ABI-significant:
+    // filters may reject unknown numbers and otherwise-fast syscalls.
+    if !seccomp::enforce_syscall_seccomp(uctx) {
+        return;
+    }
+
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
         uctx.set_retval(-LinuxError::ENOSYS.code() as _);

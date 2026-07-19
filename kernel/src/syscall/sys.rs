@@ -456,10 +456,6 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
     Ok(total as isize)
 }
 
-pub fn sys_seccomp(_op: u32, _flags: u32, _args: *const ()) -> AxResult<isize> {
-    Err(LinuxError::ENOSYS.into())
-}
-
 pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();

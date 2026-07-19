@@ -1261,6 +1261,8 @@ fn task_status(
     let cred = proc_subject_cred(task, process_view);
     let ids = cred.ids();
     let caps = cred.capabilities();
+    let seccomp = thread.seccomp_snapshot();
+    let seccomp_filter_count = seccomp.filter_count();
     let cpu_mask = task_cpu_mask_bits(task);
     let mem_mask = PROC_NUMA_NODEMASK;
     let cpu_width = axhal::cpu_num().max(1);
@@ -1285,6 +1287,8 @@ fn task_status(
         VmSwap:\t0 kB\n\
         Threads:\t{}\n\
         NoNewPrivs:\t{}\n\
+        Seccomp:\t{}\n\
+        Seccomp_filters:\t{}\n\
         CapInh:\t{}\n\
         CapPrm:\t{}\n\
         CapEff:\t{}\n\
@@ -1313,6 +1317,8 @@ fn task_status(
         locked_kb,
         threads,
         cred.no_new_privs() as u8,
+        seccomp.mode() as u8,
+        seccomp_filter_count,
         format_cap_set(caps.inheritable()),
         format_cap_set(caps.permitted()),
         format_cap_set(caps.effective()),

@@ -22,6 +22,7 @@ LINUX_ABI_REPOSITORY=https://github.com/chenty2333/thekernel-linux-abi
 AX_PACKAGES=(
     thekernel-axsched
     thekernel-axpoll
+    thekernel-axcbpf
     thekernel-axfault
     thekernel-axtask
     thekernel-axtlb
@@ -31,6 +32,7 @@ LINUX_ABI_PACKAGES=(
     thekernel-linux-cred
     thekernel-linux-mm
     thekernel-linux-io-uring
+    thekernel-linux-seccomp
     thekernel-linux-process
     thekernel-linux-signal
     thekernel-linux-vfs
@@ -39,12 +41,14 @@ LINUX_ABI_PACKAGES=(
 CONSUMED_PACKAGES=(
     thekernel-axsched
     thekernel-axpoll
+    thekernel-axcbpf
     thekernel-axfault
     thekernel-axtask
     thekernel-axtlb
     thekernel-linux-cred
     thekernel-linux-mm
     thekernel-linux-io-uring
+    thekernel-linux-seccomp
     thekernel-linux-process
     thekernel-linux-vfs
     thekernel-linux-fd
@@ -290,6 +294,7 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
             --locked --no-verify \
             -p thekernel-axsched \
             -p thekernel-axpoll \
+            -p thekernel-axcbpf \
             -p thekernel-axfault \
             -p thekernel-axtask \
             -p thekernel-axtlb
@@ -306,6 +311,7 @@ printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
             -p thekernel-linux-cred \
             -p thekernel-linux-mm \
             -p thekernel-linux-io-uring \
+            -p thekernel-linux-seccomp \
             -p thekernel-linux-process \
             -p thekernel-linux-signal \
             -p thekernel-linux-vfs \
@@ -374,6 +380,9 @@ python3 "$SCRIPT_DIR/release-lock-artifacts.py" \
     --lock "${ARTIFACT_DIRS[thekernel-linux-signal]}/Cargo.lock" \
     --artifact \
         "thekernel-linux-usercopy=${ARCHIVE_PATHS[thekernel-linux-usercopy]}"
+python3 "$SCRIPT_DIR/release-lock-artifacts.py" \
+    --lock "${ARTIFACT_DIRS[thekernel-linux-seccomp]}/Cargo.lock" \
+    --artifact "thekernel-axcbpf=${ARCHIVE_PATHS[thekernel-axcbpf]}"
 
 # Copy the live integration state, including its intentional uncommitted slice,
 # but never copy Git metadata, build outputs, CI state, or release workspaces.
@@ -401,12 +410,14 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --manifest "$consumer_root/Cargo.toml" \
     --replace "../thekernel-ax/crates/thekernel-axsched=../artifacts/thekernel-axsched-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axpoll=../artifacts/thekernel-axpoll-$VERSION" \
+    --replace "../thekernel-ax/crates/thekernel-axcbpf=../artifacts/thekernel-axcbpf-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-$VERSION" \
     --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
     --replace "../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-$VERSION" \
     --replace "../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-$VERSION" \
     --replace "../thekernel-linux-abi/crates/process=../artifacts/thekernel-linux-process-$VERSION" \
     --replace "../thekernel-linux-abi/crates/vfs=../artifacts/thekernel-linux-vfs-$VERSION" \
     --replace "../thekernel-linux-abi/crates/fd=../artifacts/thekernel-linux-fd-$VERSION" \
@@ -511,7 +522,7 @@ release_set_tmp="$OUTPUT_RELEASE_SET.tmp.$$"
     printf 'package\tversion\tsha256\trepository_head\n'
     for package in "${all_packages[@]}"; do
         case "$package" in
-            thekernel-axsched|thekernel-axpoll|thekernel-axfault|thekernel-axtask|thekernel-axtlb)
+            thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axtask|thekernel-axtlb)
                 repo_head=$AX_HEAD
                 ;;
             *)

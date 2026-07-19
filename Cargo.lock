@@ -3100,6 +3100,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axcbpf"
+version = "0.1.0"
+
+[[package]]
 name = "thekernel-axfault"
 version = "0.1.0"
 
@@ -3216,6 +3220,7 @@ dependencies = [
  "thekernel-linux-io-uring",
  "thekernel-linux-mm",
  "thekernel-linux-process-adapter",
+ "thekernel-linux-seccomp",
  "thekernel-linux-vfs",
  "thekernel-readiness-adapter",
  "uluru",
@@ -3257,6 +3262,13 @@ name = "thekernel-linux-process-adapter"
 version = "0.1.0"
 dependencies = [
  "thekernel-linux-process",
+]
+
+[[package]]
+name = "thekernel-linux-seccomp"
+version = "0.1.0"
+dependencies = [
+ "thekernel-axcbpf",
 ]
 
 [[package]]

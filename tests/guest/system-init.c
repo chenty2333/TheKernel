@@ -229,6 +229,27 @@ static int test_userfaultfd(void) {
     return 0;
 }
 
+static int test_seccomp(void) {
+    static const char path[] =
+        "/opt/thekernel-tests/bin/thekernel-seccomp-smoke";
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("seccomp-fork");
+    }
+    if (child == 0) {
+        execl(path, path, "--thekernel", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL seccomp-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "seccomp-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_SECCOMP_OK");
+    return 0;
+}
+
 static int test_signal_wait_boundary(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -315,7 +336,8 @@ int main(int argc, char **argv) {
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
         test_process_pipe_and_exec() || test_signal_wait_boundary() ||
-        test_wait_boundary() || test_io_uring() || test_userfaultfd()) {
+        test_wait_boundary() || test_io_uring() || test_userfaultfd() ||
+        test_seccomp()) {
         return 1;
     }
 

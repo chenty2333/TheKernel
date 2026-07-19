@@ -716,7 +716,7 @@ class VendorProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(result.errors, ())
         self.assertEqual(result.package_checks, 28)
-        self.assertEqual(result.maintained_checks, 11)
+        self.assertEqual(result.maintained_checks, 13)
 
 
 if __name__ == "__main__":

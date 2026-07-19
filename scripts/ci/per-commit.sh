@@ -127,6 +127,13 @@ ci_run_step kernel-host-check "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" cargo check --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu
 
+ci_run_step kernel-seccomp-adapter-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
+    seccomp::tests -- --test-threads=1
+
 ci_run_step kernel-futex-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -512,6 +519,10 @@ ci_run_step axpoll-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axpoll
+ci_run_step axcbpf-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
+    -p thekernel-axcbpf --all-targets
 ci_run_step axfault-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
@@ -549,6 +560,16 @@ ci_run_step io-uring-core-check "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-io-uring --no-default-features
+ci_run_step seccomp-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +nightly-2025-05-20 test --locked \
+    --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-seccomp --all-features
+ci_run_step seccomp-core-check "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +nightly-2025-05-20 check --locked \
+    --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-seccomp --no-default-features
 ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \

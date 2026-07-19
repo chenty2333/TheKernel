@@ -8,6 +8,7 @@ use axtask::{
     reserve_prepared_task,
 };
 use starry_process::Pid;
+use thekernel_linux_seccomp::SeccompState;
 
 use crate::{
     file::{FD_TABLE, FdTable, executable, init_fd_scope_default, try_new_process_scope},
@@ -19,8 +20,8 @@ use crate::{
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
         ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
-        init_process_domain, linux_pid_from_task_id, prepare_task_table_admission,
-        spawn_alarm_task, try_new_user_task,
+        init_process_domain, init_seccomp_filter_budget, linux_pid_from_task_id,
+        prepare_task_table_admission, spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -29,6 +30,7 @@ pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
     crate::mm::init_tlb_shootdown();
+    init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
         system_off();
@@ -180,8 +182,9 @@ pub fn init(args: &[String], envs: &[String]) {
     let thread_admission = proc
         .prepare_thread(tid)
         .expect("Failed to admit init thread membership");
-    let (thr, signal_registration) = Thread::try_new(tid, proc.clone(), credential)
-        .expect("Failed to allocate init thread state");
+    let (thr, signal_registration) =
+        Thread::try_new(tid, proc.clone(), credential, SeccompState::disabled())
+            .expect("Failed to allocate init thread state");
     proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
         .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {

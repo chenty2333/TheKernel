@@ -16,6 +16,7 @@ use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use starry_process::Pid;
 use starry_signal::api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration};
+use thekernel_linux_seccomp::SeccompState;
 
 use super::{
     ProcessData,
@@ -711,6 +712,23 @@ pub struct Thread {
     /// publication point.
     pub(in crate::task) credential: Arc<CredentialSlot>,
 
+    /// One atomically consistent, task-local seccomp mode and filter ancestry.
+    ///
+    /// Fork and clone initialize an independent publication slot from one
+    /// caller snapshot. Immutable filter nodes remain shared and accounted
+    /// until their final owner exits.
+    pub(in crate::task) seccomp: SpinNoIrq<SeccompState>,
+
+    /// Negative fast-path for syscall entry.
+    ///
+    /// This bit is not a second writable seccomp state: the guarded
+    /// `SeccompState` remains authoritative. It changes only after a complete
+    /// state publication and lets permanently-disabled tasks avoid taking the
+    /// publication lock or cloning an empty filter chain on every syscall.
+    /// It returns to `false` only after this task's irreversible exit commit,
+    /// when no later syscall or seccomp publication is permitted.
+    pub(in crate::task) seccomp_active: AtomicBool,
+
     /// Per-task operation credential used while an OFD read/write is active.
     /// This is not process Scope state: sibling threads may block or perform
     /// I/O concurrently without replacing each other's Linux `file->f_cred`.
@@ -798,6 +816,7 @@ impl Thread {
         tid: u32,
         proc_data: Arc<ProcessData>,
         credential: Arc<CredentialSlot>,
+        seccomp: SeccompState,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;
@@ -809,10 +828,13 @@ impl Thread {
         let task_parent =
             TaskParentNode::try_new(tid, Arc::downgrade(&proc_data), Arc::downgrade(&credential))?;
         let time = TimeManager::new(&proc_data);
+        let seccomp_active = seccomp.mode() != thekernel_linux_seccomp::SeccompMode::Disabled;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
             credential,
+            seccomp: SpinNoIrq::new(seccomp),
+            seccomp_active: AtomicBool::new(seccomp_active),
             file_operation_credential: SpinNoIrq::new(None),
             file_write_credentials: SpinNoIrq::new(None),
             set_child_tid: AtomicUsize::new(0),

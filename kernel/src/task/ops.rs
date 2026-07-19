@@ -1245,6 +1245,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // lifecycle/task-parent serialization before any retained credential.
     // Normal exit performs the same order explicitly at the end below.
     let mut ptrace_retirements = ExitPtraceRetirements::default();
+    // Declared before the lifecycle guard so unwind also releases every outer
+    // lock before a detached immutable filter chain can run its iterative Drop.
+    let mut seccomp_retirement = None;
     let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
     let final_exit = match remove_current_thread(process, tid, exit_code) {
@@ -1451,12 +1454,21 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // thread-pidfd resolver must never observe removed membership paired with
     // a still-live task flag and retry the retired task identity.
     thr.set_exit();
+    // The task is now terminal while lifecycle serialization still excludes
+    // clone/TSYNC-style publishers. Only detach under that ordering boundary;
+    // the returned chain is destroyed after every outer guard below.
+    assert!(
+        seccomp_retirement.is_none(),
+        "seccomp exit ownership retired more than once"
+    );
+    seccomp_retirement = Some(thr.retire_seccomp_after_exit());
     // Both non-final and final paths have released their graph gate by here.
     // Keep this defensive take adjacent to lifecycle release so future exit
     // edits cannot accidentally move credential free callbacks back under it.
     drop(task_parent_publication.take());
     drop(lifecycle);
     drop(ptrace_retirements);
+    drop(seccomp_retirement.take());
     thr.proc_data.exec_event.wake();
     thr.exit_event.wake();
     Ok(())

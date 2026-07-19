@@ -35,3 +35,5 @@ type exists.
   (`draft`)
 - [RFC 0005: Bounded io_uring Core and Kernel Adapter Contract](0005-io-uring-contract.md)
   (`draft`)
+- [RFC 0006: Bounded Task-Local Seccomp Contract](0006-seccomp-contract.md)
+  (`draft`)
