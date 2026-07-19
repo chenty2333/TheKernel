@@ -10,7 +10,7 @@ use super::{
     has_pending_fatal_signal, set_timer_state, wait_if_stopped,
 };
 use crate::{
-    mm::{PageFaultFailure, PageFaultResult},
+    mm::{PageFaultFailure, PageFaultResult, handle_user_page_fault},
     syscall::handle_syscall,
 };
 
@@ -77,11 +77,8 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
-                        let result = aspace_handle.lock().handle_page_fault_result(
-                            addr,
-                            flags,
-                            Some(uctx.sp().into()),
-                        );
+                        let result =
+                            handle_user_page_fault(aspace_handle, addr, flags, uctx.sp().into());
                         if result != PageFaultResult::Handled {
                             #[cfg(target_arch = "riscv64")]
                             info!(

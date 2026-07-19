@@ -2,6 +2,7 @@
 
 mod access;
 mod aspace;
+mod fault;
 mod io;
 mod loader;
 mod remap;
@@ -11,6 +12,7 @@ mod userfaultfd;
 
 pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
 pub(crate) use self::{
+    fault::handle_user_page_fault,
     remap::remap_user_mapping,
     tlb::{
         init as init_tlb_shootdown, retire_after_tlb_grace, synchronize_icache, synchronize_tlb,
