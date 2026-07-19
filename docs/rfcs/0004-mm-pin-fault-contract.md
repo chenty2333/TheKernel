@@ -193,15 +193,21 @@ The generic broker uses an owned request identity:
 pub struct FaultKey {
     pub address_space: AddressSpaceId,
     pub mapping: MappingId,
-    pub generation: MappingGeneration,
-    pub page: PageOffset,
+    pub fault_epoch: MappingGeneration,
+    pub page_address: FaultPageAddress,
     pub access: FaultAccess,
 }
 ```
 
+The page identity is absolute rather than VMA-relative, so an unchanged
+request survives `mprotect` splits and a partial-unmap survivor whose VMA start
+moves. The consumer-owned fault epoch remains stable across those topology
+changes and changes only when mapping or registration authority is replaced.
+
 One request records type, range, credential/security decision, cancellation
 state, waiter ownership, and a completion token. Overlapping requests may
-coalesce only when mapping identity, generation, access, and handler match.
+coalesce only when mapping identity, fault epoch, absolute page, access, and
+handler match.
 Every waiter remains independently cancellable.
 
 The broker has bounded per-address-space and per-handler queues plus global
