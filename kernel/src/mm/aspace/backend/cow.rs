@@ -1,5 +1,6 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
+    mem::MaybeUninit,
     slice,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,7 +10,10 @@ use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError},
+    paging::{
+        MappingFlags, PageSize, PageTable, PageTableCursor, PagingError, PrepareTableFramesError,
+        PreparedMapError, PreparedPageTableFrames,
+    },
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
@@ -73,6 +77,122 @@ impl FrameTableRefCount {
 }
 
 static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
+
+/// Data-frame and page-table-frame ownership prepared before an anonymous
+/// leaf publication enters the address-space critical section.
+///
+/// Publication borrows this value and transfers only the data frame plus any
+/// table frames made reachable from the page table. Every unused resource
+/// remains here so the caller can drop it after releasing the address-space
+/// lock.
+#[must_use = "prepared COW page ownership must be published or dropped outside the address-space \
+              lock"]
+pub(crate) struct PreparedCowPage {
+    frame: PreparedCowFrame,
+    tables: PreparedPageTableFrames,
+}
+
+enum PreparedCowFrame {
+    Empty,
+    /// Owned storage whose initializer failed and which must never become
+    /// user-visible.
+    Incomplete(PhysAddr),
+    Ready(PhysAddr),
+}
+
+impl PreparedCowPage {
+    pub(crate) fn try_new() -> AxResult<Self> {
+        Ok(Self {
+            frame: PreparedCowFrame::Empty,
+            tables: PreparedPageTableFrames::try_new(0).map_err(Self::prepare_table_error)?,
+        })
+    }
+
+    fn prepare_table_error(error: PrepareTableFramesError) -> AxError {
+        match error {
+            PrepareTableFramesError::NoMemory => AxError::NoMemory,
+            PrepareTableFramesError::TooMany { .. } => AxError::BadState,
+        }
+    }
+
+    /// Replenishes enough table ownership for any supported 4 KiB leaf path.
+    ///
+    /// Reusing the reservation means this allocates only frames consumed by
+    /// earlier publications. The caller invokes it outside the address-space
+    /// lock, after which `NeedMore` is an internal consistency failure.
+    pub(crate) fn reserve_max_table_frames(&mut self) -> AxResult {
+        self.tables
+            .try_reserve_max()
+            .map_err(Self::prepare_table_error)
+    }
+
+    /// Allocates one data frame whose entire contents are initialized to zero.
+    pub(crate) fn prepare_zeroed(&mut self) -> AxResult {
+        if !matches!(self.frame, PreparedCowFrame::Empty) {
+            return Err(AxError::BadState);
+        }
+        let frame = alloc_frame(true, PageSize::Size4K)?;
+        self.frame = PreparedCowFrame::Ready(frame);
+        Ok(())
+    }
+
+    /// Allocates one uninitialized data frame and lets the caller initialize
+    /// every byte.
+    ///
+    /// `fill` runs outside the address-space lock. A failed fill leaves an
+    /// explicitly non-publishable frame owned by this value for lock-external
+    /// reclamation.
+    ///
+    /// # Safety
+    ///
+    /// Returning `Ok(())` from `fill` must mean every byte in the supplied
+    /// slice was initialized. The production caller uses the checked VM
+    /// usercopy primitive, which has exactly that success contract.
+    pub(crate) unsafe fn prepare_uninitialized(
+        &mut self,
+        fill: impl FnOnce(&mut [MaybeUninit<u8>]) -> AxResult,
+    ) -> AxResult {
+        if !matches!(self.frame, PreparedCowFrame::Empty) {
+            return Err(AxError::BadState);
+        }
+        let frame = alloc_frame(false, PageSize::Size4K)?;
+        self.frame = PreparedCowFrame::Incomplete(frame);
+        let bytes = unsafe {
+            slice::from_raw_parts_mut(
+                phys_to_virt(frame).as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                PAGE_SIZE_4K,
+            )
+        };
+        fill(bytes)?;
+        self.frame = PreparedCowFrame::Ready(frame);
+        Ok(())
+    }
+
+    fn frame(&self) -> AxResult<PhysAddr> {
+        match self.frame {
+            PreparedCowFrame::Ready(frame) => Ok(frame),
+            PreparedCowFrame::Empty | PreparedCowFrame::Incomplete(_) => Err(AxError::BadState),
+        }
+    }
+
+    fn commit_frame(&mut self) {
+        debug_assert!(matches!(self.frame, PreparedCowFrame::Ready(_)));
+        self.frame = PreparedCowFrame::Empty;
+    }
+}
+
+impl Drop for PreparedCowPage {
+    fn drop(&mut self) {
+        let frame = match self.frame {
+            PreparedCowFrame::Empty => None,
+            PreparedCowFrame::Incomplete(frame) | PreparedCowFrame::Ready(frame) => Some(frame),
+        };
+        self.frame = PreparedCowFrame::Empty;
+        if let Some(frame) = frame {
+            dealloc_frame(frame, PageSize::Size4K);
+        }
+    }
+}
 
 /// Materialized COW leaves detached from a page table but not yet reclaimed.
 pub(super) struct CowUnmapRetirement {
@@ -394,6 +514,49 @@ impl CowBackend {
         FRAME_TABLE.lock().get_or_init_frame(paddr)
     }
 
+    pub(super) fn is_4k_anonymous(&self) -> bool {
+        self.size == PageSize::Size4K && self.file.is_none()
+    }
+
+    /// Atomically publishes one fully initialized anonymous page.
+    ///
+    /// This path performs no allocation or deallocation. On every error all
+    /// resource ownership remains in `prepared`; on success the data frame and
+    /// only the consumed table frames become page-table/backend ownership.
+    pub(super) fn publish_prepared_page(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        pt: &mut PageTable,
+        prepared: &mut PreparedCowPage,
+    ) -> AxResult {
+        if !self.is_4k_anonymous() {
+            return Err(AxError::InvalidInput);
+        }
+        let frame = prepared.frame()?;
+        let committed = pt.cursor().map_prepared(
+            vaddr,
+            frame,
+            PageSize::Size4K,
+            page_table_flags(flags),
+            &mut prepared.tables,
+        );
+        match committed {
+            Ok(_) => {
+                prepared.commit_frame();
+                self.mark_materialized();
+                Ok(())
+            }
+            Err(PreparedMapError::NeedMore { .. }) => Err(AxError::BadState),
+            Err(PreparedMapError::Paging(PagingError::AlreadyMapped))
+            | Err(PreparedMapError::Paging(PagingError::MappedToHugePage)) => {
+                Err(AxError::AlreadyExists)
+            }
+            Err(PreparedMapError::Paging(PagingError::NoMemory)) => Err(AxError::NoMemory),
+            Err(PreparedMapError::Paging(_)) => Err(AxError::BadAddress),
+        }
+    }
+
     fn alloc_new_at(
         &self,
         vaddr: VirtAddr,
@@ -705,6 +868,18 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn incomplete_prepared_frame_is_never_publishable() {
+        let mut prepared = PreparedCowPage {
+            frame: PreparedCowFrame::Incomplete(PhysAddr::from(0x4000)),
+            tables: PreparedPageTableFrames::try_new(0).unwrap(),
+        };
+        assert_eq!(prepared.frame(), Err(AxError::BadState));
+        // This test uses a synthetic physical address to exercise only the
+        // ownership state machine; restore Empty so Drop does not reclaim it.
+        prepared.frame = PreparedCowFrame::Empty;
+    }
 
     #[test]
     fn materialized_growdown_must_clone_backend_identity_to_remerge() {

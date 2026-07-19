@@ -33,7 +33,13 @@ All published test paths are present but adapted to the maintained fork: `tests/
   exact fallible allocation and any destructive drain. A post-preflight commit
   or rollback mismatch fails stop instead of returning a partially changed
   page table.
-- Maintained delta: multi-architecture page-table traversal, drain, and TLB primitives with focused allocation tests.
+- Prepared leaf publication can retain and transactionally replenish at most
+  three zeroed intermediate-table frames outside the page-table critical
+  section. A failed replenish reclaims only its unpublished prefix and leaves
+  the reusable reservation unchanged.
+- Maintained delta: multi-architecture page-table traversal, failure-atomic
+  prepared publication/drain, and TLB primitives with focused allocation
+  tests.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

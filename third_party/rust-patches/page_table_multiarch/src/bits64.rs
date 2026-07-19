@@ -116,6 +116,54 @@ impl<H: PagingHandler> PreparedPageTableFrames<H> {
         Self::try_new(MAX_PREPARED_TABLE_FRAMES_64)
     }
 
+    /// Ensures that this reservation retains at least `frame_count` frames.
+    ///
+    /// Callers may reuse one reservation across a sequence of prepared leaf
+    /// commits. Frames consumed by earlier commits can be replenished here
+    /// after leaving the page-table critical section, avoiding a fresh
+    /// maximum-size reservation for every leaf.
+    ///
+    /// Allocation is transactional: an error leaves the pre-existing
+    /// reservation unchanged and reclaims every frame allocated by this call.
+    /// This method must not be invoked while holding a page-table lock.
+    pub fn try_reserve_to(&mut self, frame_count: usize) -> Result<(), PrepareTableFramesError> {
+        if frame_count > MAX_PREPARED_TABLE_FRAMES_64 {
+            return Err(PrepareTableFramesError::TooMany {
+                requested: frame_count,
+                maximum: MAX_PREPARED_TABLE_FRAMES_64,
+            });
+        }
+        let additional = frame_count.saturating_sub(self.frames.len());
+        if additional == 0 {
+            return Ok(());
+        }
+
+        let mut fresh = ArrayVec::<PhysAddr, MAX_PREPARED_TABLE_FRAMES_64>::new();
+        for _ in 0..additional {
+            let Ok(frame) = alloc_zeroed_table_frame::<H>() else {
+                for frame in fresh {
+                    H::dealloc_frame(frame);
+                }
+                return Err(PrepareTableFramesError::NoMemory);
+            };
+            fresh
+                .try_push(frame)
+                .expect("validated prepared-frame capacity");
+        }
+        for frame in fresh {
+            self.frames
+                .try_push(frame)
+                .expect("validated prepared-frame capacity");
+        }
+        Ok(())
+    }
+
+    /// Replenishes this reusable reservation to the largest supported
+    /// 64-bit page-table path.
+    pub fn try_reserve_max(&mut self) -> Result<(), PrepareTableFramesError> {
+        self.try_reserve_to(MAX_PREPARED_TABLE_FRAMES_64)
+    }
+
     /// Number of frames currently retained by this reservation.
     pub fn len(&self) -> usize {
         self.frames.len()

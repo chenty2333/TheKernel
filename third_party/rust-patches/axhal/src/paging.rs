@@ -4,13 +4,19 @@ use axalloc::{UsageKind, global_allocator};
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use page_table_multiarch::PagingHandler;
 #[doc(no_inline)]
-pub use page_table_multiarch::{MappingFlags, PageSize, PagingError, PagingResult};
+pub use page_table_multiarch::{
+    MappingFlags, PageSize, PagingError, PagingResult, PrepareTableFramesError, PreparedMapError,
+};
 
 use crate::mem::{phys_to_virt, virt_to_phys};
 
 /// Implementation of [`PagingHandler`], to provide physical memory manipulation to
 /// the [page_table_multiarch] crate.
 pub struct PagingHandlerImpl;
+
+/// Architecture-specific reservation of preallocated 64-bit page-table
+/// frames for one or more prepared leaf publications.
+pub type PreparedPageTableFrames = page_table_multiarch::PreparedPageTableFrames<PagingHandlerImpl>;
 
 impl PagingHandler for PagingHandlerImpl {
     fn alloc_frame() -> Option<PhysAddr> {

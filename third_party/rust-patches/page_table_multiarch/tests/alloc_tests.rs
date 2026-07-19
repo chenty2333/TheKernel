@@ -1451,6 +1451,52 @@ fn test_prepared_reservation_allocation_failure_is_atomic() {
 }
 
 #[test]
+fn test_prepared_reservation_replenishment_is_atomic_and_reusable() {
+    reset_prepared_test_state();
+    let table = PreparedTable::<PreparedMeta4>::try_new().unwrap();
+    let mut prepared = PreparedFrames::<PreparedMeta4>::try_new(1).unwrap();
+    assert_eq!(prepared.len(), 1);
+    let allocated_before_failure = ALLOCATED.with_borrow(|allocated| allocated.len());
+
+    fail_frame_allocation_at(2);
+    assert_eq!(
+        prepared.try_reserve_to(3),
+        Err(PrepareTableFramesError::NoMemory)
+    );
+    clear_frame_allocation_failure();
+    assert_eq!(prepared.len(), 1, "failed replenish changed reservation");
+    assert_eq!(
+        ALLOCATED.with_borrow(|allocated| allocated.len()),
+        allocated_before_failure,
+        "failed replenish leaked its transactional prefix"
+    );
+
+    prepared.try_reserve_to(2).unwrap();
+    assert_eq!(prepared.len(), 2);
+    prepared.try_reserve_max().unwrap();
+    assert_eq!(prepared.len(), 3);
+    let allocations_at_max = frame_allocation_count();
+    prepared.try_reserve_max().unwrap();
+    assert_eq!(
+        frame_allocation_count(),
+        allocations_at_max,
+        "full reusable reservation allocated again"
+    );
+    assert_eq!(
+        prepared.try_reserve_to(4),
+        Err(PrepareTableFramesError::TooMany {
+            requested: 4,
+            maximum: 3,
+        })
+    );
+    assert_eq!(prepared.len(), 3);
+
+    drop(prepared);
+    drop(table);
+    assert_prepared_test_frames_reclaimed();
+}
+
+#[test]
 fn test_prepared_commit_drops_only_unused_frames_after_unlock() {
     reset_prepared_test_state();
     let mut table = PreparedTable::<PreparedMeta4>::try_new().unwrap();

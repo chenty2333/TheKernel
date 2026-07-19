@@ -23,6 +23,7 @@ mod shared;
 
 pub use self::shared::{SharedAtomicU32, SharedPages};
 pub(crate) use self::{
+    cow::PreparedCowPage,
     file::WritableMappingAdmission,
     phys_pin::{PhysicalFramePins, PreparedPhysicalFramePins, prepare_physical_pin_registry},
     shared::PreparedFixedSharedMapping,
