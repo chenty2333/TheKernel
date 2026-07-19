@@ -100,7 +100,11 @@ impl EthernetDevice {
             LinkPacketType::Broadcast
         } else if dst.is_multicast() {
             LinkPacketType::Multicast
-        } else if dst == EMPTY_MAC || dst == local {
+        } else if dst == EMPTY_MAC {
+            // The ordinary receive path accepts this legacy placeholder, but
+            // it is not a local unicast address for capture metadata.
+            LinkPacketType::OtherHost
+        } else if dst == local {
             LinkPacketType::Host
         } else {
             LinkPacketType::OtherHost
@@ -642,6 +646,19 @@ impl Drop for EthernetDevice {
 mod tests {
     use super::*;
     use crate::packet::{PacketBroker, PacketProtocol, PacketSelector, PacketView};
+
+    #[test]
+    fn zero_destination_is_not_classified_as_local_host_metadata() {
+        let local = EthernetAddress([2, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            EthernetDevice::packet_type(EMPTY_MAC, local),
+            LinkPacketType::OtherHost
+        );
+        assert_eq!(
+            EthernetDevice::packet_type(local, local),
+            LinkPacketType::Host
+        );
+    }
 
     #[test]
     fn raw_outgoing_capture_preserves_frame_and_uses_request_protocol() {

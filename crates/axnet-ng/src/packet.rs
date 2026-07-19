@@ -579,7 +579,6 @@ impl PacketEndpoint {
     /// Returns [`PacketError::Detached`] after the owning broker is gone.
     pub fn set_selector(&self, selector: PacketSelector) -> PacketResult<()> {
         let broker = self.broker.upgrade().ok_or(PacketError::Detached)?;
-        broker.drain_staged();
         let quiescent = broker.capture_is_quiescent();
         let mut state = self.state.lock();
         if state
@@ -640,7 +639,6 @@ impl PacketEndpoint {
     /// every retained filter generation.
     pub fn set_filter(&self, filter: Option<Arc<dyn PacketFilter>>) -> PacketResult<()> {
         let broker = self.broker.upgrade().ok_or(PacketError::Detached)?;
-        broker.drain_staged();
         let quiescent = broker.capture_is_quiescent();
         let mut state = self.state.lock();
         if quiescent {
@@ -774,6 +772,31 @@ struct CaptureState {
     reserved: usize,
 }
 
+enum StagedCapture {
+    Packet(PendingPacket),
+    Drop(PendingDrop),
+}
+
+impl CaptureState {
+    fn pop_next(&mut self, prefer_drop: &mut bool) -> Option<StagedCapture> {
+        let staged = if *prefer_drop {
+            self.drops
+                .pop_front()
+                .map(StagedCapture::Drop)
+                .or_else(|| self.pending.pop_front().map(StagedCapture::Packet))
+        } else {
+            self.pending
+                .pop_front()
+                .map(StagedCapture::Packet)
+                .or_else(|| self.drops.pop_front().map(StagedCapture::Drop))
+        };
+        if staged.is_some() {
+            *prefer_drop = matches!(&staged, Some(StagedCapture::Packet(_)));
+        }
+        staged
+    }
+}
+
 /// Per-network-stack registry and publication point for link frames.
 pub struct PacketBroker {
     state: Mutex<BrokerState>,
@@ -862,33 +885,13 @@ impl PacketBroker {
         }
     }
 
-    fn reserve_capture_slot(&self) -> PacketResult<()> {
-        let mut capture = self.capture.lock();
-        let occupied = capture
-            .pending
-            .len()
-            .checked_add(capture.reserved)
-            .ok_or(PacketError::Capacity(PacketCapacity::CaptureBacklog))?;
-        if occupied >= MAX_PACKET_CAPTURE_BACKLOG {
-            return Err(PacketError::Capacity(PacketCapacity::CaptureBacklog));
-        }
-        capture.reserved += 1;
-        Ok(())
-    }
-
-    fn cancel_capture_slot(&self) {
-        let mut capture = self.capture.lock();
-        debug_assert!(capture.reserved > 0, "packet capture reservation underflow");
-        capture.reserved = capture.reserved.saturating_sub(1);
-    }
-
-    fn stage_drop(
+    fn stage_drop_locked(
         &self,
+        capture: &mut CaptureState,
         metadata: PacketMetadata,
         origin: Option<PacketEndpointId>,
         sequence: u64,
     ) {
-        let mut capture = self.capture.lock();
         if capture.drops.len() < MAX_PACKET_DROP_BACKLOG {
             capture.drops.push_back(PendingDrop {
                 metadata,
@@ -898,6 +901,47 @@ impl PacketBroker {
         } else {
             self.unattributed_drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn reserve_capture_slot(
+        &self,
+        metadata: PacketMetadata,
+        origin: Option<PacketEndpointId>,
+    ) -> PacketResult<u64> {
+        let mut capture = self.capture.lock();
+        // Sequence publication and its first in-flight representation share
+        // this lock. Epoch compaction can therefore never observe an allocated
+        // sequence before either a reservation or its accounted drop exists.
+        let sequence = self
+            .next_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| PacketError::SequenceExhausted)?;
+        let Some(occupied) = capture.pending.len().checked_add(capture.reserved) else {
+            self.stage_drop_locked(&mut capture, metadata, origin, sequence);
+            return Err(PacketError::Capacity(PacketCapacity::CaptureBacklog));
+        };
+        if occupied >= MAX_PACKET_CAPTURE_BACKLOG {
+            self.stage_drop_locked(&mut capture, metadata, origin, sequence);
+            return Err(PacketError::Capacity(PacketCapacity::CaptureBacklog));
+        }
+        capture.reserved += 1;
+        Ok(sequence)
+    }
+
+    fn fail_capture_slot(
+        &self,
+        metadata: PacketMetadata,
+        origin: Option<PacketEndpointId>,
+        sequence: u64,
+    ) {
+        let mut capture = self.capture.lock();
+        debug_assert!(capture.reserved > 0, "packet capture reservation underflow");
+        // Keep the old sequence represented continuously: reservation removal
+        // and failure-ledger publication are one capture-state transition.
+        capture.reserved = capture.reserved.saturating_sub(1);
+        self.stage_drop_locked(&mut capture, metadata, origin, sequence);
     }
 
     fn deliver_drop(&self, pending: PendingDrop) {
@@ -956,51 +1000,36 @@ impl PacketBroker {
         {
             return Err(PacketError::InvalidInput);
         }
-        let sequence = self
-            .next_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| PacketError::SequenceExhausted)?;
-
-        if let Err(error) = self.reserve_capture_slot() {
-            self.stage_drop(metadata, origin, sequence);
-            return Err(error);
-        }
+        let sequence = self.reserve_capture_slot(metadata, origin)?;
         let reserved_charge = match total_len.checked_add(size_of::<SharedPacketFrame>()) {
             Some(charge) => charge,
             None => {
-                self.cancel_capture_slot();
-                self.stage_drop(metadata, origin, sequence);
+                self.fail_capture_slot(metadata, origin, sequence);
                 return Err(PacketError::Allocation);
             }
         };
         if let Err(error) = self.pool.try_charge(reserved_charge) {
-            self.cancel_capture_slot();
-            self.stage_drop(metadata, origin, sequence);
+            self.fail_capture_slot(metadata, origin, sequence);
             return Err(error);
         }
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(total_len).is_err() {
             self.pool.release(reserved_charge);
-            self.cancel_capture_slot();
-            self.stage_drop(metadata, origin, sequence);
+            self.fail_capture_slot(metadata, origin, sequence);
             return Err(PacketError::Allocation);
         }
         let charge = match bytes.capacity().checked_add(size_of::<SharedPacketFrame>()) {
             Some(charge) => charge,
             None => {
                 self.pool.release(reserved_charge);
-                self.cancel_capture_slot();
-                self.stage_drop(metadata, origin, sequence);
+                self.fail_capture_slot(metadata, origin, sequence);
                 return Err(PacketError::Allocation);
             }
         };
         if charge > reserved_charge {
             if let Err(error) = self.pool.try_charge(charge - reserved_charge) {
                 self.pool.release(reserved_charge);
-                self.cancel_capture_slot();
-                self.stage_drop(metadata, origin, sequence);
+                self.fail_capture_slot(metadata, origin, sequence);
                 return Err(error);
             }
         } else if charge < reserved_charge {
@@ -1017,8 +1046,7 @@ impl PacketBroker {
             Err(_) => {
                 // `Arc::try_new` drops its input value on allocation failure;
                 // `SharedPacketFrame::drop` releases the pool charge.
-                self.cancel_capture_slot();
-                self.stage_drop(metadata, origin, sequence);
+                self.fail_capture_slot(metadata, origin, sequence);
                 return Err(PacketError::Allocation);
             }
         };
@@ -1077,7 +1105,9 @@ impl PacketBroker {
     ///
     /// Concurrent callers coalesce behind a single drainer.  The handoff loop
     /// closes the empty-queue/owner-release race so a staged frame is never
-    /// stranded solely because another drainer was exiting.
+    /// stranded solely because another drainer was exiting. Pending frames and
+    /// accounted drops alternate whenever both classes are available; this is
+    /// class fairness, not a global sequence FIFO.
     pub fn drain_staged(&self) {
         if self
             .draining
@@ -1086,19 +1116,15 @@ impl PacketBroker {
         {
             return;
         }
+        let mut prefer_drop = false;
         loop {
             loop {
-                let pending = { self.capture.lock().pending.pop_front() };
-                if let Some(pending) = pending {
-                    self.deliver(pending);
-                    continue;
+                let staged = { self.capture.lock().pop_next(&mut prefer_drop) };
+                match staged {
+                    Some(StagedCapture::Packet(pending)) => self.deliver(pending),
+                    Some(StagedCapture::Drop(dropped)) => self.deliver_drop(dropped),
+                    None => break,
                 }
-                let dropped = { self.capture.lock().drops.pop_front() };
-                if let Some(dropped) = dropped {
-                    self.deliver_drop(dropped);
-                    continue;
-                }
-                break;
             }
             self.draining.store(false, Ordering::Release);
             let empty = {
@@ -1131,11 +1157,11 @@ impl PacketBroker {
     }
 
     fn capture_is_quiescent(&self) -> bool {
-        if self.draining.load(Ordering::Acquire) {
-            return false;
-        }
         let capture = self.capture.lock();
-        capture.reserved == 0 && capture.pending.is_empty() && capture.drops.is_empty()
+        !self.draining.load(Ordering::Acquire)
+            && capture.reserved == 0
+            && capture.pending.is_empty()
+            && capture.drops.is_empty()
     }
 }
 
@@ -1283,6 +1309,176 @@ mod tests {
     }
 
     #[test]
+    fn capture_reservations_preserve_epochs_and_failure_sequences() {
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::Exact(0x0800),
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        let ipv4 = metadata(0x0800, LinkPacketType::Host);
+        let ipv4_sequence = broker.reserve_capture_slot(ipv4, None).unwrap();
+        assert_eq!(ipv4_sequence, 1);
+        assert!(!broker.capture_is_quiescent());
+
+        endpoint
+            .set_selector(PacketSelector::new(
+                PacketProtocol::Exact(0x0806),
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        endpoint.set_filter(Some(Arc::new(Snaplen(4)))).unwrap();
+
+        let arp = metadata(0x0806, LinkPacketType::Host);
+        let arp_sequence = broker.reserve_capture_slot(arp, None).unwrap();
+        assert_eq!(arp_sequence, 2);
+        endpoint
+            .set_selector(PacketSelector::new(
+                PacketProtocol::Exact(0x86dd),
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        endpoint.set_filter(Some(Arc::new(Snaplen(8)))).unwrap();
+
+        {
+            let state = endpoint.state.lock();
+            assert_eq!(
+                state
+                    .selectors
+                    .iter()
+                    .map(|epoch| epoch.starts_at)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(
+                state
+                    .filters
+                    .iter()
+                    .map(|epoch| epoch.starts_at)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+        }
+
+        broker.fail_capture_slot(ipv4, None, ipv4_sequence);
+        broker.fail_capture_slot(arp, None, arp_sequence);
+        {
+            let capture = broker.capture.lock();
+            assert_eq!(capture.reserved, 0);
+            assert_eq!(
+                capture
+                    .drops
+                    .iter()
+                    .map(|dropped| dropped.sequence)
+                    .collect::<Vec<_>>(),
+                [1, 2]
+            );
+        }
+        assert!(!broker.capture_is_quiescent());
+
+        broker.drain_staged();
+        assert_eq!(
+            endpoint.take_stats(),
+            PacketEndpointStats {
+                packets: 2,
+                drops: 2,
+                ..PacketEndpointStats::default()
+            }
+        );
+        assert!(broker.capture_is_quiescent());
+    }
+
+    #[test]
+    fn popped_capture_remains_nonquiescent_while_drainer_owns_delivery() {
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        broker
+            .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[1])
+            .unwrap();
+
+        broker.draining.store(true, Ordering::Release);
+        let in_delivery = {
+            let mut capture = broker.capture.lock();
+            let mut prefer_drop = false;
+            let Some(StagedCapture::Packet(pending)) = capture.pop_next(&mut prefer_drop) else {
+                panic!("staged packet missing");
+            };
+            assert!(capture.pending.is_empty());
+            assert!(capture.drops.is_empty());
+            pending
+        };
+        assert!(!broker.capture_is_quiescent());
+
+        broker.deliver(in_delivery);
+        broker.draining.store(false, Ordering::Release);
+        assert!(broker.capture_is_quiescent());
+        assert_eq!(endpoint.try_receive(false).unwrap().data().last(), Some(&1));
+    }
+
+    #[test]
+    fn staged_drain_alternates_classes_without_claiming_global_fifo() {
+        let broker = PacketBroker::try_new().unwrap();
+        let _endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        broker
+            .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[1])
+            .unwrap();
+        broker
+            .stage_parts(metadata(0x0800, LinkPacketType::Host), &[0; 14], &[2])
+            .unwrap();
+        let dropped_metadata = metadata(0x0800, LinkPacketType::Host);
+        let dropped_sequence = broker.reserve_capture_slot(dropped_metadata, None).unwrap();
+        broker.fail_capture_slot(dropped_metadata, None, dropped_sequence);
+
+        let (first, second, third) = {
+            let mut capture = broker.capture.lock();
+            let mut prefer_drop = false;
+            let first = capture.pop_next(&mut prefer_drop).unwrap();
+            assert!(prefer_drop);
+            let second = capture.pop_next(&mut prefer_drop).unwrap();
+            assert!(!prefer_drop);
+            let third = capture.pop_next(&mut prefer_drop).unwrap();
+            assert!(prefer_drop);
+            (first, second, third)
+        };
+        assert!(matches!(
+            &first,
+            StagedCapture::Packet(pending) if pending.sequence == 1
+        ));
+        assert!(matches!(
+            &second,
+            StagedCapture::Drop(dropped) if dropped.sequence == 3
+        ));
+        assert!(matches!(
+            &third,
+            StagedCapture::Packet(pending) if pending.sequence == 2
+        ));
+        drop((first, second, third));
+        assert_eq!(broker.charged_shared_bytes(), 0);
+        assert!(broker.capture_is_quiescent());
+    }
+
+    #[test]
     fn selector_and_filter_histories_report_their_own_capacity() {
         let broker = PacketBroker::try_new().unwrap();
         let endpoint = broker
@@ -1293,7 +1489,10 @@ mod tests {
                 true,
             ))
             .unwrap();
-        broker.reserve_capture_slot().unwrap();
+        let reserved_metadata = metadata(0x0800, LinkPacketType::Host);
+        let reserved_sequence = broker
+            .reserve_capture_slot(reserved_metadata, None)
+            .unwrap();
         for transition in 0..MAX_PACKET_SELECTOR_EPOCHS - 1 {
             broker
                 .stage_parts(
@@ -1323,7 +1522,7 @@ mod tests {
             )),
             Err(PacketError::Capacity(PacketCapacity::SelectorEpochs))
         );
-        broker.cancel_capture_slot();
+        broker.fail_capture_slot(reserved_metadata, None, reserved_sequence);
 
         let broker = PacketBroker::try_new().unwrap();
         let endpoint = broker
@@ -1334,7 +1533,10 @@ mod tests {
                 true,
             ))
             .unwrap();
-        broker.reserve_capture_slot().unwrap();
+        let reserved_metadata = metadata(0x0800, LinkPacketType::Host);
+        let reserved_sequence = broker
+            .reserve_capture_slot(reserved_metadata, None)
+            .unwrap();
         for transition in 0..MAX_PACKET_FILTER_EPOCHS - 1 {
             broker
                 .stage_parts(
@@ -1354,7 +1556,7 @@ mod tests {
             endpoint.set_filter(Some(Arc::new(Snaplen(1)))),
             Err(PacketError::Capacity(PacketCapacity::FilterEpochs))
         );
-        broker.cancel_capture_slot();
+        broker.fail_capture_slot(reserved_metadata, None, reserved_sequence);
     }
 
     #[test]
@@ -1480,6 +1682,11 @@ mod tests {
                 true,
             ))
             .unwrap();
+        assert!(matches!(
+            endpoint.try_receive(false),
+            Err(AxError::WouldBlock)
+        ));
+        broker.drain_staged();
         assert_eq!(endpoint.try_receive(false).unwrap().data().last(), Some(&1));
 
         broker
