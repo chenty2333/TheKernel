@@ -156,7 +156,7 @@ for ((run = 1; run <= RUNS; ++run)); do
             "$run" >&2
         exit 1
     fi
-    if [ "$(grep -c '^THEKERNEL_PACKET_SEND_BOUNDARY ' "$log" || true)" -ne 2 ] ||
+    if [ "$(grep -c '^THEKERNEL_PACKET_SEND_BOUNDARY ' "$log" || true)" -ne 3 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_NAME_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_OPTION_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_CONTROL_BOUNDARY ' "$log" || true)" -ne 1 ]; then

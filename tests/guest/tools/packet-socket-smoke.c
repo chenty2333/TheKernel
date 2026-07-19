@@ -57,6 +57,15 @@ struct udp_pair {
     struct sockaddr_in destination;
 };
 
+struct extended_sockaddr_ll {
+    struct sockaddr_ll address;
+    unsigned char ninth_address_byte;
+};
+
+_Static_assert(offsetof(struct extended_sockaddr_ll, ninth_address_byte) ==
+                   sizeof(struct sockaddr_ll),
+               "sockaddr_ll extension must immediately follow sll_addr");
+
 static unsigned int loopback_index;
 static unsigned int token_counter;
 static bool linux_host_mode;
@@ -876,6 +885,48 @@ static void test_dgram_send_boundaries(void) {
     print_send_boundary("sendto-zero-protocol", observed);
     close_checked(sender, "send-zero-source-close");
     close_checked(observer, "send-zero-observer-close");
+
+    observer = bound_packet_socket(SOCK_RAW, ETH_P_ALL, loopback_index);
+    sender = bound_packet_socket(SOCK_DGRAM, CUSTOM_PROTOCOL, loopback_index);
+    struct extended_sockaddr_ll extended_address;
+    memset(&extended_address, 0, sizeof(extended_address));
+    fill_packet_destination(&extended_address.address, CUSTOM_PROTOCOL,
+                            destination);
+    extended_address.address.sll_halen = 9;
+    extended_address.address.sll_addr[6] = 0xde;
+    extended_address.address.sll_addr[7] = 0xad;
+    extended_address.ninth_address_byte = 0xbe;
+    const socklen_t extended_length =
+        (socklen_t)(offsetof(struct sockaddr_ll, sll_addr) + 9);
+    require_true(extended_length <= sizeof(extended_address),
+                 "send-extended-address-storage");
+    make_token(token, 3, 5);
+    errno = 0;
+    sent = sendto(sender, token, sizeof(token), 0,
+                  (const struct sockaddr *)&extended_address,
+                  sizeof(struct sockaddr_ll));
+    if (sent != -1 || errno != EINVAL) {
+        fail_value("send-extended-address-short", sent, -1);
+    }
+    require_no_matching_record(observer, token, sizeof(token));
+    sent = sendto(sender, token, sizeof(token), 0,
+                  (const struct sockaddr *)&extended_address,
+                  extended_length);
+    if (sent != (ssize_t)sizeof(token)) {
+        fail_value("send-extended-address", sent, (long)sizeof(token));
+    }
+    collect_records(observer, token, sizeof(token), observed, 2);
+    require_wire_frame(&observed[0], destination, zero, CUSTOM_PROTOCOL,
+                       token, sizeof(token));
+    require_wire_frame(&observed[1], destination, zero, CUSTOM_PROTOCOL,
+                       token, sizeof(token));
+    require_packet_address(&observed[0], CUSTOM_PROTOCOL, PACKET_OUTGOING,
+                           zero);
+    require_packet_address(&observed[1], CUSTOM_PROTOCOL, PACKET_OTHERHOST,
+                           zero);
+    print_send_boundary("extended-halen9", observed);
+    close_checked(sender, "send-extended-source-close");
+    close_checked(observer, "send-extended-observer-close");
 }
 
 static void test_send(void) {
