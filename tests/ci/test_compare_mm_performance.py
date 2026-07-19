@@ -404,6 +404,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         policy: Path | None = None,
         stability_policy: Path | None = None,
         normalize_timestamps: bool = True,
+        output: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         self.series_counter += 1
         if normalize_timestamps:
@@ -427,8 +428,9 @@ class CompareMmPerformanceTests(unittest.TestCase):
                     pair_start + dt.timedelta(seconds=2),
                     pair_start + dt.timedelta(seconds=3),
                 )
-        report = self.root / "report.tsv"
-        report.unlink(missing_ok=True)
+        report = output or self.root / "report.tsv"
+        if output is None:
+            report.unlink(missing_ok=True)
         arguments = [sys.executable, str(COMPARATOR)]
         for baseline in baselines:
             arguments.extend(("--baseline", str(baseline)))
@@ -916,6 +918,49 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, _ = self.compare(baseline, candidate)
         self.assertEqual(result.returncode, 2)
         self.assertIn("90 percent throughput retention", result.stderr)
+
+    def test_stability_policy_cannot_weaken_pair_ratio_spread_limit(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+        payload = json.loads(self.stability_policy.read_text(encoding="utf-8"))
+        payload["maximum_pair_ratio_spread_percent"] = 21
+        self.stability_policy.write_text(json.dumps(payload), encoding="utf-8")
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("20 percent pair-ratio spread ceiling", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_validation_failure_preserves_preexisting_output(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"bundle_schema": "invalid-bundle"}),
+        )
+        report = self.root / "preexisting-report.tsv"
+        sentinel = b"operator-owned evidence\n"
+        report.write_bytes(sentinel)
+
+        result, _ = self.compare_series(baselines, candidates, output=report)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported bundle_schema", result.stderr)
+        self.assertEqual(report.read_bytes(), sentinel)
+
+    def test_output_inside_input_bundle_is_rejected_without_mutation(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        report = baselines[0] / "operator-receipt.tsv"
+        sentinel = b"preserve this bundle receipt\n"
+        report.write_bytes(sentinel)
+
+        result, _ = self.compare_series(baselines, candidates, output=report)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside every input evidence bundle", result.stderr)
+        self.assertEqual(report.read_bytes(), sentinel)
 
     def test_host_diagnostics_reject_unsafe_fields(self) -> None:
         baseline = self.bundle("baseline")

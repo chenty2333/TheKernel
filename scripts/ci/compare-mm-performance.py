@@ -39,6 +39,7 @@ RFC3339_UTC_RE = re.compile(
     r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
 )
 HOST_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+MAX_PAIR_RATIO_SPREAD_PERCENT = 20
 
 
 class EvidenceError(ValueError):
@@ -844,11 +845,31 @@ def load_stability_policy(path: Path) -> StabilityPolicy:
             "stability policy maximum_pairs must be odd, at least minimum_pairs, "
             "and at most 101"
         )
-    if spread < 0 or spread > 100:
+    if spread < 0 or spread > MAX_PAIR_RATIO_SPREAD_PERCENT:
         raise EvidenceError(
-            "stability policy maximum_pair_ratio_spread_percent must be in 0..100"
+            "stability policy may not weaken the 20 percent pair-ratio "
+            "spread ceiling"
         )
     return StabilityPolicy(minimum, maximum, spread)
+
+
+def validate_output_destination(path: Path, bundles: Iterable[Bundle]) -> Path:
+    try:
+        destination = path.expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise EvidenceError(
+            f"cannot resolve regression report destination {path}: {error}"
+        ) from error
+    for bundle in bundles:
+        try:
+            destination.relative_to(bundle.root)
+        except ValueError:
+            continue
+        raise EvidenceError(
+            "regression report destination must be outside every input "
+            f"evidence bundle: output={destination} bundle={bundle.root}"
+        )
+    return destination
 
 
 def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
@@ -1231,15 +1252,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         baselines = [load_bundle(path) for path in args.baseline]
         candidates = [load_bundle(path) for path in args.candidate]
+        output = validate_output_destination(
+            args.output, (*baselines, *candidates)
+        )
         policy = load_policy(args.policy)
         stability = load_stability_policy(args.stability_policy)
         rows = compare_series(baselines, candidates, policy, stability)
-        write_report(args.output, rows)
+        write_report(output, rows)
     except EvidenceError as error:
-        try:
-            args.output.expanduser().unlink(missing_ok=True)
-        except OSError:
-            pass
         print(f"compare-mm-performance: INVALID: {error}", file=sys.stderr)
         return 2
     failures = sum(row.result == "FAIL" for row in rows)
