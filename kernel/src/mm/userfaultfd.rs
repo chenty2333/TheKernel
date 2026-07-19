@@ -1392,18 +1392,32 @@ impl DeliveredUffdEvent {
     }
 }
 
-/// Ownership retired by final OFD close.  Wake and destruction happen only
-/// after the caller releases the address-space lock.
+/// Wake ownership retired by one OFD close.
+///
+/// The per-address-space broker deliberately remains installed after the
+/// final handler detaches. A fault session may still own a waiter token and
+/// must be able to observe `HandlerDetached` before its request credit can be
+/// reclaimed. Only the deferred wake runs after the address-space lock is
+/// released.
 pub(crate) struct DetachedUffdHandler {
     wake: DeferredUffdWake,
-    retired_state: Option<Box<UffdAddressSpaceState>>,
 }
 
 impl DetachedUffdHandler {
     pub(crate) fn finish(self) {
         self.wake.finish();
-        drop(self.retired_state);
     }
+}
+
+fn detach_uffd_handler_state(
+    state: &mut Option<Box<UffdAddressSpaceState>>,
+    handler: FaultHandlerId,
+) -> AxResult<DetachedUffdHandler> {
+    let wake = state
+        .as_mut()
+        .ok_or(AxError::BadFileDescriptor)?
+        .detach_handler(handler)?;
+    Ok(DetachedUffdHandler { wake })
 }
 
 impl AddrSpace {
@@ -1501,17 +1515,7 @@ impl AddrSpace {
         &mut self,
         handler: FaultHandlerId,
     ) -> AxResult<DetachedUffdHandler> {
-        let (wake, retire_state) = {
-            let state = self.uffd.as_mut().ok_or(AxError::BadFileDescriptor)?;
-            let wake = state.detach_handler(handler)?;
-            (wake, !state.has_handlers())
-        };
-        let retired_state =
-            retire_state.then(|| self.uffd.take().expect("empty userfault state disappeared"));
-        Ok(DetachedUffdHandler {
-            wake,
-            retired_state,
-        })
+        detach_uffd_handler_state(&mut self.uffd, handler)
     }
 
     pub(crate) fn uffd_handler_pending(&self, handler: FaultHandlerId) -> AxResult<bool> {
@@ -2921,6 +2925,40 @@ mod tests {
         assert!(!state.has_handlers());
         assert_eq!(state.pending(handler), Err(AxError::BadFileDescriptor));
         detached.finish();
+    }
+
+    #[test]
+    fn final_handler_detach_retains_broker_until_address_space_teardown() {
+        let mut retained = Some(UffdAddressSpaceState::try_new_boxed().unwrap());
+        let state = retained.as_mut().unwrap();
+        let first = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let mapping = snapshot(2, 41, 0x1000, PAGE_SIZE_4K, MappingKind::AnonymousPrivate);
+        let admission = state.admit_test_request(first, request_for(mapping, first, 0x1000));
+        let original = core::ptr::from_ref::<UffdAddressSpaceState>(state);
+
+        let detached = detach_uffd_handler_state(&mut retained, first).unwrap();
+        let state = retained
+            .as_mut()
+            .expect("final close retired the fault broker");
+        assert_eq!(
+            core::ptr::from_ref::<UffdAddressSpaceState>(state),
+            original
+        );
+        assert!(!state.has_handlers());
+        assert_eq!(
+            state.observe_test_waiter(admission.waiter()).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::HandlerDetached)
+        );
+
+        let second = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            state.observe_test_waiter(admission.waiter()).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::HandlerDetached)
+        );
+
+        detached.finish();
+        state.detach_handler(second).unwrap().finish();
     }
 
     #[test]
