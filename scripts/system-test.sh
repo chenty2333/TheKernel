@@ -20,8 +20,8 @@ Options:
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
 program to complete rootfs, tmpfs, procfs, process, pipe, raw io_uring,
-userfaultfd, and seccomp ABI checks. QEMU stops after the final success marker;
-platform shutdown is tested separately from this semantic gate.
+userfaultfd, AF_PACKET, and seccomp ABI checks. QEMU stops after the final
+success marker; platform shutdown is tested separately from this semantic gate.
 EOF
 }
 
@@ -135,6 +135,13 @@ for marker in \
     THEKERNEL_USERFAULTFD_EXEC_COPY_OK \
     THEKERNEL_USERFAULTFD_OK \
     THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK \
+    THEKERNEL_PACKET_CREATE_OK \
+    THEKERNEL_PACKET_RECEIVE_OK \
+    THEKERNEL_PACKET_FAULT_OWNERSHIP_OK \
+    THEKERNEL_PACKET_SEND_OK \
+    THEKERNEL_PACKET_OPTIONS_OK \
+    THEKERNEL_PACKET_OK \
+    THEKERNEL_SYSTEM_TEST_PACKET_OK \
     THEKERNEL_SECCOMP_API_OK \
     THEKERNEL_SECCOMP_FILTER_ERRORS_OK \
     THEKERNEL_SECCOMP_UNALIGNED_OK \
@@ -172,7 +179,7 @@ do
     }
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

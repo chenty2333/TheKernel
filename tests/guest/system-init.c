@@ -229,6 +229,29 @@ static int test_userfaultfd(void) {
     return 0;
 }
 
+static int test_packet_socket(void) {
+    static const char path[] =
+        "/opt/thekernel-tests/bin/thekernel-packet-socket-smoke";
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("packet-socket-fork");
+    }
+    if (child == 0) {
+        /* Exercise the same strict Linux contract as the host differential;
+         * no target-only option or capability skip is accepted. */
+        execl(path, path, "--linux-host", "--require-options", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL packet-socket-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "packet-socket-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_PACKET_OK");
+    return 0;
+}
+
 static int test_seccomp(void) {
     static const char path[] =
         "/opt/thekernel-tests/bin/thekernel-seccomp-smoke";
@@ -337,7 +360,7 @@ int main(int argc, char **argv) {
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
         test_process_pipe_and_exec() || test_signal_wait_boundary() ||
         test_wait_boundary() || test_io_uring() || test_userfaultfd() ||
-        test_seccomp()) {
+        test_packet_socket() || test_seccomp()) {
         return 1;
     }
 

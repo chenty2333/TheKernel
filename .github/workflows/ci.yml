@@ -21,7 +21,7 @@ env:
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
   THEKERNEL_AX_REF: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
-  THEKERNEL_LINUX_ABI_REF: e1eba966b6fdd254317e9c12c545ef4f47dbbeb3
+  THEKERNEL_LINUX_ABI_REF: a50c268cd4599814a36a5c7caac4a34ed9a6f563
 
 jobs:
   per-commit:
@@ -80,6 +80,27 @@ jobs:
         with:
           name: host-seccomp-differential
           path: .state/ci/seccomp-host-differential/
+          include-hidden-files: true
+
+  # Run the AF_PACKET Linux oracle on a bare runner as well. The gate creates
+  # a fresh user and network namespace for every run and treats missing
+  # namespace/CAP_NET_RAW support as failure rather than a compatibility skip.
+  host-packet-differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run host Linux packet differential
+        run: ./scripts/ci/packet-host-differential.sh
+
+      - name: Upload packet differential evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-packet-differential
+          path: .state/ci/packet-host-differential/
           include-hidden-files: true
 
   # Full dual-architecture boot remains on the self-hosted QEMU runner. Root

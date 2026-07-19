@@ -155,6 +155,7 @@ build_guest_tool io-pin-safety.c thekernel-io-pin-safety -pthread
 build_guest_tool mm-performance.c thekernel-mm-performance -pthread
 build_guest_tool smp-tlb-shootdown.c thekernel-smp-tlb-shootdown -pthread
 build_guest_tool oom-admission.c thekernel-oom-admission
+build_guest_tool packet-socket-smoke.c thekernel-packet-socket-smoke
 build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias
 build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
 build_guest_tool seccomp-smoke.c thekernel-seccomp-smoke -pthread
