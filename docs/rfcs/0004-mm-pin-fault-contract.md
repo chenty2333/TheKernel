@@ -504,19 +504,25 @@ acceptance:
 | --- | --- |
 | TheKernel targeted UFFD host tests | 72 passed |
 | `thekernel-linux-mm` tests | 47 passed |
-| `thekernel-axfault` tests | 39 unit tests and 1 doc test passed |
+| `thekernel-axfault` tests | 40 unit tests and 1 doc test passed |
 | Native Linux helper | Passed through `THEKERNEL_USERFAULTFD_EXEC_COPY_OK` and the final marker, including the executable COPY fixture |
-| Exact current RISC-V guest | Pending |
-| Exact current LoongArch guest | Pending |
-| Current RV/LA 4- and 8-CPU UFFD/TLB execution matrix | Pending |
+| Exact current RISC-V guest | Passed all 11 bounded-profile markers, including signed error/partial progress, deferred wake, copyout-fault recovery, and executable COPY |
+| Exact current LoongArch guest | Passed the same 11 bounded-profile markers, including executable COPY into the odd 4 KiB half of an 8 KiB TLB pair |
+| Current RV/LA 4- and 8-CPU TLB and wait-boundary matrix | Passed all four runs with per-CPU liveness, 1-page and 64-page mutation cases, and zero stale translations; this matrix does not run the UFFD helper |
 | UFFD pressure, race, differential, and performance gates | Pending |
-| Clean exact-HEAD CI, package/release gate, and publication | Pending |
+| Clean exact-HEAD local CI and package/release-consumer gate | Passed with exact sibling revisions and 13 versioned crate artifacts |
+| Sibling publication and remotely fetchable GitHub CI | Pending; the accepted sibling commits are not yet advertised by their remotes |
 
 The host counts exercise state machines and ABI composition; the native Linux
-run validates the helper/reference fixture. Neither proves TheKernel guest or
-architecture behavior. Older guest logs from a smaller helper, or a failed run
-whose executable/copyout fixture was later changed, are diagnostic artifacts
-and are not current acceptance receipts.
+run validates the helper/reference fixture. The two system guests exercise the
+complete bounded helper on one virtual CPU per architecture. The separate
+four- and eight-CPU matrix covers scheduler wait boundaries and MM translation
+invalidation, but it does not execute UFFD faults across harts. Older guest
+logs from a smaller helper, or a failed run whose executable/copyout fixture
+was later changed, are diagnostic artifacts and are not current acceptance
+receipts. Local package evidence is not publication: until the two sibling
+revisions are available from their configured remotes, hosted CI cannot fetch
+the exact dependency graph.
 
 ## Rejected alternatives
 
