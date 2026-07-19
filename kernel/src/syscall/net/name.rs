@@ -1,9 +1,12 @@
-use axerrno::AxResult;
+use axerrno::{AxResult, LinuxError};
 use axnet::SocketOps;
 use linux_raw_sys::net::{sockaddr, socklen_t};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use super::{SocketSyscallSnapshot, addr::SocketAddrExt, import_socket_output_after_policy};
+use super::{
+    SocketSyscallSnapshot, addr::SocketAddrExt, import_socket_output_after_policy,
+    packet::write_socket_name,
+};
 use crate::{
     file::{PinnedSocketDescription, SocketBackendKind},
     mm::UserPtr,
@@ -32,6 +35,19 @@ pub fn sys_getsockname(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
+    if pinned.backend()? == SocketBackendKind::Packet {
+        dispatch_socket(&SocketSecurityContext::get_sock_name(
+            snapshot.actor(),
+            &socket_ref,
+        ))?;
+        // The backend result precedes output-capacity import, as in Linux's
+        // getname -> move_addr_to_user sequence.
+        let name = pinned.packet()?.get_name()?;
+        let mut length = read_socklen(addrlen)?;
+        write_socket_name(name, addr, &mut length)?;
+        write_socklen(addrlen, length)?;
+        return Ok(0);
+    }
     let mut length = import_socket_output_after_policy(
         || {
             dispatch_socket(&SocketSecurityContext::get_sock_name(
@@ -64,6 +80,15 @@ pub fn sys_getpeername(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
+    if pinned.backend()? == SocketBackendKind::Packet {
+        // `packet_getname(peer=true)` rejects before Linux imports either
+        // output pointer. Keep the security hook in front of that rejection.
+        dispatch_socket(&SocketSecurityContext::get_peer_name(
+            snapshot.actor(),
+            &socket_ref,
+        ))?;
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
     let mut length = import_socket_output_after_policy(
         || {
             dispatch_socket(&SocketSecurityContext::get_peer_name(

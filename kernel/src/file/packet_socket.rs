@@ -4,8 +4,9 @@
 //! publication, errno conversion, ordinary queue copies, and file readiness.
 //! Linux value/state rules remain in `thekernel-linux-packet`; packet capture,
 //! injection, queue budgets, and wake registration remain in `axnet-ng`.
-//! TPACKET rings, fanout, mmap, and statistics are deliberately not represented
-//! by this baseline instead of being exposed as placeholder success.
+//! TPACKET rings, fanout, and mmap are deliberately rejected instead of being
+//! exposed as placeholder success. Ordinary endpoint statistics retain their
+//! single destructive owner in Layer 1.
 
 use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{
@@ -19,20 +20,22 @@ use axnet::{
     InterfaceKind,
     packet::{
         LinkHardwareType, LinkPacketType, MAX_PACKET_FRAME_BYTES, PacketDeviceCapabilities,
-        PacketEndpoint, PacketMetadata, PacketProtocol, PacketSelector, PacketSendRequest,
-        PacketView as EndpointPacketView,
+        PacketEndpoint, PacketError as PacketMechanismError, PacketMetadata, PacketProtocol,
+        PacketSelector, PacketSendRequest, PacketView as EndpointPacketView,
     },
 };
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use thekernel_linux_packet::{
-    FrameLayout, InterfaceIndex, LinkLayerAddress, LinkLayerInfo, PacketBindRequest, PacketBinding,
-    PacketError, PacketSocketState, PacketSocketType, PacketType, ProtocolSelector, ReceiveFlags,
-    SockAddrLl,
+    FrameLayout, GetPacketOption, InterfaceIndex, LinkLayerAddress, LinkLayerInfo,
+    PacketBindRequest, PacketBinding, PacketError, PacketOptionValue, PacketSendAddress,
+    PacketSocketState, PacketSocketType, PacketStatistics, PacketType, ProtocolSelector,
+    ReceiveFlags, SetPacketOption, SockAddrLl,
 };
 
 use super::{
-    FileLike, IoDst, IoSrc, Kstat, PseudoInode, packet::socket_ifreq_ioctl, try_pseudo_inode_path,
+    FileLike, FileMmapRequest, IoDst, IoSrc, Kstat, PreparedFileMmap, PseudoInode,
+    packet::socket_ifreq_ioctl, try_pseudo_inode_path,
 };
 use crate::{readiness::block_on_poll_io, task::NetworkNamespace};
 
@@ -70,12 +73,20 @@ impl PacketReceiveResult {
     }
 }
 
-struct PacketSendPlan {
+/// Kernel-owned admission for one ordinary packet submission.
+///
+/// This freezes only normalized device and link-layer facts. It intentionally
+/// exposes neither a Linux UAPI layout nor a userspace pointer. The current
+/// namespace has no device hotplug, so the lower device cannot disappear
+/// between preparation and the single synchronous submit; a future hotplug
+/// implementation must add an explicit device generation/revocation check.
+pub(crate) struct PacketSendPlan {
     interface_index: u32,
     socket_type: PacketSocketType,
     protocol: u16,
     destination: [u8; 8],
     destination_len: usize,
+    payload_len: usize,
 }
 
 /// One AF_PACKET open-file backend.
@@ -103,7 +114,8 @@ impl PacketSocket {
         let state = PacketSocketState::new(socket_type, protocol);
         let endpoint = net_ns
             .stack()
-            .subscribe_packets(selector_for_state(&state))?;
+            .subscribe_packets(selector_for_state(&state))
+            .map_err(packet_mechanism_error)?;
         Arc::try_new(Self {
             net_ns,
             endpoint,
@@ -122,6 +134,13 @@ impl PacketSocket {
         self.state.lock().binding()
     }
 
+    /// Returns the immutable Linux packet socket type from the Layer 2 state
+    /// core. Generic SOL_SOCKET introspection uses this typed value instead of
+    /// downcasting through the unrelated network backend.
+    pub(crate) fn socket_type(&self) -> PacketSocketType {
+        self.state.lock().socket_type()
+    }
+
     /// Publishes a bind as `validate device -> lower selector -> ABI state`.
     ///
     /// The state mutex excludes another adapter transition between prepare and
@@ -136,7 +155,9 @@ impl PacketSocket {
         if !plan.is_noop() {
             let selector =
                 selector_for_binding(state.socket_type(), replacement, state.ignore_outgoing());
-            self.endpoint.set_selector(selector)?;
+            self.endpoint
+                .set_selector(selector)
+                .map_err(packet_mechanism_error)?;
         }
 
         state.publish_bind(plan).map_err(|error| {
@@ -177,6 +198,42 @@ impl PacketSocket {
             )
         };
         state.get_name(link).map_err(packet_error)
+    }
+
+    /// Applies a decoded ordinary packet option as `lower selector -> state`.
+    /// A failed selector epoch allocation leaves the Linux-visible value
+    /// unchanged.
+    pub(crate) fn set_packet_option(&self, option: SetPacketOption) -> AxResult<()> {
+        let mut state = self.state.lock();
+        let SetPacketOption::IgnoreOutgoing(enabled) = option;
+        if state.ignore_outgoing() == enabled {
+            return Ok(());
+        }
+        let selector = selector_for_binding(state.socket_type(), state.binding(), enabled);
+        self.endpoint
+            .set_selector(selector)
+            .map_err(packet_mechanism_error)?;
+        state.set_option(option);
+        Ok(())
+    }
+
+    /// Reads one decoded option. Statistics are taken and reset exactly once
+    /// by the endpoint; neither this adapter nor Layer 2 owns a second reset.
+    pub(crate) fn get_packet_option(&self, option: GetPacketOption) -> PacketOptionValue {
+        match option {
+            GetPacketOption::IgnoreOutgoing => {
+                PacketOptionValue::IgnoreOutgoing(self.state.lock().ignore_outgoing())
+            }
+            GetPacketOption::Statistics => {
+                let stats = self.endpoint.take_stats();
+                PacketOptionValue::Statistics(PacketStatistics::from_destructive_snapshot(
+                    stats.packets,
+                    stats.drops,
+                    stats.filter_rejected,
+                    stats.filter_errors,
+                ))
+            }
+        }
     }
 
     /// Performs one ordinary queue receive. `nonblocking` is an OFD snapshot;
@@ -226,41 +283,17 @@ impl PacketSocket {
         })
     }
 
-    /// Sends one already-copied ordinary RAW frame or cooked DGRAM payload.
+    /// Prepares one ordinary send without touching the payload or submitting
+    /// any lower-layer work.
     ///
-    /// Layer 1 does not yet expose device completion credits or writable
-    /// admission readiness. Consequently blocking and nonblocking sends share
-    /// this single attempt and a racing lower `WouldBlock` is returned as-is;
-    /// ring transmission, retry, and deferred completion are outside this
-    /// baseline.
-    pub(crate) fn send_with_nonblocking(
-        &self,
-        payload: &[u8],
-        destination: Option<SockAddrLl>,
-        _nonblocking: bool,
-    ) -> AxResult<usize> {
-        if payload.len() > MAX_PACKET_FRAME_BYTES {
-            return Err(LinuxError::EMSGSIZE.into());
-        }
-        let plan = self.prepare_send(payload.len(), destination)?;
-        let request = match plan.socket_type {
-            PacketSocketType::Raw => PacketSendRequest::Raw { frame: payload },
-            PacketSocketType::Datagram => PacketSendRequest::Cooked {
-                protocol: plan.protocol,
-                destination: &plan.destination[..plan.destination_len],
-                payload,
-            },
-        };
-        self.net_ns
-            .stack()
-            .send_packet(plan.interface_index, self.endpoint.id(), request)?;
-        Ok(payload.len())
-    }
-
-    fn prepare_send(
+    /// Device existence/capabilities, MTU, binding/default destination, and
+    /// the effective protocol are resolved here. Syscall and file-write
+    /// adapters must call this before copying payload bytes from userspace so
+    /// Linux mechanism errors keep precedence over a later payload fault.
+    pub(crate) fn prepare_send(
         &self,
         payload_len: usize,
-        destination: Option<SockAddrLl>,
+        destination: Option<PacketSendAddress>,
     ) -> AxResult<PacketSendPlan> {
         let state = self.state.lock();
         let socket_type = state.socket_type();
@@ -268,8 +301,7 @@ impl PacketSocket {
         drop(state);
 
         let selected_interface = destination
-            .map(SockAddrLl::interface)
-            .filter(|interface| !interface.is_any())
+            .map(PacketSendAddress::interface)
             .unwrap_or(binding.interface());
         let interface_index =
             exact_interface(selected_interface).map_err(|_| AxError::from(LinuxError::ENXIO))?;
@@ -302,27 +334,28 @@ impl PacketSocket {
                 .ok_or(AxError::InvalidInput)?,
             PacketSocketType::Datagram => info.mtu,
         };
-        if payload_len > max_len {
+        if payload_len > max_len || payload_len > MAX_PACKET_FRAME_BYTES {
             return Err(LinuxError::EMSGSIZE.into());
         }
 
         let protocol = destination
-            .map(SockAddrLl::protocol)
-            .filter(|protocol| *protocol != ProtocolSelector::Disabled)
+            .map(PacketSendAddress::protocol)
             .unwrap_or(binding.protocol())
             .host_order();
         let mut address = [0_u8; 8];
-        let destination_address = destination.map(SockAddrLl::address);
-        let destination_len =
-            if let Some(link) = destination_address.filter(|link| !link.is_empty()) {
-                if link.len() != capabilities.address_len {
-                    return Err(AxError::InvalidInput);
-                }
+        let destination_len = match (socket_type, destination) {
+            (PacketSocketType::Raw, _) => 0,
+            (PacketSocketType::Datagram, Some(destination)) => {
+                let link = destination
+                    .address_for_device(capabilities.address_len)
+                    .map_err(packet_error)?;
                 address = link.padded_bytes();
                 usize::from(link.len())
-            } else {
-                default_destination(&mut address, info.hardware_address, capabilities)?
-            };
+            }
+            (PacketSocketType::Datagram, None) => {
+                default_cooked_destination(&mut address, info.kind, capabilities)?
+            }
+        };
 
         Ok(PacketSendPlan {
             interface_index,
@@ -330,7 +363,37 @@ impl PacketSocket {
             protocol,
             destination: address,
             destination_len,
+            payload_len,
         })
+    }
+
+    /// Submits one already-copied ordinary RAW frame or cooked DGRAM payload
+    /// using a matching side-effect-free admission.
+    ///
+    /// Layer 1 does not yet expose device completion credits or writable
+    /// admission readiness. Consequently blocking and nonblocking sends share
+    /// this single attempt and a racing lower `WouldBlock` is returned as-is;
+    /// ring transmission, retry, and deferred completion are outside this
+    /// baseline.
+    pub(crate) fn send_prepared(&self, plan: PacketSendPlan, payload: &[u8]) -> AxResult<usize> {
+        if payload.len() != plan.payload_len {
+            return Err(AxError::BadState);
+        }
+        let request = match plan.socket_type {
+            PacketSocketType::Raw => PacketSendRequest::Raw {
+                protocol: plan.protocol,
+                frame: payload,
+            },
+            PacketSocketType::Datagram => PacketSendRequest::Cooked {
+                protocol: plan.protocol,
+                destination: &plan.destination[..plan.destination_len],
+                payload,
+            },
+        };
+        self.net_ns
+            .stack()
+            .send_packet(plan.interface_index, self.endpoint.id(), request)?;
+        Ok(payload.len())
     }
 }
 
@@ -342,9 +405,7 @@ impl FileLike for PacketSocket {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let len = src.remaining();
-        if len > MAX_PACKET_FRAME_BYTES {
-            return Err(LinuxError::EMSGSIZE.into());
-        }
+        let plan = self.prepare_send(len, None)?;
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(len)
@@ -353,7 +414,7 @@ impl FileLike for PacketSocket {
         // One file write is one packet. A source that violates its advertised
         // remaining length must fail instead of publishing a truncated frame.
         src.read_exact(&mut payload)?;
-        self.send_with_nonblocking(&payload, None, self.nonblocking())
+        self.send_prepared(plan, &payload)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -366,6 +427,12 @@ impl FileLike for PacketSocket {
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         socket_ifreq_ioctl(self.net_ns.stack(), cmd, arg)
+    }
+
+    fn prepare_mmap(&self, _request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        // Ordinary queues do not imply a TPACKET ring. Reject before the
+        // generic mmap adapter can misclassify this socket as a regular file.
+        Err(LinuxError::EOPNOTSUPP.into())
     }
 
     fn nonblocking(&self) -> bool {
@@ -454,22 +521,25 @@ fn exact_interface(interface: InterfaceIndex) -> AxResult<u32> {
         .ok_or(AxError::InvalidInput)
 }
 
-fn default_destination(
+fn default_cooked_destination(
     output: &mut [u8; 8],
-    hardware_address: Option<[u8; 6]>,
+    kind: InterfaceKind,
     capabilities: PacketDeviceCapabilities,
 ) -> AxResult<usize> {
     let len = usize::from(capabilities.address_len);
     if len > output.len() {
         return Err(AxError::InvalidInput);
     }
-    if let Some(address) = hardware_address {
-        if address.len() != len {
-            return Err(AxError::BadState);
+    match kind {
+        // Linux's loopback/NOARP header builder accepts a null destination and
+        // writes zeros. Ordinary Ethernet requires an explicit destination;
+        // silently substituting the local source MAC would change the frame.
+        InterfaceKind::Loopback => {
+            output[..len].fill(0);
+            Ok(len)
         }
-        output[..len].copy_from_slice(&address);
+        InterfaceKind::Ethernet => Err(AxError::InvalidInput),
     }
-    Ok(len)
 }
 
 const fn hardware_type_for_kind(kind: InterfaceKind) -> u16 {
@@ -522,10 +592,27 @@ pub(crate) fn packet_error(error: PacketError) -> AxError {
         PacketError::InvalidExactProtocol
         | PacketError::InvalidInterfaceIndex
         | PacketError::InvalidHardwareAddressLength
+        | PacketError::InvalidPacketOptionValue
         | PacketError::InvalidBindingGeneration
         | PacketError::InvalidFrameLayout
         | PacketError::InvalidCapturedLength => AxError::InvalidInput,
         _ => AxError::InvalidInput,
+    }
+}
+
+/// Maps the Linux-agnostic bounded broker's typed mechanism failures at the
+/// sole ABI ownership boundary. No lower `PacketError` is allowed to fall
+/// through an incidental `AxError` conversion.
+fn packet_mechanism_error(error: PacketMechanismError) -> AxError {
+    match error {
+        PacketMechanismError::Allocation => AxError::NoMemory,
+        PacketMechanismError::InvalidInput => AxError::InvalidInput,
+        // A live `PacketSocket` owns both its namespace and broker endpoint.
+        // Reaching a detached broker here is therefore an internal lifecycle
+        // violation, not an observable device-removal condition.
+        PacketMechanismError::Detached => AxError::BadState,
+        PacketMechanismError::SequenceExhausted => LinuxError::EOVERFLOW.into(),
+        PacketMechanismError::Capacity(_) => LinuxError::ENOBUFS.into(),
     }
 }
 
@@ -602,14 +689,14 @@ mod tests {
         NetworkNamespace::try_new_loopback_only(UserNamespace::try_new_root().unwrap()).unwrap()
     }
 
-    fn loopback_address(protocol: ProtocolSelector) -> SockAddrLl {
-        SockAddrLl::new(
-            InterfaceIndex::exact(1).unwrap(),
-            protocol,
-            ARPHRD_LOOPBACK,
-            PacketType::HOST,
-            LinkLayerAddress::new([0; 8], 6).unwrap(),
+    fn loopback_send_address(protocol: ProtocolSelector) -> PacketSendAddress {
+        PacketSendAddress::try_from_network_order_fields(
+            protocol.to_network_order_u16(),
+            1,
+            6,
+            [0; 8],
         )
+        .unwrap()
     }
 
     fn raw_ipv4_frame() -> [u8; 34] {
@@ -619,6 +706,161 @@ mod tests {
         frame[16..18].copy_from_slice(&20_u16.to_be_bytes());
         frame[22] = 64;
         frame
+    }
+
+    fn submit(
+        socket: &PacketSocket,
+        payload: &[u8],
+        destination: Option<PacketSendAddress>,
+    ) -> AxResult<usize> {
+        let plan = socket.prepare_send(payload.len(), destination)?;
+        socket.send_prepared(plan, payload)
+    }
+
+    fn packet_capabilities(hardware_type: LinkHardwareType) -> PacketDeviceCapabilities {
+        PacketDeviceCapabilities {
+            hardware_type,
+            raw_receive: true,
+            raw_send: true,
+            cooked_receive: true,
+            cooked_send: true,
+            link_header_len: 14,
+            address_len: 6,
+        }
+    }
+
+    #[test]
+    fn typed_packet_mechanism_errors_are_mapped_only_at_the_linux_adapter() {
+        use axnet::packet::PacketCapacity;
+
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::Allocation),
+            AxError::NoMemory
+        );
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::InvalidInput),
+            AxError::InvalidInput
+        );
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::Detached),
+            AxError::BadState
+        );
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::SequenceExhausted),
+            LinuxError::EOVERFLOW.into()
+        );
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::Capacity(
+                PacketCapacity::EndpointRegistry,
+            )),
+            LinuxError::ENOBUFS.into()
+        );
+        assert_eq!(
+            packet_mechanism_error(PacketMechanismError::Capacity(
+                PacketCapacity::SelectorEpochs,
+            )),
+            LinuxError::ENOBUFS.into()
+        );
+    }
+
+    #[test]
+    fn cooked_null_destination_is_loopback_only_and_canonical_zero() {
+        let mut loopback = [9_u8; 8];
+        assert_eq!(
+            default_cooked_destination(
+                &mut loopback,
+                InterfaceKind::Loopback,
+                packet_capabilities(LinkHardwareType::Loopback),
+            ),
+            Ok(6)
+        );
+        assert_eq!(&loopback[..6], &[0; 6]);
+
+        let mut ethernet = [0_u8; 8];
+        assert_eq!(
+            default_cooked_destination(
+                &mut ethernet,
+                InterfaceKind::Ethernet,
+                packet_capabilities(LinkHardwareType::Ethernet),
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn explicit_send_address_never_inherits_zero_fields_or_declared_halen() {
+        let _context = packet_test_context();
+        let socket = PacketSocket::try_new(
+            PacketSocketType::Datagram,
+            ProtocolSelector::from_host_order(0x0800),
+            namespace(),
+        )
+        .unwrap();
+        let raw_address = [1, 2, 3, 4, 5, 6, 7, 8];
+        let destination =
+            PacketSendAddress::try_from_network_order_fields(0, 1, 0, raw_address).unwrap();
+        let plan = socket.prepare_send(20, Some(destination)).unwrap();
+        assert_eq!(plan.interface_index, 1);
+        assert_eq!(plan.protocol, 0);
+        assert_eq!(plan.destination_len, 6);
+        assert_eq!(&plan.destination[..6], &raw_address[..6]);
+
+        let wildcard =
+            PacketSendAddress::try_from_network_order_fields(0, 0, 0, raw_address).unwrap();
+        let error = match socket.prepare_send(20, Some(wildcard)) {
+            Ok(_) => panic!("explicit wildcard unexpectedly inherited the bound interface"),
+            Err(error) => error,
+        };
+        assert_eq!(error, LinuxError::ENXIO.into());
+    }
+
+    #[test]
+    fn packet_options_update_selector_and_statistics_have_one_reset_owner() {
+        let _context = packet_test_context();
+        let net_ns = namespace();
+        let receiver =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
+                .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
+                .unwrap();
+
+        assert_eq!(
+            receiver.get_packet_option(GetPacketOption::IgnoreOutgoing),
+            PacketOptionValue::IgnoreOutgoing(false)
+        );
+        receiver
+            .set_packet_option(SetPacketOption::IgnoreOutgoing(true))
+            .unwrap();
+        assert_eq!(
+            receiver.get_packet_option(GetPacketOption::IgnoreOutgoing),
+            PacketOptionValue::IgnoreOutgoing(true)
+        );
+
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
+        net_ns.stack().poll_interfaces();
+
+        let PacketOptionValue::Statistics(first) =
+            receiver.get_packet_option(GetPacketOption::Statistics)
+        else {
+            panic!("statistics query returned a different option value")
+        };
+        assert_eq!(first.packets(), 1);
+        assert_eq!(first.drops(), 0);
+
+        let PacketOptionValue::Statistics(second) =
+            receiver.get_packet_option(GetPacketOption::Statistics)
+        else {
+            panic!("statistics query returned a different option value")
+        };
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -668,13 +910,14 @@ mod tests {
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
                 .unwrap();
 
-        sender
-            .send_with_nonblocking(
-                &raw_ipv4_frame(),
-                Some(loopback_address(ProtocolSelector::from_host_order(0x0800))),
-                true,
-            )
-            .unwrap();
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
         net_ns.stack().poll_interfaces();
 
         assert_eq!(all.endpoint.queue_usage().0, 2);
@@ -691,13 +934,14 @@ mod tests {
                 .unwrap();
         let sender =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns).unwrap();
-        sender
-            .send_with_nonblocking(
-                &raw_ipv4_frame(),
-                Some(loopback_address(ProtocolSelector::from_host_order(0x0800))),
-                true,
-            )
-            .unwrap();
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
 
         let mut bytes = [0_u8; 8];
         let mut dst = &mut bytes[..];
@@ -721,13 +965,14 @@ mod tests {
         let sender =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns).unwrap();
 
-        sender
-            .send_with_nonblocking(
-                &raw_ipv4_frame(),
-                Some(loopback_address(ProtocolSelector::from_host_order(0x0800))),
-                true,
-            )
-            .unwrap();
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
         assert_eq!(receiver.endpoint.queue_usage().0, 1);
         let mut ordinary = FaultDst {
             remaining: raw_ipv4_frame().len(),
@@ -738,13 +983,14 @@ mod tests {
         );
         assert_eq!(receiver.endpoint.queue_usage().0, 0);
 
-        sender
-            .send_with_nonblocking(
-                &raw_ipv4_frame(),
-                Some(loopback_address(ProtocolSelector::from_host_order(0x0800))),
-                true,
-            )
-            .unwrap();
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
         assert_eq!(receiver.endpoint.queue_usage().0, 1);
         let mut peek = FaultDst {
             remaining: raw_ipv4_frame().len(),
@@ -765,6 +1011,12 @@ mod tests {
             namespace(),
         )
         .unwrap();
+        socket
+            .bind(PacketBindRequest::new(
+                InterfaceIndex::exact(1).unwrap(),
+                ProtocolSelector::from_host_order(0x0800),
+            ))
+            .unwrap();
         let mut source = ShortSrc {
             bytes: &[1, 2, 3],
             offset: 0,

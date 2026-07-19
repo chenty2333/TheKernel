@@ -21,13 +21,17 @@ use linux_raw_sys::{
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
-use super::{SocketSyscallSnapshot, addr::SocketAddrExt};
+use super::{
+    SocketSyscallSnapshot,
+    addr::SocketAddrExt,
+    packet::{decode_bind_address, snapshot_address},
+};
 use crate::{
     file::{
-        AcceptedSocketSecurityRef, AfAlgSocket, FileDescription, FileLike, NetlinkSocket,
-        PacketSocket, PendingSocketSecurityRef, PinnedSocketDescription, PreparedSocketAddress,
-        Socket, SocketBackendKind, af_alg, close_file_like, packet_socket::packet_error,
-        permission::VfsSecurityContext, reserve_fd,
+        AcceptedSocketSecurityRef, AfAlgSocket, BareAcceptedSocketSecurityRef, FileDescription,
+        FileLike, NetlinkSocket, PacketSocket, PendingSocketSecurityRef, PinnedSocketDescription,
+        PreparedSocketAddress, Socket, SocketBackendKind, af_alg, close_file_like,
+        packet_socket::packet_error, permission::VfsSecurityContext, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
     task::{
@@ -324,7 +328,21 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             ))?;
             pinned.netlink()?.bind(port_id, addr.nl_groups)?;
         }
-        SocketBackendKind::Packet => return Err(LinuxError::EOPNOTSUPP.into()),
+        SocketBackendKind::Packet => {
+            let address = snapshot_address(addr, addrlen)?;
+            let prepared = PreparedSocketAddress::Packet(address);
+            dispatch_socket(&SocketSecurityContext::bind(
+                actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
+            let PreparedSocketAddress::Packet(address) = &prepared else {
+                unreachable!();
+            };
+            let request = decode_bind_address(address)?;
+            pinned.packet()?.bind(request)?;
+        }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
             let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
@@ -368,6 +386,23 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
     // a sibling sharing the fd table can no longer redirect the operation by
     // closing and reusing the numeric descriptor between those two steps.
     let pinned = PinnedSocketDescription::pin_fd(fd)?;
+
+    if pinned.backend() == Ok(SocketBackendKind::Packet) {
+        // Linux's generic connect layer copies the complete bounded address,
+        // runs the security hook, and only then reaches sock_no_connect.
+        // It does not impose sockaddr_ll bind/send validation here.
+        let address = snapshot_address(addr, addrlen)?;
+        let actor = snapshot.actor();
+        let socket_ref = pinned.security_ref()?;
+        let prepared = PreparedSocketAddress::Packet(address);
+        dispatch_socket(&SocketSecurityContext::connect(
+            actor,
+            &socket_ref,
+            &prepared,
+            addrlen as usize,
+        ))?;
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
 
     if addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
         && super::addr::read_family(addr, addrlen)? as u32 == AF_UNSPEC
@@ -474,7 +509,6 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
 
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
-    let socket = pinned.network()?;
     // Linux compares `(unsigned int)backlog` with somaxconn. Negative values
     // therefore clamp to the namespace maximum rather than to zero.
     let backlog = clamp_listen_backlog(backlog);
@@ -487,6 +521,10 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
         &socket_ref,
         prepared_backlog,
     ))?;
+    if pinned.backend()? == SocketBackendKind::Packet {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let socket = pinned.network()?;
     if let SocketInner::Unix(unix) = &socket.inner {
         unix.listen_as(backlog, snapshot.unix_credentials())?;
     } else {
@@ -518,6 +556,23 @@ pub fn sys_accept4(
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let actor = snapshot.actor();
     let listening_ref = pinned.security_ref()?;
+    if pinned.backend()? == SocketBackendKind::Packet {
+        // AF_PACKET installs `sock_no_accept`, but Linux invokes
+        // security_socket_accept() with an otherwise bare `newsock` first.
+        // Preserve that policy ordering without allocating/subscribing an
+        // endpoint which can never be published.
+        let bare_ref = BareAcceptedSocketSecurityRef::new(
+            SocketBackendKind::Packet,
+            listening_ref.net_namespace(),
+        );
+        let accepted_ref = AcceptedSocketSecurityRef::Bare(bare_ref);
+        dispatch_socket(&SocketSecurityContext::accept(
+            &actor,
+            &listening_ref,
+            &accepted_ref,
+        ))?;
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
     if pinned.backend()? == SocketBackendKind::AfAlg {
         let request = pinned.af_alg()?.accept_request()?;
         let request = prepare_new_socket_like(request, nonblocking)?;
@@ -566,7 +621,6 @@ pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
 
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
-    let socket = pinned.network()?;
     let actor = snapshot.actor();
     let socket_ref = pinned.security_ref()?;
     dispatch_socket(&SocketSecurityContext::shutdown(
@@ -574,6 +628,10 @@ pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
         &socket_ref,
         how as i32,
     ))?;
+    if pinned.backend()? == SocketBackendKind::Packet {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let socket = pinned.network()?;
     let how = match how {
         SHUT_RD => Shutdown::Read,
         SHUT_WR => Shutdown::Write,

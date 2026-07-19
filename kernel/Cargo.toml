@@ -90,6 +90,7 @@ linux-vfs.workspace = true
 linux-raw-sys = { version = "0.12", default-features = false, features = [
     "no_std",
     "general",
+    "if_packet",
     "net",
     "prctl",
     "system",

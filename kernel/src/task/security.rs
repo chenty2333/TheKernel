@@ -6295,14 +6295,16 @@ mod tests {
     use super::*;
     use crate::{
         file::{
-            namespace_mutation,
+            BareAcceptedSocketSecurityRef, FileDescription, FileLike, PacketSockaddrSnapshot,
+            PacketSocket, PinnedSocketDescription, SocketBackendKind, namespace_mutation,
+            packet_socket::packet_test_context,
             permission::{SecurityFsContextExt, VfsSecurityContext},
         },
         mm::Backend,
         pseudofs::MemoryFs,
         task::{
             CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime,
-            ExecFileIdentity, ExecImageIdentity, IdMapInputExtent, Kgid, Kuid,
+            ExecFileIdentity, ExecImageIdentity, IdMapInputExtent, Kgid, Kuid, NetworkNamespace,
             creds::{
                 CAPABILITY_WORDS, capability_state_for_test, credential_publication_lock_held,
             },
@@ -6385,6 +6387,8 @@ mod tests {
     static CRED_STATE_INODE_RENAME_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_FILE_OPEN_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_SOCKET_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_SOCKET_BARE_ACCEPT_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_MMAP_FILE_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_MMAP_ADDR_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_MPROTECT_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -6462,6 +6466,8 @@ mod tests {
             &CRED_STATE_INODE_RENAME_TRACE,
             &CRED_STATE_FILE_OPEN_TRACE,
             &CRED_STATE_SOCKET_TRACE,
+            &CRED_STATE_SOCKET_BARE_ACCEPT_TRACE,
+            &CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE,
             &CRED_STATE_MMAP_FILE_TRACE,
             &CRED_STATE_MMAP_ADDR_TRACE,
             &CRED_STATE_MPROTECT_TRACE,
@@ -7195,7 +7201,49 @@ mod tests {
             assert!(actor_state.committed.load(Ordering::SeqCst));
             let operation_actor = match context.operation() {
                 SocketSecurityOperation::Create(operation) => operation.actor(),
-                _ => panic!("socket registry probe expects create context"),
+                SocketSecurityOperation::Accept(operation) => {
+                    let listening = operation.listening_socket();
+                    let AcceptedSocketSecurityRef::Bare(accepted) = operation.new_socket() else {
+                        panic!("bare accept probe received a published accepted socket")
+                    };
+                    assert_eq!(listening.backend(), SocketBackendKind::Packet);
+                    assert_eq!(accepted.backend(), SocketBackendKind::Packet);
+                    assert_eq!(accepted.published_ofd_identity(), None);
+                    let listening_namespace = listening
+                        .net_namespace()
+                        .expect("packet listener carries its network namespace");
+                    let accepted_namespace = accepted
+                        .net_namespace()
+                        .expect("bare packet newsock carries its network namespace");
+                    assert!(Arc::ptr_eq(listening_namespace, accepted_namespace));
+                    append_trace(&CRED_STATE_SOCKET_BARE_ACCEPT_TRACE, key);
+                    operation.actor()
+                }
+                SocketSecurityOperation::Bind(operation) => {
+                    assert_eq!(operation.socket().backend(), SocketBackendKind::Packet);
+                    let PreparedSocketAddress::Packet(address) = operation.address() else {
+                        panic!("packet bind probe received a decoded/non-packet address")
+                    };
+                    assert_eq!(operation.address_length(), address.len());
+                    append_trace(&CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE, key);
+                    operation.actor()
+                }
+                SocketSecurityOperation::SendMessage(operation) => {
+                    assert_eq!(operation.socket().backend(), SocketBackendKind::Packet);
+                    if let Some(address) = operation.prepared_message().packet_address() {
+                        assert_eq!(operation.prepared_message().name_length(), address.len());
+                        append_trace(&CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE, key);
+                    } else {
+                        // Plain `write(2)` has no destination sockaddr. It is
+                        // still a typed Packet send operation and must remain
+                        // policy-visible without manufacturing an address.
+                        assert_eq!(operation.prepared_message().name_length(), 0);
+                    }
+                    operation.actor()
+                }
+                _ => panic!(
+                    "socket registry probe expects create, packet snapshot, or bare accept context"
+                ),
             };
             assert!(core::ptr::eq(context.actor().core(), operation_actor));
             append_trace(&CRED_STATE_SOCKET_TRACE, key);
@@ -11503,6 +11551,107 @@ mod tests {
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bare_packet_accept_context_is_typed_and_policy_denial_precedes_no_accept() {
+        let _probe_guard = reset_credential_state_probes();
+        let _packet_guard = packet_test_context();
+        let registry = probe_registry();
+        let user_namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, user_namespace.clone()).unwrap();
+        let net_namespace = NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
+        let packet = PacketSocket::try_new(
+            thekernel_linux_packet::PacketSocketType::Raw,
+            thekernel_linux_packet::ProtocolSelector::Disabled,
+            net_namespace.clone(),
+        )
+        .unwrap();
+        let packet_file: Arc<dyn FileLike> = packet;
+        let description = FileDescription::new(packet_file).unwrap();
+        let pinned = PinnedSocketDescription::from_description(description).unwrap();
+        let listening = pinned.security_ref().unwrap();
+        let accepted = AcceptedSocketSecurityRef::Bare(BareAcceptedSocketSecurityRef::new(
+            SocketBackendKind::Packet,
+            Some(&net_namespace),
+        ));
+        let context = SocketSecurityContext::accept(&actor, &listening, &accepted);
+
+        dispatch_socket(&context).unwrap();
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(
+            CRED_STATE_SOCKET_BARE_ACCEPT_TRACE.load(Ordering::SeqCst),
+            23
+        );
+
+        CRED_STATE_SOCKET_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_SOCKET_BARE_ACCEPT_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_SOCKET_DENY_KEY.store(2, Ordering::SeqCst);
+        assert_eq!(dispatch_socket(&context), Err(AxError::PermissionDenied));
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            CRED_STATE_SOCKET_BARE_ACCEPT_TRACE.load(Ordering::SeqCst),
+            2
+        );
+        CRED_STATE_SOCKET_DENY_KEY.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn invalid_packet_addresses_are_copied_into_context_before_policy_denial() {
+        let _probe_guard = reset_credential_state_probes();
+        let _packet_guard = packet_test_context();
+        let registry = probe_registry();
+        let user_namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, user_namespace.clone()).unwrap();
+        let net_namespace = NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
+        let packet = PacketSocket::try_new(
+            thekernel_linux_packet::PacketSocketType::Raw,
+            thekernel_linux_packet::ProtocolSelector::Disabled,
+            net_namespace,
+        )
+        .unwrap();
+        let packet_file: Arc<dyn FileLike> = packet;
+        let description = FileDescription::new(packet_file).unwrap();
+        let pinned = PinnedSocketDescription::from_description(description).unwrap();
+        let socket = pinned.security_ref().unwrap();
+
+        fn snapshot(length: usize, family: u16, interface: i32) -> PacketSockaddrSnapshot {
+            let mut storage = [0_u8; crate::file::PACKET_SOCKADDR_STORAGE_LEN];
+            storage[..2].copy_from_slice(&family.to_ne_bytes());
+            storage[4..8].copy_from_slice(&interface.to_ne_bytes());
+            PacketSockaddrSnapshot::new(storage, length).unwrap()
+        }
+
+        let short = snapshot(19, linux_raw_sys::net::AF_PACKET as u16, 1);
+        let wrong_family = snapshot(20, 0, 1);
+        let negative_interface = snapshot(20, linux_raw_sys::net::AF_PACKET as u16, -1);
+
+        CRED_STATE_SOCKET_DENY_KEY.store(2, Ordering::SeqCst);
+        for address in [short.clone(), wrong_family, negative_interface] {
+            CRED_STATE_SOCKET_TRACE.store(0, Ordering::SeqCst);
+            CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE.store(0, Ordering::SeqCst);
+            let prepared = PreparedSocketAddress::Packet(address.clone());
+            let context = SocketSecurityContext::bind(&actor, &socket, &prepared, address.len());
+            assert_eq!(dispatch_socket(&context), Err(AxError::PermissionDenied));
+            assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE.load(Ordering::SeqCst),
+                2
+            );
+        }
+
+        CRED_STATE_SOCKET_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE.store(0, Ordering::SeqCst);
+        let message = PreparedSocketMessage::new(linux_raw_sys::net::MSG_OOB, 1, short.len(), 0, 0)
+            .with_packet_address(short);
+        let context = SocketSecurityContext::send_message(&actor, &socket, &message, 16);
+        assert_eq!(dispatch_socket(&context), Err(AxError::PermissionDenied));
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            CRED_STATE_SOCKET_PACKET_SNAPSHOT_TRACE.load(Ordering::SeqCst),
+            2
+        );
+        CRED_STATE_SOCKET_DENY_KEY.store(0, Ordering::SeqCst);
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod cmsg;
 mod io;
 mod name;
 mod opt;
+mod packet;
 mod socket;
 
 use alloc::sync::Arc;

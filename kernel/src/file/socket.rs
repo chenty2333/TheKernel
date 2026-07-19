@@ -8,14 +8,50 @@ use axnet::{
 
 use super::{
     af_alg::AfAlgSocket,
-    desc::{FileDescription, OfdIoStatus},
+    desc::{FileDescription, FileHandle, OfdIoStatus},
     fd_table::get_file_description,
     fs::File,
     net::Socket,
     netlink::NetlinkSocket,
     packet_socket::PacketSocket,
+    types::FileLike,
 };
 use crate::task::NetworkNamespace;
+
+/// Linux bounds imported socket addresses by `sockaddr_storage` before any
+/// protocol-specific validation or security hook dispatch.
+pub(crate) const PACKET_SOCKADDR_STORAGE_LEN: usize = 128;
+
+/// One complete, kernel-owned AF_PACKET address snapshot.
+///
+/// The prefix has been copied from userspace exactly once, but its family,
+/// minimum structure size, interface index, protocol, and hardware address
+/// remain intentionally undecoded until after the relevant security hook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PacketSockaddrSnapshot {
+    storage: [u8; PACKET_SOCKADDR_STORAGE_LEN],
+    length: u8,
+}
+
+impl PacketSockaddrSnapshot {
+    pub(crate) fn new(storage: [u8; PACKET_SOCKADDR_STORAGE_LEN], length: usize) -> AxResult<Self> {
+        if length > PACKET_SOCKADDR_STORAGE_LEN {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(Self {
+            storage,
+            length: length as u8,
+        })
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.length as usize
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.storage[..self.len()]
+    }
+}
 
 /// Concrete socket backend retained by one pinned open file description.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,18 +69,20 @@ pub(crate) enum SocketBackendKind {
 pub(crate) enum PreparedSocketAddress {
     Network(SocketAddrEx),
     Netlink(super::netlink::SockaddrNl),
+    Packet(PacketSockaddrSnapshot),
     AfAlg(super::af_alg::SockAddrAlg),
     Unspecified,
 }
 
 /// Copied message-layout facts shared by send and receive policy leaves.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedSocketMessage {
     flags: u32,
     iov_count: usize,
     name_length: usize,
     control_length: usize,
     ancillary_items: usize,
+    packet_address: Option<PacketSockaddrSnapshot>,
 }
 
 impl PreparedSocketMessage {
@@ -61,7 +99,13 @@ impl PreparedSocketMessage {
             name_length,
             control_length,
             ancillary_items,
+            packet_address: None,
         }
+    }
+
+    pub(crate) fn with_packet_address(mut self, address: PacketSockaddrSnapshot) -> Self {
+        self.packet_address = Some(address);
+        self
     }
 
     pub(crate) const fn flags(&self) -> u32 {
@@ -82,6 +126,10 @@ impl PreparedSocketMessage {
 
     pub(crate) const fn ancillary_items(&self) -> usize {
         self.ancillary_items
+    }
+
+    pub(crate) const fn packet_address(&self) -> Option<&PacketSockaddrSnapshot> {
+        self.packet_address.as_ref()
     }
 }
 
@@ -115,10 +163,50 @@ pub(crate) struct PendingSocketSecurityRef<'a> {
     _reservation: PhantomData<&'a ()>,
 }
 
+/// Typed policy projection of Linux's pre-accept `newsock` before it owns an
+/// endpoint or an open-file-description identity.
+///
+/// Some backends install `sock_no_accept`, but Linux still supplies a bare
+/// socket to `security_socket_accept` before reporting that mechanism error.
+/// This projection makes that hook input explicit without allocating or
+/// subscribing a lower endpoint merely to manufacture an identity.
+#[derive(Clone, Copy)]
+pub(crate) struct BareAcceptedSocketSecurityRef<'a> {
+    backend: SocketBackendKind,
+    net_namespace: Option<&'a Arc<NetworkNamespace>>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum AcceptedSocketSecurityRef<'a> {
     Description(SocketSecurityRef<'a>),
     Pending(PendingSocketSecurityRef<'a>),
+    Bare(BareAcceptedSocketSecurityRef<'a>),
+}
+
+impl<'a> BareAcceptedSocketSecurityRef<'a> {
+    pub(crate) const fn new(
+        backend: SocketBackendKind,
+        net_namespace: Option<&'a Arc<NetworkNamespace>>,
+    ) -> Self {
+        Self {
+            backend,
+            net_namespace,
+        }
+    }
+
+    pub(crate) const fn backend(self) -> SocketBackendKind {
+        self.backend
+    }
+
+    pub(crate) const fn net_namespace(self) -> Option<&'a Arc<NetworkNamespace>> {
+        self.net_namespace
+    }
+
+    /// A bare pre-accept socket has not reached OFD publication and therefore
+    /// deliberately exposes no synthetic replacement identity.
+    pub(crate) const fn published_ofd_identity(self) -> Option<u64> {
+        None
+    }
 }
 
 impl<'a> PendingSocketSecurityRef<'a> {
@@ -203,6 +291,31 @@ impl PinnedSocketDescription {
     /// Stabilizes an already allocated but unpublished socket description.
     pub(crate) fn from_description(description: Arc<FileDescription>) -> AxResult<Self> {
         Self::from_lookup(|| Ok(description))
+    }
+
+    /// Classifies a socket from an already retained exact OFD and the status
+    /// snapshot captured for the same ordinary-I/O operation.
+    ///
+    /// This constructor never performs a numeric-fd lookup. Generic read/write
+    /// adapters use it to dispatch socket policy without allowing close+reuse
+    /// to redirect the operation after `FileHandle` acquisition.
+    pub(crate) fn from_file_handle(
+        handle: &FileHandle<dyn FileLike>,
+        io_status: OfdIoStatus,
+    ) -> AxResult<Option<Self>> {
+        handle.check_io_status(io_status)?;
+        debug_assert!(Arc::ptr_eq(&handle.description.inner, &handle.file));
+        let description = handle.description.clone();
+        let backend = match Self::classify(&description, io_status) {
+            Ok(backend) => backend,
+            Err(AxError::NotASocket) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(Self {
+            description,
+            backend: Ok(backend),
+            io_status,
+        }))
     }
 
     fn from_lookup(lookup: impl FnOnce() -> AxResult<Arc<FileDescription>>) -> AxResult<Self> {
@@ -417,6 +530,41 @@ mod tests {
             assert_eq!(lookups.get(), 1);
             assert_eq!(pinned.backend(), Ok(expected));
         }
+    }
+
+    #[test]
+    fn exact_file_handle_constructor_reuses_one_ofd_and_captured_status() {
+        let _context = packet_test_context();
+        let [_network, _netlink, packet, _af_alg] = socket_descriptions();
+        let handle = packet.file_handle();
+        let status = handle.io_status_snapshot();
+        let pinned = PinnedSocketDescription::from_file_handle(&handle, status)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(pinned.backend(), Ok(SocketBackendKind::Packet));
+        assert_eq!(pinned.nonblocking(), status.nonblocking());
+        assert_eq!(
+            pinned.security_ref().unwrap().ofd_identity(),
+            handle.open_file_description_key()
+        );
+        assert!(Arc::ptr_eq(&pinned.description, &handle.description));
+
+        assert!(matches!(
+            PinnedSocketDescription::from_file_handle(&handle, OfdIoStatus::new(O_PATH)),
+            Err(AxError::BadFileDescriptor)
+        ));
+
+        let non_socket = description(Arc::new(NonSocket), 0);
+        let non_socket = non_socket.file_handle();
+        assert!(
+            PinnedSocketDescription::from_file_handle(
+                &non_socket,
+                non_socket.io_status_snapshot(),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

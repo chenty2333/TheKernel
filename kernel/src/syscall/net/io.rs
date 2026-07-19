@@ -21,11 +21,16 @@ use linux_raw_sys::{
 };
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{vm_read_slice, vm_write_slice};
+use thekernel_linux_packet::ReceiveFlags as PacketReceiveFlags;
 
-use super::{SocketSyscallSnapshot, addr::SocketAddrExt};
+use super::{
+    SocketSyscallSnapshot,
+    addr::SocketAddrExt,
+    packet::{decode_send_address, snapshot_address, write_received_address},
+};
 use crate::{
     file::{
-        FileLike, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind,
+        FileLike, PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind,
         af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
     },
     mm::{
@@ -158,17 +163,61 @@ fn write_user_field<T: Copy>(base: usize, offset: usize, value: T) -> AxResult {
     write_user_copy(UserPtr::<T>::from(address), value)
 }
 
-fn validate_recvmsg_flags(flags: u32) -> AxResult<RecvFlags> {
-    if flags & !SUPPORTED_RECVMSG_FLAGS != 0 {
+#[derive(Clone, Copy, Debug)]
+struct ValidatedRecvFlags {
+    raw: u32,
+    generic: RecvFlags,
+    defer_packet_mechanism: bool,
+}
+
+impl ValidatedRecvFlags {
+    fn packet_flags(self) -> AxResult<PacketReceiveFlags> {
+        debug_assert!(self.defer_packet_mechanism);
+        // These are valid generic recvmsg flag bits, but AF_PACKET rejects or
+        // short-circuits them in its protocol receive operation. Keep that
+        // mechanism decision after security_socket_recvmsg.
+        if self.raw & !SUPPORTED_RECVMSG_FLAGS != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if self.raw & MSG_OOB != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if self.raw & MSG_ERRQUEUE != 0 {
+            return Err(LinuxError::EAGAIN.into());
+        }
+        if self.raw & MSG_WAITALL != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let mut bits = 0;
+        if self.generic.contains(RecvFlags::PEEK) {
+            bits |= MSG_PEEK;
+        }
+        if self.generic.contains(RecvFlags::TRUNCATE) {
+            bits |= MSG_TRUNC;
+        }
+        PacketReceiveFlags::from_bits(bits).map_err(crate::file::packet_socket::packet_error)
+    }
+
+    fn insert_dont_wait(&mut self) {
+        self.raw |= MSG_DONTWAIT;
+        self.generic |= RecvFlags::DONT_WAIT;
+    }
+}
+
+fn validate_recvmsg_flags(
+    flags: u32,
+    defer_packet_mechanism: bool,
+) -> AxResult<ValidatedRecvFlags> {
+    if !defer_packet_mechanism && flags & !SUPPORTED_RECVMSG_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & MSG_OOB != 0 {
+    if !defer_packet_mechanism && flags & MSG_OOB != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & MSG_ERRQUEUE != 0 {
+    if !defer_packet_mechanism && flags & MSG_ERRQUEUE != 0 {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
-    if flags & MSG_WAITALL != 0 {
+    if !defer_packet_mechanism && flags & MSG_WAITALL != 0 {
         return Err(AxError::OperationNotSupported);
     }
 
@@ -182,7 +231,11 @@ fn validate_recvmsg_flags(flags: u32) -> AxResult<RecvFlags> {
     if flags & MSG_DONTWAIT != 0 {
         recv_flags |= RecvFlags::DONT_WAIT;
     }
-    Ok(recv_flags)
+    Ok(ValidatedRecvFlags {
+        raw: flags,
+        generic: recv_flags,
+        defer_packet_mechanism,
+    })
 }
 
 fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
@@ -301,6 +354,31 @@ const fn effective_message_flags(flags: u32, nonblocking: bool) -> u32 {
     }
 }
 
+/// Completes the AF_PACKET mechanism phase after policy admission.
+///
+/// The lower-device/MTU plan is prepared before allocation or payload copy.
+/// This is the ordering Linux's `packet_snd` relies on: an invalid explicit
+/// interface remains `ENXIO` even when the payload mapping would later fault.
+fn send_packet_after_security(
+    socket: &PacketSocket,
+    mut src: impl Read + IoBuf,
+    destination: Option<thekernel_linux_packet::PacketSendAddress>,
+    ancillary_items: usize,
+) -> AxResult<usize> {
+    let len = src.remaining();
+    let plan = socket.prepare_send(len, destination)?;
+    if ancillary_items != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(len)
+        .map_err(|_| AxError::NoMemory)?;
+    payload.resize(len, 0);
+    src.read_exact(&mut payload)?;
+    socket.send_prepared(plan, &payload)
+}
+
 fn send_impl(
     socket: &PinnedSocketDescription,
     snapshot: &SocketSyscallSnapshot,
@@ -310,23 +388,39 @@ fn send_impl(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
     cmsg: Vec<CMsgData>,
+    packet_control_length: usize,
     iov_count: usize,
     control_length: usize,
 ) -> AxResult<isize> {
-    let send_flags = validate_sendmsg_flags(flags)?;
     let backend = socket.backend()?;
-    let addr = if backend == SocketBackendKind::Network && !addr.is_null() && addrlen != 0 {
-        Some(SocketAddrEx::read_from_user(addr, addrlen)?)
-    } else {
+    let send_flags = if backend == SocketBackendKind::Packet {
         None
+    } else {
+        Some(validate_sendmsg_flags(flags)?)
     };
-    let message = PreparedSocketMessage::new(
+    let (network_addr, packet_address) = match backend {
+        SocketBackendKind::Network if !addr.is_null() && addrlen != 0 => {
+            (Some(SocketAddrEx::read_from_user(addr, addrlen)?), None)
+        }
+        SocketBackendKind::Packet if !addr.is_null() => {
+            (None, Some(snapshot_address(addr, addrlen)?))
+        }
+        _ => (None, None),
+    };
+    let mut message = PreparedSocketMessage::new(
         flags,
         iov_count,
-        if addr.is_some() { addrlen as usize } else { 0 },
+        if network_addr.is_some() || packet_address.is_some() {
+            addrlen as usize
+        } else {
+            0
+        },
         control_length,
         cmsg.len(),
     );
+    if let Some(address) = packet_address.clone() {
+        message = message.with_packet_address(address);
+    }
     let socket_ref = socket.security_ref()?;
     dispatch_socket(&SocketSecurityContext::send_message(
         snapshot.actor(),
@@ -344,7 +438,22 @@ fn send_impl(
         return socket.write(&mut src).map(|sent| sent as isize);
     }
 
-    debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
+    if backend == SocketBackendKind::Packet {
+        // AF_PACKET flag interpretation and ancillary support are protocol
+        // mechanism decisions. The raw flags/control length were visible to
+        // policy above; reject them only after that hook.
+        validate_sendmsg_flags(flags)?;
+        let destination = packet_address
+            .as_ref()
+            .map(decode_send_address)
+            .transpose()?;
+        debug!("sys_send <= fd: {fd}, flags: {flags}, packet: {destination:?}");
+        let ancillary_items = usize::from(packet_control_length != 0 || !cmsg.is_empty());
+        return send_packet_after_security(socket.packet()?, src, destination, ancillary_items)
+            .map(|sent| sent as isize);
+    }
+
+    debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {network_addr:?}");
 
     if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
@@ -352,8 +461,8 @@ fn send_impl(
     let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
     let options = SendOptions {
-        to: addr,
-        flags: send_flags,
+        to: network_addr,
+        flags: send_flags.ok_or(AxError::BadState)?,
         cmsg,
         nonblocking_override: Some(nonblocking),
     };
@@ -403,10 +512,22 @@ pub fn sys_sendto(
     addrlen: socklen_t,
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
-    if len != 0 {
-        check_user_readable(buf as usize, len)?;
-    }
-    let socket = PinnedSocketDescription::from_fd(fd)?;
+    let payload_admission = if len == 0 {
+        Ok(())
+    } else {
+        check_user_readable(buf as usize, len)
+    };
+    // Preserve the established eager-prefault errno order for every existing
+    // backend while deferring only AF_PACKET payload faults until after its
+    // security hook and device/MTU plan. The speculative fd classification is
+    // read-only; if it fails after an eager fault, the legacy fault still wins.
+    let socket = match payload_admission {
+        Ok(()) => PinnedSocketDescription::from_fd(fd)?,
+        Err(payload_error) => match PinnedSocketDescription::from_fd(fd) {
+            Ok(socket) if socket.backend()? == SocketBackendKind::Packet => socket,
+            _ => return Err(payload_error.into()),
+        },
+    };
     let flags = effective_message_flags(flags, socket.nonblocking());
     send_impl(
         &socket,
@@ -417,6 +538,7 @@ pub fn sys_sendto(
         addr,
         addrlen,
         Vec::new(),
+        0,
         1,
         0,
     )
@@ -506,8 +628,21 @@ fn sendmsg_with_socket(
     }
 
     let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
-    send_iov.check_readable()?;
-    let cmsg = parse_send_control(&msg)?;
+    if socket.backend()? != SocketBackendKind::Packet {
+        send_iov.check_readable()?;
+    }
+    let (cmsg, packet_control_length) = if socket.backend()? == SocketBackendKind::Packet {
+        // Copy the bounded generic control buffer once, but defer semantic
+        // cmsg parsing/support to the AF_PACKET mechanism phase after policy.
+        let control = snapshot_user_bytes(
+            msg.msg_control.cast::<u8>(),
+            msg.msg_controllen,
+            MAX_SENDMSG_CONTROL_LEN,
+        )?;
+        (Vec::new(), control.len())
+    } else {
+        (parse_send_control(&msg)?, 0)
+    };
 
     send_impl(
         socket,
@@ -518,6 +653,7 @@ fn sendmsg_with_socket(
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
         cmsg,
+        packet_control_length,
         msg.msg_iovlen,
         msg.msg_controllen,
     )
@@ -533,6 +669,7 @@ pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<i
 enum ReceivedSocketAddress {
     Network(SocketAddrEx),
     NetlinkKernel,
+    Packet(thekernel_linux_packet::SockAddrLl),
 }
 
 impl ReceivedSocketAddress {
@@ -559,31 +696,55 @@ impl ReceivedSocketAddress {
                 *addrlen = bytes.len() as _;
                 Ok(())
             }
+            Self::Packet(address) => write_received_address(address, addr, addrlen),
         }
     }
+}
+
+struct ReceiveOutcome {
+    returned_len: isize,
+    message_truncated: bool,
+    control_truncated: bool,
+    address: Option<ReceivedSocketAddress>,
 }
 
 fn recv_impl(
     socket: &PinnedSocketDescription,
     fd: i32,
     mut dst: impl Write + IoBufMut,
-    recv_flags: RecvFlags,
+    recv_flags: ValidatedRecvFlags,
     want_address: bool,
     cmsg_builder: Option<CMsgBuilder>,
     cloexec_rights: bool,
-) -> AxResult<(isize, bool, Option<ReceivedSocketAddress>)> {
+) -> AxResult<ReceiveOutcome> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
     if socket.backend()? == SocketBackendKind::Netlink {
         let nonblocking = socket.nonblocking();
         let netlink = socket.netlink()?;
-        let recv = netlink.recv_with_nonblocking(&mut dst, recv_flags, nonblocking)?;
+        let recv = netlink.recv_with_nonblocking(&mut dst, recv_flags.generic, nonblocking)?;
         debug!("sys_recv => fd: {fd}, netlink recv: {recv}");
-        return Ok((
-            recv as isize,
-            false,
-            want_address.then_some(ReceivedSocketAddress::NetlinkKernel),
-        ));
+        return Ok(ReceiveOutcome {
+            returned_len: recv as isize,
+            message_truncated: false,
+            control_truncated: false,
+            address: want_address.then_some(ReceivedSocketAddress::NetlinkKernel),
+        });
+    }
+
+    if socket.backend()? == SocketBackendKind::Packet {
+        let packet_flags = recv_flags.packet_flags()?;
+        let result = socket.packet()?.recv_with_nonblocking(
+            &mut dst,
+            packet_flags,
+            recv_flags.generic.contains(RecvFlags::DONT_WAIT),
+        )?;
+        return Ok(ReceiveOutcome {
+            returned_len: result.returned_len() as isize,
+            message_truncated: result.message_truncated(),
+            control_truncated: false,
+            address: want_address.then_some(ReceivedSocketAddress::Packet(result.address())),
+        });
     }
 
     if socket.backend()? != SocketBackendKind::Network {
@@ -598,7 +759,7 @@ fn recv_impl(
         &mut dst,
         RecvOptions {
             from: remote_addr.as_mut(),
-            flags: recv_flags,
+            flags: recv_flags.generic,
             cmsg: Some(&mut cmsg),
             nonblocking_override: Some(nonblocking),
         },
@@ -626,11 +787,12 @@ fn recv_impl(
     }
 
     debug!("sys_recv => fd: {fd}, recv: {recv}");
-    Ok((
-        recv as isize,
+    Ok(ReceiveOutcome {
+        returned_len: recv as isize,
+        message_truncated: false,
         control_truncated,
-        remote_addr.map(ReceivedSocketAddress::Network),
-    ))
+        address: remote_addr.map(ReceivedSocketAddress::Network),
+    })
 }
 
 fn dispatch_receive_message(
@@ -693,12 +855,16 @@ pub fn sys_recvfrom(
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
-    if len != 0 {
+    let socket = PinnedSocketDescription::from_fd(fd)?;
+    // Linux packet receive claims an ordinary skb before payload copy.  Do
+    // not pre-fault packet destinations: a later EFAULT must consume ordinary
+    // receive while MSG_PEEK retains it. Other backends keep their established
+    // eager-writable admission.
+    if len != 0 && socket.backend()? != SocketBackendKind::Packet {
         check_user_writable(buf as usize, len)?;
     }
-    let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
-    let recv_flags = validate_recvmsg_flags(flags)?;
+    let recv_flags = validate_recvmsg_flags(flags, socket.backend()? == SocketBackendKind::Packet)?;
     let message = recvfrom_security_message(flags);
     receive_socket_output_after_policy(
         || dispatch_receive_message(&socket, &snapshot, &message, len, flags),
@@ -713,15 +879,15 @@ pub fn sys_recvfrom(
                 flags & MSG_CMSG_CLOEXEC != 0,
             )
         },
-        |(recv, _control_truncated, remote_addr)| {
-            if let Some(remote_addr) = remote_addr {
+        |outcome| {
+            if let Some(remote_addr) = outcome.address {
                 let mut user_addrlen = read_user_copy(UserConstPtr::<socklen_t>::from(
                     addrlen.address().as_usize(),
                 ))?;
                 remote_addr.write_to_user(addr, &mut user_addrlen)?;
                 write_user_copy(addrlen, user_addrlen)?;
             }
-            Ok(recv)
+            Ok(outcome.returned_len)
         },
     )
 }
@@ -733,7 +899,7 @@ struct ImportedRecvMessage {
 }
 
 impl ImportedRecvMessage {
-    fn import(user: UserPtr<msghdr>) -> AxResult<Self> {
+    fn import(user: UserPtr<msghdr>, defer_payload_fault: bool) -> AxResult<Self> {
         let msg_hdr = read_user_copy(UserConstPtr::<msghdr>::from(user.address().as_usize()))?;
         if (msg_hdr.msg_namelen as i32) < 0 || (msg_hdr.msg_controllen as isize) < 0 {
             return Err(AxError::InvalidInput);
@@ -741,7 +907,9 @@ impl ImportedRecvMessage {
         validate_recvmsg_iovlen(msg_hdr.msg_iovlen)?;
 
         let recv_iov = IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?;
-        recv_iov.check_writable()?;
+        if !defer_payload_fault {
+            recv_iov.check_writable()?;
+        }
         Ok(Self {
             user,
             header: msg_hdr,
@@ -771,7 +939,7 @@ fn recvmsg_imported(
     fd: i32,
     imported: ImportedRecvMessage,
     flags: u32,
-    recv_flags: RecvFlags,
+    recv_flags: ValidatedRecvFlags,
 ) -> AxResult<isize> {
     let ImportedRecvMessage {
         user: msg,
@@ -790,7 +958,7 @@ fn recvmsg_imported(
             &mut msg_hdr.msg_controllen,
         ))
     };
-    let (recv, control_truncated, remote_addr) = recv_impl(
+    let recv = recv_impl(
         socket,
         fd,
         recv_iov.into_io(),
@@ -801,11 +969,14 @@ fn recvmsg_imported(
     )?;
     // Ancillary fd numbers are a Linux publication point. `recv_impl` handles
     // those first, so an invalid msg_name preserves already exposed fds.
-    if let Some(remote_addr) = remote_addr {
+    if let Some(remote_addr) = recv.address {
         remote_addr.write_to_user(UserPtr::from(msg_hdr.msg_name as usize), &mut name_len)?;
     }
-    if control_truncated {
+    if recv.control_truncated {
         msg_hdr.msg_flags |= MSG_CTRUNC;
+    }
+    if recv.message_truncated {
+        msg_hdr.msg_flags |= MSG_TRUNC;
     }
     let msg_addr = msg.address().as_usize();
     // Match Linux's ordered field copyout instead of rewriting the input half
@@ -827,15 +998,16 @@ fn recvmsg_imported(
         core::mem::offset_of!(msghdr, msg_controllen),
         msg_hdr.msg_controllen,
     )?;
-    Ok(recv)
+    Ok(recv.returned_len)
 }
 
 pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
-    let recv_flags = validate_recvmsg_flags(flags)?;
-    let imported = ImportedRecvMessage::import(msg)?;
+    let recv_flags = validate_recvmsg_flags(flags, socket.backend()? == SocketBackendKind::Packet)?;
+    let imported =
+        ImportedRecvMessage::import(msg, socket.backend()? == SocketBackendKind::Packet)?;
     receive_after_socket_hook(
         imported,
         |imported| {
@@ -929,12 +1101,14 @@ pub fn sys_recvmmsg(
     }
     let wait_for_one = flags & MSG_WAITFORONE != 0;
     let mut active_flags = effective_message_flags(flags & !MSG_WAITFORONE, socket.nonblocking());
-    let mut recv_flags = validate_recvmsg_flags(active_flags)?;
+    let mut recv_flags =
+        validate_recvmsg_flags(active_flags, socket.backend()? == SocketBackendKind::Packet)?;
     let mut received = 0usize;
+    let defer_payload_fault = socket.backend()? == SocketBackendKind::Packet;
     let base = msgvec.address().as_usize();
     let first_ptr = mmsg_address(base, 0)?;
     let first_msg = UserPtr::<mmsghdr>::from(first_ptr).cast::<msghdr>();
-    let first_imported = ImportedRecvMessage::import(first_msg)?;
+    let first_imported = ImportedRecvMessage::import(first_msg, defer_payload_fault)?;
     let message = first_imported.security_message(active_flags);
     dispatch_receive_message(
         &socket,
@@ -965,7 +1139,7 @@ pub fn sys_recvmmsg(
                 .expect("first recvmmsg element was imported before dispatch")
         } else {
             let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
-            match ImportedRecvMessage::import(msg) {
+            match ImportedRecvMessage::import(msg, defer_payload_fault) {
                 Ok(imported) => imported,
                 Err(err) if received != 0 => {
                     remember_recvmmsg_error(&socket, err);
@@ -1006,7 +1180,7 @@ pub fn sys_recvmmsg(
                 received += 1;
                 if wait_for_one && received == 1 {
                     active_flags |= MSG_DONTWAIT;
-                    recv_flags |= RecvFlags::DONT_WAIT;
+                    recv_flags.insert_dont_wait();
                 }
             }
             Err(err) if received != 0 => {
@@ -1023,6 +1197,82 @@ pub fn sys_recvmmsg(
 mod tests {
     use super::*;
 
+    struct FaultingPayload<'a> {
+        reads: &'a core::cell::Cell<usize>,
+        len: usize,
+    }
+
+    impl Read for FaultingPayload<'_> {
+        fn read(&mut self, _output: &mut [u8]) -> AxResult<usize> {
+            self.reads.set(self.reads.get() + 1);
+            Err(AxError::BadAddress)
+        }
+    }
+
+    impl IoBuf for FaultingPayload<'_> {
+        fn remaining(&self) -> usize {
+            self.len
+        }
+    }
+
+    #[test]
+    fn packet_invalid_device_precedes_a_faulting_payload_copy() {
+        use core::cell::Cell;
+
+        let _context = crate::file::packet_socket::packet_test_context();
+        let user_namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let net_namespace =
+            crate::task::NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
+        let socket = PacketSocket::try_new(
+            thekernel_linux_packet::PacketSocketType::Datagram,
+            thekernel_linux_packet::ProtocolSelector::Disabled,
+            net_namespace,
+        )
+        .unwrap();
+        let invalid = thekernel_linux_packet::PacketSendAddress::try_from_network_order_fields(
+            0x0800_u16.to_be(),
+            999,
+            6,
+            [0; 8],
+        )
+        .unwrap();
+        let reads = Cell::new(0);
+        assert_eq!(
+            send_packet_after_security(
+                &socket,
+                FaultingPayload {
+                    reads: &reads,
+                    len: 20,
+                },
+                Some(invalid),
+                0,
+            ),
+            Err(LinuxError::ENXIO.into())
+        );
+        assert_eq!(reads.get(), 0);
+
+        let valid = thekernel_linux_packet::PacketSendAddress::try_from_network_order_fields(
+            0x0800_u16.to_be(),
+            1,
+            6,
+            [0; 8],
+        )
+        .unwrap();
+        assert_eq!(
+            send_packet_after_security(
+                &socket,
+                FaultingPayload {
+                    reads: &reads,
+                    len: 20,
+                },
+                Some(valid),
+                0,
+            ),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
     #[test]
     fn mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch() {
         assert_eq!(admitted_sendmmsg_vlen(0), None);
@@ -1031,6 +1281,23 @@ mod tests {
         assert_eq!(admitted_recvmmsg_vlen(0), None);
         assert_eq!(admitted_recvmmsg_vlen(1), Some(1));
         assert_eq!(admitted_recvmmsg_vlen(u32::MAX), Some(u32::MAX as usize));
+    }
+
+    #[test]
+    fn packet_receive_mechanism_flags_are_rejected_only_after_policy_stage() {
+        for (flag, expected) in [
+            (MSG_OOB, LinuxError::EINVAL),
+            (MSG_ERRQUEUE, LinuxError::EAGAIN),
+            (MSG_WAITALL, LinuxError::EINVAL),
+            (1_u32 << 31, LinuxError::EINVAL),
+        ] {
+            assert!(validate_recvmsg_flags(flag, false).is_err());
+            let deferred = validate_recvmsg_flags(flag, true).unwrap();
+            assert_eq!(
+                deferred.packet_flags().map_err(LinuxError::from),
+                Err(expected)
+            );
+        }
     }
 
     #[test]

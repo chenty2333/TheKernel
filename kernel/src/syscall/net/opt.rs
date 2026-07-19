@@ -3,15 +3,26 @@ use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     general::CAP_NET_ADMIN,
+    if_packet::tpacket_stats,
     net::{
-        AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_RCVBUFFORCE, SO_SNDBUFFORCE,
-        SOL_IPV6, SOL_NETLINK, SOL_SOCKET, socklen_t,
+        AF_INET, AF_PACKET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_ATTACH_FILTER,
+        SO_ATTACH_REUSEPORT_CBPF, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_BPF, SO_DETACH_REUSEPORT_BPF,
+        SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_SNDBUF,
+        SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW, SOL_IPV6, SOL_NETLINK, SOL_PACKET,
+        SOL_SOCKET, socklen_t,
     },
+};
+use starry_vm::vm_write_slice;
+use thekernel_linux_packet::{
+    GetPacketOption, PacketError, PacketOption, PacketOptionOperation, PacketOptionValue,
+    PacketSocketType, SetPacketOption,
 };
 
 use super::{SocketSyscallSnapshot, import_socket_output_after_policy};
 use crate::{
-    file::{FileLike, PinnedSocketDescription, SocketBackendKind, af_alg},
+    file::{
+        FileLike, PinnedSocketDescription, SocketBackendKind, af_alg, packet_socket::packet_error,
+    },
     mm::{UserConstPtr, UserPtr},
     task::{
         ns_capable,
@@ -28,6 +39,96 @@ const XT_EXTENSION_MAXNAMELEN: usize = 29;
 const XT_ENTRY_HEADER_SIZE: usize = 2 + XT_EXTENSION_MAXNAMELEN + 1;
 const XT_ALIGNMENT: usize = 8;
 const IPT_REPLACE_MAX_BYTES: usize = 1 << 20;
+const TPACKET_STATS_LEN: usize = size_of::<tpacket_stats>();
+
+const _: [(); 8] = [(); TPACKET_STATS_LEN];
+const _: [(); 0] = [(); core::mem::offset_of!(tpacket_stats, tp_packets)];
+const _: [(); 4] = [(); core::mem::offset_of!(tpacket_stats, tp_drops)];
+
+fn packet_sol_socket_value(socket_type: PacketSocketType, optname: u32) -> AxResult<i32> {
+    match optname {
+        SO_TYPE => Ok(match socket_type {
+            PacketSocketType::Raw => SOCK_RAW as i32,
+            PacketSocketType::Datagram => SOCK_DGRAM as i32,
+        }),
+        SO_ERROR => Ok(0),
+        SO_DOMAIN => Ok(AF_PACKET as i32),
+        // Linux reports the generic `sk_protocol` field here. AF_PACKET's
+        // EtherType selector is separate bind/send state and must not leak
+        // into SO_PROTOCOL.
+        SO_PROTOCOL => Ok(0),
+        // Buffer accounting/tuning is not backed by the ordinary bounded
+        // packet broker yet. Do not report axnet defaults which this OFD does
+        // not consume.
+        _ => Err(LinuxError::ENOPROTOOPT.into()),
+    }
+}
+
+fn packet_sol_socket_set_error(optname: u32) -> AxError {
+    match optname {
+        SO_SNDBUF
+        | SO_RCVBUF
+        | SO_SNDBUFFORCE
+        | SO_RCVBUFFORCE
+        | SO_ATTACH_FILTER
+        | SO_DETACH_BPF
+        | SO_ATTACH_BPF
+        | SO_LOCK_FILTER
+        | SO_ATTACH_REUSEPORT_CBPF
+        | SO_ATTACH_REUSEPORT_EBPF
+        | SO_DETACH_REUSEPORT_BPF => LinuxError::EOPNOTSUPP.into(),
+        // Read-only introspection and unknown SOL_SOCKET names have no setter
+        // in this packet baseline.
+        _ => LinuxError::ENOPROTOOPT.into(),
+    }
+}
+
+fn packet_option_error(error: PacketError) -> AxError {
+    match error {
+        PacketError::UnknownPacketOption => LinuxError::ENOPROTOOPT.into(),
+        PacketError::UnsupportedPacketOption { option, operation } => {
+            let has_no_linux_getter = matches!(
+                option,
+                PacketOption::AddMembership
+                    | PacketOption::DropMembership
+                    | PacketOption::ReceiveOutput
+                    | PacketOption::ReceiveRing
+                    | PacketOption::TransmitRing
+            );
+            let has_no_linux_setter = matches!(
+                option,
+                PacketOption::Statistics
+                    | PacketOption::HeaderLength
+                    | PacketOption::RolloverStatistics
+            );
+            if (operation == PacketOptionOperation::Get && has_no_linux_getter)
+                || (operation == PacketOptionOperation::Set && has_no_linux_setter)
+            {
+                LinuxError::ENOPROTOOPT.into()
+            } else {
+                LinuxError::EOPNOTSUPP.into()
+            }
+        }
+        other => packet_error(other),
+    }
+}
+
+fn write_packet_option_bytes(
+    output: UserPtr<u8>,
+    length: &mut socklen_t,
+    bytes: &[u8],
+) -> AxResult<()> {
+    let copied = packet_option_copy_len(*length, bytes.len());
+    if copied != 0 {
+        vm_write_slice(output.address().as_usize() as *mut u8, &bytes[..copied])?;
+    }
+    *length = copied as socklen_t;
+    Ok(())
+}
+
+fn packet_option_copy_len(requested: socklen_t, available: usize) -> usize {
+    (requested as usize).min(available)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -361,6 +462,38 @@ pub fn sys_getsockopt(
         return Ok(0);
     }
 
+    if pinned.backend()? == SocketBackendKind::Packet {
+        if level == SOL_SOCKET {
+            let value = packet_sol_socket_value(pinned.packet()?.socket_type(), optname)?;
+            write_packet_option_bytes(optval, optlen, &value.to_ne_bytes())?;
+            return Ok(0);
+        }
+        if level != SOL_PACKET {
+            return Err(LinuxError::ENOPROTOOPT.into());
+        }
+        let option = GetPacketOption::decode(optname as i32).map_err(packet_option_error)?;
+        // For PACKET_STATISTICS this call is the sole destructive reset and
+        // deliberately precedes optval copyout. A later EFAULT still consumes
+        // the snapshot, matching Linux.
+        let value = pinned.packet()?.get_packet_option(option);
+        match value {
+            PacketOptionValue::IgnoreOutgoing(enabled) => {
+                write_packet_option_bytes(optval, optlen, &i32::from(enabled).to_ne_bytes())?;
+            }
+            PacketOptionValue::Statistics(statistics) => {
+                // Linux's native counters are u32 and wrap at that UAPI
+                // boundary; do not invent saturation or drop reasons. Build
+                // the asserted native layout bytewise so no Rust padding can
+                // ever become userspace-visible.
+                let mut native = [0_u8; TPACKET_STATS_LEN];
+                native[..4].copy_from_slice(&(statistics.packets() as u32).to_ne_bytes());
+                native[4..].copy_from_slice(&(statistics.drops() as u32).to_ne_bytes());
+                write_packet_option_bytes(optval, optlen, &native)?;
+            }
+        }
+        return Ok(0);
+    }
+
     let socket = pinned.network()?;
     macro_rules! dispatch {
         ($which:ident) => {
@@ -435,6 +568,26 @@ pub fn sys_setsockopt(
         return Ok(0);
     }
 
+    if pinned.backend()? == SocketBackendKind::Packet {
+        if level == SOL_SOCKET {
+            return Err(packet_sol_socket_set_error(optname));
+        }
+        if level != SOL_PACKET {
+            return Err(LinuxError::ENOPROTOOPT.into());
+        }
+        let option = PacketOption::from_raw(optname as i32).map_err(packet_option_error)?;
+        if option != PacketOption::IgnoreOutgoing {
+            return Err(packet_option_error(PacketError::UnsupportedPacketOption {
+                option,
+                operation: PacketOptionOperation::Set,
+            }));
+        }
+        let value = *get::<i32>(optval, optlen)?;
+        let option = SetPacketOption::decode(optname as i32, value).map_err(packet_option_error)?;
+        pinned.packet()?.set_packet_option(option)?;
+        return Ok(0);
+    }
+
     let socket = pinned.network()?;
     if level == SOL_IPV6 && optname == IPV6_ADDRFORM {
         if *get::<i32>(optval, optlen)? as u32 != AF_INET {
@@ -505,4 +658,104 @@ pub fn sys_setsockopt(
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn errno(error: AxError) -> LinuxError {
+        LinuxError::from(error)
+    }
+
+    #[test]
+    fn packet_sol_socket_introspection_is_typed_and_does_not_leak_ethertype() {
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Raw, SO_TYPE),
+            Ok(SOCK_RAW as i32)
+        );
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Datagram, SO_TYPE),
+            Ok(SOCK_DGRAM as i32)
+        );
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Raw, SO_ERROR),
+            Ok(0)
+        );
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Raw, SO_DOMAIN),
+            Ok(AF_PACKET as i32)
+        );
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Raw, SO_PROTOCOL),
+            Ok(0)
+        );
+        assert_eq!(
+            packet_sol_socket_value(PacketSocketType::Raw, SO_RCVBUF).map_err(errno),
+            Err(LinuxError::ENOPROTOOPT)
+        );
+    }
+
+    #[test]
+    fn packet_sol_socket_mutation_is_an_explicit_nonclaim() {
+        assert_eq!(
+            errno(packet_sol_socket_set_error(SO_RCVBUF)),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            errno(packet_sol_socket_set_error(SO_ATTACH_BPF)),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            errno(packet_sol_socket_set_error(SO_TYPE)),
+            LinuxError::ENOPROTOOPT
+        );
+        assert_eq!(
+            errno(packet_sol_socket_set_error(u32::MAX)),
+            LinuxError::ENOPROTOOPT
+        );
+    }
+
+    #[test]
+    fn packet_integer_options_accept_and_report_short_copy_lengths() {
+        assert_eq!(packet_option_copy_len(0, size_of::<i32>()), 0);
+        assert_eq!(packet_option_copy_len(1, size_of::<i32>()), 1);
+        assert_eq!(packet_option_copy_len(2, size_of::<i32>()), 2);
+        assert_eq!(packet_option_copy_len(3, size_of::<i32>()), 3);
+        assert_eq!(packet_option_copy_len(4, size_of::<i32>()), 4);
+        assert_eq!(packet_option_copy_len(99, size_of::<i32>()), 4);
+    }
+
+    #[test]
+    fn packet_option_classifier_distinguishes_unknown_absent_and_deferred_surfaces() {
+        assert_eq!(
+            errno(packet_option_error(PacketError::UnknownPacketOption)),
+            LinuxError::ENOPROTOOPT
+        );
+        assert_eq!(
+            errno(packet_option_error(PacketError::UnsupportedPacketOption {
+                option: PacketOption::ReceiveRing,
+                operation: PacketOptionOperation::Get,
+            })),
+            LinuxError::ENOPROTOOPT
+        );
+        assert_eq!(
+            errno(packet_option_error(PacketError::UnsupportedPacketOption {
+                option: PacketOption::Statistics,
+                operation: PacketOptionOperation::Set,
+            })),
+            LinuxError::ENOPROTOOPT
+        );
+        assert_eq!(
+            errno(packet_option_error(PacketError::UnsupportedPacketOption {
+                option: PacketOption::Fanout,
+                operation: PacketOptionOperation::Set,
+            })),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            errno(packet_option_error(PacketError::InvalidPacketOptionValue)),
+            LinuxError::EINVAL
+        );
+    }
 }

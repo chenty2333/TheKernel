@@ -56,7 +56,8 @@ pub(crate) use self::{
     metadata::{PseudoInode, anon_inode_stat},
     packet_socket::PacketSocket,
     socket::{
-        AcceptedSocketSecurityRef, PendingSocketSecurityRef, PinnedSocketDescription,
+        AcceptedSocketSecurityRef, BareAcceptedSocketSecurityRef, PACKET_SOCKADDR_STORAGE_LEN,
+        PacketSockaddrSnapshot, PendingSocketSecurityRef, PinnedSocketDescription,
         PreparedSocketAddress, PreparedSocketMessage, SocketBackendKind, SocketSecurityRef,
         UnixEndpointSecurityRef,
     },
