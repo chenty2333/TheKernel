@@ -1,8 +1,8 @@
 # RFC 0006: Bounded Task-Local Seccomp Contract
 
-- Status: draft
+- Status: implemented
 - Date: 2026-07-19
-- Last implementation audit: 2026-07-19
+- Last implementation audit: 2026-07-20
 - Owners: TheKernel maintainers
 - Target layers: `thekernel-axcbpf`, `thekernel-linux-seccomp`, and the
   TheKernel syscall, task, credential, signal, process-exit, procfs, and CI
@@ -579,10 +579,9 @@ seccomp kill bypasses libc's private pthread-exit bookkeeping; requiring
 The TID-disappearance check directly proves the Linux kernel-visible scope
 while the spawner's exit code proves that its sibling survived.
 
-### Required additional evidence
+### Retained acceptance evidence
 
-Before this RFC can become `implemented`, one source-exact evidence set must
-bind and retain:
+The implemented checkpoint retains one source-exact evidence set binding:
 
 - the three exact repository revisions and package checksums;
 - complete Layer 1 and Layer 2 test/lint/doc/package logs;
@@ -603,15 +602,39 @@ failure, concurrency, and teardown gates.
 
 ## Status and acceptance gate
 
-The source checkpoint contains the three-layer implementation and the gate
-wiring described above. This RFC deliberately records no pass count and no
-claim that the current worktree has completed host, packaged-consumer, RV, or
-LoongArch execution. In-repository scripts are test definitions, not receipts.
+The acceptance set completed on 2026-07-20 with these exact revisions:
 
-The RFC remains `draft` until an exact-revision evidence set runs the complete
-Layer 1, Layer 2, host, package-consumer, RV guest, and LoongArch guest gates.
-It may move to `implemented` only if the adapter advertises no feature beyond
-those receipts and the explicit unsupported boundaries remain fail-closed.
+| Repository role | Revision |
+| --- | --- |
+| TheKernel runtime feature | `64aaf69e737943e09f3beb782ef657336a5b69c3` |
+| TheKernel release-harness closure | `e94a123ab72f227da9420f0efe79f262414b86cb` |
+| `thekernel-ax` / axcbpf | `5c34536fd766b5f84f2fb8e6b18a2ab340659582` |
+| `thekernel-linux-abi` / seccomp | `da1eb8e460958807be5e9b51aed7d384e58b9014` |
+
+The release-harness closure changes only this RFC and release-consumer CI
+scripts/tests relative to the runtime feature revision; it changes no kernel,
+rootfs, or guest-test input. The evidence authorities are deliberately kept
+separate:
+
+| Gate | Result and retained digest |
+| --- | --- |
+| Full canonical-container per-commit gate at `e94a123` | PASS; driver log SHA-256 `0adeee5fc2d11cc8e04551d3b957f8c9829b835cbe624dd99133764ffe4fd046` |
+| Bare-host Linux differential from initial seccomp mode zero | PASS; portable log SHA-256 `2c24b9f50aea13dd643e9d20bdfac3933f107f2d08a61fc0fcda2013d049aecd` |
+| Source-workspace RISC-V guest at `64aaf69` plus the exact sibling revisions above | PASS with every required marker; console SHA-256 `4194e07fd315f2bcef453b63e1e22342deb9a2233c8edc1f347f3038fd608f6b` |
+| Source-workspace LoongArch guest at the same revisions | PASS with every required marker; console SHA-256 `96bc3eb66f3bbb8f2dbc76fef1ca71af4581dccca64737291491ec99b2003e44` |
+| Packaged-artifact consumer build at `e94a123` | PASS twice for RV and LA; both runs produced the byte-identical 15-crate release set with SHA-256 `ce22733de97b67b958a8eaadbb280908b4789e38d6abeb060b693c36dc938789` |
+
+The package gate proves normalized archives, exact sibling checksums, no
+source-worktree fallback, and locked offline RV/LA consumer builds. It still
+does not boot the packaged kernels. The guest gates boot source-workspace
+kernels and therefore do not substitute for that future packaged-kernel boot
+receipt.
+
+This is a local implemented source checkpoint, not registry publication
+evidence. The first public crates.io sequence remains axcbpf, then Linux
+seccomp (with usercopy preceding signal in the wider package set), then the
+TheKernel consumer. A real crates.io publish dry-run and remote CI receipt can
+exist only after each prerequisite version is visible in the registry index.
 
 TSYNC, listener/notification ownership, ptrace seccomp events, Linux audit
 fidelity, core-dump exactness, and JIT hardening are outside this initial
