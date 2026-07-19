@@ -233,6 +233,33 @@ class VendorProvenanceTests(unittest.TestCase):
         )
         return temporary, fixture
 
+    def make_linux_packet_fixture(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Fixture]:
+        temporary = tempfile.TemporaryDirectory()
+        fixture = Fixture(Path(temporary.name) / "consumer")
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-linux-abi/crates/packet/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-linux-packet"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        (fixture.root / "Cargo.toml").write_text(
+            '[workspace]\n'
+            '[workspace.dependencies]\n'
+            'thekernel-linux-packet = { version = "=0.1.0", '
+            'default-features = false }\n'
+            '[patch.crates-io]\n'
+            'foo = { path = "vendor/foo" }\n'
+            'thekernel-linux-packet = { path = '
+            '"../thekernel-linux-abi/crates/packet" }\n',
+            encoding="utf-8",
+        )
+        return temporary, fixture
+
     def test_valid_archive_and_metadata_pass(self) -> None:
         temporary, fixture = self.make_fixture()
         self.addCleanup(temporary.cleanup)
@@ -628,6 +655,54 @@ class VendorProvenanceTests(unittest.TestCase):
             noncanonical.errors,
         )
 
+    def test_linux_packet_is_a_maintained_sibling_not_a_vendor_patch(self) -> None:
+        temporary, fixture = self.make_linux_packet_fixture()
+        self.addCleanup(temporary.cleanup)
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.maintained_checks, 1)
+        self.assertEqual(result.package_checks, 1)
+
+    def test_linux_packet_maintained_patch_rejects_wrong_path(self) -> None:
+        temporary, fixture = self.make_linux_packet_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                "../thekernel-linux-abi/crates/packet",
+                "../thekernel-linux-abi/crates/not-packet",
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-linux-packet" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_packet_workspace_dependency_requires_exact_version(self) -> None:
+        temporary, fixture = self.make_linux_packet_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace('version = "=0.1.0"', 'version = "0.1.0"'),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "workspace dependency thekernel-linux-packet version" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
     def test_non_vendor_patch_rejects_a_fabricated_provenance_record(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -716,7 +791,7 @@ class VendorProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(result.errors, ())
         self.assertEqual(result.package_checks, 28)
-        self.assertEqual(result.maintained_checks, 13)
+        self.assertEqual(result.maintained_checks, 14)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ LINUX_ABI_PACKAGES=(
     thekernel-linux-usercopy
     thekernel-linux-cred
     thekernel-linux-mm
+    thekernel-linux-packet
     thekernel-linux-io-uring
     thekernel-linux-seccomp
     thekernel-linux-process
@@ -47,6 +48,7 @@ CONSUMED_PACKAGES=(
     thekernel-axtlb
     thekernel-linux-cred
     thekernel-linux-mm
+    thekernel-linux-packet
     thekernel-linux-io-uring
     thekernel-linux-seccomp
     thekernel-linux-process
@@ -370,6 +372,7 @@ printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
             -p thekernel-linux-usercopy \
             -p thekernel-linux-cred \
             -p thekernel-linux-mm \
+            -p thekernel-linux-packet \
             -p thekernel-linux-io-uring \
             -p thekernel-linux-seccomp \
             -p thekernel-linux-process \
@@ -477,6 +480,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-$VERSION" \
     --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
     --replace "../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/packet=../artifacts/thekernel-linux-packet-$VERSION" \
     --replace "../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-$VERSION" \
     --replace "../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-$VERSION" \
     --replace "../thekernel-linux-abi/crates/process=../artifacts/thekernel-linux-process-$VERSION" \

@@ -24,6 +24,7 @@ grep -Fq \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-linux-packet \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq 'stage_prepublish_archive' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq \
     '"$usercopy_archive" thekernel-linux-usercopy \' \
@@ -45,6 +46,7 @@ axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekerne
 axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
+thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
 thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp" }
 
@@ -60,6 +62,7 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
     --replace '../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/packet=../artifacts/thekernel-linux-packet-0.1.0' \
     --replace '../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-0.1.0' \
     --replace '../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-0.1.0' \
     --forbid-text '../source/' \
@@ -77,6 +80,8 @@ grep -Fq 'path = "../artifacts/thekernel-axtlb-0.1.0"' \
 grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-mm-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-packet-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-io-uring-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
@@ -304,6 +309,7 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
     "$tmp/artifacts/thekernel-linux-mm-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-packet-0.1.0" \
     "$tmp/artifacts/thekernel-linux-io-uring-0.1.0" \
     "$tmp/artifacts/thekernel-linux-seccomp-0.1.0" \
     "$tmp/artifacts/thekernel-linux-process-0.1.0" \
@@ -326,6 +332,7 @@ release_names = [
     "thekernel-axtlb",
     "thekernel-linux-cred",
     "thekernel-linux-mm",
+    "thekernel-linux-packet",
     "thekernel-linux-io-uring",
     "thekernel-linux-seccomp",
     "thekernel-linux-process",
@@ -419,7 +426,8 @@ graph_args=(
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axcbpf thekernel-axfault \
     thekernel-axtask thekernel-axtlb \
-    thekernel-linux-cred thekernel-linux-mm thekernel-linux-io-uring \
+    thekernel-linux-cred thekernel-linux-mm thekernel-linux-packet \
+    thekernel-linux-io-uring \
     thekernel-linux-seccomp \
     thekernel-linux-process \
     thekernel-linux-vfs thekernel-linux-fd; do
