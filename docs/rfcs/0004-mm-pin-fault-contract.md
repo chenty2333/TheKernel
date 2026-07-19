@@ -262,7 +262,10 @@ the complete design in this RFC. `thekernel-linux-mm` now exists as a `no_std`,
   budget, reservation/publication, mutation admission, release, and teardown
   accounting;
 - remap geometry, affine relocation, page-covering, and memlock planners;
-- typed fault admission and stale-completion validation seams.
+- typed fault admission and stale-completion validation seams; and
+- bounded Linux v6.12 MISSING-registration policy, canonical partial-register
+  deltas, mixed-owner mapping replacement, fault-epoch projection, and checked
+  COPY/ZEROPAGE result policy.
 
 TheKernel consumes the packaged crate without moving generic frame, page-table,
 or page-cache mechanisms into syscall code. The current consumer checkpoint:
@@ -295,7 +298,20 @@ or page-cache mechanisms into syscall code. The current consumer checkpoint:
   staged before lower mutation, every address-space listener must acknowledge
   detachment, foreign-owner contention restores the staged cache state, and
   only the populating owner may defer its own detach until `PopulateOutcome`
-  completion.
+  completion;
+- has a dormant, per-address-space userfaultfd adapter with fixed handler,
+  registration, request, waiter, and readiness capacities. REGISTER/UNREGISTER
+  are all-or-none registration-table transactions only; neither operation is a
+  main-MM/VMA transaction. Ordinary `munmap`/`mprotect` sidecars are preflighted
+  before the main MM transaction and committed only after it succeeds.
+  `mprotect` uses RAII to abort an uncommitted sidecar, while `munmap` explicitly
+  aborts its copy-only plan on every recoverable MM failure; and
+- projects `mprotect` through MemorySet's exact touching/flags/lineage/backend
+  merge law. A split preserves every source fragment and its fault epoch; a
+  permission restore canonically folds compatible fragments back to one in a
+  single mixed-owner transaction. Different handlers, fault epochs, modes,
+  holes, page geometry, or actual post-VMA boundaries remain separate, and a
+  partial source projection fails closed.
 
 The current address-space consumer also has two independent, per-address-space
 resource ceilings: 65,536 live logical mapping lineages and 65,536 live VMA
@@ -306,10 +322,12 @@ runtime-tunable `vm.max_map_count`; exposing a compatible control requires a
 separate policy and accounting decision.
 
 This checkpoint does not implement fault-in pinning, long-term/DMA pins,
-revocation or an MMU-notifier equivalent. It also does not provide broker
-queues, a userfaultfd FD adapter, userfaultfd commands, or teardown/event
-semantics. `userfaultfd` therefore remains unsupported and this RFC remains
-`draft`.
+revocation or an MMU-notifier equivalent. The bounded generic broker and
+dormant address-space registration adapter are not yet connected to page-fault
+delegation or a published userfaultfd FD/syscall. COPY/ZEROPAGE installation,
+complete event/teardown behavior, fork/remap/remove events, and Linux
+differential/runtime gates remain open. `userfaultfd` therefore remains
+unsupported and this RFC remains `draft`.
 
 The correctness checkpoint is not a claim that the direct-I/O pin path is
 performance-complete. Each 64-page lower-pin/revalidation window still performs

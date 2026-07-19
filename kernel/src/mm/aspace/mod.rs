@@ -27,9 +27,10 @@ use thekernel_linux_mm::{
     AddressSpaceId, ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess,
     MappingGeneration, MappingId, MappingKind, MappingSnapshot, MmError, PageRange, PinBudget,
     PinBudgetCharge, PinOwner, PinQuota, PinRegistry, PinRequest, PinReservation, PinToken,
+    UffdRegistration,
 };
 
-use super::checked_align_up_4k;
+use super::{OptionalUffdPlan, PreparedUffdMutation, checked_align_up_4k};
 
 mod backend;
 mod mapping;
@@ -800,6 +801,61 @@ impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
     }
 }
 
+/// Commits the main area transaction before handing a prepared sidecar back
+/// to its caller for publication.
+///
+/// The synchronization callback runs after the page-table attempt on both the
+/// success and failure paths. If the main transaction fails, `?` drops the
+/// sidecar in this function; an RAII sidecar can therefore abort its own
+/// preflight authority before the error escapes. On success, the caller gets
+/// the still-armed sidecar back and may publish it only after any infallible
+/// main-MM bookkeeping that must precede sidecar visibility.
+fn commit_area_before_sidecar<'a, B, S>(
+    transaction: PreparedAreaProtect<'a, B>,
+    sidecar: S,
+    synchronize: impl FnOnce(),
+) -> MappingResult<(&'a mut MemorySet<B>, S)>
+where
+    B: memory_set::MappingBackend,
+{
+    let areas = transaction.commit();
+    synchronize();
+    let areas = areas?;
+    Ok((areas, sidecar))
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedProtectPiece<'a, B: memory_set::MappingBackend> {
+    area: &'a MemoryArea<B>,
+    start: B::Addr,
+    end: B::Addr,
+    flags: B::Flags,
+}
+
+struct ProjectedProtectRun<'a, B: memory_set::MappingBackend> {
+    left_area: &'a MemoryArea<B>,
+    start: B::Addr,
+    end: B::Addr,
+    flags: B::Flags,
+}
+
+fn projected_protect_pieces_share_structure<B: memory_set::MappingBackend>(
+    left: &ProjectedProtectPiece<'_, B>,
+    right: &ProjectedProtectPiece<'_, B>,
+) -> bool {
+    left.end == right.start
+        && left.flags == right.flags
+        && left.area.lineage() == right.area.lineage()
+}
+
+fn projected_protect_pieces_merge<B: memory_set::MappingBackend>(
+    left: &ProjectedProtectPiece<'_, B>,
+    right: &ProjectedProtectPiece<'_, B>,
+) -> bool {
+    projected_protect_pieces_share_structure(left, right)
+        && memory_set::MappingBackend::can_merge(left.area.backend(), right.area.backend())
+}
+
 /// One immutable, pre-change VMA view in a prepared protection transaction.
 ///
 /// The full area bounds identify the VMA that future policy hooks must inspect;
@@ -866,6 +922,7 @@ pub(crate) struct PreparedProtect<'a> {
     next_topology_generation: MappingGeneration,
     mapping_identities: &'a mut MappingIdentityIndex,
     mapping_mutations: Vec<MappingIdentityMutation>,
+    uffd_mutation: Option<PreparedUffdMutation<'a>>,
     synchronize_instruction_stream: bool,
 }
 
@@ -953,16 +1010,21 @@ impl PreparedProtect<'_> {
             next_topology_generation,
             mapping_identities,
             mapping_mutations,
+            uffd_mutation,
             synchronize_instruction_stream,
         } = self;
-        let areas = transaction.commit();
-        if synchronize_instruction_stream {
-            drop(super::synchronize_tlb_and_icache());
-        } else {
-            drop(super::synchronize_tlb());
-        }
-        let areas = areas?;
+        let (areas, uffd_mutation) =
+            commit_area_before_sidecar(transaction, uffd_mutation, || {
+                if synchronize_instruction_stream {
+                    let _ = super::synchronize_tlb_and_icache();
+                } else {
+                    let _ = super::synchronize_tlb();
+                }
+            })?;
         Self::refresh_growdown_starts(areas, growdown_starts);
+        if let Some(mutation) = uffd_mutation {
+            mutation.commit();
+        }
         commit_mapping_identity_mutations(mapping_identities, &mapping_mutations);
         *topology_generation = next_topology_generation;
         Ok(())
@@ -1613,12 +1675,20 @@ impl AddrSpace {
     }
 
     fn mapping_snapshot(&self, area: &MemoryArea<Backend>) -> AxResult<MappingSnapshot> {
+        Self::mapping_snapshot_from_parts(self.address_space_id, &self.mapping_identities, area)
+    }
+
+    fn mapping_snapshot_from_parts(
+        address_space_id: AddressSpaceId,
+        mapping_identities: &MappingIdentityIndex,
+        area: &MemoryArea<Backend>,
+    ) -> AxResult<MappingSnapshot> {
         let flags = area.flags();
-        let identity = self.mapping_identity(area.lineage())?;
+        let identity = mapping_identity(mapping_identities, area.lineage())?;
         let range =
             PageRange::new(area.start().as_usize(), area.size(), PAGE_SIZE_4K).map_err(mm_error)?;
         Ok(MappingSnapshot::new(
-            self.address_space_id,
+            address_space_id,
             identity.id,
             identity.generation,
             range,
@@ -1631,6 +1701,181 @@ impl AddrSpace {
             false,
             false,
         ))
+    }
+
+    fn projected_protect_piece_at<'a, B: memory_set::MappingBackend>(
+        areas: &'a MemorySet<B>,
+        protect: memory_addr::AddrRange<B::Addr>,
+        new_flags: B::Flags,
+        address: B::Addr,
+    ) -> Option<ProjectedProtectPiece<'a, B>> {
+        let area = areas.find(address)?;
+        let (start, end, flags) = if address < protect.start {
+            (area.start(), area.end().min(protect.start), area.flags())
+        } else if address < protect.end {
+            (
+                area.start().max(protect.start),
+                area.end().min(protect.end),
+                new_flags,
+            )
+        } else {
+            (area.start().max(protect.end), area.end(), area.flags())
+        };
+        (start < end).then_some(ProjectedProtectPiece {
+            area,
+            start,
+            end,
+            flags,
+        })
+    }
+
+    /// Projects MemorySet's exact post-mprotect merge law without mutating the
+    /// area tree or allocating. The scan replays the retained-left merge law
+    /// for the final structurally compatible run containing `address`.
+    fn projected_protect_run_at<'a, B: memory_set::MappingBackend>(
+        areas: &'a MemorySet<B>,
+        protect: memory_addr::AddrRange<B::Addr>,
+        new_flags: B::Flags,
+        address: B::Addr,
+    ) -> Option<ProjectedProtectRun<'a, B>> {
+        let mut anchor = Self::projected_protect_piece_at(areas, protect, new_flags, address)?;
+
+        // Backend compatibility is deliberately not a left-scan barrier.
+        // MemorySet processes protection actions in ascending address order,
+        // retains the left backend after a merge, and starts a new run after
+        // an incompatible pair. Replaying from the first structurally
+        // compatible piece is therefore necessary because `can_merge` is not
+        // required to be transitive.
+        while Into::<usize>::into(anchor.start) != 0 {
+            let previous_address = B::Addr::from(Into::<usize>::into(anchor.start) - 1);
+            let Some(previous) =
+                Self::projected_protect_piece_at(areas, protect, new_flags, previous_address)
+            else {
+                break;
+            };
+            if !projected_protect_pieces_share_structure(&previous, &anchor) {
+                break;
+            }
+            anchor = previous;
+        }
+
+        let mut run = ProjectedProtectRun {
+            left_area: anchor.area,
+            start: anchor.start,
+            end: anchor.end,
+            flags: anchor.flags,
+        };
+        loop {
+            let Some(next) = Self::projected_protect_piece_at(areas, protect, new_flags, run.end)
+            else {
+                return (run.start <= address && address < run.end).then_some(run);
+            };
+            // MemorySet retains the left/current area when it absorbs a right
+            // neighbor. Keep comparing that surviving backend against every
+            // later neighbor; `can_merge` is not required to be transitive.
+            let survivor = ProjectedProtectPiece {
+                area: run.left_area,
+                start: run.start,
+                end: run.end,
+                flags: run.flags,
+            };
+            if projected_protect_pieces_merge(&survivor, &next) {
+                run.end = next.end;
+                continue;
+            }
+            if run.start <= address && address < run.end {
+                return Some(run);
+            }
+            if !projected_protect_pieces_share_structure(&survivor, &next) {
+                return None;
+            }
+            run = ProjectedProtectRun {
+                left_area: next.area,
+                start: next.start,
+                end: next.end,
+                flags: next.flags,
+            };
+        }
+    }
+
+    fn projected_uffd_protect_snapshot(
+        address_space_id: AddressSpaceId,
+        areas: &MemorySet<Backend>,
+        mapping_identities: &MappingIdentityIndex,
+        protect: VirtAddrRange,
+        new_flags: MappingFlags,
+        registration: UffdRegistration,
+        fragment: PageRange,
+    ) -> AxResult<Option<MappingSnapshot>> {
+        let current = Self::uffd_snapshot_for_registration(
+            address_space_id,
+            areas,
+            mapping_identities,
+            registration,
+        )?;
+        let run = Self::projected_protect_run_at(
+            areas,
+            protect,
+            new_flags,
+            VirtAddr::from(fragment.start()),
+        )
+        .ok_or(AxError::BadState)?;
+        let post_range = PageRange::new(
+            run.start.as_usize(),
+            run.end.sub_addr(run.start),
+            PAGE_SIZE_4K,
+        )
+        .map_err(mm_error)?;
+        if !post_range.contains(fragment) {
+            return Err(AxError::BadState);
+        }
+        // This is the only `None` proof accepted by the UFFD planner: the
+        // complete source remains in one VMA with exactly its old boundaries.
+        // Access may change, but it is not registration/fault authority.
+        if fragment == registration.range() && post_range == current.range() {
+            return Ok(None);
+        }
+
+        let identity = mapping_identity(mapping_identities, run.left_area.lineage())?;
+        let post = MappingSnapshot::new(
+            address_space_id,
+            identity.id,
+            identity.generation,
+            post_range,
+            MappingAccess::new(
+                run.flags.contains(MappingFlags::READ),
+                run.flags.contains(MappingFlags::WRITE),
+                run.flags.contains(MappingFlags::EXECUTE),
+            ),
+            run.left_area.backend().linux_mapping_kind(),
+            false,
+            false,
+        );
+        if post.address_space() != registration.address_space()
+            || post.mapping() != registration.mapping()
+        {
+            return Err(AxError::BadState);
+        }
+        Ok(Some(post))
+    }
+
+    fn uffd_snapshot_for_registration(
+        address_space_id: AddressSpaceId,
+        areas: &MemorySet<Backend>,
+        mapping_identities: &MappingIdentityIndex,
+        registration: UffdRegistration,
+    ) -> AxResult<MappingSnapshot> {
+        let start = VirtAddr::from(registration.range().start());
+        let area = areas.find(start).ok_or(AxError::BadState)?;
+        let snapshot =
+            Self::mapping_snapshot_from_parts(address_space_id, mapping_identities, area)?;
+        if snapshot.address_space() != registration.address_space()
+            || snapshot.mapping() != registration.mapping()
+            || !snapshot.range().contains(registration.range())
+        {
+            return Err(AxError::BadState);
+        }
+        Ok(snapshot)
     }
 
     /// Appends every mapped VMA intersecting a userfaultfd ioctl range.
@@ -2641,12 +2886,52 @@ impl AddrSpace {
         let next_generation = self.next_topology_generation()?;
         let mapping_mutations =
             prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
+        let unmap_range = PageRange::new(start.as_usize(), size, PAGE_SIZE_4K).map_err(mm_error)?;
+        let uffd_plan = {
+            let AddrSpace {
+                address_space_id,
+                areas,
+                mapping_identities,
+                uffd,
+                ..
+            } = self;
+            let address_space_id = *address_space_id;
+            if let Some(state) = uffd.as_deref_mut() {
+                match state.preflight_unmap(0, unmap_range, |registration| {
+                    Self::uffd_snapshot_for_registration(
+                        address_space_id,
+                        areas,
+                        mapping_identities,
+                        registration,
+                    )
+                })? {
+                    OptionalUffdPlan::Noop => None,
+                    plan @ OptionalUffdPlan::Armed(_) => Some(plan),
+                }
+            } else {
+                None
+            }
+        };
 
-        self.unmap_areas_with_tlb_grace(start, size)?;
+        if let Err(error) = self.unmap_areas_with_tlb_grace(start, size) {
+            if let Some(plan) = uffd_plan {
+                self.uffd
+                    .as_mut()
+                    .expect("armed UFFD unmap plan lost its address-space state")
+                    .abort_plan(plan);
+            }
+            return Err(error.into());
+        }
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        if let Some(plan) = uffd_plan {
+            self.uffd
+                .as_mut()
+                .expect("armed UFFD unmap plan lost its address-space state")
+                .commit_plan(plan);
+        }
         commit_mapping_identity_mutations(&mut self.mapping_identities, &mapping_mutations);
         self.commit_topology_generation(next_generation);
         Ok(())
@@ -2751,10 +3036,44 @@ impl AddrSpace {
         )?;
 
         let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let protect = VirtAddrRange::new(start, end);
+        let protect_range =
+            PageRange::new(start.as_usize(), size, PAGE_SIZE_4K).map_err(mm_error)?;
+
+        let AddrSpace {
+            address_space_id,
+            areas,
+            mapping_identities,
+            growdown_starts,
+            uffd,
+            topology_generation,
+            pt,
+            ..
+        } = self;
+        let address_space_id = *address_space_id;
+        let uffd_mutation = if let Some(state) = uffd.as_deref_mut() {
+            let plan = state.preflight_protect(0, protect_range, |registration, fragment| {
+                Self::projected_uffd_protect_snapshot(
+                    address_space_id,
+                    areas,
+                    mapping_identities,
+                    protect,
+                    flags,
+                    registration,
+                    fragment,
+                )
+            })?;
+            match plan {
+                OptionalUffdPlan::Noop => None,
+                OptionalUffdPlan::Armed(_) => Some(PreparedUffdMutation::new(state, plan)),
+            }
+        } else {
+            None
+        };
 
         let transaction = PreparedAreaProtect {
-            areas: &mut self.areas,
-            page_table: &mut self.pt,
+            areas,
+            page_table: pt,
             start,
             end,
             flags,
@@ -2766,11 +3085,12 @@ impl AddrSpace {
 
         Ok(PreparedProtect {
             transaction,
-            growdown_starts: &mut self.growdown_starts,
-            topology_generation: &mut self.topology_generation,
+            growdown_starts,
+            topology_generation,
             next_topology_generation,
-            mapping_identities: &mut self.mapping_identities,
+            mapping_identities,
             mapping_mutations,
+            uffd_mutation,
             synchronize_instruction_stream,
         })
     }
@@ -3210,8 +3530,12 @@ impl Drop for AddrSpace {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::cell::Cell;
+
+    use thekernel_linux_mm::{MappingKind, UFFD_API, UffdApiState, UffdRegisterMode};
 
     use super::*;
+    use crate::mm::{UffdAddressSpaceState, UffdPollSet};
 
     const TEST_SPACE_SIZE: usize = 0x6000;
 
@@ -3265,6 +3589,42 @@ mod tests {
                 false,
             )
             .unwrap();
+    }
+
+    fn initialized_uffd_api() -> UffdApiState {
+        let mut api = UffdApiState::new();
+        let negotiation = api.prepare_raw(UFFD_API, 0).unwrap();
+        api.commit(negotiation).unwrap();
+        api
+    }
+
+    fn uffd_test_snapshot(start: usize, size: usize) -> MappingSnapshot {
+        MappingSnapshot::from_raw(
+            1,
+            2,
+            17,
+            start,
+            size,
+            PAGE_SIZE_4K,
+            MappingAccess::new(true, true, false).bits(),
+            MappingKind::AnonymousPrivate,
+            true,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn uffd_test_fragment(mapping: MappingSnapshot, range: PageRange) -> MappingSnapshot {
+        MappingSnapshot::new(
+            mapping.address_space(),
+            mapping.mapping(),
+            mapping.generation(),
+            range,
+            mapping.access(),
+            mapping.kind(),
+            mapping.long_term_pinnable(),
+            mapping.writable_file_pin_supported(),
+        )
     }
 
     #[test]
@@ -3769,7 +4129,7 @@ mod tests {
         }
 
         fn can_merge(&self, other: &Self) -> bool {
-            self == other
+            self == other || matches!((self.0, other.0), (10, 11) | (11, 10) | (11, 12) | (12, 11))
         }
     }
 
@@ -3784,6 +4144,134 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn expect_mapping_error<T>(result: MappingResult<T>) -> memory_set::MappingError {
+        match result {
+            Ok(value) => {
+                drop(value);
+                panic!("mapping transaction unexpectedly committed")
+            }
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn prepared_area_failure_aborts_uffd_and_success_commits_after_mm() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut areas,
+            &mut page_table,
+            0x1000,
+            0x3000,
+            1,
+            1,
+            mock_lineage(2),
+        );
+
+        let mut uffd = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = uffd.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let mapping = uffd_test_snapshot(0x1000, 0x3000);
+        let mut current = [mapping];
+        uffd.register_range(
+            &initialized_uffd_api(),
+            handler,
+            mapping.range(),
+            UffdRegisterMode::MISSING,
+            &mut current,
+        )
+        .unwrap();
+        let before_registrations: Vec<_> = uffd.registrations.iter().collect();
+        let before_areas = area_snapshot(&areas);
+        let before_page_table = page_table.clone();
+
+        let plan = uffd
+            .preflight_protect(
+                0,
+                PageRange::new(0x2000, 0x1000, PAGE_SIZE_4K).unwrap(),
+                |_, fragment| Ok(Some(uffd_test_fragment(mapping, fragment))),
+            )
+            .unwrap();
+        let synchronized = Cell::new(false);
+        let error = expect_mapping_error(commit_area_before_sidecar(
+            PreparedAreaProtect {
+                areas: &mut areas,
+                page_table: &mut page_table,
+                start: VirtAddr::from(0x2000),
+                end: VirtAddr::from(0x3000),
+                flags: 3,
+                max_areas: 1,
+            },
+            PreparedUffdMutation::new(&mut uffd, plan),
+            || synchronized.set(true),
+        ));
+        assert_eq!(error, memory_set::MappingError::NoMemory);
+        assert!(synchronized.get());
+        assert_eq!(area_snapshot(&areas), before_areas);
+        assert_eq!(page_table, before_page_table);
+        assert_eq!(
+            uffd.registrations.iter().collect::<Vec<_>>(),
+            before_registrations
+        );
+
+        // A second admission proves that the failed main-MM transaction's
+        // RAII drop released the bounded UFFD plan slot. The helper below is
+        // the same coordinator used by PreparedProtect::commit. Host axhal's
+        // dummy address translation cannot safely instantiate a real
+        // AddrSpace PageTable; RV/LA runtime gates cover that final wiring.
+        let plan = uffd
+            .preflight_protect(
+                0,
+                PageRange::new(0x2000, 0x1000, PAGE_SIZE_4K).unwrap(),
+                |_, fragment| Ok(Some(uffd_test_fragment(mapping, fragment))),
+            )
+            .unwrap();
+        synchronized.set(false);
+        let (committed_areas, mutation) = commit_area_before_sidecar(
+            PreparedAreaProtect {
+                areas: &mut areas,
+                page_table: &mut page_table,
+                start: VirtAddr::from(0x2000),
+                end: VirtAddr::from(0x3000),
+                flags: 3,
+                max_areas: usize::MAX,
+            },
+            PreparedUffdMutation::new(&mut uffd, plan),
+            || synchronized.set(true),
+        )
+        .unwrap();
+        assert!(synchronized.get());
+        assert_eq!(
+            area_snapshot(committed_areas),
+            vec![
+                (0x1000, 0x2000, 1, 1),
+                (0x2000, 0x3000, 3, 1),
+                (0x3000, 0x4000, 1, 1),
+            ]
+        );
+        assert!(page_table[0x2000..0x3000].iter().all(|entry| *entry == 3));
+        mutation.commit();
+
+        let mut registrations: Vec<_> = uffd.registrations.iter().collect();
+        registrations.sort_by_key(|registration| registration.range().start());
+        assert_eq!(registrations.len(), 3);
+        assert_eq!(
+            registrations[0].range(),
+            PageRange::new(0x1000, 0x1000, PAGE_SIZE_4K).unwrap()
+        );
+        assert_eq!(
+            registrations[1].range(),
+            PageRange::new(0x2000, 0x1000, PAGE_SIZE_4K).unwrap()
+        );
+        assert_eq!(
+            registrations[2].range(),
+            PageRange::new(0x3000, 0x1000, PAGE_SIZE_4K).unwrap()
+        );
+        assert!(registrations.iter().all(|registration| {
+            registration.mapping() == mapping.mapping()
+                && registration.generation() == mapping.generation()
+        }));
     }
 
     #[test]
@@ -3872,6 +4360,20 @@ mod tests {
             )
             .unwrap();
 
+        let protect = VirtAddrRange::new(VirtAddr::from(0x2000), VirtAddr::from(0x3000));
+        for (address, expected_start, expected_end, expected_flags) in [
+            (0x1000, 0x1000, 0x2000, 1),
+            (0x2000, 0x2000, 0x3000, 3),
+            (0x3000, 0x3000, 0x4000, 1),
+        ] {
+            let projected =
+                AddrSpace::projected_protect_run_at(&areas, protect, 3, VirtAddr::from(address))
+                    .unwrap();
+            assert_eq!(projected.start.as_usize(), expected_start);
+            assert_eq!(projected.end.as_usize(), expected_end);
+            assert_eq!(projected.flags, expected_flags);
+        }
+
         PreparedAreaProtect {
             areas: &mut areas,
             page_table: &mut page_table,
@@ -3894,6 +4396,15 @@ mod tests {
         assert!(page_table[0x2000..0x3000].iter().all(|entry| *entry == 3));
         assert!(page_table[0x3000..0x4000].iter().all(|entry| *entry == 1));
 
+        for address in [0x1000, 0x2000, 0x3000] {
+            let projected =
+                AddrSpace::projected_protect_run_at(&areas, protect, 1, VirtAddr::from(address))
+                    .unwrap();
+            assert_eq!(projected.start.as_usize(), 0x1000);
+            assert_eq!(projected.end.as_usize(), 0x4000);
+            assert_eq!(projected.flags, 1);
+        }
+
         PreparedAreaProtect {
             areas: &mut areas,
             page_table: &mut page_table,
@@ -3906,6 +4417,207 @@ mod tests {
         .unwrap();
         assert_eq!(area_snapshot(&areas), vec![(0x1000, 0x4000, 1, 1)]);
         assert!(page_table[0x1000..0x4000].iter().all(|entry| *entry == 1));
+    }
+
+    #[test]
+    fn projected_protect_run_respects_backend_and_lineage_barriers() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        map_mock_area(
+            &mut areas,
+            &mut page_table,
+            0x1000,
+            0x1000,
+            1,
+            1,
+            mock_lineage(2),
+        );
+        map_mock_area(
+            &mut areas,
+            &mut page_table,
+            0x2000,
+            0x1000,
+            3,
+            2,
+            mock_lineage(2),
+        );
+        map_mock_area(
+            &mut areas,
+            &mut page_table,
+            0x3000,
+            0x1000,
+            1,
+            2,
+            mock_lineage(3),
+        );
+
+        let projected = AddrSpace::projected_protect_run_at(
+            &areas,
+            VirtAddrRange::new(VirtAddr::from(0x2000), VirtAddr::from(0x3000)),
+            1,
+            VirtAddr::from(0x2000),
+        )
+        .unwrap();
+        assert_eq!(projected.start.as_usize(), 0x2000);
+        assert_eq!(projected.end.as_usize(), 0x3000);
+        assert_eq!(projected.flags, 1);
+    }
+
+    #[test]
+    fn projected_protect_run_respects_holes_and_flag_barriers() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        for (start, flags) in [(0x1000, 1), (0x3000, 1), (0x4000, 2)] {
+            map_mock_area(
+                &mut areas,
+                &mut page_table,
+                start,
+                0x1000,
+                flags,
+                1,
+                mock_lineage(2),
+            );
+        }
+
+        let protect = VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x2000));
+        let left = AddrSpace::projected_protect_run_at(&areas, protect, 1, VirtAddr::from(0x1000))
+            .unwrap();
+        assert_eq!(left.start.as_usize(), 0x1000);
+        assert_eq!(left.end.as_usize(), 0x2000);
+
+        let right = AddrSpace::projected_protect_run_at(&areas, protect, 1, VirtAddr::from(0x3000))
+            .unwrap();
+        assert_eq!(right.start.as_usize(), 0x3000);
+        assert_eq!(right.end.as_usize(), 0x4000);
+        assert_eq!(right.flags, 1);
+    }
+
+    #[test]
+    fn projected_protect_run_keeps_memory_set_left_backend_across_right_merges() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        for (start, flags, backend) in [(0x1000, 1, 10), (0x2000, 2, 11), (0x3000, 3, 12)] {
+            map_mock_area(
+                &mut areas,
+                &mut page_table,
+                start,
+                0x1000,
+                flags,
+                backend,
+                mock_lineage(2),
+            );
+        }
+
+        let protect = VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x4000));
+        for (address, start, end, backend) in [
+            (0x1000, 0x1000, 0x3000, 10),
+            (0x2000, 0x1000, 0x3000, 10),
+            (0x3000, 0x3000, 0x4000, 12),
+        ] {
+            let projected =
+                AddrSpace::projected_protect_run_at(&areas, protect, 9, VirtAddr::from(address))
+                    .unwrap();
+            assert_eq!(projected.start.as_usize(), start);
+            assert_eq!(projected.end.as_usize(), end);
+            assert_eq!(projected.left_area.backend().0, backend);
+        }
+
+        PreparedAreaProtect {
+            areas: &mut areas,
+            page_table: &mut page_table,
+            start: VirtAddr::from(0x1000),
+            end: VirtAddr::from(0x4000),
+            flags: 9,
+            max_areas: usize::MAX,
+        }
+        .commit()
+        .unwrap();
+        assert_eq!(
+            area_snapshot(&areas),
+            vec![(0x1000, 0x3000, 9, 10), (0x3000, 0x4000, 9, 12)]
+        );
+    }
+
+    #[test]
+    fn projected_protect_run_matches_memory_set_for_nontransitive_backends() {
+        let boundaries = [0x1000, 0x2000, 0x3000, 0x4000];
+        for left_flags in 1..=3 {
+            for middle_flags in 1..=3 {
+                for right_flags in 1..=3 {
+                    for protect_start in 0..3 {
+                        for protect_end in (protect_start + 1)..=3 {
+                            for new_flags in 1..=3 {
+                                let mut areas = MemorySet::new();
+                                let mut page_table = vec![0; TEST_SPACE_SIZE];
+                                for (start, flags, backend) in [
+                                    (0x1000, left_flags, 10),
+                                    (0x2000, middle_flags, 11),
+                                    (0x3000, right_flags, 12),
+                                ] {
+                                    map_mock_area(
+                                        &mut areas,
+                                        &mut page_table,
+                                        start,
+                                        0x1000,
+                                        flags,
+                                        backend,
+                                        mock_lineage(2),
+                                    );
+                                }
+
+                                let protect = VirtAddrRange::new(
+                                    VirtAddr::from(boundaries[protect_start]),
+                                    VirtAddr::from(boundaries[protect_end]),
+                                );
+                                let projected = [0x1000, 0x2000, 0x3000].map(|address| {
+                                    let run = AddrSpace::projected_protect_run_at(
+                                        &areas,
+                                        protect,
+                                        new_flags,
+                                        VirtAddr::from(address),
+                                    )
+                                    .unwrap();
+                                    (
+                                        run.start.as_usize(),
+                                        run.end.as_usize(),
+                                        run.flags,
+                                        run.left_area.backend().0,
+                                    )
+                                });
+
+                                PreparedAreaProtect {
+                                    areas: &mut areas,
+                                    page_table: &mut page_table,
+                                    start: protect.start,
+                                    end: protect.end,
+                                    flags: new_flags,
+                                    max_areas: usize::MAX,
+                                }
+                                .commit()
+                                .unwrap();
+                                for (index, address) in
+                                    [0x1000, 0x2000, 0x3000].into_iter().enumerate()
+                                {
+                                    let area = areas.find(VirtAddr::from(address)).unwrap();
+                                    assert_eq!(
+                                        projected[index],
+                                        (
+                                            area.start().as_usize(),
+                                            area.end().as_usize(),
+                                            area.flags(),
+                                            area.backend().0,
+                                        ),
+                                        "flags={left_flags}/{middle_flags}/{right_flags}, \
+                                         protect={protect_start}..{protect_end}, new={new_flags}, \
+                                         address={address:#x}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
