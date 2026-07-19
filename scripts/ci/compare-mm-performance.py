@@ -929,27 +929,43 @@ def validate_side_identity(label: str, bundles: list[Bundle]) -> None:
                     )
 
 
-def validate_alternating_capture_order(
+def validate_counterbalanced_capture_order(
     baselines: list[Bundle], candidates: list[Bundle]
 ) -> None:
-    sequence: list[tuple[str, int, Bundle]] = []
+    previous_pair_end: dt.datetime | None = None
+    previous_orientation: str | None = None
     for index, (baseline, candidate) in enumerate(
         zip(baselines, candidates, strict=True), start=1
     ):
-        sequence.extend(
-            (("baseline", index, baseline), ("candidate", index, candidate))
-        )
-    for previous, current in zip(sequence, sequence[1:]):
-        previous_label, previous_index, previous_bundle = previous
-        current_label, current_index, current_bundle = current
-        if previous_bundle.capture_end >= current_bundle.capture_start:
+        if baseline.capture_end < candidate.capture_start:
+            orientation = "baseline-first"
+            pair_start = baseline.capture_start
+            pair_end = candidate.capture_end
+        elif candidate.capture_end < baseline.capture_start:
+            orientation = "candidate-first"
+            pair_start = candidate.capture_start
+            pair_end = baseline.capture_end
+        else:
             raise EvidenceError(
-                "paired series was not captured in strict alternating order: "
-                f"{previous_label}[{previous_index}] "
-                f"end={previous_bundle.capture_end.isoformat()} must precede "
-                f"{current_label}[{current_index}] "
-                f"start={current_bundle.capture_start.isoformat()}"
+                "paired series was not captured as disjoint adjacent pairs: "
+                f"baseline[{index}]={baseline.capture_start.isoformat()}.."
+                f"{baseline.capture_end.isoformat()} candidate[{index}]="
+                f"{candidate.capture_start.isoformat()}.."
+                f"{candidate.capture_end.isoformat()}"
             )
+        if previous_pair_end is not None and previous_pair_end >= pair_start:
+            raise EvidenceError(
+                "paired series was not captured in chronological adjacent-pair "
+                f"order: pair[{index - 1}] end={previous_pair_end.isoformat()} "
+                f"must precede pair[{index}] start={pair_start.isoformat()}"
+            )
+        if previous_orientation == orientation:
+            raise EvidenceError(
+                "paired series was not captured in counterbalanced order: "
+                f"pair[{index - 1}] and pair[{index}] are both {orientation}"
+            )
+        previous_pair_end = pair_end
+        previous_orientation = orientation
 
 
 def ratio_compare(left: RatioSample, right: RatioSample) -> int:
@@ -1076,7 +1092,7 @@ def compare_series(
                     f"sha256={bundle.receipt_sha256}"
                 )
             receipts[bundle.receipt_sha256] = (label, index)
-    validate_alternating_capture_order(baselines, candidates)
+    validate_counterbalanced_capture_order(baselines, candidates)
     validate_side_identity("baseline", baselines)
     validate_side_identity("candidate", candidates)
     for index, (baseline, candidate) in enumerate(

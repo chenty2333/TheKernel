@@ -34,9 +34,12 @@ The repository-owned adapters cover:
 - `mm-performance.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs. It
   records VMA-scale mapping latency, `mremap` latency, an `mprotect` plus touch
   TLB-sensitive proxy, and regular-file direct-I/O pin latency, throughput, and
-  concurrent contention. Every metric contains count/p50/p99/p999; unavailable
-  paths remain explicit `missing` records with a reason and errno, and make the
-  mandatory matrix fail instead of being reported as a completed baseline.
+  concurrent contention. Pin workers are bound to distinct guest CPUs and do
+  their warmup after binding; the pin metrics retain the requested sparse VMA
+  fixture for their complete measured phase. Every metric contains
+  count/p50/p99/p999; unavailable paths remain explicit `missing` records with
+  a reason and errno, and make the mandatory matrix fail instead of being
+  reported as a completed baseline.
 
 These gates deliberately do not overclaim. The OOM adapter does not substitute
 for a future kernel-allocator failpoint framework or OOM-victim policy test.
@@ -114,8 +117,9 @@ manifests containing `/workspace/...` paths and single-sample v2 bundles are
 intentionally rejected rather than guessed into a new provenance claim.
 
 One adapter invocation captures one bundle and never labels a single sample as
-a regression result. Capture alternating baseline/candidate bundles on the same
-quiet runner, then pass at least three pairs, in pair order, to the comparator:
+a regression result. Capture adjacent, counterbalanced baseline/candidate pairs
+on the same quiet runner (`B1 C1`, `C2 B2`, `B3 C3`, and so on), then pass at
+least three pairs, in pair order, to the comparator:
 
 ```sh
 scripts/ci/compare-mm-performance.py \
@@ -138,10 +142,11 @@ without floating-point rounding.
 CLI order alone is not evidence of paired capture. Each hashed host diagnostic
 contains a strict UTC RFC3339 timestamp. The comparator forms a pre/post capture
 interval for every run, rejects reversed or overlapping intervals and duplicate
-bundle receipts, and requires the actual bundle intervals to satisfy
-`baseline-1 < candidate-1 < baseline-2 < candidate-2 ...`. Equal interval
-boundaries are rejected, so copied or concurrently captured inputs cannot count
-as independent alternating pairs.
+bundle receipts, and requires each pair to contain two disjoint adjacent
+captures while pair orientation alternates baseline-first, candidate-first,
+baseline-first (or the reverse). Pair intervals must also be chronological and
+disjoint. Equal interval boundaries are rejected, so copied or concurrently
+captured inputs cannot count as independent counterbalanced pairs.
 
 The repository regression policy gates every metric's median P99 at no more
 than 20 percent latency regression and requires both pin metrics to retain at

@@ -410,15 +410,22 @@ class CompareMmPerformanceTests(unittest.TestCase):
             base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(
                 days=self.series_counter
             )
-            for index, baseline in enumerate(baselines):
-                start = base + dt.timedelta(seconds=index * 4)
-                set_capture_interval(
-                    baseline, start, start + dt.timedelta(seconds=1)
+            for index, (baseline, candidate) in enumerate(
+                zip(baselines, candidates)
+            ):
+                pair_start = base + dt.timedelta(seconds=index * 4)
+                first, second = (
+                    (baseline, candidate)
+                    if index % 2 == 0
+                    else (candidate, baseline)
                 )
-            for index, candidate in enumerate(candidates):
-                start = base + dt.timedelta(seconds=index * 4 + 2)
                 set_capture_interval(
-                    candidate, start, start + dt.timedelta(seconds=1)
+                    first, pair_start, pair_start + dt.timedelta(seconds=1)
+                )
+                set_capture_interval(
+                    second,
+                    pair_start + dt.timedelta(seconds=2),
+                    pair_start + dt.timedelta(seconds=3),
                 )
         report = self.root / "report.tsv"
         report.unlink(missing_ok=True)
@@ -788,7 +795,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("reuses one bundle receipt", result.stderr)
         self.assertFalse(report.exists())
 
-    def test_hashed_capture_intervals_prove_actual_alternating_order(self) -> None:
+    def test_hashed_capture_intervals_prove_counterbalanced_pair_order(self) -> None:
         baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
         candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
         base = dt.datetime(2026, 3, 1, tzinfo=dt.UTC)
@@ -796,11 +803,17 @@ class CompareMmPerformanceTests(unittest.TestCase):
             zip(baselines, candidates, strict=True)
         ):
             pair_start = base + dt.timedelta(seconds=index * 4)
-            baseline_end = pair_start + dt.timedelta(seconds=1)
-            set_capture_interval(baseline, pair_start, baseline_end)
+            first, second = (
+                (baseline, candidate)
+                if index % 2 == 0
+                else (candidate, baseline)
+            )
             set_capture_interval(
-                candidate,
-                baseline_end + dt.timedelta(microseconds=1),
+                first, pair_start, pair_start + dt.timedelta(seconds=1)
+            )
+            set_capture_interval(
+                second,
+                pair_start + dt.timedelta(seconds=2),
                 pair_start + dt.timedelta(seconds=3),
             )
 
@@ -815,19 +828,24 @@ class CompareMmPerformanceTests(unittest.TestCase):
             normalize_timestamps=False,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("strict alternating order", result.stderr)
+        self.assertIn("adjacent-pair order", result.stderr)
         self.assertFalse(report.exists())
 
         set_capture_interval(
-            candidates[0],
-            base + dt.timedelta(seconds=1),
-            base + dt.timedelta(seconds=3),
+            baselines[1],
+            base + dt.timedelta(seconds=4),
+            base + dt.timedelta(seconds=5),
+        )
+        set_capture_interval(
+            candidates[1],
+            base + dt.timedelta(seconds=6),
+            base + dt.timedelta(seconds=7),
         )
         result, report = self.compare_series(
             baselines, candidates, normalize_timestamps=False
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("strict alternating order", result.stderr)
+        self.assertIn("counterbalanced order", result.stderr)
         self.assertFalse(report.exists())
 
     def test_capture_timestamp_and_interval_are_strictly_validated(self) -> None:

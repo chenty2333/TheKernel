@@ -42,6 +42,7 @@ enum {
     DEFAULT_LIVE_VMAS = 512,
     DEFAULT_PIN_ITERATIONS = 64,
     PIN_BUFFER_BYTES = 64 * 1024,
+    PIN_WARMUP_ITERATIONS = 64,
     PROTECT_TOUCH_PAGES = 64,
     MREMAP_SMALL_PAGES = 16,
     MREMAP_LARGE_PAGES = 32,
@@ -522,13 +523,25 @@ out:
 struct pin_worker {
     size_t iterations;
     size_t buffer_size;
+    int cpu;
     int fd;
     unsigned char *buffer;
     char path[128];
     uint64_t *samples;
-    atomic_size_t *ready_workers;
-    atomic_bool *start;
+    size_t completed;
+    int start_cpu;
+    int end_cpu;
+    uint64_t completion_ns;
+    struct pin_gate *gate;
     atomic_int *failure_errno;
+};
+
+struct pin_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    atomic_size_t ready_workers;
+    bool start;
+    bool abort;
 };
 
 static void record_first_failure(atomic_int *failure_errno, int error_number)
@@ -546,11 +559,66 @@ static void record_first_failure(atomic_int *failure_errno, int error_number)
 static void *pin_worker_main(void *opaque)
 {
     struct pin_worker *worker = opaque;
+    cpu_set_t affinity;
+    int affinity_error;
+    bool abort;
     size_t index;
 
-    atomic_fetch_add_explicit(worker->ready_workers, 1U, memory_order_release);
-    while (!atomic_load_explicit(worker->start, memory_order_acquire)) {
-        (void)sched_yield();
+    CPU_ZERO(&affinity);
+    CPU_SET(worker->cpu, &affinity);
+    affinity_error =
+        pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
+    if (affinity_error != 0) {
+        record_first_failure(worker->failure_errno, affinity_error);
+    } else if (sched_getcpu() != worker->cpu) {
+        record_first_failure(worker->failure_errno, EXDEV);
+    }
+
+    for (index = 0;
+         index < PIN_WARMUP_ITERATIONS &&
+         atomic_load_explicit(worker->failure_errno, memory_order_acquire) == 0;
+         ++index) {
+        ssize_t written =
+            pwrite(worker->fd, worker->buffer, worker->buffer_size, 0);
+
+        if (written != (ssize_t)worker->buffer_size) {
+            record_first_failure(worker->failure_errno,
+                                 written < 0 ? errno : EIO);
+        }
+    }
+
+    atomic_fetch_add_explicit(&worker->gate->ready_workers, 1U,
+                              memory_order_release);
+    affinity_error = pthread_mutex_lock(&worker->gate->mutex);
+    if (affinity_error != 0) {
+        record_first_failure(worker->failure_errno, affinity_error);
+        return NULL;
+    }
+    while (!worker->gate->start && !worker->gate->abort) {
+        affinity_error =
+            pthread_cond_wait(&worker->gate->condition, &worker->gate->mutex);
+        if (affinity_error != 0) {
+            record_first_failure(worker->failure_errno, affinity_error);
+            worker->gate->abort = true;
+            (void)pthread_cond_broadcast(&worker->gate->condition);
+            break;
+        }
+    }
+    abort = worker->gate->abort;
+    affinity_error = pthread_mutex_unlock(&worker->gate->mutex);
+    if (affinity_error != 0) {
+        record_first_failure(worker->failure_errno, affinity_error);
+        return NULL;
+    }
+    if (abort ||
+        atomic_load_explicit(worker->failure_errno, memory_order_acquire) != 0) {
+        return NULL;
+    }
+
+    worker->start_cpu = sched_getcpu();
+    if (worker->start_cpu != worker->cpu) {
+        record_first_failure(worker->failure_errno, EXDEV);
+        return NULL;
     }
 
     for (index = 0; index < worker->iterations; ++index) {
@@ -581,6 +649,12 @@ static void *pin_worker_main(void *opaque)
             break;
         }
         worker->samples[index] = after - before;
+        worker->completed = index + 1U;
+        worker->completion_ns = after;
+    }
+    worker->end_cpu = sched_getcpu();
+    if (worker->end_cpu != worker->cpu) {
+        record_first_failure(worker->failure_errno, EXDEV);
     }
     return NULL;
 }
@@ -605,20 +679,27 @@ static void cleanup_pin_workers(struct pin_worker *workers, size_t count)
 
 static struct metric_result run_pin_metric(size_t worker_count,
                                            size_t iterations,
-                                           bool contention)
+                                           bool contention,
+                                           const int *worker_cpus,
+                                           size_t live_vmas,
+                                           size_t page_size)
 {
     const size_t sample_count = worker_count * iterations;
+    const char *mode = contention ? "contention" : "single";
     pthread_t *threads = NULL;
     struct pin_worker *workers = NULL;
     uint64_t *samples = NULL;
-    atomic_size_t ready_workers;
-    atomic_bool start;
+    void **vma_fixture = NULL;
+    struct pin_gate gate;
+    bool gate_mutex_initialized = false;
+    bool gate_condition_initialized = false;
     atomic_int failure_errno;
+    size_t live_count = 0;
     struct metric_result result;
     size_t initialized = 0;
     size_t created = 0;
     size_t index;
-    uint64_t start_ns;
+    uint64_t start_ns = 0;
     uint64_t end_ns;
 
     if (contention && worker_count < 2U) {
@@ -627,15 +708,40 @@ static struct metric_result run_pin_metric(size_t worker_count,
     threads = calloc(worker_count, sizeof(*threads));
     workers = calloc(worker_count, sizeof(*workers));
     samples = calloc(sample_count, sizeof(*samples));
-    if (threads == NULL || workers == NULL || samples == NULL) {
+    vma_fixture = calloc(live_vmas, sizeof(*vma_fixture));
+    if (threads == NULL || workers == NULL || samples == NULL ||
+        vma_fixture == NULL) {
         result = missing_result("allocation_failed", ENOMEM, true);
         goto out;
     }
+
+    for (index = 0; index < live_vmas; ++index) {
+        void *mapping = mmap(NULL, page_size * 2U, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (mapping == MAP_FAILED) {
+            result = missing_result("pin_vma_fixture_mmap_failed", errno, true);
+            goto out;
+        }
+        if (munmap((unsigned char *)mapping + page_size, page_size) != 0) {
+            int saved_errno = errno;
+
+            (void)munmap(mapping, page_size * 2U);
+            result = missing_result("pin_vma_fixture_munmap_failed",
+                                    saved_errno, true);
+            goto out;
+        }
+        vma_fixture[index] = mapping;
+        live_count += 1U;
+    }
+
     for (index = 0; index < worker_count; ++index) {
         int allocation_error;
-        ssize_t warmup;
 
         workers[index].fd = -1;
+        workers[index].cpu = worker_cpus[index];
+        workers[index].start_cpu = -1;
+        workers[index].end_cpu = -1;
         if (snprintf(workers[index].path, sizeof(workers[index].path),
                      "/tmp/thekernel-mm-performance-%ld-%zu", (long)getpid(),
                      index) >= (int)sizeof(workers[index].path)) {
@@ -666,26 +772,35 @@ static struct metric_result run_pin_metric(size_t worker_count,
             result = missing_result("direct_io_resize_failed", errno, true);
             goto out;
         }
-        warmup = pwrite(workers[index].fd, workers[index].buffer,
-                        PIN_BUFFER_BYTES, 0);
-        if (warmup != PIN_BUFFER_BYTES) {
-            result = missing_result("direct_io_unavailable",
-                                    warmup < 0 ? errno : EIO, true);
-            goto out;
-        }
         workers[index].iterations = iterations;
         workers[index].buffer_size = PIN_BUFFER_BYTES;
         workers[index].samples = samples + index * iterations;
     }
 
-    atomic_init(&ready_workers, 0U);
-    atomic_init(&start, false);
+    memset(&gate, 0, sizeof(gate));
+    atomic_init(&gate.ready_workers, 0U);
+    {
+        int gate_error = pthread_mutex_init(&gate.mutex, NULL);
+
+        if (gate_error != 0) {
+            result = missing_result("pthread_mutex_init_failed", gate_error,
+                                    true);
+            goto out;
+        }
+        gate_mutex_initialized = true;
+        gate_error = pthread_cond_init(&gate.condition, NULL);
+        if (gate_error != 0) {
+            result = missing_result("pthread_cond_init_failed", gate_error,
+                                    true);
+            goto out;
+        }
+        gate_condition_initialized = true;
+    }
     atomic_init(&failure_errno, 0);
     for (index = 0; index < worker_count; ++index) {
         int thread_error;
 
-        workers[index].ready_workers = &ready_workers;
-        workers[index].start = &start;
+        workers[index].gate = &gate;
         workers[index].failure_errno = &failure_errno;
         thread_error = pthread_create(&threads[index], NULL, pin_worker_main,
                                       &workers[index]);
@@ -695,24 +810,45 @@ static struct metric_result run_pin_metric(size_t worker_count,
         }
         created += 1U;
     }
-    while (atomic_load_explicit(&ready_workers, memory_order_acquire) < created) {
-        (void)sched_yield();
+    {
+        int gate_error;
+
+        while (atomic_load_explicit(&gate.ready_workers,
+                                    memory_order_acquire) < created) {
+            (void)sched_yield();
+        }
+        gate_error = pthread_mutex_lock(&gate.mutex);
+        if (gate_error != 0) {
+            record_first_failure(&failure_errno, gate_error);
+        } else {
+            if (created != worker_count) {
+                gate.abort = true;
+            }
+            if (atomic_load_explicit(&failure_errno, memory_order_acquire) != 0) {
+                gate.abort = true;
+            }
+            if (!gate.abort) {
+                if (monotonic_ns(&start_ns) != 0) {
+                    record_first_failure(&failure_errno, errno);
+                    gate.abort = true;
+                    start_ns = 0;
+                } else {
+                    gate.start = true;
+                }
+            }
+            (void)pthread_cond_broadcast(&gate.condition);
+            gate_error = pthread_mutex_unlock(&gate.mutex);
+            if (gate_error != 0) {
+                record_first_failure(&failure_errno, gate_error);
+            }
+        }
     }
-    if (monotonic_ns(&start_ns) != 0) {
-        record_first_failure(&failure_errno, errno);
-        start_ns = 0;
-    }
-    atomic_store_explicit(&start, true, memory_order_release);
     for (index = 0; index < created; ++index) {
         int join_error = pthread_join(threads[index], NULL);
 
         if (join_error != 0) {
             record_first_failure(&failure_errno, join_error);
         }
-    }
-    if (monotonic_ns(&end_ns) != 0) {
-        record_first_failure(&failure_errno, errno);
-        end_ns = start_ns;
     }
     if (created != worker_count) {
         result = missing_result("pthread_create_failed",
@@ -727,6 +863,37 @@ static struct metric_result run_pin_metric(size_t worker_count,
                                                      memory_order_acquire),
                                 true);
         goto out;
+    }
+    end_ns = 0;
+    for (index = 0; index < worker_count; ++index) {
+        size_t sample_index;
+        size_t over_10_ms = 0;
+        size_t over_50_ms = 0;
+        uint64_t worker_p99;
+
+        if (workers[index].completed != iterations ||
+            workers[index].start_cpu != workers[index].cpu ||
+            workers[index].end_cpu != workers[index].cpu) {
+            result = missing_result("pin_worker_placement_failed", EXDEV, true);
+            goto out;
+        }
+        if (workers[index].completion_ns > end_ns) {
+            end_ns = workers[index].completion_ns;
+        }
+        for (sample_index = 0; sample_index < iterations; ++sample_index) {
+            const uint64_t sample = workers[index].samples[sample_index];
+
+            over_10_ms += sample > UINT64_C(10000000);
+            over_50_ms += sample > UINT64_C(50000000);
+        }
+        qsort(workers[index].samples, iterations,
+              sizeof(*workers[index].samples), compare_u64);
+        worker_p99 = nearest_rank(workers[index].samples, iterations, 990);
+        printf("MM_PERF_PIN_WORKER mode=%s status=ok worker=%zu cpu=%d"
+               " completed=%zu p99_ns=%" PRIu64
+               " over_10ms=%zu over_50ms=%zu\n",
+               mode, index, workers[index].cpu, workers[index].completed,
+               worker_p99, over_10_ms, over_50_ms);
     }
     if (end_ns <= start_ns) {
         result = missing_result("zero_elapsed_time", 0, true);
@@ -743,7 +910,17 @@ static struct metric_result run_pin_metric(size_t worker_count,
     }
 
 out:
+    if (vma_fixture != NULL) {
+        cleanup_mappings(vma_fixture, live_count, page_size);
+    }
+    if (gate_condition_initialized) {
+        (void)pthread_cond_destroy(&gate.condition);
+    }
+    if (gate_mutex_initialized) {
+        (void)pthread_mutex_destroy(&gate.mutex);
+    }
     cleanup_pin_workers(workers, initialized);
+    free(vma_fixture);
     free(samples);
     free(workers);
     free(threads);
@@ -800,6 +977,8 @@ static int parse_arguments(int argc, char **argv, struct config *config)
 
 static int raw_affinity_snapshot(size_t *returned_bytes,
                                  size_t *allowed_cpus,
+                                 int *cpu_ids,
+                                 size_t cpu_id_capacity,
                                  int *failure_errno)
 {
 #ifdef SYS_sched_getaffinity
@@ -817,10 +996,16 @@ static int raw_affinity_snapshot(size_t *returned_bytes,
     }
     for (index = 0; index < (size_t)result; ++index) {
         unsigned char byte = mask[index];
+        size_t bit;
 
-        while (byte != 0) {
-            count += byte & 1U;
-            byte >>= 1U;
+        for (bit = 0; bit < 8U; ++bit) {
+            if ((byte & (1U << bit)) == 0) {
+                continue;
+            }
+            if (count < cpu_id_capacity) {
+                cpu_ids[count] = (int)(index * 8U + bit);
+            }
+            count += 1U;
         }
     }
     if (count == 0) {
@@ -833,6 +1018,8 @@ static int raw_affinity_snapshot(size_t *returned_bytes,
 #else
     (void)returned_bytes;
     (void)allowed_cpus;
+    (void)cpu_ids;
+    (void)cpu_id_capacity;
     *failure_errno = ENOSYS;
     return -1;
 #endif
@@ -850,6 +1037,7 @@ int main(int argc, char **argv)
     const long system_page_size = sysconf(_SC_PAGESIZE);
     size_t affinity_bytes = 0;
     size_t affinity_cpus = 0;
+    int affinity_cpu_ids[MAX_PIN_WORKERS];
     int affinity_errno = 0;
     size_t page_size;
     struct metric_result result;
@@ -868,6 +1056,7 @@ int main(int argc, char **argv)
                " reason=sysconf_failed errno=%d\n",
                errno);
     } else if (raw_affinity_snapshot(&affinity_bytes, &affinity_cpus,
+                                     affinity_cpu_ids, MAX_PIN_WORKERS,
                                      &affinity_errno) != 0) {
         printf("MM_PERF_TOPOLOGY status=missing online_cpus=missing"
                " reason=affinity_abi_invalid errno=%d\n",
@@ -886,6 +1075,11 @@ int main(int argc, char **argv)
         if (config.pin_workers > MAX_PIN_WORKERS) {
             config.pin_workers = MAX_PIN_WORKERS;
         }
+    }
+    if (config.pin_workers > affinity_cpus ||
+        config.pin_workers > MAX_PIN_WORKERS) {
+        fprintf(stderr, "pin workers exceed available guest CPUs\n");
+        return 2;
     }
     if (system_page_size <= 0 || (unsigned long)system_page_size > SIZE_MAX) {
         const int saved_errno = errno;
@@ -920,9 +1114,11 @@ int main(int argc, char **argv)
     }
     result = run_protect_touch(&config, page_size);
     emit_metric("protect_touch_latency", &result);
-    result = run_pin_metric(1U, config.pin_iterations, false);
+    result = run_pin_metric(1U, config.pin_iterations, false,
+                            affinity_cpu_ids, config.live_vmas, page_size);
     emit_metric("pin_throughput", &result);
-    result = run_pin_metric(config.pin_workers, config.pin_iterations, true);
+    result = run_pin_metric(config.pin_workers, config.pin_iterations, true,
+                            affinity_cpu_ids, config.live_vmas, page_size);
     emit_metric("pin_contention", &result);
     puts("MM_PERF_DONE status=ok");
     return 0;
