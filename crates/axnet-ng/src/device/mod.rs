@@ -1,12 +1,17 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
+use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
 use axsync::spin::SpinNoIrq;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
     wire::{IpAddress, IpCidr},
+};
+
+use crate::packet::{
+    LinkHardwareType, PacketDeviceCapabilities, PacketDeviceContext, PacketSendRequest,
 };
 
 mod ethernet;
@@ -149,13 +154,50 @@ pub trait Device: Send + Sync {
         Vec::new()
     }
 
-    fn recv(&mut self, buffer: &mut PacketBuffer<()>, timestamp: Instant) -> bool;
+    /// Reports the packet-observation and injection operations this concrete
+    /// device can actually perform.
+    ///
+    /// This is deliberately independent of [`InterfaceKind`]: an IP-only
+    /// virtual device must not acquire raw-link semantics merely because it is
+    /// presented as an Ethernet-style interface to configuration code.
+    fn packet_capabilities(&self) -> PacketDeviceCapabilities {
+        let hardware_type = match self.interface_kind() {
+            InterfaceKind::Loopback => LinkHardwareType::Loopback,
+            InterfaceKind::Ethernet => LinkHardwareType::Ethernet,
+        };
+        PacketDeviceCapabilities::unsupported(hardware_type)
+    }
+
+    fn recv(
+        &mut self,
+        context: PacketDeviceContext<'_>,
+        buffer: &mut PacketBuffer<()>,
+        timestamp: Instant,
+    ) -> bool;
     /// Sends a packet to the next hop.
     ///
     /// Returns `true` if this operation resulted in the readiness of receive
     /// operation. This is true for loopback devices and can be used to speed
     /// up packet processing.
-    fn send(&mut self, next_hop: IpAddress, packet: &[u8], timestamp: Instant) -> bool;
+    fn send(
+        &mut self,
+        context: PacketDeviceContext<'_>,
+        next_hop: IpAddress,
+        packet: &[u8],
+        timestamp: Instant,
+    ) -> bool;
+
+    /// Injects one packet through an explicitly advertised raw or cooked link
+    /// capability. Unsupported devices fail without mutating their ordinary IP
+    /// datapath.
+    fn send_packet(
+        &mut self,
+        _context: PacketDeviceContext<'_>,
+        _request: PacketSendRequest<'_>,
+        _timestamp: Instant,
+    ) -> AxResult<()> {
+        Err(AxError::Unsupported)
+    }
 
     /// Refreshes the retained bridge from this device's wake source to the
     /// stack readiness source.

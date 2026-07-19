@@ -12,6 +12,7 @@ use smoltcp::{
 use crate::{
     consts::{PACKET_QUEUE_LEN, STANDARD_MTU},
     device::{Device, DevicePollBridge, DeviceStats, InterfaceKind},
+    packet::PacketDeviceContext,
 };
 
 /// One end of a virtual ethernet pair.
@@ -87,7 +88,12 @@ impl Device for VethEnd {
         STANDARD_MTU
     }
 
-    fn recv(&mut self, buffer: &mut PacketBuffer<()>, _timestamp: Instant) -> bool {
+    fn recv(
+        &mut self,
+        _context: PacketDeviceContext<'_>,
+        buffer: &mut PacketBuffer<()>,
+        _timestamp: Instant,
+    ) -> bool {
         let mut rx_buffer = self.rx_buffer.lock();
         let Ok((_, rx_buf)) = rx_buffer.dequeue() else {
             return false;
@@ -102,7 +108,13 @@ impl Device for VethEnd {
         true
     }
 
-    fn send(&mut self, next_hop: IpAddress, packet: &[u8], _timestamp: Instant) -> bool {
+    fn send(
+        &mut self,
+        _context: PacketDeviceContext<'_>,
+        next_hop: IpAddress,
+        packet: &[u8],
+        _timestamp: Instant,
+    ) -> bool {
         match self.peer_rx_buffer.lock().enqueue(packet.len(), ()) {
             Ok(tx_buf) => {
                 tx_buf.copy_from_slice(packet);
@@ -130,5 +142,26 @@ impl Device for VethEnd {
 impl Drop for VethEnd {
     fn drop(&mut self) {
         self.waker_bridge.cancel(&self.waker);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::LinkHardwareType;
+
+    #[test]
+    fn ethernet_interface_kind_does_not_imply_packet_capabilities() {
+        let (device, _peer) = VethEnd::new_pair("veth0".into(), "veth1".into());
+        assert_eq!(device.interface_kind(), InterfaceKind::Ethernet);
+
+        let capabilities = device.packet_capabilities();
+        assert_eq!(capabilities.hardware_type, LinkHardwareType::Ethernet);
+        assert!(!capabilities.raw_receive);
+        assert!(!capabilities.raw_send);
+        assert!(!capabilities.cooked_receive);
+        assert!(!capabilities.cooked_send);
+        assert_eq!(capabilities.link_header_len, 0);
+        assert_eq!(capabilities.address_len, 0);
     }
 }
