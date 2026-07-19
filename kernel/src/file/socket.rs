@@ -13,6 +13,7 @@ use super::{
     fs::File,
     net::Socket,
     netlink::NetlinkSocket,
+    packet_socket::PacketSocket,
 };
 use crate::task::NetworkNamespace;
 
@@ -21,6 +22,7 @@ use crate::task::NetworkNamespace;
 pub(crate) enum SocketBackendKind {
     Network,
     Netlink,
+    Packet,
     AfAlg,
 }
 
@@ -233,6 +235,9 @@ impl PinnedSocketDescription {
         if description.inner.downcast_ref::<NetlinkSocket>().is_some() {
             return Ok(SocketBackendKind::Netlink);
         }
+        if description.inner.downcast_ref::<PacketSocket>().is_some() {
+            return Ok(SocketBackendKind::Packet);
+        }
         if description.inner.downcast_ref::<AfAlgSocket>().is_some() {
             return Ok(SocketBackendKind::AfAlg);
         }
@@ -284,11 +289,22 @@ impl PinnedSocketDescription {
             .ok_or(AxError::BadState)
     }
 
+    pub(crate) fn packet(&self) -> AxResult<&PacketSocket> {
+        if self.backend()? != SocketBackendKind::Packet {
+            return Err(AxError::NotASocket);
+        }
+        self.description
+            .inner
+            .downcast_ref::<PacketSocket>()
+            .ok_or(AxError::BadState)
+    }
+
     pub(crate) fn security_ref(&self) -> AxResult<SocketSecurityRef<'_>> {
         let backend = self.backend()?;
         let net_namespace = match backend {
             SocketBackendKind::Network => Some(self.network()?.net_namespace()),
             SocketBackendKind::Netlink => Some(self.netlink()?.net_namespace()),
+            SocketBackendKind::Packet => Some(self.packet()?.net_namespace()),
             SocketBackendKind::AfAlg => None,
         };
         Ok(SocketSecurityRef {
@@ -320,7 +336,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        file::{FileLike, Kstat},
+        file::{FileLike, Kstat, packet_socket::packet_test_context},
         task::{NetworkNamespace, UserNamespace},
     };
 
@@ -358,7 +374,7 @@ mod tests {
         FileDescription::new_with_flags(inner, flags).unwrap()
     }
 
-    fn socket_descriptions() -> [Arc<FileDescription>; 3] {
+    fn socket_descriptions() -> [Arc<FileDescription>; 4] {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         let unix = UnixSocket::new(
@@ -366,21 +382,30 @@ mod tests {
             net_ns.stack().unix_namespace(),
         );
         let network = Socket::new(SocketInner::Unix(unix), net_ns.clone());
-        let netlink = NetlinkSocket::try_new(0, net_ns).unwrap();
+        let netlink = NetlinkSocket::try_new(0, net_ns.clone()).unwrap();
+        let packet = PacketSocket::try_new(
+            thekernel_linux_packet::PacketSocketType::Raw,
+            thekernel_linux_packet::ProtocolSelector::Disabled,
+            net_ns,
+        )
+        .unwrap();
         let af_alg = AfAlgSocket::new_listener();
         [
             description(Arc::new(network), 0),
             description(netlink, 0),
+            description(packet, 0),
             description(Arc::new(af_alg), 0),
         ]
     }
 
     #[test]
     fn classifies_every_supported_backend_from_one_description() {
+        let _context = packet_test_context();
         let descriptions = socket_descriptions();
         for (description, expected) in descriptions.into_iter().zip([
             SocketBackendKind::Network,
             SocketBackendKind::Netlink,
+            SocketBackendKind::Packet,
             SocketBackendKind::AfAlg,
         ]) {
             let lookups = Cell::new(0);
@@ -425,7 +450,8 @@ mod tests {
 
     #[test]
     fn close_and_reuse_after_lookup_cannot_redirect_backend_classification() {
-        let [original, _netlink, replacement] = socket_descriptions();
+        let _context = packet_test_context();
+        let [original, _netlink, _packet, replacement] = socket_descriptions();
         let slot = RefCell::new(original.clone());
         let lookups = Cell::new(0);
 

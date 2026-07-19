@@ -12,7 +12,7 @@ use axnet::{
     unix::{DgramTransport, StreamTransport, UnixSocket, UnixSocketAddr},
 };
 use linux_raw_sys::{
-    general::{CAP_NET_BIND_SERVICE, O_CLOEXEC, O_NONBLOCK, O_RDWR},
+    general::{CAP_NET_BIND_SERVICE, CAP_NET_RAW, O_CLOEXEC, O_NONBLOCK, O_RDWR},
     net::{
         AF_INET, AF_INET6, AF_MAX, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK,
         IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW,
@@ -25,8 +25,9 @@ use super::{SocketSyscallSnapshot, addr::SocketAddrExt};
 use crate::{
     file::{
         AcceptedSocketSecurityRef, AfAlgSocket, FileDescription, FileLike, NetlinkSocket,
-        PendingSocketSecurityRef, PinnedSocketDescription, PreparedSocketAddress, Socket,
-        SocketBackendKind, af_alg, close_file_like, permission::VfsSecurityContext, reserve_fd,
+        PacketSocket, PendingSocketSecurityRef, PinnedSocketDescription, PreparedSocketAddress,
+        Socket, SocketBackendKind, af_alg, close_file_like, packet_socket::packet_error,
+        permission::VfsSecurityContext, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
     task::{
@@ -130,11 +131,28 @@ fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
 }
 
 fn validate_pre_create_domain(domain: u32) -> AxResult<()> {
-    if domain == AF_PACKET || domain >= AF_MAX {
+    if domain >= AF_MAX {
         Err(LinuxError::EAFNOSUPPORT.into())
     } else {
         Ok(())
     }
+}
+
+fn validate_packet_create_after_capability(
+    capability_granted: bool,
+    ty: u32,
+    proto: u32,
+) -> AxResult<(
+    thekernel_linux_packet::PacketSocketType,
+    thekernel_linux_packet::ProtocolSelector,
+)> {
+    if !capability_granted {
+        return Err(LinuxError::EPERM.into());
+    }
+    let socket_type =
+        thekernel_linux_packet::PacketSocketType::from_raw(ty as i32).map_err(packet_error)?;
+    let protocol = thekernel_linux_packet::ProtocolSelector::from_network_order_i32(proto as i32);
+    Ok((socket_type, protocol))
 }
 
 fn supported_stream_protocol(proto: u32) -> bool {
@@ -176,6 +194,21 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         .ok_or(AxError::InvalidInput)?;
     let actor = snapshot.actor();
     dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
+
+    if domain == AF_PACKET {
+        let net_ns = snapshot.net_namespace().clone();
+        // Linux checks CAP_NET_RAW in the user namespace governing this exact
+        // network namespace before AF_PACKET-specific type validation.
+        let (socket_type, protocol) = validate_packet_create_after_capability(
+            ns_capable(&actor, net_ns.owner_user_ns(), CAP_NET_RAW),
+            ty,
+            proto,
+        )?;
+        let socket = PacketSocket::try_new(socket_type, protocol, net_ns)?;
+        let socket = prepare_new_socket_arc(socket, nonblocking)?;
+        dispatch_socket_post_create(&actor, &socket, spec)?;
+        return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
+    }
 
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
@@ -291,6 +324,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             ))?;
             pinned.netlink()?.bind(port_id, addr.nl_groups)?;
         }
+        SocketBackendKind::Packet => return Err(LinuxError::EOPNOTSUPP.into()),
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
             let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
@@ -659,15 +693,33 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_packet_and_out_of_range_families_fail_before_create_policy() {
-        assert_eq!(
-            validate_pre_create_domain(AF_PACKET),
-            Err(LinuxError::EAFNOSUPPORT.into())
-        );
+    fn packet_reaches_family_create_while_out_of_range_families_do_not() {
+        assert!(validate_pre_create_domain(AF_PACKET).is_ok());
         assert_eq!(
             validate_pre_create_domain(AF_MAX),
             Err(LinuxError::EAFNOSUPPORT.into())
         );
         assert!(validate_pre_create_domain(AF_INET).is_ok());
+    }
+
+    #[test]
+    fn packet_capability_precedes_family_specific_type_and_protocol_validation() {
+        assert_eq!(
+            validate_packet_create_after_capability(false, SOCK_STREAM, u32::MAX),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            validate_packet_create_after_capability(true, SOCK_STREAM, 0),
+            Err(LinuxError::ESOCKTNOSUPPORT.into())
+        );
+        assert!(validate_packet_create_after_capability(true, SOCK_RAW, u32::MAX).is_ok());
+        assert!(
+            validate_packet_create_after_capability(
+                true,
+                SOCK_DGRAM,
+                u32::from(0x0800_u16.to_be())
+            )
+            .is_ok()
+        );
     }
 }

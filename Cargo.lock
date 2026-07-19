@@ -3219,6 +3219,7 @@ dependencies = [
  "thekernel-linux-fd",
  "thekernel-linux-io-uring",
  "thekernel-linux-mm",
+ "thekernel-linux-packet",
  "thekernel-linux-process-adapter",
  "thekernel-linux-seccomp",
  "thekernel-linux-vfs",
@@ -3247,6 +3248,10 @@ version = "0.1.0"
 
 [[package]]
 name = "thekernel-linux-mm"
+version = "0.1.0"
+
+[[package]]
+name = "thekernel-linux-packet"
 version = "0.1.0"
 
 [[package]]

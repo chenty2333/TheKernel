@@ -63,6 +63,7 @@ thekernel-linux-cred.workspace = true
 thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true
 thekernel-linux-mm.workspace = true
+thekernel-linux-packet.workspace = true
 thekernel-linux-seccomp.workspace = true
 axtlb.workspace = true
 bitflags = "2.10"

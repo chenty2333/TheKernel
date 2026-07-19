@@ -17,6 +17,7 @@ pub(crate) mod namespace_mutation;
 mod net;
 pub(crate) mod netlink;
 pub(crate) mod packet;
+pub(crate) mod packet_socket;
 pub(crate) mod permission;
 mod pidfd;
 pub(crate) mod pipe;
@@ -53,6 +54,7 @@ pub(crate) use self::{
         resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,
     },
     metadata::{PseudoInode, anon_inode_stat},
+    packet_socket::PacketSocket,
     socket::{
         AcceptedSocketSecurityRef, PendingSocketSecurityRef, PinnedSocketDescription,
         PreparedSocketAddress, PreparedSocketMessage, SocketBackendKind, SocketSecurityRef,

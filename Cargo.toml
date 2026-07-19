@@ -49,6 +49,7 @@ thekernel-linux-cred = { version = "=0.1.0", default-features = false }
 thekernel-linux-fd = { version = "=0.1.0" }
 thekernel-linux-io-uring = { version = "=0.1.0", default-features = false }
 thekernel-linux-mm = { version = "=0.1.0", default-features = false }
+thekernel-linux-packet = { version = "=0.1.0", default-features = false }
 thekernel-linux-process = { version = "=0.1.0", default-features = false }
 thekernel-linux-seccomp = { version = "=0.1.0", default-features = false }
 axtlb = { package = "thekernel-axtlb", version = "=0.1.0", default-features = false }
@@ -142,6 +143,7 @@ thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
 thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
+thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet" }
 thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
 thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
