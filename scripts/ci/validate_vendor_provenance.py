@@ -29,6 +29,7 @@ COMMIT_KINDS = {"exact", "context"}
 MAINTAINED_SIBLING_PATCHES = {
     "thekernel-axsched": ("../thekernel-ax/crates/thekernel-axsched", "0.1.0"),
     "thekernel-axpoll": ("../thekernel-ax/crates/thekernel-axpoll", "0.1.0"),
+    "thekernel-axfault": ("../thekernel-ax/crates/thekernel-axfault", "0.1.0"),
     "thekernel-axtask": ("../thekernel-ax/crates/thekernel-axtask", "0.1.0"),
     "thekernel-axtlb": ("../thekernel-ax/crates/thekernel-axtlb", "0.1.0"),
     "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
@@ -41,6 +42,7 @@ MAINTAINED_SIBLING_PATCHES = {
 MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-axsched": ("ax", Path("crates/thekernel-axsched")),
     "thekernel-axpoll": ("ax", Path("crates/thekernel-axpoll")),
+    "thekernel-axfault": ("ax", Path("crates/thekernel-axfault")),
     "thekernel-axtask": ("ax", Path("crates/thekernel-axtask")),
     "thekernel-axtlb": ("ax", Path("crates/thekernel-axtlb")),
     "thekernel-linux-vfs": ("linux-abi", Path("crates/vfs")),
@@ -51,6 +53,7 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-linux-io-uring": ("linux-abi", Path("crates/io-uring")),
 }
 MAINTAINED_WORKSPACE_DEPENDENCIES = {
+    "axfault": ("thekernel-axfault", "=0.1.0"),
     "axtlb": ("thekernel-axtlb", "=0.1.0"),
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
@@ -58,6 +61,7 @@ MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "thekernel-linux-io-uring": ("thekernel-linux-io-uring", "=0.1.0"),
 }
 MAINTAINED_SIBLING_LIB_NAMES = {
+    "thekernel-axfault": "axfault",
     "thekernel-axtlb": "axtlb",
 }
 LOCAL_ADAPTER_PATCHES = {

@@ -19,7 +19,13 @@ PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly-2025-05-20}
 VERSION=0.1.0
 AX_REPOSITORY=https://github.com/chenty2333/thekernel-ax
 LINUX_ABI_REPOSITORY=https://github.com/chenty2333/thekernel-linux-abi
-AX_PACKAGES=(thekernel-axsched thekernel-axpoll thekernel-axtask thekernel-axtlb)
+AX_PACKAGES=(
+    thekernel-axsched
+    thekernel-axpoll
+    thekernel-axfault
+    thekernel-axtask
+    thekernel-axtlb
+)
 LINUX_ABI_PACKAGES=(
     thekernel-linux-usercopy
     thekernel-linux-cred
@@ -33,6 +39,7 @@ LINUX_ABI_PACKAGES=(
 CONSUMED_PACKAGES=(
     thekernel-axsched
     thekernel-axpoll
+    thekernel-axfault
     thekernel-axtask
     thekernel-axtlb
     thekernel-linux-cred
@@ -283,6 +290,7 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
             --locked --no-verify \
             -p thekernel-axsched \
             -p thekernel-axpoll \
+            -p thekernel-axfault \
             -p thekernel-axtask \
             -p thekernel-axtlb
 )
@@ -393,6 +401,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --manifest "$consumer_root/Cargo.toml" \
     --replace "../thekernel-ax/crates/thekernel-axsched=../artifacts/thekernel-axsched-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axpoll=../artifacts/thekernel-axpoll-$VERSION" \
+    --replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-$VERSION" \
     --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
@@ -502,7 +511,7 @@ release_set_tmp="$OUTPUT_RELEASE_SET.tmp.$$"
     printf 'package\tversion\tsha256\trepository_head\n'
     for package in "${all_packages[@]}"; do
         case "$package" in
-            thekernel-axsched|thekernel-axpoll|thekernel-axtask|thekernel-axtlb)
+            thekernel-axsched|thekernel-axpoll|thekernel-axfault|thekernel-axtask|thekernel-axtlb)
                 repo_head=$AX_HEAD
                 ;;
             *)

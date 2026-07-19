@@ -179,6 +179,33 @@ class VendorProvenanceTests(unittest.TestCase):
         )
         return temporary, fixture
 
+    def make_ax_fault_fixture(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Fixture]:
+        temporary = tempfile.TemporaryDirectory()
+        fixture = Fixture(Path(temporary.name) / "consumer")
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-ax/crates/thekernel-axfault/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-axfault"\nversion = "0.1.0"\n'
+            '[lib]\nname = "axfault"\n',
+            encoding="utf-8",
+        )
+        (fixture.root / "Cargo.toml").write_text(
+            '[workspace]\n'
+            '[workspace.dependencies]\n'
+            'axfault = { package = "thekernel-axfault", version = "=0.1.0" }\n'
+            '[patch.crates-io]\n'
+            'foo = { path = "vendor/foo" }\n'
+            'thekernel-axfault = { path = '
+            '"../thekernel-ax/crates/thekernel-axfault" }\n',
+            encoding="utf-8",
+        )
+        return temporary, fixture
+
     def make_linux_cred_fixture(
         self,
     ) -> tuple[tempfile.TemporaryDirectory[str], Fixture]:
@@ -297,6 +324,60 @@ class VendorProvenanceTests(unittest.TestCase):
         result = validator.validate_repository(fixture.root, archive_policy="skip")
         self.assertEqual(result.errors, ())
         self.assertEqual(result.maintained_checks, 1)
+
+    def test_ax_fault_workspace_dependency_patch_and_lib_are_classified(self) -> None:
+        temporary, fixture = self.make_ax_fault_fixture()
+        self.addCleanup(temporary.cleanup)
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.maintained_checks, 1)
+
+    def test_ax_fault_patch_requires_direct_workspace_dependency(self) -> None:
+        temporary, fixture = self.make_ax_fault_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                'axfault = { package = "thekernel-axfault", '
+                'version = "=0.1.0" }\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-axfault requires "
+                "workspace dependency axfault" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_ax_fault_maintained_patch_rejects_wrong_lib_name(self) -> None:
+        temporary, fixture = self.make_ax_fault_fixture()
+        self.addCleanup(temporary.cleanup)
+        sibling_manifest = (
+            Path(temporary.name)
+            / "thekernel-ax/crates/thekernel-axfault/Cargo.toml"
+        )
+        sibling_manifest.write_text(
+            '[package]\nname = "thekernel-axfault"\nversion = "0.1.0"\n'
+            '[lib]\nname = "not_axfault"\n',
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling lib name is 'not_axfault', expected 'axfault'"
+                in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
 
     def test_ax_tlb_maintained_patch_rejects_wrong_path(self) -> None:
         temporary, fixture = self.make_ax_tlb_fixture()
@@ -635,6 +716,7 @@ class VendorProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(result.errors, ())
         self.assertEqual(result.package_checks, 28)
+        self.assertEqual(result.maintained_checks, 11)
 
 
 if __name__ == "__main__":

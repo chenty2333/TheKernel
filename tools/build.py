@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -379,6 +380,82 @@ def kernel_params(req: KernelRequest) -> dict[str, str]:
     return params
 
 
+def _manifest_path_values(value: object) -> Iterator[str]:
+    if isinstance(value, dict):
+        path = value.get("path")
+        if isinstance(path, str):
+            yield path
+        for nested in value.values():
+            yield from _manifest_path_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _manifest_path_values(nested)
+
+
+def _relative_input_path(root: Path, path: Path) -> str:
+    return Path(os.path.relpath(path.resolve(), root.resolve())).as_posix()
+
+
+def _external_workspace_root(package: Path, consumer_root: Path) -> Path | None:
+    common = Path(os.path.commonpath((package.resolve(), consumer_root.resolve())))
+    current = package.resolve()
+    while current != common:
+        manifest = current / "Cargo.toml"
+        if manifest.is_file():
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(data.get("workspace"), dict):
+                return current
+        current = current.parent
+    return None
+
+
+def external_kernel_input_specs(root: Path) -> list[InputSpec]:
+    """Fingerprint the external source roots named by the live manifest.
+
+    Normal development manifests resolve maintained crates through sibling
+    workspaces, while the release-consumer gate rewrites those paths to exact
+    extracted artifacts. Deriving the roots from Cargo.toml keeps both graphs
+    cache-sound without requiring a source-workspace-shaped release fixture.
+    """
+
+    manifest = root / "Cargo.toml"
+    data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    external_packages: dict[Path, None] = {}
+    for raw_path in _manifest_path_values(data):
+        package = (root / raw_path).resolve()
+        if not package.is_relative_to(root.resolve()):
+            external_packages.setdefault(package, None)
+
+    specs: dict[InputSpec, None] = {}
+    workspaces: dict[Path, None] = {}
+    for package in external_packages:
+        workspace = _external_workspace_root(package, root)
+        if workspace is None:
+            specs.setdefault(InputSpec("tree", _relative_input_path(root, package)), None)
+            continue
+        workspaces.setdefault(workspace, None)
+        crates = workspace / "crates"
+        if crates.is_dir() and package.is_relative_to(crates):
+            specs.setdefault(InputSpec("tree", _relative_input_path(root, crates)), None)
+        else:
+            specs.setdefault(InputSpec("tree", _relative_input_path(root, package)), None)
+
+    for workspace in workspaces:
+        specs.setdefault(
+            InputSpec("file", _relative_input_path(root, workspace / "Cargo.toml")),
+            None,
+        )
+        for support in ("Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"):
+            specs.setdefault(
+                InputSpec(
+                    "optional_file",
+                    _relative_input_path(root, workspace / support),
+                ),
+                None,
+            )
+    return list(specs)
+
+
 def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
     return [
         InputSpec("file", "Cargo.toml"),
@@ -393,18 +470,10 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
         InputSpec("tree", "crates"),
         InputSpec("tree", "third_party/rust-patches"),
         InputSpec("tree", "make"),
-        # These are real Cargo path dependencies, not merely repositories
-        # mentioned by release tooling.  Their source must therefore be part
-        # of the content-addressed kernel identity; otherwise a sibling update
-        # can incorrectly reuse a kernel compiled from older code.
-        InputSpec("file", "../thekernel-ax/Cargo.toml"),
-        InputSpec("file", "../thekernel-ax/Cargo.lock"),
-        InputSpec("file", "../thekernel-ax/rust-toolchain.toml"),
-        InputSpec("tree", "../thekernel-ax/crates"),
-        InputSpec("file", "../thekernel-linux-abi/Cargo.toml"),
-        InputSpec("file", "../thekernel-linux-abi/Cargo.lock"),
-        InputSpec("file", "../thekernel-linux-abi/rust-toolchain.toml"),
-        InputSpec("tree", "../thekernel-linux-abi/crates"),
+        # External Cargo path dependencies are build inputs, not merely
+        # repositories mentioned by release tooling. Their live manifest
+        # roots must be part of the content-addressed identity.
+        *external_kernel_input_specs(req.root),
     ]
 
 

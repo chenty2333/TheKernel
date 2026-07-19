@@ -13,6 +13,7 @@ from tools.build import (
     KernelRequest,
     RootfsRequest,
     ensure_rootfs,
+    external_kernel_input_specs,
     fingerprint_inputs,
     hash_params,
     kernel_input_specs,
@@ -115,6 +116,38 @@ class BuildCacheTests(unittest.TestCase):
 
 
 class BuildKernelParamTests(unittest.TestCase):
+    def test_release_artifact_paths_replace_sibling_workspace_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            root = run / "consumer"
+            artifact = run / "artifacts" / "thekernel-axfault-0.1.0"
+            root.mkdir()
+            artifact.mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                "[workspace]\n"
+                'members = []\n'
+                "\n"
+                "[patch.crates-io]\n"
+                'thekernel-axfault = { path = '
+                '"../artifacts/thekernel-axfault-0.1.0" }\n',
+                encoding="utf-8",
+            )
+            (artifact / "Cargo.toml").write_text(
+                "[package]\n"
+                'name = "thekernel-axfault"\n'
+                'version = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (artifact / "src").mkdir()
+            (artifact / "src" / "lib.rs").write_text(
+                "#![no_std]\n", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                external_kernel_input_specs(root),
+                [InputSpec("tree", "../artifacts/thekernel-axfault-0.1.0")],
+            )
+
     def test_kernel_identity_includes_maintained_path_dependency_sources(self) -> None:
         request = KernelRequest(
             name="kernel-rv",
@@ -128,10 +161,10 @@ class BuildKernelParamTests(unittest.TestCase):
         self.assertTrue(
             {
                 InputSpec("file", "../thekernel-ax/Cargo.toml"),
-                InputSpec("file", "../thekernel-ax/Cargo.lock"),
+                InputSpec("optional_file", "../thekernel-ax/Cargo.lock"),
                 InputSpec("tree", "../thekernel-ax/crates"),
                 InputSpec("file", "../thekernel-linux-abi/Cargo.toml"),
-                InputSpec("file", "../thekernel-linux-abi/Cargo.lock"),
+                InputSpec("optional_file", "../thekernel-linux-abi/Cargo.lock"),
                 InputSpec("tree", "../thekernel-linux-abi/crates"),
             }.issubset(specs)
         )

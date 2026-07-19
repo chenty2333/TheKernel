@@ -42,12 +42,35 @@ if grep -Eq '^\[workspace\]' "$work_dir/Cargo.toml"; then
     exit 2
 fi
 
+# Cargo's normalized registry manifests may carry `resolver` in `[package]`.
+# Once this disposable copy becomes a workspace root the setting belongs in
+# `[workspace]`; retaining both locations is a hard manifest error.
+package_resolver=$(
+    sed -n \
+        '/^\[package\]/,/^\[/s/^resolver[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$work_dir/Cargo.toml"
+)
+case "$package_resolver" in
+    '') workspace_resolver=2 ;;
+    1|2|3) workspace_resolver=$package_resolver ;;
+    *)
+        printf 'focused-cargo-test: unsupported package resolver %s in %s\n' \
+            "$package_resolver" "$package_name" >&2
+        exit 2
+        ;;
+esac
+if [ -n "$package_resolver" ]; then
+    sed -i \
+        '/^\[package\]/,/^\[/ { /^resolver[[:space:]]*=/d; }' \
+        "$work_dir/Cargo.toml"
+fi
+
 # These vendored packages live below, but are not members of, the root
 # workspace. A copied standalone workspace is the only way Cargo can compile
 # their dev-dependencies without mutating provenance manifests. Reuse the
 # repository patch table so the test still exercises the current local forks.
 {
-    printf '\n[workspace]\nresolver = "2"\n\n'
+    printf '\n[workspace]\nresolver = "%s"\n\n' "$workspace_resolver"
     sed -n '/^\[patch\.crates-io\]/,$p' "$REPO_ROOT/Cargo.toml" \
         | sed "s#path = \"#path = \"$REPO_ROOT/#g" \
         | sed \

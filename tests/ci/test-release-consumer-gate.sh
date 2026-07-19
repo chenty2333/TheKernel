@@ -10,6 +10,18 @@ trap 'rm -rf "$tmp"' EXIT
 
 bash -n "$CI_DIR/release-consumer-gate.sh"
 "$CI_DIR/release-consumer-gate.sh" --help >/dev/null
+if [ "$(grep -c '^    thekernel-axfault$' \
+    "$CI_DIR/release-consumer-gate.sh")" -lt 2 ]; then
+    printf 'test-release-consumer: axfault is absent from a release package set\n' >&2
+    exit 1
+fi
+grep -Fq -- '-p thekernel-axfault \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- \
+    '--replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    'thekernel-axsched|thekernel-axpoll|thekernel-axfault|thekernel-axtask|thekernel-axtlb)' \
+    "$CI_DIR/release-consumer-gate.sh"
 
 # The temporary-manifest rewrite is exact and refuses to proceed if an anchor
 # disappeared or became ambiguous.
@@ -20,6 +32,7 @@ members = []
 
 [workspace.dependencies]
 one = { path = "../source/one" }
+axfault = { package = "thekernel-axfault", path = "../thekernel-ax/crates/thekernel-axfault" }
 axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
@@ -32,6 +45,7 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --manifest "$tmp/rewrite/Cargo.toml" \
     --replace '../source/one=../artifacts/one-0.1.0' \
     --replace '../source/two=../artifacts/two-0.1.0' \
+    --replace '../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
     --replace '../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-0.1.0' \
@@ -42,6 +56,8 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --record "$tmp/rewrite/record.tsv" >/dev/null
 grep -Fq 'path = "../artifacts/one-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-axfault-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axtlb-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
@@ -241,6 +257,7 @@ mkdir -p \
     "$tmp/consumer/crates/process-adapter" \
     "$tmp/artifacts/thekernel-axsched-0.1.0" \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
+    "$tmp/artifacts/thekernel-axfault-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
@@ -260,6 +277,7 @@ root = pathlib.Path(sys.argv[1]).resolve()
 release_names = [
     "thekernel-axsched",
     "thekernel-axpoll",
+    "thekernel-axfault",
     "thekernel-axtask",
     "thekernel-axtlb",
     "thekernel-linux-cred",
@@ -354,7 +372,8 @@ graph_args=(
     --release-source-root "$tmp/source-linux-abi"
 )
 for package in \
-    thekernel-axsched thekernel-axpoll thekernel-axtask thekernel-axtlb \
+    thekernel-axsched thekernel-axpoll thekernel-axfault \
+    thekernel-axtask thekernel-axtlb \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-io-uring \
     thekernel-linux-process \
     thekernel-linux-vfs thekernel-linux-fd; do
