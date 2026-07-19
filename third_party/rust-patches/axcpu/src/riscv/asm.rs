@@ -109,6 +109,11 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
 /// Synchronizes instruction fetches with earlier writes to executable memory.
 #[inline]
 pub fn flush_icache_all() {
+    // Zifencei specifies that cross-hart instruction publication requires the
+    // writer to make its data stores globally visible before requesting
+    // remote FENCE.I execution. The higher-level maintenance broker publishes
+    // that request only after this function returns.
+    unsafe { core::arch::asm!("fence rw, rw", options(nostack)) };
     riscv::asm::fence_i();
 }
 

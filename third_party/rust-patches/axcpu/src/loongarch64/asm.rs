@@ -3,7 +3,7 @@
 use core::arch::asm;
 
 use loongArch64::register::{crmd, ecfg, eentry, pgdh, pgdl};
-use memory_addr::{PhysAddr, VirtAddr};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
@@ -86,6 +86,10 @@ pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {
 pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     unsafe {
         if let Some(vaddr) = vaddr {
+            // One LoongArch TLB entry contains the adjacent even/odd page
+            // pair. INVTLB's VA operand therefore names the pair rather than
+            // an individual 4-KiB leaf.
+            let pair = vaddr.align_down(2 * PAGE_SIZE_4K);
             // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_dbar>
             //
             // Only after all previous load/store access operations are completely
@@ -102,7 +106,7 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
             //
             // When the operation indicated by op does not require an ASID, the
             // general register rj should be set to r0.
-            asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) vaddr.as_usize());
+            asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) pair.as_usize());
         } else {
             // op 0x0: Clear all page table entries
             asm!("dbar 0; invtlb 0x00, $r0, $r0");
