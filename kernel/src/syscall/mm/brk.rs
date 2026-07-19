@@ -7,7 +7,7 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, align_up_4k};
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
-    mm::check_memory_overcommit,
+    mm::{DeferredUffdWake, check_memory_overcommit},
     task::AsThread,
 };
 
@@ -95,15 +95,22 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         let shrink_size = current_top_aligned.saturating_sub(shrink_start.as_usize());
         let aspace_handle = proc_data.aspace();
 
-        if shrink_size > 0
-            && aspace_handle
-                .lock()
-                .unmap(shrink_start, shrink_size)
-                .is_err()
-        {
-            return Ok(current_top as isize);
-        }
+        let wake = if shrink_size == 0 {
+            DeferredUffdWake::empty()
+        } else {
+            let result = {
+                let mut aspace = aspace_handle.lock();
+                aspace.unmap(shrink_start, shrink_size)
+            };
+            let Ok(wake) = result else {
+                return Ok(current_top as isize);
+            };
+            wake
+        };
         proc_data.clear_mempolicy_range(shrink_start.as_usize(), shrink_size);
+        proc_data.set_heap_top(addr);
+        wake.finish();
+        return Ok(addr as isize);
     }
 
     proc_data.set_heap_top(addr);

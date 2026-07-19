@@ -10,7 +10,10 @@ use memory_set::MappingLineage;
 use thekernel_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
-    mm::{AddrSpace, Backend, BackendOps, ExistingLineageMapError},
+    mm::{
+        AddrSpace, Backend, BackendOps, DeferredUffdWake, ExistingLineageMapError,
+        LockExternalUffdOutcome,
+    },
     task::ProcessData,
 };
 
@@ -715,9 +718,10 @@ fn commit_prepared_remap(
     has_ipc_lock: bool,
     request: MremapRequest,
     prepared: PreparedRemapPlan,
-) -> AxResult<isize> {
+) -> LockExternalUffdOutcome<isize, AxError> {
     debug_assert!(!request.fixed);
-    match prepared {
+    let mut wake = DeferredUffdWake::empty();
+    let outcome = (|| match prepared {
         PreparedRemapPlan::Duplicate {
             source_segments: _,
             destination_segments,
@@ -747,6 +751,8 @@ fn commit_prepared_remap(
                     )
                 },
             );
+            let (duplicate, transaction_wake) = duplicate.into_parts();
+            wake.merge(transaction_wake);
             duplicate?;
             Ok(destination.as_usize() as isize)
         }
@@ -814,13 +820,16 @@ fn commit_prepared_remap(
                     Ok(())
                 },
             );
+            let (moved, transaction_wake) = moved.into_parts();
+            wake.merge(transaction_wake);
             moved?;
 
             proc_data.clear_mempolicy_range(request.addr.as_usize(), request.old_size);
             proc_data.clear_mempolicy_range(destination.as_usize(), request.new_size);
             Ok(destination.as_usize() as isize)
         }
-    }
+    })();
+    LockExternalUffdOutcome::new(outcome, wake)
 }
 
 fn commit_locked_remap(
@@ -830,11 +839,12 @@ fn commit_locked_remap(
     has_ipc_lock: bool,
     request: MremapRequest,
     plan: RemapPlan,
-) -> AxResult<isize> {
-    match plan {
+) -> LockExternalUffdOutcome<isize, AxError> {
+    let mut wake = DeferredUffdWake::empty();
+    let outcome = (|| match plan {
         RemapPlan::Return(address) => Ok(address.as_usize() as isize),
         RemapPlan::Shrink { start, size } => {
-            aspace.unmap(start, size)?;
+            wake.merge(aspace.unmap(start, size)?);
             proc_data.clear_mempolicy_range(start.as_usize(), size);
             Ok(request.addr.as_usize() as isize)
         }
@@ -903,6 +913,8 @@ fn commit_locked_remap(
                     },
                 )
             };
+            let (duplicate, transaction_wake) = duplicate.into_parts();
+            wake.merge(transaction_wake);
             duplicate?;
             if request.fixed {
                 proc_data.clear_mempolicy_range(destination.as_usize(), request.new_size);
@@ -1041,12 +1053,15 @@ fn commit_locked_remap(
                     },
                 )
             };
+            let (moved, transaction_wake) = moved.into_parts();
+            wake.merge(transaction_wake);
             moved?;
             proc_data.clear_mempolicy_range(request.addr.as_usize(), request.old_size);
             proc_data.clear_mempolicy_range(destination.as_usize(), request.new_size);
             Ok(destination.as_usize() as isize)
         }
-    }
+    })();
+    LockExternalUffdOutcome::new(outcome, wake)
 }
 
 enum OptimisticRemapOutcome {
@@ -1071,8 +1086,10 @@ fn try_optimistic_mremap(
             return Ok(OptimisticRemapOutcome::Complete(address.as_usize() as isize));
         }
         RemapPlan::Shrink { start, size } => {
-            aspace.unmap(start, size)?;
+            let wake = aspace.unmap(start, size)?;
             proc_data.clear_mempolicy_range(start.as_usize(), size);
+            drop(aspace);
+            wake.finish();
             return Ok(OptimisticRemapOutcome::Complete(
                 request.addr.as_usize() as isize
             ));
@@ -1089,7 +1106,9 @@ fn try_optimistic_mremap(
     if !proc_data.image_matches(&aspace_handle) || !prepared.revalidate(&aspace, request) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
-    let result = commit_prepared_remap(&mut aspace, proc_data, has_ipc_lock, request, prepared)?;
+    let committed = commit_prepared_remap(&mut aspace, proc_data, has_ipc_lock, request, prepared);
+    drop(aspace);
+    let result = committed.finish()?;
     Ok(OptimisticRemapOutcome::Complete(result))
 }
 
@@ -1108,13 +1127,15 @@ fn run_locked_mremap(
         match plan {
             RemapPlan::Return(address) => return Ok(address.as_usize() as isize),
             RemapPlan::Shrink { start, size } => {
-                aspace.unmap(start, size)?;
+                let wake = aspace.unmap(start, size)?;
                 proc_data.clear_mempolicy_range(start.as_usize(), size);
+                drop(aspace);
+                wake.finish();
                 return Ok(request.addr.as_usize() as isize);
             }
             _ => {}
         }
-        return commit_locked_remap(
+        let committed = commit_locked_remap(
             &mut aspace,
             &aspace_handle,
             proc_data,
@@ -1122,6 +1143,8 @@ fn run_locked_mremap(
             request,
             plan,
         );
+        drop(aspace);
+        return committed.finish();
     }
 }
 

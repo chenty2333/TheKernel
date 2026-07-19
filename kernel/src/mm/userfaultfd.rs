@@ -2,21 +2,27 @@
 //!
 //! Linux-visible validation remains in `thekernel-linux-mm`; queue identity,
 //! coalescing, and waiter ownership remain in `thekernel-axfault`.  This
-//! dormant adapter now owns bounded REGISTER/UNREGISTER transactions and the
-//! per-address-space handler registry. It still does not route page faults or
-//! expose COPY/ZEROPAGE/WAKE resolution.
+//! adapter owns bounded REGISTER/UNREGISTER transactions, per-address-space
+//! handler state, MISSING admission, and lock-external waiter publication. It
+//! does not yet expose COPY/ZEROPAGE/WAKE resolver ioctls.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
-use axfault::{CompletionVisibility, FaultBroker};
+use axfault::{
+    AdmissionError, CompletionVisibility, FaultBroker, RequestCreditPool, RequestPhase,
+    WaiterError, WaiterToken,
+};
 use axpoll::PollSet;
+use memory_addr::VirtAddr;
 use thekernel_linux_mm::{
-    AddressSpaceId, FaultDisposition, FaultHandlerId, FaultRequest, MappingGeneration, MappingId,
-    MappingSnapshot, MmError, PageRange, UffdApiState, UffdIoctls, UffdRegisterMode,
-    UffdRegistration, UffdRegistrationId, UffdRegistrationIntent, UffdRegistrationPlan,
-    UffdRegistrationReplacement, UffdRegistrationRequest, UffdRegistrationTable,
+    AddressSpaceId, FaultAccess, FaultAdmissionContext, FaultAdmissionKind, FaultCapacity,
+    FaultDisposition, FaultHandlerId, FaultKey, FaultLifecycleState, FaultLoad, FaultRequest,
+    FaultType, MappingGeneration, MappingId, MappingSnapshot, MmError, PageRange, UffdApiState,
+    UffdFaultPolicy, UffdIoctls, UffdRegisterMode, UffdRegistration, UffdRegistrationId,
+    UffdRegistrationIntent, UffdRegistrationPlan, UffdRegistrationReplacement,
+    UffdRegistrationRequest, UffdRegistrationTable,
 };
 
 use super::AddrSpace;
@@ -26,6 +32,8 @@ pub(crate) const UFFD_MAX_REGISTRATIONS: usize = 64;
 pub(crate) const UFFD_MAX_REQUESTS: usize = 64;
 pub(crate) const UFFD_MAX_WAITERS: usize = 128;
 pub(crate) const UFFD_POLL_CAPACITY: usize = 256;
+const UFFD_MAX_REQUESTS_PER_HANDLER: usize = UFFD_MAX_REQUESTS;
+const UFFD_GLOBAL_MAX_REQUESTS: usize = 4096;
 const UFFD_MAX_TXN_FRAGMENTS: usize = UFFD_MAX_REGISTRATIONS;
 const UFFD_MAX_PROTECT_CANDIDATES: usize = UFFD_MAX_TXN_FRAGMENTS * 3;
 const UFFD_PLAN_SLOTS: usize = 2;
@@ -33,6 +41,24 @@ const UFFD_PLAN_SLOTS: usize = 2;
 pub(crate) type UffdPollSet = PollSet<UFFD_POLL_CAPACITY>;
 type UffdBroker = FaultBroker<FaultRequest, FaultHandlerId, FaultDisposition>;
 type UffdRegistrations = UffdRegistrationTable<UFFD_MAX_REGISTRATIONS>;
+
+/// One finite request-credit domain shared by every UFFD address space.
+///
+/// Per-address-space and per-handler policy remain stricter at 64 requests.
+/// The larger system ceiling prevents a collection of otherwise-valid
+/// address spaces from consuming unbounded preallocated request ownership.
+static UFFD_REQUEST_CREDITS: RequestCreditPool = RequestCreditPool::new(UFFD_GLOBAL_MAX_REQUESTS);
+
+/// Current hardware-leaf state at the faulting address.
+///
+/// MISSING registration delegates only an absent leaf. A present leaf may
+/// still fault for COW or permissions and must retain one ordinary backend
+/// page of forward progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UffdFaultLeafState {
+    Missing,
+    Present,
+}
 
 static NEXT_UFFD_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,7 +73,9 @@ fn allocate_handler_id() -> AxResult<FaultHandlerId> {
 
 pub(crate) fn uffd_policy_error(error: MmError) -> AxError {
     match error {
-        MmError::CapacityExceeded | MmError::IdExhausted => AxError::NoMemory,
+        MmError::CapacityExceeded | MmError::IdExhausted | MmError::QuotaExceeded => {
+            AxError::NoMemory
+        }
         MmError::Busy | MmError::OwnerBusy | MmError::UffdRegistrationOverlap => {
             AxError::ResourceBusy
         }
@@ -67,33 +95,38 @@ fn broker_config_error(error: axfault::BrokerConfigError) -> AxError {
     }
 }
 
+fn broker_admission_error(error: AdmissionError) -> AxError {
+    match error {
+        AdmissionError::RequestCapacity
+        | AdmissionError::RequestCreditCapacity
+        | AdmissionError::RequestTokenExhausted
+        | AdmissionError::WaiterCapacity
+        | AdmissionError::WaiterTokenExhausted => AxError::NoMemory,
+        AdmissionError::InconsistentState => AxError::BadState,
+        _ => AxError::BadState,
+    }
+}
+
+fn broker_waiter_error(error: WaiterError) -> AxError {
+    match error {
+        WaiterError::NotReady => AxError::WouldBlock,
+        WaiterError::StaleOrForeign | WaiterError::InconsistentState => AxError::BadState,
+        _ => AxError::BadState,
+    }
+}
+
+fn uffd_fault_capacity(global: usize) -> AxResult<FaultCapacity> {
+    FaultCapacity::new(
+        UFFD_MAX_REQUESTS as u32,
+        UFFD_MAX_REQUESTS_PER_HANDLER as u32,
+        u32::try_from(global).map_err(|_| AxError::BadState)?,
+    )
+    .map_err(uffd_policy_error)
+}
+
 struct UffdHandlerState {
     id: FaultHandlerId,
     readiness: Arc<UffdPollSet>,
-}
-
-#[derive(Clone, Copy)]
-struct UffdWakeSpan {
-    handler: FaultHandlerId,
-    address_space: AddressSpaceId,
-    mapping: MappingId,
-    generation: MappingGeneration,
-    range: PageRange,
-}
-
-impl UffdWakeSpan {
-    fn matches(self, handler: FaultHandlerId, request: FaultRequest) -> bool {
-        let key = request.key();
-        handler == self.handler
-            && request.handler() == self.handler
-            && key.address_space() == self.address_space
-            && key.mapping() == self.mapping
-            && key.generation() == self.generation
-            && self
-                .range
-                .user_range()
-                .contains_address(key.page_address().get())
-    }
 }
 
 struct UffdTxnScratch {
@@ -101,7 +134,6 @@ struct UffdTxnScratch {
     removed: Vec<UffdRegistrationId>,
     register_replacements: Vec<UffdRegistrationRequest>,
     mapping_replacements: Vec<UffdRegistrationReplacement>,
-    wake_spans: Vec<UffdWakeSpan>,
 }
 
 impl UffdTxnScratch {
@@ -119,7 +151,6 @@ impl UffdTxnScratch {
             removed: reserved()?,
             register_replacements: reserved()?,
             mapping_replacements: reserved()?,
-            wake_spans: reserved()?,
         })
     }
 
@@ -127,7 +158,6 @@ impl UffdTxnScratch {
         self.removed.clear();
         self.register_replacements.clear();
         self.mapping_replacements.clear();
-        self.wake_spans.clear();
     }
 }
 
@@ -268,7 +298,7 @@ pub(crate) struct DeferredUffdWake {
 }
 
 impl DeferredUffdWake {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             fault_completion: None,
             handlers: core::array::from_fn(|_| None),
@@ -292,6 +322,22 @@ impl DeferredUffdWake {
         *slot = Some(readiness);
     }
 
+    pub(crate) fn merge(&mut self, mut other: Self) {
+        if let Some(other_completion) = other.fault_completion.take() {
+            if let Some(current) = &self.fault_completion {
+                assert!(
+                    Arc::ptr_eq(current, &other_completion),
+                    "cannot merge deferred UFFD wakes from different address spaces"
+                );
+            } else {
+                self.fault_completion = Some(other_completion);
+            }
+        }
+        for readiness in other.handlers.into_iter().flatten() {
+            self.add_handler(readiness);
+        }
+    }
+
     pub(crate) fn finish(self) {
         if let Some(completion) = self.fault_completion {
             completion.wake();
@@ -301,9 +347,94 @@ impl DeferredUffdWake {
         }
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.fault_completion.is_none() && self.handlers.iter().all(Option::is_none)
+    }
+}
+
+/// Concrete MM outcome paired with PollSet ownership that must leave the
+/// address-space critical section before publication.
+///
+/// Destructive failures are first-class outcomes: a fixed replacement may
+/// retire destination authority before a later stage fails, so neither
+/// `Result::map_err` nor `?` may discard its wake receipt.
+#[must_use = "drop the address-space lock, then finish the UFFD mutation outcome"]
+pub(crate) struct LockExternalUffdOutcome<T, E> {
+    outcome: Result<T, E>,
+    wake: DeferredUffdWake,
+}
+
+impl<T, E> LockExternalUffdOutcome<T, E> {
+    pub(crate) fn new(outcome: Result<T, E>, wake: DeferredUffdWake) -> Self {
+        Self { outcome, wake }
+    }
+
+    pub(crate) fn map_err<F>(self, map: impl FnOnce(E) -> F) -> LockExternalUffdOutcome<T, F> {
+        LockExternalUffdOutcome::new(self.outcome.map_err(map), self.wake)
+    }
+
+    pub(crate) fn into_parts(self) -> (Result<T, E>, DeferredUffdWake) {
+        (self.outcome, self.wake)
+    }
+
+    /// Publishes the receipt and returns its concrete outcome.
+    ///
+    /// The caller must already have released the address-space mutex.
+    pub(crate) fn finish(self) -> Result<T, E> {
+        self.wake.finish();
+        self.outcome
+    }
+}
+
+/// Lock-external publication ownership for one admitted MISSING fault.
+///
+/// The broker waiter is already authoritative. Only a genuinely new request
+/// carries handler readiness; an exact coalesced waiter must not create a
+/// duplicate userspace event notification.
+#[must_use = "drop the address-space lock, then publish the admitted UFFD fault"]
+pub(crate) struct AdmittedUffdFault {
+    wait: UffdFaultWait,
+    wake: DeferredUffdWake,
+}
+
+impl AdmittedUffdFault {
+    pub(crate) fn publish(self) -> UffdFaultWait {
+        self.wake.finish();
+        self.wait
+    }
+
+    #[cfg(test)]
+    const fn waiter(&self) -> WaiterToken {
+        self.wait.waiter
+    }
+}
+
+/// Owned identity retained while one faulting task waits outside the
+/// address-space mutex.
+#[must_use = "a delegated UFFD waiter must be completed or cancelled"]
+pub(crate) struct UffdFaultWait {
+    request: FaultRequest,
+    waiter: WaiterToken,
+    completion: Arc<UffdPollSet>,
+}
+
+impl UffdFaultWait {
+    pub(crate) fn completion(&self) -> &UffdPollSet {
+        &self.completion
+    }
+}
+
+/// Lock-external readiness ownership produced by signal/resource cancellation.
+#[must_use = "drop the address-space lock, then finish UFFD waiter cancellation"]
+pub(crate) struct CancelledUffdFaultWait {
+    completion: Option<FaultDisposition>,
+    wake: DeferredUffdWake,
+}
+
+impl CancelledUffdFaultWait {
+    pub(crate) fn finish(self) -> Option<FaultDisposition> {
+        self.wake.finish();
+        self.completion
     }
 }
 
@@ -315,6 +446,7 @@ impl DeferredUffdWake {
 pub(crate) struct UffdAddressSpaceState {
     pub(crate) registrations: UffdRegistrations,
     broker: UffdBroker,
+    request_credits: &'static RequestCreditPool,
     handlers: [Option<UffdHandlerState>; UFFD_MAX_HANDLERS],
     fault_completion: Arc<UffdPollSet>,
     scratch: UffdTxnScratch,
@@ -324,11 +456,19 @@ pub(crate) struct UffdAddressSpaceState {
 
 impl UffdAddressSpaceState {
     pub(crate) fn try_new_boxed() -> AxResult<Box<Self>> {
-        let broker = UffdBroker::try_new(UFFD_MAX_REQUESTS, UFFD_MAX_WAITERS)
-            .map_err(broker_config_error)?;
+        Self::try_new_boxed_with_credit_pool(&UFFD_REQUEST_CREDITS)
+    }
+
+    fn try_new_boxed_with_credit_pool(
+        credit_pool: &'static RequestCreditPool,
+    ) -> AxResult<Box<Self>> {
+        let broker =
+            UffdBroker::try_new_with_credit_pool(UFFD_MAX_REQUESTS, UFFD_MAX_WAITERS, credit_pool)
+                .map_err(broker_config_error)?;
         let state = Self {
             registrations: UffdRegistrations::new(1).map_err(uffd_policy_error)?,
             broker,
+            request_credits: credit_pool,
             handlers: core::array::from_fn(|_| None),
             fault_completion: Arc::try_new(UffdPollSet::new()).map_err(|_| AxError::NoMemory)?,
             scratch: UffdTxnScratch::try_new()?,
@@ -538,9 +678,9 @@ impl UffdAddressSpaceState {
     ///
     /// The ranges are normalized without allocation. Intersecting records are
     /// removed and up to three survivors are refreshed in the same all-or-none
-    /// table plan. This path deliberately does not inspect or complete the
-    /// fault broker: ordinary mapping teardown does not acquire userfaultfd
-    /// wake ownership.
+    /// table plan. Broker reconciliation is deliberately deferred until the
+    /// main MM transaction and this table plan both commit, at which point
+    /// invalid request ownership is returned as a lock-external wake receipt.
     pub(crate) fn preflight_unmap_ranges<F>(
         &mut self,
         slot_index: usize,
@@ -847,13 +987,20 @@ impl UffdAddressSpaceState {
 
     /// Consumes every token owned by a remap plan-set. The unchosen
     /// alternative is always released before the chosen table commit.
-    pub(crate) fn resolve_remap(&mut self, prepared: PreparedRemapUffd, outcome: RemapUffdOutcome) {
+    pub(crate) fn resolve_remap(
+        &mut self,
+        prepared: PreparedRemapUffd,
+        outcome: RemapUffdOutcome,
+    ) -> DeferredUffdWake {
         match prepared {
-            PreparedRemapUffd::None => {}
+            PreparedRemapUffd::None => DeferredUffdWake::empty(),
             PreparedRemapUffd::FixedDuplicate { destination } => match outcome {
-                RemapUffdOutcome::Preserved => self.abort_plan(destination),
+                RemapUffdOutcome::Preserved => {
+                    self.abort_plan(destination);
+                    DeferredUffdWake::empty()
+                }
                 RemapUffdOutcome::DestructiveFailure | RemapUffdOutcome::Committed => {
-                    self.commit_plan(destination);
+                    self.commit_plan(destination)
                 }
             },
             PreparedRemapUffd::FixedMove {
@@ -863,23 +1010,108 @@ impl UffdAddressSpaceState {
                 RemapUffdOutcome::Preserved => {
                     self.abort_plan(on_failure);
                     self.abort_plan(on_success);
+                    DeferredUffdWake::empty()
                 }
                 RemapUffdOutcome::DestructiveFailure => {
                     self.abort_plan(on_success);
-                    self.commit_plan(on_failure);
+                    self.commit_plan(on_failure)
                 }
                 RemapUffdOutcome::Committed => {
                     self.abort_plan(on_failure);
-                    self.commit_plan(on_success);
+                    self.commit_plan(on_success)
                 }
             },
             PreparedRemapUffd::NonfixedMove { on_success } => match outcome {
                 RemapUffdOutcome::Committed => self.commit_plan(on_success),
                 RemapUffdOutcome::Preserved | RemapUffdOutcome::DestructiveFailure => {
                     self.abort_plan(on_success);
+                    DeferredUffdWake::empty()
                 }
             },
         }
+    }
+
+    fn registration_authorizes_request(
+        registrations: &UffdRegistrations,
+        broker_handler: FaultHandlerId,
+        request: FaultRequest,
+    ) -> bool {
+        if request.handler() != broker_handler || request.fault_type() != FaultType::Missing {
+            return false;
+        }
+        let key = request.key();
+        registrations.iter().any(|registration| {
+            registration.handler() == broker_handler
+                && registration.address_space() == key.address_space()
+                && registration.mapping() == key.mapping()
+                && registration.generation() == key.generation()
+                && registration
+                    .range()
+                    .user_range()
+                    .contains_address(key.page_address().get())
+        })
+    }
+
+    /// Reconciles broker ownership against the authoritative registration
+    /// table after one mapping-sidecar commit.
+    ///
+    /// Open requests which lost authority become visibly cancelled. Deferred
+    /// immutable completions retain their resolver result and are only made
+    /// visible. Already-visible terminals need no transition. All PollSet
+    /// ownership is returned to the caller for publication after dropping the
+    /// address-space mutex.
+    fn reconcile_requests_after_registration_change(&mut self) -> DeferredUffdWake {
+        let Self {
+            registrations,
+            broker,
+            handlers,
+            fault_completion,
+            ..
+        } = self;
+        let mut wake = DeferredUffdWake::empty();
+
+        for snapshot in broker.requests() {
+            if snapshot.phase() == RequestPhase::TerminalVisible
+                || Self::registration_authorizes_request(
+                    registrations,
+                    *snapshot.handler(),
+                    *snapshot.key(),
+                )
+            {
+                continue;
+            }
+            let readiness = handlers
+                .iter()
+                .flatten()
+                .find(|handler| handler.id == *snapshot.handler())
+                .expect("open or deferred UFFD request lost its live handler")
+                .readiness
+                .clone();
+            wake.add_handler(readiness);
+        }
+
+        let completed = broker.complete_where(
+            |snapshot| {
+                !Self::registration_authorizes_request(
+                    registrations,
+                    *snapshot.handler(),
+                    *snapshot.key(),
+                )
+            },
+            FaultDisposition::Cancelled,
+            CompletionVisibility::Visible,
+        );
+        let released = broker.release_where(|snapshot| {
+            !Self::registration_authorizes_request(
+                registrations,
+                *snapshot.handler(),
+                *snapshot.key(),
+            )
+        });
+        if completed.waiters_released() + released.waiters_released() != 0 {
+            wake.fault_completion = Some(fault_completion.clone());
+        }
+        wake
     }
 
     /// Commits a mapping-sidecar plan after the main MM transaction succeeded.
@@ -888,9 +1120,9 @@ impl UffdAddressSpaceState {
     /// between preflight and commit. A token or table revision mismatch is thus
     /// internal state corruption and must fail-stop instead of returning an
     /// errno after the VMA/PTE commit is already visible.
-    pub(crate) fn commit_plan(&mut self, plan: OptionalUffdPlan) {
+    pub(crate) fn commit_plan(&mut self, plan: OptionalUffdPlan) -> DeferredUffdWake {
         let OptionalUffdPlan::Armed(token) = plan else {
-            return;
+            return DeferredUffdWake::empty();
         };
         let slot_index = usize::from(token.slot);
         let Self {
@@ -913,6 +1145,7 @@ impl UffdAddressSpaceState {
             .expect("UFFD mapping plan became stale under the address-space lock");
         slot.armed = None;
         slot.clear_payload();
+        self.reconcile_requests_after_registration_change()
     }
 
     /// Releases an uncommitted mapping-sidecar plan without changing the table.
@@ -1063,27 +1296,12 @@ impl UffdAddressSpaceState {
         let result = (|| {
             for registration in self.registrations.intersecting(address_space, range) {
                 self.handler(registration.handler())?;
-                if self.scratch.removed.len() == self.scratch.removed.capacity()
-                    || self.scratch.wake_spans.len() == self.scratch.wake_spans.capacity()
-                {
+                if self.scratch.removed.len() == self.scratch.removed.capacity() {
                     return Err(AxError::NoMemory);
                 }
                 let wake_start = registration.range().start().max(range.start());
                 let wake_end = registration.range().end().min(range.end());
-                let wake_range = PageRange::with_page_size(
-                    wake_start,
-                    wake_end.checked_sub(wake_start).ok_or(AxError::BadState)?,
-                    range.page_size(),
-                )
-                .map_err(uffd_policy_error)?;
                 self.scratch.removed.push(registration.id());
-                self.scratch.wake_spans.push(UffdWakeSpan {
-                    handler: registration.handler(),
-                    address_space: registration.address_space(),
-                    mapping: registration.mapping(),
-                    generation: registration.generation(),
-                    range: wake_range,
-                });
 
                 for survivor in [
                     (registration.range().start(), wake_start),
@@ -1137,46 +1355,7 @@ impl UffdAddressSpaceState {
                     |_| {},
                 )
                 .map_err(uffd_policy_error)?;
-
-            let mut deferred = DeferredUffdWake::empty();
-            let (completed, released) = {
-                let wake_spans = &self.scratch.wake_spans;
-                let completed = self.broker.complete_where(
-                    |snapshot| {
-                        wake_spans
-                            .iter()
-                            .copied()
-                            .any(|span| span.matches(*snapshot.handler(), *snapshot.key()))
-                    },
-                    FaultDisposition::Cancelled,
-                    CompletionVisibility::Visible,
-                );
-                let released = self.broker.release_where(|snapshot| {
-                    wake_spans
-                        .iter()
-                        .copied()
-                        .any(|span| span.matches(*snapshot.handler(), *snapshot.key()))
-                });
-                (completed, released)
-            };
-            if completed.requests_completed() != 0 {
-                // Readiness is a hint. Waking every affected handler keeps the
-                // hot broker path to one bounded scan and DeferredUffdWake
-                // deduplicates shared handler readiness objects.
-                for index in 0..self.scratch.wake_spans.len() {
-                    let span = self.scratch.wake_spans[index];
-                    deferred.add_handler(
-                        self.handler(span.handler)
-                            .expect("registered UFFD handler disappeared under address-space lock")
-                            .readiness
-                            .clone(),
-                    );
-                }
-            }
-            if completed.waiters_released() + released.waiters_released() != 0 {
-                deferred.fault_completion = Some(self.fault_completion.clone());
-            }
-            Ok(deferred)
+            Ok(self.reconcile_requests_after_registration_change())
         })();
         self.scratch.clear_transaction();
         result
@@ -1268,6 +1447,204 @@ impl UffdAddressSpaceState {
         self.handlers.iter().any(Option::is_some)
     }
 
+    fn registration_covering_page(
+        &self,
+        mapping: MappingSnapshot,
+        address: usize,
+    ) -> Option<UffdRegistration> {
+        self.registrations.iter().find(|registration| {
+            registration.address_space() == mapping.address_space()
+                && registration.mapping() == mapping.mapping()
+                && registration.range().user_range().contains_address(address)
+        })
+    }
+
+    /// Atomically admits one registered, absent 4 KiB page and its waiter.
+    ///
+    /// The caller retains the address-space mutex across its page-table query,
+    /// current mapping snapshot, and this complete broker transition. The
+    /// returned handler wake is deliberately deferred until after that mutex
+    /// is released.
+    pub(crate) fn admit_missing_fault(
+        &mut self,
+        mapping: MappingSnapshot,
+        address: usize,
+        access: FaultAccess,
+    ) -> AxResult<Option<AdmittedUffdFault>> {
+        let Some(registration) = self.registration_covering_page(mapping, address) else {
+            return Ok(None);
+        };
+        // Mapping topology generations may advance while one registration
+        // keeps its independent fault epoch. Project only that generation;
+        // current range/access/kind remain the revalidation facts.
+        let current = mapping.with_generation(registration.generation());
+        let request = FaultRequest::new(
+            FaultKey::from_address(current, address, access).map_err(uffd_policy_error)?,
+            registration.handler(),
+            FaultType::Missing,
+        );
+        let handler = registration.handler();
+        let readiness = self.handler(handler)?.readiness.clone();
+
+        let context = if let Some(existing) = self.broker.matching_request(handler, request) {
+            FaultAdmissionContext::exact_request(*existing.key())
+        } else {
+            let load = self.broker.load();
+            let handler_requests = self
+                .broker
+                .requests()
+                .filter(|snapshot| *snapshot.handler() == handler)
+                .count();
+            let load = FaultLoad::new(
+                u32::try_from(load.live_requests()).map_err(|_| AxError::BadState)?,
+                u32::try_from(handler_requests).map_err(|_| AxError::BadState)?,
+                u32::try_from(self.request_credits.live_requests())
+                    .map_err(|_| AxError::BadState)?,
+            );
+            FaultAdmissionContext::new_request(
+                uffd_fault_capacity(self.request_credits.capacity())?,
+                load,
+            )
+        };
+        let permit = UffdFaultPolicy::admit(
+            registration,
+            current,
+            request,
+            context,
+            FaultLifecycleState::Open,
+        )
+        .map_err(uffd_policy_error)?;
+        let admission = self
+            .broker
+            .admit(handler, request)
+            .map_err(broker_admission_error)?;
+        assert_eq!(
+            permit.kind(),
+            if admission.coalesced() {
+                FaultAdmissionKind::CoalescedWaiter
+            } else {
+                FaultAdmissionKind::NewRequest
+            },
+            "UFFD policy/broker admission class diverged under one address-space lock"
+        );
+
+        let mut wake = DeferredUffdWake::empty();
+        if !admission.coalesced() {
+            wake.add_handler(readiness);
+        }
+        Ok(Some(AdmittedUffdFault {
+            wait: UffdFaultWait {
+                request,
+                waiter: admission.waiter(),
+                completion: self.fault_completion.clone(),
+            },
+            wake,
+        }))
+    }
+
+    pub(crate) fn take_fault_completion(
+        &mut self,
+        wait: &UffdFaultWait,
+    ) -> AxResult<FaultDisposition> {
+        self.broker
+            .take_waiter_completion(wait.waiter)
+            .map(|completion| completion.into_completion())
+            .map_err(broker_waiter_error)
+    }
+
+    /// Cancels one interrupting task's waiter. A visible completion returned
+    /// here won the final completion-vs-signal race and remains authoritative.
+    pub(crate) fn cancel_fault_wait(
+        &mut self,
+        wait: &UffdFaultWait,
+    ) -> AxResult<CancelledUffdFaultWait> {
+        let cancelled = self
+            .broker
+            .cancel_waiter(wait.waiter)
+            .map_err(broker_waiter_error)?;
+        let mut wake = DeferredUffdWake::empty();
+        if cancelled.request_reclaimed()
+            && let Some(handler) = self
+                .handlers
+                .iter()
+                .flatten()
+                .find(|handler| handler.id == wait.request.handler())
+        {
+            wake.add_handler(handler.readiness.clone());
+        }
+        Ok(CancelledUffdFaultWait {
+            completion: cancelled.completion().copied(),
+            wake,
+        })
+    }
+
+    /// Returns the largest leading prefix which does not intersect a MISSING
+    /// registration. The scan is bounded by the fixed registration table and
+    /// allocates no scratch storage.
+    fn ordinary_fault_prefix(
+        &self,
+        address_space: AddressSpaceId,
+        fault_address: usize,
+        backend_start: usize,
+        backend_page_size: usize,
+        length: usize,
+        leaf_state: UffdFaultLeafState,
+    ) -> usize {
+        if backend_page_size == 0
+            || !backend_page_size.is_power_of_two()
+            || !backend_start.is_multiple_of(backend_page_size)
+            || length < backend_page_size
+        {
+            return 0;
+        }
+        let Some(current_page_end) = backend_start.checked_add(backend_page_size) else {
+            return 0;
+        };
+        if fault_address < backend_start || fault_address >= current_page_end {
+            return 0;
+        }
+        let Some(end) = backend_start.checked_add(length) else {
+            return 0;
+        };
+
+        let scan_start = match leaf_state {
+            UffdFaultLeafState::Missing => {
+                if self.registrations.iter().any(|registration| {
+                    registration.address_space() == address_space
+                        && registration
+                            .range()
+                            .user_range()
+                            .contains_address(fault_address)
+                }) {
+                    return 0;
+                }
+                backend_start
+            }
+            // A present registered page is not a MISSING event. Let its COW
+            // or permission transition complete, but do not fault-around into
+            // a registered missing neighbor.
+            UffdFaultLeafState::Present => current_page_end,
+        };
+        if scan_start >= end {
+            return length;
+        }
+
+        let mut prefix_end = end;
+        for registration in self.registrations.iter() {
+            if registration.address_space() != address_space
+                || registration.range().end() <= scan_start
+                || registration.range().start() >= end
+            {
+                continue;
+            }
+            prefix_end = prefix_end
+                .max(scan_start)
+                .min(registration.range().start().max(scan_start));
+        }
+        let prefix = prefix_end.saturating_sub(backend_start);
+        prefix / backend_page_size * backend_page_size
+    }
+
     pub(crate) fn pending(&self, id: FaultHandlerId) -> AxResult<bool> {
         self.handler(id)?;
         Ok(self.broker.has_pending(id))
@@ -1344,13 +1721,13 @@ impl<'a> PreparedUffdMutation<'a> {
         }
     }
 
-    pub(crate) fn commit(mut self) {
+    pub(crate) fn commit(mut self) -> DeferredUffdWake {
         // `commit_plan` treats an impossible token/revision mismatch as
         // fail-stop. Disarm this outer RAII owner first so host unwind does
         // not attempt a second abort with the same corrupt token and turn the
         // original invariant failure into a double panic.
         self.finished = true;
-        self.state.commit_plan(self.plan);
+        self.state.commit_plan(self.plan)
     }
 }
 
@@ -1534,6 +1911,79 @@ impl AddrSpace {
             .ok_or(AxError::BadFileDescriptor)?
             .claim_next(handler)
     }
+
+    /// Clamps ordinary fault-around so it cannot pre-populate a neighboring
+    /// page whose MISSING registration belongs to userspace.
+    pub(super) fn ordinary_fault_prefix_before_uffd(
+        &self,
+        fault_address: VirtAddr,
+        backend_start: VirtAddr,
+        backend_page_size: usize,
+        length: usize,
+        leaf_state: UffdFaultLeafState,
+    ) -> usize {
+        self.uffd.as_ref().map_or(length, |state| {
+            state.ordinary_fault_prefix(
+                self.address_space_id(),
+                fault_address.as_usize(),
+                backend_start.as_usize(),
+                backend_page_size,
+                length,
+                leaf_state,
+            )
+        })
+    }
+
+    /// USER_MODE_ONLY faults raised by kernel usercopy must fail back to the
+    /// exception-fixup path instead of silently populating a registered page.
+    pub(super) fn blocks_kernel_usercopy_missing(&self, address: VirtAddr) -> bool {
+        let Some(state) = self.uffd.as_ref() else {
+            return false;
+        };
+        match self.missing_mapping_snapshot_at(address) {
+            Ok(Some(mapping)) => state
+                .registration_covering_page(mapping, address.as_usize())
+                .is_some(),
+            Ok(None) => false,
+            // A corrupt page-table walk under registered policy fails closed.
+            Err(_) => true,
+        }
+    }
+
+    /// Performs the absent-PTE, mapping, registration, quota, and broker
+    /// transition under the one address-space mutex held by the caller.
+    pub(super) fn admit_uffd_missing_fault(
+        &mut self,
+        address: VirtAddr,
+        access: FaultAccess,
+    ) -> AxResult<Option<AdmittedUffdFault>> {
+        let Some(mapping) = self.missing_mapping_snapshot_at(address)? else {
+            return Ok(None);
+        };
+        self.uffd.as_deref_mut().map_or(Ok(None), |state| {
+            state.admit_missing_fault(mapping, address.as_usize(), access)
+        })
+    }
+
+    pub(super) fn take_uffd_fault_completion(
+        &mut self,
+        wait: &UffdFaultWait,
+    ) -> AxResult<FaultDisposition> {
+        self.uffd
+            .as_deref_mut()
+            .ok_or(AxError::BadState)?
+            .take_fault_completion(wait)
+    }
+
+    pub(super) fn cancel_uffd_fault_wait(
+        &mut self,
+        wait: &UffdFaultWait,
+    ) -> AxResult<CancelledUffdFaultWait> {
+        self.uffd
+            .as_deref_mut()
+            .ok_or(AxError::BadState)?
+            .cancel_fault_wait(wait)
+    }
 }
 
 #[cfg(test)]
@@ -1541,6 +1991,10 @@ mod tests {
     extern crate std;
 
     use alloc::vec;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Wake, Waker},
+    };
 
     use memory_addr::PAGE_SIZE_4K;
     use thekernel_linux_mm::{
@@ -1548,6 +2002,34 @@ mod tests {
     };
 
     use super::*;
+
+    struct CountingWake(AtomicUsize);
+
+    impl CountingWake {
+        const fn new() -> Self {
+            Self(AtomicUsize::new(0))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn arm_counting_wake(poll_set: &UffdPollSet) -> Arc<CountingWake> {
+        let counter = Arc::new(CountingWake::new());
+        poll_set.register(&Waker::from(counter.clone())).unwrap();
+        counter
+    }
 
     fn snapshot(
         mapping: u64,
@@ -1670,6 +2152,239 @@ mod tests {
             .unwrap();
         assert!(!state.pending(handler).unwrap());
         assert!(state.claim_next(handler).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_fault_admission_charges_new_request_but_not_exact_waiter() {
+        static CREDITS: RequestCreditPool = RequestCreditPool::new(1);
+
+        let mut state = *UffdAddressSpaceState::try_new_boxed_with_credit_pool(&CREDITS).unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let registered = snapshot(
+            2,
+            17,
+            0x1000,
+            3 * PAGE_SIZE_4K,
+            MappingKind::AnonymousPrivate,
+        );
+        let mut current = [registered];
+        state
+            .register_range(
+                &api,
+                handler,
+                registered.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        // A topology-only mapping generation change does not replace the
+        // independent registration/fault epoch.
+        let current = registered.with_generation(MappingGeneration::new(23).unwrap());
+        let first = state
+            .admit_missing_fault(current, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        assert!(!first.wake.is_empty());
+        assert_eq!(CREDITS.live_requests(), 1);
+        assert_eq!(state.broker.load().live_requests(), 1);
+        assert_eq!(state.broker.load().live_waiters(), 1);
+
+        let second = state
+            .admit_missing_fault(current, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        assert!(second.wake.is_empty());
+        assert_eq!(CREDITS.live_requests(), 1);
+        assert_eq!(state.broker.load().live_requests(), 1);
+        assert_eq!(state.broker.load().live_waiters(), 2);
+
+        // The shared pool is full, but exact coalescing above remained
+        // possible. A distinct request fails without publishing a slot.
+        assert!(matches!(
+            state.admit_missing_fault(current, 0x2000, FaultAccess::Read),
+            Err(AxError::NoMemory)
+        ));
+        assert_eq!(state.broker.load().live_requests(), 1);
+        assert_eq!(state.broker.load().live_waiters(), 2);
+        assert_eq!(CREDITS.live_requests(), 1);
+
+        assert!(
+            !state
+                .broker
+                .cancel_waiter(first.waiter())
+                .unwrap()
+                .request_reclaimed()
+        );
+        assert_eq!(CREDITS.live_requests(), 1);
+        assert!(
+            state
+                .broker
+                .cancel_waiter(second.waiter())
+                .unwrap()
+                .request_reclaimed()
+        );
+        assert_eq!(CREDITS.live_requests(), 0);
+    }
+
+    #[test]
+    fn missing_fault_policy_failure_has_no_broker_or_credit_side_effect() {
+        static CREDITS: RequestCreditPool = RequestCreditPool::new(2);
+
+        let mut state = *UffdAddressSpaceState::try_new_boxed_with_credit_pool(&CREDITS).unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let read_only = MappingSnapshot::from_raw(
+            1,
+            2,
+            17,
+            0x1000,
+            PAGE_SIZE_4K,
+            PAGE_SIZE_4K,
+            MappingAccess::new(true, false, false).bits(),
+            MappingKind::AnonymousPrivate,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut current = [read_only];
+        state
+            .register_range(
+                &api,
+                handler,
+                read_only.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state.admit_missing_fault(read_only, 0x1000, FaultAccess::Write),
+            Err(AxError::OperationNotPermitted)
+        ));
+        assert_eq!(state.broker.load().live_requests(), 0);
+        assert_eq!(state.broker.load().live_waiters(), 0);
+        assert_eq!(CREDITS.live_requests(), 0);
+        assert!(
+            state
+                .admit_missing_fault(read_only, 0x3000, FaultAccess::Read)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(CREDITS.live_requests(), 0);
+    }
+
+    #[test]
+    fn ordinary_fault_around_stops_before_registered_missing_pages() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 1, 0x1000, 0x8000, MappingKind::AnonymousPrivate);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                page_range(0x3000, 0x2000),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.ordinary_fault_prefix(
+                mapping.address_space(),
+                0x1000,
+                0x1000,
+                PAGE_SIZE_4K,
+                0x6000,
+                UffdFaultLeafState::Missing,
+            ),
+            0x2000
+        );
+        assert_eq!(
+            state.ordinary_fault_prefix(
+                mapping.address_space(),
+                0x3000,
+                0x3000,
+                PAGE_SIZE_4K,
+                0x4000,
+                UffdFaultLeafState::Missing,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn present_registered_fault_keeps_cow_progress_without_crossing_neighbor() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 1, 0x1000, 0x8000, MappingKind::AnonymousPrivate);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                page_range(0x3000, 0x2000),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.ordinary_fault_prefix(
+                mapping.address_space(),
+                0x3000,
+                0x3000,
+                PAGE_SIZE_4K,
+                0x4000,
+                UffdFaultLeafState::Present,
+            ),
+            PAGE_SIZE_4K
+        );
+        assert_eq!(
+            state.ordinary_fault_prefix(
+                mapping.address_space(),
+                0x4000,
+                0x4000,
+                PAGE_SIZE_4K,
+                0x3000,
+                UffdFaultLeafState::Present,
+            ),
+            0x3000
+        );
+    }
+
+    #[test]
+    fn unrelated_address_space_does_not_clamp_fault_around() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(2, 1, 0x1000, 0x8000, MappingKind::AnonymousPrivate);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                page_range(0x3000, 0x2000),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.ordinary_fault_prefix(
+                AddressSpaceId::new(2).unwrap(),
+                0x1000,
+                0x1000,
+                PAGE_SIZE_4K,
+                0x6000,
+                UffdFaultLeafState::Missing,
+            ),
+            0x6000
+        );
     }
 
     #[test]
@@ -1861,14 +2576,20 @@ mod tests {
     }
 
     #[test]
-    fn unregister_trims_mixed_owners_and_wakes_only_exact_registered_faults() {
+    fn unregister_trims_mixed_owners_and_preserves_unaffected_authority() {
         let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
         let first = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
         let second = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
         let api = initialized_api();
         let first_mapping = snapshot(2, 7, 0x1000, 0x3000, MappingKind::AnonymousPrivate);
         let second_mapping = snapshot(3, 9, 0x6000, 0x3000, MappingKind::AnonymousPrivate);
-        for (handler, mapping) in [(first, first_mapping), (second, second_mapping)] {
+        let unaffected_mapping =
+            snapshot(4, 11, 0xa000, PAGE_SIZE_4K, MappingKind::AnonymousPrivate);
+        for (handler, mapping) in [
+            (first, first_mapping),
+            (second, second_mapping),
+            (first, unaffected_mapping),
+        ] {
             let mut current = [mapping];
             state
                 .register_range(
@@ -1885,15 +2606,19 @@ mod tests {
             state.admit_test_request(first, request_for(first_mapping, first, 0x1000));
         let second_fault =
             state.admit_test_request(second, request_for(second_mapping, second, 0x6000));
-        let gap_mapping = snapshot(99, 1, 0x4000, 0x2000, MappingKind::AnonymousPrivate);
-        let gap_fault = state.admit_test_request(first, request_for(gap_mapping, first, 0x4000));
+        let unaffected_fault =
+            state.admit_test_request(first, request_for(unaffected_mapping, first, 0xa000));
 
         let mut current = [first_mapping, second_mapping];
         let deferred = state
             .unregister_range(&api, page_range(0x1000, 0x8000), &mut current)
             .unwrap();
 
-        assert!(state.registrations.is_empty());
+        assert_eq!(state.registrations.len(), 1);
+        assert_eq!(
+            state.registrations.iter().next().unwrap().range(),
+            unaffected_mapping.range()
+        );
         assert_eq!(
             state.observe_test_waiter(first_fault.waiter()).unwrap(),
             axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
@@ -1903,11 +2628,14 @@ mod tests {
             axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
         );
         assert_eq!(
-            state.observe_test_waiter(gap_fault.waiter()).unwrap(),
+            state
+                .observe_test_waiter(unaffected_fault.waiter())
+                .unwrap(),
             axfault::WaiterObservation::Pending
         );
         assert!(!deferred.is_empty());
         deferred.finish();
+        state.complete_test_request(unaffected_fault.request());
     }
 
     #[test]
@@ -1966,7 +2694,7 @@ mod tests {
             .unwrap();
         assert!(matches!(plan, OptionalUffdPlan::Armed(_)));
         assert_eq!(state.registrations.len(), 1);
-        state.commit_plan(plan);
+        state.commit_plan(plan).finish();
 
         let mut fragments: Vec<_> = state.registrations.iter().collect();
         fragments.sort_by_key(|registration| registration.range().start());
@@ -2005,7 +2733,7 @@ mod tests {
                     Ok(Some(projected_fragment(mapping, fragment)))
                 })
                 .unwrap();
-            state.commit_plan(split);
+            state.commit_plan(split).finish();
             assert_eq!(state.registrations.len(), 3);
 
             let restore = state
@@ -2013,7 +2741,7 @@ mod tests {
                     Ok(Some(mapping))
                 })
                 .unwrap();
-            state.commit_plan(restore);
+            state.commit_plan(restore).finish();
             let canonical: Vec<_> = state.registrations.iter().collect();
             assert_eq!(canonical.len(), 1);
             assert_eq!(canonical[0].range(), mapping.range());
@@ -2171,9 +2899,12 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_unmap_trims_epoch_without_completing_or_waking_faults() {
-        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
-        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+    fn ordinary_unmap_cancels_only_retired_faults_and_defers_wakes() {
+        static CREDITS: RequestCreditPool = RequestCreditPool::new(2);
+
+        let mut state = *UffdAddressSpaceState::try_new_boxed_with_credit_pool(&CREDITS).unwrap();
+        let handler_readiness = Arc::new(UffdPollSet::new());
+        let handler = state.attach_handler(handler_readiness.clone()).unwrap();
         let api = initialized_api();
         let mapping = snapshot(2, 29, 0x1000, 0x8000, MappingKind::AnonymousPrivate);
         let mut current = [mapping];
@@ -2186,12 +2917,25 @@ mod tests {
                 &mut current,
             )
             .unwrap();
-        let admission = state.admit_test_request(handler, request_for(mapping, handler, 0x4000));
+        let retired = state
+            .admit_missing_fault(mapping, 0x4000, FaultAccess::Read)
+            .unwrap()
+            .unwrap()
+            .publish();
+        let survivor = state
+            .admit_missing_fault(mapping, 0x2000, FaultAccess::Read)
+            .unwrap()
+            .unwrap()
+            .publish();
+        assert_eq!(CREDITS.live_requests(), 2);
+
+        let handler_wake = arm_counting_wake(&handler_readiness);
+        let fault_wake = arm_counting_wake(&state.fault_completion);
 
         let plan = state
             .preflight_unmap(0, page_range(0x4000, 0x2000), |_| Ok(mapping))
             .unwrap();
-        state.commit_plan(plan);
+        let wake = state.commit_plan(plan);
 
         let mut fragments: Vec<_> = state.registrations.iter().collect();
         fragments.sort_by_key(|registration| registration.range().start());
@@ -2205,25 +2949,193 @@ mod tests {
         );
         assert!(state.pending(handler).unwrap());
         assert_eq!(
-            state.observe_test_waiter(admission.waiter()).unwrap(),
-            axfault::WaiterObservation::Pending
+            state.observe_test_waiter(retired.waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
         );
-        let plan = state
-            .preflight_unmap(0, page_range(0, 0xa000), |_| {
-                panic!("fully removed UFFD registrations need no survivor snapshot")
-            })
-            .unwrap();
-        state.commit_plan(plan);
-        assert!(state.registrations.is_empty());
-        assert!(state.pending(handler).unwrap());
         assert_eq!(
-            state.observe_test_waiter(admission.waiter()).unwrap(),
+            state.observe_test_waiter(survivor.waiter).unwrap(),
             axfault::WaiterObservation::Pending
         );
-        // The pending observation above is the no-wake assertion. Retire the
-        // synthetic request explicitly so this test does not rely on state
-        // teardown to release its bounded broker slot.
-        state.complete_test_request(admission.request());
+        assert_eq!(handler_wake.count(), 0);
+        assert_eq!(fault_wake.count(), 0);
+
+        wake.finish();
+        assert_eq!(handler_wake.count(), 1);
+        assert_eq!(fault_wake.count(), 1);
+        assert_eq!(
+            state.take_fault_completion(&retired).unwrap(),
+            FaultDisposition::Cancelled
+        );
+        assert_eq!(CREDITS.live_requests(), 1);
+        assert_eq!(state.cancel_fault_wait(&survivor).unwrap().finish(), None);
+        assert_eq!(CREDITS.live_requests(), 0);
+    }
+
+    #[test]
+    fn unmap_releases_deferred_result_without_overwriting_it() {
+        static CREDITS: RequestCreditPool = RequestCreditPool::new(1);
+
+        let mut state = *UffdAddressSpaceState::try_new_boxed_with_credit_pool(&CREDITS).unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(
+            2,
+            31,
+            0x1000,
+            2 * PAGE_SIZE_4K,
+            MappingKind::AnonymousPrivate,
+        );
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                mapping.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        let wait = state
+            .admit_missing_fault(mapping, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap()
+            .publish();
+        let request = state
+            .broker
+            .matching_request(handler, wait.request)
+            .unwrap()
+            .token();
+        state
+            .broker
+            .complete(
+                request,
+                FaultDisposition::ZeroFill,
+                CompletionVisibility::Deferred,
+            )
+            .unwrap();
+        assert_eq!(
+            state.observe_test_waiter(wait.waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+
+        let plan = state
+            .preflight_unmap(0, page_range(0x1000, PAGE_SIZE_4K), |_| Ok(mapping))
+            .unwrap();
+        let wake = state.commit_plan(plan);
+        assert!(!wake.is_empty());
+        assert_eq!(
+            state.observe_test_waiter(wait.waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+        assert_eq!(
+            state.take_fault_completion(&wait).unwrap(),
+            FaultDisposition::ZeroFill
+        );
+        assert_eq!(CREDITS.live_requests(), 0);
+        wake.finish();
+    }
+
+    #[test]
+    fn unmap_does_not_overwrite_or_rewake_visible_terminal() {
+        static CREDITS: RequestCreditPool = RequestCreditPool::new(1);
+
+        let mut state = *UffdAddressSpaceState::try_new_boxed_with_credit_pool(&CREDITS).unwrap();
+        let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let api = initialized_api();
+        let mapping = snapshot(
+            2,
+            37,
+            0x1000,
+            2 * PAGE_SIZE_4K,
+            MappingKind::AnonymousPrivate,
+        );
+        let mut current = [mapping];
+        state
+            .register_range(
+                &api,
+                handler,
+                mapping.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        let wait = state
+            .admit_missing_fault(mapping, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap()
+            .publish();
+        let request = state
+            .broker
+            .matching_request(handler, wait.request)
+            .unwrap()
+            .token();
+        state
+            .broker
+            .complete(
+                request,
+                FaultDisposition::ZeroFill,
+                CompletionVisibility::Visible,
+            )
+            .unwrap();
+
+        let plan = state
+            .preflight_unmap(0, page_range(0x1000, PAGE_SIZE_4K), |_| Ok(mapping))
+            .unwrap();
+        let wake = state.commit_plan(plan);
+        assert!(wake.is_empty());
+        assert_eq!(
+            state.take_fault_completion(&wait).unwrap(),
+            FaultDisposition::ZeroFill
+        );
+        assert_eq!(CREDITS.live_requests(), 0);
+    }
+
+    #[test]
+    fn adapter_cancel_preserves_visible_completion_and_reclaims_deferred_waiter() {
+        static VISIBLE_CREDITS: RequestCreditPool = RequestCreditPool::new(1);
+        static DEFERRED_CREDITS: RequestCreditPool = RequestCreditPool::new(1);
+
+        for (credits, visibility, expected) in [
+            (
+                &VISIBLE_CREDITS,
+                CompletionVisibility::Visible,
+                Some(FaultDisposition::ZeroFill),
+            ),
+            (&DEFERRED_CREDITS, CompletionVisibility::Deferred, None),
+        ] {
+            let mut state =
+                *UffdAddressSpaceState::try_new_boxed_with_credit_pool(credits).unwrap();
+            let handler = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+            let api = initialized_api();
+            let mapping = snapshot(2, 41, 0x1000, PAGE_SIZE_4K, MappingKind::AnonymousPrivate);
+            let mut current = [mapping];
+            state
+                .register_range(
+                    &api,
+                    handler,
+                    mapping.range(),
+                    UffdRegisterMode::MISSING,
+                    &mut current,
+                )
+                .unwrap();
+            let wait = state
+                .admit_missing_fault(mapping, 0x1000, FaultAccess::Read)
+                .unwrap()
+                .unwrap()
+                .publish();
+            let request = state
+                .broker
+                .matching_request(handler, wait.request)
+                .unwrap()
+                .token();
+            state
+                .broker
+                .complete(request, FaultDisposition::ZeroFill, visibility)
+                .unwrap();
+
+            assert_eq!(state.cancel_fault_wait(&wait).unwrap().finish(), expected);
+            assert_eq!(credits.live_requests(), 0);
+        }
     }
 
     #[test]
@@ -2246,7 +3158,7 @@ mod tests {
         let prefix = state
             .preflight_unmap(0, page_range(0x1000, 0x2000), |_| Ok(mapping))
             .unwrap();
-        state.commit_plan(prefix);
+        state.commit_plan(prefix).finish();
         let after_prefix = state.registrations.iter().next().unwrap();
         assert_eq!(after_prefix.range(), page_range(0x3000, 0x3000));
         assert_eq!(after_prefix.generation().get(), 30);
@@ -2254,7 +3166,7 @@ mod tests {
         let suffix = state
             .preflight_unmap(0, page_range(0x5000, 0x2000), |_| Ok(mapping))
             .unwrap();
-        state.commit_plan(suffix);
+        state.commit_plan(suffix).finish();
         let after_suffix: Vec<_> = state.registrations.iter().collect();
         assert_eq!(after_suffix.len(), 1);
         assert_eq!(after_suffix[0].range(), page_range(0x3000, 0x2000));
@@ -2290,7 +3202,7 @@ mod tests {
                 |_| Ok(mapping),
             )
             .unwrap();
-        state.commit_plan(plan);
+        state.commit_plan(plan).finish();
 
         let mut survivors: Vec<_> = state.registrations.iter().collect();
         survivors.sort_by_key(|registration| registration.range().start());
@@ -2332,7 +3244,7 @@ mod tests {
                 |_| Ok(mapping),
             )
             .unwrap();
-        state.commit_plan(plan);
+        state.commit_plan(plan).finish();
 
         let mut survivors: Vec<_> = state.registrations.iter().collect();
         survivors.sort_by_key(|registration| registration.range().start());
@@ -2369,7 +3281,7 @@ mod tests {
                 .unwrap();
             assert!(state.plan_slots.iter().all(|slot| slot.armed.is_some()));
 
-            state.resolve_remap(prepared, outcome);
+            state.resolve_remap(prepared, outcome).finish();
 
             let mut ranges: Vec<_> = state
                 .registrations
@@ -2404,7 +3316,7 @@ mod tests {
                 .unwrap();
             assert!(duplicate.plan_slots[0].armed.is_some());
             assert!(duplicate.plan_slots[1].armed.is_none());
-            duplicate.resolve_remap(prepared, outcome);
+            duplicate.resolve_remap(prepared, outcome).finish();
             let mut duplicate_ranges: Vec<_> = duplicate
                 .registrations
                 .iter()
@@ -2444,7 +3356,9 @@ mod tests {
                 |_| panic!("fully retired source needs no survivor snapshot"),
             )
             .unwrap();
-        moved.resolve_remap(prepared, RemapUffdOutcome::DestructiveFailure);
+        moved
+            .resolve_remap(prepared, RemapUffdOutcome::DestructiveFailure)
+            .finish();
         assert_eq!(moved.registrations.len(), 1);
         let retry = moved
             .preflight_remap(
@@ -2455,7 +3369,9 @@ mod tests {
                 |_| panic!("fully retired source needs no survivor snapshot"),
             )
             .unwrap();
-        moved.resolve_remap(retry, RemapUffdOutcome::Committed);
+        moved
+            .resolve_remap(retry, RemapUffdOutcome::Committed)
+            .finish();
         assert!(moved.registrations.is_empty());
 
         let nonce = moved.next_plan_nonce;
@@ -2470,7 +3386,9 @@ mod tests {
             .unwrap();
         assert!(matches!(duplicate, PreparedRemapUffd::None));
         assert_eq!(moved.next_plan_nonce, nonce);
-        moved.resolve_remap(duplicate, RemapUffdOutcome::Committed);
+        moved
+            .resolve_remap(duplicate, RemapUffdOutcome::Committed)
+            .finish();
     }
 
     #[test]
@@ -2554,7 +3472,7 @@ mod tests {
                 0x8000,
             )
             .unwrap();
-        state.commit_plan(tail);
+        state.commit_plan(tail).finish();
         let extended = state.registrations.iter().next().unwrap();
         assert_eq!(extended.range(), page_range(0x3000, 0x5000));
         assert_eq!(extended.generation().get(), 89);
@@ -2565,7 +3483,7 @@ mod tests {
                 panic!("fully removed extension needs no snapshot")
             })
             .unwrap();
-        state.commit_plan(remove);
+        state.commit_plan(remove).finish();
         let head_registration = page_range(0x2000, 0x3000);
         let mut current = [mapping];
         state
@@ -2586,7 +3504,7 @@ mod tests {
                 0x1000,
             )
             .unwrap();
-        state.commit_plan(head);
+        state.commit_plan(head).finish();
         let extended = state.registrations.iter().next().unwrap();
         assert_eq!(extended.range(), page_range(0x1000, 0x4000));
         assert_eq!(extended.generation().get(), 89);
@@ -2758,7 +3676,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(plan, OptionalUffdPlan::Armed(_)));
-        state.commit_plan(plan);
+        state.commit_plan(plan).finish();
 
         let mut registrations: Vec<_> = state.registrations.iter().collect();
         registrations.sort_by_key(|registration| registration.range().start());
@@ -2799,7 +3717,7 @@ mod tests {
         assert!(state.plan_slots[0].replacements.is_empty());
 
         let retry = state.preflight_unmap(0, range, |_| Ok(mapping)).unwrap();
-        state.commit_plan(retry);
+        state.commit_plan(retry).finish();
         let mut survivors: Vec<_> = state.registrations.iter().collect();
         survivors.sort_by_key(|registration| registration.range().start());
         assert_eq!(survivors.len(), 2);
@@ -2869,10 +3787,12 @@ mod tests {
         else {
             panic!("protect split must arm a plan");
         };
-        state.commit_plan(OptionalUffdPlan::Armed(UffdPlanToken {
-            nonce: token.nonce + 1,
-            ..token
-        }));
+        state
+            .commit_plan(OptionalUffdPlan::Armed(UffdPlanToken {
+                nonce: token.nonce + 1,
+                ..token
+            }))
+            .finish();
     }
 
     #[test]
@@ -2905,7 +3825,9 @@ mod tests {
         });
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            PreparedUffdMutation::new(&mut state, stale).commit();
+            PreparedUffdMutation::new(&mut state, stale)
+                .commit()
+                .finish();
         }));
         assert!(result.is_err());
         // The first invariant panic is caught without an RAII re-entry panic.

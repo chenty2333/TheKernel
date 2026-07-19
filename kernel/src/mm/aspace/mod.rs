@@ -13,7 +13,7 @@ use core::{
 use axerrno::{AxError, AxResult, ax_bail};
 use axhal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageTable},
+    paging::{MappingFlags, PageSize, PageTable, PagingError},
     trap::PageFaultFlags,
 };
 use axsync::Mutex;
@@ -31,8 +31,8 @@ use thekernel_linux_mm::{
 };
 
 use super::{
-    OptionalUffdPlan, PreparedRemapUffd, PreparedUffdMutation, RemapUffdOutcome, UffdRemapKind,
-    checked_align_up_4k,
+    DeferredUffdWake, LockExternalUffdOutcome, OptionalUffdPlan, PreparedRemapUffd,
+    PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState, UffdRemapKind, checked_align_up_4k,
 };
 
 mod backend;
@@ -103,6 +103,21 @@ fn uffd_vma_scan_range(
         VirtAddr::from(start),
         VirtAddr::from(end),
     ))
+}
+
+/// The first MISSING-only profile does not advertise
+/// `UFFD_FEATURE_MISSING_HUGETLBFS`.
+///
+/// Mapping snapshots deliberately use 4 KiB Linux policy geometry, so
+/// accepting a larger backend leaf here would let a resolver or ordinary
+/// fault populate outside one registered 4 KiB page. Reject it before any
+/// registration-table mutation.
+fn validate_uffd_missing_backend_granule(page_size: PageSize) -> AxResult {
+    if page_size == PageSize::Size4K {
+        Ok(())
+    } else {
+        Err(AxError::InvalidInput)
+    }
 }
 
 const USER_IO_PIN_MAX_TOKENS: u64 = 64;
@@ -1073,7 +1088,7 @@ impl PreparedProtect<'_> {
 
     /// Commits the already-preflighted request through MemorySet's staged
     /// split/protect/rollback/merge transaction.
-    pub(crate) fn commit(self) -> AxResult {
+    pub(crate) fn commit(self) -> AxResult<DeferredUffdWake> {
         let Self {
             transaction,
             growdown_starts,
@@ -1093,12 +1108,10 @@ impl PreparedProtect<'_> {
                 }
             })?;
         Self::refresh_growdown_starts(areas, growdown_starts);
-        if let Some(mutation) = uffd_mutation {
-            mutation.commit();
-        }
+        let wake = uffd_mutation.map_or_else(DeferredUffdWake::empty, |mutation| mutation.commit());
         commit_mapping_identity_mutations(mapping_identities, &mapping_mutations);
         *topology_generation = next_topology_generation;
-        Ok(())
+        Ok(wake)
     }
 
     fn refresh_growdown_starts(
@@ -1126,6 +1139,11 @@ impl AddrSpace {
     /// Returns the address space end.
     pub const fn end(&self) -> VirtAddr {
         self.va_range.end
+    }
+
+    /// Returns the stable policy identity of this address space.
+    pub(super) const fn address_space_id(&self) -> AddressSpaceId {
+        self.address_space_id
     }
 
     /// Returns the address space size.
@@ -1749,6 +1767,31 @@ impl AddrSpace {
         Self::mapping_snapshot_from_parts(self.address_space_id, &self.mapping_identities, area)
     }
 
+    /// Returns the current mapping snapshot only when `address` is covered by
+    /// a VMA and its 4 KiB page-table leaf is still absent.
+    ///
+    /// This is a generic, read-only admission primitive. It does not interpret
+    /// Linux userfaultfd registration or allocate page-table state; the
+    /// adapter performs that policy check separately while retaining the same
+    /// address-space lock.
+    pub(super) fn missing_mapping_snapshot_at(
+        &self,
+        address: VirtAddr,
+    ) -> AxResult<Option<MappingSnapshot>> {
+        if !self.va_range.contains(address) {
+            return Ok(None);
+        }
+        let Some(area) = self.areas.find(address) else {
+            return Ok(None);
+        };
+        let page = address.align_down(PAGE_SIZE_4K);
+        match self.pt.query(page) {
+            Ok(_) => Ok(None),
+            Err(PagingError::NotMapped) => self.mapping_snapshot(area).map(Some),
+            Err(_) => Err(AxError::BadState),
+        }
+    }
+
     fn mapping_snapshot_from_parts(
         address_space_id: AddressSpaceId,
         mapping_identities: &MappingIdentityIndex,
@@ -1962,6 +2005,7 @@ impl AddrSpace {
     ) -> AxResult {
         let scan_range = uffd_vma_scan_range(range, self.base(), self.end())?;
         for area in self.areas.iter_overlapping(scan_range) {
+            validate_uffd_missing_backend_granule(area.backend().page_size())?;
             if snapshots.len() == snapshots.capacity() {
                 return Err(AxError::NoMemory);
             }
@@ -2305,7 +2349,11 @@ impl AddrSpace {
             .as_deref_mut()
             .expect("armed UFFD lineage-extension plan lost its address-space state");
         if published {
-            state.commit_plan(plan);
+            let wake = state.commit_plan(plan);
+            assert!(
+                wake.is_empty(),
+                "authority-preserving UFFD lineage growth invalidated a live request"
+            );
         } else {
             state.abort_plan(plan);
         }
@@ -2568,14 +2616,19 @@ impl AddrSpace {
         })
     }
 
-    fn resolve_remap_uffd(&mut self, prepared: PreparedRemapUffd, outcome: RemapUffdOutcome) {
+    fn resolve_remap_uffd(
+        &mut self,
+        prepared: PreparedRemapUffd,
+        outcome: RemapUffdOutcome,
+    ) -> DeferredUffdWake {
         if let Some(state) = self.uffd.as_deref_mut() {
-            state.resolve_remap(prepared, outcome);
+            state.resolve_remap(prepared, outcome)
         } else {
             assert!(
                 matches!(prepared, PreparedRemapUffd::None),
                 "armed UFFD remap plan lost its address-space state"
             );
+            DeferredUffdWake::empty()
         }
     }
 
@@ -2589,18 +2642,19 @@ impl AddrSpace {
         destination_changed: bool,
         next_topology_generation: MappingGeneration,
         uffd_plan: PreparedRemapUffd,
+        wake: &mut DeferredUffdWake,
     ) -> MappingTransactionFailure {
         let rollback =
             self.rollback_staged_mapping(destination_start, destination_size, destination_lineage);
         let rollback_error = rollback.err();
         let effect = classify_failed_remap_effect(destination_changed, rollback_error.is_some());
-        self.resolve_remap_uffd(
+        wake.merge(self.resolve_remap_uffd(
             uffd_plan,
             match effect {
                 RemapTransactionEffect::Preserved => RemapUffdOutcome::Preserved,
                 RemapTransactionEffect::Destructive => RemapUffdOutcome::DestructiveFailure,
             },
-        );
+        ));
         if destination_changed {
             commit_mapping_identity_mutations(&mut self.mapping_identities, destination_mutations);
         }
@@ -2623,134 +2677,147 @@ impl AddrSpace {
         staged_fragments: usize,
         fragment_limit: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> Result<T, MappingTransactionFailure> {
-        self.validate_region(source_start, source_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        self.validate_region(destination_start, destination_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        if staged_fragments == 0 {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-        let source_range = VirtAddrRange::from_start_size(source_start, source_size);
-        let destination_range = VirtAddrRange::from_start_size(destination_start, destination_size);
-        if source_range.overlaps(destination_range) {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-        if !range_is_fully_mapped(&self.areas, source_start, source_size) {
-            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
-        }
-
-        let replacing = matches!(destination, RemapDestination::Replace);
-        if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-        if replacing {
-            self.check_no_user_io_pin_overlap(
-                destination_start,
-                destination_size,
-                InvalidationReason::Remap,
-            )
-            .map_err(MappingTransactionFailure::preserved)?;
-        }
-
-        let destination_mutations = if replacing {
-            prepare_unmap_mapping_mutations(
-                &self.areas,
-                &self.mapping_identities,
-                destination_start,
-                destination_size,
-            )
-            .map_err(MappingTransactionFailure::preserved)?
-        } else {
-            Vec::new()
-        };
-        let policy = self
-            .prepare_remap_policy(source_start, source_size, destination_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        let destination_unmaps = [destination_range];
-        let unmaps = if replacing {
-            destination_unmaps.as_slice()
-        } else {
-            &[]
-        };
-        admit_staged_fragments_after_unmaps(&self.areas, &unmaps, staged_fragments, fragment_limit)
-            .map_err(MappingTransactionFailure::preserved)?;
-        if replacing {
-            self.preflight_transaction_unmap(destination_start, destination_size)
+    ) -> LockExternalUffdOutcome<T, MappingTransactionFailure> {
+        let mut wake = DeferredUffdWake::empty();
+        let outcome = (|| {
+            self.validate_region(source_start, source_size)
                 .map_err(MappingTransactionFailure::preserved)?;
-        }
-        let next_topology_generation = self
-            .next_topology_generation()
-            .map_err(MappingTransactionFailure::preserved)?;
-        let destination_lineage = self
-            .prepare_fresh_mapping_lineage()
-            .map_err(MappingTransactionFailure::preserved)?;
-        let uffd_plan = match self.preflight_remap_uffd(
-            UffdRemapKind::Duplicate,
-            replacing,
-            source_start,
-            source_size,
-            destination_start,
-            destination_size,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
-                debug_assert!(removed);
-                return Err(MappingTransactionFailure::preserved(error));
+            self.validate_region(destination_start, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+            if staged_fragments == 0 {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
             }
-        };
+            let source_range = VirtAddrRange::from_start_size(source_start, source_size);
+            let destination_range =
+                VirtAddrRange::from_start_size(destination_start, destination_size);
+            if source_range.overlaps(destination_range) {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+            }
+            if !range_is_fully_mapped(&self.areas, source_start, source_size) {
+                return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+            }
 
-        let destination_changed = !destination_mutations.is_empty();
-        if replacing
-            && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
-        {
-            let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
-            debug_assert!(removed);
-            self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved);
-            return Err(MappingTransactionFailure::preserved(error));
-        }
-
-        let staged = stage(self, destination_lineage);
-        match staged {
-            Ok(value)
-                if lineage_exactly_covers_range(
-                    &self.areas,
-                    destination_lineage,
+            let replacing = matches!(destination, RemapDestination::Replace);
+            if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+            }
+            if replacing {
+                self.check_no_user_io_pin_overlap(
                     destination_start,
                     destination_size,
-                ) =>
-            {
-                self.apply_remap_policy(destination_start, &policy);
-                self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed);
-                commit_mapping_identity_mutations(
-                    &mut self.mapping_identities,
-                    &destination_mutations,
-                );
-                self.commit_topology_generation(next_topology_generation);
-                Ok(value)
+                    InvalidationReason::Remap,
+                )
+                .map_err(MappingTransactionFailure::preserved)?;
             }
-            Ok(_) => Err(self.finish_failed_mapping_transaction(
-                AxError::BadState,
+
+            let destination_mutations = if replacing {
+                prepare_unmap_mapping_mutations(
+                    &self.areas,
+                    &self.mapping_identities,
+                    destination_start,
+                    destination_size,
+                )
+                .map_err(MappingTransactionFailure::preserved)?
+            } else {
+                Vec::new()
+            };
+            let policy = self
+                .prepare_remap_policy(source_start, source_size, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+            let destination_unmaps = [destination_range];
+            let unmaps = if replacing {
+                destination_unmaps.as_slice()
+            } else {
+                &[]
+            };
+            admit_staged_fragments_after_unmaps(
+                &self.areas,
+                &unmaps,
+                staged_fragments,
+                fragment_limit,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+            if replacing {
+                self.preflight_transaction_unmap(destination_start, destination_size)
+                    .map_err(MappingTransactionFailure::preserved)?;
+            }
+            let next_topology_generation = self
+                .next_topology_generation()
+                .map_err(MappingTransactionFailure::preserved)?;
+            let destination_lineage = self
+                .prepare_fresh_mapping_lineage()
+                .map_err(MappingTransactionFailure::preserved)?;
+            let uffd_plan = match self.preflight_remap_uffd(
+                UffdRemapKind::Duplicate,
+                replacing,
+                source_start,
+                source_size,
                 destination_start,
                 destination_size,
-                destination_lineage,
-                &destination_mutations,
-                destination_changed,
-                next_topology_generation,
-                uffd_plan,
-            )),
-            Err(operation_error) => Err(self.finish_failed_mapping_transaction(
-                operation_error,
-                destination_start,
-                destination_size,
-                destination_lineage,
-                &destination_mutations,
-                destination_changed,
-                next_topology_generation,
-                uffd_plan,
-            )),
-        }
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                    debug_assert!(removed);
+                    return Err(MappingTransactionFailure::preserved(error));
+                }
+            };
+
+            let destination_changed = !destination_mutations.is_empty();
+            if replacing
+                && let Err(error) =
+                    self.destroy_remap_destination(destination_start, destination_size)
+            {
+                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                debug_assert!(removed);
+                wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved));
+                return Err(MappingTransactionFailure::preserved(error));
+            }
+
+            let staged = stage(self, destination_lineage);
+            match staged {
+                Ok(value)
+                    if lineage_exactly_covers_range(
+                        &self.areas,
+                        destination_lineage,
+                        destination_start,
+                        destination_size,
+                    ) =>
+                {
+                    self.apply_remap_policy(destination_start, &policy);
+                    wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed));
+                    commit_mapping_identity_mutations(
+                        &mut self.mapping_identities,
+                        &destination_mutations,
+                    );
+                    self.commit_topology_generation(next_topology_generation);
+                    Ok(value)
+                }
+                Ok(_) => Err(self.finish_failed_mapping_transaction(
+                    AxError::BadState,
+                    destination_start,
+                    destination_size,
+                    destination_lineage,
+                    &destination_mutations,
+                    destination_changed,
+                    next_topology_generation,
+                    uffd_plan,
+                    &mut wake,
+                )),
+                Err(operation_error) => Err(self.finish_failed_mapping_transaction(
+                    operation_error,
+                    destination_start,
+                    destination_size,
+                    destination_lineage,
+                    &destination_mutations,
+                    destination_changed,
+                    next_topology_generation,
+                    uffd_plan,
+                    &mut wake,
+                )),
+            }
+        })();
+        LockExternalUffdOutcome::new(outcome, wake)
     }
 
     fn move_mapping_transaction<T>(
@@ -2763,176 +2830,189 @@ impl AddrSpace {
         staged_fragments: usize,
         fragment_limit: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> Result<T, MappingTransactionFailure> {
-        self.validate_region(source_start, source_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        self.validate_region(destination_start, destination_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        if staged_fragments == 0 {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-        self.check_no_user_io_pin_overlap(source_start, source_size, InvalidationReason::Remap)
-            .map_err(MappingTransactionFailure::preserved)?;
-        let source_range = VirtAddrRange::from_start_size(source_start, source_size);
-        let destination_range = VirtAddrRange::from_start_size(destination_start, destination_size);
-        if source_range.overlaps(destination_range) {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-
-        let replacing = matches!(destination, RemapDestination::Replace);
-        if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
-            return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
-        }
-        if replacing {
-            self.check_no_user_io_pin_overlap(
-                destination_start,
-                destination_size,
-                InvalidationReason::Remap,
-            )
-            .map_err(MappingTransactionFailure::preserved)?;
-        }
-
-        if !range_is_fully_mapped(&self.areas, source_start, source_size) {
-            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
-        }
-        let destination_mutations = if replacing {
-            prepare_unmap_mapping_mutations(
-                &self.areas,
-                &self.mapping_identities,
-                destination_start,
-                destination_size,
-            )
-            .map_err(MappingTransactionFailure::preserved)?
-        } else {
-            Vec::new()
-        };
-        let replacement_success_ranges = [destination_range, source_range];
-        let source_success_ranges = [source_range];
-        let success_ranges = if replacing {
-            replacement_success_ranges.as_slice()
-        } else {
-            source_success_ranges.as_slice()
-        };
-        let success_mutations = prepare_unmap_mapping_mutations_for_ranges(
-            &self.areas,
-            &self.mapping_identities,
-            success_ranges,
-        )
-        .map_err(MappingTransactionFailure::preserved)?;
-        if success_mutations.is_empty() {
-            return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
-        }
-
-        let policy = self
-            .prepare_remap_policy(source_start, source_size, destination_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        let replacement_destination_unmaps = [destination_range];
-        let destination_unmaps = if replacing {
-            replacement_destination_unmaps.as_slice()
-        } else {
-            &[]
-        };
-        admit_staged_fragments_after_unmaps(
-            &self.areas,
-            &destination_unmaps,
-            staged_fragments,
-            fragment_limit,
-        )
-        .map_err(MappingTransactionFailure::preserved)?;
-        admit_staged_fragments_after_unmaps(
-            &self.areas,
-            success_ranges,
-            staged_fragments,
-            fragment_limit,
-        )
-        .map_err(MappingTransactionFailure::preserved)?;
-        if replacing {
-            self.preflight_transaction_unmap(destination_start, destination_size)
+    ) -> LockExternalUffdOutcome<T, MappingTransactionFailure> {
+        let mut wake = DeferredUffdWake::empty();
+        let outcome = (|| {
+            self.validate_region(source_start, source_size)
                 .map_err(MappingTransactionFailure::preserved)?;
-        }
-        self.preflight_transaction_unmap(source_start, source_size)
-            .map_err(MappingTransactionFailure::preserved)?;
-        let next_topology_generation = self
-            .next_topology_generation()
-            .map_err(MappingTransactionFailure::preserved)?;
-        let destination_lineage = self
-            .prepare_fresh_mapping_lineage()
-            .map_err(MappingTransactionFailure::preserved)?;
-        let uffd_plan = match self.preflight_remap_uffd(
-            UffdRemapKind::Move,
-            replacing,
-            source_start,
-            source_size,
-            destination_start,
-            destination_size,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
-                debug_assert!(removed);
-                return Err(MappingTransactionFailure::preserved(error));
+            self.validate_region(destination_start, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+            if staged_fragments == 0 {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
             }
-        };
+            self.check_no_user_io_pin_overlap(source_start, source_size, InvalidationReason::Remap)
+                .map_err(MappingTransactionFailure::preserved)?;
+            let source_range = VirtAddrRange::from_start_size(source_start, source_size);
+            let destination_range =
+                VirtAddrRange::from_start_size(destination_start, destination_size);
+            if source_range.overlaps(destination_range) {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+            }
 
-        let destination_changed = !destination_mutations.is_empty();
-        if replacing
-            && let Err(error) = self.destroy_remap_destination(destination_start, destination_size)
-        {
-            let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
-            debug_assert!(removed);
-            self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved);
-            return Err(MappingTransactionFailure::preserved(error));
-        }
-
-        let staged = stage(self, destination_lineage);
-        let operation: AxResult<T> = match staged {
-            Ok(value)
-                if lineage_exactly_covers_range(
-                    &self.areas,
-                    destination_lineage,
+            let replacing = matches!(destination, RemapDestination::Replace);
+            if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
+                return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
+            }
+            if replacing {
+                self.check_no_user_io_pin_overlap(
                     destination_start,
                     destination_size,
-                ) =>
-            {
-                self.apply_remap_policy(destination_start, &policy);
-                let source_commit = self.unmap_areas_with_tlb_grace(source_start, source_size);
-                match source_commit {
-                    Ok(()) => {
-                        self.refresh_growdown_starts();
-                        Self::clear_interval(
-                            &mut self.wipe_on_fork_ranges,
-                            source_start,
-                            source_size,
-                        );
-                        Self::clear_interval(&mut self.dontfork_ranges, source_start, source_size);
-                        self.clear_locked_range(source_start, source_size);
-                        self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed);
-                        commit_mapping_identity_mutations(
-                            &mut self.mapping_identities,
-                            &success_mutations,
-                        );
-                        self.commit_topology_generation(next_topology_generation);
-                        return Ok(value);
-                    }
-                    Err(error) => Err(error.into()),
-                }
+                    InvalidationReason::Remap,
+                )
+                .map_err(MappingTransactionFailure::preserved)?;
             }
-            Ok(_) => Err(AxError::BadState),
-            Err(error) => Err(error),
-        };
 
-        Err(self.finish_failed_mapping_transaction(
-            operation
-                .err()
-                .expect("failed remap operation lost its error"),
-            destination_start,
-            destination_size,
-            destination_lineage,
-            &destination_mutations,
-            destination_changed,
-            next_topology_generation,
-            uffd_plan,
-        ))
+            if !range_is_fully_mapped(&self.areas, source_start, source_size) {
+                return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+            }
+            let destination_mutations = if replacing {
+                prepare_unmap_mapping_mutations(
+                    &self.areas,
+                    &self.mapping_identities,
+                    destination_start,
+                    destination_size,
+                )
+                .map_err(MappingTransactionFailure::preserved)?
+            } else {
+                Vec::new()
+            };
+            let replacement_success_ranges = [destination_range, source_range];
+            let source_success_ranges = [source_range];
+            let success_ranges = if replacing {
+                replacement_success_ranges.as_slice()
+            } else {
+                source_success_ranges.as_slice()
+            };
+            let success_mutations = prepare_unmap_mapping_mutations_for_ranges(
+                &self.areas,
+                &self.mapping_identities,
+                success_ranges,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+            if success_mutations.is_empty() {
+                return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
+            }
+
+            let policy = self
+                .prepare_remap_policy(source_start, source_size, destination_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+            let replacement_destination_unmaps = [destination_range];
+            let destination_unmaps = if replacing {
+                replacement_destination_unmaps.as_slice()
+            } else {
+                &[]
+            };
+            admit_staged_fragments_after_unmaps(
+                &self.areas,
+                &destination_unmaps,
+                staged_fragments,
+                fragment_limit,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+            admit_staged_fragments_after_unmaps(
+                &self.areas,
+                success_ranges,
+                staged_fragments,
+                fragment_limit,
+            )
+            .map_err(MappingTransactionFailure::preserved)?;
+            if replacing {
+                self.preflight_transaction_unmap(destination_start, destination_size)
+                    .map_err(MappingTransactionFailure::preserved)?;
+            }
+            self.preflight_transaction_unmap(source_start, source_size)
+                .map_err(MappingTransactionFailure::preserved)?;
+            let next_topology_generation = self
+                .next_topology_generation()
+                .map_err(MappingTransactionFailure::preserved)?;
+            let destination_lineage = self
+                .prepare_fresh_mapping_lineage()
+                .map_err(MappingTransactionFailure::preserved)?;
+            let uffd_plan = match self.preflight_remap_uffd(
+                UffdRemapKind::Move,
+                replacing,
+                source_start,
+                source_size,
+                destination_start,
+                destination_size,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                    debug_assert!(removed);
+                    return Err(MappingTransactionFailure::preserved(error));
+                }
+            };
+
+            let destination_changed = !destination_mutations.is_empty();
+            if replacing
+                && let Err(error) =
+                    self.destroy_remap_destination(destination_start, destination_size)
+            {
+                let removed = self.remove_mapping_lineage_if_unused(destination_lineage);
+                debug_assert!(removed);
+                wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved));
+                return Err(MappingTransactionFailure::preserved(error));
+            }
+
+            let staged = stage(self, destination_lineage);
+            let operation: AxResult<T> = match staged {
+                Ok(value)
+                    if lineage_exactly_covers_range(
+                        &self.areas,
+                        destination_lineage,
+                        destination_start,
+                        destination_size,
+                    ) =>
+                {
+                    self.apply_remap_policy(destination_start, &policy);
+                    let source_commit = self.unmap_areas_with_tlb_grace(source_start, source_size);
+                    match source_commit {
+                        Ok(()) => {
+                            self.refresh_growdown_starts();
+                            Self::clear_interval(
+                                &mut self.wipe_on_fork_ranges,
+                                source_start,
+                                source_size,
+                            );
+                            Self::clear_interval(
+                                &mut self.dontfork_ranges,
+                                source_start,
+                                source_size,
+                            );
+                            self.clear_locked_range(source_start, source_size);
+                            wake.merge(
+                                self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed),
+                            );
+                            commit_mapping_identity_mutations(
+                                &mut self.mapping_identities,
+                                &success_mutations,
+                            );
+                            self.commit_topology_generation(next_topology_generation);
+                            return Ok(value);
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                Ok(_) => Err(AxError::BadState),
+                Err(error) => Err(error),
+            };
+
+            Err(self.finish_failed_mapping_transaction(
+                operation
+                    .err()
+                    .expect("failed remap operation lost its error"),
+                destination_start,
+                destination_size,
+                destination_lineage,
+                &destination_mutations,
+                destination_changed,
+                next_topology_generation,
+                uffd_plan,
+                &mut wake,
+            ))
+        })();
+        LockExternalUffdOutcome::new(outcome, wake)
     }
 
     pub(crate) fn duplicate_mapping_into_empty_transaction<T>(
@@ -2943,7 +3023,7 @@ impl AddrSpace {
         destination_size: usize,
         staged_fragments: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> AxResult<T> {
+    ) -> LockExternalUffdOutcome<T, AxError> {
         self.duplicate_mapping_transaction(
             RemapDestination::Empty,
             source_start,
@@ -2965,7 +3045,7 @@ impl AddrSpace {
         destination_size: usize,
         staged_fragments: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> Result<T, ReplaceMappingError> {
+    ) -> LockExternalUffdOutcome<T, ReplaceMappingError> {
         self.duplicate_mapping_transaction(
             RemapDestination::Replace,
             source_start,
@@ -2987,7 +3067,7 @@ impl AddrSpace {
         destination_size: usize,
         staged_fragments: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> AxResult<T> {
+    ) -> LockExternalUffdOutcome<T, AxError> {
         self.move_mapping_transaction(
             RemapDestination::Empty,
             source_start,
@@ -3009,7 +3089,7 @@ impl AddrSpace {
         destination_size: usize,
         staged_fragments: usize,
         stage: impl FnOnce(&mut Self, MappingLineage) -> AxResult<T>,
-    ) -> Result<T, ReplaceMappingError> {
+    ) -> LockExternalUffdOutcome<T, ReplaceMappingError> {
         self.move_mapping_transaction(
             RemapDestination::Replace,
             source_start,
@@ -3170,10 +3250,10 @@ impl AddrSpace {
     ///
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
-    pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
+    pub(crate) fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult<DeferredUffdWake> {
         self.validate_region(start, size)?;
         if size == 0 {
-            return Ok(());
+            return Ok(DeferredUffdWake::empty());
         }
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
         let next_generation = self.next_topology_generation()?;
@@ -3219,15 +3299,17 @@ impl AddrSpace {
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
-        if let Some(plan) = uffd_plan {
+        let wake = if let Some(plan) = uffd_plan {
             self.uffd
                 .as_mut()
                 .expect("armed UFFD unmap plan lost its address-space state")
-                .commit_plan(plan);
-        }
+                .commit_plan(plan)
+        } else {
+            DeferredUffdWake::empty()
+        };
         commit_mapping_identity_mutations(&mut self.mapping_identities, &mapping_mutations);
         self.commit_topology_generation(next_generation);
-        Ok(())
+        Ok(wake)
     }
 
     /// To process data in this area with the given function.
@@ -3388,10 +3470,6 @@ impl AddrSpace {
         })
     }
 
-    pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
-        self.prepare_protect(start, size, flags)?.commit()
-    }
-
     fn check_protect_range(
         &self,
         mut start: VirtAddr,
@@ -3417,6 +3495,13 @@ impl AddrSpace {
     /// Removes all mappings and starts a fresh identity generation for exec.
     pub fn clear(&mut self) -> AxResult {
         if self.user_io_pins.progress().total() != 0 {
+            return Err(AxError::ResourceBusy);
+        }
+        // Image reset is currently used only on a fresh address space. Do not
+        // silently recycle an mm which still owns UFFD registrations,
+        // terminal results, or waiter credits; that lifecycle needs an
+        // explicit lock-external detach receipt.
+        if self.uffd.is_some() {
             return Err(AxError::ResourceBusy);
         }
         // Reserve the replacement identity before destroying the current
@@ -3512,7 +3597,11 @@ impl AddrSpace {
         ) {
             if error.published() {
                 self.move_growdown_start(current_start, fault_page);
-                return self.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
+                // Mapping and UFFD sidecar authority are now visible. Return
+                // to the user-fault dispatcher instead of populating under
+                // this recursive lock-held path; the retried instruction must
+                // pass through delegated-fault admission for the new page.
+                return PageFaultResult::Handled;
             }
             let err = error.into_error();
             warn!(
@@ -3526,7 +3615,11 @@ impl AddrSpace {
             };
         }
         self.move_growdown_start(current_start, fault_page);
-        self.handle_page_fault_result(vaddr, access_flags, Some(user_sp))
+        // Growth is one committed transition. A second hardware fault either
+        // delegates the inherited UFFD MISSING registration or performs the
+        // ordinary population path. `Handled` already means retry the same
+        // userspace instruction at the trap boundary.
+        PageFaultResult::Handled
     }
 
     /// Checks whether an access to the specified memory region is valid.
@@ -3587,10 +3680,32 @@ impl AddrSpace {
                     return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
                 }
                 let fault_around = area.backend().fault_around_size(access_flags);
-                let len = area
+                let fault_around_len = area
                     .end()
                     .sub_addr(start)
                     .min(fault_around.max(page_size as usize));
+                let leaf_state = match self.pt.query(vaddr.align_down(PAGE_SIZE_4K)) {
+                    Ok(_) => UffdFaultLeafState::Present,
+                    Err(PagingError::NotMapped) => UffdFaultLeafState::Missing,
+                    Err(_) => {
+                        return PageFaultResult::Failed(PageFaultFailure::InternalInconsistency);
+                    }
+                };
+                let len = self.ordinary_fault_prefix_before_uffd(
+                    vaddr,
+                    start,
+                    page_size as usize,
+                    fault_around_len,
+                    leaf_state,
+                );
+                if len == 0 {
+                    // User-originated registered faults are intercepted by
+                    // `FaultSession`; kernel-originated USER_MODE_ONLY faults
+                    // are rejected by `handle_page_fault` below. Reaching the
+                    // ordinary population path for the registered page would
+                    // violate both boundaries, so fail closed.
+                    return PageFaultResult::Failed(PageFaultFailure::InternalInconsistency);
+                }
                 let populate_outcome = area.backend().populate(
                     VirtAddrRange::from_start_size(start, len),
                     flags,
@@ -3621,6 +3736,9 @@ impl AddrSpace {
     /// Returns `true` if the page fault is handled successfully (not a real
     /// fault).
     pub fn handle_page_fault(&mut self, vaddr: VirtAddr, access_flags: PageFaultFlags) -> bool {
+        if self.blocks_kernel_usercopy_missing(vaddr) {
+            return false;
+        }
         matches!(
             self.handle_page_fault_result(vaddr, access_flags, None),
             PageFaultResult::Handled
@@ -3945,6 +4063,22 @@ mod tests {
                 VirtAddr::from(0x1000),
                 VirtAddr::from(TEST_SPACE_SIZE),
             ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn first_uffd_profile_rejects_huge_backend_granules() {
+        assert_eq!(
+            validate_uffd_missing_backend_granule(PageSize::Size4K),
+            Ok(())
+        );
+        assert_eq!(
+            validate_uffd_missing_backend_granule(PageSize::Size2M),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_uffd_missing_backend_granule(PageSize::Size1G),
             Err(AxError::InvalidInput)
         );
     }
@@ -4598,7 +4732,7 @@ mod tests {
             ]
         );
         assert!(page_table[0x2000..0x3000].iter().all(|entry| *entry == 3));
-        mutation.commit();
+        mutation.commit().finish();
 
         let mut registrations: Vec<_> = uffd.registrations.iter().collect();
         registrations.sort_by_key(|registration| registration.range().start());

@@ -28,7 +28,7 @@ use super::{
     shmmax_limit, shmmni_limit,
 };
 use crate::{
-    mm::{Backend, SharedPages, UserPtr, nullable},
+    mm::{Backend, DeferredUffdWake, SharedPages, UserPtr, nullable},
     task::AsThread,
     time::wall_time,
 };
@@ -1827,45 +1827,53 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
 // shm_id and the shm_inner,   but the shm_inner is not deleted or modifyed!
 pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
     let shmaddr = VirtAddr::from(shmaddr);
-    let _transaction = SHM_TRANSACTION.lock();
+    let transaction = SHM_TRANSACTION.lock();
+    let mut deferred_uffd_wake = DeferredUffdWake::empty();
+    let outcome = (|| {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
 
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+        let pid = proc_data.proc.pid();
+        let shmid = {
+            let shm_manager = SHM_MANAGER.lock();
+            shm_manager
+                .get_shmid_by_vaddr(pid, shmaddr)
+                .ok_or(AxError::InvalidInput)?
+        };
 
-    let pid = proc_data.proc.pid();
-    let shmid = {
-        let shm_manager = SHM_MANAGER.lock();
-        shm_manager
-            .get_shmid_by_vaddr(pid, shmaddr)
-            .ok_or(AxError::InvalidInput)?
-    };
+        let shm_inner = {
+            let shm_manager = SHM_MANAGER.lock();
+            shm_manager
+                .get_inner_by_shmid(shmid)
+                .ok_or(AxError::InvalidInput)?
+        };
+        let va_range = shm_inner
+            .lock()
+            .get_addr_range(pid, shmaddr)
+            .ok_or(AxError::InvalidInput)?;
 
-    let shm_inner = {
-        let shm_manager = SHM_MANAGER.lock();
-        shm_manager
-            .get_inner_by_shmid(shmid)
-            .ok_or(AxError::InvalidInput)?
-    };
-    let va_range = shm_inner
-        .lock()
-        .get_addr_range(pid, shmaddr)
-        .ok_or(AxError::InvalidInput)?;
+        let aspace_handle = proc_data.aspace();
+        let wake = {
+            let mut aspace = aspace_handle.lock();
+            aspace.unmap(va_range.start, va_range.size())?
+        };
+        deferred_uffd_wake.merge(wake);
 
-    let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-    aspace.unmap(va_range.start, va_range.size())?;
+        SHM_MANAGER.lock().remove_shmaddr(pid, shmaddr);
+        let remove = {
+            let mut state = shm_inner.lock();
+            state.detach_process(pid, shmaddr);
+            (state.rmid && !state.has_attachment_owners()).then_some(state.page_num)
+        };
+        if let Some(page_num) = remove {
+            SHM_MANAGER.lock().remove_shmid(shmid, page_num)?;
+        }
 
-    SHM_MANAGER.lock().remove_shmaddr(pid, shmaddr);
-    let remove = {
-        let mut state = shm_inner.lock();
-        state.detach_process(pid, shmaddr);
-        (state.rmid && !state.has_attachment_owners()).then_some(state.page_num)
-    };
-    if let Some(page_num) = remove {
-        SHM_MANAGER.lock().remove_shmid(shmid, page_num)?;
-    }
-
-    Ok(0)
+        Ok(0)
+    })();
+    drop(transaction);
+    deferred_uffd_wake.finish();
+    outcome
 }
 
 #[cfg(test)]
