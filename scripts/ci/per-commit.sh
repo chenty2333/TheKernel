@@ -65,11 +65,28 @@ canonical_workspace() {
     (cd -- "$path" && pwd -P)
 }
 
+canonical_target_dir() {
+    local label=$1
+    local path=$2
+    case "$path" in
+        /*) ;;
+        *) path="$REPO_ROOT/$path" ;;
+    esac
+    mkdir -p -- "$path" || ci_die "cannot create $label Cargo target: $path"
+    (cd -- "$path" && pwd -P)
+}
+
 AX_REPO=$(canonical_workspace thekernel-ax "$AX_REPO")
 LINUX_ABI_REPO=$(canonical_workspace thekernel-linux-abi "$LINUX_ABI_REPO")
 export THEKERNEL_AX_REPO="$AX_REPO"
 export THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO"
-SIBLING_TARGET_DIR="$REPO_ROOT/target/ci-maintained-siblings"
+CI_TARGET_DIR=$(canonical_target_dir per-commit \
+    "${THEKERNEL_CI_TARGET_DIR:-target/ci-per-commit}")
+SIBLING_TARGET_DIR=$(canonical_target_dir maintained-sibling \
+    "${THEKERNEL_CI_SIBLING_TARGET_DIR:-target/ci-maintained-siblings}")
+[ "$CI_TARGET_DIR" != "$SIBLING_TARGET_DIR" ] \
+    || ci_die 'per-commit and maintained-sibling Cargo targets must be distinct'
+export CARGO_TARGET_DIR="$CI_TARGET_DIR"
 
 # lwext4's host build script probes generic tool names. Pin those names instead
 # of inheriting cross-compiler variables from a developer shell or CI runner.

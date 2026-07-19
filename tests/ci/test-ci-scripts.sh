@@ -16,6 +16,36 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
 done
 bash -n "$0"
 
+# The host and pinned Debian developer container must never execute artifacts
+# from the same primary or maintained-sibling Cargo target. This is a static
+# contract test because the remainder of this file deliberately stays
+# Docker-free.
+grep -Fq \
+    '"${THEKERNEL_CI_TARGET_DIR:-target/ci-per-commit}")' \
+    "$CI_DIR/per-commit.sh"
+grep -Fq \
+    '"${THEKERNEL_CI_SIBLING_TARGET_DIR:-target/ci-maintained-siblings}")' \
+    "$CI_DIR/per-commit.sh"
+grep -Fq \
+    'THEKERNEL_CI_TARGET_DIR: /workspace/target/ci-per-commit-container' \
+    "$REPO_ROOT/dev-env/compose.yaml"
+grep -Fq \
+    'THEKERNEL_CI_SIBLING_TARGET_DIR: /workspace/target/ci-maintained-siblings-container' \
+    "$REPO_ROOT/dev-env/compose.yaml"
+mkdir -p "$tmp/shared-cargo-target"
+ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
+if env \
+    THEKERNEL_CI_TARGET_DIR="$tmp/shared-cargo-target" \
+    THEKERNEL_CI_SIBLING_TARGET_DIR="$tmp/aliased-cargo-target" \
+    "$CI_DIR/per-commit.sh" --log-dir "$tmp/target-alias-log" \
+    >"$tmp/target-alias.stdout" 2>"$tmp/target-alias.stderr"; then
+    printf 'test-ci-scripts: aliased Cargo targets were accepted\n' >&2
+    exit 1
+fi
+grep -Fq \
+    'per-commit and maintained-sibling Cargo targets must be distinct' \
+    "$tmp/target-alias.stderr"
+
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
 python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"

@@ -7,6 +7,8 @@ x-common-env: &common-env
   THEKERNEL_ROOTFS_DIR: /opt/thekernel/rootfs
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   PYTHONDONTWRITEBYTECODE: "1"
+  THEKERNEL_CI_TARGET_DIR: /workspace/target/ci-per-commit-container
+  THEKERNEL_CI_SIBLING_TARGET_DIR: /workspace/target/ci-maintained-siblings-container
   LOCAL_UID: "${LOCAL_UID:-1000}"
   LOCAL_GID: "${LOCAL_GID:-1000}"
 
