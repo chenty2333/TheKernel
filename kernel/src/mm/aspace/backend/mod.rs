@@ -360,6 +360,23 @@ impl DeferredUnmapBackend for Backend {
 }
 
 impl Backend {
+    pub(crate) fn supports_uffd_missing_resolver(&self) -> bool {
+        matches!(self, Self::Cow(cow) if cow.is_4k_anonymous())
+    }
+
+    pub(crate) fn publish_prepared_cow_page(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        pt: &mut PageTable,
+        prepared: &mut PreparedCowPage,
+    ) -> AxResult {
+        match self {
+            Self::Cow(cow) => cow.publish_prepared_page(vaddr, flags, pt, prepared),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
     pub(crate) fn linux_mapping_kind(&self) -> MappingKind {
         match self {
             Backend::Cow(_) if self.file_mapping().is_some() => MappingKind::FilePrivate,

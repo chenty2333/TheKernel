@@ -3,8 +3,8 @@
 //! Linux-visible validation remains in `thekernel-linux-mm`; queue identity,
 //! coalescing, and waiter ownership remain in `thekernel-axfault`.  This
 //! adapter owns bounded REGISTER/UNREGISTER transactions, per-address-space
-//! handler state, MISSING admission, and lock-external waiter publication. It
-//! does not yet expose COPY/ZEROPAGE/WAKE resolver ioctls.
+//! handler state, MISSING admission, resolver completion, and lock-external
+//! waiter publication.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -12,16 +12,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use axerrno::{AxError, AxResult};
 use axfault::{
     AdmissionError, CompletionVisibility, FaultBroker, RequestCreditPool, RequestPhase,
-    WaiterError, WaiterToken,
+    RequestToken, WaiterError, WaiterToken,
 };
 use axpoll::PollSet;
 use memory_addr::VirtAddr;
+#[cfg(test)]
+use thekernel_linux_mm::MappingGeneration;
 use thekernel_linux_mm::{
     AddressSpaceId, FaultAccess, FaultAdmissionContext, FaultAdmissionKind, FaultCapacity,
-    FaultDisposition, FaultHandlerId, FaultKey, FaultLifecycleState, FaultLoad, FaultRequest,
-    FaultType, MappingGeneration, MappingId, MappingSnapshot, MmError, PageRange, UffdApiState,
-    UffdFaultPolicy, UffdIoctls, UffdRegisterMode, UffdRegistration, UffdRegistrationId,
-    UffdRegistrationIntent, UffdRegistrationPlan, UffdRegistrationReplacement,
+    FaultCompletionPermit, FaultDisposition, FaultHandlerId, FaultKey, FaultLifecycleState,
+    FaultLoad, FaultRequest, FaultType, MappingId, MappingSnapshot, MmError, PageRange,
+    UffdApiState, UffdFaultPolicy, UffdIoctls, UffdRegisterMode, UffdRegistration,
+    UffdRegistrationId, UffdRegistrationIntent, UffdRegistrationPlan, UffdRegistrationReplacement,
     UffdRegistrationRequest, UffdRegistrationTable,
 };
 
@@ -45,8 +47,9 @@ type UffdRegistrations = UffdRegistrationTable<UFFD_MAX_REGISTRATIONS>;
 /// One finite request-credit domain shared by every UFFD address space.
 ///
 /// Per-address-space and per-handler policy remain stricter at 64 requests.
-/// The larger system ceiling prevents a collection of otherwise-valid
-/// address spaces from consuming unbounded preallocated request ownership.
+/// The larger system ceiling bounds system-wide live request ownership. It
+/// does not account for retained per-address-space broker storage or other
+/// UFFD state bytes.
 static UFFD_REQUEST_CREDITS: RequestCreditPool = RequestCreditPool::new(UFFD_GLOBAL_MAX_REQUESTS);
 
 /// Current hardware-leaf state at the faulting address.
@@ -58,6 +61,108 @@ static UFFD_REQUEST_CREDITS: RequestCreditPool = RequestCreditPool::new(UFFD_GLO
 pub(super) enum UffdFaultLeafState {
     Missing,
     Present,
+}
+
+/// Whole-range resolver authority frozen before page preparation.
+///
+/// COPY/ZEROPAGE installation is an address-space capability in Linux: the
+/// invoking OFD need not own the destination registration. The registration
+/// identity retained here nevertheless determines which pending request, if
+/// any, receives the immutable resolver result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UffdResolverLease {
+    registration: UffdRegistration,
+    destination: PageRange,
+}
+
+impl UffdResolverLease {
+    pub(super) const fn destination(self) -> PageRange {
+        self.destination
+    }
+}
+
+/// Exact optional broker transition validated before a resolver publishes a
+/// page-table leaf.
+///
+/// This value consumes the Layer 2 completion permit only after the leaf is
+/// visible. Keeping the request token with the permit avoids a second
+/// predicate scan and makes the post-publication transition fail-stop if the
+/// lower broker changed while the address-space lock was held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct UffdResolverCompletion {
+    token: RequestToken,
+    permit: FaultCompletionPermit,
+}
+
+const UFFD_RESOLVER_COMPLETION_CAPACITY: usize = 3;
+
+/// Fixed ownership for every access variant waiting on one missing page.
+///
+/// `FaultAccess` is part of the generic broker key, so one page can have
+/// independent read, write, and execute requests. Linux resolves the page,
+/// not just the first access variant; validating the complete bounded batch
+/// before PTE publication keeps that all-or-nothing rule explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct UffdResolverCompletions {
+    entries: [Option<UffdResolverCompletion>; UFFD_RESOLVER_COMPLETION_CAPACITY],
+    len: usize,
+}
+
+impl UffdResolverCompletions {
+    const fn new() -> Self {
+        Self {
+            entries: [None; UFFD_RESOLVER_COMPLETION_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, completion: UffdResolverCompletion) -> AxResult {
+        let slot = self.entries.get_mut(self.len).ok_or(AxError::BadState)?;
+        *slot = Some(completion);
+        self.len += 1;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) const fn len(self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    pub(super) const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// One allocation-free attempt to publish a prepared UFFD page.
+///
+/// An executable mapping cannot become visible until every CPU has observed
+/// an instruction-cache synchronization after the data frame was initialized.
+/// The adapter therefore asks the caller to leave the address-space critical
+/// section, synchronize, and retry. The retry revalidates the VMA,
+/// registration, PTE, and broker transitions before publishing anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a requested instruction-cache synchronization must precede publication retry"]
+pub(crate) enum UffdPagePublication {
+    NeedsIcacheSynchronization,
+    Published,
+}
+
+/// Affine proof that an initialized resolver frame passed through global
+/// instruction-cache synchronization before executable PTE publication.
+///
+/// The private field prevents safe callers from replacing the proof with a
+/// boolean. The next publication attempt consumes it.
+pub(crate) struct UffdIcacheSynchronization {
+    _private: (),
+}
+
+impl UffdPagePublication {
+    pub(crate) fn synchronize(self) -> UffdIcacheSynchronization {
+        assert_eq!(self, Self::NeedsIcacheSynchronization);
+        drop(super::synchronize_icache());
+        UffdIcacheSynchronization { _private: () }
+    }
 }
 
 static NEXT_UFFD_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
@@ -1459,6 +1564,166 @@ impl UffdAddressSpaceState {
         })
     }
 
+    pub(super) fn prepare_resolver(
+        &self,
+        mapping: MappingSnapshot,
+        destination: PageRange,
+    ) -> AxResult<UffdResolverLease> {
+        if !mapping.range().contains(destination) {
+            return Err(AxError::from(axerrno::LinuxError::ENOENT));
+        }
+        let registration = self
+            .registrations
+            .resolver_registration(mapping.address_space(), destination)
+            .map_err(|_| AxError::from(axerrno::LinuxError::ENOENT))?;
+        registration
+            .revalidate(mapping.with_generation(registration.generation()))
+            .map_err(|_| AxError::from(axerrno::LinuxError::ENOENT))?;
+        Ok(UffdResolverLease {
+            registration,
+            destination,
+        })
+    }
+
+    pub(super) fn revalidate_resolver(
+        &self,
+        lease: UffdResolverLease,
+        mapping: MappingSnapshot,
+    ) -> AxResult<MappingSnapshot> {
+        if !mapping.range().contains(lease.destination) {
+            return Err(AxError::from(axerrno::LinuxError::ENOENT));
+        }
+        let registration = self
+            .registrations
+            .get(lease.registration.id())
+            .map_err(|_| AxError::from(axerrno::LinuxError::ENOENT))?;
+        if registration != lease.registration {
+            return Err(AxError::from(axerrno::LinuxError::ENOENT));
+        }
+        let current = mapping.with_generation(registration.generation());
+        registration
+            .revalidate(current)
+            .map_err(|_| AxError::from(axerrno::LinuxError::ENOENT))?;
+        Ok(current)
+    }
+
+    fn request_matches_resolved_page(
+        registration: UffdRegistration,
+        page: PageRange,
+        request: FaultRequest,
+    ) -> bool {
+        let key = request.key();
+        request.handler() == registration.handler()
+            && request.fault_type() == FaultType::Missing
+            && key.address_space() == registration.address_space()
+            && key.mapping() == registration.mapping()
+            && key.generation() == registration.generation()
+            && page.user_range().contains_address(key.page_address().get())
+    }
+
+    /// Validates all optional broker completions before page-table
+    /// publication. A proactive fill with no request is valid.
+    pub(super) fn validate_resolver_completion(
+        &self,
+        lease: UffdResolverLease,
+        current: MappingSnapshot,
+        page: PageRange,
+        disposition: FaultDisposition,
+    ) -> AxResult<UffdResolverCompletions> {
+        if !matches!(
+            disposition,
+            FaultDisposition::Supply | FaultDisposition::ZeroFill
+        ) {
+            return Err(AxError::InvalidInput);
+        }
+        let mut completions = UffdResolverCompletions::new();
+        for snapshot in self.broker.requests() {
+            let request = *snapshot.key();
+            if !Self::request_matches_resolved_page(lease.registration, page, request) {
+                continue;
+            }
+            if !matches!(
+                snapshot.phase(),
+                RequestPhase::Pending | RequestPhase::Delivered
+            ) {
+                // A prior DONTWAKE or failed result copyout may leave an
+                // immutable terminal for this page. MADV_DONTNEED can then
+                // retire the PTE without revoking the registration epoch.
+                // Refilling the page must preserve that older result; only
+                // currently open access variants belong to this publication.
+                continue;
+            }
+            let permit = UffdFaultPolicy::prepare_completion(request, current, disposition)
+                .map_err(uffd_policy_error)?;
+            completions.push(UffdResolverCompletion {
+                token: snapshot.token(),
+                permit,
+            })?;
+        }
+        Ok(completions)
+    }
+
+    /// Records immutable resolver results for all same-page access variants
+    /// after the corresponding PTE became visible. Every transition is
+    /// infallible and remains deferred until the Linux signed result field has
+    /// been copied out or an explicit WAKE arrives.
+    pub(super) fn defer_resolver_completions(&mut self, completions: UffdResolverCompletions) {
+        for completion in completions.entries.into_iter().flatten() {
+            let effect = self
+                .broker
+                .complete(
+                    completion.token,
+                    completion.permit.disposition(),
+                    CompletionVisibility::Deferred,
+                )
+                .expect("validated UFFD resolver request changed under the address-space lock");
+            assert_eq!(
+                effect.waiters_released(),
+                0,
+                "deferred UFFD resolver completion released a waiter"
+            );
+        }
+    }
+
+    /// Implements one handler-scoped Linux UFFDIO_WAKE range.
+    ///
+    /// Open requests receive a retry terminal; deferred COPY/ZEROPAGE results
+    /// are released without being overwritten. The invoking handler boundary
+    /// is deliberate even though resolver installation itself is mm-wide.
+    pub(super) fn wake_handler_range(
+        &mut self,
+        handler: FaultHandlerId,
+        range: PageRange,
+    ) -> AxResult<DeferredUffdWake> {
+        self.handler(handler)?;
+        let matches = |snapshot: axfault::RequestSnapshot<FaultRequest, FaultHandlerId>| {
+            *snapshot.handler() == handler
+                && range
+                    .user_range()
+                    .contains_address(snapshot.key().key().page_address().get())
+        };
+        let completed = self.broker.complete_where(
+            matches,
+            FaultDisposition::Cancelled,
+            CompletionVisibility::Visible,
+        );
+        let released = self.broker.release_where(matches);
+        let mut wake = DeferredUffdWake::empty();
+        if completed.waiters_released() + released.waiters_released() != 0 {
+            wake.fault_completion = Some(self.fault_completion.clone());
+        }
+        Ok(wake)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wake_test_range(
+        &mut self,
+        handler: FaultHandlerId,
+        range: PageRange,
+    ) -> AxResult<DeferredUffdWake> {
+        self.wake_handler_range(handler, range)
+    }
+
     /// Atomically admits one registered, absent 4 KiB page and its waiter.
     ///
     /// The caller retains the address-space mutex across its page-table query,
@@ -2038,6 +2303,24 @@ mod tests {
         length: usize,
         kind: MappingKind,
     ) -> MappingSnapshot {
+        snapshot_with_access(
+            mapping,
+            generation,
+            start,
+            length,
+            kind,
+            MappingAccess::new(true, true, false),
+        )
+    }
+
+    fn snapshot_with_access(
+        mapping: u64,
+        generation: u64,
+        start: usize,
+        length: usize,
+        kind: MappingKind,
+        access: MappingAccess,
+    ) -> MappingSnapshot {
         MappingSnapshot::from_raw(
             1,
             mapping,
@@ -2045,7 +2328,7 @@ mod tests {
             start,
             length,
             PAGE_SIZE_4K,
-            MappingAccess::new(true, true, false).bits(),
+            access.bits(),
             kind,
             true,
             false,
@@ -2111,6 +2394,44 @@ mod tests {
         (state, source, destination)
     }
 
+    fn registered_resolver_state(
+        length: usize,
+    ) -> (
+        UffdAddressSpaceState,
+        FaultHandlerId,
+        FaultHandlerId,
+        MappingSnapshot,
+    ) {
+        registered_resolver_state_with_access(length, MappingAccess::new(true, true, false))
+    }
+
+    fn registered_resolver_state_with_access(
+        length: usize,
+        access: MappingAccess,
+    ) -> (
+        UffdAddressSpaceState,
+        FaultHandlerId,
+        FaultHandlerId,
+        MappingSnapshot,
+    ) {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let owner = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let other = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        let mapping =
+            snapshot_with_access(2, 71, 0x1000, length, MappingKind::AnonymousPrivate, access);
+        let mut current = [mapping];
+        state
+            .register_range(
+                &initialized_api(),
+                owner,
+                mapping.range(),
+                UffdRegisterMode::MISSING,
+                &mut current,
+            )
+            .unwrap();
+        (state, owner, other, mapping)
+    }
+
     fn request_for(
         snapshot: MappingSnapshot,
         handler: FaultHandlerId,
@@ -2152,6 +2473,369 @@ mod tests {
             .unwrap();
         assert!(!state.pending(handler).unwrap());
         assert!(state.claim_next(handler).unwrap().is_none());
+    }
+
+    #[test]
+    fn proactive_resolver_fill_needs_no_broker_request() {
+        let (mut state, _owner, _other, mapping) = registered_resolver_state(PAGE_SIZE_4K);
+        let page = mapping.range();
+        let lease = state.prepare_resolver(mapping, page).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+
+        let completions = state
+            .validate_resolver_completion(lease, current, page, FaultDisposition::Supply)
+            .unwrap();
+        assert!(completions.is_empty());
+        state.defer_resolver_completions(completions);
+        assert_eq!(state.broker.load().live_requests(), 0);
+        assert_eq!(
+            state.validate_resolver_completion(
+                lease,
+                current,
+                page,
+                FaultDisposition::Failure(thekernel_linux_mm::FaultFailure::Io),
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn resolver_install_is_mm_wide_but_wake_is_handler_scoped() {
+        let (mut state, owner, other, mapping) = registered_resolver_state(PAGE_SIZE_4K);
+        let admitted = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let waiter = admitted.waiter();
+        let _wait = admitted.publish();
+
+        let lease = state.prepare_resolver(mapping, mapping.range()).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+        let completions = state
+            .validate_resolver_completion(lease, current, mapping.range(), FaultDisposition::Supply)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        state.defer_resolver_completions(completions);
+        assert_eq!(
+            state.broker.waiter(waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+
+        assert!(
+            state
+                .wake_handler_range(other, mapping.range())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state.broker.waiter(waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+        let wake = state.wake_handler_range(owner, mapping.range()).unwrap();
+        assert!(!wake.is_empty());
+        assert_eq!(
+            state.broker.waiter(waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Supply)
+        );
+        wake.finish();
+    }
+
+    #[test]
+    fn resolver_completes_all_same_page_access_variants() {
+        let (mut state, owner, _other, mapping) = registered_resolver_state_with_access(
+            PAGE_SIZE_4K,
+            MappingAccess::new(true, true, true),
+        );
+        let read = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let read_waiter = read.waiter();
+        let _read_wait = read.publish();
+        let write = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Write)
+            .unwrap()
+            .unwrap();
+        let write_waiter = write.waiter();
+        let _write_wait = write.publish();
+        let execute = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Execute)
+            .unwrap()
+            .unwrap();
+        let execute_waiter = execute.waiter();
+        let _execute_wait = execute.publish();
+
+        let lease = state.prepare_resolver(mapping, mapping.range()).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+        let completions = state
+            .validate_resolver_completion(
+                lease,
+                current,
+                mapping.range(),
+                FaultDisposition::ZeroFill,
+            )
+            .unwrap();
+        assert_eq!(completions.len(), UFFD_RESOLVER_COMPLETION_CAPACITY);
+        state.defer_resolver_completions(completions);
+        assert_eq!(
+            state.broker.waiter(read_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+        assert_eq!(
+            state.broker.waiter(write_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+        assert_eq!(
+            state.broker.waiter(execute_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(read_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+        assert_eq!(
+            state.broker.waiter(write_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+        assert_eq!(
+            state.broker.waiter(execute_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+    }
+
+    #[test]
+    fn resolver_refill_preserves_prior_terminal_and_completes_new_variant() {
+        let (mut state, owner, _other, mapping) = registered_resolver_state(PAGE_SIZE_4K);
+        let read = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let read_waiter = read.waiter();
+        let _read_wait = read.publish();
+        let lease = state.prepare_resolver(mapping, mapping.range()).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+
+        let first = state
+            .validate_resolver_completion(lease, current, mapping.range(), FaultDisposition::Supply)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        state.defer_resolver_completions(first);
+        assert!(
+            state
+                .validate_resolver_completion(
+                    lease,
+                    current,
+                    mapping.range(),
+                    FaultDisposition::ZeroFill,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        let write = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Write)
+            .unwrap()
+            .unwrap();
+        let write_waiter = write.waiter();
+        let _write_wait = write.publish();
+        let refill = state
+            .validate_resolver_completion(
+                lease,
+                current,
+                mapping.range(),
+                FaultDisposition::ZeroFill,
+            )
+            .unwrap();
+        assert_eq!(refill.len(), 1);
+        state.defer_resolver_completions(refill);
+
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(read_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Supply)
+        );
+        assert_eq!(
+            state.broker.waiter(write_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+        assert!(
+            state
+                .validate_resolver_completion(
+                    lease,
+                    current,
+                    mapping.range(),
+                    FaultDisposition::ZeroFill,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn visible_same_access_terminal_does_not_satisfy_a_later_refault() {
+        let (mut state, owner, _other, mapping) = registered_resolver_state(PAGE_SIZE_4K);
+        let first = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let first_waiter = first.waiter();
+        let _first_wait = first.publish();
+        let lease = state.prepare_resolver(mapping, mapping.range()).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+        let first_completion = state
+            .validate_resolver_completion(lease, current, mapping.range(), FaultDisposition::Supply)
+            .unwrap();
+        state.defer_resolver_completions(first_completion);
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(first_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Supply)
+        );
+        assert_eq!(state.broker.load().live_requests(), 1);
+
+        // Model MADV_DONTNEED retiring the PTE without consuming the old
+        // waiter. A later fault with the exact same key must create a new
+        // broker generation and a new event, not inherit the old Supply.
+        let second = state
+            .admit_missing_fault(mapping, mapping.range().start(), FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let second_waiter = second.waiter();
+        let _second_wait = second.publish();
+        assert_eq!(state.broker.load().live_requests(), 2);
+        assert!(state.pending(owner).unwrap());
+        let delivered = state.claim_next(owner).unwrap().unwrap();
+        assert_eq!(delivered.request().key().access(), FaultAccess::Read);
+        assert_eq!(
+            state.broker.waiter(second_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+
+        let refill = state
+            .validate_resolver_completion(
+                lease,
+                current,
+                mapping.range(),
+                FaultDisposition::ZeroFill,
+            )
+            .unwrap();
+        assert_eq!(refill.len(), 1);
+        state.defer_resolver_completions(refill);
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(first_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Supply)
+        );
+        assert_eq!(
+            state.broker.waiter(second_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+    }
+
+    #[test]
+    fn wake_releases_pending_delivered_and_deferred_faults() {
+        let (mut state, owner, _other, mapping) = registered_resolver_state(2 * PAGE_SIZE_4K);
+        let first = state
+            .admit_missing_fault(mapping, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let first_waiter = first.waiter();
+        let _first_wait = first.publish();
+        let second = state
+            .admit_missing_fault(mapping, 0x2000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let second_waiter = second.waiter();
+        let _second_wait = second.publish();
+        assert_eq!(
+            state
+                .claim_next(owner)
+                .unwrap()
+                .unwrap()
+                .request()
+                .key()
+                .page_address()
+                .get(),
+            0x1000
+        );
+
+        let lease = state.prepare_resolver(mapping, mapping.range()).unwrap();
+        let current = state.revalidate_resolver(lease, mapping).unwrap();
+        for (page, disposition) in [
+            (page_range(0x1000, PAGE_SIZE_4K), FaultDisposition::Supply),
+            (page_range(0x2000, PAGE_SIZE_4K), FaultDisposition::ZeroFill),
+        ] {
+            let completions = state
+                .validate_resolver_completion(lease, current, page, disposition)
+                .unwrap();
+            state.defer_resolver_completions(completions);
+        }
+        assert_eq!(
+            state.broker.waiter(first_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+        assert_eq!(
+            state.broker.waiter(second_waiter).unwrap(),
+            axfault::WaiterObservation::Pending
+        );
+
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(first_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Supply)
+        );
+        assert_eq!(
+            state.broker.waiter(second_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::ZeroFill)
+        );
+    }
+
+    #[test]
+    fn wake_turns_unresolved_pending_and_delivered_faults_into_retry() {
+        let (mut state, owner, _other, mapping) = registered_resolver_state(2 * PAGE_SIZE_4K);
+        let first = state
+            .admit_missing_fault(mapping, 0x1000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let first_waiter = first.waiter();
+        let _first_wait = first.publish();
+        let second = state
+            .admit_missing_fault(mapping, 0x2000, FaultAccess::Read)
+            .unwrap()
+            .unwrap();
+        let second_waiter = second.waiter();
+        let _second_wait = second.publish();
+        state.claim_next(owner).unwrap().unwrap();
+
+        state
+            .wake_handler_range(owner, mapping.range())
+            .unwrap()
+            .finish();
+        assert_eq!(
+            state.broker.waiter(first_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
+        );
+        assert_eq!(
+            state.broker.waiter(second_waiter).unwrap(),
+            axfault::WaiterObservation::Ready(FaultDisposition::Cancelled)
+        );
     }
 
     #[test]
@@ -3847,6 +4531,26 @@ mod tests {
         assert!(!state.has_handlers());
         assert_eq!(state.pending(handler), Err(AxError::BadFileDescriptor));
         detached.finish();
+    }
+
+    #[test]
+    fn handler_capacity_is_bounded_and_reusable_after_detach() {
+        let mut state = *UffdAddressSpaceState::try_new_boxed().unwrap();
+        let mut handlers = vec![];
+        for _ in 0..UFFD_MAX_HANDLERS {
+            handlers.push(state.attach_handler(Arc::new(UffdPollSet::new())).unwrap());
+        }
+        assert_eq!(
+            state.attach_handler(Arc::new(UffdPollSet::new())),
+            Err(AxError::NoMemory)
+        );
+
+        state
+            .detach_handler(handlers.pop().unwrap())
+            .unwrap()
+            .finish();
+        let replacement = state.attach_handler(Arc::new(UffdPollSet::new())).unwrap();
+        assert!(!handlers.contains(&replacement));
     }
 
     #[test]

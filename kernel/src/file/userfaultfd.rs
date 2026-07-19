@@ -1,9 +1,10 @@
-//! Dormant Linux userfaultfd open-file-description adapter.
+//! Linux v6.12 userfaultfd open-file-description adapter.
 //!
-//! The public syscall remains unavailable until registration, fault waiting,
-//! resolution, lifecycle races, and cross-architecture contracts close.  This
-//! module establishes the bounded OFD/API/readiness shell plus dormant
-//! REGISTER/UNREGISTER ioctls; it does not route or resolve page faults.
+//! The initial bounded profile handles user-mode 4 KiB anonymous-private
+//! MISSING faults. It owns API negotiation, registration, readiness/event
+//! delivery, COPY/ZEROPAGE/WAKE resolution, and lock-external waiter wakeups;
+//! optional WP, MINOR, lifecycle-event, shmem, and hugetlb features remain
+//! unadvertised.
 
 use alloc::{
     borrow::Cow,
@@ -15,31 +16,39 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex as BlockingMutex;
+use axtask::current;
 use bytemuck::{Pod, Zeroable, pod_read_unaligned};
 use linux_raw_sys::{
     general::{
-        UFFD_EVENT_PAGEFAULT, UFFD_PAGEFAULT_FLAG_WRITE, uffdio_api, uffdio_range, uffdio_register,
+        UFFD_EVENT_PAGEFAULT, UFFD_PAGEFAULT_FLAG_WRITE, uffdio_api, uffdio_copy, uffdio_range,
+        uffdio_register, uffdio_zeropage,
     },
     ioctl::{
-        UFFDIO_API as UFFDIO_API_CMD, UFFDIO_REGISTER as UFFDIO_REGISTER_CMD,
-        UFFDIO_UNREGISTER as UFFDIO_UNREGISTER_CMD,
+        UFFDIO_API as UFFDIO_API_CMD, UFFDIO_COPY as UFFDIO_COPY_CMD,
+        UFFDIO_REGISTER as UFFDIO_REGISTER_CMD, UFFDIO_UNREGISTER as UFFDIO_UNREGISTER_CMD,
+        UFFDIO_WAKE as UFFDIO_WAKE_CMD, UFFDIO_ZEROPAGE as UFFDIO_ZEROPAGE_CMD,
     },
 };
 use memory_addr::PAGE_SIZE_4K;
-use starry_vm::{VmMutPtr, VmPtr};
+use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
 use thekernel_linux_mm::{
-    FaultAccess, FaultHandlerId, MmError, PageRange, UffdApiNegotiation, UffdApiState,
-    UffdCreateFlags, UffdIoctls, UffdRegisterMode,
+    FaultAccess, FaultDisposition, FaultHandlerId, MmError, PageRange, UffdApiNegotiation,
+    UffdApiState, UffdCopyMode, UffdCopyRequest, UffdCreateFlags, UffdIoctls, UffdRegisterMode,
+    UffdResolverOutcome, UffdResolverResult, UffdZeroPageMode, UffdZeroPageRequest, UserRange,
 };
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     file::{FileLike, IoDst, Kstat, anon_inode_stat},
-    mm::{AddrSpace, DeliveredUffdEvent, UffdAddressSpaceState, UffdPollSet, uffd_policy_error},
+    mm::{
+        AddrSpace, DeliveredUffdEvent, PreparedCowPage, UffdAddressSpaceState,
+        UffdIcacheSynchronization, UffdPagePublication, UffdPollSet, uffd_policy_error,
+    },
     readiness::block_on_poll_io,
+    task::{AsThread, has_pending_sigkill},
 };
 
 const UFFD_MSG_SIZE: usize = 32;
@@ -81,9 +90,47 @@ struct UffdRegisterRaw {
     ioctls: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdCopyInputRaw {
+    dst: u64,
+    src: u64,
+    len: u64,
+    mode: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdCopyRaw {
+    dst: u64,
+    src: u64,
+    len: u64,
+    mode: u64,
+    copy: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdZeroPageInputRaw {
+    range: UffdRangeRaw,
+    mode: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct UffdZeroPageRaw {
+    range: UffdRangeRaw,
+    mode: u64,
+    zeropage: i64,
+}
+
 const UFFD_RANGE_SIZE: usize = mem::size_of::<UffdRangeRaw>();
 const UFFD_REGISTER_INPUT_SIZE: usize = mem::size_of::<UffdRegisterInputRaw>();
 const UFFD_REGISTER_IOCTLS_OFFSET: usize = mem::offset_of!(UffdRegisterRaw, ioctls);
+const UFFD_COPY_INPUT_SIZE: usize = mem::size_of::<UffdCopyInputRaw>();
+const UFFD_COPY_OUTPUT_OFFSET: usize = mem::offset_of!(UffdCopyRaw, copy);
+const UFFD_ZEROPAGE_INPUT_SIZE: usize = mem::size_of::<UffdZeroPageInputRaw>();
+const UFFD_ZEROPAGE_OUTPUT_OFFSET: usize = mem::offset_of!(UffdZeroPageRaw, zeropage);
 
 const _: [(); mem::size_of::<uffdio_range>()] = [(); mem::size_of::<UffdRangeRaw>()];
 const _: [(); mem::align_of::<uffdio_range>()] = [(); mem::align_of::<UffdRangeRaw>()];
@@ -98,6 +145,64 @@ const _: [(); mem::offset_of!(uffdio_register, mode)] =
 const _: [(); mem::offset_of!(uffdio_register, ioctls)] =
     [(); mem::offset_of!(UffdRegisterRaw, ioctls)];
 const _: [(); UFFD_REGISTER_INPUT_SIZE] = [(); UFFD_REGISTER_IOCTLS_OFFSET];
+const _: [(); mem::size_of::<uffdio_copy>()] = [(); mem::size_of::<UffdCopyRaw>()];
+const _: [(); mem::align_of::<uffdio_copy>()] = [(); mem::align_of::<UffdCopyRaw>()];
+const _: [(); mem::offset_of!(uffdio_copy, dst)] = [(); mem::offset_of!(UffdCopyRaw, dst)];
+const _: [(); mem::offset_of!(uffdio_copy, src)] = [(); mem::offset_of!(UffdCopyRaw, src)];
+const _: [(); mem::offset_of!(uffdio_copy, len)] = [(); mem::offset_of!(UffdCopyRaw, len)];
+const _: [(); mem::offset_of!(uffdio_copy, mode)] = [(); mem::offset_of!(UffdCopyRaw, mode)];
+const _: [(); mem::offset_of!(uffdio_copy, copy)] = [(); mem::offset_of!(UffdCopyRaw, copy)];
+const _: [(); UFFD_COPY_INPUT_SIZE] = [(); UFFD_COPY_OUTPUT_OFFSET];
+const _: [(); mem::size_of::<uffdio_zeropage>()] = [(); mem::size_of::<UffdZeroPageRaw>()];
+const _: [(); mem::align_of::<uffdio_zeropage>()] = [(); mem::align_of::<UffdZeroPageRaw>()];
+const _: [(); mem::offset_of!(uffdio_zeropage, range)] =
+    [(); mem::offset_of!(UffdZeroPageRaw, range)];
+const _: [(); mem::offset_of!(uffdio_zeropage, mode)] =
+    [(); mem::offset_of!(UffdZeroPageRaw, mode)];
+const _: [(); mem::offset_of!(uffdio_zeropage, zeropage)] =
+    [(); mem::offset_of!(UffdZeroPageRaw, zeropage)];
+const _: [(); UFFD_ZEROPAGE_INPUT_SIZE] = [(); UFFD_ZEROPAGE_OUTPUT_OFFSET];
+
+#[derive(Clone, Copy, Debug)]
+struct UffdResolverProgress {
+    completed: usize,
+    lower_error: Option<AxError>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UffdResolverData {
+    Copy(UserRange),
+    Zero,
+}
+
+impl UffdResolverData {
+    const fn disposition(self) -> FaultDisposition {
+        match self {
+            Self::Copy(_) => FaultDisposition::Supply,
+            Self::Zero => FaultDisposition::ZeroFill,
+        }
+    }
+
+    fn prepare(self, offset: usize, prepared: &mut PreparedCowPage) -> AxResult {
+        match self {
+            Self::Copy(source) => {
+                let source = source
+                    .start()
+                    .checked_add(offset)
+                    .ok_or(AxError::BadState)?;
+                // SAFETY: vm_read_slice returns success only after writing the
+                // complete PAGE_SIZE_4K destination slice.
+                unsafe {
+                    prepared.prepare_uninitialized(|destination| {
+                        vm_read_slice(source as *const u8, destination)?;
+                        Ok(())
+                    })
+                }
+            }
+            Self::Zero => prepared.prepare_zeroed(),
+        }
+    }
+}
 
 enum UffdHandlerBinding {
     // Linux keeps the userfaultfd context but not the old image's live VMA
@@ -114,6 +219,7 @@ struct AttachedUffdHandler {
 }
 
 impl AttachedUffdHandler {
+    #[cfg(test)]
     const fn handler(&self) -> FaultHandlerId {
         self.handler
     }
@@ -204,6 +310,48 @@ impl AttachedUffdHandler {
         // address-space/state guard above has been dropped.
         deferred.finish();
         Ok(())
+    }
+
+    fn resolver_target(&self) -> AxResult<Arc<axsync::Mutex<AddrSpace>>> {
+        match &self.binding {
+            UffdHandlerBinding::AddressSpace(aspace) => aspace
+                .upgrade()
+                .ok_or_else(|| AxError::from(LinuxError::ESRCH)),
+            #[cfg(test)]
+            UffdHandlerBinding::Standalone(_) => Err(AxError::OperationNotSupported),
+        }
+    }
+
+    fn wake_retained(&self, aspace: &Arc<axsync::Mutex<AddrSpace>>, range: PageRange) -> AxResult {
+        let wake = {
+            let mut locked = aspace.lock();
+            locked.wake_uffd_handler_range(self.handler, range)?
+        };
+        wake.finish();
+        Ok(())
+    }
+
+    fn wake_range(&self, range: PageRange) -> AxResult {
+        match &self.binding {
+            UffdHandlerBinding::AddressSpace(aspace) => {
+                let Some(aspace) = aspace.upgrade() else {
+                    // UFFDIO_WAKE does not retain or inspect the old mm. A
+                    // valid range with no remaining waiter is a successful
+                    // no-op after exec/teardown.
+                    return Ok(());
+                };
+                self.wake_retained(&aspace, range)
+            }
+            #[cfg(test)]
+            UffdHandlerBinding::Standalone(state) => {
+                let Some(state) = state.upgrade() else {
+                    return Ok(());
+                };
+                let wake = state.lock().wake_test_range(self.handler, range)?;
+                wake.finish();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -458,6 +606,291 @@ impl UserfaultFile {
         })
     }
 
+    fn checked_copy_request(request: UffdCopyInputRaw) -> AxResult<UffdCopyRequest> {
+        let destination = Self::checked_range(UffdRangeRaw {
+            start: request.dst,
+            len: request.len,
+        })?;
+        let source_start = usize::try_from(request.src).map_err(|_| AxError::InvalidInput)?;
+        let source_len = usize::try_from(request.len).map_err(|_| AxError::InvalidInput)?;
+        let user_end = USER_SPACE_BASE
+            .checked_add(USER_SPACE_SIZE)
+            .ok_or(AxError::InvalidInput)?;
+        let source = UserRange::new_bounded(source_start, source_len, user_end)
+            .map_err(uffd_policy_error)?;
+        let mode = UffdCopyMode::from_bits(request.mode).map_err(uffd_policy_error)?;
+        UffdCopyRequest::new(source, destination, mode).map_err(uffd_policy_error)
+    }
+
+    fn checked_zeropage_request(request: UffdZeroPageInputRaw) -> AxResult<UffdZeroPageRequest> {
+        let destination = Self::checked_range(request.range)?;
+        let mode = UffdZeroPageMode::from_bits(request.mode).map_err(uffd_policy_error)?;
+        Ok(UffdZeroPageRequest::new(destination, mode))
+    }
+
+    fn install_resolver_pages(
+        target: &Arc<axsync::Mutex<AddrSpace>>,
+        destination: PageRange,
+        data: UffdResolverData,
+    ) -> AxResult<UffdResolverProgress> {
+        // The raw geometry/mode gates have already passed. Destination
+        // VMA/registration failure comes from Linux's mfill operation, so it
+        // is a zero-progress lower error that must be written to the signed
+        // output field.
+        let lease = match {
+            let locked = target.lock();
+            locked.preflight_uffd_resolver_range(destination)
+        } {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Ok(UffdResolverProgress {
+                    completed: 0,
+                    lower_error: Some(error),
+                });
+            }
+        };
+
+        let mut progress = UffdResolverProgress {
+            completed: 0,
+            lower_error: None,
+        };
+        let mut prepared = match PreparedCowPage::try_new() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                progress.lower_error = Some(error);
+                return Ok(progress);
+            }
+        };
+
+        while progress.completed < destination.len() {
+            // The at-most-three table pages are retained and reused across the
+            // range. Replenishment and data preparation both happen without an
+            // address-space guard.
+            if let Err(error) = prepared.reserve_max_table_frames() {
+                progress.lower_error = Some(error);
+                break;
+            }
+            if let Err(error) = data.prepare(progress.completed, &mut prepared) {
+                progress.lower_error = Some(error);
+                break;
+            }
+            let page = destination
+                .subrange(progress.completed, PAGE_SIZE_4K)
+                .map_err(|_| AxError::BadState)?;
+            let mut icache_synchronization: Option<UffdIcacheSynchronization> = None;
+            loop {
+                let publication = {
+                    let mut locked = target.lock();
+                    locked.publish_prepared_uffd_page(
+                        lease,
+                        page,
+                        data.disposition(),
+                        &mut prepared,
+                        icache_synchronization.take(),
+                    )
+                };
+                match publication {
+                    Ok(publication @ UffdPagePublication::NeedsIcacheSynchronization) => {
+                        // The initialized frame is not reachable yet. Remote
+                        // maintenance stays outside the address-space mutex;
+                        // the retry revalidates all publication authority.
+                        icache_synchronization = Some(publication.synchronize());
+                    }
+                    Ok(UffdPagePublication::Published) => {
+                        progress.completed = progress
+                            .completed
+                            .checked_add(PAGE_SIZE_4K)
+                            .ok_or(AxError::BadState)?;
+                        break;
+                    }
+                    Err(error) => {
+                        progress.lower_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if progress.lower_error.is_some() {
+                break;
+            }
+
+            if progress.completed < destination.len() {
+                // Match Linux's per-page cond_resched/fatal-signal boundary.
+                // This runs after all MM ownership has left the critical
+                // section, and a completed prefix remains reportable as
+                // positive progress.
+                axtask::resched_if_needed();
+                if has_pending_sigkill(current().as_thread()) {
+                    progress.lower_error = Some(AxError::Interrupted);
+                    break;
+                }
+            }
+        }
+        // Unused table reservations and a failed/unpublished data frame are
+        // reclaimed before usercopy, with no MM lock held.
+        drop(prepared);
+        Ok(progress)
+    }
+
+    fn reject_copy_wp_after_target_preflight(
+        target: &Arc<axsync::Mutex<AddrSpace>>,
+        destination: PageRange,
+    ) -> UffdResolverProgress {
+        // UFFDIO_COPY_MODE_WP is a recognized Linux bit, not malformed raw
+        // input. This MISSING-only profile cannot install a UFFD-WP PTE, but
+        // Linux resolves target-mm/range errors before reporting that mode
+        // mismatch through the signed `uffdio_copy.copy` field.
+        let preflight = {
+            let locked = target.lock();
+            locked
+                .preflight_uffd_resolver_range(destination)
+                .map(|_lease| ())
+        };
+        Self::copy_wp_progress(preflight)
+    }
+
+    fn copy_wp_progress(preflight: AxResult) -> UffdResolverProgress {
+        let lower_error = preflight.err().unwrap_or(AxError::InvalidInput);
+        UffdResolverProgress {
+            completed: 0,
+            lower_error: Some(lower_error),
+        }
+    }
+
+    fn finish_resolver_with(
+        result: UffdResolverResult,
+        lower_error: Option<AxError>,
+        copyout: impl FnOnce(i64) -> AxResult,
+        wake: impl FnOnce(PageRange) -> AxResult,
+    ) -> AxResult<usize> {
+        // Linux stores the signed result before waking. If this copyout fails,
+        // installed pages and deferred broker completions remain intact and a
+        // later explicit WAKE can recover the waiter.
+        copyout(result.reported_bytes())?;
+        if let Some(range) = result.wake_range() {
+            wake(range)?;
+        }
+        match result.outcome() {
+            UffdResolverOutcome::Complete if lower_error.is_none() => Ok(0),
+            UffdResolverOutcome::Retry if lower_error.is_some() => {
+                Err(AxError::from(LinuxError::EAGAIN))
+            }
+            UffdResolverOutcome::Failed => {
+                let error = lower_error.ok_or(AxError::BadState)?;
+                Err(error)
+            }
+            UffdResolverOutcome::Complete | UffdResolverOutcome::Retry => Err(AxError::BadState),
+        }
+    }
+
+    fn finish_resolver(
+        &self,
+        target: &Arc<axsync::Mutex<AddrSpace>>,
+        result: UffdResolverResult,
+        lower_error: Option<AxError>,
+        copyout: impl FnOnce(i64) -> AxResult,
+    ) -> AxResult<usize> {
+        Self::finish_resolver_with(result, lower_error, copyout, |range| {
+            self.binding.wake_retained(target, range)
+        })
+    }
+
+    fn copy_with_usercopy(
+        &self,
+        copyin: impl FnOnce() -> AxResult<UffdCopyInputRaw>,
+        copyout: impl FnOnce(i64) -> AxResult,
+    ) -> AxResult<usize> {
+        let _api = self.api_snapshot()?;
+        let request = Self::checked_copy_request(copyin()?)?;
+        let target = self.binding.resolver_target()?;
+        let progress = if request.mode().write_protect() {
+            Self::reject_copy_wp_after_target_preflight(&target, request.destination())
+        } else {
+            Self::install_resolver_pages(
+                &target,
+                request.destination(),
+                UffdResolverData::Copy(request.source()),
+            )?
+        };
+        let result = if progress.completed == 0 {
+            let error = progress.lower_error.ok_or(AxError::BadState)?;
+            UffdResolverResult::failure(LinuxError::from(error).code())
+                .map_err(uffd_policy_error)?
+        } else {
+            UffdResolverResult::for_copy(request, progress.completed).map_err(uffd_policy_error)?
+        };
+        self.finish_resolver(&target, result, progress.lower_error, copyout)
+    }
+
+    fn ioctl_copy(&self, arg: usize) -> AxResult<usize> {
+        self.copy_with_usercopy(
+            || {
+                let input = arg as *const [u8; UFFD_COPY_INPUT_SIZE];
+                Ok(pod_read_unaligned(&input.vm_read()?))
+            },
+            |result| {
+                let output = arg
+                    .checked_add(UFFD_COPY_OUTPUT_OFFSET)
+                    .ok_or(AxError::BadAddress)?
+                    as *mut [u8; mem::size_of::<i64>()];
+                Ok(output.vm_write(result.to_ne_bytes())?)
+            },
+        )
+    }
+
+    fn zeropage_with_usercopy(
+        &self,
+        copyin: impl FnOnce() -> AxResult<UffdZeroPageInputRaw>,
+        copyout: impl FnOnce(i64) -> AxResult,
+    ) -> AxResult<usize> {
+        let _api = self.api_snapshot()?;
+        let request = Self::checked_zeropage_request(copyin()?)?;
+        let target = self.binding.resolver_target()?;
+        let progress =
+            Self::install_resolver_pages(&target, request.destination(), UffdResolverData::Zero)?;
+        let result = if progress.completed == 0 {
+            let error = progress.lower_error.ok_or(AxError::BadState)?;
+            UffdResolverResult::failure(LinuxError::from(error).code())
+                .map_err(uffd_policy_error)?
+        } else {
+            UffdResolverResult::for_zeropage(request, progress.completed)
+                .map_err(uffd_policy_error)?
+        };
+        self.finish_resolver(&target, result, progress.lower_error, copyout)
+    }
+
+    fn ioctl_zeropage(&self, arg: usize) -> AxResult<usize> {
+        self.zeropage_with_usercopy(
+            || {
+                let input = arg as *const [u8; UFFD_ZEROPAGE_INPUT_SIZE];
+                Ok(pod_read_unaligned(&input.vm_read()?))
+            },
+            |result| {
+                let output = arg
+                    .checked_add(UFFD_ZEROPAGE_OUTPUT_OFFSET)
+                    .ok_or(AxError::BadAddress)?
+                    as *mut [u8; mem::size_of::<i64>()];
+                Ok(output.vm_write(result.to_ne_bytes())?)
+            },
+        )
+    }
+
+    fn wake_with_usercopy(
+        &self,
+        copyin: impl FnOnce() -> AxResult<UffdRangeRaw>,
+    ) -> AxResult<usize> {
+        let _api = self.api_snapshot()?;
+        let range = Self::checked_range(copyin()?)?;
+        self.binding.wake_range(range)?;
+        Ok(0)
+    }
+
+    fn ioctl_wake(&self, arg: usize) -> AxResult<usize> {
+        self.wake_with_usercopy(|| {
+            let input = arg as *const [u8; UFFD_RANGE_SIZE];
+            Ok(pod_read_unaligned(&input.vm_read()?))
+        })
+    }
+
     fn encode_pagefault(event: DeliveredUffdEvent) -> [u8; UFFD_MSG_SIZE] {
         let request = event.request();
         let mut message = [0u8; UFFD_MSG_SIZE];
@@ -548,6 +981,9 @@ impl FileLike for UserfaultFile {
             UFFDIO_API_CMD => self.ioctl_api(arg),
             UFFDIO_REGISTER_CMD => self.ioctl_register(arg),
             UFFDIO_UNREGISTER_CMD => self.ioctl_unregister(arg),
+            UFFDIO_WAKE_CMD => self.ioctl_wake(arg),
+            UFFDIO_COPY_CMD => self.ioctl_copy(arg),
+            UFFDIO_ZEROPAGE_CMD => self.ioctl_zeropage(arg),
             // Linux v6.12 returns EINVAL both before initialization and for an
             // unsupported command after initialization.
             _ => Err(AxError::InvalidInput),
@@ -739,6 +1175,31 @@ mod tests {
         }
     }
 
+    fn copy_input(dst: usize, src: usize, length: usize, mode: u64) -> UffdCopyInputRaw {
+        UffdCopyInputRaw {
+            dst: dst as u64,
+            src: src as u64,
+            len: length as u64,
+            mode,
+        }
+    }
+
+    fn dead_address_space_file() -> UserfaultFile {
+        let mut api = UffdApiState::new();
+        let negotiation = api.prepare_raw(UFFD_API, 0).unwrap();
+        api.commit(negotiation).unwrap();
+        UserfaultFile {
+            binding: AttachedUffdHandler {
+                binding: UffdHandlerBinding::AddressSpace(Weak::new()),
+                handler: FaultHandlerId::new(1).unwrap(),
+            },
+            api: BlockingMutex::new(api),
+            api_initialized: AtomicBool::new(true),
+            nonblocking: AtomicBool::new(true),
+            readiness: Arc::new(UffdPollSet::new()),
+        }
+    }
+
     struct StateLockWakeProbe {
         state: ArcWeak<BlockingMutex<UffdAddressSpaceState>>,
         calls: AtomicUsize,
@@ -866,6 +1327,152 @@ mod tests {
         assert_eq!(
             file.ioctl(UFFDIO_UNREGISTER_CMD, usize::MAX),
             Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.ioctl(UFFDIO_WAKE_CMD, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.ioctl(UFFDIO_COPY_CMD, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            file.ioctl(UFFDIO_ZEROPAGE_CMD, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn resolver_layout_and_geometry_match_linux_v6_12() {
+        let _context = test_context();
+        assert_eq!(UFFD_COPY_INPUT_SIZE, 32);
+        assert_eq!(UFFD_COPY_OUTPUT_OFFSET, 32);
+        assert_eq!(mem::size_of::<UffdCopyRaw>(), 40);
+        assert_eq!(UFFD_ZEROPAGE_INPUT_SIZE, 24);
+        assert_eq!(UFFD_ZEROPAGE_OUTPUT_OFFSET, 24);
+        assert_eq!(mem::size_of::<UffdZeroPageRaw>(), 32);
+
+        let copy = UserfaultFile::checked_copy_request(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 0))
+            .unwrap();
+        assert_eq!(copy.source().start(), 0x1801);
+        assert_eq!(copy.destination().start(), 0x4000);
+        let copy_wp =
+            UserfaultFile::checked_copy_request(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 1 << 1))
+                .unwrap();
+        assert!(copy_wp.mode().write_protect());
+        assert_eq!(
+            UserfaultFile::checked_copy_request(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 1 << 2,)),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            UserfaultFile::checked_copy_request(copy_input(0x4001, 0x1801, PAGE_SIZE_4K, 0,)),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            UserfaultFile::checked_copy_request(copy_input(
+                0x4000,
+                usize::MAX - PAGE_SIZE_4K + 2,
+                PAGE_SIZE_4K,
+                0,
+            )),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            UserfaultFile::checked_zeropage_request(UffdZeroPageInputRaw {
+                range: range(0x4000, PAGE_SIZE_4K),
+                mode: u64::MAX,
+            }),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn resolver_raw_preflight_and_retired_mm_leave_output_untouched() {
+        let _context = test_context();
+        let (_state, file) = new_file(true);
+        initialize(&file);
+        let copied_out = AtomicBool::new(false);
+        assert_eq!(
+            file.copy_with_usercopy(
+                || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, u64::MAX)),
+                |_| {
+                    copied_out.store(true, Ordering::Release);
+                    Ok(())
+                },
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert!(!copied_out.load(Ordering::Acquire));
+
+        let dead = dead_address_space_file();
+        assert_eq!(
+            dead.copy_with_usercopy(
+                || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 0)),
+                |_| {
+                    copied_out.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .map_err(LinuxError::from),
+            Err(LinuxError::ESRCH)
+        );
+        assert!(!copied_out.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn copy_wp_reports_post_target_errors_through_the_signed_output() {
+        let _context = test_context();
+
+        let unsupported = UserfaultFile::copy_wp_progress(Ok(()));
+        assert_eq!(
+            unsupported.lower_error.map(LinuxError::from),
+            Some(LinuxError::EINVAL)
+        );
+
+        let target_error = AxError::from(LinuxError::ENOENT);
+        let progress = UserfaultFile::copy_wp_progress(Err(target_error));
+        assert_eq!(progress.completed, 0);
+        assert_eq!(
+            progress.lower_error.map(LinuxError::from),
+            Some(LinuxError::ENOENT)
+        );
+        let result = UffdResolverResult::failure(LinuxError::ENOENT.code()).unwrap();
+        let mut reported = None;
+        assert_eq!(
+            UserfaultFile::finish_resolver_with(
+                result,
+                progress.lower_error,
+                |value| {
+                    reported = Some(value);
+                    Ok(())
+                },
+                |_| panic!("a zero-progress failure must not wake a range"),
+            )
+            .map_err(LinuxError::from),
+            Err(LinuxError::ENOENT)
+        );
+        assert_eq!(reported, Some(-LinuxError::ENOENT.code() as i64));
+
+        assert_eq!(
+            UserfaultFile::finish_resolver_with(
+                result,
+                Some(target_error),
+                |_| Err(AxError::BadAddress),
+                |_| panic!("copyout failure must precede wake"),
+            ),
+            Err(AxError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn wake_is_a_successful_noop_after_target_mm_retires() {
+        let _context = test_context();
+        let (state, file) = new_file(true);
+        initialize(&file);
+        drop(state);
+        assert_eq!(
+            file.wake_with_usercopy(|| Ok(range(0x4000, PAGE_SIZE_4K))),
+            Ok(0)
         );
     }
 

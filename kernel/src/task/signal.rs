@@ -325,6 +325,16 @@ pub(crate) fn has_pending_fatal_signal(thr: &Thread) -> bool {
     false
 }
 
+/// Matches Linux's `fatal_signal_pending()` boundary used by `mfill_atomic`.
+///
+/// Linux's predicate is narrower than this kernel's exec-oriented
+/// [`has_pending_fatal_signal`]: it asks specifically whether SIGKILL is
+/// pending, independent of the blocked mask. Keep the distinction explicit so
+/// a blocked default-terminate signal cannot truncate a UFFD COPY/ZEROPAGE.
+pub(crate) fn has_pending_sigkill(thr: &Thread) -> bool {
+    thr.signal.pending().has(Signo::SIGKILL)
+}
+
 pub fn with_blocked_signals<R>(
     blocked: Option<SignalSet>,
     f: impl FnOnce() -> AxResult<R>,

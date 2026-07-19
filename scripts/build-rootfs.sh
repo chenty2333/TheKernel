@@ -158,6 +158,7 @@ build_guest_tool oom-admission.c thekernel-oom-admission
 build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias
 build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
 build_guest_tool sync-fence.c thekernel-sync-fence
+build_guest_tool userfaultfd-smoke.c thekernel-userfaultfd-smoke -pthread
 build_guest_tool wait-boundary.c thekernel-wait-boundary -pthread
 
 for script in "$REPO_ROOT"/tests/guest/nightly/*; do

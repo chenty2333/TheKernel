@@ -1,12 +1,19 @@
 use alloc::sync::Arc;
 
-use axerrno::{AxResult, LinuxError};
-use linux_raw_sys::general::{O_NONBLOCK, O_RDONLY};
-use thekernel_linux_mm::UffdCreateFlags;
+use axerrno::AxResult;
+use axtask::current;
+use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK, O_RDONLY};
+use thekernel_linux_mm::{UFFD_O_CLOEXEC, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY, UffdCreateFlags};
 
 use crate::{
-    file::{FileDescription, userfaultfd::UserfaultFile},
+    file::{FileDescription, reserve_fd, userfaultfd::UserfaultFile},
     mm::{AddrSpace, uffd_policy_error},
+    task::AsThread,
+};
+
+const _: () = {
+    assert!(UFFD_O_NONBLOCK == O_NONBLOCK);
+    assert!(UFFD_O_CLOEXEC == O_CLOEXEC);
 };
 
 const fn userfaultfd_status_flags(flags: UffdCreateFlags) -> u32 {
@@ -14,46 +21,47 @@ const fn userfaultfd_status_flags(flags: UffdCreateFlags) -> u32 {
 }
 
 fn checked_userfaultfd_flags(flags: i32) -> AxResult<UffdCreateFlags> {
-    UffdCreateFlags::from_bits(flags as u32)
+    let flags = flags as u32;
+    // Linux performs the unprivileged USER_MODE_ONLY permission gate before
+    // validating the remaining namespace. Under this bounded unprivileged
+    // profile, an unknown bit without USER_MODE_ONLY is therefore EPERM, while
+    // USER_MODE_ONLY combined with an unknown bit is EINVAL.
+    if flags & UFFD_USER_MODE_ONLY == 0 {
+        return Err(axerrno::AxError::OperationNotPermitted);
+    }
+    UffdCreateFlags::from_bits(flags)
         .and_then(UffdCreateFlags::validate_profile)
         .map_err(uffd_policy_error)
 }
 
-/// Unpublished ownership prepared for the eventual syscall visibility commit.
-///
-/// Keeping fd reservation out of this dormant helper makes it impossible for
-/// an internal caller to expose a partially implemented object accidentally.
-#[allow(dead_code)]
-pub(crate) struct PreparedUserfaultfd {
-    pub(crate) description: Arc<FileDescription>,
-    pub(crate) close_on_exec: bool,
-}
-
-#[allow(dead_code)]
-pub(crate) fn prepare_userfaultfd(
+fn prepare_userfaultfd_description(
     aspace: Arc<axsync::Mutex<AddrSpace>>,
-    raw_flags: i32,
-) -> AxResult<PreparedUserfaultfd> {
-    let flags = checked_userfaultfd_flags(raw_flags)?;
+    flags: UffdCreateFlags,
+) -> AxResult<Arc<FileDescription>> {
     let file = UserfaultFile::try_new(aspace, flags)?;
-    let description = FileDescription::new_with_flags(file, userfaultfd_status_flags(flags))?;
-    Ok(PreparedUserfaultfd {
-        description,
-        close_on_exec: flags.close_on_exec(),
-    })
+    FileDescription::new_with_flags(file, userfaultfd_status_flags(flags))
 }
 
-pub fn sys_userfaultfd(_flags: i32) -> AxResult<isize> {
-    // Do not reserve or publish an fd until REGISTER, resolver ioctls, fault
-    // waiting, lifecycle races, and cross-architecture guest contracts close.
-    Err(LinuxError::ENOSYS.into())
+pub fn sys_userfaultfd(raw_flags: i32) -> AxResult<isize> {
+    let flags = checked_userfaultfd_flags(raw_flags)?;
+
+    // Reserve the process-visible name before attaching a handler to the
+    // address space. EMFILE therefore has no userfaultfd/MM side effect. Every
+    // later fallible owner is unpublished and rolls back through Drop.
+    let reservation = reserve_fd(flags.close_on_exec())?;
+    let aspace = current().as_thread().proc_data.aspace();
+    let description = prepare_userfaultfd_description(aspace, flags)?;
+    let publication = reservation.prepare_publication(description)?;
+
+    // Descriptor accounting and exact-table admission are complete. This is
+    // the only visibility transition and is infallible.
+    Ok(publication.commit() as isize)
 }
 
 #[cfg(test)]
 mod tests {
     use axerrno::AxError;
     use linux_raw_sys::general::O_ACCMODE;
-    use thekernel_linux_mm::{UFFD_O_CLOEXEC, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY};
 
     use super::*;
 
@@ -74,7 +82,14 @@ mod tests {
             checked_userfaultfd_flags(0),
             Err(AxError::OperationNotPermitted)
         );
-        assert_eq!(checked_userfaultfd_flags(2), Err(AxError::InvalidInput));
+        assert_eq!(
+            checked_userfaultfd_flags(2),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            checked_userfaultfd_flags((UFFD_USER_MODE_ONLY | 2) as i32),
+            Err(AxError::InvalidInput)
+        );
 
         let flags = checked_userfaultfd_flags(
             (UFFD_USER_MODE_ONLY | UFFD_O_NONBLOCK | UFFD_O_CLOEXEC) as i32,
@@ -83,12 +98,5 @@ mod tests {
         assert!(flags.user_mode_only());
         assert!(flags.nonblocking());
         assert!(flags.close_on_exec());
-    }
-
-    #[test]
-    fn public_entry_stays_unconditionally_dormant() {
-        let enosys: AxError = LinuxError::ENOSYS.into();
-        assert_eq!(sys_userfaultfd(0), Err(enosys));
-        assert_eq!(sys_userfaultfd(UFFD_USER_MODE_ONLY as i32), Err(enosys));
     }
 }

@@ -24,15 +24,16 @@ use memory_addr::{
 };
 use memory_set::{MappingLineage, MappingResult, MemoryArea, MemorySet};
 use thekernel_linux_mm::{
-    AddressSpaceId, ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess,
-    MappingGeneration, MappingId, MappingKind, MappingSnapshot, MmError, PageRange, PinBudget,
-    PinBudgetCharge, PinOwner, PinQuota, PinRegistry, PinRequest, PinReservation, PinToken,
-    UffdRegistration,
+    AddressSpaceId, ExpectedMapping, FaultDisposition, FaultHandlerId, InvalidationRange,
+    InvalidationReason, MappingAccess, MappingGeneration, MappingId, MappingKind, MappingSnapshot,
+    MmError, PageRange, PinBudget, PinBudgetCharge, PinOwner, PinQuota, PinRegistry, PinRequest,
+    PinReservation, PinToken, UffdRegistration,
 };
 
 use super::{
     DeferredUffdWake, LockExternalUffdOutcome, OptionalUffdPlan, PreparedRemapUffd,
-    PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState, UffdRemapKind, checked_align_up_4k,
+    PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState, UffdIcacheSynchronization,
+    UffdPagePublication, UffdRemapKind, UffdResolverLease, checked_align_up_4k,
 };
 
 mod backend;
@@ -84,6 +85,10 @@ fn synchronize_executable_publication(flags: MappingFlags) {
 
 fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> bool {
     new_flags.contains(MappingFlags::EXECUTE) && !old_flags.contains(MappingFlags::EXECUTE)
+}
+
+fn present_leaf_satisfies_fault(page_flags: MappingFlags, access_flags: PageFaultFlags) -> bool {
+    page_flags.contains(access_flags)
 }
 
 /// Clamps one userfaultfd ioctl range to the address space that may contain
@@ -1765,6 +1770,110 @@ impl AddrSpace {
 
     fn mapping_snapshot(&self, area: &MemoryArea<Backend>) -> AxResult<MappingSnapshot> {
         Self::mapping_snapshot_from_parts(self.address_space_id, &self.mapping_identities, area)
+    }
+
+    fn uffd_resolver_area_in(
+        areas: &MemorySet<Backend>,
+        destination: PageRange,
+    ) -> AxResult<&MemoryArea<Backend>> {
+        if destination.page_size().bytes() != PAGE_SIZE_4K {
+            return Err(AxError::InvalidInput);
+        }
+        let start = VirtAddr::from(destination.start());
+        let area = areas
+            .find(start)
+            .ok_or_else(|| AxError::from(axerrno::LinuxError::ENOENT))?;
+        if area.start() > start
+            || area.end().as_usize() < destination.end()
+            || !area.backend().supports_uffd_missing_resolver()
+        {
+            return Err(AxError::from(axerrno::LinuxError::ENOENT));
+        }
+        Ok(area)
+    }
+
+    /// Freezes whole-range COPY/ZEROPAGE authority before any page or
+    /// page-table allocation.
+    ///
+    /// Linux requires the complete destination to remain within one
+    /// compatible registered VMA. The returned lease is revalidated for every
+    /// page publication, allowing the long-running ioctl to release the
+    /// address-space mutex between pages without weakening that rule.
+    pub(crate) fn preflight_uffd_resolver_range(
+        &self,
+        destination: PageRange,
+    ) -> AxResult<UffdResolverLease> {
+        let area = Self::uffd_resolver_area_in(&self.areas, destination)?;
+        let mapping = self.mapping_snapshot(area)?;
+        self.uffd
+            .as_ref()
+            .ok_or_else(|| AxError::from(axerrno::LinuxError::ENOENT))?
+            .prepare_resolver(mapping, destination)
+    }
+
+    /// Publishes one fully initialized resolver page with a short
+    /// address-space critical section.
+    ///
+    /// All allocation, source usercopy, unused-owner reclamation, executable
+    /// synchronization, signed-result copyout, and waiter wake remain outside
+    /// this method. Under the mutex it only revalidates VMA/registration/PTE
+    /// state, publishes one prepared leaf, and records an immutable deferred
+    /// broker completion.
+    pub(crate) fn publish_prepared_uffd_page(
+        &mut self,
+        lease: UffdResolverLease,
+        page: PageRange,
+        disposition: FaultDisposition,
+        prepared: &mut PreparedCowPage,
+        icache_synchronization: Option<UffdIcacheSynchronization>,
+    ) -> AxResult<UffdPagePublication> {
+        if page.len() != PAGE_SIZE_4K || !lease.destination().contains(page) {
+            return Err(AxError::InvalidInput);
+        }
+
+        let Self {
+            address_space_id,
+            areas,
+            mapping_identities,
+            uffd,
+            pt,
+            ..
+        } = self;
+        let area = Self::uffd_resolver_area_in(areas, lease.destination())?;
+        let mapping =
+            Self::mapping_snapshot_from_parts(*address_space_id, mapping_identities, area)?;
+        let state = uffd
+            .as_mut()
+            .ok_or_else(|| AxError::from(axerrno::LinuxError::ENOENT))?;
+        let current = state.revalidate_resolver(lease, mapping)?;
+        let flags = area.flags();
+        if flags.contains(MappingFlags::EXECUTE) && icache_synchronization.is_none() {
+            return Ok(UffdPagePublication::NeedsIcacheSynchronization);
+        }
+        let completions = state.validate_resolver_completion(lease, current, page, disposition)?;
+        area.backend().publish_prepared_cow_page(
+            VirtAddr::from(page.start()),
+            flags,
+            pt,
+            prepared,
+        )?;
+        state.defer_resolver_completions(completions);
+        Ok(UffdPagePublication::Published)
+    }
+
+    /// Applies one handler-scoped UFFDIO_WAKE transition.
+    ///
+    /// The returned receipt owns every PollSet wake and must be finished only
+    /// after the caller releases the address-space mutex.
+    pub(crate) fn wake_uffd_handler_range(
+        &mut self,
+        handler: FaultHandlerId,
+        range: PageRange,
+    ) -> AxResult<DeferredUffdWake> {
+        self.uffd
+            .as_mut()
+            .ok_or(AxError::BadState)?
+            .wake_handler_range(handler, range)
     }
 
     /// Returns the current mapping snapshot only when `address` is covered by
@@ -3685,6 +3794,17 @@ impl AddrSpace {
                     .sub_addr(start)
                     .min(fault_around.max(page_size as usize));
                 let leaf_state = match self.pt.query(vaddr.align_down(PAGE_SIZE_4K)) {
+                    Ok((_paddr, page_flags, _page_size))
+                        if present_leaf_satisfies_fault(page_flags, access_flags) =>
+                    {
+                        // A remote resolver/fault may have published this
+                        // formerly absent leaf after the hardware cached an
+                        // invalid translation. Repair only the fault-receiving
+                        // CPU; a global shootdown on every fresh map would put
+                        // the wrong ownership and cost on the publisher.
+                        super::repair_local_spurious_fault(vaddr);
+                        return PageFaultResult::Handled;
+                    }
                     Ok(_) => UffdFaultLeafState::Present,
                     Err(PagingError::NotMapped) => UffdFaultLeafState::Missing,
                     Err(_) => {
@@ -5110,6 +5230,23 @@ mod tests {
         assert!(!adds_execute_permission(read_execute, read_execute));
         assert!(!adds_execute_permission(read_execute, read_write));
         assert!(!adds_execute_permission(read_write, read_write));
+    }
+
+    #[test]
+    fn present_leaf_repairs_only_faults_already_granted_by_the_pte() {
+        let read_execute = MappingFlags::READ | MappingFlags::EXECUTE;
+        assert!(present_leaf_satisfies_fault(
+            read_execute,
+            MappingFlags::READ
+        ));
+        assert!(present_leaf_satisfies_fault(
+            read_execute,
+            MappingFlags::EXECUTE
+        ));
+        assert!(!present_leaf_satisfies_fault(
+            read_execute,
+            MappingFlags::WRITE
+        ));
     }
 
     #[test]

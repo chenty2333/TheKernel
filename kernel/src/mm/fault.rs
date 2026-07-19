@@ -14,7 +14,7 @@ use axsync::Mutex;
 use memory_addr::VirtAddr;
 use thekernel_linux_mm::{FaultAccess, FaultDisposition, FaultFailure as DelegatedFaultFailure};
 
-use super::{AddrSpace, PageFaultFailure, PageFaultResult};
+use super::{AddrSpace, PageFaultFailure, PageFaultResult, repair_local_spurious_fault};
 use crate::{
     readiness::block_on_poll_set_interruptible_if,
     task::{AsThread, has_pending_syscall_signal, linux_pid_from_task_id},
@@ -93,6 +93,15 @@ impl FaultSession {
                 }
             }
         };
+        if matches!(
+            disposition,
+            FaultDisposition::Supply | FaultDisposition::ZeroFill
+        ) {
+            // The resolver may have run on another CPU. Repair this waiter's
+            // current CPU before retrying the original userspace instruction;
+            // each coalesced waiter owns its own local maintenance.
+            repair_local_spurious_fault(vaddr);
+        }
         disposition_result(disposition)
     }
 }

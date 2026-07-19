@@ -1,3 +1,15 @@
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+
+/// Repairs one current-CPU cached-invalid translation after another CPU has
+/// published a valid leaf.
+///
+/// RISC-V and LoongArch may retain an invalid translation. The hardware fault
+/// receiver, rather than the publisher, owns this targeted local repair. It is
+/// intentionally not a global shootdown.
+pub(crate) fn repair_local_spurious_fault(vaddr: VirtAddr) {
+    axhal::asm::flush_tlb(Some(vaddr.align_down(PAGE_SIZE_4K)));
+}
+
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
     use core::sync::atomic::{AtomicU64, Ordering};
