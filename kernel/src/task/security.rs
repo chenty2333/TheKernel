@@ -5469,6 +5469,208 @@ pub(crate) fn dispatch_socket(context: &SocketSecurityContext<'_>) -> AxResult<(
         .dispatch_socket_with_credential_state(context)
 }
 
+/// Per-registry observer used by socketpair adapter tests.
+///
+/// The probe is owned by one test credential, so parallel tests cannot replace
+/// a global callback or consume another test's lifecycle events.
+#[cfg(test)]
+pub(crate) struct SocketPairSecurityTestProbe {
+    net_namespace: Arc<super::NetworkNamespace>,
+    deny_pair: bool,
+    step: core::sync::atomic::AtomicUsize,
+    create_calls: core::sync::atomic::AtomicUsize,
+    post_create_calls: core::sync::atomic::AtomicUsize,
+    pair_calls: core::sync::atomic::AtomicUsize,
+    first_ofd: core::sync::atomic::AtomicU64,
+    second_ofd: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl SocketPairSecurityTestProbe {
+    pub(crate) fn new(net_namespace: Arc<super::NetworkNamespace>, deny_pair: bool) -> Arc<Self> {
+        Arc::new(Self {
+            net_namespace,
+            deny_pair,
+            step: core::sync::atomic::AtomicUsize::new(0),
+            create_calls: core::sync::atomic::AtomicUsize::new(0),
+            post_create_calls: core::sync::atomic::AtomicUsize::new(0),
+            pair_calls: core::sync::atomic::AtomicUsize::new(0),
+            first_ofd: core::sync::atomic::AtomicU64::new(0),
+            second_ofd: core::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn assert_spec(spec: SocketCreateSpec) {
+        assert_eq!(spec.family(), linux_raw_sys::net::AF_PACKET as i32);
+        assert!(matches!(
+            spec.socket_type(),
+            value if value == linux_raw_sys::net::SOCK_RAW as i32
+                || value == linux_raw_sys::net::SOCK_DGRAM as i32
+        ));
+        assert!(!spec.kernel_origin());
+    }
+
+    fn advance(&self, expected: usize, next: usize) {
+        assert_eq!(
+            self.step.compare_exchange(
+                expected,
+                next,
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            ),
+            Ok(expected),
+            "socketpair security hook order changed"
+        );
+    }
+
+    fn observe_create(&self, spec: SocketCreateSpec) {
+        Self::assert_spec(spec);
+        match self.step.load(core::sync::atomic::Ordering::SeqCst) {
+            0 => self.advance(0, 1),
+            2 => self.advance(2, 3),
+            step => panic!("socketpair create hook reached at step {step}"),
+        }
+        self.create_calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn assert_packet_socket(&self, socket: &SocketSecurityRef<'_>) -> u64 {
+        assert_eq!(socket.backend(), crate::file::SocketBackendKind::Packet);
+        let socket_namespace = socket
+            .net_namespace()
+            .expect("packet socket security ref carries a network namespace");
+        assert!(Arc::ptr_eq(socket_namespace, &self.net_namespace));
+        socket.ofd_identity()
+    }
+
+    fn observe_post_create(&self, socket: &SocketSecurityRef<'_>, spec: SocketCreateSpec) {
+        Self::assert_spec(spec);
+        let ofd = self.assert_packet_socket(socket);
+        match self.step.load(core::sync::atomic::Ordering::SeqCst) {
+            1 => {
+                self.first_ofd
+                    .store(ofd, core::sync::atomic::Ordering::SeqCst);
+                self.advance(1, 2);
+            }
+            3 => {
+                self.second_ofd
+                    .store(ofd, core::sync::atomic::Ordering::SeqCst);
+                self.advance(3, 4);
+            }
+            step => panic!("socketpair post-create hook reached at step {step}"),
+        }
+        self.post_create_calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn observe_pair(
+        &self,
+        first: &SocketSecurityRef<'_>,
+        second: &SocketSecurityRef<'_>,
+    ) -> AxResult<()> {
+        let first_ofd = self.assert_packet_socket(first);
+        let second_ofd = self.assert_packet_socket(second);
+        assert_ne!(first_ofd, second_ofd);
+        assert_eq!(
+            first_ofd,
+            self.first_ofd.load(core::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            second_ofd,
+            self.second_ofd.load(core::sync::atomic::Ordering::SeqCst)
+        );
+        self.advance(4, 0);
+        self.pair_calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        if self.deny_pair {
+            Err(AxError::PermissionDenied)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn assert_complete_cycles(&self, cycles: usize) {
+        assert_eq!(self.step.load(core::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            self.create_calls.load(core::sync::atomic::Ordering::SeqCst),
+            cycles * 2
+        );
+        assert_eq!(
+            self.post_create_calls
+                .load(core::sync::atomic::Ordering::SeqCst),
+            cycles * 2
+        );
+        assert_eq!(
+            self.pair_calls.load(core::sync::atomic::Ordering::SeqCst),
+            cycles
+        );
+    }
+}
+
+#[cfg(test)]
+struct SocketPairSecurityTestModule {
+    probe: Arc<SocketPairSecurityTestProbe>,
+}
+
+#[cfg(test)]
+impl SecurityModule for SocketPairSecurityTestModule {
+    const KEY: ModuleKey = ModuleKey(0x736f_636b_7061_6972);
+    type CredentialState = ();
+
+    fn try_boot_init() -> Result<Self, RegistryBuildError> {
+        unreachable!("socketpair test module is registered as an initialized instance")
+    }
+
+    fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+        Ok(())
+    }
+
+    fn try_prepare_credential(
+        &self,
+        _old_credential: &CoreCred,
+        _old_state: &Self::CredentialState,
+        _proposed_credential: &CoreCred,
+        _transition: CredentialStateTransition,
+    ) -> AxResult<Self::CredentialState> {
+        Ok(())
+    }
+
+    fn socket(&self, context: &SocketSecurityContext<'_>) -> AxResult<()> {
+        match context.operation() {
+            SocketSecurityOperation::Create(operation) => {
+                self.probe.observe_create(operation.spec());
+                Ok(())
+            }
+            SocketSecurityOperation::PostCreate(operation) => {
+                self.probe
+                    .observe_post_create(operation.created_socket(), operation.spec());
+                Ok(())
+            }
+            SocketSecurityOperation::Pair(operation) => self
+                .probe
+                .observe_pair(operation.first_socket(), operation.second_socket()),
+            _ => panic!("socketpair test credential received an unrelated socket hook"),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn socket_pair_security_test_credential(
+    user_namespace: Arc<UserNamespace>,
+    probe: Arc<SocketPairSecurityTestProbe>,
+) -> Arc<Cred> {
+    let mut builder = SecurityRegistryBuilder::try_new()
+        .expect("socketpair test registry allocation failed")
+        .try_register_commoncap()
+        .expect("socketpair test commoncap registration failed");
+    builder
+        .try_register_initialized(SocketPairSecurityTestModule { probe })
+        .expect("socketpair test module registration failed");
+    let registry = Box::new(builder.freeze());
+    Cred::try_root_with_registry(FrozenSecurityRegistry(Box::leak(registry)), user_namespace)
+        .expect("socketpair test credential construction failed")
+}
+
 fn mmap_memory_protection(flags: MappingFlags) -> MemoryProtection {
     let mut bits = 0;
     if flags.contains(MappingFlags::READ) {

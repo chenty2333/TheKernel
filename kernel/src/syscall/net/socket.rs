@@ -159,6 +159,72 @@ fn validate_packet_create_after_capability(
     Ok((socket_type, protocol))
 }
 
+/// Completes one AF_PACKET creation after its create hook has admitted the
+/// normalized request, but before any descriptor can be published.
+fn prepare_packet_socket_after_create(
+    actor: &crate::task::Cred,
+    net_ns: Arc<NetworkNamespace>,
+    ty: u32,
+    proto: u32,
+    nonblocking: bool,
+    spec: SocketCreateSpec,
+) -> AxResult<PinnedSocketDescription> {
+    // Linux checks CAP_NET_RAW in the user namespace governing this exact
+    // network namespace before AF_PACKET-specific type validation.
+    let (socket_type, protocol) = validate_packet_create_after_capability(
+        ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_RAW),
+        ty,
+        proto,
+    )?;
+    let socket = PacketSocket::try_new(socket_type, protocol, net_ns)?;
+    let socket = prepare_new_socket_arc(socket, nonblocking)?;
+    dispatch_socket_post_create(actor, &socket, spec)?;
+    Ok(socket)
+}
+
+/// Runs Linux's two independent socket-creation leaves and the pair hook over
+/// unpublished AF_PACKET descriptions.
+///
+/// `packet_ops` has no pair mechanism.  Keeping both descriptions private
+/// means every denial or final `EOPNOTSUPP` drops both lower endpoints without
+/// reserving or publishing an fd.
+fn prepare_packet_socket_pair(
+    actor: &crate::task::Cred,
+    net_ns: &Arc<NetworkNamespace>,
+    ty: u32,
+    proto: u32,
+    nonblocking: bool,
+    spec: SocketCreateSpec,
+) -> AxResult<(PinnedSocketDescription, PinnedSocketDescription)> {
+    dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
+    let first =
+        prepare_packet_socket_after_create(actor, net_ns.clone(), ty, proto, nonblocking, spec)?;
+
+    dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
+    let second =
+        prepare_packet_socket_after_create(actor, net_ns.clone(), ty, proto, nonblocking, spec)?;
+
+    {
+        let first_ref = first.security_ref()?;
+        let second_ref = second.security_ref()?;
+        dispatch_socket(&SocketSecurityContext::pair(actor, &first_ref, &second_ref))?;
+    }
+    Ok((first, second))
+}
+
+fn packet_socketpair_after_parse(
+    actor: &crate::task::Cred,
+    net_ns: &Arc<NetworkNamespace>,
+    ty: u32,
+    proto: u32,
+    nonblocking: bool,
+    spec: SocketCreateSpec,
+) -> AxResult<isize> {
+    let (_first, _second) =
+        prepare_packet_socket_pair(actor, net_ns, ty, proto, nonblocking, spec)?;
+    Err(LinuxError::EOPNOTSUPP.into())
+}
+
 fn supported_stream_protocol(proto: u32) -> bool {
     proto == 0 || proto == IPPROTO_TCP as u32
 }
@@ -201,16 +267,8 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
 
     if domain == AF_PACKET {
         let net_ns = snapshot.net_namespace().clone();
-        // Linux checks CAP_NET_RAW in the user namespace governing this exact
-        // network namespace before AF_PACKET-specific type validation.
-        let (socket_type, protocol) = validate_packet_create_after_capability(
-            ns_capable(&actor, net_ns.owner_user_ns(), CAP_NET_RAW),
-            ty,
-            proto,
-        )?;
-        let socket = PacketSocket::try_new(socket_type, protocol, net_ns)?;
-        let socket = prepare_new_socket_arc(socket, nonblocking)?;
-        dispatch_socket_post_create(&actor, &socket, spec)?;
+        let socket =
+            prepare_packet_socket_after_create(&actor, net_ns, ty, proto, nonblocking, spec)?;
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
@@ -650,6 +708,20 @@ pub fn sys_socketpair(
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
 
+    if domain == AF_PACKET {
+        let snapshot = SocketSyscallSnapshot::capture();
+        let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
+            .ok_or(AxError::InvalidInput)?;
+        let actor = snapshot.actor();
+        let net_ns = snapshot.net_namespace();
+
+        // Linux's generic socketpair path also exposes pre-reserved descriptor
+        // numbers before the backend pair operation.  TheKernel's existing
+        // generic publication order does not yet model that behavior.  This
+        // unsupported AF_PACKET path deliberately publishes and writes none.
+        return packet_socketpair_after_parse(actor, net_ns, ty, proto, nonblocking, spec);
+    }
+
     if matches!(domain, AF_INET | AF_INET6) {
         return Err(inet_socketpair_error(ty, proto));
     }
@@ -743,6 +815,9 @@ pub fn sys_socketpair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::security::{
+        SocketPairSecurityTestProbe, socket_pair_security_test_credential,
+    };
 
     #[test]
     fn socket_creation_flags_keep_read_write_and_nonblocking_on_the_ofd() {
@@ -778,6 +853,70 @@ mod tests {
                 u32::from(0x0800_u16.to_be())
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn packet_socketpair_reaches_pair_then_drops_both_private_endpoints() {
+        let _context = crate::file::packet_socket::packet_test_context();
+        let user_namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let net_namespace =
+            NetworkNamespace::try_new_loopback_only(user_namespace.clone()).unwrap();
+        let probe = SocketPairSecurityTestProbe::new(net_namespace.clone(), false);
+        let actor = socket_pair_security_test_credential(user_namespace, probe.clone());
+        let raw_spec =
+            SocketCreateSpec::try_new(AF_PACKET as i32, SOCK_RAW as i32, 0, false).unwrap();
+
+        assert_eq!(
+            packet_socketpair_after_parse(&actor, &net_namespace, SOCK_RAW, 0, false, raw_spec,),
+            Err(LinuxError::EOPNOTSUPP.into())
+        );
+
+        let dgram_spec =
+            SocketCreateSpec::try_new(AF_PACKET as i32, SOCK_DGRAM as i32, 0, false).unwrap();
+        assert_eq!(
+            packet_socketpair_after_parse(&actor, &net_namespace, SOCK_DGRAM, 0, true, dgram_spec,),
+            Err(LinuxError::EOPNOTSUPP.into())
+        );
+        probe.assert_complete_cycles(2);
+    }
+
+    #[test]
+    fn packet_socketpair_pair_denial_drops_both_private_endpoints() {
+        let _context = crate::file::packet_socket::packet_test_context();
+        let user_namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let net_namespace =
+            NetworkNamespace::try_new_loopback_only(user_namespace.clone()).unwrap();
+        let probe = SocketPairSecurityTestProbe::new(net_namespace.clone(), true);
+        let actor = socket_pair_security_test_credential(user_namespace, probe.clone());
+        let spec = SocketCreateSpec::try_new(AF_PACKET as i32, SOCK_RAW as i32, 0, false).unwrap();
+
+        // Pair denial happens only after both endpoints exist. Repeating past
+        // the broker's 64-endpoint bound proves every denied transaction drops
+        // both unpublished descriptions and unregisters their lower endpoints.
+        for _ in 0..65 {
+            assert_eq!(
+                packet_socketpair_after_parse(&actor, &net_namespace, SOCK_RAW, 0, false, spec),
+                Err(AxError::PermissionDenied)
+            );
+        }
+        probe.assert_complete_cycles(65);
+    }
+
+    #[test]
+    fn packet_socketpair_keeps_generic_and_capability_error_precedence() {
+        assert_eq!(parse_socket_type(0x7f), Err(AxError::InvalidInput));
+        assert_eq!(
+            validate_packet_create_after_capability(false, SOCK_RAW, 0),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            validate_packet_create_after_capability(false, SOCK_STREAM, 0),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            validate_packet_create_after_capability(true, SOCK_STREAM, 0),
+            Err(LinuxError::ESOCKTNOSUPPORT.into())
         );
     }
 }
