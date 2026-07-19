@@ -131,6 +131,13 @@ scripts/ci/compare-mm-performance.py \
   --output /evidence/mm-regression.tsv
 ```
 
+Qualify a runner and workload revision first with a counterbalanced null series
+whose baseline and candidate sides use the same exact TheKernel commit. A null
+series that returns `2` is evidence that the runner or workload is too noisy;
+do not use that environment to accept or reject a kernel optimization. Keep the
+failed bundle intact for diagnosis rather than adding pairs after existing
+ratio extrema have already made the configured spread unattainable.
+
 The pair count must be odd and within the independent, versioned stability
 policy (three through nine by default). Every bundle is validated before use;
 every pair must have matching workload, dependency, rootfs, QEMU, runner, host
