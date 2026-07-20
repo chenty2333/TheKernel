@@ -1,11 +1,13 @@
 use alloc::{boxed::Box, string::String, sync::Arc, task::Wake, vec::Vec};
 use core::{
     sync::atomic::{AtomicI32, Ordering},
-    task::Waker,
+    task::{Context, Waker},
 };
 
 use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
-use axpoll::{PollRegistrationError, PollSet, PreparedPollRegistration};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use axsync::Mutex;
 use smoltcp::{
     iface::SocketHandle,
@@ -14,11 +16,11 @@ use smoltcp::{
 };
 
 use crate::{
-    device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice},
+    device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice, PacketSendProgress},
     listen_table::ListenTable,
     packet::{
-        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketResult, PacketSelector,
-        PacketSendRequest,
+        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketRecord, PacketResult,
+        PacketSelector, PacketSendRequest,
     },
     router::{RouteInfo, Router, Rule},
     service::Service,
@@ -192,7 +194,76 @@ impl NetStack {
             .lock()
             .send_packet(interface_index, origin, request);
         self.packet_broker.drain_staged();
-        result
+        match result {
+            Ok(PacketSendProgress::NoImmediateIngress) => Ok(()),
+            Ok(PacketSendProgress::ImmediateIngressQueued) => {
+                // Loopback injection queues an immediate ingress copy. Retire
+                // it after the service lock and outgoing capture so observers
+                // do not depend on an unrelated transport call.
+                self.poll_interfaces();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Claims an already-published record without scanning devices, then polls
+    /// device ingress once if the endpoint would otherwise block.
+    pub fn try_receive_packet(
+        &self,
+        endpoint: &PacketEndpoint,
+        peek: bool,
+    ) -> AxResult<PacketRecord> {
+        match endpoint.try_receive(peek) {
+            Ok(record) => Ok(record),
+            Err(AxError::WouldBlock) => {
+                self.poll_interfaces();
+                endpoint.try_receive(peek)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns endpoint readiness directly when data or hangup is published,
+    /// polling the network service only while receive readiness is absent.
+    pub fn poll_packet_endpoint(&self, endpoint: &PacketEndpoint) -> IoEvents {
+        let ready = endpoint.poll();
+        if ready.intersects(IoEvents::READABLE | IoEvents::HANGUP) {
+            return ready;
+        }
+        self.poll_interfaces();
+        endpoint.poll()
+    }
+
+    /// Registers both endpoint publication and device-network wake sources.
+    ///
+    /// Endpoint readiness alone cannot wake a receive-only packet socket when
+    /// a device has work that has not yet crossed the capture point. The
+    /// aggregate retains both sources, while writable-only interest remains
+    /// optimistic until devices expose completion-credit readiness.
+    pub fn register_packet_endpoint<'a>(
+        &'a self,
+        endpoint: &'a PacketEndpoint,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let endpoint_interest = events.intersects(IoEvents::READABLE | IoEvents::HANGUP);
+        let network_interest = events.contains(IoEvents::READABLE) && !endpoint.is_detached();
+        let mut prepared = PreparedPollRegistration::try_new(
+            usize::from(endpoint_interest) + usize::from(network_interest),
+        )?;
+        if endpoint_interest {
+            endpoint.arm_readiness(&mut prepared, context.waker())?;
+        }
+        if network_interest {
+            self.arm_readiness(&mut prepared, u64::MAX, context.waker())?;
+            // Close the device-bridge -> stack-source arm window. A device
+            // wake that arrived before the stack source was armed leaves real
+            // receive work behind; polling after both registrations converts
+            // that work into endpoint readiness before publication.
+            self.poll_interfaces();
+        }
+        prepared.commit()
     }
 
     /// Add a routing rule to this stack.
@@ -332,8 +403,72 @@ impl NetStack {
 
 #[cfg(test)]
 mod tests {
+    use alloc::task::Wake;
+    use core::sync::atomic::AtomicUsize;
+
     use super::*;
-    use crate::InterfaceKind;
+    use crate::{
+        InterfaceKind,
+        packet::{LinkPacketType, PacketProtocol, PacketView},
+    };
+
+    const TEST_PROTOCOL: u16 = 0x88b5;
+    const TEST_FRAME: [u8; 20] = [
+        0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // destination
+        0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, // source
+        0x88, 0xb5, // protocol
+        b'p', b'a', b'c', b'k', b'e', b't',
+    ];
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn packet_endpoint(stack: &NetStack) -> Arc<PacketEndpoint> {
+        stack
+            .subscribe_packets(PacketSelector::new(
+                PacketProtocol::All,
+                Some(1),
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap()
+    }
+
+    fn ingress_only_endpoint(stack: &NetStack) -> Arc<PacketEndpoint> {
+        stack
+            .subscribe_packets(PacketSelector::new(
+                PacketProtocol::Exact(TEST_PROTOCOL),
+                Some(1),
+                PacketView::Raw,
+                false,
+            ))
+            .unwrap()
+    }
+
+    fn queue_loopback_without_poll(stack: &NetStack, source: &PacketEndpoint) {
+        let progress = stack
+            .service
+            .lock()
+            .send_packet(
+                1,
+                source,
+                PacketSendRequest::Raw {
+                    protocol: TEST_PROTOCOL,
+                    frame: &TEST_FRAME,
+                },
+            )
+            .unwrap();
+        assert_eq!(progress, PacketSendProgress::ImmediateIngressQueued);
+    }
 
     #[test]
     fn loopback_stack_reports_real_interface_and_routes() {
@@ -349,5 +484,91 @@ mod tests {
         assert_eq!(routes.len(), 2);
         assert!(routes.iter().all(|route| route.interface_index == 1));
         assert!(routes.iter().all(|route| route.gateway.is_none()));
+    }
+
+    #[test]
+    fn direct_loopback_packet_send_retires_outgoing_and_ingress() {
+        let stack = NetStack::new_loopback_only();
+        let source = packet_endpoint(&stack);
+        let observer = packet_endpoint(&stack);
+
+        stack
+            .send_packet(
+                1,
+                source.as_ref(),
+                PacketSendRequest::Raw {
+                    protocol: TEST_PROTOCOL,
+                    frame: &TEST_FRAME,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(observer.queue_usage().0, 2);
+        assert_eq!(source.queue_usage().0, 1);
+        let outgoing = observer.try_receive(false).unwrap();
+        let ingress = observer.try_receive(false).unwrap();
+        assert_eq!(outgoing.metadata().packet_type, LinkPacketType::Outgoing);
+        assert_eq!(ingress.metadata().packet_type, LinkPacketType::OtherHost);
+        assert_eq!(outgoing.data(), TEST_FRAME);
+        assert_eq!(ingress.data(), TEST_FRAME);
+    }
+
+    #[test]
+    fn packet_receive_attempt_polls_pending_device_ingress() {
+        let stack = NetStack::new_loopback_only();
+        let source = packet_endpoint(&stack);
+        let receiver = ingress_only_endpoint(&stack);
+        queue_loopback_without_poll(&stack, source.as_ref());
+        assert_eq!(receiver.queue_usage().0, 0);
+
+        let record = stack.try_receive_packet(receiver.as_ref(), false).unwrap();
+        assert_eq!(record.metadata().packet_type, LinkPacketType::OtherHost);
+        assert_eq!(record.data(), TEST_FRAME);
+    }
+
+    #[test]
+    fn packet_read_registration_closes_pending_device_wake_gap() {
+        let stack = NetStack::new_loopback_only();
+        let source = packet_endpoint(&stack);
+        let receiver = ingress_only_endpoint(&stack);
+        queue_loopback_without_poll(&stack, source.as_ref());
+        assert_eq!(receiver.queue_usage().0, 0);
+
+        let wake_count = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        let registration = stack
+            .register_packet_endpoint(receiver.as_ref(), &mut context, IoEvents::READABLE)
+            .unwrap();
+
+        assert!(wake_count.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(receiver.queue_usage().0, 1);
+        drop(registration);
+    }
+
+    #[test]
+    fn packet_read_wait_retains_endpoint_and_network_sources() {
+        let stack = NetStack::new_loopback_only();
+        let endpoint = packet_endpoint(&stack);
+        let wake_count = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        let registration = stack
+            .register_packet_endpoint(&endpoint, &mut context, IoEvents::READABLE)
+            .unwrap();
+        assert_eq!(registration.source_count(), 2);
+        drop(registration);
+
+        let registration = stack
+            .register_packet_endpoint(&endpoint, &mut context, IoEvents::HANGUP)
+            .unwrap();
+        assert_eq!(registration.source_count(), 1);
+        drop(registration);
+
+        let registration = stack
+            .register_packet_endpoint(&endpoint, &mut context, IoEvents::WRITABLE)
+            .unwrap();
+        assert_eq!(registration.source_count(), 0);
     }
 }

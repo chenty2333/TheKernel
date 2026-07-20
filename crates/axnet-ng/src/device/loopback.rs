@@ -12,7 +12,8 @@ use smoltcp::{
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
     device::{
-        Device, DevicePollBridge, DeviceStats, InterfaceKind, classify_ethernet_ingress_protocol,
+        Device, DevicePollBridge, DeviceStats, InterfaceKind, PacketSendProgress,
+        classify_ethernet_ingress_protocol,
     },
     packet::{
         LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
@@ -258,7 +259,7 @@ impl Device for LoopbackDevice {
         context: PacketDeviceContext<'_>,
         request: PacketSendRequest<'_>,
         _timestamp: Instant,
-    ) -> AxResult<()> {
+    ) -> AxResult<PacketSendProgress> {
         let (protocol, header, payload) = match request {
             PacketSendRequest::Raw { protocol, frame } => {
                 if frame.len() < LOOPBACK_HEADER_LEN {
@@ -285,6 +286,7 @@ impl Device for LoopbackDevice {
         }
         self.enqueue_packet(context, protocol, header, payload)
             .inspect_err(|_| self.stats.record_tx_drop())
+            .map(|()| PacketSendProgress::ImmediateIngressQueued)
     }
 
     fn register_waker(&self, waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {

@@ -4192,7 +4192,7 @@ mod tests {
     };
     use axio::{IoBuf, Read};
     use thekernel_linux_packet::{
-        PacketSendAddress, PacketSocketType, ProtocolSelector, ReceiveFlags,
+        PacketSendAddress, PacketSocketType, ProtocolSelector, ReceiveFlags, SetPacketOption,
     };
 
     use super::*;
@@ -4273,6 +4273,9 @@ mod tests {
             namespace.clone(),
         )
         .unwrap();
+        receiver
+            .set_packet_option(SetPacketOption::IgnoreOutgoing(true))
+            .unwrap();
         let sender =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
         let pinned = pinned_packet(receiver.clone());
@@ -4326,6 +4329,9 @@ mod tests {
             namespace.clone(),
         )
         .unwrap();
+        receiver
+            .set_packet_option(SetPacketOption::IgnoreOutgoing(true))
+            .unwrap();
         let sender =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
         let file: Arc<dyn FileLike> = receiver.clone();

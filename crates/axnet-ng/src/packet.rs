@@ -16,11 +16,14 @@ use alloc::{
 use core::{
     mem::size_of,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    task::Context,
+    task::{Context, Waker},
 };
 
 use axerrno::{AxError, AxResult};
-use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, RegisterError};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+    RegisterError,
+};
 use axsync::Mutex;
 use axtask::WaitQueue;
 
@@ -828,6 +831,38 @@ impl PacketEndpoint {
         let state = self.state.lock();
         (state.queue.len(), state.queued_bytes)
     }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn arm_readiness<'a>(
+        &'a self,
+        prepared: &mut PreparedPollRegistration<'a>,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
+        if self.is_detached() {
+            waker.wake_by_ref();
+            return Ok(());
+        }
+        match prepared.arm(&self.readiness, waker) {
+            Ok(()) => {}
+            Err(PollRegistrationError::Source {
+                error: RegisterError::Closed,
+                ..
+            }) if self.is_detached() => {
+                waker.wake_by_ref();
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        // Check after arming so queue publication or broker teardown racing
+        // registration cannot lose its terminal edge.
+        if self.is_detached() || !self.state.lock().queue.is_empty() {
+            waker.wake_by_ref();
+        }
+        Ok(())
+    }
 }
 
 impl Pollable for PacketEndpoint {
@@ -853,27 +888,9 @@ impl Pollable for PacketEndpoint {
         if !terminal_interest {
             return PollRegistration::empty();
         }
-        if self.detached.load(Ordering::Acquire) {
-            context.waker().wake_by_ref();
-            return PollRegistration::empty();
-        }
-        let registration = match PollRegistration::single(&self.readiness, context.waker()) {
-            Ok(registration) => registration,
-            Err(PollRegistrationError::Source {
-                error: RegisterError::Closed,
-                ..
-            }) if self.detached.load(Ordering::Acquire) => {
-                context.waker().wake_by_ref();
-                return PollRegistration::empty();
-            }
-            Err(error) => return Err(error),
-        };
-        // Check after arming so queue publication or broker teardown racing
-        // registration cannot lose its terminal edge.
-        if self.detached.load(Ordering::Acquire) || !self.state.lock().queue.is_empty() {
-            context.waker().wake_by_ref();
-        }
-        Ok(registration)
+        let mut prepared = PreparedPollRegistration::try_new(1)?;
+        self.arm_readiness(&mut prepared, context.waker())?;
+        prepared.commit()
     }
 }
 

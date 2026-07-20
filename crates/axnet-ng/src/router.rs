@@ -11,7 +11,7 @@ use smoltcp::{
 
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
-    device::{Device, DeviceStats, InterfaceInfo},
+    device::{Device, DeviceStats, InterfaceInfo, PacketSendProgress},
     listen_table::ListenTable,
     packet::{
         PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpoint, PacketError,
@@ -172,7 +172,7 @@ impl Router {
         origin: &PacketEndpoint,
         request: PacketSendRequest<'_>,
         timestamp: Instant,
-    ) -> AxResult<()> {
+    ) -> AxResult<PacketSendProgress> {
         let origin = self
             .packet_broker
             .origin_id(origin)

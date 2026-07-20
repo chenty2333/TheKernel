@@ -250,7 +250,10 @@ impl PacketSocket {
             // Linux ordinary packet receive dequeues before usercopy: EFAULT
             // consumes the record. MSG_PEEK clones the head and therefore
             // retains it across the same fault.
-            let record = self.endpoint.try_receive(peek)?;
+            let record = self
+                .net_ns
+                .stack()
+                .try_receive_packet(self.endpoint.as_ref(), peek)?;
             let metadata = record.metadata();
             let socket_type = self.state.lock().socket_type();
             let header_len = usize::from(metadata.link_header_len);
@@ -459,7 +462,9 @@ impl Pollable for PacketSocket {
     fn poll(&self) -> IoEvents {
         // READABLE is queue-backed. WRITABLE is deliberately optimistic until
         // Layer 1 grows a device completion-credit readiness contract.
-        self.endpoint.poll()
+        self.net_ns
+            .stack()
+            .poll_packet_endpoint(self.endpoint.as_ref())
     }
 
     fn register<'a>(
@@ -467,7 +472,9 @@ impl Pollable for PacketSocket {
         context: &mut Context<'_>,
         events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
-        self.endpoint.register(context, events)
+        self.net_ns
+            .stack()
+            .register_packet_endpoint(self.endpoint.as_ref(), context, events)
     }
 }
 
@@ -855,7 +862,6 @@ mod tests {
             ))),
         )
         .unwrap();
-        net_ns.stack().poll_interfaces();
 
         let PacketOptionValue::Statistics(first) =
             receiver.get_packet_option(GetPacketOption::Statistics)
@@ -928,7 +934,6 @@ mod tests {
             ))),
         )
         .unwrap();
-        net_ns.stack().poll_interfaces();
 
         assert_eq!(all.endpoint.queue_usage().0, 2);
         assert_eq!(exact.endpoint.queue_usage().0, 1);
@@ -962,6 +967,8 @@ mod tests {
         assert_eq!(result.returned_len(), raw_ipv4_frame().len());
         assert!(result.message_truncated());
         assert_eq!(result.address().packet_type(), PacketType::OUTGOING);
+        let ingress = receiver.endpoint.try_receive(false).unwrap();
+        assert_eq!(ingress.metadata().packet_type, LinkPacketType::Host);
         assert_eq!(receiver.endpoint.queue_usage().0, 0);
     }
 
@@ -972,6 +979,9 @@ mod tests {
         let receiver =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
                 .unwrap();
+        receiver
+            .set_packet_option(SetPacketOption::IgnoreOutgoing(true))
+            .unwrap();
         let sender =
             PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns).unwrap();
 

@@ -16,6 +16,7 @@ use smoltcp::{
 };
 
 use crate::{
+    device::PacketSendProgress,
     packet::{PacketEndpoint, PacketSendRequest},
     router::{Router, Rule},
     wrapper::SocketSetWrapper,
@@ -72,7 +73,7 @@ impl Service {
         interface_index: u32,
         origin: &PacketEndpoint,
         request: PacketSendRequest<'_>,
-    ) -> AxResult<()> {
+    ) -> AxResult<PacketSendProgress> {
         self.router
             .send_packet(interface_index, origin, request, now())
     }

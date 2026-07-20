@@ -21,7 +21,9 @@ use smoltcp::{
 
 use crate::{
     consts::{ETHERNET_MAX_PENDING_PACKETS, STANDARD_MTU},
-    device::{Device, DeviceStats, InterfaceKind, classify_ethernet_ingress_protocol},
+    device::{
+        Device, DeviceStats, InterfaceKind, PacketSendProgress, classify_ethernet_ingress_protocol,
+    },
     packet::{
         LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
         PacketMetadata, PacketSendRequest,
@@ -548,7 +550,7 @@ impl Device for EthernetDevice {
         context: PacketDeviceContext<'_>,
         request: PacketSendRequest<'_>,
         _timestamp: Instant,
-    ) -> AxResult<()> {
+    ) -> AxResult<PacketSendProgress> {
         match request {
             PacketSendRequest::Raw { protocol, frame } => {
                 let header_len = EthernetFrame::<&[u8]>::header_len();
@@ -591,6 +593,7 @@ impl Device for EthernetDevice {
                 )
             }
         }
+        .map(|()| PacketSendProgress::NoImmediateIngress)
     }
 
     fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {

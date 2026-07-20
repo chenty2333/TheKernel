@@ -30,6 +30,16 @@ const ETHERNET_TYPE_MIN: u16 = 0x0600;
 const ETHERNET_802_3_PROTOCOL: u16 = 0x0001;
 const ETHERNET_802_2_PROTOCOL: u16 = 0x0004;
 
+/// Describes whether a successful link-layer send queued receive work that
+/// must be retired by this same network stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketSendProgress {
+    /// The send did not synchronously queue receive work for this stack.
+    NoImmediateIngress,
+    /// The send queued receive work that this stack must poll immediately.
+    ImmediateIngressQueued,
+}
+
 /// Classifies a received Ethernet frame independently of transmit metadata.
 ///
 /// Values below the Ethernet-II type range are length fields.  A leading
@@ -209,13 +219,15 @@ pub trait Device: Send + Sync {
 
     /// Injects one packet through an explicitly advertised raw or cooked link
     /// capability. Unsupported devices fail without mutating their ordinary IP
-    /// datapath.
+    /// datapath. The result distinguishes ordinary device dispatch from
+    /// immediate ingress queued for this same stack; it is not a hardware
+    /// completion signal.
     fn send_packet(
         &mut self,
         _context: PacketDeviceContext<'_>,
         _request: PacketSendRequest<'_>,
         _timestamp: Instant,
-    ) -> AxResult<()> {
+    ) -> AxResult<PacketSendProgress> {
         Err(AxError::Unsupported)
     }
 
