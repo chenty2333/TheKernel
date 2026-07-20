@@ -439,10 +439,11 @@ fn send_impl(
     }
 
     if backend == SocketBackendKind::Packet {
-        // AF_PACKET flag interpretation and ancillary support are protocol
-        // mechanism decisions. The raw flags/control length were visible to
-        // policy above; reject them only after that hook.
-        validate_sendmsg_flags(flags)?;
+        // Linux packet_snd consumes MSG_DONTWAIT for allocation policy and
+        // otherwise leaves ordinary send flags uninterpreted. This bounded
+        // adapter does not wait for transmit capacity, so the raw flags need
+        // only remain visible to policy above; do not apply stream/datagram
+        // protocol whitelists to AF_PACKET.
         let destination = packet_address
             .as_ref()
             .map(decode_send_address)

@@ -8,7 +8,7 @@ use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
     MAX_LISTEN_BACKLOG, Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
     tcp::TcpSocket,
-    udp::UdpSocket,
+    udp::{UdpSocket, UdpSocketFamily},
     unix::{DgramTransport, StreamTransport, UnixSocket, UnixSocketAddr},
 };
 use linux_raw_sys::{
@@ -302,7 +302,12 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             if !supported_datagram_protocol(proto) {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Udp(UdpSocket::new(net_stack.clone())?)
+            let family = if domain == AF_INET6 {
+                UdpSocketFamily::Ipv6
+            } else {
+                UdpSocketFamily::Ipv4
+            };
+            SocketInner::Udp(UdpSocket::new_with_family(net_stack.clone(), family)?)
         }
         (AF_INET | AF_INET6, SOCK_DCCP) => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));

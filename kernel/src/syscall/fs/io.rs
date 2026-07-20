@@ -19,9 +19,9 @@ use syscalls::Sysno;
 use crate::{
     file::{
         Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst, IoSrc,
-        OfdIoStatus, PidFd, PinnedSocketDescription, Pipe, PreparedSocketMessage, Socket,
-        allowed_write_len, check_resize_limit, executable, flock, get_file_like, get_typed_file,
-        inode_flags,
+        OfdIoStatus, PacketSocket, PidFd, PinnedSocketDescription, Pipe, PreparedSocketMessage,
+        Socket, allowed_write_len, check_resize_limit, executable, flock, get_file_like,
+        get_typed_file, inode_flags,
         inotify::{
             notify_exact, notify_parent, notify_read, notify_read_file, notify_write,
             notify_write_file,
@@ -405,6 +405,8 @@ fn read_file_like_with_status(
     } else if let Some(pipe) = file_like.downcast_ref::<NamedPipe>() {
         pipe.read_with_nonblocking(dst, status.nonblocking())
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
+        socket.read_with_nonblocking(dst, status.nonblocking())
+    } else if let Some(socket) = file_like.downcast_ref::<PacketSocket>() {
         socket.read_with_nonblocking(dst, status.nonblocking())
     } else {
         file_like.read(dst)
@@ -4312,6 +4314,50 @@ mod tests {
         assert_eq!(outcome.returned_len(), frame.len());
         assert_eq!(drained, frame);
         assert!(!receiver.poll().contains(IoEvents::READABLE));
+    }
+
+    #[test]
+    fn generic_packet_read_uses_the_frozen_ofd_nonblocking_state() {
+        let _context = packet_test_context();
+        let namespace = packet_test_namespace();
+        let receiver = PacketSocket::try_new(
+            PacketSocketType::Raw,
+            ProtocolSelector::All,
+            namespace.clone(),
+        )
+        .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace).unwrap();
+        let file: Arc<dyn FileLike> = receiver.clone();
+        let description = FileDescription::new(file).unwrap();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description);
+        let frozen_nonblocking = handle.set_nonblocking_status(true).unwrap();
+        assert!(frozen_nonblocking.nonblocking());
+        assert!(!handle.set_nonblocking_status(false).unwrap().nonblocking());
+
+        let worker_handle = handle.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut output = [0_u8; 34];
+            let result = read_file_like_with_status(
+                &worker_handle,
+                frozen_nonblocking,
+                &mut &mut output[..],
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        match result_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(result) => assert_eq!(result, Err(AxError::WouldBlock)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                enqueue_outgoing_packet(&sender, &raw_ipv4_packet());
+                let _ = result_rx.recv_timeout(Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("packet read resampled the live blocking flag");
+            }
+            Err(error) => panic!("packet read worker failed: {error:?}"),
+        }
+        worker.join().unwrap();
     }
 
     #[test]

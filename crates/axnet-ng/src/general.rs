@@ -543,6 +543,7 @@ mod tests {
     static TASK_SERIAL: Mutex<()> = Mutex::new(());
 
     fn init_task_runtime() {
+        axhal::percpu::init_primary(0);
         TASK_INIT.call_once(|| axtask::init_scheduler().unwrap());
     }
 

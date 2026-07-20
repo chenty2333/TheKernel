@@ -170,6 +170,10 @@ impl SendOptions {
 #[derive(Default)]
 pub struct RecvOptions<'a> {
     /// If set, the sender's address is written here.
+    ///
+    /// This output choice does not control peer admission. A connected
+    /// datagram endpoint filters by its peer whether or not an address is
+    /// requested, while an unconnected endpoint accepts any sender.
     pub from: Option<&'a mut SocketAddrEx>,
     /// Receive flags.
     pub flags: RecvFlags,

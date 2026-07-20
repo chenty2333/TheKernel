@@ -118,6 +118,7 @@ impl std::error::Error for RecvError {}
 #[derive(Debug)]
 pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
+    remote_endpoint: Option<IpEndpoint>,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -133,6 +134,7 @@ impl<'a> Socket<'a> {
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            remote_endpoint: None,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -182,6 +184,41 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn endpoint(&self) -> IpListenEndpoint {
         self.endpoint
+    }
+
+    /// Return the exact remote endpoint admitted by this socket, if any.
+    ///
+    /// Existing queued datagrams retain the admission decision made when they
+    /// arrived; changing this endpoint does not purge or reclassify them.
+    #[inline]
+    pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
+        self.remote_endpoint
+    }
+
+    /// Limit newly arriving datagrams to an exact remote endpoint.
+    ///
+    /// Passing `None` restores unconnected UDP admission. Existing queued
+    /// datagrams are neither purged nor reclassified, so callers can treat a
+    /// change as an ingress admission boundary.
+    #[inline]
+    pub fn set_remote_endpoint(&mut self, remote_endpoint: Option<IpEndpoint>) {
+        self.remote_endpoint = remote_endpoint;
+    }
+
+    /// Clear the local and remote endpoints without discarding queued packets.
+    ///
+    /// This is distinct from [`Self::close`]: a datagram disconnect may release
+    /// an automatically selected local port while datagrams admitted before the
+    /// transition remain available to the owner.
+    pub fn unbind(&mut self) {
+        self.endpoint = IpListenEndpoint::default();
+        self.remote_endpoint = None;
+
+        #[cfg(feature = "async")]
+        {
+            self.rx_waker.wake();
+            self.tx_waker.wake();
+        }
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -241,6 +278,7 @@ impl<'a> Socket<'a> {
     pub fn close(&mut self) {
         // Clear the bound endpoint of the socket.
         self.endpoint = IpListenEndpoint::default();
+        self.remote_endpoint = None;
 
         // Reset the RX and TX buffers of the socket.
         self.tx_buffer.reset();
@@ -511,6 +549,12 @@ impl<'a> Socket<'a> {
         {
             return false;
         }
+        if self
+            .remote_endpoint
+            .is_some_and(|remote| remote.addr != ip_repr.src_addr() || remote.port != repr.src_port)
+        {
+            return false;
+        }
 
         true
     }
@@ -672,6 +716,10 @@ mod test {
                 addr: IpAddress::Ipv4(REMOTE_ADDR),
                 port: REMOTE_PORT,
             };
+            const OTHER_REMOTE_END: IpEndpoint = IpEndpoint {
+                addr: IpAddress::Ipv4(OTHER_ADDR),
+                port: REMOTE_PORT + 1,
+            };
         } else {
             use crate::wire::Ipv6Address as IpvXAddress;
             use crate::wire::Ipv6Repr as IpvXRepr;
@@ -688,6 +736,10 @@ mod test {
             const REMOTE_END: IpEndpoint = IpEndpoint {
                 addr: IpAddress::Ipv6(REMOTE_ADDR),
                 port: REMOTE_PORT,
+            };
+            const OTHER_REMOTE_END: IpEndpoint = IpEndpoint {
+                addr: IpAddress::Ipv6(OTHER_ADDR),
+                port: REMOTE_PORT + 1,
             };
         }
     }
@@ -724,6 +776,14 @@ mod test {
         hop_limit: 64,
     });
 
+    pub const OTHER_REMOTE_IP_REPR: IpRepr = IpReprIpvX(IpvXRepr {
+        src_addr: OTHER_ADDR,
+        dst_addr: LOCAL_ADDR,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + 6,
+        hop_limit: 64,
+    });
+
     const LOCAL_UDP_REPR: UdpRepr = UdpRepr {
         src_port: LOCAL_PORT,
         dst_port: REMOTE_PORT,
@@ -731,6 +791,11 @@ mod test {
 
     const REMOTE_UDP_REPR: UdpRepr = UdpRepr {
         src_port: REMOTE_PORT,
+        dst_port: LOCAL_PORT,
+    };
+
+    const OTHER_REMOTE_UDP_REPR: UdpRepr = UdpRepr {
+        src_port: REMOTE_PORT + 1,
         dst_port: LOCAL_PORT,
     };
 
@@ -890,6 +955,95 @@ mod test {
             socket.recv(),
             Ok((&b"abcdef"[..], remote_metadata_with_local()))
         );
+        assert!(!socket.can_recv());
+    }
+
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_connected_peer_admission_precedes_rx_queue(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let mut socket = socket(buffer(1), buffer(0));
+
+        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        socket.set_remote_endpoint(Some(REMOTE_END));
+        assert_eq!(socket.remote_endpoint(), Some(REMOTE_END));
+
+        for _ in 0..4 {
+            assert!(!socket.accepts(cx, &OTHER_REMOTE_IP_REPR, &OTHER_REMOTE_UDP_REPR));
+        }
+        assert!(!socket.can_recv());
+
+        let mut wrong_port = REMOTE_UDP_REPR;
+        wrong_port.src_port += 1;
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &wrong_port));
+
+        assert!(socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+        assert_eq!(
+            socket.recv(),
+            Ok((&b"abcdef"[..], remote_metadata_with_local()))
+        );
+    }
+
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_remote_changes_preserve_admission_time_queue_order(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let mut socket = socket(buffer(3), buffer(0));
+
+        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        socket.set_remote_endpoint(Some(REMOTE_END));
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+
+        socket.set_remote_endpoint(Some(OTHER_REMOTE_END));
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        assert!(socket.accepts(cx, &OTHER_REMOTE_IP_REPR, &OTHER_REMOTE_UDP_REPR));
+        assert_eq!(socket.recv().unwrap().1.endpoint, REMOTE_END);
+
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &OTHER_REMOTE_IP_REPR,
+            &OTHER_REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+
+        socket.set_remote_endpoint(None);
+        assert!(socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+
+        assert_eq!(socket.recv().unwrap().1.endpoint, OTHER_REMOTE_END);
+        assert_eq!(socket.recv().unwrap().1.endpoint, REMOTE_END);
         assert!(!socket.can_recv());
     }
 
@@ -1106,9 +1260,33 @@ mod test {
         let recv_buffer = PacketBuffer::new(&mut meta[..], vec![]);
         let mut socket = socket(recv_buffer, buffer(0));
         assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        socket.set_remote_endpoint(Some(REMOTE_END));
 
         assert!(socket.is_open());
         socket.close();
         assert!(!socket.is_open());
+        assert_eq!(socket.remote_endpoint(), None);
+        assert!(!socket.can_recv());
+    }
+
+    #[test]
+    fn test_unbind_preserves_admitted_datagrams() {
+        let mut socket = socket(buffer(1), buffer(0));
+        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        socket.set_remote_endpoint(Some(REMOTE_END));
+        socket
+            .rx_buffer
+            .enqueue(PAYLOAD.len(), remote_metadata_with_local())
+            .unwrap()
+            .copy_from_slice(PAYLOAD);
+
+        socket.unbind();
+
+        assert!(!socket.is_open());
+        assert_eq!(socket.remote_endpoint(), None);
+        assert_eq!(
+            socket.recv(),
+            Ok((&b"abcdef"[..], remote_metadata_with_local()))
+        );
     }
 }

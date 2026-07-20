@@ -202,19 +202,63 @@ static void udp_pair_close(struct udp_pair *pair) {
     close_checked(pair->receiver, "udp-pair-receiver");
 }
 
-static void udp_send_and_drain(struct udp_pair *pair,
-                               const unsigned char token[16]) {
+static void udp_send_token(struct udp_pair *pair,
+                           const unsigned char token[16]) {
     ssize_t sent = sendto(pair->sender, token, 16, 0,
                           (const struct sockaddr *)&pair->destination,
                           sizeof(pair->destination));
     if (sent != 16) {
         fail_value("udp-send", sent, 16);
     }
+}
+
+static void require_udp_token(const unsigned char copy[16], ssize_t received,
+                              const unsigned char token[16],
+                              const char *stage) {
+    if (received != 16 || memcmp(copy, token, 16) != 0) {
+        fail_value(stage, received, 16);
+    }
+}
+
+static void udp_send_and_drain(struct udp_pair *pair,
+                               const unsigned char token[16]) {
+    udp_send_token(pair, token);
     unsigned char copy[16];
     ssize_t received = recv(pair->receiver, copy, sizeof(copy), 0);
-    if (received != 16 || memcmp(copy, token, sizeof(copy)) != 0) {
-        fail_value("udp-receive", received, 16);
-    }
+    require_udp_token(copy, received, token, "udp-receive");
+}
+
+static void test_udp_receive_without_source_output(void) {
+    struct udp_pair udp;
+    udp_pair_open(&udp);
+    unsigned char token[16];
+    unsigned char copy[16];
+
+    make_token(token, 0, 1);
+    udp_send_token(&udp, token);
+    require_udp_token(copy, recv(udp.receiver, copy, sizeof(copy), 0), token,
+                      "udp-recv-null-source");
+
+    make_token(token, 0, 2);
+    udp_send_token(&udp, token);
+    require_udp_token(copy,
+                      recvfrom(udp.receiver, copy, sizeof(copy), 0, NULL, NULL),
+                      token, "udp-recvfrom-null-source");
+
+    make_token(token, 0, 3);
+    udp_send_token(&udp, token);
+    struct iovec iov = {.iov_base = copy, .iov_len = sizeof(copy)};
+    struct msghdr message = {
+        .msg_name = NULL,
+        .msg_namelen = 0,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+    require_udp_token(copy, recvmsg(udp.receiver, &message, 0), token,
+                      "udp-recvmsg-null-source");
+
+    udp_pair_close(&udp);
+    marker("THEKERNEL_PACKET_UDP_PRECONDITION_OK");
 }
 
 static short poll_once(int fd, short events, int timeout_milliseconds) {
@@ -1031,10 +1075,58 @@ static void test_dgram_send_boundaries(void) {
     close_checked(observer, "send-extended-observer-close");
 }
 
+static void test_send_flags(void) {
+    static const unsigned char destination[6] = {0x02, 0x71, 0x72,
+                                                  0x73, 0x74, 0x75};
+    static const unsigned char source[6] = {0};
+    static const struct {
+        int flag;
+        const char *name;
+    } cases[] = {
+        {MSG_OOB, "OOB"},
+        {MSG_MORE, "MORE"},
+        {MSG_DONTROUTE, "DONTROUTE"},
+        {MSG_EOR, "EOR"},
+        {MSG_CONFIRM, "CONFIRM"},
+        {MSG_NOSIGNAL, "NOSIGNAL"},
+    };
+
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        int observer =
+            bound_packet_socket(SOCK_RAW, ETH_P_ALL, loopback_index);
+        int sender =
+            bound_packet_socket(SOCK_DGRAM, CUSTOM_PROTOCOL, loopback_index);
+        struct sockaddr_ll send_address;
+        fill_packet_destination(&send_address, CUSTOM_PROTOCOL, destination);
+        unsigned char token[16];
+        make_token(token, 3, (unsigned char)(10 + index));
+        ssize_t sent = sendto(sender, token, sizeof(token), cases[index].flag,
+                              (const struct sockaddr *)&send_address,
+                              sizeof(send_address));
+        if (sent != (ssize_t)sizeof(token)) {
+            fail_value(cases[index].name, sent, (long)sizeof(token));
+        }
+        struct packet_record observed[2];
+        collect_records(observer, token, sizeof(token), observed, 2);
+        require_wire_frame(&observed[0], destination, source, CUSTOM_PROTOCOL,
+                           token, sizeof(token));
+        require_wire_frame(&observed[1], destination, source, CUSTOM_PROTOCOL,
+                           token, sizeof(token));
+        close_checked(sender, "send-flags-source-close");
+        close_checked(observer, "send-flags-observer-close");
+    }
+
+    printf("THEKERNEL_PACKET_SEND_FLAGS_BOUNDARY "
+           "accepted=OOB,MORE,DONTROUTE,EOR,CONFIRM,NOSIGNAL\n");
+    fflush(stdout);
+    marker("THEKERNEL_PACKET_SEND_FLAGS_OK");
+}
+
 static void test_send(void) {
     test_raw_send();
     test_dgram_send();
     test_dgram_send_boundaries();
+    test_send_flags();
     marker("THEKERNEL_PACKET_SEND_OK");
 }
 
@@ -1271,6 +1363,7 @@ int main(int argc, char **argv) {
         fail_message("loopback", "if-nametoindex");
     }
 
+    test_udp_receive_without_source_output();
     test_create();
     test_receive();
     test_fault_ownership();

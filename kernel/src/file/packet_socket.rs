@@ -283,6 +283,17 @@ impl PacketSocket {
         })
     }
 
+    /// Reads one ordinary queued packet using the OFD status captured by the
+    /// caller for this complete operation.
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
+        self.recv_with_nonblocking(dst, ReceiveFlags::EMPTY, nonblocking)
+            .map(PacketReceiveResult::returned_len)
+    }
+
     /// Prepares one ordinary send without touching the payload or submitting
     /// any lower-layer work.
     ///
@@ -392,15 +403,14 @@ impl PacketSocket {
         };
         self.net_ns
             .stack()
-            .send_packet(plan.interface_index, self.endpoint.id(), request)?;
+            .send_packet(plan.interface_index, self.endpoint.as_ref(), request)?;
         Ok(payload.len())
     }
 }
 
 impl FileLike for PacketSocket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.recv_with_nonblocking(dst, ReceiveFlags::EMPTY, self.nonblocking())
-            .map(PacketReceiveResult::returned_len)
+        self.read_with_nonblocking(dst, self.nonblocking())
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {

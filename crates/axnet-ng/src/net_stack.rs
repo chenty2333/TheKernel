@@ -17,8 +17,8 @@ use crate::{
     device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice},
     listen_table::ListenTable,
     packet::{
-        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketEndpointId, PacketResult,
-        PacketSelector, PacketSendRequest,
+        PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketResult, PacketSelector,
+        PacketSendRequest,
     },
     router::{RouteInfo, Router, Rule},
     service::Service,
@@ -76,7 +76,7 @@ impl NetStack {
         let poll_wake =
             Arc::try_new(NetPollWake(poll_source.clone())).map_err(|_| AxError::NoMemory)?;
         let poll_waker = Waker::from(poll_wake);
-        Arc::try_new(Self {
+        let stack = Arc::try_new(Self {
             unix_namespace,
             packet_broker,
             listen_table,
@@ -89,7 +89,10 @@ impl NetStack {
             ipv4_conf_default_tag: AtomicI32::new(0),
             ipv4_conf_lo_tag: AtomicI32::new(0),
         })
-        .map_err(|_| AxError::NoMemory)
+        .map_err(|_| AxError::NoMemory)?;
+        #[cfg(target_os = "none")]
+        stack.packet_broker.start_drain_worker()?;
+        Ok(stack)
     }
 
     /// Returns the AF_UNIX abstract-name namespace paired with this network
@@ -181,7 +184,7 @@ impl NetStack {
     pub fn send_packet(
         &self,
         interface_index: u32,
-        origin: PacketEndpointId,
+        origin: &PacketEndpoint,
         request: PacketSendRequest<'_>,
     ) -> AxResult<()> {
         let result = self

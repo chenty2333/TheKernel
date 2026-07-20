@@ -666,7 +666,8 @@ mod tests {
         let selector = PacketSelector::new(PacketProtocol::All, Some(1), PacketView::Raw, true);
         let source = broker.subscribe(selector).unwrap();
         let observer = broker.subscribe(selector).unwrap();
-        let context = PacketDeviceContext::new(1, &broker, Some(source.id()));
+        let origin = broker.origin_id(source.as_ref()).unwrap();
+        let context = PacketDeviceContext::new(1, &broker, Some(origin));
         let bytes = [
             2, 1, 2, 3, 4, 5, // destination
             0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, // source

@@ -14,7 +14,7 @@ use crate::{
     device::{Device, DeviceStats, InterfaceInfo},
     listen_table::ListenTable,
     packet::{
-        PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpointId, PacketError,
+        PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpoint, PacketError,
         PacketSendRequest,
     },
 };
@@ -169,10 +169,14 @@ impl Router {
     pub(crate) fn send_packet(
         &mut self,
         interface_index: u32,
-        origin: PacketEndpointId,
+        origin: &PacketEndpoint,
         request: PacketSendRequest<'_>,
         timestamp: Instant,
     ) -> AxResult<()> {
+        let origin = self
+            .packet_broker
+            .origin_id(origin)
+            .map_err(map_packet_error)?;
         let index = usize::try_from(
             interface_index
                 .checked_sub(1)

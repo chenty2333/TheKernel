@@ -16,7 +16,7 @@ use smoltcp::{
 };
 
 use crate::{
-    packet::{PacketEndpointId, PacketSendRequest},
+    packet::{PacketEndpoint, PacketSendRequest},
     router::{Router, Rule},
     wrapper::SocketSetWrapper,
 };
@@ -70,7 +70,7 @@ impl Service {
     pub(crate) fn send_packet(
         &mut self,
         interface_index: u32,
-        origin: PacketEndpointId,
+        origin: &PacketEndpoint,
         request: PacketSendRequest<'_>,
     ) -> AxResult<()> {
         self.router

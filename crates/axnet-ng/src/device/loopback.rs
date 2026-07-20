@@ -374,7 +374,8 @@ mod tests {
         let source = broker.subscribe(selector).unwrap();
         let observer = broker.subscribe(selector).unwrap();
         let mut device = LoopbackDevice::try_new().unwrap();
-        let inject = PacketDeviceContext::new(1, &broker, Some(source.id()));
+        let origin = broker.origin_id(source.as_ref()).unwrap();
+        let inject = PacketDeviceContext::new(1, &broker, Some(origin));
         let ingress = PacketDeviceContext::new(1, &broker, None);
         let frame = [
             2, 1, 2, 3, 4, 5, // non-local unicast destination
