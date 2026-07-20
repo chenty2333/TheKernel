@@ -5,10 +5,12 @@
 - Owners: TheKernel maintainers
 - Target layers: `axnet-ng`, `thekernel-linux-packet`, and the TheKernel
   network/syscall/security adapter
-- Audited implementation: Layer 1 through `02ae6ba`, Layer 2 through
-  `8db01bb`, Layer 3 ordinary-queue integration through `45440a8`, generic
-  file-I/O authorization through `9c03b96`, and socketpair lifecycle closure
-  through `b2aa205`; the final Layer 2 consumer pin is `13fd5bf`
+- Audited implementation: Layer 1 and the Layer 3 ordinary-queue/UDP closure
+  through `6491f98846205e5db14f0f20292f6eff08cf1281`, Layer 2 through
+  `43f58fa0075c564a2a8a8e4caddca473cf0be1b7`, and the exact-source evidence
+  gates through `6b9db6efccd248d893a489647a802d1a06440c5f`; the maintained
+  task/readiness dependency is pinned at
+  `5c34536fd766b5f84f2fb8e6b18a2ab340659582`
 
 ## Problem
 
@@ -48,15 +50,22 @@ The public behavior was cross-checked against:
 - the official Linux
   [`Packet MMAP` documentation](https://docs.kernel.org/networking/packet_mmap.html)
   to define the ring, TPACKET, mmap, and fanout boundary that this RFC does not
-  claim.
+  claim; and
+- the official Linux
+  [`NAPI` documentation](https://docs.kernel.org/networking/napi.html) for the
+  generic precedent that one scheduled owner processes a fixed budget and is
+  serviced again when work remains. TheKernel borrows that bounded ownership
+  rule, not Linux's softirq, IRQ-masking, queue-pair, or userspace busy-poll API.
 
 The portable oracle and bounded receipt generator are committed as
 `tests/guest/tools/packet-socket-smoke.c` and
-`scripts/ci/packet-host-differential.sh` through `91edb54`. Every accepted run
-records the exact helper and script hashes, compiler, host kernel, namespace
-mode, two independent logs, and their checksums. The oracle program was
-written locally; no Linux selftest or GPL implementation text was copied.
-TheKernel reimplements observable contracts and public UAPI values in Rust.
+`scripts/ci/packet-host-differential.sh`. Every accepted run compiles a helper
+snapshot materialized from the starting commit tree, records the starting HEAD,
+tree, helper and script hashes, compiler, host kernel, namespace mode, and two
+independent logs, then revalidates HEAD, tree, cleanliness, and both live input
+hashes before writing PASS. The oracle program was written locally; no Linux
+selftest or GPL implementation text was copied. TheKernel reimplements
+observable contracts and public UAPI values in Rust.
 
 ## Decision
 
@@ -138,22 +147,40 @@ concurrent adapter writer can make the final plan stale. Future adapters that
 prepare outside this mutex must roll back their lower lease when publication
 reports `StaleBindPlan`; they must not retry without a bound.
 
-This binding generation is distinct from Layer 1 capture sequence numbers.
-Each endpoint retains at most eight selector epochs and eight filter epochs so
-an already staged frame is classified by the state live at capture time.
-Sequence allocation and the matching reservation or accounted-drop publication
-are one capture-mutex transition. Quiescence also remains false while a drainer
-owns an already-dequeued delivery. These two linearization rules prevent epoch
-history from collapsing around a frame which still needs it. A selector/filter
-setter never drains packet work synchronously; it performs only its bounded
-transition. Genuine quiescence collapses history, while excessive concurrent
-rebind/filter churn returns `ENOBUFS` rather than growing memory or
-reclassifying an old frame.
+This binding generation is distinct from Layer 1 capture sequence numbers and
+the broker's subscription epoch. Each endpoint retains at most eight selector
+epochs and eight filter epochs so an already staged frame is classified by the
+state live at capture time. Sequence allocation and the matching reservation or
+accounted-drop publication are one capture-mutex transition. Quiescence also
+remains false while a drainer owns an already-dequeued delivery. These
+linearization rules prevent epoch history from collapsing around a frame which
+still needs it. A selector/filter setter never drains packet work synchronously;
+it performs only its bounded transition. Genuine quiescence collapses history,
+while excessive concurrent rebind/filter churn returns `ENOBUFS` rather than
+growing memory or reclassifying an old frame.
+
+The final endpoint unregister advances the non-wrapping subscription epoch and
+clears already published capture/drop backlog before a new endpoint can enter
+the registry. A reservation records its subscription epoch. If allocation
+finishes after the old endpoint era ended, publication observes the mismatch,
+refunds its frame charge, and cannot deliver that frame to a later subscriber.
+Subscription-epoch exhaustion closes future admission instead of wrapping an
+old reservation into a live generation.
 
 Layer 1 returns typed mechanism failures rather than Linux errnos. Layer 3
 maps allocation to `ENOMEM`, sequence exhaustion to `EOVERFLOW`, bounded
 capacity exhaustion to `ENOBUFS`, and invalid copied input to `EINVAL`.
-Detached internal state is not exposed as a Linux ABI category.
+Broker teardown or failure of the broker's sole deferred-work owner enters an
+explicit, permanent Layer 1 terminal state. The transition clears staged
+packet/drop work, invalidates every in-flight reservation, closes endpoint
+readiness, reports `HANGUP`, and rejects future subscriptions as `Detached`.
+Already queued endpoint records may still drain; an empty receive returns
+`BadState`, while ordinary network capture becomes a fast no-op. A normal
+Layer 3 packet socket retains its network namespace, which retains the broker,
+so this boundary is ordinarily not reached through the current Linux ABI. It
+remains defined for independent mechanism consumers and teardown/failure races
+rather than being treated as unreachable. Layer 3 does not expose `Detached`
+as a new Linux ABI category.
 
 ### 3. Preserve the ordinary packet view
 
@@ -203,6 +230,7 @@ All limits are per network stack or endpoint, not boot-global hidden policy.
 | live endpoints per network stack | 64 |
 | staged capture records | 128 |
 | staged drop-accounting records | 128 |
+| packet/drop events delivered by one drain invocation | 32 |
 | selector epochs per endpoint | 8 |
 | filter epochs per endpoint | 8 |
 | queued records per endpoint | 256 |
@@ -226,20 +254,45 @@ pressure records a bounded drop and cannot reject the ordinary IP path.
 Overflow of the bounded drop ledger increments one diagnostic counter. The
 drainer alternates pending frames and accounted drops whenever both classes
 exist, preventing class starvation without claiming a cross-class global FIFO.
+One invocation consumes at most 32 packet/drop events and returns an explicit
+`Continuation` when work remains. Each bare-metal `NetStack` owns one sleeping
+deferred drainer. A producer performs its first bounded drain only after
+releasing the service mutex; `Continuation` schedules that owner, which yields
+between fixed-credit invocations and uses check-arm-check before sleeping.
+Socket `poll`, readiness registration, and receive never carry broker work.
+There is no hidden drain-until-empty loop in a syscall or readiness path.
+
+If either deferred-owner wait fails, the worker does not silently exit or
+retry without a bound. It performs the single fail-closed terminal transition
+described above, using registry-then-capture lock order and a fixed endpoint
+snapshot, then exits. An allocation already represented by a reservation may
+finish, but its terminal recheck can only refund the charge; it cannot publish
+new backlog or join a later subscription era.
+
+Single-drainer handoff closes the owner-release race. After its final empty pop
+or credit exhaustion, the owner releases `draining` and rechecks staging. A
+producer that staged work and coalesced before that release is observed by the
+recheck and produces `Continuation`; a producer arriving after release can
+become the next drainer. The deferred owner is notified only for broker work,
+not through endpoint readiness. Therefore bounded draining may defer work, but
+cannot strand it solely at the final-empty-pop/owner-release boundary.
 
 These rules do not make capture lockless or allocation-free. A capture may
 allocate one frame, and broker/endpoint mutexes remain. The claim is bounded
-retention, no global packet hot lock, and no subscriber fanout or wakeup under
-the broader network-service lock.
+retention, no global packet hot lock, and a fanout drainer which never owns the
+broader network-service mutex.
 
 ### 5. Give readiness and completion one owner
 
-Layer 1 reports `READABLE` exactly when the endpoint queue is nonempty. Waiter
-registration uses check-arm-check, and only an empty-to-nonempty transition
-wakes readers. Ordinary dequeue removes the record and refunds its logical
-charge before usercopy; `MSG_PEEK` clones the queue head without removing it.
-Layer 3 combines OFD `O_NONBLOCK` and per-call `MSG_DONTWAIT` with the common
-readiness wait path.
+Layer 1 reports `READABLE` exactly when the endpoint queue is nonempty and
+`HANGUP` after broker detach. Readable/HUP registration uses check-arm-check;
+an empty-to-nonempty transition or detach wakes the same bounded source. A
+source-close race is reclassified as the already published HUP terminal state,
+not exposed as an internal registration error. Broker continuation never wakes
+this source. Ordinary dequeue removes the record and refunds its logical charge
+before usercopy; `MSG_PEEK` clones the queue head without removing it. Layer 3
+combines OFD `O_NONBLOCK` and per-call `MSG_DONTWAIT` with the common readiness
+wait path.
 
 For a short receive buffer, both paths copy the available prefix and report
 output `MSG_TRUNC`. Without input `MSG_TRUNC`, success returns copied length;
@@ -332,10 +385,12 @@ The source-level contract is exercised in:
 
 The guest helper must emit these stage markers exactly:
 
+- `THEKERNEL_PACKET_UDP_PRECONDITION_OK`;
 - `THEKERNEL_PACKET_CREATE_OK`;
 - `THEKERNEL_PACKET_RECEIVE_OK`;
-- `THEKERNEL_PACKET_SEND_OK`;
 - `THEKERNEL_PACKET_FAULT_OWNERSHIP_OK`;
+- `THEKERNEL_PACKET_SEND_FLAGS_OK`;
+- `THEKERNEL_PACKET_SEND_OK`;
 - `THEKERNEL_PACKET_OPTIONS_OK`; and
 - final `THEKERNEL_PACKET_OK`.
 
@@ -345,10 +400,33 @@ marker. Acceptance requires exact-revision host/package tests and RISC-V 64
 and LoongArch64 build/boot receipts; marker presence without exact source and
 artifact hashes is not release evidence.
 
-The broker evidence harness is committed through `08f4dd1`. It runs five
-fixed-shape cases twice and records schema 2 observations, source identities,
-host identity, artifact checksums, queue/drop invariants, and a final
-`charged_shared_bytes=0` teardown condition. It defines no portable throughput
-or latency threshold. These observations can detect accounting leaks and
-large regressions on a comparable host, but cannot establish line-rate,
+The PR gate's finalizer writes one source-set, artifact manifest, checksum
+manifest, and PASS/FAIL receipt. A source-mode PASS binds the unchanged clean
+TheKernel, `thekernel-ax`, and `thekernel-linux-abi` commits and trees to the
+release and shell kernels, both rootfs images, boot QEMU receipts/consoles, and
+both semantic-system consoles. It also requires the packet marker contract in
+each semantic console, rehashes every present artifact, and performs a second
+three-repository HEAD/tree/clean check immediately before deciding PASS. An
+early build or boot failure still leaves a FAIL receipt with present and missing
+artifacts distinguished; it cannot be promoted to PASS by the finalizer.
+`--skip-build` is explicitly reuse mode and never claims release evidence for
+the current source set.
+
+The broker evidence harness runs five fixed-shape cases twice and records schema
+2 observations, the starting identities of all three source repositories, host
+identity, artifact checksums, queue/drop invariants, and a final
+`charged_shared_bytes=0` teardown condition. It writes PASS only after all three
+HEAD/tree pairs and clean worktrees are revalidated. It defines no portable
+throughput or latency threshold. These observations can detect accounting leaks
+and large regressions on a comparable host, but cannot establish line-rate,
 lock-free, allocator-total-memory, or cross-machine performance claims.
+
+The repository workflow runs the dual-architecture job for PRs, `main` pushes,
+and manual dispatches when `THEKERNEL_QEMU_CI=1`, but it is not currently a
+universal required check. It depends on a configured `thekernel-qemu`
+self-hosted runner, published exact sibling commits, and branch-protection rules
+which live outside this repository. Removing the workflow condition before
+those external requirements exist would produce an indefinitely queued or
+deterministically failing check, not stronger evidence. Local and self-hosted
+receipts therefore remain bounded evidence rather than a claim that every
+public PR or `main` update has passed the dual-architecture gate.
