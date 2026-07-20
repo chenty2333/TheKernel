@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 AX_REPO=$(cd -- "${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}" && pwd -P)
 LINUX_ABI_REPO=$(
     cd -- "${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}" && pwd -P
@@ -32,9 +34,14 @@ package_name=$(sed -n '/^\[package\]/,/^\[/s/^name[[:space:]]*=[[:space:]]*"\([^
 }
 
 work_root=${THEKERNEL_CI_FOCUSED_WORK_ROOT:-$REPO_ROOT/.state/ci/focused-workspaces}
-work_dir="$work_root/$package_name"
-rm -rf "$work_dir"
-mkdir -p "$work_dir"
+case "$work_root" in
+    /*) ;;
+    *) work_root="$REPO_ROOT/$work_root" ;;
+esac
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+work_dir=$(ci_prepare_owned_run_dir \
+    "focused-$package_name" "$work_root/$package_name-$run_id" \
+    "$REPO_ROOT" "$REPO_ROOT/.state")
 cp -a "$source_dir/." "$work_dir/"
 
 if grep -Eq '^\[workspace\]' "$work_dir/Cargo.toml"; then

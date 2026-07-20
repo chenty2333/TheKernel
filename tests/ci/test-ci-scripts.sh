@@ -41,12 +41,21 @@ grep -Fq -- '-p thekernel-linux-seccomp' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-seccomp-adapter-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- 'seccomp::tests -- --test-threads=1' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-packet-adapter-tests' "$CI_DIR/per-commit.sh"
-grep -Fq -- 'packet -- --test-threads=1' "$CI_DIR/per-commit.sh"
+grep -Fq -- '--minimum 24 --filter packet --' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step vendored-smoltcp-udp-tests' "$CI_DIR/per-commit.sh"
+grep -Fq 'RUSTUP_TOOLCHAIN=1.85.0' "$CI_DIR/per-commit.sh"
+grep -Fq -- '--minimum 41 --filter socket::udp::test --' \
+    "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step packet-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step packet-core-check' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-linux-packet --all-targets' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-linux-packet --no-default-features' \
     "$CI_DIR/per-commit.sh"
+grep -Fq 'runner.temp }}/thekernel-pr-gate/' \
+    "$REPO_ROOT/.github/workflows/ci.yml"
+grep -Fq 'self-contained evidence directory' \
+    "$REPO_ROOT/.github/workflows/ci.yml"
+grep -Fq "github.event_name == 'push'" "$REPO_ROOT/.github/workflows/ci.yml"
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \
@@ -60,6 +69,27 @@ fi
 grep -Fq \
     'per-commit and maintained-sibling Cargo targets must be distinct' \
     "$tmp/target-alias.stderr"
+grep -Fqx $'schema\tthekernel-ci-owned-run-v1' \
+    "$tmp/target-alias-log/.thekernel-ci-owned-run"
+mkdir -p "$tmp/per-commit-log-target"
+printf '%s\n' preserve >"$tmp/per-commit-log-target/sentinel"
+if "$CI_DIR/per-commit.sh" --log-dir "$tmp/per-commit-log-target" \
+    >"$tmp/per-commit-reuse.stdout" 2>"$tmp/per-commit-reuse.stderr";
+then
+    printf '%s\n' 'test-ci-scripts: per-commit reused a non-empty log directory' >&2
+    exit 1
+fi
+grep -Fq 'refusing to reuse non-empty run directory' \
+    "$tmp/per-commit-reuse.stderr"
+grep -Fqx preserve "$tmp/per-commit-log-target/sentinel"
+ln -s "$tmp/per-commit-log-target" "$tmp/per-commit-log-alias"
+if "$CI_DIR/per-commit.sh" --log-dir "$tmp/per-commit-log-alias" \
+    >"$tmp/per-commit-alias.stdout" 2>"$tmp/per-commit-alias.stderr";
+then
+    printf '%s\n' 'test-ci-scripts: per-commit accepted a symlinked log directory' >&2
+    exit 1
+fi
+grep -Fq 'symbolic-link component' "$tmp/per-commit-alias.stderr"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
@@ -68,6 +98,83 @@ python3 "$REPO_ROOT/tests/ci/test_mm_performance_host.py"
 python3 "$REPO_ROOT/tests/ci/test_rootfs_image_reproducibility.py"
 "$REPO_ROOT/tests/ci/test-mm-performance-boundary.sh"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
+"$REPO_ROOT/tests/ci/test-packet-evidence-scripts.sh"
+
+# Filtered Rust tests must first discover a non-trivial set. Cargo considers a
+# typo which matches zero tests successful, so the adapter gate cannot rely on
+# the test process exit status alone.
+cat >"$tmp/fake-rust-tests" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+count=${FAKE_DISCOVERED_TESTS:-24}
+printf 'running %s tests\n' "$count"
+printf '%s\n' executed >"$FAKE_TEST_EXECUTION"
+printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' \
+    "$count"
+EOF
+chmod +x "$tmp/fake-rust-tests"
+FAKE_TEST_EXECUTION="$tmp/filtered-test.executed" \
+    "$CI_DIR/rust-filtered-test-gate.sh" \
+    --minimum 24 --filter packet -- "$tmp/fake-rust-tests" \
+    >"$tmp/filtered-test.out"
+[ -s "$tmp/filtered-test.executed" ]
+grep -Fq 'rust-filtered-test-gate: toolchain=rustc ' \
+    "$tmp/filtered-test.out"
+grep -Fq 'rust-filtered-test-gate: PASS executed=24 minimum=24 filter=packet' \
+    "$tmp/filtered-test.out"
+if FAKE_DISCOVERED_TESTS=23 FAKE_TEST_EXECUTION="$tmp/too-small.executed" \
+    "$CI_DIR/rust-filtered-test-gate.sh" \
+    --minimum 24 --filter packet -- "$tmp/fake-rust-tests" >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: undersized filtered test set was accepted' >&2
+    exit 1
+fi
+[ -s "$tmp/too-small.executed" ]
+
+# Destructive CI work directories are claimed once with a regular owner marker.
+# Source roots, symlink components, and non-empty reuse are rejected without
+# touching the existing data.
+# shellcheck source=../../scripts/ci/lib.sh
+source "$CI_DIR/lib.sh"
+owned_run=$(ci_prepare_owned_run_dir \
+    fixture "$tmp/owned-run" "$REPO_ROOT" "$REPO_ROOT/.state")
+[ "$owned_run" = "$tmp/owned-run" ]
+grep -Fqx $'schema\tthekernel-ci-owned-run-v1' \
+    "$owned_run/.thekernel-ci-owned-run"
+printf '%s\n' preserve >"$owned_run/sentinel"
+if (ci_prepare_owned_run_dir \
+    fixture "$owned_run" "$REPO_ROOT" "$REPO_ROOT/.state") \
+    >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: non-empty owned run directory was reused' >&2
+    exit 1
+fi
+grep -Fqx preserve "$owned_run/sentinel"
+mkdir -p "$tmp/owned-target"
+printf '%s\n' preserve >"$tmp/owned-target/sentinel"
+ln -s "$tmp/owned-target" "$tmp/owned-alias"
+if (ci_prepare_owned_run_dir \
+    fixture "$tmp/owned-alias/new" "$REPO_ROOT" "$REPO_ROOT/.state") \
+    >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: symlinked owned run path was accepted' >&2
+    exit 1
+fi
+grep -Fqx preserve "$tmp/owned-target/sentinel"
+if (ci_prepare_owned_run_dir \
+    fixture "$REPO_ROOT" "$REPO_ROOT" "$REPO_ROOT/.state") \
+    >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: source root was accepted as a run directory' >&2
+    exit 1
+fi
+if grep -F 'rm -rf "$WORKDIR"' "$REPO_ROOT/scripts/system-test.sh" >/dev/null ||
+    grep -F 'rm -rf "$workdir"' "$CI_DIR/boot-shell-gate.sh" >/dev/null ||
+    grep -F 'rm -rf "$work_dir"' "$CI_DIR/focused-cargo-test.sh" >/dev/null ||
+    grep -F 'rm -rf "$run_dir"' "$CI_DIR/nightly/lib.sh" >/dev/null
+then
+    printf '%s\n' 'test-ci-scripts: a direct gate still recursively clears caller paths' >&2
+    exit 1
+fi
 
 # The developer container must see maintained sibling checkouts at the exact
 # absolute paths produced by Cargo's ../thekernel-* patch dependencies. Keep
@@ -190,7 +297,13 @@ fi
 # and skip both operations when --skip-build is requested.
 pr_fixture="$tmp/pr-fixture"
 mkdir -p "$pr_fixture/scripts/ci" "$pr_fixture/fake-bin"
-cp "$CI_DIR/pr-gate.sh" "$CI_DIR/lib.sh" "$pr_fixture/scripts/ci/"
+cp \
+    "$CI_DIR/pr-gate.sh" \
+    "$CI_DIR/pr-gate-evidence.sh" \
+    "$CI_DIR/exact-source-lib.sh" \
+    "$CI_DIR/verify-pr-gate-evidence.sh" \
+    "$CI_DIR/lib.sh" \
+    "$pr_fixture/scripts/ci/"
 cat >"$pr_fixture/scripts/ci/release-consumer-gate.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -210,15 +323,76 @@ cat >"$pr_fixture/scripts/ci/boot-shell-gate.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'boot %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+log_dir=
+while (($#)); do
+    case "$1" in
+        --log-dir) log_dir=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$log_dir" ]
+mkdir -p "$log_dir"
+printf 'step\tstatus\texit_code\tlog\n' >"$log_dir/status.tsv"
+for arch in rv la; do
+    mkdir -p "$log_dir/$arch"
+    printf 'shell\n' >"$log_dir/$arch.commands"
+    printf 'CI_BOOT_GATE_PASS\n' >"$log_dir/$arch/qemu.log"
+    printf '{}\n' >"$log_dir/$arch/qemu-runner-receipt.json"
+done
 EOF
 cat >"$pr_fixture/scripts/system-test.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'system %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+workdir=
+while (($#)); do
+    case "$1" in
+        --workdir) workdir=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$workdir" ]
+mkdir -p "$workdir"
+cat >"$workdir/console.log" <<'MARKERS'
+THEKERNEL_PACKET_UDP_PRECONDITION_OK
+THEKERNEL_PACKET_CREATE_OK
+THEKERNEL_PACKET_RECEIVE_OK
+THEKERNEL_PACKET_FAULT_OWNERSHIP_OK
+THEKERNEL_PACKET_SEND_FLAGS_BOUNDARY accepted=OOB,MORE,DONTROUTE,EOR,CONFIRM,NOSIGNAL
+THEKERNEL_PACKET_SEND_FLAGS_OK
+THEKERNEL_PACKET_SEND_OK
+THEKERNEL_PACKET_OPTIONS_OK
+THEKERNEL_PACKET_OK
+THEKERNEL_SYSTEM_TEST_PACKET_OK
+MARKERS
+if [ -n "${SYSTEM_CONSOLE_CRLF:-}" ]; then
+    sed -i 's/$/\r/' "$workdir/console.log"
+fi
+if [ -n "${SYSTEM_DUPLICATE_PACKET_OK:-}" ]; then
+    if [ -n "${SYSTEM_CONSOLE_CRLF:-}" ]; then
+        printf 'THEKERNEL_PACKET_OK\r\n' >>"$workdir/console.log"
+    else
+        printf 'THEKERNEL_PACKET_OK\n' >>"$workdir/console.log"
+    fi
+fi
 EOF
 cat >"$pr_fixture/fake-bin/make" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${PR_MUTATE_RESTORE_FILE:-}" ]; then
+    backup=$(mktemp)
+    cp -- "$PR_MUTATE_RESTORE_FILE" "$backup"
+    restore_source() {
+        cp -- "$backup" "$PR_MUTATE_RESTORE_FILE"
+        rm -f -- "$backup"
+    }
+    trap restore_source EXIT
+    printf '%s\n' mutated >"$PR_MUTATE_RESTORE_FILE"
+    [ "$(cat source-token)" = committed ]
+fi
+if [ -n "${PR_MUTATE_ORIGIN_FILE:-}" ]; then
+    printf '%s\n' mutated >"$PR_MUTATE_ORIGIN_FILE"
+fi
 printf 'make %s\n' "$*" >>"$PR_FIXTURE_TRACE"
 case "$*" in
     kernels) printf fixture >kernel-rv; printf fixture >kernel-la ;;
@@ -237,13 +411,31 @@ chmod +x \
     "$pr_fixture/scripts/system-test.sh" \
     "$pr_fixture/fake-bin/make"
 
+printf '%s\n' /kernel-rv /kernel-la /.state >"$pr_fixture/.gitignore"
+printf '%s\n' committed >"$pr_fixture/source-token"
+git -C "$pr_fixture" init --quiet
+git -C "$pr_fixture" add .gitignore source-token scripts fake-bin
+git -C "$pr_fixture" -c user.name=CI -c user.email=ci@example.invalid \
+    commit --quiet -m fixture
+for sibling in pr-ax pr-linux-abi; do
+    mkdir -p "$tmp/$sibling"
+    git -C "$tmp/$sibling" init --quiet
+    printf '%s\n' fixture >"$tmp/$sibling/source"
+    git -C "$tmp/$sibling" add source
+    git -C "$tmp/$sibling" -c user.name=CI -c user.email=ci@example.invalid \
+        commit --quiet -m fixture
+done
+
 pr_trace="$tmp/pr-gate.trace"
-ax_exact=1111111111111111111111111111111111111111
-linux_abi_exact=2222222222222222222222222222222222222222
+ax_exact=$(git -C "$tmp/pr-ax" rev-parse HEAD)
+linux_abi_exact=$(git -C "$tmp/pr-linux-abi" rev-parse HEAD)
 env PATH="$pr_fixture/fake-bin:$PATH" \
     PR_FIXTURE_TRACE="$pr_trace" \
+    PR_MUTATE_RESTORE_FILE="$pr_fixture/source-token" \
     THEKERNEL_AX_REF="$ax_exact" \
     THEKERNEL_LINUX_ABI_REF="$linux_abi_exact" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --log-dir "$tmp/pr-gate-logs" >/dev/null
 grep -Fxq \
@@ -262,12 +454,180 @@ grep -Fq \
     "$pr_trace"
 [ -s "$tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
 grep -q $'^release-consumer\tpass\t0\t' "$tmp/pr-gate-logs/status.tsv"
+grep -Fqx $'result\tPASS' "$tmp/pr-gate-logs/evidence/receipt.tsv"
+grep -Fqx $'release_evidence\tYES' "$tmp/pr-gate-logs/evidence/receipt.tsv"
+grep -Fqx $'result\tPASS' "$tmp/pr-gate-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'release_qualified\tYES' \
+    "$tmp/pr-gate-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'artifact_hashes_revalidated\tPASS' \
+    "$tmp/pr-gate-logs/evidence/receipt.tsv"
+grep -Fqx $'source_execution\tcommit-materialized' \
+    "$tmp/pr-gate-logs/evidence/receipt.tsv"
+"$CI_DIR/verify-pr-gate-evidence.sh" \
+    "$tmp/pr-gate-logs/evidence" >/dev/null
+"$CI_DIR/verify-pr-gate-evidence.sh" --require-release-pass \
+    "$tmp/pr-gate-logs/evidence" >/dev/null
+"$tmp/pr-gate-logs/evidence/verify.sh" \
+    "$tmp/pr-gate-logs/evidence" >/dev/null
+"$tmp/pr-gate-logs/evidence/verify.sh" --require-release-pass \
+    "$tmp/pr-gate-logs/evidence" >/dev/null
+[ "$(cat "$pr_fixture/source-token")" = committed ]
+for bundled_path in \
+    bundle/logs/release-kernels.log \
+    bundle/logs/boot/status.tsv \
+    bundle/logs/boot/rv.commands \
+    bundle/logs/system/rv/console.log \
+    bundle/products/rootfs-la.img
+do
+    grep -Fq $'\t'"$bundled_path" \
+        "$tmp/pr-gate-logs/evidence/artifacts.tsv"
+    grep -Fq "  $bundled_path" \
+        "$tmp/pr-gate-logs/evidence/checksums.sha256"
+done
+
+# The materialized child may finish successfully while the caller's origin
+# changes. Only the outer wrapper can publish the terminal result: it must emit
+# a checksum-covered FAIL envelope and must not leak a canonical PASS line.
+set +e
+env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    PR_MUTATE_ORIGIN_FILE="$pr_fixture/source-token" \
+    THEKERNEL_AX_REF="$ax_exact" \
+    THEKERNEL_LINUX_ABI_REF="$linux_abi_exact" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --log-dir "$tmp/pr-gate-origin-change-logs" \
+    >"$tmp/pr-gate-origin-change.out" 2>&1
+status=$?
+set -e
+printf '%s\n' committed >"$pr_fixture/source-token"
+[ "$status" -eq 1 ]
+if grep -Fqx 'PR gate: PASS' "$tmp/pr-gate-origin-change.out"; then
+    printf '%s\n' 'test-ci-scripts: inner PR gate published terminal PASS' >&2
+    exit 1
+fi
+grep -Fq 'PR gate: FAIL reason=origin-source-changed' \
+    "$tmp/pr-gate-origin-change.out"
+grep -Fqx $'result\tFAIL' \
+    "$tmp/pr-gate-origin-change-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'child_exit_code\t0' \
+    "$tmp/pr-gate-origin-change-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'origin_source_revalidated\tFAIL' \
+    "$tmp/pr-gate-origin-change-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'reason\torigin-source-changed' \
+    "$tmp/pr-gate-origin-change-logs/evidence/gate-envelope.tsv"
+"$tmp/pr-gate-origin-change-logs/evidence/verify.sh" \
+    "$tmp/pr-gate-origin-change-logs/evidence" >/dev/null
+if "$tmp/pr-gate-origin-change-logs/evidence/verify.sh" \
+    --require-release-pass \
+    "$tmp/pr-gate-origin-change-logs/evidence" >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: origin-change evidence was release-qualified' >&2
+    exit 1
+fi
+(cd "$tmp/pr-gate-origin-change-logs/evidence" && \
+    sha256sum -c checksums.sha256 >/dev/null)
+git -C "$pr_fixture" diff --quiet -- source-token
+
+# Every actual kernel/rootfs/log/receipt is part of the portable manifest.
+# Mutating a staged kernel must make both the standard replay and verifier fail.
+printf mutation >>"$tmp/pr-gate-logs/evidence/bundle/products/kernel-rv"
+if (cd "$tmp/pr-gate-logs/evidence" && \
+    sha256sum -c checksums.sha256 >/dev/null 2>&1); then
+    printf '%s\n' 'test-ci-scripts: mutated PR artifact passed checksum replay' >&2
+    exit 1
+fi
+if "$CI_DIR/verify-pr-gate-evidence.sh" \
+    "$tmp/pr-gate-logs/evidence" >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: mutated PR artifact passed bundle verification' >&2
+    exit 1
+fi
+
+# Destructive log aliases are rejected before materialization. Existing data,
+# including a previous owned evidence run, must remain byte-for-byte intact.
+receipt_before=$(sha256sum "$tmp/pr-gate-logs/evidence/receipt.tsv" | awk '{print $1}')
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-logs" >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: PR gate overwrote owned evidence' >&2
+    exit 1
+fi
+[ "$(sha256sum "$tmp/pr-gate-logs/evidence/receipt.tsv" | awk '{print $1}')" = \
+    "$receipt_before" ]
+
+mkdir -p "$tmp/pr-unowned-logs"
+printf '%s\n' preserve >"$tmp/pr-unowned-logs/sentinel"
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-unowned-logs" >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: PR gate accepted unowned non-empty logs' >&2
+    exit 1
+fi
+grep -Fqx preserve "$tmp/pr-unowned-logs/sentinel"
+
+mkdir -p "$tmp/pr-symlink-marker-logs"
+printf '%s\n' preserve >"$tmp/pr-marker-target"
+ln -s "$tmp/pr-marker-target" \
+    "$tmp/pr-symlink-marker-logs/.thekernel-pr-gate-owned"
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-symlink-marker-logs" >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: PR gate accepted symlink ownership marker' >&2
+    exit 1
+fi
+grep -Fqx preserve "$tmp/pr-marker-target"
+
+ln -s "$pr_fixture" "$tmp/pr-source-alias"
+mkdir -p "$tmp/pr-external-target"
+ln -s "$tmp/pr-external-target" "$tmp/pr-external-alias"
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-external-alias" >/dev/null 2>&1;
+then
+    printf '%s\n' 'test-ci-scripts: PR gate accepted an external symlink log directory' >&2
+    exit 1
+fi
+if find "$tmp/pr-external-target" -mindepth 1 -print -quit | grep -q .; then
+    printf '%s\n' 'test-ci-scripts: external symlink target was modified' >&2
+    exit 1
+fi
+for unsafe_log in / "$pr_fixture" "$pr_fixture/nested-log" \
+    "$tmp/pr-source-alias" "$tmp/pr-source-alias/nested-log" \
+    "$tmp/pr-ax" "$tmp/pr-ax/nested-log" \
+    "$tmp/pr-linux-abi" "$tmp/pr-linux-abi/nested-log"
+do
+    if env PATH="$pr_fixture/fake-bin:$PATH" \
+        PR_FIXTURE_TRACE="$pr_trace" \
+        THEKERNEL_AX_REPO="$tmp/pr-ax" \
+        THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+        "$pr_fixture/scripts/ci/pr-gate.sh" \
+        --skip-build --log-dir "$unsafe_log" >/dev/null 2>&1; then
+        printf 'test-ci-scripts: PR gate accepted unsafe log path: %s\n' \
+            "$unsafe_log" >&2
+        exit 1
+    fi
+done
 
 : >"$pr_trace"
 if env PATH="$pr_fixture/fake-bin:$PATH" \
     PR_FIXTURE_TRACE="$pr_trace" \
     THEKERNEL_AX_REF=main \
     THEKERNEL_LINUX_ABI_REF="$linux_abi_exact" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --log-dir "$tmp/pr-gate-invalid-ref-logs" >/dev/null 2>&1; then
     printf 'test-ci-scripts: PR gate accepted a non-exact sibling ref\n' >&2
@@ -275,9 +635,31 @@ if env PATH="$pr_fixture/fake-bin:$PATH" \
 fi
 [ ! -s "$pr_trace" ]
 
+for reuse_path in \
+    kernel-rv kernel-la \
+    .state/shell/kernel-rv .state/shell/kernel-la \
+    .state/rootfs/rootfs-rv.img .state/rootfs/rootfs-la.img
+do
+    mkdir -p -- "$(dirname -- "$pr_fixture/$reuse_path")"
+    printf fixture >"$pr_fixture/$reuse_path"
+done
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_PR_GATE_MATERIALIZED=1 \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-unverified-internal" \
+    >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: unverified internal PR gate was accepted' >&2
+    exit 1
+fi
+[ ! -e "$tmp/pr-gate-unverified-internal" ]
 env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
     PATH="$pr_fixture/fake-bin:$PATH" \
     PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --skip-build --log-dir "$tmp/pr-gate-skip-logs" >/dev/null
 [ "$(wc -l <"$pr_trace")" -eq 3 ]
@@ -288,16 +670,137 @@ if grep -Eq '^(release-consumer|make) ' "$pr_trace"; then
     printf 'test-ci-scripts: --skip-build ran release or source build\n' >&2
     exit 1
 fi
+grep -Fqx $'result\tPASS' "$tmp/pr-gate-skip-logs/evidence/receipt.tsv"
+grep -Fqx $'release_evidence\tNO' "$tmp/pr-gate-skip-logs/evidence/receipt.tsv"
+grep -Fqx $'result\tPASS' \
+    "$tmp/pr-gate-skip-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'release_qualified\tNO' \
+    "$tmp/pr-gate-skip-logs/evidence/gate-envelope.tsv"
+grep -Fqx $'reason\treuse-non-release' \
+    "$tmp/pr-gate-skip-logs/evidence/gate-envelope.tsv"
+if "$tmp/pr-gate-skip-logs/evidence/verify.sh" --require-release-pass \
+    "$tmp/pr-gate-skip-logs/evidence" >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: reused artifacts became release evidence' >&2
+    exit 1
+fi
+
+# QEMU console lines use CRLF in practice. Logical exact-once validation strips
+# one transport CR without weakening marker or boundary cardinality.
+: >"$pr_trace"
+env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
+    PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    SYSTEM_CONSOLE_CRLF=1 \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-crlf-logs" >/dev/null
+grep -Fqx $'result\tPASS' "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
+grep -Fqx $'rv_packet_markers\tPASS' \
+    "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
+grep -Fqx $'la_packet_markers\tPASS' \
+    "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
+
+set +e
+env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
+    PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    SYSTEM_CONSOLE_CRLF=1 \
+    SYSTEM_DUPLICATE_PACKET_OK=1 \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-crlf-duplicate-logs" \
+    >/dev/null 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ]
+grep -Fqx $'result\tFAIL' \
+    "$tmp/pr-gate-crlf-duplicate-logs/evidence/receipt.tsv"
+grep -Eq $'^(rv|la)_packet_markers\tFAIL$' \
+    "$tmp/pr-gate-crlf-duplicate-logs/evidence/receipt.tsv"
+
+# Successful child steps cannot promote an incomplete semantic console. This
+# fixture intentionally omits PACKET_OPTIONS and must be downgraded by the
+# final evidence validator.
+sed '/THEKERNEL_PACKET_OPTIONS_OK/d' \
+    "$pr_fixture/scripts/system-test.sh" >"$tmp/incomplete-system-test.sh"
+cp "$tmp/incomplete-system-test.sh" "$pr_fixture/scripts/system-test.sh"
+git -C "$pr_fixture" add scripts/system-test.sh
+git -C "$pr_fixture" -c user.name=CI -c user.email=ci@example.invalid \
+    commit --quiet -m incomplete-marker-fixture
+set +e
+env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-marker-fail-logs" >/dev/null 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ]
+grep -Fqx $'result\tFAIL' "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
+grep -Fqx $'command_exit_code\t0' \
+    "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
+grep -Fqx $'effective_exit_code\t1' \
+    "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
+grep -Eq $'^(rv|la)_packet_markers\tFAIL$' \
+    "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
+"$tmp/pr-gate-marker-fail-logs/evidence/verify.sh" \
+    "$tmp/pr-gate-marker-fail-logs/evidence" \
+    >"$tmp/pr-gate-marker-fail.verify"
+grep -Fq 'PR evidence verifier: INTEGRITY_OK' \
+    "$tmp/pr-gate-marker-fail.verify"
+if grep -Fq 'PR evidence verifier: PASS' \
+    "$tmp/pr-gate-marker-fail.verify"; then
+    printf '%s\n' 'test-ci-scripts: integrity-only verification printed PASS' >&2
+    exit 1
+fi
+if "$tmp/pr-gate-marker-fail-logs/evidence/verify.sh" \
+    --require-release-pass "$tmp/pr-gate-marker-fail-logs/evidence" \
+    >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: failed semantic evidence became releasable' >&2
+    exit 1
+fi
+
+# A failed gate still writes a FAIL receipt and preserves the artifact census.
+cat >"$pr_fixture/scripts/system-test.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'system %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+exit 9
+EOF
+chmod +x "$pr_fixture/scripts/system-test.sh"
+git -C "$pr_fixture" add scripts/system-test.sh
+git -C "$pr_fixture" -c user.name=CI -c user.email=ci@example.invalid \
+    commit --quiet -m failing-fixture
+set +e
+env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REPO="$tmp/pr-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-fail-logs" >/dev/null 2>&1
+status=$?
+set -e
+[ "$status" -eq 9 ]
+grep -Fqx $'result\tFAIL' "$tmp/pr-gate-fail-logs/evidence/receipt.tsv"
+grep -Fqx $'command_exit_code\t9' "$tmp/pr-gate-fail-logs/evidence/receipt.tsv"
+"$tmp/pr-gate-fail-logs/evidence/verify.sh" \
+    "$tmp/pr-gate-fail-logs/evidence" >/dev/null
 
 # The semantic system gate accepts the runner's intentional-stop status only
 # after the exact final marker is written, then validates the complete marker
 # sequence from the captured console log.
 system_fixture="$tmp/system-fixture"
 mkdir -p \
-    "$system_fixture/scripts" \
+    "$system_fixture/scripts/ci" \
     "$system_fixture/fake-bin" \
     "$system_fixture/.state/rootfs"
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
+cp "$CI_DIR/lib.sh" "$system_fixture/scripts/ci/"
 printf fixture >"$system_fixture/kernel-rv"
 printf fixture >"$system_fixture/kernel-la"
 printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
@@ -366,9 +869,12 @@ THEKERNEL_USERFAULTFD_COPYOUT_FAULT_OK
 THEKERNEL_USERFAULTFD_EXEC_COPY_OK
 THEKERNEL_USERFAULTFD_OK
 THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK
+THEKERNEL_PACKET_UDP_PRECONDITION_OK
 THEKERNEL_PACKET_CREATE_OK
 THEKERNEL_PACKET_RECEIVE_OK
 THEKERNEL_PACKET_FAULT_OWNERSHIP_OK
+THEKERNEL_PACKET_SEND_FLAGS_BOUNDARY accepted=OOB,MORE,DONTROUTE,EOR,CONFIRM,NOSIGNAL
+THEKERNEL_PACKET_SEND_FLAGS_OK
 THEKERNEL_PACKET_SEND_OK
 THEKERNEL_PACKET_OPTIONS_OK
 THEKERNEL_PACKET_OK
@@ -407,12 +913,23 @@ MARKERS_AFTER_SETRLIMIT
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$system_fixture/fake-bin/python3"
+if env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-unsafe.args" \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --skip-build --workdir "$system_fixture" >/dev/null 2>&1
+then
+    printf '%s\n' 'test-ci-scripts: system gate accepted its source root as workdir' >&2
+    exit 1
+fi
+[ -s "$system_fixture/kernel-rv" ]
 system_args="$tmp/system-runner.args"
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
     FAKE_SYSTEM_RUNNER_STATUS=75 \
     "$system_fixture/scripts/system-test.sh" \
     --arch rv --skip-build --workdir "$tmp/system-run" >/dev/null
+grep -Fqx $'owner\tsystem-test-rv' \
+    "$tmp/system-run/.thekernel-ci-owned-run"
 grep -Fxq -- '--stop-after-marker' "$system_args"
 grep -Fxq -- 'THEKERNEL_SYSTEM_TEST_PASS' "$system_args"
 system_args_la="$tmp/system-runner-la.args"
@@ -517,6 +1034,9 @@ env \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly" >/dev/null
 
 [ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 6 ]
+grep -Fqx $'owner\tnightly-gate' "$tmp/nightly/.thekernel-ci-owned-run"
+grep -Fqx $'owner\tnightly-steps' \
+    "$tmp/nightly/steps/.thekernel-ci-owned-run"
 
 # Configured adapters retain the same three-state contract as repository
 # adapters. In particular, exit 78 must remain unsupported and make the whole

@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=ci/lib.sh
+source "$SCRIPT_DIR/ci/lib.sh"
 
 ARCH=""
 WORKDIR=""
@@ -14,7 +16,7 @@ usage() {
 Usage: scripts/system-test.sh --arch {rv|la} [OPTIONS]
 
 Options:
-  --workdir DIR   Run directory (default: .state/system-test/ARCH)
+  --workdir DIR   Run directory (default: unique run below .state/system-test/ARCH)
   --timeout SECS  QEMU timeout (default: 300)
   --skip-build    Reuse existing kernel and rootfs artifacts
 
@@ -45,7 +47,8 @@ case "$TIMEOUT_SECS" in
 esac
 
 if [ -z "$WORKDIR" ]; then
-    WORKDIR="$REPO_ROOT/.state/system-test/$ARCH"
+    default_run_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    WORKDIR="$REPO_ROOT/.state/system-test/$ARCH/$default_run_id"
 elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
 fi
@@ -58,8 +61,8 @@ fi
 [ -s "$KERNEL" ] || { printf 'system-test: missing kernel: %s\n' "$KERNEL" >&2; exit 1; }
 [ -s "$ROOTFS" ] || { printf 'system-test: missing rootfs: %s\n' "$ROOTFS" >&2; exit 1; }
 
-rm -rf "$WORKDIR"
-mkdir -p "$WORKDIR"
+WORKDIR=$(ci_prepare_owned_run_dir \
+    "system-test-$ARCH" "$WORKDIR" "$REPO_ROOT" "$REPO_ROOT/.state")
 set +e
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m tools.qemu_runner run \
@@ -135,9 +138,11 @@ for marker in \
     THEKERNEL_USERFAULTFD_EXEC_COPY_OK \
     THEKERNEL_USERFAULTFD_OK \
     THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK \
+    THEKERNEL_PACKET_UDP_PRECONDITION_OK \
     THEKERNEL_PACKET_CREATE_OK \
     THEKERNEL_PACKET_RECEIVE_OK \
     THEKERNEL_PACKET_FAULT_OWNERSHIP_OK \
+    THEKERNEL_PACKET_SEND_FLAGS_OK \
     THEKERNEL_PACKET_SEND_OK \
     THEKERNEL_PACKET_OPTIONS_OK \
     THEKERNEL_PACKET_OK \

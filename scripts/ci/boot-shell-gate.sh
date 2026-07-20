@@ -7,7 +7,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 source "$SCRIPT_DIR/lib.sh"
 
 ARCH=both
-LOG_DIR="$REPO_ROOT/.state/ci/boot-shell"
+default_log_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_DIR="$REPO_ROOT/.state/ci/boot-shell/$default_log_id"
 TIMEOUT_SECS=${THEKERNEL_CI_BOOT_TIMEOUT_SECS:-300}
 BUILD_TIMEOUT_SECS=${THEKERNEL_CI_BUILD_TIMEOUT_SECS:-3600}
 READY_TIMEOUT_SECS=${THEKERNEL_CI_READY_TIMEOUT_SECS:-120}
@@ -22,7 +23,7 @@ Usage: scripts/ci/boot-shell-gate.sh [OPTIONS]
 
 Options:
   --arch {rv|la|both}    Architectures to gate (default: both)
-  --log-dir DIR          Gate logs (default: .state/ci/boot-shell)
+  --log-dir DIR          Gate logs (default: unique run below .state/ci/boot-shell)
   --timeout SECS         QEMU timeout per architecture (default: 300)
   --build-timeout SECS   Shell-kernel build timeout per arch (default: 3600)
   --ready-timeout SECS   Fail unless the exact boot-shell marker appears (default: 120)
@@ -66,6 +67,8 @@ case "$LOG_DIR" in
     /*) ;;
     *) LOG_DIR="$REPO_ROOT/$LOG_DIR" ;;
 esac
+LOG_DIR=$(ci_prepare_owned_run_dir \
+    boot-shell-gate "$LOG_DIR" "$REPO_ROOT" "$REPO_ROOT/.state")
 
 cd "$REPO_ROOT"
 export CI_LOG_DIR="$LOG_DIR"
@@ -134,8 +137,8 @@ gate_arch() {
     commands="$LOG_DIR/$arch.commands"
     workdir="$LOG_DIR/$arch"
     write_commands "$commands"
-    rm -rf "$workdir"
-    mkdir -p "$workdir"
+    workdir=$(ci_prepare_owned_run_dir \
+        "boot-shell-$arch" "$workdir" "$REPO_ROOT" "$REPO_ROOT/.state")
 
     ci_run_step "boot-qemu-$arch" "$((TIMEOUT_SECS + 90))" \
         "$SCRIPT_DIR/boot-shell-runner.sh" \

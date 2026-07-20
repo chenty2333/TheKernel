@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=exact-source-lib.sh
+source "$SCRIPT_DIR/exact-source-lib.sh"
 AX_REPO=$(cd -- "${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}" && pwd -P)
 LINUX_ABI_REPO=$(
     cd -- "${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}" && pwd -P
@@ -49,39 +51,91 @@ command -v timeout >/dev/null 2>&1 || {
     exit 1
 }
 
-BUILD_SOURCE_PATHS=(
-    .cargo
-    Cargo.toml
-    Cargo.lock
-    Makefile
-    build.rs
-    configs
-    crates
-    kernel
-    modules
-    platforms
-    rust-toolchain
-    rust-toolchain.toml
-    scripts/ci
-    third_party
-)
-for repo in "$REPO_ROOT" "$AX_REPO" "$LINUX_ABI_REPO"; do
-    git -C "$repo" diff --quiet HEAD -- || {
-        printf 'packet-broker-performance: tracked source is dirty: %s\n' "$repo" >&2
-        exit 1
+exact_source_require_clean_repo TheKernel "$REPO_ROOT" || exit 1
+exact_source_require_clean_repo thekernel-ax "$AX_REPO" || exit 1
+exact_source_require_clean_repo thekernel-linux-abi "$LINUX_ABI_REPO" || exit 1
+
+if [ "${THEKERNEL_PACKET_BROKER_MATERIALIZED:-0}" != 1 ]; then
+    source_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    ax_head=$(git -C "$AX_REPO" rev-parse HEAD)
+    linux_abi_head=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD)
+    materialization=$(mktemp -d \
+        "${TMPDIR:-/tmp}/thekernel-packet-broker-exact.XXXXXX")
+    cleanup_materialization() {
+        rm -rf -- "$materialization"
     }
-    git -C "$repo" diff --cached --quiet || {
-        printf 'packet-broker-performance: staged source is dirty: %s\n' "$repo" >&2
-        exit 1
-    }
-    untracked_source=$(git -C "$repo" ls-files --others --exclude-standard -- \
-        "${BUILD_SOURCE_PATHS[@]}")
-    if [ -n "$untracked_source" ]; then
-        printf 'packet-broker-performance: untracked build source in %s:\n%s\n' \
-            "$repo" "$untracked_source" >&2
-        exit 1
+    trap cleanup_materialization EXIT
+    exact_source_materialize_set "$materialization/sources" \
+        "$REPO_ROOT" "$source_head" "$AX_REPO" "$ax_head" \
+        "$LINUX_ABI_REPO" "$linux_abi_head"
+    materialized_repo="$materialization/sources/TheKernel"
+    set +e
+    THEKERNEL_PACKET_BROKER_MATERIALIZED=1 \
+        THEKERNEL_AX_REPO="$materialization/sources/thekernel-ax" \
+        THEKERNEL_LINUX_ABI_REPO="$materialization/sources/thekernel-linux-abi" \
+        THEKERNEL_EXACT_SOURCE_RECEIPT="$materialization/sources/source-set.tsv" \
+        "$materialized_repo/scripts/ci/packet-broker-performance.sh" \
+        --workdir "$WORKDIR"
+    child_status=$?
+    set -e
+    terminal_status=$child_status
+    origin_result=PASS
+    exact_source_require_clean_repo TheKernel "$REPO_ROOT" || origin_result=FAIL
+    exact_source_require_clean_repo thekernel-ax "$AX_REPO" || origin_result=FAIL
+    exact_source_require_clean_repo thekernel-linux-abi "$LINUX_ABI_REPO" \
+        || origin_result=FAIL
+    final_origin_head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null \
+        || printf '%s' missing)
+    final_origin_ax_head=$(git -C "$AX_REPO" rev-parse HEAD 2>/dev/null \
+        || printf '%s' missing)
+    final_origin_linux_abi_head=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD \
+        2>/dev/null || printf '%s' missing)
+    [ "$final_origin_head" = "$source_head" ] || origin_result=FAIL
+    [ "$final_origin_ax_head" = "$ax_head" ] || origin_result=FAIL
+    [ "$final_origin_linux_abi_head" = "$linux_abi_head" ] || origin_result=FAIL
+    envelope_result=FAIL
+    terminal_reason=child-gate-failed
+    if [ "$origin_result" = FAIL ]; then
+        terminal_reason=origin-source-changed
+        [ "$terminal_status" -ne 0 ] || terminal_status=1
+    elif [ "$child_status" -eq 0 ]; then
+        envelope_result=PASS
+        terminal_reason=evidence-qualified
     fi
-done
+    if [ -d "$WORKDIR" ] && [ ! -L "$WORKDIR" ]; then
+        {
+            printf 'schema\tpacket-broker-envelope-v1\n'
+            printf 'result\t%s\n' "$envelope_result"
+            printf 'child_exit_code\t%s\n' "$child_status"
+            printf 'origin_source_revalidated\t%s\n' "$origin_result"
+            printf 'reason\t%s\n' "$terminal_reason"
+        } >"$WORKDIR/gate-envelope.tsv"
+        if [ -f "$WORKDIR/checksums.sha256" ]; then
+            (
+                cd -- "$WORKDIR"
+                sha256sum gate-envelope.tsv >>checksums.sha256
+            )
+        fi
+    fi
+    trap - EXIT
+    cleanup_materialization
+    if [ "$terminal_status" -eq 0 ]; then
+        printf 'packet-broker-performance: PASS source_head=%s artifacts=%s\n' \
+            "$source_head" "$WORKDIR"
+    else
+        printf 'packet-broker-performance: FAIL reason=%s exit=%s\n' \
+            "$terminal_reason" "$terminal_status" >&2
+    fi
+    exit "$terminal_status"
+fi
+
+exact_source_verify_materialization \
+    "${THEKERNEL_EXACT_SOURCE_RECEIPT:-}" \
+    "$REPO_ROOT" "$AX_REPO" "$LINUX_ABI_REPO" || {
+    printf '%s\n' \
+        'packet-broker-performance: invalid materialized source receipt' >&2
+    exit 1
+}
 
 if [ -d "$WORKDIR" ] && find "$WORKDIR" -mindepth 1 -print -quit | grep -q .; then
     printf 'packet-broker-performance: artifact directory is not empty: %s\n' "$WORKDIR" >&2
@@ -93,14 +147,16 @@ WORKDIR=$(cd -- "$WORKDIR" && pwd -P)
 source_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
 source_tree=$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})
 ax_head=$(git -C "$AX_REPO" rev-parse HEAD)
+ax_tree=$(git -C "$AX_REPO" rev-parse HEAD^{tree})
 linux_abi_head=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD)
+linux_abi_tree=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD^{tree})
 printf '%s\n' "$source_head" >"$WORKDIR/source-head.txt"
 printf '%s\n' \
-    $'schema\tpacket-broker-source-set-v1' \
-    $'repository\thead\ttree' \
-    "TheKernel"$'\t'"$source_head"$'\t'"$source_tree" \
-    "thekernel-ax"$'\t'"$ax_head"$'\t'"$(git -C "$AX_REPO" rev-parse HEAD^{tree})" \
-    "thekernel-linux-abi"$'\t'"$linux_abi_head"$'\t'"$(git -C "$LINUX_ABI_REPO" rev-parse HEAD^{tree})" \
+    $'schema\tpacket-broker-source-set-v2' \
+    $'phase\trepository\thead\ttree\tstate' \
+    "start"$'\t'"TheKernel"$'\t'"$source_head"$'\t'"$source_tree"$'\t'"clean" \
+    "start"$'\t'"thekernel-ax"$'\t'"$ax_head"$'\t'"$ax_tree"$'\t'"clean" \
+    "start"$'\t'"thekernel-linux-abi"$'\t'"$linux_abi_head"$'\t'"$linux_abi_tree"$'\t'"clean" \
     >"$WORKDIR/source-set.tsv"
 
 host_kernel=$(uname -srmo | tr '\t' ' ')
@@ -140,9 +196,28 @@ validate_run() {
     local log=$2
     local metrics=$3
     local signature=$4
+    local failure_pattern
 
+    local ok_count
     grep '^THEKERNEL_PACKET_BROKER_PERF schema=2 ' "$log" >"$metrics"
-    grep -Fqx 'THEKERNEL_PACKET_BROKER_PERF_OK schema=2 cases=5' "$log"
+    ok_count=$(awk '
+        { sub(/\r$/, "", $0) }
+        $0 == "THEKERNEL_PACKET_BROKER_PERF_OK schema=2 cases=5" { count += 1 }
+        END { print count + 0 }
+    ' "$log")
+    [ "$ok_count" -eq 1 ] || {
+        printf 'packet-broker-performance: run %s success marker count=%s\n' \
+            "$run" "$ok_count" >&2
+        return 1
+    }
+    failure_pattern='THEKERNEL_PACKET_BROKER_PERF_FAIL|thread .* panicked|panicked at'
+    failure_pattern+='|test result: FAILED|error: test failed'
+    if grep -Eq "$failure_pattern" "$log"
+    then
+        printf 'packet-broker-performance: run %s contains failure or panic output\n' \
+            "$run" >&2
+        return 1
+    fi
     awk -v expected_run="$run" '
         BEGIN {
             expected[1] = "zero_subscriber"
@@ -215,12 +290,39 @@ done
 
 diff -u "$WORKDIR/run1-schema.txt" "$WORKDIR/run2-schema.txt" \
     >"$WORKDIR/schema-diff.txt"
+
+final_source_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+final_source_tree=$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})
+final_ax_head=$(git -C "$AX_REPO" rev-parse HEAD)
+final_ax_tree=$(git -C "$AX_REPO" rev-parse HEAD^{tree})
+final_linux_abi_head=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD)
+final_linux_abi_tree=$(git -C "$LINUX_ABI_REPO" rev-parse HEAD^{tree})
+if [ "$final_source_head" != "$source_head" ] ||
+    [ "$final_source_tree" != "$source_tree" ] ||
+    [ "$final_ax_head" != "$ax_head" ] || [ "$final_ax_tree" != "$ax_tree" ] ||
+    [ "$final_linux_abi_head" != "$linux_abi_head" ] ||
+    [ "$final_linux_abi_tree" != "$linux_abi_tree" ]; then
+    printf '%s\n' \
+        'packet-broker-performance: source repository identity changed during execution' >&2
+    exit 1
+fi
+exact_source_require_clean_repo TheKernel "$REPO_ROOT" || exit 1
+exact_source_require_clean_repo thekernel-ax "$AX_REPO" || exit 1
+exact_source_require_clean_repo thekernel-linux-abi "$LINUX_ABI_REPO" || exit 1
 printf '%s\n' \
-    $'schema\tpacket-broker-performance-receipt-v2' \
+    "final"$'\t'"TheKernel"$'\t'"$final_source_head"$'\t'"$final_source_tree"$'\t'"clean" \
+    "final"$'\t'"thekernel-ax"$'\t'"$final_ax_head"$'\t'"$final_ax_tree"$'\t'"clean" \
+    "final"$'\t'"thekernel-linux-abi"$'\t'"$final_linux_abi_head"$'\t'"$final_linux_abi_tree"$'\t'"clean" \
+    >>"$WORKDIR/source-set.tsv"
+
+printf '%s\n' \
+    $'schema\tpacket-broker-performance-receipt-v3' \
     "source_head"$'\t'"$source_head" \
     $'runs\t2' \
     $'portable_thresholds\tnone' \
-    $'untracked_build_inputs\tabsent' \
+    $'source_execution\tcommit-materialized' \
+    $'source_worktrees_clean\tPASS' \
+    $'source_set_revalidated\tPASS' \
     $'invariants\tPASS' \
     $'schema_diff\tPASS' \
     $'result\tPASS' \
@@ -243,5 +345,5 @@ printf '%s\n' \
         >checksums.sha256
 )
 
-printf 'packet-broker-performance: PASS runs=2 source_head=%s artifacts=%s\n' \
+printf 'packet-broker-performance internal: evidence sealed runs=2 source_head=%s artifacts=%s\n' \
     "$source_head" "$WORKDIR"

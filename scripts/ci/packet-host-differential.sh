@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
-WORKDIR="$REPO_ROOT/.state/ci/packet-host-differential"
+default_work_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+WORKDIR="$REPO_ROOT/.state/ci/packet-host-differential/$default_work_id"
 RUNS=2
 MAX_LOG_BYTES=262144
 
@@ -12,7 +13,7 @@ usage() {
 Usage: scripts/ci/packet-host-differential.sh [OPTIONS]
 
 Options:
-  --workdir DIR  Bounded evidence directory (default: .state/ci/packet-host-differential)
+  --workdir DIR  Bounded evidence directory (default: unique run below .state/ci/packet-host-differential)
   --runs N       Independent Linux namespace runs, from 2 through 8 (default: 2)
 
 Compiles the portable AF_PACKET smoke helper and runs it in fresh unprivileged
@@ -57,7 +58,7 @@ if ((RUNS < 2 || RUNS > 8)); then
     exit 2
 fi
 
-for command in awk cat cc date find git grep id ip sed sh sha256sum stat timeout uname unshare; do
+for command in awk cat cc date find git grep id ip realpath sed sh sha256sum stat timeout uname unshare; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'packet-host-differential: required command missing: %s\n' \
             "$command" >&2
@@ -65,27 +66,72 @@ for command in awk cat cc date find git grep id ip sed sh sha256sum stat timeout
     fi
 done
 
+dirty_source=$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all)
+if [ -n "$dirty_source" ]; then
+    printf '%s\n%s\n' \
+        'packet-host-differential: refusing a dirty source checkout' \
+        "$dirty_source" >&2
+    exit 1
+fi
+
+source_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+source_tree=$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')
+SOURCE_REL=tests/guest/tools/packet-socket-smoke.c
+SCRIPT_REL=scripts/ci/packet-host-differential.sh
+source_sha=$(git -C "$REPO_ROOT" show "$source_head:$SOURCE_REL" | sha256sum | awk '{print $1}')
+script_sha=$(git -C "$REPO_ROOT" show "$source_head:$SCRIPT_REL" | sha256sum | awk '{print $1}')
+[ "$(sha256sum "$REPO_ROOT/$SOURCE_REL" | awk '{print $1}')" = "$source_sha" ] || {
+    printf '%s\n' 'packet-host-differential: helper differs from committed input' >&2
+    exit 1
+}
+[ "$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')" = "$script_sha" ] || {
+    printf '%s\n' 'packet-host-differential: gate script differs from committed input' >&2
+    exit 1
+}
+
 case "$WORKDIR" in
     /*) ;;
     *) WORKDIR="$REPO_ROOT/$WORKDIR" ;;
 esac
-mkdir -p -- "$WORKDIR"
-WORKDIR=$(cd -- "$WORKDIR" && pwd -P)
-if [ "$WORKDIR" = / ]; then
+WORKDIR=$(realpath -m -- "$WORKDIR")
+[ "$WORKDIR" != / ] || {
     printf '%s\n' 'packet-host-differential: refusing root as workdir' >&2
     exit 2
+}
+if [ -d "$WORKDIR" ] && find "$WORKDIR" -mindepth 1 -print -quit | grep -q .; then
+    printf 'packet-host-differential: evidence directory is not empty: %s\n' \
+        "$WORKDIR" >&2
+    exit 1
 fi
+mkdir -p -- "$WORKDIR/input"
+WORKDIR=$(cd -- "$WORKDIR" && pwd -P)
 
-SOURCE="$REPO_ROOT/tests/guest/tools/packet-socket-smoke.c"
+SOURCE="$WORKDIR/input/packet-socket-smoke.c"
+FROZEN_SCRIPT="$WORKDIR/input/packet-host-differential.sh"
 BINARY="$WORKDIR/packet-socket-smoke"
 PREFLIGHT="$WORKDIR/preflight.log"
 RECEIPT="$WORKDIR/receipt.tsv"
+SOURCE_SET="$WORKDIR/source-set.tsv"
 INPUT_CHECKSUMS="$WORKDIR/inputs.sha256"
 ARTIFACT_CHECKSUMS="$WORKDIR/artifacts.sha256"
+BUNDLE_CHECKSUMS="$WORKDIR/bundle.sha256"
 
-rm -f -- "$BINARY" "$PREFLIGHT" "$RECEIPT" "$INPUT_CHECKSUMS" \
-    "$ARTIFACT_CHECKSUMS"
-find "$WORKDIR" -maxdepth 1 -type f -name 'run-*.log' -delete
+git -C "$REPO_ROOT" show "$source_head:$SOURCE_REL" >"$SOURCE"
+git -C "$REPO_ROOT" show "$source_head:$SCRIPT_REL" >"$FROZEN_SCRIPT"
+[ "$(sha256sum "$SOURCE" | awk '{print $1}')" = "$source_sha" ]
+[ "$(sha256sum "$FROZEN_SCRIPT" | awk '{print $1}')" = "$script_sha" ]
+{
+    printf 'schema\tpacket-host-differential-source-set-v1\n'
+    printf 'kind\tphase\tname\thead\ttree\tstate\tsha256\n'
+    printf 'repository\tstart\tTheKernel\t%s\t%s\tclean\t-\n' \
+        "$source_head" "$source_tree"
+    printf 'input\tstart\t%s\t-\t-\tcommitted\t%s\n' "$SOURCE_REL" "$source_sha"
+    printf 'input\tstart\t%s\t-\t-\tcommitted\t%s\n' "$SCRIPT_REL" "$script_sha"
+} >"$SOURCE_SET"
+{
+    printf '%s  %s\n' "$source_sha" 'input/packet-socket-smoke.c'
+    printf '%s  %s\n' "$script_sha" 'input/packet-host-differential.sh'
+} >"$INPUT_CHECKSUMS"
 
 cc -O2 -std=c11 -Wall -Wextra -Werror "$SOURCE" -o "$BINARY"
 
@@ -112,13 +158,18 @@ grep -Eq '^lo_ifindex=[1-9][0-9]*$' "$PREFLIGHT"
 grep -Eq '^CapEff:[[:space:]]+[0-9a-fA-F]*[1-9a-fA-F][0-9a-fA-F]*$' "$PREFLIGHT"
 
 required_markers=(
+    THEKERNEL_PACKET_UDP_PRECONDITION_OK
     THEKERNEL_PACKET_CREATE_OK
     THEKERNEL_PACKET_RECEIVE_OK
     THEKERNEL_PACKET_FAULT_OWNERSHIP_OK
+    THEKERNEL_PACKET_SEND_FLAGS_OK
     THEKERNEL_PACKET_SEND_OK
     THEKERNEL_PACKET_OPTIONS_OK
     THEKERNEL_PACKET_OK
 )
+send_flags_boundary=
+send_flags_boundary+='THEKERNEL_PACKET_SEND_FLAGS_BOUNDARY '
+send_flags_boundary+='accepted=OOB,MORE,DONTROUTE,EOR,CONFIRM,NOSIGNAL'
 
 for ((run = 1; run <= RUNS; ++run)); do
     log="$WORKDIR/run-$run.log"
@@ -157,6 +208,8 @@ for ((run = 1; run <= RUNS; ++run)); do
         exit 1
     fi
     if [ "$(grep -c '^THEKERNEL_PACKET_SEND_BOUNDARY ' "$log" || true)" -ne 3 ] ||
+        [ "$(grep -c '^THEKERNEL_PACKET_SEND_FLAGS_BOUNDARY ' "$log" || true)" -ne 1 ] ||
+        [ "$(grep -Fxc -- "$send_flags_boundary" "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_NAME_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_OPTION_BOUNDARY ' "$log" || true)" -ne 1 ] ||
         [ "$(grep -c '^THEKERNEL_PACKET_SOL_SOCKET_BOUNDARY ' "$log" || true)" -ne 1 ] ||
@@ -168,29 +221,54 @@ for ((run = 1; run <= RUNS; ++run)); do
     fi
 done
 
-source_sha=$(sha256sum "$SOURCE" | awk '{print $1}')
-script_sha=$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')
 binary_sha=$(sha256sum "$BINARY" | awk '{print $1}')
-{
-    printf '%s  %s\n' "$source_sha" 'tests/guest/tools/packet-socket-smoke.c'
-    printf '%s  %s\n' "$script_sha" 'scripts/ci/packet-host-differential.sh'
-} >"$INPUT_CHECKSUMS"
+
+verify_final_source_identity() {
+    final_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    final_tree=$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')
+    final_source_sha=$(sha256sum "$REPO_ROOT/$SOURCE_REL" | awk '{print $1}')
+    final_script_sha=$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')
+    final_dirty=$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all)
+    if [ "$final_head" != "$source_head" ] || [ "$final_tree" != "$source_tree" ] ||
+        [ "$final_source_sha" != "$source_sha" ] ||
+        [ "$final_script_sha" != "$script_sha" ] || [ -n "$final_dirty" ]; then
+        printf '%s\n' \
+            'packet-host-differential: source identity or cleanliness changed during execution' >&2
+        [ -z "$final_dirty" ] || printf '%s\n' "$final_dirty" >&2
+        return 1
+    fi
+}
+
+verify_final_source_identity
+printf 'repository\tfinal\tTheKernel\t%s\t%s\tclean\t-\n' \
+    "$final_head" "$final_tree" \
+    >>"$SOURCE_SET"
 
 (
     cd -- "$WORKDIR"
-    sha256sum packet-socket-smoke preflight.log run-*.log
+    sha256sum \
+        input/packet-socket-smoke.c \
+        input/packet-host-differential.sh \
+        packet-socket-smoke \
+        preflight.log \
+        run-*.log \
+        source-set.tsv \
+        inputs.sha256
 ) >"$ARTIFACT_CHECKSUMS"
+artifact_checksums_sha=$(sha256sum "$ARTIFACT_CHECKSUMS" | awk '{print $1}')
 
-repository_state=clean
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]; then
-    repository_state=dirty
-fi
+# Hashing the bounded artifact set happens after the first final snapshot. Take
+# one more source observation immediately before publishing the PASS receipt.
+verify_final_source_identity
 {
-    printf 'schema\tpacket-host-differential-v1\n'
+    printf 'schema\tpacket-host-differential-v2\n'
     printf 'status\tPASS\n'
     printf 'generated_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'repository_head\t%s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    printf 'repository_state\t%s\n' "$repository_state"
+    printf 'repository_head\t%s\n' "$source_head"
+    printf 'repository_tree\t%s\n' "$source_tree"
+    printf 'repository_state\tclean\n'
+    printf 'source_set_revalidated\tPASS\n'
+    printf 'artifact_checksums_sha256\t%s\n' "$artifact_checksums_sha"
     printf 'source_sha256\t%s\n' "$source_sha"
     printf 'script_sha256\t%s\n' "$script_sha"
     printf 'binary_sha256\t%s\n' "$binary_sha"
@@ -206,6 +284,10 @@ fi
             "$(sha256sum "$WORKDIR/run-$run.log" | awk '{print $1}')"
     done
 } >"$RECEIPT"
+(
+    cd -- "$WORKDIR"
+    sha256sum receipt.tsv artifacts.sha256
+) >"$BUNDLE_CHECKSUMS"
 
 printf 'packet-host-differential: PASS runs=%s source_sha256=%s evidence=%s\n' \
     "$RUNS" "$source_sha" "$WORKDIR"

@@ -38,6 +38,100 @@ ci_prepare_log_dir() {
     printf 'step\tstatus\texit_code\tlog\n' >"$directory/status.tsv"
 }
 
+ci_path_is_within() {
+    local path=$1
+    local root=$2
+    [ "$path" = "$root" ] || [[ "$path" == "$root/"* ]]
+}
+
+ci_validate_owned_run_path() {
+    local owner=$1
+    local directory=$2
+    local repo_root=$3
+    local allowed_state_root=$4
+    local lexical
+    local resolved
+
+    [[ "$owner" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || ci_die "unsafe run-directory owner: $owner"
+    ci_require_command find
+    ci_require_command realpath
+
+    repo_root=$(realpath -e -- "$repo_root") \
+        || ci_die "cannot resolve repository root: $repo_root"
+    allowed_state_root=$(realpath -m -- "$allowed_state_root") \
+        || ci_die "cannot resolve allowed state root: $allowed_state_root"
+    lexical=$(realpath -ms -- "$directory") \
+        || ci_die "cannot normalize run directory: $directory"
+    resolved=$(realpath -m -- "$directory") \
+        || ci_die "cannot resolve run directory: $directory"
+
+    [ "$lexical" = "$resolved" ] \
+        || ci_die "run directory contains a symbolic-link component: $directory"
+    [ "$resolved" != / ] || ci_die 'run directory must not be the filesystem root'
+    if ci_path_is_within "$repo_root" "$resolved"; then
+        ci_die "run directory must not contain the source repository: $resolved"
+    fi
+    if ci_path_is_within "$resolved" "$repo_root" &&
+        ! ci_path_is_within "$resolved" "$allowed_state_root"
+    then
+        ci_die "run directory is inside source outside the state root: $resolved"
+    fi
+    printf '%s\n' "$resolved"
+}
+
+# Creates one fresh, marker-owned run directory without deleting prior data.
+# Paths below a repository are accepted only beneath the caller's designated
+# ignored state root. Existing symlink components and non-empty reuse are
+# rejected before any gate writes artifacts.
+ci_prepare_owned_run_dir() {
+    local owner=$1
+    local directory=$2
+    local repo_root=$3
+    local allowed_state_root=$4
+    local resolved
+    local physical
+    local marker
+    local entry
+
+    resolved=$(ci_validate_owned_run_path \
+        "$owner" "$directory" "$repo_root" "$allowed_state_root") || return
+    [ ! -L "$resolved" ] || ci_die "run directory must not be a symlink: $resolved"
+    if [ -e "$resolved" ] && [ ! -d "$resolved" ]; then
+        ci_die "run path is not a directory: $resolved"
+    fi
+    if [ -d "$resolved" ] &&
+        find "$resolved" -mindepth 1 -maxdepth 1 -print -quit | grep -q .
+    then
+        ci_die "refusing to reuse non-empty run directory: $resolved"
+    fi
+
+    mkdir -p -- "$resolved"
+    physical=$(realpath -e -- "$resolved") \
+        || ci_die "cannot resolve created run directory: $resolved"
+    [ "$physical" = "$resolved" ] \
+        || ci_die "run directory changed through a symbolic link: $directory"
+    marker="$physical/.thekernel-ci-owned-run"
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] \
+        || ci_die "run-directory marker already exists: $marker"
+    if ! (
+        set -o noclobber
+        printf '%s\n' \
+            $'schema\tthekernel-ci-owned-run-v1' \
+            "owner"$'\t'"$owner" >"$marker"
+    ); then
+        ci_die "cannot claim run-directory marker: $marker"
+    fi
+    [ -f "$marker" ] && [ ! -L "$marker" ] \
+        || ci_die "unsafe run-directory marker: $marker"
+    while IFS= read -r -d '' entry; do
+        [ "$entry" = "$marker" ] \
+            || ci_die "run directory changed during ownership claim: $physical"
+    done < <(find "$physical" -mindepth 1 -maxdepth 1 -print0)
+
+    printf '%s\n' "$physical"
+}
+
 ci_run_step() {
     if [ "$#" -lt 3 ]; then
         ci_die 'ci_run_step requires NAME TIMEOUT COMMAND [ARGS...]'

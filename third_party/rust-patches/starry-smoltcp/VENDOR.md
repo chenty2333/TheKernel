@@ -29,10 +29,13 @@ must remain attributed to the smoltcp contributors.
 - `96df7d9b5a2bb86e83d2f92b9d9a31b279407b03` added fallible buffer-replacement
   hooks used by the kernel network layer.
 
-Against the verified archive, the current `src/` patch is 143 insertions and
-5 deletions across TCP, UDP, and async-waker code. It includes:
+Against the verified archive, the maintained `src/` patch spans TCP, UDP, and
+async-waker code. It includes:
 
 - TCP and UDP receive/transmit buffer replacement with state/emptiness checks;
+- exact connected-UDP peer admission before receive-queue allocation, with
+  admission-time queue semantics across reconnect/disconnect, a queue-preserving
+  endpoint unbind primitive, and reset on close;
 - receive-window validation and a focused TCP regression test;
 - reset of SACK, duplicate-ACK, timestamp, and window-tracking state;
 - reset-time async-waker clearing for TheKernel's wrapper model.
@@ -49,7 +52,10 @@ If a caller cannot run a waker destructor while holding its own lock, it must
 move the registration out and defer destruction explicitly; leaking a waker
 is not an accepted cancellation mechanism.
 
-The focused test passes with the installed stable Rust toolchain. The pinned
+The per-commit gate tests an exact copied source snapshot with stable Rust
+1.85.0, inside this package's declared Rust 1.81-or-newer range, and accepts the
+run only when the same successful harness invocation reports at least 41 UDP
+tests. The pinned
 `nightly-2025-05-20` standalone test remains blocked before reaching smoltcp by
 `zerocopy 0.8.41` using the newer `stdarch_x86_avx512` API. This toolchain
 boundary is distinct from the lifecycle result and must not be reported as a

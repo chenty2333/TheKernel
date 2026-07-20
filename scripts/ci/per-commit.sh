@@ -6,7 +6,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-LOG_DIR="$REPO_ROOT/.state/ci/per-commit"
+default_log_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_DIR="$REPO_ROOT/.state/ci/per-commit/$default_log_id"
 STEP_TIMEOUT_SECS=${THEKERNEL_CI_STEP_TIMEOUT_SECS:-900}
 AX_REPO=${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}
 LINUX_ABI_REPO=${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}
@@ -18,9 +19,9 @@ Usage: scripts/ci/per-commit.sh [--log-dir DIR] [--step-timeout SECS]
 Runs the reusable per-commit gate: diff whitespace checks, rustfmt, vendored
 source provenance validation, project tool tests, a host kernel check, and
 focused tests for the maintained ax/Linux-ABI cores, local adapters, fallible
-lifecycle, VFS, signal, and user-copy contracts that currently change most
-often. Broader network, filesystem, and cross-architecture behavior belongs to
-the PR and nightly gates.
+lifecycle, VFS, signal, user-copy, and vendored UDP contracts that currently
+change most often. Broader network, filesystem, and cross-architecture behavior
+belongs to the PR and nightly gates.
 
 CI_DIFF_BASE may name a merge base. When absent, the committed HEAD^..HEAD
 diff is checked in addition to staged and unstaged changes.
@@ -52,6 +53,8 @@ case "$LOG_DIR" in
     /*) ;;
     *) LOG_DIR="$REPO_ROOT/$LOG_DIR" ;;
 esac
+LOG_DIR=$(ci_prepare_owned_run_dir \
+    per-commit "$LOG_DIR" "$REPO_ROOT" "$REPO_ROOT/.state")
 
 cd "$REPO_ROOT"
 export CI_LOG_DIR="$LOG_DIR"
@@ -117,6 +120,12 @@ ci_run_step rustfmt 180 cargo fmt --all -- --check
 ci_run_step vendor-provenance 60 python3 \
     "$SCRIPT_DIR/validate_vendor_provenance.py" --archive-policy if-present \
     --ax-repo "$AX_REPO" --linux-abi-repo "$LINUX_ABI_REPO"
+ci_run_step vendored-smoltcp-udp-tests "$STEP_TIMEOUT_SECS" \
+    env RUSTUP_TOOLCHAIN=1.85.0 \
+    "$SCRIPT_DIR/rust-filtered-test-gate.sh" \
+    --minimum 41 --filter socket::udp::test -- \
+    "$SCRIPT_DIR/focused-cargo-test.sh" \
+    third_party/rust-patches/starry-smoltcp/Cargo.toml
 ci_run_step ci-script-tests 90 \
     env THEKERNEL_AX_REPO="$AX_REPO" \
     THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO" \
@@ -137,9 +146,10 @@ ci_run_step kernel-seccomp-adapter-tests "$STEP_TIMEOUT_SECS" \
 ci_run_step kernel-packet-adapter-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    "$SCRIPT_DIR/rust-filtered-test-gate.sh" \
+    --minimum 24 --filter packet -- \
     cargo test --locked --manifest-path kernel/Cargo.toml \
-    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu \
-    packet -- --test-threads=1
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu
 
 ci_run_step kernel-futex-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \

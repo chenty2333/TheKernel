@@ -21,7 +21,7 @@ env:
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
   THEKERNEL_AX_REF: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
-  THEKERNEL_LINUX_ABI_REF: 8db01bb7f6396b30c64df29ab3edffae3592cd4d
+  THEKERNEL_LINUX_ABI_REF: 43f58fa0075c564a2a8a8e4caddca473cf0be1b7
 
 jobs:
   per-commit:
@@ -108,7 +108,8 @@ jobs:
   dual-arch-pr:
     if: >-
       ${{ vars.THEKERNEL_QEMU_CI == '1' &&
-          (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+          (github.event_name == 'pull_request' || github.event_name == 'push' ||
+           github.event_name == 'workflow_dispatch') }}
     runs-on:
       - self-hosted
       - linux
@@ -136,15 +137,14 @@ jobs:
 
       - name: Dual-architecture release and boot gate
         id: gate
-        run: ./scripts/ci/pr-gate.sh
+        run: ./scripts/ci/pr-gate.sh --log-dir "$RUNNER_TEMP/thekernel-pr-gate"
 
       - name: Upload PR gate logs
         if: ${{ always() && steps.gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: dual-arch-pr-logs
-          path: |
-            .state/ci/pr/
-            kernel-rv
-            kernel-la
+          # The gate seals kernels, rootfs images, receipts, consoles, and all
+          # step logs into this external, self-contained evidence directory.
+          path: ${{ runner.temp }}/thekernel-pr-gate/
           include-hidden-files: true

@@ -6,7 +6,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-LOG_DIR="$REPO_ROOT/.state/ci/nightly"
+default_log_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_DIR="$REPO_ROOT/.state/ci/nightly/$default_log_id"
 CASE_TIMEOUT_SECS=${THEKERNEL_NIGHTLY_CASE_TIMEOUT_SECS:-7200}
 
 usage() {
@@ -59,11 +60,14 @@ case "$LOG_DIR" in
     /*) ;;
     *) LOG_DIR="$REPO_ROOT/$LOG_DIR" ;;
 esac
+LOG_DIR=$(ci_prepare_owned_run_dir \
+    nightly-gate "$LOG_DIR" "$REPO_ROOT" "$REPO_ROOT/.state")
 
 cd "$REPO_ROOT"
-export CI_LOG_DIR="$LOG_DIR/steps"
+CI_LOG_DIR=$(ci_prepare_owned_run_dir \
+    nightly-steps "$LOG_DIR/steps" "$REPO_ROOT" "$REPO_ROOT/.state")
+export CI_LOG_DIR
 ci_prepare_log_dir "$CI_LOG_DIR"
-mkdir -p "$LOG_DIR"
 RESULTS="$LOG_DIR/nightly-status.tsv"
 printf 'category\tstatus\treason\tlog\n' >"$RESULTS"
 
@@ -141,9 +145,12 @@ run_adapter_case() {
             failures=$((failures + 1))
             return
         fi
+        category_log_dir=$(ci_prepare_owned_run_dir \
+            "nightly-$category" "$LOG_DIR/$category" \
+            "$REPO_ROOT" "$REPO_ROOT/.state")
         if ci_run_step "nightly-$category" "$CASE_TIMEOUT_SECS" \
             env \
-                THEKERNEL_NIGHTLY_LOG_DIR="$LOG_DIR/$category" \
+                THEKERNEL_NIGHTLY_LOG_DIR="$category_log_dir" \
                 THEKERNEL_NIGHTLY_CASE_TIMEOUT_SECS="$CASE_TIMEOUT_SECS" \
                 "$adapter"; then
             status=0

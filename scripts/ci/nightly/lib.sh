@@ -158,8 +158,8 @@ nightly_prepare_guest_run() {
     local kernel_sha commands_sha rootfs_sha qemu_sha compiler_sha
     local qemu_version compiler_version rustc_version cargo_version
 
-    rm -rf "$run_dir"
-    mkdir -p "$run_dir"
+    run_dir=$(ci_prepare_owned_run_dir \
+        "nightly-guest-$arch" "$run_dir" "$REPO_ROOT" "$REPO_ROOT/.state")
     [ -f "$commands" ] || nightly_fail "missing guest command stream: $commands"
     staged_commands="$run_dir/commands"
     cp -- "$commands" "$staged_commands"
