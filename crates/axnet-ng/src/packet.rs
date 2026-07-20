@@ -576,6 +576,15 @@ impl PacketEndpoint {
         }
     }
 
+    fn detach_after_broker_drop(&self) {
+        // PacketBroker::drop owns the final broker reference, so no broker-side
+        // enqueue can still race this publication. Receivers retain the endpoint
+        // state mutex and may drain records queued before the broker disappeared.
+        if !self.detached.swap(true, Ordering::AcqRel) {
+            self.readiness.close();
+        }
+    }
+
     fn enqueue(
         &self,
         frame: Arc<SharedPacketFrame>,
@@ -1669,17 +1678,14 @@ impl PacketBroker {
 impl Drop for PacketBroker {
     fn drop(&mut self) {
         self.drain_wait.notify_all(false);
-        // A stack which never published an endpoint has no teardown work.
-        // Avoid entering the sleeping registry mutex from an arbitrary Arc
-        // destructor context merely to observe the already-known empty state.
-        if self.endpoint_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
         let mut endpoints: [Option<Arc<PacketEndpoint>>; MAX_PACKET_ENDPOINTS] =
             core::array::from_fn(|_| None);
         let mut endpoint_count = 0usize;
         {
-            let mut state = self.state.lock();
+            // Drop has exclusive access after the final strong broker owner is
+            // gone. Do not enter a sleeping mutex from an arbitrary destructor
+            // context when its protected state is already exclusively owned.
+            let state = self.state.get_mut();
             for (_, endpoint) in &state.endpoints {
                 if let Some(endpoint) = endpoint.upgrade() {
                     endpoints[endpoint_count] = Some(endpoint);
@@ -1690,7 +1696,7 @@ impl Drop for PacketBroker {
             self.endpoint_count.store(0, Ordering::Release);
         }
         for endpoint in endpoints[..endpoint_count].iter().flatten() {
-            endpoint.detach();
+            endpoint.detach_after_broker_drop();
         }
     }
 }
@@ -2798,6 +2804,26 @@ mod tests {
             endpoint.try_receive(false),
             Err(AxError::BadState)
         ));
+    }
+
+    #[test]
+    fn broker_drop_does_not_reenter_endpoint_state_mutex() {
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+
+        let state = endpoint.state.lock();
+        drop(broker);
+        assert!(endpoint.detached.load(Ordering::Acquire));
+        drop(state);
+
+        assert!(endpoint.poll().contains(IoEvents::HANGUP));
     }
 
     #[test]
