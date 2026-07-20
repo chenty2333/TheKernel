@@ -22,6 +22,7 @@ pub mod bpf;
 mod config;
 mod deferred_work;
 mod file;
+mod keyring;
 mod mm;
 mod mounts;
 mod pseudofs;

@@ -27,7 +27,10 @@ use axtask::{current, current_may_uninit};
 use extern_trait::extern_trait;
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_vm::{VmError, VmIo, VmResult, vm_load_until_nul, vm_read_slice, vm_write_slice};
+use starry_vm::{
+    VmError, VmIo, VmResult, vm_load_until_nul, vm_load_until_nul_bounded, vm_read_slice,
+    vm_write_slice,
+};
 use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
 
 use super::{
@@ -678,6 +681,16 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
 pub fn vm_load_string(ptr: *const c_char) -> AxResult<String> {
     #[allow(clippy::unnecessary_cast)]
     let bytes = vm_load_until_nul(ptr as *const u8)?;
+    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
+}
+
+/// Loads one NUL-terminated UTF-8 string within an explicit byte budget.
+///
+/// `scan_bytes` includes the terminating NUL, matching Linux's field-size
+/// limits for syscall strings.
+pub fn vm_load_string_bounded(ptr: *const c_char, scan_bytes: usize) -> AxResult<String> {
+    #[allow(clippy::unnecessary_cast)]
+    let bytes = vm_load_until_nul_bounded(ptr as *const u8, scan_bytes)?;
     String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
 }
 
