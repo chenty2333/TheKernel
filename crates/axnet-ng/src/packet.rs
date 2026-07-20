@@ -1669,6 +1669,12 @@ impl PacketBroker {
 impl Drop for PacketBroker {
     fn drop(&mut self) {
         self.drain_wait.notify_all(false);
+        // A stack which never published an endpoint has no teardown work.
+        // Avoid entering the sleeping registry mutex from an arbitrary Arc
+        // destructor context merely to observe the already-known empty state.
+        if self.endpoint_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut endpoints: [Option<Arc<PacketEndpoint>>; MAX_PACKET_ENDPOINTS] =
             core::array::from_fn(|_| None);
         let mut endpoint_count = 0usize;
