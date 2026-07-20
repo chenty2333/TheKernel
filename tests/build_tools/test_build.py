@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -158,14 +159,26 @@ class BuildKernelParamTests(unittest.TestCase):
             root=repo_root(),
         )
         specs = set(kernel_input_specs(request))
+        ax_root = Path(
+            os.path.relpath(
+                (request.root / "../thekernel-ax").resolve(),
+                request.root.resolve(),
+            )
+        ).as_posix()
+        linux_abi_root = Path(
+            os.path.relpath(
+                (request.root / "../thekernel-linux-abi").resolve(),
+                request.root.resolve(),
+            )
+        ).as_posix()
         self.assertTrue(
             {
-                InputSpec("file", "../thekernel-ax/Cargo.toml"),
-                InputSpec("optional_file", "../thekernel-ax/Cargo.lock"),
-                InputSpec("tree", "../thekernel-ax/crates"),
-                InputSpec("file", "../thekernel-linux-abi/Cargo.toml"),
-                InputSpec("optional_file", "../thekernel-linux-abi/Cargo.lock"),
-                InputSpec("tree", "../thekernel-linux-abi/crates"),
+                InputSpec("file", f"{ax_root}/Cargo.toml"),
+                InputSpec("optional_file", f"{ax_root}/Cargo.lock"),
+                InputSpec("tree", f"{ax_root}/crates"),
+                InputSpec("file", f"{linux_abi_root}/Cargo.toml"),
+                InputSpec("optional_file", f"{linux_abi_root}/Cargo.lock"),
+                InputSpec("tree", f"{linux_abi_root}/crates"),
             }.issubset(specs)
         )
 
