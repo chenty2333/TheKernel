@@ -3,6 +3,8 @@
 //! This module owns the Linux-visible key policy and state machine. Syscall
 //! entry code is responsible only for UAPI decoding and userspace copies.
 
+mod accounting;
+mod manager;
 mod service;
 
 pub(crate) use service::{
