@@ -4,7 +4,9 @@
 //! entry code is responsible only for UAPI decoding and userspace copies.
 
 mod accounting;
+mod contract;
 mod manager;
+mod object;
 mod service;
 
 pub(crate) use service::{

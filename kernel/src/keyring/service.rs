@@ -9,7 +9,8 @@ pub(crate) use super::{
         key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys, set_key_maxbytes,
         set_key_maxkeys, set_key_root_maxbytes, set_key_root_maxkeys,
     },
-    manager::{KeyActor, KeyTypeKind, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
+    contract::{KeyActor, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
+    object::KeyTypeKind,
 };
 
 static KEY_MANAGER: Mutex<KeyManager> = Mutex::new(KeyManager::new());
