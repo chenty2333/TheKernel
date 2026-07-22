@@ -19,7 +19,7 @@ env:
   # Maintained sibling inputs are source-controlled immutable release
   # candidates. Local development may still override their checkout paths.
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
-  THEKERNEL_AX_REF: da0a5f9b861dd8e363f5b633d008e9ac6c34bc40
+  THEKERNEL_AX_REF: 00a04c356ee13d349ebd360bd4eddcc1e5a8c5bb
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
   THEKERNEL_LINUX_ABI_REF: df13793f1c372432d0c5144d44636dfd53ccec45
 
@@ -91,6 +91,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Ubuntu 24.04 enables AppArmor mediation for unprivileged user
+      # namespaces. This dedicated ephemeral job needs a fresh user+network
+      # namespace so CAP_NET_RAW is scoped to the oracle instead of the host.
+      # Provision that prerequisite explicitly; the differential script still
+      # treats any namespace, capability, or Linux behavior failure as fatal.
+      - name: Enable isolated unprivileged user namespaces
+        run: |
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -e "$restriction" && "$(<"$restriction")" != 0 ]]; then
+            printf '0\n' | sudo tee "$restriction" >/dev/null
+          fi
+          [[ ! -e "$restriction" || "$(<"$restriction")" == 0 ]]
 
       - name: Run host Linux packet differential
         run: ./scripts/ci/packet-host-differential.sh

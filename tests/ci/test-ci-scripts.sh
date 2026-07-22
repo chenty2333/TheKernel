@@ -53,6 +53,8 @@ grep -Fq 'ci_run_step vendored-smoltcp-udp-tests' "$CI_DIR/per-commit.sh"
 grep -Fq 'RUSTUP_TOOLCHAIN=1.85.0' "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 41 --filter socket::udp::test --' \
     "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step ci-script-tests "$STEP_TIMEOUT_SECS"' \
+    "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step packet-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step packet-core-check' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-linux-packet --all-targets' "$CI_DIR/per-commit.sh"
@@ -63,6 +65,12 @@ grep -Fq 'runner.temp }}/thekernel-pr-gate/' \
 grep -Fq 'self-contained evidence directory' \
     "$REPO_ROOT/.github/workflows/ci.yml"
 grep -Fq "github.event_name == 'push'" "$REPO_ROOT/.github/workflows/ci.yml"
+grep -Fq 'Enable isolated unprivileged user namespaces' \
+    "$REPO_ROOT/.github/workflows/ci.yml"
+grep -Fq '/proc/sys/kernel/apparmor_restrict_unprivileged_userns' \
+    "$REPO_ROOT/.github/workflows/ci.yml"
+grep -Fq 'sudo tee "$restriction"' \
+    "$REPO_ROOT/.github/workflows/ci.yml"
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \

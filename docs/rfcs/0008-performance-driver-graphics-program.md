@@ -329,7 +329,7 @@ This RFC does not claim:
 
 The first bounded implementation slice landed on 2026-07-23.  Its source
 anchors are TheKernel `2d1d2be7110cc55526054e3e94a03715d7c721fb`,
-`thekernel-ax` `da0a5f9b861dd8e363f5b633d008e9ac6c34bc40`, and
+`thekernel-ax` `00a04c356ee13d349ebd360bd4eddcc1e5a8c5bb`, and
 `thekernel-linux-abi` `df13793f1c372432d0c5144d44636dfd53ccec45`.
 This checkpoint narrows several immediate bottlenecks, but does not supersede
 the dependency order or release gates above.
@@ -400,7 +400,24 @@ the simplified CFS policy only after it provides an allocation-free augmented
 tree, lag and virtual-deadline arithmetic, sleeper and reweight semantics,
 migration invariants, a reference model, and watchdog/fallback gates.  The
 maintained readiness design is
-[`thekernel-ax/docs/design/0001-eevdf-readiness.md`](https://github.com/chenty2333/thekernel-ax/blob/da0a5f9b861dd8e363f5b633d008e9ac6c34bc40/docs/design/0001-eevdf-readiness.md).
+[`thekernel-ax/docs/design/0001-eevdf-readiness.md`](https://github.com/chenty2333/thekernel-ax/blob/00a04c356ee13d349ebd360bd4eddcc1e5a8c5bb/docs/design/0001-eevdf-readiness.md).
+
+The same maintained-AX checkpoint also closes a pre-existing lifecycle race
+between a remote affinity update and publication of a blocked task's wake.  A
+single per-task, wait-free mutation state now serializes new-task publication,
+the `cpumask -> cpu_id -> Blocked` transaction, affinity changes, immediate
+wake enqueue, and deferred old-CPU handoff.  A racing wake is either owned or
+delegated exactly once; the target scheduler clears that claim under its lock
+after linking the task but before the task can be selected.  This removes the
+Ready-before-enqueue and next-block ABA windows without spinning or nesting
+source and target run-queue locks.  Impossible enqueue or handoff failures are
+currently fail-stop while preserving the exact task owner and wake obligation;
+a preallocated retry owner remains future high-availability work.
+
+This closure is a scheduler lifecycle correctness prerequisite, not EEVDF,
+idle stealing, remote preemption, or evidence of a performance speedup.  It
+also does not establish the cause of the separately observed, unreproduced
+LoongArch four-CPU mutex panic.
 
 ### Integration evidence and remaining gate
 

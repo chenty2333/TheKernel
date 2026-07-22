@@ -126,7 +126,7 @@ ci_run_step vendored-smoltcp-udp-tests "$STEP_TIMEOUT_SECS" \
     --minimum 41 --filter socket::udp::test -- \
     "$SCRIPT_DIR/focused-cargo-test.sh" \
     third_party/rust-patches/starry-smoltcp/Cargo.toml
-ci_run_step ci-script-tests 90 \
+ci_run_step ci-script-tests "$STEP_TIMEOUT_SECS" \
     env THEKERNEL_AX_REPO="$AX_REPO" \
     THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO" \
     "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
