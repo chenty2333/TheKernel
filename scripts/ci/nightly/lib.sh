@@ -49,17 +49,25 @@ nightly_qemu_binary() {
 }
 
 nightly_kernel_target() {
-    case "$1" in
-        rv) printf 'kernel-rv-shell\n' ;;
-        la) printf 'kernel-la-shell\n' ;;
+    case "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-shell}:$1" in
+        shell:rv) printf 'kernel-rv-shell\n' ;;
+        shell:la) printf 'kernel-la-shell\n' ;;
+        mm-performance:rv) printf 'kernel-rv-mm-performance\n' ;;
+        mm-performance:la) printf 'kernel-la-mm-performance\n' ;;
         *) return 2 ;;
     esac
 }
 
 nightly_kernel_path() {
-    case "$1" in
-        rv) printf '%s/.state/shell/kernel-rv\n' "$REPO_ROOT" ;;
-        la) printf '%s/.state/shell/kernel-la\n' "$REPO_ROOT" ;;
+    case "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-shell}:$1" in
+        shell:rv) printf '%s/.state/shell/kernel-rv\n' "$REPO_ROOT" ;;
+        shell:la) printf '%s/.state/shell/kernel-la\n' "$REPO_ROOT" ;;
+        mm-performance:rv)
+            printf '%s/.state/mm-performance-shell/kernel-rv\n' "$REPO_ROOT"
+            ;;
+        mm-performance:la)
+            printf '%s/.state/mm-performance-shell/kernel-la\n' "$REPO_ROOT"
+            ;;
         *) return 2 ;;
     esac
 }
@@ -198,11 +206,15 @@ nightly_prepare_guest_run() {
         printf 'schema_version\t1\n'
         printf 'arch\t%s\n' "$arch"
         printf 'requested_cpus\t%s\n' "${THEKERNEL_QEMU_CPUS:-1}"
+        printf 'kernel_profile\t%s\n' \
+            "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-shell}"
         printf 'kernel_path\t%s\n' "$staged_kernel"
         printf 'kernel_size_bytes\t%s\n' "$(stat -c %s "$staged_kernel")"
         printf 'kernel_sha256\t%s\n' "$kernel_sha"
         printf 'commands_path\t%s\n' "$staged_commands"
         printf 'commands_size_bytes\t%s\n' "$(stat -c %s "$staged_commands")"
+        printf 'commands_line_count\t%s\n' \
+            "$(awk 'END { print NR + 0 }' "$staged_commands")"
         printf 'commands_sha256\t%s\n' "$commands_sha"
         printf 'rootfs_source\t%s\n' "$rootfs"
         printf 'rootfs_size_bytes\t%s\n' "$(stat -c %s "$rootfs")"

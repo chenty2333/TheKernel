@@ -15,6 +15,17 @@ MM_PERF_VMAS=${THEKERNEL_MM_PERF_VMAS:-512}
 MM_PERF_PIN_ITERATIONS=${THEKERNEL_MM_PERF_PIN_ITERATIONS:-64}
 MM_PERF_HOST_CPUS=${THEKERNEL_MM_PERF_HOST_CPUS:-}
 MM_PERF_SETTLE_SECS=${THEKERNEL_MM_PERF_SETTLE_SECS:-5}
+MM_PERF_MEASUREMENT_MODE=${THEKERNEL_MM_PERF_MEASUREMENT_MODE:-product}
+
+MM_PERF_KERNEL_PROFILE=$(mm_perf_kernel_profile_for_mode "$MM_PERF_MEASUREMENT_MODE") \
+    || nightly_fail \
+        'THEKERNEL_MM_PERF_MEASUREMENT_MODE must be product or diagnostic'
+if [ -n "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-}" ] && \
+    [ "$THEKERNEL_NIGHTLY_KERNEL_PROFILE" != "$MM_PERF_KERNEL_PROFILE" ]; then
+    nightly_fail \
+        "THEKERNEL_NIGHTLY_KERNEL_PROFILE conflicts with MM measurement mode: mode=$MM_PERF_MEASUREMENT_MODE expected=$MM_PERF_KERNEL_PROFILE actual=$THEKERNEL_NIGHTLY_KERNEL_PROFILE"
+fi
+export THEKERNEL_NIGHTLY_KERNEL_PROFILE=$MM_PERF_KERNEL_PROFILE
 
 ci_require_positive_int mm_perf_iterations "$MM_PERF_ITERATIONS"
 ci_require_positive_int mm_perf_vmas "$MM_PERF_VMAS"
@@ -84,8 +95,10 @@ runner_contract_sha256=$(
                 scripts/ci/capture-mm-performance-host.py \
                 scripts/ci/compare-mm-performance.py \
                 scripts/ci/nightly/lib.sh \
+                scripts/ci/parse-mm-lock-diagnostics.py \
                 scripts/ci/parse-mm-performance.py \
                 scripts/ci/select-mm-performance-cpus.py \
+                scripts/ci/validate-qemu-receipt.py \
                 scripts/ci/nightly/mm-performance-regression-policy.json \
                 scripts/ci/nightly/mm-performance-stability-policy.json \
                 scripts/build-rootfs.sh \
@@ -100,6 +113,10 @@ runner_contract_sha256=$(
                 "$(sha256sum "$REPO_ROOT/$relative" | awk '{ print $1 }')"
         done
         printf 'setting\tmm_perf_settle_seconds=%s\n' "$MM_PERF_SETTLE_SECS"
+        printf 'setting\tmm_perf_measurement_mode=%s\n' "$MM_PERF_MEASUREMENT_MODE"
+        printf 'setting\tmm_perf_kernel_profile=%s\n' "$MM_PERF_KERNEL_PROFILE"
+        printf 'setting\tmm_perf_diagnostic_off_retries=%s\n' \
+            "$MM_PERF_DIAGNOSTIC_OFF_RETRIES"
     } | sha256sum | awk '{ print $1 }'
 )
 
@@ -185,6 +202,8 @@ manifest_columns=(
     thekernel_commit
     thekernel_ax_commit
     thekernel_linux_abi_commit
+    measurement_mode
+    kernel_profile
     arch
     requested_cpus
     online_cpus
@@ -207,9 +226,18 @@ manifest_columns=(
     metrics_artifact
     metrics_sha256
     metrics_size_bytes
+    mm_lock_diagnostics_artifact
+    mm_lock_diagnostics_sha256
+    mm_lock_diagnostics_size_bytes
     commands
     commands_sha256
     commands_size_bytes
+    guest_inputs
+    guest_inputs_sha256
+    guest_inputs_size_bytes
+    qemu_receipt
+    qemu_receipt_sha256
+    qemu_receipt_size_bytes
     qemu_log
     qemu_log_sha256
     qemu_log_size_bytes
@@ -231,7 +259,10 @@ while IFS= read -r arch; do
         artifact="$run_dir/mm-performance.tsv"
         kernel_relative="$run_name/kernel"
         metrics_relative="$run_name/mm-performance.tsv"
-        commands_relative="$run_name.commands"
+        diagnostics_artifact="$run_dir/mm-lock-diagnostics.tsv"
+        commands_relative="$run_name/commands"
+        guest_inputs_relative="$run_name/guest-inputs.tsv"
+        qemu_receipt_relative="$run_name/qemu-runner-receipt.json"
         qemu_log_relative="$run_name/qemu.log"
         host_pre_relative="$run_name/host-pre.tsv"
         host_post_relative="$run_name/host-post.tsv"
@@ -243,13 +274,11 @@ while IFS= read -r arch; do
             host_cpu_selection host_cpu_class <<<"$selection_row"
         [ "$selected_count" = "$cpus" ] \
             || nightly_fail "host CPU selection count drift for $run_name"
-        printf '%s %s %s %s %s %s %s %s %s; exit\n' \
-            /opt/thekernel-tests/bin/thekernel-mm-performance \
-            --iterations "$MM_PERF_ITERATIONS" \
-            --vmas "$MM_PERF_VMAS" \
-            --pin-iterations "$MM_PERF_PIN_ITERATIONS" \
-            --pin-workers "$cpus" \
-            >"$commands"
+        mm_perf_write_guest_commands \
+            "$MM_PERF_MEASUREMENT_MODE" "$commands" \
+            "$MM_PERF_ITERATIONS" "$MM_PERF_VMAS" \
+            "$MM_PERF_PIN_ITERATIONS" "$cpus" \
+            || nightly_fail "cannot materialize MM guest commands for $run_name"
 
         (
             taskset --pid --cpu-list "$host_cpu_set" "$BASHPID" >/dev/null \
@@ -259,6 +288,20 @@ while IFS= read -r arch; do
                 "$host_cpu_set" "$host_cpu_selection" "$host_cpu_class" \
                 "$MM_PERF_SETTLE_SECS"
         )
+        qemu_binary=$(nightly_qemu_binary "$arch") \
+            || nightly_fail "invalid QEMU architecture after run: $arch"
+        qemu=$(command -v "$qemu_binary") \
+            || nightly_fail "QEMU binary disappeared after run: $qemu_binary"
+        rootfs=$(nightly_rootfs_path "$arch") \
+            || nightly_fail "invalid rootfs architecture after run: $arch"
+        python3 "$CI_SCRIPT_DIR/validate-qemu-receipt.py" \
+            --receipt "$run_dir/qemu-runner-receipt.json" \
+            --arch "$arch" --cpus "$cpus" --kernel "$run_dir/kernel" \
+            --rootfs "$rootfs" --rootfs-mode snapshot \
+            --log "$run_dir/qemu.log" --qemu-binary "$qemu" \
+            --commands "$run_dir/commands" >/dev/null \
+            || nightly_fail \
+                "invalid QEMU command-stream receipt for $run_name"
         nightly_validate_guest_log \
             "$run_dir/qemu.log" clean \
             'MM_PERF_SEMANTICS status=ok' \
@@ -266,9 +309,41 @@ while IFS= read -r arch; do
         python3 "$CI_SCRIPT_DIR/parse-mm-performance.py" \
             "$run_dir/qemu.log" --arch "$arch" --cpus "$cpus" \
             --iterations "$MM_PERF_ITERATIONS" \
+            --vmas "$MM_PERF_VMAS" \
             --pin-iterations "$MM_PERF_PIN_ITERATIONS" \
             --pin-workers "$cpus" \
             --output "$artifact"
+
+        receipt_kernel_profile=$(mm_perf_receipt_value \
+            "$run_dir/guest-inputs.tsv" kernel_profile) \
+            || nightly_fail "missing prepared kernel profile for $run_name"
+        [ "$receipt_kernel_profile" = "$MM_PERF_KERNEL_PROFILE" ] \
+            || nightly_fail \
+                "prepared kernel profile drift for $run_name: expected=$MM_PERF_KERNEL_PROFILE actual=$receipt_kernel_profile"
+        case "$MM_PERF_MEASUREMENT_MODE" in
+            product)
+                if grep -Eq '^MM_LOCK_' "$run_dir/qemu.log"; then
+                    nightly_fail \
+                        "product MM run emitted lock diagnostics: $run_name"
+                fi
+                [ ! -e "$diagnostics_artifact" ] \
+                    || nightly_fail \
+                        "product MM run created a diagnostics artifact: $run_name"
+                diagnostics_relative=$MM_PERF_DIAGNOSTIC_SENTINEL
+                diagnostics_sha256=$MM_PERF_DIAGNOSTIC_SENTINEL
+                diagnostics_size_bytes=$MM_PERF_DIAGNOSTIC_SENTINEL
+                ;;
+            diagnostic)
+                diagnostics_relative="$run_name/mm-lock-diagnostics.tsv"
+                python3 "$CI_SCRIPT_DIR/parse-mm-lock-diagnostics.py" \
+                    "$run_dir/qemu.log" --output "$diagnostics_artifact"
+                [ -s "$diagnostics_artifact" ] \
+                    || nightly_fail \
+                        "diagnostic MM run produced an empty lock artifact: $run_name"
+                diagnostics_sha256=$(sha256sum "$diagnostics_artifact" | awk '{ print $1 }')
+                diagnostics_size_bytes=$(stat -c '%s' "$diagnostics_artifact")
+                ;;
+        esac
 
         if [ "$first_artifact" -eq 1 ]; then
             cp "$artifact" "$matrix"
@@ -277,10 +352,6 @@ while IFS= read -r arch; do
             tail -n +2 "$artifact" >>"$matrix"
         fi
 
-        qemu_binary=$(nightly_qemu_binary "$arch") \
-            || nightly_fail "invalid QEMU architecture after run: $arch"
-        qemu=$(command -v "$qemu_binary") \
-            || nightly_fail "QEMU binary disappeared after run: $qemu_binary"
         kernel_artifact="$run_dir/kernel"
         online_cpus=$(awk -F '\t' 'NR == 2 { print $3 }' "$artifact")
         [ "$online_cpus" = "$cpus" ] \
@@ -295,8 +366,14 @@ while IFS= read -r arch; do
         qemu_version=${qemu_version//$'\t'/ }
         metrics_sha256=$(sha256sum "$artifact" | awk '{ print $1 }')
         metrics_size_bytes=$(stat -c '%s' "$artifact")
-        commands_sha256=$(sha256sum "$commands" | awk '{ print $1 }')
-        commands_size_bytes=$(stat -c '%s' "$commands")
+        commands_sha256=$(sha256sum "$run_dir/commands" | awk '{ print $1 }')
+        commands_size_bytes=$(stat -c '%s' "$run_dir/commands")
+        guest_inputs_sha256=$(sha256sum "$run_dir/guest-inputs.tsv" | awk '{ print $1 }')
+        guest_inputs_size_bytes=$(stat -c '%s' "$run_dir/guest-inputs.tsv")
+        qemu_receipt_sha256=$(sha256sum \
+            "$run_dir/qemu-runner-receipt.json" | awk '{ print $1 }')
+        qemu_receipt_size_bytes=$(stat -c '%s' \
+            "$run_dir/qemu-runner-receipt.json")
         qemu_log_sha256=$(sha256sum "$run_dir/qemu.log" | awk '{ print $1 }')
         qemu_log_size_bytes=$(stat -c '%s' "$run_dir/qemu.log")
         host_pre_sha256=$(sha256sum "$run_dir/host-pre.tsv" | awk '{ print $1 }')
@@ -304,10 +381,12 @@ while IFS= read -r arch; do
         host_post_sha256=$(sha256sum "$run_dir/host-post.tsv" | awk '{ print $1 }')
         host_post_size_bytes=$(stat -c '%s' "$run_dir/host-post.tsv")
         manifest_row=(
-            thekernel-mm-performance-bundle-v3
+            thekernel-mm-performance-bundle-v8
             "$repo_commit"
             "$ax_commit"
             "$linux_abi_commit"
+            "$MM_PERF_MEASUREMENT_MODE"
+            "$MM_PERF_KERNEL_PROFILE"
             "$arch"
             "$cpus"
             "$online_cpus"
@@ -330,9 +409,18 @@ while IFS= read -r arch; do
             "$metrics_relative"
             "$metrics_sha256"
             "$metrics_size_bytes"
+            "$diagnostics_relative"
+            "$diagnostics_sha256"
+            "$diagnostics_size_bytes"
             "$commands_relative"
             "$commands_sha256"
             "$commands_size_bytes"
+            "$guest_inputs_relative"
+            "$guest_inputs_sha256"
+            "$guest_inputs_size_bytes"
+            "$qemu_receipt_relative"
+            "$qemu_receipt_sha256"
+            "$qemu_receipt_size_bytes"
             "$qemu_log_relative"
             "$qemu_log_sha256"
             "$qemu_log_size_bytes"
@@ -357,7 +445,7 @@ missing_count=$(
     || nightly_fail "MM performance evidence contains $missing_count missing metrics"
 metric_rows=$(awk 'END { print NR - 1 }' "$matrix")
 manifest_rows=$(awk 'END { print NR - 1 }' "$manifest")
-[ "$metric_rows" -eq $((run_count * 5)) ] \
+[ "$metric_rows" -eq $((run_count * 10)) ] \
     || nightly_fail "MM performance matrix row-count drift: $metric_rows"
 [ "$manifest_rows" -eq "$run_count" ] \
     || nightly_fail "MM performance manifest row-count drift: $manifest_rows"
@@ -374,5 +462,5 @@ for state in \
 done
 
 printf '%s\n' \
-    "nightly MM performance evidence: COMPLETE matrix=$matrix manifest=$manifest" \
+    "nightly MM performance evidence: COMPLETE mode=$MM_PERF_MEASUREMENT_MODE matrix=$matrix manifest=$manifest" \
     "explicit_missing=$missing_count host_cpu_matrix=$host_cpu_matrix"

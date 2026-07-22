@@ -99,6 +99,7 @@ python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
 python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_host.py"
+python3 "$REPO_ROOT/tests/ci/test_mm_performance_guest.py"
 python3 "$REPO_ROOT/tests/ci/test_rootfs_image_reproducibility.py"
 "$REPO_ROOT/tests/ci/test-mm-performance-boundary.sh"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
@@ -1132,23 +1133,81 @@ else
 fi
 grep -q $'^must-timeout\ttimeout\t124\t' "$CI_LOG_DIR/status.tsv"
 
-# A guest can close the serial pipe before the throttled producer finishes.
-# The runner must preserve the QEMU status and leave panic/missing-marker
-# classification to validate-boot-log.sh instead of surfacing SIGPIPE 141.
+# The boot wrapper binds the actual bytes accepted by the runner to the staged
+# command stream. SIGPIPE 141 is never an exact-evidence success, even if an
+# independently recorded relay happens to match the complete source.
 mkdir -p "$tmp/fake-bin" "$tmp/fake-work"
+real_python3=$(command -v python3)
 cat >"$tmp/fake-bin/python3" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = -m ] && [ "${2:-}" = tools.qemu_runner ] && \
+    [ "${3:-}" = finalize-input ]; then
+    exec "$REAL_PYTHON3" "$@"
+fi
 [ -z "${FAKE_QEMU_RUNNER_ARGS:-}" ] || printf '%s\n' "$@" >"$FAKE_QEMU_RUNNER_ARGS"
+receipt=
+previous=
+for argument in "$@"; do
+    if [ "$previous" = --receipt ]; then
+        receipt=$argument
+        break
+    fi
+    previous=$argument
+done
+[ -n "$receipt" ]
+forwarded=$(mktemp)
+trap 'rm -f "$forwarded"' EXIT
+source_eof=true
+relay_complete=true
+if [ "${FAKE_INPUT_MODE:-complete}" = truncate ]; then
+    IFS= read -r line || true
+    printf '%s\n' "${line:-}" >"$forwarded"
+    source_eof=false
+    relay_complete=false
+else
+    cat >"$forwarded"
+fi
+sha256=$(sha256sum "$forwarded" | awk '{ print $1 }')
+bytes=$(stat -c '%s' "$forwarded")
+lines=$(awk 'END { print NR + 0 }' "$forwarded")
+mkdir -p "$(dirname "$receipt")"
+"$REAL_PYTHON3" - "$receipt" "$sha256" "$bytes" "$lines" \
+    "$source_eof" "$relay_complete" <<'PY'
+import json
+import pathlib
+import sys
+
+receipt, digest, byte_count, line_count, source_eof, relay_complete = sys.argv[1:]
+payload = {
+    "schema_version": 2,
+    "state": "awaiting_producer",
+    "interaction": {"external_input_producer": True},
+    "stdin": {
+        "state": "awaiting_producer",
+        "sha256": digest,
+        "bytes": int(byte_count),
+        "line_count": int(line_count),
+        "observed_bytes": int(byte_count),
+        "source_eof": source_eof == "true",
+        "broken_pipe": False,
+        "relay_complete": relay_complete == "true",
+    },
+}
+pathlib.Path(receipt).write_text(json.dumps(payload), encoding="utf-8")
+PY
 exit "${FAKE_QEMU_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$tmp/fake-bin/python3"
 for _ in $(seq 1 20000); do
     printf 'echo serial-input-padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'
 done >"$tmp/commands"
-env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=0 \
+env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
+    FAKE_QEMU_RUNNER_STATUS=0 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0
-if env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=23 \
+if env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
+    FAKE_QEMU_RUNNER_STATUS=23 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0; then
     printf 'test-ci-scripts: QEMU runner failure was hidden by pipe handling\n' >&2
@@ -1161,8 +1220,23 @@ else
     }
 fi
 
+if env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
+    FAKE_QEMU_RUNNER_STATUS=0 FAKE_INPUT_MODE=truncate \
+    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$tmp/fake-work" "$tmp/commands" 1 1 0; then
+    printf 'test-ci-scripts: truncated stdin stream was accepted\n' >&2
+    exit 1
+else
+    status=$?
+    [ "$status" -eq 141 ] || {
+        printf 'test-ci-scripts: truncated stdin returned %s, expected 141\n' "$status" >&2
+        exit 1
+    }
+fi
+
 printf 'exit\n' >"$tmp/short-commands"
-env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=75 \
+env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
+    FAKE_QEMU_RUNNER_STATUS=75 \
     FAKE_QEMU_RUNNER_ARGS="$tmp/qemu-runner.args" \
     THEKERNEL_QEMU_CPUS=8 \
     "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \

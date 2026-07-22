@@ -32,14 +32,37 @@ The repository-owned adapters cover:
   window, stale access, incomplete CPU/case matrix, topology mismatch, or
   operational failure rejects the run;
 - `mm-performance.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs. It
-  records VMA-scale mapping latency, `mremap` latency, an `mprotect` plus touch
-  TLB-sensitive proxy, and regular-file direct-I/O pin latency, throughput, and
-  concurrent contention. Pin workers are bound to distinct guest CPUs and do
-  their warmup after binding; the pin metrics retain the requested sparse VMA
-  fixture for their complete measured phase. Every metric contains
-  count/p50/p99/p999; unavailable paths remain explicit `missing` records with
-  a reason and errno, and make the mandatory matrix fail instead of being
-  reported as a completed baseline.
+  records VMA-scale mapping latency, private-anonymous `mremap` resize latency,
+  fixed replacement while retaining the declared sparse VMA fixture,
+  two-CPU fixed `mremap` contention over disjoint slots in one address space,
+  regular-file `MAP_SHARED` `old_size == 0` duplication, shared-anonymous
+  grow/shrink, an `mprotect` plus touch TLB-sensitive proxy, and regular-file
+  direct-I/O latency, throughput, same-address-space contention, and
+  cross-address-space contention proxies. VMA-scale, both fixed-remap cases,
+  and all three direct-I/O proxy
+  records distinguish the requested fixture size from the live VMA count
+  verified through `/proc/self/maps`. The fixture uses
+  spaced `MAP_FIXED_NOREPLACE` slots; unsupported fixed placement or proc maps
+  is explicit missing evidence. The disjoint remap workers use four
+  non-overlapping slots, retain per-page sentinels, bind to distinct CPUs, and
+  publish execution windows that must overlap. The run record binds the system
+  page size, and the affinity record carries the ordered guest CPU IDs; the
+  parser requires every worker CPU to occur in that witness and checks that the
+  two-page remap slots are page-aligned. Direct-I/O workers are bound to
+  distinct guest CPUs and do their warmup after binding; the proxy metrics retain the
+  requested sparse VMA fixture for their complete measured phase. The
+  cross-address-space case verifies the fixture in the parent, then forks one
+  process per worker so the exact fixture is inherited into independent
+  address spaces. Each child creates its direct-I/O file and aligned buffer
+  after the fork, warms up before a pipe barrier, and publishes samples through
+  bounded shared anonymous storage. Raw worker records include distinct child
+  PIDs, a private COW-isolation witness, fixed CPU placement, and pre/post
+  fixture counts. Every metric
+  contains count/p50/p99/p999; unavailable paths remain explicit `missing`
+  records with a reason and errno, and make the mandatory matrix fail instead
+  of being reported as a completed baseline. A cleanup failure also invalidates
+  an otherwise successful metric, so leaked fixtures cannot silently influence
+  a later case.
 
 These gates deliberately do not overclaim. The OOM adapter does not substitute
 for a future kernel-allocator failpoint framework or OOM-victim policy test.
@@ -50,10 +73,17 @@ with volatile caches still require hardware-appropriate flush/fence testing.
 The MM adapter verifies that the guest actually brought the requested CPU count
 online and rejects a topology mismatch. Its protect-and-touch metric is a
 user-visible TLB-sensitive proxy, not a hardware TLB-shootdown event counter.
-Likewise, concurrent direct I/O is an end-to-end proxy that reaches the pin
-path; it does not isolate time spent in one particular spinlock. The standalone
+Likewise, concurrent direct I/O is an end-to-end proxy. A successful write does
+not by itself prove that the kernel selected its short-pin path; the opt-in lock
+diagnostic run separately proves whether all pin stages were exercised. The
+cross-address-space case can expose contention in globally shared state, but no
+proxy metric isolates time spent in one particular shard lock. The disjoint
+`mremap` case proves that two workload windows overlap and measures the current
+serialized path; it does not claim a lockless MM design or prove that every pair
+of syscalls overlapped.
+The standalone
 parser can still normalize an explicit `missing` record for diagnostic use,
-but the nightly adapter requires all five metrics to be present.
+but the nightly adapter requires all ten metrics to be present.
 
 The SMP TLB adapter is a semantic gate, not a hardware event counter. Its
 qualification must include a mutation run from a disposable build in which
@@ -83,6 +113,40 @@ sets the product variables to the same value and the guest record provides the
 third, runtime check. The rootfs is rematerialized through its content-addressed
 builder so the guest helper cannot silently predate the checked-out source.
 
+The default `THEKERNEL_MM_PERF_MEASUREMENT_MODE=product` uses the ordinary
+`shell` kernel profile. That profile does not compile the MM lock diagnostic
+feature, does not issue diagnostic control commands, and records
+`not-collected` for every diagnostic artifact manifest field. These are the
+only bundles accepted by the regression comparator.
+
+Lock attribution is a separate, opt-in diagnostic run:
+
+```sh
+THEKERNEL_MM_PERF_MEASUREMENT_MODE=diagnostic \
+  scripts/ci/nightly/mm-performance.sh
+```
+
+Diagnostic mode selects the `mm-performance` kernel profile. Its hashed guest
+command stream disables collection, resets it, enables it, runs the complete
+workload, disables it with a bounded drain retry, and only then reads
+`/proc/mm_lock_stats`. The parser requires matching header/end control state
+and publication sequence,
+`enabled=0`, `resetting=0`, `active_samples=0`, complete unsaturated histograms,
+nonzero samples in all six user-pin stages and physical publish/release, and at
+least one exercised `mremap` stage. It emits a separate hashed TSV artifact.
+Diagnostic counters can perturb the paths they measure, so diagnostic bundles
+are deliberately rejected as product regression evidence instead of being
+compared to product or to other diagnostic bundles.
+
+The diagnostic profile is for attribution and distribution shape only. Its
+`wait_ns` is lock acquisition latency, including fixed acquisition cost, not
+pure contention time. Physical-shard sample publication currently runs while
+the outer address-space guard is still held, so it can increase the reported
+`user_pin_collect_owners` hold time. The collection window also spans the whole
+helper, including semantic preflight, worker warmup, measured operations, and
+cleanup; stage counts therefore do not map one-to-one to measured samples.
+Only the runtime-off product profile is authoritative for performance values.
+
 Before the matrix starts, the adapter intersects the runner's allowed affinity
 with sysfs topology and groups CPUs by physical package and maximum frequency.
 It selects one group large enough for the largest matrix entry and uses nested
@@ -96,10 +160,18 @@ QEMU, so every child inherits the same host CPU set.
 `mm-performance.sh` refuses to label a dirty checkout as exact-HEAD evidence.
 Its manifest records the full TheKernel, `thekernel-ax`, and
 `thekernel-linux-abi` commits; workload parameters; guest online topology;
+measurement mode and the derived kernel profile;
 kernel and rootfs SHA-256; QEMU version and binary SHA-256; a runner and runner
 contract fingerprint; the host CPU set, selection method, and class; and the
-immutable per-run kernel, command, metrics, log, and pre/post host-diagnostic
-artifacts. Host diagnostics are bounded to 64 KiB and contain only selected CPU
+immutable per-run kernel, command, guest-input, QEMU-runner, metrics, log, and
+pre/post host-diagnostic artifacts. The QEMU runner hashes and counts only bytes
+successfully relayed into its stdin pipe, distinguishes producer EOF from a
+broken pipe, and leaves the receipt awaiting the wrapper's real producer status.
+The wrapper atomically finalizes that receipt only after the pipeline exits;
+exact evidence requires a normal producer exit and an exact SHA-256, byte, and
+line-count match with the unchanged staged command artifact. This proves relay
+into the QEMU stdin pipe, while guest semantic and completion markers prove
+execution. Host diagnostics are bounded to 64 KiB and contain only selected CPU
 topology/frequency, load, CPU pressure, and cgroup CPU accounting; process names,
 command lines, hostnames, and user identifiers are not captured. It rechecks
 all three clean HEADs after the matrix. The guest
@@ -107,14 +179,25 @@ also completes fixed-destination replacement, shared `old_size == 0`
 alias/coherence, and grow/shrink prefix-integrity checks before emitting the
 semantic-pass marker.
 
-The MM output is a `thekernel-mm-performance-bundle-v3` directory. Manifest
+The MM output is a `thekernel-mm-performance-bundle-v8` directory. Manifest
 artifact paths are normalized POSIX paths relative to the bundle root; every
 referenced artifact carries a SHA-256 and byte size. The comparator rejects
 absolute paths, `..`, symlink escapes, missing files, and digest or size drift.
-The top-level metric matrix must also equal the union of the hashed per-run
-metric files. Copy the complete directory, not individual files. Old v1
-manifests containing `/workspace/...` paths and single-sample v2 bundles are
-intentionally rejected rather than guessed into a new provenance claim.
+It reruns the versioned performance parser on every raw QEMU log and requires
+the result to be structurally identical to the per-run metric artifact. In
+diagnostic mode it also requires the lock parser's canonical output to match the
+diagnostic artifact byte for byte; a product log containing any `MM_LOCK_`
+record is invalid. The top-level metric matrix must also equal the union of the
+hashed per-run metric files. These checks establish bundle-internal derivation,
+not external authorship; publication that requires adversarial provenance still
+needs an external signature or trusted transparency record. Copy the complete
+directory, not individual files. Old v1
+manifests containing `/workspace/...` paths, single-sample v2 bundles, v3
+bundles without the three path-specific `mremap` metrics, and v4 bundles without
+an explicit measurement boundary are intentionally rejected. V5 bundles lack
+the independent-address-space pin workload, and v6 bundles do not bind the
+guest-input and QEMU command-stream receipts. Older evidence is rejected rather
+than guessed into a new provenance claim.
 
 One adapter invocation captures one bundle and never labels a single sample as
 a regression result. Capture adjacent, counterbalanced baseline/candidate pairs
@@ -130,6 +213,11 @@ scripts/ci/compare-mm-performance.py \
   --stability-policy scripts/ci/nightly/mm-performance-stability-policy.json \
   --output /evidence/mm-regression.tsv
 ```
+
+By default, every input bundle must contain exactly the release matrix
+`rv4`, `rv8`, `la4`, and `la8`. `--allow-partial` accepts only a nonempty
+subset for local triage, prints `PARTIAL`, and records `release_gate=false`;
+its result is not publication evidence.
 
 Qualify a runner and workload revision first with a counterbalanced null series
 whose baseline and candidate sides use the same exact TheKernel commit. A null
@@ -156,7 +244,7 @@ disjoint. Equal interval boundaries are rejected, so copied or concurrently
 captured inputs cannot count as independent counterbalanced pairs.
 
 The repository regression policy gates every metric's median P99 at no more
-than 20 percent latency regression and requires both pin metrics to retain at
+than 20 percent latency regression and requires all three direct-I/O proxy metrics to retain at
 least 90 percent of baseline throughput. A custom policy may be stricter, but
 the validator rejects any policy that weakens either limit. The independent
 stability policy rejects a gated statistic when its maximum paired ratio is
@@ -166,7 +254,7 @@ regression.
 
 Every P999 value is compared and reported as `REPORT_ONLY`, which is not a pass
 and cannot be enabled as a hard gate by policy. A single run currently gives
-only 64 pin samples and at most 512 samples for the other default metric shapes; its P999
+only 64 direct-I/O samples and at most 512 samples for the other default metric shapes; its P999
 is too close to a maximum sample to serve as a stable hard gate under QEMU.
 Future hard P999 gating requires a new evidence and policy schema after enough
 paired samples justify it.

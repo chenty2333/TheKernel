@@ -7,9 +7,11 @@ import argparse
 import csv
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -22,13 +24,29 @@ from mm_performance_schema import (
     BUNDLE_SCHEMA,
     EXPECTED_METRICS,
     HOST_DIAGNOSTIC_SCHEMA,
+    KERNEL_PROFILE_BY_MODE,
     MANIFEST_COLUMNS,
+    MEASUREMENT_MODES,
     METRIC_COLUMNS,
+    MM_LOCK_DIAGNOSTIC_SENTINEL,
     PIN_METRICS,
     POLICY_SCHEMA,
     REPORT_COLUMNS,
     STABILITY_POLICY_SCHEMA,
+    VMA_FIXTURE_METRICS,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.qemu_runner.receipt import (  # noqa: E402
+    ReceiptError,
+    command_stream_evidence,
+    validate_completed_input_receipt,
+    validate_receipt_file_evidence,
+)
+from tools.qemu_runner.command import build_qemu_command  # noqa: E402
+from tools.qemu_runner.model import Drive  # noqa: E402
 
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -40,6 +58,10 @@ RFC3339_UTC_RE = re.compile(
 )
 HOST_DIAGNOSTIC_MAX_BYTES = 64 * 1024
 MAX_PAIR_RATIO_SPREAD_PERCENT = 20
+PARSER_DIR = Path(__file__).resolve().parent
+REQUIRED_RELEASE_RUN_KEYS = frozenset(
+    {("rv", 4), ("rv", 8), ("la", 4), ("la", 8)}
+)
 
 
 class EvidenceError(ValueError):
@@ -65,6 +87,8 @@ class MetricRecord:
     p99_ns: int
     p999_ns: int
     throughput_bytes_per_sec: int | None
+    requested_vmas: int | None
+    fixture_vmas: int | None
 
     @property
     def key(self) -> tuple[str, int, str]:
@@ -136,34 +160,78 @@ def parse_positive_int(text: str, field: str, context: str) -> int:
     return value
 
 
+def read_tsv_source(
+    source: Any, expected_columns: tuple[str, ...], context: str
+) -> list[dict[str, str]]:
+    reader = csv.reader(source, delimiter="\t", strict=True)
+    try:
+        header = tuple(next(reader))
+    except StopIteration as error:
+        raise EvidenceError(f"{context} is empty") from error
+    if header != expected_columns:
+        raise EvidenceError(
+            f"{context} header mismatch: expected={expected_columns!r} "
+            f"actual={header!r}"
+        )
+    rows: list[dict[str, str]] = []
+    for line_number, cells in enumerate(reader, start=2):
+        if len(cells) != len(expected_columns):
+            raise EvidenceError(
+                f"{context} row {line_number} has {len(cells)} fields; "
+                f"expected {len(expected_columns)}"
+            )
+        rows.append(dict(zip(expected_columns, cells, strict=True)))
+    if not rows:
+        raise EvidenceError(f"{context} has no data rows")
+    return rows
+
+
 def read_tsv(
     path: Path, expected_columns: tuple[str, ...], context: str
 ) -> list[dict[str, str]]:
     try:
         with path.open("r", encoding="utf-8", newline="") as source:
-            reader = csv.reader(source, delimiter="\t", strict=True)
-            try:
-                header = tuple(next(reader))
-            except StopIteration as error:
-                raise EvidenceError(f"{context} is empty: {path}") from error
-            if header != expected_columns:
-                raise EvidenceError(
-                    f"{context} header mismatch: expected={expected_columns!r} "
-                    f"actual={header!r}"
-                )
-            rows: list[dict[str, str]] = []
-            for line_number, cells in enumerate(reader, start=2):
-                if len(cells) != len(expected_columns):
-                    raise EvidenceError(
-                        f"{context} row {line_number} has {len(cells)} fields; "
-                        f"expected {len(expected_columns)}"
-                    )
-                rows.append(dict(zip(expected_columns, cells, strict=True)))
+            return read_tsv_source(source, expected_columns, context)
     except (OSError, csv.Error) as error:
         raise EvidenceError(f"cannot read {context} {path}: {error}") from error
-    if not rows:
-        raise EvidenceError(f"{context} has no data rows: {path}")
-    return rows
+
+
+def read_tsv_bytes(
+    payload: bytes, expected_columns: tuple[str, ...], context: str
+) -> list[dict[str, str]]:
+    try:
+        source = io.StringIO(payload.decode("utf-8"), newline="")
+        return read_tsv_source(source, expected_columns, context)
+    except (UnicodeDecodeError, csv.Error) as error:
+        raise EvidenceError(f"cannot read {context}: {error}") from error
+
+
+def run_evidence_parser(
+    script_name: str, arguments: list[str], context: str
+) -> bytes:
+    script = PARSER_DIR / script_name
+    if not script.is_file():
+        raise EvidenceError(f"{context} parser is missing: {script}")
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), *arguments],
+            cwd=PARSER_DIR,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise EvidenceError(f"cannot run {context} parser: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise EvidenceError(
+            f"{context} parser rejected the raw QEMU log: {detail or 'no diagnostic'}"
+        )
+    return completed.stdout
+
+
+def canonical_metric_rows(rows: list[dict[str, str]]) -> list[tuple[str, ...]]:
+    return sorted(tuple(row[column] for column in METRIC_COLUMNS) for row in rows)
 
 
 def safe_bundle_file(root: Path, relative: str, field: str) -> Path:
@@ -351,6 +419,150 @@ def validate_host_diagnostics(
     )
 
 
+def read_guest_inputs(path: Path, context: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as source:
+            reader = csv.reader(source, delimiter="\t", strict=True)
+            for line_number, cells in enumerate(reader, start=1):
+                if len(cells) != 2 or not cells[0] or not cells[1]:
+                    raise EvidenceError(
+                        f"{context} guest input receipt row {line_number} is invalid"
+                    )
+                key, value = cells
+                if key in values:
+                    raise EvidenceError(
+                        f"{context} guest input receipt duplicates {key!r}"
+                    )
+                values[key] = value
+    except (OSError, csv.Error) as error:
+        raise EvidenceError(f"cannot read {context} guest input receipt: {error}") from error
+    return values
+
+
+def validate_input_receipts(
+    *,
+    row: dict[str, str],
+    context: str,
+    commands_path: Path,
+    guest_inputs_path: Path,
+    qemu_receipt_path: Path,
+) -> None:
+    commands = command_stream_evidence(commands_path)
+    guest = read_guest_inputs(guest_inputs_path, context)
+    expected_guest = {
+        "schema_version": "1",
+        "arch": row["arch"],
+        "requested_cpus": row["requested_cpus"],
+        "kernel_profile": row["kernel_profile"],
+        "kernel_size_bytes": row["kernel_size_bytes"],
+        "kernel_sha256": row["kernel_sha256"],
+        "commands_size_bytes": str(commands["bytes"]),
+        "commands_line_count": str(commands["line_count"]),
+        "commands_sha256": str(commands["sha256"]),
+        "rootfs_sha256": row["rootfs_sha256"],
+        "qemu_sha256": row["qemu_sha256"],
+        "qemu_version": row["qemu_version"],
+    }
+    for key, expected in expected_guest.items():
+        actual = guest.get(key)
+        if actual != expected:
+            raise EvidenceError(
+                f"{context} guest input receipt {key} mismatch: "
+                f"expected={expected!r} actual={actual!r}"
+            )
+    qemu_binary = guest.get("qemu_binary")
+    if not qemu_binary or Path(qemu_binary).name != row["qemu_binary"]:
+        raise EvidenceError(f"{context} guest input receipt qemu_binary mismatch")
+
+    try:
+        with qemu_receipt_path.open(encoding="utf-8") as source:
+            loaded: Any = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"cannot read {context} QEMU receipt: {error}") from error
+    if not isinstance(loaded, dict):
+        raise EvidenceError(f"{context} QEMU receipt must be a JSON object")
+    receipt: dict[str, Any] = loaded
+    try:
+        validate_completed_input_receipt(receipt, commands_path)
+    except ReceiptError as error:
+        raise EvidenceError(f"{context} QEMU stdin receipt is invalid: {error}") from error
+    try:
+        evidence_records = validate_receipt_file_evidence(receipt)
+    except ReceiptError as error:
+        raise EvidenceError(f"{context} QEMU receipt is invalid: {error}") from error
+
+    expected_scalars: dict[str, Any] = {
+        "arch": row["arch"],
+        "cpus": int(row["requested_cpus"], 10),
+        "memory": "1G",
+        "rootfs_mode": "snapshot",
+        "returncode": 0,
+        "error_message": None,
+        "timed_out": False,
+        "interrupted": False,
+        "intentionally_stopped": False,
+    }
+    for key, expected in expected_scalars.items():
+        if receipt.get(key) != expected:
+            raise EvidenceError(
+                f"{context} QEMU receipt {key} mismatch: "
+                f"expected={expected!r} actual={receipt.get(key)!r}"
+            )
+    expected_interaction = {
+        "interactive": True,
+        "input_after_marker": "THEKERNEL_SHELL_READY",
+        "stop_after_marker": None,
+        "external_input_producer": True,
+    }
+    if receipt.get("interaction") != expected_interaction:
+        raise EvidenceError(f"{context} QEMU receipt interaction contract mismatch")
+    for key in (
+        "extra_block_source",
+        "extra_block_runtime_before",
+        "extra_block_runtime_after",
+    ):
+        if key in receipt:
+            raise EvidenceError(f"{context} QEMU receipt unexpectedly contains {key}")
+
+    expected_evidence = {
+        "kernel": (row["kernel_sha256"], int(row["kernel_size_bytes"], 10)),
+        "rootfs_source": (row["rootfs_sha256"], None),
+        "qemu": (row["qemu_sha256"], None),
+        "log": (row["qemu_log_sha256"], int(row["qemu_log_size_bytes"], 10)),
+    }
+    for key, (expected_sha256, expected_size) in expected_evidence.items():
+        evidence = evidence_records[key]
+        if evidence.get("sha256") != expected_sha256:
+            raise EvidenceError(f"{context} QEMU receipt {key} SHA-256 mismatch")
+        if expected_size is not None and evidence.get("size_bytes") != expected_size:
+            raise EvidenceError(f"{context} QEMU receipt {key} size mismatch")
+
+    rootfs_source = evidence_records["rootfs_source"]
+    for key in ("rootfs_runtime_before", "rootfs_runtime_after"):
+        runtime = evidence_records[key]
+        if runtime.get("sha256") != rootfs_source.get("sha256") or runtime.get(
+            "size_bytes"
+        ) != rootfs_source.get("size_bytes"):
+            raise EvidenceError(f"{context} QEMU receipt {key} differs from rootfs source")
+    runtime_evidence = evidence_records["rootfs_runtime_before"]
+    kernel_evidence = evidence_records["kernel"]
+    qemu_evidence = evidence_records["qemu"]
+    expected_command = list(
+        build_qemu_command(
+            arch=row["arch"],
+            kernel=Path(kernel_evidence["path"]),
+            rootfs=Drive(Path(runtime_evidence["path"]), "snapshot"),
+            extra_block=None,
+            memory="1G",
+            cpus=int(row["requested_cpus"], 10),
+            qemu_binary=qemu_evidence["path"],
+        )
+    )
+    if receipt.get("command") != expected_command:
+        raise EvidenceError(f"{context} QEMU receipt command does not match its inputs")
+
+
 def validate_manifest_row(
     root: Path, row: dict[str, str], line_number: int
 ) -> tuple[ManifestRecord, Path]:
@@ -367,6 +579,17 @@ def validate_manifest_row(
     ):
         if not HEX40_RE.fullmatch(row[field]):
             raise EvidenceError(f"{context} has invalid {field}: {row[field]!r}")
+    measurement_mode = row["measurement_mode"]
+    if measurement_mode not in MEASUREMENT_MODES:
+        raise EvidenceError(
+            f"{context} has invalid measurement_mode: {measurement_mode!r}"
+        )
+    expected_kernel_profile = KERNEL_PROFILE_BY_MODE[measurement_mode]
+    if row["kernel_profile"] != expected_kernel_profile:
+        raise EvidenceError(
+            f"{context} kernel_profile does not match measurement_mode: "
+            f"expected={expected_kernel_profile!r} actual={row['kernel_profile']!r}"
+        )
     arch = row["arch"]
     if arch not in {"rv", "la"}:
         raise EvidenceError(f"{context} has invalid arch: {arch!r}")
@@ -384,7 +607,7 @@ def validate_manifest_row(
     )
     pin_workers = parse_positive_int(row["pin_workers"], "pin_workers", context)
     if iterations > 100000 or live_vmas > 16384 or pin_iterations > 10000:
-        raise EvidenceError(f"{context} workload exceeds the bundle-v3 limits")
+        raise EvidenceError(f"{context} workload exceeds the bundle-v8 limits")
     if pin_workers != requested_cpus:
         raise EvidenceError(
             f"{context} pin worker topology mismatch: "
@@ -459,6 +682,27 @@ def validate_manifest_row(
         "metrics_size_bytes",
         context,
     )
+    diagnostics_path: Path | None = None
+    if measurement_mode == "product":
+        for field in (
+            "mm_lock_diagnostics_artifact",
+            "mm_lock_diagnostics_sha256",
+            "mm_lock_diagnostics_size_bytes",
+        ):
+            if row[field] != MM_LOCK_DIAGNOSTIC_SENTINEL:
+                raise EvidenceError(
+                    f"{context} product evidence must use "
+                    f"{field}={MM_LOCK_DIAGNOSTIC_SENTINEL!r}"
+                )
+    else:
+        diagnostics_path = validate_artifact(
+            root,
+            row,
+            "mm_lock_diagnostics_artifact",
+            "mm_lock_diagnostics_sha256",
+            "mm_lock_diagnostics_size_bytes",
+            context,
+        )
     commands_path = validate_artifact(
         root,
         row,
@@ -467,7 +711,23 @@ def validate_manifest_row(
         "commands_size_bytes",
         context,
     )
-    validate_artifact(
+    guest_inputs_path = validate_artifact(
+        root,
+        row,
+        "guest_inputs",
+        "guest_inputs_sha256",
+        "guest_inputs_size_bytes",
+        context,
+    )
+    qemu_receipt_path = validate_artifact(
+        root,
+        row,
+        "qemu_receipt",
+        "qemu_receipt_sha256",
+        "qemu_receipt_size_bytes",
+        context,
+    )
+    qemu_log_path = validate_artifact(
         root,
         row,
         "qemu_log",
@@ -475,6 +735,75 @@ def validate_manifest_row(
         "qemu_log_size_bytes",
         context,
     )
+    validate_input_receipts(
+        row=row,
+        context=context,
+        commands_path=commands_path,
+        guest_inputs_path=guest_inputs_path,
+        qemu_receipt_path=qemu_receipt_path,
+    )
+    try:
+        qemu_log = qemu_log_path.read_bytes()
+    except OSError as error:
+        raise EvidenceError(f"cannot read {context} raw QEMU log: {error}") from error
+    if measurement_mode == "product" and any(
+        line.startswith(b"MM_LOCK_") for line in qemu_log.splitlines()
+    ):
+        raise EvidenceError(f"{context} product raw QEMU log contains MM lock diagnostics")
+
+    derived_metrics = run_evidence_parser(
+        "parse-mm-performance.py",
+        [
+            str(qemu_log_path),
+            "--arch",
+            arch,
+            "--cpus",
+            str(requested_cpus),
+            "--iterations",
+            row["iterations"],
+            "--vmas",
+            row["live_vmas"],
+            "--pin-iterations",
+            row["pin_iterations"],
+            "--pin-workers",
+            row["pin_workers"],
+        ],
+        f"{context} MM performance",
+    )
+    derived_metric_rows = read_tsv_bytes(
+        derived_metrics,
+        METRIC_COLUMNS,
+        f"{context} metrics derived from raw QEMU log",
+    )
+    artifact_metric_rows = read_tsv(
+        metrics_path,
+        METRIC_COLUMNS,
+        f"{context} metrics artifact",
+    )
+    if canonical_metric_rows(derived_metric_rows) != canonical_metric_rows(
+        artifact_metric_rows
+    ):
+        raise EvidenceError(
+            f"{context} metrics artifact does not match the raw QEMU log"
+        )
+
+    if diagnostics_path is not None:
+        derived_diagnostics = run_evidence_parser(
+            "parse-mm-lock-diagnostics.py",
+            [str(qemu_log_path)],
+            f"{context} MM lock diagnostics",
+        )
+        try:
+            artifact_diagnostics = diagnostics_path.read_bytes()
+        except OSError as error:
+            raise EvidenceError(
+                f"cannot read {context} MM lock diagnostics artifact: {error}"
+            ) from error
+        if artifact_diagnostics != derived_diagnostics:
+            raise EvidenceError(
+                f"{context} MM lock diagnostics artifact does not match "
+                "the raw QEMU log"
+            )
     capture_start = validate_host_diagnostics(root, row, "pre", context)
     capture_end = validate_host_diagnostics(root, row, "post", context)
     if capture_start >= capture_end:
@@ -482,12 +811,30 @@ def validate_manifest_row(
             f"{context} has a reversed or empty capture interval: "
             f"pre={capture_start.isoformat()} post={capture_end.isoformat()}"
         )
-    expected_command = (
+    workload_command = (
         "/opt/thekernel-tests/bin/thekernel-mm-performance "
         f"--iterations {row['iterations']} --vmas {row['live_vmas']} "
         f"--pin-iterations {row['pin_iterations']} "
-        f"--pin-workers {row['pin_workers']}; exit\n"
+        f"--pin-workers {row['pin_workers']}"
     )
+    if measurement_mode == "product":
+        expected_command = workload_command + " || exit 1\nexit\n"
+    else:
+        expected_command = "\n".join(
+            (
+                "echo mm_lock_stats=off > /proc/io_test_control || exit 1",
+                "echo mm_lock_stats=reset > /proc/io_test_control || exit 1",
+                "echo mm_lock_stats=on > /proc/io_test_control || exit 1",
+                workload_command + " || exit 1",
+                "mm_lock_off_attempt=0; until echo mm_lock_stats=off > "
+                "/proc/io_test_control; do mm_lock_off_attempt="
+                "$((mm_lock_off_attempt + 1)); "
+                '[ "$mm_lock_off_attempt" -lt 64 ] || exit 1; done',
+                "cat /proc/mm_lock_stats || exit 1",
+                "exit",
+                "",
+            )
+        )
     try:
         command_text = commands_path.read_text(encoding="utf-8")
     except OSError as error:
@@ -510,9 +857,14 @@ def expected_metric_count(manifest: ManifestRecord, metric: str) -> int:
     return {
         "vma_scale": iterations,
         "mremap_latency": iterations * 2,
+        "mremap_fixed_replace_latency": iterations,
+        "mremap_disjoint_same_as_contention": iterations * 2,
+        "mremap_file_duplicate_latency": iterations,
+        "mremap_shared_anon_resize_latency": iterations * 2,
         "protect_touch_latency": iterations,
-        "pin_throughput": pin_iterations,
-        "pin_contention": pin_iterations * pin_workers,
+        "direct_io_pin_proxy_throughput": pin_iterations,
+        "direct_io_pin_proxy_same_as_contention": pin_iterations * pin_workers,
+        "direct_io_pin_proxy_cross_as_contention": pin_iterations * pin_workers,
     }[metric]
 
 
@@ -563,6 +915,33 @@ def parse_metric_row(
                 f"{context} metric={metric} must use '-' for throughput"
             )
         throughput = None
+    requested_vmas: int | None
+    fixture_vmas: int | None
+    if metric in VMA_FIXTURE_METRICS:
+        requested_vmas = parse_positive_int(
+            row["requested_vmas"], "requested_vmas", context
+        )
+        fixture_vmas = parse_positive_int(
+            row["fixture_vmas"], "fixture_vmas", context
+        )
+        manifest_vmas = int(manifest.values["live_vmas"], 10)
+        if requested_vmas != manifest_vmas:
+            raise EvidenceError(
+                f"{context} metric={metric} requested_vmas mismatch: "
+                f"manifest={manifest_vmas} actual={requested_vmas}"
+            )
+        if fixture_vmas != requested_vmas:
+            raise EvidenceError(
+                f"{context} metric={metric} fixture_vmas mismatch: "
+                f"requested={requested_vmas} verified={fixture_vmas}"
+            )
+    else:
+        requested_vmas = None
+        if row["requested_vmas"] != "-" or row["fixture_vmas"] != "-":
+            raise EvidenceError(
+                f"{context} metric={metric} must use '-' for VMA fixture fields"
+            )
+        fixture_vmas = None
     if row["reason"] != "-" or row["errno"] != "-":
         raise EvidenceError(f"{context} metric={metric} ok row has reason or errno")
     return MetricRecord(
@@ -575,6 +954,8 @@ def parse_metric_row(
         p99,
         p999,
         throughput,
+        requested_vmas,
+        fixture_vmas,
     )
 
 
@@ -600,7 +981,7 @@ def parse_run_metrics(path: Path, manifest: ManifestRecord) -> dict[str, MetricR
     return metrics
 
 
-def load_bundle(path: Path) -> Bundle:
+def load_bundle(path: Path, *, allow_partial: bool = False) -> Bundle:
     try:
         root = path.expanduser().resolve(strict=True)
     except OSError as error:
@@ -623,6 +1004,20 @@ def load_bundle(path: Path) -> Bundle:
                 raise EvidenceError(f"bundle has duplicate metric key: {metric.key!r}")
             metrics[metric.key] = metric
 
+    run_keys = set(manifest)
+    if allow_partial:
+        if not run_keys or not run_keys.issubset(REQUIRED_RELEASE_RUN_KEYS):
+            raise EvidenceError(
+                "partial bundle run-key set must be a nonempty subset of "
+                f"{sorted(REQUIRED_RELEASE_RUN_KEYS)!r}: actual={sorted(run_keys)!r}"
+            )
+    elif run_keys != REQUIRED_RELEASE_RUN_KEYS:
+        raise EvidenceError(
+            "release bundle run-key set mismatch: "
+            f"expected={sorted(REQUIRED_RELEASE_RUN_KEYS)!r} "
+            f"actual={sorted(run_keys)!r}; use --allow-partial only for triage"
+        )
+
     capture_records = list(manifest.values())
     for previous, current in zip(capture_records, capture_records[1:]):
         if previous.capture_end >= current.capture_start:
@@ -637,6 +1032,8 @@ def load_bundle(path: Path) -> Bundle:
         "thekernel_commit",
         "thekernel_ax_commit",
         "thekernel_linux_abi_commit",
+        "measurement_mode",
+        "kernel_profile",
         "iterations",
         "live_vmas",
         "pin_iterations",
@@ -726,6 +1123,22 @@ def load_bundle(path: Path) -> Bundle:
         capture_records[0].capture_start,
         capture_records[-1].capture_end,
     )
+
+
+def require_product_regression_evidence(
+    label: str, bundles: list[Bundle]
+) -> None:
+    for index, bundle in enumerate(bundles, start=1):
+        modes = {
+            record.values["measurement_mode"]
+            for record in bundle.manifest.values()
+        }
+        if modes != {"product"}:
+            actual = ",".join(sorted(modes))
+            raise EvidenceError(
+                f"{label} bundle {index} measurement_mode={actual!r} "
+                "is not product regression evidence"
+            )
 
 
 def policy_percent(value: Any, field: str, metric: str, *, nullable: bool) -> int | None:
@@ -883,6 +1296,8 @@ def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
         )
     comparable_fields = (
         "bundle_schema",
+        "measurement_mode",
+        "kernel_profile",
         "thekernel_ax_commit",
         "thekernel_linux_abi_commit",
         "arch",
@@ -1192,7 +1607,9 @@ def compare_series(
     return rows
 
 
-def write_report(path: Path, rows: Iterable[ReportRow]) -> None:
+def write_report(
+    path: Path, rows: Iterable[ReportRow], *, release_gate: bool
+) -> None:
     destination = path.expanduser().resolve()
     parent = destination.parent
     if not parent.is_dir():
@@ -1208,6 +1625,8 @@ def write_report(path: Path, rows: Iterable[ReportRow]) -> None:
             for row in rows:
                 writer.writerow(
                     (
+                        "release" if release_gate else "partial_triage",
+                        "true" if release_gate else "false",
                         row.arch,
                         row.requested_cpus,
                         row.metric,
@@ -1244,21 +1663,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--stability-policy", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="accept a nonempty subset of the release matrix for triage only",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        baselines = [load_bundle(path) for path in args.baseline]
-        candidates = [load_bundle(path) for path in args.candidate]
+        baselines = [
+            load_bundle(path, allow_partial=args.allow_partial)
+            for path in args.baseline
+        ]
+        candidates = [
+            load_bundle(path, allow_partial=args.allow_partial)
+            for path in args.candidate
+        ]
+        require_product_regression_evidence("baseline", baselines)
+        require_product_regression_evidence("candidate", candidates)
         output = validate_output_destination(
             args.output, (*baselines, *candidates)
         )
         policy = load_policy(args.policy)
         stability = load_stability_policy(args.stability_policy)
         rows = compare_series(baselines, candidates, policy, stability)
-        write_report(output, rows)
+        write_report(output, rows, release_gate=not args.allow_partial)
     except EvidenceError as error:
         print(f"compare-mm-performance: INVALID: {error}", file=sys.stderr)
         return 2
@@ -1266,10 +1698,13 @@ def main(argv: list[str] | None = None) -> int:
     report_only = sum(row.result == "REPORT_ONLY" for row in rows)
     print(
         "compare-mm-performance: "
+        f"{'PARTIAL ' if args.allow_partial else ''}"
         f"{'REGRESSION' if failures else 'PASS'} "
         f"pairs={len(args.baseline)} "
         f"gates={len(rows) - report_only} failures={failures} "
-        f"report_only={report_only} report={args.output}"
+        f"report_only={report_only} "
+        f"release_gate={'false' if args.allow_partial else 'true'} "
+        f"report={args.output}"
     )
     return 1 if failures else 0
 

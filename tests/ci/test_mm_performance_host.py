@@ -141,14 +141,18 @@ class HostDiagnosticTests(unittest.TestCase):
 
 
 class RunnerContractTests(unittest.TestCase):
-    def test_shell_manifest_header_tracks_v3_schema(self) -> None:
+    def test_shell_manifest_header_tracks_v7_schema(self) -> None:
         source = (CI_DIR / "nightly" / "mm-performance.sh").read_text(
             encoding="utf-8"
         )
         block = source.split("manifest_columns=(", 1)[1].split("\n)", 1)[0]
         columns = tuple(line.strip() for line in block.splitlines() if line.strip())
         self.assertEqual(columns, schema.MANIFEST_COLUMNS)
-        self.assertIn("thekernel-mm-performance-bundle-v3", source)
+        self.assertIn("thekernel-mm-performance-bundle-v8", source)
+        self.assertIn(
+            f"$((run_count * {len(schema.EXPECTED_METRICS)}))",
+            source,
+        )
 
     def test_runner_hash_covers_affinity_diagnostics_and_pairing_contract(self) -> None:
         source = (CI_DIR / "nightly" / "mm-performance.sh").read_text(
@@ -160,6 +164,7 @@ class RunnerContractTests(unittest.TestCase):
             "scripts/ci/select-mm-performance-cpus.py",
             "scripts/ci/compare-mm-performance.py",
             "scripts/ci/nightly/mm-performance-boundary.sh",
+            "scripts/ci/parse-mm-lock-diagnostics.py",
             "scripts/ci/nightly/mm-performance-regression-policy.json",
             "scripts/ci/nightly/mm-performance-stability-policy.json",
             "scripts/create-rootfs-image.sh",
@@ -167,6 +172,9 @@ class RunnerContractTests(unittest.TestCase):
             self.assertIn(relative, source)
         self.assertIn("mm_perf_settle_seconds=%s", source)
         self.assertIn('"$MM_PERF_SETTLE_SECS"', source)
+        self.assertIn("mm_perf_measurement_mode=%s", source)
+        self.assertIn("mm_perf_kernel_profile=%s", source)
+        self.assertIn("mm_perf_diagnostic_off_retries=%s", source)
 
 
 if __name__ == "__main__":

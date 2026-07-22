@@ -17,7 +17,9 @@ from typing import Any, Callable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 COMPARATOR = REPO_ROOT / "scripts" / "ci" / "compare-mm-performance.py"
+LOCK_PARSER = REPO_ROOT / "scripts" / "ci" / "parse-mm-lock-diagnostics.py"
 DEFAULT_POLICY = (
     REPO_ROOT
     / "scripts"
@@ -37,6 +39,8 @@ MANIFEST_COLUMNS = (
     "thekernel_commit",
     "thekernel_ax_commit",
     "thekernel_linux_abi_commit",
+    "measurement_mode",
+    "kernel_profile",
     "arch",
     "requested_cpus",
     "online_cpus",
@@ -59,9 +63,18 @@ MANIFEST_COLUMNS = (
     "metrics_artifact",
     "metrics_sha256",
     "metrics_size_bytes",
+    "mm_lock_diagnostics_artifact",
+    "mm_lock_diagnostics_sha256",
+    "mm_lock_diagnostics_size_bytes",
     "commands",
     "commands_sha256",
     "commands_size_bytes",
+    "guest_inputs",
+    "guest_inputs_sha256",
+    "guest_inputs_size_bytes",
+    "qemu_receipt",
+    "qemu_receipt_sha256",
+    "qemu_receipt_size_bytes",
     "qemu_log",
     "qemu_log_sha256",
     "qemu_log_size_bytes",
@@ -83,17 +96,51 @@ METRIC_COLUMNS = (
     "p99_ns",
     "p999_ns",
     "throughput_bytes_per_sec",
+    "requested_vmas",
+    "fixture_vmas",
     "reason",
     "errno",
 )
 EXPECTED_METRICS = (
     "vma_scale",
     "mremap_latency",
+    "mremap_fixed_replace_latency",
+    "mremap_disjoint_same_as_contention",
+    "mremap_file_duplicate_latency",
+    "mremap_shared_anon_resize_latency",
     "protect_touch_latency",
-    "pin_throughput",
-    "pin_contention",
+    "direct_io_pin_proxy_throughput",
+    "direct_io_pin_proxy_same_as_contention",
+    "direct_io_pin_proxy_cross_as_contention",
 )
-PIN_METRICS = frozenset({"pin_throughput", "pin_contention"})
+PIN_METRICS = frozenset(
+    {"direct_io_pin_proxy_throughput", "direct_io_pin_proxy_same_as_contention", "direct_io_pin_proxy_cross_as_contention"}
+)
+VMA_FIXTURE_METRICS = frozenset(
+    {
+        "vma_scale",
+        "mremap_fixed_replace_latency",
+        "mremap_disjoint_same_as_contention",
+        "direct_io_pin_proxy_throughput",
+        "direct_io_pin_proxy_same_as_contention",
+        "direct_io_pin_proxy_cross_as_contention",
+    }
+)
+MM_LOCK_STAGES = (
+    "user_pin_admission",
+    "user_pin_expectation",
+    "user_pin_collect_owners",
+    "user_pin_revalidate",
+    "user_pin_commit",
+    "user_pin_release",
+    "mremap_optimistic_plan",
+    "mremap_optimistic_commit",
+    "mremap_serialized",
+    "phys_pin_registry_shard",
+    "phys_pin_publish_shard",
+    "phys_pin_release_shard",
+    "phys_pin_dealloc_probe_shard",
+)
 
 
 def sha256(path: Path) -> str:
@@ -120,10 +167,128 @@ def expected_count(metric: str, iterations: int, pin_iterations: int, pin_worker
     return {
         "vma_scale": iterations,
         "mremap_latency": iterations * 2,
+        "mremap_fixed_replace_latency": iterations,
+        "mremap_disjoint_same_as_contention": iterations * 2,
+        "mremap_file_duplicate_latency": iterations,
+        "mremap_shared_anon_resize_latency": iterations * 2,
         "protect_touch_latency": iterations,
-        "pin_throughput": pin_iterations,
-        "pin_contention": pin_iterations * pin_workers,
+        "direct_io_pin_proxy_throughput": pin_iterations,
+        "direct_io_pin_proxy_same_as_contention": pin_iterations * pin_workers,
+        "direct_io_pin_proxy_cross_as_contention": pin_iterations * pin_workers,
     }[metric]
+
+
+def metric_log_record(row: dict[str, str]) -> str:
+    fields = [
+        f"metric={row['metric']}",
+        f"status={row['status']}",
+        f"count={row['count']}",
+        f"p50_ns={row['p50_ns']}",
+        f"p99_ns={row['p99_ns']}",
+        f"p999_ns={row['p999_ns']}",
+    ]
+    if row["throughput_bytes_per_sec"] != "-":
+        fields.append(
+            f"throughput_bytes_per_sec={row['throughput_bytes_per_sec']}"
+        )
+    if row["requested_vmas"] != "-":
+        fields.extend(
+            (
+                f"requested_vmas={row['requested_vmas']}",
+                f"fixture_vmas={row['fixture_vmas']}",
+            )
+        )
+    if row["status"] == "missing":
+        fields.extend((f"reason={row['reason']}", f"errno={row['errno']}"))
+    return "MM_PERF " + " ".join(fields)
+
+
+def lock_diagnostic_log_records() -> list[str]:
+    buckets = ["0"] * 64
+    buckets[1] = "1"
+    histogram = ",".join(buckets)
+    records = [
+        "MM_LOCK_DIAGNOSTICS schema=thekernel-mm-lock-diagnostics-v1 "
+        "enabled=0 resetting=0 active_samples=0 epoch=7 sequence=101 "
+        "sequence_exhausted=0 histogram=log2_ns_v1"
+    ]
+    records.extend(
+        "MM_LOCK_STAGE "
+        f"stage={stage} epoch=7 samples=1 wait_sum_ns=1 wait_max_ns=1 "
+        "hold_sum_ns=1 hold_max_ns=1 saturated=0 "
+        f"wait_buckets={histogram} hold_buckets={histogram}"
+        for stage in MM_LOCK_STAGES
+    )
+    records.append(
+        "MM_LOCK_DIAGNOSTICS_END enabled=0 resetting=0 active_samples=0 "
+        "epoch=7 sequence=101 sequence_exhausted=0"
+    )
+    return records
+
+
+def render_qemu_log(
+    rows: list[dict[str, str]], measurement_mode: str, values: dict[str, str]
+) -> str:
+    online_cpus = rows[0]["online_cpus"]
+    pin_workers = int(values["pin_workers"])
+    pin_iterations = values["pin_iterations"]
+    live_vmas = values["live_vmas"]
+    records = [
+        "fixture guest log",
+        f"MM_PERF_TOPOLOGY status=ok online_cpus={online_cpus}",
+        f"MM_PERF_AFFINITY status=ok bytes=8 allowed_cpus={online_cpus} "
+        f"cpu_ids={','.join(str(cpu) for cpu in range(int(online_cpus)))} "
+        "cpu_ids_complete=1",
+        "MM_PERF_RUN schema=thekernel-mm-performance-run-v2 "
+        f"arch={values['arch']} iterations={values['iterations']} "
+        f"vmas={live_vmas} pin_iterations={pin_iterations} "
+        f"pin_workers={pin_workers} page_size=4096",
+        "MM_PERF_SEMANTICS status=ok",
+        "MM_PERF_MREMAP_WORKER status=ok worker=0 cpu=0 "
+        f"completed={values['iterations']} slot_a=1048576 slot_b=1060864 "
+        "bytes=8192 start_ns=100 end_ns=300 p99_ns=100 "
+        f"fixture_before_vmas={live_vmas} fixture_after_vmas={live_vmas}",
+        "MM_PERF_MREMAP_WORKER status=ok worker=1 cpu=1 "
+        f"completed={values['iterations']} slot_a=1073152 slot_b=1085440 "
+        "bytes=8192 start_ns=150 end_ns=350 p99_ns=100 "
+        f"fixture_before_vmas={live_vmas} fixture_after_vmas={live_vmas}",
+        "MM_PERF_PIN_WORKER mode=single status=ok worker=0 cpu=0 "
+        f"completed={pin_iterations} p99_ns=100 over_10ms=0 over_50ms=0 "
+        f"fixture_before_vmas={live_vmas} fixture_after_vmas={live_vmas}",
+        *(
+            "MM_PERF_PIN_WORKER mode=contention status=ok "
+            f"worker={worker} cpu={worker} completed={pin_iterations} "
+            "p99_ns=100 over_10ms=0 over_50ms=0 "
+            f"fixture_before_vmas={live_vmas} fixture_after_vmas={live_vmas}"
+            for worker in range(pin_workers)
+        ),
+        *(
+            "MM_PERF_PIN_CROSS_AS_WORKER status=ok "
+            f"worker={worker} pid={1000 + worker} cpu={worker} "
+            f"completed={pin_iterations} p99_ns=100 "
+            f"fixture_before_vmas={live_vmas} fixture_after_vmas={live_vmas} "
+            "cow_isolated=1"
+            for worker in range(pin_workers)
+        ),
+        *(metric_log_record(row) for row in rows),
+        "MM_PERF_DONE status=ok",
+    ]
+    if measurement_mode == "diagnostic":
+        records.extend(lock_diagnostic_log_records())
+    records.append("System is shutting down")
+    return "\n".join(records) + "\n"
+
+
+def derive_lock_diagnostics(qemu_log: Path) -> bytes:
+    completed = subprocess.run(
+        [sys.executable, str(LOCK_PARSER), str(qemu_log)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.stdout
 
 
 def make_bundle(
@@ -131,37 +296,54 @@ def make_bundle(
     *,
     manifest_overrides: dict[str, str] | None = None,
     kernel_content: bytes = b"fixture-kernel\n",
+    measurement_mode: str = "product",
+    arch: str = "rv",
+    requested_cpus: int = 4,
+    capture_offset_secs: int = 0,
+    capture_day: int = 1,
 ) -> None:
+    run_name = f"{arch}-{requested_cpus}cpu"
+    qemu_binary = {
+        "rv": "qemu-system-riscv64",
+        "la": "qemu-system-loongarch64",
+    }[arch]
+    host_cpu_set = "0" if requested_cpus == 1 else f"0-{requested_cpus - 1}"
     root.mkdir(parents=True)
-    run = root / "rv-4cpu"
+    run = root / run_name
     run.mkdir()
     values = {
-        "bundle_schema": "thekernel-mm-performance-bundle-v3",
+        "bundle_schema": "thekernel-mm-performance-bundle-v8",
         "thekernel_commit": "1" * 40,
         "thekernel_ax_commit": "2" * 40,
         "thekernel_linux_abi_commit": "3" * 40,
-        "arch": "rv",
-        "requested_cpus": "4",
-        "online_cpus": "4",
+        "measurement_mode": measurement_mode,
+        "kernel_profile": (
+            "mm-performance" if measurement_mode == "diagnostic" else "shell"
+        ),
+        "arch": arch,
+        "requested_cpus": str(requested_cpus),
+        "online_cpus": str(requested_cpus),
         "iterations": "100",
         "live_vmas": "512",
         "pin_iterations": "25",
-        "pin_workers": "4",
+        "pin_workers": str(requested_cpus),
         "rootfs_sha256": "4" * 64,
-        "qemu_binary": "qemu-system-riscv64",
+        "qemu_binary": qemu_binary,
         "qemu_version": "QEMU emulator version fixture",
         "qemu_sha256": "5" * 64,
         "runner_fingerprint": f"auto-sha256:{'6' * 64}",
         "runner_contract_sha256": "7" * 64,
-        "host_cpu_set": "0-3",
+        "host_cpu_set": host_cpu_set,
         "host_cpu_selection": "auto-homogeneous-v1",
         "host_cpu_class": "package:0,max_freq_khz:3700000",
-        "kernel_artifact": "rv-4cpu/kernel",
-        "metrics_artifact": "rv-4cpu/mm-performance.tsv",
-        "commands": "rv-4cpu.commands",
-        "qemu_log": "rv-4cpu/qemu.log",
-        "host_diagnostics_pre": "rv-4cpu/host-pre.tsv",
-        "host_diagnostics_post": "rv-4cpu/host-post.tsv",
+        "kernel_artifact": f"{run_name}/kernel",
+        "metrics_artifact": f"{run_name}/mm-performance.tsv",
+        "commands": f"{run_name}/commands",
+        "guest_inputs": f"{run_name}/guest-inputs.tsv",
+        "qemu_receipt": f"{run_name}/qemu-runner-receipt.json",
+        "qemu_log": f"{run_name}/qemu.log",
+        "host_diagnostics_pre": f"{run_name}/host-pre.tsv",
+        "host_diagnostics_post": f"{run_name}/host-post.tsv",
     }
     if manifest_overrides:
         values.update(manifest_overrides)
@@ -169,8 +351,14 @@ def make_bundle(
         hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12], 16
     ) % 1_000_000
     timestamps = {
-        "pre": f"2026-01-01T00:00:00.{timestamp_fraction:06d}+00:00",
-        "post": f"2026-01-01T00:00:01.{timestamp_fraction:06d}+00:00",
+        "pre": (
+            f"2026-01-{capture_day:02d}T00:00:{capture_offset_secs:02d}."
+            f"{timestamp_fraction:06d}+00:00"
+        ),
+        "post": (
+            f"2026-01-{capture_day:02d}T00:00:{capture_offset_secs + 1:02d}."
+            f"{timestamp_fraction:06d}+00:00"
+        ),
     }
     iterations = int(values["iterations"])
     pin_iterations = int(values["pin_iterations"])
@@ -181,21 +369,34 @@ def make_bundle(
     values["kernel_sha256"] = sha256(kernel)
     values["kernel_size_bytes"] = str(kernel.stat().st_size)
 
-    commands = root / "rv-4cpu.commands"
-    commands.write_text(
+    commands = run / "commands"
+    workload_command = (
         "/opt/thekernel-tests/bin/thekernel-mm-performance "
         f"--iterations {values['iterations']} --vmas {values['live_vmas']} "
         f"--pin-iterations {values['pin_iterations']} "
-        f"--pin-workers {values['pin_workers']}; exit\n",
-        encoding="utf-8",
+        f"--pin-workers {values['pin_workers']}"
     )
+    if values["measurement_mode"] == "diagnostic":
+        command_text = "\n".join(
+            (
+                "echo mm_lock_stats=off > /proc/io_test_control || exit 1",
+                "echo mm_lock_stats=reset > /proc/io_test_control || exit 1",
+                "echo mm_lock_stats=on > /proc/io_test_control || exit 1",
+                workload_command + " || exit 1",
+                "mm_lock_off_attempt=0; until echo mm_lock_stats=off > "
+                "/proc/io_test_control; do mm_lock_off_attempt="
+                "$((mm_lock_off_attempt + 1)); "
+                '[ "$mm_lock_off_attempt" -lt 64 ] || exit 1; done',
+                "cat /proc/mm_lock_stats || exit 1",
+                "exit",
+                "",
+            )
+        )
+    else:
+        command_text = workload_command + " || exit 1\nexit\n"
+    commands.write_text(command_text, encoding="utf-8")
     values["commands_sha256"] = sha256(commands)
     values["commands_size_bytes"] = str(commands.stat().st_size)
-
-    qemu_log = run / "qemu.log"
-    qemu_log.write_text("fixture guest log\nSystem is shutting down\n", encoding="utf-8")
-    values["qemu_log_sha256"] = sha256(qemu_log)
-    values["qemu_log_size_bytes"] = str(qemu_log.stat().st_size)
 
     for phase in ("pre", "post"):
         diagnostics = run / f"host-{phase}.tsv"
@@ -212,7 +413,7 @@ def make_bundle(
                     "value": values["host_cpu_selection"],
                 },
                 {"key": "host_cpu_class", "value": values["host_cpu_class"]},
-                {"key": "online_cpu_set", "value": "0-3"},
+                {"key": "online_cpu_set", "value": values["host_cpu_set"]},
                 {"key": "loadavg", "value": "0.00 0.00 0.00 1/1 1"},
                 {"key": "psi.cpu", "value": "missing"},
                 {"key": "cgroup.cpu_stat", "value": "missing"},
@@ -249,6 +450,12 @@ def make_bundle(
                 "p99_ns": "100",
                 "p999_ns": "200",
                 "throughput_bytes_per_sec": "1000" if metric in PIN_METRICS else "-",
+                "requested_vmas": (
+                    values["live_vmas"] if metric in VMA_FIXTURE_METRICS else "-"
+                ),
+                "fixture_vmas": (
+                    values["live_vmas"] if metric in VMA_FIXTURE_METRICS else "-"
+                ),
                 "reason": "-",
                 "errno": "-",
             }
@@ -259,7 +466,206 @@ def make_bundle(
     write_tsv(matrix, METRIC_COLUMNS, metric_rows)
     values["metrics_sha256"] = sha256(metrics)
     values["metrics_size_bytes"] = str(metrics.stat().st_size)
+
+    qemu_log = run / "qemu.log"
+    qemu_log.write_text(
+        render_qemu_log(metric_rows, values["measurement_mode"], values),
+        encoding="utf-8",
+    )
+    values["qemu_log_sha256"] = sha256(qemu_log)
+    values["qemu_log_size_bytes"] = str(qemu_log.stat().st_size)
+
+    command_line_count = len(commands.read_text(encoding="utf-8").splitlines())
+    guest_inputs = run / "guest-inputs.tsv"
+    guest_inputs.write_text(
+        "".join(
+            f"{key}\t{value}\n"
+            for key, value in (
+                ("schema_version", "1"),
+                ("arch", values["arch"]),
+                ("requested_cpus", values["requested_cpus"]),
+                ("kernel_profile", values["kernel_profile"]),
+                ("kernel_path", str(kernel.resolve())),
+                ("kernel_size_bytes", values["kernel_size_bytes"]),
+                ("kernel_sha256", values["kernel_sha256"]),
+                ("commands_path", str(commands.resolve())),
+                ("commands_size_bytes", values["commands_size_bytes"]),
+                ("commands_line_count", str(command_line_count)),
+                ("commands_sha256", values["commands_sha256"]),
+                ("rootfs_source", "/fixture/rootfs.img"),
+                ("rootfs_size_bytes", "1"),
+                ("rootfs_sha256", values["rootfs_sha256"]),
+                ("qemu_binary", f"/usr/bin/{values['qemu_binary']}"),
+                ("qemu_sha256", values["qemu_sha256"]),
+                ("qemu_version", values["qemu_version"]),
+            )
+        ),
+        encoding="utf-8",
+    )
+    values["guest_inputs_sha256"] = sha256(guest_inputs)
+    values["guest_inputs_size_bytes"] = str(guest_inputs.stat().st_size)
+
+    from tools.qemu_runner.command import build_qemu_command
+    from tools.qemu_runner.model import Drive
+
+    fixture_rootfs = Path("/fixture/rootfs.img")
+    fixture_qemu = Path(f"/usr/bin/{values['qemu_binary']}")
+    recorded_command = list(
+        build_qemu_command(
+            arch=values["arch"],
+            kernel=kernel.resolve(),
+            rootfs=Drive(fixture_rootfs, "snapshot"),
+            extra_block=None,
+            memory="1G",
+            cpus=int(values["requested_cpus"]),
+            qemu_binary=str(fixture_qemu),
+        )
+    )
+    qemu_receipt = run / "qemu-runner-receipt.json"
+    qemu_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "state": "complete",
+                "arch": values["arch"],
+                "cpus": int(values["requested_cpus"]),
+                "memory": "1G",
+                "rootfs_mode": "snapshot",
+                "extra_block_mode": "rw",
+                "command": recorded_command,
+                "returncode": 0,
+                "error_message": None,
+                "timed_out": False,
+                "interrupted": False,
+                "intentionally_stopped": False,
+                "interaction": {
+                    "interactive": True,
+                    "input_after_marker": "THEKERNEL_SHELL_READY",
+                    "stop_after_marker": None,
+                    "external_input_producer": True,
+                },
+                "log_path": str(qemu_log.resolve()),
+                "kernel": {
+                    "path": str(kernel.resolve()),
+                    "sha256": values["kernel_sha256"],
+                    "size_bytes": int(values["kernel_size_bytes"]),
+                },
+                "rootfs_source": {
+                    "path": str(fixture_rootfs),
+                    "sha256": values["rootfs_sha256"],
+                    "size_bytes": 1,
+                },
+                "rootfs_runtime_before": {
+                    "path": str(fixture_rootfs),
+                    "sha256": values["rootfs_sha256"],
+                    "size_bytes": 1,
+                },
+                "rootfs_runtime_after": {
+                    "path": str(fixture_rootfs),
+                    "sha256": values["rootfs_sha256"],
+                    "size_bytes": 1,
+                },
+                "qemu": {
+                    "requested": values["qemu_binary"],
+                    "path": str(fixture_qemu),
+                    "sha256": values["qemu_sha256"],
+                    "size_bytes": 1,
+                },
+                "log": {
+                    "path": str(qemu_log.resolve()),
+                    "sha256": values["qemu_log_sha256"],
+                    "size_bytes": int(values["qemu_log_size_bytes"]),
+                },
+                "stdin": {
+                    "state": "complete",
+                    "sha256": values["commands_sha256"],
+                    "bytes": int(values["commands_size_bytes"]),
+                    "line_count": command_line_count,
+                    "observed_bytes": int(values["commands_size_bytes"]),
+                    "source_eof": True,
+                    "broken_pipe": False,
+                    "relay_complete": True,
+                    "source_sha256": values["commands_sha256"],
+                    "source_bytes": int(values["commands_size_bytes"]),
+                    "source_line_count": command_line_count,
+                    "source_unchanged": True,
+                    "producer_status": 0,
+                    "producer_status_kind": "exit:0",
+                    "source_fully_relayed": True,
+                    "producer_status_accepted": True,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    values["qemu_receipt_sha256"] = sha256(qemu_receipt)
+    values["qemu_receipt_size_bytes"] = str(qemu_receipt.stat().st_size)
+    if values["measurement_mode"] == "diagnostic":
+        lock_diagnostics = run / "mm-lock-diagnostics.tsv"
+        lock_diagnostics.write_bytes(derive_lock_diagnostics(qemu_log))
+        values["mm_lock_diagnostics_artifact"] = (
+            f"{run_name}/mm-lock-diagnostics.tsv"
+        )
+        values["mm_lock_diagnostics_sha256"] = sha256(lock_diagnostics)
+        values["mm_lock_diagnostics_size_bytes"] = str(
+            lock_diagnostics.stat().st_size
+        )
+    else:
+        values["mm_lock_diagnostics_artifact"] = "not-collected"
+        values["mm_lock_diagnostics_sha256"] = "not-collected"
+        values["mm_lock_diagnostics_size_bytes"] = "not-collected"
     write_tsv(root / "mm-performance-manifest.tsv", MANIFEST_COLUMNS, [values])
+
+
+def make_release_bundle(
+    root: Path,
+    *,
+    manifest_overrides: dict[str, str] | None = None,
+    kernel_content: bytes = b"fixture-kernel\n",
+    capture_day: int = 1,
+) -> None:
+    root.mkdir(parents=True)
+    manifest_rows: list[dict[str, str]] = []
+    metric_rows: list[dict[str, str]] = []
+    artifact_fields = (
+        "kernel_artifact",
+        "metrics_artifact",
+        "commands",
+        "guest_inputs",
+        "qemu_receipt",
+        "qemu_log",
+        "host_diagnostics_pre",
+        "host_diagnostics_post",
+    )
+    for index, (arch, cpus) in enumerate(
+        (("rv", 4), ("rv", 8), ("la", 4), ("la", 8))
+    ):
+        source = root / f"source-{arch}-{cpus}"
+        make_bundle(
+            source,
+            manifest_overrides=manifest_overrides,
+            kernel_content=kernel_content,
+            arch=arch,
+            requested_cpus=cpus,
+            capture_offset_secs=index * 2,
+            capture_day=capture_day,
+        )
+        _, rows = read_tsv(source / "mm-performance-manifest.tsv")
+        row = rows[0]
+        for field in artifact_fields:
+            row[field] = f"{source.name}/{row[field]}"
+        manifest_rows.append(row)
+        _, source_metrics = read_tsv(source / "mm-performance.tsv")
+        metric_rows.extend(source_metrics)
+    write_tsv(
+        root / "mm-performance-manifest.tsv",
+        MANIFEST_COLUMNS,
+        manifest_rows,
+    )
+    write_tsv(root / "mm-performance.tsv", METRIC_COLUMNS, metric_rows)
 
 
 def mutate_manifest(root: Path, mutator: Callable[[dict[str, str]], None]) -> None:
@@ -267,6 +673,31 @@ def mutate_manifest(root: Path, mutator: Callable[[dict[str, str]], None]) -> No
     columns, rows = read_tsv(path)
     mutator(rows[0])
     write_tsv(path, columns, rows)
+
+
+def refresh_qemu_receipt_log(root: Path) -> dict[str, str]:
+    qemu_log = root / "rv-4cpu" / "qemu.log"
+    qemu_receipt = root / "rv-4cpu" / "qemu-runner-receipt.json"
+    receipt = json.loads(qemu_receipt.read_text(encoding="utf-8"))
+    receipt["log"]["sha256"] = sha256(qemu_log)
+    receipt["log"]["size_bytes"] = qemu_log.stat().st_size
+    qemu_receipt.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "qemu_receipt_sha256": sha256(qemu_receipt),
+        "qemu_receipt_size_bytes": str(qemu_receipt.stat().st_size),
+    }
+
+
+def receipt_artifact_fields(root: Path, name: str) -> dict[str, str]:
+    artifact = root / "rv-4cpu" / name
+    prefix = "guest_inputs" if name == "guest-inputs.tsv" else "qemu_receipt"
+    return {
+        f"{prefix}_sha256": sha256(artifact),
+        f"{prefix}_size_bytes": str(artifact.stat().st_size),
+    }
 
 
 def clone_bundle(source: Path, destination: Path, marker: str) -> None:
@@ -317,6 +748,7 @@ def mutate_metrics(
     mutator: Callable[[list[dict[str, str]]], None],
     *,
     update_matrix: bool = True,
+    update_log: bool = True,
 ) -> None:
     metrics = root / "rv-4cpu" / "mm-performance.tsv"
     columns, rows = read_tsv(metrics)
@@ -324,14 +756,31 @@ def mutate_metrics(
     write_tsv(metrics, columns, rows)
     if update_matrix:
         write_tsv(root / "mm-performance.tsv", columns, rows)
+    updates = {
+        "metrics_sha256": sha256(metrics),
+        "metrics_size_bytes": str(metrics.stat().st_size),
+    }
+    if update_log:
+        _, manifest_rows = read_tsv(root / "mm-performance-manifest.tsv")
+        qemu_log = root / "rv-4cpu" / "qemu.log"
+        qemu_log.write_text(
+            render_qemu_log(
+                rows,
+                manifest_rows[0]["measurement_mode"],
+                manifest_rows[0],
+            ),
+            encoding="utf-8",
+        )
+        updates.update(
+            {
+                "qemu_log_sha256": sha256(qemu_log),
+                "qemu_log_size_bytes": str(qemu_log.stat().st_size),
+            }
+        )
+        updates.update(refresh_qemu_receipt_log(root))
     mutate_manifest(
         root,
-        lambda row: row.update(
-            {
-                "metrics_sha256": sha256(metrics),
-                "metrics_size_bytes": str(metrics.stat().st_size),
-            }
-        ),
+        lambda row: row.update(updates),
     )
 
 
@@ -405,6 +854,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         stability_policy: Path | None = None,
         normalize_timestamps: bool = True,
         output: Path | None = None,
+        allow_partial: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         self.series_counter += 1
         if normalize_timestamps:
@@ -436,6 +886,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
             arguments.extend(("--baseline", str(baseline)))
         for candidate in candidates:
             arguments.extend(("--candidate", str(candidate)))
+        if allow_partial:
+            arguments.append("--allow-partial")
         arguments.extend(
             (
                 "--policy",
@@ -470,10 +922,60 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, report = self.compare(baseline, candidate)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PARTIAL PASS", result.stdout)
+        self.assertIn("release_gate=false", result.stdout)
         rows = self.report_rows(report)
-        self.assertEqual(len(rows), 12)
-        self.assertEqual(sum(row["result"] == "PASS" for row in rows), 7)
-        self.assertEqual(sum(row["result"] == "REPORT_ONLY" for row in rows), 5)
+        self.assertEqual(len(rows), 23)
+        self.assertEqual({row["evidence_scope"] for row in rows}, {"partial_triage"})
+        self.assertEqual({row["release_gate"] for row in rows}, {"false"})
+        self.assertEqual(sum(row["result"] == "PASS" for row in rows), 13)
+        self.assertEqual(sum(row["result"] == "REPORT_ONLY" for row in rows), 10)
+
+    def test_default_rejects_incomplete_release_matrix(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+
+        result, _ = self.compare_series(
+            [baseline], [candidate], allow_partial=False
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("release bundle run-key set mismatch", result.stderr)
+        self.assertIn("--allow-partial only for triage", result.stderr)
+
+    def test_default_accepts_complete_release_matrix_and_marks_report(self) -> None:
+        baselines: list[Path] = []
+        candidates: list[Path] = []
+        for index in range(3):
+            baseline = self.root / f"release-baseline-{index}"
+            candidate = self.root / f"release-candidate-{index}"
+            baseline_day = index * 2 + (1 if index % 2 == 0 else 2)
+            candidate_day = index * 2 + (2 if index % 2 == 0 else 1)
+            make_release_bundle(baseline, capture_day=baseline_day)
+            make_release_bundle(
+                candidate,
+                manifest_overrides={"thekernel_commit": "8" * 40},
+                kernel_content=b"candidate-kernel\n",
+                capture_day=candidate_day,
+            )
+            baselines.append(baseline)
+            candidates.append(candidate)
+
+        result, report = self.compare_series(
+            baselines,
+            candidates,
+            allow_partial=False,
+            normalize_timestamps=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS", result.stdout)
+        self.assertNotIn("PARTIAL", result.stdout)
+        self.assertIn("release_gate=true", result.stdout)
+        rows = self.report_rows(report)
+        self.assertEqual(len(rows), 92)
+        self.assertEqual({row["evidence_scope"] for row in rows}, {"release"})
+        self.assertEqual({row["release_gate"] for row in rows}, {"true"})
 
     def test_p99_relative_boundary_uses_exact_integer_arithmetic(self) -> None:
         baseline = self.bundle("baseline")
@@ -494,21 +996,21 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertEqual(row["result"], "FAIL")
         self.assertEqual(row["threshold_percent"], "120")
 
-    def test_pin_throughput_relative_boundary_is_gated(self) -> None:
+    def test_direct_io_pin_proxy_throughput_relative_boundary_is_gated(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate")
-        set_metric(candidate, "pin_throughput", throughput_bytes_per_sec=900)
+        set_metric(candidate, "direct_io_pin_proxy_throughput", throughput_bytes_per_sec=900)
 
         result, _ = self.compare(baseline, candidate)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        set_metric(candidate, "pin_throughput", throughput_bytes_per_sec=899)
+        set_metric(candidate, "direct_io_pin_proxy_throughput", throughput_bytes_per_sec=899)
         result, report = self.compare(baseline, candidate)
         self.assertEqual(result.returncode, 1, result.stderr)
         row = next(
             row
             for row in self.report_rows(report)
-            if row["metric"] == "pin_throughput"
+            if row["metric"] == "direct_io_pin_proxy_throughput"
             and row["statistic"] == "throughput_bytes_per_sec"
         )
         self.assertEqual(row["result"], "FAIL")
@@ -611,7 +1113,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("run-key set mismatch", result.stderr)
 
-    def test_invalid_topology_and_metric_count_are_rejected(self) -> None:
+    def test_invalid_topology_metric_count_and_fixture_are_rejected(self) -> None:
         baseline = self.bundle("baseline")
         topology = self.bundle(
             "topology", manifest_overrides={"online_cpus": "3"}
@@ -625,6 +1127,23 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, _ = self.compare(baseline, count)
         self.assertEqual(result.returncode, 2)
         self.assertIn("count mismatch", result.stderr)
+
+        fixture = self.bundle("fixture")
+        set_metric(fixture, "mremap_fixed_replace_latency", fixture_vmas=511)
+        result, _ = self.compare(baseline, fixture)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("fixture_vmas mismatch", result.stderr)
+
+        requested = self.bundle("requested")
+        set_metric(
+            requested,
+            "mremap_fixed_replace_latency",
+            requested_vmas=511,
+            fixture_vmas=511,
+        )
+        result, _ = self.compare(baseline, requested)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requested_vmas mismatch", result.stderr)
 
     def test_duplicate_and_missing_metric_keys_are_rejected(self) -> None:
         baseline = self.bundle("baseline")
@@ -641,7 +1160,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         )
         result, _ = self.compare(baseline, missing)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("metric set mismatch", result.stderr)
+        self.assertIn("missing required metric records", result.stderr)
 
     def test_absolute_parent_and_symlink_escape_paths_are_rejected(self) -> None:
         baseline = self.bundle("baseline")
@@ -690,6 +1209,228 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, _ = self.compare(baseline, corrupt)
         self.assertEqual(result.returncode, 2)
         self.assertRegex(result.stderr, r"kernel_artifact (size|SHA-256) mismatch")
+
+    def test_diagnostic_bundles_are_not_product_regression_evidence(self) -> None:
+        baseline = self.bundle("baseline-diagnostic", measurement_mode="diagnostic")
+        candidate = self.bundle("candidate-diagnostic", measurement_mode="diagnostic")
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not product regression evidence", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_product_sentinel_and_diagnostic_artifact_are_fail_closed(self) -> None:
+        baseline = self.bundle("baseline")
+        product = self.bundle("product-bad-sentinel")
+        mutate_manifest(
+            product,
+            lambda row: row.update(
+                {"mm_lock_diagnostics_size_bytes": "0"}
+            ),
+        )
+        result, report = self.compare(baseline, product)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("product evidence must use", result.stderr)
+        self.assertFalse(report.exists())
+
+        diagnostic_baseline = self.bundle(
+            "diagnostic-baseline", measurement_mode="diagnostic"
+        )
+        diagnostic = self.bundle("diagnostic-corrupt", measurement_mode="diagnostic")
+        lock_artifact = diagnostic / "rv-4cpu" / "mm-lock-diagnostics.tsv"
+        lock_artifact.write_text("corrupt\n", encoding="utf-8")
+        result, report = self.compare(diagnostic_baseline, diagnostic)
+        self.assertEqual(result.returncode, 2)
+        self.assertRegex(result.stderr, r"mm_lock_diagnostics_artifact (size|SHA-256) mismatch")
+        self.assertFalse(report.exists())
+
+    def test_metrics_artifact_must_be_derived_from_raw_qemu_log(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate-spliced-metrics")
+
+        def change_metric(rows: list[dict[str, str]]) -> None:
+            next(row for row in rows if row["metric"] == "vma_scale")[
+                "p99_ns"
+            ] = "119"
+
+        mutate_metrics(candidate, change_metric, update_log=False)
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("metrics artifact does not match the raw QEMU log", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_product_raw_log_rejects_lock_diagnostics(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate-product-lock-log")
+        qemu_log = candidate / "rv-4cpu" / "qemu.log"
+        with qemu_log.open("a", encoding="utf-8") as output:
+            output.write("MM_LOCK_FORGED status=present\n")
+        receipt_updates = refresh_qemu_receipt_log(candidate)
+        mutate_manifest(
+            candidate,
+            lambda row: row.update(
+                {
+                    "qemu_log_sha256": sha256(qemu_log),
+                    "qemu_log_size_bytes": str(qemu_log.stat().st_size),
+                    **receipt_updates,
+                }
+            ),
+        )
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("product raw QEMU log contains MM lock diagnostics", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_diagnostic_artifact_must_be_derived_from_raw_qemu_log(self) -> None:
+        baseline = self.bundle("diagnostic-baseline", measurement_mode="diagnostic")
+        candidate = self.bundle("diagnostic-spliced", measurement_mode="diagnostic")
+        diagnostics = candidate / "rv-4cpu" / "mm-lock-diagnostics.tsv"
+        with diagnostics.open("a", encoding="utf-8") as output:
+            output.write("forged\trow\n")
+        mutate_manifest(
+            candidate,
+            lambda row: row.update(
+                {
+                    "mm_lock_diagnostics_sha256": sha256(diagnostics),
+                    "mm_lock_diagnostics_size_bytes": str(
+                        diagnostics.stat().st_size
+                    ),
+                }
+            ),
+        )
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "MM lock diagnostics artifact does not match the raw QEMU log",
+            result.stderr,
+        )
+        self.assertFalse(report.exists())
+
+    def test_guest_input_receipt_cannot_be_spliced_from_another_run(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+        donor = self.bundle(
+            "donor-guest-inputs", manifest_overrides={"iterations": "101"}
+        )
+        shutil.copy2(
+            donor / "rv-4cpu" / "guest-inputs.tsv",
+            candidate / "rv-4cpu" / "guest-inputs.tsv",
+        )
+        updates = receipt_artifact_fields(candidate, "guest-inputs.tsv")
+        mutate_manifest(candidate, lambda row: row.update(updates))
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("guest input receipt", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_qemu_receipt_cannot_be_spliced_from_another_run(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+        donor = self.bundle(
+            "donor-qemu-receipt", manifest_overrides={"iterations": "101"}
+        )
+        shutil.copy2(
+            donor / "rv-4cpu" / "qemu-runner-receipt.json",
+            candidate / "rv-4cpu" / "qemu-runner-receipt.json",
+        )
+        updates = receipt_artifact_fields(candidate, "qemu-runner-receipt.json")
+        mutate_manifest(candidate, lambda row: row.update(updates))
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("QEMU stdin receipt is invalid", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_qemu_receipt_requires_complete_file_evidence_records(self) -> None:
+        baseline = self.bundle("baseline")
+        for key in ("qemu", "rootfs_source"):
+            with self.subTest(key=key):
+                candidate = self.bundle(f"candidate-missing-{key}-size")
+                receipt_path = (
+                    candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+                )
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                del receipt[key]["size_bytes"]
+                receipt_path.write_text(
+                    json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                updates = receipt_artifact_fields(
+                    candidate, "qemu-runner-receipt.json"
+                )
+                mutate_manifest(candidate, lambda row: row.update(updates))
+
+                result, report = self.compare(baseline, candidate)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"invalid {key} size", result.stderr)
+                self.assertFalse(report.exists())
+
+    def test_truncated_forwarding_receipt_is_rejected(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate-truncated-stdin")
+        commands = candidate / "rv-4cpu" / "commands"
+        prefix = commands.read_bytes().splitlines(keepends=True)[0]
+        receipt_path = candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["stdin"].update(
+            {
+                "sha256": hashlib.sha256(prefix).hexdigest(),
+                "bytes": len(prefix),
+                "line_count": 1,
+                "observed_bytes": len(prefix),
+                "source_eof": False,
+                "relay_complete": False,
+                "source_fully_relayed": False,
+                "producer_status_accepted": False,
+            }
+        )
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        updates = receipt_artifact_fields(candidate, "qemu-runner-receipt.json")
+        mutate_manifest(candidate, lambda row: row.update(updates))
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("QEMU stdin receipt is invalid", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_exact_stream_with_producer_141_is_not_exact_evidence(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate-producer-141")
+        receipt_path = candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["stdin"].update(
+            {
+                "producer_status": 141,
+                "producer_status_kind": "signal:13",
+                "producer_status_accepted": False,
+            }
+        )
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        updates = receipt_artifact_fields(candidate, "qemu-runner-receipt.json")
+        mutate_manifest(candidate, lambda row: row.update(updates))
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("producer_status_accepted is not true", result.stderr)
+        self.assertFalse(report.exists())
 
     def test_bundle_remains_valid_after_copying_to_a_new_directory(self) -> None:
         baseline = self.bundle("baseline")
@@ -911,7 +1652,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
 
         shutil.copy2(DEFAULT_POLICY, self.policy)
         payload = json.loads(self.policy.read_text(encoding="utf-8"))
-        payload["metrics"]["pin_throughput"][
+        payload["metrics"]["direct_io_pin_proxy_throughput"][
             "throughput_min_retained_percent"
         ] = 89
         self.policy.write_text(json.dumps(payload), encoding="utf-8")
@@ -985,9 +1726,9 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("contains unsafe key", result.stderr)
         self.assertFalse(report.exists())
 
-    def test_v1_and_v2_manifests_are_not_silently_upgraded(self) -> None:
+    def test_v1_through_v6_manifests_are_not_silently_upgraded(self) -> None:
         baseline = self.bundle("baseline")
-        for version in ("v1", "v2"):
+        for version in ("v1", "v2", "v3", "v4", "v5", "v6"):
             with self.subTest(version=version):
                 candidate = self.bundle(f"candidate-{version}")
                 mutate_manifest(
