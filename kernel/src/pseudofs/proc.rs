@@ -32,6 +32,8 @@ use linux_raw_sys::{
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::VmMutPtr;
 
+#[cfg(feature = "mm-lock-diagnostics")]
+use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
     file::{
         FD_TABLE, FileDescription, PidFd, current_file_operation_security_credential,
@@ -615,6 +617,72 @@ fn render_proc_io_stats() -> Vec<u8> {
         out,
         "virtio.blk_async_resource_leaks {}",
         virtio.blk_async_resource_leaks
+    );
+    out.into_bytes()
+}
+
+#[cfg(feature = "mm-lock-diagnostics")]
+fn render_proc_mm_lock_stats() -> Vec<u8> {
+    let mut out = String::new();
+    let first = mm_lock_diagnostics_snapshot(MmLockStage::ALL[0]);
+    let _ = writeln!(
+        out,
+        "MM_LOCK_DIAGNOSTICS schema=thekernel-mm-lock-diagnostics-v1 enabled={} resetting={} \
+         active_samples={} epoch={} sequence={} sequence_exhausted={} histogram=log2_ns_v1",
+        u8::from(first.enabled),
+        u8::from(first.resetting),
+        first.active_samples,
+        first.epoch,
+        first.sequence,
+        u8::from(first.sequence_exhausted)
+    );
+
+    for (index, stage) in MmLockStage::ALL.iter().copied().enumerate() {
+        let snapshot = if index == 0 {
+            first
+        } else {
+            mm_lock_diagnostics_snapshot(stage)
+        };
+        let stage = snapshot.stage;
+        let _ = write!(
+            out,
+            "MM_LOCK_STAGE stage={} epoch={} samples={} wait_sum_ns={} wait_max_ns={} \
+             hold_sum_ns={} hold_max_ns={} saturated={} wait_buckets=",
+            stage.stage.as_str(),
+            snapshot.epoch,
+            stage.samples,
+            stage.wait_ns,
+            stage.max_wait_ns,
+            stage.hold_ns,
+            stage.max_hold_ns,
+            u8::from(stage.saturated),
+        );
+        for (bucket, count) in stage.wait_buckets.iter().enumerate() {
+            if bucket != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{count}");
+        }
+        out.push_str(" hold_buckets=");
+        for (bucket, count) in stage.hold_buckets.iter().enumerate() {
+            if bucket != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{count}");
+        }
+        out.push('\n');
+    }
+    let final_snapshot = mm_lock_diagnostics_snapshot(MmLockStage::ALL[0]);
+    let _ = writeln!(
+        out,
+        "MM_LOCK_DIAGNOSTICS_END enabled={} resetting={} active_samples={} epoch={} sequence={} \
+         sequence_exhausted={}",
+        u8::from(final_snapshot.enabled),
+        u8::from(final_snapshot.resetting),
+        final_snapshot.active_samples,
+        final_snapshot.epoch,
+        final_snapshot.sequence,
+        u8::from(final_snapshot.sequence_exhausted)
     );
     out.into_bytes()
 }
@@ -2690,6 +2758,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodePermission::from_bits_truncate(0o444),
             || -> VfsResult<Vec<u8>> { Ok(render_proc_io_stats()) },
+        ),
+    );
+    #[cfg(feature = "mm-lock-diagnostics")]
+    root.add(
+        "mm_lock_stats",
+        SimpleFile::new_regular_with_permission(
+            fs.clone(),
+            NodePermission::from_bits_truncate(0o444),
+            || -> VfsResult<Vec<u8>> { Ok(render_proc_mm_lock_stats()) },
         ),
     );
     #[cfg(feature = "test-io-control")]

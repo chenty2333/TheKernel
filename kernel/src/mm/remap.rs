@@ -1076,7 +1076,7 @@ fn try_optimistic_mremap(
     request: MremapRequest,
 ) -> AxResult<OptimisticRemapOutcome> {
     let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
+    let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapOptimisticPlan);
     if !proc_data.image_matches(&aspace_handle) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
@@ -1102,7 +1102,7 @@ fn try_optimistic_mremap(
     drop(aspace);
 
     let prepared = prepare_remap_plan(plan, request, &aspace_handle)?;
-    let mut aspace = aspace_handle.lock();
+    let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapOptimisticCommit);
     if !proc_data.image_matches(&aspace_handle) || !prepared.revalidate(&aspace, request) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
@@ -1119,7 +1119,7 @@ fn run_locked_mremap(
 ) -> AxResult<isize> {
     loop {
         let aspace_handle = proc_data.aspace();
-        let mut aspace = aspace_handle.lock();
+        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSerialized);
         if !proc_data.image_matches(&aspace_handle) {
             continue;
         }

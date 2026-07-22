@@ -27,6 +27,8 @@ use crate::mm::{
     USER_IO_PIN_TEST_DELAY_MS_MAX, reset_user_io_pin_counters, set_user_io_pin_counters_enabled,
     set_user_io_pin_test_delay_ms,
 };
+#[cfg(feature = "mm-lock-diagnostics")]
+use crate::mm::{reset_mm_lock_diagnostics, set_mm_lock_diagnostics_enabled};
 
 const CONTROL_HELP: &str = concat!(
     "test-only I/O control; write exactly one key=value command\n",
@@ -47,6 +49,9 @@ const CONTROL_HELP: &str = concat!(
     "async_block_selftest_irq_first_scratch=<device>\n",
     "test_policy=reset\n",
 );
+
+#[cfg(feature = "mm-lock-diagnostics")]
+const MM_LOCK_CONTROL_HELP: &str = "mm_lock_stats=on|off|reset\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Toggle {
@@ -87,6 +92,8 @@ enum TestIoCommand<'a> {
     AsyncBlockAdaptive(AdaptiveCommand),
     AsyncBlockMergeWrite(Toggle),
     PinDelayMs(u64),
+    #[cfg(feature = "mm-lock-diagnostics")]
+    MmLockStats(CounterCommand),
     Selftest {
         kind: SelftestKind,
         scratch_device: &'a str,
@@ -171,6 +178,11 @@ fn parse_command(text: &str) -> VfsResult<TestIoCommand<'_>> {
             }
             TestIoCommand::PinDelayMs(delay_ms)
         }
+        #[cfg(feature = "mm-lock-diagnostics")]
+        "mm_lock_stats" => TestIoCommand::MmLockStats(match value {
+            "reset" => CounterCommand::Reset,
+            _ => CounterCommand::Set(parse_toggle(value).ok_or(VfsError::InvalidInput)?),
+        }),
         "test_policy" if value == "reset" => TestIoCommand::ResetTestPolicy,
         _ => return parse_selftest(key, value)?.ok_or(VfsError::InvalidInput),
     };
@@ -192,6 +204,8 @@ fn reset_test_policy() -> VfsResult<()> {
     set_cached_readahead_enabled(false);
     set_lwext4_async_mapped_read_enabled(false);
     set_user_io_pin_test_delay_ms(0).map_err(|_| VfsError::InvalidInput)?;
+    #[cfg(feature = "mm-lock-diagnostics")]
+    set_mm_lock_diagnostics_enabled(false).map_err(|_| VfsError::InvalidInput)?;
     Ok(())
 }
 
@@ -237,6 +251,14 @@ fn apply_command(command: TestIoCommand<'_>) -> VfsResult<()> {
         TestIoCommand::PinDelayMs(delay_ms) => {
             set_user_io_pin_test_delay_ms(delay_ms).map_err(|_| VfsError::InvalidInput)?;
         }
+        #[cfg(feature = "mm-lock-diagnostics")]
+        TestIoCommand::MmLockStats(CounterCommand::Set(toggle)) => {
+            set_mm_lock_diagnostics_enabled(enabled(toggle)).map_err(|_| VfsError::InvalidInput)?;
+        }
+        #[cfg(feature = "mm-lock-diagnostics")]
+        TestIoCommand::MmLockStats(CounterCommand::Reset) => {
+            reset_mm_lock_diagnostics().map_err(|_| VfsError::InvalidInput)?;
+        }
         TestIoCommand::Selftest {
             kind,
             scratch_device,
@@ -257,7 +279,12 @@ fn apply_command(command: TestIoCommand<'_>) -> VfsResult<()> {
 
 fn control_operation(request: SimpleFileOperation<'_>) -> VfsResult<Option<Vec<u8>>> {
     match request {
-        SimpleFileOperation::Read => Ok(Some(CONTROL_HELP.as_bytes().to_vec())),
+        SimpleFileOperation::Read => {
+            let mut help = CONTROL_HELP.as_bytes().to_vec();
+            #[cfg(feature = "mm-lock-diagnostics")]
+            help.extend_from_slice(MM_LOCK_CONTROL_HELP.as_bytes());
+            Ok(Some(help))
+        }
         SimpleFileOperation::Write(data) => {
             if data.iter().all(|byte| byte.is_ascii_whitespace()) {
                 return Ok(None);
@@ -296,6 +323,11 @@ mod tests {
         assert!(parse_command("async_block_on").is_err());
         assert!(parse_command("async_block =on").is_err());
         assert!(parse_command("pin_delay_ms=1001").is_err());
+        #[cfg(feature = "mm-lock-diagnostics")]
+        assert_eq!(
+            parse_command("mm_lock_stats=reset"),
+            Ok(TestIoCommand::MmLockStats(CounterCommand::Reset))
+        );
     }
 
     #[test]

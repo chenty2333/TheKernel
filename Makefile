@@ -23,6 +23,7 @@ CLEAN_DIRS ?= \
 	$(STATE_DIR)/ci \
 	$(STATE_DIR)/empty-rootfs \
 	$(STATE_DIR)/io-test-shell \
+	$(STATE_DIR)/mm-performance-shell \
 	$(STATE_DIR)/qemu-runner \
 	$(STATE_DIR)/rootfs \
 	$(STATE_DIR)/rootfs-build \
@@ -92,6 +93,12 @@ kernel-rv-io-test:
 
 kernel-la-io-test:
 	@$(BUILD_TOOL) io-test-shell la
+
+kernel-rv-mm-performance:
+	@$(BUILD_TOOL) mm-performance-shell rv
+
+kernel-la-mm-performance:
+	@$(BUILD_TOOL) mm-performance-shell la
 
 rootfs-rv:
 	@$(BUILD_TOOL) rootfs rv --output "$(ROOTFS_RV)"
@@ -202,7 +209,9 @@ check-kernel-size:
 
 .PHONY: \
 	help all artifacts test-fixtures kernels rootfs \
-	kernel-rv kernel-la kernel-rv-shell kernel-la-shell rootfs-rv rootfs-la \
+	kernel-rv kernel-la kernel-rv-shell kernel-la-shell \
+	kernel-rv-io-test kernel-la-io-test \
+	kernel-rv-mm-performance kernel-la-mm-performance rootfs-rv rootfs-la \
 	shell-rv shell-la system-test system-test-rv system-test-la \
 	smoke-list smoke test-tools \
 	dev-image dev-check dev-shell dev-shell-root \

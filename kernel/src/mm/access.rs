@@ -917,7 +917,10 @@ struct UserIoRangePin {
 
 impl Drop for UserIoRangePin {
     fn drop(&mut self) {
-        self.aspace.lock().end_user_io_pin(self.token);
+        {
+            let mut aspace = super::lock_mm_diagnosed!(self.aspace, UserPinRelease);
+            aspace.end_user_io_pin(self.token);
+        }
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_UNPINS, 1);
     }
 }
@@ -1027,7 +1030,8 @@ impl Drop for UnpublishedUserIoPin {
         self.frame_pins.clear();
         self.page_cache_pins.clear();
         if let Some(reservation) = self.reservation.take() {
-            self.aspace.lock().cancel_user_io_pin(reservation);
+            let mut aspace = super::lock_mm_diagnosed!(self.aspace, UserPinRelease);
+            aspace.cancel_user_io_pin(reservation);
         }
         drop(self.system_charge.take());
     }
@@ -1081,7 +1085,7 @@ fn prepare_user_io_pin(
     let page_len = page_end - page_start;
     let aspace_handle = thr.proc_data.aspace();
     let admission = {
-        let mut aspace = aspace_handle.lock();
+        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinAdmission);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
         let request = PinRequest::new(
             UserRange::new(start, len).ok()?,
@@ -1123,7 +1127,7 @@ fn prepare_user_io_pin(
     while expectation_cursor < page_end {
         let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
         let expectation_result = {
-            let aspace = aspace_handle.lock();
+            let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
             aspace.append_user_io_mapping_expectations(
                 expectation_cursor,
                 chunk_end - expectation_cursor,
@@ -1188,7 +1192,7 @@ fn prepare_user_io_pin(
         };
 
         let chunk_pin = {
-            let aspace = aspace_handle.lock();
+            let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCollectOwners);
             (|| {
                 let mut window_cursor = scan_cursor;
                 while window_cursor < chunk_end {
@@ -1320,7 +1324,7 @@ fn prepare_user_io_pin(
         // protect, remap, and discard publication between windows, so releasing
         // AddrSpace here cannot make an earlier validated prefix stale.
         let validation = {
-            let mut aspace = aspace_handle.lock();
+            let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinRevalidate);
             aspace.revalidate_user_io_pin_window(
                 preparation.reservation(),
                 &preparation.expectations()[validated_expectations..],
@@ -1380,7 +1384,7 @@ fn prepare_user_io_pin(
     // transition. Keep the guard in an explicit scope so an error cannot drop
     // unpublished owners and recursively cancel while AddrSpace is still held.
     let publication = {
-        let mut aspace = aspace_handle.lock();
+        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCommit);
         aspace.commit_user_io_pin(preparation.reservation())
     };
     let token = match publication {

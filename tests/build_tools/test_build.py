@@ -214,11 +214,24 @@ class BuildKernelParamTests(unittest.TestCase):
         for mode in ("release", "shell"):
             request = make_kernel_request(mode, "rv", root)
             self.assertNotIn("test-io-control", request.app_features.split())
+            self.assertNotIn("mm-lock-diagnostics", request.app_features.split())
 
         test_request = make_kernel_request("io-test-shell", "rv", root)
         self.assertIn("test-io-control", test_request.app_features.split())
+        self.assertNotIn("mm-lock-diagnostics", test_request.app_features.split())
         self.assertNotEqual(
             test_request.name, make_kernel_request("shell", "rv", root).name
+        )
+
+        mm_request = make_kernel_request("mm-performance-shell", "rv", root)
+        self.assertEqual(
+            {"test-io-control", "mm-lock-diagnostics"}
+            & set(mm_request.app_features.split()),
+            {"test-io-control", "mm-lock-diagnostics"},
+        )
+        self.assertNotEqual(mm_request.name, test_request.name)
+        self.assertNotEqual(
+            mm_request.name, make_kernel_request("shell", "rv", root).name
         )
 
     def test_requested_kernel_cpu_count_is_part_of_build_identity(self) -> None:

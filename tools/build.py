@@ -504,18 +504,25 @@ def requested_kernel_cpu_count() -> int | None:
 
 
 def make_kernel_request(
-    mode: Literal["release", "shell", "io-test-shell"], arch: str, root: Path
+    mode: Literal[
+        "release", "shell", "io-test-shell", "mm-performance-shell"
+    ],
+    arch: str,
+    root: Path,
 ) -> KernelRequest:
     arch_alias = normalize_short_arch(arch)
     full_arch: Literal["riscv64", "loongarch64"] = "riscv64" if arch_alias == "rv" else "loongarch64"
     name = "kernel-rv" if arch_alias == "rv" else "kernel-la"
     features = "qemu"
-    if mode in ("shell", "io-test-shell"):
+    if mode in ("shell", "io-test-shell", "mm-performance-shell"):
         name = f"{name}-shell"
         features = "qemu boot-shell"
     if mode == "io-test-shell":
         name = f"{name}-io-test"
         features = f"{features} test-io-control"
+    elif mode == "mm-performance-shell":
+        name = f"{name}-mm-performance"
+        features = f"{features} test-io-control mm-lock-diagnostics"
     make_args = ["BUS=mmio"] if arch_alias == "rv" else []
     requested_cpus = requested_kernel_cpu_count()
     if requested_cpus is not None:
@@ -586,7 +593,9 @@ def kernel_build_env(req: KernelRequest) -> dict[str, str]:
 
 def ensure_kernel(
     *,
-    mode: Literal["release", "shell", "io-test-shell"],
+    mode: Literal[
+        "release", "shell", "io-test-shell", "mm-performance-shell"
+    ],
     arch: str,
     root: Path | None = None,
     output: Path | None = None,
@@ -610,8 +619,12 @@ def ensure_kernel(
             output = root / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
         elif mode == "shell":
             output = root / ".state" / "shell" / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
-        else:
+        elif mode == "io-test-shell":
             output = root / ".state" / "io-test-shell" / (
+                "kernel-rv" if arch_alias == "rv" else "kernel-la"
+            )
+        else:
+            output = root / ".state" / "mm-performance-shell" / (
                 "kernel-rv" if arch_alias == "rv" else "kernel-la"
             )
     materialize_file(result.cache_path, output, prefer_hardlink=True, root=root)
@@ -822,6 +835,16 @@ def build_parser() -> argparse.ArgumentParser:
     io_test_shell.add_argument("--verbose", action="store_true")
     io_test_shell.set_defaults(func=io_test_shell_cmd)
 
+    mm_performance_shell = sub.add_parser(
+        "mm-performance-shell",
+        help="build/reuse an MM performance diagnostics shell kernel",
+    )
+    mm_performance_shell.add_argument(
+        "arch", choices=("rv", "la", "riscv64", "loongarch64")
+    )
+    mm_performance_shell.add_argument("--verbose", action="store_true")
+    mm_performance_shell.set_defaults(func=mm_performance_shell_cmd)
+
     rootfs = sub.add_parser(
         "rootfs", help="build or reuse a project test root filesystem"
     )
@@ -849,6 +872,15 @@ def shell_cmd(args: argparse.Namespace) -> int:
 
 def io_test_shell_cmd(args: argparse.Namespace) -> int:
     result = ensure_kernel(mode="io-test-shell", arch=args.arch, verbose=args.verbose)
+    if args.verbose:
+        print(result.output_path)
+    return 0
+
+
+def mm_performance_shell_cmd(args: argparse.Namespace) -> int:
+    result = ensure_kernel(
+        mode="mm-performance-shell", arch=args.arch, verbose=args.verbose
+    )
     if args.verbose:
         print(result.output_path)
     return 0
