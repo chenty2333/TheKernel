@@ -13,8 +13,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.qemu_runner.command import build_qemu_command  # noqa: E402
-from tools.qemu_runner.evidence import file_evidence  # noqa: E402
+from tools.qemu_runner.evidence import (  # noqa: E402
+    EvidenceError as FileEvidenceError,
+    file_evidence,
+    validate_file_evidence,
+)
 from tools.qemu_runner.model import Drive  # noqa: E402
+from tools.qemu_runner.receipt import (  # noqa: E402
+    RECEIPT_SCHEMA_VERSION,
+    ReceiptError,
+    validate_completed_input_receipt,
+    validate_receipt_file_evidence,
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -23,20 +33,10 @@ def require(condition: bool, message: str) -> None:
 
 
 def evidence_record(value: Any, label: str) -> dict[str, Any]:
-    require(isinstance(value, dict), f"missing {label} evidence")
-    path = value.get("path")
-    size = value.get("size_bytes")
-    digest = value.get("sha256")
-    require(isinstance(path, str) and path != "", f"invalid {label} path")
-    require(path == str(Path(path).expanduser().resolve()), f"non-canonical {label} path")
-    require(type(size) is int and size >= 0, f"invalid {label} size")
-    require(
-        isinstance(digest, str)
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest),
-        f"invalid {label} SHA-256",
-    )
-    return value
+    try:
+        return validate_file_evidence(value, label)
+    except FileEvidenceError as error:
+        raise ValueError(str(error)) from error
 
 
 def validate(args: argparse.Namespace) -> None:
@@ -47,7 +47,8 @@ def validate(args: argparse.Namespace) -> None:
     receipt: dict[str, Any] = loaded
 
     require(
-        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        type(receipt.get("schema_version")) is int
+        and receipt["schema_version"] == RECEIPT_SCHEMA_VERSION,
         "unsupported receipt schema",
     )
     require(receipt.get("state") == "complete", "QEMU receipt is not complete")
@@ -73,15 +74,14 @@ def validate(args: argparse.Namespace) -> None:
         "invalid QEMU duration",
     )
 
+    receipt_evidence = validate_receipt_file_evidence(receipt)
     kernel = file_evidence(Path(args.kernel))
-    require(receipt.get("kernel") == kernel, "kernel evidence mismatch")
-    rootfs_source = evidence_record(receipt.get("rootfs_source"), "rootfs source")
+    require(receipt_evidence["kernel"] == kernel, "kernel evidence mismatch")
+    rootfs_source = receipt_evidence["rootfs_source"]
     expected_rootfs_path = str(Path(args.rootfs).expanduser().resolve())
     require(rootfs_source.get("path") == expected_rootfs_path, "rootfs path mismatch")
-    rootfs_runtime_before = receipt.get("rootfs_runtime_before")
-    rootfs_runtime_after = receipt.get("rootfs_runtime_after")
-    rootfs_runtime_before = evidence_record(rootfs_runtime_before, "pre-run rootfs")
-    rootfs_runtime_after = evidence_record(rootfs_runtime_after, "post-run rootfs")
+    rootfs_runtime_before = receipt_evidence["rootfs_runtime_before"]
+    rootfs_runtime_after = receipt_evidence["rootfs_runtime_after"]
     rootfs_runtime_path = rootfs_runtime_before.get("path")
     require(isinstance(rootfs_runtime_path, str), "missing runtime rootfs path")
     require(
@@ -100,13 +100,7 @@ def validate(args: argparse.Namespace) -> None:
             rootfs_source == rootfs_runtime_before,
             "in-place writable rootfs has inconsistent pre-run evidence",
         )
-    if rootfs_mode != "rw":
-        require(
-            rootfs_runtime_before == rootfs_runtime_after,
-            "read-only runtime rootfs changed during QEMU",
-        )
-
-    qemu = evidence_record(receipt.get("qemu"), "QEMU")
+    qemu = receipt_evidence["qemu"]
     qemu_path = qemu.get("path")
     require(isinstance(qemu_path, str), "missing resolved QEMU path")
     expected_qemu = file_evidence(Path(args.qemu_binary))
@@ -168,8 +162,18 @@ def validate(args: argparse.Namespace) -> None:
     command = receipt.get("command")
     require(command == expected_command, "QEMU command does not match the recorded inputs")
     log = file_evidence(Path(args.log))
-    require(receipt.get("log_path") == log["path"], "log path mismatch")
-    require(evidence_record(receipt.get("log"), "QEMU log") == log, "QEMU log evidence mismatch")
+    require(receipt_evidence["log"] == log, "QEMU log evidence mismatch")
+    interaction = receipt.get("interaction")
+    external_input_producer = (
+        isinstance(interaction, dict)
+        and interaction.get("external_input_producer") is True
+    )
+    require(
+        external_input_producer == (args.commands is not None),
+        "external-producer receipts require --commands and ordinary receipts reject it",
+    )
+    if external_input_producer:
+        validate_completed_input_receipt(receipt, Path(args.commands))
 
 
 def main() -> int:
@@ -192,11 +196,15 @@ def main() -> int:
     )
     parser.add_argument("--log", required=True)
     parser.add_argument("--qemu-binary", required=True)
+    parser.add_argument(
+        "--commands",
+        help="require a complete external-producer stdin receipt for this command stream",
+    )
     parser.add_argument("--memory", default="1G")
     args = parser.parse_args()
     try:
         validate(args)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ReceiptError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(f"QEMU receipt: PASS receipt={Path(args.receipt).resolve()}")
     return 0

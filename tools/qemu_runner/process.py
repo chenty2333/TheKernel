@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import select
@@ -14,6 +15,7 @@ from typing import BinaryIO
 
 from .model import (
     Arch,
+    InputForwarding,
     INTENTIONAL_STOP_RETURN_CODE,
     Interaction,
     RunLimits,
@@ -23,6 +25,58 @@ from .model import (
 
 class ProcessError(ValueError):
     """Raised when process interaction settings are inconsistent."""
+
+
+MAX_PENDING_INPUT_BYTES = 64 * 1024
+
+
+class _InputForwardingRecorder:
+    """Track only bytes accepted by the QEMU stdin pipe."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._bytes_forwarded = 0
+        self._newlines = 0
+        self._last_byte: int | None = None
+        self.observed_bytes = 0
+        self.source_eof = False
+        self.broken_pipe = False
+
+    def observe(self, data: bytes) -> None:
+        self.observed_bytes += len(data)
+
+    def forwarded(self, data: bytes) -> None:
+        if not data:
+            return
+        self._digest.update(data)
+        self._bytes_forwarded += len(data)
+        self._newlines += data.count(b"\n")
+        self._last_byte = data[-1]
+
+    def mark_eof(self) -> None:
+        self.source_eof = True
+
+    def mark_broken_pipe(self) -> None:
+        self.broken_pipe = True
+
+    def snapshot(self) -> InputForwarding:
+        line_count = self._newlines
+        if self._bytes_forwarded > 0 and self._last_byte != ord("\n"):
+            line_count += 1
+        relay_complete = (
+            self.source_eof
+            and not self.broken_pipe
+            and self._bytes_forwarded == self.observed_bytes
+        )
+        return InputForwarding(
+            sha256=self._digest.hexdigest(),
+            bytes_forwarded=self._bytes_forwarded,
+            line_count=line_count,
+            observed_bytes=self.observed_bytes,
+            source_eof=self.source_eof,
+            broken_pipe=self.broken_pipe,
+            relay_complete=relay_complete,
+        )
 
 
 def _validate_marker(name: str, marker: str | None) -> None:
@@ -84,15 +138,17 @@ def _wait_for_process(
     interaction: Interaction,
     input_stream: BinaryIO,
     console_stream: BinaryIO | None,
+    input_recorder: _InputForwardingRecorder | None,
 ) -> tuple[int, str | None]:
     started_at = time.monotonic()
     last_output_at = started_at
     input_ready = interaction.input_after_marker is None
-    input_open = interaction.input_after_marker is not None
+    input_open = input_recorder is not None
     stdout_open = True
     pending_output = bytearray()
+    pending_input = bytearray()
     assert process.stdout is not None
-    if interaction.input_after_marker is not None:
+    if input_recorder is not None:
         assert process.stdin is not None
 
     def consume_lines(data: bytes, *, final: bool = False) -> tuple[int, str] | None:
@@ -118,11 +174,20 @@ def _wait_for_process(
 
     while True:
         readers: list[object] = []
+        writers: list[object] = []
         if stdout_open:
             readers.append(process.stdout)
-        if input_ready and input_open:
+        if (
+            input_ready
+            and input_open
+            and len(pending_input) < MAX_PENDING_INPUT_BYTES
+        ):
             readers.append(input_stream)
-        ready, _, _ = select.select(readers, [], [], 0.1)
+        if pending_input:
+            assert process.stdin is not None
+            if not process.stdin.closed:
+                writers.append(process.stdin)
+        ready, writable, _ = select.select(readers, writers, [], 0.1)
 
         if stdout_open and process.stdout in ready:
             data = os.read(process.stdout.fileno(), 65_536)
@@ -139,18 +204,44 @@ def _wait_for_process(
                 stdout_open = False
 
         if input_ready and input_open and input_stream in ready:
-            data = os.read(input_stream.fileno(), 65_536)
+            data = os.read(
+                input_stream.fileno(),
+                MAX_PENDING_INPUT_BYTES - len(pending_input),
+            )
             if data:
-                try:
-                    assert process.stdin is not None
-                    process.stdin.write(data)
-                    process.stdin.flush()
-                except (BrokenPipeError, OSError, ValueError):
-                    input_open = False
+                assert input_recorder is not None
+                input_recorder.observe(data)
+                pending_input.extend(data)
             else:
                 input_open = False
-                assert process.stdin is not None
+                assert input_recorder is not None
+                input_recorder.mark_eof()
+
+        if process.stdin is not None and process.stdin in writable:
+            assert input_recorder is not None
+            try:
+                written = os.write(process.stdin.fileno(), pending_input)
+                if written <= 0:
+                    raise BrokenPipeError("QEMU stdin accepted zero bytes")
+            except (BlockingIOError, InterruptedError):
+                pass
+            except (BrokenPipeError, OSError, ValueError):
+                input_recorder.mark_broken_pipe()
+                input_open = False
+                pending_input.clear()
                 process.stdin.close()
+            else:
+                input_recorder.forwarded(bytes(pending_input[:written]))
+                del pending_input[:written]
+
+        if (
+            input_recorder is not None
+            and input_recorder.source_eof
+            and not pending_input
+            and process.stdin is not None
+            and not process.stdin.closed
+        ):
+            process.stdin.close()
 
         returncode = process.poll()
         if returncode is not None:
@@ -210,6 +301,7 @@ def run_process(
     interaction: Interaction,
     input_stream: BinaryIO | None = None,
     console_stream: BinaryIO | None = None,
+    proxy_interactive_input: bool = False,
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
 
@@ -227,10 +319,14 @@ def run_process(
             raise ProcessError("interactive input stream must expose a file descriptor") from error
     started_at = time.monotonic()
     process: subprocess.Popen[bytes] | None = None
+    proxy_input = (
+        interaction.input_after_marker is not None or proxy_interactive_input
+    )
+    input_recorder = _InputForwardingRecorder() if proxy_input else None
     launched = False
     error_message: str | None = None
     try:
-        if interaction.input_after_marker is not None:
+        if proxy_input:
             process_stdin: int | BinaryIO | None = subprocess.PIPE
         elif interaction.interactive:
             process_stdin = input_stream
@@ -248,6 +344,9 @@ def run_process(
                 start_new_session=True,
             )
             launched = True
+            if input_recorder is not None:
+                assert process.stdin is not None
+                os.set_blocking(process.stdin.fileno(), False)
             returncode, error_message = _wait_for_process(
                 process,
                 log_file=log_file,
@@ -255,6 +354,7 @@ def run_process(
                 interaction=interaction,
                 input_stream=input_stream,
                 console_stream=console_stream,
+                input_recorder=input_recorder,
             )
     except KeyboardInterrupt:
         if process is not None:
@@ -286,4 +386,7 @@ def run_process(
         log_path=log_path,
         workdir=workdir,
         error_message=error_message,
+        input_forwarding=(
+            input_recorder.snapshot() if input_recorder is not None else None
+        ),
     )

@@ -21,6 +21,14 @@ stop_marker=${10:-}
 ready_marker=THEKERNEL_SHELL_READY
 cpus=${THEKERNEL_QEMU_CPUS:-1}
 
+[ -f "$commands" ] || {
+    printf 'guest command stream is missing: %s\n' "$commands" >&2
+    exit 2
+}
+commands_sha256_before=$(sha256sum "$commands" | awk '{ print $1 }')
+commands_bytes_before=$(stat -c '%s' "$commands")
+commands_lines_before=$(awk 'END { print NR + 0 }' "$commands")
+
 case "$cpus" in
     ''|*[!0-9]*)
         printf 'THEKERNEL_QEMU_CPUS must be a positive integer: %s\n' "$cpus" >&2
@@ -41,6 +49,7 @@ runner_args=(
     --workdir "$workdir"
     --log "$workdir/qemu.log"
     --receipt "$workdir/qemu-runner-receipt.json"
+    --external-input-producer
     --interactive
     --input-after-marker "$ready_marker"
     --ready-timeout "$ready_timeout_secs"
@@ -50,9 +59,13 @@ runner_args=(
 
 set +e
 (
-    while IFS= read -r line; do
+    first_line=1
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$first_line" -eq 0 ]; then
+            sleep "$line_delay_secs"
+        fi
         printf '%s\n' "$line"
-        sleep "$line_delay_secs"
+        first_line=0
     done <"$commands"
 ) | python3 -m tools.qemu_runner run \
     "${runner_args[@]}"
@@ -62,15 +75,33 @@ set -e
 producer_status=${pipeline_status[0]}
 runner_status=${pipeline_status[1]}
 
-# The guest may shut down (cleanly or after a panic) before the throttled input
-# producer has written every line. In that case the producer receives SIGPIPE
-# (128 + SIGPIPE == 141). The QEMU runner result and the subsequent strict log
-# validator are authoritative: missing markers, panics, and dirty shutdowns
-# still fail, but they are no longer obscured by an incidental pipe status.
+set +e
+python3 -m tools.qemu_runner finalize-input \
+    --receipt "$workdir/qemu-runner-receipt.json" \
+    --commands "$commands" \
+    --expected-sha256 "$commands_sha256_before" \
+    --expected-bytes "$commands_bytes_before" \
+    --expected-line-count "$commands_lines_before" \
+    --producer-status "$producer_status"
+finalizer_status=$?
+commands_sha256_after=$(sha256sum "$commands" 2>/dev/null | awk '{ print $1 }')
+commands_bytes_after=$(stat -c '%s' "$commands" 2>/dev/null)
+commands_lines_after=$(awk 'END { print NR + 0 }' "$commands" 2>/dev/null)
+source_status=$?
+set -e
+
 if [ "$runner_status" -ne 0 ]; then
     exit "$runner_status"
 fi
 case "$producer_status" in
-    0|141) exit 0 ;;
+    0) ;;
     *) exit "$producer_status" ;;
 esac
+if [ "$source_status" -ne 0 ] || \
+    [ "$commands_sha256_after" != "$commands_sha256_before" ] || \
+    [ "$commands_bytes_after" != "$commands_bytes_before" ] || \
+    [ "$commands_lines_after" != "$commands_lines_before" ]; then
+    printf 'guest command stream changed while QEMU was running: %s\n' "$commands" >&2
+    exit 1
+fi
+[ "$finalizer_status" -eq 0 ] || exit "$finalizer_status"

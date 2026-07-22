@@ -221,7 +221,7 @@ while IFS= read -r arch; do
             --receipt "$qemu_receipt" --arch "$arch" --cpus "$cpus" \
             --kernel "$kernel_artifact" --rootfs "$rootfs" \
             --rootfs-mode snapshot --log "$run_dir/qemu.log" \
-            --qemu-binary "$qemu_binary" >/dev/null \
+            --qemu-binary "$qemu_binary" --commands "$commands_artifact" >/dev/null \
             || nightly_fail "invalid QEMU lifecycle receipt: $qemu_receipt"
 
         write_tsv_row \

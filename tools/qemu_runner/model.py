@@ -49,6 +49,25 @@ class Interaction:
 
 
 @dataclass(frozen=True)
+class InputForwarding:
+    """Evidence for bytes successfully forwarded to the QEMU stdin pipe.
+
+    ``observed`` counts bytes read from the external producer, while the
+    digest and counters below cover only bytes accepted by the QEMU stdin
+    pipe.  Keeping those two notions separate prevents a source-file hash
+    from being mistaken for proof that QEMU's stdin pipe accepted the stream.
+    """
+
+    sha256: str
+    bytes_forwarded: int
+    line_count: int
+    observed_bytes: int
+    source_eof: bool
+    broken_pipe: bool
+    relay_complete: bool
+
+
+@dataclass(frozen=True)
 class RunResult:
     """Process-level result without external result-aggregation policy."""
 
@@ -59,6 +78,7 @@ class RunResult:
     log_path: Path
     workdir: Path
     error_message: str | None = None
+    input_forwarding: InputForwarding | None = None
 
     @property
     def ok(self) -> bool:

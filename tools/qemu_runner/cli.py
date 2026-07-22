@@ -12,6 +12,7 @@ from .evidence import EvidenceError
 from .images import ImageError
 from .model import INTENTIONAL_STOP_RETURN_CODE, Interaction, RunLimits
 from .process import ProcessError
+from .receipt import ReceiptError, finalize_external_input_receipt
 from .runner import RunConfig, RunnerError, normalize_arch, run
 
 
@@ -59,6 +60,7 @@ def run_cmd(args: argparse.Namespace) -> int:
         cpus=args.cpus,
         qemu_binary=args.qemu_binary,
         receipt_path=Path(args.receipt) if args.receipt else None,
+        external_input_producer=args.external_input_producer,
     )
     result = run(config)
     print(
@@ -77,6 +79,24 @@ def run_cmd(args: argparse.Namespace) -> int:
     if result.returncode < 0:
         return 1
     return result.returncode
+
+
+def finalize_input_cmd(args: argparse.Namespace) -> int:
+    accepted = finalize_external_input_receipt(
+        receipt_path=Path(args.receipt),
+        commands_path=Path(args.commands),
+        expected_sha256=args.expected_sha256,
+        expected_bytes=args.expected_bytes,
+        expected_line_count=args.expected_line_count,
+        producer_status=args.producer_status,
+    )
+    state = "accepted" if accepted else "rejected"
+    print(
+        f"qemu-runner input-receipt={state} producer_status={args.producer_status} "
+        f"receipt={Path(args.receipt).expanduser().resolve()}",
+        file=sys.stderr,
+    )
+    return 0 if accepted else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,7 +166,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--receipt",
         help="write an atomic JSON receipt before launch and after completion",
     )
+    run_parser.add_argument(
+        "--external-input-producer",
+        action="store_true",
+        help="leave the receipt awaiting a wrapper-recorded stdin producer status",
+    )
     run_parser.set_defaults(func=run_cmd)
+
+    finalize_parser = subparsers.add_parser(
+        "finalize-input",
+        help="atomically bind an external stdin producer status to a QEMU receipt",
+    )
+    finalize_parser.add_argument("--receipt", required=True)
+    finalize_parser.add_argument("--commands", required=True)
+    finalize_parser.add_argument("--expected-sha256", required=True)
+    finalize_parser.add_argument("--expected-bytes", required=True, type=int)
+    finalize_parser.add_argument("--expected-line-count", required=True, type=int)
+    finalize_parser.add_argument("--producer-status", required=True, type=int)
+    finalize_parser.set_defaults(func=finalize_input_cmd)
     return parser
 
 
@@ -164,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         ImageError,
         CommandError,
         ProcessError,
+        ReceiptError,
         OSError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)

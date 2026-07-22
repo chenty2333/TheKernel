@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import subprocess
 import sys
@@ -9,11 +10,199 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.qemu_runner.model import RunResult
+from tools.qemu_runner.model import InputForwarding, Interaction, RunResult
+from tools.qemu_runner.receipt import finalize_external_input_receipt
 from tools.qemu_runner.runner import RunConfig, RunnerError, run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_external_producer_receipt_is_finalized_from_forwarded_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            commands = root / "commands"
+            receipt_path = root / "run" / "receipt.json"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            payload = b"first\nsecond\n"
+            commands.write_bytes(payload)
+            forwarding = InputForwarding(
+                sha256=hashlib.sha256(payload).hexdigest(),
+                bytes_forwarded=len(payload),
+                line_count=2,
+                observed_bytes=len(payload),
+                source_eof=True,
+                broken_pipe=False,
+                relay_complete=True,
+            )
+            config = RunConfig(
+                arch="rv",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                receipt_path=receipt_path,
+                interaction=Interaction(interactive=True, input_after_marker="READY"),
+                external_input_producer=True,
+            )
+            expected = RunResult(
+                arch="rv",
+                command=("qemu",),
+                returncode=0,
+                duration_ms=1,
+                log_path=config.log_path,
+                workdir=config.workdir,
+                input_forwarding=forwarding,
+            )
+
+            def complete_run(**kwargs):
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
+                run(config)
+            pending = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(pending["schema_version"], 2)
+            self.assertEqual(pending["state"], "awaiting_producer")
+            self.assertNotIn("producer_status", pending["stdin"])
+
+            self.assertTrue(
+                finalize_external_input_receipt(
+                    receipt_path=receipt_path,
+                    commands_path=commands,
+                    expected_sha256=forwarding.sha256,
+                    expected_bytes=len(payload),
+                    expected_line_count=2,
+                    producer_status=0,
+                )
+            )
+            completed = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed["state"], "complete")
+            self.assertTrue(completed["stdin"]["source_fully_relayed"])
+            self.assertTrue(completed["stdin"]["producer_status_accepted"])
+            self.assertEqual(completed["stdin"]["producer_status_kind"], "exit:0")
+
+            validator = Path(__file__).resolve().parents[2] / "scripts/ci/validate-qemu-receipt.py"
+            validator_args = [
+                sys.executable,
+                str(validator),
+                "--receipt",
+                str(receipt_path),
+                "--arch",
+                "rv",
+                "--cpus",
+                "1",
+                "--kernel",
+                str(kernel),
+                "--rootfs",
+                str(rootfs),
+                "--rootfs-mode",
+                config.rootfs_mode,
+                "--log",
+                str(config.log_path),
+                "--qemu-binary",
+                sys.executable,
+            ]
+            self.assertNotEqual(
+                subprocess.run(validator_args, check=False).returncode,
+                0,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    [*validator_args, "--commands", str(commands)], check=False
+                ).returncode,
+                0,
+            )
+
+    def test_external_producer_truncation_is_recorded_and_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "commands"
+            receipt = root / "receipt.json"
+            payload = b"first\nsecond\n"
+            prefix = b"first\n"
+            commands.write_bytes(payload)
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "state": "awaiting_producer",
+                        "interaction": {"external_input_producer": True},
+                        "stdin": {
+                            "state": "awaiting_producer",
+                            "sha256": hashlib.sha256(prefix).hexdigest(),
+                            "bytes": len(prefix),
+                            "line_count": 1,
+                            "observed_bytes": len(prefix),
+                            "source_eof": True,
+                            "broken_pipe": False,
+                            "relay_complete": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                finalize_external_input_receipt(
+                    receipt_path=receipt,
+                    commands_path=commands,
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    expected_bytes=len(payload),
+                    expected_line_count=2,
+                    producer_status=141,
+                )
+            )
+            completed = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(completed["state"], "complete")
+            self.assertFalse(completed["stdin"]["source_fully_relayed"])
+            self.assertFalse(completed["stdin"]["producer_status_accepted"])
+
+    def test_exact_stream_does_not_turn_sigpipe_141_into_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "commands"
+            receipt = root / "receipt.json"
+            payload = b"first\nsecond\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            commands.write_bytes(payload)
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "state": "awaiting_producer",
+                        "interaction": {"external_input_producer": True},
+                        "stdin": {
+                            "state": "awaiting_producer",
+                            "sha256": digest,
+                            "bytes": len(payload),
+                            "line_count": 2,
+                            "observed_bytes": len(payload),
+                            "source_eof": True,
+                            "broken_pipe": False,
+                            "relay_complete": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                finalize_external_input_receipt(
+                    receipt_path=receipt,
+                    commands_path=commands,
+                    expected_sha256=digest,
+                    expected_bytes=len(payload),
+                    expected_line_count=2,
+                    producer_status=141,
+                )
+            )
+            completed = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertTrue(completed["stdin"]["source_fully_relayed"])
+            self.assertFalse(completed["stdin"]["producer_status_accepted"])
+            self.assertEqual(completed["stdin"]["producer_status_kind"], "signal:13")
+
     def test_explicit_artifacts_are_composed_without_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,6 +280,15 @@ class RunnerTests(unittest.TestCase):
                 sys.executable,
             ]
             self.assertEqual(subprocess.run(validator_args, check=False).returncode, 0)
+
+            commands = root / "unexpected-commands"
+            commands.write_bytes(b"echo should-not-be-present\n")
+            self.assertNotEqual(
+                subprocess.run(
+                    [*validator_args, "--commands", str(commands)], check=False
+                ).returncode,
+                0,
+            )
 
             wrong_mode_args = validator_args.copy()
             wrong_mode_args[wrong_mode_args.index("--rootfs-mode") + 1] = "readonly"

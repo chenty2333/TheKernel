@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .command import VALID_DRIVE_MODES, build_qemu_command
 from .evidence import file_evidence
 from .images import materialize_writable_image, prepare_image
 from .model import Arch, Drive, DriveMode, Interaction, RunLimits, RunResult
 from .process import run_process
+from .receipt import (
+    RECEIPT_SCHEMA_VERSION,
+    atomic_write_receipt,
+    input_forwarding_payload,
+)
 
 
 class RunnerError(ValueError):
@@ -38,6 +39,7 @@ class RunConfig:
     cpus: int = 1
     qemu_binary: str | None = None
     receipt_path: Path | None = None
+    external_input_producer: bool = False
 
 
 def normalize_arch(value: str) -> Arch:
@@ -86,30 +88,6 @@ def _qemu_evidence(command: tuple[str, ...]) -> dict[str, str | int | None]:
     return {"requested": requested, **evidence}
 
 
-def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
-    path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        output = os.fdopen(descriptor, "w", encoding="utf-8")
-        descriptor = -1
-        with output:
-            json.dump(payload, output, indent=2, sort_keys=True)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-
-
 def _validate_output_destination(
     destination: Path,
     *,
@@ -134,6 +112,11 @@ def run(
     console_stream=None,
 ) -> RunResult:
     """Prepare explicit artifacts and run one architecture without discovery."""
+
+    if config.external_input_producer and not config.interaction.interactive:
+        raise RunnerError("external input producer requires interactive mode")
+    if config.external_input_producer and config.receipt_path is None:
+        raise RunnerError("external input producer requires a receipt")
 
     kernel = config.kernel.expanduser().resolve()
     if not kernel.is_file():
@@ -196,7 +179,7 @@ def run(
         else file_evidence(rootfs_runtime_path)
     )
     receipt = {
-        "schema_version": 1,
+        "schema_version": RECEIPT_SCHEMA_VERSION,
         "state": "prepared",
         "arch": config.arch,
         "cpus": config.cpus,
@@ -210,6 +193,12 @@ def run(
         "log_path": str(log_path),
         "rootfs_mode": rootfs_mode,
         "extra_block_mode": extra_mode,
+        "interaction": {
+            "interactive": config.interaction.interactive,
+            "input_after_marker": config.interaction.input_after_marker,
+            "stop_after_marker": config.interaction.stop_after_marker,
+            "external_input_producer": config.external_input_producer,
+        },
     }
     if config.extra_block is not None and extra_block is not None:
         receipt["extra_block_source"] = file_evidence(config.extra_block.expanduser().resolve())
@@ -221,7 +210,7 @@ def run(
             label="receipt",
             protected_paths=tuple([*run_input_paths, log_path]),
         )
-        _write_receipt(receipt_path, receipt)
+        atomic_write_receipt(receipt_path, receipt)
 
     result = run_process(
         arch=config.arch,
@@ -232,15 +221,27 @@ def run(
         interaction=config.interaction,
         input_stream=input_stream,
         console_stream=console_stream,
+        proxy_interactive_input=config.external_input_producer,
     )
     if receipt_path is not None:
         receipt["rootfs_runtime_after"] = file_evidence(rootfs_runtime_path)
         receipt["log"] = file_evidence(result.log_path)
         if config.extra_block is not None and extra_block is not None:
             receipt["extra_block_runtime_after"] = file_evidence(extra_block.path.resolve())
+        final_state = "awaiting_producer" if config.external_input_producer else "complete"
+        if result.input_forwarding is not None:
+            stdin = input_forwarding_payload(result.input_forwarding)
+            if not config.external_input_producer:
+                stdin.update(
+                    {
+                        "state": "runner_complete",
+                        "source_fully_relayed": result.input_forwarding.relay_complete,
+                    }
+                )
+            receipt["stdin"] = stdin
         receipt.update(
             {
-                "state": "complete",
+                "state": final_state,
                 "returncode": result.returncode,
                 "duration_ms": result.duration_ms,
                 "error_message": result.error_message,
@@ -249,5 +250,5 @@ def run(
                 "intentionally_stopped": result.intentionally_stopped,
             }
         )
-        _write_receipt(receipt_path, receipt)
+        atomic_write_receipt(receipt_path, receipt)
     return result
