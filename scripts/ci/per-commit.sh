@@ -152,6 +152,14 @@ ci_run_step kernel-userfaultfd-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu
 
+ci_run_step kernel-io-uring-adapter-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    "$SCRIPT_DIR/rust-filtered-test-gate.sh" \
+    --minimum 4 --filter io_uring:: -- \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu
+
 ci_run_step kernel-seccomp-adapter-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \

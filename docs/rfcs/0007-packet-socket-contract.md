@@ -1,6 +1,7 @@
 # RFC 0007: Bounded AF_PACKET Ordinary-Queue Contract
 
-- Status: implemented ordinary-queue baseline
+- Status: implemented
+- Profile: ordinary-queue baseline
 - Date: 2026-07-20
 - Owners: TheKernel maintainers
 - Target layers: `axnet-ng`, `thekernel-linux-packet`, and the TheKernel
