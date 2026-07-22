@@ -37,3 +37,7 @@ type exists.
   (`draft`)
 - [RFC 0006: Bounded Task-Local Seccomp Contract](0006-seccomp-contract.md)
   (`draft`)
+- [RFC 0007: Bounded AF_PACKET Ordinary-Queue Contract](0007-packet-socket-contract.md)
+  (`implemented ordinary-queue baseline`)
+- [RFC 0008: Modern Performance, Driver, and Graphics Program](0008-performance-driver-graphics-program.md)
+  (`accepted`)
