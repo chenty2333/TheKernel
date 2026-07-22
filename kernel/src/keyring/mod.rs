@@ -6,7 +6,7 @@
 mod service;
 
 pub(crate) use service::{
-    KeyActor, KeyTypeKind, KeyctlCommand, KeyctlOutput, ReqKeyDefault, add_key, key_maxbytes,
-    key_maxkeys, key_root_maxbytes, key_root_maxkeys, key_users_snapshot, keyctl, request_key,
-    set_key_maxbytes, set_key_maxkeys, set_key_root_maxbytes, set_key_root_maxkeys,
+    KeyActor, KeyTypeKind, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault, add_key,
+    key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys, key_user_records, keyctl,
+    request_key, set_key_maxbytes, set_key_maxkeys, set_key_root_maxbytes, set_key_root_maxkeys,
 };

@@ -1,9 +1,10 @@
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::{ffi::c_char, mem::size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{CAP_SETUID, CAP_SYS_ADMIN};
+use memory_addr::PAGE_SIZE_4K;
 use starry_vm::{vm_load, vm_write_slice};
 use thekernel_linux_cred::KeyPermissionMask;
 
@@ -90,16 +91,16 @@ fn validate_key_payload(
             Ok(Vec::new())
         }
         KeyTypeKind::User | KeyTypeKind::Logon => {
-            if plen > kind.payload_limit() {
+            if plen == 0 || plen > kind.payload_limit() {
                 return Err(AxError::InvalidInput);
             }
-            if kind == KeyTypeKind::Logon && !description.contains(':') {
+            if kind == KeyTypeKind::Logon && description.find(':').is_none_or(|colon| colon == 0) {
                 return Err(AxError::InvalidInput);
             }
             load_payload(payload, plen)
         }
         KeyTypeKind::BigKey => {
-            if plen > kind.payload_limit() {
+            if plen == 0 || plen > kind.payload_limit() {
                 return Err(AxError::InvalidInput);
             }
             load_payload(payload, plen)
@@ -137,8 +138,11 @@ fn write_counted_bytes_if_fits(buf: *mut u8, size: usize, bytes: &[u8]) -> AxRes
 }
 
 fn write_keyctl_capabilities(buf: *mut u8, size: usize) -> AxResult<isize> {
-    if buf.is_null() || size == 0 {
+    if size == 0 {
         return Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize);
+    }
+    if buf.is_null() {
+        return Err(AxError::BadAddress);
     }
 
     let copy_len = KEYCTL_CAPABILITIES_BYTES.len().min(size);
@@ -226,10 +230,10 @@ pub fn sys_keyctl(
             },
         },
         KEYCTL_UPDATE => {
-            let payload = load_payload(arg3 as *const u8, arg4)?;
-            if payload.len() > KeyTypeKind::BigKey.payload_limit() {
+            if arg4 > PAGE_SIZE_4K {
                 return Err(AxError::InvalidInput);
             }
+            let payload = load_payload(arg3 as *const u8, arg4)?;
             KeyctlCommand::Update {
                 key: arg2 as i32,
                 payload,
@@ -278,7 +282,7 @@ pub fn sys_keyctl(
         KEYCTL_INVALIDATE => KeyctlCommand::Invalidate { key: arg2 as i32 },
         KEYCTL_GET_PERSISTENT => KeyctlCommand::GetPersistent {
             uid: (arg2 != u32::MAX as usize).then_some(arg2 as u32),
-            destination: (arg3 != 0).then_some(arg3 as i32),
+            destination: arg3 as i32,
         },
         KEYCTL_RESTRICT_KEYRING => {
             if arg3 == 0 && arg4 != 0 || arg3 != 0 && arg4 == 0 {
@@ -323,38 +327,61 @@ pub fn sys_keyctl(
     }
 }
 
-pub(crate) fn key_users_snapshot() -> String {
-    keyring::key_users_snapshot()
-}
+#[cfg(test)]
+mod tests {
+    use core::ptr;
 
-pub(crate) fn key_maxkeys() -> usize {
-    keyring::key_maxkeys()
-}
+    use super::*;
 
-pub(crate) fn set_key_maxkeys(value: usize) {
-    keyring::set_key_maxkeys(value);
-}
+    #[test]
+    fn keyctl_capabilities_requires_a_non_null_output_for_nonzero_size() {
+        assert_eq!(
+            write_keyctl_capabilities(ptr::null_mut(), 1),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(
+            write_keyctl_capabilities(ptr::null_mut(), 0),
+            Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
+        );
+    }
 
-pub(crate) fn key_maxbytes() -> usize {
-    keyring::key_maxbytes()
-}
+    #[test]
+    fn big_key_payload_must_be_nonempty() {
+        assert_eq!(
+            validate_key_payload(KeyTypeKind::BigKey, "key", ptr::null(), 0),
+            Err(AxError::InvalidInput)
+        );
+    }
 
-pub(crate) fn set_key_maxbytes(value: usize) {
-    keyring::set_key_maxbytes(value);
-}
+    #[test]
+    fn user_and_logon_payloads_must_be_nonempty() {
+        for kind in [KeyTypeKind::User, KeyTypeKind::Logon] {
+            assert_eq!(
+                validate_key_payload(kind, "name:field", ptr::null(), 0),
+                Err(AxError::InvalidInput)
+            );
+        }
+    }
 
-pub(crate) fn key_root_maxkeys() -> usize {
-    keyring::key_root_maxkeys()
-}
+    #[test]
+    fn logon_description_requires_a_nonempty_prefix() {
+        assert_eq!(
+            validate_key_payload(KeyTypeKind::Logon, ":secret", [1_u8].as_ptr(), 1),
+            Err(AxError::InvalidInput)
+        );
+    }
 
-pub(crate) fn set_key_root_maxkeys(value: usize) {
-    keyring::set_key_root_maxkeys(value);
-}
-
-pub(crate) fn key_root_maxbytes() -> usize {
-    keyring::key_root_maxbytes()
-}
-
-pub(crate) fn set_key_root_maxbytes(value: usize) {
-    keyring::set_key_root_maxbytes(value);
+    #[test]
+    fn keyctl_update_rejects_more_than_one_page_before_copying() {
+        assert_eq!(
+            sys_keyctl(
+                KEYCTL_UPDATE,
+                1,
+                ptr::null::<u8>() as usize,
+                PAGE_SIZE_4K + 1,
+                0,
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
 }

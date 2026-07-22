@@ -37,6 +37,11 @@ use crate::{
         FD_TABLE, FileDescription, PidFd, current_file_operation_security_credential,
         fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
     },
+    keyring::{
+        KeyUserRecord, key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys,
+        key_user_records, set_key_maxbytes, set_key_maxkeys, set_key_root_maxbytes,
+        set_key_root_maxkeys,
+    },
     mm::{
         AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes,
         overcommit_memory_policy, overcommit_ratio, set_overcommit_memory_policy,
@@ -52,16 +57,14 @@ use crate::{
     syscall::{
         aio_max_nr, aio_nr, current_can_administer_uts, current_domainname_string,
         current_hostname_string, current_machine_string, current_release_string,
-        current_sysname_string, current_version_string, key_maxbytes, key_maxkeys,
-        key_root_maxbytes, key_root_maxkeys, key_users_snapshot, mq_msg_max, mq_msgsize_max,
-        mq_queues_max, msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string,
-        sched_rr_timeslice_ms, sem_limits_string, sem_next_id, set_aio_max_nr,
-        set_domainname_bytes, set_hostname_bytes, set_key_maxbytes, set_key_maxkeys,
-        set_key_root_maxbytes, set_key_root_maxkeys, set_mq_msg_max, set_mq_msgsize_max,
-        set_mq_queues_max, set_msg_next_id, set_msgmni_limit, set_sched_rr_timeslice_ms,
-        set_sem_limits, set_sem_next_id, set_shm_next_id, set_shmall_limit, set_shmmax_limit,
-        set_shmmni_limit, shm_next_id, shmall_limit, shmmax_limit, shmmni_limit,
-        sysvipc_msg_snapshot, sysvipc_sem_snapshot, sysvipc_shm_snapshot,
+        current_sysname_string, current_version_string, mq_msg_max, mq_msgsize_max, mq_queues_max,
+        msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string, sched_rr_timeslice_ms,
+        sem_limits_string, sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes,
+        set_mq_msg_max, set_mq_msgsize_max, set_mq_queues_max, set_msg_next_id, set_msgmni_limit,
+        set_sched_rr_timeslice_ms, set_sem_limits, set_sem_next_id, set_shm_next_id,
+        set_shmall_limit, set_shmmax_limit, set_shmmni_limit, shm_next_id, shmall_limit,
+        shmmax_limit, shmmni_limit, sysvipc_msg_snapshot, sysvipc_sem_snapshot,
+        sysvipc_shm_snapshot,
     },
     task::{
         AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy,
@@ -78,6 +81,28 @@ use crate::{
 
 const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+fn key_users_snapshot() -> String {
+    let mut out = String::new();
+    for KeyUserRecord {
+        uid,
+        usage,
+        keys,
+        instantiated_keys,
+        quota_keys,
+        max_keys,
+        quota_bytes,
+        max_bytes,
+    } in key_user_records()
+    {
+        let _ = writeln!(
+            out,
+            "{uid:5}: {usage:5} {keys}/{instantiated_keys} {quota_keys}/{max_keys} \
+             {quota_bytes}/{max_bytes}"
+        );
+    }
+    out
+}
 
 fn try_pid_name(pid: u32) -> VfsResult<String> {
     let mut name = String::new();
@@ -3062,7 +3087,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_key_maxkeys(value);
+                                set_key_maxkeys(value).map_err(|_| VfsError::InvalidInput)?;
                                 Ok(None)
                             }
                         }),
@@ -3081,7 +3106,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_key_maxbytes(value);
+                                set_key_maxbytes(value).map_err(|_| VfsError::InvalidInput)?;
                                 Ok(None)
                             }
                         }),
@@ -3100,7 +3125,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_key_root_maxkeys(value);
+                                set_key_root_maxkeys(value).map_err(|_| VfsError::InvalidInput)?;
                                 Ok(None)
                             }
                         }),
@@ -3119,7 +3144,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_key_root_maxbytes(value);
+                                set_key_root_maxbytes(value).map_err(|_| VfsError::InvalidInput)?;
                                 Ok(None)
                             }
                         }),
