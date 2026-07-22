@@ -324,3 +324,101 @@ This RFC does not claim:
 - that every mechanism must be lock-free, RCU-based, or dynamically
   programmable; or
 - that evaluator-specific behavior may enter default kernel policy.
+
+## Implementation checkpoint: first bounded foundations
+
+The first bounded implementation slice landed on 2026-07-23.  Its source
+anchors are TheKernel `2d1d2be7110cc55526054e3e94a03715d7c721fb`,
+`thekernel-ax` `da0a5f9b861dd8e363f5b633d008e9ac6c34bc40`, and
+`thekernel-linux-abi` `df13793f1c372432d0c5144d44636dfd53ccec45`.
+This checkpoint narrows several immediate bottlenecks, but does not supersede
+the dependency order or release gates above.
+
+### ABI contracts and evidence
+
+The existing bounded io_uring, userfaultfd, seccomp, and AF_PACKET profiles
+remain deliberately incomplete.  This slice adds an io_uring adapter test to
+the per-commit gate and validates that every RFC index status matches its
+document.  It expands evidence, not Linux-visible capability: registered
+buffers, io-wq, SQPOLL, multishot io_uring operations, packet mmap/TPACKET,
+AF_XDP, userfaultfd write protection, and line-rate capture remain outside the
+implemented profiles.
+
+### ASID pilot
+
+`asid-fast-switch` is an opt-in RISC-V and LoongArch pilot and is off by
+default.  It probes the architecture width, assigns a unique nonzero numeric
+ASID for the rest of the boot, and retains translations only between valid
+nonzero identities in the same non-reused boot generation.  ASID 0, an
+unexpected width, exhaustion, a generation mismatch, or the same numeric ASID
+with a different root takes the full-flush path.  Generic page-table cursors
+remain all-ASID conservative because they do not yet carry owner scope.
+
+This is not the complete generation allocator required by Decision 2.  There
+is no numeric reuse, rollover, CPU-hotplug quiescence protocol, or performance
+counter for avoided flushes.  RISC-V can assign at most 65,535 nonzero IDs and
+LoongArch at most 1,023 under the supported architectural widths; after
+exhaustion, every new address space permanently falls back to ASID 0.  The
+existing remote shootdown and delayed-retirement contracts remain
+authoritative.
+
+### Clean file-cache pressure baseline
+
+The first pressure worker uses low/high watermarks and bounded persistent
+registry and per-inode cursors.  It can reclaim only clean, disk-backed,
+unmapped file-cache pages.  Dirty, pinned, writeback, mapping-listener,
+in-memory/tmpfs, and lock-busy candidates are skipped.  Work per wake, registry
+walks, inode scans, reclaim batches, and no-progress retry intervals are all
+bounded.  `/proc/memory_pressure` exposes versioned progress and exclusion
+counters, while explicit `/proc/meminfo` collection estimates `MemAvailable`
+from free pages plus a conservative clean-cache estimate above the low
+watermark.
+
+This remains background-only file-cache reclaim.  It provides no direct
+allocation retry, anonymous reclaim, swap, PSI, mature OOM selection, dirty
+throttling, mapped-file reclaim, or unified page ownership.  MGLRU, DAMON
+actions, and transparent huge-page policy therefore remain later work.
+
+### Load-aware placement before EEVDF
+
+Initial task placement and affinity-forced migration now use one bounded scan
+of at most `MAX_CPU_NUM` entries, filter by affinity and initialized run queues,
+and select the lowest advisory runnable load with a rotated deterministic tie.
+Per-CPU ready and non-idle-running counts are available as lock-free diagnostic
+snapshots.  In the current no-hotplug system, an initialized run queue is the
+online-CPU proxy.
+
+An ordinary wake stays on its affinity-allowed source CPU.  Only an affinity
+change that excludes that source invokes the load-aware selector.  This avoids
+turning every wake into a remote enqueue before a remote-preemption contract
+exists.  Idle stealing, general wake balancing, NUMA placement, and CPU
+hotplug are not implemented.
+
+EEVDF does not replace this cross-CPU placement mechanism: it changes which
+eligible task one run queue selects.  A later opt-in EEVDF slice may replace
+the simplified CFS policy only after it provides an allocation-free augmented
+tree, lag and virtual-deadline arithmetic, sleeper and reweight semantics,
+migration invariants, a reference model, and watchdog/fallback gates.  The
+maintained readiness design is
+[`thekernel-ax/docs/design/0001-eevdf-readiness.md`](https://github.com/chenty2333/thekernel-ax/blob/da0a5f9b861dd8e363f5b633d008e9ac6c34bc40/docs/design/0001-eevdf-readiness.md).
+
+### Integration evidence and remaining gate
+
+The source-equivalent pre-commit integration runs completed the full system
+test on RISC-V 2 CPU/128 MiB and LoongArch 2 CPU/256 MiB with the default ASID
+path, on both architectures with the opt-in ASID path, and on RISC-V 4 CPU/
+1 GiB with the opt-in path.  The last profile exercises the maximum supported
+pressure-test memory and the multi-CPU placement topology.  Focused host
+evidence covered 167 MM tests, six ASID allocator tests, three context-switch
+predicates, six file-cache pressure tests, the build-tool suite, and the CI
+script suite.
+
+These local runs are integration evidence, not the final clean exact-HEAD
+release receipt.  The exact-HEAD per-commit gate, dual-architecture SMP TLB
+stress, physical-hardware counters, and product performance comparison remain
+required before the ASID pilot can become default-on or any speedup is claimed.
+An earlier experimental remote-wake placement amplified a nondeterministic
+QEMU-TCG `RLIMIT_CPU` latency failure; that policy was removed.  The retained
+source-local wake policy passed the final integration matrix, while the timer
+path remains a separate diagnostic target rather than evidence for EEVDF or
+idle stealing.
