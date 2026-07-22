@@ -1,10 +1,7 @@
 //! Wrapper functions for assembly instructions.
 
 use memory_addr::{PhysAddr, VirtAddr};
-use riscv::{
-    asm,
-    register::{satp, sstatus, stvec},
-};
+use riscv::register::{satp, sstatus, stvec};
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
@@ -61,6 +58,13 @@ pub fn read_kernel_page_table() -> PhysAddr {
     read_user_page_table()
 }
 
+/// Reads the ASID currently installed in `satp`.
+#[cfg(feature = "asid-fast-switch")]
+#[inline]
+pub fn read_current_asid() -> usize {
+    satp::read().asid()
+}
+
 /// Writes the register to update the current page table root for user space
 /// (`satp`).
 ///
@@ -75,6 +79,56 @@ pub fn read_kernel_page_table() -> PhysAddr {
 #[inline]
 pub unsafe fn write_user_page_table(root_paddr: PhysAddr) {
     unsafe { satp::set(satp::Mode::Sv39, 0, root_paddr.as_usize() >> 12) };
+}
+
+/// Writes a user page-table root and its hardware ASID without flushing.
+///
+/// # Safety
+///
+/// The caller must ensure that `asid` identifies `root_paddr` under the active
+/// allocator generation and must issue any required TLB invalidation.
+#[cfg(feature = "asid-fast-switch")]
+#[inline]
+pub unsafe fn write_user_page_table_with_asid(root_paddr: PhysAddr, asid: usize) {
+    unsafe { satp::set(satp::Mode::Sv39, asid, root_paddr.as_usize() >> 12) };
+}
+
+/// Probes the implemented WARL width of the `satp.ASID` field.
+#[cfg(feature = "asid-fast-switch")]
+pub fn probe_asid_width() -> usize {
+    let old = satp::read();
+    let mode = old.mode();
+    let ppn = old.ppn();
+    let old_asid = old.asid();
+
+    unsafe { satp::set(mode, u16::MAX as usize, ppn) };
+    flush_tlb_all();
+    let implemented = satp::read().asid() & u16::MAX as usize;
+    unsafe { satp::set(mode, old_asid, ppn) };
+    flush_tlb_all();
+    // The privileged architecture defines ASIDLEN as a contiguous set of
+    // implemented low-order satp.ASID bits, so counting read-back ones yields
+    // ASIDLEN after this WARL probe.
+    implemented.count_ones() as usize
+}
+
+/// Flushes all virtual addresses for all ASIDs on the current hart.
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe { core::arch::asm!("sfence.vma x0, x0", options(nostack)) }
+}
+
+/// Flushes one virtual address for one ASID on the current hart.
+#[inline]
+pub fn flush_tlb_addr_asid(vaddr: VirtAddr, asid: usize) {
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma {addr}, {asid}",
+            addr = in(reg) vaddr.as_usize(),
+            asid = in(reg) asid,
+            options(nostack)
+        )
+    }
 }
 
 /// Writes the register to update the current page table root for user space
@@ -100,9 +154,13 @@ pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {
 #[inline]
 pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     if let Some(vaddr) = vaddr {
-        asm::sfence_vma(0, vaddr.as_usize())
+        #[cfg(feature = "asid-fast-switch")]
+        let asid = read_current_asid();
+        #[cfg(not(feature = "asid-fast-switch"))]
+        let asid = 0;
+        flush_tlb_addr_asid(vaddr, asid)
     } else {
-        asm::sfence_vma_all();
+        flush_tlb_all();
     }
 }
 

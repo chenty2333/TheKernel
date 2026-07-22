@@ -21,7 +21,8 @@ use crate::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
         ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
         init_process_domain, init_seccomp_filter_budget, linux_pid_from_task_id,
-        prepare_task_table_admission, spawn_alarm_task, try_new_user_task,
+        prepare_task_table_admission, set_task_user_address_space, spawn_alarm_task,
+        try_new_user_task,
     },
 };
 
@@ -30,6 +31,7 @@ pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
     crate::mm::init_tlb_shootdown();
+    crate::mm::init_hardware_asids();
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
@@ -63,6 +65,7 @@ pub fn init(args: &[String], envs: &[String]) {
     axfs::set_atime_update_policy(crate::mounts::should_update_atime);
     axfs::set_mount_access_policy(crate::mounts::note_mount_access);
     crate::deferred_work::init();
+    crate::mm::init_memory_pressure();
     crate::file::inotify::init_filesystem_release_notifications();
     let security_registry = match crate::task::security::init() {
         Ok(registry) => registry,
@@ -109,7 +112,7 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to allocate init task name");
     task_name.push_str(name);
     let mut task = try_new_user_task(task_name, uctx).expect("Failed to allocate init task");
-    task.ctx_mut().set_page_table_root(uspace.page_table_root());
+    set_task_user_address_space(task.ctx_mut(), uspace.address_space_token());
 
     let tid = linux_pid_from_task_id(task.id().as_u64())
         .expect("init task identity must fit the Linux PID domain");

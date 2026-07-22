@@ -33,7 +33,9 @@ use thekernel_linux_mm::{
 use super::{
     DeferredUffdWake, LockExternalUffdOutcome, OptionalUffdPlan, PreparedRemapUffd,
     PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState, UffdIcacheSynchronization,
-    UffdPagePublication, UffdRemapKind, UffdResolverLease, checked_align_up_4k,
+    UffdPagePublication, UffdRemapKind, UffdResolverLease,
+    asid::{AddressSpaceToken, HardwareAddressSpaceId, reserve_hardware_address_space_id},
+    checked_align_up_4k,
 };
 
 mod backend;
@@ -784,6 +786,7 @@ impl Drop for UserIoSystemPinCharge {
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     address_space_id: AddressSpaceId,
+    hardware_asid: HardwareAddressSpaceId,
     topology_mapping_id: MappingId,
     topology_generation: MappingGeneration,
     areas: MemorySet<Backend>,
@@ -1171,6 +1174,11 @@ impl AddrSpace {
         self.pt.root_paddr()
     }
 
+    /// Returns the page-table root and bounded hardware-ASID identity.
+    pub const fn address_space_token(&self) -> AddressSpaceToken {
+        AddressSpaceToken::new(self.pt.root_paddr(), self.hardware_asid)
+    }
+
     /// Checks if the address space contains the given address range.
     pub fn contains_range(&self, start: VirtAddr, size: usize) -> bool {
         self.va_range.contains(start) && (self.va_range.end - start) >= size
@@ -1181,9 +1189,11 @@ impl AddrSpace {
         let va_range = VirtAddrRange::try_from_start_size(base, size).ok_or(AxError::NoMemory)?;
         let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
             new_user_io_policy()?;
+        let hardware_asid = reserve_hardware_address_space_id();
         Ok(Self {
             va_range,
             address_space_id,
+            hardware_asid,
             topology_mapping_id,
             topology_generation,
             areas: MemorySet::new(),
@@ -4048,6 +4058,8 @@ impl fmt::Debug for AddrSpace {
         f.debug_struct("AddrSpace")
             .field("va_range", &self.va_range)
             .field("page_table_root", &self.pt.root_paddr())
+            .field("hardware_asid", &self.hardware_asid.asid())
+            .field("hardware_asid_generation", &self.hardware_asid.generation())
             .field("areas", &self.areas)
             .finish()
     }

@@ -121,16 +121,35 @@ static int test_tmpfs(void) {
 }
 
 static int test_procfs(void) {
-    char buffer[32];
+    char buffer[1024] = {0};
     int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return fail("proc-meminfo-open");
     }
-    ssize_t count = read(fd, buffer, sizeof(buffer));
+    ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
     if (close(fd) != 0 || count <= 0) {
         return fail("proc-meminfo-read");
     }
     puts("THEKERNEL_SYSTEM_TEST_PROCFS_OK");
+
+    memset(buffer, 0, sizeof(buffer));
+    fd = open("/proc/memory_pressure", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return fail("proc-memory-pressure-open");
+    }
+    count = read(fd, buffer, sizeof(buffer) - 1);
+    if (close(fd) != 0 || count <= 0) {
+        return fail("proc-memory-pressure-read");
+    }
+    if (strstr(buffer, "schema=thekernel-mm-pressure-v1\n") == NULL ||
+        strstr(buffer, "low_watermark_pages=") == NULL ||
+        strstr(buffer, "reclaimable_clean_file_pages=") == NULL ||
+        strstr(buffer, "scan_budget_exhausted_files=") == NULL ||
+        strstr(buffer, "snapshot_truncations=") == NULL) {
+        errno = EPROTO;
+        return fail("proc-memory-pressure-schema");
+    }
+    puts("THEKERNEL_SYSTEM_TEST_MM_PRESSURE_OK");
     return 0;
 }
 
@@ -140,6 +159,26 @@ static int wait_for_success(pid_t child, const char *stage) {
         errno = ECHILD;
         return fail(stage);
     }
+    return 0;
+}
+
+static int test_memory_pressure_reclaim(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("memory-pressure-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-memory-pressure-smoke",
+              "thekernel-memory-pressure-smoke", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL memory-pressure-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "memory-pressure-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK");
     return 0;
 }
 
@@ -358,7 +397,7 @@ int main(int argc, char **argv) {
     puts("THEKERNEL_SYSTEM_TEST_START");
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
-        test_process_pipe_and_exec() || test_signal_wait_boundary() ||
+        test_memory_pressure_reclaim() || test_process_pipe_and_exec() || test_signal_wait_boundary() ||
         test_wait_boundary() || test_io_uring() || test_userfaultfd() ||
         test_packet_socket() || test_seccomp()) {
         return 1;

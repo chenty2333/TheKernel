@@ -489,9 +489,25 @@ const DIRTY_WRITEBACK_SEGMENT_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 1024;
 const ALIGNED_BYPASS_CHUNK: usize = 64 * 1024;
 const CLOSED_FILE_CACHE_RETAIN_MAX_PAGES: usize = 1024;
+/// Bound every system-wide cache walk so memory reporting and pressure work
+/// cannot turn one very large inode registry into an unbounded critical path.
+const GLOBAL_FILE_CACHE_SCAN_LIMIT: usize = 64;
+/// Share one reclaim pass across active inodes instead of draining the first
+/// cache found in registry order.
+const GLOBAL_FILE_CACHE_RECLAIM_PER_FILE: usize = 16;
+/// Total page inspections allowed for one inode in one reclaim pass.  This is
+/// shared by every successful removal so an ineligible LRU cannot be rescanned
+/// once per target page.
+const GLOBAL_FILE_CACHE_RECLAIM_SCAN_PER_FILE: usize = 128;
+/// Bound the number of pages inspected per inode while estimating
+/// MemAvailable.  Truncation only under-estimates reclaimable memory.
+const GLOBAL_FILE_CACHE_ESTIMATE_PER_FILE: usize = 128;
 type CachedFileRegistryKey = (u64, u64);
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<CachedFileRegistryKey, FileUserData>>> =
     Once::new();
+static FILE_CACHE_ESTIMATE_CURSOR: Once<Mutex<Option<CachedFileRegistryKey>>> = Once::new();
+static FILE_CACHE_RECLAIM_CURSOR: Once<Mutex<Option<CachedFileRegistryKey>>> = Once::new();
+static FILE_CACHE_RECLAIM_SCAN_EPOCH: AtomicU64 = AtomicU64::new(1);
 static ENABLE_CACHED_FILE_IO_COUNTERS: AtomicBool = AtomicBool::new(false);
 static READ_BYPASS_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static READ_BYPASS_HITS: AtomicU64 = AtomicU64::new(0);
@@ -762,6 +778,14 @@ fn file_cache_registry() -> &'static Mutex<BTreeMap<CachedFileRegistryKey, FileU
     FILE_CACHE_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
 }
 
+fn file_cache_reclaim_cursor() -> &'static Mutex<Option<CachedFileRegistryKey>> {
+    FILE_CACHE_RECLAIM_CURSOR.call_once(|| Mutex::new(None))
+}
+
+fn file_cache_estimate_cursor() -> &'static Mutex<Option<CachedFileRegistryKey>> {
+    FILE_CACHE_ESTIMATE_CURSOR.call_once(|| Mutex::new(None))
+}
+
 fn remove_released_cached_file_registry_entry(
     key: CachedFileRegistryKey,
     shared: *const CachedFileShared,
@@ -1002,6 +1026,364 @@ fn cached_file_page_count(shared: &CachedFileShared) -> usize {
     shared.page_cache.lock().len()
 }
 
+/// Conservative, bounded snapshot used to estimate immediately reclaimable
+/// file-cache memory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CachedFileReclaimEstimate {
+    /// Clean, unpinned pages observed in ordinary disk-backed caches.
+    pub reclaimable_pages: usize,
+    /// Registry entries whose cache state was inspected.
+    pub scanned_files: usize,
+    /// Entries skipped because their page-cache lock was contended.
+    pub busy_files: usize,
+    /// Entries skipped because they have active mapping listeners.
+    pub mapped_files: usize,
+    /// Some live registry entries were outside the bounded snapshot.
+    pub snapshot_truncated: bool,
+}
+
+/// Outcome of one bounded, non-blocking global clean-cache reclaim pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CachedFileReclaimStats {
+    pub requested_pages: usize,
+    /// Registry slots visited, including dead or unsupported entries.
+    pub visited_registry_entries: usize,
+    /// Registry size observed when this bounded snapshot was taken.
+    pub registry_entries: usize,
+    pub scanned_files: usize,
+    pub scanned_pages: usize,
+    pub reclaimed_pages: usize,
+    pub dirty_pages: usize,
+    pub pinned_pages: usize,
+    pub writeback_pages: usize,
+    pub busy_files: usize,
+    pub mapped_files: usize,
+    pub scan_budget_exhausted_files: usize,
+    pub snapshot_truncated: bool,
+}
+
+struct CachedFileReclaimSnapshot {
+    entries: [Option<Arc<CachedFileShared>>; GLOBAL_FILE_CACHE_SCAN_LIMIT],
+    len: usize,
+    visited: usize,
+    registry_entries: usize,
+    truncated: bool,
+}
+
+fn cached_file_reclaim_snapshot(
+    cursor: &Mutex<Option<CachedFileRegistryKey>>,
+) -> CachedFileReclaimSnapshot {
+    let registry = file_cache_registry().lock();
+    let mut snapshot = CachedFileReclaimSnapshot {
+        entries: core::array::from_fn(|_| None),
+        len: 0,
+        visited: 0,
+        registry_entries: registry.len(),
+        truncated: false,
+    };
+    let mut cursor = cursor.lock();
+    let mut visited = 0usize;
+    let mut last_visited = None;
+    let start = *cursor;
+
+    macro_rules! visit_entries {
+        ($entries:expr) => {
+            for (key, entry) in $entries {
+                if visited == GLOBAL_FILE_CACHE_SCAN_LIMIT {
+                    break;
+                }
+                visited += 1;
+                last_visited = Some(*key);
+                if let Some(shared) = entry.shared() {
+                    snapshot.entries[snapshot.len] = Some(shared);
+                    snapshot.len += 1;
+                }
+            }
+        };
+    }
+
+    if let Some(start) = start {
+        visit_entries!(registry.range((
+            core::ops::Bound::Excluded(start),
+            core::ops::Bound::Unbounded,
+        )));
+        if visited < GLOBAL_FILE_CACHE_SCAN_LIMIT {
+            visit_entries!(registry.range(..=start));
+        }
+    } else {
+        visit_entries!(registry.iter());
+    }
+    if let Some(last_visited) = last_visited {
+        *cursor = Some(last_visited);
+    }
+    snapshot.truncated = visited < registry.len();
+    snapshot.visited = visited;
+    drop(cursor);
+    drop(registry);
+    snapshot
+}
+
+/// Returns a bounded lower-bound estimate of clean file-cache pages that can
+/// be reclaimed without writeback.  tmpfs/ALWAYS_CACHE pages, dirty pages,
+/// pinned pages, writeback pages, and contended caches are deliberately not
+/// counted.
+pub fn cached_file_reclaim_estimate() -> CachedFileReclaimEstimate {
+    let snapshot = cached_file_reclaim_snapshot(file_cache_estimate_cursor());
+    let mut estimate = CachedFileReclaimEstimate {
+        snapshot_truncated: snapshot.truncated,
+        ..CachedFileReclaimEstimate::default()
+    };
+    for shared in snapshot.entries.into_iter().take(snapshot.len).flatten() {
+        if shared.in_memory {
+            continue;
+        }
+        let Some(_direct_guard) = shared.direct_io_lock.try_write() else {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        };
+        let Some(admission) = shared.user_io_pin_admission.try_lock() else {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        };
+        if admission.invalidating || admission.cache_users != 0 || admission.pin_windows != 0 {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        }
+        let Some(_writeback_guard) = shared.writeback_lock.try_write() else {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        };
+        let Some(listeners) = shared.evict_listeners.try_lock() else {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        };
+        if !listeners.is_empty() {
+            estimate.mapped_files = estimate.mapped_files.saturating_add(1);
+            continue;
+        }
+        let Some(cache) = shared.page_cache.try_lock() else {
+            estimate.busy_files = estimate.busy_files.saturating_add(1);
+            continue;
+        };
+        estimate.scanned_files = estimate.scanned_files.saturating_add(1);
+        estimate.reclaimable_pages = estimate.reclaimable_pages.saturating_add(
+            cache
+                .iter()
+                .take(GLOBAL_FILE_CACHE_ESTIMATE_PER_FILE)
+                .filter(|(_pn, page)| {
+                    !page.is_dirty() && !page.is_pinned() && !page.is_writeback()
+                })
+                .count(),
+        );
+    }
+    estimate
+}
+
+/// Reconciles closed-cache accounting with the page-cache state observed
+/// while the caller holds `direct_io_lock` for writing.
+///
+/// Using the actual remaining page count is important: the last open handle
+/// may establish retention immediately before a pressure pass.  Applying a
+/// reclaim delta to that newer retention would otherwise be able to release a
+/// shared cache that still contains dirty pages.
+fn synchronize_retained_page_count(shared: &Arc<CachedFileShared>, remaining_pages: usize) {
+    let released = {
+        let mut registry = file_cache_registry().lock();
+        let Some(entry) = registry.get_mut(&shared.registry_key) else {
+            return;
+        };
+        let is_retained_shared = entry
+            .retained
+            .as_ref()
+            .is_some_and(|retained| Arc::ptr_eq(retained, shared));
+        if !is_retained_shared {
+            return;
+        }
+
+        let old_pages = entry.retained_pages;
+        if remaining_pages > old_pages {
+            CLOSED_FILE_CACHE_RETAINED_PAGES
+                .fetch_add(remaining_pages - old_pages, Ordering::AcqRel);
+        } else if old_pages > remaining_pages {
+            CLOSED_FILE_CACHE_RETAINED_PAGES
+                .fetch_sub(old_pages - remaining_pages, Ordering::AcqRel);
+        }
+        entry.retained_pages = remaining_pages;
+        if remaining_pages == 0 {
+            entry.release_retained()
+        } else {
+            None
+        }
+    };
+    drop(released);
+}
+
+fn reclaim_clean_pages_from_shared(
+    shared: &Arc<CachedFileShared>,
+    target_pages: usize,
+    stats: &mut CachedFileReclaimStats,
+) -> usize {
+    reclaim_clean_pages_from_shared_with_scan_budget(
+        shared,
+        target_pages,
+        GLOBAL_FILE_CACHE_RECLAIM_SCAN_PER_FILE,
+        stats,
+    )
+}
+
+fn reclaim_clean_pages_from_shared_with_scan_budget(
+    shared: &Arc<CachedFileShared>,
+    target_pages: usize,
+    scan_budget_per_pass: usize,
+    stats: &mut CachedFileReclaimStats,
+) -> usize {
+    if target_pages == 0 || shared.in_memory {
+        return 0;
+    }
+
+    let reclaimed = {
+        let Some(_direct_guard) = shared.direct_io_lock.try_write() else {
+            stats.busy_files = stats.busy_files.saturating_add(1);
+            return 0;
+        };
+        let Ok(_mutation) = CachedFile::try_begin_shared_cache_invalidating_mutation(shared) else {
+            stats.busy_files = stats.busy_files.saturating_add(1);
+            return 0;
+        };
+        let Some(_writeback_guard) = shared.writeback_lock.try_write() else {
+            stats.busy_files = stats.busy_files.saturating_add(1);
+            return 0;
+        };
+        let Some(listeners) = shared.evict_listeners.try_lock() else {
+            stats.busy_files = stats.busy_files.saturating_add(1);
+            return 0;
+        };
+        if !listeners.is_empty() {
+            // A mapped page needs PTE teardown and a TLB grace period.  The
+            // first pressure slice deliberately leaves that work to a future
+            // batched interface instead of issuing one shootdown per page.
+            stats.mapped_files = stats.mapped_files.saturating_add(1);
+            return 0;
+        }
+
+        let scan_epoch = FILE_CACHE_RECLAIM_SCAN_EPOCH.load(Ordering::Acquire);
+        let inode_scan_epoch = shared.pressure_reclaim_scan_epoch.load(Ordering::Acquire);
+        let mut cycle_scan_remaining = shared.pressure_reclaim_scan_remaining.load(Ordering::Acquire);
+        if inode_scan_epoch == scan_epoch && cycle_scan_remaining == 0 {
+            // This inode has already completed a full LRU traversal in the
+            // current system-wide epoch. Do not silently start another cycle:
+            // different inode sizes would otherwise have to align before the
+            // worker could ever observe one complete no-progress sweep.
+            return 0;
+        }
+
+        let mut reclaimed = 0usize;
+        let mut remaining_pages_after_reclaim = None;
+        let mut cycle_scan_initialized = inode_scan_epoch == scan_epoch;
+        let mut remaining_scan_budget = scan_budget_per_pass;
+        while reclaimed < target_pages && remaining_scan_budget != 0 {
+            let (candidate, remaining_pages) = {
+                let Some(mut cache) = shared.page_cache.try_lock() else {
+                    stats.busy_files = stats.busy_files.saturating_add(1);
+                    break;
+                };
+                if !cycle_scan_initialized {
+                    cycle_scan_remaining = cache.len();
+                    shared
+                        .pressure_reclaim_scan_remaining
+                        .store(cycle_scan_remaining, Ordering::Relaxed);
+                    shared
+                        .pressure_reclaim_scan_epoch
+                        .store(scan_epoch, Ordering::Release);
+                    cycle_scan_initialized = true;
+                } else {
+                    cycle_scan_remaining = cycle_scan_remaining.min(cache.len());
+                }
+                let scan = pop_clean_unpinned_lru_page(
+                    &mut cache,
+                    remaining_scan_budget.min(cycle_scan_remaining),
+                );
+                remaining_scan_budget = remaining_scan_budget.saturating_sub(scan.scanned);
+                cycle_scan_remaining = cycle_scan_remaining.saturating_sub(scan.scanned);
+                shared
+                    .pressure_reclaim_scan_remaining
+                    .store(cycle_scan_remaining, Ordering::Release);
+                stats.scanned_pages = stats.scanned_pages.saturating_add(scan.scanned);
+                stats.dirty_pages = stats.dirty_pages.saturating_add(scan.dirty);
+                stats.pinned_pages = stats.pinned_pages.saturating_add(scan.pinned);
+                stats.writeback_pages = stats.writeback_pages.saturating_add(scan.writeback);
+                (scan.page, cache.len())
+            };
+            remaining_pages_after_reclaim = Some(remaining_pages);
+            let Some((_pn, page)) = candidate else {
+                break;
+            };
+            // The listener lock is still held and known empty, so no mapping
+            // can begin observing this cache page before it is released.
+            drop(page);
+            reclaimed += 1;
+        }
+        if reclaimed < target_pages
+            && remaining_scan_budget == 0
+            && cycle_scan_remaining != 0
+        {
+            stats.scan_budget_exhausted_files =
+                stats.scan_budget_exhausted_files.saturating_add(1);
+        }
+
+        if let (true, Some(remaining_pages)) = (reclaimed != 0, remaining_pages_after_reclaim) {
+            synchronize_retained_page_count(shared, remaining_pages);
+        }
+        reclaimed
+    };
+
+    reclaimed
+}
+
+/// Reclaims at most a fixed system-wide batch of clean, unpinned,
+/// non-writeback pages from ordinary disk-backed files.  The operation never
+/// waits for a contended cache/direct-I/O path and never initiates writeback.
+pub fn reclaim_clean_cached_file_pages(target_pages: usize) -> CachedFileReclaimStats {
+    let bounded_target = target_pages.min(
+        GLOBAL_FILE_CACHE_SCAN_LIMIT.saturating_mul(GLOBAL_FILE_CACHE_RECLAIM_PER_FILE),
+    );
+    let mut stats = CachedFileReclaimStats {
+        requested_pages: bounded_target,
+        ..CachedFileReclaimStats::default()
+    };
+    if bounded_target == 0 {
+        return stats;
+    }
+    let snapshot = cached_file_reclaim_snapshot(file_cache_reclaim_cursor());
+    stats.visited_registry_entries = snapshot.visited;
+    stats.registry_entries = snapshot.registry_entries;
+    stats.snapshot_truncated = snapshot.truncated;
+    for shared in snapshot.entries.into_iter().take(snapshot.len).flatten() {
+        if stats.reclaimed_pages == bounded_target {
+            break;
+        }
+        stats.scanned_files = stats.scanned_files.saturating_add(1);
+        let per_file_target = bounded_target
+            .saturating_sub(stats.reclaimed_pages)
+            .min(GLOBAL_FILE_CACHE_RECLAIM_PER_FILE);
+        stats.reclaimed_pages = stats.reclaimed_pages.saturating_add(
+            reclaim_clean_pages_from_shared(&shared, per_file_target, &mut stats),
+        );
+    }
+    stats
+}
+
+/// Starts a new system-wide bounded LRU scan after the previous epoch reached
+/// a complete no-progress registry sweep. Individual inode cursors are reset
+/// lazily, so advancing the epoch is constant-time and allocation-free.
+pub fn advance_clean_cached_file_reclaim_scan_epoch() {
+    FILE_CACHE_RECLAIM_SCAN_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            epoch.checked_add(1)
+        })
+        .expect("clean file-cache reclaim scan epoch exhausted");
+}
+
 fn release_closed_cached_file_retention(location: &Location) {
     let key = cached_file_registry_key(location);
     let released = {
@@ -1126,15 +1508,22 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
         return false;
     }
 
-    let pages = cached_file_page_count(shared);
-    if pages == 0 {
-        return false;
-    }
-    release_cached_file_writeback_anchor_if_clean(shared);
-
     let key = cached_file_registry_key(location);
     loop {
-        let decision = {
+        let (pages, decision) = {
+            // Pressure reclaim owns this lock for writing.  Keep the page
+            // count and retention publication in one read-side transaction,
+            // so a reclaim pass can only run wholly before or wholly after it.
+            let _direct_guard = shared.direct_io_lock.read();
+            if shared.open_handles.load(Ordering::Acquire) != 0 {
+                return false;
+            }
+            let pages = cached_file_page_count(shared);
+            if pages == 0 {
+                return false;
+            }
+            release_cached_file_writeback_anchor_if_clean(shared);
+
             let mut registry = file_cache_registry().lock();
             if shared.open_handles.load(Ordering::Acquire) != 0 {
                 return false;
@@ -1147,14 +1536,17 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
                 .saturating_sub(entry.retained_pages);
             if current_without_entry.saturating_add(pages) <= CLOSED_FILE_CACHE_RETAIN_MAX_PAGES {
                 let retired = entry.retain_closed(location, shared, pages);
-                ClosedFileCacheRetentionDecision::Retained(retired)
+                (pages, ClosedFileCacheRetentionDecision::Retained(retired))
             } else {
-                ClosedFileCacheRetentionDecision::Trim(closed_file_cache_trim_candidates(
-                    &registry,
-                    key,
-                    current_without_entry,
+                (
                     pages,
-                ))
+                    ClosedFileCacheRetentionDecision::Trim(closed_file_cache_trim_candidates(
+                        &registry,
+                        key,
+                        current_without_entry,
+                        pages,
+                    )),
+                )
             }
         };
 
@@ -1297,6 +1689,44 @@ fn pop_unpinned_lru_page(
     } else {
         Err(VfsError::ResourceBusy)
     }
+}
+
+#[derive(Default)]
+struct CleanPageScan {
+    page: Option<(u32, PageCache)>,
+    scanned: usize,
+    dirty: usize,
+    pinned: usize,
+    writeback: usize,
+}
+
+fn pop_clean_unpinned_lru_page(
+    cache: &mut LruCache<u32, PageCache>,
+    scan_budget: usize,
+) -> CleanPageScan {
+    let mut scan = CleanPageScan::default();
+    let limit = cache.len().min(scan_budget);
+    while scan.scanned < limit {
+        let Some((pn, page)) = cache.peek_lru() else {
+            break;
+        };
+        let pn = *pn;
+        let dirty = page.is_dirty();
+        let pinned = page.is_pinned();
+        let writeback = page.is_writeback();
+        scan.scanned += 1;
+        scan.dirty += usize::from(dirty);
+        scan.pinned += usize::from(pinned);
+        scan.writeback += usize::from(writeback);
+        if !dirty && !pinned && !writeback {
+            scan.page = cache.pop_lru();
+            break;
+        }
+        // Rotate an ineligible LRU entry so a bounded scan can inspect every
+        // resident page without allocating a side list.
+        cache.promote(&pn);
+    }
+    scan
 }
 
 fn pop_unused_readahead_lru_page(cache: &mut LruCache<u32, PageCache>) -> Option<(u32, PageCache)> {
@@ -2422,7 +2852,15 @@ struct CachedFileShared {
     /// Registry slot owned weakly by this shared state. Final release removes
     /// it only when both this key and this allocation still match.
     registry_key: CachedFileRegistryKey,
+    /// tmpfs and ALWAYS_CACHE files have no lower storage from which clean
+    /// pages can be faulted back, so global pressure reclaim must skip them.
+    in_memory: bool,
     page_cache: Mutex<LruCache<u32, PageCache>>,
+    /// Remaining entries in the current bounded pressure-scan cycle. The LRU
+    /// rotation is the cursor; this counter prevents an all-ineligible inode
+    /// from requesting active retries forever.
+    pressure_reclaim_scan_remaining: AtomicUsize,
+    pressure_reclaim_scan_epoch: AtomicU64,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     unlinked: AtomicBool,
     open_handles: AtomicUsize,
@@ -2444,7 +2882,10 @@ impl CachedFileShared {
         };
         Self {
             registry_key,
+            in_memory,
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
+            pressure_reclaim_scan_remaining: AtomicUsize::new(0),
+            pressure_reclaim_scan_epoch: AtomicU64::new(0),
             evict_listeners: Mutex::new(LinkedList::default()),
             unlinked: AtomicBool::new(false),
             open_handles: AtomicUsize::new(0),
@@ -2822,6 +3263,22 @@ impl CachedFile {
         shared: &Arc<CachedFileShared>,
     ) -> VfsResult<CachedFileMutationGuard> {
         let mut admission = shared.user_io_pin_admission.lock();
+        if admission.invalidating || admission.cache_users != 0 || admission.pin_windows != 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        admission.invalidating = true;
+        drop(admission);
+        Ok(CachedFileMutationGuard {
+            shared: shared.clone(),
+        })
+    }
+
+    fn try_begin_shared_cache_invalidating_mutation(
+        shared: &Arc<CachedFileShared>,
+    ) -> VfsResult<CachedFileMutationGuard> {
+        let Some(mut admission) = shared.user_io_pin_admission.try_lock() else {
+            return Err(VfsError::ResourceBusy);
+        };
         if admission.invalidating || admission.cache_users != 0 || admission.pin_windows != 0 {
             return Err(VfsError::ResourceBusy);
         }
@@ -5546,14 +6003,21 @@ mod tests {
 
     use super::{
         ALIGNED_BYPASS_CHUNK, CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile,
-        CachedFileEvictionOwner, CachedFileShared, CachedPageInvalidationTransaction, File,
-        FileBackend, FileFlags, FileUserData, MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions,
-        PAGE_SIZE, PinnedPhysicalSegment, WritePlacement, acknowledge_cached_page_eviction,
-        cached_file_registry_key, cached_file_shared_for_location_or_create, discard_cached_pages,
-        file_cache_registry, physical_to_virtual, release_unlinked_cached_file_registry_ownership,
-        try_zeroed_pinned_io_bounce, validate_pinned_physical_segments,
+        CachedFileEvictionOwner, CachedFileReclaimStats, CachedFileShared,
+        CachedPageInvalidationTransaction, File, FileBackend, FileFlags, FileUserData,
+        MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PinnedPhysicalSegment,
+        WritePlacement,
+        acknowledge_cached_page_eviction, cached_file_registry_key,
+        cached_file_shared_for_location_or_create, discard_cached_pages, file_cache_registry,
+        advance_clean_cached_file_reclaim_scan_epoch, physical_to_virtual,
+        reclaim_clean_pages_from_shared,
+        reclaim_clean_pages_from_shared_with_scan_budget,
+        release_unlinked_cached_file_registry_ownership, try_zeroed_pinned_io_bounce,
+        synchronize_retained_page_count, validate_pinned_physical_segments,
         with_sync_and_invalidate_cached_file_pages,
     };
+
+    static PRESSURE_RECLAIM_EPOCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn no_data_open_options_emit_no_data_access_flags() {
@@ -5866,6 +6330,189 @@ mod tests {
             })
             .unwrap();
         paddr.unwrap()
+    }
+
+    #[test]
+    fn pressure_reclaim_only_drops_clean_unpinned_pages() {
+        let (cached, _location, _state) = cached_append_test_file(3 * PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x10, false);
+        seed_cached_page(&cached, 1, 0x20, true);
+        let pinned_paddr = seed_cached_page(&cached, 2, 0x30, false);
+        let pin = cached
+            .pin_cached_page_by_paddr(2, pinned_paddr, false)
+            .unwrap();
+
+        let mut stats = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 16, &mut stats),
+            1
+        );
+        assert!(stats.dirty_pages >= 1);
+        assert!(stats.pinned_pages >= 1);
+        cached.with_page(0, |page| assert!(page.is_none()));
+        cached.with_page(1, |page| assert!(page.is_some()));
+        cached.with_page(2, |page| assert!(page.is_some()));
+        drop(pin);
+    }
+
+    #[test]
+    fn pressure_reclaim_skips_mapping_listeners() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x41, false);
+        let owner = CachedFileEvictionOwner::new(77).unwrap();
+        let handle = cached.add_evict_listener(owner, |_pn, _page| false);
+
+        let mut stats = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut stats),
+            0
+        );
+        assert_eq!(stats.mapped_files, 1);
+        cached.with_page(0, |page| assert!(page.is_some()));
+        unsafe { cached.remove_evict_listener(handle) };
+    }
+
+    #[test]
+    fn pressure_reclaim_continues_a_bounded_inode_scan_across_passes() {
+        let _epoch_guard = PRESSURE_RECLAIM_EPOCH_TEST_LOCK.lock().unwrap();
+        const TEST_SCAN_BUDGET: usize = 2;
+        let pages = TEST_SCAN_BUDGET + 1;
+        let (cached, _location, _state) =
+            cached_append_test_file((pages * PAGE_SIZE) as u64);
+        for page in 0..TEST_SCAN_BUDGET {
+            seed_cached_page(&cached, page as u32, 0x61, true);
+        }
+        seed_cached_page(&cached, TEST_SCAN_BUDGET as u32, 0x62, false);
+
+        let mut first = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared_with_scan_budget(
+                &cached.shared,
+                1,
+                TEST_SCAN_BUDGET,
+                &mut first,
+            ),
+            0
+        );
+        assert_eq!(first.scanned_pages, TEST_SCAN_BUDGET);
+        assert_eq!(first.scan_budget_exhausted_files, 1);
+        assert_eq!(
+            cached
+                .shared
+                .pressure_reclaim_scan_remaining
+                .load(Ordering::Acquire),
+            1
+        );
+
+        let mut second = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared_with_scan_budget(
+                &cached.shared,
+                1,
+                TEST_SCAN_BUDGET,
+                &mut second,
+            ),
+            1
+        );
+        assert_eq!(second.scanned_pages, 1);
+        assert_eq!(second.scan_budget_exhausted_files, 0);
+        assert_eq!(
+            cached
+                .shared
+                .pressure_reclaim_scan_remaining
+                .load(Ordering::Acquire),
+            0
+        );
+        cached.with_page(TEST_SCAN_BUDGET as u32, |page| {
+            assert!(page.is_none())
+        });
+    }
+
+    #[test]
+    fn pressure_reclaim_does_not_restart_a_completed_inode_scan_epoch() {
+        let _epoch_guard = PRESSURE_RECLAIM_EPOCH_TEST_LOCK.lock().unwrap();
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x63, true);
+
+        let mut first = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut first),
+            0
+        );
+        assert_eq!(first.scanned_pages, 1);
+        assert_eq!(first.scan_budget_exhausted_files, 0);
+
+        let mut repeated = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut repeated),
+            0
+        );
+        assert_eq!(repeated.scanned_pages, 0);
+        assert_eq!(repeated.scan_budget_exhausted_files, 0);
+    }
+
+    #[test]
+    fn pressure_reclaim_new_epoch_reenables_a_completed_inode_scan() {
+        let _epoch_guard = PRESSURE_RECLAIM_EPOCH_TEST_LOCK.lock().unwrap();
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x64, true);
+
+        let mut completed = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut completed),
+            0
+        );
+        assert_eq!(completed.scanned_pages, 1);
+
+        advance_clean_cached_file_reclaim_scan_epoch();
+        let mut next_epoch = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut next_epoch),
+            0
+        );
+        assert_eq!(next_epoch.scanned_pages, 1);
+    }
+
+    #[test]
+    fn pressure_reconcile_does_not_apply_an_old_delta_to_new_retention() {
+        let (cached, location, _state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x51, false);
+        seed_cached_page(&cached, 1, 0x52, true);
+
+        // Model the critical old interleaving directly: reclaim has already
+        // removed one clean page, then a last-close transaction publishes a
+        // retention count based on the one dirty page that remains.  The
+        // reconciliation must preserve that actual count rather than subtract
+        // the earlier reclaim delta from it.
+        let clean = cached.shared.page_cache.lock().pop(&0).unwrap();
+        drop(clean);
+        let key = cached_file_registry_key(&location);
+        {
+            let mut registry = file_cache_registry().lock();
+            let entry = registry
+                .entry(key)
+                .or_insert_with(|| FileUserData::new(&location, &cached.shared));
+            let retired = entry.retain_closed(&location, &cached.shared, 1);
+            drop(retired);
+        }
+
+        synchronize_retained_page_count(&cached.shared, 1);
+        {
+            let registry = file_cache_registry().lock();
+            let entry = registry.get(&key).unwrap();
+            assert_eq!(entry.retained_pages, 1);
+            assert!(entry
+                .retained
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(retained, &cached.shared)));
+        }
+        cached.with_page(1, |page| {
+            assert!(page.is_some_and(|page| page.is_dirty()))
+        });
+
+        let retired = file_cache_registry().lock().remove(&key);
+        drop(retired);
+        cached.shared.unlinked.store(true, Ordering::Release);
     }
 
     struct RawPhysicalReader {

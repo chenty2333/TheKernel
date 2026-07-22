@@ -35,7 +35,7 @@ use crate::{
         check_signals, commit_exec_identity_handoff, fail_closed_exit, get_task,
         has_pending_fatal_signal, linux_pid_from_task_id, map_exec_dumpability,
         notify_ptrace_attach_stop, ns_capable, prepare_task_alias_admission, process_error,
-        release_exec_action_then_complete, set_current_user_page_table_root,
+        release_exec_action_then_complete, set_current_user_address_space,
     },
 };
 
@@ -449,7 +449,7 @@ fn do_execve(
     // the address-space handle nor the procfs cmdline may allocate after the
     // CLOEXEC commit point.
     let new_aspace = Arc::try_new(axsync::Mutex::new(new_aspace)).map_err(|_| AxError::NoMemory)?;
-    let new_root = new_aspace.lock().page_table_root();
+    let new_token = new_aspace.lock().address_space_token();
     let new_cmdline = Arc::try_new(loaded.arguments).map_err(|_| AxError::NoMemory)?;
     let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
     let task_alias_admission = new_task_alias
@@ -582,7 +582,7 @@ fn do_execve(
     let executable_key = exec_retirement
         .finish_executable_lease()
         .unwrap_or_else(|error| fail_closed_exit(error));
-    set_current_user_page_table_root(new_root);
+    set_current_user_address_space(new_token);
     proc_data.replace_executable(executable_key);
 
     drop(curr.replace_name(task_name));

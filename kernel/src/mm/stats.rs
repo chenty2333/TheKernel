@@ -17,13 +17,16 @@ pub struct SystemMemoryStats {
     pub total_bytes: usize,
     pub free_bytes: usize,
     pub available_bytes: usize,
+    pub reclaimable_file_cache_bytes: usize,
+    pub low_watermark_bytes: usize,
     pub used_bytes: usize,
     pub cached_bytes: usize,
     pub page_table_bytes: usize,
 }
 
-/// Returns the best-effort system memory statistics used by procfs/sysinfo.
-pub fn system_memory_stats() -> SystemMemoryStats {
+fn system_memory_stats_with_reclaimable_pages(
+    reclaimable_file_cache_pages: usize,
+) -> SystemMemoryStats {
     let alloc = global_allocator();
     let used_pages = alloc.used_pages();
     let free_pages = alloc.available_pages();
@@ -38,15 +41,38 @@ pub fn system_memory_stats() -> SystemMemoryStats {
     };
     let free_bytes = free_pages.saturating_mul(PAGE_SIZE_4K).min(total_bytes);
     let usages = alloc.usages();
+    let total_pages = total_bytes / PAGE_SIZE_4K;
+    let reclaimable_pages =
+        reclaimable_file_cache_pages.min(total_pages.saturating_sub(free_pages));
+    let available_pages = super::available_memory_pages(total_pages, free_pages, reclaimable_pages);
+    let low_watermark_pages = super::memory_watermarks(total_pages).low_pages;
 
     SystemMemoryStats {
         total_bytes,
         free_bytes,
-        available_bytes: free_bytes,
+        available_bytes: available_pages.saturating_mul(PAGE_SIZE_4K),
+        reclaimable_file_cache_bytes: reclaimable_pages.saturating_mul(PAGE_SIZE_4K),
+        low_watermark_bytes: low_watermark_pages.saturating_mul(PAGE_SIZE_4K),
         used_bytes: total_bytes.saturating_sub(free_bytes),
         cached_bytes: usages.get(UsageKind::PageCache),
         page_table_bytes: usages.get(UsageKind::PageTable),
     }
+}
+
+/// Returns the cheap allocator-backed memory snapshot used by syscall and
+/// allocation-policy paths. It deliberately performs no global file-cache
+/// scan; the resulting availability estimate is conservative.
+pub fn system_memory_stats() -> SystemMemoryStats {
+    system_memory_stats_with_reclaimable_pages(0)
+}
+
+/// Returns a reclaim-aware snapshot for explicit procfs/diagnostic reads.
+/// The caller owns the bounded cache scan so hot syscall paths cannot acquire
+/// per-inode locks as a side effect of reading allocator state.
+pub(crate) fn system_memory_stats_with_reclaimable_file_cache(
+    reclaimable_file_cache_pages: usize,
+) -> SystemMemoryStats {
+    system_memory_stats_with_reclaimable_pages(reclaimable_file_cache_pages)
 }
 
 pub fn overcommit_memory_policy() -> u32 {

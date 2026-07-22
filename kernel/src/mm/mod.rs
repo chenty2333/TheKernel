@@ -1,12 +1,14 @@
 //! User address space management and user-space memory access.
 
 mod access;
+mod asid;
 mod aspace;
 #[cfg(feature = "mm-lock-diagnostics")]
 mod diagnostics;
 mod fault;
 mod io;
 mod loader;
+mod pressure;
 mod remap;
 mod stats;
 mod tlb;
@@ -20,9 +22,13 @@ pub use self::diagnostics::{
     MmLockDiagnosticsSnapshot, MmLockStage, MmLockStageSnapshot, mm_lock_diagnostics_enabled,
     mm_lock_diagnostics_snapshot, reset_mm_lock_diagnostics, set_mm_lock_diagnostics_enabled,
 };
-pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
+pub use self::{
+    access::*, asid::AddressSpaceToken, aspace::*, io::*, loader::*, pressure::*, stats::*,
+};
 pub(crate) use self::{
+    asid::init as init_hardware_asids,
     fault::handle_user_page_fault,
+    pressure::init_memory_pressure,
     remap::remap_user_mapping,
     tlb::{
         init as init_tlb_shootdown, repair_local_spurious_fault, retire_after_tlb_grace,

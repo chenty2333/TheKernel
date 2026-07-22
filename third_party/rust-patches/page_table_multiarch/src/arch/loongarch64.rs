@@ -2,7 +2,9 @@
 
 use core::arch::asm;
 
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use memory_addr::VirtAddr;
+#[cfg(not(feature = "asid-fast-switch"))]
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K};
 use page_table_entry::loongarch64::LA64PTE;
 
 use crate::{PageTable64, PageTable64Cursor, PagingMetaData};
@@ -52,31 +54,28 @@ impl PagingMetaData for LA64MetaData {
 
     #[inline]
     fn flush_tlb(vaddr: Option<VirtAddr>) {
+        #[cfg(feature = "asid-fast-switch")]
+        let _ = vaddr;
+        #[cfg(feature = "asid-fast-switch")]
+        unsafe {
+            // A cursor can own an inactive page-table root; the current ASID
+            // therefore cannot safely scope this invalidation.  Keep the
+            // generic cursor conservative until owner scope is part of its
+            // API.  Current-address-space fault repair uses axcpu's explicit
+            // VA+current-ASID helper.
+            asm!("dbar 0; invtlb 0x00, $r0, $r0");
+        }
+
+        #[cfg(not(feature = "asid-fast-switch"))]
         unsafe {
             if let Some(vaddr) = vaddr {
                 // One LoongArch TLB entry contains the adjacent even/odd page
                 // pair. INVTLB's VA operand therefore names the pair rather
-                // than an individual 4-KiB leaf.
+                // than an individual 4-KiB leaf.  The default configuration
+                // installs every user root with ASID 0.
                 let pair = vaddr.align_down(2 * PAGE_SIZE_4K);
-                // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_dbar>
-                //
-                // Only after all previous load/store access operations are completely
-                // executed, the DBAR 0 instruction can be executed; and only after the
-                // execution of DBAR 0 is completed, all subsequent load/store access
-                // operations can be executed.
-                //
-                // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_invtlb>
-                //
-                // formats: invtlb op, asid, addr
-                //
-                // op 0x5: Clear all page table entries with G=0 and ASID equal to the
-                // register specified ASID, and VA equal to the register specified VA.
-                //
-                // When the operation indicated by op does not require an ASID, the
-                // general register rj should be set to r0.
                 asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) pair.as_usize());
             } else {
-                // op 0x0: Clear all page table entries
                 asm!("dbar 0; invtlb 0x00, $r0, $r0");
             }
         }

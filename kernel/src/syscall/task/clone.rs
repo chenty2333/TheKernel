@@ -28,8 +28,8 @@ use crate::{
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessThreadAdmission, TaskParentChoice, Thread,
         get_process_data, linux_pid_from_task_id, lock_task_parent_publication,
-        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
-        try_tasks,
+        prepare_task_table_admission, process_domain, send_signal_thread_inner,
+        set_task_user_address_space, try_new_user_task, try_tasks,
     },
 };
 
@@ -478,9 +478,10 @@ impl CloneArgs {
         };
 
         let (new_proc_data, thread_publication) = if flags.contains(CloneFlags::THREAD) {
-            new_task
-                .ctx_mut()
-                .set_page_table_root(parent_aspace.lock().page_table_root());
+            set_task_user_address_space(
+                new_task.ctx_mut(),
+                parent_aspace.lock().address_space_token(),
+            );
             let proc_data = old_proc_data.clone();
             let thread_admission = proc_data.prepare_thread(tid)?;
             (proc_data, CloneThreadPublication::Live(thread_admission))
@@ -507,9 +508,7 @@ impl CloneArgs {
             };
             let access_state =
                 clone_process_access_state(flags, parent_dumpability, parent_access_state)?;
-            new_task
-                .ctx_mut()
-                .set_page_table_root(aspace.lock().page_table_root());
+            set_task_user_address_space(new_task.ctx_mut(), aspace.lock().address_space_token());
 
             let signal_actions = if flags.contains(CloneFlags::SIGHAND) {
                 old_proc_data.signal.actions.clone()

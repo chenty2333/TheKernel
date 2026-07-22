@@ -35,7 +35,7 @@ use super::{
 };
 use crate::{
     keyring::{self, KeyTaskOwner},
-    mm::{AddrSpace, UserPtr, access_user_memory},
+    mm::{AddrSpace, AddressSpaceToken, UserPtr, access_user_memory},
     pseudofs::cgroup,
     syscall::acct_process_exit,
 };
@@ -345,10 +345,40 @@ impl<W: RegistryWeak> Drop for RegistryCleanupGuard<'_, W> {
     }
 }
 
-fn install_current_user_page_table_root(curr_ptr: *mut TaskInner, root: PhysAddr) {
+/// Stores one user address-space token in a task context.
+pub fn set_task_user_address_space(
+    ctx: &mut axhal::context::TaskContext,
+    token: AddressSpaceToken,
+) {
+    #[cfg(all(
+        feature = "asid-fast-switch",
+        any(target_arch = "riscv64", target_arch = "loongarch64")
+    ))]
     unsafe {
-        (*curr_ptr).ctx_mut().set_page_table_root(root);
-        axhal::asm::write_user_page_table(root);
+        ctx.set_page_table_root_with_asid(token.root(), token.asid(), token.generation());
+    }
+
+    #[cfg(not(all(
+        feature = "asid-fast-switch",
+        any(target_arch = "riscv64", target_arch = "loongarch64")
+    )))]
+    ctx.set_page_table_root(token.root());
+}
+
+fn install_current_user_address_space(curr_ptr: *mut TaskInner, token: AddressSpaceToken) {
+    unsafe {
+        set_task_user_address_space((*curr_ptr).ctx_mut(), token);
+        #[cfg(all(
+            feature = "asid-fast-switch",
+            any(target_arch = "riscv64", target_arch = "loongarch64")
+        ))]
+        axhal::asm::write_user_page_table_with_asid(token.root(), token.asid());
+
+        #[cfg(not(all(
+            feature = "asid-fast-switch",
+            any(target_arch = "riscv64", target_arch = "loongarch64")
+        )))]
+        axhal::asm::write_user_page_table(token.root());
     }
     #[cfg(not(target_arch = "x86_64"))]
     axhal::asm::flush_tlb(None);
@@ -827,12 +857,17 @@ pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
 
 /// Updates the current task's saved and active user page table root.
 pub fn set_current_user_page_table_root(root: PhysAddr) {
+    set_current_user_address_space(AddressSpaceToken::legacy(root));
+}
+
+/// Updates the current task's saved and active user address-space token.
+pub fn set_current_user_address_space(token: AddressSpaceToken) {
     let _guard = NoPreemptIrqSave::new();
     let curr = current();
     // SAFETY: this only mutates the current task's saved TaskContext while the task
     // is running on the current CPU, so no other code can access it concurrently.
     let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
-    install_current_user_page_table_root(curr_ptr, root);
+    install_current_user_address_space(curr_ptr, token);
 }
 
 struct ProcessPtraceExitRetirements {

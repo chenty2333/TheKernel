@@ -46,8 +46,9 @@ use crate::{
     },
     mm::{
         AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes,
-        overcommit_memory_policy, overcommit_ratio, set_overcommit_memory_policy,
-        set_overcommit_ratio, system_memory_stats, user_io_pin_counters_snapshot,
+        memory_pressure_snapshot, memory_watermarks, overcommit_memory_policy, overcommit_ratio,
+        set_overcommit_memory_policy, set_overcommit_ratio,
+        system_memory_stats_with_reclaimable_file_cache, user_io_pin_counters_snapshot,
     },
     mounts,
     pseudofs::{
@@ -1163,7 +1164,8 @@ impl Pollable for ProcUserNamespaceFile {
 }
 
 fn real_meminfo() -> String {
-    let stats = system_memory_stats();
+    let reclaim = axfs::cached_file_reclaim_estimate();
+    let stats = system_memory_stats_with_reclaimable_file_cache(reclaim.reclaimable_pages);
     let total_kb = stats.total_bytes / 1024;
     let free_kb = stats.free_bytes / 1024;
     let available_kb = stats.available_bytes / 1024;
@@ -1177,6 +1179,74 @@ fn real_meminfo() -> String {
          kB\nSwapCached:            0 kB\nSwapTotal:             0 kB\nSwapFree:              0 \
          kB\nPageTables:     {page_tables_kb:>8} kB\nCommitLimit:    {commit_limit_kb:>8} \
          kB\nCommitted_AS:   {committed_kb:>8} kB\n"
+    )
+}
+
+fn real_memory_pressure() -> String {
+    let snapshot = memory_pressure_snapshot();
+    let reclaim = axfs::cached_file_reclaim_estimate();
+    let memory = system_memory_stats_with_reclaimable_file_cache(reclaim.reclaimable_pages);
+    let total_pages = memory.total_bytes / PAGE_SIZE_4K;
+    let free_pages = memory.free_bytes / PAGE_SIZE_4K;
+    let watermarks = memory_watermarks(total_pages);
+    format!(
+        concat!(
+            "schema=thekernel-mm-pressure-v1\n",
+            "total_pages={}\n",
+            "free_pages={}\n",
+            "low_watermark_pages={}\n",
+            "high_watermark_pages={}\n",
+            "mem_available_bytes={}\n",
+            "low_watermark_bytes={}\n",
+            "reclaimable_clean_file_bytes={}\n",
+            "reclaimable_clean_file_pages={}\n",
+            "reclaim_estimate_scanned_files={}\n",
+            "reclaim_estimate_busy_files={}\n",
+            "reclaim_estimate_mapped_files={}\n",
+            "reclaim_estimate_truncated={}\n",
+            "checks={}\n",
+            "pressure_events={}\n",
+            "reclaim_passes={}\n",
+            "reclaimed_pages={}\n",
+            "no_progress_passes={}\n",
+            "visited_registry_entries={}\n",
+            "scanned_files={}\n",
+            "scanned_pages={}\n",
+            "dirty_pages={}\n",
+            "pinned_pages={}\n",
+            "writeback_pages={}\n",
+            "busy_files={}\n",
+            "mapped_files={}\n",
+            "scan_budget_exhausted_files={}\n",
+            "snapshot_truncations={}\n",
+        ),
+        total_pages,
+        free_pages,
+        watermarks.low_pages,
+        watermarks.high_pages,
+        memory.available_bytes,
+        memory.low_watermark_bytes,
+        memory.reclaimable_file_cache_bytes,
+        reclaim.reclaimable_pages,
+        reclaim.scanned_files,
+        reclaim.busy_files,
+        reclaim.mapped_files,
+        usize::from(reclaim.snapshot_truncated),
+        snapshot.checks,
+        snapshot.pressure_events,
+        snapshot.reclaim_passes,
+        snapshot.reclaimed_pages,
+        snapshot.no_progress_passes,
+        snapshot.visited_registry_entries,
+        snapshot.scanned_files,
+        snapshot.scanned_pages,
+        snapshot.dirty_pages,
+        snapshot.pinned_pages,
+        snapshot.writeback_pages,
+        snapshot.busy_files,
+        snapshot.mapped_files,
+        snapshot.scan_budget_exhausted_files,
+        snapshot.snapshot_truncations,
     )
 }
 
@@ -2736,6 +2806,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     root.add(
         "meminfo",
         SimpleFile::new_regular(fs.clone(), || Ok(real_meminfo())),
+    );
+    root.add(
+        "memory_pressure",
+        SimpleFile::new_regular(fs.clone(), || Ok(real_memory_pressure())),
     );
     root.add(
         "cgroups",

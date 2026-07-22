@@ -49,6 +49,7 @@ rustc-args = [
 all-features = true
 
 [features]
+asid-fast-switch = []
 axerrno = ["dep:axerrno"]
 copy-from = ["dep:bitmaps"]
 default = []

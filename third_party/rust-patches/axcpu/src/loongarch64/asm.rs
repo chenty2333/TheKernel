@@ -2,6 +2,8 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "asid-fast-switch")]
+use loongArch64::register::asid;
 use loongArch64::register::{crmd, ecfg, eentry, pgdh, pgdl};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
 
@@ -54,6 +56,13 @@ pub fn read_kernel_page_table() -> PhysAddr {
     PhysAddr::from(pgdh::read().base())
 }
 
+/// Reads the ASID currently installed in the ASID CSR.
+#[cfg(feature = "asid-fast-switch")]
+#[inline]
+pub fn read_current_asid() -> usize {
+    asid::read().asid()
+}
+
 /// Writes the register to update the current page table root for user space
 /// (`PGDL`).
 ///
@@ -64,6 +73,44 @@ pub fn read_kernel_page_table() -> PhysAddr {
 /// This function is unsafe as it changes the virtual memory address space.
 pub unsafe fn write_user_page_table(root_paddr: PhysAddr) {
     pgdl::set_base(root_paddr.as_usize() as _);
+}
+
+/// Writes a user page-table root and its hardware ASID without flushing.
+///
+/// # Safety
+///
+/// The caller must ensure that `asid_value` identifies `root_paddr` under the
+/// active allocator generation and must issue any required TLB invalidation.
+#[cfg(feature = "asid-fast-switch")]
+pub unsafe fn write_user_page_table_with_asid(root_paddr: PhysAddr, asid_value: usize) {
+    pgdl::set_base(root_paddr.as_usize() as _);
+    asid::set_asid(asid_value);
+}
+
+/// Returns the implemented ASID width reported by the architecture CSR.
+#[cfg(feature = "asid-fast-switch")]
+#[inline]
+pub fn probe_asid_width() -> usize {
+    asid::read().asid_width()
+}
+
+/// Flushes all virtual addresses for all ASIDs on the current core.
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe { asm!("dbar 0; invtlb 0x00, $r0, $r0") }
+}
+
+/// Flushes one virtual-address pair for one ASID on the current core.
+#[inline]
+pub fn flush_tlb_addr_asid(vaddr: VirtAddr, asid_value: usize) {
+    let pair = vaddr.align_down(2 * PAGE_SIZE_4K);
+    unsafe {
+        asm!(
+            "dbar 0; invtlb 0x05, {asid}, {addr}",
+            asid = in(reg) asid_value,
+            addr = in(reg) pair.as_usize()
+        )
+    }
 }
 
 /// Writes the register to update the current page table root for kernel space
@@ -84,33 +131,34 @@ pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {
 /// entry that maps the given virtual address.
 #[inline]
 pub fn flush_tlb(vaddr: Option<VirtAddr>) {
-    unsafe {
-        if let Some(vaddr) = vaddr {
-            // One LoongArch TLB entry contains the adjacent even/odd page
-            // pair. INVTLB's VA operand therefore names the pair rather than
-            // an individual 4-KiB leaf.
-            let pair = vaddr.align_down(2 * PAGE_SIZE_4K);
-            // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_dbar>
-            //
-            // Only after all previous load/store access operations are completely
-            // executed, the DBAR 0 instruction can be executed; and only after the
-            // execution of DBAR 0 is completed, all subsequent load/store access
-            // operations can be executed.
-            //
-            // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_invtlb>
-            //
-            // formats: invtlb op, asid, addr
-            //
-            // op 0x5: Clear all page table entries with G=0 and ASID equal to the
-            // register specified ASID, and VA equal to the register specified VA.
-            //
-            // When the operation indicated by op does not require an ASID, the
-            // general register rj should be set to r0.
-            asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) pair.as_usize());
-        } else {
-            // op 0x0: Clear all page table entries
-            asm!("dbar 0; invtlb 0x00, $r0, $r0");
-        }
+    if let Some(vaddr) = vaddr {
+        // One LoongArch TLB entry contains the adjacent even/odd page
+        // pair. INVTLB's VA operand therefore names the pair rather than
+        // an individual 4-KiB leaf.
+        // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_dbar>
+        //
+        // Only after all previous load/store access operations are completely
+        // executed, the DBAR 0 instruction can be executed; and only after the
+        // execution of DBAR 0 is completed, all subsequent load/store access
+        // operations can be executed.
+        //
+        // <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_invtlb>
+        //
+        // formats: invtlb op, asid, addr
+        //
+        // op 0x5: Clear all page table entries with G=0 and ASID equal to the
+        // register specified ASID, and VA equal to the register specified VA.
+        //
+        // When the operation indicated by op does not require an ASID, the
+        // general register rj should be set to r0.
+        #[cfg(feature = "asid-fast-switch")]
+        let asid_value = read_current_asid();
+        #[cfg(not(feature = "asid-fast-switch"))]
+        let asid_value = 0;
+        flush_tlb_addr_asid(vaddr, asid_value);
+    } else {
+        // op 0x0: Clear all page table entries
+        flush_tlb_all();
     }
 }
 

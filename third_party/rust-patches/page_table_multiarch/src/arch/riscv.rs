@@ -14,6 +14,17 @@ pub trait SvVirtAddr: memory_addr::MemoryAddr + Send + Sync {
 impl SvVirtAddr for VirtAddr {
     #[inline]
     fn flush_tlb(vaddr: Option<Self>) {
+        #[cfg(feature = "asid-fast-switch")]
+        let _ = vaddr;
+        #[cfg(feature = "asid-fast-switch")]
+        // A page-table cursor can mutate an inactive/foreign root, so the
+        // currently installed hardware ASID does not identify the cursor's
+        // owner.  Until the cursor carries owner scope, use the architectural
+        // all-address/all-ASID form.  Current-address-space fault repair uses
+        // axcpu's explicit VA+current-ASID helper instead.
+        riscv::asm::sfence_vma_all();
+
+        #[cfg(not(feature = "asid-fast-switch"))]
         if let Some(vaddr) = vaddr {
             riscv::asm::sfence_vma(0, vaddr.as_usize())
         } else {

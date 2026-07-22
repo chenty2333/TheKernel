@@ -9,6 +9,9 @@ source "$SCRIPT_DIR/ci/lib.sh"
 ARCH=""
 WORKDIR=""
 TIMEOUT_SECS=300
+CPUS=1
+MEMORY=""
+ASID_FAST_SWITCH=0
 SKIP_BUILD=0
 
 usage() {
@@ -18,6 +21,11 @@ Usage: scripts/system-test.sh --arch {rv|la} [OPTIONS]
 Options:
   --workdir DIR   Run directory (default: unique run below .state/system-test/ARCH)
   --timeout SECS  QEMU timeout (default: 300)
+  --cpus N        Build and boot with N CPUs, from 1 through 4096 (default: 1)
+  --memory SIZE   Build and boot with 128M..1G (RV) or 256M..1G (LA)
+                  (defaults: rv=128M, la=256M for the LA DMA carveout)
+  --asid-fast-switch
+                  Build the opt-in hardware-ASID context-switch path
   --skip-build    Reuse existing kernel and rootfs artifacts
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
@@ -32,6 +40,9 @@ while (($#)); do
         --arch) ARCH=${2:-}; shift 2 ;;
         --workdir) WORKDIR=${2:-}; shift 2 ;;
         --timeout) TIMEOUT_SECS=${2:-}; shift 2 ;;
+        --cpus) CPUS=${2:-}; shift 2 ;;
+        --memory) MEMORY=${2:-}; shift 2 ;;
+        --asid-fast-switch) ASID_FAST_SWITCH=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'system-test: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -39,15 +50,50 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la) ;;
+    rv) DEFAULT_MEMORY=128M ;;
+    la) DEFAULT_MEMORY=256M ;;
     *) printf '%s\n' 'system-test: --arch must be rv or la' >&2; exit 2 ;;
 esac
+if [ -z "$MEMORY" ]; then
+    MEMORY=$DEFAULT_MEMORY
+fi
 case "$TIMEOUT_SECS" in
     ''|*[!0-9]*|0) printf 'system-test: invalid timeout: %s\n' "$TIMEOUT_SECS" >&2; exit 2 ;;
 esac
+if [[ ! "$CPUS" =~ ^[1-9][0-9]{0,3}$ ]] || ((CPUS > 4096)); then
+    printf 'system-test: --cpus must be an integer between 1 and 4096: %s\n' \
+        "$CPUS" >&2
+    exit 2
+fi
+if [[ ! "$MEMORY" =~ ^[1-9][0-9]{0,6}[KMG]$ ]]; then
+    printf 'system-test: --memory must be a bounded positive K/M/G size: %s\n' \
+        "$MEMORY" >&2
+    exit 2
+fi
+memory_value=${MEMORY%?}
+memory_unit=${MEMORY: -1}
+case "$memory_unit" in
+    K) memory_kib=$((10#$memory_value)) ;;
+    M) memory_kib=$((10#$memory_value * 1024)) ;;
+    G) memory_kib=$((10#$memory_value * 1024 * 1024)) ;;
+esac
+case "$ARCH" in
+    rv) minimum_memory_kib=$((128 * 1024)) ;;
+    la) minimum_memory_kib=$((256 * 1024)) ;;
+esac
+maximum_memory_kib=$((1024 * 1024))
+if ((memory_kib < minimum_memory_kib || memory_kib > maximum_memory_kib)); then
+    printf 'system-test: %s memory must be between %s and 1G for the bounded pressure profile: %s\n' \
+        "$ARCH" "${DEFAULT_MEMORY}" "$MEMORY" >&2
+    exit 2
+fi
+if [ "$ASID_FAST_SWITCH" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
+    printf '%s\n' 'system-test: --asid-fast-switch cannot be combined with --skip-build' >&2
+    exit 2
+fi
 
 if [ -z "$WORKDIR" ]; then
-    default_run_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    default_run_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-${CPUS}cpu-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     WORKDIR="$REPO_ROOT/.state/system-test/$ARCH/$default_run_id"
 elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
@@ -56,7 +102,9 @@ fi
 KERNEL="$REPO_ROOT/kernel-$ARCH"
 ROOTFS="$REPO_ROOT/.state/rootfs/rootfs-$ARCH.img"
 if [ "$SKIP_BUILD" -eq 0 ]; then
-    make -C "$REPO_ROOT" "kernel-$ARCH" "rootfs-$ARCH"
+    THEKERNEL_KERNEL_ASID_FAST_SWITCH="$ASID_FAST_SWITCH" \
+    make -C "$REPO_ROOT" SMP="$CPUS" MEM="$MEMORY" \
+        "kernel-$ARCH" "rootfs-$ARCH"
 fi
 [ -s "$KERNEL" ] || { printf 'system-test: missing kernel: %s\n' "$KERNEL" >&2; exit 1; }
 [ -s "$ROOTFS" ] || { printf 'system-test: missing rootfs: %s\n' "$ROOTFS" >&2; exit 1; }
@@ -69,6 +117,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         --arch "$ARCH" \
         --kernel "$KERNEL" \
         --rootfs "$ROOTFS" \
+        --cpus "$CPUS" \
+        --memory "$MEMORY" \
         --workdir "$WORKDIR" \
         --timeout "$TIMEOUT_SECS" \
         --stop-after-marker THEKERNEL_SYSTEM_TEST_PASS
@@ -104,12 +154,17 @@ for marker in \
     THEKERNEL_SYSTEM_TEST_ROOTFS_OK \
     THEKERNEL_SYSTEM_TEST_TMPFS_OK \
     THEKERNEL_SYSTEM_TEST_PROCFS_OK \
+    THEKERNEL_SYSTEM_TEST_MM_PRESSURE_OK \
+    THEKERNEL_MM_PRESSURE_WORKER_OK \
+    THEKERNEL_MM_PRESSURE_RECLAIM_OK \
+    THEKERNEL_MM_PRESSURE_OK \
+    THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK \
     THEKERNEL_SYSTEM_TEST_PROCESS_OK \
     THEKERNEL_EXEC_SMOKE_OK \
     THEKERNEL_SYSTEM_TEST_EXEC_OK \
     CI_SIGNAL_WAIT_BOUNDARY_PASS \
     THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK \
-    CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK\ online_cpus=1 \
+    "CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$CPUS" \
     CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK \
     CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK\ min_hits=3 \
     CI_WAIT_BOUNDARY_ITIMER_CPU_OK\ no_syscall_loop=1 \

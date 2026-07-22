@@ -503,6 +503,44 @@ def requested_kernel_cpu_count() -> int | None:
     return product_value if product_value is not None else make_value
 
 
+def _parse_kernel_memory(value: str, variable: str) -> str | None:
+    if not value:
+        return None
+    suffix = value[-1:].upper()
+    digits = value[:-1]
+    if (
+        suffix not in ("K", "M", "G")
+        or not digits.isascii()
+        or not digits.isdecimal()
+        or int(digits, 10) <= 0
+    ):
+        raise BuildError(f"{variable} must be a positive K/M/G size")
+    return f"{int(digits, 10)}{suffix}"
+
+
+def requested_kernel_memory() -> str | None:
+    product_value = _parse_kernel_memory(
+        os.environ.get("THEKERNEL_KERNEL_MEMORY", ""),
+        "THEKERNEL_KERNEL_MEMORY",
+    )
+    make_value = _parse_kernel_memory(os.environ.get("MEM", ""), "MEM")
+    if product_value is not None and make_value is not None:
+        if product_value != make_value:
+            raise BuildError("THEKERNEL_KERNEL_MEMORY and MEM request different sizes")
+    return product_value if product_value is not None else make_value
+
+
+def requested_asid_fast_switch() -> bool:
+    value = os.environ.get("THEKERNEL_KERNEL_ASID_FAST_SWITCH", "").strip().lower()
+    if value in ("", "0", "false"):
+        return False
+    if value in ("1", "true"):
+        return True
+    raise BuildError(
+        "THEKERNEL_KERNEL_ASID_FAST_SWITCH must be one of 0, 1, false, or true"
+    )
+
+
 def make_kernel_request(
     mode: Literal[
         "release", "shell", "io-test-shell", "mm-performance-shell"
@@ -529,6 +567,11 @@ def make_kernel_request(
         make_args.append(f"SMP={requested_cpus}")
         if requested_cpus > 1:
             features = f"{features} smp"
+    requested_memory = requested_kernel_memory()
+    if requested_memory is not None:
+        make_args.append(f"MEM={requested_memory}")
+    if requested_asid_fast_switch():
+        features = f"{features} asid-fast-switch"
     return KernelRequest(
         name=name,
         arch=full_arch,
@@ -576,8 +619,9 @@ def kernel_build(req: KernelRequest, output: Path) -> None:
 
 def _kernel_make_var_args(req: KernelRequest) -> list[str]:
     args = list(req.make_args)
+    overridden = {argument.partition("=")[0] for argument in req.make_args if "=" in argument}
     for key, value in KERNEL_ENV.items():
-        if value != "":
+        if value != "" and key not in overridden:
             args.append(f"{key}={value}")
     return args
 
@@ -585,6 +629,10 @@ def _kernel_make_var_args(req: KernelRequest) -> list[str]:
 def kernel_build_env(req: KernelRequest) -> dict[str, str]:
     env = os.environ.copy()
     env.update(KERNEL_ENV)
+    for argument in req.make_args:
+        key, separator, value = argument.partition("=")
+        if separator:
+            env[key] = value
     env["ARCH"] = req.arch
     env["APP_FEATURES"] = req.app_features
     env["PYTHONDONTWRITEBYTECODE"] = "1"

@@ -62,6 +62,7 @@ targets = [
 
 [features]
 arm-el2 = ["page_table_entry/arm-el2"]
+asid-fast-switch = []
 default = []
 fp-simd = []
 host-test-context = []

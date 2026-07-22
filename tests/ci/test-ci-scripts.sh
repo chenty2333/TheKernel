@@ -15,6 +15,7 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
     sh -n "$script"
 done
 bash -n "$0"
+python3 "$CI_DIR/validate-rfc-index.py" >/dev/null
 
 # The host and pinned Debian developer container must never execute artifacts
 # from the same primary or maintained-sibling Cargo target. This is a static
@@ -44,6 +45,8 @@ grep -Fq 'ci_run_step kernel-keyring-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 66 --filter keyring:: --' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-userfaultfd-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 72 --filter userfaultfd:: --' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step kernel-io-uring-adapter-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- '--minimum 4 --filter io_uring:: --' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-packet-adapter-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 24 --filter packet --' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step vendored-smoltcp-udp-tests' "$CI_DIR/per-commit.sh"
@@ -816,17 +819,23 @@ set -euo pipefail
 printf '%s\n' "$@" >"$FAKE_SYSTEM_RUNNER_ARGS"
 workdir=
 arch=
+cpus=
+memory=
 while (($#)); do
     case "$1" in
         --arch) arch=${2:-}; shift 2 ;;
+        --cpus) cpus=${2:-}; shift 2 ;;
+        --memory) memory=${2:-}; shift 2 ;;
         --workdir) workdir=${2:-}; shift 2 ;;
         *) shift ;;
     esac
 done
 [ -n "$workdir" ]
 [ -n "$arch" ]
+[ -n "$cpus" ]
+[ -n "$memory" ]
 mkdir -p "$workdir"
-cat >"$workdir/console.log" <<'MARKERS_BEFORE_SETRLIMIT'
+cat >"$workdir/console.log" <<MARKERS_BEFORE_SETRLIMIT
 THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK
 THEKERNEL_SYSTEM_TEST_INIT_EXEC_2_OK
 THEKERNEL_SYSTEM_TEST_START
@@ -834,12 +843,17 @@ THEKERNEL_SYSTEM_TEST_MOUNTS_OK
 THEKERNEL_SYSTEM_TEST_ROOTFS_OK
 THEKERNEL_SYSTEM_TEST_TMPFS_OK
 THEKERNEL_SYSTEM_TEST_PROCFS_OK
+THEKERNEL_SYSTEM_TEST_MM_PRESSURE_OK
+THEKERNEL_MM_PRESSURE_WORKER_OK
+THEKERNEL_MM_PRESSURE_RECLAIM_OK
+THEKERNEL_MM_PRESSURE_OK
+THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK
 THEKERNEL_SYSTEM_TEST_PROCESS_OK
 THEKERNEL_EXEC_SMOKE_OK
 THEKERNEL_SYSTEM_TEST_EXEC_OK
 CI_SIGNAL_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK
-CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=1
+CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$cpus
 CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK
 CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK min_hits=3
 CI_WAIT_BOUNDARY_ITIMER_CPU_OK no_syscall_loop=1
@@ -918,6 +932,14 @@ MARKERS_AFTER_SETRLIMIT
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$system_fixture/fake-bin/python3"
+cat >"$system_fixture/fake-bin/make" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'THEKERNEL_KERNEL_ASID_FAST_SWITCH=%s\n' \
+    "${THEKERNEL_KERNEL_ASID_FAST_SWITCH:-}" >"$FAKE_SYSTEM_MAKE_ARGS"
+printf '%s\n' "$@" >>"$FAKE_SYSTEM_MAKE_ARGS"
+EOF
+chmod +x "$system_fixture/fake-bin/make"
 if env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-unsafe.args" \
     "$system_fixture/scripts/system-test.sh" \
@@ -937,13 +959,95 @@ grep -Fqx $'owner\tsystem-test-rv' \
     "$tmp/system-run/.thekernel-ci-owned-run"
 grep -Fxq -- '--stop-after-marker' "$system_args"
 grep -Fxq -- 'THEKERNEL_SYSTEM_TEST_PASS' "$system_args"
+grep -Fxq -- '--cpus' "$system_args"
+grep -Fxq -- '1' "$system_args"
+grep -Fxq -- '--memory' "$system_args"
+grep -Fxq -- '128M' "$system_args"
 system_args_la="$tmp/system-runner-la.args"
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args_la" \
     FAKE_SYSTEM_RUNNER_STATUS=75 \
     "$system_fixture/scripts/system-test.sh" \
     --arch la --skip-build --workdir "$tmp/system-run-la" >/dev/null
+grep -Fxq -- '--cpus' "$system_args_la"
+grep -Fxq -- '1' "$system_args_la"
+grep -Fxq -- '--memory' "$system_args_la"
+grep -Fxq -- '256M' "$system_args_la"
 grep -Fxq -- 'la' "$system_args_la"
+set +e
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-la-memory.args" \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch la --memory 128M --skip-build \
+    --workdir "$tmp/system-invalid-la-memory" >/dev/null 2>&1
+status=$?
+set -e
+[ "$status" -eq 2 ]
+system_args_smp="$tmp/system-runner-smp.args"
+system_make_args="$tmp/system-make-smp.args"
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$system_args_smp" \
+    FAKE_SYSTEM_MAKE_ARGS="$system_make_args" \
+    FAKE_SYSTEM_RUNNER_STATUS=75 \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --cpus 4 --workdir "$tmp/system-run-smp" >/dev/null
+grep -Fxq -- 'SMP=4' "$system_make_args"
+grep -Fxq -- 'MEM=128M' "$system_make_args"
+grep -Fxq -- 'kernel-rv' "$system_make_args"
+grep -Fxq -- 'rootfs-rv' "$system_make_args"
+grep -Fxq -- '--cpus' "$system_args_smp"
+grep -Fxq -- '4' "$system_args_smp"
+grep -Fxq -- '--memory' "$system_args_smp"
+grep -Fxq -- '128M' "$system_args_smp"
+system_args_asid="$tmp/system-runner-asid.args"
+system_make_args_asid="$tmp/system-make-asid.args"
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$system_args_asid" \
+    FAKE_SYSTEM_MAKE_ARGS="$system_make_args_asid" \
+    FAKE_SYSTEM_RUNNER_STATUS=75 \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --asid-fast-switch \
+    --workdir "$tmp/system-run-asid" >/dev/null
+grep -Fxq -- 'THEKERNEL_KERNEL_ASID_FAST_SWITCH=1' "$system_make_args_asid"
+set +e
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-asid-skip.args" \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --asid-fast-switch --skip-build \
+    --workdir "$tmp/system-invalid-asid-skip" >/dev/null 2>&1
+status=$?
+set -e
+[ "$status" -eq 2 ]
+for invalid_cpus in 0 4097 not-a-number; do
+    set +e
+    env PATH="$system_fixture/fake-bin:$PATH" \
+        FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-$invalid_cpus.args" \
+        "$system_fixture/scripts/system-test.sh" \
+        --arch rv --cpus "$invalid_cpus" --skip-build \
+        --workdir "$tmp/system-invalid-$invalid_cpus" >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 2 ]; then
+        printf 'test-ci-scripts: invalid CPU count %s returned %s, expected 2\n' \
+            "$invalid_cpus" "$status" >&2
+        exit 1
+    fi
+done
+for invalid_memory in 0 64M 2G 128 128MB bad; do
+    set +e
+    env PATH="$system_fixture/fake-bin:$PATH" \
+        FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-memory-$invalid_memory.args" \
+        "$system_fixture/scripts/system-test.sh" \
+        --arch rv --memory "$invalid_memory" --skip-build \
+        --workdir "$tmp/system-invalid-memory-$invalid_memory" >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 2 ]; then
+        printf 'test-ci-scripts: invalid memory %s returned %s, expected 2\n' \
+            "$invalid_memory" "$status" >&2
+        exit 1
+    fi
+done
 set +e
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args" \

@@ -18,8 +18,10 @@ from tools.build import (
     fingerprint_inputs,
     hash_params,
     kernel_input_specs,
+    kernel_build_env,
     kernel_params,
     make_kernel_request,
+    _kernel_make_var_args,
     rootfs_params,
 )
 from tools.project_paths import repo_root
@@ -265,6 +267,44 @@ class BuildKernelParamTests(unittest.TestCase):
         ):
             with self.assertRaises(BuildError):
                 make_kernel_request("shell", "rv", root)
+
+    def test_requested_kernel_memory_overrides_the_product_default(self) -> None:
+        root = repo_root()
+        with patch.dict("os.environ", {"MEM": "128m"}, clear=True):
+            request = make_kernel_request("release", "rv", root)
+        self.assertIn("MEM=128M", request.make_args)
+        make_args = _kernel_make_var_args(request)
+        self.assertEqual(make_args.count("MEM=128M"), 1)
+        self.assertNotIn("MEM=1G", make_args)
+        self.assertEqual(kernel_build_env(request)["MEM"], "128M")
+
+    def test_conflicting_kernel_memory_inputs_are_rejected(self) -> None:
+        root = repo_root()
+        with patch.dict(
+            "os.environ",
+            {"THEKERNEL_KERNEL_MEMORY": "1G", "MEM": "128M"},
+            clear=True,
+        ):
+            with self.assertRaises(BuildError):
+                make_kernel_request("release", "rv", root)
+
+    def test_asid_fast_switch_is_an_explicit_cache_identity_feature(self) -> None:
+        root = repo_root()
+        with patch.dict(
+            "os.environ", {"THEKERNEL_KERNEL_ASID_FAST_SWITCH": "1"}, clear=True
+        ):
+            request = make_kernel_request("release", "rv", root)
+        self.assertIn("asid-fast-switch", request.app_features.split())
+        self.assertIn("asid-fast-switch", kernel_params(request)["app_features"].split())
+
+        for value in ("sometimes", "2"):
+            with self.subTest(value=value), patch.dict(
+                "os.environ",
+                {"THEKERNEL_KERNEL_ASID_FAST_SWITCH": value},
+                clear=True,
+            ):
+                with self.assertRaises(BuildError):
+                    make_kernel_request("release", "rv", root)
 
     def test_requested_kernel_cpu_count_is_strictly_validated(self) -> None:
         root = repo_root()

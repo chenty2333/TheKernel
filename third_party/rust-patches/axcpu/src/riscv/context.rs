@@ -287,6 +287,12 @@ pub struct TaskContext {
     /// The `satp` register value, i.e., the page table root.
     #[cfg(feature = "uspace")]
     pub satp: memory_addr::PhysAddr,
+    /// Numeric hardware ASID installed with `satp`.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub asid: usize,
+    /// Non-wrapping allocator generation that owns `asid`.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub asid_generation: u64,
     #[cfg(feature = "fp-simd")]
     pub fp_state: FpState,
 }
@@ -303,6 +309,10 @@ impl TaskContext {
         Self {
             #[cfg(feature = "uspace")]
             satp: crate::asm::read_kernel_page_table(),
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            asid: 0,
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            asid_generation: 0,
             ..Default::default()
         }
     }
@@ -322,6 +332,30 @@ impl TaskContext {
     #[cfg(feature = "uspace")]
     pub fn set_page_table_root(&mut self, satp: memory_addr::PhysAddr) {
         self.satp = satp;
+        #[cfg(feature = "asid-fast-switch")]
+        {
+            self.asid = 0;
+            self.asid_generation = 0;
+        }
+    }
+
+    /// Changes the user root and its bounded hardware-ASID identity.
+    ///
+    /// # Safety
+    ///
+    /// The numeric ASID must uniquely identify `satp` for the entire boot.  It
+    /// must not be recycled without a protocol that quiesces every CPU still
+    /// able to run or refill the old identity.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub unsafe fn set_page_table_root_with_asid(
+        &mut self,
+        satp: memory_addr::PhysAddr,
+        asid: usize,
+        generation: u64,
+    ) {
+        self.satp = satp;
+        self.asid = asid;
+        self.asid_generation = generation;
     }
 
     /// Switches to another task.
@@ -334,10 +368,32 @@ impl TaskContext {
             self.tp = crate::asm::read_thread_pointer();
             unsafe { crate::asm::write_thread_pointer(next_ctx.tp) };
         }
-        #[cfg(feature = "uspace")]
+        #[cfg(all(feature = "uspace", not(feature = "asid-fast-switch")))]
         if self.satp != next_ctx.satp {
             unsafe { crate::asm::write_user_page_table(next_ctx.satp) };
-            crate::asm::flush_tlb(None); // currently flush the entire TLB
+            crate::asm::flush_tlb(None);
+        }
+        #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+        {
+            let address_space_changed = self.satp != next_ctx.satp
+                || self.asid != next_ctx.asid
+                || self.asid_generation != next_ctx.asid_generation;
+            if address_space_changed {
+                let can_retain_tlb = crate::can_retain_user_tlb(
+                    self.satp.as_usize(),
+                    self.asid,
+                    self.asid_generation,
+                    next_ctx.satp.as_usize(),
+                    next_ctx.asid,
+                    next_ctx.asid_generation,
+                );
+                unsafe {
+                    crate::asm::write_user_page_table_with_asid(next_ctx.satp, next_ctx.asid)
+                };
+                if !can_retain_tlb {
+                    crate::asm::flush_tlb(None);
+                }
+            }
         }
         #[cfg(feature = "fp-simd")]
         {

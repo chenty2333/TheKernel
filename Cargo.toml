@@ -70,6 +70,7 @@ repository.workspace = true
 [features]
 default = []
 boot-shell = []
+asid-fast-switch = ["thekernel-kernel/asid-fast-switch"]
 mm-lock-diagnostics = ["thekernel-kernel/mm-lock-diagnostics"]
 test-io-control = ["thekernel-kernel/test-io-control"]
 qemu = [
