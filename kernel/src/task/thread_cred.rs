@@ -15,6 +15,7 @@ use super::{
         DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
     },
 };
+use crate::keyring;
 
 /// One-shot proof that the exact credential currently installed in one slot
 /// passed the typed setgroups capability hook before userspace input was read.
@@ -233,7 +234,7 @@ impl Thread {
             return Ok(());
         }
         update.builder.no_new_privs = true;
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 }
@@ -258,9 +259,15 @@ impl Thread {
         self.credential.try_lock_snapshot()
     }
 
-    fn commit_credential<'a>(&self, prepared: PreparedCred<'a>) -> Arc<Cred> {
-        self.proc_data
-            .publish_credential(prepared, self.pdeath_signal_state())
+    fn commit_credential<'a>(&self, prepared: PreparedCred<'a>) -> AxResult<Arc<Cred>> {
+        let old_ids = prepared.old_arc().ids();
+        let new_ids = prepared.proposed_arc().ids();
+        if old_ids.fsuid != new_ids.fsuid || old_ids.fsgid != new_ids.fsgid {
+            keyring::credential_fsids_precommit(self.kernel_tid(), new_ids.fsuid, new_ids.fsgid)?;
+        }
+        Ok(self
+            .proc_data
+            .publish_credential(prepared, self.pdeath_signal_state()))
     }
 
     pub(crate) fn admit_setgroups(&self) -> AxResult<SetgroupsAdmission> {
@@ -282,13 +289,13 @@ impl Thread {
             return Ok(());
         }
         update.builder.groups = groups;
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
     pub(crate) fn apply_capset(&self, request: CapsetRequest) -> AxResult<()> {
         if let Some(update) = prepare_capset_update(&self.credential, request)? {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -324,7 +331,7 @@ impl Thread {
             .caps
             .try_drop_bounding(cap)
             .map_err(super::cred_error)?;
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
@@ -342,7 +349,7 @@ impl Thread {
             .caps
             .try_raise_ambient(cap)
             .map_err(super::cred_error)?;
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
@@ -353,7 +360,7 @@ impl Thread {
             .caps
             .try_lower_ambient(cap)
             .map_err(super::cred_error)?;
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
@@ -363,7 +370,7 @@ impl Thread {
             return Ok(());
         }
         update.builder.caps.clear_ambient();
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
@@ -373,7 +380,7 @@ impl Thread {
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
         if let Some(update) = prepare_securebits_update(&self.credential, securebits)? {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -393,7 +400,7 @@ impl Thread {
         if update.builder.caps == old {
             return Ok(());
         }
-        self.commit_credential(update.finish()?);
+        self.commit_credential(update.finish()?)?;
         Ok(())
     }
 
@@ -401,7 +408,7 @@ impl Thread {
         let (_, update) =
             prepare_user_id_update(&self.credential, UserIdTransitionInput::setuid(uid))?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -410,7 +417,7 @@ impl Thread {
         let (_, update) =
             prepare_group_id_update(&self.credential, GroupIdTransitionInput::setgid(gid))?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -421,7 +428,7 @@ impl Thread {
             UserIdTransitionInput::setreuid(ruid, euid),
         )?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -432,7 +439,7 @@ impl Thread {
             GroupIdTransitionInput::setregid(rgid, egid),
         )?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -448,7 +455,7 @@ impl Thread {
             UserIdTransitionInput::setresuid(ruid, euid, suid),
         )?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -464,7 +471,7 @@ impl Thread {
             GroupIdTransitionInput::setresgid(rgid, egid, sgid),
         )?;
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(())
     }
@@ -472,7 +479,7 @@ impl Thread {
     pub(crate) fn setfsuid(&self, fsuid: Kuid) -> AxResult<Kuid> {
         let (old_fsuid, update) = prepare_setfsuid_update(&self.credential, fsuid);
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(old_fsuid)
     }
@@ -480,7 +487,7 @@ impl Thread {
     pub(crate) fn setfsgid(&self, fsgid: Kgid) -> AxResult<Kgid> {
         let (old_fsgid, update) = prepare_setfsgid_update(&self.credential, fsgid);
         if let Some(update) = update {
-            self.commit_credential(update);
+            self.commit_credential(update)?;
         }
         Ok(old_fsgid)
     }

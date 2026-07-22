@@ -13,9 +13,37 @@ const KEY_REQKEY_DEFL_SESSION_KEYRING: i32 = 3;
 const KEY_REQKEY_DEFL_USER_KEYRING: i32 = 4;
 const KEY_REQKEY_DEFL_USER_SESSION_KEYRING: i32 = 5;
 
+/// Immutable task/process identities used by keyring lifecycle transitions.
+///
+/// `thread_owner` is the scheduler-derived kernel TID and never follows the
+/// visible-TID rebind performed by a non-leader exec. `process_owner` is the
+/// process-domain PID shared by every `CLONE_THREAD` sibling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KeyTaskOwner {
+    thread_owner: u32,
+    process_owner: u32,
+}
+
+impl KeyTaskOwner {
+    pub(crate) const fn new(thread_owner: u32, process_owner: u32) -> Self {
+        Self {
+            thread_owner,
+            process_owner,
+        }
+    }
+
+    pub(super) const fn thread_owner(self) -> u32 {
+        self.thread_owner
+    }
+
+    pub(super) const fn process_owner(self) -> u32 {
+        self.process_owner
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KeyUserRecord {
-    pub(crate) uid: u32,
+    pub(crate) uid: Kuid,
     pub(crate) usage: usize,
     pub(crate) keys: usize,
     pub(crate) instantiated_keys: usize,
@@ -74,8 +102,12 @@ impl KeyActor {
         self.dac.gid()
     }
 
-    pub(super) fn user_uid(&self) -> Kuid {
+    pub(super) fn real_uid(&self) -> Kuid {
         self.ids.ruid
+    }
+
+    pub(super) fn real_gid(&self) -> Kgid {
+        self.ids.rgid
     }
 
     pub(super) fn in_group(&self, gid: Kgid) -> bool {

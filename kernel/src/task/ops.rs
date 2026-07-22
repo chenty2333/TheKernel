@@ -34,6 +34,7 @@ use super::{
     send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
+    keyring::{self, KeyTaskOwner},
     mm::{AddrSpace, UserPtr, access_user_memory},
     pseudofs::cgroup,
     syscall::acct_process_exit,
@@ -1282,6 +1283,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let final_exit = final_exit
         .map(|exit| thr.proc_data.prepare_zombie_exit(exit))
         .transpose()?;
+    let final_thread = final_exit.is_some();
     if final_exit.is_some() {
         // Freeze shared generation before zombie publication. A concurrent
         // sender that prepared outside the endpoint lock must fail its commit
@@ -1467,6 +1469,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // edits cannot accidentally move credential free callbacks back under it.
     drop(task_parent_publication.take());
     drop(lifecycle);
+    keyring::exit_committed(
+        KeyTaskOwner::new(thr.kernel_tid(), process.pid()),
+        final_thread,
+    )
+    .unwrap_or_else(|error| fail_closed_exit(error));
     drop(ptrace_retirements);
     drop(seccomp_retirement.take());
     thr.proc_data.exec_event.wake();

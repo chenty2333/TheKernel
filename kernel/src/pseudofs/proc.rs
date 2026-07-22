@@ -82,7 +82,10 @@ use crate::{
 const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
-fn key_users_snapshot() -> String {
+fn render_key_users_snapshot(
+    records: Vec<KeyUserRecord>,
+    viewer_user_ns: &UserNamespace,
+) -> String {
     let mut out = String::new();
     for KeyUserRecord {
         uid,
@@ -93,8 +96,12 @@ fn key_users_snapshot() -> String {
         max_keys,
         quota_bytes,
         max_bytes,
-    } in key_user_records()
+    } in records
     {
+        let Some(uid) = viewer_user_ns.kernel_uid_to_user(uid) else {
+            continue;
+        };
+        let uid = uid.into_raw();
         let _ = writeln!(
             out,
             "{uid:5}: {usage:5} {keys}/{instantiated_keys} {quota_keys}/{max_keys} \
@@ -102,6 +109,15 @@ fn key_users_snapshot() -> String {
         );
     }
     out
+}
+
+fn key_users_snapshot() -> VfsResult<String> {
+    let viewer_user_ns = current().as_thread().current_cred().user_ns().clone();
+    let records = key_user_records().map_err(|error| match error {
+        AxError::NoMemory => VfsError::NoMemory,
+        _ => VfsError::Io,
+    })?;
+    Ok(render_key_users_snapshot(records, &viewer_user_ns))
 }
 
 fn try_pid_name(pid: u32) -> VfsResult<String> {
@@ -2705,7 +2721,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
     root.add(
         "key-users",
-        SimpleFile::new_regular(fs.clone(), || Ok(key_users_snapshot())),
+        SimpleFile::new_regular(fs.clone(), key_users_snapshot),
     );
     root.add(
         "version",
@@ -3361,6 +3377,31 @@ mod tests {
 
     fn kgid(raw: u32) -> Kgid {
         Kgid::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn key_users_snapshot_maps_and_filters_for_reader_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let map = child
+            .try_build_uid_map(vec![IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        child.publish_uid_map(map).unwrap();
+        let record = |uid| KeyUserRecord {
+            uid: kuid(uid),
+            usage: 1,
+            keys: 1,
+            instantiated_keys: 1,
+            quota_keys: 1,
+            max_keys: 200,
+            quota_bytes: 10,
+            max_bytes: 20_000,
+        };
+
+        assert_eq!(
+            render_key_users_snapshot(vec![record(1000), record(2000)], &child),
+            "    0:     1 1/1 1/200 10/20000\n"
+        );
     }
 
     #[test]

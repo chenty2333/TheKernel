@@ -22,6 +22,7 @@ use crate::{
         FD_TABLE, ResolveAtResult, fanotify, permission::VfsSecurityContext,
         replace_process_fd_table, resolve_at_with_security,
     },
+    keyring::{self, KeyTaskOwner},
     mm::{
         ExecImageAccess, copy_from_kernel, finish_prepared_user_app, new_user_aspace_empty,
         prepare_user_app_at, vm_load_string,
@@ -565,6 +566,8 @@ fn do_execve(
         new_access_state,
     );
     drop(lifecycle);
+    keyring::exec_committed(KeyTaskOwner::new(thr.kernel_tid(), proc_data.proc.pid()))
+        .unwrap_or_else(|error| fail_closed_exit(error));
     // Image, group-leader, and task-alias publication locks are now absent.
     // Notify before taking the ptrace-action lock, while the returned
     // retirement continues to own the old credential and old image through

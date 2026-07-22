@@ -5,7 +5,7 @@ use axerrno::{AxError, AxResult};
 use thekernel_linux_cred::{KeyPermission, KeyPermissionMask};
 
 use super::accounting::{AbiQuotaCharge, QuotaAdmission, ResidentCharge};
-use crate::task::{Kgid, Kuid};
+use crate::task::{Kgid, Kuid, UserNamespaceId};
 
 const USER_KEY_PAYLOAD_MAX: usize = 32_767;
 const BIG_KEY_PAYLOAD_MAX: usize = 1 << 20;
@@ -17,6 +17,12 @@ pub(super) const KEY_LINK_CHARGE: usize = size_of::<i32>();
 pub(super) enum KeyState {
     Positive,
     Revoked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PublishedKeyringName {
+    pub(super) namespace: UserNamespaceId,
+    pub(super) order: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,17 +141,30 @@ pub(super) struct Key {
     pub(super) description: String,
     pub(super) payload: Vec<u8>,
     pub(super) links: Vec<i32>,
+    /// Linux-visible owner used by permission and describe operations.
     pub(super) uid: Kuid,
+    /// Stable owner of the ABI quota charge.
+    ///
+    /// This is intentionally distinct from `uid`: credential-driven visible
+    /// ownership changes may leave the quota owner unchanged, while
+    /// `KEYCTL_CHOWN` transfers both identities transactionally.
+    pub(super) quota_uid: Kuid,
     pub(super) gid: Kgid,
     pub(super) perm: KeyPermissionMask,
     pub(super) state: KeyState,
     pub(super) expires_at: Option<u64>,
     pub(super) restricted: bool,
+    /// Namespace and stable publication order of this public keyring name.
+    /// This is non-owning and allocation-free; duplicate names remain legal.
+    pub(super) published_name: Option<PublishedKeyringName>,
     pub(super) in_owner_quota: bool,
     pub(super) abi_charge: AbiQuotaCharge,
     pub(super) resident_charge: ResidentCharge,
     pub(super) root_refs: usize,
     pub(super) link_refs: usize,
+    /// Allocation-free scratch used only while the manager plans namespace
+    /// root retirement. It must be zero outside that transaction.
+    pub(super) namespace_prune_refs: usize,
     pub(super) gc_next: Option<i32>,
 }
 
@@ -231,11 +250,13 @@ impl Key {
             payload,
             links: Vec::new(),
             uid,
+            quota_uid: uid,
             gid,
             perm,
             state: KeyState::Positive,
             expires_at: None,
             restricted: false,
+            published_name: None,
             in_owner_quota: true,
             abi_charge: AbiQuotaCharge {
                 keys: 1,
@@ -248,6 +269,7 @@ impl Key {
             },
             root_refs: 0,
             link_refs: 0,
+            namespace_prune_refs: 0,
             gc_next: None,
         })
     }

@@ -18,6 +18,7 @@ use starry_vm::VmMutPtr;
 use crate::task::copy_current_user_fpu_state_to;
 use crate::{
     file::{FD_TABLE, FdTable, FileDescription, PidFd, reserve_fd, try_new_process_scope},
+    keyring::{self, KeyTaskOwner},
     mm::copy_from_kernel,
     pseudofs::cgroup,
     readiness::block_on_poll_set_uninterruptible,
@@ -448,6 +449,21 @@ impl CloneArgs {
         } else {
             Some(old_proc_data.clone())
         };
+        let child_ids = child_cred.ids();
+        let pending_key_fork = keyring::prepare_fork(
+            KeyTaskOwner::new(calling_thread.kernel_tid(), old_proc_data.proc.pid()),
+            KeyTaskOwner::new(
+                tid,
+                if flags.contains(CloneFlags::THREAD) {
+                    old_proc_data.proc.pid()
+                } else {
+                    tid
+                },
+            ),
+            flags.contains(CloneFlags::THREAD),
+            child_ids.ruid,
+            child_ids.rgid,
+        )?;
         // CLONE_THREAD has no new process parent, but its reserved core
         // membership must still exclude the current process's final exit until
         // exact-parent, core, and TASK_TABLE publication complete. This keeps
@@ -720,8 +736,11 @@ impl CloneArgs {
         signal_registration
             .commit()
             .expect("private child signal registration was cancelled before publication");
-        let thread_completion =
-            task_table_admission.commit_with_publication(|| thread_publication.commit());
+        let thread_completion = task_table_admission.commit_with_publication(|| {
+            let completion = thread_publication.commit();
+            pending_key_fork.commit();
+            completion
+        });
         drop(task_parent_publication);
 
         // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden

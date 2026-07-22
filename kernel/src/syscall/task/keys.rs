@@ -11,7 +11,7 @@ use thekernel_linux_cred::KeyPermissionMask;
 use crate::{
     keyring::{self, KeyActor, KeyTypeKind, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
     mm::vm_load_string_bounded,
-    task::AsThread,
+    task::{AsThread, Cred},
 };
 
 const KEYCTL_GET_KEYRING_ID: i32 = 0;
@@ -59,11 +59,26 @@ const KEY_TYPE_STRING_MAX: usize = 32;
 const KEY_DESCRIPTION_STRING_MAX: usize = 4096;
 const KEY_CALLOUT_STRING_MAX: usize = 4096;
 
+fn key_actor_capabilities(credential: &Cred) -> (bool, bool) {
+    (
+        credential.has_effective_capability_in_own_user_ns(CAP_SYS_ADMIN),
+        credential.has_effective_capability_in_own_user_ns(CAP_SETUID),
+    )
+}
+
+fn parse_add_key_kind(type_name: &str, description: &str) -> AxResult<KeyTypeKind> {
+    if type_name.starts_with("keyring") && description.starts_with('.') {
+        return Err(AxError::OperationNotPermitted);
+    }
+    KeyTypeKind::from_name(type_name).ok_or(AxError::NoSuchDevice)
+}
+
 fn current_key_actor() -> KeyActor {
     let curr = current();
     let thread = curr.as_thread();
     let credential = thread.current_cred();
     let ids = credential.ids();
+    let (has_sys_admin, has_setuid) = key_actor_capabilities(&credential);
     KeyActor::new(
         thread.tid(),
         thread.proc_data.proc.pid(),
@@ -72,8 +87,8 @@ fn current_key_actor() -> KeyActor {
         ids,
         credential.fs_dac_credentials(),
         credential.user_ns().clone(),
-        credential.has_effective_capability(CAP_SYS_ADMIN),
-        credential.has_effective_capability(CAP_SETUID),
+        has_sys_admin,
+        has_setuid,
     )
 }
 
@@ -166,8 +181,8 @@ pub fn sys_add_key(
     keyring: i32,
 ) -> AxResult<isize> {
     let type_name = vm_load_string_bounded(type_name, KEY_TYPE_STRING_MAX)?;
-    let kind = KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?;
     let description = vm_load_string_bounded(description, KEY_DESCRIPTION_STRING_MAX)?;
+    let kind = parse_add_key_kind(&type_name, &description)?;
     let payload = validate_key_payload(kind, &description, payload, plen)?;
     keyring::add_key(&current_key_actor(), kind, description, payload, keyring)
 }
@@ -332,6 +347,55 @@ mod tests {
     use core::ptr;
 
     use super::*;
+    use crate::task::{Kgid, Kuid, UserNamespace, ns_capable};
+
+    #[test]
+    fn key_actor_capabilities_are_relative_to_own_user_namespace_only() {
+        let root_namespace = UserNamespace::try_new_root().unwrap();
+        let root_credential = Cred::try_root(root_namespace.clone()).unwrap();
+        let child_namespace = root_namespace
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let sibling_namespace = root_namespace
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let child_credential =
+            Cred::try_with_user_namespace(&root_credential, child_namespace.clone()).unwrap();
+
+        assert_eq!(key_actor_capabilities(&child_credential), (true, true));
+        assert!(ns_capable(
+            &child_credential,
+            &child_namespace,
+            CAP_SYS_ADMIN
+        ));
+        assert!(!ns_capable(
+            &child_credential,
+            &root_namespace,
+            CAP_SYS_ADMIN
+        ));
+        assert!(!ns_capable(
+            &child_credential,
+            &sibling_namespace,
+            CAP_SYS_ADMIN
+        ));
+    }
+
+    #[test]
+    fn add_key_adapter_rejects_private_keyring_prefix_before_type_lookup() {
+        assert_eq!(
+            parse_add_key_kind("keyring", ".private"),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            parse_add_key_kind("keyring.invalid", ".private"),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            parse_add_key_kind("user", ".public-to-keyring-core"),
+            Ok(KeyTypeKind::User)
+        );
+        assert_eq!(parse_add_key_kind("keyring", ""), Ok(KeyTypeKind::Keyring));
+    }
 
     #[test]
     fn keyctl_capabilities_requires_a_non_null_output_for_nonzero_size() {

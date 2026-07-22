@@ -2,10 +2,12 @@ use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     string::{String, ToString},
+    sync::{Arc, Weak},
     vec::Vec,
 };
 #[cfg(test)]
 use core::mem::size_of;
+use core::ops::Bound::{Excluded, Unbounded};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use thekernel_linux_cred::{KeyPermission, KeyPermissionMask};
@@ -22,24 +24,24 @@ use super::{
         AbiQuotaCharge, AccountingPlan, ManagerBudget, OwnerLedger, QuotaAdmission, ResidentCharge,
         user_maxbytes, user_maxkeys,
     },
-    contract::{KeyActor, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
+    contract::{KeyActor, KeyTaskOwner, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
     object::{
         BIG_KEY_ABI_PAYLOAD_CHARGE, KEY_LINK_CHARGE, Key, KeyState, KeyTypeKind,
-        anonymous_session_keyring_permissions, named_session_keyring_permissions,
-        persistent_keyring_permissions, thread_process_keyring_permissions,
-        uid_keyring_permissions, wipe_key_bytes,
+        PublishedKeyringName, anonymous_session_keyring_permissions,
+        named_session_keyring_permissions, persistent_keyring_permissions,
+        thread_process_keyring_permissions, uid_keyring_permissions, wipe_key_bytes,
     },
 };
 #[cfg(test)]
-use crate::task::{Credentials, DacCredentialView, UserNamespace};
+use crate::task::{Credentials, DacCredentialView};
 use crate::{
-    task::{Kgid, Kuid},
+    task::{Kgid, Kuid, UserNamespace, UserNamespaceId},
     time::wall_time,
 };
 
-const KEY_SPEC_THREAD_KEYRING: i32 = -1;
+pub(super) const KEY_SPEC_THREAD_KEYRING: i32 = -1;
 const KEY_SPEC_PROCESS_KEYRING: i32 = -2;
-const KEY_SPEC_SESSION_KEYRING: i32 = -3;
+pub(super) const KEY_SPEC_SESSION_KEYRING: i32 = -3;
 const KEY_SPEC_USER_KEYRING: i32 = -4;
 const KEY_SPEC_USER_SESSION_KEYRING: i32 = -5;
 
@@ -89,32 +91,91 @@ impl From<i32> for ResolvedKey {
 
 pub(super) struct KeyManager {
     next_serial: i32,
+    next_name_order: u64,
     keys: BTreeMap<i32, Key>,
     owners: OwnerLedger,
     budget: ManagerBudget,
     thread_keyrings: BTreeMap<u32, i32>,
     process_keyrings: BTreeMap<u32, i32>,
     session_keyrings: BTreeMap<u32, i32>,
+    reqkey_defaults: BTreeMap<u32, i32>,
+    namespaces: BTreeMap<UserNamespaceId, NamespaceRegistry>,
+    #[cfg(test)]
+    namespace_ensure_calls: usize,
+    #[cfg(test)]
+    namespace_prune_candidates: usize,
+}
+
+/// Keyring state whose lifetime and lookup domain are one user namespace.
+///
+/// The weak namespace handle is deliberate: the key manager must not keep a
+/// namespace alive merely because task-exit hooks have not yet retired every
+/// cached root. The next manager operation prunes dead registries and releases
+/// their root references under the existing service mutex.
+struct NamespaceRegistry {
+    namespace: Weak<UserNamespace>,
     user_keyrings: BTreeMap<Kuid, i32>,
     user_session_keyrings: BTreeMap<Kuid, i32>,
     persistent_keyrings: BTreeMap<Kuid, i32>,
-    reqkey_defaults: BTreeMap<u32, i32>,
 }
 
-#[derive(Clone, Copy)]
+impl NamespaceRegistry {
+    fn new(namespace: &Arc<UserNamespace>) -> Self {
+        Self {
+            namespace: Arc::downgrade(namespace),
+            user_keyrings: BTreeMap::new(),
+            user_session_keyrings: BTreeMap::new(),
+            persistent_keyrings: BTreeMap::new(),
+        }
+    }
+
+    fn root_serials(&self) -> impl Iterator<Item = &i32> {
+        self.user_keyrings
+            .values()
+            .chain(self.user_session_keyrings.values())
+            .chain(self.persistent_keyrings.values())
+    }
+
+    fn detach_serial(&mut self, serial: i32) {
+        self.user_keyrings.retain(|_, linked| *linked != serial);
+        self.user_session_keyrings
+            .retain(|_, linked| *linked != serial);
+        self.persistent_keyrings
+            .retain(|_, linked| *linked != serial);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootSource {
     Thread(u32),
     Process(u32),
     Session(u32),
-    User(Kuid),
-    UserSession(Kuid),
-    Persistent(Kuid),
+    User(UserNamespaceId, Kuid),
+    UserSession(UserNamespaceId, Kuid),
+    Persistent(UserNamespaceId, Kuid),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedTaskRoot {
+    source: RootSource,
+    serial: i32,
+}
+
+/// Exact child-owned state installed while clone construction is still
+/// private. The service façade retains this value until TASK_TABLE publication
+/// succeeds, then either disarms it or uses it for allocation-free rollback.
+pub(super) struct ForkUndo {
+    child: KeyTaskOwner,
+    thread_keyring: Option<i32>,
+    session_keyring: Option<i32>,
+    reqkey_default: Option<i32>,
 }
 
 impl KeyManager {
     pub(super) const fn new() -> Self {
         Self {
             next_serial: 1,
+            next_name_order: 1,
             keys: BTreeMap::new(),
             owners: OwnerLedger {
                 usage: BTreeMap::new(),
@@ -123,10 +184,12 @@ impl KeyManager {
             thread_keyrings: BTreeMap::new(),
             process_keyrings: BTreeMap::new(),
             session_keyrings: BTreeMap::new(),
-            user_keyrings: BTreeMap::new(),
-            user_session_keyrings: BTreeMap::new(),
-            persistent_keyrings: BTreeMap::new(),
             reqkey_defaults: BTreeMap::new(),
+            namespaces: BTreeMap::new(),
+            #[cfg(test)]
+            namespace_ensure_calls: 0,
+            #[cfg(test)]
+            namespace_prune_candidates: 0,
         }
     }
 
@@ -145,12 +208,164 @@ impl KeyManager {
         }
     }
 
+    fn plan_name_publication(
+        &self,
+        serial: i32,
+        namespace: UserNamespaceId,
+    ) -> AxResult<(PublishedKeyringName, u64)> {
+        let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
+        if !key.is_keyring() || key.published_name.is_some() {
+            return Err(AxError::BadState);
+        }
+        let next = self
+            .next_name_order
+            .checked_add(1)
+            .ok_or(AxError::from(LinuxError::ENOSPC))?;
+        Ok((
+            PublishedKeyringName {
+                namespace,
+                order: self.next_name_order,
+            },
+            next,
+        ))
+    }
+
+    /// Commits a previously validated publication after its owning link/root
+    /// has become durable under the same manager mutex.
+    fn commit_name_publication(
+        &mut self,
+        serial: i32,
+        publication: PublishedKeyringName,
+        next: u64,
+    ) {
+        debug_assert_eq!(publication.order, self.next_name_order);
+        let key = self
+            .keys
+            .get_mut(&serial)
+            .expect("planned keyring name lost before publication");
+        debug_assert!(key.is_keyring() && key.published_name.is_none());
+        key.published_name = Some(publication);
+        self.next_name_order = next;
+    }
+
     #[cfg(test)]
     fn with_budget(limits: ManagerBudgetLimits) -> Self {
         Self {
             budget: ManagerBudget::new(limits),
             ..Self::new()
         }
+    }
+
+    /// Rolls back allocation-free namespace-prune planning metadata.
+    fn clear_namespace_prune_scratch(&mut self, identity: UserNamespaceId) {
+        let (namespaces, keys) = (&self.namespaces, &mut self.keys);
+        let Some(registry) = namespaces.get(&identity) else {
+            return;
+        };
+        for serial in registry.root_serials() {
+            if let Some(key) = keys.get_mut(serial) {
+                key.namespace_prune_refs = 0;
+            }
+        }
+    }
+
+    /// Drops namespace-owned roots after the namespace's final strong
+    /// reference disappears. No namespace `Arc` is retained by the manager.
+    fn prune_dead_namespaces(&mut self) -> AxResult<()> {
+        let mut cursor = None;
+        loop {
+            let next = match cursor {
+                Some(identity) => self
+                    .namespaces
+                    .range((Excluded(identity), Unbounded))
+                    .next(),
+                None => self.namespaces.iter().next(),
+            }
+            .map(|(identity, registry)| (*identity, registry.namespace.strong_count() == 0));
+            let Some((identity, dead)) = next else {
+                break;
+            };
+            cursor = Some(identity);
+            #[cfg(test)]
+            {
+                self.namespace_prune_candidates += 1;
+            }
+            if !dead {
+                continue;
+            }
+
+            // Validate every multiplicity before detaching the registry. This
+            // keeps a stale/corrupt root from turning pruning into a partial
+            // commit where only some namespace roots were released.
+            let prepare_result = (|| -> AxResult<()> {
+                let (namespaces, keys) = (&self.namespaces, &mut self.keys);
+                let registry = namespaces.get(&identity).ok_or(AxError::BadState)?;
+                for serial in registry.root_serials() {
+                    let key = keys.get(serial).ok_or(AxError::BadState)?;
+                    if key.namespace_prune_refs != 0 {
+                        return Err(AxError::BadState);
+                    }
+                }
+                for serial in registry.root_serials() {
+                    let key = keys.get_mut(serial).ok_or(AxError::BadState)?;
+                    key.namespace_prune_refs = key
+                        .namespace_prune_refs
+                        .checked_add(1)
+                        .ok_or(AxError::BadState)?;
+                }
+                for serial in registry.root_serials() {
+                    let key = keys.get(serial).ok_or(AxError::BadState)?;
+                    if key.root_refs < key.namespace_prune_refs {
+                        return Err(AxError::BadState);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = prepare_result {
+                self.clear_namespace_prune_scratch(identity);
+                return Err(error);
+            }
+
+            let registry = self.namespaces.remove(&identity).ok_or(AxError::BadState)?;
+            for serial in registry.root_serials() {
+                let key = self.keys.get_mut(serial).ok_or(AxError::BadState)?;
+                let count = core::mem::take(&mut key.namespace_prune_refs);
+                if count == 0 {
+                    continue;
+                }
+                key.root_refs = key.root_refs.checked_sub(count).ok_or(AxError::BadState)?;
+            }
+            for serial in registry.root_serials() {
+                if let Err(error) = self.collect_unreferenced(*serial) {
+                    for pending in registry.root_serials() {
+                        if let Some(key) = self.keys.get_mut(pending) {
+                            key.namespace_prune_refs = 0;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_namespace_registry(&mut self, actor: &KeyActor) -> AxResult<UserNamespaceId> {
+        #[cfg(test)]
+        {
+            self.namespace_ensure_calls += 1;
+        }
+        self.prune_dead_namespaces()?;
+        let identity = actor.user_ns.identity();
+        if let Some(registry) = self.namespaces.get(&identity) {
+            let namespace = registry.namespace.upgrade().ok_or(AxError::BadState)?;
+            if !Arc::ptr_eq(&namespace, &actor.user_ns) {
+                return Err(AxError::BadState);
+            }
+            return Ok(identity);
+        }
+        self.namespaces
+            .insert(identity, NamespaceRegistry::new(&actor.user_ns));
+        Ok(identity)
     }
 
     #[cfg(test)]
@@ -163,9 +378,12 @@ impl KeyManager {
         // QUOTA_OVERRUN only relaxes creation admission. The object remains
         // charged, and all later growth and ownership transfers are enforced.
         key.in_owner_quota = admission != QuotaAdmission::Exempt;
-        let owner =
-            self.owners
-                .plan_replace(key.uid, admission, AbiQuotaCharge::ZERO, key.abi_charge)?;
+        let owner = self.owners.plan_replace(
+            key.quota_uid,
+            admission,
+            AbiQuotaCharge::ZERO,
+            key.abi_charge,
+        )?;
         let budget = self
             .budget
             .plan_replace(ResidentCharge::ZERO, key.resident_charge)?;
@@ -228,7 +446,7 @@ impl KeyManager {
             .ok_or(AxError::from(LinuxError::ENOKEY))?;
         Ok(AccountingPlan {
             owner: self.owners.plan_replace(
-                key.uid,
+                key.quota_uid,
                 key.ongoing_quota_admission(),
                 key.abi_charge,
                 new_abi,
@@ -262,14 +480,26 @@ impl KeyManager {
             RootSource::Thread(owner) => self.thread_keyrings.get(&owner).copied(),
             RootSource::Process(owner) => self.process_keyrings.get(&owner).copied(),
             RootSource::Session(owner) => self.session_keyrings.get(&owner).copied(),
-            RootSource::User(uid) => self.user_keyrings.get(&uid).copied(),
-            RootSource::UserSession(uid) => self.user_session_keyrings.get(&uid).copied(),
-            RootSource::Persistent(uid) => self.persistent_keyrings.get(&uid).copied(),
+            RootSource::User(namespace, uid) => self
+                .namespaces
+                .get(&namespace)
+                .and_then(|registry| registry.user_keyrings.get(&uid))
+                .copied(),
+            RootSource::UserSession(namespace, uid) => self
+                .namespaces
+                .get(&namespace)
+                .and_then(|registry| registry.user_session_keyrings.get(&uid))
+                .copied(),
+            RootSource::Persistent(namespace, uid) => self
+                .namespaces
+                .get(&namespace)
+                .and_then(|registry| registry.persistent_keyrings.get(&uid))
+                .copied(),
         }
     }
 
-    fn anonymous_session_admission(&self, process_owner: u32) -> QuotaAdmission {
-        if self.session_keyrings.contains_key(&process_owner) {
+    fn anonymous_session_admission(&self, thread_owner: u32) -> QuotaAdmission {
+        if self.session_keyrings.contains_key(&thread_owner) {
             QuotaAdmission::Enforced
         } else {
             QuotaAdmission::AllowOverrun
@@ -277,6 +507,15 @@ impl KeyManager {
     }
 
     fn install_root(&mut self, source: RootSource, serial: i32) -> AxResult<()> {
+        let namespace = match source {
+            RootSource::User(namespace, _)
+            | RootSource::UserSession(namespace, _)
+            | RootSource::Persistent(namespace, _) => Some(namespace),
+            RootSource::Thread(_) | RootSource::Process(_) | RootSource::Session(_) => None,
+        };
+        if namespace.is_some_and(|namespace| !self.namespaces.contains_key(&namespace)) {
+            return Err(AxError::BadState);
+        }
         let old = self.root_serial(source);
         if old == Some(serial) {
             return Ok(());
@@ -296,9 +535,24 @@ impl KeyManager {
             RootSource::Thread(owner) => self.thread_keyrings.insert(owner, serial),
             RootSource::Process(owner) => self.process_keyrings.insert(owner, serial),
             RootSource::Session(owner) => self.session_keyrings.insert(owner, serial),
-            RootSource::User(uid) => self.user_keyrings.insert(uid, serial),
-            RootSource::UserSession(uid) => self.user_session_keyrings.insert(uid, serial),
-            RootSource::Persistent(uid) => self.persistent_keyrings.insert(uid, serial),
+            RootSource::User(namespace, uid) => self
+                .namespaces
+                .get_mut(&namespace)
+                .ok_or(AxError::BadState)?
+                .user_keyrings
+                .insert(uid, serial),
+            RootSource::UserSession(namespace, uid) => self
+                .namespaces
+                .get_mut(&namespace)
+                .ok_or(AxError::BadState)?
+                .user_session_keyrings
+                .insert(uid, serial),
+            RootSource::Persistent(namespace, uid) => self
+                .namespaces
+                .get_mut(&namespace)
+                .ok_or(AxError::BadState)?
+                .persistent_keyrings
+                .insert(uid, serial),
         };
         if let Some(old) = old {
             self.release_root_ref(old)?;
@@ -319,6 +573,280 @@ impl KeyManager {
             .ok_or(AxError::BadState)?
             .root_refs = refs;
         self.collect_unreferenced(serial)
+    }
+
+    fn task_root_serial(&self, source: RootSource) -> AxResult<Option<i32>> {
+        match source {
+            RootSource::Thread(owner) => Ok(self.thread_keyrings.get(&owner).copied()),
+            RootSource::Process(owner) => Ok(self.process_keyrings.get(&owner).copied()),
+            RootSource::Session(owner) => Ok(self.session_keyrings.get(&owner).copied()),
+            RootSource::User(..) | RootSource::UserSession(..) | RootSource::Persistent(..) => {
+                Err(AxError::BadState)
+            }
+        }
+    }
+
+    fn remove_task_root(&mut self, source: RootSource) -> AxResult<Option<i32>> {
+        match source {
+            RootSource::Thread(owner) => Ok(self.thread_keyrings.remove(&owner)),
+            RootSource::Process(owner) => Ok(self.process_keyrings.remove(&owner)),
+            RootSource::Session(owner) => Ok(self.session_keyrings.remove(&owner)),
+            RootSource::User(..) | RootSource::UserSession(..) | RootSource::Persistent(..) => {
+                Err(AxError::BadState)
+            }
+        }
+    }
+
+    fn current_task_root(&self, source: RootSource) -> AxResult<Option<ExpectedTaskRoot>> {
+        Ok(self
+            .task_root_serial(source)?
+            .map(|serial| ExpectedTaskRoot { source, serial }))
+    }
+
+    /// Detaches a bounded set of exact task roots after validating the complete
+    /// mutation. No namespace registry work or dynamic planning allocation is
+    /// permitted on credential lifecycle paths.
+    fn detach_expected_task_roots(
+        &mut self,
+        expected: [Option<ExpectedTaskRoot>; 3],
+        allow_already_absent: bool,
+    ) -> AxResult<()> {
+        let mut present = [None; 3];
+        for (index, entry) in expected.into_iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if expected[..index]
+                .iter()
+                .flatten()
+                .any(|prior| prior.source == entry.source)
+            {
+                return Err(AxError::BadState);
+            }
+            match self.task_root_serial(entry.source)? {
+                Some(serial) if serial == entry.serial => present[index] = Some(entry),
+                None if allow_already_absent => {}
+                Some(_) | None => return Err(AxError::BadState),
+            }
+        }
+
+        for entry in present.iter().flatten() {
+            let multiplicity = present
+                .iter()
+                .flatten()
+                .filter(|candidate| candidate.serial == entry.serial)
+                .count();
+            let key = self.keys.get(&entry.serial).ok_or(AxError::BadState)?;
+            if !key.is_keyring() || key.namespace_prune_refs != 0 || key.root_refs < multiplicity {
+                return Err(AxError::BadState);
+            }
+        }
+
+        for entry in present.iter().flatten() {
+            if self.remove_task_root(entry.source)? != Some(entry.serial) {
+                return Err(AxError::BadState);
+            }
+        }
+        for entry in present.iter().flatten() {
+            let key = self.keys.get_mut(&entry.serial).ok_or(AxError::BadState)?;
+            key.root_refs = key.root_refs.checked_sub(1).ok_or(AxError::BadState)?;
+        }
+        for (index, entry) in present.iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if present[..index]
+                .iter()
+                .flatten()
+                .any(|prior| prior.serial == entry.serial)
+            {
+                continue;
+            }
+            self.collect_unreferenced(entry.serial)?;
+        }
+        Ok(())
+    }
+
+    fn validate_lifecycle_root(&self, source: RootSource) -> AxResult<Option<i32>> {
+        let Some(serial) = self.task_root_serial(source)? else {
+            return Ok(None);
+        };
+        let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
+        if !key.is_keyring() || key.root_refs == 0 || key.namespace_prune_refs != 0 {
+            return Err(AxError::BadState);
+        }
+        Ok(Some(serial))
+    }
+
+    pub(super) fn prepare_fork(
+        &mut self,
+        parent: KeyTaskOwner,
+        child: KeyTaskOwner,
+        clone_thread: bool,
+        child_ruid: Kuid,
+        child_rgid: Kgid,
+    ) -> AxResult<ForkUndo> {
+        if parent.thread_owner() == child.thread_owner()
+            || clone_thread && parent.process_owner() != child.process_owner()
+            || !clone_thread
+                && (child.thread_owner() != child.process_owner()
+                    || parent.process_owner() == child.process_owner())
+            || self.thread_keyrings.contains_key(&child.thread_owner())
+            || self.session_keyrings.contains_key(&child.thread_owner())
+            || self.reqkey_defaults.contains_key(&child.thread_owner())
+            || !clone_thread && self.process_keyrings.contains_key(&child.process_owner())
+        {
+            return Err(AxError::BadState);
+        }
+
+        let parent_thread =
+            self.validate_lifecycle_root(RootSource::Thread(parent.thread_owner()))?;
+        let parent_session =
+            self.validate_lifecycle_root(RootSource::Session(parent.thread_owner()))?;
+        if clone_thread {
+            let _ = self.validate_lifecycle_root(RootSource::Process(parent.process_owner()))?;
+        }
+        if let Some(serial) = parent_session {
+            self.keys
+                .get(&serial)
+                .ok_or(AxError::BadState)?
+                .root_refs
+                .checked_add(1)
+                .ok_or(AxError::NoMemory)?;
+        }
+        let reqkey_default = self.reqkey_defaults.get(&parent.thread_owner()).copied();
+        if reqkey_default.is_some_and(|setting| ReqKeyDefault::from_raw(setting).is_none()) {
+            return Err(AxError::BadState);
+        }
+
+        let mut undo = ForkUndo {
+            child,
+            thread_keyring: None,
+            session_keyring: None,
+            reqkey_default,
+        };
+        if clone_thread && parent_thread.is_some() {
+            undo.thread_keyring = Some(self.try_create_rooted_keyring(
+                RootSource::Thread(child.thread_owner()),
+                format!("_tid.{}", child.thread_owner()),
+                child_ruid,
+                child_rgid,
+                thread_process_keyring_permissions(),
+                QuotaAdmission::AllowOverrun,
+            )?);
+        }
+        if let Some(serial) = parent_session {
+            if let Err(error) = self.install_root(RootSource::Session(child.thread_owner()), serial)
+            {
+                self.rollback_fork(undo).unwrap_or_else(|rollback_error| {
+                    panic!(
+                        "prepared keyring fork rollback lost exact child ownership: \
+                         {rollback_error}"
+                    )
+                });
+                return Err(error);
+            }
+            undo.session_keyring = Some(serial);
+        }
+        if let Some(setting) = reqkey_default {
+            self.reqkey_defaults.insert(child.thread_owner(), setting);
+        }
+        Ok(undo)
+    }
+
+    pub(super) fn rollback_fork(&mut self, undo: ForkUndo) -> AxResult<()> {
+        let ForkUndo {
+            child,
+            thread_keyring,
+            session_keyring,
+            reqkey_default,
+        } = undo;
+
+        for (actual, expected) in [
+            (
+                self.thread_keyrings.get(&child.thread_owner()).copied(),
+                thread_keyring,
+            ),
+            (
+                self.session_keyrings.get(&child.thread_owner()).copied(),
+                session_keyring,
+            ),
+        ] {
+            if expected.is_none() && actual.is_some() || actual.is_some() && actual != expected {
+                return Err(AxError::BadState);
+            }
+        }
+        let actual_default = self.reqkey_defaults.get(&child.thread_owner()).copied();
+        if reqkey_default.is_none() && actual_default.is_some()
+            || actual_default.is_some() && actual_default != reqkey_default
+        {
+            return Err(AxError::BadState);
+        }
+
+        self.detach_expected_task_roots(
+            [
+                thread_keyring.map(|serial| ExpectedTaskRoot {
+                    source: RootSource::Thread(child.thread_owner()),
+                    serial,
+                }),
+                session_keyring.map(|serial| ExpectedTaskRoot {
+                    source: RootSource::Session(child.thread_owner()),
+                    serial,
+                }),
+                None,
+            ],
+            true,
+        )?;
+        if actual_default == reqkey_default {
+            self.reqkey_defaults.remove(&child.thread_owner());
+        }
+        Ok(())
+    }
+
+    pub(super) fn exec_committed(&mut self, owner: KeyTaskOwner) -> AxResult<()> {
+        let roots = [
+            self.current_task_root(RootSource::Thread(owner.thread_owner()))?,
+            self.current_task_root(RootSource::Process(owner.process_owner()))?,
+            None,
+        ];
+        self.detach_expected_task_roots(roots, false)
+    }
+
+    pub(super) fn exit_committed(
+        &mut self,
+        owner: KeyTaskOwner,
+        final_thread: bool,
+    ) -> AxResult<()> {
+        let roots = [
+            self.current_task_root(RootSource::Thread(owner.thread_owner()))?,
+            self.current_task_root(RootSource::Session(owner.thread_owner()))?,
+            if final_thread {
+                self.current_task_root(RootSource::Process(owner.process_owner()))?
+            } else {
+                None
+            },
+        ];
+        self.detach_expected_task_roots(roots, false)?;
+        self.reqkey_defaults.remove(&owner.thread_owner());
+        Ok(())
+    }
+
+    pub(super) fn credential_fsids_precommit(
+        &mut self,
+        thread_owner: u32,
+        new_fsuid: Kuid,
+        new_fsgid: Kgid,
+    ) -> AxResult<()> {
+        let Some(serial) = self.task_root_serial(RootSource::Thread(thread_owner))? else {
+            return Ok(());
+        };
+        let key = self.keys.get_mut(&serial).ok_or(AxError::BadState)?;
+        if !key.is_keyring() || key.root_refs == 0 || key.namespace_prune_refs != 0 {
+            return Err(AxError::BadState);
+        }
+        key.uid = new_fsuid;
+        key.gid = new_fsgid;
+        Ok(())
     }
 
     fn clear_gc_pending(&mut self, mut pending: Option<i32>) {
@@ -344,7 +872,7 @@ impl KeyManager {
         let mut pending = Some(serial);
         let result = (|| -> AxResult<()> {
             while let Some(serial) = pending {
-                let (next, uid, admission, abi_charge, resident_charge) = {
+                let (next, quota_uid, admission, abi_charge, resident_charge) = {
                     let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
                     if key.has_references() {
                         return Err(AxError::BadState);
@@ -360,7 +888,7 @@ impl KeyManager {
                     }
                     (
                         key.gc_next,
-                        key.uid,
+                        key.quota_uid,
                         key.ongoing_quota_admission(),
                         key.abi_charge,
                         key.resident_charge,
@@ -368,9 +896,12 @@ impl KeyManager {
                 };
                 self.keys.get_mut(&serial).ok_or(AxError::BadState)?.gc_next = None;
                 pending = next;
-                let owner =
-                    self.owners
-                        .plan_replace(uid, admission, abi_charge, AbiQuotaCharge::ZERO)?;
+                let owner = self.owners.plan_replace(
+                    quota_uid,
+                    admission,
+                    abi_charge,
+                    AbiQuotaCharge::ZERO,
+                )?;
                 let budget = self
                     .budget
                     .plan_replace(resident_charge, ResidentCharge::ZERO)?;
@@ -410,7 +941,13 @@ impl KeyManager {
         self.collect_unreferenced(serial)
     }
 
-    fn special_keyring(&mut self, spec: i32, actor: &KeyActor, create: bool) -> AxResult<i32> {
+    fn special_keyring_in_namespace(
+        &mut self,
+        spec: i32,
+        actor: &KeyActor,
+        namespace: UserNamespaceId,
+        create: bool,
+    ) -> AxResult<i32> {
         match spec {
             KEY_SPEC_THREAD_KEYRING => {
                 if let Some(id) = self.thread_keyrings.get(&actor.thread_owner) {
@@ -422,8 +959,8 @@ impl KeyManager {
                 let id = self.try_create_rooted_keyring(
                     RootSource::Thread(actor.thread_owner),
                     format!("_tid.{}", actor.tid),
-                    actor.owner_uid(),
-                    actor.owner_gid(),
+                    actor.real_uid(),
+                    actor.real_gid(),
                     thread_process_keyring_permissions(),
                     QuotaAdmission::AllowOverrun,
                 )?;
@@ -439,40 +976,49 @@ impl KeyManager {
                 let id = self.try_create_rooted_keyring(
                     RootSource::Process(actor.process_owner),
                     format!("_pid.{}", actor.pid),
-                    actor.owner_uid(),
-                    actor.owner_gid(),
+                    actor.real_uid(),
+                    actor.real_gid(),
                     thread_process_keyring_permissions(),
                     QuotaAdmission::AllowOverrun,
                 )?;
                 Ok(id)
             }
             KEY_SPEC_SESSION_KEYRING => {
-                if let Some(id) = self.session_keyrings.get(&actor.process_owner) {
+                if let Some(id) = self.session_keyrings.get(&actor.thread_owner) {
                     return Ok(*id);
                 }
                 if !create {
-                    let id = self.special_keyring(KEY_SPEC_USER_SESSION_KEYRING, actor, true)?;
-                    self.install_root(RootSource::Session(actor.process_owner), id)?;
+                    let id = self.special_keyring_in_namespace(
+                        KEY_SPEC_USER_SESSION_KEYRING,
+                        actor,
+                        namespace,
+                        true,
+                    )?;
+                    self.install_root(RootSource::Session(actor.thread_owner), id)?;
                     return Ok(id);
                 }
                 let id = self.try_create_rooted_keyring(
-                    RootSource::Session(actor.process_owner),
+                    RootSource::Session(actor.thread_owner),
                     format!("_ses.{}", actor.pid),
-                    actor.owner_uid(),
-                    actor.owner_gid(),
+                    actor.real_uid(),
+                    actor.real_gid(),
                     anonymous_session_keyring_permissions(),
                     QuotaAdmission::AllowOverrun,
                 )?;
                 Ok(id)
             }
             KEY_SPEC_USER_KEYRING => {
-                let uid = actor.user_uid();
-                if let Some(id) = self.user_keyrings.get(&uid) {
+                let uid = actor.real_uid();
+                if let Some(id) = self
+                    .namespaces
+                    .get(&namespace)
+                    .and_then(|registry| registry.user_keyrings.get(&uid))
+                {
                     return Ok(*id);
                 }
                 let id = self.try_create_rooted_keyring(
-                    RootSource::User(uid),
-                    format!("_uid.{}", uid.into_raw()),
+                    RootSource::User(namespace, uid),
+                    format!("_uid.{}", actor.display_uid(uid)),
                     uid,
                     actor.owner_gid(),
                     uid_keyring_permissions(),
@@ -481,13 +1027,22 @@ impl KeyManager {
                 Ok(id)
             }
             KEY_SPEC_USER_SESSION_KEYRING => {
-                let uid = actor.user_uid();
-                if let Some(id) = self.user_session_keyrings.get(&uid) {
+                let uid = actor.real_uid();
+                if let Some(id) = self
+                    .namespaces
+                    .get(&namespace)
+                    .and_then(|registry| registry.user_session_keyrings.get(&uid))
+                {
                     return Ok(*id);
                 }
-                let user_keyring = self.special_keyring(KEY_SPEC_USER_KEYRING, actor, true)?;
+                let user_keyring = self.special_keyring_in_namespace(
+                    KEY_SPEC_USER_KEYRING,
+                    actor,
+                    namespace,
+                    true,
+                )?;
                 let id = self.try_create_keyring(
-                    format!("_uid_ses.{}", uid.into_raw()),
+                    format!("_uid_ses.{}", actor.display_uid(uid)),
                     uid,
                     actor.owner_gid(),
                     uid_keyring_permissions(),
@@ -497,7 +1052,7 @@ impl KeyManager {
                     self.discard_new_key(id)?;
                     return Err(error);
                 }
-                if let Err(error) = self.install_root(RootSource::UserSession(uid), id) {
+                if let Err(error) = self.install_root(RootSource::UserSession(namespace, uid), id) {
                     self.discard_new_key(id)?;
                     return Err(error);
                 }
@@ -507,13 +1062,20 @@ impl KeyManager {
         }
     }
 
-    fn resolve_keyring(
+    #[cfg(test)]
+    fn special_keyring(&mut self, spec: i32, actor: &KeyActor, create: bool) -> AxResult<i32> {
+        let namespace = self.ensure_namespace_registry(actor)?;
+        self.special_keyring_in_namespace(spec, actor, namespace, create)
+    }
+
+    fn resolve_keyring_in_namespace(
         &mut self,
         id: i32,
         actor: &KeyActor,
+        namespace: UserNamespaceId,
         create: bool,
     ) -> AxResult<ResolvedKey> {
-        let resolved = self.resolve_key(id, actor, create)?;
+        let resolved = self.resolve_key_in_namespace(id, actor, namespace, create)?;
         let key = self
             .keys
             .get(&resolved.serial)
@@ -525,14 +1087,31 @@ impl KeyManager {
         }
     }
 
-    fn resolve_key(
+    #[cfg(test)]
+    fn resolve_keyring(
         &mut self,
         id: i32,
         actor: &KeyActor,
+        create: bool,
+    ) -> AxResult<ResolvedKey> {
+        let namespace = self.ensure_namespace_registry(actor)?;
+        self.resolve_keyring_in_namespace(id, actor, namespace, create)
+    }
+
+    fn resolve_key_in_namespace(
+        &mut self,
+        id: i32,
+        actor: &KeyActor,
+        namespace: UserNamespaceId,
         create_special: bool,
     ) -> AxResult<ResolvedKey> {
         let resolved = if id < 0 {
-            ResolvedKey::possessed(self.special_keyring(id, actor, create_special)?)
+            ResolvedKey::possessed(self.special_keyring_in_namespace(
+                id,
+                actor,
+                namespace,
+                create_special,
+            )?)
         } else {
             ResolvedKey::numeric(id)
         };
@@ -569,9 +1148,13 @@ impl KeyManager {
         if let Some(id) = self.process_keyrings.get(&actor.process_owner) {
             roots.push(*id);
         }
-        if let Some(id) = self.session_keyrings.get(&actor.process_owner) {
+        if let Some(id) = self.session_keyrings.get(&actor.thread_owner) {
             roots.push(*id);
-        } else if let Some(id) = self.user_session_keyrings.get(&actor.user_uid()) {
+        } else if let Some(id) = self
+            .namespaces
+            .get(&actor.user_ns.identity())
+            .and_then(|registry| registry.user_session_keyrings.get(&actor.real_uid()))
+        {
             roots.push(*id);
         }
         roots
@@ -694,9 +1277,11 @@ impl KeyManager {
             .values()
             .chain(self.process_keyrings.values())
             .chain(self.session_keyrings.values())
-            .chain(self.user_keyrings.values())
-            .chain(self.user_session_keyrings.values())
-            .chain(self.persistent_keyrings.values())
+            .chain(
+                self.namespaces
+                    .values()
+                    .flat_map(NamespaceRegistry::root_serials),
+            )
             .filter(|linked| **linked == serial)
             .count();
         let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
@@ -725,9 +1310,9 @@ impl KeyManager {
         detach_roots!(self.thread_keyrings);
         detach_roots!(self.process_keyrings);
         detach_roots!(self.session_keyrings);
-        detach_roots!(self.user_keyrings);
-        detach_roots!(self.user_session_keyrings);
-        detach_roots!(self.persistent_keyrings);
+        for registry in self.namespaces.values_mut() {
+            registry.detach_serial(serial);
+        }
 
         self.keys
             .get_mut(&serial)
@@ -1363,8 +1948,18 @@ impl KeyManager {
         }
     }
 
-    fn get_persistent_keyring(&mut self, uid: Kuid, actor: &KeyActor) -> AxResult<ResolvedKey> {
-        if let Some(serial) = self.persistent_keyrings.get(&uid).copied() {
+    fn get_persistent_keyring_in_namespace(
+        &mut self,
+        uid: Kuid,
+        actor: &KeyActor,
+        namespace: UserNamespaceId,
+    ) -> AxResult<ResolvedKey> {
+        if let Some(serial) = self
+            .namespaces
+            .get(&namespace)
+            .and_then(|registry| registry.persistent_keyrings.get(&uid))
+            .copied()
+        {
             let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
             let now = wall_time().as_secs();
             if !key.expires_at.is_some_and(|expires_at| now >= expires_at) {
@@ -1373,13 +1968,17 @@ impl KeyManager {
             if key.root_refs == 0 {
                 return Err(AxError::BadState);
             }
-            self.persistent_keyrings.remove(&uid);
+            self.namespaces
+                .get_mut(&namespace)
+                .ok_or(AxError::BadState)?
+                .persistent_keyrings
+                .remove(&uid);
             self.release_root_ref(serial)?;
         }
 
         let serial = self.try_create_rooted_keyring(
-            RootSource::Persistent(uid),
-            format!("_persistent.{}", uid.into_raw()),
+            RootSource::Persistent(namespace, uid),
+            format!("_persistent.{}", actor.display_uid(uid)),
             uid,
             actor.owner_gid(),
             persistent_keyring_permissions(),
@@ -1389,6 +1988,12 @@ impl KeyManager {
         // that possession through the link transaction instead of resolving
         // the persistent root as an unrelated numeric serial.
         Ok(ResolvedKey::possessed(serial))
+    }
+
+    #[cfg(test)]
+    fn get_persistent_keyring(&mut self, uid: Kuid, actor: &KeyActor) -> AxResult<ResolvedKey> {
+        let namespace = self.ensure_namespace_registry(actor)?;
+        self.get_persistent_keyring_in_namespace(uid, actor, namespace)
     }
 
     fn link_persistent_keyring(
@@ -1417,9 +2022,13 @@ impl KeyManager {
         if let Some(id) = self.process_keyrings.get(&actor.process_owner) {
             keyrings.push(ResolvedKey::possessed(*id));
         }
-        if let Some(id) = self.session_keyrings.get(&actor.process_owner) {
+        if let Some(id) = self.session_keyrings.get(&actor.thread_owner) {
             keyrings.push(ResolvedKey::possessed(*id));
-        } else if let Some(id) = self.user_session_keyrings.get(&actor.user_uid()) {
+        } else if let Some(id) = self
+            .namespaces
+            .get(&actor.user_ns.identity())
+            .and_then(|registry| registry.user_session_keyrings.get(&actor.real_uid()))
+        {
             keyrings.push(ResolvedKey::possessed(*id));
         }
         keyrings
@@ -1453,11 +2062,12 @@ impl KeyManager {
         dest: i32,
         key: impl Into<ResolvedKey>,
         actor: &KeyActor,
+        namespace: UserNamespaceId,
     ) -> AxResult<()> {
         if dest == 0 {
             return Ok(());
         }
-        let destination = self.resolve_keyring(dest, actor, true)?;
+        let destination = self.resolve_keyring_in_namespace(dest, actor, namespace, true)?;
         self.link_existing_key(destination, key, actor, false)
     }
 
@@ -1491,7 +2101,7 @@ impl KeyManager {
                     .ok_or(AxError::NoMemory)?,
             };
             let _ = self.owners.plan_replace(
-                key.uid,
+                key.quota_uid,
                 key.ongoing_quota_admission(),
                 key.abi_charge,
                 transient_abi,
@@ -1515,20 +2125,21 @@ impl KeyManager {
         Ok(())
     }
 
-    pub(super) fn key_user_records(&self) -> Vec<KeyUserRecord> {
+    pub(super) fn key_user_records(&mut self) -> AxResult<Vec<KeyUserRecord>> {
+        self.prune_dead_namespaces()?;
         let mut live_keys = BTreeMap::<Kuid, usize>::new();
         for key in self.keys.values() {
-            *live_keys.entry(key.uid).or_default() += 1;
+            *live_keys.entry(key.quota_uid).or_default() += 1;
         }
         for uid in self.owners.usage.keys() {
             live_keys.entry(*uid).or_default();
         }
-        live_keys
+        Ok(live_keys
             .into_iter()
             .map(|(uid, keys)| {
                 let quota = self.owners.usage(uid);
                 KeyUserRecord {
-                    uid: uid.into_raw(),
+                    uid,
                     // TheKernel has no transient key_user references: every
                     // live key owns exactly one record reference.
                     usage: keys,
@@ -1542,7 +2153,7 @@ impl KeyManager {
                     max_bytes: user_maxbytes(uid),
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -1555,8 +2166,9 @@ impl KeyManager {
         payload: Vec<u8>,
         keyring: i32,
     ) -> AxResult<isize> {
+        let namespace = self.ensure_namespace_registry(actor)?;
         let manager = self;
-        let keyring = manager.resolve_keyring(keyring, actor, true)?;
+        let keyring = manager.resolve_keyring_in_namespace(keyring, actor, namespace, true)?;
         if !manager.keyring_has_write(keyring, actor)? {
             return Err(LinuxError::EACCES.into());
         }
@@ -1570,6 +2182,10 @@ impl KeyManager {
             return Ok(serial as isize);
         }
 
+        let publish_name = kind == KeyTypeKind::Keyring
+            && !description.is_empty()
+            && !description.starts_with('.');
+
         manager.check_link_destination(keyring.serial)?;
         let key = Key::positive(
             kind,
@@ -1579,9 +2195,23 @@ impl KeyManager {
             actor.owner_gid(),
         );
         let serial = manager.try_insert_key(key?, QuotaAdmission::Enforced)?;
+        let publication = if publish_name {
+            match manager.plan_name_publication(serial, namespace) {
+                Ok(publication) => Some(publication),
+                Err(error) => {
+                    manager.discard_new_key(serial)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = manager.link_key_replace(keyring.serial, serial) {
             manager.discard_new_key(serial)?;
             return Err(error);
+        }
+        if let Some((publication, next)) = publication {
+            manager.commit_name_publication(serial, publication, next);
         }
         Ok(serial as isize)
     }
@@ -1594,6 +2224,7 @@ impl KeyManager {
         callout_present: bool,
         dest_keyring: i32,
     ) -> AxResult<isize> {
+        let namespace = self.ensure_namespace_registry(actor)?;
         let manager = self;
         if let Some(resolved) = manager.search_current(actor, kind, description)? {
             let key = manager
@@ -1601,7 +2232,7 @@ impl KeyManager {
                 .get(&resolved.serial)
                 .ok_or(AxError::from(LinuxError::ENOKEY))?;
             manager.check_key_available(key, true)?;
-            manager.link_existing_request_result(dest_keyring, resolved, actor)?;
+            manager.link_existing_request_result(dest_keyring, resolved, actor, namespace)?;
             return Ok(resolved.serial as isize);
         }
 
@@ -1620,54 +2251,106 @@ impl KeyManager {
         actor: &KeyActor,
         command: KeyctlCommand,
     ) -> AxResult<KeyctlOutput> {
+        let namespace = self.ensure_namespace_registry(actor)?;
         let manager = self;
         let value = match command {
             KeyctlCommand::GetKeyringId { keyring, create } => {
-                let serial = manager.resolve_keyring(keyring, actor, create)?;
+                let serial =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, create)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SEARCH)? {
                     return Err(LinuxError::EACCES.into());
                 }
                 serial.serial as isize
             }
             KeyctlCommand::JoinSession { name } => {
-                let serial = if let Some(name) = name.as_deref() {
+                let (serial, publication, created) = if let Some(name) = name.as_deref() {
                     if name.starts_with('.') {
                         return Err(AxError::OperationNotPermitted);
                     }
-                    let existing = manager.keys.iter().find_map(|(serial, key)| {
-                        (key.is_keyring()
-                            && key.description == name
-                            && manager
-                                .key_has_perm(*serial, actor, KeyPermission::SEARCH)
-                                .unwrap_or(false))
-                        .then_some(*serial)
-                    });
-                    if let Some(serial) = existing {
-                        serial
+                    if name.is_empty() {
+                        (
+                            manager.try_create_keyring(
+                                String::new(),
+                                actor.real_uid(),
+                                actor.real_gid(),
+                                named_session_keyring_permissions(),
+                                QuotaAdmission::Enforced,
+                            )?,
+                            None,
+                            true,
+                        )
                     } else {
-                        manager.try_create_keyring(
-                            name.to_string(),
-                            actor.owner_uid(),
-                            actor.owner_gid(),
-                            named_session_keyring_permissions(),
-                            QuotaAdmission::Enforced,
-                        )?
+                        let existing = manager
+                            .keys
+                            .iter()
+                            .filter_map(|(serial, key)| {
+                                let publication = key.published_name?;
+                                (publication.namespace == namespace
+                                    && key.is_keyring()
+                                    && key.description == name
+                                    && actor.user_ns.kernel_uid_to_user(key.quota_uid).is_some()
+                                    && manager.check_key_available(key, true).is_ok()
+                                    && key.perm.allows(
+                                        key.uid,
+                                        key.gid,
+                                        &actor.dac,
+                                        false,
+                                        KeyPermission::SEARCH,
+                                    ))
+                                .then_some((publication.order, *serial))
+                            })
+                            .min_by_key(|(order, _)| *order)
+                            .map(|(_, serial)| serial);
+                        if let Some(serial) = existing {
+                            (serial, None, false)
+                        } else {
+                            let serial = manager.try_create_keyring(
+                                name.to_string(),
+                                actor.real_uid(),
+                                actor.real_gid(),
+                                named_session_keyring_permissions(),
+                                QuotaAdmission::Enforced,
+                            )?;
+                            let publication = match manager.plan_name_publication(serial, namespace)
+                            {
+                                Ok(publication) => publication,
+                                Err(error) => {
+                                    manager.discard_new_key(serial)?;
+                                    return Err(error);
+                                }
+                            };
+                            (serial, Some(publication), true)
+                        }
                     }
                 } else {
-                    let admission = manager.anonymous_session_admission(actor.process_owner);
-                    manager.try_create_keyring(
-                        format!("_ses.{}", actor.pid),
-                        actor.owner_uid(),
-                        actor.owner_gid(),
-                        anonymous_session_keyring_permissions(),
-                        admission,
-                    )?
+                    let admission = manager.anonymous_session_admission(actor.thread_owner);
+                    (
+                        manager.try_create_keyring(
+                            format!("_ses.{}", actor.pid),
+                            actor.real_uid(),
+                            actor.real_gid(),
+                            anonymous_session_keyring_permissions(),
+                            admission,
+                        )?,
+                        None,
+                        true,
+                    )
                 };
-                manager.install_root(RootSource::Session(actor.process_owner), serial)?;
+                if let Err(error) =
+                    manager.install_root(RootSource::Session(actor.thread_owner), serial)
+                {
+                    if created {
+                        manager.discard_new_key(serial)?;
+                    }
+                    return Err(error);
+                }
+                if let Some((publication, next)) = publication {
+                    manager.commit_name_publication(serial, publication, next);
+                }
                 serial as isize
             }
             KeyctlCommand::Update { key, payload } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::WRITE)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1675,7 +2358,7 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::Revoke { key } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 let can_write = manager.key_has_perm(serial, actor, KeyPermission::WRITE)?;
                 let can_setattr = manager.key_has_perm(serial, actor, KeyPermission::SETATTR)?;
                 if !can_write && !can_setattr {
@@ -1685,16 +2368,17 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::Chown { key, uid, gid } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SETATTR)? {
                     return Err(LinuxError::EACCES.into());
                 }
-                let (old_uid, old_gid, charge, admission) = manager
+                let (old_uid, old_quota_uid, old_gid, charge, admission) = manager
                     .keys
                     .get(&serial.serial)
                     .map(|key| {
                         (
                             key.uid,
+                            key.quota_uid,
                             key.gid,
                             key.abi_charge,
                             key.ongoing_quota_admission(),
@@ -1712,12 +2396,13 @@ impl KeyManager {
                 {
                     return Err(AxError::OperationNotPermitted);
                 }
+                let uid = uid.filter(|uid| *uid != old_uid);
                 let owner_updates = uid
-                    .filter(|uid| *uid != old_uid)
+                    .filter(|uid| *uid != old_quota_uid)
                     .map(|uid| {
                         manager
                             .owners
-                            .plan_transfer(old_uid, uid, admission, charge)
+                            .plan_transfer(old_quota_uid, uid, admission, charge)
                     })
                     .transpose()?
                     .unwrap_or([None, None]);
@@ -1727,6 +2412,7 @@ impl KeyManager {
                     .ok_or(AxError::from(LinuxError::ENOKEY))?;
                 if let Some(uid) = uid {
                     key.uid = uid;
+                    key.quota_uid = uid;
                 }
                 if let Some(gid) = gid {
                     key.gid = gid;
@@ -1736,7 +2422,7 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::SetPerm { key, permissions } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SETATTR)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1756,7 +2442,7 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::Describe { key } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::VIEW)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1776,7 +2462,8 @@ impl KeyManager {
                 return Ok(KeyctlOutput::CountedBytes(description));
             }
             KeyctlCommand::Clear { keyring } => {
-                let keyring = manager.resolve_keyring(keyring, actor, false)?;
+                let keyring =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 if !manager.keyring_has_write(keyring, actor)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1784,13 +2471,15 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::Link { key, keyring } => {
-                let serial = manager.resolve_key(key, actor, false)?;
-                let keyring = manager.resolve_keyring(keyring, actor, true)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
+                let keyring =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, true)?;
                 manager.link_existing_key(keyring, serial, actor, false)?;
                 0
             }
             KeyctlCommand::Unlink { serial, keyring } => {
-                let keyring = manager.resolve_keyring(keyring, actor, false)?;
+                let keyring =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 if !manager.keyring_has_write(keyring, actor)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1803,19 +2492,25 @@ impl KeyManager {
                 description,
                 destination,
             } => {
-                let keyring = manager.resolve_keyring(keyring, actor, false)?;
+                let keyring =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 let kind = KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?;
                 let serial = manager
                     .search_keyring(keyring, actor, kind, &description, &mut BTreeSet::new())?
                     .ok_or(AxError::from(LinuxError::ENOKEY))?;
                 if let Some(destination) = destination {
-                    let dest = manager.resolve_keyring(destination, actor, true)?;
+                    let dest = manager.resolve_keyring_in_namespace(
+                        destination,
+                        actor,
+                        namespace,
+                        true,
+                    )?;
                     manager.link_existing_key(dest, serial, actor, false)?;
                 }
                 serial.serial as isize
             }
             KeyctlCommand::Read { key, copy_limit } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::READ)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1839,7 +2534,7 @@ impl KeyManager {
             KeyctlCommand::SetReqKeyring { setting } => {
                 let old_setting = manager
                     .reqkey_defaults
-                    .get(&actor.process_owner)
+                    .get(&actor.thread_owner)
                     .copied()
                     .unwrap_or(ReqKeyDefault::Default as i32);
                 match setting {
@@ -1847,30 +2542,40 @@ impl KeyManager {
                         return Ok(KeyctlOutput::Value(old_setting as isize));
                     }
                     ReqKeyDefault::Thread => {
-                        manager.special_keyring(KEY_SPEC_THREAD_KEYRING, actor, true)?;
+                        manager.special_keyring_in_namespace(
+                            KEY_SPEC_THREAD_KEYRING,
+                            actor,
+                            namespace,
+                            true,
+                        )?;
                         manager
                             .reqkey_defaults
-                            .insert(actor.process_owner, setting as i32);
+                            .insert(actor.thread_owner, setting as i32);
                     }
                     ReqKeyDefault::Process => {
-                        manager.special_keyring(KEY_SPEC_PROCESS_KEYRING, actor, true)?;
+                        manager.special_keyring_in_namespace(
+                            KEY_SPEC_PROCESS_KEYRING,
+                            actor,
+                            namespace,
+                            true,
+                        )?;
                         manager
                             .reqkey_defaults
-                            .insert(actor.process_owner, setting as i32);
+                            .insert(actor.thread_owner, setting as i32);
                     }
                     ReqKeyDefault::Default => {
-                        manager.reqkey_defaults.remove(&actor.process_owner);
+                        manager.reqkey_defaults.remove(&actor.thread_owner);
                     }
                     ReqKeyDefault::Session | ReqKeyDefault::User | ReqKeyDefault::UserSession => {
                         manager
                             .reqkey_defaults
-                            .insert(actor.process_owner, setting as i32);
+                            .insert(actor.thread_owner, setting as i32);
                     }
                 }
                 old_setting as isize
             }
             KeyctlCommand::SetTimeout { key, seconds } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SETATTR)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1883,7 +2588,7 @@ impl KeyManager {
                 0
             }
             KeyctlCommand::Invalidate { key } => {
-                let serial = manager.resolve_key(key, actor, false)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SEARCH)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1898,16 +2603,19 @@ impl KeyManager {
                 if uid != actor.ids.ruid && uid != actor.ids.euid && !actor.has_setuid {
                     return Err(AxError::OperationNotPermitted);
                 }
-                let dest = manager.resolve_keyring(destination, actor, true)?;
+                let dest =
+                    manager.resolve_keyring_in_namespace(destination, actor, namespace, true)?;
                 if !manager.keyring_has_write(dest, actor)? {
                     return Err(LinuxError::EACCES.into());
                 }
-                let persistent = manager.get_persistent_keyring(uid, actor)?;
+                let persistent =
+                    manager.get_persistent_keyring_in_namespace(uid, actor, namespace)?;
                 manager.link_persistent_keyring(dest, persistent, actor)?;
                 persistent.serial as isize
             }
             KeyctlCommand::Restrict { keyring } => {
-                let serial = manager.resolve_keyring(keyring, actor, false)?;
+                let serial =
+                    manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SETATTR)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -1927,9 +2635,9 @@ impl KeyManager {
                 to,
                 exclusive,
             } => {
-                let serial = manager.resolve_key(key, actor, false)?;
-                let from = manager.resolve_keyring(from, actor, false)?;
-                let to = manager.resolve_keyring(to, actor, true)?;
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
+                let from = manager.resolve_keyring_in_namespace(from, actor, namespace, false)?;
+                let to = manager.resolve_keyring_in_namespace(to, actor, namespace, true)?;
                 if !manager.keyring_has_write(from, actor)?
                     || !manager.keyring_has_write(to, actor)?
                     || !manager.key_has_perm(serial, actor, KeyPermission::LINK)?
@@ -1956,9 +2664,18 @@ mod tests {
     use super::*;
 
     fn actor(tid: u32, pid: u32, uid: u32, gid: u32) -> KeyActor {
+        actor_in_namespace(tid, pid, uid, gid, UserNamespace::try_new_root().unwrap())
+    }
+
+    fn actor_in_namespace(
+        tid: u32,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+        user_ns: Arc<UserNamespace>,
+    ) -> KeyActor {
         let uid = Kuid::from_raw(uid).unwrap();
         let gid = Kgid::from_raw(gid).unwrap();
-        let user_ns = UserNamespace::try_new_root().unwrap();
         let groups = GroupInfo::try_new(Vec::new()).unwrap();
         KeyActor {
             tid,
@@ -1982,6 +2699,13 @@ mod tests {
         }
     }
 
+    fn keyctl_value(output: KeyctlOutput) -> isize {
+        match output {
+            KeyctlOutput::Value(value) => value,
+            _ => panic!("expected scalar keyctl output"),
+        }
+    }
+
     fn assert_accounting_consistent(manager: &KeyManager) {
         let mut owners = BTreeMap::<Kuid, OwnerUsage>::new();
         let mut budget = ManagerBudgetUsage::default();
@@ -1990,7 +2714,7 @@ mod tests {
 
         for (serial, key) in &manager.keys {
             if key.in_owner_quota {
-                let usage = owners.entry(key.uid).or_default();
+                let usage = owners.entry(key.quota_uid).or_default();
                 usage.keys += key.abi_charge.keys;
                 usage.bytes += key.abi_charge.bytes;
             }
@@ -2009,9 +2733,12 @@ mod tests {
             .values()
             .chain(manager.process_keyrings.values())
             .chain(manager.session_keyrings.values())
-            .chain(manager.user_keyrings.values())
-            .chain(manager.user_session_keyrings.values())
-            .chain(manager.persistent_keyrings.values())
+            .chain(
+                manager
+                    .namespaces
+                    .values()
+                    .flat_map(NamespaceRegistry::root_serials),
+            )
         {
             *root_refs.entry(*serial).or_default() += 1;
         }
@@ -2021,6 +2748,7 @@ mod tests {
         for (serial, key) in &manager.keys {
             assert_eq!(key.root_refs, root_refs[serial]);
             assert_eq!(key.link_refs, link_refs[serial]);
+            assert_eq!(key.namespace_prune_refs, 0);
             assert_eq!(key.gc_next, None);
             assert_eq!(
                 key.resident_charge.link_bytes,
@@ -2048,12 +2776,12 @@ mod tests {
         let owner = actor(1, 1, 1000, 1000);
         let mut manager = KeyManager::new();
         assert_eq!(
-            manager.anonymous_session_admission(owner.process_owner),
+            manager.anonymous_session_admission(owner.thread_owner),
             QuotaAdmission::AllowOverrun
         );
         let session = manager
             .try_create_rooted_keyring(
-                RootSource::Session(owner.process_owner),
+                RootSource::Session(owner.thread_owner),
                 "_ses.1".to_string(),
                 owner.owner_uid(),
                 owner.owner_gid(),
@@ -2062,10 +2790,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            manager.anonymous_session_admission(owner.process_owner),
+            manager.anonymous_session_admission(owner.thread_owner),
             QuotaAdmission::Enforced
         );
-        assert_eq!(manager.session_keyrings[&owner.process_owner], session);
+        assert_eq!(manager.session_keyrings[&owner.thread_owner], session);
         assert_accounting_consistent(&manager);
     }
 
@@ -2078,9 +2806,883 @@ mod tests {
             .special_keyring(KEY_SPEC_SESSION_KEYRING, &owner, false)
             .unwrap();
 
-        assert_eq!(manager.session_keyrings[&owner.process_owner], session);
-        assert_eq!(manager.user_session_keyrings[&owner.user_uid()], session);
+        assert_eq!(manager.session_keyrings[&owner.thread_owner], session);
+        assert_eq!(
+            manager.namespaces[&owner.user_ns.identity()].user_session_keyrings[&owner.real_uid()],
+            session
+        );
         assert_eq!(manager.keys[&session].root_refs, 2);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn initial_special_keyrings_use_real_ids_after_fsids_diverge() {
+        let mut owner = actor(3, 3, 1000, 1001);
+        let fsuid = Kuid::from_raw(2000).unwrap();
+        let fsgid = Kgid::from_raw(2001).unwrap();
+        owner.ids.fsuid = fsuid;
+        owner.ids.fsgid = fsgid;
+        owner.dac = DacCredentialView::new(
+            fsuid,
+            fsgid,
+            GroupInfo::try_new(Vec::new()).unwrap(),
+            [0; CAPABILITY_WORDS],
+            true,
+        );
+
+        let mut manager = KeyManager::new();
+        let thread = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &owner, true)
+            .unwrap();
+        let session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &owner, true)
+            .unwrap();
+        for serial in [thread, process, session] {
+            let key = &manager.keys[&serial];
+            assert_eq!(key.uid, owner.ids.ruid);
+            assert_eq!(key.quota_uid, owner.ids.ruid);
+            assert_eq!(key.gid, owner.ids.rgid);
+        }
+
+        let named_session = keyctl_value(
+            manager
+                .keyctl(
+                    &owner,
+                    KeyctlCommand::JoinSession {
+                        name: Some("real-owner".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        let named_session = &manager.keys[&named_session];
+        assert_eq!(named_session.uid, owner.ids.ruid);
+        assert_eq!(named_session.quota_uid, owner.ids.ruid);
+        assert_eq!(named_session.gid, owner.ids.rgid);
+
+        let ordinary = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::User,
+                "fs-owner".to_string(),
+                vec![1],
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        assert_eq!(manager.keys[&ordinary].uid, fsuid);
+        assert_eq!(manager.keys[&ordinary].quota_uid, fsuid);
+        assert_eq!(manager.keys[&ordinary].gid, fsgid);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn session_and_reqkey_subscriptions_are_isolated_by_immutable_task_owner() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let first = actor_in_namespace(10, 77, 1000, 1000, namespace.clone());
+        let second = actor_in_namespace(11, 77, 1000, 1000, namespace);
+        let mut manager = KeyManager::new();
+
+        let first_session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &first, true)
+            .unwrap();
+        let second_session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &second, true)
+            .unwrap();
+        assert_ne!(first_session, second_session);
+        assert_eq!(manager.session_keyrings[&first.thread_owner], first_session);
+        assert_eq!(
+            manager.session_keyrings[&second.thread_owner],
+            second_session
+        );
+
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &first,
+                        KeyctlCommand::SetReqKeyring {
+                            setting: ReqKeyDefault::Session,
+                        },
+                    )
+                    .unwrap(),
+            ),
+            ReqKeyDefault::Default as isize
+        );
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &second,
+                        KeyctlCommand::SetReqKeyring {
+                            setting: ReqKeyDefault::NoChange,
+                        },
+                    )
+                    .unwrap(),
+            ),
+            ReqKeyDefault::Default as isize
+        );
+
+        let mut namespace_shifted = first.clone();
+        namespace_shifted.user_ns = UserNamespace::try_new_root().unwrap();
+        assert_eq!(
+            manager.special_keyring(KEY_SPEC_SESSION_KEYRING, &namespace_shifted, false),
+            Ok(first_session)
+        );
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &namespace_shifted,
+                        KeyctlCommand::SetReqKeyring {
+                            setting: ReqKeyDefault::NoChange,
+                        },
+                    )
+                    .unwrap(),
+            ),
+            ReqKeyDefault::Session as isize
+        );
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn ordinary_fork_inherits_only_session_and_reqkey_and_rolls_back_exactly() {
+        let parent = actor(40, 40, 1000, 1001);
+        let parent_owner = KeyTaskOwner::new(parent.thread_owner, parent.process_owner);
+        let child_owner = KeyTaskOwner::new(41, 41);
+        let mut manager = KeyManager::new();
+        let parent_thread = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &parent, true)
+            .unwrap();
+        let parent_process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &parent, true)
+            .unwrap();
+        let session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &parent, true)
+            .unwrap();
+        manager
+            .reqkey_defaults
+            .insert(parent.thread_owner, ReqKeyDefault::Session as i32);
+        let session_refs = manager.keys[&session].root_refs;
+
+        let undo = manager
+            .prepare_fork(
+                parent_owner,
+                child_owner,
+                false,
+                parent.real_uid(),
+                parent.real_gid(),
+            )
+            .unwrap();
+        assert!(!manager.thread_keyrings.contains_key(&41));
+        assert!(!manager.process_keyrings.contains_key(&41));
+        assert_eq!(manager.session_keyrings[&41], session);
+        assert_eq!(manager.reqkey_defaults[&41], ReqKeyDefault::Session as i32);
+        assert_eq!(manager.keys[&session].root_refs, session_refs + 1);
+        assert_eq!(manager.thread_keyrings[&40], parent_thread);
+        assert_eq!(manager.process_keyrings[&40], parent_process);
+
+        manager.rollback_fork(undo).unwrap();
+        assert!(!manager.thread_keyrings.contains_key(&41));
+        assert!(!manager.process_keyrings.contains_key(&41));
+        assert!(!manager.session_keyrings.contains_key(&41));
+        assert!(!manager.reqkey_defaults.contains_key(&41));
+        assert_eq!(manager.keys[&session].root_refs, session_refs);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn clone_thread_creates_a_fresh_thread_ring_only_when_parent_has_one() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let parent = actor_in_namespace(50, 77, 1000, 1001, namespace.clone());
+        let child = actor_in_namespace(51, 77, 1000, 1001, namespace);
+        let parent_owner = KeyTaskOwner::new(parent.thread_owner, parent.process_owner);
+        let child_owner = KeyTaskOwner::new(child.thread_owner, child.process_owner);
+        let mut manager = KeyManager::new();
+        let process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &parent, true)
+            .unwrap();
+        let session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &parent, true)
+            .unwrap();
+        manager
+            .reqkey_defaults
+            .insert(parent.thread_owner, ReqKeyDefault::Process as i32);
+
+        let no_thread = manager
+            .prepare_fork(
+                parent_owner,
+                child_owner,
+                true,
+                child.real_uid(),
+                child.real_gid(),
+            )
+            .unwrap();
+        assert!(!manager.thread_keyrings.contains_key(&child.thread_owner));
+        assert_eq!(manager.session_keyrings[&child.thread_owner], session);
+        assert_eq!(
+            manager.reqkey_defaults[&child.thread_owner],
+            ReqKeyDefault::Process as i32
+        );
+        assert_eq!(manager.process_keyrings[&parent.process_owner], process);
+        manager.rollback_fork(no_thread).unwrap();
+
+        let parent_thread = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &parent, true)
+            .unwrap();
+        let _committed = manager
+            .prepare_fork(
+                parent_owner,
+                child_owner,
+                true,
+                child.real_uid(),
+                child.real_gid(),
+            )
+            .unwrap();
+        let child_thread = manager.thread_keyrings[&child.thread_owner];
+        assert_ne!(child_thread, parent_thread);
+        let child_key = &manager.keys[&child_thread];
+        assert!(child_key.links.is_empty());
+        assert_eq!(child_key.uid, child.real_uid());
+        assert_eq!(child_key.quota_uid, child.real_uid());
+        assert_eq!(child_key.gid, child.real_gid());
+        assert_eq!(manager.session_keyrings[&child.thread_owner], session);
+        assert_eq!(manager.process_keyrings[&parent.process_owner], process);
+
+        // Manager preparation has already staged the committed state; the
+        // service token owns whether this undo record is consumed or applied.
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn exec_and_exit_retire_only_their_linux_lifecycle_roots() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let leader = actor_in_namespace(60, 60, 1000, 1000, namespace.clone());
+        let sibling = actor_in_namespace(61, 60, 1000, 1000, namespace);
+        let mut manager = KeyManager::new();
+        let leader_thread = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &leader, true)
+            .unwrap();
+        let process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &leader, true)
+            .unwrap();
+        let session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &leader, true)
+            .unwrap();
+        manager
+            .reqkey_defaults
+            .insert(leader.thread_owner, ReqKeyDefault::Session as i32);
+        let _sibling_undo = manager
+            .prepare_fork(
+                KeyTaskOwner::new(leader.thread_owner, leader.process_owner),
+                KeyTaskOwner::new(sibling.thread_owner, sibling.process_owner),
+                true,
+                sibling.real_uid(),
+                sibling.real_gid(),
+            )
+            .unwrap();
+        let sibling_thread = manager.thread_keyrings[&sibling.thread_owner];
+
+        manager
+            .exit_committed(
+                KeyTaskOwner::new(sibling.thread_owner, sibling.process_owner),
+                false,
+            )
+            .unwrap();
+        assert!(!manager.keys.contains_key(&sibling_thread));
+        assert_eq!(manager.process_keyrings[&leader.process_owner], process);
+        assert_eq!(manager.session_keyrings[&leader.thread_owner], session);
+        assert!(!manager.reqkey_defaults.contains_key(&sibling.thread_owner));
+
+        manager
+            .exec_committed(KeyTaskOwner::new(leader.thread_owner, leader.process_owner))
+            .unwrap();
+        assert!(!manager.keys.contains_key(&leader_thread));
+        assert!(!manager.process_keyrings.contains_key(&leader.process_owner));
+        assert_eq!(manager.session_keyrings[&leader.thread_owner], session);
+        assert_eq!(
+            manager.reqkey_defaults[&leader.thread_owner],
+            ReqKeyDefault::Session as i32
+        );
+        let post_exec_process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &leader, true)
+            .unwrap();
+
+        manager
+            .exit_committed(
+                KeyTaskOwner::new(leader.thread_owner, leader.process_owner),
+                true,
+            )
+            .unwrap();
+        assert!(!manager.session_keyrings.contains_key(&leader.thread_owner));
+        assert!(!manager.process_keyrings.contains_key(&leader.process_owner));
+        assert!(!manager.reqkey_defaults.contains_key(&leader.thread_owner));
+        assert!(!manager.keys.contains_key(&session));
+        assert!(!manager.keys.contains_key(&post_exec_process));
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn fsid_precommit_changes_only_thread_visible_owner() {
+        let owner = actor(70, 70, 1000, 1001);
+        let mut manager = KeyManager::new();
+        let thread = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let process = manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &owner, true)
+            .unwrap();
+        let session = manager
+            .special_keyring(KEY_SPEC_SESSION_KEYRING, &owner, true)
+            .unwrap();
+        let quota_uid = manager.keys[&thread].quota_uid;
+        let quota_before = manager.owners.usage(quota_uid);
+        let process_owner = (manager.keys[&process].uid, manager.keys[&process].gid);
+        let session_owner = (manager.keys[&session].uid, manager.keys[&session].gid);
+        let fsuid = Kuid::from_raw(2000).unwrap();
+        let fsgid = Kgid::from_raw(2001).unwrap();
+
+        manager
+            .credential_fsids_precommit(owner.thread_owner, fsuid, fsgid)
+            .unwrap();
+        assert_eq!(manager.keys[&thread].uid, fsuid);
+        assert_eq!(manager.keys[&thread].gid, fsgid);
+        assert_eq!(manager.keys[&thread].quota_uid, quota_uid);
+        assert_eq!(manager.owners.usage(quota_uid), quota_before);
+        assert_eq!(
+            (manager.keys[&process].uid, manager.keys[&process].gid),
+            process_owner
+        );
+        assert_eq!(
+            (manager.keys[&session].uid, manager.keys[&session].gid),
+            session_owner
+        );
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn namespace_roots_are_isolated_and_dead_registry_pruning_reclaims_them() {
+        let owner = actor(20, 20, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        let user = manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        let user_session = manager
+            .special_keyring(KEY_SPEC_USER_SESSION_KEYRING, &owner, true)
+            .unwrap();
+        let persistent = manager
+            .get_persistent_keyring(owner.real_uid(), &owner)
+            .unwrap()
+            .serial;
+        assert!(manager.namespaces.contains_key(&namespace));
+
+        drop(owner);
+        assert!(manager.key_user_records().unwrap().is_empty());
+        assert!(!manager.namespaces.contains_key(&namespace));
+        for serial in [user, user_session, persistent] {
+            assert!(!manager.keys.contains_key(&serial));
+        }
+
+        let replacement = actor(21, 21, 1000, 1000);
+        let replacement_user = manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &replacement, true)
+            .unwrap();
+        assert_ne!(replacement_user, user);
+        assert_ne!(replacement.user_ns.identity(), namespace);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn namespace_root_descriptions_use_visible_not_global_uid() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root
+            .try_fork(
+                Kuid::from_raw(1000).unwrap(),
+                Kgid::from_raw(1000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let uid_map = child
+            .try_build_uid_map(vec![crate::task::IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        child.publish_uid_map(uid_map).unwrap();
+        let owner = actor_in_namespace(23, 23, 1000, 1000, child);
+        let mut manager = KeyManager::new();
+
+        let user = manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        let user_session = manager
+            .special_keyring(KEY_SPEC_USER_SESSION_KEYRING, &owner, true)
+            .unwrap();
+        let persistent = manager
+            .get_persistent_keyring(owner.real_uid(), &owner)
+            .unwrap()
+            .serial;
+        assert_eq!(manager.keys[&user].description, "_uid.0");
+        assert_eq!(manager.keys[&user_session].description, "_uid_ses.0");
+        assert_eq!(manager.keys[&persistent].description, "_persistent.0");
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn dead_namespace_prune_prevalidation_never_partially_detaches_roots() {
+        let owner = actor(22, 22, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        let user = manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        manager.keys.get_mut(&user).unwrap().root_refs = 0;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert_eq!(
+            manager.namespaces[&namespace]
+                .user_keyrings
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![user]
+        );
+        assert!(manager.keys.contains_key(&user));
+        assert_eq!(manager.keys[&user].namespace_prune_refs, 0);
+    }
+
+    #[test]
+    fn namespace_prune_counts_duplicate_roots_once_and_clears_stale_scratch() {
+        let owner = actor(24, 24, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        manager.ensure_namespace_registry(&owner).unwrap();
+        let serial = manager
+            .try_create_keyring(
+                "shared-root".to_string(),
+                owner.owner_uid(),
+                owner.owner_gid(),
+                uid_keyring_permissions(),
+                QuotaAdmission::Enforced,
+            )
+            .unwrap();
+        manager
+            .install_root(RootSource::User(namespace, owner.real_uid()), serial)
+            .unwrap();
+        manager
+            .install_root(RootSource::UserSession(namespace, owner.real_uid()), serial)
+            .unwrap();
+        assert_eq!(manager.keys[&serial].root_refs, 2);
+        manager.keys.get_mut(&serial).unwrap().namespace_prune_refs = 7;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert!(manager.namespaces.contains_key(&namespace));
+        assert_eq!(manager.keys[&serial].root_refs, 2);
+        assert_eq!(manager.keys[&serial].namespace_prune_refs, 0);
+
+        assert!(manager.key_user_records().unwrap().is_empty());
+        assert!(!manager.namespaces.contains_key(&namespace));
+        assert!(!manager.keys.contains_key(&serial));
+    }
+
+    #[test]
+    fn namespace_prune_visits_each_dead_registry_once() {
+        const DEAD_NAMESPACES: usize = 128;
+
+        let mut manager = KeyManager::new();
+        let mut namespaces = Vec::new();
+        for _ in 0..DEAD_NAMESPACES {
+            let namespace = UserNamespace::try_new_root().unwrap();
+            assert!(
+                manager
+                    .namespaces
+                    .insert(namespace.identity(), NamespaceRegistry::new(&namespace),)
+                    .is_none()
+            );
+            namespaces.push(namespace);
+        }
+        drop(namespaces);
+
+        manager.namespace_prune_candidates = 0;
+        let live = actor(25, 25, 1000, 1000);
+        manager.ensure_namespace_registry(&live).unwrap();
+        assert_eq!(manager.namespace_prune_candidates, DEAD_NAMESPACES);
+        assert_eq!(manager.namespaces.len(), 1);
+        assert!(manager.namespaces.contains_key(&live.user_ns.identity()));
+    }
+
+    #[test]
+    fn public_operations_validate_and_prune_the_actor_namespace_once() {
+        let owner = actor(26, 26, 1000, 1000);
+        let mut manager = KeyManager::new();
+
+        manager.namespace_ensure_calls = 0;
+        let serial = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::User,
+                "single-ensure".to_string(),
+                vec![1],
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        assert_eq!(manager.namespace_ensure_calls, 1);
+
+        manager.namespace_ensure_calls = 0;
+        assert_eq!(
+            manager
+                .request_key(
+                    &owner,
+                    KeyTypeKind::User,
+                    "single-ensure",
+                    false,
+                    KEY_SPEC_PROCESS_KEYRING,
+                )
+                .unwrap(),
+            serial as isize
+        );
+        assert_eq!(manager.namespace_ensure_calls, 1);
+
+        manager.namespace_ensure_calls = 0;
+        manager
+            .keyctl(
+                &owner,
+                KeyctlCommand::GetPersistent {
+                    uid: None,
+                    destination: KEY_SPEC_THREAD_KEYRING,
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.namespace_ensure_calls, 1);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn named_sessions_are_namespace_scoped_and_name_metadata_owns_no_root() {
+        let first = actor(30, 30, 1000, 1000);
+        let second = actor(31, 31, 1000, 1000);
+        let mut manager = KeyManager::new();
+
+        let first_serial = keyctl_value(
+            manager
+                .keyctl(
+                    &first,
+                    KeyctlCommand::JoinSession {
+                        name: Some("shared-name".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        let second_serial = keyctl_value(
+            manager
+                .keyctl(
+                    &second,
+                    KeyctlCommand::JoinSession {
+                        name: Some("shared-name".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_ne!(first_serial, second_serial);
+        assert_eq!(manager.keys[&first_serial].root_refs, 1);
+        assert_eq!(manager.keys[&second_serial].root_refs, 1);
+        assert_eq!(
+            manager.keys[&first_serial]
+                .published_name
+                .unwrap()
+                .namespace,
+            first.user_ns.identity()
+        );
+        assert_eq!(
+            manager.keys[&second_serial]
+                .published_name
+                .unwrap()
+                .namespace,
+            second.user_ns.identity()
+        );
+
+        manager.keys.get_mut(&first_serial).unwrap().perm = permission_mask(
+            KeyPermission::ALL,
+            KeyPermission::VIEW | KeyPermission::SEARCH,
+        );
+        let rejoined = keyctl_value(
+            manager
+                .keyctl(
+                    &first,
+                    KeyctlCommand::JoinSession {
+                        name: Some("shared-name".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_eq!(rejoined, first_serial);
+        assert_eq!(manager.keys[&first_serial].root_refs, 1);
+
+        manager
+            .keyctl(&first, KeyctlCommand::JoinSession { name: None })
+            .unwrap();
+        assert!(!manager.keys.contains_key(&first_serial));
+        assert!(manager.keys.contains_key(&second_serial));
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn empty_join_session_names_are_never_published_or_reused() {
+        let owner = actor(33, 33, 1000, 1000);
+        let mut manager = KeyManager::new();
+        let first = keyctl_value(
+            manager
+                .keyctl(
+                    &owner,
+                    KeyctlCommand::JoinSession {
+                        name: Some(String::new()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_eq!(manager.keys[&first].published_name, None);
+
+        let second = keyctl_value(
+            manager
+                .keyctl(
+                    &owner,
+                    KeyctlCommand::JoinSession {
+                        name: Some(String::new()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_ne!(first, second);
+        assert!(!manager.keys.contains_key(&first));
+        assert_eq!(manager.keys[&second].published_name, None);
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn named_join_does_not_reuse_a_possessor_only_keyring() {
+        let owner = actor(34, 34, 1000, 1000);
+        let mut manager = KeyManager::new();
+        let possessor_only = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                "direct-search-required".to_string(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        assert!(manager.is_possessed(possessor_only, &owner));
+        assert!(!manager.keys[&possessor_only].perm.allows(
+            manager.keys[&possessor_only].uid,
+            manager.keys[&possessor_only].gid,
+            &owner.dac,
+            false,
+            KeyPermission::SEARCH,
+        ));
+
+        let joined = keyctl_value(
+            manager
+                .keyctl(
+                    &owner,
+                    KeyctlCommand::JoinSession {
+                        name: Some("direct-search-required".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_ne!(joined, possessor_only);
+        assert!(manager.keys.contains_key(&possessor_only));
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn named_join_skips_quota_owners_unmapped_in_the_publication_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let first_namespace = root
+            .try_fork(
+                Kuid::from_raw(1000).unwrap(),
+                Kgid::from_raw(1000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let first_map = first_namespace
+            .try_build_uid_map(vec![crate::task::IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        first_namespace.publish_uid_map(first_map).unwrap();
+        let second_namespace = root
+            .try_fork(
+                Kuid::from_raw(2000).unwrap(),
+                Kgid::from_raw(2000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let second_map = second_namespace
+            .try_build_uid_map(vec![crate::task::IdMapInputExtent::new(0, 2000, 1)])
+            .unwrap();
+        second_namespace.publish_uid_map(second_map).unwrap();
+
+        let first = actor_in_namespace(35, 35, 1000, 1000, first_namespace);
+        let mut second = actor_in_namespace(36, 36, 2000, 2000, second_namespace);
+        second.has_sys_admin = true;
+        let mut manager = KeyManager::new();
+        let original = manager
+            .add_key(
+                &first,
+                KeyTypeKind::Keyring,
+                "mapped-owner".to_string(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        manager.keys.get_mut(&original).unwrap().perm = KeyPermissionMask::from_lanes(
+            Some(KeyPermission::ALL),
+            Some(KeyPermission::ALL),
+            Some(KeyPermission::ALL),
+            Some(KeyPermission::ALL),
+        );
+        manager
+            .keyctl(
+                &second,
+                KeyctlCommand::Chown {
+                    key: original,
+                    uid: Some(0),
+                    gid: None,
+                },
+            )
+            .unwrap();
+        let transferred_uid = Kuid::from_raw(2000).unwrap();
+        assert_eq!(manager.keys[&original].quota_uid, transferred_uid);
+        assert!(first.user_ns.kernel_uid_to_user(transferred_uid).is_none());
+
+        let joined = keyctl_value(
+            manager
+                .keyctl(
+                    &first,
+                    KeyctlCommand::JoinSession {
+                        name: Some("mapped-owner".to_string()),
+                    },
+                )
+                .unwrap(),
+        ) as i32;
+        assert_ne!(joined, original);
+        assert!(manager.keys.contains_key(&original));
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn public_keyring_names_allow_duplicates_choose_oldest_and_rollback_failures() {
+        let owner = actor(32, 32, 1000, 1000);
+        let mut manager = KeyManager::new();
+        manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        manager
+            .special_keyring(KEY_SPEC_PROCESS_KEYRING, &owner, true)
+            .unwrap();
+
+        let empty = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                String::new(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        assert_eq!(manager.keys[&empty].published_name, None);
+
+        let first = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                "duplicate".to_string(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        let second = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                "duplicate".to_string(),
+                Vec::new(),
+                KEY_SPEC_PROCESS_KEYRING,
+            )
+            .unwrap() as i32;
+        assert_ne!(first, second);
+        for serial in [first, second] {
+            manager.keys.get_mut(&serial).unwrap().perm = permission_mask(
+                KeyPermission::ALL,
+                KeyPermission::VIEW | KeyPermission::SEARCH,
+            );
+        }
+        assert!(
+            manager.keys[&first].published_name.unwrap().order
+                < manager.keys[&second].published_name.unwrap().order
+        );
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &owner,
+                        KeyctlCommand::JoinSession {
+                            name: Some("duplicate".to_string()),
+                        },
+                    )
+                    .unwrap(),
+            ) as i32,
+            first
+        );
+
+        manager.revoke_key(first).unwrap();
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &owner,
+                        KeyctlCommand::JoinSession {
+                            name: Some("duplicate".to_string()),
+                        },
+                    )
+                    .unwrap(),
+            ) as i32,
+            second
+        );
+
+        let key_count = manager.keys.len();
+        let private = manager
+            .add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                ".private".to_string(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            )
+            .unwrap() as i32;
+        assert_eq!(manager.keys[&private].published_name, None);
+        assert_eq!(manager.keys.len(), key_count + 1);
+
+        manager.next_name_order = u64::MAX;
+        let key_count = manager.keys.len();
+        let links_before = manager.keys[&manager.thread_keyrings[&owner.thread_owner]]
+            .links
+            .clone();
+        assert_eq!(
+            manager.add_key(
+                &owner,
+                KeyTypeKind::Keyring,
+                "order-exhausted".to_string(),
+                Vec::new(),
+                KEY_SPEC_THREAD_KEYRING,
+            ),
+            Err(LinuxError::ENOSPC.into())
+        );
+        assert_eq!(
+            manager.keys[&manager.thread_keyrings[&owner.thread_owner]].links,
+            links_before
+        );
+        assert_eq!(manager.keys.len(), key_count);
         assert_accounting_consistent(&manager);
     }
 
@@ -2093,7 +3695,7 @@ mod tests {
             .unwrap();
 
         let persistent = manager
-            .get_persistent_keyring(owner.user_uid(), &owner)
+            .get_persistent_keyring(owner.real_uid(), &owner)
             .unwrap();
         assert_eq!(persistent.possession, PossessionContext::Fixed(true));
         assert!(!manager.is_possessed(persistent.serial, &owner));
@@ -2118,14 +3720,14 @@ mod tests {
         assert_eq!(manager.keys[&persistent.serial].link_refs, 1);
 
         let reused = manager
-            .get_persistent_keyring(owner.user_uid(), &owner)
+            .get_persistent_keyring(owner.real_uid(), &owner)
             .unwrap();
         assert_eq!(reused.serial, persistent.serial);
         assert!(manager.keys[&persistent.serial].expires_at.unwrap() >= first_expiry);
 
         manager.keys.get_mut(&persistent.serial).unwrap().expires_at = Some(0);
         let replacement = manager
-            .get_persistent_keyring(owner.user_uid(), &owner)
+            .get_persistent_keyring(owner.real_uid(), &owner)
             .unwrap();
         assert_ne!(replacement.serial, persistent.serial);
         assert_eq!(manager.keys[&persistent.serial].root_refs, 0);
@@ -2477,14 +4079,15 @@ mod tests {
         ));
         manager.link_key_replace(search_root, destination).unwrap();
         manager.link_key_replace(search_root, serial).unwrap();
+        let namespace = owner.user_ns.identity();
 
         manager
-            .link_existing_request_result(0, serial, &owner)
+            .link_existing_request_result(0, serial, &owner, namespace)
             .unwrap();
         assert!(!manager.keys[&destination].links.contains(&serial));
 
         manager
-            .link_existing_request_result(destination, serial, &owner)
+            .link_existing_request_result(destination, serial, &owner, namespace)
             .unwrap();
         assert!(manager.keys[&destination].links.contains(&serial));
     }
@@ -2918,14 +4521,100 @@ mod tests {
             )
             .unwrap();
 
-        let records = manager.key_user_records();
+        let records = manager.key_user_records().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].uid, 1000);
+        assert_eq!(records[0].uid.into_raw(), 1000);
         assert_eq!(records[0].usage, 2);
         assert_eq!(records[0].keys, 2);
         assert_eq!(records[0].instantiated_keys, 2);
         assert_eq!(records[0].quota_keys, 1);
         assert_eq!(records[0].quota_bytes, "charged".len() + 1 + 1);
+    }
+
+    #[test]
+    fn visible_uid_and_quota_uid_diverge_until_chown_transfers_both() {
+        let mut owner = actor(78, 78, 1000, 1000);
+        owner.has_sys_admin = true;
+        let mut manager = KeyManager::new();
+        let root = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let serial = manager.insert_key(Key::positive(
+            KeyTypeKind::User,
+            "quota-owner".to_string(),
+            vec![1],
+            owner.owner_uid(),
+            owner.owner_gid(),
+        ));
+        manager.link_key_replace(root, serial).unwrap();
+
+        let visible_uid = Kuid::from_raw(2000).unwrap();
+        manager.keys.get_mut(&serial).unwrap().uid = visible_uid;
+        manager.replace_payload(serial, vec![2; 32]).unwrap();
+        assert_eq!(manager.keys[&serial].uid, visible_uid);
+        assert_eq!(manager.keys[&serial].quota_uid, owner.owner_uid());
+        assert!(
+            manager
+                .key_user_records()
+                .unwrap()
+                .iter()
+                .all(|record| record.uid != visible_uid)
+        );
+
+        let charge = manager.keys[&serial].abi_charge;
+        let old_usage = manager.owners.usage(owner.owner_uid());
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &owner,
+                        KeyctlCommand::Chown {
+                            key: serial,
+                            uid: Some(visible_uid.into_raw()),
+                            gid: None,
+                        },
+                    )
+                    .unwrap(),
+            ),
+            0
+        );
+        assert_eq!(manager.keys[&serial].uid, visible_uid);
+        assert_eq!(manager.keys[&serial].quota_uid, owner.owner_uid());
+        assert_eq!(manager.owners.usage(owner.owner_uid()), old_usage);
+        assert_eq!(manager.owners.usage(visible_uid), OwnerUsage::default());
+
+        assert_eq!(
+            keyctl_value(
+                manager
+                    .keyctl(
+                        &owner,
+                        KeyctlCommand::Chown {
+                            key: serial,
+                            uid: Some(3000),
+                            gid: None,
+                        },
+                    )
+                    .unwrap(),
+            ),
+            0
+        );
+        let new_uid = Kuid::from_raw(3000).unwrap();
+        assert_eq!(manager.keys[&serial].uid, new_uid);
+        assert_eq!(manager.keys[&serial].quota_uid, new_uid);
+        assert_eq!(
+            manager.owners.usage(owner.owner_uid()).keys,
+            old_usage.keys - charge.keys
+        );
+        assert_eq!(
+            manager.owners.usage(owner.owner_uid()).bytes,
+            old_usage.bytes - charge.bytes
+        );
+        assert_eq!(manager.owners.usage(new_uid).keys, charge.keys);
+        assert_eq!(manager.owners.usage(new_uid).bytes, charge.bytes);
+
+        manager.unlink_key_from_keyring(root, serial).unwrap();
+        assert_eq!(manager.owners.usage(new_uid), OwnerUsage::default());
+        assert_accounting_consistent(&manager);
     }
 
     #[test]

@@ -250,6 +250,18 @@ pub(crate) const UTS_FIELD_LEN: usize = 64;
 const PROC_NS_INO_BASE: u64 = 0x9_0000_0000;
 static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
 
+fn try_allocate_namespace_id(counter: &AtomicU64) -> AxResult<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| axerrno::LinuxError::ENOSPC.into())
+}
+
+fn try_allocate_proc_namespace_id() -> AxResult<u64> {
+    try_allocate_namespace_id(&PROC_NS_ID)
+}
+
 /// Implementation ceiling for queued RT nodes charged to one (user_ns, ruid).
 /// RLIMIT_SIGPENDING may lower this value but cannot raise it.
 pub(crate) const SIGNAL_QUEUE_PER_USER_HARD_LIMIT: usize = 4_096;
@@ -263,6 +275,14 @@ pub(crate) const USER_NAMESPACE_HARD_LIMIT: usize = 4_096;
 /// by one tracer process.
 pub(crate) const PTRACE_REVERSE_LINK_HARD_LIMIT: usize = 4_096;
 static LIVE_USER_NAMESPACES: AtomicUsize = AtomicUsize::new(0);
+
+/// Stable identity for one user-namespace object.
+///
+/// The identifier is allocated once and never reused. Consumers that need to
+/// namespace internal state can therefore use this value without retaining an
+/// `Arc<UserNamespace>` and extending the namespace lifetime.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct UserNamespaceId(u64);
 
 fn try_increment_bounded(counter: &AtomicUsize, limit: usize) -> bool {
     counter
@@ -302,11 +322,8 @@ impl CgroupNamespace {
     }
 
     fn try_new(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
-        Arc::try_new(Self {
-            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
-            owner_user_ns,
-        })
-        .map_err(|_| AxError::NoMemory)
+        let id = try_allocate_proc_namespace_id()?;
+        Arc::try_new(Self { id, owner_user_ns }).map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn try_fork(
@@ -343,8 +360,9 @@ impl PidNamespace {
         init_pid: Option<Pid>,
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
+        let id = try_allocate_proc_namespace_id()?;
         Arc::try_new(Self {
-            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             parent,
             init_pid,
             owner_user_ns,
@@ -396,9 +414,10 @@ impl UserNamespace {
         let global_signal_account = SignalQueueAccount::try_new(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT)
             .map_err(|_| AxError::NoMemory)?;
         let admission = UserNamespaceAdmission::try_new()?;
+        let id = try_allocate_proc_namespace_id()?;
         Arc::try_new(Self {
             _admission: admission,
-            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             domain: UserNamespaceDomain::initial(),
             map_state: SpinNoIrq::new(map_state),
             signal_accounts: SignalAccountRegistryMutex::new(HashMap::new()),
@@ -428,9 +447,10 @@ impl UserNamespace {
         .map_err(cred_error)?;
         let map_state = UserNamespaceMapState::try_child(setgroups_allowed).map_err(cred_error)?;
         let admission = UserNamespaceAdmission::try_new()?;
+        let id = try_allocate_proc_namespace_id()?;
         Arc::try_new(Self {
             _admission: admission,
-            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             domain,
             map_state: SpinNoIrq::new(map_state),
             signal_accounts: SignalAccountRegistryMutex::new(HashMap::new()),
@@ -441,6 +461,11 @@ impl UserNamespace {
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.domain.parent()
+    }
+
+    /// Returns the stable, non-owning identity of this namespace.
+    pub(crate) const fn identity(&self) -> UserNamespaceId {
+        UserNamespaceId(self.id)
     }
 
     pub(crate) fn is_initial(&self) -> bool {
@@ -3686,7 +3711,7 @@ mod tests {
     extern crate std;
 
     use alloc::{boxed::Box, sync::Arc, vec};
-    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::{sync::Barrier, thread, vec::Vec};
 
     use axerrno::AxError;
@@ -3708,7 +3733,8 @@ mod tests {
         ptrace_image_snapshot_if_session, ptrace_inactive_image_snapshot_if_session,
         ptrace_lifecycle_first_key, release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
-        snapshot_credential_image, snapshot_group_credential_image, try_increment_bounded,
+        snapshot_credential_image, snapshot_group_credential_image, try_allocate_namespace_id,
+        try_increment_bounded,
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
@@ -5322,5 +5348,20 @@ mod tests {
     fn implementation_signal_queue_ceilings_are_bounded() {
         assert_eq!(SIGNAL_QUEUE_PER_USER_HARD_LIMIT, 4_096);
         assert_eq!(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, 16_384);
+    }
+
+    #[test]
+    fn namespace_identity_allocator_never_wraps_or_reuses() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(try_allocate_namespace_id(&counter), Ok(u64::MAX - 1));
+        assert_eq!(
+            try_allocate_namespace_id(&counter),
+            Err(axerrno::LinuxError::ENOSPC.into())
+        );
+        assert_eq!(
+            try_allocate_namespace_id(&counter),
+            Err(axerrno::LinuxError::ENOSPC.into())
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
