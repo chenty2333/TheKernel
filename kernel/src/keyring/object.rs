@@ -186,7 +186,9 @@ pub(super) struct Key {
     /// ownership changes may leave the quota owner unchanged, while
     /// `KEYCTL_CHOWN` transfers both identities transactionally.
     pub(super) quota_uid: Kuid,
-    pub(super) gid: Kgid,
+    /// Linux-visible group owner. `None` represents `INVALID_GID` and must
+    /// never select the group permission lane.
+    pub(super) owner_gid: Option<Kgid>,
     pub(super) perm: KeyPermissionMask,
     pub(super) state: KeyState,
     pub(super) expires_at: Option<u64>,
@@ -225,7 +227,7 @@ impl Key {
     pub(super) fn keyring(
         description: String,
         uid: Kuid,
-        gid: Kgid,
+        owner_gid: Kgid,
         perm: KeyPermissionMask,
     ) -> AxResult<Self> {
         Self::new(
@@ -233,7 +235,22 @@ impl Key {
             description,
             Vec::new(),
             uid,
-            gid,
+            owner_gid,
+            perm,
+        )
+    }
+
+    pub(super) fn keyring_without_group(
+        description: String,
+        uid: Kuid,
+        perm: KeyPermissionMask,
+    ) -> AxResult<Self> {
+        Self::new_with_owner_gid(
+            KeyTypeKind::Keyring,
+            description,
+            Vec::new(),
+            uid,
+            None,
             perm,
         )
     }
@@ -243,14 +260,14 @@ impl Key {
         description: String,
         payload: Vec<u8>,
         uid: Kuid,
-        gid: Kgid,
+        owner_gid: Kgid,
     ) -> AxResult<Self> {
         Self::new(
             kind,
             description,
             payload,
             uid,
-            gid,
+            owner_gid,
             kind.default_permissions(),
         )
     }
@@ -260,7 +277,18 @@ impl Key {
         description: String,
         payload: Vec<u8>,
         uid: Kuid,
-        gid: Kgid,
+        owner_gid: Kgid,
+        perm: KeyPermissionMask,
+    ) -> AxResult<Self> {
+        Self::new_with_owner_gid(kind, description, payload, uid, Some(owner_gid), perm)
+    }
+
+    fn new_with_owner_gid(
+        kind: KeyTypeKind,
+        description: String,
+        payload: Vec<u8>,
+        uid: Kuid,
+        owner_gid: Option<Kgid>,
         perm: KeyPermissionMask,
     ) -> AxResult<Self> {
         if payload.len() > kind.payload_limit()
@@ -290,7 +318,7 @@ impl Key {
             links: Vec::new(),
             uid,
             quota_uid: uid,
-            gid,
+            owner_gid,
             perm,
             state: KeyState::Positive,
             expires_at: None,

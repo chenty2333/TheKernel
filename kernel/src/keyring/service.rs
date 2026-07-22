@@ -76,12 +76,12 @@ pub(crate) fn exit_committed(owner: KeyTaskOwner, final_thread: bool) -> AxResul
 
 pub(crate) fn credential_fsids_precommit(
     thread_owner: u32,
-    new_fsuid: Kuid,
-    new_fsgid: Kgid,
+    fsuid_change: Option<Kuid>,
+    fsgid_change: Option<Kgid>,
 ) -> AxResult<()> {
     KEY_MANAGER
         .lock()
-        .credential_fsids_precommit(thread_owner, new_fsuid, new_fsgid)
+        .credential_fsids_precommit(thread_owner, fsuid_change, fsgid_change)
 }
 
 pub(crate) fn add_key(

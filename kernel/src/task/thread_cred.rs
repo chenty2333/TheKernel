@@ -262,8 +262,10 @@ impl Thread {
     fn commit_credential<'a>(&self, prepared: PreparedCred<'a>) -> AxResult<Arc<Cred>> {
         let old_ids = prepared.old_arc().ids();
         let new_ids = prepared.proposed_arc().ids();
-        if old_ids.fsuid != new_ids.fsuid || old_ids.fsgid != new_ids.fsgid {
-            keyring::credential_fsids_precommit(self.kernel_tid(), new_ids.fsuid, new_ids.fsgid)?;
+        let fsuid_change = (old_ids.fsuid != new_ids.fsuid).then_some(new_ids.fsuid);
+        let fsgid_change = (old_ids.fsgid != new_ids.fsgid).then_some(new_ids.fsgid);
+        if fsuid_change.is_some() || fsgid_change.is_some() {
+            keyring::credential_fsids_precommit(self.kernel_tid(), fsuid_change, fsgid_change)?;
         }
         Ok(self
             .proc_data

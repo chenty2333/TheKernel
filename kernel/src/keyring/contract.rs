@@ -133,9 +133,9 @@ impl KeyActor {
             .unwrap_or(65_534)
     }
 
-    pub(super) fn display_gid(&self, gid: Kgid) -> u32 {
-        self.user_ns
-            .kernel_gid_to_user(gid)
+    pub(super) fn display_key_gid(&self, owner_gid: Option<Kgid>) -> u32 {
+        owner_gid
+            .and_then(|gid| self.user_ns.kernel_gid_to_user(gid))
             .map(UserGid::into_raw)
             .unwrap_or(65_534)
     }
