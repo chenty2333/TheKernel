@@ -1177,6 +1177,7 @@ struct worker_gate {
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     atomic_size_t ready_workers;
+    atomic_size_t started_workers;
     bool start;
     bool abort;
 };
@@ -1418,6 +1419,7 @@ static struct metric_result run_pin_metric(size_t worker_count,
 
     memset(&gate, 0, sizeof(gate));
     atomic_init(&gate.ready_workers, 0U);
+    atomic_init(&gate.started_workers, 0U);
     {
         int gate_error = pthread_mutex_init(&gate.mutex, NULL);
 
@@ -1708,6 +1710,22 @@ static void *mremap_contention_worker_main(void *opaque)
         record_first_failure(worker->failure_errno, errno);
         return NULL;
     }
+    /*
+     * The start-condition broadcast does not guarantee that both pinned
+     * workers run before one completes a short sample set.  Qualify the
+     * contention window only after every worker has published its timestamp.
+     */
+    atomic_fetch_add_explicit(&worker->gate->started_workers, 1U,
+                              memory_order_release);
+    while (atomic_load_explicit(&worker->gate->started_workers,
+                                memory_order_acquire) <
+           MREMAP_CONTENTION_WORKERS) {
+        if (atomic_load_explicit(worker->failure_errno,
+                                 memory_order_acquire) != 0) {
+            return NULL;
+        }
+        (void)sched_yield();
+    }
 
     for (index = 0; index < worker->iterations; ++index) {
         void *target = worker->current == worker->slot_a ? worker->slot_b
@@ -1872,6 +1890,7 @@ static struct metric_result run_mremap_disjoint_same_as_contention(
 
     memset(&gate, 0, sizeof(gate));
     atomic_init(&gate.ready_workers, 0U);
+    atomic_init(&gate.started_workers, 0U);
     {
         int gate_error = pthread_mutex_init(&gate.mutex, NULL);
 
