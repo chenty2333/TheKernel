@@ -61,6 +61,34 @@ pub(super) struct OwnerUsage {
     pub(super) bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OwnerGcScratch {
+    epoch: u64,
+    retire: AbiQuotaCharge,
+    after: OwnerUsage,
+    next: Option<Kuid>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct OwnerLedgerEntry {
+    usage: OwnerUsage,
+    gc: OwnerGcScratch,
+}
+
+impl OwnerLedgerEntry {
+    const fn new(usage: OwnerUsage) -> Self {
+        Self {
+            usage,
+            gc: OwnerGcScratch {
+                epoch: 0,
+                retire: AbiQuotaCharge::ZERO,
+                after: OwnerUsage { keys: 0, bytes: 0 },
+                next: None,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct OwnerLedgerUpdate {
     uid: Kuid,
@@ -69,12 +97,15 @@ pub(super) struct OwnerLedgerUpdate {
 
 #[derive(Default)]
 pub(super) struct OwnerLedger {
-    pub(super) usage: BTreeMap<Kuid, OwnerUsage>,
+    pub(super) usage: BTreeMap<Kuid, OwnerLedgerEntry>,
 }
 
 impl OwnerLedger {
     pub(super) fn usage(&self, uid: Kuid) -> OwnerUsage {
-        self.usage.get(&uid).copied().unwrap_or_default()
+        self.usage
+            .get(&uid)
+            .map(|entry| entry.usage)
+            .unwrap_or_default()
     }
 
     pub(super) fn plan_replace(
@@ -172,9 +203,125 @@ impl OwnerLedger {
         };
         if update.after == OwnerUsage::default() {
             self.usage.remove(&update.uid);
+        } else if let Some(entry) = self.usage.get_mut(&update.uid) {
+            debug_assert_eq!(entry.gc, OwnerGcScratch::default());
+            entry.usage = update.after;
         } else {
-            self.usage.insert(update.uid, update.after);
+            self.usage
+                .insert(update.uid, OwnerLedgerEntry::new(update.after));
         }
+    }
+
+    /// Adds one object's charge to an allocation-free GC owner plan.
+    ///
+    /// The caller holds the key-manager mutex for the complete prepare/commit
+    /// transaction, so an epoch can own scratch without another lock.
+    pub(super) fn plan_gc_retire(
+        &mut self,
+        uid: Kuid,
+        charge: AbiQuotaCharge,
+        epoch: u64,
+        owner_head: &mut Option<Kuid>,
+    ) -> AxResult<bool> {
+        let entry = self.usage.get_mut(&uid).ok_or(AxError::BadState)?;
+        let newly_touched = if entry.gc.epoch == 0 {
+            if entry.gc != OwnerGcScratch::default() {
+                return Err(AxError::BadState);
+            }
+            true
+        } else if entry.gc.epoch == epoch {
+            false
+        } else {
+            return Err(AxError::BadState);
+        };
+        let retire = AbiQuotaCharge {
+            keys: entry
+                .gc
+                .retire
+                .keys
+                .checked_add(charge.keys)
+                .ok_or(AxError::BadState)?,
+            bytes: entry
+                .gc
+                .retire
+                .bytes
+                .checked_add(charge.bytes)
+                .ok_or(AxError::BadState)?,
+        };
+        let after = OwnerUsage {
+            keys: entry
+                .usage
+                .keys
+                .checked_sub(retire.keys)
+                .ok_or(AxError::BadState)?,
+            bytes: entry
+                .usage
+                .bytes
+                .checked_sub(retire.bytes)
+                .ok_or(AxError::BadState)?,
+        };
+        if newly_touched {
+            entry.gc.epoch = epoch;
+            entry.gc.next = *owner_head;
+            *owner_head = Some(uid);
+        }
+        entry.gc.retire = retire;
+        entry.gc.after = after;
+        Ok(newly_touched)
+    }
+
+    pub(super) fn abort_gc(&mut self, epoch: u64, mut head: Option<Kuid>, count: usize) {
+        for _ in 0..count {
+            let uid = head.expect("prepared owner chain ended early");
+            let entry = self
+                .usage
+                .get_mut(&uid)
+                .expect("prepared owner disappeared before abort");
+            assert_eq!(entry.gc.epoch, epoch, "foreign owner GC scratch");
+            head = entry.gc.next;
+            entry.gc = OwnerGcScratch::default();
+        }
+        assert!(head.is_none(), "prepared owner chain exceeded its count");
+    }
+
+    pub(super) fn commit_gc(&mut self, epoch: u64, mut head: Option<Kuid>, count: usize) {
+        for _ in 0..count {
+            let uid = head.expect("prepared owner chain ended early");
+            let (next, after) = {
+                let entry = self
+                    .usage
+                    .get_mut(&uid)
+                    .expect("prepared owner disappeared before commit");
+                assert_eq!(entry.gc.epoch, epoch, "foreign owner GC scratch");
+                (entry.gc.next, entry.gc.after)
+            };
+            if after == OwnerUsage::default() {
+                self.usage
+                    .remove(&uid)
+                    .expect("prepared owner disappeared during commit");
+            } else {
+                let entry = self
+                    .usage
+                    .get_mut(&uid)
+                    .expect("prepared owner disappeared during commit");
+                entry.usage = after;
+                entry.gc = OwnerGcScratch::default();
+            }
+            head = next;
+        }
+        assert!(head.is_none(), "prepared owner chain exceeded its count");
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_usage_for_test(&mut self, uid: Kuid, usage: OwnerUsage) {
+        self.usage.insert(uid, OwnerLedgerEntry::new(usage));
+    }
+
+    #[cfg(test)]
+    pub(super) fn gc_scratch_is_idle(&self) -> bool {
+        self.usage
+            .values()
+            .all(|entry| entry.gc == OwnerGcScratch::default())
     }
 }
 

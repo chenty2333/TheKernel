@@ -26,6 +26,43 @@ pub(super) struct PublishedKeyringName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GcPlanState {
+    Touched,
+    Queued,
+    Retire,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GcPlanScratch {
+    pub(super) epoch: u64,
+    pub(super) root_drops: usize,
+    pub(super) link_drops: usize,
+    pub(super) state: Option<GcPlanState>,
+    pub(super) touched_next: Option<i32>,
+    pub(super) work_next: Option<i32>,
+}
+
+impl GcPlanScratch {
+    pub(super) const IDLE: Self = Self {
+        epoch: 0,
+        root_drops: 0,
+        link_drops: 0,
+        state: None,
+        touched_next: None,
+        work_next: None,
+    };
+
+    pub(super) const fn is_idle(self) -> bool {
+        self.epoch == 0
+            && self.root_drops == 0
+            && self.link_drops == 0
+            && self.state.is_none()
+            && self.touched_next.is_none()
+            && self.work_next.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyTypeKind {
     Keyring,
     User,
@@ -162,9 +199,11 @@ pub(super) struct Key {
     pub(super) resident_charge: ResidentCharge,
     pub(super) root_refs: usize,
     pub(super) link_refs: usize,
-    /// Allocation-free scratch used only while the manager plans namespace
-    /// root retirement. It must be zero outside that transaction.
-    pub(super) namespace_prune_refs: usize,
+    /// Intrusive, allocation-free scratch for a manager-owned GC transaction.
+    /// It must be idle whenever the manager mutex is released.
+    pub(super) gc_plan: GcPlanScratch,
+    /// Intrusive work link used by the legacy single-root collector. Prepared
+    /// GC refuses to touch a key while this field is populated.
     pub(super) gc_next: Option<i32>,
 }
 
@@ -269,7 +308,7 @@ impl Key {
             },
             root_refs: 0,
             link_refs: 0,
-            namespace_prune_refs: 0,
+            gc_plan: GcPlanScratch::IDLE,
             gc_next: None,
         })
     }

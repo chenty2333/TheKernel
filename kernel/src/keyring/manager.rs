@@ -26,8 +26,8 @@ use super::{
     },
     contract::{KeyActor, KeyTaskOwner, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
     object::{
-        BIG_KEY_ABI_PAYLOAD_CHARGE, KEY_LINK_CHARGE, Key, KeyState, KeyTypeKind,
-        PublishedKeyringName, anonymous_session_keyring_permissions,
+        BIG_KEY_ABI_PAYLOAD_CHARGE, GcPlanScratch, GcPlanState, KEY_LINK_CHARGE, Key, KeyState,
+        KeyTypeKind, PublishedKeyringName, anonymous_session_keyring_permissions,
         named_session_keyring_permissions, persistent_keyring_permissions,
         thread_process_keyring_permissions, uid_keyring_permissions, wipe_key_bytes,
     },
@@ -92,6 +92,7 @@ impl From<i32> for ResolvedKey {
 pub(super) struct KeyManager {
     next_serial: i32,
     next_name_order: u64,
+    next_gc_epoch: u64,
     keys: BTreeMap<i32, Key>,
     owners: OwnerLedger,
     budget: ManagerBudget,
@@ -161,6 +162,34 @@ struct ExpectedTaskRoot {
     serial: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedGcRoots {
+    Namespace(UserNamespaceId),
+    Task([Option<ExpectedTaskRoot>; 3]),
+}
+
+struct GcTxnBuild {
+    epoch: u64,
+    roots: PreparedGcRoots,
+    touched_head: Option<i32>,
+    touched_count: usize,
+    work_head: Option<i32>,
+    owner_head: Option<Kuid>,
+    owner_count: usize,
+    retired: ResidentCharge,
+}
+
+#[must_use = "a prepared key GC transaction must be committed under the manager lock"]
+struct PreparedGcTxn {
+    epoch: u64,
+    roots: PreparedGcRoots,
+    touched_head: Option<i32>,
+    touched_count: usize,
+    owner_head: Option<Kuid>,
+    owner_count: usize,
+    budget_after: super::accounting::ManagerBudgetUsage,
+}
+
 /// Exact child-owned state installed while clone construction is still
 /// private. The service façade retains this value until TASK_TABLE publication
 /// succeeds, then either disarms it or uses it for allocation-free rollback.
@@ -176,6 +205,7 @@ impl KeyManager {
         Self {
             next_serial: 1,
             next_name_order: 1,
+            next_gc_epoch: 1,
             keys: BTreeMap::new(),
             owners: OwnerLedger {
                 usage: BTreeMap::new(),
@@ -256,21 +286,375 @@ impl KeyManager {
         }
     }
 
-    /// Rolls back allocation-free namespace-prune planning metadata.
-    fn clear_namespace_prune_scratch(&mut self, identity: UserNamespaceId) {
-        let (namespaces, keys) = (&self.namespaces, &mut self.keys);
-        let Some(registry) = namespaces.get(&identity) else {
-            return;
+    fn next_gc_epoch(&mut self) -> AxResult<u64> {
+        let epoch = self.next_gc_epoch;
+        self.next_gc_epoch = epoch
+            .checked_add(1)
+            .ok_or(AxError::from(LinuxError::ENOSPC))?;
+        Ok(epoch)
+    }
+
+    fn gc_touch_key(
+        keys: &mut BTreeMap<i32, Key>,
+        build: &mut GcTxnBuild,
+        serial: i32,
+    ) -> AxResult<()> {
+        let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
+        if key.gc_plan.epoch == build.epoch {
+            return Ok(());
+        }
+        if !key.gc_plan.is_idle() || key.gc_next.is_some() {
+            return Err(AxError::BadState);
+        }
+        let touched_count = build
+            .touched_count
+            .checked_add(1)
+            .ok_or(AxError::BadState)?;
+        key.gc_plan = GcPlanScratch {
+            epoch: build.epoch,
+            root_drops: 0,
+            link_drops: 0,
+            state: Some(GcPlanState::Touched),
+            touched_next: build.touched_head,
+            work_next: None,
         };
-        for serial in registry.root_serials() {
-            if let Some(key) = keys.get_mut(serial) {
-                key.namespace_prune_refs = 0;
+        build.touched_head = Some(serial);
+        build.touched_count = touched_count;
+        Ok(())
+    }
+
+    fn gc_add_root_drop(
+        keys: &mut BTreeMap<i32, Key>,
+        build: &mut GcTxnBuild,
+        serial: i32,
+    ) -> AxResult<()> {
+        Self::gc_touch_key(keys, build, serial)?;
+        let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
+        if !key.is_keyring() {
+            return Err(AxError::BadState);
+        }
+        key.gc_plan.root_drops = key
+            .gc_plan
+            .root_drops
+            .checked_add(1)
+            .ok_or(AxError::BadState)?;
+        if key.gc_plan.root_drops > key.root_refs {
+            return Err(AxError::BadState);
+        }
+        Ok(())
+    }
+
+    fn gc_add_link_drop(
+        keys: &mut BTreeMap<i32, Key>,
+        build: &mut GcTxnBuild,
+        serial: i32,
+    ) -> AxResult<()> {
+        Self::gc_touch_key(keys, build, serial)?;
+        let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
+        key.gc_plan.link_drops = key
+            .gc_plan
+            .link_drops
+            .checked_add(1)
+            .ok_or(AxError::BadState)?;
+        if key.gc_plan.link_drops > key.link_refs {
+            return Err(AxError::BadState);
+        }
+        Ok(())
+    }
+
+    fn gc_maybe_queue(
+        keys: &mut BTreeMap<i32, Key>,
+        build: &mut GcTxnBuild,
+        serial: i32,
+    ) -> AxResult<()> {
+        let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
+        if key.gc_plan.epoch != build.epoch {
+            return Err(AxError::BadState);
+        }
+        let roots_left = key
+            .root_refs
+            .checked_sub(key.gc_plan.root_drops)
+            .ok_or(AxError::BadState)?;
+        let links_left = key
+            .link_refs
+            .checked_sub(key.gc_plan.link_drops)
+            .ok_or(AxError::BadState)?;
+        if roots_left != 0 || links_left != 0 {
+            return Ok(());
+        }
+        match key.gc_plan.state {
+            Some(GcPlanState::Touched) => {
+                key.gc_plan.state = Some(GcPlanState::Queued);
+                key.gc_plan.work_next = build.work_head;
+                build.work_head = Some(serial);
+                Ok(())
+            }
+            Some(GcPlanState::Queued) | Some(GcPlanState::Retire) => Ok(()),
+            None => Err(AxError::BadState),
+        }
+    }
+
+    fn gc_plan_roots(&mut self, build: &mut GcTxnBuild) -> AxResult<()> {
+        match build.roots {
+            PreparedGcRoots::Namespace(identity) => {
+                let (namespaces, keys) = (&self.namespaces, &mut self.keys);
+                let registry = namespaces.get(&identity).ok_or(AxError::BadState)?;
+                if registry.namespace.strong_count() != 0 {
+                    return Err(AxError::BadState);
+                }
+                for serial in registry.root_serials() {
+                    Self::gc_add_root_drop(keys, build, *serial)?;
+                }
+                for serial in registry.root_serials() {
+                    Self::gc_maybe_queue(keys, build, *serial)?;
+                }
+            }
+            PreparedGcRoots::Task(roots) => {
+                for root in roots.into_iter().flatten() {
+                    Self::gc_add_root_drop(&mut self.keys, build, root.serial)?;
+                }
+                for root in roots.into_iter().flatten() {
+                    Self::gc_maybe_queue(&mut self.keys, build, root.serial)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn gc_discover_closure(&mut self, build: &mut GcTxnBuild) -> AxResult<()> {
+        while let Some(serial) = build.work_head {
+            let link_count = {
+                let key = self.keys.get_mut(&serial).ok_or(AxError::BadState)?;
+                if key.gc_plan.epoch != build.epoch
+                    || key.gc_plan.state != Some(GcPlanState::Queued)
+                {
+                    return Err(AxError::BadState);
+                }
+                build.work_head = key.gc_plan.work_next.take();
+                key.gc_plan.state = Some(GcPlanState::Retire);
+                if key.root_refs != key.gc_plan.root_drops
+                    || key.link_refs != key.gc_plan.link_drops
+                    || !key.is_keyring() && !key.links.is_empty()
+                {
+                    return Err(AxError::BadState);
+                }
+                key.links.len()
+            };
+            for index in 0..link_count {
+                let linked = self
+                    .keys
+                    .get(&serial)
+                    .and_then(|key| key.links.get(index))
+                    .copied()
+                    .ok_or(AxError::BadState)?;
+                Self::gc_add_link_drop(&mut self.keys, build, linked)?;
+                Self::gc_maybe_queue(&mut self.keys, build, linked)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn gc_plan_accounting(
+        &mut self,
+        build: &mut GcTxnBuild,
+    ) -> AxResult<super::accounting::ManagerBudgetUsage> {
+        let mut current = build.touched_head;
+        for _ in 0..build.touched_count {
+            let serial = current.ok_or(AxError::BadState)?;
+            let (next, state, root_refs, link_refs, root_drops, link_drops, resident, owner) = {
+                let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
+                if key.gc_plan.epoch != build.epoch || key.gc_plan.work_next.is_some() {
+                    return Err(AxError::BadState);
+                }
+                (
+                    key.gc_plan.touched_next,
+                    key.gc_plan.state,
+                    key.root_refs,
+                    key.link_refs,
+                    key.gc_plan.root_drops,
+                    key.gc_plan.link_drops,
+                    key.resident_charge,
+                    key.in_owner_quota
+                        .then_some((key.quota_uid, key.abi_charge)),
+                )
+            };
+            let roots_left = root_refs.checked_sub(root_drops).ok_or(AxError::BadState)?;
+            let links_left = link_refs.checked_sub(link_drops).ok_or(AxError::BadState)?;
+            match state {
+                Some(GcPlanState::Retire) => {
+                    if roots_left != 0 || links_left != 0 {
+                        return Err(AxError::BadState);
+                    }
+                    build.retired = ResidentCharge {
+                        objects: build
+                            .retired
+                            .objects
+                            .checked_add(resident.objects)
+                            .ok_or(AxError::BadState)?,
+                        bytes: build
+                            .retired
+                            .bytes
+                            .checked_add(resident.bytes)
+                            .ok_or(AxError::BadState)?,
+                        link_bytes: build
+                            .retired
+                            .link_bytes
+                            .checked_add(resident.link_bytes)
+                            .ok_or(AxError::BadState)?,
+                    };
+                    if let Some((uid, charge)) = owner {
+                        if self.owners.plan_gc_retire(
+                            uid,
+                            charge,
+                            build.epoch,
+                            &mut build.owner_head,
+                        )? {
+                            build.owner_count = build
+                                .owner_count
+                                .checked_add(1)
+                                .expect("GC owner chain cannot exceed the owner ledger");
+                        }
+                    }
+                }
+                Some(GcPlanState::Touched) => {
+                    if roots_left == 0 && links_left == 0 {
+                        return Err(AxError::BadState);
+                    }
+                }
+                Some(GcPlanState::Queued) | None => return Err(AxError::BadState),
+            }
+            current = next;
+        }
+        if current.is_some() {
+            return Err(AxError::BadState);
+        }
+        self.budget
+            .plan_replace(build.retired, ResidentCharge::ZERO)
+    }
+
+    fn abort_gc_build(&mut self, build: &GcTxnBuild) {
+        self.owners
+            .abort_gc(build.epoch, build.owner_head, build.owner_count);
+        let mut current = build.touched_head;
+        for _ in 0..build.touched_count {
+            let serial = current.expect("prepared key chain ended early");
+            let key = self
+                .keys
+                .get_mut(&serial)
+                .expect("prepared key disappeared before abort");
+            assert_eq!(key.gc_plan.epoch, build.epoch, "foreign key GC scratch");
+            current = key.gc_plan.touched_next;
+            key.gc_plan = GcPlanScratch::IDLE;
+        }
+        assert!(current.is_none(), "prepared key chain exceeded its count");
+    }
+
+    /// Plans and commits one GC closure without allowing prepared scratch to
+    /// escape this call. Epochs are issued before any scratch is written and
+    /// never reused, so an equal epoch can only belong to this transaction
+    /// while the manager mutex excludes interposition.
+    fn run_gc_txn(&mut self, roots: PreparedGcRoots) -> AxResult<()> {
+        let epoch = self.next_gc_epoch()?;
+        let mut build = GcTxnBuild {
+            epoch,
+            roots,
+            touched_head: None,
+            touched_count: 0,
+            work_head: None,
+            owner_head: None,
+            owner_count: 0,
+            retired: ResidentCharge::ZERO,
+        };
+        let result = (|| {
+            self.gc_plan_roots(&mut build)?;
+            self.gc_discover_closure(&mut build)?;
+            self.gc_plan_accounting(&mut build)
+        })();
+        match result {
+            Ok(budget_after) => {
+                self.commit_gc_txn(PreparedGcTxn {
+                    epoch,
+                    roots,
+                    touched_head: build.touched_head,
+                    touched_count: build.touched_count,
+                    owner_head: build.owner_head,
+                    owner_count: build.owner_count,
+                    budget_after,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.abort_gc_build(&build);
+                Err(error)
             }
         }
     }
 
+    fn commit_gc_txn(&mut self, plan: PreparedGcTxn) {
+        match plan.roots {
+            PreparedGcRoots::Namespace(identity) => {
+                self.namespaces
+                    .remove(&identity)
+                    .expect("prepared namespace disappeared before GC commit");
+            }
+            PreparedGcRoots::Task(roots) => {
+                for root in roots.into_iter().flatten() {
+                    let removed = match root.source {
+                        RootSource::Thread(owner) => self.thread_keyrings.remove(&owner),
+                        RootSource::Process(owner) => self.process_keyrings.remove(&owner),
+                        RootSource::Session(owner) => self.session_keyrings.remove(&owner),
+                        RootSource::User(..)
+                        | RootSource::UserSession(..)
+                        | RootSource::Persistent(..) => {
+                            panic!("namespace root in prepared task GC")
+                        }
+                    };
+                    assert_eq!(removed, Some(root.serial), "prepared task root changed");
+                }
+            }
+        }
+
+        self.owners
+            .commit_gc(plan.epoch, plan.owner_head, plan.owner_count);
+        self.budget.apply(plan.budget_after);
+        let mut current = plan.touched_head;
+        for _ in 0..plan.touched_count {
+            let serial = current.expect("prepared key chain ended early");
+            let (next, scratch) = {
+                let key = self
+                    .keys
+                    .get(&serial)
+                    .expect("prepared key disappeared before GC commit");
+                assert_eq!(key.gc_plan.epoch, plan.epoch, "foreign key GC scratch");
+                (key.gc_plan.touched_next, key.gc_plan)
+            };
+            if scratch.state == Some(GcPlanState::Retire) {
+                self.keys
+                    .remove(&serial)
+                    .expect("prepared key disappeared during GC commit");
+            } else {
+                let key = self
+                    .keys
+                    .get_mut(&serial)
+                    .expect("prepared survivor disappeared during GC commit");
+                key.root_refs = key
+                    .root_refs
+                    .checked_sub(scratch.root_drops)
+                    .expect("prepared root decrement became invalid");
+                key.link_refs = key
+                    .link_refs
+                    .checked_sub(scratch.link_drops)
+                    .expect("prepared link decrement became invalid");
+                key.gc_plan = GcPlanScratch::IDLE;
+            }
+            current = next;
+        }
+        assert!(current.is_none(), "prepared key chain exceeded its count");
+    }
+
     /// Drops namespace-owned roots after the namespace's final strong
-    /// reference disappears. No namespace `Arc` is retained by the manager.
+    /// reference disappears. The complete transitive retirement closure is
+    /// validated before the registry or any reference/accounting state moves.
     fn prune_dead_namespaces(&mut self) -> AxResult<()> {
         let mut cursor = None;
         loop {
@@ -293,58 +677,7 @@ impl KeyManager {
             if !dead {
                 continue;
             }
-
-            // Validate every multiplicity before detaching the registry. This
-            // keeps a stale/corrupt root from turning pruning into a partial
-            // commit where only some namespace roots were released.
-            let prepare_result = (|| -> AxResult<()> {
-                let (namespaces, keys) = (&self.namespaces, &mut self.keys);
-                let registry = namespaces.get(&identity).ok_or(AxError::BadState)?;
-                for serial in registry.root_serials() {
-                    let key = keys.get(serial).ok_or(AxError::BadState)?;
-                    if key.namespace_prune_refs != 0 {
-                        return Err(AxError::BadState);
-                    }
-                }
-                for serial in registry.root_serials() {
-                    let key = keys.get_mut(serial).ok_or(AxError::BadState)?;
-                    key.namespace_prune_refs = key
-                        .namespace_prune_refs
-                        .checked_add(1)
-                        .ok_or(AxError::BadState)?;
-                }
-                for serial in registry.root_serials() {
-                    let key = keys.get(serial).ok_or(AxError::BadState)?;
-                    if key.root_refs < key.namespace_prune_refs {
-                        return Err(AxError::BadState);
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(error) = prepare_result {
-                self.clear_namespace_prune_scratch(identity);
-                return Err(error);
-            }
-
-            let registry = self.namespaces.remove(&identity).ok_or(AxError::BadState)?;
-            for serial in registry.root_serials() {
-                let key = self.keys.get_mut(serial).ok_or(AxError::BadState)?;
-                let count = core::mem::take(&mut key.namespace_prune_refs);
-                if count == 0 {
-                    continue;
-                }
-                key.root_refs = key.root_refs.checked_sub(count).ok_or(AxError::BadState)?;
-            }
-            for serial in registry.root_serials() {
-                if let Err(error) = self.collect_unreferenced(*serial) {
-                    for pending in registry.root_serials() {
-                        if let Some(key) = self.keys.get_mut(pending) {
-                            key.namespace_prune_refs = 0;
-                        }
-                    }
-                    return Err(error);
-                }
-            }
+            self.run_gc_txn(PreparedGcRoots::Namespace(identity))?;
         }
         Ok(())
     }
@@ -586,17 +919,6 @@ impl KeyManager {
         }
     }
 
-    fn remove_task_root(&mut self, source: RootSource) -> AxResult<Option<i32>> {
-        match source {
-            RootSource::Thread(owner) => Ok(self.thread_keyrings.remove(&owner)),
-            RootSource::Process(owner) => Ok(self.process_keyrings.remove(&owner)),
-            RootSource::Session(owner) => Ok(self.session_keyrings.remove(&owner)),
-            RootSource::User(..) | RootSource::UserSession(..) | RootSource::Persistent(..) => {
-                Err(AxError::BadState)
-            }
-        }
-    }
-
     fn current_task_root(&self, source: RootSource) -> AxResult<Option<ExpectedTaskRoot>> {
         Ok(self
             .task_root_serial(source)?
@@ -630,41 +952,7 @@ impl KeyManager {
             }
         }
 
-        for entry in present.iter().flatten() {
-            let multiplicity = present
-                .iter()
-                .flatten()
-                .filter(|candidate| candidate.serial == entry.serial)
-                .count();
-            let key = self.keys.get(&entry.serial).ok_or(AxError::BadState)?;
-            if !key.is_keyring() || key.namespace_prune_refs != 0 || key.root_refs < multiplicity {
-                return Err(AxError::BadState);
-            }
-        }
-
-        for entry in present.iter().flatten() {
-            if self.remove_task_root(entry.source)? != Some(entry.serial) {
-                return Err(AxError::BadState);
-            }
-        }
-        for entry in present.iter().flatten() {
-            let key = self.keys.get_mut(&entry.serial).ok_or(AxError::BadState)?;
-            key.root_refs = key.root_refs.checked_sub(1).ok_or(AxError::BadState)?;
-        }
-        for (index, entry) in present.iter().enumerate() {
-            let Some(entry) = entry else {
-                continue;
-            };
-            if present[..index]
-                .iter()
-                .flatten()
-                .any(|prior| prior.serial == entry.serial)
-            {
-                continue;
-            }
-            self.collect_unreferenced(entry.serial)?;
-        }
-        Ok(())
+        self.run_gc_txn(PreparedGcRoots::Task(present))
     }
 
     fn validate_lifecycle_root(&self, source: RootSource) -> AxResult<Option<i32>> {
@@ -672,7 +960,11 @@ impl KeyManager {
             return Ok(None);
         };
         let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
-        if !key.is_keyring() || key.root_refs == 0 || key.namespace_prune_refs != 0 {
+        if !key.is_keyring()
+            || key.root_refs == 0
+            || !key.gc_plan.is_idle()
+            || key.gc_next.is_some()
+        {
             return Err(AxError::BadState);
         }
         Ok(Some(serial))
@@ -841,7 +1133,11 @@ impl KeyManager {
             return Ok(());
         };
         let key = self.keys.get_mut(&serial).ok_or(AxError::BadState)?;
-        if !key.is_keyring() || key.root_refs == 0 || key.namespace_prune_refs != 0 {
+        if !key.is_keyring()
+            || key.root_refs == 0
+            || !key.gc_plan.is_idle()
+            || key.gc_next.is_some()
+        {
             return Err(AxError::BadState);
         }
         key.uid = new_fsuid;
@@ -865,7 +1161,7 @@ impl KeyManager {
         if key.has_references() {
             return Ok(());
         }
-        if key.gc_next.is_some() {
+        if !key.gc_plan.is_idle() || key.gc_next.is_some() {
             return Err(AxError::BadState);
         }
 
@@ -874,15 +1170,13 @@ impl KeyManager {
             while let Some(serial) = pending {
                 let (next, quota_uid, admission, abi_charge, resident_charge) = {
                     let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
-                    if key.has_references() {
+                    if key.has_references() || !key.gc_plan.is_idle() {
                         return Err(AxError::BadState);
                     }
                     for linked in &key.links {
-                        if self
-                            .keys
-                            .get(linked)
-                            .is_none_or(|linked_key| linked_key.link_refs == 0)
-                        {
+                        if self.keys.get(linked).is_none_or(|linked_key| {
+                            linked_key.link_refs == 0 || !linked_key.gc_plan.is_idle()
+                        }) {
                             return Err(AxError::BadState);
                         }
                     }
@@ -1177,17 +1471,25 @@ impl KeyManager {
             };
             if serial == target {
                 return self.check_key_available(key, true).is_ok()
-                    && key
-                        .perm
-                        .allows(key.uid, key.gid, &actor.dac, true, KeyPermission::SEARCH);
+                    && key.perm.allows(
+                        key.uid,
+                        Some(key.gid),
+                        &actor.dac,
+                        true,
+                        KeyPermission::SEARCH,
+                    );
             }
             if depth > KEYRING_SEARCH_MAX_DEPTH {
                 continue;
             }
             if self.check_key_available(key, true).is_err()
-                || !key
-                    .perm
-                    .allows(key.uid, key.gid, &actor.dac, true, KeyPermission::SEARCH)
+                || !key.perm.allows(
+                    key.uid,
+                    Some(key.gid),
+                    &actor.dac,
+                    true,
+                    KeyPermission::SEARCH,
+                )
             {
                 continue;
             }
@@ -1216,7 +1518,7 @@ impl KeyManager {
         };
         Ok(key
             .perm
-            .allows(key.uid, key.gid, &actor.dac, possessed, permission))
+            .allows(key.uid, Some(key.gid), &actor.dac, possessed, permission))
     }
 
     fn keyring_has_write(
@@ -2292,7 +2594,7 @@ impl KeyManager {
                                     && manager.check_key_available(key, true).is_ok()
                                     && key.perm.allows(
                                         key.uid,
-                                        key.gid,
+                                        Some(key.gid),
                                         &actor.dac,
                                         false,
                                         KeyPermission::SEARCH,
@@ -2743,18 +3045,46 @@ mod tests {
             *root_refs.entry(*serial).or_default() += 1;
         }
 
-        assert_eq!(manager.owners.usage, owners);
+        assert_eq!(manager.owners.usage.len(), owners.len());
+        for (uid, usage) in owners {
+            assert_eq!(manager.owners.usage(uid), usage);
+        }
+        assert!(manager.owners.gc_scratch_is_idle());
         assert_eq!(manager.budget.used, budget);
         for (serial, key) in &manager.keys {
             assert_eq!(key.root_refs, root_refs[serial]);
             assert_eq!(key.link_refs, link_refs[serial]);
-            assert_eq!(key.namespace_prune_refs, 0);
+            assert!(key.gc_plan.is_idle());
             assert_eq!(key.gc_next, None);
             assert_eq!(
                 key.resident_charge.link_bytes,
                 key.links.capacity() * KEY_LINK_CHARGE
             );
         }
+    }
+
+    fn gc_key_state(
+        manager: &KeyManager,
+    ) -> Vec<(i32, usize, usize, Vec<i32>, GcPlanScratch, Option<i32>)> {
+        manager
+            .keys
+            .iter()
+            .map(|(serial, key)| {
+                (
+                    *serial,
+                    key.root_refs,
+                    key.link_refs,
+                    key.links.clone(),
+                    key.gc_plan,
+                    key.gc_next,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_prepared_gc_scratch_idle(manager: &KeyManager) {
+        assert!(manager.owners.gc_scratch_is_idle());
+        assert!(manager.keys.values().all(|key| key.gc_plan.is_idle()));
     }
 
     #[test]
@@ -3124,6 +3454,119 @@ mod tests {
     }
 
     #[test]
+    fn task_root_gc_missing_grandchild_is_zero_mutation() {
+        let owner = actor(62, 62, 1000, 1000);
+        let task_owner = KeyTaskOwner::new(owner.thread_owner, owner.process_owner);
+        let mut manager = KeyManager::new();
+        let root = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let branch = manager.create_keyring(
+            "branch".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            thread_process_keyring_permissions(),
+        );
+        let grandchild = manager.insert_key(Key::positive(
+            KeyTypeKind::User,
+            "grandchild".to_string(),
+            vec![0x5a],
+            owner.owner_uid(),
+            owner.owner_gid(),
+        ));
+        manager.link_key_replace(root, branch).unwrap();
+        manager.link_key_replace(branch, grandchild).unwrap();
+        drop(manager.keys.remove(&grandchild).unwrap());
+
+        let thread_roots = manager.thread_keyrings.clone();
+        let process_roots = manager.process_keyrings.clone();
+        let session_roots = manager.session_keyrings.clone();
+        let keys = gc_key_state(&manager);
+        let owners = manager.owners.usage.clone();
+        let budget = manager.budget.used;
+
+        assert_eq!(manager.exec_committed(task_owner), Err(AxError::BadState));
+        assert_eq!(manager.thread_keyrings, thread_roots);
+        assert_eq!(manager.process_keyrings, process_roots);
+        assert_eq!(manager.session_keyrings, session_roots);
+        assert_eq!(gc_key_state(&manager), keys);
+        assert_eq!(manager.owners.usage, owners);
+        assert_eq!(manager.budget.used, budget);
+        assert_prepared_gc_scratch_idle(&manager);
+    }
+
+    #[test]
+    fn prepared_task_gc_retires_a_diamond_once() {
+        let owner = actor(63, 63, 1000, 1000);
+        let task_owner = KeyTaskOwner::new(owner.thread_owner, owner.process_owner);
+        let mut manager = KeyManager::new();
+        let root = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let left = manager.create_keyring(
+            "left".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            thread_process_keyring_permissions(),
+        );
+        let right = manager.create_keyring(
+            "right".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            thread_process_keyring_permissions(),
+        );
+        let shared = manager.create_keyring(
+            "shared".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            thread_process_keyring_permissions(),
+        );
+        manager.link_key_replace(root, left).unwrap();
+        manager.link_key_replace(root, right).unwrap();
+        manager.link_key_replace(left, shared).unwrap();
+        manager.link_key_replace(right, shared).unwrap();
+        assert_eq!(manager.keys[&shared].link_refs, 2);
+
+        manager.exec_committed(task_owner).unwrap();
+
+        for serial in [root, left, right, shared] {
+            assert!(!manager.keys.contains_key(&serial));
+        }
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn prepared_task_gc_preserves_a_shared_child_with_a_live_root() {
+        let owner = actor(64, 64, 1000, 1000);
+        let task_owner = KeyTaskOwner::new(owner.thread_owner, owner.process_owner);
+        let mut manager = KeyManager::new();
+        let root = manager
+            .special_keyring(KEY_SPEC_THREAD_KEYRING, &owner, true)
+            .unwrap();
+        let shared = manager.create_keyring(
+            "shared-survivor".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            thread_process_keyring_permissions(),
+        );
+        manager
+            .install_root(RootSource::Session(owner.thread_owner), shared)
+            .unwrap();
+        manager.link_key_replace(root, shared).unwrap();
+        assert_eq!(manager.keys[&shared].root_refs, 1);
+        assert_eq!(manager.keys[&shared].link_refs, 1);
+
+        manager.exec_committed(task_owner).unwrap();
+
+        assert!(!manager.keys.contains_key(&root));
+        assert_eq!(manager.session_keyrings[&owner.thread_owner], shared);
+        assert_eq!(manager.keys[&shared].root_refs, 1);
+        assert_eq!(manager.keys[&shared].link_refs, 0);
+        assert!(manager.keys[&shared].gc_plan.is_idle());
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
     fn fsid_precommit_changes_only_thread_visible_owner() {
         let owner = actor(70, 70, 1000, 1001);
         let mut manager = KeyManager::new();
@@ -3248,13 +3691,66 @@ mod tests {
             vec![user]
         );
         assert!(manager.keys.contains_key(&user));
-        assert_eq!(manager.keys[&user].namespace_prune_refs, 0);
+        assert!(manager.keys[&user].gc_plan.is_idle());
     }
 
     #[test]
-    fn namespace_prune_counts_duplicate_roots_once_and_clears_stale_scratch() {
+    fn namespace_prune_leaves_foreign_gc_scratch_untouched() {
         let owner = actor(24, 24, 1000, 1000);
         let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        manager.ensure_namespace_registry(&owner).unwrap();
+        let normal = manager
+            .try_create_keyring(
+                "normal-root".to_string(),
+                owner.owner_uid(),
+                owner.owner_gid(),
+                uid_keyring_permissions(),
+                QuotaAdmission::Enforced,
+            )
+            .unwrap();
+        let foreign = manager
+            .try_create_keyring(
+                "foreign-root".to_string(),
+                owner.owner_uid(),
+                owner.owner_gid(),
+                uid_keyring_permissions(),
+                QuotaAdmission::Enforced,
+            )
+            .unwrap();
+        manager
+            .install_root(RootSource::User(namespace, owner.real_uid()), normal)
+            .unwrap();
+        manager
+            .install_root(
+                RootSource::UserSession(namespace, owner.real_uid()),
+                foreign,
+            )
+            .unwrap();
+        let foreign_scratch = GcPlanScratch {
+            epoch: u64::MAX,
+            root_drops: 7,
+            link_drops: 3,
+            state: Some(GcPlanState::Touched),
+            touched_next: Some(1234),
+            work_next: None,
+        };
+        manager.keys.get_mut(&foreign).unwrap().gc_plan = foreign_scratch;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert!(manager.namespaces.contains_key(&namespace));
+        assert_eq!(manager.keys[&normal].root_refs, 1);
+        assert!(manager.keys[&normal].gc_plan.is_idle());
+        assert_eq!(manager.keys[&foreign].root_refs, 1);
+        assert_eq!(manager.keys[&foreign].gc_plan, foreign_scratch);
+    }
+
+    #[test]
+    fn namespace_prune_counts_duplicate_roots_and_retires_once() {
+        let owner = actor(24, 24, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let uid = owner.real_uid();
         let mut manager = KeyManager::new();
         manager.ensure_namespace_registry(&owner).unwrap();
         let serial = manager
@@ -3267,23 +3763,125 @@ mod tests {
             )
             .unwrap();
         manager
-            .install_root(RootSource::User(namespace, owner.real_uid()), serial)
+            .install_root(RootSource::User(namespace, uid), serial)
             .unwrap();
         manager
-            .install_root(RootSource::UserSession(namespace, owner.real_uid()), serial)
+            .install_root(RootSource::UserSession(namespace, uid), serial)
             .unwrap();
         assert_eq!(manager.keys[&serial].root_refs, 2);
-        manager.keys.get_mut(&serial).unwrap().namespace_prune_refs = 7;
         drop(owner);
-
-        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
-        assert!(manager.namespaces.contains_key(&namespace));
-        assert_eq!(manager.keys[&serial].root_refs, 2);
-        assert_eq!(manager.keys[&serial].namespace_prune_refs, 0);
 
         assert!(manager.key_user_records().unwrap().is_empty());
         assert!(!manager.namespaces.contains_key(&namespace));
         assert!(!manager.keys.contains_key(&serial));
+        assert_accounting_consistent(&manager);
+    }
+
+    #[test]
+    fn namespace_gc_link_ref_underflow_is_zero_mutation() {
+        let owner = actor(25, 25, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        let root = manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        let child = manager.create_keyring(
+            "underflow-child".to_string(),
+            owner.owner_uid(),
+            owner.owner_gid(),
+            uid_keyring_permissions(),
+        );
+        manager.link_key_replace(root, child).unwrap();
+        manager.keys.get_mut(&child).unwrap().link_refs = 0;
+
+        let namespace_roots = manager.namespaces[&namespace]
+            .root_serials()
+            .copied()
+            .collect::<Vec<_>>();
+        let keys = gc_key_state(&manager);
+        let owners = manager.owners.usage.clone();
+        let budget = manager.budget.used;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert_eq!(
+            manager.namespaces[&namespace]
+                .root_serials()
+                .copied()
+                .collect::<Vec<_>>(),
+            namespace_roots
+        );
+        assert_eq!(gc_key_state(&manager), keys);
+        assert_eq!(manager.owners.usage, owners);
+        assert_eq!(manager.budget.used, budget);
+        assert_prepared_gc_scratch_idle(&manager);
+    }
+
+    #[test]
+    fn namespace_gc_owner_underflow_is_zero_mutation() {
+        let owner = actor(26, 26, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let uid = owner.owner_uid();
+        let mut manager = KeyManager::new();
+        manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        manager
+            .owners
+            .set_usage_for_test(uid, OwnerUsage::default());
+        let namespace_roots = manager.namespaces[&namespace]
+            .root_serials()
+            .copied()
+            .collect::<Vec<_>>();
+        let keys = gc_key_state(&manager);
+        let owners = manager.owners.usage.clone();
+        let budget = manager.budget.used;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert_eq!(
+            manager.namespaces[&namespace]
+                .root_serials()
+                .copied()
+                .collect::<Vec<_>>(),
+            namespace_roots
+        );
+        assert_eq!(gc_key_state(&manager), keys);
+        assert_eq!(manager.owners.usage, owners);
+        assert_eq!(manager.budget.used, budget);
+        assert_prepared_gc_scratch_idle(&manager);
+    }
+
+    #[test]
+    fn namespace_gc_budget_underflow_is_zero_mutation() {
+        let owner = actor(27, 27, 1000, 1000);
+        let namespace = owner.user_ns.identity();
+        let mut manager = KeyManager::new();
+        manager
+            .special_keyring(KEY_SPEC_USER_KEYRING, &owner, true)
+            .unwrap();
+        manager.budget.used = ManagerBudgetUsage::default();
+        let namespace_roots = manager.namespaces[&namespace]
+            .root_serials()
+            .copied()
+            .collect::<Vec<_>>();
+        let keys = gc_key_state(&manager);
+        let owners = manager.owners.usage.clone();
+        let budget = manager.budget.used;
+        drop(owner);
+
+        assert_eq!(manager.key_user_records(), Err(AxError::BadState));
+        assert_eq!(
+            manager.namespaces[&namespace]
+                .root_serials()
+                .copied()
+                .collect::<Vec<_>>(),
+            namespace_roots
+        );
+        assert_eq!(gc_key_state(&manager), keys);
+        assert_eq!(manager.owners.usage, owners);
+        assert_eq!(manager.budget.used, budget);
+        assert_prepared_gc_scratch_idle(&manager);
     }
 
     #[test]
@@ -3475,7 +4073,7 @@ mod tests {
         assert!(manager.is_possessed(possessor_only, &owner));
         assert!(!manager.keys[&possessor_only].perm.allows(
             manager.keys[&possessor_only].uid,
-            manager.keys[&possessor_only].gid,
+            Some(manager.keys[&possessor_only].gid),
             &owner.dac,
             false,
             KeyPermission::SEARCH,
@@ -4714,7 +5312,7 @@ mod tests {
     }
 
     #[test]
-    fn iterative_gc_retires_a_deep_keyring_chain_without_stack_growth() {
+    fn prepared_task_gc_retires_a_deep_keyring_chain_without_stack_growth() {
         const DEPTH: usize = 2_048;
 
         let owner = actor(80, 80, 1000, 1000);
@@ -4750,8 +5348,9 @@ mod tests {
             parent = child;
         }
 
-        assert_eq!(manager.thread_keyrings.remove(&80), Some(root));
-        manager.release_root_ref(root).unwrap();
+        manager
+            .exec_committed(KeyTaskOwner::new(owner.thread_owner, owner.process_owner))
+            .unwrap();
         assert!(manager.keys.is_empty());
         assert_accounting_consistent(&manager);
     }
@@ -4875,7 +5474,7 @@ mod tests {
         let owner = actor(85, 85, 1000, 1000);
         let uid = owner.owner_uid();
         let mut ledger = OwnerLedger::default();
-        ledger.usage.insert(
+        ledger.set_usage_for_test(
             uid,
             OwnerUsage {
                 keys: usize::MAX,
