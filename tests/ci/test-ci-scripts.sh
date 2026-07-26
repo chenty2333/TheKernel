@@ -71,6 +71,34 @@ grep -Fq '/proc/sys/kernel/apparmor_restrict_unprivileged_userns' \
     "$REPO_ROOT/.github/workflows/ci.yml"
 grep -Fq 'sudo tee "$restriction"' \
     "$REPO_ROOT/.github/workflows/ci.yml"
+
+# Container jobs are resolved before any runner step can source versions.env,
+# and GitHub does not expose the env context to container.image. Keep the two
+# default images fixed to the current toolchain tag, preserve the repository
+# variable override, and make this test derive the expected literal from the
+# canonical version file so a future toolchain bump cannot drift silently.
+rust_toolchain=$(sed -n 's/^RUST_TOOLCHAIN=//p' \
+    "$REPO_ROOT/dev-env/versions.env")
+[ -n "$rust_toolchain" ]
+[ "$(grep -c '^RUST_TOOLCHAIN=' "$REPO_ROOT/dev-env/versions.env")" -eq 1 ]
+expected_ci_image="      image: \${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:${rust_toolchain}', github.repository_owner) }}"
+[ "$(grep -Fxc -- "$expected_ci_image" \
+    "$REPO_ROOT/.github/workflows/ci.yml")" -eq 2 ]
+if grep -Fq 'thekernel-dev:latest' "$REPO_ROOT/.github/workflows/ci.yml"; then
+    printf '%s\n' 'test-ci-scripts: CI container fallback still uses latest' >&2
+    exit 1
+fi
+
+# Publishing always emits the version-derived toolchain tag. Only a main
+# branch push may additionally move latest; a manual feature-branch dispatch
+# therefore cannot replace the default floating image.
+grep -Fqx '            type=raw,value=${{ env.RUST_TOOLCHAIN }}' \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml"
+grep -Fqx \
+    "            type=raw,value=latest,enable=\${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}" \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml"
+[ "$(grep -Fc 'type=raw,value=latest' \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml")" -eq 1 ]
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \

@@ -27,7 +27,7 @@ jobs:
   per-commit:
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -164,7 +164,7 @@ jobs:
       - linux
       - thekernel-qemu
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
