@@ -149,7 +149,10 @@ differential_missing_markers() {
 # Markers that remain unwaived are printed to stdout. Malformed allowlists
 # are hard errors, never silent skips.
 differential_apply_allowlist() {
-    python3 - "$1" "$2" "$3" <<'PY'
+    # Keep fd 0 attached to the caller's marker stream. Feeding the Python
+    # program itself through stdin would consume that stream before
+    # sys.stdin.read() can observe it.
+    python3 /dev/fd/3 "$1" "$2" "$3" 3<<'PY'
 import json
 import re
 import sys
