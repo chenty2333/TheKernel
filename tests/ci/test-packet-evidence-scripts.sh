@@ -20,6 +20,10 @@ commit_fixture() {
 host_repo="$tmp/host-repo"
 mkdir -p "$host_repo/scripts/ci" "$host_repo/tests/guest/tools" "$tmp/host-bin"
 cp "$CI_DIR/packet-host-differential.sh" "$host_repo/scripts/ci/"
+mkdir -p "$host_repo/scripts/ci/differential/manifests"
+cp "$CI_DIR/differential/lib.sh" "$host_repo/scripts/ci/differential/"
+cp "$CI_DIR/differential/manifests/packet.markers" \
+    "$host_repo/scripts/ci/differential/manifests/"
 printf '%s\n' 'int main(void) { return 0; }' \
     >"$host_repo/tests/guest/tools/packet-socket-smoke.c"
 commit_fixture "$host_repo"
@@ -82,6 +86,11 @@ PATH="$tmp/host-bin:$PATH" "$host_repo/scripts/ci/packet-host-differential.sh" \
     --workdir "$tmp/host-pass" >/dev/null
 grep -Fqx $'status\tPASS' "$tmp/host-pass/receipt.tsv"
 grep -Fqx $'source_set_revalidated\tPASS' "$tmp/host-pass/receipt.tsv"
+python3 "$CI_DIR/differential/validate-receipt.py" \
+    --receipt "$tmp/host-pass/receipt.json" \
+    --case packet \
+    --manifest "$CI_DIR/differential/manifests/packet.markers" \
+    --require-empty-allowlist --require-pass >/dev/null
 (cd "$tmp/host-pass" && sha256sum -c artifacts.sha256 >/dev/null)
 (cd "$tmp/host-pass" && sha256sum -c bundle.sha256 >/dev/null)
 
@@ -96,6 +105,7 @@ set -e
 grep -Fq 'source identity or cleanliness changed during execution' \
     "$tmp/host-mutation.out"
 [ ! -e "$tmp/host-mutation/receipt.tsv" ]
+[ ! -e "$tmp/host-mutation/receipt.json" ]
 
 # The broker harness is driven with deterministic schema-2 output. Its second
 # run can mutate one maintained sibling, proving the final three-repository

@@ -3,8 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=scripts/ci/differential/lib.sh
+. "$SCRIPT_DIR/differential/lib.sh"
 WORKDIR="$REPO_ROOT/.state/ci/seccomp-host-differential"
 ALLOW_INHERITED=0
+CASE=seccomp
+MANIFEST="$SCRIPT_DIR/differential/manifests/seccomp.markers"
+ALLOWLIST="$SCRIPT_DIR/differential/allowlist/seccomp.json"
 
 usage() {
     cat <<'EOF'
@@ -47,21 +52,17 @@ while (($#)); do
     esac
 done
 
-case "$WORKDIR" in
-    /*) ;;
-    *) WORKDIR="$REPO_ROOT/$WORKDIR" ;;
-esac
-mkdir -p -- "$WORKDIR"
-WORKDIR=$(cd -- "$WORKDIR" && pwd -P)
+WORKDIR=$(differential_resolve_workdir "$REPO_ROOT" "$WORKDIR")
 
 BINARY="$WORKDIR/seccomp-smoke"
 LOG="$WORKDIR/seccomp-smoke.log"
 RESULT="$WORKDIR/result.txt"
-rm -f -- "$BINARY" "$LOG" "$RESULT"
+RECEIPT="$WORKDIR/receipt.json"
+APPLIED="$WORKDIR/allowlist-applied.jsonl"
+rm -f -- "$BINARY" "$LOG" "$RESULT" "$RECEIPT" "$APPLIED"
 
-cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
-    "$REPO_ROOT/tests/guest/tools/seccomp-smoke.c" \
-    -o "$BINARY"
+differential_build_smoke "$BINARY" "$REPO_ROOT/tests/guest/tools/seccomp-smoke.c" \
+    -O2 -std=c11 -Wall -Wextra -Werror -pthread
 command -v timeout >/dev/null 2>&1 || {
     printf '%s\n' 'seccomp-host-differential: timeout command is required' >&2
     exit 1
@@ -91,22 +92,50 @@ case "$seccomp_mode" in
         ;;
 esac
 
-set +e
-timeout --kill-after=5s 60s "$BINARY" >"$LOG" 2>&1
-smoke_status=$?
-set -e
+markers_expected=$(differential_manifest_count "$MANIFEST")
+missing_total=
+
+count_lines() {
+    if [ -z "$1" ]; then
+        printf '0\n'
+    else
+        printf '%s\n' "$1" | wc -l
+    fi
+}
+
+emit_receipt() {
+    local matched
+    matched=$((markers_expected - $(count_lines "$missing_total")))
+    differential_write_receipt "$RECEIPT" "$CASE" "$REPO_ROOT" \
+        "$markers_expected" "$matched" "$APPLIED" "$1"
+}
+
+smoke_status=0
+differential_run_bounded "$LOG" 60s 5s -- "$BINARY" || smoke_status=$?
+missing_total=$(differential_missing_markers "$LOG" "$MANIFEST" || true)
+missing=$missing_total
 if [ "$smoke_status" -ne 0 ]; then
+    emit_receipt fail
     printf 'seccomp-host-differential: FAIL smoke_exit=%s timeout_secs=60\n' \
         "$smoke_status" | tee "$RESULT" >&2
     exit 1
 fi
-grep -Fqx 'THEKERNEL_SECCOMP_KILL_SCOPE_OK' "$LOG"
-grep -Fqx 'THEKERNEL_SECCOMP_RESOURCE_PORTABLE_OK' "$LOG"
-grep -Fqx 'THEKERNEL_SECCOMP_OK' "$LOG"
+if [ -n "$missing" ]; then
+    missing=$(printf '%s\n' "$missing" \
+        | differential_apply_allowlist "$ALLOWLIST" "$(uname -r)" "$APPLIED")
+fi
+if [ -n "$missing" ]; then
+    emit_receipt fail
+    printf 'seccomp-host-differential: FAIL missing_marker=%s\n' \
+        "$(printf '%s\n' "$missing" | sed -n 1p)" | tee "$RESULT" >&2
+    exit 1
+fi
 if grep -Fq 'THEKERNEL_SECCOMP_FAIL' "$LOG"; then
+    emit_receipt fail
     printf '%s\n' 'seccomp-host-differential: portable smoke reported a failure' >&2
     exit 1
 fi
 
+emit_receipt pass
 printf '%s\n' 'seccomp-host-differential: PASS initial_seccomp_mode=0' \
     | tee "$RESULT"
