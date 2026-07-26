@@ -413,7 +413,14 @@ static void *exclusive_waiter_main(void *argument) {
          * the release write cannot also observe the shared fd as ready.
          * EAGAIN is fine: a concurrent winner already drained it. */
         uint64_t value = 0;
-        (void)read(exclusive_shared_efd, &value, sizeof(value));
+        ssize_t drained;
+        do {
+            drained = read(exclusive_shared_efd, &value, sizeof(value));
+        } while (drained < 0 && errno == EINTR);
+        if ((drained < 0 && errno != EAGAIN) ||
+            (drained >= 0 && drained != (ssize_t)sizeof(value))) {
+            return (void *)(uintptr_t)1;
+        }
         if (write(exclusive_winner_pipe[1], "W", 1) != 1) {
             return (void *)(uintptr_t)1;
         }
