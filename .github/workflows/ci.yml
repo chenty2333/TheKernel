@@ -19,7 +19,7 @@ env:
   # Maintained sibling inputs are source-controlled immutable release
   # candidates. Local development may still override their checkout paths.
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
-  THEKERNEL_AX_REF: b73ed3f75ba190343f9d4b2669267884cac5a3b6
+  THEKERNEL_AX_REF: 12e208e2a992d2b8bb1395d38f65125779b499b9
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
   THEKERNEL_LINUX_ABI_REF: df13793f1c372432d0c5144d44636dfd53ccec45
 
