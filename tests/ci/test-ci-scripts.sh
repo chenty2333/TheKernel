@@ -224,6 +224,40 @@ then
     exit 1
 fi
 
+# A focused copy becomes its own workspace root. Packages such as axnet-ng
+# inherit the repository lint policy, so the generated root must carry the
+# real tables rather than an empty compatibility placeholder.
+focused_bin="$tmp/focused-bin"
+mkdir -p "$focused_bin"
+cat >"$focused_bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+manifest=
+while (($#)); do
+    case "$1" in
+        --manifest-path) manifest=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$manifest" ]
+cp "$manifest" "$FOCUSED_MANIFEST_CAPTURE"
+EOF
+chmod +x "$focused_bin/cargo"
+env \
+    PATH="$focused_bin:$PATH" \
+    FOCUSED_MANIFEST_CAPTURE="$tmp/focused-Cargo.toml" \
+    THEKERNEL_CI_FOCUSED_WORK_ROOT="$tmp/focused-workspaces" \
+    "$CI_DIR/focused-cargo-test.sh" crates/axnet-ng/Cargo.toml
+[ "$(grep -Fxc '[workspace.lints.rust]' "$tmp/focused-Cargo.toml")" -eq 1 ]
+[ "$(grep -Fxc '[workspace.lints.clippy]' "$tmp/focused-Cargo.toml")" -eq 1 ]
+grep -Fqx 'dead_code = "allow"' "$tmp/focused-Cargo.toml"
+grep -Fqx 'drop_non_drop = "allow"' "$tmp/focused-Cargo.toml"
+grep -Fqx 'too_many_arguments = "allow"' "$tmp/focused-Cargo.toml"
+if grep -Fq '[workspace.package]' "$tmp/focused-Cargo.toml"; then
+    printf '%s\n' 'test-ci-scripts: focused manifest copied unrelated workspace tables' >&2
+    exit 1
+fi
+
 # The developer container must see maintained sibling checkouts at the exact
 # absolute paths produced by Cargo's ../thekernel-* patch dependencies. Keep
 # this test Docker-free by capturing the final compose invocation.
