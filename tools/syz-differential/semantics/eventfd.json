@@ -1,0 +1,110 @@
+{
+  "schema": "syz-differential-semantics-v0",
+  "name": "eventfd",
+  "marker_prefix": "EVENTFDGEN",
+  "c_includes": ["sys/eventfd.h", "fcntl.h"],
+  "checks": [
+    {
+      "marker": "CREATE_PLAIN",
+      "locals": {},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "0"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "CREATE_BADFLAGS",
+      "locals": {},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "0x100"],
+         "expect": {"ret": "-1", "errno": "EINVAL"}}
+      ]
+    },
+    {
+      "marker": "CREATE_CLOEXEC",
+      "locals": {},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "EFD_CLOEXEC"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"call": "fcntl$getfd", "args": ["@efd", "F_GETFD"],
+         "expect": {"ret": "1"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "COUNTER_INITVAL",
+      "locals": {"rval": "u64"},
+      "steps": [
+        {"call": "eventfd2", "args": ["3", "EFD_NONBLOCK"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "8"}},
+        {"expect": {"var": "rval", "cmp": "==", "value": 3}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "-1", "errno": "EAGAIN"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "READ_EAGAIN_EMPTY",
+      "locals": {"rval": "u64"},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "EFD_NONBLOCK"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "-1", "errno": "EAGAIN"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "WRITE_ACCUMULATE",
+      "locals": {"wval": "u64", "rval": "u64"},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "EFD_NONBLOCK"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"set": "wval", "value": 5},
+        {"call": "write$eventfd", "args": ["@efd", "&wval", "8"],
+         "expect": {"ret": "8"}},
+        {"set": "wval", "value": 2},
+        {"call": "write$eventfd", "args": ["@efd", "&wval", "8"],
+         "expect": {"ret": "8"}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "8"}},
+        {"expect": {"var": "rval", "cmp": "==", "value": 7}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "SEMAPHORE_DECREMENT",
+      "locals": {"rval": "u64"},
+      "steps": [
+        {"call": "eventfd2", "args": ["3", "EFD_SEMAPHORE|EFD_NONBLOCK"],
+         "save": "efd", "expect": {"ret": ">=0"}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "8"}},
+        {"expect": {"var": "rval", "cmp": "==", "value": 1}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "8"}},
+        {"expect": {"var": "rval", "cmp": "==", "value": 1}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "8"}},
+        {"expect": {"var": "rval", "cmp": "==", "value": 1}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
+         "expect": {"ret": "-1", "errno": "EAGAIN"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    },
+    {
+      "marker": "READ_BADSIZE",
+      "locals": {"rval": "u64"},
+      "steps": [
+        {"call": "eventfd2", "args": ["0", "0"], "save": "efd",
+         "expect": {"ret": ">=0"}},
+        {"call": "read$eventfd", "args": ["@efd", "&rval", "3"],
+         "expect": {"ret": "-1", "errno": "EINVAL"}},
+        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
+      ]
+    }
+  ]
+}
