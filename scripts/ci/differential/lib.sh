@@ -27,6 +27,50 @@ differential_repo_root() {
     (cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)
 }
 
+# Rejects any tracked, staged, or untracked source change. Ignored build and
+# evidence directories remain permitted, so a completed host run can be
+# repeated without weakening the source identity.
+differential_require_clean_repo() {
+    local repo=$1
+    local dirty
+    dirty=$(git -C "$repo" status --porcelain=v1 --untracked-files=all)
+    if [ -n "$dirty" ]; then
+        printf '%s\n%s\n' \
+            'differential: refusing a dirty source checkout' "$dirty" >&2
+        return 1
+    fi
+}
+
+# Writes a path exactly as stored in COMMIT into OUTPUT. Host runners compile
+# this frozen input instead of the live checkout, binding their receipt's
+# git_rev to the bytes that were actually executed.
+differential_materialize_committed_input() {
+    local repo=$1
+    local commit=$2
+    local relative=$3
+    local output=$4
+    mkdir -p -- "$(dirname -- "$output")"
+    git -C "$repo" cat-file blob "$commit:$relative" >"$output"
+}
+
+# Revalidates the clean repository snapshot immediately before publishing a
+# receipt. EXPECTED_HEAD and EXPECTED_TREE come from the runner's preflight.
+differential_revalidate_clean_repo() {
+    local repo=$1
+    local expected_head=$2
+    local expected_tree=$3
+    local actual_head actual_tree
+    actual_head=$(git -C "$repo" rev-parse HEAD)
+    actual_tree=$(git -C "$repo" rev-parse 'HEAD^{tree}')
+    if [ "$actual_head" != "$expected_head" ] ||
+        [ "$actual_tree" != "$expected_tree" ]; then
+        printf '%s\n' \
+            'differential: repository revision changed during execution' >&2
+        return 1
+    fi
+    differential_require_clean_repo "$repo"
+}
+
 # Validates and prints the value of a `--workdir` option while parsing
 # arguments. PROG is the runner name used in the diagnostic. Call with the
 # remaining positional parameters starting at `--workdir` itself:
