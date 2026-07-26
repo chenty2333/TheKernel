@@ -27,6 +27,11 @@ from mm_performance_schema import (
     KERNEL_PROFILE_BY_MODE,
     MANIFEST_COLUMNS,
     MEASUREMENT_MODES,
+    PHYSICAL_FREQ_POLICY,
+    PLATFORM_CLASSES,
+    PLATFORM_NOT_APPLICABLE,
+    PMU_SOURCES,
+    PMU_SOURCE_BY_ARCH,
     METRIC_COLUMNS,
     MM_LOCK_DIAGNOSTIC_SENTINEL,
     PIN_METRICS,
@@ -593,6 +598,44 @@ def validate_manifest_row(
     arch = row["arch"]
     if arch not in {"rv", "la"}:
         raise EvidenceError(f"{context} has invalid arch: {arch!r}")
+    platform_class = row["platform_class"]
+    if platform_class not in PLATFORM_CLASSES:
+        raise EvidenceError(
+            f"{context} has invalid platform_class: {platform_class!r}"
+        )
+    if platform_class == "physical":
+        # RFC 0008: physical evidence needs its own receipt authority (PMU
+        # receipts, firmware identity, frequency pinning) before it can be
+        # validated. Declaring the class now reserves the vocabulary; accepting
+        # a half-validated row here would let TCG-grade evidence carry
+        # physical-grade claims.
+        raise EvidenceError(
+            f"{context} declares platform_class=physical, but the physical "
+            "evidence authority is not implemented yet; qemu-tcg is the only "
+            "accepted platform class"
+        )
+    pmu_source = row["pmu_source"]
+    if pmu_source not in PMU_SOURCES:
+        raise EvidenceError(f"{context} has invalid pmu_source: {pmu_source!r}")
+    if pmu_source != "none":
+        if pmu_source != PMU_SOURCE_BY_ARCH[arch]:
+            raise EvidenceError(
+                f"{context} pmu_source does not match arch: "
+                f"arch={arch!r} pmu_source={pmu_source!r}"
+            )
+        raise EvidenceError(
+            f"{context} qemu-tcg evidence must use pmu_source='none'; "
+            "architectural PMU claims require physical evidence authority"
+        )
+    for field in ("cpu_model", "firmware_version", "cpu_freq_policy"):
+        if row[field] != PLATFORM_NOT_APPLICABLE:
+            raise EvidenceError(
+                f"{context} qemu-tcg evidence must use "
+                f"{field}={PLATFORM_NOT_APPLICABLE!r}; TCG has no "
+                "authoritative CPU identity or frequency policy "
+                f"(physical rows will require cpu_freq_policy="
+                f"{PHYSICAL_FREQ_POLICY!r})"
+            )
     requested_cpus = parse_positive_int(row["requested_cpus"], "requested_cpus", context)
     online_cpus = parse_positive_int(row["online_cpus"], "online_cpus", context)
     if requested_cpus > 64 or online_cpus != requested_cpus:
@@ -607,7 +650,7 @@ def validate_manifest_row(
     )
     pin_workers = parse_positive_int(row["pin_workers"], "pin_workers", context)
     if iterations > 100000 or live_vmas > 16384 or pin_iterations > 10000:
-        raise EvidenceError(f"{context} workload exceeds the bundle-v8 limits")
+        raise EvidenceError(f"{context} workload exceeds the bundle-v9 limits")
     if pin_workers != requested_cpus:
         raise EvidenceError(
             f"{context} pin worker topology mismatch: "
@@ -1316,6 +1359,11 @@ def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
         "host_cpu_set",
         "host_cpu_selection",
         "host_cpu_class",
+        "platform_class",
+        "pmu_source",
+        "cpu_model",
+        "firmware_version",
+        "cpu_freq_policy",
         "commands_sha256",
     )
     for key in sorted(baseline_keys):

@@ -179,9 +179,13 @@ also completes fixed-destination replacement, shared `old_size == 0`
 alias/coherence, and grow/shrink prefix-integrity checks before emitting the
 semantic-pass marker.
 
-The MM output is a `thekernel-mm-performance-bundle-v8` directory. Manifest
-artifact paths are normalized POSIX paths relative to the bundle root; every
-referenced artifact carries a SHA-256 and byte size. The comparator rejects
+The MM output is a `thekernel-mm-performance-bundle-v9` directory. Every QEMU
+row is explicitly classified as `qemu-tcg` with `pmu_source=none`; CPU model,
+firmware, and frequency-policy fields use `not-applicable`. The comparator
+rejects physical or architectural-PMU claims until a separate physical receipt
+authority exists. Manifest artifact paths are normalized POSIX paths relative
+to the bundle root; every referenced artifact carries a SHA-256 and byte size.
+The comparator rejects
 absolute paths, `..`, symlink escapes, missing files, and digest or size drift.
 It reruns the versioned performance parser on every raw QEMU log and requires
 the result to be structurally identical to the per-run metric artifact. In
@@ -197,7 +201,8 @@ bundles without the three path-specific `mremap` metrics, and v4 bundles without
 an explicit measurement boundary are intentionally rejected. V5 bundles lack
 the independent-address-space pin workload, and v6 bundles do not bind the
 guest-input and QEMU command-stream receipts. Older evidence is rejected rather
-than guessed into a new provenance claim.
+than guessed into a new provenance claim. V8 bundles do not carry the explicit
+platform and PMU provenance fields and are rejected for the same reason.
 
 One adapter invocation captures one bundle and never labels a single sample as
 a regression result. Capture adjacent, counterbalanced baseline/candidate pairs

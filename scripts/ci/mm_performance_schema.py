@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 
-BUNDLE_SCHEMA = "thekernel-mm-performance-bundle-v8"
+BUNDLE_SCHEMA = "thekernel-mm-performance-bundle-v9"
 POLICY_SCHEMA = "thekernel-mm-performance-regression-policy-v5"
 STABILITY_POLICY_SCHEMA = "thekernel-mm-performance-stability-policy-v1"
 HOST_DIAGNOSTIC_SCHEMA = "thekernel-mm-performance-host-diagnostics-v1"
 MEASUREMENT_MODES = frozenset({"product", "diagnostic"})
+# Where the measurement physically ran. QEMU TCG establishes correctness and
+# relative regression evidence only; absolute performance and architectural
+# event claims require `physical` evidence, which carries its own receipt
+# authority once the hardware bring-up lands (RFC 0008). The vocabulary is
+# reserved now so a TCG receipt can never masquerade as a physical one.
+PLATFORM_CLASSES = frozenset({"qemu-tcg", "physical"})
+# Which counter mechanism produced any PMU-derived numbers in the bundle.
+PMU_SOURCES = frozenset({"none", "sbi-pmu", "loongarch-pmcfg"})
+PMU_SOURCE_BY_ARCH = {"rv": "sbi-pmu", "la": "loongarch-pmcfg"}
+# Sentinel for platform fields that do not apply to the row's platform class.
+PLATFORM_NOT_APPLICABLE = "not-applicable"
+# The only frequency policy under which physical latency numbers are
+# comparable: DVFS/boost must be pinned for cycle counts to mean anything.
+PHYSICAL_FREQ_POLICY = "fixed-frequency"
 KERNEL_PROFILE_BY_MODE = {
     "product": "shell",
     "diagnostic": "mm-performance",
@@ -63,6 +77,11 @@ MANIFEST_COLUMNS = (
     "host_cpu_set",
     "host_cpu_selection",
     "host_cpu_class",
+    "platform_class",
+    "pmu_source",
+    "cpu_model",
+    "firmware_version",
+    "cpu_freq_policy",
     "kernel_artifact",
     "metrics_artifact",
     "metrics_sha256",

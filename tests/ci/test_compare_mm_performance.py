@@ -59,6 +59,11 @@ MANIFEST_COLUMNS = (
     "host_cpu_set",
     "host_cpu_selection",
     "host_cpu_class",
+    "platform_class",
+    "pmu_source",
+    "cpu_model",
+    "firmware_version",
+    "cpu_freq_policy",
     "kernel_artifact",
     "metrics_artifact",
     "metrics_sha256",
@@ -312,7 +317,7 @@ def make_bundle(
     run = root / run_name
     run.mkdir()
     values = {
-        "bundle_schema": "thekernel-mm-performance-bundle-v8",
+        "bundle_schema": "thekernel-mm-performance-bundle-v9",
         "thekernel_commit": "1" * 40,
         "thekernel_ax_commit": "2" * 40,
         "thekernel_linux_abi_commit": "3" * 40,
@@ -336,6 +341,11 @@ def make_bundle(
         "host_cpu_set": host_cpu_set,
         "host_cpu_selection": "auto-homogeneous-v1",
         "host_cpu_class": "package:0,max_freq_khz:3700000",
+        "platform_class": "qemu-tcg",
+        "pmu_source": "none",
+        "cpu_model": "not-applicable",
+        "firmware_version": "not-applicable",
+        "cpu_freq_policy": "not-applicable",
         "kernel_artifact": f"{run_name}/kernel",
         "metrics_artifact": f"{run_name}/mm-performance.tsv",
         "commands": f"{run_name}/commands",
@@ -1690,6 +1700,78 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("unsupported bundle_schema", result.stderr)
         self.assertEqual(report.read_bytes(), sentinel)
 
+    def test_physical_platform_class_is_explicitly_unimplemented(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update(
+                {
+                    "platform_class": "physical",
+                    "pmu_source": "sbi-pmu",
+                    "cpu_model": "sifive-u74",
+                    "firmware_version": "opensbi-1.4",
+                    "cpu_freq_policy": "fixed-frequency",
+                }
+            ),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("physical evidence authority is not implemented", result.stderr)
+
+    def test_unknown_platform_class_is_rejected(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"platform_class": "qemu-kvm"}),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid platform_class", result.stderr)
+
+    def test_tcg_pmu_source_is_rejected(self) -> None:
+        for pmu_source, expected_error in (
+            ("loongarch-pmcfg", "pmu_source does not match arch"),
+            ("sbi-pmu", "qemu-tcg evidence must use pmu_source='none'"),
+        ):
+            with self.subTest(pmu_source=pmu_source):
+                baselines = [
+                    self.bundle(f"baseline-{pmu_source}-{index}")
+                    for index in range(3)
+                ]
+                candidates = [
+                    self.bundle(f"candidate-{pmu_source}-{index}")
+                    for index in range(3)
+                ]
+                mutate_manifest(
+                    candidates[0],
+                    lambda row: row.update({"pmu_source": pmu_source}),
+                )
+
+                result, _ = self.compare_series(baselines, candidates)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_tcg_rows_must_not_claim_platform_identity(self) -> None:
+        # A TCG receipt carrying a CPU model would read as physical evidence.
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"cpu_model": "sifive-u74"}),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("qemu-tcg evidence must use cpu_model", result.stderr)
+
     def test_output_inside_input_bundle_is_rejected_without_mutation(self) -> None:
         baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
         candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
@@ -1728,7 +1810,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
 
     def test_v1_through_v6_manifests_are_not_silently_upgraded(self) -> None:
         baseline = self.bundle("baseline")
-        for version in ("v1", "v2", "v3", "v4", "v5", "v6"):
+        for version in ("v1", "v2", "v3", "v4", "v5", "v6", "v8"):
             with self.subTest(version=version):
                 candidate = self.bundle(f"candidate-{version}")
                 mutate_manifest(

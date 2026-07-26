@@ -222,6 +222,11 @@ manifest_columns=(
     host_cpu_set
     host_cpu_selection
     host_cpu_class
+    platform_class
+    pmu_source
+    cpu_model
+    firmware_version
+    cpu_freq_policy
     kernel_artifact
     metrics_artifact
     metrics_sha256
@@ -381,7 +386,7 @@ while IFS= read -r arch; do
         host_post_sha256=$(sha256sum "$run_dir/host-post.tsv" | awk '{ print $1 }')
         host_post_size_bytes=$(stat -c '%s' "$run_dir/host-post.tsv")
         manifest_row=(
-            thekernel-mm-performance-bundle-v8
+            thekernel-mm-performance-bundle-v9
             "$repo_commit"
             "$ax_commit"
             "$linux_abi_commit"
@@ -405,6 +410,11 @@ while IFS= read -r arch; do
             "$host_cpu_set"
             "$host_cpu_selection"
             "$host_cpu_class"
+            qemu-tcg
+            none
+            not-applicable
+            not-applicable
+            not-applicable
             "$kernel_relative"
             "$metrics_relative"
             "$metrics_sha256"
