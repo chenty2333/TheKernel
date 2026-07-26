@@ -134,6 +134,10 @@ ci_run_step ci-script-tests "$STEP_TIMEOUT_SECS" \
     env THEKERNEL_AX_REPO="$AX_REPO" \
     THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO" \
     "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
+ci_run_step differential-framework-tests 60 \
+    "$REPO_ROOT/tests/ci/test-differential-framework.sh"
+ci_run_step syz-differential-prototype 120 \
+    "$REPO_ROOT/tools/syz-differential/test_prototype.sh"
 ci_run_step tool-tests "$STEP_TIMEOUT_SECS" make test-tools
 
 ci_run_step kernel-host-check "$STEP_TIMEOUT_SECS" \

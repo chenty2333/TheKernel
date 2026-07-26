@@ -11,7 +11,10 @@ Contents:
 
 - `lib.sh` — shared bash library used by the host runners
   (`scripts/ci/seccomp-host-differential.sh`,
-  `scripts/ci/packet-host-differential.sh`, and future case runners).
+  `scripts/ci/packet-host-differential.sh`,
+  `scripts/ci/futex-host-differential.sh`,
+  `scripts/ci/epoll-host-differential.sh`, and
+  `scripts/ci/signal-order-host-differential.sh`).
 - `manifests/<case>.markers` — the exact marker set a passing run must emit.
 - `allowlist/` — documented host-divergence waivers, empty by default.
 - `validate-receipt.py` — schema validator for produced receipts.
@@ -93,6 +96,23 @@ Every executed run writes `<workdir>/receipt.json`:
   "result": "pass"
 }
 ```
+
+Portable runners refuse a dirty checkout, freeze their C source and marker
+manifest directly from `git_rev`, execute that frozen source, and revalidate
+the repository revision and cleanliness immediately before publishing the
+receipt. Thus `git_rev` identifies the exact input bytes rather than merely
+describing whichever commit happened to be checked out near the run.
+
+`epoll` has an explicit guest capability boundary. Host Linux is checked
+against `epoll.markers`, including real `EPOLLEXCLUSIVE` wake selection. The
+current TheKernel fd-core contract lacks the cross-epoll/source selector needed
+to implement that rule, so guest replay invokes the same binary with
+`--thekernel` and checks `epoll-guest.markers`: `EPOLL_CTL_ADD` and
+`EPOLL_CTL_MOD` must reject `EPOLLEXCLUSIVE` with `EINVAL`, and the guest
+console records `THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_OK`. Every other epoll
+marker is shared and remains strict. This bounded capability branch must be
+removed when the lower-layer selector exists; it is not a Linux conformance
+PASS.
 
 A `pass` receipt must account for every expected marker as either matched or
 explicitly allowlisted. Validate with:

@@ -446,6 +446,44 @@ static int thread_is_blocked(pid_t tid) {
     return state[2] == 'S';
 }
 
+/* The maintained fd core intentionally has no EPOLLEXCLUSIVE capability in
+ * its 0.1.0 contract: implementing Linux's selector requires a registry that
+ * arbitrates wake ownership across distinct epoll instances sharing one
+ * source. TheKernel must reject the flag explicitly until that mechanism
+ * exists; accepting it as ordinary level-triggered interest would be a false
+ * Linux-semantic claim. */
+static int test_exclusive_unsupported(void) {
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    int event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (epoll_fd < 0 || event_fd < 0) {
+        return fail("exclusive-unsupported-create");
+    }
+
+    struct epoll_event event = {.events = EPOLLIN | EPOLLEXCLUSIVE};
+    event.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, event_fd, &event, EINVAL,
+                         "exclusive-unsupported-add")) {
+        return 1;
+    }
+    if (ctl_add(epoll_fd, event_fd, EPOLLIN, EXCLUSIVE_SHARED_TAG,
+                "exclusive-unsupported-add-plain")) {
+        return 1;
+    }
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_MOD, event_fd, &event, EINVAL,
+                         "exclusive-unsupported-mod")) {
+        return 1;
+    }
+    marker("THEKERNEL_EPOLL_EXCLUSIVE_MOD_EINVAL_OK");
+    printf("THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_BOUNDARY "
+           "capability=unsupported add_errno=EINVAL mod_errno=EINVAL\n");
+    fflush(stdout);
+    marker("THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_OK");
+
+    close(event_fd);
+    close(epoll_fd);
+    return 0;
+}
+
 static int test_exclusive(void) {
     exclusive_shared_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     int release_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -558,11 +596,12 @@ static int test_exclusive(void) {
 }
 
 int main(int argc, char **argv) {
+    int thekernel_mode = 0;
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
     if (argc == 2 && strcmp(argv[1], "--thekernel") == 0) {
-        /* Reserved for guest-strict variants; no semantic divergence today. */
+        thekernel_mode = 1;
     } else if (argc != 1) {
         errno = EINVAL;
         return fail("unknown-option");
@@ -575,7 +614,7 @@ int main(int argc, char **argv) {
 
     if (test_level_vs_edge() || test_et_partial_read() || test_oneshot() ||
         test_ctl_errors() || test_hup() || test_timeouts() || test_nested() ||
-        test_exclusive()) {
+        (thekernel_mode ? test_exclusive_unsupported() : test_exclusive())) {
         return 1;
     }
 

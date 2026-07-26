@@ -162,6 +162,31 @@ static int wait_for_success(pid_t child, const char *stage) {
     return 0;
 }
 
+static int test_portable_differential(const char *path, const char *argument,
+                                      const char *stage,
+                                      const char *success_marker) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail(stage);
+    }
+    if (child == 0) {
+        if (argument == NULL) {
+            execl(path, path, (char *)NULL);
+        } else {
+            execl(path, path, argument, (char *)NULL);
+        }
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL %s-exec errno=%d (%s)\n",
+                stage, errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, stage) != 0) {
+        return 1;
+    }
+    puts(success_marker);
+    return 0;
+}
+
 static int test_memory_pressure_reclaim(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -398,8 +423,24 @@ int main(int argc, char **argv) {
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
         test_memory_pressure_reclaim() || test_process_pipe_and_exec() || test_signal_wait_boundary() ||
-        test_wait_boundary() || test_io_uring() || test_userfaultfd() ||
-        test_packet_socket() || test_seccomp()) {
+        test_wait_boundary() ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-futex-smoke",
+            NULL,
+            "futex-differential-child",
+            "THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK") ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-epoll-smoke",
+            "--thekernel",
+            "epoll-differential-child",
+            "THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK") ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-signal-order-smoke",
+            NULL,
+            "signal-order-differential-child",
+            "THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK") ||
+        test_io_uring() || test_userfaultfd() || test_packet_socket() ||
+        test_seccomp()) {
         return 1;
     }
 

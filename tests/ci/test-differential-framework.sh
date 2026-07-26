@@ -56,4 +56,24 @@ actual=$(printf '%s\n' "$waived_marker" |
 [ "$actual" = "$waived_marker" ]
 [ ! -s "$applied" ]
 
+# The guest epoll capability branch may differ only at the one lower-layer
+# mechanism that is explicitly unsupported. All other Linux-observable
+# markers stay shared and strict.
+python3 - \
+    "$REPO_ROOT/scripts/ci/differential/manifests/epoll.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/epoll-guest.markers" <<'PY'
+import sys
+
+
+def markers(path):
+    with open(path, encoding="utf-8") as source:
+        return {line.strip() for line in source if line.strip()}
+
+
+host = markers(sys.argv[1])
+guest = markers(sys.argv[2])
+assert host - guest == {"THEKERNEL_EPOLL_EXCLUSIVE_OK"}
+assert guest - host == {"THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_OK"}
+PY
+
 printf '%s\n' 'test-differential-framework: PASS'

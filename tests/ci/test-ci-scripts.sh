@@ -824,10 +824,15 @@ grep -Fqx $'command_exit_code\t9' "$tmp/pr-gate-fail-logs/evidence/receipt.tsv"
 system_fixture="$tmp/system-fixture"
 mkdir -p \
     "$system_fixture/scripts/ci" \
+    "$system_fixture/scripts/ci/differential/manifests" \
     "$system_fixture/fake-bin" \
     "$system_fixture/.state/rootfs"
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
 cp "$CI_DIR/lib.sh" "$system_fixture/scripts/ci/"
+cp "$CI_DIR/differential/manifests/futex.markers" \
+    "$CI_DIR/differential/manifests/epoll-guest.markers" \
+    "$CI_DIR/differential/manifests/signal-order.markers" \
+    "$system_fixture/scripts/ci/differential/manifests/"
 printf fixture >"$system_fixture/kernel-rv"
 printf fixture >"$system_fixture/kernel-la"
 printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
@@ -886,13 +891,24 @@ case "$arch" in
     la) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent' ;;
     *) exit 2 ;;
 esac >>"$workdir/console.log"
-cat >>"$workdir/console.log" <<'MARKERS_AFTER_SETRLIMIT'
+cat >>"$workdir/console.log" <<'MARKERS_AFTER_WAIT'
 CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT
 CI_WAIT_BOUNDARY_FUTEX_WAKE_OK
 CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK
 CI_WAIT_BOUNDARY_FUTEX_WAITV_OK
 CI_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK
+MARKERS_AFTER_WAIT
+fixture_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cat \
+    "$fixture_root/scripts/ci/differential/manifests/futex.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/epoll-guest.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/signal-order.markers" \
+    >>"$workdir/console.log"
+cat >>"$workdir/console.log" <<'MARKERS_AFTER_DIFFERENTIAL'
+THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK
 THEKERNEL_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_IO_URING_OK
 THEKERNEL_USERFAULTFD_API_OK
@@ -947,7 +963,7 @@ THEKERNEL_SECCOMP_RESOURCE_ROLLBACK_OK
 THEKERNEL_SECCOMP_OK
 THEKERNEL_SYSTEM_TEST_SECCOMP_OK
 THEKERNEL_SYSTEM_TEST_PASS
-MARKERS_AFTER_SETRLIMIT
+MARKERS_AFTER_DIFFERENTIAL
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$system_fixture/fake-bin/python3"
