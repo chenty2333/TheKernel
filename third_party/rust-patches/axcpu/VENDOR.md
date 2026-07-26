@@ -38,6 +38,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - Adds a fixed-capacity `IrqBoundary` transport around the existing
   `handle_trap!(IRQ, ...)` dispatch. It reports enter/exit only; platform IRQ
   acknowledgement and scheduler policy remain in `axhal`/higher layers.
+- `host-test-context` disables exception-table recovery in hosted unit tests,
+  which cannot route CPU faults through the kernel trap entry or use the
+  production linker script; the `target_os = "none"` kernel path is unchanged.
 - Maintained delta: LoongArch user-copy assembly, unaligned access handling,
   architecture initialization, pair-granular local TLB invalidation, and
   current-CPU instruction-cache publication primitives only; Linux user-copy
