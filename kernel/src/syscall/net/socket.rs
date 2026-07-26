@@ -100,10 +100,11 @@ fn require_bind_permissions(
         return Ok(());
     };
 
-    if ip_addr.port() != 0 && ip_addr.port() < FIRST_UNPRIVILEGED_PORT {
-        if !ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_BIND_SERVICE) {
-            return Err(AxError::from(LinuxError::EACCES));
-        }
+    if ip_addr.port() != 0
+        && ip_addr.port() < FIRST_UNPRIVILEGED_PORT
+        && !ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_BIND_SERVICE)
+    {
+        return Err(AxError::from(LinuxError::EACCES));
     }
 
     Ok(())
@@ -263,19 +264,19 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
         .ok_or(AxError::InvalidInput)?;
     let actor = snapshot.actor();
-    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
+    dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
 
     if domain == AF_PACKET {
         let net_ns = snapshot.net_namespace().clone();
         let socket =
-            prepare_packet_socket_after_create(&actor, net_ns, ty, proto, nonblocking, spec)?;
+            prepare_packet_socket_after_create(actor, net_ns, ty, proto, nonblocking, spec)?;
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
         let socket = prepare_new_socket_like(AfAlgSocket::new_listener(), nonblocking)?;
-        dispatch_socket_post_create(&actor, &socket, spec)?;
+        dispatch_socket_post_create(actor, &socket, spec)?;
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
@@ -285,7 +286,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         NetlinkSocket::validate_socket_type(ty, proto)?;
         let socket = NetlinkSocket::try_new(proto, net_ns)?;
         let socket = prepare_new_socket_arc(socket, nonblocking)?;
-        dispatch_socket_post_create(&actor, &socket, spec)?;
+        dispatch_socket_post_create(actor, &socket, spec)?;
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
@@ -337,7 +338,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     };
     let socket = Socket::new(socket, net_ns);
     let socket = prepare_new_socket_like(socket, nonblocking)?;
-    dispatch_socket_post_create(&actor, &socket, spec)?;
+    dispatch_socket_post_create(actor, &socket, spec)?;
     publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)
 }
 
@@ -352,7 +353,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             debug!("sys_bind <= fd: {fd}, af_alg: {addr:?}");
             let prepared = PreparedSocketAddress::AfAlg(addr);
             dispatch_socket(&SocketSecurityContext::bind(
-                &actor,
+                actor,
                 &socket_ref,
                 &prepared,
                 addrlen as usize,
@@ -384,7 +385,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             };
             let prepared = PreparedSocketAddress::Netlink(addr);
             dispatch_socket(&SocketSecurityContext::bind(
-                &actor,
+                actor,
                 &socket_ref,
                 &prepared,
                 addrlen as usize,
@@ -412,7 +413,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
             let prepared = PreparedSocketAddress::Network(addr);
             dispatch_socket(&SocketSecurityContext::bind(
-                &actor,
+                actor,
                 &socket_ref,
                 &prepared,
                 addrlen as usize,
@@ -476,7 +477,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
         let socket_ref = pinned.security_ref()?;
         let prepared = PreparedSocketAddress::Unspecified;
         dispatch_socket(&SocketSecurityContext::connect(
-            &actor,
+            actor,
             &socket_ref,
             &prepared,
             addrlen as usize,
@@ -493,7 +494,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
     let socket_ref = pinned.security_ref()?;
     let prepared = PreparedSocketAddress::Network(addr);
     dispatch_socket(&SocketSecurityContext::connect(
-        &actor,
+        actor,
         &socket_ref,
         &prepared,
         addrlen as usize,
@@ -521,7 +522,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
                     &reservation,
                 );
                 dispatch_socket(&SocketSecurityContext::unix_stream_connect(
-                    &actor,
+                    actor,
                     &socket_ref,
                     &listening,
                     &accepted,
@@ -546,7 +547,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
                     &reservation,
                 );
                 dispatch_socket(&SocketSecurityContext::unix_stream_connect(
-                    &actor,
+                    actor,
                     &socket_ref,
                     &listening,
                     &accepted,
@@ -580,7 +581,7 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
     let prepared_backlog =
         SocketListenBacklog::try_from_clamped(backlog as i32).ok_or(AxError::InvalidInput)?;
     dispatch_socket(&SocketSecurityContext::listen(
-        &actor,
+        actor,
         &socket_ref,
         prepared_backlog,
     ))?;
@@ -630,7 +631,7 @@ pub fn sys_accept4(
         );
         let accepted_ref = AcceptedSocketSecurityRef::Bare(bare_ref);
         dispatch_socket(&SocketSecurityContext::accept(
-            &actor,
+            actor,
             &listening_ref,
             &accepted_ref,
         ))?;
@@ -642,7 +643,7 @@ pub fn sys_accept4(
         let accepted_ref = request.security_ref()?;
         let accepted_ref = AcceptedSocketSecurityRef::Description(accepted_ref);
         dispatch_socket(&SocketSecurityContext::accept(
-            &actor,
+            actor,
             &listening_ref,
             &accepted_ref,
         ))?;
@@ -658,7 +659,7 @@ pub fn sys_accept4(
     let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
     let accepted_ref = AcceptedSocketSecurityRef::Pending(pending_ref);
     dispatch_socket(&SocketSecurityContext::accept(
-        &actor,
+        actor,
         &listening_ref,
         &accepted_ref,
     ))?;
@@ -687,7 +688,7 @@ pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
     let actor = snapshot.actor();
     let socket_ref = pinned.security_ref()?;
     dispatch_socket(&SocketSecurityContext::shutdown(
-        &actor,
+        actor,
         &socket_ref,
         how as i32,
     ))?;
@@ -739,8 +740,8 @@ pub fn sys_socketpair(
     let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
         .ok_or(AxError::InvalidInput)?;
     let actor = snapshot.actor();
-    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
-    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
+    dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
+    dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
 
     let credentials = snapshot.unix_credentials();
     let net_ns = snapshot.net_namespace().clone();
@@ -790,13 +791,13 @@ pub fn sys_socketpair(
     )?;
     let socket1 = PinnedSocketDescription::from_description(description1)?;
     let socket2 = PinnedSocketDescription::from_description(description2)?;
-    dispatch_socket_post_create(&actor, &socket1, spec)?;
-    dispatch_socket_post_create(&actor, &socket2, spec)?;
+    dispatch_socket_post_create(actor, &socket1, spec)?;
+    dispatch_socket_post_create(actor, &socket2, spec)?;
     {
         let socket1_ref = socket1.security_ref()?;
         let socket2_ref = socket2.security_ref()?;
         dispatch_socket(&SocketSecurityContext::pair(
-            &actor,
+            actor,
             &socket1_ref,
             &socket2_ref,
         ))?;

@@ -301,7 +301,7 @@ impl AfAlgSocket {
             AlgFamily::Skcipher => match state.binding.alg_name.as_str() {
                 "salsa20" => Vec::new(),
                 "cbc(aes-generic)" => {
-                    if state.buffer.len() % 16 != 0 {
+                    if !state.buffer.len().is_multiple_of(16) {
                         return Err(AxError::InvalidInput);
                     }
                     state.buffer.clone()

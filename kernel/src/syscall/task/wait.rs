@@ -460,16 +460,13 @@ pub fn sys_waitpid(
                 return Err(err);
             }
 
-            match &event {
-                WaitEvent::Exited { child, snapshot } => {
-                    let reaped = reap_child(child)?;
-                    if !reaped {
-                        return Ok(None);
-                    }
-                    cgroup::detach_process(child.pid());
-                    proc_data.account_waited_child(snapshot.total_usage().into());
+            if let WaitEvent::Exited { child, snapshot } = &event {
+                let reaped = reap_child(child)?;
+                if !reaped {
+                    return Ok(None);
                 }
-                _ => {}
+                cgroup::detach_process(child.pid());
+                proc_data.account_waited_child(snapshot.total_usage().into());
             }
 
             return Ok(Some(event.pid() as isize));

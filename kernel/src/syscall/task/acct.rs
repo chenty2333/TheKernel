@@ -137,7 +137,7 @@ pub fn acct_process_exit(proc_data: &ProcessData, exit_code: i32, usage: TaskUsa
         .unwrap_or("");
     let record = build_record(
         proc_data,
-        &command,
+        command,
         usage,
         exit_code,
         accounting.uid,
@@ -175,7 +175,7 @@ pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
         Ok(stat) => stat,
         Err(err) => {
             let _ = close_file_like(fd);
-            return Err(err.into());
+            return Err(err);
         }
     };
     if stat.node_type != NodeType::RegularFile {

@@ -87,10 +87,10 @@ fn xattr_location(file_like: &dyn FileLike) -> Option<Location> {
         Some(file.inner().location().clone())
     } else if let Some(directory) = file_like.downcast_ref::<Directory>() {
         Some(directory.inner().clone())
-    } else if let Some(pipe) = file_like.downcast_ref::<NamedPipe>() {
-        Some(pipe.location().clone())
     } else {
-        None
+        file_like
+            .downcast_ref::<NamedPipe>()
+            .map(|pipe| pipe.location().clone())
     }
 }
 

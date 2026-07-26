@@ -3,7 +3,6 @@
 
 #![no_std]
 #![feature(likely_unlikely)]
-#![feature(bstr)]
 #![feature(allocator_api)]
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -30,4 +29,6 @@ mod random;
 mod readiness;
 mod syscall;
 mod task;
+#[cfg(test)]
+mod test_support;
 mod time;

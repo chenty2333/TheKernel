@@ -26,6 +26,9 @@ readme = false
 license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 repository = "https://github.com/arceos-org/arceos/tree/main/modules/axnet"
 
+[lints]
+workspace = true
+
 [features]
 vsock = ["axdriver/vsock"]
 

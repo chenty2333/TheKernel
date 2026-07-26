@@ -1816,12 +1816,12 @@ impl ThreadFdInfoDir {
         if let Some(fanotify) = description.inner.downcast_ref::<FanotifyFile>() {
             out.push_str(&fanotify.fdinfo());
         }
-        if let Some(pidfd) = description.inner.downcast_ref::<PidFd>() {
-            if let Ok(proc_data) = pidfd.process_data() {
-                let pid = proc_data.proc.pid();
-                let _ = writeln!(out, "Pid:\t{pid}");
-                let _ = writeln!(out, "NSpid:\t{pid}");
-            }
+        if let Some(pidfd) = description.inner.downcast_ref::<PidFd>()
+            && let Ok(proc_data) = pidfd.process_data()
+        {
+            let pid = proc_data.proc.pid();
+            let _ = writeln!(out, "Pid:\t{pid}");
+            let _ = writeln!(out, "NSpid:\t{pid}");
         }
         out
     }
@@ -2532,8 +2532,8 @@ impl SimpleDirOps for ThreadDir {
                     .has_effective_capability(CAP_SYS_ADMIN);
                 ProcPagemapFile::new(fs, aspace, show_pfn).into()
             }
-            "mounts" => SimpleFile::new_regular(fs, move || render_mounts()).into(),
-            "mountinfo" => SimpleFile::new_regular(fs, move || render_mountinfo()).into(),
+            "mounts" => SimpleFile::new_regular(fs, render_mounts).into(),
+            "mountinfo" => SimpleFile::new_regular(fs, render_mountinfo).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();

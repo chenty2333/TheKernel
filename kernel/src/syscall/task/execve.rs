@@ -509,9 +509,7 @@ fn do_execve(
     }
     sibling_tids.retain(|&tid| tid != curr_tid);
     interrupt_exec_siblings(&sibling_tids);
-    if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
-        return Err(err);
-    }
+    wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids)?;
     if let Some(private) = private_fd_table {
         let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
         drop(previous);
@@ -648,6 +646,47 @@ pub fn sys_execve(
     let loc = resolve_at_with_security(AT_FDCWD, Some(&path), 0, &security)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
+    do_execve(uctx, loc, args, envs, &security)
+}
+
+pub fn sys_execveat(
+    uctx: &mut UserContext,
+    dirfd: i32,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    flags: i32,
+) -> AxResult<isize> {
+    if flags < 0 || (flags as u32) & !SUPPORTED_EXECVEAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let path = vm_load_string(path)?;
+    let (args, envs) = load_exec_args_env(argv, envp)?;
+    debug!(
+        "sys_execveat <= dirfd: {dirfd}, path: {path:?}, args: {args:?}, envs: {envs:?}, flags: \
+         {flags:#x}"
+    );
+
+    // Use one pre-exec view for the initial path and every interpreter lookup.
+    let security = VfsSecurityContext::new(current().as_thread().current_cred());
+    let resolved = if path.is_empty() {
+        if (flags as u32) & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        resolve_at_with_security(dirfd, None, flags as u32, &security)?
+    } else {
+        resolve_at_with_security(dirfd, Some(path.as_str()), flags as u32, &security)?
+    };
+
+    let loc = match resolved {
+        ResolveAtResult::File(loc) => loc,
+        ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
+    };
+    if (flags as u32) & AT_SYMLINK_NOFOLLOW != 0 && loc.node_type() == NodeType::Symlink {
+        return Err(axerrno::LinuxError::ELOOP.into());
+    }
+
     do_execve(uctx, loc, args, envs, &security)
 }
 
@@ -816,45 +855,4 @@ mod tests {
         drop(retirement);
         assert_eq!(trace.load(Ordering::SeqCst), 12);
     }
-}
-
-pub fn sys_execveat(
-    uctx: &mut UserContext,
-    dirfd: i32,
-    path: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
-    flags: i32,
-) -> AxResult<isize> {
-    if flags < 0 || (flags as u32) & !SUPPORTED_EXECVEAT_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let path = vm_load_string(path)?;
-    let (args, envs) = load_exec_args_env(argv, envp)?;
-    debug!(
-        "sys_execveat <= dirfd: {dirfd}, path: {path:?}, args: {args:?}, envs: {envs:?}, flags: \
-         {flags:#x}"
-    );
-
-    // Use one pre-exec view for the initial path and every interpreter lookup.
-    let security = VfsSecurityContext::new(current().as_thread().current_cred());
-    let resolved = if path.is_empty() {
-        if (flags as u32) & AT_EMPTY_PATH == 0 {
-            return Err(AxError::NotFound);
-        }
-        resolve_at_with_security(dirfd, None, flags as u32, &security)?
-    } else {
-        resolve_at_with_security(dirfd, Some(path.as_str()), flags as u32, &security)?
-    };
-
-    let loc = match resolved {
-        ResolveAtResult::File(loc) => loc,
-        ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
-    };
-    if (flags as u32) & AT_SYMLINK_NOFOLLOW != 0 && loc.node_type() == NodeType::Symlink {
-        return Err(axerrno::LinuxError::ELOOP.into());
-    }
-
-    do_execve(uctx, loc, args, envs, &security)
 }

@@ -6,6 +6,9 @@ publish = false
 description = "Transitional package-name facade for TheKernel's maintained axtask"
 license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 name = "axtask"
 path = "src/lib.rs"

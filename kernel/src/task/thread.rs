@@ -245,24 +245,25 @@ fn link_task_parent_locked(
     let old_head = parent.state.lock().first_child.take();
     let old_head_node = old_head.as_ref().and_then(Weak::upgrade);
     let displaced_backward = old_head_node.as_ref().and_then(|old_head| {
-        core::mem::replace(
-            &mut old_head.state.lock().previous_sibling,
-            Some(Arc::downgrade(child)),
-        )
+        old_head
+            .state
+            .lock()
+            .previous_sibling
+            .replace(Arc::downgrade(child))
     });
     let (old_parent, old_previous, old_next) = {
         let mut child_state = child.state.lock();
-        let old = (
+        (
             child_state.parent.replace(parent.clone()),
             child_state.previous_sibling.take(),
             core::mem::replace(&mut child_state.next_sibling, old_head),
-        );
-        old
+        )
     };
-    let displaced_forward = core::mem::replace(
-        &mut parent.state.lock().first_child,
-        Some(Arc::downgrade(child)),
-    );
+    let displaced_forward = parent
+        .state
+        .lock()
+        .first_child
+        .replace(Arc::downgrade(child));
     RetiredTaskParentLinks {
         _parent: old_parent,
         _previous: old_previous,

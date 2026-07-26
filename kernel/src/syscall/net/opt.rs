@@ -298,7 +298,7 @@ fn xt_entry_size(table: &[u8], offset: usize) -> AxResult<usize> {
     Ok(u16::from_ne_bytes([raw[0], raw[1]]) as usize)
 }
 
-fn xt_entry_name<'a>(table: &'a [u8], offset: usize) -> AxResult<&'a [u8]> {
+fn xt_entry_name(table: &[u8], offset: usize) -> AxResult<&[u8]> {
     let name_start = offset.checked_add(2).ok_or(AxError::InvalidInput)?;
     let name_end = name_start
         .checked_add(XT_EXTENSION_MAXNAMELEN)

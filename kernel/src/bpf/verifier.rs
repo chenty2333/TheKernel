@@ -1098,9 +1098,7 @@ fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType, src_ty: Option<RegType>) -
 }
 
 fn clobber_caller_saved(regs: &mut [RegState; BPF_MAX_REGS]) {
-    for reg in 1..=5 {
-        regs[reg] = RegState::default();
-    }
+    regs[1..=5].fill(RegState::default());
 }
 
 fn clobber_map_value_ptrs(regs: &mut [RegState; BPF_MAX_REGS]) {

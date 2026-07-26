@@ -340,6 +340,10 @@ fn install_prepared_pin_shard(
 fn prepare_physical_pin_registry_with(
     mut allocate: impl FnMut(usize) -> AxResult<PinnedFrameTable>,
 ) -> AxResult<()> {
+    // `shard_index` is an operand, not just a subscript: the allocator and the
+    // installer both receive it so a partially installed prefix stays
+    // identifiable. Iterating the shard array directly would lose that.
+    #[allow(clippy::needless_range_loop)]
     for shard_index in 0..PIN_TABLE_SHARDS {
         if crate::mm::lock_mm_diagnosed!(PINNED_FRAME_SHARDS[shard_index], PhysPinRegistryShard)
             .is_some()

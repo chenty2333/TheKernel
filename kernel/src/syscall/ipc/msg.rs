@@ -470,6 +470,9 @@ impl MsgInfo {
         }
     }
 
+    // Mirrors the `MSG_INFO` msgctl command rather than a Rust constructor
+    // convention; the name is the Linux operation it answers.
+    #[allow(clippy::self_named_constructors)]
     fn msg_info(msg_manager: &MsgManager) -> Self {
         let mut info = Self::ipc_info();
         info.msgpool = msg_manager.queue_count().min(i32::MAX as usize) as i32;

@@ -136,13 +136,7 @@ impl<'a> BpfVm<'a> {
             BPF_OP_ADD => self.regs[dst].wrapping_add(src_val),
             BPF_OP_SUB => self.regs[dst].wrapping_sub(src_val),
             BPF_OP_MUL => self.regs[dst].wrapping_mul(src_val),
-            BPF_OP_DIV => {
-                if src_val == 0 {
-                    0
-                } else {
-                    self.regs[dst] / src_val
-                }
-            }
+            BPF_OP_DIV => self.regs[dst].checked_div(src_val).unwrap_or(0),
             BPF_OP_MOD => {
                 if src_val == 0 {
                     self.regs[dst]
@@ -205,13 +199,7 @@ impl<'a> BpfVm<'a> {
             BPF_OP_ADD => dst_val.wrapping_add(src_val),
             BPF_OP_SUB => dst_val.wrapping_sub(src_val),
             BPF_OP_MUL => dst_val.wrapping_mul(src_val),
-            BPF_OP_DIV => {
-                if src_val == 0 {
-                    0
-                } else {
-                    dst_val / src_val
-                }
-            }
+            BPF_OP_DIV => dst_val.checked_div(src_val).unwrap_or(0),
             BPF_OP_MOD => {
                 if src_val == 0 {
                     dst_val
@@ -396,7 +384,7 @@ impl<'a> BpfVm<'a> {
         let size = insn.code & 0x18;
 
         // Sign-extend the 32-bit immediate to 64-bit
-        let imm = insn.imm as i32 as i64 as u64;
+        let imm = insn.imm as i64 as u64;
 
         match size {
             BPF_SIZE_B => self.mem_write::<u8>(addr, imm as u8)?,
@@ -569,7 +557,7 @@ impl<'a> BpfVm<'a> {
         if insn.code & BPF_SRC_X != 0 {
             self.regs[insn.src_reg() as usize]
         } else {
-            insn.imm as i32 as i64 as u64
+            insn.imm as i64 as u64
         }
     }
 }

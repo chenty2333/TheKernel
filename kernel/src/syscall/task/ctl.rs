@@ -890,7 +890,7 @@ pub fn sys_move_pages(
                 let node = nodes.wrapping_add(index).vm_read()?;
                 validate_movable_node(node)?;
                 if flags & MPOL_MF_MOVE_ALL as usize == 0 && numa_page_is_shareable(&target, page) {
-                    -(LinuxError::EACCES.code() as i32)
+                    -LinuxError::EACCES.code()
                 } else {
                     target.bind_mempolicy_range(
                         VirtAddr::from(page).align_down_4k().as_usize(),
@@ -900,7 +900,7 @@ pub fn sys_move_pages(
                     node
                 }
             }
-            Err(_) => -(LinuxError::EFAULT.code() as i32),
+            Err(_) => -LinuxError::EFAULT.code(),
         };
         status.wrapping_add(index).vm_write(status_value)?;
     }

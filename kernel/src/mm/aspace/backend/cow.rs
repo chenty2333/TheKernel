@@ -614,7 +614,7 @@ impl CowBackend {
                 }
                 Err(err) => {
                     dealloc_frame(frame, self.size);
-                    return Err(err.into());
+                    return Err(err);
                 }
             };
             let tail_start = start + read;
@@ -860,6 +860,156 @@ impl CowBackend {
 
     pub(crate) fn is_private_anonymous(&self) -> bool {
         self.file.is_none()
+    }
+}
+
+impl BackendOps for CowBackend {
+    fn page_size(&self) -> PageSize {
+        self.size
+    }
+
+    fn map(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        _pt: &mut PageTableCursor,
+    ) -> AxResult {
+        debug!("Cow::map: {range:?} {flags:?}",);
+        Ok(())
+    }
+
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
+        debug!("Cow::unmap: {range:?}");
+        pages_in(range, self.size)?;
+        if !self.is_materialized() {
+            return Ok(BackendRetirement::empty());
+        }
+        let materialized = pt.drain_present_leaves(range.start, range.size())?;
+        for (_, _, _, page_size) in &materialized {
+            assert_eq!(*page_size, self.size);
+        }
+        Ok(BackendRetirement::cow(CowUnmapRetirement {
+            leaves: materialized,
+        }))
+    }
+
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
+        preflight_sparse_unmap(range, self.size, pt)
+    }
+
+    fn populate(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        access_flags: MappingFlags,
+        pt: &mut PageTableCursor,
+    ) -> PopulateOutcome {
+        PopulateOutcome::immediate((|| {
+            let mut pages = 0;
+            for addr in pages_in(range, self.size)? {
+                match pt.query(addr) {
+                    Ok((paddr, page_flags, page_size)) => {
+                        if self.size != page_size {
+                            return Err(AxError::BadAddress);
+                        }
+                        if access_flags.contains(MappingFlags::WRITE)
+                            && !page_flags.contains(MappingFlags::WRITE)
+                        {
+                            self.handle_cow_fault(addr, paddr, flags, pt)?;
+                            pages += 1;
+                        } else if page_flags.contains(access_flags) {
+                            pages += 1;
+                        }
+                    }
+                    // If the page is not mapped, try map it.
+                    Err(PagingError::NotMapped) => {
+                        self.alloc_new_at(addr, flags, pt)?;
+                        pages += 1;
+                    }
+                    Err(_) => return Err(AxError::BadAddress),
+                }
+            }
+            Ok(pages)
+        })())
+    }
+
+    fn clone_map(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        old_pt: &mut PageTableCursor,
+        new_pt: &mut PageTableCursor,
+        _new_aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Backend> {
+        let cow_flags = page_table_flags(flags) - MappingFlags::WRITE;
+        pages_in(range, self.size)?;
+        if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
+            // Fork must snapshot the parent's current private data image, not the
+            // original ELF file contents. Populate writable file-backed pages in
+            // the parent before sharing them read-only with the child.
+            for vaddr in pages_in(range, self.size)? {
+                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
+                    self.alloc_new_at(vaddr, cow_flags, old_pt)?;
+                }
+            }
+        }
+        let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
+        if !materialized.is_empty() {
+            self.mark_materialized();
+        }
+        let pages = materialized
+            .into_iter()
+            .map(|(vaddr, paddr, source_flags, page_size)| CowClonePage {
+                source_vaddr: vaddr,
+                destination_vaddr: vaddr,
+                paddr,
+                source_flags,
+                destination_flags: cow_flags,
+                page_size,
+                protect_source: source_flags.contains(MappingFlags::WRITE),
+            });
+        let mut ops = CursorCowCloneOps { old_pt, new_pt };
+        clone_pages_transactionally(pages, self.size, &mut ops, |paddr| {
+            self.get_or_track_frame_ref(paddr)
+        })?;
+
+        Ok(Backend::Cow(self.clone()))
+    }
+}
+
+impl Backend {
+    pub fn new_cow(
+        start: VirtAddr,
+        size: PageSize,
+        file: Location,
+        file_start: u64,
+        file_end: Option<u64>,
+        sigbus_on_eof: bool,
+    ) -> Self {
+        Self::Cow(CowBackend {
+            start,
+            size,
+            file: Some((
+                CachedFile::get_or_create(file),
+                file_start,
+                file_end,
+                sigbus_on_eof,
+            )),
+            map_id: Arc::new(()),
+            materialized: Arc::new(AtomicBool::new(false)),
+            status: MappingStatus::default(),
+        })
+    }
+
+    pub fn new_alloc(start: VirtAddr, size: PageSize) -> Self {
+        Self::Cow(CowBackend {
+            start,
+            size,
+            file: None,
+            map_id: Arc::new(()),
+            materialized: Arc::new(AtomicBool::new(false)),
+            status: MappingStatus::default(),
+        })
     }
 }
 
@@ -1164,155 +1314,5 @@ mod tests {
                 (pages[0].destination_vaddr, pages[0].paddr, page_size),
             ]
         );
-    }
-}
-
-impl BackendOps for CowBackend {
-    fn page_size(&self) -> PageSize {
-        self.size
-    }
-
-    fn map(
-        &self,
-        range: VirtAddrRange,
-        flags: MappingFlags,
-        _pt: &mut PageTableCursor,
-    ) -> AxResult {
-        debug!("Cow::map: {range:?} {flags:?}",);
-        Ok(())
-    }
-
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
-        debug!("Cow::unmap: {range:?}");
-        pages_in(range, self.size)?;
-        if !self.is_materialized() {
-            return Ok(BackendRetirement::empty());
-        }
-        let materialized = pt.drain_present_leaves(range.start, range.size())?;
-        for (_, _, _, page_size) in &materialized {
-            assert_eq!(*page_size, self.size);
-        }
-        Ok(BackendRetirement::cow(CowUnmapRetirement {
-            leaves: materialized,
-        }))
-    }
-
-    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
-        preflight_sparse_unmap(range, self.size, pt)
-    }
-
-    fn populate(
-        &self,
-        range: VirtAddrRange,
-        flags: MappingFlags,
-        access_flags: MappingFlags,
-        pt: &mut PageTableCursor,
-    ) -> PopulateOutcome {
-        PopulateOutcome::immediate((|| {
-            let mut pages = 0;
-            for addr in pages_in(range, self.size)? {
-                match pt.query(addr) {
-                    Ok((paddr, page_flags, page_size)) => {
-                        if self.size != page_size {
-                            return Err(AxError::BadAddress);
-                        }
-                        if access_flags.contains(MappingFlags::WRITE)
-                            && !page_flags.contains(MappingFlags::WRITE)
-                        {
-                            self.handle_cow_fault(addr, paddr, flags, pt)?;
-                            pages += 1;
-                        } else if page_flags.contains(access_flags) {
-                            pages += 1;
-                        }
-                    }
-                    // If the page is not mapped, try map it.
-                    Err(PagingError::NotMapped) => {
-                        self.alloc_new_at(addr, flags, pt)?;
-                        pages += 1;
-                    }
-                    Err(_) => return Err(AxError::BadAddress),
-                }
-            }
-            Ok(pages)
-        })())
-    }
-
-    fn clone_map(
-        &self,
-        range: VirtAddrRange,
-        flags: MappingFlags,
-        old_pt: &mut PageTableCursor,
-        new_pt: &mut PageTableCursor,
-        _new_aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> AxResult<Backend> {
-        let cow_flags = page_table_flags(flags) - MappingFlags::WRITE;
-        pages_in(range, self.size)?;
-        if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
-            // Fork must snapshot the parent's current private data image, not the
-            // original ELF file contents. Populate writable file-backed pages in
-            // the parent before sharing them read-only with the child.
-            for vaddr in pages_in(range, self.size)? {
-                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
-                    self.alloc_new_at(vaddr, cow_flags, old_pt)?;
-                }
-            }
-        }
-        let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
-        if !materialized.is_empty() {
-            self.mark_materialized();
-        }
-        let pages = materialized
-            .into_iter()
-            .map(|(vaddr, paddr, source_flags, page_size)| CowClonePage {
-                source_vaddr: vaddr,
-                destination_vaddr: vaddr,
-                paddr,
-                source_flags,
-                destination_flags: cow_flags,
-                page_size,
-                protect_source: source_flags.contains(MappingFlags::WRITE),
-            });
-        let mut ops = CursorCowCloneOps { old_pt, new_pt };
-        clone_pages_transactionally(pages, self.size, &mut ops, |paddr| {
-            self.get_or_track_frame_ref(paddr)
-        })?;
-
-        Ok(Backend::Cow(self.clone()))
-    }
-}
-
-impl Backend {
-    pub fn new_cow(
-        start: VirtAddr,
-        size: PageSize,
-        file: Location,
-        file_start: u64,
-        file_end: Option<u64>,
-        sigbus_on_eof: bool,
-    ) -> Self {
-        Self::Cow(CowBackend {
-            start,
-            size,
-            file: Some((
-                CachedFile::get_or_create(file),
-                file_start,
-                file_end,
-                sigbus_on_eof,
-            )),
-            map_id: Arc::new(()),
-            materialized: Arc::new(AtomicBool::new(false)),
-            status: MappingStatus::default(),
-        })
-    }
-
-    pub fn new_alloc(start: VirtAddr, size: PageSize) -> Self {
-        Self::Cow(CowBackend {
-            start,
-            size,
-            file: None,
-            map_id: Arc::new(()),
-            materialized: Arc::new(AtomicBool::new(false)),
-            status: MappingStatus::default(),
-        })
     }
 }

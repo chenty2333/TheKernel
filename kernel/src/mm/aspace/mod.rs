@@ -2851,7 +2851,7 @@ impl AddrSpace {
             };
             admit_staged_fragments_after_unmaps(
                 &self.areas,
-                &unmaps,
+                unmaps,
                 staged_fragments,
                 fragment_limit,
             )
@@ -3023,7 +3023,7 @@ impl AddrSpace {
             };
             admit_staged_fragments_after_unmaps(
                 &self.areas,
-                &destination_unmaps,
+                destination_unmaps,
                 staged_fragments,
                 fragment_limit,
             )
@@ -4475,8 +4475,7 @@ mod tests {
         let mut page_table = vec![0; (VMA_COUNT + 1) * STRIDE];
         let mut identities = MappingIdentityIndex::new();
         identities.states.reserve(VMA_COUNT);
-        let mut ranges = Vec::new();
-        ranges.reserve(VMA_COUNT / 64);
+        let mut ranges = Vec::with_capacity(VMA_COUNT / 64);
 
         for index in 0..VMA_COUNT {
             let start = index * STRIDE;

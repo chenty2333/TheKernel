@@ -39,9 +39,9 @@ Against the extracted registry source, the maintained patch across
 
 The manifest-declared `tests/test.rs` and original manifest have been restored
 from the verified archive. Two test-only `MaybeUninit` convenience calls were
-rewritten into equivalent operations supported by TheKernel's pinned
-nightly-2025-05-20 toolchain. Registry marker files and upstream repository CI
-are not part of the maintained fork contract.
+rewritten into equivalent operations supported by TheKernel's
+`nightly-2025-05-20` pin at the time that patch was introduced. Registry marker
+files and upstream repository CI are not part of the maintained fork contract.
 
 When rebasing, compare against the archive checksum and recorded source commit,
 then reapply the bounded snapshot and error contracts rather than copying only

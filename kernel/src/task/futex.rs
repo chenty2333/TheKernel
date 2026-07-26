@@ -25,6 +25,13 @@ use crate::{
     task::{AlarmClock, AsThread, PreparedClockSleep, ProcStateHint, prepare_clock_sleep},
 };
 
+/// Ordered waiter storage shared by every futex queue.
+type WaiterQueue = VecDeque<Arc<SpinNoIrq<WaiterEntry>>>;
+
+/// Destination queue, remaining requeue budget, and the entry that will own the
+/// moved waiters.
+type RequeueTarget<'a> = (&'a mut WaiterQueue, usize, Weak<FutexEntry>);
+
 /// Wait queue used by futex.
 #[derive(Default)]
 pub struct WaitQueue {
@@ -239,14 +246,10 @@ impl WaitQueue {
     }
 
     fn wake_and_requeue_locked(
-        src: &mut VecDeque<Arc<SpinNoIrq<WaiterEntry>>>,
+        src: &mut WaiterQueue,
         wake_count: usize,
         mask: u32,
-        mut requeue: Option<(
-            &mut VecDeque<Arc<SpinNoIrq<WaiterEntry>>>,
-            usize,
-            Weak<FutexEntry>,
-        )>,
+        mut requeue: Option<RequeueTarget<'_>>,
         pending_wakers: &mut Vec<Waker>,
     ) -> (usize, usize) {
         let mut woke = 0;
@@ -428,33 +431,33 @@ impl WaitQueue {
             let mut queue = self.queue.lock();
             queue.retain(|waiter| !waiter.lock().cancelled);
             count = count.min(queue.len());
-            return count;
+            count
         } else if (self as *const Self as usize) < (target as *const Self as usize) {
             let _self_gate = self.gate.lock();
             let _target_gate = target.gate.lock();
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            return Self::wake_and_requeue_locked(
+            Self::wake_and_requeue_locked(
                 &mut src,
                 0,
                 u32::MAX,
                 Some((&mut dst, count, target_owner)),
                 &mut Vec::new(),
             )
-            .1;
+            .1
         } else {
             let _target_gate = target.gate.lock();
             let _self_gate = self.gate.lock();
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            return Self::wake_and_requeue_locked(
+            Self::wake_and_requeue_locked(
                 &mut src,
                 0,
                 u32::MAX,
                 Some((&mut dst, count, target_owner)),
                 &mut Vec::new(),
             )
-            .1;
+            .1
         }
     }
 
@@ -590,26 +593,253 @@ pub fn wait_on_any_futex_if(
     resolve_wait_any(&mut registrations, result)
 }
 
+/// A key that uniquely identifies a futex in the system.
+pub enum FutexKey {
+    /// A futex that is private to the current process.
+    Private {
+        /// The memory address of the futex.
+        address: usize,
+    },
+
+    /// A futex in a shared memory region.
+    Shared {
+        /// The offset of the futex within the shared memory region.
+        offset: usize,
+        /// The shared memory region.
+        region: Result<Weak<SharedPages>, Weak<()>>,
+    },
+}
+
+impl FutexKey {
+    /// Creates a new `FutexKey`.
+    pub fn new(aspace: &AddrSpace, address: usize) -> Self {
+        if let Some(area) = aspace.find_area(VirtAddr::from_usize(address)) {
+            match area.backend() {
+                Backend::Shared(backend) => {
+                    if let Some(offset) = backend.backing_offset(address) {
+                        return Self::Shared {
+                            offset,
+                            region: Ok(Arc::downgrade(backend.pages())),
+                        };
+                    }
+                }
+                Backend::File(file) => {
+                    let (handle, offset) = file.futex_key(address);
+                    return Self::Shared {
+                        offset,
+                        region: Err(handle),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Self::Private { address }
+    }
+
+    /// Shortcut to create a `FutexKey` for the current task's address space.
+    pub fn new_current(address: usize) -> Self {
+        let aspace_handle = current().as_thread().proc_data.aspace();
+        Self::new(&aspace_handle.lock(), address)
+    }
+
+    /// Creates a `FutexKey` for a private futex, skipping the aspace lock and
+    /// VMA walk that `new_current` performs. Only valid when the caller has
+    /// already determined the futex is process-private (e.g. via
+    /// `FUTEX_PRIVATE_FLAG`).
+    pub fn new_private(address: usize) -> Self {
+        Self::Private { address }
+    }
+
+    fn as_usize(&self) -> usize {
+        match self {
+            FutexKey::Private { address } => *address,
+            FutexKey::Shared { offset, .. } => *offset,
+        }
+    }
+}
+
+/// The futex entry structure
+pub struct FutexEntry {
+    /// The wait queue associated with this futex.
+    pub wq: WaitQueue,
+}
+
+impl FutexEntry {
+    fn new() -> Self {
+        Self {
+            wq: WaitQueue::new(),
+        }
+    }
+}
+
+/// A table mapping memory addresses to futex wait queues.
+pub struct FutexTable(Mutex<HashMap<usize, Arc<FutexEntry>>>);
+
+impl FutexTable {
+    /// Creates a new `FutexTable`.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+
+    /// Checks if the futex table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+
+    /// Gets the wait queue associated with the given address.
+    pub fn get(&self, key: &FutexKey) -> Option<FutexGuard<'_>> {
+        let key = key.as_usize();
+        let entry = self.0.lock().get(&key).cloned()?;
+        Some(FutexGuard {
+            table: self,
+            key,
+            inner: entry,
+        })
+    }
+
+    /// Gets the wait queue associated with the given address, or inserts a a
+    /// new one if it doesn't exist.
+    pub fn get_or_insert(&self, key: &FutexKey) -> FutexGuard<'_> {
+        let key = key.as_usize();
+        let mut table = self.0.lock();
+        let entry = table
+            .entry(key)
+            .or_insert_with(|| Arc::new(FutexEntry::new()));
+        FutexGuard {
+            table: self,
+            key,
+            inner: entry.clone(),
+        }
+    }
+
+    /// Gets or inserts a futex entry and keeps its table slot alive until the
+    /// returned handle is dropped.
+    pub fn get_or_insert_owned(self: &Arc<Self>, key: &FutexKey) -> FutexHandle {
+        let key = key.as_usize();
+        let mut table = self.0.lock();
+        let entry = table
+            .entry(key)
+            .or_insert_with(|| Arc::new(FutexEntry::new()));
+        FutexHandle {
+            table: self.clone(),
+            key,
+            inner: entry.clone(),
+        }
+    }
+
+    /// Opportunistically removes an idle entry without splitting one futex
+    /// identity into two independently wakeable queues.
+    ///
+    /// Both the map identity and the strong-reference count must be observed
+    /// while the table is locked. Otherwise a concurrent lookup can clone the
+    /// mapped entry after an out-of-lock liveness check but before removal,
+    /// leaving that lookup attached to an entry which future wakers can no
+    /// longer find through the table.
+    fn try_remove_idle(&self, key: usize, entry: &Arc<FutexEntry>) {
+        let mut table = self.0.lock();
+        let Some(mapped) = table.get(&key) else {
+            return;
+        };
+        if Arc::ptr_eq(mapped, entry) && Arc::strong_count(entry) == 2 && entry.wq.is_empty() {
+            table.remove(&key);
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct FutexGuard<'a> {
+    table: &'a FutexTable,
+    key: usize,
+    inner: Arc<FutexEntry>,
+}
+
+impl Deref for FutexGuard<'_> {
+    type Target = Arc<FutexEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// An owned futex table entry handle that can be held across a blocking wait.
+pub struct FutexHandle {
+    table: Arc<FutexTable>,
+    key: usize,
+    inner: Arc<FutexEntry>,
+}
+
+impl Deref for FutexHandle {
+    type Target = Arc<FutexEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for FutexHandle {
+    fn drop(&mut self) {
+        self.table.try_remove_idle(self.key, &self.inner);
+    }
+}
+
+impl Drop for FutexGuard<'_> {
+    fn drop(&mut self) {
+        self.table.try_remove_idle(self.key, &self.inner);
+    }
+}
+
+struct FutexTables {
+    map: BTreeMap<usize, Arc<FutexTable>>,
+    operations: usize,
+}
+impl FutexTables {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            operations: 0,
+        }
+    }
+
+    fn get_or_insert(&mut self, key: usize) -> Arc<FutexTable> {
+        self.operations += 1;
+        if self.operations == 100 {
+            self.operations = 0;
+            self.map
+                .retain(|_, table| Arc::strong_count(table) > 1 || !table.is_empty());
+        }
+        self.map
+            .entry(key)
+            .or_insert_with(|| Arc::new(FutexTable::new()))
+            .clone()
+    }
+}
+
+static SHARED_FUTEX_TABLES: Mutex<FutexTables> = Mutex::new(FutexTables::new());
+
+/// Returns the futex table for the given key.
+pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
+    match key {
+        FutexKey::Private { .. } => current().as_thread().proc_data.futex_table.clone(),
+        FutexKey::Shared { region, .. } => {
+            let ptr = match region {
+                Ok(pages) => Weak::as_ptr(pages) as usize,
+                Err(key) => Weak::as_ptr(key) as usize,
+            };
+            SHARED_FUTEX_TABLES.lock().get_or_insert(ptr)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
     use core::task::{Context, Poll, Waker};
 
-    use spin::Once;
-
     use super::*;
 
-    static INIT: Once<()> = Once::new();
-
     fn init_scheduler() {
-        INIT.call_once(|| {
-            if let Err(error) = axtask::init_scheduler() {
-                assert!(
-                    axtask::current_may_uninit().is_some(),
-                    "host scheduler initialization failed: {error:?}"
-                );
-            }
-        });
+        crate::test_support::ensure_scheduler();
     }
 
     fn register_test_waiter(entry: &Arc<FutexEntry>) -> WaitRegistration {
@@ -930,243 +1160,5 @@ mod tests {
         drop(concurrent);
         drop(retiring);
         assert!(table.is_empty());
-    }
-}
-
-/// A key that uniquely identifies a futex in the system.
-pub enum FutexKey {
-    /// A futex that is private to the current process.
-    Private {
-        /// The memory address of the futex.
-        address: usize,
-    },
-
-    /// A futex in a shared memory region.
-    Shared {
-        /// The offset of the futex within the shared memory region.
-        offset: usize,
-        /// The shared memory region.
-        region: Result<Weak<SharedPages>, Weak<()>>,
-    },
-}
-
-impl FutexKey {
-    /// Creates a new `FutexKey`.
-    pub fn new(aspace: &AddrSpace, address: usize) -> Self {
-        if let Some(area) = aspace.find_area(VirtAddr::from_usize(address)) {
-            match area.backend() {
-                Backend::Shared(backend) => {
-                    if let Some(offset) = backend.backing_offset(address) {
-                        return Self::Shared {
-                            offset,
-                            region: Ok(Arc::downgrade(backend.pages())),
-                        };
-                    }
-                }
-                Backend::File(file) => {
-                    let (handle, offset) = file.futex_key(address);
-                    return Self::Shared {
-                        offset,
-                        region: Err(handle),
-                    };
-                }
-                _ => {}
-            }
-        }
-        Self::Private { address }
-    }
-
-    /// Shortcut to create a `FutexKey` for the current task's address space.
-    pub fn new_current(address: usize) -> Self {
-        let aspace_handle = current().as_thread().proc_data.aspace();
-        Self::new(&aspace_handle.lock(), address)
-    }
-
-    /// Creates a `FutexKey` for a private futex, skipping the aspace lock and
-    /// VMA walk that `new_current` performs. Only valid when the caller has
-    /// already determined the futex is process-private (e.g. via
-    /// `FUTEX_PRIVATE_FLAG`).
-    pub fn new_private(address: usize) -> Self {
-        Self::Private { address }
-    }
-
-    fn as_usize(&self) -> usize {
-        match self {
-            FutexKey::Private { address } => *address,
-            FutexKey::Shared { offset, .. } => *offset,
-        }
-    }
-}
-
-/// The futex entry structure
-pub struct FutexEntry {
-    /// The wait queue associated with this futex.
-    pub wq: WaitQueue,
-}
-
-impl FutexEntry {
-    fn new() -> Self {
-        Self {
-            wq: WaitQueue::new(),
-        }
-    }
-}
-
-/// A table mapping memory addresses to futex wait queues.
-pub struct FutexTable(Mutex<HashMap<usize, Arc<FutexEntry>>>);
-
-impl FutexTable {
-    /// Creates a new `FutexTable`.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
-    }
-
-    /// Checks if the futex table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.0.lock().is_empty()
-    }
-
-    /// Gets the wait queue associated with the given address.
-    pub fn get(&self, key: &FutexKey) -> Option<FutexGuard<'_>> {
-        let key = key.as_usize();
-        let entry = self.0.lock().get(&key).cloned()?;
-        Some(FutexGuard {
-            table: self,
-            key,
-            inner: entry,
-        })
-    }
-
-    /// Gets the wait queue associated with the given address, or inserts a a
-    /// new one if it doesn't exist.
-    pub fn get_or_insert(&self, key: &FutexKey) -> FutexGuard<'_> {
-        let key = key.as_usize();
-        let mut table = self.0.lock();
-        let entry = table
-            .entry(key)
-            .or_insert_with(|| Arc::new(FutexEntry::new()));
-        FutexGuard {
-            table: self,
-            key,
-            inner: entry.clone(),
-        }
-    }
-
-    /// Gets or inserts a futex entry and keeps its table slot alive until the
-    /// returned handle is dropped.
-    pub fn get_or_insert_owned(self: &Arc<Self>, key: &FutexKey) -> FutexHandle {
-        let key = key.as_usize();
-        let mut table = self.0.lock();
-        let entry = table
-            .entry(key)
-            .or_insert_with(|| Arc::new(FutexEntry::new()));
-        FutexHandle {
-            table: self.clone(),
-            key,
-            inner: entry.clone(),
-        }
-    }
-
-    /// Opportunistically removes an idle entry without splitting one futex
-    /// identity into two independently wakeable queues.
-    ///
-    /// Both the map identity and the strong-reference count must be observed
-    /// while the table is locked. Otherwise a concurrent lookup can clone the
-    /// mapped entry after an out-of-lock liveness check but before removal,
-    /// leaving that lookup attached to an entry which future wakers can no
-    /// longer find through the table.
-    fn try_remove_idle(&self, key: usize, entry: &Arc<FutexEntry>) {
-        let mut table = self.0.lock();
-        let Some(mapped) = table.get(&key) else {
-            return;
-        };
-        if Arc::ptr_eq(mapped, entry) && Arc::strong_count(entry) == 2 && entry.wq.is_empty() {
-            table.remove(&key);
-        }
-    }
-}
-
-#[doc(hidden)]
-pub struct FutexGuard<'a> {
-    table: &'a FutexTable,
-    key: usize,
-    inner: Arc<FutexEntry>,
-}
-
-impl Deref for FutexGuard<'_> {
-    type Target = Arc<FutexEntry>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// An owned futex table entry handle that can be held across a blocking wait.
-pub struct FutexHandle {
-    table: Arc<FutexTable>,
-    key: usize,
-    inner: Arc<FutexEntry>,
-}
-
-impl Deref for FutexHandle {
-    type Target = Arc<FutexEntry>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl Drop for FutexHandle {
-    fn drop(&mut self) {
-        self.table.try_remove_idle(self.key, &self.inner);
-    }
-}
-
-impl Drop for FutexGuard<'_> {
-    fn drop(&mut self) {
-        self.table.try_remove_idle(self.key, &self.inner);
-    }
-}
-
-struct FutexTables {
-    map: BTreeMap<usize, Arc<FutexTable>>,
-    operations: usize,
-}
-impl FutexTables {
-    const fn new() -> Self {
-        Self {
-            map: BTreeMap::new(),
-            operations: 0,
-        }
-    }
-
-    fn get_or_insert(&mut self, key: usize) -> Arc<FutexTable> {
-        self.operations += 1;
-        if self.operations == 100 {
-            self.operations = 0;
-            self.map
-                .retain(|_, table| Arc::strong_count(table) > 1 || !table.is_empty());
-        }
-        self.map
-            .entry(key)
-            .or_insert_with(|| Arc::new(FutexTable::new()))
-            .clone()
-    }
-}
-
-static SHARED_FUTEX_TABLES: Mutex<FutexTables> = Mutex::new(FutexTables::new());
-
-/// Returns the futex table for the given key.
-pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
-    match key {
-        FutexKey::Private { .. } => current().as_thread().proc_data.futex_table.clone(),
-        FutexKey::Shared { region, .. } => {
-            let ptr = match region {
-                Ok(pages) => Weak::as_ptr(pages) as usize,
-                Err(key) => Weak::as_ptr(key) as usize,
-            };
-            SHARED_FUTEX_TABLES.lock().get_or_insert(ptr)
-        }
     }
 }

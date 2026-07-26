@@ -846,10 +846,10 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
         return Err(AxError::OperationNotPermitted);
     }
 
-    if let Some(tz) = tz {
-        if tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60 {
-            return Err(AxError::InvalidInput);
-        }
+    if let Some(tz) = tz
+        && (tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60)
+    {
+        return Err(AxError::InvalidInput);
     }
 
     if let Some(ts) = ts {
@@ -889,6 +889,97 @@ pub fn sys_clock_adjtime(
 
 pub fn sys_adjtimex(timex_ptr: *mut KernelOldTimex) -> AxResult<isize> {
     sys_do_clock_adjtime(CLOCK_REALTIME as _, timex_ptr)
+}
+
+#[repr(C)]
+pub struct Tms {
+    /// user time
+    tms_utime: usize,
+    /// system time
+    tms_stime: usize,
+    /// user time of children
+    tms_cutime: usize,
+    /// system time of children
+    tms_cstime: usize,
+}
+
+pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
+    if let Some(tms) = tms.nullable() {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        let self_usage = proc_data.self_usage();
+        let child_usage = proc_data.children_usage();
+        tms.vm_write(Tms {
+            tms_utime: self_usage.utime_ticks() as usize,
+            tms_stime: self_usage.stime_ticks() as usize,
+            tms_cutime: child_usage.utime_ticks() as usize,
+            tms_cstime: child_usage.stime_ticks() as usize,
+        })?;
+    }
+    Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
+}
+
+pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {
+    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
+    let curr = current();
+    poll_timer(&curr);
+    let (it_interval, it_value) = get_process_itimer(&curr.as_thread().proc_data, ty);
+
+    value.vm_write(itimerval {
+        it_interval: timeval::from_time_value(it_interval),
+        it_value: timeval::from_time_value(it_value),
+    })?;
+    Ok(0)
+}
+
+pub fn sys_setitimer(
+    which: i32,
+    new_value: *const itimerval,
+    old_value: *mut itimerval,
+) -> AxResult<isize> {
+    // Linux copies and validates the replacement before dispatching `which`.
+    // Preserve EFAULT/EINVAL precedence for combined bad-pointer/bad-selector
+    // calls instead of rejecting the selector before touching userspace.
+    let (interval, remained) = match new_value.nullable() {
+        Some(new_value) => {
+            // FIXME: AnyBitPattern
+            let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
+            let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
+                .map_err(|_| AxError::OutOfRange)?;
+            let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
+                .map_err(|_| AxError::OutOfRange)?;
+            (interval, remaining)
+        }
+        None => (0, 0),
+    };
+    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
+    let curr = current();
+
+    debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
+
+    poll_timer(&curr);
+    let ((old_interval, old_remaining), cpu_epoch) =
+        set_process_itimer(&curr.as_thread().proc_data, ty, interval, remained)?;
+    if let Some(epoch) = cpu_epoch {
+        // The interval that began at the pre-arm poll crosses the exact arm
+        // cutoff. Account it to the lifetime total while the old local epoch
+        // conservatively omits it from the newly armed eligible clock, then
+        // start the next interval in the returned (or a newer) generation.
+        poll_timer(&curr);
+        let _guard = NoPreemptIrqSave::new();
+        curr.as_thread()
+            .time
+            .borrow_mut()
+            .sync_process_cpu_timer_epoch(ty, epoch);
+    }
+
+    if let Some(old_value) = old_value.nullable() {
+        old_value.vm_write(itimerval {
+            it_interval: timeval::from_time_value(old_interval),
+            it_value: timeval::from_time_value(old_remaining),
+        })?;
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -1061,95 +1152,4 @@ mod tests {
             Err(AxError::InvalidInput)
         );
     }
-}
-
-#[repr(C)]
-pub struct Tms {
-    /// user time
-    tms_utime: usize,
-    /// system time
-    tms_stime: usize,
-    /// user time of children
-    tms_cutime: usize,
-    /// system time of children
-    tms_cstime: usize,
-}
-
-pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
-    if let Some(tms) = tms.nullable() {
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        let self_usage = proc_data.self_usage();
-        let child_usage = proc_data.children_usage();
-        tms.vm_write(Tms {
-            tms_utime: self_usage.utime_ticks() as usize,
-            tms_stime: self_usage.stime_ticks() as usize,
-            tms_cutime: child_usage.utime_ticks() as usize,
-            tms_cstime: child_usage.stime_ticks() as usize,
-        })?;
-    }
-    Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
-}
-
-pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {
-    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
-    let curr = current();
-    poll_timer(&curr);
-    let (it_interval, it_value) = get_process_itimer(&curr.as_thread().proc_data, ty);
-
-    value.vm_write(itimerval {
-        it_interval: timeval::from_time_value(it_interval),
-        it_value: timeval::from_time_value(it_value),
-    })?;
-    Ok(0)
-}
-
-pub fn sys_setitimer(
-    which: i32,
-    new_value: *const itimerval,
-    old_value: *mut itimerval,
-) -> AxResult<isize> {
-    // Linux copies and validates the replacement before dispatching `which`.
-    // Preserve EFAULT/EINVAL precedence for combined bad-pointer/bad-selector
-    // calls instead of rejecting the selector before touching userspace.
-    let (interval, remained) = match new_value.nullable() {
-        Some(new_value) => {
-            // FIXME: AnyBitPattern
-            let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
-            let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
-                .map_err(|_| AxError::OutOfRange)?;
-            let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
-                .map_err(|_| AxError::OutOfRange)?;
-            (interval, remaining)
-        }
-        None => (0, 0),
-    };
-    let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
-    let curr = current();
-
-    debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
-
-    poll_timer(&curr);
-    let ((old_interval, old_remaining), cpu_epoch) =
-        set_process_itimer(&curr.as_thread().proc_data, ty, interval, remained)?;
-    if let Some(epoch) = cpu_epoch {
-        // The interval that began at the pre-arm poll crosses the exact arm
-        // cutoff. Account it to the lifetime total while the old local epoch
-        // conservatively omits it from the newly armed eligible clock, then
-        // start the next interval in the returned (or a newer) generation.
-        poll_timer(&curr);
-        let _guard = NoPreemptIrqSave::new();
-        curr.as_thread()
-            .time
-            .borrow_mut()
-            .sync_process_cpu_timer_epoch(ty, epoch);
-    }
-
-    if let Some(old_value) = old_value.nullable() {
-        old_value.vm_write(itimerval {
-            it_interval: timeval::from_time_value(old_interval),
-            it_value: timeval::from_time_value(old_remaining),
-        })?;
-    }
-    Ok(0)
 }

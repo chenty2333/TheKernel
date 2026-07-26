@@ -628,12 +628,17 @@ impl UserNamespace {
         self.user_gid_to_kernel(UserGid::ROOT)
     }
 
+    // Named after Linux's `from_kuid_munged(struct user_namespace *, kuid_t)`,
+    // where the namespace is the subject and the kuid is the operand. Renaming
+    // to satisfy the `from_*` convention would break that correspondence.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn from_kuid_munged(&self, uid: Kuid) -> u32 {
         self.kernel_uid_to_user(uid)
             .map(UserUid::into_raw)
             .unwrap_or(USER_NAMESPACE_OVERFLOW_ID)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn from_kgid_munged(&self, gid: Kgid) -> u32 {
         self.kernel_gid_to_user(gid)
             .map(UserGid::into_raw)
@@ -1174,7 +1179,7 @@ impl GroupLeaderIdentityBinding {
         let retired_signal = match (current_signal.as_mut(), signal) {
             (Some(current), Some(signal)) => match current.as_ref() {
                 Some(existing) if existing.same_endpoint(&signal) => None,
-                _ => core::mem::replace(&mut **current, Some(signal)),
+                _ => (**current).replace(signal),
             },
             _ => None,
         };
@@ -3101,6 +3106,9 @@ impl ProcessData {
     /// Stops at a signal-delivery boundary while transferring exact queue
     /// ownership into ptrace state. On failure the caller gets the untouched
     /// record back and may publish it normally.
+    // Returning the record by value is the rollback contract stated above;
+    // boxing it would add an allocation to signal delivery.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn try_ptrace_signal_stop(
         &self,
         record: PtraceSignalRecord,

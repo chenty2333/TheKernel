@@ -249,10 +249,8 @@ fn validate_prog_test_run_attr(
         return Err(AxError::InvalidInput);
     }
 
-    if prog_type == BPF_PROG_TYPE_RAW_TRACEPOINT {
-        if attr.ctx_out != 0 || attr.repeat != 0 {
-            return Err(AxError::InvalidInput);
-        }
+    if prog_type == BPF_PROG_TYPE_RAW_TRACEPOINT && (attr.ctx_out != 0 || attr.repeat != 0) {
+        return Err(AxError::InvalidInput);
     }
 
     let repeat = attr.repeat.max(1);

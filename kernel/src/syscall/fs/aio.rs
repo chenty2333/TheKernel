@@ -505,10 +505,10 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
-        if let Some(event) = resfd {
-            if let Err(err) = event.signal(1) {
-                return fail_io_submit(&context, reserved, completions, submitted, err);
-            }
+        if let Some(event) = resfd
+            && let Err(err) = event.signal(1)
+        {
+            return fail_io_submit(&context, reserved, completions, submitted, err);
         }
         completions.push_back(IoEvent {
             data: iocb.aio_data,

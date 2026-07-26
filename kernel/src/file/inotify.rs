@@ -128,8 +128,7 @@ const RELEASE_FILES_PER_BATCH: usize = 16;
 const RELEASE_WATCHES_PER_BATCH: usize = 256;
 const CLOSE_NOTIFICATIONS_PER_BATCH: usize = 64;
 const MAX_INOTIFY_EVENT_SIZE: usize = size_of::<inotify_event>()
-    + (MAX_NAME_LEN + 1 + size_of::<inotify_event>() - 1) / size_of::<inotify_event>()
-        * size_of::<inotify_event>();
+    + (MAX_NAME_LEN + 1).div_ceil(size_of::<inotify_event>()) * size_of::<inotify_event>();
 
 /// Preallocated final-OFD notification. FileDescription::drop only publishes
 /// this node to the lock-free stack; filesystem, inotify, fanotify, and

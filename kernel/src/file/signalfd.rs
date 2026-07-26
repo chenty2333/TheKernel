@@ -115,65 +115,6 @@ impl SignalfdSiginfo {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use linux_raw_sys::general::sigval_t;
-    use starry_signal::Signo;
-
-    use super::*;
-
-    #[test]
-    fn timer_siginfo_projects_timer_fields() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGRTMIN);
-        info.set_code(SI_TIMER);
-        let timer = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
-        timer._tid = 17;
-        timer._overrun = 9;
-        let value = 0x1234_5678_abcd_ef01usize;
-        timer._sigval = sigval_t {
-            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
-        };
-
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_tid, 17);
-        assert_eq!(projected.ssi_overrun, 9);
-        assert_eq!(projected.ssi_int as u32, value as u32);
-        assert_eq!(projected.ssi_ptr, value as u64);
-    }
-
-    #[test]
-    fn mqueue_siginfo_projects_registration_identity_and_value() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGRT1);
-        info.set_code(SI_MESGQ);
-        let rt = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt };
-        rt._pid = 42;
-        rt._uid = 1000;
-        let value = 0x7654_3210_abcd_ef01usize;
-        rt._sigval = sigval_t {
-            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
-        };
-
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_pid, 42);
-        assert_eq!(projected.ssi_uid, 1000);
-        assert_eq!(projected.ssi_int as u32, value as u32);
-        assert_eq!(projected.ssi_ptr, value as u64);
-    }
-
-    #[test]
-    fn sigio_siginfo_projects_fd_and_band() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGIO);
-        info.set_code(SI_SIGIO);
-        let poll = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigpoll };
-        poll._fd = 37;
-        poll._band = 0x1234;
-
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_fd, 37);
-        assert_eq!(projected.ssi_band, 0x1234);
-    }
-}
-
 pub struct Signalfd {
     mask: RwLock<SignalSet>,
     non_blocking: AtomicBool,
@@ -285,5 +226,64 @@ impl Pollable for Signalfd {
         } else {
             axpoll::PollRegistration::empty()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use linux_raw_sys::general::sigval_t;
+    use starry_signal::Signo;
+
+    use super::*;
+
+    #[test]
+    fn timer_siginfo_projects_timer_fields() {
+        let mut info = SignalInfo::new_kernel(Signo::SIGRTMIN);
+        info.set_code(SI_TIMER);
+        let timer = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
+        timer._tid = 17;
+        timer._overrun = 9;
+        let value = 0x1234_5678_abcd_ef01usize;
+        timer._sigval = sigval_t {
+            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
+        };
+
+        let projected = SignalfdSiginfo::from_signal_info(&info);
+        assert_eq!(projected.ssi_tid, 17);
+        assert_eq!(projected.ssi_overrun, 9);
+        assert_eq!(projected.ssi_int as u32, value as u32);
+        assert_eq!(projected.ssi_ptr, value as u64);
+    }
+
+    #[test]
+    fn mqueue_siginfo_projects_registration_identity_and_value() {
+        let mut info = SignalInfo::new_kernel(Signo::SIGRT1);
+        info.set_code(SI_MESGQ);
+        let rt = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt };
+        rt._pid = 42;
+        rt._uid = 1000;
+        let value = 0x7654_3210_abcd_ef01usize;
+        rt._sigval = sigval_t {
+            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
+        };
+
+        let projected = SignalfdSiginfo::from_signal_info(&info);
+        assert_eq!(projected.ssi_pid, 42);
+        assert_eq!(projected.ssi_uid, 1000);
+        assert_eq!(projected.ssi_int as u32, value as u32);
+        assert_eq!(projected.ssi_ptr, value as u64);
+    }
+
+    #[test]
+    fn sigio_siginfo_projects_fd_and_band() {
+        let mut info = SignalInfo::new_kernel(Signo::SIGIO);
+        info.set_code(SI_SIGIO);
+        let poll = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigpoll };
+        poll._fd = 37;
+        poll._band = 0x1234;
+
+        let projected = SignalfdSiginfo::from_signal_info(&info);
+        assert_eq!(projected.ssi_fd, 37);
+        assert_eq!(projected.ssi_band, 0x1234);
     }
 }

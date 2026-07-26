@@ -237,7 +237,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         info!("Skipping core dump for pid {pid}: process image is not dumpable");
         return Ok(false);
     };
-    let path = format!("/tmp/core.{}", pid);
+    let path = format!("/tmp/core.{pid}");
     let aspace = aspace_handle.lock();
 
     // Collect user-accessible memory areas.

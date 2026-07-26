@@ -760,7 +760,7 @@ impl FileHandle<Directory> {
     /// `Location`.
     pub(crate) fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> AxResult<usize> {
         self.check_io_access()?;
-        Ok(self.inner.read_dir(offset, sink)?)
+        self.inner.read_dir(offset, sink)
     }
 }
 

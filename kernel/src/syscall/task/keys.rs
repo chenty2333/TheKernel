@@ -134,7 +134,7 @@ fn load_payload(payload: *const u8, plen: usize) -> AxResult<Vec<u8>> {
 }
 
 fn write_keyring_ids(buf: *mut u8, size: usize, ids: &[i32]) -> AxResult<isize> {
-    let full_size = ids.len() * size_of::<i32>();
+    let full_size = core::mem::size_of_val(ids);
     if size != 0 && !buf.is_null() {
         let mut bytes = Vec::new();
         for id in ids.iter().take(size / size_of::<i32>()) {

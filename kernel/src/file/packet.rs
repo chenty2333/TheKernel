@@ -26,7 +26,14 @@ fn ifreq_name_eq(ifr: &ifreq, name: &[u8]) -> bool {
         && raw_name[..len]
             .iter()
             .zip(name)
-            .all(|(left, right)| *left as u8 == *right)
+            // `c_char` is unsigned on the kernel targets and signed on the
+            // x86_64 host test target, so this cast is load-bearing in one
+            // profile and redundant in the other.
+            .all(|(left, right)| {
+                #[allow(clippy::unnecessary_cast)]
+                let left = *left as u8;
+                left == *right
+            })
 }
 
 fn interface_by_name<'a>(

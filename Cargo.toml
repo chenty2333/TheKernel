@@ -8,6 +8,41 @@ members = [
 ]
 exclude = ["arceos"]
 
+# Lint policy for TheKernel-owned packages. `scripts/ci/clippy-gate.sh` promotes
+# everything that survives this table to an error, so an entry here is a
+# deliberate, reviewable decision rather than a silent local override. Vendored
+# sources under `third_party/rust-patches/` keep their upstream posture and are
+# reported separately by the gate.
+#
+# Every allowance must state the mechanism that makes the lint wrong for this
+# codebase, not merely that it is inconvenient.
+[workspace.lints.rust]
+# `dead_code` answers a different question in every build configuration: a
+# symbol unreachable in the riscv64 `qemu` profile is frequently live under
+# `smp`, `bpf`, `asid-fast-switch`, `mm-lock-diagnostics`, or the host test
+# profile. A single-profile gate cannot decide it truthfully, and 76 of the 102
+# current reports sit in `kernel/src/task/security.rs`, whose decomposition is
+# tracked separately. Denied once that decomposition lands and the remaining
+# reports have been resolved per-profile rather than blanket-annotated.
+dead_code = "allow"
+
+[workspace.lints.clippy]
+# `mm::synchronize_tlb`/`synchronize_icache` return `GlobalGrace`, which only
+# carries drop glue when `smp-tlb-shootdown` is enabled. Dropping the returned
+# grace is the release point of a remote shootdown, so the explicit `drop(...)`
+# is load-bearing in the shipped SMP configuration even where a uniprocessor or
+# host build sees a unit struct. Removing these calls would be a silent
+# correctness regression rather than a cleanup.
+drop_non_drop = "allow"
+
+# RFC 0000's public-API freeze gate requires callers to pass immutable
+# snapshots, capabilities, and operation context explicitly instead of reading
+# implicit kernel globals such as the current task or the global FD table.
+# Wide signatures are the intended consequence of that rule; collapsing them
+# into context structs purely to satisfy an arity threshold would re-introduce
+# the ambient state the gate exists to remove.
+too_many_arguments = "allow"
+
 [workspace.package]
 version = "0.2.0-preview.2"
 edition = "2024"
@@ -66,6 +101,9 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = []

@@ -41,7 +41,7 @@ use crate::{
     },
 };
 
-const CGROUP_SUPER_MAGIC: u32 = 0x27e0_eb;
+const CGROUP_SUPER_MAGIC: u32 = 0x0027_e0eb;
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 const MAX_CGROUP_CHILDREN: usize = 65_536;
 /// Bound recursive hierarchy walks and the number of simultaneously held
@@ -206,7 +206,7 @@ enum CgroupVersion {
 }
 
 pub fn new_cgroup_v1(controllers: Vec<String>) -> VfsResult<Filesystem> {
-    CgroupFs::new(CgroupVersion::V1, controllers)
+    CgroupFs::mount(CgroupVersion::V1, controllers)
 }
 
 pub fn new_cgroup_v2() -> VfsResult<Filesystem> {
@@ -217,7 +217,7 @@ pub fn new_cgroup_v2() -> VfsResult<Filesystem> {
     for controller in ALL_CONTROLLERS {
         controllers.push(try_owned(controller)?);
     }
-    CgroupFs::new(CgroupVersion::V2, controllers)
+    CgroupFs::mount(CgroupVersion::V2, controllers)
 }
 
 pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
@@ -283,7 +283,7 @@ struct CgroupFs {
 }
 
 impl CgroupFs {
-    fn new(version: CgroupVersion, controllers: Vec<String>) -> VfsResult<Filesystem> {
+    fn mount(version: CgroupVersion, controllers: Vec<String>) -> VfsResult<Filesystem> {
         let fs = Arc::try_new(Self {
             name: match version {
                 CgroupVersion::V1 => "cgroup",
@@ -1926,6 +1926,14 @@ impl Pollable for CgroupFile {
     }
 }
 
+impl CgroupDir {
+    fn bind_control_files(self: &Arc<Self>) {
+        for file in self.files.values() {
+            file.bind_dir(self);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -1948,7 +1956,7 @@ mod tests {
     }
 
     fn test_cgroup_fs() -> Filesystem {
-        CgroupFs::new(CgroupVersion::V1, Vec::from(["pids".to_string()])).unwrap()
+        CgroupFs::mount(CgroupVersion::V1, Vec::from(["pids".to_string()])).unwrap()
     }
 
     fn metadata_state(
@@ -2502,13 +2510,5 @@ mod tests {
         assert!(v2_root_dir.supports_named_create(NodeType::Directory));
         assert!(!v2_root_dir.supports_named_create(NodeType::RegularFile));
         assert!(!v2_root_dir.supports_symlink());
-    }
-}
-
-impl CgroupDir {
-    fn bind_control_files(self: &Arc<Self>) {
-        for file in self.files.values() {
-            file.bind_dir(self);
-        }
     }
 }

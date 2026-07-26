@@ -14,6 +14,8 @@ EXPECTED_RELEASE_SET=${THEKERNEL_EXPECTED_RELEASE_SET:-}
 OUTPUT_RELEASE_SET=${THEKERNEL_OUTPUT_RELEASE_SET:-$REPO_ROOT/.state/ci/release-consumer/release-set.tsv}
 WORK_ROOT=${THEKERNEL_RELEASE_GATE_WORK_ROOT:-$REPO_ROOT/.state/ci/release-consumer-work}
 ARCHES=${THEKERNEL_RELEASE_GATE_ARCHES:-both}
+# Packaging verifies the maintained sibling crates at their shared compatibility
+# nightly. It is intentionally not inherited from TheKernel's root compiler pin.
 PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly-2025-05-20}
 
 VERSION=0.1.0

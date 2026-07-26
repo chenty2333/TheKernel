@@ -252,7 +252,7 @@ impl MappingBackend for Backend {
             return false;
         };
         if let Err(err) = BackendOps::map(self, range, flags, &mut pt.cursor()) {
-            warn!("Failed to map area: {:?}", err);
+            warn!("Failed to map area: {err:?}");
             false
         } else {
             true
@@ -272,7 +272,7 @@ impl MappingBackend for Backend {
                 true
             }
             Err(err) => {
-                warn!("Failed to unmap area: {:?}", err);
+                warn!("Failed to unmap area: {err:?}");
                 false
             }
         }
@@ -283,7 +283,7 @@ impl MappingBackend for Backend {
             return false;
         };
         if let Err(err) = BackendOps::preflight_unmap(self, range, pt) {
-            warn!("Failed to preflight area unmap: {:?}", err);
+            warn!("Failed to preflight area unmap: {err:?}");
             false
         } else {
             true
@@ -301,7 +301,7 @@ impl MappingBackend for Backend {
             return false;
         };
         if let Err(err) = BackendOps::preflight_protect(self, range, new_flags, pt) {
-            warn!("Failed to preflight area protection: {:?}", err);
+            warn!("Failed to preflight area protection: {err:?}");
             false
         } else {
             true
@@ -321,7 +321,7 @@ impl MappingBackend for Backend {
         let mut cursor = pt.cursor();
         if let Backend::File(file) = self {
             if let Err(err) = file.protect_range(range, new_flags, &mut cursor) {
-                warn!("Failed to protect file area: {:?}", err);
+                warn!("Failed to protect file area: {err:?}");
                 return false;
             }
             return true;
@@ -352,7 +352,7 @@ impl DeferredUnmapBackend for Backend {
         match result {
             Ok(retired) => Some(retired),
             Err(err) => {
-                warn!("Failed to defer area unmap: {:?}", err);
+                warn!("Failed to defer area unmap: {err:?}");
                 None
             }
         }

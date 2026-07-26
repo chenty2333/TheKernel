@@ -955,7 +955,7 @@ fn check_inode_permissions_with_metadata(
         actor,
         credentials,
     )?;
-    let object = InodeSecurityRef::new(loc, &metadata);
+    let object = InodeSecurityRef::new(loc, metadata);
     dispatch_inode_permission(&InodePermissionSecurityContext::new(
         actor,
         credentials,

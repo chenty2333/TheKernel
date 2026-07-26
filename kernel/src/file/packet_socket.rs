@@ -633,26 +633,13 @@ fn packet_mechanism_error(error: PacketMechanismError) -> AxError {
     }
 }
 
-#[cfg(test)]
-static PACKET_TEST_INIT: std::sync::Once = std::sync::Once::new();
-#[cfg(test)]
-static PACKET_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Serializes host tests that share the emulated primary-CPU current-task slot.
+///
+/// A module-local latch would only order packet tests against each other, so
+/// this defers to the crate-wide bootstrap.
 #[cfg(test)]
 pub(crate) fn packet_test_context() -> std::sync::MutexGuard<'static, ()> {
-    let guard = PACKET_TEST_SERIAL
-        .lock()
-        .expect("packet test runtime lock poisoned");
-    PACKET_TEST_INIT.call_once(|| {
-        if let Err(error) = axtask::init_scheduler() {
-            assert!(
-                axtask::current_may_uninit().is_some(),
-                "host scheduler initialization failed: {error:?}"
-            );
-        }
-    });
-    guard
+    crate::test_support::scheduler_test_context()
 }
 
 #[cfg(test)]

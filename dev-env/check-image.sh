@@ -16,7 +16,7 @@ expect_target() {
 }
 
 QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-9.2.1}"
-RUST_TOOLCHAIN_EXPECTED="${RUSTUP_TOOLCHAIN:-nightly-2025-05-20}"
+RUST_TOOLCHAIN_EXPECTED="${RUSTUP_TOOLCHAIN:-nightly-2026-06-07}"
 
 for cmd in \
     cargo rustc rustup python3 \

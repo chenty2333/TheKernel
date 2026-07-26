@@ -351,8 +351,8 @@ impl CloneArgs {
         } = self;
 
         debug!(
-            "do_clone <= flags: {:?}, exit_signal: {}, stack: {:#x}, tls: {:#x}",
-            flags, exit_signal, stack, tls
+            "do_clone <= flags: {flags:?}, exit_signal: {exit_signal}, stack: {stack:#x}, tls: \
+             {tls:#x}"
         );
         let exit_signal = if exit_signal > 0 {
             Some(Signo::from_repr(exit_signal as u8).ok_or(AxError::InvalidInput)?)

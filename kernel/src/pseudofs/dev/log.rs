@@ -19,6 +19,10 @@ pub fn bind_dev_log(
         crate::file::unix_socket::try_path("/dev/log")?,
         security,
     )?;
+    // The socket is already bound at this point, so a discarded spawn failure
+    // would leave `/dev/log` present with nothing draining it while this
+    // function still reported success. Propagate instead: the caller treats a
+    // failure to construct the boot device tree as fatal.
     axtask::spawn_with_name(
         move || {
             let mut buf = [0u8; 65536];
@@ -39,6 +43,6 @@ pub fn bind_dev_log(
             }
         },
         "dev-log-server".into(),
-    );
+    )?;
     Ok(())
 }

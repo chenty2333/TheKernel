@@ -28,7 +28,7 @@ use crate::{
     task::AsThread,
 };
 
-const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS as u32 | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FSTATAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_STATX_FLAGS: u32 =
     AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
@@ -280,7 +280,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
 
     let curr = current();
     let actor = curr.as_thread().current_cred();
-    let effective = flags & AT_EACCESS as u32 != 0;
+    let effective = flags & AT_EACCESS != 0;
     let security = effective.then(|| VfsSecurityContext::new(actor.clone()));
     let synthetic = (!effective).then(|| actor.real_id_access_dac_credentials());
     let file = if let Some(security) = security.as_ref() {
@@ -297,12 +297,12 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         crate::file::ResolveAtResult::File(loc) => Some(loc),
         crate::file::ResolveAtResult::Other(_) => None,
     };
-    if let Some(loc) = loc {
-        if mode & X_OK != 0 && node_type == NodeType::RegularFile {
-            if crate::mounts::is_noexec(loc)? {
-                return Err(AxError::PermissionDenied);
-            }
-        }
+    if let Some(loc) = loc
+        && mode & X_OK != 0
+        && node_type == NodeType::RegularFile
+        && crate::mounts::is_noexec(loc)?
+    {
+        return Err(AxError::PermissionDenied);
     }
 
     if mode == 0 {

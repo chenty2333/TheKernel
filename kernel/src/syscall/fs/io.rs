@@ -516,9 +516,8 @@ fn read_at_pinned_user_segments(
     unsafe {
         // The MM pin owners outlive this call and axfs validates mutable
         // segment disjointness before materializing any destination slice.
-        Ok(file
-            .inner()
-            .read_at_pinned_segments(segments, offset, false)?)
+        file.inner()
+            .read_at_pinned_segments(segments, offset, false)
     }
 }
 
@@ -530,9 +529,8 @@ fn write_at_pinned_user_segments(
     unsafe {
         // Pinned source ownership is held by the caller; cache alias policy
         // remains entirely inside axfs-ng.
-        Ok(file
-            .inner()
-            .write_at_pinned_segments(segments, offset, false)?)
+        file.inner()
+            .write_at_pinned_segments(segments, offset, false)
     }
 }
 
@@ -1804,46 +1802,44 @@ fn do_pwritev(
                     )
                 },
             )
+        } else if write_uses_inode_append(file.inner(), status) {
+            file.write_at_end_with_status_and_direct_validation(
+                status,
+                &mut io.into_io(),
+                &security,
+                |append_offset, len| {
+                    validate_direct_iov_prefix_limit(
+                        file.as_ref(),
+                        append_offset,
+                        len,
+                        direct_alignment_limit,
+                    )
+                },
+            )
         } else {
-            if write_uses_inode_append(file.inner(), status) {
-                file.write_at_end_with_status_and_direct_validation(
-                    status,
-                    &mut io.into_io(),
-                    &security,
-                    |append_offset, len| {
-                        validate_direct_iov_prefix_limit(
-                            file.as_ref(),
-                            append_offset,
-                            len,
-                            direct_alignment_limit,
-                        )
-                    },
-                )
-            } else {
-                if let Some(written) = try_regular_file_pwritev_user_segments(
-                    file.as_ref(),
-                    status,
-                    &security,
-                    &io,
-                    offset as u64,
-                )? {
-                    return Ok((written, status));
-                }
-                file.write_at_with_status_and_direct_validation(
-                    status,
-                    &mut io.into_io(),
-                    offset as u64,
-                    &security,
-                    |write_offset, len| {
-                        validate_direct_iov_prefix_limit(
-                            file.as_ref(),
-                            write_offset,
-                            len,
-                            direct_alignment_limit,
-                        )
-                    },
-                )
+            if let Some(written) = try_regular_file_pwritev_user_segments(
+                file.as_ref(),
+                status,
+                &security,
+                &io,
+                offset as u64,
+            )? {
+                return Ok((written, status));
             }
+            file.write_at_with_status_and_direct_validation(
+                status,
+                &mut io.into_io(),
+                offset as u64,
+                &security,
+                |write_offset, len| {
+                    validate_direct_iov_prefix_limit(
+                        file.as_ref(),
+                        write_offset,
+                        len,
+                        direct_alignment_limit,
+                    )
+                },
+            )
         }
         .map(|written| (written, status))
     })?;
@@ -1934,7 +1930,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     let loc = FS_CONTEXT.lock().resolve_security(path, &security)?;
     check_open_permissions_with_security(
         &loc,
-        W_OK as u32,
+        W_OK,
         security.actor(),
         security.credentials(),
         security.filesystem_owner_user_ns(),
@@ -2129,8 +2125,8 @@ pub fn sys_fallocate(
         }
         FALLOC_FL_COLLAPSE_RANGE => {
             if len == 0
-                || offset % TMPFS_FALLOC_BLOCK_SIZE != 0
-                || len % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || !offset.is_multiple_of(TMPFS_FALLOC_BLOCK_SIZE)
+                || !len.is_multiple_of(TMPFS_FALLOC_BLOCK_SIZE)
                 || end > size
             {
                 return Err(AxError::InvalidInput);
@@ -2146,8 +2142,8 @@ pub fn sys_fallocate(
         }
         FALLOC_FL_INSERT_RANGE => {
             if len == 0
-                || offset % TMPFS_FALLOC_BLOCK_SIZE != 0
-                || len % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || !offset.is_multiple_of(TMPFS_FALLOC_BLOCK_SIZE)
+                || !len.is_multiple_of(TMPFS_FALLOC_BLOCK_SIZE)
                 || offset >= size
             {
                 return Err(AxError::InvalidInput);

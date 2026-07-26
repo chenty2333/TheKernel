@@ -203,7 +203,7 @@ const fn pad_str(info: &str) -> [c_char; 65] {
 }
 
 const PER_MASK: u32 = 0xff;
-const UNAME26: u32 = 0x0020_000;
+const UNAME26: u32 = 0x0002_0000;
 const SUPPORTED_PERSONALITY: u32 = UNAME26;
 const UNAME26_RELEASE: &[u8] = b"2.6.60";
 
@@ -311,13 +311,13 @@ pub(crate) fn current_can_administer_uts() -> bool {
 
 fn cstr_field_to_string(field: &[c_char; 65]) -> String {
     let len = field.iter().position(|&ch| ch == 0).unwrap_or(field.len());
-    field[..len]
+    // `c_char` is signed on the host test target and unsigned on the kernel
+    // targets, so normalize before widening to `char`.
+    #[allow(clippy::unnecessary_cast)]
+    return field[..len]
         .iter()
-        .map(|&ch| ch as u8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(char::from)
-        .collect()
+        .map(|&ch| char::from(ch as u8))
+        .collect();
 }
 
 pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
@@ -438,7 +438,7 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
         };
         if let Err(error) = fill_result {
             return if total == 0 {
-                Err(error.into())
+                Err(error)
             } else {
                 Ok(total as isize)
             };

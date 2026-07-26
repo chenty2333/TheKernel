@@ -137,6 +137,36 @@ make test-tools
 scripts/ci/per-commit.sh
 ```
 
+The per-commit gate runs focused, single-threaded test sets per subsystem, each
+with a floor on the number of tests executed, and then runs the whole suite once
+with the harness' default parallelism. The focused runs give precise
+attribution; only the full run can observe tests that no filter names, or
+interference between tests that share kernel globals.
+
+## Lints
+
+`cargo fmt` and `cargo clippy` both gate. Clippy runs per build profile,
+because several lints answer a different question in each one: a symbol that is
+unreachable in the `x86_64` host test build is often the live architecture
+path, `GlobalGrace` only carries drop glue when `smp-tlb-shootdown` is enabled,
+and a `c_char` cast that is redundant on RISC-V is required on the host.
+
+```bash
+scripts/ci/clippy-gate.sh --profile host
+scripts/ci/clippy-gate.sh --profile rv
+scripts/ci/clippy-gate.sh --profile la
+```
+
+The per-commit gate runs the `host` and `rv` profiles; the PR gate adds `la`.
+Only TheKernel-owned packages are linted. Vendored sources under
+`third_party/rust-patches/` keep their upstream lint posture; their diagnostics
+are counted and printed but never fail the gate, so a clean owned report never
+implies a clean tree.
+
+The lint policy lives in `[workspace.lints]` in the root `Cargo.toml`, so
+editors and a bare `cargo clippy` enforce exactly what CI does. Every allowance
+there records the mechanism that makes the lint wrong for this codebase.
+
 The PR gate builds both architectures and boots the project rootfs. Nightly
 adapters add mixed pressure, deterministic allocation failure, ext4 power-cut
 recovery, and non-loopback network coverage.

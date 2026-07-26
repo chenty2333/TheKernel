@@ -709,7 +709,7 @@ pub fn sys_fsconfig(
             Ok(0)
         }
         FSCONFIG_CMD_RECONFIGURE => Err(AxError::OperationNotSupported),
-        _ => return Err(LinuxError::EINVAL.into()),
+        _ => Err(LinuxError::EINVAL.into()),
     }
 }
 

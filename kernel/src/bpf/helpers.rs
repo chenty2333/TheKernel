@@ -164,23 +164,23 @@ impl<'a> HelperContext<'a> {
         }
 
         let ptr = ptr as usize;
-        if allowed.contains(HelperMemMask::STACK) {
-            if let Some(bytes) = self.read_stack_bytes(ptr, len) {
-                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
-                return Ok(bytes);
-            }
+        if allowed.contains(HelperMemMask::STACK)
+            && let Some(bytes) = self.read_stack_bytes(ptr, len)
+        {
+            charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
+            return Ok(bytes);
         }
-        if allowed.contains(HelperMemMask::CTX) {
-            if let Some(bytes) = self.read_ctx_bytes(ptr, len) {
-                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
-                return Ok(bytes);
-            }
+        if allowed.contains(HelperMemMask::CTX)
+            && let Some(bytes) = self.read_ctx_bytes(ptr, len)
+        {
+            charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
+            return Ok(bytes);
         }
-        if allowed.contains(HelperMemMask::MAP_VALUE) {
-            if let Some(bytes) = self.read_map_value_bytes(ptr, len) {
-                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
-                return Ok(bytes);
-            }
+        if allowed.contains(HelperMemMask::MAP_VALUE)
+            && let Some(bytes) = self.read_map_value_bytes(ptr, len)
+        {
+            charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
+            return Ok(bytes);
         }
 
         Err(AxError::BadAddress)
@@ -192,10 +192,8 @@ impl<'a> HelperContext<'a> {
         }
 
         let ptr = ptr as usize;
-        if allowed.contains(HelperMemMask::STACK) {
-            if self.write_stack_bytes(ptr, bytes) {
-                return Ok(());
-            }
+        if allowed.contains(HelperMemMask::STACK) && self.write_stack_bytes(ptr, bytes) {
+            return Ok(());
         }
         if allowed.contains(HelperMemMask::CTX) && self.write_ctx_bytes(ptr, bytes)? {
             return Ok(());
@@ -315,7 +313,7 @@ pub fn call_helper(
         BPF_FUNC_MAP_LOOKUP_ELEM => helper_map_lookup_elem(r1, r2, hctx),
         BPF_FUNC_MAP_UPDATE_ELEM => helper_map_update_elem(r1, r2, r3, r4, hctx),
         BPF_FUNC_MAP_DELETE_ELEM => helper_map_delete_elem(r1, r2, hctx),
-        BPF_FUNC_KTIME_GET_NS => Ok(monotonic_time_nanos() as u64),
+        BPF_FUNC_KTIME_GET_NS => Ok(monotonic_time_nanos()),
         BPF_FUNC_GET_CURRENT_PID_TGID => Ok(helper_get_current_pid_tgid()),
         BPF_FUNC_GET_CURRENT_UID_GID => Ok(helper_get_current_uid_gid()),
         BPF_FUNC_GET_CURRENT_COMM => helper_get_current_comm(r1, r2, hctx),
@@ -536,7 +534,7 @@ fn helper_trace_printk(
 fn helper_get_prandom_u32() -> u64 {
     // Simple PRNG — use monotonic time as entropy source.
     // Not cryptographically secure, but sufficient for BPF use cases.
-    let t = monotonic_time_nanos() as u64;
+    let t = monotonic_time_nanos();
     // xorshift32-ish
     let mut x = t as u32;
     x ^= x << 13;
