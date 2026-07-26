@@ -8,13 +8,18 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 bpf = []
 asid-fast-switch = ["axhal/asid-fast-switch"]
+asid-switch-diagnostics = ["asid-fast-switch", "axhal/asid-switch-diagnostics"]
 dev-log = []
 input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 mm-lock-diagnostics = []
+pmu-diagnostics = ["dep:axpmu", "axpmu/riscv-sbi"]
 test-io-control = ["axfs/test-io-control"]
 vsock = ["axfeat/vsock"]
 smp-tlb-shootdown = ["axruntime/ipi"]
@@ -61,6 +66,7 @@ axfs-ng-vfs = "0.1"
 axio = "0.3.0-pre.1"
 axpoll.workspace = true
 axfault.workspace = true
+axpmu = { workspace = true, optional = true }
 thekernel-linux-cred.workspace = true
 thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true

@@ -76,7 +76,7 @@ class MmPerformanceGuestTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "MM_PERF_RUN schema=thekernel-mm-performance-run-v2 arch=host "
+            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=host "
             "iterations=1 vmas=4 pin_iterations=1 pin_workers=2 "
             f"page_size={os.sysconf('SC_PAGESIZE')}",
             result.stdout,
@@ -244,6 +244,120 @@ int main(void)
                 "-Werror",
                 "-pthread",
                 str(harness_source),
+                "-o",
+                str(harness_binary),
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+
+        result = subprocess.run(
+            [str(harness_binary)],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_address_space_switch_child_exit_is_structured_and_restores_sigpipe(self) -> None:
+        compiler = shutil.which("cc")
+        assert compiler is not None
+        harness_source = Path(self.temporary.name) / "switch-failure-harness.c"
+        harness_binary = Path(self.temporary.name) / "switch-failure-harness"
+        harness_source.write_text(
+            f"""
+#define main thekernel_mm_performance_main
+#include "{SOURCE.as_posix()}"
+#undef main
+
+ssize_t __real_write(int fd, const void *buffer, size_t count);
+
+static pid_t harness_parent;
+
+static void harness_sigpipe_handler(int signal_number)
+{{
+    (void)signal_number;
+}}
+
+ssize_t __wrap_write(int fd, const void *buffer, size_t count)
+{{
+    ssize_t written;
+
+    if (harness_parent > 0 && getpid() != harness_parent) {{
+        int candidate;
+
+        for (candidate = 3; candidate < fd; ++candidate) {{
+            (void)close(candidate);
+        }}
+        written = __real_write(fd, buffer, count);
+        _exit(written == (ssize_t)count ? 77 : 78);
+    }}
+    return __real_write(fd, buffer, count);
+}}
+
+int main(void)
+{{
+    cpu_set_t allowed;
+    struct sigaction sentinel;
+    struct sigaction observed;
+    struct metric_result result;
+    int cpu = -1;
+    int status;
+
+    harness_parent = getpid();
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {{
+        return 30;
+    }}
+    for (int candidate = 0; candidate < CPU_SETSIZE; ++candidate) {{
+        if (CPU_ISSET(candidate, &allowed)) {{
+            cpu = candidate;
+            break;
+        }}
+    }}
+    if (cpu < 0) {{
+        return 31;
+    }}
+    memset(&sentinel, 0, sizeof(sentinel));
+    sentinel.sa_handler = harness_sigpipe_handler;
+    if (sigemptyset(&sentinel.sa_mask) != 0 ||
+        sigaction(SIGPIPE, &sentinel, NULL) != 0) {{
+        return 32;
+    }}
+    result = run_address_space_switch_ping_pong(1, cpu);
+    if (result.ok || result.reason == NULL ||
+        strcmp(result.reason, "address_space_switch_round_trip_failed") != 0 ||
+        result.error_number != EPIPE) {{
+        return 33;
+    }}
+    if (sigaction(SIGPIPE, NULL, &observed) != 0 ||
+        observed.sa_handler != harness_sigpipe_handler) {{
+        return 34;
+    }}
+    errno = 0;
+    if (waitpid(-1, &status, WNOHANG) != -1 || errno != ECHILD) {{
+        return 35;
+    }}
+    return 0;
+}}
+""",
+            encoding="utf-8",
+        )
+        build = subprocess.run(
+            [
+                compiler,
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                str(harness_source),
+                "-Wl,--wrap=write",
                 "-o",
                 str(harness_binary),
             ],

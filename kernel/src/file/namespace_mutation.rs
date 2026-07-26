@@ -536,7 +536,7 @@ pub(crate) fn reject_unnameable_link_source(
         source: LinkRequestSource::Unnameable,
         security,
     })
-    .and_then(|_| Err(AxError::BadState))
+    .and(Err(AxError::BadState))
 }
 
 pub(crate) struct UnlinkOutcome {
@@ -2950,6 +2950,10 @@ mod tests {
     }
 
     #[test]
+    // Spelling each signature out in full is the assertion: this test freezes
+    // the public mutation surface, so collapsing the types into aliases would
+    // remove exactly what is being checked.
+    #[allow(clippy::type_complexity)]
     fn public_namespace_mutations_require_the_shared_operation_capability() {
         let _: fn(
             &NamespaceOperationGuard,

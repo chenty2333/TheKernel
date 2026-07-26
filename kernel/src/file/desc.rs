@@ -187,7 +187,7 @@ fn retain_deferred_file_lease(references: &AtomicUsize) {
         // addressable machine. If internal code leaks clones and nevertheless
         // reaches the sentinel, leaking the node is safer than a
         // user-triggerable panic or premature free.
-        let next = current.checked_add(1).unwrap_or(usize::MAX);
+        let next = current.saturating_add(1);
         match references.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => return,
@@ -864,7 +864,7 @@ fn sigio_info(signal: u8, fd: i32, reason: u32) -> SignalInfo {
 fn send_sigio_to_process(process: &ProcessData, info: SignalInfo) {
     if info.signo().is_realtime() {
         match send_queued_signal_to_process_data(process, Some(info)) {
-            Ok(_) => return,
+            Ok(_) => (),
             Err(AxError::WouldBlock) => {
                 // Linux falls back from a saturated F_SETSIG real-time queue
                 // to plain SIGIO. Delivering the selected RT number as

@@ -29,9 +29,10 @@ Options:
   --skip-build    Reuse existing kernel and rootfs artifacts
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
-program to complete rootfs, tmpfs, procfs, process, pipe, raw io_uring,
-userfaultfd, AF_PACKET, and seccomp ABI checks. QEMU stops after the final
-success marker; platform shutdown is tested separately from this semantic gate.
+program to complete rootfs, tmpfs, procfs, process, pipe, futex, epoll, signal
+ordering, raw io_uring, userfaultfd, AF_PACKET, and seccomp ABI checks. QEMU
+stops after the final success marker; platform shutdown is tested separately
+from this semantic gate.
 EOF
 }
 
@@ -179,6 +180,9 @@ for marker in \
     CI_WAIT_BOUNDARY_FUTEX_WAITV_OK \
     CI_WAIT_BOUNDARY_PASS \
     THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK \
+    THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK \
     THEKERNEL_IO_URING_OK \
     THEKERNEL_SYSTEM_TEST_IO_URING_OK \
     THEKERNEL_USERFAULTFD_API_OK \
@@ -239,7 +243,24 @@ do
     }
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+for manifest in \
+    "$REPO_ROOT/scripts/ci/differential/manifests/futex.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/epoll-guest.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/signal-order.markers"
+do
+    while IFS= read -r marker; do
+        case "$marker" in
+            ''|'#'*) continue ;;
+        esac
+        log_has_exact_line "$marker" || {
+            printf 'system-test: missing differential marker %s in %s\n' \
+                "$marker" "$LOG" >&2
+            exit 1
+        }
+    done <"$manifest"
+done
+
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_FUTEX_FAIL|THEKERNEL_EPOLL_FAIL|THEKERNEL_SIGORDER_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

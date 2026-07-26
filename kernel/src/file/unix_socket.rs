@@ -108,19 +108,17 @@ pub(crate) fn bind_path(
         let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
         let initial_data = InitialNodeData::from_shared(slot);
 
-        let location = parent
-            .create_named(
-                &name,
-                &NamedCreateOptions {
-                    node_type: NodeType::Socket,
-                    permission: mode,
-                    owner: Some(owner),
-                    rdev: None,
-                    initial_data: Some(initial_data),
-                },
-                CreateDisposition::Exclusive,
-            )
-            .map_err(AxError::from)?;
+        let location = parent.create_named(
+            &name,
+            &NamedCreateOptions {
+                node_type: NodeType::Socket,
+                permission: mode,
+                owner: Some(owner),
+                rdev: None,
+                initial_data: Some(initial_data),
+            },
+            CreateDisposition::Exclusive,
+        )?;
 
         // No fallible work is permitted after the backend makes the initialized
         // name visible. Committing only moves/clones already admitted ownership.

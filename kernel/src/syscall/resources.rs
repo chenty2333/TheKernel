@@ -44,13 +44,12 @@ fn update_resource_limit(
         rlim_cur: limit.current,
         rlim_max: limit.max,
     };
-    if new_limit.rlim_max <= limit.max {
-        limit.max = new_limit.rlim_max;
-    } else if can_raise_hard_limit {
-        limit.max = new_limit.rlim_max;
-    } else {
+    // Lowering the hard limit is always permitted. Raising it requires the
+    // capability the caller resolved before taking this lock.
+    if new_limit.rlim_max > limit.max && !can_raise_hard_limit {
         return Err(AxError::OperationNotPermitted);
     }
+    limit.max = new_limit.rlim_max;
 
     limit.current = new_limit.rlim_cur;
     if resource == RLIMIT_CPU {

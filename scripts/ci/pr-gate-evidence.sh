@@ -377,18 +377,20 @@ pr_evidence_status_contract() {
     awk -F '\t' -v build_mode="$PR_EVIDENCE_BUILD_MODE" '
         BEGIN {
             if (build_mode == "source") {
-                expected_count = 6
-                expected[1] = "release-consumer"
-                expected[2] = "release-kernels"
-                expected[3] = "release-shell-kernels"
-                expected[4] = "dual-arch-boot"
-                expected[5] = "system-rv"
-                expected[6] = "system-la"
+                expected_count = 7
+                expected[1] = "clippy-la"
+                expected[2] = "release-consumer"
+                expected[3] = "release-kernels"
+                expected[4] = "release-shell-kernels"
+                expected[5] = "dual-arch-boot"
+                expected[6] = "system-rv"
+                expected[7] = "system-la"
             } else {
-                expected_count = 3
-                expected[1] = "dual-arch-boot"
-                expected[2] = "system-rv"
-                expected[3] = "system-la"
+                expected_count = 4
+                expected[1] = "clippy-la"
+                expected[2] = "dual-arch-boot"
+                expected[3] = "system-rv"
+                expected[4] = "system-la"
             }
         }
         NR == 1 {

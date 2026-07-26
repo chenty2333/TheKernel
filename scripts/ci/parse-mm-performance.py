@@ -19,7 +19,7 @@ from mm_performance_schema import (
 )
 
 REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
-RUN_SCHEMA = "thekernel-mm-performance-run-v2"
+RUN_SCHEMA = "thekernel-mm-performance-run-v3"
 SINGLE_PROXY_METRIC = "direct_io_pin_proxy_throughput"
 SAME_AS_PROXY_METRIC = "direct_io_pin_proxy_same_as_contention"
 CROSS_AS_PROXY_METRIC = "direct_io_pin_proxy_cross_as_contention"
@@ -819,6 +819,7 @@ def parse_evidence(
         "mremap_file_duplicate_latency": iterations,
         "mremap_shared_anon_resize_latency": iterations * 2,
         "protect_touch_latency": iterations,
+        "address_space_switch_ping_pong_latency": iterations,
         SINGLE_PROXY_METRIC: pin_iterations,
         SAME_AS_PROXY_METRIC: pin_iterations * pin_workers,
         CROSS_AS_PROXY_METRIC: pin_iterations * pin_workers,

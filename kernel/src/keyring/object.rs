@@ -446,12 +446,7 @@ impl Key {
         }
         let new_len = self.links.len().checked_add(1).ok_or(AxError::NoMemory)?;
         Ok(Some(
-            self.links
-                .capacity()
-                .checked_mul(2)
-                .unwrap_or(usize::MAX)
-                .max(4)
-                .max(new_len),
+            self.links.capacity().saturating_mul(2).max(4).max(new_len),
         ))
     }
 

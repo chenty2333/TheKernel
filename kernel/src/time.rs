@@ -127,39 +127,6 @@ pub(crate) fn wall_time_discontinuity_waiters()
     &WALL_TIME_DISCONTINUITY_WAITERS
 }
 
-#[cfg(test)]
-mod publication_tests {
-    use core::{cell::Cell, sync::atomic::AtomicI64};
-
-    use super::*;
-
-    #[test]
-    fn snapshot_retries_instead_of_pairing_old_generation_with_new_value() {
-        let sequence = AtomicU64::new(0);
-        let value = AtomicI64::new(7);
-        let first = Cell::new(true);
-
-        let (observed, generation) = read_wall_time_publication(&sequence, || {
-            let observed = value.load(Ordering::Relaxed);
-            if first.replace(false) {
-                sequence.store(1, Ordering::Release);
-                value.store(9, Ordering::Relaxed);
-                sequence.store(2, Ordering::Release);
-            }
-            observed
-        });
-
-        assert_eq!((observed, generation), (9, 1));
-    }
-
-    #[test]
-    fn publication_generation_never_wraps() {
-        assert_eq!(next_wall_time_publication(0), Some((1, 2)));
-        assert_eq!(next_wall_time_publication(1), None);
-        assert_eq!(next_wall_time_publication(u64::MAX - 1), None);
-    }
-}
-
 /// A helper trait for converting from and to `TimeValue`.
 pub trait TimeValueLike {
     /// Converts from `TimeValue`.
@@ -281,5 +248,38 @@ impl TimeValueLike for __kernel_sock_timeval {
             self.tv_sec as u64,
             self.tv_usec as u32 * 1000,
         ))
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use core::{cell::Cell, sync::atomic::AtomicI64};
+
+    use super::*;
+
+    #[test]
+    fn snapshot_retries_instead_of_pairing_old_generation_with_new_value() {
+        let sequence = AtomicU64::new(0);
+        let value = AtomicI64::new(7);
+        let first = Cell::new(true);
+
+        let (observed, generation) = read_wall_time_publication(&sequence, || {
+            let observed = value.load(Ordering::Relaxed);
+            if first.replace(false) {
+                sequence.store(1, Ordering::Release);
+                value.store(9, Ordering::Relaxed);
+                sequence.store(2, Ordering::Release);
+            }
+            observed
+        });
+
+        assert_eq!((observed, generation), (9, 1));
+    }
+
+    #[test]
+    fn publication_generation_never_wraps() {
+        assert_eq!(next_wall_time_publication(0), Some((1, 2)));
+        assert_eq!(next_wall_time_publication(1), None);
+        assert_eq!(next_wall_time_publication(u64::MAX - 1), None);
     }
 }

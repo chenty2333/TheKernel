@@ -6,6 +6,9 @@ publish = false
 description = "TheKernel zombie payload and type aliases over the explicit Linux process domain"
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 name = "starry_process"
 path = "src/lib.rs"

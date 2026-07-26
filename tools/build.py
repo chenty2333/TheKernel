@@ -560,7 +560,10 @@ def make_kernel_request(
         features = f"{features} test-io-control"
     elif mode == "mm-performance-shell":
         name = f"{name}-mm-performance"
-        features = f"{features} test-io-control mm-lock-diagnostics"
+        features = (
+            f"{features} test-io-control mm-lock-diagnostics "
+            "asid-switch-diagnostics pmu-diagnostics"
+        )
     make_args = ["BUS=mmio"] if arch_alias == "rv" else []
     requested_cpus = requested_kernel_cpu_count()
     if requested_cpus is not None:

@@ -2,9 +2,9 @@
 //! programs and managing processes.
 
 #![no_std]
-#![feature(likely_unlikely)]
-#![feature(bstr)]
 #![feature(allocator_api)]
+#![cfg_attr(feature = "dev-log", feature(bstr))]
+#![feature(likely_unlikely)]
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -25,9 +25,13 @@ mod file;
 mod keyring;
 mod mm;
 mod mounts;
+#[cfg(feature = "pmu-diagnostics")]
+mod pmu;
 mod pseudofs;
 mod random;
 mod readiness;
 mod syscall;
 mod task;
+#[cfg(test)]
+mod test_support;
 mod time;

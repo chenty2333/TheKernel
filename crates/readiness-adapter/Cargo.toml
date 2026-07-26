@@ -6,6 +6,9 @@ publish = false
 description = "TheKernel object-readiness adapter over bounded ax and Linux FD contracts"
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 name = "axpoll"
 path = "src/lib.rs"

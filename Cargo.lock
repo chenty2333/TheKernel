@@ -331,6 +331,7 @@ dependencies = [
  "percpu",
  "riscv 0.16.0",
  "static_assertions",
+ "thekernel-axpmu",
  "tock-registers 0.10.1",
  "x86",
  "x86_64",
@@ -3108,6 +3109,13 @@ name = "thekernel-axfault"
 version = "0.1.0"
 
 [[package]]
+name = "thekernel-axpmu"
+version = "0.1.0"
+dependencies = [
+ "sbi-rt",
+]
+
+[[package]]
 name = "thekernel-axpoll"
 version = "0.1.0"
 dependencies = [
@@ -3213,6 +3221,7 @@ dependencies = [
  "strum 0.28.0",
  "syscalls",
  "thekernel-axfault",
+ "thekernel-axpmu",
  "thekernel-axtask",
  "thekernel-axtlb",
  "thekernel-linux-cred",

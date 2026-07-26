@@ -170,6 +170,7 @@ impl PtraceRelationshipSnapshot {
     }
 }
 
+#[derive(Default)]
 pub(in crate::task) struct PtraceControlState {
     relationship: Option<PtraceRelationshipSnapshot>,
     /// Last generation successfully published. Never reset on detach.
@@ -269,18 +270,6 @@ impl PtraceControlState {
         let relationship = self.clear_session(session)?;
         self.generation = previous_generation;
         Some(relationship)
-    }
-}
-
-impl Default for PtraceControlState {
-    fn default() -> Self {
-        Self {
-            relationship: None,
-            generation: 0,
-            seized: false,
-            options: 0,
-            event_message: 0,
-        }
     }
 }
 

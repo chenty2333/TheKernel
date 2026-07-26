@@ -27,6 +27,8 @@ use crate::mm::{
     USER_IO_PIN_TEST_DELAY_MS_MAX, reset_user_io_pin_counters, set_user_io_pin_counters_enabled,
     set_user_io_pin_test_delay_ms,
 };
+#[cfg(feature = "asid-switch-diagnostics")]
+use crate::mm::{reset_asid_switch_diagnostics, set_asid_switch_diagnostics_enabled};
 #[cfg(feature = "mm-lock-diagnostics")]
 use crate::mm::{reset_mm_lock_diagnostics, set_mm_lock_diagnostics_enabled};
 
@@ -52,6 +54,8 @@ const CONTROL_HELP: &str = concat!(
 
 #[cfg(feature = "mm-lock-diagnostics")]
 const MM_LOCK_CONTROL_HELP: &str = "mm_lock_stats=on|off|reset\n";
+#[cfg(feature = "asid-switch-diagnostics")]
+const ASID_SWITCH_CONTROL_HELP: &str = "asid_switch_stats=on|off|reset\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Toggle {
@@ -94,6 +98,8 @@ enum TestIoCommand<'a> {
     PinDelayMs(u64),
     #[cfg(feature = "mm-lock-diagnostics")]
     MmLockStats(CounterCommand),
+    #[cfg(feature = "asid-switch-diagnostics")]
+    AsidSwitchStats(CounterCommand),
     Selftest {
         kind: SelftestKind,
         scratch_device: &'a str,
@@ -183,6 +189,11 @@ fn parse_command(text: &str) -> VfsResult<TestIoCommand<'_>> {
             "reset" => CounterCommand::Reset,
             _ => CounterCommand::Set(parse_toggle(value).ok_or(VfsError::InvalidInput)?),
         }),
+        #[cfg(feature = "asid-switch-diagnostics")]
+        "asid_switch_stats" => TestIoCommand::AsidSwitchStats(match value {
+            "reset" => CounterCommand::Reset,
+            _ => CounterCommand::Set(parse_toggle(value).ok_or(VfsError::InvalidInput)?),
+        }),
         "test_policy" if value == "reset" => TestIoCommand::ResetTestPolicy,
         _ => return parse_selftest(key, value)?.ok_or(VfsError::InvalidInput),
     };
@@ -206,6 +217,8 @@ fn reset_test_policy() -> VfsResult<()> {
     set_user_io_pin_test_delay_ms(0).map_err(|_| VfsError::InvalidInput)?;
     #[cfg(feature = "mm-lock-diagnostics")]
     set_mm_lock_diagnostics_enabled(false).map_err(|_| VfsError::InvalidInput)?;
+    #[cfg(feature = "asid-switch-diagnostics")]
+    set_asid_switch_diagnostics_enabled(false);
     Ok(())
 }
 
@@ -259,6 +272,14 @@ fn apply_command(command: TestIoCommand<'_>) -> VfsResult<()> {
         TestIoCommand::MmLockStats(CounterCommand::Reset) => {
             reset_mm_lock_diagnostics().map_err(|_| VfsError::InvalidInput)?;
         }
+        #[cfg(feature = "asid-switch-diagnostics")]
+        TestIoCommand::AsidSwitchStats(CounterCommand::Set(toggle)) => {
+            set_asid_switch_diagnostics_enabled(enabled(toggle));
+        }
+        #[cfg(feature = "asid-switch-diagnostics")]
+        TestIoCommand::AsidSwitchStats(CounterCommand::Reset) => {
+            reset_asid_switch_diagnostics();
+        }
         TestIoCommand::Selftest {
             kind,
             scratch_device,
@@ -283,6 +304,8 @@ fn control_operation(request: SimpleFileOperation<'_>) -> VfsResult<Option<Vec<u
             let mut help = CONTROL_HELP.as_bytes().to_vec();
             #[cfg(feature = "mm-lock-diagnostics")]
             help.extend_from_slice(MM_LOCK_CONTROL_HELP.as_bytes());
+            #[cfg(feature = "asid-switch-diagnostics")]
+            help.extend_from_slice(ASID_SWITCH_CONTROL_HELP.as_bytes());
             Ok(Some(help))
         }
         SimpleFileOperation::Write(data) => {
@@ -327,6 +350,11 @@ mod tests {
         assert_eq!(
             parse_command("mm_lock_stats=reset"),
             Ok(TestIoCommand::MmLockStats(CounterCommand::Reset))
+        );
+        #[cfg(feature = "asid-switch-diagnostics")]
+        assert_eq!(
+            parse_command("asid_switch_stats=reset"),
+            Ok(TestIoCommand::AsidSwitchStats(CounterCommand::Reset))
         );
     }
 

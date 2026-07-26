@@ -747,8 +747,7 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
     let out_size = size as usize;
     if attr.is_null()
         || pid < 0
-        || out_size > SCHED_ATTR_MAX_SIZE
-        || out_size < SCHED_ATTR_SIZE_VER0
+        || !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&out_size)
         || flags != 0
     {
         return Err(AxError::InvalidInput);
@@ -758,7 +757,7 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
     let state = sched_state(&task);
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
-        sched_policy: linux_policy_from_state(&task, state) as u32 & !(SCHED_RESET_ON_FORK as u32),
+        sched_policy: linux_policy_from_state(&task, state) as u32 & !SCHED_RESET_ON_FORK,
         sched_flags: if sched_reset_on_fork(&task) {
             SUPPORTED_SCHED_ATTR_FLAGS
         } else {
@@ -775,7 +774,7 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
     out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
 
     let copy_size = out_size.min(size_of::<SchedAttr>());
-    vm_write_slice(attr.cast::<u8>(), &unsafe {
+    vm_write_slice(attr.cast::<u8>(), unsafe {
         core::slice::from_raw_parts((&out as *const SchedAttr).cast::<u8>(), copy_size)
     })?;
 

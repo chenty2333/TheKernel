@@ -31,6 +31,7 @@ pub enum ExceptionKind {
     Other,
 }
 
+#[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ExceptionTableEntry {
@@ -38,11 +39,13 @@ struct ExceptionTableEntry {
     to: usize,
 }
 
+#[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
 unsafe extern "C" {
     static _ex_table_start: [ExceptionTableEntry; 0];
     static _ex_table_end: [ExceptionTableEntry; 0];
 }
 
+#[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
 impl TrapFrame {
     pub(crate) fn fixup_exception(&mut self) -> bool {
         let entries = unsafe {
@@ -63,6 +66,16 @@ impl TrapFrame {
     }
 }
 
+#[cfg(all(not(target_os = "none"), feature = "host-test-context"))]
+impl TrapFrame {
+    pub(crate) fn fixup_exception(&mut self) -> bool {
+        // Hosted tests cannot route a CPU fault through the kernel trap entry
+        // and do not use axhal's kernel linker script.
+        false
+    }
+}
+
+#[cfg(not(all(not(target_os = "none"), feature = "host-test-context")))]
 pub(crate) fn init_exception_table() {
     // Sort exception table
     let ex_table = unsafe {
@@ -75,3 +88,6 @@ pub(crate) fn init_exception_table() {
     };
     ex_table.sort_unstable();
 }
+
+#[cfg(all(not(target_os = "none"), feature = "host-test-context"))]
+pub(crate) fn init_exception_table() {}

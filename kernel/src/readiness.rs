@@ -238,6 +238,89 @@ where
     }
 }
 
+/// Interruptible synchronous wait for one raw generic source.
+pub(crate) fn block_on_poll_set<const CAPACITY: usize, F, T>(
+    source: &PollSet<CAPACITY>,
+    operation: F,
+) -> Result<T, AxError>
+where
+    F: FnMut() -> Result<T, AxError>,
+{
+    block_on_poll_io(&PollSetSource(source), IoEvents::empty(), false, operation)
+}
+
+/// Deadline-aware synchronous form for one raw generic source.
+pub(crate) fn block_on_poll_set_until<F, T>(
+    source: &PollSet,
+    deadline: Option<TimeValue>,
+    operation: F,
+) -> Result<AxResult<T>, axtask::future::Elapsed>
+where
+    F: FnMut() -> AxResult<T>,
+{
+    block_on_poll_io_until(
+        &PollSetSource(source),
+        IoEvents::empty(),
+        false,
+        deadline,
+        operation,
+    )
+}
+
+/// Non-interruptible synchronous wait for kernel lifecycle handshakes such as
+/// vfork publication. Typed block and registration failures still propagate.
+pub(crate) fn block_on_poll_set_uninterruptible<const CAPACITY: usize, F, T>(
+    source: &PollSet<CAPACITY>,
+    mut operation: F,
+) -> Result<T, AxError>
+where
+    F: FnMut() -> Result<T, AxError>,
+{
+    let pollable = PollSetSource(source);
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if error != AxError::WouldBlock => return Err(error),
+            Err(_) => {}
+        }
+
+        let wait = match ReadinessWait::arm(&pollable, IoEvents::empty()) {
+            Ok(wait) => wait,
+            Err(error) => {
+                return completed_operation(operation(), false)
+                    .unwrap_or_else(|| Err(registration_error(error)));
+            }
+        };
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if error != AxError::WouldBlock => return Err(error),
+            Err(_) => {}
+        }
+
+        axtask::future::block_on(wait).map_err(AxError::from)?;
+    }
+}
+
+/// Waits on one source while consuming task interrupts only when the caller's
+/// Linux-visible predicate says that interrupt should terminate the syscall.
+pub(crate) fn block_on_poll_set_interruptible_if<const CAPACITY: usize, F, I, T>(
+    source: &PollSet<CAPACITY>,
+    operation: F,
+    should_interrupt: I,
+) -> Result<T, AxError>
+where
+    F: FnMut() -> Result<T, AxError>,
+    I: FnMut() -> bool,
+{
+    block_on_poll_io_interruptible_if(
+        &PollSetSource(source),
+        IoEvents::empty(),
+        false,
+        operation,
+        should_interrupt,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use core::cell::Cell;
@@ -333,87 +416,4 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(source.is_empty());
     }
-}
-
-/// Interruptible synchronous wait for one raw generic source.
-pub(crate) fn block_on_poll_set<const CAPACITY: usize, F, T>(
-    source: &PollSet<CAPACITY>,
-    operation: F,
-) -> Result<T, AxError>
-where
-    F: FnMut() -> Result<T, AxError>,
-{
-    block_on_poll_io(&PollSetSource(source), IoEvents::empty(), false, operation)
-}
-
-/// Deadline-aware synchronous form for one raw generic source.
-pub(crate) fn block_on_poll_set_until<F, T>(
-    source: &PollSet,
-    deadline: Option<TimeValue>,
-    operation: F,
-) -> Result<AxResult<T>, axtask::future::Elapsed>
-where
-    F: FnMut() -> AxResult<T>,
-{
-    block_on_poll_io_until(
-        &PollSetSource(source),
-        IoEvents::empty(),
-        false,
-        deadline,
-        operation,
-    )
-}
-
-/// Non-interruptible synchronous wait for kernel lifecycle handshakes such as
-/// vfork publication. Typed block and registration failures still propagate.
-pub(crate) fn block_on_poll_set_uninterruptible<const CAPACITY: usize, F, T>(
-    source: &PollSet<CAPACITY>,
-    mut operation: F,
-) -> Result<T, AxError>
-where
-    F: FnMut() -> Result<T, AxError>,
-{
-    let pollable = PollSetSource(source);
-    loop {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error) if error != AxError::WouldBlock => return Err(error),
-            Err(_) => {}
-        }
-
-        let wait = match ReadinessWait::arm(&pollable, IoEvents::empty()) {
-            Ok(wait) => wait,
-            Err(error) => {
-                return completed_operation(operation(), false)
-                    .unwrap_or_else(|| Err(registration_error(error)));
-            }
-        };
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error) if error != AxError::WouldBlock => return Err(error),
-            Err(_) => {}
-        }
-
-        axtask::future::block_on(wait).map_err(AxError::from)?;
-    }
-}
-
-/// Waits on one source while consuming task interrupts only when the caller's
-/// Linux-visible predicate says that interrupt should terminate the syscall.
-pub(crate) fn block_on_poll_set_interruptible_if<const CAPACITY: usize, F, I, T>(
-    source: &PollSet<CAPACITY>,
-    operation: F,
-    should_interrupt: I,
-) -> Result<T, AxError>
-where
-    F: FnMut() -> Result<T, AxError>,
-    I: FnMut() -> bool,
-{
-    block_on_poll_io_interruptible_if(
-        &PollSetSource(source),
-        IoEvents::empty(),
-        false,
-        operation,
-        should_interrupt,
-    )
 }

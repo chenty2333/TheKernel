@@ -44,6 +44,16 @@ const MAX_INTERPRETER_PATH: u64 = 4096;
 // Linux permits five binfmt rewrites before returning ELOOP.
 const MAX_SCRIPT_RECURSION: usize = 5;
 
+/// Substitutes path resolution so a test can exercise the loader without a
+/// mounted filesystem.
+#[cfg(test)]
+type TestResolver<'a> = Option<&'a dyn Fn(&str) -> AxResult<Location>>;
+
+/// Observes each resolved path component so a test can assert the order and
+/// identity of the security objects the walk produced.
+#[cfg(test)]
+type ComponentObserver<'a> = Option<&'a dyn Fn(&ExecFileSecurityObject) -> AxResult>;
+
 #[derive(Clone, Copy)]
 enum ExecAccess<'a> {
     TrustedBoot,
@@ -53,9 +63,9 @@ enum ExecAccess<'a> {
         filesystem_owner_user_ns: &'a alloc::sync::Arc<UserNamespace>,
         all_readable: &'a Cell<bool>,
         #[cfg(test)]
-        test_resolver: Option<&'a dyn Fn(&str) -> AxResult<Location>>,
+        test_resolver: TestResolver<'a>,
         #[cfg(test)]
-        component_observer: Option<&'a dyn Fn(&ExecFileSecurityObject) -> AxResult>,
+        component_observer: ComponentObserver<'a>,
     },
 }
 
@@ -401,14 +411,9 @@ enum ExecLoadTarget<'a> {
 impl ExecLoadTarget<'_> {
     fn read_at(&self, cache: &CachedFile, buf: &mut [u8], offset: u64) -> AxResult<usize> {
         match self {
-            Self::Mapped(_) => cache.read_at(buf, offset).map_err(Into::into),
+            Self::Mapped(_) => cache.read_at(buf, offset),
             #[cfg(test)]
-            Self::Probe => cache
-                .location()
-                .entry()
-                .as_file()?
-                .read_at(buf, offset)
-                .map_err(Into::into),
+            Self::Probe => cache.location().entry().as_file()?.read_at(buf, offset),
         }
     }
 

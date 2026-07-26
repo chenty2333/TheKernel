@@ -51,7 +51,10 @@ mm_perf_write_guest_commands() {
                 printf '%s\n' \
                     'echo mm_lock_stats=off > /proc/io_test_control || exit 1' \
                     'echo mm_lock_stats=reset > /proc/io_test_control || exit 1' \
-                    'echo mm_lock_stats=on > /proc/io_test_control || exit 1'
+                    'echo mm_lock_stats=on > /proc/io_test_control || exit 1' \
+                    'echo asid_switch_stats=off > /proc/io_test_control || exit 1' \
+                    'echo asid_switch_stats=reset > /proc/io_test_control || exit 1' \
+                    'echo asid_switch_stats=on > /proc/io_test_control || exit 1'
                 printf '%s %s %s %s %s %s %s %s %s%s\n' \
                     /opt/thekernel-tests/bin/thekernel-mm-performance \
                     --iterations "$iterations" \
@@ -64,7 +67,10 @@ mm_perf_write_guest_commands() {
                     "$MM_PERF_DIAGNOSTIC_OFF_RETRIES" \
                     ' ] || exit 1; done'
                 printf '%s\n' \
+                    'echo asid_switch_stats=off > /proc/io_test_control || exit 1' \
                     'cat /proc/mm_lock_stats || exit 1' \
+                    'cat /proc/asid_switch_stats || exit 1' \
+                    'cat /proc/pmu_capabilities || exit 1' \
                     'exit'
             } >"$output"
             ;;

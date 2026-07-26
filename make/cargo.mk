@@ -28,3 +28,15 @@ endif
 define cargo_build
   $(call run_cmd,cargo -C $(1) build,$(build_args) --features "$(strip $(2))")
 endef
+
+# Lint the real kernel target rather than the host test target. Dead-code and
+# drop-glue lints are configuration-sensitive: a symbol that is unreachable in
+# the x86_64 host test build is frequently the live architecture path, and
+# `GlobalGrace` only carries drop glue when `smp-tlb-shootdown` is enabled.
+# Only the architecture build answers those lints truthfully.
+# `-C` is resolved before cargo dispatches to the `cargo-clippy` subcommand
+# binary, so the enabling `-Z unstable-options` must precede the subcommand
+# name here. `cargo build` tolerates the trailing form; `cargo clippy` does not.
+define cargo_clippy
+  $(call run_cmd,cargo -Z unstable-options -C $(1) clippy,$(build_args) --features "$(strip $(2))" $(CLIPPY_PACKAGES) $(CLIPPY_ARGS))
+endef

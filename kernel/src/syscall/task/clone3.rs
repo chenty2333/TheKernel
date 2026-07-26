@@ -1,6 +1,6 @@
 use core::mem::{self, MaybeUninit};
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use bytemuck::AnyBitPattern;
 use starry_vm::vm_read_slice;
@@ -30,7 +30,12 @@ const CLONE3_ARGS_SIZE_VER2: usize = core::mem::size_of::<Clone3Args>();
 
 fn validate_extra_bytes(bytes: &[u8]) -> AxResult<()> {
     if bytes.iter().any(|byte| *byte != 0) {
-        Err(LinuxError::E2BIG.into())
+        // `AxError` distinguishes its own kinds from Linux-encoded ones by
+        // sign, so `LinuxError::E2BIG.into()` and
+        // `AxError::ArgumentListTooLong` compare unequal despite mapping to
+        // the same errno. Keep the semantic kind here and let the Linux
+        // adapter perform the errno mapping, per RFC 0000.
+        Err(AxError::ArgumentListTooLong)
     } else {
         Ok(())
     }
@@ -41,7 +46,7 @@ impl TryFrom<Clone3Args> for CloneArgs {
 
     fn try_from(args: Clone3Args) -> AxResult<Self> {
         if args.set_tid_size != 0 {
-            return Err(LinuxError::EOPNOTSUPP.into());
+            return Err(AxError::OperationNotSupported);
         }
         let flags = CloneFlags::from_bits(args.flags).ok_or(AxError::InvalidInput)?;
 

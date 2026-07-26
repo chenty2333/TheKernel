@@ -124,6 +124,9 @@ impl SemInfo {
         }
     }
 
+    // Mirrors the `SEM_INFO` semctl command rather than a Rust constructor
+    // convention; the name is the Linux operation it answers.
+    #[allow(clippy::self_named_constructors)]
     fn sem_info(manager: &SemManager) -> Self {
         let mut info = Self::ipc_info();
         info.semusz = manager.active_array_count().min(c_int::MAX as usize) as c_int;
@@ -774,12 +777,11 @@ fn add_wait_count(
             }
         }
     }
-    let guard = WaitCountGuard {
+    WaitCountGuard {
         array,
         index: blocked_index,
         wait_zero,
-    };
-    guard
+    }
 }
 
 fn deadline_elapsed(deadline: Option<Duration>) -> bool {

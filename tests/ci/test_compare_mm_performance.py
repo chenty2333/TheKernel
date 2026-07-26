@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 COMPARATOR = REPO_ROOT / "scripts" / "ci" / "compare-mm-performance.py"
 LOCK_PARSER = REPO_ROOT / "scripts" / "ci" / "parse-mm-lock-diagnostics.py"
+ASID_PARSER = REPO_ROOT / "scripts" / "ci" / "parse-asid-switch-diagnostics.py"
 DEFAULT_POLICY = (
     REPO_ROOT
     / "scripts"
@@ -59,6 +60,11 @@ MANIFEST_COLUMNS = (
     "host_cpu_set",
     "host_cpu_selection",
     "host_cpu_class",
+    "platform_class",
+    "pmu_source",
+    "cpu_model",
+    "firmware_version",
+    "cpu_freq_policy",
     "kernel_artifact",
     "metrics_artifact",
     "metrics_sha256",
@@ -66,6 +72,9 @@ MANIFEST_COLUMNS = (
     "mm_lock_diagnostics_artifact",
     "mm_lock_diagnostics_sha256",
     "mm_lock_diagnostics_size_bytes",
+    "asid_switch_diagnostics_artifact",
+    "asid_switch_diagnostics_sha256",
+    "asid_switch_diagnostics_size_bytes",
     "commands",
     "commands_sha256",
     "commands_size_bytes",
@@ -109,6 +118,7 @@ EXPECTED_METRICS = (
     "mremap_file_duplicate_latency",
     "mremap_shared_anon_resize_latency",
     "protect_touch_latency",
+    "address_space_switch_ping_pong_latency",
     "direct_io_pin_proxy_throughput",
     "direct_io_pin_proxy_same_as_contention",
     "direct_io_pin_proxy_cross_as_contention",
@@ -172,6 +182,7 @@ def expected_count(metric: str, iterations: int, pin_iterations: int, pin_worker
         "mremap_file_duplicate_latency": iterations,
         "mremap_shared_anon_resize_latency": iterations * 2,
         "protect_touch_latency": iterations,
+        "address_space_switch_ping_pong_latency": iterations,
         "direct_io_pin_proxy_throughput": pin_iterations,
         "direct_io_pin_proxy_same_as_contention": pin_iterations * pin_workers,
         "direct_io_pin_proxy_cross_as_contention": pin_iterations * pin_workers,
@@ -239,7 +250,7 @@ def render_qemu_log(
         f"MM_PERF_AFFINITY status=ok bytes=8 allowed_cpus={online_cpus} "
         f"cpu_ids={','.join(str(cpu) for cpu in range(int(online_cpus)))} "
         "cpu_ids_complete=1",
-        "MM_PERF_RUN schema=thekernel-mm-performance-run-v2 "
+        "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 "
         f"arch={values['arch']} iterations={values['iterations']} "
         f"vmas={live_vmas} pin_iterations={pin_iterations} "
         f"pin_workers={pin_workers} page_size=4096",
@@ -275,6 +286,24 @@ def render_qemu_log(
     ]
     if measurement_mode == "diagnostic":
         records.extend(lock_diagnostic_log_records())
+        records.extend(
+            (
+                "ASID_SWITCH_DIAGNOSTICS "
+                "schema=thekernel-asid-switch-diagnostics-v1 enabled=0 "
+                "fast_path_avoided=100 fallback_asid_zero=0 "
+                "fallback_invalid_width=0 fallback_exhausted=0 "
+                "fallback_generation_mismatch=0 "
+                "fallback_same_id_different_root=0 saturated=0",
+                "PMU_CAPABILITIES schema=thekernel-pmu-capabilities-v1 "
+                "source=sbi-pmu counter_count=2 consistent_snapshot=0 "
+                "samples_collected=0",
+                "PMU_EVENT event=cpu_cycles requestable=1 sampled=0",
+                "PMU_EVENT event=instructions requestable=1 sampled=0",
+                "PMU_EVENT event=dtlb_read_misses requestable=1 sampled=0",
+                "PMU_EVENT event=dtlb_write_misses requestable=1 sampled=0",
+                "PMU_EVENT event=itlb_read_misses requestable=1 sampled=0",
+            )
+        )
     records.append("System is shutting down")
     return "\n".join(records) + "\n"
 
@@ -282,6 +311,18 @@ def render_qemu_log(
 def derive_lock_diagnostics(qemu_log: Path) -> bytes:
     completed = subprocess.run(
         [sys.executable, str(LOCK_PARSER), str(qemu_log)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.stdout
+
+
+def derive_asid_diagnostics(qemu_log: Path) -> bytes:
+    completed = subprocess.run(
+        [sys.executable, str(ASID_PARSER), str(qemu_log)],
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
@@ -312,7 +353,7 @@ def make_bundle(
     run = root / run_name
     run.mkdir()
     values = {
-        "bundle_schema": "thekernel-mm-performance-bundle-v8",
+        "bundle_schema": "thekernel-mm-performance-bundle-v10",
         "thekernel_commit": "1" * 40,
         "thekernel_ax_commit": "2" * 40,
         "thekernel_linux_abi_commit": "3" * 40,
@@ -336,6 +377,11 @@ def make_bundle(
         "host_cpu_set": host_cpu_set,
         "host_cpu_selection": "auto-homogeneous-v1",
         "host_cpu_class": "package:0,max_freq_khz:3700000",
+        "platform_class": "qemu-tcg",
+        "pmu_source": "none",
+        "cpu_model": "not-applicable",
+        "firmware_version": "not-applicable",
+        "cpu_freq_policy": "not-applicable",
         "kernel_artifact": f"{run_name}/kernel",
         "metrics_artifact": f"{run_name}/mm-performance.tsv",
         "commands": f"{run_name}/commands",
@@ -382,12 +428,18 @@ def make_bundle(
                 "echo mm_lock_stats=off > /proc/io_test_control || exit 1",
                 "echo mm_lock_stats=reset > /proc/io_test_control || exit 1",
                 "echo mm_lock_stats=on > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=off > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=reset > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=on > /proc/io_test_control || exit 1",
                 workload_command + " || exit 1",
                 "mm_lock_off_attempt=0; until echo mm_lock_stats=off > "
                 "/proc/io_test_control; do mm_lock_off_attempt="
                 "$((mm_lock_off_attempt + 1)); "
                 '[ "$mm_lock_off_attempt" -lt 64 ] || exit 1; done',
+                "echo asid_switch_stats=off > /proc/io_test_control || exit 1",
                 "cat /proc/mm_lock_stats || exit 1",
+                "cat /proc/asid_switch_stats || exit 1",
+                "cat /proc/pmu_capabilities || exit 1",
                 "exit",
                 "",
             )
@@ -613,10 +665,22 @@ def make_bundle(
         values["mm_lock_diagnostics_size_bytes"] = str(
             lock_diagnostics.stat().st_size
         )
+        asid_diagnostics = run / "asid-switch-diagnostics.tsv"
+        asid_diagnostics.write_bytes(derive_asid_diagnostics(qemu_log))
+        values["asid_switch_diagnostics_artifact"] = (
+            f"{run_name}/asid-switch-diagnostics.tsv"
+        )
+        values["asid_switch_diagnostics_sha256"] = sha256(asid_diagnostics)
+        values["asid_switch_diagnostics_size_bytes"] = str(
+            asid_diagnostics.stat().st_size
+        )
     else:
         values["mm_lock_diagnostics_artifact"] = "not-collected"
         values["mm_lock_diagnostics_sha256"] = "not-collected"
         values["mm_lock_diagnostics_size_bytes"] = "not-collected"
+        values["asid_switch_diagnostics_artifact"] = "not-collected"
+        values["asid_switch_diagnostics_sha256"] = "not-collected"
+        values["asid_switch_diagnostics_size_bytes"] = "not-collected"
     write_tsv(root / "mm-performance-manifest.tsv", MANIFEST_COLUMNS, [values])
 
 
@@ -925,11 +989,11 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("PARTIAL PASS", result.stdout)
         self.assertIn("release_gate=false", result.stdout)
         rows = self.report_rows(report)
-        self.assertEqual(len(rows), 23)
+        self.assertEqual(len(rows), 25)
         self.assertEqual({row["evidence_scope"] for row in rows}, {"partial_triage"})
         self.assertEqual({row["release_gate"] for row in rows}, {"false"})
-        self.assertEqual(sum(row["result"] == "PASS" for row in rows), 13)
-        self.assertEqual(sum(row["result"] == "REPORT_ONLY" for row in rows), 10)
+        self.assertEqual(sum(row["result"] == "PASS" for row in rows), 14)
+        self.assertEqual(sum(row["result"] == "REPORT_ONLY" for row in rows), 11)
 
     def test_default_rejects_incomplete_release_matrix(self) -> None:
         baseline = self.bundle("baseline")
@@ -973,7 +1037,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertNotIn("PARTIAL", result.stdout)
         self.assertIn("release_gate=true", result.stdout)
         rows = self.report_rows(report)
-        self.assertEqual(len(rows), 92)
+        self.assertEqual(len(rows), 100)
         self.assertEqual({row["evidence_scope"] for row in rows}, {"release"})
         self.assertEqual({row["release_gate"] for row in rows}, {"true"})
 
@@ -1261,7 +1325,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("metrics artifact does not match the raw QEMU log", result.stderr)
         self.assertFalse(report.exists())
 
-    def test_product_raw_log_rejects_lock_diagnostics(self) -> None:
+    def test_product_raw_log_rejects_diagnostics(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate-product-lock-log")
         qemu_log = candidate / "rv-4cpu" / "qemu.log"
@@ -1282,7 +1346,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, report = self.compare(baseline, candidate)
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("product raw QEMU log contains MM lock diagnostics", result.stderr)
+        self.assertIn("product raw QEMU log contains diagnostics", result.stderr)
         self.assertFalse(report.exists())
 
     def test_diagnostic_artifact_must_be_derived_from_raw_qemu_log(self) -> None:
@@ -1310,6 +1374,34 @@ class CompareMmPerformanceTests(unittest.TestCase):
             "MM lock diagnostics artifact does not match the raw QEMU log",
             result.stderr,
         )
+        self.assertFalse(report.exists())
+
+    def test_diagnostic_bundle_rejects_pmu_sample_claims(self) -> None:
+        baseline = self.bundle("diagnostic-pmu-baseline", measurement_mode="diagnostic")
+        candidate = self.bundle("diagnostic-pmu-sampled", measurement_mode="diagnostic")
+        qemu_log = candidate / "rv-4cpu" / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                "samples_collected=0", "samples_collected=1", 1
+            ),
+            encoding="utf-8",
+        )
+        receipt_updates = refresh_qemu_receipt_log(candidate)
+        mutate_manifest(
+            candidate,
+            lambda row: row.update(
+                {
+                    "qemu_log_sha256": sha256(qemu_log),
+                    "qemu_log_size_bytes": str(qemu_log.stat().st_size),
+                    **receipt_updates,
+                }
+            ),
+        )
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("samples_collected=0", result.stderr)
         self.assertFalse(report.exists())
 
     def test_guest_input_receipt_cannot_be_spliced_from_another_run(self) -> None:
@@ -1690,6 +1782,78 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("unsupported bundle_schema", result.stderr)
         self.assertEqual(report.read_bytes(), sentinel)
 
+    def test_physical_platform_class_is_explicitly_unimplemented(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update(
+                {
+                    "platform_class": "physical",
+                    "pmu_source": "sbi-pmu",
+                    "cpu_model": "sifive-u74",
+                    "firmware_version": "opensbi-1.4",
+                    "cpu_freq_policy": "fixed-frequency",
+                }
+            ),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("physical evidence authority is not implemented", result.stderr)
+
+    def test_unknown_platform_class_is_rejected(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"platform_class": "qemu-kvm"}),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid platform_class", result.stderr)
+
+    def test_tcg_pmu_source_is_rejected(self) -> None:
+        for pmu_source, expected_error in (
+            ("loongarch-pmcfg", "pmu_source does not match arch"),
+            ("sbi-pmu", "qemu-tcg evidence must use pmu_source='none'"),
+        ):
+            with self.subTest(pmu_source=pmu_source):
+                baselines = [
+                    self.bundle(f"baseline-{pmu_source}-{index}")
+                    for index in range(3)
+                ]
+                candidates = [
+                    self.bundle(f"candidate-{pmu_source}-{index}")
+                    for index in range(3)
+                ]
+                mutate_manifest(
+                    candidates[0],
+                    lambda row: row.update({"pmu_source": pmu_source}),
+                )
+
+                result, _ = self.compare_series(baselines, candidates)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_tcg_rows_must_not_claim_platform_identity(self) -> None:
+        # A TCG receipt carrying a CPU model would read as physical evidence.
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"cpu_model": "sifive-u74"}),
+        )
+
+        result, _ = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("qemu-tcg evidence must use cpu_model", result.stderr)
+
     def test_output_inside_input_bundle_is_rejected_without_mutation(self) -> None:
         baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
         candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
@@ -1728,7 +1892,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
 
     def test_v1_through_v6_manifests_are_not_silently_upgraded(self) -> None:
         baseline = self.bundle("baseline")
-        for version in ("v1", "v2", "v3", "v4", "v5", "v6"):
+        for version in ("v1", "v2", "v3", "v4", "v5", "v6", "v8"):
             with self.subTest(version=version):
                 candidate = self.bundle(f"candidate-{version}")
                 mutate_manifest(

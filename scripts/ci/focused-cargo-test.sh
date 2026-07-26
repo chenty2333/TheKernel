@@ -72,12 +72,46 @@ if [ -n "$package_resolver" ]; then
         "$work_dir/Cargo.toml"
 fi
 
+workspace_lints=$(awk '
+    /^\[workspace\.lints(\.[^]]+)?\][[:space:]]*$/ {
+        in_workspace_lints = 1
+    }
+    in_workspace_lints && /^\[/ &&
+        $0 !~ /^\[workspace\.lints(\.[^]]+)?\][[:space:]]*$/ {
+        exit
+    }
+    in_workspace_lints {
+        print
+    }
+' "$REPO_ROOT/Cargo.toml")
+if awk '
+    /^\[lints\][[:space:]]*$/ {
+        in_lints = 1
+        next
+    }
+    /^\[/ {
+        in_lints = 0
+    }
+    in_lints && /^workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$/ {
+        inherits_workspace_lints = 1
+    }
+    END {
+        exit inherits_workspace_lints ? 0 : 1
+    }
+' "$work_dir/Cargo.toml" && [ -z "$workspace_lints" ]; then
+    printf 'focused-cargo-test: %s inherits missing workspace lint policy\n' \
+        "$package_name" >&2
+    exit 2
+fi
+
 # These vendored packages live below, but are not members of, the root
 # workspace. A copied standalone workspace is the only way Cargo can compile
 # their dev-dependencies without mutating provenance manifests. Reuse the
-# repository patch table so the test still exercises the current local forks.
+# repository lint policy and patch table so the test still exercises the same
+# diagnostics and current local forks as the source workspace.
 {
     printf '\n[workspace]\nresolver = "%s"\n\n' "$workspace_resolver"
+    printf '%s\n\n' "$workspace_lints"
     sed -n '/^\[patch\.crates-io\]/,$p' "$REPO_ROOT/Cargo.toml" \
         | sed "s#path = \"#path = \"$REPO_ROOT/#g" \
         | sed \

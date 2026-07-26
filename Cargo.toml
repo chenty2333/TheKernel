@@ -8,6 +8,41 @@ members = [
 ]
 exclude = ["arceos"]
 
+# Lint policy for TheKernel-owned packages. `scripts/ci/clippy-gate.sh` promotes
+# everything that survives this table to an error, so an entry here is a
+# deliberate, reviewable decision rather than a silent local override. Vendored
+# sources under `third_party/rust-patches/` keep their upstream posture and are
+# reported separately by the gate.
+#
+# Every allowance must state the mechanism that makes the lint wrong for this
+# codebase, not merely that it is inconvenient.
+[workspace.lints.rust]
+# `dead_code` answers a different question in every build configuration: a
+# symbol unreachable in the riscv64 `qemu` profile is frequently live under
+# `smp`, `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. The
+# host/RISC-V/LoongArch gates still do not span the full feature power set, so
+# they cannot classify reachability truthfully. Keep this rustc lint outside
+# the zero-owned-Clippy-diagnostic contract; feature-local cleanup must use a
+# narrow `cfg` or a separately reviewed allowance rather than inferred removal.
+dead_code = "allow"
+
+[workspace.lints.clippy]
+# `mm::synchronize_tlb`/`synchronize_icache` return `GlobalGrace`, which only
+# carries drop glue when `smp-tlb-shootdown` is enabled. Dropping the returned
+# grace is the release point of a remote shootdown, so the explicit `drop(...)`
+# is load-bearing in the shipped SMP configuration even where a uniprocessor or
+# host build sees a unit struct. Removing these calls would be a silent
+# correctness regression rather than a cleanup.
+drop_non_drop = "allow"
+
+# RFC 0000's public-API freeze gate requires callers to pass immutable
+# snapshots, capabilities, and operation context explicitly instead of reading
+# implicit kernel globals such as the current task or the global FD table.
+# Wide signatures are the intended consequence of that rule; collapsing them
+# into context structs purely to satisfy an arity threshold would re-introduce
+# the ambient state the gate exists to remove.
+too_many_arguments = "allow"
+
 [workspace.package]
 version = "0.2.0-preview.2"
 edition = "2024"
@@ -43,6 +78,7 @@ axsync = { version = "0.3.0-preview.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
 axcbpf = { package = "thekernel-axcbpf", version = "=0.1.0" }
 axfault = { package = "thekernel-axfault", version = "=0.1.0" }
+axpmu = { package = "thekernel-axpmu", version = "=0.1.0", default-features = false }
 axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
 thekernel-linux-cred = { version = "=0.1.0", default-features = false }
@@ -67,11 +103,16 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = []
 boot-shell = []
 asid-fast-switch = ["thekernel-kernel/asid-fast-switch"]
+asid-switch-diagnostics = ["thekernel-kernel/asid-switch-diagnostics"]
 mm-lock-diagnostics = ["thekernel-kernel/mm-lock-diagnostics"]
+pmu-diagnostics = ["thekernel-kernel/pmu-diagnostics"]
 test-io-control = ["thekernel-kernel/test-io-control"]
 qemu = [
     "axfeat/defplat",
@@ -141,6 +182,7 @@ thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
 thekernel-axcbpf = { path = "../thekernel-ax/crates/thekernel-axcbpf" }
 thekernel-axfault = { path = "../thekernel-ax/crates/thekernel-axfault" }
+thekernel-axpmu = { path = "../thekernel-ax/crates/thekernel-axpmu" }
 thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
 thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }

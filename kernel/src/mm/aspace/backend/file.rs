@@ -163,13 +163,13 @@ fn activate_writable_mapping(
         // before executable admission so a sealed mapping publishes nothing.
         registration.set_active(true)?;
     }
-    if let Some(registration) = executable_mapping {
-        if let Err(error) = registration.set_active(true) {
-            if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
-                let _ = registration.set_active(false);
-            }
-            return Err(error);
+    if let Some(registration) = executable_mapping
+        && let Err(error) = registration.set_active(true)
+    {
+        if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
+            let _ = registration.set_active(false);
         }
+        return Err(error);
     }
 
     Ok(WritableMappingActivation {
@@ -508,7 +508,7 @@ impl FileBackendInner {
             }
             Err(PagingError::NotMapped) => true,
             Err(err) => {
-                warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
+                warn!("Failed to unmap page {vaddr:?}: {err:?}");
                 false
             }
         }
@@ -1109,7 +1109,7 @@ impl BackendOps for FileBackend {
             match pt.unmap(addr) {
                 Ok(_) | Err(PagingError::NotMapped) => {}
                 Err(err) => {
-                    warn!("Failed to unmap page {:?}: {:?}", addr, err);
+                    warn!("Failed to unmap page {addr:?}: {err:?}");
                     if self.writable_segment_active() {
                         self.retain_writable_exclusion_fail_closed();
                     }
@@ -1194,15 +1194,14 @@ impl BackendOps for FileBackend {
                                 pn,
                                 owner,
                                 |page, evicted| {
-                                    if let Some(evicted) = evicted {
-                                        if let Some(deferred_owner) = evicted.deferred_owner() {
-                                            assert_eq!(
-                                                deferred_owner, owner,
-                                                "foreign address-space owner deferred cache \
-                                                 eviction"
-                                            );
-                                            deferred_evictions.push(evicted);
-                                        }
+                                    if let Some(evicted) = evicted
+                                        && let Some(deferred_owner) = evicted.deferred_owner()
+                                    {
+                                        assert_eq!(
+                                            deferred_owner, owner,
+                                            "foreign address-space owner deferred cache eviction"
+                                        );
+                                        deferred_evictions.push(evicted);
                                     }
                                     pt.map(
                                         addr,

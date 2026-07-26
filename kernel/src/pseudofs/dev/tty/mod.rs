@@ -528,6 +528,25 @@ impl<R, W> Drop for Tty<R, W> {
     }
 }
 
+pub struct CurrentTty;
+impl DeviceOps for CurrentTty {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> AxResult<usize> {
+        Err(AxError::NotATty)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> AxResult<usize> {
+        Err(AxError::NotATty)
+    }
+
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+        Err(AxError::NotATty)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::{borrow::Cow, boxed::Box, sync::Arc};
@@ -571,13 +590,33 @@ mod tests {
         }
     }
 
+    /// Drains the deferred description-cleanup queue to quiescence.
+    ///
+    /// The queue is global and every test that drops a committed
+    /// `FileDescription` publishes to it, so a single bounded batch — which is
+    /// all `drain_deferred_description_resource_only_for_test` performs — only
+    /// reaches quiescence when this test happens to run alone. The bound keeps
+    /// a genuine leak a failure rather than a hang.
     fn drain_all_description_cleanup() {
-        drain_deferred_description_resource_only_for_test();
-        assert!(!has_deferred_description_cleanup_work());
+        const MAX_DRAIN_BATCHES: usize = 1024;
+
+        for _ in 0..MAX_DRAIN_BATCHES {
+            if !has_deferred_description_cleanup_work() {
+                return;
+            }
+            drain_deferred_description_resource_only_for_test();
+        }
+        assert!(
+            !has_deferred_description_cleanup_work(),
+            "deferred description cleanup did not reach quiescence"
+        );
     }
 
     #[test]
     fn master_dup_releases_devpts_and_hangs_up_slave_only_after_deferred_final_close() {
+        // Asserts on the shared deferred-cleanup queue, so it must not
+        // interleave with other tests that publish to it.
+        let _context = crate::test_support::scheduler_test_context();
         drain_all_description_cleanup();
         let (master, slave) = pty::create_pty_pair_for_test().unwrap();
         let (lease, slot) = pts::reserve_test_lease().unwrap();
@@ -631,24 +670,5 @@ mod tests {
         drop(slave);
         drop(master);
         drain_all_description_cleanup();
-    }
-}
-
-pub struct CurrentTty;
-impl DeviceOps for CurrentTty {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> AxResult<usize> {
-        Err(AxError::NotATty)
-    }
-
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> AxResult<usize> {
-        Err(AxError::NotATty)
-    }
-
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
-        Err(AxError::NotATty)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

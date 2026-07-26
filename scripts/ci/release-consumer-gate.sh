@@ -14,6 +14,8 @@ EXPECTED_RELEASE_SET=${THEKERNEL_EXPECTED_RELEASE_SET:-}
 OUTPUT_RELEASE_SET=${THEKERNEL_OUTPUT_RELEASE_SET:-$REPO_ROOT/.state/ci/release-consumer/release-set.tsv}
 WORK_ROOT=${THEKERNEL_RELEASE_GATE_WORK_ROOT:-$REPO_ROOT/.state/ci/release-consumer-work}
 ARCHES=${THEKERNEL_RELEASE_GATE_ARCHES:-both}
+# Packaging verifies the maintained sibling crates at their shared compatibility
+# nightly. It is intentionally not inherited from TheKernel's root compiler pin.
 PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly-2025-05-20}
 
 VERSION=0.1.0
@@ -24,6 +26,7 @@ AX_PACKAGES=(
     thekernel-axpoll
     thekernel-axcbpf
     thekernel-axfault
+    thekernel-axpmu
     thekernel-axtask
     thekernel-axtlb
 )
@@ -44,6 +47,7 @@ CONSUMED_PACKAGES=(
     thekernel-axpoll
     thekernel-axcbpf
     thekernel-axfault
+    thekernel-axpmu
     thekernel-axtask
     thekernel-axtlb
     thekernel-linux-cred
@@ -63,7 +67,9 @@ Usage: scripts/ci/release-consumer-gate.sh [OPTIONS]
 Packages the clean thekernel-ax and thekernel-linux-abi release workspaces,
 validates and safely extracts the exact .crate archives, retargets a temporary
 copy of TheKernel to those artifacts, rejects legacy or source-workspace
-instances, and builds the RISC-V and LoongArch release-mode kernels.
+instances, and builds the RISC-V and LoongArch release and MM-diagnostics
+kernels. The latter is compile coverage for target-specific ASID/PMU consumers,
+not runtime or performance evidence.
 
 Options:
   --ax-repo DIR                 thekernel-ax checkout
@@ -298,6 +304,7 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
             -p thekernel-axpoll \
             -p thekernel-axcbpf \
             -p thekernel-axfault \
+            -p thekernel-axpmu \
             -p thekernel-axtask \
             -p thekernel-axtlb
 )
@@ -476,6 +483,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-ax/crates/thekernel-axpoll=../artifacts/thekernel-axpoll-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axcbpf=../artifacts/thekernel-axcbpf-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \
+    --replace "../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-$VERSION" \
     --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
@@ -514,8 +522,8 @@ done
 python3 "$SCRIPT_DIR/release-dependency-graph.py" "${graph_args[@]}"
 
 # Fetch the locked graph before forcing the actual kernel builds offline.  The
-# wrapper adds --locked to the Makefile's cargo build invocation without
-# modifying the real or copied Makefiles.
+# wrapper adds --locked and --offline to the Makefile's cargo build invocation
+# without modifying the real or copied Makefiles.
 (cd "$consumer_root" && cargo fetch --locked)
 real_cargo=$(command -v cargo)
 wrapper_bin="$work_dir/locked-bin"
@@ -525,7 +533,7 @@ cat >"$wrapper_bin/cargo" <<'EOF'
 set -euo pipefail
 for argument in "$@"; do
     if [ "$argument" = build ]; then
-        exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@" --locked
+        exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@" --locked --offline
     fi
 done
 exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@"
@@ -552,10 +560,43 @@ build_arch() {
         || ci_die "$arch consumer build did not produce $output"
 }
 
+build_diagnostics_arch() {
+    local arch=$1
+    local goal output
+    case "$arch" in
+        rv)
+            goal=kernel-rv-mm-performance
+            output=.state/mm-performance-shell/kernel-rv
+            ;;
+        la)
+            goal=kernel-la-mm-performance
+            output=.state/mm-performance-shell/kernel-la
+            ;;
+        *) ci_die "internal unsupported diagnostics architecture: $arch" ;;
+    esac
+    printf \
+        '[release-consumer] build %s ASID/PMU diagnostics from exact extracted artifacts\n' \
+        "$arch"
+    (
+        cd "$consumer_root"
+        PATH="$wrapper_bin:$PATH" \
+        THEKERNEL_RELEASE_REAL_CARGO="$real_cargo" \
+        CARGO_NET_OFFLINE=true \
+            make --no-print-directory "$goal"
+    )
+    [ -s "$consumer_root/$output" ] \
+        || ci_die "$arch diagnostics consumer build did not produce $output"
+}
+
 case "$ARCHES" in
-    rv) build_arch rv ;;
-    la) build_arch la ;;
-    both) build_arch rv; build_arch la ;;
+    rv) build_arch rv; build_diagnostics_arch rv ;;
+    la) build_arch la; build_diagnostics_arch la ;;
+    both)
+        build_arch rv
+        build_diagnostics_arch rv
+        build_arch la
+        build_diagnostics_arch la
+        ;;
 esac
 
 lock_after_build=$(sha256sum "$consumer_root/Cargo.lock" | awk '{print $1}')
@@ -587,7 +628,7 @@ release_set_tmp="$OUTPUT_RELEASE_SET.tmp.$$"
     printf 'package\tversion\tsha256\trepository_head\n'
     for package in "${all_packages[@]}"; do
         case "$package" in
-            thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axtask|thekernel-axtlb)
+            thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb)
                 repo_head=$AX_HEAD
                 ;;
             *)

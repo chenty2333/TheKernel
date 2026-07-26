@@ -323,7 +323,7 @@ impl Pollable for MqFd {
     fn poll(&self) -> IoEvents {
         let queue = self.queue.lock();
         let mut events = IoEvents::empty();
-        events.set(IoEvents::READABLE, queue.messages.len() > 0);
+        events.set(IoEvents::READABLE, !queue.messages.is_empty());
         events.set(IoEvents::WRITABLE, queue.messages.len() < queue.maxmsg);
         events
     }
@@ -480,11 +480,12 @@ fn validate_notify_event(event: &RawSigevent) -> AxResult {
     match event.notify() as u32 {
         SIGEV_NONE | SIGEV_THREAD => Ok(()),
         SIGEV_SIGNAL => {
-            if event.signo() == 0 {
-                Ok(())
-            } else if (1..=64).contains(&event.signo())
-                && Signo::from_repr(event.signo() as u8).is_some()
-            {
+            // Signo 0 selects "notify without delivering a signal"; any other
+            // value must name a signal this kernel can actually deliver.
+            let accepted = event.signo() == 0
+                || ((1..=64).contains(&event.signo())
+                    && Signo::from_repr(event.signo() as u8).is_some());
+            if accepted {
                 Ok(())
             } else {
                 Err(AxError::InvalidInput)

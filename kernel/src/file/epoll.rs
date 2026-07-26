@@ -616,7 +616,10 @@ impl EpollInner {
     fn check_fault(&self) -> AxResult<()> {
         match self.fault.load(Ordering::Acquire) {
             EPOLL_FAULT_NONE => Ok(()),
-            EPOLL_FAULT_PENDING_OVERFLOW | EPOLL_FAULT_CORE_INVARIANT | _ => Err(AxError::BadState),
+            // `EPOLL_FAULT_PENDING_OVERFLOW`, `EPOLL_FAULT_CORE_INVARIANT`,
+            // and any fault code added later all mean the same thing to a
+            // caller: this epoll instance can no longer be trusted.
+            _ => Err(AxError::BadState),
         }
     }
 
@@ -925,10 +928,7 @@ impl EpollInner {
 impl Drop for EpollInner {
     fn drop(&mut self) {
         let state = self.state.get_mut();
-        loop {
-            let Some(slot) = state.by_slot.iter().position(Option::is_some) else {
-                break;
-            };
+        while let Some(slot) = state.by_slot.iter().position(Option::is_some) {
             let Some(record) = state.by_slot[slot].take() else {
                 error!("epoll adapter slot disappeared during exclusive teardown");
                 break;

@@ -141,14 +141,14 @@ class HostDiagnosticTests(unittest.TestCase):
 
 
 class RunnerContractTests(unittest.TestCase):
-    def test_shell_manifest_header_tracks_v7_schema(self) -> None:
+    def test_shell_manifest_header_tracks_current_schema(self) -> None:
         source = (CI_DIR / "nightly" / "mm-performance.sh").read_text(
             encoding="utf-8"
         )
         block = source.split("manifest_columns=(", 1)[1].split("\n)", 1)[0]
         columns = tuple(line.strip() for line in block.splitlines() if line.strip())
         self.assertEqual(columns, schema.MANIFEST_COLUMNS)
-        self.assertIn("thekernel-mm-performance-bundle-v8", source)
+        self.assertIn("thekernel-mm-performance-bundle-v10", source)
         self.assertIn(
             f"$((run_count * {len(schema.EXPECTED_METRICS)}))",
             source,
@@ -165,6 +165,8 @@ class RunnerContractTests(unittest.TestCase):
             "scripts/ci/compare-mm-performance.py",
             "scripts/ci/nightly/mm-performance-boundary.sh",
             "scripts/ci/parse-mm-lock-diagnostics.py",
+            "scripts/ci/parse-asid-switch-diagnostics.py",
+            "scripts/ci/parse-pmu-capabilities.py",
             "scripts/ci/nightly/mm-performance-regression-policy.json",
             "scripts/ci/nightly/mm-performance-stability-policy.json",
             "scripts/create-rootfs-image.sh",

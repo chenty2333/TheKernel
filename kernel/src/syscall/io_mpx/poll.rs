@@ -1,5 +1,4 @@
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use axerrno::{AxError, AxResult};
 use axhal::{
@@ -92,7 +91,7 @@ fn do_poll(
         if invalid_count != 0 {
             return Ok(invalid_count as isize);
         }
-        return wait_signal_only(uctx, timeout.map(Duration::from), sigmask);
+        return wait_signal_only(uctx, timeout, sigmask);
     }
     let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
     let mut poll_once = || {

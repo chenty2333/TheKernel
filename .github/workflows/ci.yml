@@ -19,7 +19,7 @@ env:
   # Maintained sibling inputs are source-controlled immutable release
   # candidates. Local development may still override their checkout paths.
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
-  THEKERNEL_AX_REF: 00a04c356ee13d349ebd360bd4eddcc1e5a8c5bb
+  THEKERNEL_AX_REF: 12e208e2a992d2b8bb1395d38f65125779b499b9
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
   THEKERNEL_LINUX_ABI_REF: df13793f1c372432d0c5144d44636dfd53ccec45
 
@@ -27,7 +27,7 @@ jobs:
   per-commit:
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -116,6 +116,42 @@ jobs:
           path: .state/ci/packet-host-differential/
           include-hidden-files: true
 
+  # These portable cases need no elevated host capability. Run each against
+  # the bare hosted Linux kernel, publish its source-exact receipt, and replay
+  # the same C source in the dual-architecture semantic rootfs below.
+  host-portable-differentials:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - futex
+          - epoll
+          - signal-order
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run host Linux ${{ matrix.case }} differential
+        run: ./scripts/ci/${{ matrix.case }}-host-differential.sh
+
+      - name: Validate host differential receipt
+        run: >-
+          python3 scripts/ci/differential/validate-receipt.py
+          --receipt .state/ci/${{ matrix.case }}-host-differential/receipt.json
+          --case ${{ matrix.case }}
+          --manifest scripts/ci/differential/manifests/${{ matrix.case }}.markers
+          --require-empty-allowlist --require-pass
+
+      - name: Upload ${{ matrix.case }} differential evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.case }}-differential
+          path: .state/ci/${{ matrix.case }}-host-differential/
+          include-hidden-files: true
+
   # Full dual-architecture boot remains on the self-hosted QEMU runner. Root
   # images are built from this repository by the gate itself.
   dual-arch-pr:
@@ -128,7 +164,7 @@ jobs:
       - linux
       - thekernel-qemu
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

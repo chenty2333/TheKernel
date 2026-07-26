@@ -291,7 +291,7 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
                         send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
                 }
             }
-            ChildExitCompletionStep::Reap => match reap_process(&child) {
+            ChildExitCompletionStep::Reap => match reap_process(child) {
                 Ok(true) => cgroup::detach_process(child.pid()),
                 Ok(false) => error!(
                     "inherited zombie {} was already reaped during autoreap",
@@ -355,7 +355,12 @@ pub fn set_task_user_address_space(
         any(target_arch = "riscv64", target_arch = "loongarch64")
     ))]
     unsafe {
-        ctx.set_page_table_root_with_asid(token.root(), token.asid(), token.generation());
+        ctx.set_page_table_root_with_asid(
+            token.root(),
+            token.asid(),
+            token.generation(),
+            token.fallback_reason(),
+        );
     }
 
     #[cfg(not(all(
@@ -1257,7 +1262,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let visible_tid = thr.tid();
 
     match curr.id_name() {
-        Ok(name) => info!("{} exit with code: {}", name, exit_code),
+        Ok(name) => info!("{name} exit with code: {exit_code}"),
         Err(error) => info!(
             "Task({}) exit with code: {} (name unavailable: {})",
             curr.id().as_u64(),

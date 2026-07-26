@@ -392,8 +392,11 @@ pub(crate) fn drain_deferred_cleanup_work() {
     for _ in 0..FANOTIFY_CLEANUP_BUDGET {
         if let Some(event) = work.queue.pop_front() {
             drop(event);
-        } else if let Some(mark) = work.marks.pop() {
-            drop(mark);
+        } else if work.marks.pop().is_some() {
+            // `FanotifyMark` is plain `Copy` data, so removing it from the
+            // vector is the entire release; there is no destructor to run.
+            // It still spends one unit of the drain budget so that a long mark
+            // list cannot monopolize a single pass.
         } else if let Some(permission) = work.pending_permissions.pop() {
             drop(permission);
         } else {

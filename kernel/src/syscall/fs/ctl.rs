@@ -8,7 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileBackend, FileFlags};
 use axfs_ng_vfs::{
-    DeviceId, Location, Metadata, MetadataUpdate, NodePermission, NodeType,
+    DeviceId, Location, MetadataUpdate, NodePermission, NodeType,
     path::{FinalComponent, FinalComponentKind, Path},
 };
 use axhal::power::system_off;
@@ -44,9 +44,7 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::{
-        AsThread, Cred, DacCredentialView, Kgid, Kuid, PidNamespace, UserGid, UserUid, ns_capable,
-    },
+    task::{AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, ns_capable},
     time::{TimeValueLike, wall_time},
 };
 
@@ -238,10 +236,10 @@ fn hardlink_location_from_file_like(file_like: &dyn FileLike) -> Option<Location
         Some(file.inner().location().clone())
     } else if let Some(directory) = file_like.downcast_ref::<Directory>() {
         Some(directory.inner().clone())
-    } else if let Some(pipe) = file_like.downcast_ref::<crate::file::pipe::NamedPipe>() {
-        Some(pipe.location().clone())
     } else {
-        None
+        file_like
+            .downcast_ref::<crate::file::pipe::NamedPipe>()
+            .map(|pipe| pipe.location().clone())
     }
 }
 
@@ -1631,10 +1629,11 @@ mod tests {
     use alloc::vec::Vec;
     use core::{cell::Cell, time::Duration};
 
-    use axfs_ng_vfs::Mountpoint;
+    use axfs_ng_vfs::{Metadata, Mountpoint};
     use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
+    use crate::task::DacCredentialView;
 
     fn linkat_test_security() -> VfsSecurityContext {
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();

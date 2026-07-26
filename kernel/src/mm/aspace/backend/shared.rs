@@ -431,7 +431,7 @@ impl BackendOps for SharedBackend {
         flags: MappingFlags,
         _pt: &mut PageTableCursor,
     ) -> AxResult {
-        debug!("Shared::map: {:?} {:?}", range, flags);
+        debug!("Shared::map: {range:?} {flags:?}");
         pages_in(range, self.pages.size)?;
         self.check_protect_flags(flags)?;
         Ok(())
@@ -448,7 +448,7 @@ impl BackendOps for SharedBackend {
     }
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
-        debug!("Shared::unmap: {:?}", range);
+        debug!("Shared::unmap: {range:?}");
         for vaddr in pages_in(range, self.pages.size)? {
             match pt.unmap(vaddr) {
                 Ok(_) | Err(PagingError::NotMapped) => {}

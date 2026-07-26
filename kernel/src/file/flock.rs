@@ -495,9 +495,7 @@ fn record_lock_blocking(
                 .insert(owner, RecordLockWait { id, req });
             Ok(())
         })();
-        if let Err(error) = admission {
-            return Err(error);
-        }
+        admission?;
         Err(AxError::WouldBlock)
     });
     if result.is_err() {
@@ -1276,6 +1274,9 @@ mod tests {
 
     #[test]
     fn ofd_record_release_is_batched_and_removes_only_its_owner() {
+        // Reaches the global record-lock table through a sleepable mutex,
+        // which needs a live current task.
+        let _context = crate::test_support::scheduler_test_context();
         const OWNER: u64 = u64::MAX - 100;
         const OBSERVER: u64 = u64::MAX - 101;
         const DEVICE: u64 = u64::MAX - 102;
@@ -1323,6 +1324,7 @@ mod tests {
 
     #[test]
     fn flock_release_is_batched_and_allows_immediate_reacquire() {
+        let _context = crate::test_support::scheduler_test_context();
         const OWNER: u64 = u64::MAX - 200;
         const OBSERVER: u64 = u64::MAX - 201;
         const DEVICE: u64 = u64::MAX - 202;

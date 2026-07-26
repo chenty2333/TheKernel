@@ -1,0 +1,28 @@
+# timerfd, described in the syzlang subset defined in tools/syz-differential/README.md.
+# Modeled on syzkaller's sys/linux/sys.txt timerfd declarations, restricted to
+# the subset grammar (resources, flag sets, structs, typed syscall signatures).
+
+include <linux/timerfd.h>
+include <time.h>
+
+resource fd_timer[fd]
+
+timerfd_clock_ids = CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME
+timerfd_create_flags = TFD_NONBLOCK, TFD_CLOEXEC
+timerfd_settime_flags = TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET
+
+timespec {
+	sec	intptr
+	nsec	intptr
+}
+
+itimerspec {
+	interval	timespec
+	value	timespec
+}
+
+timerfd_create(clockid flags[timerfd_clock_ids], flags flags[timerfd_create_flags]) fd_timer
+timerfd_settime(fd fd_timer, flags flags[timerfd_settime_flags], new ptr[in, itimerspec], old ptr[out, itimerspec]) int32
+timerfd_gettime(fd fd_timer, cur ptr[out, itimerspec]) int32
+read$timerfd(fd fd_timer, buf ptr[out, int64], count len[buf]) int64
+close$timerfd(fd fd_timer)

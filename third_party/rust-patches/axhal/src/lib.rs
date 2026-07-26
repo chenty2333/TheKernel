@@ -105,7 +105,12 @@ pub mod trap {
 /// - [`TaskContext`][axcpu::TaskContext]: The context of a task.
 /// - [`TrapFrame`][axcpu::TrapFrame]: The context of an interrupt or an exception.
 pub mod context {
-    pub use axcpu::{TaskContext, TrapFrame};
+    pub use axcpu::{AddressSpaceFallbackReason, TaskContext, TrapFrame};
+    #[cfg(feature = "asid-switch-diagnostics")]
+    pub use axcpu::{
+        AsidSwitchDiagnosticsSnapshot, asid_switch_diagnostics_snapshot,
+        reset_asid_switch_diagnostics, set_asid_switch_diagnostics_enabled,
+    };
 }
 
 pub use axcpu::asm;

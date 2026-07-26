@@ -1069,15 +1069,15 @@ impl IoUring {
             RegisteredFileTable::new(self.id, table_id, capacity, self.layout.sq_entries())
                 .map_err(map_core_error)?;
         for (slot, file) in files.into_iter().enumerate() {
-            if let Some(file) = file {
-                if let Err(error) = table.install(
+            if let Some(file) = file
+                && let Err(error) = table.install(
                     FileSlot::new(u32::try_from(slot).map_err(|_| AxError::InvalidInput)?),
                     file,
-                ) {
-                    let kind = error.error();
-                    drop(error.into_owner());
-                    return Err(map_core_error(kind));
-                }
+                )
+            {
+                let kind = error.error();
+                drop(error.into_owner());
+                return Err(map_core_error(kind));
             }
         }
         table.publish().map_err(map_core_error)?;
@@ -1354,10 +1354,10 @@ impl IoUring {
                 poll_events_to_linux(ready) as i32,
             )?;
         }
-        if control.has_source_wake() {
-            if let Some(ring) = self.self_weak.get().and_then(Weak::upgrade) {
-                ring.publish_poll_hint(id);
-            }
+        if control.has_source_wake()
+            && let Some(ring) = self.self_weak.get().and_then(Weak::upgrade)
+        {
+            ring.publish_poll_hint(id);
         }
         Ok(())
     }
@@ -1637,6 +1637,36 @@ pub(crate) fn drain_deferred_io_uring_work() {
     }
 }
 
+fn initialize_ring_header(pages: &SharedPages, layout: RingLayout) -> AxResult<()> {
+    let sq = layout.sq_offsets();
+    let cq = layout.cq_offsets();
+    for (offset, value) in [
+        (sq.head(), 0),
+        (sq.tail(), 0),
+        (sq.ring_mask(), layout.sq_mask()),
+        (sq.ring_entries(), layout.sq_entries()),
+        (sq.flags(), 0),
+        (sq.dropped(), 0),
+        (cq.head(), 0),
+        (cq.tail(), 0),
+        (cq.ring_mask(), layout.cq_mask()),
+        (cq.ring_entries(), layout.cq_entries()),
+        (cq.overflow(), 0),
+        (cq.flags(), 0),
+    ] {
+        pages.write_bytes(offset as usize, &value.to_ne_bytes())?;
+    }
+    if let Some(array) = sq.array() {
+        for index in 0..layout.sq_entries() {
+            let offset = array
+                .checked_add(index.checked_mul(4).ok_or(AxError::InvalidInput)?)
+                .ok_or(AxError::InvalidInput)?;
+            pages.write_bytes(offset as usize, &index.to_ne_bytes())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod adapter_state_tests {
     use super::*;
@@ -1669,34 +1699,4 @@ mod adapter_state_tests {
         progress.enter(FinalClosePhase::Completions);
         assert_eq!(progress.take_slots(1), 0..1);
     }
-}
-
-fn initialize_ring_header(pages: &SharedPages, layout: RingLayout) -> AxResult<()> {
-    let sq = layout.sq_offsets();
-    let cq = layout.cq_offsets();
-    for (offset, value) in [
-        (sq.head(), 0),
-        (sq.tail(), 0),
-        (sq.ring_mask(), layout.sq_mask()),
-        (sq.ring_entries(), layout.sq_entries()),
-        (sq.flags(), 0),
-        (sq.dropped(), 0),
-        (cq.head(), 0),
-        (cq.tail(), 0),
-        (cq.ring_mask(), layout.cq_mask()),
-        (cq.ring_entries(), layout.cq_entries()),
-        (cq.overflow(), 0),
-        (cq.flags(), 0),
-    ] {
-        pages.write_bytes(offset as usize, &value.to_ne_bytes())?;
-    }
-    if let Some(array) = sq.array() {
-        for index in 0..layout.sq_entries() {
-            let offset = array
-                .checked_add(index.checked_mul(4).ok_or(AxError::InvalidInput)?)
-                .ok_or(AxError::InvalidInput)?;
-            pages.write_bytes(offset as usize, &index.to_ne_bytes())?;
-        }
-    }
-    Ok(())
 }

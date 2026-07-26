@@ -35,6 +35,8 @@ grep -Fq \
     "$REPO_ROOT/dev-env/compose.yaml"
 grep -Fq 'ci_run_step axfault-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-axfault' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-axpmu --all-targets' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'bpf,asid-switch-diagnostics,pmu-diagnostics' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step axcbpf-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-axcbpf' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step seccomp-core-tests' "$CI_DIR/per-commit.sh"
@@ -71,6 +73,34 @@ grep -Fq '/proc/sys/kernel/apparmor_restrict_unprivileged_userns' \
     "$REPO_ROOT/.github/workflows/ci.yml"
 grep -Fq 'sudo tee "$restriction"' \
     "$REPO_ROOT/.github/workflows/ci.yml"
+
+# Container jobs are resolved before any runner step can source versions.env,
+# and GitHub does not expose the env context to container.image. Keep the two
+# default images fixed to the current toolchain tag, preserve the repository
+# variable override, and make this test derive the expected literal from the
+# canonical version file so a future toolchain bump cannot drift silently.
+rust_toolchain=$(sed -n 's/^RUST_TOOLCHAIN=//p' \
+    "$REPO_ROOT/dev-env/versions.env")
+[ -n "$rust_toolchain" ]
+[ "$(grep -c '^RUST_TOOLCHAIN=' "$REPO_ROOT/dev-env/versions.env")" -eq 1 ]
+expected_ci_image="      image: \${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:${rust_toolchain}', github.repository_owner) }}"
+[ "$(grep -Fxc -- "$expected_ci_image" \
+    "$REPO_ROOT/.github/workflows/ci.yml")" -eq 2 ]
+if grep -Fq 'thekernel-dev:latest' "$REPO_ROOT/.github/workflows/ci.yml"; then
+    printf '%s\n' 'test-ci-scripts: CI container fallback still uses latest' >&2
+    exit 1
+fi
+
+# Publishing always emits the version-derived toolchain tag. Only a main
+# branch push may additionally move latest; a manual feature-branch dispatch
+# therefore cannot replace the default floating image.
+grep -Fqx '            type=raw,value=${{ env.RUST_TOOLCHAIN }}' \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml"
+grep -Fqx \
+    "            type=raw,value=latest,enable=\${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}" \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml"
+[ "$(grep -Fc 'type=raw,value=latest' \
+    "$REPO_ROOT/.github/workflows/publish-dev-image.yml")" -eq 1 ]
 mkdir -p "$tmp/shared-cargo-target"
 ln -s "$tmp/shared-cargo-target" "$tmp/aliased-cargo-target"
 if env \
@@ -108,6 +138,8 @@ grep -Fq 'symbolic-link component' "$tmp/per-commit-alias.stderr"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
+python3 "$REPO_ROOT/tests/ci/test_asid_switch_diagnostics_parser.py"
+python3 "$REPO_ROOT/tests/ci/test_pmu_capabilities_parser.py"
 python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_host.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_guest.py"
@@ -189,6 +221,40 @@ if grep -F 'rm -rf "$WORKDIR"' "$REPO_ROOT/scripts/system-test.sh" >/dev/null ||
     grep -F 'rm -rf "$run_dir"' "$CI_DIR/nightly/lib.sh" >/dev/null
 then
     printf '%s\n' 'test-ci-scripts: a direct gate still recursively clears caller paths' >&2
+    exit 1
+fi
+
+# A focused copy becomes its own workspace root. Packages such as axnet-ng
+# inherit the repository lint policy, so the generated root must carry the
+# real tables rather than an empty compatibility placeholder.
+focused_bin="$tmp/focused-bin"
+mkdir -p "$focused_bin"
+cat >"$focused_bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+manifest=
+while (($#)); do
+    case "$1" in
+        --manifest-path) manifest=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$manifest" ]
+cp "$manifest" "$FOCUSED_MANIFEST_CAPTURE"
+EOF
+chmod +x "$focused_bin/cargo"
+env \
+    PATH="$focused_bin:$PATH" \
+    FOCUSED_MANIFEST_CAPTURE="$tmp/focused-Cargo.toml" \
+    THEKERNEL_CI_FOCUSED_WORK_ROOT="$tmp/focused-workspaces" \
+    "$CI_DIR/focused-cargo-test.sh" crates/axnet-ng/Cargo.toml
+[ "$(grep -Fxc '[workspace.lints.rust]' "$tmp/focused-Cargo.toml")" -eq 1 ]
+[ "$(grep -Fxc '[workspace.lints.clippy]' "$tmp/focused-Cargo.toml")" -eq 1 ]
+grep -Fqx 'dead_code = "allow"' "$tmp/focused-Cargo.toml"
+grep -Fqx 'drop_non_drop = "allow"' "$tmp/focused-Cargo.toml"
+grep -Fqx 'too_many_arguments = "allow"' "$tmp/focused-Cargo.toml"
+if grep -Fq '[workspace.package]' "$tmp/focused-Cargo.toml"; then
+    printf '%s\n' 'test-ci-scripts: focused manifest copied unrelated workspace tables' >&2
     exit 1
 fi
 
@@ -392,6 +458,11 @@ if [ -n "${SYSTEM_DUPLICATE_PACKET_OK:-}" ]; then
     fi
 fi
 EOF
+cat >"$pr_fixture/scripts/ci/clippy-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'clippy %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+EOF
 cat >"$pr_fixture/fake-bin/make" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -423,6 +494,7 @@ esac
 EOF
 chmod +x \
     "$pr_fixture/scripts/ci/release-consumer-gate.sh" \
+    "$pr_fixture/scripts/ci/clippy-gate.sh" \
     "$pr_fixture/scripts/ci/boot-shell-gate.sh" \
     "$pr_fixture/scripts/system-test.sh" \
     "$pr_fixture/fake-bin/make"
@@ -457,10 +529,13 @@ env PATH="$pr_fixture/fake-bin:$PATH" \
 grep -Fxq \
     "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" \
     "$pr_trace"
-[ "$(sed -n '1p' "$pr_trace")" = \
+# Linting precedes the release build so a lint failure costs no image.
+[ "$(sed -n '1p' "$pr_trace")" = 'clippy --profile la' ]
+[ "$(sed -n '2p' "$pr_trace")" = \
     "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
-[ "$(sed -n '2p' "$pr_trace")" = 'make kernels' ]
-[ "$(sed -n '3p' "$pr_trace")" = 'make kernel-rv-shell kernel-la-shell rootfs' ]
+[ "$(sed -n '3p' "$pr_trace")" = 'make kernels' ]
+[ "$(sed -n '4p' "$pr_trace")" = 'make kernel-rv-shell kernel-la-shell rootfs' ]
+grep -Fq 'clippy --profile la' "$pr_trace"
 grep -Fq 'boot --arch both --skip-build' "$pr_trace"
 grep -Fq \
     "system --arch rv --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/rv" \
@@ -678,7 +753,9 @@ env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
     THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --skip-build --log-dir "$tmp/pr-gate-skip-logs" >/dev/null
-[ "$(wc -l <"$pr_trace")" -eq 3 ]
+# clippy-la, dual-arch-boot, system-rv, system-la.
+[ "$(wc -l <"$pr_trace")" -eq 4 ]
+grep -Fq 'clippy --profile la' "$pr_trace"
 grep -Fq 'boot --arch both --skip-build' "$pr_trace"
 grep -Fq 'system --arch rv --skip-build' "$pr_trace"
 grep -Fq 'system --arch la --skip-build' "$pr_trace"
@@ -813,10 +890,15 @@ grep -Fqx $'command_exit_code\t9' "$tmp/pr-gate-fail-logs/evidence/receipt.tsv"
 system_fixture="$tmp/system-fixture"
 mkdir -p \
     "$system_fixture/scripts/ci" \
+    "$system_fixture/scripts/ci/differential/manifests" \
     "$system_fixture/fake-bin" \
     "$system_fixture/.state/rootfs"
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
 cp "$CI_DIR/lib.sh" "$system_fixture/scripts/ci/"
+cp "$CI_DIR/differential/manifests/futex.markers" \
+    "$CI_DIR/differential/manifests/epoll-guest.markers" \
+    "$CI_DIR/differential/manifests/signal-order.markers" \
+    "$system_fixture/scripts/ci/differential/manifests/"
 printf fixture >"$system_fixture/kernel-rv"
 printf fixture >"$system_fixture/kernel-la"
 printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
@@ -875,13 +957,24 @@ case "$arch" in
     la) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent' ;;
     *) exit 2 ;;
 esac >>"$workdir/console.log"
-cat >>"$workdir/console.log" <<'MARKERS_AFTER_SETRLIMIT'
+cat >>"$workdir/console.log" <<'MARKERS_AFTER_WAIT'
 CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT
 CI_WAIT_BOUNDARY_FUTEX_WAKE_OK
 CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK
 CI_WAIT_BOUNDARY_FUTEX_WAITV_OK
 CI_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK
+MARKERS_AFTER_WAIT
+fixture_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cat \
+    "$fixture_root/scripts/ci/differential/manifests/futex.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/epoll-guest.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/signal-order.markers" \
+    >>"$workdir/console.log"
+cat >>"$workdir/console.log" <<'MARKERS_AFTER_DIFFERENTIAL'
+THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK
 THEKERNEL_IO_URING_OK
 THEKERNEL_SYSTEM_TEST_IO_URING_OK
 THEKERNEL_USERFAULTFD_API_OK
@@ -936,7 +1029,7 @@ THEKERNEL_SECCOMP_RESOURCE_ROLLBACK_OK
 THEKERNEL_SECCOMP_OK
 THEKERNEL_SYSTEM_TEST_SECCOMP_OK
 THEKERNEL_SYSTEM_TEST_PASS
-MARKERS_AFTER_SETRLIMIT
+MARKERS_AFTER_DIFFERENTIAL
 exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$system_fixture/fake-bin/python3"
@@ -1513,6 +1606,118 @@ sed 's/kind=stale stale_count=1/kind=operational stale_count=1/' \
 if "$CI_DIR/validate-smp-tlb-log.sh" \
     "$tmp/smp-tlb-mutation-operational.log" 2 stale >/dev/null 2>&1; then
     printf 'test-ci-scripts: mutation parser accepted an operational failure\n' >&2
+    exit 1
+fi
+
+# The unfiltered suite must keep running: the focused gates cannot see tests no
+# filter names, nor interference between tests sharing kernel globals.
+grep -Fq 'ci_run_step kernel-full-suite' "$CI_DIR/per-commit.sh"
+grep -Fq 'rust-full-test-gate.sh' "$CI_DIR/per-commit.sh"
+
+# The floor must reject a shrinking suite and accept the real count.
+full_gate_out="$tmp/full-gate.txt"
+if "$CI_DIR/rust-full-test-gate.sh" --minimum 5 -- \
+    printf 'running 4 tests\n' >"$full_gate_out" 2>&1; then
+    printf 'test-ci-scripts: full test gate accepted a shrinking suite\n' >&2
+    exit 1
+fi
+grep -Fq 'executed 4 tests; require at least 5' "$full_gate_out"
+"$CI_DIR/rust-full-test-gate.sh" --minimum 4 -- \
+    printf 'running 4 tests\n' >"$full_gate_out" 2>&1
+grep -Fq 'executed 4 tests (minimum 4)' "$full_gate_out"
+# Two harness reports (lib plus integration binaries) sum rather than reset.
+"$CI_DIR/rust-full-test-gate.sh" --minimum 7 -- \
+    printf 'running 4 tests\nrunning 3 tests\n' >"$full_gate_out" 2>&1
+grep -Fq 'executed 7 tests (minimum 7)' "$full_gate_out"
+# A run that produced no harness report at all proves nothing.
+if "$CI_DIR/rust-full-test-gate.sh" --minimum 1 -- \
+    printf 'no harness output\n' >"$full_gate_out" 2>&1; then
+    printf 'test-ci-scripts: full test gate accepted a missing harness report\n' >&2
+    exit 1
+fi
+if "$CI_DIR/rust-full-test-gate.sh" --minimum 0 -- true >/dev/null 2>&1; then
+    printf 'test-ci-scripts: full test gate accepted a zero minimum\n' >&2
+    exit 1
+fi
+
+# The clippy gate must stay wired into both gates, and must keep linting the
+# host profile alongside an architecture profile: `dead_code`, drop glue, and
+# `c_char` casts answer differently per profile, so one profile alone would let
+# the other rot.
+grep -Fq 'ci_run_step clippy-host' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'clippy-gate.sh" --profile host' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step clippy-rv' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'clippy-gate.sh" --profile rv' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step clippy-la' "$CI_DIR/pr-gate.sh"
+grep -Fq -- 'clippy-gate.sh" --profile la' "$CI_DIR/pr-gate.sh"
+# The lint policy is a reviewable table, not a scattering of local overrides.
+grep -Fq '[workspace.lints.clippy]' "$REPO_ROOT/Cargo.toml"
+for manifest in \
+    "$REPO_ROOT/Cargo.toml" \
+    "$REPO_ROOT/kernel/Cargo.toml" \
+    "$REPO_ROOT/crates/axnet-ng/Cargo.toml" \
+    "$REPO_ROOT/crates/axtask-compat/Cargo.toml" \
+    "$REPO_ROOT/crates/process-adapter/Cargo.toml" \
+    "$REPO_ROOT/crates/readiness-adapter/Cargo.toml"; do
+    grep -Fq 'workspace = true' "$manifest" \
+        || {
+            printf 'test-ci-scripts: %s does not opt into the workspace lints\n' \
+                "$manifest" >&2
+            exit 1
+        }
+done
+"$CI_DIR/clippy-gate.sh" --profile bogus >/dev/null 2>&1 && {
+    printf 'test-ci-scripts: clippy gate accepted an unknown profile\n' >&2
+    exit 1
+}
+
+# The diagnostic partition decides what fails the build, so exercise it
+# directly rather than trusting a clean run to have proved anything.
+clippy_owned='{"reason":"compiler-message","message":{"level":"warning","code":{"code":"clippy::x"},"rendered":"owned\n","spans":[{"is_primary":true,"file_name":"kernel/src/a.rs"}]}}'
+clippy_vendored='{"reason":"compiler-message","message":{"level":"warning","code":{"code":"clippy::y"},"rendered":"vendored\n","spans":[{"is_primary":true,"file_name":"third_party/rust-patches/z/src/b.rs"}]}}'
+clippy_registry='{"reason":"compiler-message","message":{"level":"warning","code":{"code":"clippy::z"},"rendered":"registry\n","spans":[{"is_primary":true,"file_name":"/usr/local/cargo/registry/c.rs"}]}}'
+clippy_vendored_error='{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0001"},"rendered":"broken\n","spans":[{"is_primary":true,"file_name":"third_party/rust-patches/z/src/b.rs"}]}}'
+clippy_owned_absolute="{\"reason\":\"compiler-message\",\"package_id\":\"path+file://$REPO_ROOT/kernel#thekernel-kernel@0.2.0-preview.2\",\"message\":{\"level\":\"warning\",\"code\":{\"code\":\"clippy::absolute_owned\"},\"rendered\":\"absolute owned\\n\",\"spans\":[{\"is_primary\":true,\"file_name\":\"$REPO_ROOT/kernel/src/lib.rs\"}]}}"
+clippy_sibling="{\"reason\":\"compiler-message\",\"package_id\":\"path+file://$REPO_ROOT/../thekernel-ax#thekernel-axtask@0.1.0\",\"message\":{\"level\":\"warning\",\"code\":{\"code\":\"clippy::sibling\"},\"rendered\":\"sibling\\n\",\"spans\":[{\"is_primary\":true,\"file_name\":\"src/lib.rs\"}]}}"
+
+printf '%s\n' "$clippy_vendored" "$clippy_registry" \
+    | python3 "$CI_DIR/clippy-report.py" --profile test >"$tmp/clippy-clean.txt" || {
+        printf 'test-ci-scripts: clippy report failed on vendored-only input\n' >&2
+        exit 1
+    }
+grep -Fq 'clippy[test]: clean' "$tmp/clippy-clean.txt"
+grep -Fq 'vendored diagnostics (reported, not gated): 2' "$tmp/clippy-clean.txt"
+
+if printf '%s\n' "$clippy_owned" "$clippy_vendored" \
+    | python3 "$CI_DIR/clippy-report.py" --profile test >"$tmp/clippy-owned.txt"; then
+    printf 'test-ci-scripts: clippy report passed an owned diagnostic\n' >&2
+    exit 1
+fi
+grep -Fq 'owned diagnostics: 1' "$tmp/clippy-owned.txt"
+grep -Fq 'vendored diagnostics (reported, not gated): 1' "$tmp/clippy-owned.txt"
+
+# Cargo's package identity, not span spelling, owns the boundary. An absolute
+# span inside this repository still gates, while a sibling's relative `src/`
+# span remains under that sibling's independent lint gate.
+if printf '%s\n' "$clippy_owned_absolute" \
+    | python3 "$CI_DIR/clippy-report.py" --profile test \
+        >"$tmp/clippy-owned-absolute.txt"; then
+    printf 'test-ci-scripts: clippy report treated an owned absolute span as vendored\n' >&2
+    exit 1
+fi
+grep -Fq 'owned diagnostics: 1' "$tmp/clippy-owned-absolute.txt"
+printf '%s\n' "$clippy_sibling" \
+    | python3 "$CI_DIR/clippy-report.py" --profile test \
+        >"$tmp/clippy-sibling.txt" || {
+        printf 'test-ci-scripts: clippy report gated a maintained sibling diagnostic\n' >&2
+        exit 1
+    }
+grep -Fq 'vendored diagnostics (reported, not gated): 1' "$tmp/clippy-sibling.txt"
+
+# A compile error inside vendored source still means the gate proved nothing.
+if printf '%s\n' "$clippy_vendored_error" \
+    | python3 "$CI_DIR/clippy-report.py" --profile test >"$tmp/clippy-error.txt"; then
+    printf 'test-ci-scripts: clippy report ignored a vendored compile error\n' >&2
     exit 1
 fi
 

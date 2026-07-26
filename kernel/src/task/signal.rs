@@ -31,6 +31,10 @@ fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
     }
 }
 
+// The error variant deliberately carries the untouched `PtraceSignalRecord`
+// back to the caller so it can publish the signal normally. Boxing it to
+// shrink the variant would put an allocation on the signal-delivery path.
+#[allow(clippy::result_large_err)]
 fn try_ptrace_signal_stop(
     proc_data: &ProcessData,
     record: PtraceSignalRecord,
@@ -926,10 +930,10 @@ fn interrupt_stop_siblings(proc_data: &ProcessData) {
     let curr_tid = linux_pid_from_task_id(current().id().as_u64())
         .unwrap_or_else(|error| fail_closed_exit(error));
     for tid in proc_data.proc.thread_ids() {
-        if tid != curr_tid {
-            if let Ok(task) = get_task(tid) {
-                task.interrupt();
-            }
+        if tid != curr_tid
+            && let Ok(task) = get_task(tid)
+        {
+            task.interrupt();
         }
     }
 }

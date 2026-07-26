@@ -14,6 +14,11 @@ mod stats;
 mod tlb;
 mod userfaultfd;
 
+#[cfg(feature = "asid-switch-diagnostics")]
+pub use axhal::context::asid_switch_diagnostics_snapshot;
+#[cfg(all(feature = "asid-switch-diagnostics", feature = "test-io-control"))]
+pub use axhal::context::{reset_asid_switch_diagnostics, set_asid_switch_diagnostics_enabled};
+
 #[cfg(feature = "mm-lock-diagnostics")]
 // This is the MM-local control surface for the proc/runner integration slice.
 #[allow(unused_imports)]

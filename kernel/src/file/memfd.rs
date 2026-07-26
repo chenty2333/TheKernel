@@ -453,9 +453,7 @@ pub(crate) fn install_memfd_state(
     allow_sealing: bool,
 ) -> AxResult<Arc<MemfdState>> {
     let mut guard = loc.user_data();
-    guard
-        .try_get_or_insert_with(|| MemfdState::new(allow_sealing))
-        .map_err(Into::into)
+    guard.try_get_or_insert_with(|| MemfdState::new(allow_sealing))
 }
 
 pub(crate) fn current_seals(loc: &Location) -> Option<u32> {

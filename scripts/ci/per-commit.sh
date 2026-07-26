@@ -11,6 +11,10 @@ LOG_DIR="$REPO_ROOT/.state/ci/per-commit/$default_log_id"
 STEP_TIMEOUT_SECS=${THEKERNEL_CI_STEP_TIMEOUT_SECS:-900}
 AX_REPO=${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}
 LINUX_ABI_REPO=${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}
+# Maintained Linux-ABI crates retain their own compatibility baseline. This is
+# deliberately independent of TheKernel's root nightly and must track the
+# sibling workspace's rust-toolchain.toml instead.
+LINUX_ABI_COMPAT_TOOLCHAIN=${THEKERNEL_LINUX_ABI_COMPAT_TOOLCHAIN:-nightly-2025-05-20}
 
 usage() {
     cat <<'EOF'
@@ -130,11 +134,36 @@ ci_run_step ci-script-tests "$STEP_TIMEOUT_SECS" \
     env THEKERNEL_AX_REPO="$AX_REPO" \
     THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO" \
     "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
+ci_run_step differential-framework-tests 60 \
+    "$REPO_ROOT/tests/ci/test-differential-framework.sh"
+ci_run_step syz-differential-prototype 120 \
+    "$REPO_ROOT/tools/syz-differential/test_prototype.sh"
 ci_run_step tool-tests "$STEP_TIMEOUT_SECS" make test-tools
 
 ci_run_step kernel-host-check "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" cargo check --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu
+
+# The focused gates above name one subsystem each. Run the whole suite once as
+# well: tests no filter names would otherwise never execute, and the focused
+# gates pin `--test-threads=1`, so interference between tests that share kernel
+# globals is invisible to them. Both failure modes have occurred.
+ci_run_step kernel-full-suite "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    "$SCRIPT_DIR/rust-full-test-gate.sh" \
+    --minimum 1027 -- \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu
+
+# Clippy runs on the host test profile and on one architecture. The two answer
+# different questions: `dead_code` and drop-glue lints are configuration
+# sensitive, and a `c_char` cast that is redundant on riscv64 is required on the
+# x86_64 host. The remaining architecture is covered by the PR gate.
+ci_run_step clippy-host "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/clippy-gate.sh" --profile host
+ci_run_step clippy-rv "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/clippy-gate.sh" --profile rv
 
 ci_run_step kernel-keyring-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
@@ -568,10 +597,18 @@ ci_run_step axfault-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axfault
+ci_run_step axpmu-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
+    -p thekernel-axpmu --all-targets
 ci_run_step axtlb-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axtlb --all-targets
+ci_run_step kernel-asid-pmu-diagnostics-check "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" cargo check --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,asid-switch-diagnostics,pmu-diagnostics \
+    --target x86_64-unknown-linux-gnu
 ci_run_step axtask-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
@@ -611,12 +648,12 @@ ci_run_step io-uring-core-check "$STEP_TIMEOUT_SECS" \
     -p thekernel-linux-io-uring --no-default-features
 ci_run_step seccomp-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
-    cargo +nightly-2025-05-20 test --locked \
+    cargo "+$LINUX_ABI_COMPAT_TOOLCHAIN" test --locked \
     --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-seccomp --all-features
 ci_run_step seccomp-core-check "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
-    cargo +nightly-2025-05-20 check --locked \
+    cargo "+$LINUX_ABI_COMPAT_TOOLCHAIN" check --locked \
     --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-seccomp --no-default-features
 ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \

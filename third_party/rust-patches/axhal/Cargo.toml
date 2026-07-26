@@ -31,6 +31,10 @@ asid-fast-switch = [
     "axcpu/asid-fast-switch",
     "page_table_multiarch?/asid-fast-switch",
 ]
+asid-switch-diagnostics = [
+    "asid-fast-switch",
+    "axcpu/asid-switch-diagnostics",
+]
 default = []
 defplat = [
     "dep:axplat-x86-pc",

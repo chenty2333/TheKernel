@@ -5,12 +5,7 @@ use core::mem::{offset_of, size_of};
 use axerrno::{AxError, AxResult};
 
 use crate::{
-    bpf::{
-        alloc_map_id,
-        defs::*,
-        map::{self, BpfMap},
-        read_bpf_attr, require_bpf_attr_range,
-    },
+    bpf::{alloc_map_id, defs::*, map, read_bpf_attr, require_bpf_attr_range},
     file::FileLike,
 };
 

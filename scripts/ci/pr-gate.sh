@@ -235,6 +235,12 @@ then
     ci_die 'PR gate requires clean TheKernel and maintained-sibling source worktrees'
 fi
 
+# The per-commit gate lints the host and riscv64 profiles. LoongArch closes the
+# remaining architecture here, where a cross toolchain is already required.
+# It runs before the build so a lint failure does not cost a full image.
+ci_run_step clippy-la "$BUILD_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/clippy-gate.sh" --profile la
+
 if [ "$SKIP_BUILD" -eq 0 ]; then
     ci_require_positive_int release_consumer_timeout "$RELEASE_CONSUMER_TIMEOUT_SECS"
     RELEASE_SET="$LOG_DIR/release-consumer/release-set.tsv"

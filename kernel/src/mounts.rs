@@ -1,5 +1,5 @@
 use alloc::{
-    string::{String, ToString},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -1133,6 +1133,8 @@ pub fn statfs_mount_flags(loc: &Location, base_flags: u32) -> AxResult<u32> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     fn record(mount_id: u64, parent_id: u64, target: &str) -> MountRecord {

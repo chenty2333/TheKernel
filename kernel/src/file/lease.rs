@@ -69,7 +69,7 @@ struct OpenRecord {
 impl OpenRecord {
     fn conflict(self) -> ConflictType {
         self.owner
-            .and_then(|_| self.visible_conflict)
+            .and(self.visible_conflict)
             .unwrap_or(self.pending_conflict)
     }
 }
@@ -528,7 +528,7 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
     if arg as u32 == F_UNLCK {
         let removed = {
             let mut table = LEASE_TABLE.lock();
-            let removed = if table
+            if table
                 .leases
                 .get(&id)
                 .is_some_and(|state| state.owner == owner)
@@ -537,8 +537,7 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
                 table.leases.remove(&id)
             } else {
                 None
-            };
-            removed
+            }
         };
         if removed.is_some() {
             LEASE_WAITERS.wake();

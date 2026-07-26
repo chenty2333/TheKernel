@@ -6,6 +6,7 @@
 //! reuse safe.  Once the probed ASID space is exhausted, every later address
 //! space receives the legacy ASID-0 token and takes the full-flush path.
 
+use axhal::context::AddressSpaceFallbackReason;
 use memory_addr::PhysAddr;
 
 const LEGACY_ASID: usize = 0;
@@ -24,14 +25,21 @@ const BOOT_GENERATION: u64 = 1;
 pub(crate) struct HardwareAddressSpaceId {
     asid: usize,
     generation: u64,
+    fallback_reason: AddressSpaceFallbackReason,
 }
 
 impl HardwareAddressSpaceId {
     /// The conservative ASID-0 identity.
     pub(crate) const fn legacy() -> Self {
+        Self::fallback(AddressSpaceFallbackReason::AsidZero)
+    }
+
+    /// A conservative identity carrying its exact allocator failure.
+    const fn fallback(fallback_reason: AddressSpaceFallbackReason) -> Self {
         Self {
             asid: LEGACY_ASID,
             generation: LEGACY_GENERATION,
+            fallback_reason,
         }
     }
 
@@ -43,7 +51,11 @@ impl HardwareAddressSpaceId {
         )
     ))]
     const fn new(asid: usize, generation: u64) -> Self {
-        Self { asid, generation }
+        Self {
+            asid,
+            generation,
+            fallback_reason: AddressSpaceFallbackReason::None,
+        }
     }
 
     /// Returns the numeric hardware ASID.
@@ -54,6 +66,11 @@ impl HardwareAddressSpaceId {
     /// Returns the non-wrapping allocator generation.
     pub(crate) const fn generation(self) -> u64 {
         self.generation
+    }
+
+    /// Returns why this identity uses ASID 0.
+    pub(crate) const fn fallback_reason(self) -> AddressSpaceFallbackReason {
+        self.fallback_reason
     }
 }
 
@@ -92,6 +109,11 @@ impl AddressSpaceToken {
     pub const fn generation(self) -> u64 {
         self.id.generation()
     }
+
+    /// Returns why this token uses ASID 0.
+    pub const fn fallback_reason(self) -> AddressSpaceFallbackReason {
+        self.id.fallback_reason()
+    }
 }
 
 #[cfg(any(
@@ -104,7 +126,7 @@ impl AddressSpaceToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReserveDecision {
     Assigned(HardwareAddressSpaceId),
-    Legacy,
+    Legacy(AddressSpaceFallbackReason),
 }
 
 #[cfg(any(
@@ -117,6 +139,7 @@ enum ReserveDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AllocatorStatus {
     Disabled,
+    InvalidWidth,
     Active,
     Exhausted,
 }
@@ -162,9 +185,26 @@ impl AllocatorState {
         true
     }
 
+    fn reject_invalid_width(&mut self) -> bool {
+        if self.status != AllocatorStatus::Disabled {
+            return false;
+        }
+        self.status = AllocatorStatus::InvalidWidth;
+        true
+    }
+
     fn reserve(&mut self) -> ReserveDecision {
-        if self.status != AllocatorStatus::Active {
-            return ReserveDecision::Legacy;
+        match self.status {
+            AllocatorStatus::Disabled => {
+                return ReserveDecision::Legacy(AddressSpaceFallbackReason::AsidZero);
+            }
+            AllocatorStatus::InvalidWidth => {
+                return ReserveDecision::Legacy(AddressSpaceFallbackReason::InvalidWidth);
+            }
+            AllocatorStatus::Exhausted => {
+                return ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted);
+            }
+            AllocatorStatus::Active => {}
         }
 
         if self.next_asid <= self.capacity {
@@ -178,7 +218,7 @@ impl AllocatorState {
         // any numeric identifier until a future protocol can first move every
         // running old context to ASID 0 (or otherwise stop those refills).
         self.status = AllocatorStatus::Exhausted;
-        ReserveDecision::Legacy
+        ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
     }
 }
 
@@ -223,7 +263,12 @@ pub(crate) fn init() {
     ))]
     {
         let capacity = capacity_for_width(axhal::asm::probe_asid_width());
-        if capacity != 0 {
+        if capacity == 0 {
+            assert!(
+                ALLOCATOR.lock().reject_invalid_width(),
+                "hardware ASID allocator initialized more than once"
+            );
+        } else {
             assert!(
                 ALLOCATOR.lock().enable(capacity),
                 "hardware ASID allocator initialized more than once"
@@ -242,7 +287,7 @@ pub(super) fn reserve_hardware_address_space_id() -> HardwareAddressSpaceId {
         let decision = ALLOCATOR.lock().reserve();
         match decision {
             ReserveDecision::Assigned(id) => return id,
-            ReserveDecision::Legacy => return HardwareAddressSpaceId::legacy(),
+            ReserveDecision::Legacy(reason) => return HardwareAddressSpaceId::fallback(reason),
         }
     }
 
@@ -280,10 +325,19 @@ mod tests {
             allocator.reserve(),
             ReserveDecision::Assigned(HardwareAddressSpaceId::new(1, BOOT_GENERATION))
         );
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
         assert_eq!(allocator.status, AllocatorStatus::Exhausted);
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
     }
 
     #[test]
@@ -291,9 +345,15 @@ mod tests {
         let mut allocator = AllocatorState::disabled();
         assert!(allocator.enable(1));
         let _ = allocator.reserve();
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
         assert!(!allocator.enable(1));
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
     }
 
     #[test]
@@ -309,7 +369,10 @@ mod tests {
                 ))
             );
         }
-        assert_eq!(allocator.reserve(), ReserveDecision::Legacy);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
         assert_eq!(allocator.status, AllocatorStatus::Exhausted);
     }
 
@@ -318,6 +381,10 @@ mod tests {
         let token = AddressSpaceToken::legacy(PhysAddr::from_usize(0x1000));
         assert_eq!(token.asid(), 0);
         assert_eq!(token.generation(), 0);
+        assert_eq!(
+            token.fallback_reason(),
+            AddressSpaceFallbackReason::AsidZero
+        );
     }
 
     #[test]
@@ -327,5 +394,16 @@ mod tests {
         assert_eq!(capacity_for_width_and_max(17, 16), 0);
         assert_eq!(capacity_for_width_and_max(10, 10), 1_023);
         assert_eq!(capacity_for_width_and_max(11, 10), 0);
+    }
+
+    #[test]
+    fn invalid_width_is_preserved_in_every_fallback_identity() {
+        let mut allocator = AllocatorState::disabled();
+        assert!(allocator.reject_invalid_width());
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::InvalidWidth)
+        );
+        assert!(!allocator.enable(1));
     }
 }

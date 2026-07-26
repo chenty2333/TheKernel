@@ -68,9 +68,7 @@ fn actor_capable_in_target_namespace(security: &VfsSecurityContext, capability: 
 }
 
 fn unsupported_access_control_xattr(name: &[u8]) -> bool {
-    UNSUPPORTED_ACCESS_CONTROL_XATTRS
-        .iter()
-        .any(|unsupported| name == *unsupported)
+    UNSUPPORTED_ACCESS_CONTROL_XATTRS.contains(&name)
 }
 
 /// Linux permits user.* on regular files, directories, FIFOs, and sockets.
@@ -171,9 +169,9 @@ fn check_namespace_access(
     )
 }
 
-fn with_xattr_security<'context, 'location, T>(
+fn with_xattr_security<'context, T>(
     security: &'context VfsSecurityContext,
-    location: &'location Location,
+    location: &Location,
     metadata: &Metadata,
     operation: InodeXattrOperation<'context>,
     provider: impl FnOnce() -> AxResult<T>,

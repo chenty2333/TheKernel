@@ -240,10 +240,9 @@ fn enforce_special_open_rules(
             metadata.node_type,
             NodeType::CharacterDevice | NodeType::BlockDevice
         )
+        && crate::mounts::is_nodev(loc)?
     {
-        if crate::mounts::is_nodev(loc)? {
-            return Err(AxError::PermissionDenied);
-        }
+        return Err(AxError::PermissionDenied);
     }
     if flags & O_TRUNC != 0 {
         drop(memfd::begin_resize(loc, 0)?);
@@ -994,10 +993,8 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             warn!("open notification failed: {error}");
         }
     }
-    if truncates_regular {
-        if let Err(error) = notify_exact(&loc, IN_MODIFY | IN_ATTRIB) {
-            warn!("open truncate notification failed: {error}");
-        }
+    if truncates_regular && let Err(error) = notify_exact(&loc, IN_MODIFY | IN_ATTRIB) {
+        warn!("open truncate notification failed: {error}");
     }
 
     Ok(fd)

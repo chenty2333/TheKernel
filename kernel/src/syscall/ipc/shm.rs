@@ -1101,10 +1101,9 @@ impl Drop for ProcShmForkAdmission<'_> {
                                 && Arc::ptr_eq(&attachment.publication, publication)
                         })
                 });
-            let removed = exact
+            exact
                 .then(|| manager.pid_vaddr_shmid.remove(&self.child_pid))
-                .flatten();
-            removed
+                .flatten()
         };
 
         if removed_manager.is_none() {
@@ -1143,10 +1142,10 @@ impl Drop for ProcShmForkAdmission<'_> {
                 )
             };
             all_segments_removed &= removed_segment;
-            if let Some((shmid, page_num)) = remove_segment {
-                if let Err(error) = self.manager.lock().remove_shmid(shmid, page_num) {
-                    error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
-                }
+            if let Some((shmid, page_num)) = remove_segment
+                && let Err(error) = self.manager.lock().remove_shmid(shmid, page_num)
+            {
+                error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
             }
         }
         if all_segments_removed && let Some(attachments) = removed_manager {
@@ -1396,10 +1395,10 @@ fn clear_proc_shm_in(transaction: &Mutex<()>, manager: &Mutex<ShmManager>, pid: 
             state.detach_process(pid, vaddr);
             (state.rmid && !state.has_attachment_owners()).then_some(state.page_num)
         };
-        if let Some(page_num) = remove {
-            if let Err(error) = manager.lock().remove_shmid(shmid, page_num) {
-                error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
-            }
+        if let Some(page_num) = remove
+            && let Err(error) = manager.lock().remove_shmid(shmid, page_num)
+        {
+            error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
         }
     }
 }
@@ -1635,7 +1634,7 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
             .find_kernel_area(aspace.base(), search_length, limit, SHMLBA)
             .ok_or(AxError::NoMemory)?
     } else {
-        if addr % SHMLBA != 0 && !shm_flg.contains(ShmAtFlags::SHM_RND) {
+        if !addr.is_multiple_of(SHMLBA) && !shm_flg.contains(ShmAtFlags::SHM_RND) {
             return Err(AxError::InvalidInput);
         }
         let candidate_addr = if shm_flg.contains(ShmAtFlags::SHM_RND) {

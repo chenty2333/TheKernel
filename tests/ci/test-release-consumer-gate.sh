@@ -16,11 +16,15 @@ if [ "$(grep -c '^    thekernel-axfault$' \
     exit 1
 fi
 grep -Fq -- '-p thekernel-axfault \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-axpmu \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- \
     '--replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- \
+    '--replace "../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
 grep -Fq \
-    'thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axtask|thekernel-axtlb)' \
+    'thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb)' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
@@ -31,6 +35,17 @@ grep -Fq \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '--locked --offline --no-verify --registry crates-io \' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@" --locked --offline' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'goal=kernel-rv-mm-performance' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'goal=kernel-la-mm-performance' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'build_diagnostics_arch rv' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'build_diagnostics_arch la' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- 'CARGO_NET_OFFLINE=true \' "$CI_DIR/release-consumer-gate.sh"
 
 # The temporary-manifest rewrite is exact and refuses to proceed if an anchor
 # disappeared or became ambiguous.
@@ -42,6 +57,7 @@ members = []
 [workspace.dependencies]
 one = { path = "../source/one" }
 axfault = { package = "thekernel-axfault", path = "../thekernel-ax/crates/thekernel-axfault" }
+axpmu = { package = "thekernel-axpmu", path = "../thekernel-ax/crates/thekernel-axpmu" }
 axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf" }
 axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
@@ -58,6 +74,7 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../source/one=../artifacts/one-0.1.0' \
     --replace '../source/two=../artifacts/two-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-0.1.0' \
+    --replace '../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axcbpf=../artifacts/thekernel-axcbpf-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
@@ -72,6 +89,8 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
 grep -Fq 'path = "../artifacts/one-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axfault-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-axpmu-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axcbpf-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
@@ -305,6 +324,7 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
     "$tmp/artifacts/thekernel-axcbpf-0.1.0" \
     "$tmp/artifacts/thekernel-axfault-0.1.0" \
+    "$tmp/artifacts/thekernel-axpmu-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
@@ -328,6 +348,7 @@ release_names = [
     "thekernel-axpoll",
     "thekernel-axcbpf",
     "thekernel-axfault",
+    "thekernel-axpmu",
     "thekernel-axtask",
     "thekernel-axtlb",
     "thekernel-linux-cred",
@@ -425,7 +446,7 @@ graph_args=(
 )
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axcbpf thekernel-axfault \
-    thekernel-axtask thekernel-axtlb \
+    thekernel-axpmu thekernel-axtask thekernel-axtlb \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-packet \
     thekernel-linux-io-uring \
     thekernel-linux-seccomp \

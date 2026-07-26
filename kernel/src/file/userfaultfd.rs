@@ -230,16 +230,14 @@ impl AttachedUffdHandler {
                 let Some(aspace) = aspace.upgrade() else {
                     return Ok(None);
                 };
-                let result = aspace.lock().claim_uffd_event(self.handler);
-                result
+                aspace.lock().claim_uffd_event(self.handler)
             }
             #[cfg(test)]
             UffdHandlerBinding::Standalone(state) => {
                 let Some(state) = state.upgrade() else {
                     return Ok(None);
                 };
-                let result = state.lock().claim_next(self.handler);
-                result
+                state.lock().claim_next(self.handler)
             }
         }
     }
@@ -250,16 +248,14 @@ impl AttachedUffdHandler {
                 let Some(aspace) = aspace.upgrade() else {
                     return Ok(false);
                 };
-                let result = aspace.lock().uffd_handler_pending(self.handler);
-                result
+                aspace.lock().uffd_handler_pending(self.handler)
             }
             #[cfg(test)]
             UffdHandlerBinding::Standalone(state) => {
                 let Some(state) = state.upgrade() else {
                     return Ok(false);
                 };
-                let result = state.lock().pending(self.handler);
-                result
+                state.lock().pending(self.handler)
             }
         }
     }
@@ -275,18 +271,16 @@ impl AttachedUffdHandler {
                 // Linux reports ENOMEM when mmget_not_zero() cannot retain the
                 // old mm for REGISTER/UNREGISTER.
                 let aspace = aspace.upgrade().ok_or(AxError::NoMemory)?;
-                let result = aspace
+                aspace
                     .lock()
-                    .register_uffd_range(api, self.handler, range, mode);
-                result
+                    .register_uffd_range(api, self.handler, range, mode)
             }
             #[cfg(test)]
             UffdHandlerBinding::Standalone(state) => {
                 let state = state.upgrade().ok_or(AxError::NoMemory)?;
-                let result = state
+                state
                     .lock()
-                    .register_test_range(api, self.handler, range, mode);
-                result
+                    .register_test_range(api, self.handler, range, mode)
             }
         }
     }
@@ -637,10 +631,11 @@ impl UserfaultFile {
         // VMA/registration failure comes from Linux's mfill operation, so it
         // is a zero-progress lower error that must be written to the signed
         // output field.
-        let lease = match {
+        let preflight = {
             let locked = target.lock();
             locked.preflight_uffd_resolver_range(destination)
-        } {
+        };
+        let lease = match preflight {
             Ok(lease) => lease,
             Err(error) => {
                 return Ok(UffdResolverProgress {
@@ -1037,7 +1032,7 @@ mod tests {
     use alloc::sync::{Arc, Weak as ArcWeak};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{
-        sync::{Mutex, MutexGuard, Once},
+        sync::MutexGuard,
         task::{Wake, Waker},
     };
 
@@ -1051,13 +1046,8 @@ mod tests {
     use super::*;
     use crate::file::{FileDescription, FileHandle};
 
-    static INIT: Once = Once::new();
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     fn test_context() -> MutexGuard<'static, ()> {
-        let guard = SERIAL.lock().expect("userfaultfd test lock poisoned");
-        INIT.call_once(|| axtask::init_scheduler().expect("test scheduler initialization failed"));
-        guard
+        crate::test_support::scheduler_test_context()
     }
 
     struct TestDst {

@@ -306,8 +306,8 @@ fn bounded_log(data: &SeccompData, action: u32) {
         );
     } else if !SECCOMP_LOG_SUPPRESSION_REPORTED.swap(true, Ordering::Relaxed) {
         warn!(
-            "seccomp diagnostic budget exhausted after {} records; suppressing further entries",
-            SECCOMP_LOG_RECORD_LIMIT
+            "seccomp diagnostic budget exhausted after {SECCOMP_LOG_RECORD_LIMIT} records; \
+             suppressing further entries"
         );
     }
 }

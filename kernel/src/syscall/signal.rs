@@ -410,7 +410,7 @@ fn check_zombie_process_signal_permission(
     }
 
     let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
-    check_current_zombie_signal_access(&process, &snapshot.credential, operation)?;
+    check_current_zombie_signal_access(process, &snapshot.credential, operation)?;
     Ok(true)
 }
 
@@ -709,7 +709,7 @@ impl SignalTargetResultReducer {
             // Linux's historical kill(-1) reducer starts at success and lets
             // every result except EPERM replace it. Thus an existing set of
             // entirely forbidden targets still returns success.
-            SignalTargetAggregation::Broadcast => self.broadcast_result.unwrap_or_else(|| {
+            SignalTargetAggregation::Broadcast => self.broadcast_result.unwrap_or({
                 if self.saw_target {
                     Ok(())
                 } else {
@@ -1071,7 +1071,7 @@ const SIGNAL_SP_ALIGNMENT: usize = 1;
 
 fn valid_signal_user_address(address: usize, alignment: usize) -> bool {
     let end = crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE;
-    address >= crate::config::USER_SPACE_BASE && address < end && address % alignment == 0
+    address >= crate::config::USER_SPACE_BASE && address < end && address.is_multiple_of(alignment)
 }
 
 fn reject_bad_sigreturn(reason: &str) -> AxResult<isize> {
@@ -1475,14 +1475,14 @@ fn prepare_sigaltstack_update(
     current_sp: usize,
     candidate: SignalStack,
 ) -> AxResult<SignalStack> {
-    let valid_flags = SS_DISABLE as u32;
-    if candidate.flags & !valid_flags != 0 || candidate.flags & SS_ONSTACK as u32 != 0 {
+    let valid_flags = SS_DISABLE;
+    if candidate.flags & !valid_flags != 0 || candidate.flags & SS_ONSTACK != 0 {
         return Err(AxError::InvalidInput);
     }
     if current_stack.contains_sp(current_sp) {
         return Err(AxError::OperationNotPermitted);
     }
-    if candidate.flags == SS_DISABLE as u32 {
+    if candidate.flags == SS_DISABLE {
         return Ok(SignalStack::default());
     }
     if candidate.size < MINSIGSTKSZ as usize {
