@@ -19,11 +19,11 @@ exclude = ["arceos"]
 [workspace.lints.rust]
 # `dead_code` answers a different question in every build configuration: a
 # symbol unreachable in the riscv64 `qemu` profile is frequently live under
-# `smp`, `bpf`, `asid-fast-switch`, `mm-lock-diagnostics`, or the host test
-# profile. A single-profile gate cannot decide it truthfully, and 76 of the 102
-# current reports sit in `kernel/src/task/security.rs`, whose decomposition is
-# tracked separately. Denied once that decomposition lands and the remaining
-# reports have been resolved per-profile rather than blanket-annotated.
+# `smp`, `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. The
+# host/RISC-V/LoongArch gates still do not span the full feature power set, so
+# they cannot classify reachability truthfully. Keep this rustc lint outside
+# the zero-owned-Clippy-diagnostic contract; feature-local cleanup must use a
+# narrow `cfg` or a separately reviewed allowance rather than inferred removal.
 dead_code = "allow"
 
 [workspace.lints.clippy]
