@@ -36,15 +36,21 @@ cat >"$tmp/diagnostic.expected" <<'EOF'
 echo mm_lock_stats=off > /proc/io_test_control || exit 1
 echo mm_lock_stats=reset > /proc/io_test_control || exit 1
 echo mm_lock_stats=on > /proc/io_test_control || exit 1
+echo asid_switch_stats=off > /proc/io_test_control || exit 1
+echo asid_switch_stats=reset > /proc/io_test_control || exit 1
+echo asid_switch_stats=on > /proc/io_test_control || exit 1
 /opt/thekernel-tests/bin/thekernel-mm-performance --iterations 11 --vmas 22 --pin-iterations 33 --pin-workers 4 || exit 1
 mm_lock_off_attempt=0; until echo mm_lock_stats=off > /proc/io_test_control; do mm_lock_off_attempt=$((mm_lock_off_attempt + 1)); [ "$mm_lock_off_attempt" -lt 64 ] || exit 1; done
+echo asid_switch_stats=off > /proc/io_test_control || exit 1
 cat /proc/mm_lock_stats || exit 1
+cat /proc/asid_switch_stats || exit 1
+cat /proc/pmu_capabilities || exit 1
 exit
 EOF
 diff -u "$tmp/product.expected" "$product_commands"
 diff -u "$tmp/diagnostic.expected" "$diagnostic_commands"
-if grep -Eq 'mm_lock_stats|/proc/mm_lock_stats' "$product_commands"; then
-    printf '%s\n' 'product command stream contains MM lock diagnostics' >&2
+if grep -Eq 'mm_lock_stats|asid_switch_stats|pmu_capabilities' "$product_commands"; then
+    printf '%s\n' 'product command stream contains diagnostic controls' >&2
     exit 1
 fi
 for invalid in 0 -1 invalid ''; do

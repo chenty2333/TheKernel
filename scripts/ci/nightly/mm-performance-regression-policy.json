@@ -1,5 +1,5 @@
 {
-  "schema": "thekernel-mm-performance-regression-policy-v5",
+  "schema": "thekernel-mm-performance-regression-policy-v6",
   "metrics": {
     "vma_scale": {
       "p99_max_regression_percent": 20,
@@ -26,6 +26,10 @@
       "throughput_min_retained_percent": null
     },
     "protect_touch_latency": {
+      "p99_max_regression_percent": 20,
+      "throughput_min_retained_percent": null
+    },
+    "address_space_switch_ping_pong_latency": {
       "p99_max_regression_percent": 20,
       "throughput_min_retained_percent": null
     },

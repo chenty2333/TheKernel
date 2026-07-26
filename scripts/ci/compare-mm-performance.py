@@ -650,7 +650,7 @@ def validate_manifest_row(
     )
     pin_workers = parse_positive_int(row["pin_workers"], "pin_workers", context)
     if iterations > 100000 or live_vmas > 16384 or pin_iterations > 10000:
-        raise EvidenceError(f"{context} workload exceeds the bundle-v9 limits")
+        raise EvidenceError(f"{context} workload exceeds the bundle-v10 limits")
     if pin_workers != requested_cpus:
         raise EvidenceError(
             f"{context} pin worker topology mismatch: "
@@ -726,11 +726,22 @@ def validate_manifest_row(
         context,
     )
     diagnostics_path: Path | None = None
+    asid_diagnostics_path: Path | None = None
     if measurement_mode == "product":
         for field in (
             "mm_lock_diagnostics_artifact",
             "mm_lock_diagnostics_sha256",
             "mm_lock_diagnostics_size_bytes",
+        ):
+            if row[field] != MM_LOCK_DIAGNOSTIC_SENTINEL:
+                raise EvidenceError(
+                    f"{context} product evidence must use "
+                    f"{field}={MM_LOCK_DIAGNOSTIC_SENTINEL!r}"
+                )
+        for field in (
+            "asid_switch_diagnostics_artifact",
+            "asid_switch_diagnostics_sha256",
+            "asid_switch_diagnostics_size_bytes",
         ):
             if row[field] != MM_LOCK_DIAGNOSTIC_SENTINEL:
                 raise EvidenceError(
@@ -744,6 +755,14 @@ def validate_manifest_row(
             "mm_lock_diagnostics_artifact",
             "mm_lock_diagnostics_sha256",
             "mm_lock_diagnostics_size_bytes",
+            context,
+        )
+        asid_diagnostics_path = validate_artifact(
+            root,
+            row,
+            "asid_switch_diagnostics_artifact",
+            "asid_switch_diagnostics_sha256",
+            "asid_switch_diagnostics_size_bytes",
             context,
         )
     commands_path = validate_artifact(
@@ -790,9 +809,10 @@ def validate_manifest_row(
     except OSError as error:
         raise EvidenceError(f"cannot read {context} raw QEMU log: {error}") from error
     if measurement_mode == "product" and any(
-        line.startswith(b"MM_LOCK_") for line in qemu_log.splitlines()
+        line.startswith((b"MM_LOCK_", b"ASID_SWITCH_", b"PMU_"))
+        for line in qemu_log.splitlines()
     ):
-        raise EvidenceError(f"{context} product raw QEMU log contains MM lock diagnostics")
+        raise EvidenceError(f"{context} product raw QEMU log contains diagnostics")
 
     derived_metrics = run_evidence_parser(
         "parse-mm-performance.py",
@@ -847,6 +867,28 @@ def validate_manifest_row(
                 f"{context} MM lock diagnostics artifact does not match "
                 "the raw QEMU log"
             )
+    if asid_diagnostics_path is not None:
+        derived_asid_diagnostics = run_evidence_parser(
+            "parse-asid-switch-diagnostics.py",
+            [str(qemu_log_path)],
+            f"{context} ASID switch diagnostics",
+        )
+        try:
+            artifact_asid_diagnostics = asid_diagnostics_path.read_bytes()
+        except OSError as error:
+            raise EvidenceError(
+                f"cannot read {context} ASID switch diagnostics artifact: {error}"
+            ) from error
+        if artifact_asid_diagnostics != derived_asid_diagnostics:
+            raise EvidenceError(
+                f"{context} ASID switch diagnostics artifact does not match "
+                "the raw QEMU log"
+            )
+        run_evidence_parser(
+            "parse-pmu-capabilities.py",
+            [str(qemu_log_path), "--arch", arch],
+            f"{context} capability-only PMU diagnostics",
+        )
     capture_start = validate_host_diagnostics(root, row, "pre", context)
     capture_end = validate_host_diagnostics(root, row, "post", context)
     if capture_start >= capture_end:
@@ -868,12 +910,18 @@ def validate_manifest_row(
                 "echo mm_lock_stats=off > /proc/io_test_control || exit 1",
                 "echo mm_lock_stats=reset > /proc/io_test_control || exit 1",
                 "echo mm_lock_stats=on > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=off > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=reset > /proc/io_test_control || exit 1",
+                "echo asid_switch_stats=on > /proc/io_test_control || exit 1",
                 workload_command + " || exit 1",
                 "mm_lock_off_attempt=0; until echo mm_lock_stats=off > "
                 "/proc/io_test_control; do mm_lock_off_attempt="
                 "$((mm_lock_off_attempt + 1)); "
                 '[ "$mm_lock_off_attempt" -lt 64 ] || exit 1; done',
+                "echo asid_switch_stats=off > /proc/io_test_control || exit 1",
                 "cat /proc/mm_lock_stats || exit 1",
+                "cat /proc/asid_switch_stats || exit 1",
+                "cat /proc/pmu_capabilities || exit 1",
                 "exit",
                 "",
             )
@@ -905,6 +953,7 @@ def expected_metric_count(manifest: ManifestRecord, metric: str) -> int:
         "mremap_file_duplicate_latency": iterations,
         "mremap_shared_anon_resize_latency": iterations * 2,
         "protect_touch_latency": iterations,
+        "address_space_switch_ping_pong_latency": iterations,
         "direct_io_pin_proxy_throughput": pin_iterations,
         "direct_io_pin_proxy_same_as_contention": pin_iterations * pin_workers,
         "direct_io_pin_proxy_cross_as_contention": pin_iterations * pin_workers,

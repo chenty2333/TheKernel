@@ -63,6 +63,7 @@ targets = [
 [features]
 arm-el2 = ["page_table_entry/arm-el2"]
 asid-fast-switch = []
+asid-switch-diagnostics = ["asid-fast-switch", "dep:axpmu"]
 default = []
 fp-simd = []
 host-test-context = []
@@ -75,6 +76,12 @@ path = "src/lib.rs"
 
 [dependencies.axbacktrace]
 version = "0.1"
+
+[dependencies.axpmu]
+package = "thekernel-axpmu"
+version = "=0.1.0"
+optional = true
+default-features = false
 
 [dependencies.cfg-if]
 version = "1.0"

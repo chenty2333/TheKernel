@@ -114,12 +114,13 @@ third, runtime check. The rootfs is rematerialized through its content-addressed
 builder so the guest helper cannot silently predate the checked-out source.
 
 The default `THEKERNEL_MM_PERF_MEASUREMENT_MODE=product` uses the ordinary
-`shell` kernel profile. That profile does not compile the MM lock diagnostic
-feature, does not issue diagnostic control commands, and records
+`shell` kernel profile. That profile does not compile the MM lock or ASID switch
+diagnostic features, does not issue diagnostic control commands, and records
 `not-collected` for every diagnostic artifact manifest field. These are the
 only bundles accepted by the regression comparator.
 
-Lock attribution is a separate, opt-in diagnostic run:
+Lock and address-space-switch attribution are a separate, opt-in diagnostic
+run:
 
 ```sh
 THEKERNEL_MM_PERF_MEASUREMENT_MODE=diagnostic \
@@ -127,13 +128,18 @@ THEKERNEL_MM_PERF_MEASUREMENT_MODE=diagnostic \
 ```
 
 Diagnostic mode selects the `mm-performance` kernel profile. Its hashed guest
-command stream disables collection, resets it, enables it, runs the complete
-workload, disables it with a bounded drain retry, and only then reads
-`/proc/mm_lock_stats`. The parser requires matching header/end control state
-and publication sequence,
+command stream disables and resets both diagnostic surfaces, enables them, runs
+the complete workload, disables them (with a bounded drain retry for MM locks),
+and only then reads `/proc/mm_lock_stats`, `/proc/asid_switch_stats`, and
+`/proc/pmu_capabilities`. The lock parser requires matching header/end control
+state and publication sequence,
 `enabled=0`, `resetting=0`, `active_samples=0`, complete unsaturated histograms,
 nonzero samples in all six user-pin stages and physical publish/release, and at
-least one exercised `mremap` stage. It emits a separate hashed TSV artifact.
+least one exercised `mremap` stage. The ASID parser requires one disabled,
+nonempty switch snapshot and emits a separate hashed TSV artifact. The PMU
+parser requires one architecture-matched capability header and all five unique
+typed event rows, with `samples_collected=0` and every `sampled=0`; it validates
+the authoritative raw log but does not create or claim a measurement artifact.
 Diagnostic counters can perturb the paths they measure, so diagnostic bundles
 are deliberately rejected as product regression evidence instead of being
 compared to product or to other diagnostic bundles.
@@ -179,7 +185,7 @@ also completes fixed-destination replacement, shared `old_size == 0`
 alias/coherence, and grow/shrink prefix-integrity checks before emitting the
 semantic-pass marker.
 
-The MM output is a `thekernel-mm-performance-bundle-v9` directory. Every QEMU
+The MM output is a `thekernel-mm-performance-bundle-v10` directory. Every QEMU
 row is explicitly classified as `qemu-tcg` with `pmu_source=none`; CPU model,
 firmware, and frequency-policy fields use `not-applicable`. The comparator
 rejects physical or architectural-PMU claims until a separate physical receipt
@@ -189,10 +195,15 @@ The comparator rejects
 absolute paths, `..`, symlink escapes, missing files, and digest or size drift.
 It reruns the versioned performance parser on every raw QEMU log and requires
 the result to be structurally identical to the per-run metric artifact. In
-diagnostic mode it also requires the lock parser's canonical output to match the
-diagnostic artifact byte for byte; a product log containing any `MM_LOCK_`
-record is invalid. The top-level metric matrix must also equal the union of the
-hashed per-run metric files. These checks establish bundle-internal derivation,
+diagnostic mode it also requires the lock and ASID parsers' canonical outputs to
+match their diagnostic artifacts byte for byte and reruns the capability-only
+PMU parser against the raw log. A product log containing any `MM_LOCK_`,
+`ASID_SWITCH_`, or `PMU_` record is invalid. An architecture-matched PMU
+capability `source` says only which typed events the backend reports as
+requestable. Because all capability records prove zero samples, they do not
+change the QEMU-TCG manifest's `pmu_source=none` and are not PMU measurements.
+The top-level metric matrix must also equal the union of the hashed per-run
+metric files. These checks establish bundle-internal derivation,
 not external authorship; publication that requires adversarial provenance still
 needs an external signature or trusted transparency record. Copy the complete
 directory, not individual files. Old v1
@@ -203,6 +214,9 @@ the independent-address-space pin workload, and v6 bundles do not bind the
 guest-input and QEMU command-stream receipts. Older evidence is rejected rather
 than guessed into a new provenance claim. V8 bundles do not carry the explicit
 platform and PMU provenance fields and are rejected for the same reason.
+V9 bundles lack the address-space-switch metric and the bound ASID and
+capability-only PMU diagnostic contracts, so they are rejected rather than
+upgraded by inference.
 
 One adapter invocation captures one bundle and never labels a single sample as
 a regression result. Capture adjacent, counterbalanced baseline/candidate pairs

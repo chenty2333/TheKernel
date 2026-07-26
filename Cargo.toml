@@ -78,6 +78,7 @@ axsync = { version = "0.3.0-preview.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
 axcbpf = { package = "thekernel-axcbpf", version = "=0.1.0" }
 axfault = { package = "thekernel-axfault", version = "=0.1.0" }
+axpmu = { package = "thekernel-axpmu", version = "=0.1.0", default-features = false }
 axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
 thekernel-linux-cred = { version = "=0.1.0", default-features = false }
@@ -109,7 +110,9 @@ workspace = true
 default = []
 boot-shell = []
 asid-fast-switch = ["thekernel-kernel/asid-fast-switch"]
+asid-switch-diagnostics = ["thekernel-kernel/asid-switch-diagnostics"]
 mm-lock-diagnostics = ["thekernel-kernel/mm-lock-diagnostics"]
+pmu-diagnostics = ["thekernel-kernel/pmu-diagnostics"]
 test-io-control = ["thekernel-kernel/test-io-control"]
 qemu = [
     "axfeat/defplat",
@@ -179,6 +182,7 @@ thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
 thekernel-axcbpf = { path = "../thekernel-ax/crates/thekernel-axcbpf" }
 thekernel-axfault = { path = "../thekernel-ax/crates/thekernel-axfault" }
+thekernel-axpmu = { path = "../thekernel-ax/crates/thekernel-axpmu" }
 thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
 thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }

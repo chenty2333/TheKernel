@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 
-BUNDLE_SCHEMA = "thekernel-mm-performance-bundle-v9"
-POLICY_SCHEMA = "thekernel-mm-performance-regression-policy-v5"
+BUNDLE_SCHEMA = "thekernel-mm-performance-bundle-v10"
+POLICY_SCHEMA = "thekernel-mm-performance-regression-policy-v6"
 STABILITY_POLICY_SCHEMA = "thekernel-mm-performance-stability-policy-v1"
 HOST_DIAGNOSTIC_SCHEMA = "thekernel-mm-performance-host-diagnostics-v1"
 MEASUREMENT_MODES = frozenset({"product", "diagnostic"})
@@ -35,6 +35,7 @@ EXPECTED_METRICS = (
     "mremap_file_duplicate_latency",
     "mremap_shared_anon_resize_latency",
     "protect_touch_latency",
+    "address_space_switch_ping_pong_latency",
     "direct_io_pin_proxy_throughput",
     "direct_io_pin_proxy_same_as_contention",
     "direct_io_pin_proxy_cross_as_contention",
@@ -89,6 +90,9 @@ MANIFEST_COLUMNS = (
     "mm_lock_diagnostics_artifact",
     "mm_lock_diagnostics_sha256",
     "mm_lock_diagnostics_size_bytes",
+    "asid_switch_diagnostics_artifact",
+    "asid_switch_diagnostics_sha256",
+    "asid_switch_diagnostics_size_bytes",
     "commands",
     "commands_sha256",
     "commands_size_bytes",

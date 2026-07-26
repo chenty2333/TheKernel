@@ -52,7 +52,7 @@
 #define MM_PERF_COMPILED_ARCH "host"
 #endif
 
-#define MM_PERF_RUN_SCHEMA "thekernel-mm-performance-run-v2"
+#define MM_PERF_RUN_SCHEMA "thekernel-mm-performance-run-v3"
 
 enum {
     DEFAULT_ITERATIONS = 256,
@@ -68,6 +68,7 @@ enum {
     MREMAP_CONTENTION_WORKERS = 2,
     MREMAP_CONTENTION_SLOT_PAGES = 2,
     MREMAP_CONTENTION_STRIDE_PAGES = 3,
+    ADDRESS_SPACE_SWITCH_WARMUP = 32,
     MAX_ITERATIONS = 100000,
     MAX_LIVE_VMAS = 16384,
     MAX_PIN_ITERATIONS = 10000,
@@ -2623,6 +2624,238 @@ static int cross_as_abort_and_reap(pid_t *children, size_t child_count)
     }
 }
 
+static int read_byte_bounded(int fd, unsigned char *value, int timeout_ms)
+{
+    for (;;) {
+        struct pollfd descriptor = {.fd = fd, .events = POLLIN};
+        int poll_result = poll(&descriptor, 1, timeout_ms);
+
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (poll_result < 0) {
+            return -1;
+        }
+        if ((descriptor.revents & POLLIN) == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        return cross_as_read_byte(fd, value);
+    }
+}
+
+/*
+ * One sample is a parent -> child -> parent pipe round trip. Both processes
+ * are pinned to the same CPU and touch private state, so every successful
+ * round requires two real process and address-space scheduling transitions.
+ */
+static struct metric_result run_address_space_switch_ping_pong(
+    size_t iterations, int cpu)
+{
+    uint64_t *samples = NULL;
+    int parent_to_child[2] = {-1, -1};
+    int child_to_parent[2] = {-1, -1};
+    cpu_set_t original_affinity;
+    cpu_set_t single_cpu;
+    struct sigaction old_pipe_action;
+    pid_t child = -1;
+    bool affinity_saved = false;
+    bool child_reaped = false;
+    bool pipe_action_installed = false;
+    struct metric_result result =
+        missing_result("address_space_switch_setup_failed", 0, false);
+    int cleanup_error = 0;
+    size_t index;
+
+    samples = calloc(iterations, sizeof(*samples));
+    if (samples == NULL) {
+        return missing_result("sample_allocation_failed", errno, false);
+    }
+    if (pipe(parent_to_child) != 0 || pipe(child_to_parent) != 0) {
+        result = missing_result("address_space_switch_pipe_failed", errno,
+                                false);
+        goto out;
+    }
+    if (sched_getaffinity(0, sizeof(original_affinity), &original_affinity) !=
+        0) {
+        result = missing_result("address_space_switch_affinity_read_failed",
+                                errno, false);
+        goto out;
+    }
+    affinity_saved = true;
+    {
+        struct sigaction ignore_pipe;
+
+        memset(&ignore_pipe, 0, sizeof(ignore_pipe));
+        ignore_pipe.sa_handler = SIG_IGN;
+        if (sigemptyset(&ignore_pipe.sa_mask) != 0 ||
+            sigaction(SIGPIPE, &ignore_pipe, &old_pipe_action) != 0) {
+            result = missing_result(
+                "address_space_switch_sigpipe_guard_failed", errno, false);
+            goto out;
+        }
+        pipe_action_installed = true;
+    }
+    child = fork();
+    if (child < 0) {
+        result = missing_result("address_space_switch_fork_failed", errno,
+                                false);
+        goto out;
+    }
+    if (child == 0) {
+        volatile uint64_t private_touch = UINT64_C(0x4153494453574954);
+        unsigned char command = 0;
+
+        (void)close(parent_to_child[1]);
+        (void)close(child_to_parent[0]);
+        CPU_ZERO(&single_cpu);
+        CPU_SET(cpu, &single_cpu);
+        if (sched_setaffinity(0, sizeof(single_cpu), &single_cpu) != 0 ||
+            sched_getcpu() != cpu ||
+            cross_as_write_byte(child_to_parent[1], 1U) != 0) {
+            _exit(1);
+        }
+        for (index = 0;
+             index < iterations + (size_t)ADDRESS_SPACE_SWITCH_WARMUP;
+             ++index) {
+            if (cross_as_read_byte(parent_to_child[0], &command) != 0) {
+                _exit(2);
+            }
+            private_touch ^= (uint64_t)command + index;
+            if (cross_as_write_byte(child_to_parent[1], command) != 0) {
+                _exit(3);
+            }
+        }
+        (void)private_touch;
+        _exit(0);
+    }
+
+    (void)close(parent_to_child[0]);
+    parent_to_child[0] = -1;
+    (void)close(child_to_parent[1]);
+    child_to_parent[1] = -1;
+    CPU_ZERO(&single_cpu);
+    CPU_SET(cpu, &single_cpu);
+    if (sched_setaffinity(0, sizeof(single_cpu), &single_cpu) != 0 ||
+        sched_getcpu() != cpu) {
+        result = missing_result("address_space_switch_affinity_failed", errno,
+                                false);
+        goto out;
+    }
+    {
+        unsigned char ready = 0;
+
+        if (read_byte_bounded(child_to_parent[0], &ready,
+                              CROSS_AS_TIMEOUT_MS) != 0 ||
+            ready != 1U) {
+            result = missing_result("address_space_switch_child_setup_failed",
+                                    errno == 0 ? EIO : errno, false);
+            goto out;
+        }
+    }
+
+    for (index = 0;
+         index < iterations + (size_t)ADDRESS_SPACE_SWITCH_WARMUP;
+         ++index) {
+        unsigned char command = (unsigned char)((index & 0x7fU) + 1U);
+        unsigned char reply = 0;
+        uint64_t before = 0;
+        uint64_t after = 0;
+
+        if (index >= (size_t)ADDRESS_SPACE_SWITCH_WARMUP &&
+            monotonic_ns(&before) != 0) {
+            result = missing_result("clock_failed", errno, false);
+            goto out;
+        }
+        if (cross_as_write_byte(parent_to_child[1], command) != 0 ||
+            read_byte_bounded(child_to_parent[0], &reply,
+                              CROSS_AS_TIMEOUT_MS) != 0 ||
+            reply != command) {
+            result = missing_result("address_space_switch_round_trip_failed",
+                                    errno == 0 ? EIO : errno, false);
+            goto out;
+        }
+        if (index >= (size_t)ADDRESS_SPACE_SWITCH_WARMUP) {
+            if (monotonic_ns(&after) != 0) {
+                result = missing_result("clock_failed", errno, false);
+                goto out;
+            }
+            samples[index - (size_t)ADDRESS_SPACE_SWITCH_WARMUP] =
+                after - before;
+        }
+    }
+    {
+        uint64_t deadline;
+        int status = 0;
+
+        if (monotonic_ns(&deadline) != 0 ||
+            deadline > UINT64_MAX - (uint64_t)CROSS_AS_CLEANUP_TIMEOUT_MS *
+                                      UINT64_C(1000000)) {
+            result = missing_result("address_space_switch_wait_failed",
+                                    errno == 0 ? EOVERFLOW : errno, false);
+            goto out;
+        }
+        deadline += (uint64_t)CROSS_AS_CLEANUP_TIMEOUT_MS * UINT64_C(1000000);
+        if (cross_as_wait_child_bounded(child, &status, &child_reaped,
+                                        deadline) != 0 ||
+            !child_reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            result = missing_result("address_space_switch_child_failed",
+                                    errno == 0 ? ECHILD : errno, false);
+            goto out;
+        }
+        child = 0;
+    }
+    result = successful_result(samples, iterations, false, 0);
+
+out:
+    if (parent_to_child[0] >= 0) {
+        if (close(parent_to_child[0]) != 0) {
+            record_cleanup_error(errno, &cleanup_error);
+        }
+    }
+    if (parent_to_child[1] >= 0) {
+        if (close(parent_to_child[1]) != 0) {
+            record_cleanup_error(errno, &cleanup_error);
+        }
+    }
+    if (child_to_parent[0] >= 0) {
+        if (close(child_to_parent[0]) != 0) {
+            record_cleanup_error(errno, &cleanup_error);
+        }
+    }
+    if (child_to_parent[1] >= 0) {
+        if (close(child_to_parent[1]) != 0) {
+            record_cleanup_error(errno, &cleanup_error);
+        }
+    }
+    if (child > 0 && !child_reaped) {
+        pid_t children[1] = {child};
+
+        if (cross_as_abort_and_reap(children, 1) != 0) {
+            record_cleanup_error(errno, &cleanup_error);
+        }
+    }
+    if (affinity_saved &&
+        sched_setaffinity(0, sizeof(original_affinity), &original_affinity) !=
+            0) {
+        record_cleanup_error(errno, &cleanup_error);
+    }
+    if (pipe_action_installed &&
+        sigaction(SIGPIPE, &old_pipe_action, NULL) != 0) {
+        record_cleanup_error(errno, &cleanup_error);
+    }
+    if (result.ok && cleanup_error != 0) {
+        result = missing_result("address_space_switch_cleanup_failed",
+                                cleanup_error, false);
+    }
+    free(samples);
+    return result;
+}
+
 static struct metric_result run_direct_io_pin_proxy_cross_as_contention(
     size_t worker_count, size_t iterations, const int *worker_cpus,
     size_t live_vmas, size_t page_size, struct vma_fixture_report *fixture)
@@ -3190,6 +3423,7 @@ int main(int argc, char **argv)
         emit_metric("mremap_file_duplicate_latency", &result);
         emit_metric("mremap_shared_anon_resize_latency", &result);
         emit_metric("protect_touch_latency", &result);
+        emit_metric("address_space_switch_ping_pong_latency", &result);
         result = missing_result("page_size_unavailable", saved_errno, true);
         emit_metric_with_fixture("direct_io_pin_proxy_throughput", &result,
                                  &direct_io_pin_proxy_throughput_fixture);
@@ -3255,6 +3489,9 @@ int main(int argc, char **argv)
     }
     result = run_protect_touch(&config, page_size);
     emit_metric("protect_touch_latency", &result);
+    result = run_address_space_switch_ping_pong(config.iterations,
+                                                affinity_cpu_ids[0]);
+    emit_metric("address_space_switch_ping_pong_latency", &result);
     result = run_pin_metric(1U, config.pin_iterations, false,
                             affinity_cpu_ids, config.live_vmas, page_size,
                             &direct_io_pin_proxy_throughput_fixture);

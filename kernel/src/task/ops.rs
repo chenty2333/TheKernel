@@ -355,7 +355,12 @@ pub fn set_task_user_address_space(
         any(target_arch = "riscv64", target_arch = "loongarch64")
     ))]
     unsafe {
-        ctx.set_page_table_root_with_asid(token.root(), token.asid(), token.generation());
+        ctx.set_page_table_root_with_asid(
+            token.root(),
+            token.asid(),
+            token.generation(),
+            token.fallback_reason(),
+        );
     }
 
     #[cfg(not(all(

@@ -24,6 +24,8 @@ mod file;
 mod keyring;
 mod mm;
 mod mounts;
+#[cfg(feature = "pmu-diagnostics")]
+mod pmu;
 mod pseudofs;
 mod random;
 mod readiness;

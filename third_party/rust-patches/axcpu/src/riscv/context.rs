@@ -1,4 +1,5 @@
 use core::arch::naked_asm;
+
 use memory_addr::VirtAddr;
 use riscv::register::sstatus::{self, FS};
 
@@ -98,7 +99,7 @@ impl FpState {
         }
         // restore the next task's FP state
         match next_fp_state.fs {
-            FS::Clean => next_fp_state.restore(), // the next task's FP state is clean, we should restore it
+            FS::Clean => next_fp_state.restore(), /* the next task's FP state is clean, we should restore it */
             FS::Initial => FpState::clear(),      // restore the FP state as constant values(all 0)
             FS::Off => {}                         // do nothing
             FS::Dirty => unreachable!("FP state of the next task should not be dirty"),
@@ -293,6 +294,9 @@ pub struct TaskContext {
     /// Non-wrapping allocator generation that owns `asid`.
     #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
     pub asid_generation: u64,
+    /// Exact reason this context uses ASID 0, or `None` for a valid identity.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub asid_fallback_reason: crate::AddressSpaceFallbackReason,
     #[cfg(feature = "fp-simd")]
     pub fp_state: FpState,
 }
@@ -313,6 +317,8 @@ impl TaskContext {
             asid: 0,
             #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
             asid_generation: 0,
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            asid_fallback_reason: crate::AddressSpaceFallbackReason::AsidZero,
             ..Default::default()
         }
     }
@@ -336,6 +342,7 @@ impl TaskContext {
         {
             self.asid = 0;
             self.asid_generation = 0;
+            self.asid_fallback_reason = crate::AddressSpaceFallbackReason::AsidZero;
         }
     }
 
@@ -352,10 +359,12 @@ impl TaskContext {
         satp: memory_addr::PhysAddr,
         asid: usize,
         generation: u64,
+        fallback_reason: crate::AddressSpaceFallbackReason,
     ) {
         self.satp = satp;
         self.asid = asid;
         self.asid_generation = generation;
+        self.asid_fallback_reason = fallback_reason;
     }
 
     /// Switches to another task.
@@ -379,18 +388,22 @@ impl TaskContext {
                 || self.asid != next_ctx.asid
                 || self.asid_generation != next_ctx.asid_generation;
             if address_space_changed {
-                let can_retain_tlb = crate::can_retain_user_tlb(
+                let decision = crate::classify_user_tlb_switch(
                     self.satp.as_usize(),
                     self.asid,
                     self.asid_generation,
+                    self.asid_fallback_reason,
                     next_ctx.satp.as_usize(),
                     next_ctx.asid,
                     next_ctx.asid_generation,
+                    next_ctx.asid_fallback_reason,
                 );
                 unsafe {
                     crate::asm::write_user_page_table_with_asid(next_ctx.satp, next_ctx.asid)
                 };
-                if !can_retain_tlb {
+                #[cfg(feature = "asid-switch-diagnostics")]
+                crate::record_asid_switch_decision(decision);
+                if matches!(decision, crate::TlbSwitchDecision::Flush(_)) {
                     crate::asm::flush_tlb(None);
                 }
             }

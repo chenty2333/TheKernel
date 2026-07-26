@@ -32,6 +32,8 @@ use linux_raw_sys::{
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::VmMutPtr;
 
+#[cfg(feature = "asid-switch-diagnostics")]
+use crate::mm::asid_switch_diagnostics_snapshot;
 #[cfg(feature = "mm-lock-diagnostics")]
 use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
@@ -685,6 +687,48 @@ fn render_proc_mm_lock_stats() -> Vec<u8> {
         final_snapshot.sequence,
         u8::from(final_snapshot.sequence_exhausted)
     );
+    out.into_bytes()
+}
+
+#[cfg(feature = "asid-switch-diagnostics")]
+fn render_proc_asid_switch_stats() -> Vec<u8> {
+    let snapshot = asid_switch_diagnostics_snapshot();
+    format!(
+        "ASID_SWITCH_DIAGNOSTICS schema=thekernel-asid-switch-diagnostics-v1 enabled={} \
+         fast_path_avoided={} fallback_asid_zero={} fallback_invalid_width={} \
+         fallback_exhausted={} fallback_generation_mismatch={} fallback_same_id_different_root={} \
+         saturated={}\n",
+        u8::from(snapshot.enabled()),
+        snapshot.fast_path_avoided(),
+        snapshot.fallback_asid_zero(),
+        snapshot.fallback_invalid_width(),
+        snapshot.fallback_exhausted(),
+        snapshot.fallback_generation_mismatch(),
+        snapshot.fallback_same_id_different_root(),
+        u8::from(snapshot.saturated()),
+    )
+    .into_bytes()
+}
+
+#[cfg(feature = "pmu-diagnostics")]
+fn render_proc_pmu_capabilities() -> Vec<u8> {
+    let snapshot = crate::pmu::capability_snapshot();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "PMU_CAPABILITIES schema=thekernel-pmu-capabilities-v1 source={} counter_count={} \
+         consistent_snapshot={} samples_collected=0",
+        snapshot.source(),
+        snapshot.counter_count(),
+        u8::from(snapshot.has_consistent_snapshot()),
+    );
+    for (event, requestable) in snapshot.events() {
+        let _ = writeln!(
+            out,
+            "PMU_EVENT event={event} requestable={} sampled=0",
+            u8::from(requestable),
+        );
+    }
     out.into_bytes()
 }
 
@@ -2841,6 +2885,24 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodePermission::from_bits_truncate(0o444),
             || -> VfsResult<Vec<u8>> { Ok(render_proc_mm_lock_stats()) },
+        ),
+    );
+    #[cfg(feature = "asid-switch-diagnostics")]
+    root.add(
+        "asid_switch_stats",
+        SimpleFile::new_regular_with_permission(
+            fs.clone(),
+            NodePermission::from_bits_truncate(0o444),
+            || -> VfsResult<Vec<u8>> { Ok(render_proc_asid_switch_stats()) },
+        ),
+    );
+    #[cfg(feature = "pmu-diagnostics")]
+    root.add(
+        "pmu_capabilities",
+        SimpleFile::new_regular_with_permission(
+            fs.clone(),
+            NodePermission::from_bits_truncate(0o444),
+            || -> VfsResult<Vec<u8>> { Ok(render_proc_pmu_capabilities()) },
         ),
     );
     #[cfg(feature = "test-io-control")]

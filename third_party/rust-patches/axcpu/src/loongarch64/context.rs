@@ -1,6 +1,7 @@
 use core::arch::naked_asm;
 #[cfg(feature = "fp-simd")]
 use core::mem::offset_of;
+
 use memory_addr::VirtAddr;
 
 /// General registers of Loongarch64.
@@ -235,6 +236,9 @@ pub struct TaskContext {
     /// Non-wrapping allocator generation that owns `asid`.
     #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
     pub asid_generation: u64,
+    /// Exact reason this context uses ASID 0, or `None` for a valid identity.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub asid_fallback_reason: crate::AddressSpaceFallbackReason,
     #[cfg(feature = "fp-simd")]
     /// Floating Point Unit states
     pub fpu: FpuState,
@@ -265,6 +269,7 @@ impl TaskContext {
         {
             self.asid = 0;
             self.asid_generation = 0;
+            self.asid_fallback_reason = crate::AddressSpaceFallbackReason::AsidZero;
         }
     }
 
@@ -281,10 +286,12 @@ impl TaskContext {
         pgdl: memory_addr::PhysAddr,
         asid: usize,
         generation: u64,
+        fallback_reason: crate::AddressSpaceFallbackReason,
     ) {
         self.pgdl = pgdl.as_usize();
         self.asid = asid;
         self.asid_generation = generation;
+        self.asid_fallback_reason = fallback_reason;
     }
 
     /// Switches to another task.
@@ -310,18 +317,22 @@ impl TaskContext {
                 || self.asid != next_ctx.asid
                 || self.asid_generation != next_ctx.asid_generation;
             if address_space_changed {
-                let can_retain_tlb = crate::can_retain_user_tlb(
+                let decision = crate::classify_user_tlb_switch(
                     self.pgdl,
                     self.asid,
                     self.asid_generation,
+                    self.asid_fallback_reason,
                     next_ctx.pgdl,
                     next_ctx.asid,
                     next_ctx.asid_generation,
+                    next_ctx.asid_fallback_reason,
                 );
                 unsafe {
                     crate::asm::write_user_page_table_with_asid(pa!(next_ctx.pgdl), next_ctx.asid)
                 };
-                if !can_retain_tlb {
+                #[cfg(feature = "asid-switch-diagnostics")]
+                crate::record_asid_switch_decision(decision);
+                if matches!(decision, crate::TlbSwitchDecision::Flush(_)) {
                     crate::asm::flush_tlb(None);
                 }
             }

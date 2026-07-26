@@ -30,7 +30,7 @@ def complete_log(
         f"cpu_ids={cpu_ids} cpu_ids_complete=1"
     )
     records.append(
-        "MM_PERF_RUN schema=thekernel-mm-performance-run-v2 arch=rv "
+        "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=rv "
         f"iterations={iterations} vmas={vmas} "
         f"pin_iterations={pin_iterations} pin_workers={pin_workers} "
         "page_size=4096"
@@ -42,6 +42,7 @@ def complete_log(
         "mremap_file_duplicate_latency",
         "mremap_shared_anon_resize_latency",
         "protect_touch_latency",
+        "address_space_switch_ping_pong_latency",
     ):
         count = iterations * (
             2 if metric in {"mremap_latency", "mremap_shared_anon_resize_latency"} else 1
@@ -167,7 +168,7 @@ class MmPerformanceParserTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 11)
+        self.assertEqual(len(lines), 12)
         self.assertEqual(
             lines[0].split("\t")[:5],
             ["arch", "requested_cpus", "online_cpus", "metric", "status"],
@@ -179,7 +180,7 @@ class MmPerformanceParserTests(unittest.TestCase):
         )
         self.assertIn(
             "\tdirect_io_pin_proxy_cross_as_contention\tok\t100\t40\t50\t60\t1048576",
-            lines[10],
+            lines[11],
         )
 
     def test_structured_missing_pin_metrics_are_evidence(self) -> None:
@@ -352,7 +353,7 @@ class MmPerformanceParserTests(unittest.TestCase):
 
     def test_rejects_missing_or_duplicate_run_record(self) -> None:
         record = (
-            "MM_PERF_RUN schema=thekernel-mm-performance-run-v2 arch=rv "
+            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=rv "
             "iterations=100 vmas=512 pin_iterations=25 pin_workers=4 "
             "page_size=4096"
         )

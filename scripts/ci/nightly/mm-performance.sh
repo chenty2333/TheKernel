@@ -96,6 +96,8 @@ runner_contract_sha256=$(
                 scripts/ci/compare-mm-performance.py \
                 scripts/ci/nightly/lib.sh \
                 scripts/ci/parse-mm-lock-diagnostics.py \
+                scripts/ci/parse-asid-switch-diagnostics.py \
+                scripts/ci/parse-pmu-capabilities.py \
                 scripts/ci/parse-mm-performance.py \
                 scripts/ci/select-mm-performance-cpus.py \
                 scripts/ci/validate-qemu-receipt.py \
@@ -234,6 +236,9 @@ manifest_columns=(
     mm_lock_diagnostics_artifact
     mm_lock_diagnostics_sha256
     mm_lock_diagnostics_size_bytes
+    asid_switch_diagnostics_artifact
+    asid_switch_diagnostics_sha256
+    asid_switch_diagnostics_size_bytes
     commands
     commands_sha256
     commands_size_bytes
@@ -265,6 +270,7 @@ while IFS= read -r arch; do
         kernel_relative="$run_name/kernel"
         metrics_relative="$run_name/mm-performance.tsv"
         diagnostics_artifact="$run_dir/mm-lock-diagnostics.tsv"
+        asid_diagnostics_artifact="$run_dir/asid-switch-diagnostics.tsv"
         commands_relative="$run_name/commands"
         guest_inputs_relative="$run_name/guest-inputs.tsv"
         qemu_receipt_relative="$run_name/qemu-runner-receipt.json"
@@ -327,16 +333,22 @@ while IFS= read -r arch; do
                 "prepared kernel profile drift for $run_name: expected=$MM_PERF_KERNEL_PROFILE actual=$receipt_kernel_profile"
         case "$MM_PERF_MEASUREMENT_MODE" in
             product)
-                if grep -Eq '^MM_LOCK_' "$run_dir/qemu.log"; then
+                if grep -Eq '^(MM_LOCK_|ASID_SWITCH_|PMU_)' "$run_dir/qemu.log"; then
                     nightly_fail \
-                        "product MM run emitted lock diagnostics: $run_name"
+                        "product MM run emitted diagnostic records: $run_name"
                 fi
                 [ ! -e "$diagnostics_artifact" ] \
                     || nightly_fail \
                         "product MM run created a diagnostics artifact: $run_name"
+                [ ! -e "$asid_diagnostics_artifact" ] \
+                    || nightly_fail \
+                        "product MM run created an ASID diagnostics artifact: $run_name"
                 diagnostics_relative=$MM_PERF_DIAGNOSTIC_SENTINEL
                 diagnostics_sha256=$MM_PERF_DIAGNOSTIC_SENTINEL
                 diagnostics_size_bytes=$MM_PERF_DIAGNOSTIC_SENTINEL
+                asid_diagnostics_relative=$MM_PERF_DIAGNOSTIC_SENTINEL
+                asid_diagnostics_sha256=$MM_PERF_DIAGNOSTIC_SENTINEL
+                asid_diagnostics_size_bytes=$MM_PERF_DIAGNOSTIC_SENTINEL
                 ;;
             diagnostic)
                 diagnostics_relative="$run_name/mm-lock-diagnostics.tsv"
@@ -347,6 +359,16 @@ while IFS= read -r arch; do
                         "diagnostic MM run produced an empty lock artifact: $run_name"
                 diagnostics_sha256=$(sha256sum "$diagnostics_artifact" | awk '{ print $1 }')
                 diagnostics_size_bytes=$(stat -c '%s' "$diagnostics_artifact")
+                asid_diagnostics_relative="$run_name/asid-switch-diagnostics.tsv"
+                python3 "$CI_SCRIPT_DIR/parse-asid-switch-diagnostics.py" \
+                    "$run_dir/qemu.log" --output "$asid_diagnostics_artifact"
+                [ -s "$asid_diagnostics_artifact" ] \
+                    || nightly_fail \
+                        "diagnostic MM run produced an empty ASID artifact: $run_name"
+                asid_diagnostics_sha256=$(sha256sum "$asid_diagnostics_artifact" | awk '{ print $1 }')
+                asid_diagnostics_size_bytes=$(stat -c '%s' "$asid_diagnostics_artifact")
+                python3 "$CI_SCRIPT_DIR/parse-pmu-capabilities.py" \
+                    "$run_dir/qemu.log" --arch "$arch" >/dev/null
                 ;;
         esac
 
@@ -386,7 +408,7 @@ while IFS= read -r arch; do
         host_post_sha256=$(sha256sum "$run_dir/host-post.tsv" | awk '{ print $1 }')
         host_post_size_bytes=$(stat -c '%s' "$run_dir/host-post.tsv")
         manifest_row=(
-            thekernel-mm-performance-bundle-v9
+            thekernel-mm-performance-bundle-v10
             "$repo_commit"
             "$ax_commit"
             "$linux_abi_commit"
@@ -422,6 +444,9 @@ while IFS= read -r arch; do
             "$diagnostics_relative"
             "$diagnostics_sha256"
             "$diagnostics_size_bytes"
+            "$asid_diagnostics_relative"
+            "$asid_diagnostics_sha256"
+            "$asid_diagnostics_size_bytes"
             "$commands_relative"
             "$commands_sha256"
             "$commands_size_bytes"
@@ -455,7 +480,7 @@ missing_count=$(
     || nightly_fail "MM performance evidence contains $missing_count missing metrics"
 metric_rows=$(awk 'END { print NR - 1 }' "$matrix")
 manifest_rows=$(awk 'END { print NR - 1 }' "$manifest")
-[ "$metric_rows" -eq $((run_count * 10)) ] \
+[ "$metric_rows" -eq $((run_count * 11)) ] \
     || nightly_fail "MM performance matrix row-count drift: $metric_rows"
 [ "$manifest_rows" -eq "$run_count" ] \
     || nightly_fail "MM performance manifest row-count drift: $manifest_rows"

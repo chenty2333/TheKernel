@@ -167,9 +167,13 @@ The lint policy lives in `[workspace.lints]` in the root `Cargo.toml`, so
 editors and a bare `cargo clippy` enforce exactly what CI does. Every allowance
 there records the mechanism that makes the lint wrong for this codebase.
 
-The PR gate builds both architectures and boots the project rootfs. Nightly
-adapters add mixed pressure, deterministic allocation failure, ext4 power-cut
-recovery, and non-loopback network coverage.
+The PR gate builds both architectures and boots the project rootfs. Its release
+consumer subgate also compiles the RV and LoongArch MM-diagnostics profiles with
+`asid-switch-diagnostics` and `pmu-diagnostics` from the normalized sibling
+`.crate` artifacts, with Cargo locked and offline. That is target-specific
+archive/API compile coverage; it does not boot those diagnostic kernels or
+claim PMU samples. Nightly adapters add mixed pressure, deterministic
+allocation failure, ext4 power-cut recovery, and non-loopback network coverage.
 
 ## Repository Layout
 

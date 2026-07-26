@@ -597,10 +597,18 @@ ci_run_step axfault-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axfault
+ci_run_step axpmu-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
+    -p thekernel-axpmu --all-targets
 ci_run_step axtlb-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axtlb --all-targets
+ci_run_step kernel-asid-pmu-diagnostics-check "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" cargo check --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,asid-switch-diagnostics,pmu-diagnostics \
+    --target x86_64-unknown-linux-gnu
 ci_run_step axtask-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
