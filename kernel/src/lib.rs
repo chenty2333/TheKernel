@@ -2,8 +2,9 @@
 //! programs and managing processes.
 
 #![no_std]
-#![feature(likely_unlikely)]
 #![feature(allocator_api)]
+#![cfg_attr(feature = "dev-log", feature(bstr))]
+#![feature(likely_unlikely)]
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
