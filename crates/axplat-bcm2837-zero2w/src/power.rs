@@ -6,6 +6,7 @@
 //! conventional bare-metal behaviour on these boards.
 
 #[cfg(not(feature = "legacy"))]
+#[cfg(not(feature = "legacy"))]
 use ax_plat::power::PowerIf;
 
 use crate::config::*;
@@ -39,18 +40,33 @@ pub(crate) fn system_off() -> ! {
     halt()
 }
 
+/// Bootstraps a secondary CPU through the BCM2836 local mailbox: stores the
+/// per-CPU stack top in the boot parameters, then writes the secondary entry
+/// physical address to the core's mailbox, releasing it from reset.
+#[cfg(feature = "smp")]
+pub(crate) fn cpu_boot_shared(cpu_id: usize, stack_top_paddr: usize) {
+    assert!(cpu_id < MAX_CPU_NUM, "secondary CPU index out of range");
+    crate::boot::secondary_stack_store(cpu_id, stack_top_paddr);
+    let entry = crate::boot::secondary_entry_paddr() as u32;
+    // SAFETY: the write releases the core; the boot parameters were stored
+    // and made visible by the store above (release ordering via the mailbox
+    // write is provided by the MMIO access).
+    mmio_write(
+        LOCAL_INTC_PADDR + PHYS_VIRT_OFFSET + LOCAL_MAILBOX0_SET0 + 16 * cpu_id,
+        entry,
+    );
+}
+
 #[cfg(not(feature = "legacy"))]
 struct PowerImpl;
 
 #[cfg(not(feature = "legacy"))]
 #[impl_plat_interface]
 impl PowerIf for PowerImpl {
-    /// Bootstraps the given CPU core with the given initial stack.
-    ///
-    /// Not supported yet: the platform currently boots a single CPU core.
+    /// Bootstraps the given CPU core with the given initial stack (physical).
     #[cfg(feature = "smp")]
-    fn cpu_boot(_cpu_id: usize, _stack_top_paddr: usize) {
-        unimplemented!("BCM2837 secondary-core boot (mailbox) is not implemented yet");
+    fn cpu_boot(cpu_id: usize, stack_top_paddr: usize) {
+        cpu_boot_shared(cpu_id, stack_top_paddr);
     }
 
     fn system_off() -> ! {
@@ -63,6 +79,6 @@ impl PowerIf for PowerImpl {
     }
 
     fn cpu_num() -> usize {
-        1
+        MAX_CPU_NUM
     }
 }

@@ -96,12 +96,18 @@ struct LegacyPower;
 
 #[impl_plat_interface]
 impl PowerIf for LegacyPower {
+    /// Bootstraps the given CPU core with the given initial stack (physical).
+    #[cfg(feature = "smp")]
+    fn cpu_boot(cpu_id: usize, stack_top_paddr: usize) {
+        crate::power::cpu_boot_shared(cpu_id, stack_top_paddr);
+    }
+
     fn system_off() -> ! {
         crate::power::system_off()
     }
 
     fn cpu_num() -> usize {
-        1
+        crate::config::MAX_CPU_NUM
     }
 }
 
@@ -237,7 +243,18 @@ impl InitIf for LegacyInit {
         crate::time::init_early();
     }
 
+    #[cfg(feature = "smp")]
+    fn init_early_secondary(_cpu_id: usize) {
+        axcpu_old::init::init_trap();
+        crate::time::init_early();
+    }
+
     fn init_later(_cpu_id: usize, _arg: usize) {
+        crate::irq::init_boot_irqs_shared();
+    }
+
+    #[cfg(feature = "smp")]
+    fn init_later_secondary(_cpu_id: usize) {
         crate::irq::init_boot_irqs_shared();
     }
 }

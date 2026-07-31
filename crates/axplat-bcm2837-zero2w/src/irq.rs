@@ -197,6 +197,14 @@ impl IrqIf for IrqIfImpl {
         init_boot_irqs_result()
     }
 
+    #[cfg(feature = "smp")]
+    fn init_secondary_boot_irqs(cpu_id: usize) -> Result<(), IrqError> {
+        // Enable the local interrupt routing for this core and its timer.
+        mmio_write(local_addr(LOCAL_CONTROL), 1 << cpu_id);
+        timer_irq_legacy_enable(true);
+        Ok(())
+    }
+
     fn set_enable(irq: IrqId, enabled: bool) -> Result<(), IrqError> {
         if irq.domain == CPU_LOCAL_IRQ_DOMAIN {
             if irq.hwirq.0 == LOCAL_IRQ_CNTPNSIRQ {

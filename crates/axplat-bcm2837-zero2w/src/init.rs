@@ -15,6 +15,7 @@ impl InitIf for InitIfImpl {
     #[cfg(feature = "smp")]
     fn init_early_secondary(_cpu_id: usize) {
         ax_cpu::init::init_trap();
+        crate::time::init_early();
     }
 
     fn init_later(_cpu_id: usize, _arg: usize) {

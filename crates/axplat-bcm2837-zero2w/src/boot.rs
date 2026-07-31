@@ -21,7 +21,7 @@ use ax_memory_addr::{PhysAddr, pa};
 #[cfg(feature = "legacy")]
 use axplat_old::mem::pa;
 
-use crate::config::{BOOT_STACK_SIZE, PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_VIRT_OFFSET};
+use crate::config::{BOOT_STACK_SIZE, MAX_CPU_NUM, PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_VIRT_OFFSET};
 #[cfg(not(feature = "legacy"))]
 use crate::config::KERNEL_ASPACE_BASE;
 
@@ -86,12 +86,13 @@ unsafe fn init_boot_page_table() {
     // are needed for the high mapping.
 }
 
-/// Installs the per-CPU runtime areas (ax-percpu layout) for CPU 0.
+/// Installs the per-CPU runtime areas (ax-percpu layout) for the primary
+/// core: initializes the whole layout (one area per CPU) and binds CPU 0.
 ///
 /// The platform reserves `CPU_LOCAL_RESERVE_PADDR` for the CPU-local runtime
 /// areas; the region is excluded from allocation by [`crate::mem`].
 #[cfg(not(feature = "legacy"))]
-fn install_cpu_local() {
+fn install_cpu_local_primary() {
     let template_size = cpu_local::cpu_area_template_size()
         .expect("per-CPU template must be linked into the kernel image");
     // Keep the region page-aligned for simplicity; the layout validation only
@@ -100,7 +101,7 @@ fn install_cpu_local() {
     // template growth beyond it fails the layout validation at boot.
     debug_assert!(template_size <= CPU_LOCAL_RESERVE_SIZE);
     let area_stride = CPU_LOCAL_RESERVE_SIZE;
-    let area_count = core::num::NonZeroU32::new(1).expect("nonzero");
+    let area_count = core::num::NonZeroU32::new(MAX_CPU_NUM as u32).expect("nonzero");
     let runtime_base = KERNEL_ASPACE_BASE + CPU_LOCAL_RESERVE_PADDR;
     let region = ax_percpu::PerCpuRegion::new(
         core::ptr::NonNull::new(runtime_base as *mut u8).expect("nonzero region base"),
@@ -111,20 +112,48 @@ fn install_cpu_local() {
     // mapped for the kernel lifetime; no CPU accesses it before this call.
     let layout = unsafe { ax_percpu::initialize_layout(region) }
         .expect("per-CPU layout initialization must succeed");
-    let area = layout
-        .area(cpu_local::CpuIndex::from_u32(0).expect("CPU 0 in range"))
-        .expect("CPU 0 area must exist")
+    let _ = layout; // layout is published globally; areas are bound per CPU.
+    install_cpu_local_cpu(0);
+}
+
+/// Binds the current CPU to its per-CPU runtime area. Called on the primary
+/// core after `initialize_layout` and on every secondary core at its entry.
+#[cfg(not(feature = "legacy"))]
+fn install_cpu_local_cpu(cpu_id: usize) {
+    let area = ax_percpu::area(cpu_local::CpuIndex::from_u32(cpu_id as u32).expect("CPU in range"))
+        .expect("CPU area must exist")
         .cpu_area()
-        .expect("CPU 0 area must be addressable");
-    // SAFETY: boot-time primary core, IRQs masked, no scheduler running.
+        .expect("CPU area must be addressable");
+    // SAFETY: boot-time core, IRQs masked, no scheduler running.
     unsafe { cpu_local::install_cpu_area(area) }
-        .expect("primary CPU-local area must install");
+        .expect("CPU-local area must install");
 }
 
 /// Physical address of the reserved CPU-local runtime area.
 pub const CPU_LOCAL_RESERVE_PADDR: usize = 0x0100_0000;
-/// Size of the reserved CPU-local runtime area.
-pub const CPU_LOCAL_RESERVE_SIZE: usize = 0x1_0000;
+/// Size of the reserved CPU-local runtime area (per-CPU stride * CPU count).
+pub const CPU_LOCAL_RESERVE_SIZE: usize = 0x1_0000 * MAX_CPU_NUM;
+
+/// Secondary-core boot parameters: per-CPU stack top (physical address),
+/// written by `PowerIf::cpu_boot` on the primary core and read by the
+/// secondary-core entry assembly (via the identity mapping, so the
+/// PC-relative address equals the physical address).
+#[cfg(feature = "smp")]
+static mut SMP_PARAMS: [usize; MAX_CPU_NUM] = [0; MAX_CPU_NUM];
+
+/// Stores the secondary stack top (called from `cpu_boot`).
+#[cfg(feature = "smp")]
+pub(crate) fn secondary_stack_store(cpu_id: usize, stack_top_paddr: usize) {
+    // SAFETY: written before the secondary core is released from reset.
+    unsafe { SMP_PARAMS[cpu_id] = stack_top_paddr };
+}
+
+/// Physical address of the secondary-core entry point.
+#[cfg(feature = "smp")]
+pub(crate) fn secondary_entry_paddr() -> usize {
+    let entry: *const () = _start_secondary as *const ();
+    entry as usize - PHYS_VIRT_OFFSET
+}
 
 // Architecture helpers selected by the interface feature. Both ax-cpu (new
 // tgoskits interface) and axcpu (legacy crates.io interface) provide the same
@@ -204,7 +233,7 @@ unsafe extern "C" fn _start() -> ! {
 fn bcm2837_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(not(feature = "legacy"))]
     {
-        install_cpu_local();
+        install_cpu_local_primary();
     }
     #[cfg(not(feature = "legacy"))]
     {
@@ -214,5 +243,64 @@ fn bcm2837_main(cpu_id: usize, arg: usize) -> ! {
     {
         // The legacy axplat runtime owns its per-CPU state.
         axplat_old::call_main(cpu_id, arg)
+    }
+}
+
+/// The earliest entry point for the secondary CPUs, released from reset by
+/// the primary core through the BCM2836 local mailbox. The firmware starts
+/// the core at EL2; the identity mapping (built by the primary core) is
+/// already active, so PC-relative access to the boot parameters works at
+/// physical addresses.
+#[cfg(feature = "smp")]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn _start_secondary() -> ! {
+    core::arch::naked_asm!(
+        "
+        mrs     x19, mpidr_el1
+        and     x19, x19, #0xff         // CPU id
+
+        adrp    x8, {smp_params}        // stack top from boot params (low addr)
+        ldr     x9, [x8, x19, lsl #3]
+        mov     sp, x9
+
+        bl      {switch_to_el1}         // EL2 -> EL1
+        bl      {enable_fp}
+        adrp    x0, {boot_pt}
+        bl      {init_mmu}              // enable MMU (shared boot page table)
+
+        mov     x8, {phys_virt_offset}  // jump to the high address space
+        add     sp, sp, x8
+
+        mov     x0, x19                 // call_platform_secondary_main(cpu_id)
+        ldr     x8, ={entry}
+        blr     x8
+        b       .",
+        switch_to_el1 = sym plat_switch_to_el1,
+        init_mmu = sym plat_init_mmu,
+        enable_fp = sym plat_enable_fp,
+        boot_pt = sym BOOT_PT_L0,
+        smp_params = sym SMP_PARAMS,
+        phys_virt_offset = const PHYS_VIRT_OFFSET,
+        entry = sym bcm2837_secondary_main,
+    )
+}
+
+/// Platform entry for the secondary cores: bind the CPU-local area and hand
+/// control to the kernel's secondary entry point.
+#[cfg(feature = "smp")]
+#[unsafe(no_mangle)]
+fn bcm2837_secondary_main(cpu_id: usize) -> ! {
+    #[cfg(not(feature = "legacy"))]
+    {
+        install_cpu_local_cpu(cpu_id);
+    }
+    #[cfg(not(feature = "legacy"))]
+    {
+        ax_plat::call_secondary_main(cpu_id)
+    }
+    #[cfg(feature = "legacy")]
+    {
+        // The legacy axplat runtime owns its per-CPU state.
+        axplat_old::call_secondary_main(cpu_id)
     }
 }

@@ -33,6 +33,9 @@ pub const KERNEL_ASPACE_SIZE: usize = 0x1_0000_0000;
 /// Boot stack size (also used as the per-CPU stack size).
 pub const BOOT_STACK_SIZE: usize = 0x40000;
 
+/// Number of CPU cores on the platform (quad Cortex-A53).
+pub const MAX_CPU_NUM: usize = 4;
+
 /// PL011 UART0.
 pub const UART0_PADDR: usize = 0x3f20_1000;
 pub const UART0_IRQ: usize = 89; // armctrl bank 2, bit 25
