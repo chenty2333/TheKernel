@@ -19,11 +19,13 @@ use axplat_old::{
     time::TimeIf,
 };
 
-use crate::config::{
-    KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, LOCAL_IRQ_CNTPNSIRQ, LOCAL_IRQ_GPU_FAST,
-    LOCAL_IRQ_PENDING0, PHYS_VIRT_OFFSET,
+use crate::{
+    config::{
+        KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, LOCAL_IRQ_CNTPNSIRQ, LOCAL_IRQ_GPU_FAST,
+        LOCAL_IRQ_PENDING0, PHYS_VIRT_OFFSET,
+    },
+    irq::{local_addr, mmio_read, scan_armctrl_pending, timer_irq_legacy_enable},
 };
-use crate::irq::{local_addr, mmio_read, scan_armctrl_pending, timer_irq_legacy_enable};
 
 /// Sentinel IRQ number for the CPU-local timer in the legacy interface.
 pub const TIMER_IRQ_LEGACY: usize = 96;

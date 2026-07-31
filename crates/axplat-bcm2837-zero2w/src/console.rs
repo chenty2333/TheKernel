@@ -6,16 +6,18 @@
 //! initializing at 115200 baud keeps the console working if firmware left
 //! the UART disabled or misconfigured.
 
-use core::fmt::{self, Write};
-use core::ptr::{read_volatile, write_volatile};
+use core::{
+    fmt::{self, Write},
+    ptr::{read_volatile, write_volatile},
+};
 
 #[cfg(not(feature = "legacy"))]
 use ax_plat::console::{ConsoleDeviceIdError, ConsoleDeviceIdResult, ConsoleIf, ConsoleIrqEvent};
 use kspin::SpinNoIrq;
 
-use crate::config::{PHYS_VIRT_OFFSET, UART0_PADDR};
 #[cfg(not(feature = "legacy"))]
 use crate::config::UART0_IRQ;
+use crate::config::{PHYS_VIRT_OFFSET, UART0_PADDR};
 
 // PL011 registers (byte offsets).
 const PL011_DR: usize = 0x00;

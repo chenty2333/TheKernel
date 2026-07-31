@@ -1,0 +1,27 @@
+# Standalone host-side test harness for the bcm283x drivers.
+#
+# Build and run ON the Raspberry Pi (aarch64 Linux, root required for
+# /dev/mem):
+#
+#   cd host-tests/bcm283x-host-test
+#   cargo build --release
+#   sudo ./target/release/bcm283x-host-test
+#
+# Before running, unload the kernel vc4 driver so it does not fight with the
+# test over the HVS/V3D registers:
+#
+#   sudo rmmod vc4   (or: add "dtoverlay=vc4-kms-v3d=off" and reboot)
+
+[workspace]
+
+[package]
+name = "bcm283x-host-test"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side bring-up test for bcm283x-hvs and bcm283x-v3d on Raspberry Pi Linux"
+
+[dependencies]
+bcm283x-hvs = { path = "../../drivers/gpu/bcm283x-hvs" }
+bcm283x-v3d = { path = "../../drivers/gpu/bcm283x-v3d" }
+rdif-display = { path = "../../drivers/interface/rdif-display" }
+libc = "0.2"

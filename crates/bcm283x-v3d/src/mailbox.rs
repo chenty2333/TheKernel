@@ -4,8 +4,10 @@
 //! and set through the mailbox `CLOCK_SET_RATE` request rather than by
 //! poking CPRMAN directly (the firmware knows the safe PLL configuration).
 
-use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
+use core::{
+    arch::asm,
+    ptr::{read_volatile, write_volatile},
+};
 
 use kspin::SpinNoIrq;
 

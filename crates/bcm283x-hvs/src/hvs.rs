@@ -77,7 +77,10 @@ impl Hvs {
 
     /// Enables the HVS global scaler.
     pub fn enable(&self) {
-        self.write(SCALER_DISPCTRL, self.read(SCALER_DISPCTRL) | SCALER_DISPCTRL_ENABLE);
+        self.write(
+            SCALER_DISPCTRL,
+            self.read(SCALER_DISPCTRL) | SCALER_DISPCTRL_ENABLE,
+        );
     }
 
     /// Programs channel 0 for the given output mode (mirrors
@@ -90,7 +93,11 @@ impl Hvs {
 
         // Enable the scaler; it waits for VSTART to start compositing.
         let dispctrl = SCALER_DISPCTRL0_ENABLE
-            | field!(mode.hdisplay, SCALER_DISPCTRL0_WIDTH_MASK, SCALER_DISPCTRL0_WIDTH_SHIFT)
+            | field!(
+                mode.hdisplay,
+                SCALER_DISPCTRL0_WIDTH_MASK,
+                SCALER_DISPCTRL0_WIDTH_SHIFT
+            )
             | field!(
                 mode.vdisplay,
                 SCALER_DISPCTRL0_HEIGHT_MASK,

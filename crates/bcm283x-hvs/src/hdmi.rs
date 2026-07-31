@@ -136,18 +136,27 @@ impl Hdmi {
     /// Starts pixel output: restarts the pixel clock and enables the video
     /// path.
     pub fn enable(&self) {
-        self.write(HDMI_VID_CTL, self.read(HDMI_VID_CTL) & !VC4_HDMI_VID_CTL_BLANKPIX);
+        self.write(
+            HDMI_VID_CTL,
+            self.read(HDMI_VID_CTL) & !VC4_HDMI_VID_CTL_BLANKPIX,
+        );
         self.write(
             HDMI_CLOCK_STOP,
             self.read(HDMI_CLOCK_STOP) & !VC4_DVP_HT_CLOCK_STOP_PIXEL,
         );
         self.write(HDMI_M_CTL, VC4_HD_M_ENABLE);
-        self.write(HDMI_VID_CTL, self.read(HDMI_VID_CTL) | VC4_HDMI_VID_CTL_ENABLE);
+        self.write(
+            HDMI_VID_CTL,
+            self.read(HDMI_VID_CTL) | VC4_HDMI_VID_CTL_ENABLE,
+        );
     }
 
     /// Stops pixel output.
     pub fn disable(&self) {
-        self.write(HDMI_VID_CTL, self.read(HDMI_VID_CTL) & !VC4_HDMI_VID_CTL_ENABLE);
+        self.write(
+            HDMI_VID_CTL,
+            self.read(HDMI_VID_CTL) & !VC4_HDMI_VID_CTL_ENABLE,
+        );
         self.write(
             HDMI_VID_CTL,
             self.read(HDMI_VID_CTL) | VC4_HDMI_VID_CTL_BLANKPIX,

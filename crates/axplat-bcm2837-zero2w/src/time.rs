@@ -5,8 +5,10 @@
 //! `LOCAL_TIMER_INT_CONTROL0` bit 1 is set. The timer frequency is read from
 //! `CNTFRQ_EL0`, which the GPU firmware programs at boot.
 
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(not(feature = "legacy"))]
 use ax_plat::time::{NANOS_PER_SEC, TimeIf};

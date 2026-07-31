@@ -21,9 +21,11 @@ use ax_memory_addr::{PhysAddr, pa};
 #[cfg(feature = "legacy")]
 use axplat_old::mem::pa;
 
-use crate::config::{BOOT_STACK_SIZE, MAX_CPU_NUM, PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_VIRT_OFFSET};
 #[cfg(not(feature = "legacy"))]
 use crate::config::KERNEL_ASPACE_BASE;
+use crate::config::{
+    BOOT_STACK_SIZE, MAX_CPU_NUM, PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_VIRT_OFFSET,
+};
 
 #[unsafe(link_section = ".bss.stack")]
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
@@ -125,8 +127,7 @@ fn install_cpu_local_cpu(cpu_id: usize) {
         .cpu_area()
         .expect("CPU area must be addressable");
     // SAFETY: boot-time core, IRQs masked, no scheduler running.
-    unsafe { cpu_local::install_cpu_area(area) }
-        .expect("CPU-local area must install");
+    unsafe { cpu_local::install_cpu_area(area) }.expect("CPU-local area must install");
 }
 
 /// Physical address of the reserved CPU-local runtime area.

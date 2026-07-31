@@ -154,7 +154,11 @@ impl HvsDisplay {
         })
     }
 
-    fn write_dlist(dlist: &mut [u32; DLIST_WORDS], resources: HvsResources, config: HvsDisplayConfig) {
+    fn write_dlist(
+        dlist: &mut [u32; DLIST_WORDS],
+        resources: HvsResources,
+        config: HvsDisplayConfig,
+    ) {
         let format = match config.format {
             PixelFormat::Rgb565 => HVS_PIXEL_FORMAT_RGB565,
             PixelFormat::Rgb888 => HVS_PIXEL_FORMAT_RGB888,
@@ -179,7 +183,12 @@ impl HvsDisplay {
     }
 
     pub fn framebuffer_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.resources.fb_vaddr as *mut u8, self.resources.fb_size) }
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.resources.fb_vaddr as *mut u8,
+                self.resources.fb_size,
+            )
+        }
     }
 
     pub fn resources(&self) -> &HvsResources {

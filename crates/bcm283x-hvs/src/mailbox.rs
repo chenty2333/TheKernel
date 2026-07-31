@@ -6,8 +6,10 @@
 //! ("Mailbox property interface"). Request buffers live in normal memory and
 //! are cache-maintained by the driver before/after each transfer.
 
-use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
+use core::{
+    arch::asm,
+    ptr::{read_volatile, write_volatile},
+};
 
 use kspin::SpinNoIrq;
 

@@ -9,8 +9,10 @@
 #[cfg(not(feature = "legacy"))]
 use ax_plat::power::PowerIf;
 
-use crate::config::*;
-use crate::irq::{mmio_read, mmio_write};
+use crate::{
+    config::*,
+    irq::{mmio_read, mmio_write},
+};
 
 const PM_PASSWORD_MASK: u32 = 0xffff_ff00;
 

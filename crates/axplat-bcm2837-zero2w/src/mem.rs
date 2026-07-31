@@ -11,10 +11,12 @@ use ax_plat::mem::{DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, RawRa
 #[cfg(feature = "legacy")]
 use axplat_old::mem::RawRange;
 
-use crate::boot::{CPU_LOCAL_RESERVE_PADDR, CPU_LOCAL_RESERVE_SIZE};
-use crate::config::{PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_MEMORY_BASE, PHYS_MEMORY_SIZE};
 #[cfg(not(feature = "legacy"))]
 use crate::config::{KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, PHYS_VIRT_OFFSET};
+use crate::{
+    boot::{CPU_LOCAL_RESERVE_PADDR, CPU_LOCAL_RESERVE_SIZE},
+    config::{PERIPHERAL_BASE, PERIPHERAL_SIZE, PHYS_MEMORY_BASE, PHYS_MEMORY_SIZE},
+};
 
 const RAM_RANGES: &[RawRange] = &[(PHYS_MEMORY_BASE, PHYS_MEMORY_SIZE)];
 

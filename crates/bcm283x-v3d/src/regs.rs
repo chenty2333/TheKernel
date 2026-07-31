@@ -32,7 +32,8 @@ pub const V3D_BPOS: usize = 0x30c;
 pub const V3D_VPMBASE: usize = 0x504;
 
 /// Expected `V3D_IDENT0` value: version 2 and the ASCII "V3D" magic.
-pub const V3D_EXPECTED_IDENT0: u32 = (2 << 24) | ('V' as u32) | ('3' as u32) << 8 | ('D' as u32) << 16;
+pub const V3D_EXPECTED_IDENT0: u32 =
+    (2 << 24) | ('V' as u32) | ('3' as u32) << 8 | ('D' as u32) << 16;
 
 pub const V3D_INT_OUTOMEM: u32 = 1 << 2;
 pub const V3D_INT_FLDONE: u32 = 1 << 1;
