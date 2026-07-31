@@ -1,0 +1,61 @@
+# Raspberry Pi Zero 2W platform configuration for TheKernel.
+#
+# The Zero 2W uses the RP3A0 SiP (BCM2710A1 die, BCM2837 family): quad
+# Cortex-A53, 512 MB LPDDR2. The GPU firmware loads the kernel image to
+# physical 0x0008_0000 and starts the ARM at EL2; the platform package drops
+# to EL1, enables the MMU and installs the flat linear mapping.
+#
+# NOTE: TheKernel currently builds for riscv64/loongarch64 only. This file
+# documents the intended aarch64 platform; wiring it into the build requires
+# aarch64 support in TheKernel's axhal first.
+
+# Architecture identifier.
+arch = "aarch64"                                # str
+# Platform identifier.
+platform = "bcm2837-zero2w"                     # str
+# Platform package.
+package = "axplat-bcm2837-zero2w"               # str
+
+#
+# Platform configs
+#
+[plat]
+# Maximum number of CPUs. The platform package boots a single core for now.
+max-cpu-num = 1                     # uint
+# Base address of the whole physical memory.
+phys-memory-base = 0x0              # uint
+# Size of the whole physical memory. (512M)
+phys-memory-size = 0x2000_0000      # uint
+# Base physical address of the kernel image (GPU firmware load point).
+kernel-base-paddr = 0x0008_0000     # uint
+# Base virtual address of the kernel image.
+kernel-base-vaddr = "0xffff_0000_0008_0000"     # uint
+# Linear mapping offset, for quick conversions between physical and virtual
+# addresses.
+phys-virt-offset = "0xffff_0000_0000_0000"      # uint
+# Offset of bus address and phys address. some boards, the bus address is
+# different from the physical address.
+phys-bus-offset = 0                             # uint
+# Kernel address space base.
+kernel-aspace-base = "0xffff_0000_0000_0000"    # uint
+# Kernel address space size. (4G)
+kernel-aspace-size = "0x0000_0001_0000_0000"    # uint
+# Stack size on bootstrapping. (256K)
+boot-stack-size = 0x40000                       # uint
+
+#
+# Device specifications
+#
+[devices]
+# MMIO ranges with format (`base_paddr`, `size`).
+mmio-ranges = [
+    [0x3f00_0000, 0x0100_0000],     # BCM2837 peripherals (ARM view)
+]                                   # [(uint, uint)]
+
+# Timer interrupt frequency in Hz (ARM generic timer, programmed by the GPU
+# firmware at boot).
+timer-frequency = 19_200_000        # uint
+# Timer interrupt num (BCM2836 local controller: physical non-secure timer).
+timer-irq = 1                       # uint
+# IPI interrupt num (unused on the single-CPU platform).
+ipi-irq = 0                         # uint

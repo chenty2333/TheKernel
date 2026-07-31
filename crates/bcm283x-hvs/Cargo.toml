@@ -1,0 +1,16 @@
+[package]
+name = "bcm283x-hvs"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+description = "Low-level driver for the Broadcom VideoCore IV HVS display controller (Raspberry Pi 0-3, Zero 2W)"
+keywords = ["raspberry-pi", "hvs", "display", "framebuffer", "bcm283x"]
+categories = ["embedded", "no-std", "hardware-support"]
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kspin = "0.1"
+log.workspace = true
+rdif-base.workspace = true
+rdif-display.workspace = true

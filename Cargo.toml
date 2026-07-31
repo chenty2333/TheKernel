@@ -2,7 +2,10 @@
 resolver = "2"
 members = [
     "kernel",
+    "crates/axplat-bcm2837-zero2w",
     "crates/axtask-compat",
+    "crates/bcm283x-hvs",
+    "crates/bcm283x-v3d",
     "crates/process-adapter",
     "crates/readiness-adapter",
 ]
@@ -93,6 +96,14 @@ starry-process = { package = "thekernel-linux-process-adapter", version = "=0.1.
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
+# Raspberry Pi Zero 2W platform and VideoCore IV GPU drivers.
+axplat-bcm2837-zero2w = { path = "crates/axplat-bcm2837-zero2w", default-features = false }
+bcm283x-hvs = { path = "crates/bcm283x-hvs" }
+bcm283x-v3d = { path = "crates/bcm283x-v3d" }
+log = "0.4"
+rdif-base = { version = "0.8.3" }
+rdif-display = { version = "0.2.0" }
+
 [package]
 name = "thekernel"
 version.workspace = true
@@ -136,6 +147,16 @@ smp = [
 
 vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
 
+# Raspberry Pi Zero 2W (aarch64). The platform package exposes the legacy
+# `axplat` interface; the GPU driver crates plug in through axdriver/axdisplay
+# once aarch64 support lands in TheKernel's axhal.
+zero2w = [
+    "dep:axplat-bcm2837-zero2w",
+    "axplat-bcm2837-zero2w/legacy",
+    "bcm283x-hvs",
+    "bcm283x-v3d",
+]
+
 [[bin]]
 name = "thekernel"
 path = "src/main.rs"
@@ -150,8 +171,22 @@ version = "0.1.0-pre.1"
 features = ["fp-simd", "irq", "rtc"]
 optional = true
 
+[dependencies.axplat-bcm2837-zero2w]
+workspace = true
+default-features = false
+optional = true
+
+[dependencies.bcm283x-hvs]
+workspace = true
+optional = true
+
+[dependencies.bcm283x-v3d]
+workspace = true
+optional = true
+
 [package.metadata.vendor-filter]
 platforms = [
+    "aarch64-unknown-none-softfloat",
     "riscv64gc-unknown-none-elf",
     "loongarch64-unknown-none",
 ]

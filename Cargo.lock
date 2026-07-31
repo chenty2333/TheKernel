@@ -251,7 +251,7 @@ dependencies = [
  "cfg-if",
  "kspin",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
  "strum 0.27.2",
 ]
@@ -325,7 +325,7 @@ dependencies = [
  "linkme",
  "log",
  "loongArch64",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_entry",
  "page_table_multiarch",
  "percpu",
@@ -615,7 +615,7 @@ dependencies = [
  "kernel_guard",
  "linkme",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_multiarch",
  "percpu",
  "spin 0.10.0",
@@ -650,7 +650,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03bf328ee0dd583179ce7108584ec69da10e06bd4beb4d6acac7f6cb33754dab"
 dependencies = [
  "axerrno 0.2.2",
- "memory_addr",
+ "memory_addr 0.4.1",
  "trait-ffi",
 ]
 
@@ -678,7 +678,7 @@ dependencies = [
  "kspin",
  "lazyinit",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "memory_set",
 ]
 
@@ -719,7 +719,7 @@ dependencies = [
  "crate_interface 0.3.0",
  "handler_table",
  "kspin",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
 ]
 
@@ -754,6 +754,17 @@ dependencies = [
  "axplat-aarch64-peripherals",
  "log",
  "page_table_entry",
+]
+
+[[package]]
+name = "axplat-bcm2837-zero2w"
+version = "0.1.0"
+dependencies = [
+ "axcpu",
+ "axplat",
+ "kspin",
+ "log",
+ "memory_addr 0.2.1",
 ]
 
 [[package]]
@@ -924,6 +935,25 @@ name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
+
+[[package]]
+name = "bcm283x-hvs"
+version = "0.1.0"
+dependencies = [
+ "kspin",
+ "log",
+ "rdif-base 0.8.3",
+ "rdif-display",
+]
+
+[[package]]
+name = "bcm283x-v3d"
+version = "0.1.0"
+dependencies = [
+ "kspin",
+ "log",
+ "rdif-base 0.8.3",
+]
 
 [[package]]
 name = "bindgen"
@@ -2071,6 +2101,12 @@ dependencies = [
 
 [[package]]
 name = "memory_addr"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c59c2ac537a8198f50fe22e8783bdbef2011cd133d5c03748d1e5bc85c9fc4d"
+
+[[package]]
+name = "memory_addr"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f0625c50adb5f6aaf47f05cae3c4dbc13a74c659241b06c4576f3d7e1da940"
@@ -2080,7 +2116,7 @@ name = "memory_set"
 version = "0.4.1"
 dependencies = [
  "axerrno 0.1.2",
- "memory_addr",
+ "memory_addr 0.4.1",
 ]
 
 [[package]]
@@ -2217,7 +2253,7 @@ checksum = "8e9a63b9b86d32f64c3874a90936939281d045ef1751d0aca3d82d5e4e06b2ef"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "bitflags 2.11.0",
- "memory_addr",
+ "memory_addr 0.4.1",
  "x86_64",
 ]
 
@@ -2229,7 +2265,7 @@ dependencies = [
  "axerrno 0.1.2",
  "bitmaps",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_entry",
  "riscv 0.16.0",
  "x86",
@@ -2453,20 +2489,20 @@ dependencies = [
  "as-any",
  "async-trait",
  "paste",
- "rdif-def",
+ "rdif-def 0.2.1",
  "thiserror",
 ]
 
 [[package]]
 name = "rdif-base"
-version = "0.8.0"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cda8c6ace8e0124ec777028cf86a56049f039c5d6f7a19b307a3f564b01ed858"
+checksum = "fb0c9fef76236ec9f355c1a44c17c4b4254268159b3ccbc02e4129826e45e888"
 dependencies = [
  "as-any",
  "async-trait",
  "paste",
- "rdif-def",
+ "rdif-def 0.3.0",
  "thiserror",
 ]
 
@@ -2480,13 +2516,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdif-def"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da68517348ae39dbf6a78f67855eeb0fcfb0ef3648dbde627a46ab582f33a38c"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "rdif-display"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c003d732854fedb64756a3213e3ec2ec10825175f890a67e4cbb38cda75f571"
+dependencies = [
+ "rdif-base 0.8.3",
+ "thiserror",
+]
+
+[[package]]
 name = "rdif-intc"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25f3b9bf119dea83dcc7e4f0e2487d7635d373f55500bde982defa934dd17e9c"
 dependencies = [
  "cfg-if",
- "rdif-base 0.8.0",
+ "rdif-base 0.8.3",
 ]
 
 [[package]]
@@ -2496,7 +2551,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4ab8ecf37d86123500a1d99519424b7dcf2489c0df6b62b56af9f436224259f"
 dependencies = [
  "pci_types",
- "rdif-base 0.8.0",
+ "rdif-base 0.8.3",
  "thiserror",
 ]
 
@@ -2524,7 +2579,7 @@ dependencies = [
  "log",
  "paste",
  "pcie",
- "rdif-base 0.8.0",
+ "rdif-base 0.8.3",
  "rdif-pcie",
  "rdrive-macros",
  "spin 0.10.0",
@@ -3096,7 +3151,10 @@ name = "thekernel"
 version = "0.2.0-preview.2"
 dependencies = [
  "axfeat",
+ "axplat-bcm2837-zero2w",
  "axplat-riscv64-visionfive2",
+ "bcm283x-hvs",
+ "bcm283x-v3d",
  "thekernel-kernel",
 ]
 
@@ -3148,7 +3206,7 @@ dependencies = [
  "kspin",
  "lazyinit",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
  "spin 0.10.0",
  "thekernel-axpoll",
@@ -3204,7 +3262,7 @@ dependencies = [
  "linkme",
  "linux-raw-sys",
  "lock_api",
- "memory_addr",
+ "memory_addr 0.4.1",
  "memory_set",
  "num_enum",
  "ouroboros",
