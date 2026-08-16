@@ -9,6 +9,15 @@ use crate::{Ext4Error, Ext4Result, error::Context, ffi::*};
 /// Device block size.
 pub const EXT4_DEV_BSIZE: usize = 512;
 
+/// One caller-owned physical-memory range for a synchronous direct request.
+/// This is kept dependency-neutral so the ext4 core does not depend on the
+/// VFS crate or on a particular DMA implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoSegment {
+    pub paddr: usize,
+    pub len: usize,
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct AsyncReadSubmission {
     pub handles: Vec<u64>,
@@ -54,6 +63,22 @@ pub trait BlockDevice {
             }
         }
         Ok(total)
+    }
+
+    /// Attempts a direct read into caller-pinned physical SG memory.
+    /// `Ok(None)` means that the underlying device has no physical-SG path.
+    ///
+    /// # Safety
+    ///
+    /// Every segment must remain pinned, DMA-accessible, writable, and
+    /// disjoint from every other segment until this synchronous call returns.
+    unsafe fn read_blocks_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<usize>> {
+        let _ = (block_id, segments);
+        Ok(None)
     }
 
     /// Attempts to submit a scatter-list read through an async block queue.
@@ -124,6 +149,22 @@ pub trait BlockDevice {
             }
         }
         Ok(total)
+    }
+
+    /// Attempts a direct overwrite from caller-pinned physical SG memory.
+    /// `Ok(None)` means that the underlying device has no physical-SG path.
+    ///
+    /// # Safety
+    ///
+    /// Every segment must remain pinned, DMA-accessible, readable, and
+    /// disjoint from every other segment until this synchronous call returns.
+    unsafe fn write_blocks_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<usize>> {
+        let _ = (block_id, segments);
+        Ok(None)
     }
 }
 

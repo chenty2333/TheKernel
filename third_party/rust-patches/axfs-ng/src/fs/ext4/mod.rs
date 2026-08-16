@@ -5,12 +5,14 @@ mod util;
 use alloc::{sync::Arc, vec::Vec};
 
 use axdriver::prelude::{
-    BlockAsyncOp, BlockDriverOps, BlockQueueRequest, BlockRequestHandle, BlockSegment, DevError,
+    BlockAsyncOp, BlockDriverOps, BlockPhysicalSegment, BlockQueueRequest, BlockRequestHandle,
+    BlockSegment, DevError,
 };
 pub use fs::*;
 pub use inode::*;
 use lwext4_rust::{
-    AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, Ext4Error, Ext4Result, ffi::EIO,
+    AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, Ext4Error, Ext4Result,
+    PhysicalIoSegment, ffi::EIO,
 };
 
 use crate::MountedBlockDevice;
@@ -95,6 +97,34 @@ impl BlockDevice for Ext4Disk {
             .read_block_vectored(block_id, bufs)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
         Ok(bytes)
+    }
+
+    unsafe fn read_blocks_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<usize>> {
+        const MAX_PHYSICAL_SG: usize = 4;
+        if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+            return Ok(None);
+        }
+        let mut physical = [BlockPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        let mut bytes = 0usize;
+        for (index, segment) in segments.iter().copied().enumerate() {
+            physical[index] = BlockPhysicalSegment {
+                paddr: segment.paddr,
+                len: segment.len,
+            };
+            bytes = bytes
+                .checked_add(segment.len)
+                .ok_or_else(|| Ext4Error::new(EIO as _, Some("physical SG length overflow")))?;
+        }
+        let mut dev = self.inner.device().lock();
+        match unsafe { dev.read_block_physical_sg(block_id, &physical[..segments.len()]) } {
+            Ok(()) => Ok(Some(bytes)),
+            Err(DevError::Unsupported) => Ok(None),
+            Err(_) => Err(Ext4Error::new(EIO as _, Some("physical SG read failed"))),
+        }
     }
 
     fn try_read_blocks_vectored_async_submit(
@@ -278,6 +308,34 @@ impl BlockDevice for Ext4Disk {
             .write_block_vectored(block_id, bufs)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
         Ok(bytes)
+    }
+
+    unsafe fn write_blocks_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<usize>> {
+        const MAX_PHYSICAL_SG: usize = 4;
+        if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+            return Ok(None);
+        }
+        let mut physical = [BlockPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        let mut bytes = 0usize;
+        for (index, segment) in segments.iter().copied().enumerate() {
+            physical[index] = BlockPhysicalSegment {
+                paddr: segment.paddr,
+                len: segment.len,
+            };
+            bytes = bytes
+                .checked_add(segment.len)
+                .ok_or_else(|| Ext4Error::new(EIO as _, Some("physical SG length overflow")))?;
+        }
+        let mut dev = self.inner.device().lock();
+        match unsafe { dev.write_block_physical_sg(block_id, &physical[..segments.len()]) } {
+            Ok(()) => Ok(Some(bytes)),
+            Err(DevError::Unsupported) => Ok(None),
+            Err(_) => Err(Ext4Error::new(EIO as _, Some("physical SG write failed"))),
+        }
     }
 
     fn num_blocks(&self) -> Ext4Result<u64> {

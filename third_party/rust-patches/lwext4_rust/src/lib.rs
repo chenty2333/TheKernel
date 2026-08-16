@@ -28,7 +28,9 @@ mod inode;
 mod iomap;
 mod util;
 
-pub use blockdev::{AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, EXT4_DEV_BSIZE};
+pub use blockdev::{
+    AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, EXT4_DEV_BSIZE, PhysicalIoSegment,
+};
 pub use error::{Ext4Error, Ext4Result};
 pub use fs::*;
 pub use hot::{

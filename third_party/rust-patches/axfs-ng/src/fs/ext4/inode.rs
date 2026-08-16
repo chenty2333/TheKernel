@@ -8,13 +8,13 @@ use core::{
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags,
-    NodeOps, NodePermission, NodeType, NodeUserData, Reference, RenameRequest, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    NodeOps, NodePermission, NodeType, NodeUserData, PhysicalIoSegment, Reference, RenameRequest,
+    UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use lwext4_rust::{
-    Ext4Error, FileAttr, InodeToken, InodeType,
+    BlockDevice, Ext4Error, FileAttr, InodeToken, InodeType,
     ffi::{EEXIST, ENODATA, ENOENT},
 };
 use spin::Once;
@@ -23,6 +23,50 @@ use super::{
     Ext4Filesystem, RuntimeReservation,
     util::{into_vfs_err, into_vfs_type},
 };
+
+const MAX_PHYSICAL_SG: usize = 4;
+const PHYSICAL_IO_ALIGNMENT: usize = 512;
+
+fn to_lwext4_physical_segments(
+    segments: &[PhysicalIoSegment],
+) -> Option<(
+    [lwext4_rust::PhysicalIoSegment; MAX_PHYSICAL_SG],
+    usize,
+    usize,
+)> {
+    if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+        return None;
+    }
+    let mut result = [lwext4_rust::PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+    let mut ranges = [(0usize, 0usize); MAX_PHYSICAL_SG];
+    let mut total = 0usize;
+    for (index, segment) in segments.iter().copied().enumerate() {
+        if segment.len == 0
+            || segment.paddr % PHYSICAL_IO_ALIGNMENT != 0
+            || segment.len % PHYSICAL_IO_ALIGNMENT != 0
+        {
+            return None;
+        }
+        let end = segment.paddr.checked_add(segment.len)?;
+        total = total.checked_add(segment.len)?;
+        result[index] = lwext4_rust::PhysicalIoSegment {
+            paddr: segment.paddr,
+            len: segment.len,
+        };
+        ranges[index] = (segment.paddr, end);
+    }
+    if total == 0 || total % PHYSICAL_IO_ALIGNMENT != 0 {
+        return None;
+    }
+    ranges[..segments.len()].sort_unstable_by_key(|range| range.0);
+    if ranges[..segments.len()]
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0)
+    {
+        return None;
+    }
+    Some((result, segments.len(), total))
+}
 
 fn combine_vfs_cleanup<T>(operation: VfsResult<T>, cleanup: VfsResult<()>) -> VfsResult<T> {
     match (operation, cleanup) {
@@ -444,6 +488,37 @@ impl FileNodeOps for Inode {
         Ok(Some(submission.bytes))
     }
 
+    unsafe fn try_read_at_physical(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let Some((physical, count, total)) = to_lwext4_physical_segments(segments) else {
+            return Ok(None);
+        };
+
+        // FileBackend::Direct holds CachedFileShared::direct_io_lock across
+        // this complete hook. Extent-changing file operations use the same
+        // lock, so the mapping sequence remains stable while the plan is
+        // detached and the synchronous device call runs without the ext4
+        // filesystem spin lock.
+        let Some(plan) = self.fs.plan_physical_io(self.ino(), offset, total, false)? else {
+            return Ok(None);
+        };
+        let mut disk = self.fs.physical_disk();
+        let Some(read) =
+            (unsafe { disk.read_blocks_physical_sg(plan.physical_block_id(), &physical[..count]) })
+                .map_err(into_vfs_err)?
+        else {
+            return Ok(None);
+        };
+        if read != total || read != plan.bytes() {
+            return Err(VfsError::Io);
+        }
+        self.fs.validate_physical_io_plan(plan)?;
+        Ok(Some(total))
+    }
+
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let mut fs = self.fs.lock();
         if fs.is_block_aligned_range(offset, buf.len()) {
@@ -498,6 +573,36 @@ impl FileNodeOps for Inode {
         };
         self.fs.wait_async_write(&submission)?;
         Ok(Some(submission.bytes))
+    }
+
+    unsafe fn try_write_at_physical(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let Some((physical, count, total)) = to_lwext4_physical_segments(segments) else {
+            return Ok(None);
+        };
+        let Some(plan) = self.fs.plan_physical_io(self.ino(), offset, total, true)? else {
+            return Ok(None);
+        };
+
+        // As with reads, the high-level direct-I/O exclusion keeps the extent
+        // identity stable. The ext4 lock is released before the synchronous
+        // driver call, and reacquired only to validate and invalidate cache.
+        let mut disk = self.fs.physical_disk();
+        let Some(written) = (unsafe {
+            disk.write_blocks_physical_sg(plan.physical_block_id(), &physical[..count])
+        })
+        .map_err(into_vfs_err)?
+        else {
+            return Ok(None);
+        };
+        if written != total || written != plan.bytes() {
+            return Err(VfsError::Io);
+        }
+        self.fs.commit_physical_io_write(plan)?;
+        Ok(Some(total))
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {

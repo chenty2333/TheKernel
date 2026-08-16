@@ -19,6 +19,7 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
 #[cfg(feature = "times")]
 use axfs_ng_vfs::MetadataUpdate;
+pub use axfs_ng_vfs::PhysicalIoSegment;
 use axfs_ng_vfs::{
     FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
     VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
@@ -1899,6 +1900,8 @@ impl PinnedPhysicalSegment {
 }
 
 const MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS: usize = 64;
+const MAX_PHYSICAL_IO_SEGMENTS: usize = 64;
+const PHYSICAL_IO_ALIGNMENT: usize = 512;
 
 #[cfg(target_os = "none")]
 fn physical_to_virtual(paddr: PhysAddr) -> VirtAddr {
@@ -1949,6 +1952,50 @@ fn validate_pinned_physical_segments(
         if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(VfsError::InvalidInput);
         }
+    }
+    Ok(total)
+}
+
+/// Validates a physical SG request before any cache or device state is
+/// touched.  Physical direct I/O is intentionally stricter than the
+/// bounce-buffer pinned path: each descriptor and the complete request are
+/// non-empty, checked, disjoint, and at least 512-byte aligned.
+fn validate_physical_io_segments(segments: &[PhysicalIoSegment], offset: u64) -> VfsResult<usize> {
+    if segments.is_empty() || segments.len() > MAX_PHYSICAL_IO_SEGMENTS {
+        return Err(VfsError::InvalidInput);
+    }
+    if offset % PHYSICAL_IO_ALIGNMENT as u64 != 0 {
+        return Err(VfsError::InvalidInput);
+    }
+
+    let mut total = 0usize;
+    let mut ranges = [(0usize, 0usize); MAX_PHYSICAL_IO_SEGMENTS];
+    for (index, segment) in segments.iter().copied().enumerate() {
+        if segment.len == 0
+            || segment.paddr % PHYSICAL_IO_ALIGNMENT != 0
+            || segment.len % PHYSICAL_IO_ALIGNMENT != 0
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        let end = segment
+            .paddr
+            .checked_add(segment.len)
+            .ok_or(VfsError::InvalidInput)?;
+        total = total
+            .checked_add(segment.len)
+            .ok_or(VfsError::InvalidInput)?;
+        ranges[index] = (segment.paddr, end);
+    }
+    if total == 0 || total % PHYSICAL_IO_ALIGNMENT != 0 {
+        return Err(VfsError::InvalidInput);
+    }
+
+    ranges[..segments.len()].sort_unstable_by_key(|range| range.0);
+    if ranges[..segments.len()]
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0)
+    {
+        return Err(VfsError::InvalidInput);
     }
     Ok(total)
 }
@@ -5051,6 +5098,41 @@ impl FileBackend {
         }
     }
 
+    /// Attempts direct I/O into caller-pinned physical SG memory.
+    ///
+    /// `Ok(None)` is the capability/fallback result.  Validation failures and
+    /// lower filesystem errors are returned as errors and are never bounced.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep all physical ranges pinned, DMA-accessible,
+    /// writable, and disjoint for the complete call.
+    pub unsafe fn try_read_at_dma_segments(
+        &self,
+        dst: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let total = validate_physical_io_segments(dst, offset)?;
+        let end = offset
+            .checked_add(u64::try_from(total).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?;
+        let file_len = self.location().entry().as_file()?.len()?;
+        if end > file_len {
+            return Ok(None);
+        }
+
+        let result = match self {
+            Self::Cached(_) => Ok(None),
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| unsafe {
+                file.try_read_at_physical(dst, offset)
+            }),
+        }?;
+        if result.is_some_and(|bytes| bytes != total) {
+            return Err(VfsError::Io);
+        }
+        Ok(result)
+    }
+
     /// Performs positioned I/O into pinned physical destination segments.
     ///
     /// # Safety
@@ -5135,6 +5217,40 @@ impl FileBackend {
                 Ok(written)
             }),
         }
+    }
+
+    /// Attempts direct overwrite I/O from caller-pinned physical SG memory.
+    /// The request is never allowed to extend the file.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep all physical ranges pinned, DMA-accessible,
+    /// readable, and disjoint for the complete call.
+    pub unsafe fn try_write_at_dma_segments(
+        &self,
+        src: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let total = validate_physical_io_segments(src, offset)?;
+        let end = offset
+            .checked_add(u64::try_from(total).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?;
+        let file_len = self.location().entry().as_file()?.len()?;
+        if end > file_len {
+            return Ok(None);
+        }
+
+        let result = match self {
+            Self::Cached(_) => Ok(None),
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |shared, file| {
+                let _append_guard = shared.append_lock.read();
+                unsafe { file.try_write_at_physical(src, offset) }
+            }),
+        }?;
+        if result.is_some_and(|bytes| bytes != total) {
+            return Err(VfsError::Io);
+        }
+        Ok(result)
     }
 
     /// Performs positioned I/O from pinned physical source segments.
@@ -5469,6 +5585,36 @@ impl File {
         Ok(read)
     }
 
+    /// Attempts a positioned direct read into caller-pinned physical memory.
+    /// `Ok(None)` permits the caller to use its ordinary fallback path.
+    ///
+    /// # Safety
+    ///
+    /// All segments must remain pinned, DMA-accessible, writable, and
+    /// disjoint until the call returns.
+    pub unsafe fn try_read_at_dma_segments(
+        &self,
+        dst: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        if !self.supports_positioned_read() {
+            return Ok(None);
+        }
+        let result = unsafe {
+            self.access(FileFlags::READ)?
+                .try_read_at_dma_segments(dst, offset)
+        }?;
+        #[cfg(feature = "times")]
+        if result.is_some_and(|bytes| bytes != 0)
+            && !self.flags.contains(FileFlags::NOATIME)
+            && FsContext::should_update_atime(self.location())
+        {
+            self.record_time_flags(1);
+            self.flush_times();
+        }
+        Ok(result)
+    }
+
     pub fn read_at_slice(&self, dst: &mut [u8], offset: u64) -> VfsResult<usize> {
         #[cfg(feature = "times")]
         let requested = dst.len();
@@ -5588,6 +5734,34 @@ impl File {
             self.flush_times();
         }
         Ok(written)
+    }
+
+    /// Attempts a positioned direct overwrite from caller-pinned physical
+    /// memory. O_APPEND and nodes without positioned writes intentionally
+    /// return `Ok(None)` without entering the backend.
+    ///
+    /// # Safety
+    ///
+    /// All segments must remain pinned, DMA-accessible, readable, and
+    /// disjoint until the call returns.
+    pub unsafe fn try_write_at_dma_segments(
+        &self,
+        src: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        if self.append_enabled() || !self.supports_positioned_write() {
+            return Ok(None);
+        }
+        let result = unsafe {
+            self.access(FileFlags::WRITE)?
+                .try_write_at_dma_segments(src, offset)
+        }?;
+        #[cfg(feature = "times")]
+        if result.is_some_and(|bytes| bytes != 0) {
+            self.record_time_flags(2);
+            self.flush_times();
+        }
+        Ok(result)
     }
 
     fn write_at_end_with_admission_and_new_end(
@@ -6126,18 +6300,70 @@ mod tests {
         ALIGNED_BYPASS_CHUNK, CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile,
         CachedFileEvictionOwner, CachedFileReclaimStats, CachedFileShared,
         CachedPageInvalidationTransaction, File, FileBackend, FileFlags, FileUserData,
-        MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PinnedPhysicalSegment,
-        WritePlacement, acknowledge_cached_page_eviction,
+        MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PhysicalIoSegment,
+        PinnedPhysicalSegment, WritePlacement, acknowledge_cached_page_eviction,
         advance_clean_cached_file_reclaim_scan_epoch, cached_file_registry_key,
         cached_file_shared_for_location_or_create, discard_cached_pages, file_cache_registry,
         physical_to_virtual, reclaim_clean_pages_from_shared,
         reclaim_clean_pages_from_shared_with_scan_budget,
         release_unlinked_cached_file_registry_ownership, remove_cached_file_registry_entry,
         synchronize_retained_page_count, try_zeroed_pinned_io_bounce,
-        validate_pinned_physical_segments, with_sync_and_invalidate_cached_file_pages,
+        validate_physical_io_segments, validate_pinned_physical_segments,
+        with_sync_and_invalidate_cached_file_pages,
     };
 
     static PRESSURE_RECLAIM_EPOCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn physical_sg_validation_requires_nonempty_aligned_disjoint_ranges() {
+        let valid = [
+            PhysicalIoSegment::new(512, 512),
+            PhysicalIoSegment::new(4096, 1024),
+        ];
+        assert_eq!(validate_physical_io_segments(&valid, 0), Ok(1536));
+        assert_eq!(
+            validate_physical_io_segments(&[], 0),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            validate_physical_io_segments(&[PhysicalIoSegment::new(512, 0)], 0),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            validate_physical_io_segments(
+                &[
+                    PhysicalIoSegment::new(512, 1024),
+                    PhysicalIoSegment::new(1024, 512),
+                ],
+                0,
+            ),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            validate_physical_io_segments(&[PhysicalIoSegment::new(512, 512)], 1),
+            Err(VfsError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn default_physical_hook_returns_fallback_without_file_io() {
+        let (file, state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE,
+            4096,
+            FileFlags::READ | FileFlags::WRITE,
+        );
+        let segments = [PhysicalIoSegment::new(512, 512)];
+        assert_eq!(
+            unsafe { file.try_read_at_dma_segments(&segments, 0) },
+            Ok(None)
+        );
+        assert_eq!(
+            unsafe { file.try_write_at_dma_segments(&segments, 0) },
+            Ok(None)
+        );
+        assert_eq!(state.read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn no_data_open_options_emit_no_data_access_flags() {

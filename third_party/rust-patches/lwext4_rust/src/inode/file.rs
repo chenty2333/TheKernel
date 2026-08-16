@@ -234,6 +234,56 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         Ok(Some(runs))
     }
 
+    /// Maps one exact, contiguous logical range without allocating a run
+    /// vector. Physical direct I/O only accepts a single written extent; the
+    /// caller captures the mapping sequence while holding the filesystem lock
+    /// and submits the device request only after releasing it.
+    pub(crate) fn map_iomap_run(
+        &mut self,
+        pos: u64,
+        len: usize,
+        overwrite_only: bool,
+    ) -> Ext4Result<Option<MappedRun>> {
+        let block_size = get_block_size(self.superblock());
+        if len == 0
+            || block_size == 0
+            || pos % block_size as u64 != 0
+            || len % block_size as usize != 0
+            || (overwrite_only
+                && pos
+                    .checked_add(len as u64)
+                    .is_none_or(|end| end > self.size()))
+        {
+            return Ok(None);
+        }
+        let blocks = u32::try_from(len / block_size as usize)
+            .map_err(|_| Ext4Error::new(EINVAL as _, "mapped physical I/O block count overflow"))?;
+        let block = u32::try_from(pos / block_size as u64).map_err(|_| {
+            Ext4Error::new(EINVAL as _, "mapped physical I/O block offset overflow")
+        })?;
+        let Some(run) = self.map_extent_run(block, blocks, false)? else {
+            return Ok(None);
+        };
+        if run.blocks != blocks {
+            return Ok(None);
+        }
+        let kind = if run.fblock == 0 {
+            if overwrite_only {
+                return Ok(None);
+            }
+            MappedRunKind::Hole
+        } else {
+            MappedRunKind::Written
+        };
+        Ok(Some(MappedRun {
+            file_offset: pos,
+            pblock: run.fblock,
+            bytes: len,
+            kind,
+            seq: self.mapping_seq,
+        }))
+    }
+
     fn ensure_mapped_runs_current(&self, runs: &[MappedRun]) -> Ext4Result<()> {
         let mut expected_offset = runs.first().map(|run| run.file_offset).unwrap_or(0);
         for run in runs {

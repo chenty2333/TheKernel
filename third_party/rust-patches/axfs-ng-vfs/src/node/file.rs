@@ -6,6 +6,31 @@ use axpoll::Pollable;
 use super::NodeOps;
 use crate::{VfsError, VfsResult};
 
+/// One caller-owned physical-memory range used by a synchronous direct I/O
+/// request.
+///
+/// The range must remain pinned, DMA-accessible, and disjoint from every
+/// other range for the complete call.  This descriptor deliberately carries
+/// no allocator, address-space, or driver dependency; the owner of the range
+/// is responsible for its lifetime and access permissions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoSegment {
+    /// Physical address of the first byte in the range.
+    pub paddr: usize,
+    /// Number of bytes in the range.
+    pub len: usize,
+}
+
+impl PhysicalIoSegment {
+    pub const fn new(paddr: usize, len: usize) -> Self {
+        Self { paddr, len }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 pub trait FileNodeOps: NodeOps + Pollable {
     /// Reads a number of bytes starting from a given offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
@@ -51,6 +76,26 @@ pub trait FileNodeOps: NodeOps + Pollable {
         Ok(None)
     }
 
+    /// Attempts a synchronous direct read into caller-pinned physical memory.
+    ///
+    /// The implementation must not construct a Rust slice from a physical
+    /// address. `Ok(None)` means that the caller may use its ordinary fallback
+    /// path; an error is terminal for this request and must not be treated as
+    /// permission to retry through a bounce buffer.
+    ///
+    /// # Safety
+    ///
+    /// Every non-empty segment must remain pinned, DMA-accessible, writable,
+    /// and disjoint from all other segments until this method returns.
+    unsafe fn try_read_at_physical(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let _ = (segments, offset);
+        Ok(None)
+    }
+
     /// Writes a number of bytes starting from a given offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
 
@@ -88,6 +133,22 @@ pub trait FileNodeOps: NodeOps + Pollable {
     fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
         let _ = bufs;
         let _ = offset;
+        Ok(None)
+    }
+
+    /// Attempts a synchronous direct overwrite from caller-pinned physical
+    /// memory. The operation must not extend the file.
+    ///
+    /// # Safety
+    ///
+    /// Every non-empty segment must remain pinned, DMA-accessible, readable,
+    /// and disjoint from all other segments until this method returns.
+    unsafe fn try_write_at_physical(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let _ = (segments, offset);
         Ok(None)
     }
 

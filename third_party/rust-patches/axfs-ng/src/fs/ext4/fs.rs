@@ -391,6 +391,40 @@ impl Ext4Filesystem {
     ) -> VfsResult<()> {
         self.disk.wait_async_read(submission).map_err(into_vfs_err)
     }
+
+    pub(crate) fn plan_physical_io(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+        overwrite_only: bool,
+    ) -> VfsResult<Option<lwext4_rust::PhysicalIoPlan>> {
+        self.lock()
+            .plan_physical_io(ino, offset, len, overwrite_only)
+            .map_err(into_vfs_err)
+    }
+
+    pub(crate) fn validate_physical_io_plan(
+        &self,
+        plan: lwext4_rust::PhysicalIoPlan,
+    ) -> VfsResult<()> {
+        self.lock()
+            .validate_physical_io_plan(plan)
+            .map_err(into_vfs_err)
+    }
+
+    pub(crate) fn commit_physical_io_write(
+        &self,
+        plan: lwext4_rust::PhysicalIoPlan,
+    ) -> VfsResult<()> {
+        self.lock()
+            .commit_physical_io_write(plan)
+            .map_err(into_vfs_err)
+    }
+
+    pub(crate) fn physical_disk(&self) -> Ext4Disk {
+        self.disk.clone()
+    }
 }
 
 unsafe impl Send for Ext4Filesystem {}

@@ -284,6 +284,30 @@ const NAMESPACE_REAP_BUDGET: usize = 32;
 /// Hard bound for long-lived VFS inode identities and deferred deletions.
 /// This also bounds final filesystem teardown work.
 const MAX_TRACKED_INODE_IDENTITIES: usize = 16_384;
+/// A validated single-extent physical I/O plan.  The plan is copyable so the
+/// caller can release the ext4 filesystem lock before entering a synchronous
+/// device wait, then revalidate the mapping before publishing write-cache
+/// invalidation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoPlan {
+    ino: u32,
+    file_offset: u64,
+    pblock: u64,
+    physical_block_id: u64,
+    bytes: usize,
+    blocks: u32,
+    mapping_seq: u64,
+}
+
+impl PhysicalIoPlan {
+    pub fn physical_block_id(self) -> u64 {
+        self.physical_block_id
+    }
+
+    pub fn bytes(self) -> usize {
+        self.bytes
+    }
+}
 
 fn try_namespace_epoch() -> Ext4Result<Arc<AtomicU64>> {
     Arc::try_new(AtomicU64::new(0))
@@ -847,6 +871,88 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             inode.get_attr(attr);
             Ok(())
         })
+    }
+
+    /// Builds a single fully-written contiguous extent plan while the caller
+    /// owns the ext4 filesystem lock. No device operation is performed here;
+    /// the copyable plan lets the caller release that lock before a
+    /// synchronous driver wait.
+    pub fn plan_physical_io(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+        overwrite_only: bool,
+    ) -> Ext4Result<Option<PhysicalIoPlan>> {
+        if len == 0 || offset % EXT4_DEV_BSIZE as u64 != 0 || len % EXT4_DEV_BSIZE != 0 {
+            return Ok(None);
+        }
+        self.with_cached_inode_ref(ino, |inode| {
+            let block_size = get_block_size(inode.superblock());
+            let Some(end) = offset.checked_add(len as u64) else {
+                return Ok(None);
+            };
+            if block_size != 4096
+                || offset % block_size as u64 != 0
+                || len % block_size as usize != 0
+                || inode.inode_type() != InodeType::RegularFile
+                || end > inode.size()
+            {
+                return Ok(None);
+            }
+            let Some(run) = inode.map_iomap_run(offset, len, overwrite_only)? else {
+                return Ok(None);
+            };
+            if run.kind != MappedRunKind::Written || run.pblock == 0 || run.bytes != len {
+                return Ok(None);
+            }
+            let blocks = u32::try_from(len / block_size as usize)
+                .map_err(|_| Ext4Error::new(EINVAL as _, "physical I/O block count overflow"))?;
+            Ok(Some((run.pblock, run.seq, blocks)))
+        })?
+        .map(|(pblock, mapping_seq, blocks)| PhysicalIoPlan {
+            ino,
+            file_offset: offset,
+            pblock,
+            physical_block_id: self.bdev.direct_physical_block_id(pblock),
+            bytes: len,
+            blocks,
+            mapping_seq,
+        })
+        .map_or(Ok(None), |plan| Ok(Some(plan)))
+    }
+
+    /// Revalidates a plan after a completed synchronous device operation.
+    /// Mapping changes are terminal: callers must not bounce or retry after
+    /// an accepted physical operation.
+    pub fn validate_physical_io_plan(&mut self, plan: PhysicalIoPlan) -> Ext4Result<()> {
+        let valid = self.with_cached_inode_ref(plan.ino, |inode| {
+            if inode.mapping_seq != plan.mapping_seq {
+                return Ok(false);
+            }
+            let Some(run) = inode.map_iomap_run(plan.file_offset, plan.bytes, true)? else {
+                return Ok(false);
+            };
+            Ok(run.seq == plan.mapping_seq
+                && run.kind == MappedRunKind::Written
+                && run.pblock == plan.pblock
+                && run.bytes == plan.bytes)
+        })?;
+        if valid {
+            Ok(())
+        } else {
+            Err(Ext4Error::new(EIO as _, "stale physical I/O mapping"))
+        }
+    }
+
+    /// Commits cache invalidation for a completed physical overwrite after
+    /// revalidating that the mapped extent did not change while the device
+    /// was running.
+    pub fn commit_physical_io_write(&mut self, plan: PhysicalIoPlan) -> Ext4Result<()> {
+        self.validate_physical_io_plan(plan)?;
+        self.bdev
+            .invalidate_logical_block_range(plan.pblock, plan.blocks);
+        Ok(())
     }
 
     pub fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> Ext4Result<usize> {
