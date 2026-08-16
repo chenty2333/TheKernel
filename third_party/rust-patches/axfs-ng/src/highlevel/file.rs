@@ -1676,6 +1676,35 @@ fn with_cache_invalidating_file_operation<R>(
     result
 }
 
+/// Runs a direct operation only after a lower filesystem has reported that
+/// the exact request is executable.  The preflight and the later operation
+/// share one direct-I/O write lock, so an extent/EOF capability decision cannot
+/// go stale while cached pages are being invalidated.  In particular, a
+/// rejected hole, fragmented run, or EOF request leaves the cache and file
+/// untouched; a lower layer may also reject an unavailable device before
+/// execution when it can prove that no descriptor was published.
+fn with_cache_invalidating_file_operation_after_preflight<R>(
+    location: &Location,
+    preflight: impl FnOnce(&Arc<CachedFileShared>, &FileNode) -> VfsResult<bool>,
+    operation: impl FnOnce(&Arc<CachedFileShared>, &FileNode) -> VfsResult<R>,
+) -> VfsResult<Option<R>> {
+    let shared = cached_file_shared_for_location_or_create(location);
+    let _direct_guard = shared.direct_io_lock.write();
+    let file = location.entry().as_file()?;
+    if !preflight(&shared, file)? {
+        return Ok(None);
+    }
+    let mutation = CachedFile::begin_shared_cache_invalidating_mutation(&shared)?;
+    sync_and_invalidate_cached_file_pages_locked(location, &shared, &mutation)?;
+    let file = location.entry().as_file()?;
+    let result = operation(&shared, file);
+    let post_result = sync_and_invalidate_cached_file_pages_locked(location, &shared, &mutation);
+    if let Err(error) = post_result {
+        return Err(error);
+    }
+    result.map(Some)
+}
+
 fn with_cache_invalidating_truncate(location: &Location, len: u64) -> VfsResult<()> {
     let shared = cached_file_shared_for_location_or_create(location);
     let _direct_guard = shared.direct_io_lock.write();
@@ -5106,26 +5135,23 @@ impl FileBackend {
     /// # Safety
     ///
     /// The caller must keep all physical ranges pinned, DMA-accessible,
-    /// writable, and disjoint for the complete call.
+    /// writable, and disjoint for the complete call. Concurrent CPU/device
+    /// access may race on contents and is the caller's responsibility; this
+    /// path does not construct Rust references from physical addresses.
     pub unsafe fn try_read_at_dma_segments(
         &self,
         dst: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
         let total = validate_physical_io_segments(dst, offset)?;
-        let end = offset
-            .checked_add(u64::try_from(total).map_err(|_| VfsError::InvalidInput)?)
-            .ok_or(VfsError::InvalidInput)?;
-        let file_len = self.location().entry().as_file()?.len()?;
-        if end > file_len {
-            return Ok(None);
-        }
-
         let result = match self {
             Self::Cached(_) => Ok(None),
-            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| unsafe {
-                file.try_read_at_physical(dst, offset)
-            }),
+            Self::Direct(loc) => with_cache_invalidating_file_operation_after_preflight(
+                loc,
+                |_, file| file.physical_read_eligible(dst, offset),
+                |_, file| unsafe { file.try_read_at_physical(dst, offset) },
+            )
+            .map(|result| result.flatten()),
         }?;
         if result.is_some_and(|bytes| bytes != total) {
             return Err(VfsError::Io);
@@ -5225,27 +5251,26 @@ impl FileBackend {
     /// # Safety
     ///
     /// The caller must keep all physical ranges pinned, DMA-accessible,
-    /// readable, and disjoint for the complete call.
+    /// readable, and disjoint for the complete call. Concurrent CPU/device
+    /// access may race on contents and is the caller's responsibility; this
+    /// path does not construct Rust references from physical addresses.
     pub unsafe fn try_write_at_dma_segments(
         &self,
         src: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
         let total = validate_physical_io_segments(src, offset)?;
-        let end = offset
-            .checked_add(u64::try_from(total).map_err(|_| VfsError::InvalidInput)?)
-            .ok_or(VfsError::InvalidInput)?;
-        let file_len = self.location().entry().as_file()?.len()?;
-        if end > file_len {
-            return Ok(None);
-        }
-
         let result = match self {
             Self::Cached(_) => Ok(None),
-            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |shared, file| {
-                let _append_guard = shared.append_lock.read();
-                unsafe { file.try_write_at_physical(src, offset) }
-            }),
+            Self::Direct(loc) => with_cache_invalidating_file_operation_after_preflight(
+                loc,
+                |_, file| file.physical_write_eligible(src, offset),
+                |shared, file| {
+                    let _append_guard = shared.append_lock.read();
+                    unsafe { file.try_write_at_physical(src, offset) }
+                },
+            )
+            .map(|result| result.flatten()),
         }?;
         if result.is_some_and(|bytes| bytes != total) {
             return Err(VfsError::Io);
@@ -5590,8 +5615,10 @@ impl File {
     ///
     /// # Safety
     ///
-    /// All segments must remain pinned, DMA-accessible, writable, and
-    /// disjoint until the call returns.
+    /// All segments must remain pinned, DMA-accessible, writable, and disjoint
+    /// until the call returns. Concurrent CPU/device content races are the
+    /// caller's responsibility and do not make physical addresses into Rust
+    /// references.
     pub unsafe fn try_read_at_dma_segments(
         &self,
         dst: &[PhysicalIoSegment],
@@ -5742,8 +5769,10 @@ impl File {
     ///
     /// # Safety
     ///
-    /// All segments must remain pinned, DMA-accessible, readable, and
-    /// disjoint until the call returns.
+    /// All segments must remain pinned, DMA-accessible, readable, and disjoint
+    /// until the call returns. Concurrent CPU/device content races are the
+    /// caller's responsibility and do not make physical addresses into Rust
+    /// references.
     pub unsafe fn try_write_at_dma_segments(
         &self,
         src: &[PhysicalIoSegment],
@@ -6309,6 +6338,7 @@ mod tests {
         release_unlinked_cached_file_registry_ownership, remove_cached_file_registry_entry,
         synchronize_retained_page_count, try_zeroed_pinned_io_bounce,
         validate_physical_io_segments, validate_pinned_physical_segments,
+        with_cache_invalidating_file_operation_after_preflight,
         with_sync_and_invalidate_cached_file_pages,
     };
 
@@ -6363,6 +6393,34 @@ mod tests {
         );
         assert_eq!(state.read_calls.load(Ordering::Acquire), 0);
         assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn physical_preflight_rejects_before_cache_mutation_or_operation() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x5a, true);
+        let preflight_calls = AtomicUsize::new(0);
+        let operation_calls = AtomicUsize::new(0);
+        let result = with_cache_invalidating_file_operation_after_preflight(
+            &location,
+            |_, _| {
+                preflight_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(false)
+            },
+            |_, _| {
+                operation_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(preflight_calls.load(Ordering::Acquire), 1);
+        assert_eq!(operation_calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+        cached.with_page(0, |page| {
+            let page = page.expect("preflight rejection discarded a cached page");
+            assert!(page.is_dirty());
+        });
     }
 
     #[test]

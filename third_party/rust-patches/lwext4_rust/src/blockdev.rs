@@ -12,6 +12,9 @@ pub const EXT4_DEV_BSIZE: usize = 512;
 /// One caller-owned physical-memory range for a synchronous direct request.
 /// This is kept dependency-neutral so the ext4 core does not depend on the
 /// VFS crate or on a particular DMA implementation.
+/// The owner must keep it pinned, DMA-accessible, and disjoint from every
+/// other range for the complete call; concurrent CPU/device content races are
+/// the caller's responsibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalIoSegment {
     pub paddr: usize,
@@ -70,8 +73,9 @@ pub trait BlockDevice {
     ///
     /// # Safety
     ///
-    /// Every segment must remain pinned, DMA-accessible, writable, and
-    /// disjoint from every other segment until this synchronous call returns.
+    /// Every segment must remain pinned, DMA-accessible, writable, and disjoint
+    /// from every other segment until this synchronous call returns. Concurrent
+    /// CPU/device content races are the caller's responsibility.
     unsafe fn read_blocks_physical_sg(
         &mut self,
         block_id: u64,
@@ -156,8 +160,9 @@ pub trait BlockDevice {
     ///
     /// # Safety
     ///
-    /// Every segment must remain pinned, DMA-accessible, readable, and
-    /// disjoint from every other segment until this synchronous call returns.
+    /// Every segment must remain pinned, DMA-accessible, readable, and disjoint
+    /// from every other segment until this synchronous call returns. Concurrent
+    /// CPU/device content races are the caller's responsibility.
     unsafe fn write_blocks_physical_sg(
         &mut self,
         block_id: u64,

@@ -519,6 +519,20 @@ impl FileNodeOps for Inode {
         Ok(Some(total))
     }
 
+    fn physical_read_eligible(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<bool> {
+        let Some((_physical, _count, total)) = to_lwext4_physical_segments(segments) else {
+            return Ok(false);
+        };
+        Ok(self
+            .fs
+            .plan_physical_io(self.ino(), offset, total, false)?
+            .is_some())
+    }
+
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let mut fs = self.fs.lock();
         if fs.is_block_aligned_range(offset, buf.len()) {
@@ -603,6 +617,20 @@ impl FileNodeOps for Inode {
         }
         self.fs.commit_physical_io_write(plan)?;
         Ok(Some(total))
+    }
+
+    fn physical_write_eligible(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<bool> {
+        let Some((_physical, _count, total)) = to_lwext4_physical_segments(segments) else {
+            return Ok(false);
+        };
+        Ok(self
+            .fs
+            .plan_physical_io(self.ino(), offset, total, true)?
+            .is_some())
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {

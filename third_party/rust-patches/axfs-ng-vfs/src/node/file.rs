@@ -9,10 +9,11 @@ use crate::{VfsError, VfsResult};
 /// One caller-owned physical-memory range used by a synchronous direct I/O
 /// request.
 ///
-/// The range must remain pinned, DMA-accessible, and disjoint from every
-/// other range for the complete call.  This descriptor deliberately carries
-/// no allocator, address-space, or driver dependency; the owner of the range
-/// is responsible for its lifetime and access permissions.
+/// The range must remain pinned, DMA-accessible, and disjoint from every other
+/// range for the complete call. This descriptor deliberately carries no
+/// allocator, address-space, or driver dependency; the owner of the range is
+/// responsible for its lifetime, access permissions, and any content race
+/// between CPU access and device DMA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalIoSegment {
     /// Physical address of the first byte in the range.
@@ -86,7 +87,9 @@ pub trait FileNodeOps: NodeOps + Pollable {
     /// # Safety
     ///
     /// Every non-empty segment must remain pinned, DMA-accessible, writable,
-    /// and disjoint from all other segments until this method returns.
+    /// and disjoint from all other segments until this method returns. The
+    /// caller is responsible for content races caused by concurrent CPU access
+    /// to the DMA range; such races do not create Rust references from paddr.
     unsafe fn try_read_at_physical(
         &self,
         segments: &[PhysicalIoSegment],
@@ -94,6 +97,19 @@ pub trait FileNodeOps: NodeOps + Pollable {
     ) -> VfsResult<Option<usize>> {
         let _ = (segments, offset);
         Ok(None)
+    }
+
+    /// Performs a side-effect-free capability and mapping preflight for a
+    /// physical read.  The high-level direct backend runs this while holding
+    /// its direct-I/O exclusion, before it invalidates cached pages; a true
+    /// result therefore remains eligible until the matching unsafe hook call.
+    fn physical_read_eligible(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<bool> {
+        let _ = (segments, offset);
+        Ok(false)
     }
 
     /// Writes a number of bytes starting from a given offset.
@@ -142,7 +158,9 @@ pub trait FileNodeOps: NodeOps + Pollable {
     /// # Safety
     ///
     /// Every non-empty segment must remain pinned, DMA-accessible, readable,
-    /// and disjoint from all other segments until this method returns.
+    /// and disjoint from all other segments until this method returns. The
+    /// caller is responsible for content races caused by concurrent CPU access
+    /// to the DMA range; such races do not create Rust references from paddr.
     unsafe fn try_write_at_physical(
         &self,
         segments: &[PhysicalIoSegment],
@@ -150,6 +168,19 @@ pub trait FileNodeOps: NodeOps + Pollable {
     ) -> VfsResult<Option<usize>> {
         let _ = (segments, offset);
         Ok(None)
+    }
+
+    /// Performs a side-effect-free capability and mapping preflight for a
+    /// physical overwrite.  It must not publish a descriptor or touch file
+    /// data; the high-level direct backend calls the unsafe hook only after a
+    /// true result and cache invalidation under the same direct-I/O lock.
+    fn physical_write_eligible(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<bool> {
+        let _ = (segments, offset);
+        Ok(false)
     }
 
     /// Appends data to the file.
