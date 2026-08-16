@@ -349,6 +349,7 @@ pub trait BackendOps {
         old_pt: &mut PageTableCursor,
         new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
+        active_long_term_cow_frames: &[PhysAddr],
     ) -> AxResult<Backend>;
 }
 

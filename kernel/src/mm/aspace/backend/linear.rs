@@ -147,6 +147,7 @@ impl BackendOps for LinearBackend {
         _old_pt: &mut PageTableCursor,
         _new_pt: &mut PageTableCursor,
         _new_aspace: &Arc<Mutex<AddrSpace>>,
+        _active_long_term_cow_frames: &[PhysAddr],
     ) -> AxResult<Backend> {
         Ok(Backend::Linear(self.clone()))
     }

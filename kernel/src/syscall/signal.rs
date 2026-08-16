@@ -18,7 +18,10 @@ use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{
     RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, SignalStackRestoreError,
     Signo,
-    api::{SignalDeliveryPreflight, SignalFrame, SignalWaitObservation, ThreadSignalManager},
+    api::{
+        SignalDeliveryPreflight, SignalWaitObservation, ThreadSignalManager,
+        copyin_and_prepare_restore_at_rsp,
+    },
 };
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -29,13 +32,14 @@ use crate::{
         SignalSecurityOperation, SignalSecuritySource, SignalTargetKind, Thread,
         acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
-        check_current_zombie_signal_access, check_signals, complete_signal_delivery,
-        force_rseq_fault_signal_current_thread, force_signal_current_thread,
-        generate_signal_for_exited_leader, get_process_data, get_process_group,
-        get_process_including_zombie, get_visible_task, process_domain, process_error,
-        send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
-        send_signal_to_process_data_with_credential, terminate_rseq_fault_current_thread,
-        with_proc_state_hint,
+        check_current_zombie_signal_access, check_signals, commit_current_legacy_fp_state,
+        complete_signal_delivery, force_rseq_fault_signal_current_thread,
+        force_signal_current_thread, generate_signal_for_exited_leader, get_process_data,
+        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
+        process_error, send_authorized_signal_thread_inner,
+        send_queued_signal_to_process_data_with_credential,
+        send_signal_to_process_data_with_credential, snapshot_current_legacy_fp_state,
+        terminate_rseq_fault_current_thread, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -1177,27 +1181,34 @@ pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
         return reject_bad_sigreturn("no active signal handler");
     }
 
-    let frame = match SignalFrame::read_from_user(memory, uctx.sp() as *const SignalFrame) {
-        Ok(frame) => frame,
-        Err(_) => return reject_bad_sigreturn("frame copy-in fault"),
-    };
-
-    let prepared = match thr.signal.prepare_restore(
+    let prepared = match copyin_and_prepare_restore_at_rsp(
+        memory,
+        uctx.sp(),
         uctx,
-        frame,
         |pc| valid_signal_user_address(pc, SIGNAL_PC_ALIGNMENT),
         |sp| valid_signal_user_address(sp, SIGNAL_SP_ALIGNMENT),
+        thr.signal.stack(),
         validate_sigreturn_stack,
     ) {
         Ok(prepared) => prepared,
         Err(err) => {
-            warn!("rt_sigreturn context validation failed: {err:?}");
-            return reject_bad_sigreturn("invalid machine context");
+            warn!("rt_sigreturn frame validation failed: {err:?}");
+            return reject_bad_sigreturn("invalid signal frame");
         }
     };
 
-    // No operation after this point may fail: context, mask and restart state
-    // become visible only after the complete frame has passed validation.
+    // Validate and commit the FP image before publishing GPR/mask/stack state.
+    // The cloned token keeps the manager-owned prepared restore intact for its
+    // no-fail commit below; a bad MXCSR leaves every task state untouched.
+    let fp_restore = prepared.fp_restore().clone();
+    if let Err(error) = commit_current_legacy_fp_state(&fp_restore) {
+        warn!("rt_sigreturn FP validation failed: {error:?}");
+        return reject_bad_sigreturn("invalid signal FP state");
+    }
+
+    // No operation after this point may fail: the complete fixed frame and FP
+    // payload passed validation, FP state is committed, and manager commit
+    // only publishes the already-prepared GPR/mask/stack values.
     thr.signal.commit_restore(uctx, prepared);
     thr.complete_sigreturn(uctx);
     Ok(uctx.retval() as isize)
@@ -1543,7 +1554,7 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                         let aspace = thr.proc_data.aspace();
                         let mut provider = AddressSpaceUserMemory::new(aspace.clone());
                         let mut memory = UserMemoryContext::new(&mut provider);
-                        match signal.observe_signal_wait_with_pre_delivery(
+                        match signal.observe_signal_wait_with_pre_delivery_and_fp_snapshot(
                             &mut memory,
                             uctx,
                             &set,
@@ -1570,6 +1581,7 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                                     }
                                 }
                             },
+                            snapshot_current_legacy_fp_state,
                         ) {
                             SignalWaitObservation::Accepted(sig) => SignalWaitStep::Accepted(sig),
                             SignalWaitObservation::Delivered(delivered) => {

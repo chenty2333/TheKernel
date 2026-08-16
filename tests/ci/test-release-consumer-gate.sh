@@ -13,9 +13,23 @@ bash -n "$CI_DIR/release-consumer-gate.sh"
 grep -Fqx \
     'PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly}' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fqx \
+    'export AX_LINKER_SCRIPT_OUTPUT := $(abspath $(LD_SCRIPT))' \
+    "$REPO_ROOT/make/cargo.mk"
+grep -Fq \
+    'std::env::var_os("AX_LINKER_SCRIPT_OUTPUT")' \
+    "$REPO_ROOT/third_party/rust-patches/axhal/build.rs"
+grep -Fq \
+    '.find(|path| path.file_name() == Some(profile.as_ref()))' \
+    "$REPO_ROOT/third_party/rust-patches/axhal/build.rs"
 if [ "$(grep -c '^    thekernel-axfault$' \
     "$CI_DIR/release-consumer-gate.sh")" -lt 2 ]; then
     printf 'test-release-consumer: axfault is absent from a release package set\n' >&2
+    exit 1
+fi
+if [ "$(grep -c '^    thekernel-linux-signal$' \
+    "$CI_DIR/release-consumer-gate.sh")" -lt 2 ]; then
+    printf 'test-release-consumer: signal is absent from a release consumer set\n' >&2
     exit 1
 fi
 grep -Fq -- '-p thekernel-axfault \' "$CI_DIR/release-consumer-gate.sh"
@@ -32,13 +46,34 @@ grep -Fq \
 grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-packet \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-linux-rseq \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq 'stage_prepublish_archive' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq \
     '"$usercopy_archive" thekernel-linux-usercopy \' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"$rseq_archive"' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"../thekernel-linux-abi/crates/signal=../artifacts/thekernel-linux-signal-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"../thekernel-linux-abi/crates/usercopy=../artifacts/thekernel-linux-usercopy-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"../thekernel-linux-abi/crates/rseq=../artifacts/thekernel-linux-rseq-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"${ARTIFACT_DIRS[thekernel-linux-signal]}/Cargo.lock"' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq \
+    '"thekernel-linux-usercopy=${ARCHIVE_PATHS[thekernel-linux-usercopy]}"' \
+    "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '--locked --offline --no-verify --registry crates-io \' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- 'exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@" --locked --offline' \
+    "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '--features qemu,asid-switch-diagnostics,pmu-diagnostics \' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- 'goal=kernel-x86_64-mm-performance' \
     "$CI_DIR/release-consumer-gate.sh"
@@ -64,6 +99,9 @@ thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
 thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp" }
+thekernel-linux-rseq = { path = "../thekernel-linux-abi/crates/rseq" }
+thekernel-linux-signal = { path = "../thekernel-linux-abi/crates/signal" }
+thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
 
 [patch.crates-io]
 two = { path = "../source/two" }
@@ -81,6 +119,9 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../thekernel-linux-abi/crates/packet=../artifacts/thekernel-linux-packet-0.1.0' \
     --replace '../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-0.1.0' \
     --replace '../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/rseq=../artifacts/thekernel-linux-rseq-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/signal=../artifacts/thekernel-linux-signal-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/usercopy=../artifacts/thekernel-linux-usercopy-0.1.0' \
     --forbid-text '../source/' \
     --forbid-text '../thekernel-ax/' \
     --forbid-text '../thekernel-linux-abi/' \
@@ -104,6 +145,12 @@ grep -Fq 'path = "../artifacts/thekernel-linux-packet-0.1.0"' \
 grep -Fq 'path = "../artifacts/thekernel-linux-io-uring-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-seccomp-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-rseq-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-signal-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-usercopy-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -q $'^before_sha256\t[0-9a-f]\{64\}$' "$tmp/rewrite/record.tsv"
 if python3 "$CI_DIR/rewrite-release-consumer.py" \
@@ -325,12 +372,15 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axpmu-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-usercopy-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-rseq-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
     "$tmp/artifacts/thekernel-linux-mm-0.1.0" \
     "$tmp/artifacts/thekernel-linux-packet-0.1.0" \
     "$tmp/artifacts/thekernel-linux-io-uring-0.1.0" \
     "$tmp/artifacts/thekernel-linux-seccomp-0.1.0" \
     "$tmp/artifacts/thekernel-linux-process-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-signal-0.1.0" \
     "$tmp/artifacts/thekernel-linux-vfs-0.1.0" \
     "$tmp/artifacts/thekernel-linux-fd-0.1.0" \
     "$tmp/source-ax" "$tmp/source-linux-abi"
@@ -349,12 +399,15 @@ release_names = [
     "thekernel-axpmu",
     "thekernel-axtask",
     "thekernel-axtlb",
+    "thekernel-linux-usercopy",
+    "thekernel-linux-rseq",
     "thekernel-linux-cred",
     "thekernel-linux-mm",
     "thekernel-linux-packet",
     "thekernel-linux-io-uring",
     "thekernel-linux-seccomp",
     "thekernel-linux-process",
+    "thekernel-linux-signal",
     "thekernel-linux-vfs",
     "thekernel-linux-fd",
 ]
@@ -411,6 +464,19 @@ process_core_id = next(
 next(node for node in nodes if node["id"] == process_adapter_id)["dependencies"] = [
     process_core_id
 ]
+signal_id = next(
+    package["id"]
+    for package in packages
+    if package["name"] == "thekernel-linux-signal"
+)
+usercopy_id = next(
+    package["id"]
+    for package in packages
+    if package["name"] == "thekernel-linux-usercopy"
+)
+next(node for node in nodes if node["id"] == signal_id)["dependencies"] = [
+    usercopy_id
+]
 metadata = {
     "packages": packages,
     "workspace_members": [packages[0]["id"]],
@@ -429,10 +495,12 @@ graph_args=(
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axcbpf thekernel-axfault \
     thekernel-axpmu thekernel-axtask thekernel-axtlb \
+    thekernel-linux-usercopy thekernel-linux-rseq \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-packet \
     thekernel-linux-io-uring \
     thekernel-linux-seccomp \
     thekernel-linux-process \
+    thekernel-linux-signal \
     thekernel-linux-vfs thekernel-linux-fd; do
     graph_args+=(--expect "$package=$tmp/artifacts/$package-0.1.0")
 done

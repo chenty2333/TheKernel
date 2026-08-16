@@ -18,7 +18,7 @@ use axio::prelude::*;
 use axsync::Mutex;
 #[cfg(feature = "test-io-control")]
 use axtask::sleep;
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
 use thekernel_linux_usercopy::{UserCopyError, VmResult};
 
@@ -90,7 +90,6 @@ static USER_IO_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "test-io-control")]
 static USER_IO_PIN_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-const MAX_USER_IO_PIN_SEGMENTS: usize = 32;
 /// Bounds one address-space critical section while collecting mapping
 /// expectations or acquiring exact lower-level owners for resident user pages.
 const USER_IO_PIN_SCAN_CHUNK_PAGES: usize = 64;
@@ -549,46 +548,51 @@ pub struct UserIoPinSegment {
 
 #[derive(Debug, Clone)]
 pub struct UserIoPinSegments {
-    segments: [UserIoPinSegment; MAX_USER_IO_PIN_SEGMENTS],
-    len: usize,
+    segments: Vec<UserIoPinSegment>,
+    max_segments: usize,
     bytes: usize,
 }
 
 impl UserIoPinSegments {
-    const fn new() -> Self {
-        Self {
-            segments: [UserIoPinSegment { paddr: 0, len: 0 }; MAX_USER_IO_PIN_SEGMENTS],
-            len: 0,
+    fn try_new(max_segments: usize) -> Option<Self> {
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(max_segments).ok()?;
+        Some(Self {
+            segments,
+            max_segments,
             bytes: 0,
-        }
+        })
     }
 
     fn push_or_merge(&mut self, paddr: usize, len: usize) -> bool {
         if len == 0 {
             return true;
         }
-        if let Some(prev) = self.len.checked_sub(1).map(|idx| &mut self.segments[idx])
+        if let Some(prev) = self
+            .segments
+            .len()
+            .checked_sub(1)
+            .map(|idx| &mut self.segments[idx])
             && prev.paddr.checked_add(prev.len) == Some(paddr)
         {
             prev.len += len;
             self.bytes += len;
             return true;
         }
-        if self.len == self.segments.len() {
+        if self.segments.len() == self.max_segments {
             return false;
         }
-        self.segments[self.len] = UserIoPinSegment { paddr, len };
-        self.len += 1;
+        self.segments.push(UserIoPinSegment { paddr, len });
         self.bytes += len;
         true
     }
 
     pub fn as_slice(&self) -> &[UserIoPinSegment] {
-        &self.segments[..self.len]
+        &self.segments
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.segments.len()
     }
 
     pub fn bytes(&self) -> usize {
@@ -674,10 +678,13 @@ struct UserIoRangePin {
 
 impl Drop for UserIoRangePin {
     fn drop(&mut self) {
-        {
+        let cow_frames = {
             let mut aspace = super::lock_mm_diagnosed!(self.aspace, UserPinRelease);
-            aspace.end_user_io_pin(self.token);
-        }
+            aspace.end_user_io_pin(self.token)
+        };
+        // The owner vector can be large; reclaim it only after releasing the
+        // address-space lock.
+        drop(cow_frames);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_UNPINS, 1);
     }
 }
@@ -695,6 +702,7 @@ struct UnpublishedUserIoPin {
     expectations: Vec<UserIoMappingExpectation>,
     frame_pins: Vec<PhysicalFramePins>,
     page_cache_pins: Vec<CachedFilePagePin>,
+    cow_frames: Vec<PhysAddr>,
     charged_pages: usize,
     frame_pages_admitted: usize,
 }
@@ -713,6 +721,7 @@ impl UnpublishedUserIoPin {
             expectations: Vec::new(),
             frame_pins: Vec::new(),
             page_cache_pins: Vec::new(),
+            cow_frames: Vec::new(),
             charged_pages: page_count,
             frame_pages_admitted: 0,
         };
@@ -727,6 +736,10 @@ impl UnpublishedUserIoPin {
                 .is_err()
             || preparation
                 .page_cache_pins
+                .try_reserve_exact(page_count)
+                .is_err()
+            || preparation
+                .cow_frames
                 .try_reserve_exact(page_count)
                 .is_err()
         {
@@ -808,6 +821,24 @@ fn prepare_user_io_pin_with(
     access_flags: MappingFlags,
     require_contiguous: bool,
 ) -> Option<PreparedUserIoPin> {
+    prepare_user_io_pin_with_duration(
+        capability,
+        start,
+        len,
+        access_flags,
+        require_contiguous,
+        PinDuration::AsyncIo,
+    )
+}
+
+fn prepare_user_io_pin_with_duration(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+    require_contiguous: bool,
+    duration: PinDuration,
+) -> Option<PreparedUserIoPin> {
     if len == 0 {
         reject_user_io_pin(&USER_IO_PIN_REJECT_EMPTY);
         return None;
@@ -843,7 +874,7 @@ fn prepare_user_io_pin_with(
             } else {
                 PinAccess::Read
             },
-            PinDuration::AsyncIo,
+            duration,
             PinUse::BlockIo,
             aspace.user_io_pin_owner(),
         );
@@ -866,36 +897,52 @@ fn prepare_user_io_pin_with(
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
         return None;
     };
+    // A page can introduce one physical SG fragment. Reserve the complete
+    // admitted page-count bound before taking any AddrSpace lock; push_or_merge
+    // is then allocation-free in every mapping scan window.
+    let Some(mut segments) = UserIoPinSegments::try_new(page_count) else {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    };
+
+    let populate_windows = duration == PinDuration::LongTerm;
 
     // The initial lock scope only installs the full-range Reserved barrier and
-    // its system charge. Build mapping expectations afterwards in bounded
-    // windows, using storage reserved outside every address-space lock. The
-    // Reserved record blocks overlapping topology/access mutations across the
-    // gaps between windows.
-    let mut expectation_cursor = page_start;
-    while expectation_cursor < page_end {
-        let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
-        let expectation_result = {
-            let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
-            aspace.append_user_io_mapping_expectations(
-                expectation_cursor,
-                chunk_end - expectation_cursor,
-                access_flags,
-                &mut preparation.expectations,
-            )
-        };
-        if expectation_result.is_err() {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-            reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
-            return None;
+    // its system charge. Resident-only callers build mapping expectations in
+    // bounded windows, using storage reserved outside every address-space lock.
+    // Long-term callers collect each expectation after populating its window.
+    // The Reserved record blocks overlapping topology/access mutations across
+    // the gaps between windows.
+    if !populate_windows {
+        let mut expectation_cursor = page_start;
+        while expectation_cursor < page_end {
+            let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
+            let expectation_result = {
+                let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
+                aspace.append_user_io_mapping_expectations(
+                    expectation_cursor,
+                    chunk_end - expectation_cursor,
+                    access_flags,
+                    &mut preparation.expectations,
+                )
+            };
+            if expectation_result.is_err() {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                return None;
+            }
+            expectation_cursor = chunk_end;
         }
-        expectation_cursor = chunk_end;
     }
-    let needs_frame_registry = preparation
+    let mut needs_frame_registry = preparation
         .expectations()
         .iter()
         .any(UserIoMappingExpectation::needs_frame_registry);
-    if needs_frame_registry && prepare_physical_pin_registry().is_err() {
+    // Long-term windows may populate a previously absent anonymous/COW page
+    // while the AddrSpace lock is held. Prepare the physical owner registry
+    // before that lock is acquired; ordinary direct-I/O remains resident-only.
+    if (needs_frame_registry || populate_windows) && prepare_physical_pin_registry().is_err() {
         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
         return None;
@@ -918,7 +965,6 @@ fn prepare_user_io_pin_with(
     // before releasing the address-space lock. In particular, COW frames are
     // never queried, unlocked, and only then pinned: a concurrent write fault
     // could otherwise replace and free the observed frame in that gap.
-    let mut segments = UserIoPinSegments::new();
     let mut copied = 0usize;
     let mut cow_frame_pages = 0usize;
     let mut shared_frame_pages = 0usize;
@@ -931,7 +977,11 @@ fn prepare_user_io_pin_with(
         // Both address and deferred-free owners are allocated before taking
         // AddrSpace. File-only requests use a zero-capacity preparation and do
         // not pay for physical-registry batch storage.
-        let frame_capacity = if needs_frame_registry { chunk_pages } else { 0 };
+        let frame_capacity = if needs_frame_registry || populate_windows {
+            chunk_pages
+        } else {
+            0
+        };
         let mut frame_preparation = match PreparedPhysicalFramePins::try_new(frame_capacity) {
             Ok(preparation) => preparation,
             Err(_) => {
@@ -941,8 +991,36 @@ fn prepare_user_io_pin_with(
         };
 
         let chunk_pin = {
-            let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCollectOwners);
+            let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCollectOwners);
             (|| {
+                if populate_windows {
+                    if aspace
+                        .populate_area(scan_cursor, chunk_end - scan_cursor, access_flags)
+                        .is_err()
+                    {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_POPULATE);
+                        return None;
+                    }
+                    let expectation_start = preparation.expectations.len();
+                    aspace
+                        .append_user_io_mapping_expectations(
+                            scan_cursor,
+                            chunk_end - scan_cursor,
+                            access_flags,
+                            &mut preparation.expectations,
+                        )
+                        .map_err(|_| {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        })
+                        .ok()?;
+                    if preparation.expectations()[expectation_start..]
+                        .iter()
+                        .any(UserIoMappingExpectation::needs_frame_registry)
+                    {
+                        needs_frame_registry = true;
+                    }
+                }
+
                 let mut window_cursor = scan_cursor;
                 while window_cursor < chunk_end {
                     let Some(area) = aspace.find_area(window_cursor) else {
@@ -981,7 +1059,10 @@ fn prepare_user_io_pin_with(
                     let backend = area.backend();
                     if backend.supports_user_io_frame_pin() {
                         match backend {
-                            Backend::Cow(_) => cow_frame_pages += 1,
+                            Backend::Cow(_) => {
+                                cow_frame_pages += 1;
+                                preparation.cow_frames.push(paddr);
+                            }
                             Backend::Shared(_) => shared_frame_pages += 1,
                             Backend::Linear(_) | Backend::File(_) => unreachable!(),
                         }
@@ -1134,7 +1215,7 @@ fn prepare_user_io_pin_with(
     // unpublished owners and recursively cancel while AddrSpace is still held.
     let publication = {
         let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCommit);
-        aspace.commit_user_io_pin(preparation.reservation())
+        aspace.commit_user_io_pin(preparation.reservation(), &mut preparation.cow_frames)
     };
     let token = match publication {
         Ok(token) => token,
@@ -1344,15 +1425,27 @@ mod tests {
 
     #[test]
     fn mutable_pin_segments_reject_physical_aliases() {
-        let mut aliases = UserIoPinSegments::new();
+        let mut aliases = UserIoPinSegments::try_new(2).unwrap();
         assert!(aliases.push_or_merge(0x1000, 0x800));
         assert!(aliases.push_or_merge(0x1000, 0x800));
         assert!(!aliases.physical_ranges_are_disjoint());
 
-        let mut disjoint = UserIoPinSegments::new();
+        let mut disjoint = UserIoPinSegments::try_new(2).unwrap();
         assert!(disjoint.push_or_merge(0x1000, 0x800));
         assert!(disjoint.push_or_merge(0x2000, 0x800));
         assert!(disjoint.physical_ranges_are_disjoint());
+    }
+
+    #[test]
+    fn fragmented_pin_segments_reserve_and_accept_more_than_32_fragments() {
+        let mut segments = UserIoPinSegments::try_new(33).unwrap();
+        for index in 0..33 {
+            assert!(segments.push_or_merge(0x1000 + index * 0x2000, PAGE_SIZE_4K));
+        }
+        assert_eq!(segments.len(), 33);
+        assert_eq!(segments.bytes(), 33 * PAGE_SIZE_4K);
+        assert!(segments.physical_ranges_are_disjoint());
+        assert!(!segments.push_or_merge(0x1000 + 33 * 0x2000, PAGE_SIZE_4K));
     }
 
     #[test]
@@ -1476,6 +1569,37 @@ pub fn try_pin_user_segments_to_user_with(
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_ATTEMPTS, 1);
     let prepared =
         prepare_user_io_pin_with(capability, ptr as usize, len, MappingFlags::WRITE, false)?;
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_HITS, 1);
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
+    record_user_io_pin_segments(&prepared.segments);
+    Some(PinnedUserSegmentsMut {
+        _ptr: ptr,
+        segments: prepared.segments,
+        _frame_pins: prepared.frame_pins,
+        _page_cache_pins: prepared.page_cache_pins,
+        _range_pin: prepared.range_pin,
+    })
+}
+
+#[allow(dead_code)]
+/// Attempts a long-term destination scatter/gather pin for registered
+/// asynchronous I/O. Unlike the direct-I/O helper above, this path faults in
+/// each bounded window before acquiring its lower-level owners and publishes
+/// the reservation with [`PinDuration::LongTerm`].
+pub fn try_pin_user_segments_to_user_longterm_with(
+    capability: &UserMemoryCapability,
+    ptr: *mut u8,
+    len: usize,
+) -> Option<PinnedUserSegmentsMut> {
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_ATTEMPTS, 1);
+    let prepared = prepare_user_io_pin_with_duration(
+        capability,
+        ptr as usize,
+        len,
+        MappingFlags::WRITE,
+        false,
+        PinDuration::LongTerm,
+    )?;
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);

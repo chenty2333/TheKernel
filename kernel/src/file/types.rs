@@ -317,6 +317,7 @@ pub struct FixedSharedMmapRegion {
     file_offset: u64,
     pages: Arc<SharedPages>,
     may_protect: FileMmapProtection,
+    retain_description: bool,
 }
 
 impl FixedSharedMmapRegion {
@@ -324,6 +325,28 @@ impl FixedSharedMmapRegion {
         file_offset: u64,
         pages: Arc<SharedPages>,
         may_protect: FileMmapProtection,
+    ) -> AxResult<Self> {
+        Self::try_new_with_description_retention(file_offset, pages, may_protect, true)
+    }
+
+    /// Builds a region whose VMA retains only the exported shared pages, not
+    /// the originating open file description. This is for anonymous control
+    /// mappings such as io_uring, where the mapped pages remain valid after
+    /// final close and retaining the ring would create a cycle through a
+    /// registered buffer's address-space pin.
+    pub fn try_new_detached(
+        file_offset: u64,
+        pages: Arc<SharedPages>,
+        may_protect: FileMmapProtection,
+    ) -> AxResult<Self> {
+        Self::try_new_with_description_retention(file_offset, pages, may_protect, false)
+    }
+
+    fn try_new_with_description_retention(
+        file_offset: u64,
+        pages: Arc<SharedPages>,
+        may_protect: FileMmapProtection,
+        retain_description: bool,
     ) -> AxResult<Self> {
         let length = pages.total_bytes();
         let page_size = pages.page_size() as usize;
@@ -341,6 +364,7 @@ impl FixedSharedMmapRegion {
             file_offset,
             pages,
             may_protect,
+            retain_description,
         })
     }
 
@@ -362,6 +386,7 @@ impl FixedSharedMmapRegion {
             request,
             pages: self.pages.clone(),
             may_protect: self.may_protect,
+            retain_description: self.retain_description,
         }))
     }
 }
@@ -396,6 +421,7 @@ pub struct PreparedFileMmap {
     request: FileMmapRequest,
     pages: Arc<SharedPages>,
     may_protect: FileMmapProtection,
+    retain_description: bool,
 }
 
 impl PreparedFileMmap {
@@ -409,6 +435,10 @@ impl PreparedFileMmap {
 
     pub(crate) const fn may_protect(&self) -> FileMmapProtection {
         self.may_protect
+    }
+
+    pub(crate) const fn retains_description(&self) -> bool {
+        self.retain_description
     }
 
     pub(crate) fn into_pages(self) -> Arc<SharedPages> {

@@ -1,4 +1,4 @@
-use std::{io::Result, path::Path};
+use std::{io::Result, path::PathBuf};
 
 fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
@@ -38,10 +38,22 @@ fn gen_linker_script(platform: &str) -> Result<()> {
         },
     );
 
-    // target/<target_triple>/<mode>/build/axhal-xxxx/out
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    // target/<target_triple>/<mode>/linker_xxxx.lds
-    let out_path = Path::new(&out_dir).join("../../..").join(fname);
+    println!("cargo:rerun-if-env-changed=AX_LINKER_SCRIPT_OUTPUT");
+    let out_path = match std::env::var_os("AX_LINKER_SCRIPT_OUTPUT") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            // Cargo has used both `build/axhal-<hash>/out` and
+            // `build/axhal/<hash>/out` layouts. Find the profile directory by
+            // name instead of assuming a fixed number of parent components.
+            let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+            let profile = std::env::var_os("PROFILE").unwrap();
+            out_dir
+                .ancestors()
+                .find(|path| path.file_name() == Some(profile.as_ref()))
+                .expect("OUT_DIR must be nested below Cargo's profile directory")
+                .join(fname)
+        }
+    };
     std::fs::write(out_path, ld_content)?;
     Ok(())
 }

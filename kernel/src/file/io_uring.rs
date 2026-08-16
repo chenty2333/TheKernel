@@ -38,7 +38,7 @@ use super::{
 };
 use crate::mm::{
     PinnedUserSegmentsMut, SharedAtomicU32, UserMemoryCapability,
-    try_pin_user_segments_to_user_with,
+    try_pin_user_segments_to_user_longterm_with,
 };
 
 const RING_WAITER_SLOTS: usize = 64;
@@ -201,6 +201,26 @@ impl Drop for RegisteredBufferPinCharge {
     }
 }
 
+struct PinBeforeCharge<P, C> {
+    pin: Option<P>,
+    _charge: C,
+}
+
+impl<P, C> PinBeforeCharge<P, C> {
+    fn new(pin: P, charge: C) -> Self {
+        Self {
+            pin: Some(pin),
+            _charge: charge,
+        }
+    }
+}
+
+impl<P, C> Drop for PinBeforeCharge<P, C> {
+    fn drop(&mut self) {
+        drop(self.pin.take());
+    }
+}
+
 fn try_reserve_global_registered_buffer_pin(pages: usize, bytes: usize) -> bool {
     if IO_URING_REGISTERED_BUFFER_PAGES
         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -237,8 +257,11 @@ struct RegisteredBuffer {
     address: usize,
     length: usize,
     capability: UserMemoryCapability,
-    _pin_charge: RegisteredBufferPinCharge,
-    _pin: PinnedUserSegmentsMut,
+    // Release the lower VM/frame/page-cache pin before making this ring's
+    // admission charge reusable. A large unpin can yield enough observable
+    // time for another registration to consume the io_uring budget while the
+    // shared lower pin budget is still occupied.
+    _pin_owner: PinBeforeCharge<PinnedUserSegmentsMut, RegisteredBufferPinCharge>,
 }
 
 // The owner retains the explicit address-space capability alongside the
@@ -858,17 +881,17 @@ impl IoUring {
         let cq_head = rings.atomic_u32(cq_offsets.head() as usize)?;
         let cq_tail = rings.atomic_u32(cq_offsets.tail() as usize)?;
         let sq_dropped = rings.atomic_u32(sq_offsets.dropped() as usize)?;
-        let ring_region = FixedSharedMmapRegion::try_new(
+        let ring_region = FixedSharedMmapRegion::try_new_detached(
             thekernel_linux_io_uring::IORING_OFF_SQ_RING,
             Arc::clone(&rings),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
-        let cq_ring_region = FixedSharedMmapRegion::try_new(
+        let cq_ring_region = FixedSharedMmapRegion::try_new_detached(
             thekernel_linux_io_uring::IORING_OFF_CQ_RING,
             Arc::clone(&rings),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
-        let sqe_region = FixedSharedMmapRegion::try_new(
+        let sqe_region = FixedSharedMmapRegion::try_new_detached(
             thekernel_linux_io_uring::IORING_OFF_SQES,
             Arc::clone(&sqes),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
@@ -1409,10 +1432,16 @@ impl IoUring {
                 .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;
             files.table.begin_retire().map_err(map_core_error)?;
         }
+        self.drain_registered_files_after_retire()
+    }
+
+    fn drain_registered_files_after_retire(&self) -> AxResult<()> {
         loop {
             let retired = {
                 let mut state = self.state.lock();
-                let files = state.fixed_files.as_mut().ok_or(AxError::BadState)?;
+                let Some(files) = state.fixed_files.as_mut() else {
+                    break;
+                };
                 let Some(token) = files.table.next_retirable().map_err(map_core_error)? else {
                     break;
                 };
@@ -1422,10 +1451,13 @@ impl IoUring {
         }
         let closed = {
             let mut state = self.state.lock();
-            let files = state.fixed_files.as_mut().ok_or(AxError::BadState)?;
-            if files.table.progress().map_err(map_core_error)?.empty() {
-                files.table.finish_retire().map_err(map_core_error)?;
-                state.fixed_files.take()
+            if let Some(files) = state.fixed_files.as_mut() {
+                if files.table.progress().map_err(map_core_error)?.empty() {
+                    files.table.finish_retire().map_err(map_core_error)?;
+                    state.fixed_files.take()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1488,7 +1520,7 @@ impl IoUring {
             let page_len = page_end - page_start;
             let page_count = page_len / PAGE_BYTES;
             let pin_charge = self.registered_buffer_budget.try_charge(page_count)?;
-            let pin = match try_pin_user_segments_to_user_with(
+            let pin = match try_pin_user_segments_to_user_longterm_with(
                 capability,
                 page_start as *mut u8,
                 page_len,
@@ -1503,8 +1535,7 @@ impl IoUring {
                 address,
                 length,
                 capability: capability.clone(),
-                _pin_charge: pin_charge,
-                _pin: pin,
+                _pin_owner: PinBeforeCharge::new(pin, pin_charge),
             })
             .map_err(|_| AxError::NoMemory)?;
             if let Err(error) = table.install(
@@ -2154,7 +2185,52 @@ fn initialize_ring_header(pages: &SharedPages, layout: RingLayout) -> AxResult<(
 
 #[cfg(test)]
 mod adapter_state_tests {
+    use alloc::vec;
+
+    use thekernel_linux_io_uring::{FeatureFlags, SetupFlags, SetupRequest};
+
     use super::*;
+
+    struct FixedFileTestObject;
+
+    impl Pollable for FixedFileTestObject {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
+    }
+
+    impl FileLike for FixedFileTestObject {
+        fn stat(&self) -> AxResult<Kstat> {
+            Ok(Kstat::default())
+        }
+
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("io-uring-fixed-file-test"))
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    struct DropProbe {
+        name: &'static str,
+        order: Arc<SpinNoIrq<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.order.lock().push(self.name);
+        }
+    }
 
     #[test]
     fn request_and_completion_capacity_are_retryable_backpressure() {
@@ -2204,5 +2280,48 @@ mod adapter_state_tests {
         drop(charge);
         assert_eq!(budget.pages.load(Ordering::Acquire), 0);
         assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn registered_buffer_lower_pin_drops_before_admission_charge() {
+        let order = Arc::new(SpinNoIrq::new(Vec::new()));
+        drop(PinBeforeCharge::new(
+            DropProbe {
+                name: "pin",
+                order: Arc::clone(&order),
+            },
+            DropProbe {
+                name: "charge",
+                order: Arc::clone(&order),
+            },
+        ));
+        assert_eq!(&*order.lock(), &["pin", "charge"]);
+    }
+
+    #[test]
+    fn unregister_drain_tolerates_last_lease_taking_the_table() {
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let description = FileDescription::new(Arc::new(FixedFileTestObject)).unwrap();
+        ring.register_files(vec![Some(description)]).unwrap();
+        let lease = ring.acquire_registered_file(FileSlot::new(0)).unwrap();
+
+        {
+            let mut state = ring.state.lock();
+            state
+                .fixed_files
+                .as_mut()
+                .unwrap()
+                .table
+                .begin_retire()
+                .unwrap();
+        }
+        drop(lease);
+
+        assert!(ring.state.lock().fixed_files.is_none());
+        ring.drain_registered_files_after_retire().unwrap();
     }
 }

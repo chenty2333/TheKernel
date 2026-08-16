@@ -299,6 +299,34 @@ static int test_io_uring(void) {
     return 0;
 }
 
+static int test_io_uring_buffers(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("io-uring-buffers-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-io-uring-buffers-smoke",
+              "thekernel-io-uring-buffers-smoke", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL io-uring-buffers-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "io-uring-buffers-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_IO_URING_BUFFERS_OK");
+    return 0;
+}
+
+static int test_signal_fp(void) {
+    return test_portable_differential(
+        "/opt/thekernel-tests/bin/thekernel-signal-fp-smoke",
+        NULL,
+        "signal-fp-child",
+        "THEKERNEL_SYSTEM_TEST_SIGNAL_FP_OK");
+}
+
 static int test_ioprio(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -561,7 +589,9 @@ int main(int argc, char **argv) {
             NULL,
             "signal-order-differential-child",
             "THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK") ||
-        test_io_uring() || test_ioprio() || test_membarrier() || test_userfaultfd() ||
+        test_signal_fp() ||
+        test_io_uring() || test_io_uring_buffers() || test_ioprio() ||
+        test_membarrier() || test_userfaultfd() ||
         test_packet_socket() ||
         test_seccomp()) {
         return 1;

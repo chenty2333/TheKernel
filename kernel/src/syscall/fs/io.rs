@@ -172,6 +172,113 @@ fn generic_write_after_socket_policy<T>(
     write()
 }
 
+fn check_file_write_admission(file: &File, len: usize) -> AxResult<()> {
+    file.inner().access(FileFlags::WRITE)?;
+    if len != 0 {
+        check_writable_mount(file.inner().location())?;
+    }
+    Ok(())
+}
+
+fn zero_offset_stream_file_like(
+    file_like: &FileHandle<dyn FileLike>,
+    no_positioned: NodeFlags,
+) -> bool {
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Fifo | FileLikeKind::Socket => true,
+        // Character devices such as tty are represented by the generic File
+        // adapter. Their stream nature is expressed by the VFS positioned-I/O
+        // prohibition rather than by a distinct FileLikeKind variant.
+        // Non-File FileLike implementations (eventfd, timerfd, signalfd,
+        // inotify, userfaultfd, fanotify, and similar anon-inodes) expose
+        // only their direct read/write methods, so they have no positioned
+        // operation to fall back to. A generic File still needs its explicit
+        // VFS marker, while regular files and directories are excluded by
+        // their own kinds above.
+        FileLikeKind::Other => file_like
+            .downcast_ref::<File>()
+            .is_none_or(|file| file.inner().location().flags().contains(no_positioned)),
+        FileLikeKind::Regular | FileLikeKind::Directory => false,
+    }
+}
+
+fn io_uring_stream_read(
+    capability: &UserMemoryCapability,
+    file_handle: &FileHandle<dyn FileLike>,
+    buf: *mut u8,
+    len: usize,
+) -> AxResult<isize> {
+    let status = file_handle.io_status_snapshot();
+    file_handle.check_io_status(status)?;
+    let socket = PinnedSocketDescription::from_file_handle(file_handle, status)?;
+    if socket.is_some() && len == 0 {
+        return Ok(0);
+    }
+    if len != 0 {
+        crate::file::fanotify::permission_check_file_like(
+            file_handle,
+            crate::file::fanotify::FAN_ACCESS_PERM,
+        )?;
+    }
+    generic_read_after_socket_policy(
+        socket.as_ref(),
+        len,
+        |socket| dispatch_generic_socket_receive(socket, status, 1, len),
+        || {
+            file_handle.with_read_credentials(|| {
+                let read = read_file_like_with_status(
+                    file_handle,
+                    status,
+                    &mut VmBytesMut::new(capability.clone(), buf, len),
+                )?;
+                if read > 0
+                    && let Some(file) = file_handle.downcast_ref::<File>()
+                {
+                    notify_read_file(file);
+                }
+                Ok(read)
+            })
+        },
+    )
+    .map(|read| read.unwrap_or(0) as isize)
+}
+
+fn io_uring_stream_write(
+    capability: &UserMemoryCapability,
+    file_handle: &FileHandle<dyn FileLike>,
+    buf: *const u8,
+    len: usize,
+) -> AxResult<isize> {
+    let security = current_vfs_security();
+    let status = file_handle.io_status_snapshot();
+    file_handle.check_io_status(status)?;
+    let socket = PinnedSocketDescription::from_file_handle(file_handle, status)?;
+    let written = generic_write_after_socket_policy(
+        socket.as_ref(),
+        |socket| dispatch_generic_socket_send(&security, socket, status, 1, len),
+        || {
+            file_handle.with_write_credentials_for_status(status, || {
+                if let Some(file) = file_handle.downcast_ref::<File>() {
+                    check_file_write_admission(file, len)?;
+                }
+                write_file_like_with_status(
+                    file_handle,
+                    status,
+                    &mut VmBytes::new(capability.clone(), buf, len),
+                    &security,
+                )
+            })
+        },
+    )?;
+    if written > 0 {
+        sync_file_like_after_status_write(status, file_handle)?;
+        if let Some(file) = file_handle.downcast_ref::<File>() {
+            notify_write_file(file);
+        }
+    }
+    Ok(written as isize)
+}
+
 fn begin_inode_content_write(
     location: &Location,
     security: &VfsSecurityContext,
@@ -1193,10 +1300,7 @@ pub fn sys_write(
         || {
             f.with_write_credentials_for_status(status, || {
                 let regular_file = if let Some(file) = f.downcast_ref::<File>() {
-                    file.inner().access(FileFlags::WRITE)?;
-                    if len != 0 {
-                        check_writable_mount(file.inner().location())?;
-                    }
+                    check_file_write_admission(file, len)?;
                     Some(file)
                 } else {
                     None
@@ -1298,10 +1402,7 @@ pub fn sys_writev(
                 let file = f.downcast::<File>()?;
                 let (written, status) = file.with_write_credentials_for_status(status, || {
                     iov.check_readable()?;
-                    file.inner().access(FileFlags::WRITE)?;
-                    if iov.len() != 0 {
-                        check_writable_mount(file.inner().location())?;
-                    }
+                    check_file_write_admission(file.as_ref(), iov.len())?;
                     let direct_alignment_limit = direct_iov_alignment_limit(file.as_ref(), &iov)?;
                     if write_uses_current_position(file.inner(), status) {
                         return with_current_position_io(file.as_ref(), iov.len(), |offset| {
@@ -2411,7 +2512,15 @@ pub(crate) fn io_uring_pread64(
     len: usize,
     offset: u64,
 ) -> AxResult<isize> {
-    let file = positioned_read_file_handle(description.file_handle())?;
+    let file_handle = description.file_handle();
+    // Linux's io_uring rw path treats a zero offset on a non-seekable file
+    // (pipe, socket, tty) as "no offset" and performs a plain read instead
+    // of failing with ESPIPE (verified on the host kernel: READ_FIXED on an
+    // empty nonblocking pipe with off=0 completes rather than failing).
+    if offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_READ) {
+        return io_uring_stream_read(capability, &file_handle, buf, len);
+    }
+    let file = positioned_read_file_handle(file_handle)?;
     pread64_file(capability, &file, buf, len, offset)
 }
 
@@ -2507,7 +2616,13 @@ pub(crate) fn io_uring_pwrite64(
     len: usize,
     offset: u64,
 ) -> AxResult<isize> {
-    let file = positioned_write_file_handle(description.file_handle())?;
+    let file_handle = description.file_handle();
+    // Mirror the pread64 treatment: a zero offset on a non-seekable file
+    // performs a plain write, matching Linux's io_uring rw behavior.
+    if offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_WRITE) {
+        return io_uring_stream_write(capability, &file_handle, buf, len);
+    }
+    let file = positioned_write_file_handle(file_handle)?;
     pwrite64_file(capability, &file, buf, len, offset)
 }
 
@@ -4639,6 +4754,7 @@ mod tests {
     struct IoContractFs {
         this: Weak<Self>,
         flags: NodeFlags,
+        node_type: NodeType,
         size: u64,
         fail_open: AtomicBool,
         fail_remove_xattr: AtomicBool,
@@ -4650,9 +4766,14 @@ mod tests {
 
     impl IoContractFs {
         fn new(flags: NodeFlags, size: u64) -> Arc<Self> {
+            Self::new_with_type(flags, size, NodeType::RegularFile)
+        }
+
+        fn new_with_type(flags: NodeFlags, size: u64, node_type: NodeType) -> Arc<Self> {
             Arc::new_cyclic(|this| Self {
                 this: this.clone(),
                 flags,
+                node_type,
                 size,
                 fail_open: AtomicBool::new(false),
                 fail_remove_xattr: AtomicBool::new(false),
@@ -4678,7 +4799,7 @@ mod tests {
             let fs = self.this.upgrade().expect("test filesystem is live");
             DirEntry::new_file(
                 FileNode::new(Arc::new(IoContractNode { fs })),
-                NodeType::RegularFile,
+                self.node_type,
                 Reference::root(),
             )
         }
@@ -4714,7 +4835,7 @@ mod tests {
                 inode: 1,
                 nlink: 1,
                 mode: NodePermission::from_bits_truncate(0o600),
-                node_type: NodeType::RegularFile,
+                node_type: self.fs.node_type,
                 uid: 0,
                 gid: 0,
                 size: self.fs.size,
@@ -4904,6 +5025,110 @@ mod tests {
         let positioned = open(NodeFlags::NON_CACHEABLE | NodeFlags::POSITIONED_APPEND);
         assert!(!write_uses_inode_append(positioned.inner(), append));
         assert!(write_uses_current_position(positioned.inner(), append));
+    }
+
+    #[test]
+    fn zero_offset_io_uses_stream_dispatch_for_tty_like_files_only() {
+        let _context = crate::test_support::scheduler_test_context();
+        let stream_fs = IoContractFs::new_with_type(
+            NodeFlags::NON_CACHEABLE
+                | NodeFlags::STREAM
+                | NodeFlags::NO_POSITIONED_READ
+                | NodeFlags::NO_POSITIONED_WRITE,
+            0,
+            NodeType::CharacterDevice,
+        );
+        let mut stream_options = OpenOptions::new();
+        stream_options.read(true).write(true);
+        let stream_file = File::new(
+            stream_options
+                .open_loc(stream_fs.location())
+                .unwrap()
+                .into_file()
+                .unwrap(),
+        );
+        let stream: Arc<dyn FileLike> = Arc::new(stream_file);
+        let stream_description = FileDescription::new(stream).unwrap();
+        let stream_handle =
+            FileHandle::<dyn FileLike>::from_description_for_test(stream_description);
+        assert!(zero_offset_stream_file_like(
+            &stream_handle,
+            NodeFlags::NO_POSITIONED_READ
+        ));
+        assert!(zero_offset_stream_file_like(
+            &stream_handle,
+            NodeFlags::NO_POSITIONED_WRITE
+        ));
+
+        // An anon-inode FileLike has no positioned operation at all. It must
+        // still use its direct read/write methods at offset zero.
+        let event: Arc<dyn FileLike> = crate::file::event::EventFd::new(0, false);
+        let event_description = FileDescription::new(event).unwrap();
+        let event_handle = FileHandle::<dyn FileLike>::from_description_for_test(event_description);
+        assert!(zero_offset_stream_file_like(
+            &event_handle,
+            NodeFlags::NO_POSITIONED_READ
+        ));
+        assert!(zero_offset_stream_file_like(
+            &event_handle,
+            NodeFlags::NO_POSITIONED_WRITE
+        ));
+
+        // A regular file remains on the positioned path even if a malformed
+        // test backend happens to advertise the stream prohibition flags.
+        let regular_fs = IoContractFs::new(
+            NodeFlags::NON_CACHEABLE
+                | NodeFlags::STREAM
+                | NodeFlags::NO_POSITIONED_READ
+                | NodeFlags::NO_POSITIONED_WRITE,
+            0,
+        );
+        let mut regular_options = OpenOptions::new();
+        regular_options.read(true).write(true);
+        let regular_file = File::new(
+            regular_options
+                .open_loc(regular_fs.location())
+                .unwrap()
+                .into_file()
+                .unwrap(),
+        );
+        let regular: Arc<dyn FileLike> = Arc::new(regular_file);
+        let regular_description = FileDescription::new(regular).unwrap();
+        let regular_handle =
+            FileHandle::<dyn FileLike>::from_description_for_test(regular_description);
+        assert!(!zero_offset_stream_file_like(
+            &regular_handle,
+            NodeFlags::NO_POSITIONED_READ
+        ));
+        assert!(!zero_offset_stream_file_like(
+            &regular_handle,
+            NodeFlags::NO_POSITIONED_WRITE
+        ));
+    }
+
+    #[test]
+    fn stream_write_admission_rejects_read_only_mount_for_nonzero_io() {
+        let fs = IoContractFs::new(NodeFlags::NON_CACHEABLE, 0);
+        let filesystem = Filesystem::new(fs.clone());
+        let mountpoint = Mountpoint::new_root(&filesystem);
+        mounts::initialize_test_mount(&mountpoint, 1).unwrap();
+        let mut options = OpenOptions::new();
+        options.write(true);
+        let file = File::new(
+            options
+                .open_loc(mountpoint.root_location())
+                .unwrap()
+                .into_file()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            check_file_write_admission(&file, 1),
+            Err(AxError::ReadOnlyFilesystem)
+        );
+        // Ordinary sys_write permits a zero-length request after access
+        // admission, so the io_uring stream path must preserve that rule.
+        assert!(check_file_write_admission(&file, 0).is_ok());
     }
 
     #[repr(align(512))]

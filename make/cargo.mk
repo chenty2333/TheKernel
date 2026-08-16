@@ -19,6 +19,7 @@ build_args = \
   $(verbose)
 
 RUSTFLAGS_LINK_ARGS := -C link-arg=-T$(LD_SCRIPT) -C link-arg=-no-pie -C link-arg=-z -C link-arg=nostart-stop-gc
+export AX_LINKER_SCRIPT_OUTPUT := $(abspath $(LD_SCRIPT))
 RUSTDOCFLAGS := -Z unstable-options --enable-index-page -D rustdoc::broken_intra_doc_links
 
 ifeq ($(MAKECMDGOALS), doc_check_missing)

@@ -3,16 +3,17 @@ use core::convert::Infallible;
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{UserContext, UserReturnHookAction};
-use axtask::{TaskInner, current};
+use axtask::{LegacyFxsaveImage, TaskInner, current};
 use linux_raw_sys::general::{RLIMIT_SIGPENDING, SI_TIMER};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{
     DefaultSignalAction, PreparedSignal, SignalAction, SignalDisposition, SignalInfo,
     SignalOSAction, SignalQueueAccount, SignalRecordGeneration, SignalSet, Signo,
     api::{
-        DeliveredSignal, SignalDeliveryPreflight, SignalDeliveryResult, ThreadSignalManager,
-        ThreadSignalSendOutcome,
+        DeliveredSignal, FpRestore, SignalDeliveryPreflight, SignalDeliveryResult,
+        ThreadSignalManager, ThreadSignalSendOutcome,
     },
+    arch::LegacyFpState64,
 };
 use thekernel_linux_usercopy::UserMemoryContext;
 
@@ -208,6 +209,48 @@ pub(crate) fn prepare_queued_signal_for_process(
     prepare_signal_for_target(target, &target_cred, info, SignalQueuePolicy::QueueRequired)
 }
 
+/// Takes an owned legacy FXSAVE snapshot from the current task.
+///
+/// The axtask session keeps the no-preemption/IRQ guard scoped only to the
+/// architectural save and the copy into an owned image. It is dropped before
+/// the signal manager resumes frame preparation or userspace copyout.
+pub(crate) fn snapshot_current_legacy_fp_state() -> LegacyFpState64 {
+    let mut session = current()
+        .legacy_fxsave_session()
+        .expect("signal FP snapshot requires the current task");
+    LegacyFpState64::from_bytes(session.snapshot().into_bytes())
+}
+
+/// Commits a validated signal-return FP action to the current task.
+///
+/// Callers must perform all usercopy and machine-context validation before
+/// entering this helper. Once a token has been validated, the axtask session
+/// performs the saved-context/live-register commit without a fallible step.
+pub(crate) fn commit_current_legacy_fp_state(restore: &FpRestore) -> AxResult<()> {
+    let session = current()
+        .legacy_fxsave_session()
+        .map_err(|_| AxError::BadState)?;
+    match restore {
+        FpRestore::Reset => session.reset(),
+        FpRestore::Image(image) => {
+            let candidate = LegacyFxsaveImage::from_bytes(image.to_bytes());
+            let token = session
+                .validate(candidate)
+                .map_err(|_| AxError::InvalidInput)?;
+            session.commit(token);
+        }
+    }
+    Ok(())
+}
+
+/// Resets the current task's saved and live legacy FXSAVE state.
+pub(crate) fn reset_current_legacy_fp_state() {
+    current()
+        .legacy_fxsave_session()
+        .expect("signal FP reset requires the current task")
+        .reset();
+}
+
 pub fn check_signals(
     thr: &Thread,
     uctx: &mut UserContext,
@@ -225,7 +268,7 @@ pub fn check_signals(
     let aspace = thr.proc_data.aspace();
     let mut provider = AddressSpaceUserMemory::new(aspace.clone());
     let mut memory = UserMemoryContext::new(&mut provider);
-    let result = thr.signal.check_signals_with_pre_delivery(
+    let result = thr.signal.check_signals_with_pre_delivery_and_fp_snapshot(
         &mut memory,
         uctx,
         restore_blocked,
@@ -254,6 +297,7 @@ pub fn check_signals(
                 }
             }
         },
+        snapshot_current_legacy_fp_state,
     );
     match result {
         SignalDeliveryResult::Delivered(delivered) => {
@@ -336,7 +380,11 @@ pub(crate) fn complete_signal_delivery(
             do_continue(&thr.proc_data);
         }
         SignalOSAction::Handler => {
-            // do nothing
+            // The handler frame is now fully published. Reset both the saved
+            // scheduler image and live registers so the handler starts with
+            // the architectural user FP state, while all failed/default
+            // paths retain the interrupted state.
+            reset_current_legacy_fp_state();
         }
     }
 }
@@ -1089,9 +1137,11 @@ pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
 
 #[cfg(test)]
 mod tests {
+    use axtask::LegacyFxsaveImage;
     use linux_raw_sys::general::SI_MESGQ;
     use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, SignalRtPayload, SignalTimerPayload, Signo,
+        arch::LegacyFpState64,
     };
 
     use super::{PtraceSignalRecord, SignalQueuePolicy, prepare_signal_with_accounts};
@@ -1164,5 +1214,18 @@ mod tests {
         drop(record);
         assert_eq!(per_user.queued(), 0);
         assert_eq!(global.queued(), 0);
+    }
+
+    #[test]
+    fn legacy_fp_conversion_rejects_bad_mxcsr_without_mutating_image() {
+        let mut bytes = [0; LegacyFpState64::SIZE];
+        bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let signal_image = LegacyFpState64::from_bytes(bytes);
+        let fxsave_image = LegacyFxsaveImage::from_bytes(signal_image.to_bytes());
+
+        assert_eq!(fxsave_image.as_bytes(), &bytes);
+        assert!(fxsave_image.validate().is_err());
+        assert_eq!(fxsave_image.into_bytes(), bytes);
+        assert_eq!(signal_image.to_bytes(), bytes);
     }
 }

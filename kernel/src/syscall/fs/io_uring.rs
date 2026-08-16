@@ -8,6 +8,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
 use axtask::future;
+use memory_addr::PAGE_SIZE_4K;
 use thekernel_linux_io_uring::{
     BufferSlot, EnterFlags, EnterRequest, FeatureFlags, FileTarget, IoUringError, LegacySignalMask,
     PINNED_IORING_OP_LAST, ParsedSubmission, PreparedRequest, ReadWriteRequest,
@@ -34,6 +35,29 @@ const THEKERNEL_IO_URING_FEATURES: FeatureFlags = FeatureFlags::SINGLE_MMAP
     .union(FeatureFlags::NODROP)
     .union(FeatureFlags::SUBMIT_STABLE)
     .union(FeatureFlags::POLL_32BITS);
+
+// Linux's io_validate_user_buf_range rejects registrations above SZ_1T before
+// checking address arithmetic. Preserve that ordering so SIZE_MAX-sized
+// descriptors stay EINVAL, while under-limit address/page-cover overflow is
+// reported as EOVERFLOW.
+const REGISTERED_BUFFER_MAX_LEN: usize = 1 << 40;
+
+fn validate_registered_buffer_range(address: usize, length: usize) -> AxResult<()> {
+    if length == 0 {
+        // Linux's io_validate_user_buf_range reports an empty non-NULL
+        // registration as EFAULT before it attempts to pin the range.
+        return Err(AxError::BadAddress);
+    }
+    if length > REGISTERED_BUFFER_MAX_LEN {
+        return Err(AxError::InvalidInput);
+    }
+    let end = address
+        .checked_add(length)
+        .ok_or_else(|| AxError::from(LinuxError::EOVERFLOW))?;
+    end.checked_add(PAGE_SIZE_4K - 1)
+        .ok_or_else(|| AxError::from(LinuxError::EOVERFLOW))?;
+    Ok(())
+}
 
 fn map_policy_error(error: IoUringError) -> AxError {
     use IoUringError::*;
@@ -153,52 +177,51 @@ fn copy_registered_buffers(
     argument: u64,
     count: u32,
 ) -> AxResult<Vec<(usize, usize)>> {
-    let count = usize::try_from(count).map_err(|_| AxError::InvalidInput)?;
-    if count == 0 || count > thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS as usize {
-        return Err(AxError::InvalidInput);
-    }
-    if argument == 0 {
-        // Linux reaches the iovec copy for a valid count and reports a bad
-        // userspace address; NULL is not a malformed registration header.
-        return Err(AxError::BadAddress);
-    }
+    // Linux attempts the userspace iovec access for a NULL argument before it
+    // applies the registration count validation. Keep this early return
+    // bounded: it performs no allocation and never walks an arbitrary count.
+    let count = registered_buffer_count(argument, count)?;
     let address = usize::try_from(argument).map_err(|_| AxError::BadAddress)?;
-    let bytes = count
-        .checked_mul(size_of::<IoVec>())
-        .ok_or(AxError::BadAddress)?;
-    address.checked_add(bytes).ok_or(AxError::BadAddress)?;
-    let mut descriptors = Vec::<MaybeUninit<IoVec>>::new();
-    descriptors
-        .try_reserve_exact(count)
-        .map_err(|_| AxError::NoMemory)?;
-    descriptors.resize_with(count, MaybeUninit::uninit);
-    capability
-        .read_slice(address as *const IoVec, &mut descriptors)
-        .map_err(map_usercopy_error)?;
-
     let mut buffers = Vec::new();
     buffers
         .try_reserve_exact(count)
         .map_err(|_| AxError::NoMemory)?;
-    for descriptor in descriptors {
-        // SAFETY: `read_slice` initialized every descriptor before returning.
-        let descriptor = unsafe { descriptor.assume_init() };
-        if descriptor.iov_len <= 0 {
+    for index in 0..count {
+        let offset = index
+            .checked_mul(size_of::<IoVec>())
+            .ok_or(AxError::BadAddress)?;
+        let descriptor_address = address.checked_add(offset).ok_or(AxError::BadAddress)?;
+        // Copy and validate one descriptor at a time. Linux does not first
+        // import the complete array and then inspect all lengths; doing so
+        // would let a later malformed entry mask an earlier bad userspace
+        // range (and would touch more user memory than necessary).
+        let descriptor = capability
+            .read_value(descriptor_address as *const IoVec)
+            .map_err(map_usercopy_error)?;
+        if descriptor.iov_len < 0 {
             return Err(AxError::InvalidInput);
         }
         let length = usize::try_from(descriptor.iov_len).map_err(|_| AxError::InvalidInput)?;
         let address = descriptor.iov_base as usize;
-        address.checked_add(length).ok_or(AxError::BadAddress)?;
+        validate_registered_buffer_range(address, length)?;
+        // Linux pins/validates each entry before fetching the next one. Keep
+        // that order so an inaccessible earlier range cannot be masked by a
+        // malformed later descriptor.
+        check_user_writable_with(capability, address, length)?;
         buffers.push((address, length));
     }
-    // Validate/populate all ranges before any long-lived pin is installed.
-    // This keeps malformed or inaccessible later iovecs from publishing a
-    // partially visible table while retaining NoMemory versus bad-address
-    // errors from the explicit user-memory capability.
-    for &(address, length) in &buffers {
-        check_user_writable_with(capability, address, length)?;
-    }
     Ok(buffers)
+}
+
+fn registered_buffer_count(argument: u64, count: u32) -> AxResult<usize> {
+    if argument == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let count = usize::try_from(count).map_err(|_| AxError::InvalidInput)?;
+    if count == 0 || count > thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS as usize {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(count)
 }
 
 fn register_probe(
@@ -296,11 +319,11 @@ fn retain_submission_buffer(
     ring.acquire_registered_buffer(slot, address, length)
 }
 
-fn submission_io_capability(
-    caller: &UserMemoryCapability,
+fn submission_io_capability<T: Clone>(
+    caller: &T,
     fixed: bool,
-    registered: impl FnOnce() -> AxResult<UserMemoryCapability>,
-) -> AxResult<UserMemoryCapability> {
+    registered: impl FnOnce() -> AxResult<T>,
+) -> AxResult<T> {
     if fixed {
         registered()
     } else {
@@ -798,13 +821,35 @@ pub fn sys_io_uring_enter(
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::mem::MaybeUninit;
 
-    use axhal::paging::{MappingFlags, PageSize};
-    use axsync::Mutex;
-    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+    use spin::Mutex;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct TestIoCapability {
+        address_space: Arc<Mutex<[u8; 1]>>,
+    }
+
+    impl TestIoCapability {
+        fn new() -> Self {
+            Self {
+                address_space: Arc::new(Mutex::new([0])),
+            }
+        }
+
+        fn address_space(&self) -> &Arc<Mutex<[u8; 1]>> {
+            &self.address_space
+        }
+
+        fn read_byte(&self) -> u8 {
+            self.address_space.lock()[0]
+        }
+
+        fn write_byte(&self, value: u8) {
+            self.address_space.lock()[0] = value;
+        }
+    }
 
     #[test]
     fn policy_failures_keep_malformed_and_buffer_range_distinct() {
@@ -827,6 +872,56 @@ mod tests {
     }
 
     #[test]
+    fn registered_buffer_range_overflow_errno_matches_linux_ordering() {
+        let overflow = |address, length| {
+            LinuxError::from(validate_registered_buffer_range(address, length).unwrap_err())
+        };
+
+        assert_eq!(overflow(0x1000, 0), LinuxError::EFAULT);
+
+        // Both the byte end and its page cover must be checked before the
+        // user-memory access check, and both are EOVERFLOW on Linux.
+        assert_eq!(overflow(usize::MAX - 1, 2), LinuxError::EOVERFLOW);
+        assert_eq!(
+            overflow(usize::MAX - PAGE_SIZE_4K, 2),
+            LinuxError::EOVERFLOW
+        );
+
+        // Linux rejects an over-SZ_1T descriptor as EINVAL before considering
+        // a potentially overflowing address expression.
+        assert_eq!(
+            overflow(0x1000, REGISTERED_BUFFER_MAX_LEN + 1),
+            LinuxError::EINVAL
+        );
+    }
+
+    #[test]
+    fn registered_buffer_count_keeps_null_usercopy_precedence_bounded() {
+        assert_eq!(
+            LinuxError::from(registered_buffer_count(0, 0).unwrap_err()),
+            LinuxError::EFAULT
+        );
+        assert_eq!(
+            LinuxError::from(registered_buffer_count(0, u32::MAX).unwrap_err()),
+            LinuxError::EFAULT
+        );
+        assert_eq!(
+            LinuxError::from(registered_buffer_count(1, 0).unwrap_err()),
+            LinuxError::EINVAL
+        );
+        assert_eq!(
+            LinuxError::from(
+                registered_buffer_count(
+                    1,
+                    thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS + 1,
+                )
+                .unwrap_err(),
+            ),
+            LinuxError::EINVAL
+        );
+    }
+
+    #[test]
     fn default_batch_stops_after_a_submission_failure() {
         assert!(SubmissionOutcome::FailedDuringSubmission.stops_default_batch());
         assert!(!SubmissionOutcome::Accepted.stops_default_batch());
@@ -834,21 +929,8 @@ mod tests {
 
     #[test]
     fn fixed_submission_keeps_registration_address_space() {
-        let mut registered =
-            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap();
-        registered
-            .map(
-                VirtAddr::from(0x1000),
-                PAGE_SIZE_4K,
-                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
-                false,
-                crate::mm::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
-            )
-            .unwrap();
-        let registered = UserMemoryCapability::new(Arc::new(Mutex::new(registered)));
-        let caller = UserMemoryCapability::new(Arc::new(Mutex::new(
-            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap(),
-        )));
+        let registered = TestIoCapability::new();
+        let caller = TestIoCapability::new();
 
         let selected = submission_io_capability(&caller, true, || Ok(registered.clone()))
             .expect("fixed operation must use its registration capability");
@@ -861,13 +943,9 @@ mod tests {
             caller.address_space()
         ));
 
-        selected.write_bytes(0x1000, &[0x5a]).unwrap();
-        let mut value = [MaybeUninit::<u8>::uninit()];
-        registered.read_bytes(0x1000, &mut value).unwrap();
-        // SAFETY: the selected capability initialized the mapped byte.
-        assert_eq!(unsafe { value[0].assume_init() }, 0x5a);
-        let mut wrong_space = [MaybeUninit::<u8>::uninit()];
-        assert!(caller.read_bytes(0x1000, &mut wrong_space).is_err());
+        selected.write_byte(0x5a);
+        assert_eq!(registered.read_byte(), 0x5a);
+        assert_eq!(caller.read_byte(), 0);
 
         let ordinary = submission_io_capability(&caller, false, || {
             panic!("ordinary I/O must not ask for a registered capability")

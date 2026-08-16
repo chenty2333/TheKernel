@@ -33,6 +33,7 @@ AX_PACKAGES=(
 )
 LINUX_ABI_PACKAGES=(
     thekernel-linux-usercopy
+    thekernel-linux-rseq
     thekernel-linux-cred
     thekernel-linux-mm
     thekernel-linux-packet
@@ -51,12 +52,15 @@ CONSUMED_PACKAGES=(
     thekernel-axpmu
     thekernel-axtask
     thekernel-axtlb
+    thekernel-linux-usercopy
+    thekernel-linux-rseq
     thekernel-linux-cred
     thekernel-linux-mm
     thekernel-linux-packet
     thekernel-linux-io-uring
     thekernel-linux-seccomp
     thekernel-linux-process
+    thekernel-linux-signal
     thekernel-linux-vfs
     thekernel-linux-fd
 )
@@ -332,11 +336,15 @@ printf '[release-consumer] package Linux-ABI dependency roots at %.12s\n' \
     CARGO_TARGET_DIR="$archive_root/linux-abi" \
         cargo "+$PACKAGE_TOOLCHAIN" package \
             --locked --no-verify \
-            -p thekernel-linux-usercopy
+            -p thekernel-linux-usercopy \
+            -p thekernel-linux-rseq
 )
 usercopy_archive="$archive_root/linux-abi/package/thekernel-linux-usercopy-$VERSION.crate"
 [ -f "$usercopy_archive" ] \
     || ci_die "thekernel-linux-usercopy package archive is missing before dependent packaging"
+rseq_archive="$archive_root/linux-abi/package/thekernel-linux-rseq-$VERSION.crate"
+[ -f "$rseq_archive" ] \
+    || ci_die "thekernel-linux-rseq package archive is missing before dependent packaging"
 
 cargo "+$PACKAGE_TOOLCHAIN" vendor \
     --manifest-path "$linux_abi_package_repo/Cargo.toml" \
@@ -378,6 +386,7 @@ printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
         cargo "+$PACKAGE_TOOLCHAIN" -Z package-workspace package \
             --locked --offline --no-verify --registry crates-io \
             -p thekernel-linux-usercopy \
+            -p thekernel-linux-rseq \
             -p thekernel-linux-cred \
             -p thekernel-linux-mm \
             -p thekernel-linux-packet \
@@ -492,8 +501,11 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-linux-abi/crates/io-uring=../artifacts/thekernel-linux-io-uring-$VERSION" \
     --replace "../thekernel-linux-abi/crates/seccomp=../artifacts/thekernel-linux-seccomp-$VERSION" \
     --replace "../thekernel-linux-abi/crates/process=../artifacts/thekernel-linux-process-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/rseq=../artifacts/thekernel-linux-rseq-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/signal=../artifacts/thekernel-linux-signal-$VERSION" \
     --replace "../thekernel-linux-abi/crates/vfs=../artifacts/thekernel-linux-vfs-$VERSION" \
     --replace "../thekernel-linux-abi/crates/fd=../artifacts/thekernel-linux-fd-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/usercopy=../artifacts/thekernel-linux-usercopy-$VERSION" \
     --forbid-text '../thekernel-ax/' \
     --forbid-text '../thekernel-linux-abi/' \
     --record "$rewrite_record"
@@ -502,7 +514,12 @@ lock_before=$(sha256sum "$consumer_root/Cargo.lock" | awk '{print $1}')
 metadata_path="$work_dir/consumer-metadata.json"
 (
     cd "$consumer_root"
-    cargo metadata --locked --format-version 1 --features qemu >"$metadata_path"
+    # Audit the union consumed by the two builds below. axpmu is deliberately
+    # optional in the normal qemu product and becomes reachable only in the
+    # ASID/PMU diagnostics profile.
+    cargo metadata --locked --format-version 1 \
+        --features qemu,asid-switch-diagnostics,pmu-diagnostics \
+        >"$metadata_path"
 )
 lock_after_metadata=$(sha256sum "$consumer_root/Cargo.lock" | awk '{print $1}')
 [ "$lock_after_metadata" = "$lock_before" ] \

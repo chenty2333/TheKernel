@@ -935,13 +935,7 @@ pub fn set_current_user_address_space(token: AddressSpaceToken) {
 /// updates both the saved scheduler image and the registers currently owned by
 /// this CPU, so the next executable cannot inherit the old image's FP state.
 pub fn reset_current_task_extended_state() {
-    let _guard = NoPreemptIrqSave::new();
-    let curr = current();
-    // SAFETY: preemption and interrupts are disabled, and this is the task
-    // executing on the current CPU; no scheduler path can access its context
-    // concurrently while the reset is in progress.
-    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
-    unsafe { (*curr_ptr).ctx_mut().reset_extended_state() };
+    super::signal::reset_current_legacy_fp_state();
 }
 
 struct ProcessPtraceExitRetirements {

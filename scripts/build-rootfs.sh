@@ -149,6 +149,7 @@ build_guest_tool exec-smoke.c thekernel-exec-smoke
 build_guest_tool epoll-smoke.c thekernel-epoll-smoke -pthread
 build_guest_tool futex-smoke.c thekernel-futex-smoke -pthread
 build_guest_tool io-uring-smoke.c thekernel-io-uring-smoke
+build_guest_tool io-uring-buffers-smoke.c thekernel-io-uring-buffers-smoke -pthread
 build_guest_tool io-pin-safety.c thekernel-io-pin-safety -pthread
 build_guest_tool memory-pressure-smoke.c thekernel-memory-pressure-smoke
 build_guest_tool mm-performance.c thekernel-mm-performance -pthread
@@ -164,6 +165,7 @@ build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
 build_guest_tool pause-smoke.c thekernel-pause-smoke
 build_guest_tool seccomp-smoke.c thekernel-seccomp-smoke -pthread
 build_guest_tool signal-order-smoke.c thekernel-signal-order-smoke
+build_guest_tool signal-fp-smoke.c thekernel-signal-fp-smoke
 build_guest_tool sync-fence.c thekernel-sync-fence
 build_guest_tool userfaultfd-smoke.c thekernel-userfaultfd-smoke -pthread
 build_guest_tool wait-boundary.c thekernel-wait-boundary -pthread

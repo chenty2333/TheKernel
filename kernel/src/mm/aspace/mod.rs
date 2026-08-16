@@ -152,6 +152,19 @@ static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MAPPING_ID: AtomicU64 = AtomicU64::new(2);
 static USER_IO_PIN_BUDGET: SpinNoIrq<Option<UserIoPinBudget>> = SpinNoIrq::new(None);
 
+/// Exact private-COW frames retained by one active long-term writable pin.
+///
+/// The physical identity, rather than the registration-time VA, is retained:
+/// active long-term pins deliberately allow later remap/unmap operations while
+/// their lower owner remains live.  Fork can therefore ask whether the frame
+/// currently present at a private-COW leaf is owned by this address
+/// space's pin, without conservatively copying unrelated globally pinned
+/// frames.
+struct ActiveLongTermCowPin {
+    token: PinToken,
+    frames: Vec<PhysAddr>,
+}
+
 fn allocate_nonwrapping_id(sequence: &AtomicU64) -> AxResult<u64> {
     sequence
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -324,6 +337,22 @@ fn mapping_identity(
     lineage: MappingLineage,
 ) -> AxResult<MappingIdentityState> {
     identities.get(lineage).ok_or(AxError::BadState)
+}
+
+/// Derives long-term user-I/O admission from the concrete lower owner that
+/// keeps the mapping's pages stable. Device/linear mappings have no such
+/// owner. A writable file-backed shared mapping additionally needs an owner
+/// that records dirty/writeback state; currently only `FileBackend` provides
+/// that contract through `CachedFilePagePin`.
+fn mapping_user_io_pin_policy(backend: &Backend) -> (bool, bool) {
+    match backend {
+        Backend::Linear(_) => (false, false),
+        Backend::Cow(_) => (true, false),
+        // SharedPages has an exact frame owner, but it does not itself carry
+        // the dirty/writeback contract required for writable FileShared pins.
+        Backend::Shared(_) => (true, false),
+        Backend::File(_) => (true, true),
+    }
 }
 
 fn reserve_mapping_identity_slot(identities: &mut MappingIdentityIndex, limit: usize) -> AxResult {
@@ -983,6 +1012,7 @@ pub struct AddrSpace {
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
     user_io_pins: UserIoPinRegistry,
+    active_long_term_cow_pins: Vec<ActiveLongTermCowPin>,
     pub(super) uffd: Option<Box<super::userfaultfd::UffdAddressSpaceState>>,
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
@@ -1403,6 +1433,10 @@ impl AddrSpace {
         let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
             new_user_io_policy()?;
         let hardware_asid = reserve_hardware_address_space_id();
+        let mut active_long_term_cow_pins = Vec::new();
+        active_long_term_cow_pins
+            .try_reserve_exact(USER_IO_PIN_MAX_TOKENS as usize)
+            .map_err(|_| AxError::NoMemory)?;
         Ok(Self {
             va_range,
             address_space_id,
@@ -1417,6 +1451,7 @@ impl AddrSpace {
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
             user_io_pins,
+            active_long_term_cow_pins,
             uffd: None,
             lock_future_mappings: false,
             lock_future_on_fault: false,
@@ -1911,17 +1946,65 @@ impl AddrSpace {
     ///
     /// Every per-VMA operation has already completed in bounded windows, so
     /// this final address-space critical section is constant-time.
-    pub(crate) fn commit_user_io_pin(&mut self, reservation: PinReservation) -> AxResult<PinToken> {
-        self.user_io_pins.commit(reservation).map_err(mm_error)
+    pub(crate) fn commit_user_io_pin(
+        &mut self,
+        reservation: PinReservation,
+        cow_frames: &mut Vec<PhysAddr>,
+    ) -> AxResult<PinToken> {
+        let request = self
+            .user_io_pins
+            .view(reservation.token())
+            .map_err(mm_error)?
+            .request();
+        let tracks_cow_frames = request.duration() == thekernel_linux_mm::PinDuration::LongTerm
+            && request.access() == thekernel_linux_mm::PinAccess::Write
+            && !cow_frames.is_empty();
+        if tracks_cow_frames
+            && self.active_long_term_cow_pins.len() == self.active_long_term_cow_pins.capacity()
+        {
+            return Err(AxError::ResourceBusy);
+        }
+
+        let token = self.user_io_pins.commit(reservation).map_err(mm_error)?;
+        if tracks_cow_frames {
+            self.active_long_term_cow_pins.push(ActiveLongTermCowPin {
+                token,
+                frames: core::mem::take(cow_frames),
+            });
+        }
+        Ok(token)
     }
 
-    pub(crate) fn end_user_io_pin(&mut self, token: PinToken) {
+    pub(crate) fn end_user_io_pin(&mut self, token: PinToken) -> Option<Vec<PhysAddr>> {
         if let Err(error) = self.user_io_pins.release(token) {
             warn!(
                 "AddrSpace::end_user_io_pin: token {}: {error:?}",
                 token.get()
             );
+            return None;
         }
+        self.active_long_term_cow_pins
+            .iter()
+            .position(|pin| pin.token == token)
+            .map(|index| self.active_long_term_cow_pins.swap_remove(index).frames)
+    }
+
+    fn active_long_term_cow_frames(&self) -> AxResult<Vec<PhysAddr>> {
+        let count = self
+            .active_long_term_cow_pins
+            .iter()
+            .try_fold(0usize, |count, pin| count.checked_add(pin.frames.len()))
+            .ok_or(AxError::NoMemory)?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(count)
+            .map_err(|_| AxError::NoMemory)?;
+        for pin in &self.active_long_term_cow_pins {
+            frames.extend_from_slice(&pin.frames);
+        }
+        frames.sort_unstable();
+        frames.dedup();
+        Ok(frames)
     }
 
     pub fn user_io_pin_overlaps(&self, start: VirtAddr, size: usize) -> bool {
@@ -2134,6 +2217,8 @@ impl AddrSpace {
         let identity = mapping_identity(mapping_identities, area.lineage())?;
         let range =
             PageRange::new(area.start().as_usize(), area.size(), PAGE_SIZE_4K).map_err(mm_error)?;
+        let (long_term_pinnable, writable_file_pin_supported) =
+            mapping_user_io_pin_policy(area.backend());
         Ok(MappingSnapshot::new(
             address_space_id,
             identity.id,
@@ -2145,8 +2230,8 @@ impl AddrSpace {
                 flags.contains(MappingFlags::EXECUTE),
             ),
             area.backend().linux_mapping_kind(),
-            false,
-            false,
+            long_term_pinnable,
+            writable_file_pin_supported,
         ))
     }
 
@@ -2284,6 +2369,8 @@ impl AddrSpace {
         }
 
         let identity = mapping_identity(mapping_identities, run.left_area.lineage())?;
+        let (long_term_pinnable, writable_file_pin_supported) =
+            mapping_user_io_pin_policy(run.left_area.backend());
         let post = MappingSnapshot::new(
             address_space_id,
             identity.id,
@@ -2295,8 +2382,8 @@ impl AddrSpace {
                 run.flags.contains(MappingFlags::EXECUTE),
             ),
             run.left_area.backend().linux_mapping_kind(),
-            false,
-            false,
+            long_term_pinnable,
+            writable_file_pin_supported,
         );
         if post.address_space() != registration.address_space()
             || post.mapping() != registration.mapping()
@@ -3878,6 +3965,7 @@ impl AddrSpace {
         self.wipe_on_fork_ranges.clear();
         self.dontfork_ranges.clear();
         self.locked_ranges.clear();
+        debug_assert!(self.active_long_term_cow_pins.is_empty());
         self.user_io_pins.begin_teardown().map_err(mm_error)?;
         self.user_io_pins.finish_teardown().map_err(mm_error)?;
         (
@@ -4127,12 +4215,16 @@ impl AddrSpace {
     /// size, then iterates over all memory areas in the original address
     /// space to copy or share their mappings into the new one.
     pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
-        if self.user_io_pins.progress().total() != 0 {
+        if self.user_io_pins.has_clone_blocker() {
             return Err(AxError::ResourceBusy);
         }
         if self.fork_fragment_count()? > MAX_VMA_FRAGMENTS {
             return Err(AxError::NoMemory);
         }
+        // Resolve owner-aware physical identities before any parent PTE is
+        // COW-protected. Allocation failure therefore leaves fork entirely
+        // unpublished and the parent untouched.
+        let active_long_term_cow_frames = self.active_long_term_cow_frames()?;
 
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
         let next_topology_generation = self.next_topology_generation()?;
@@ -4243,6 +4335,7 @@ impl AddrSpace {
                             &mut self_modify,
                             &mut new_modify,
                             &new_aspace_clone,
+                            &active_long_term_cow_frames,
                         )?
                     };
                     // Fork keeps the segment at the same virtual address. In
@@ -4319,6 +4412,7 @@ impl fmt::Debug for AddrSpace {
 impl Drop for AddrSpace {
     fn drop(&mut self) {
         debug_assert_eq!(self.user_io_pins.progress().total(), 0);
+        debug_assert!(self.active_long_term_cow_pins.is_empty());
         if let Err(err) = self.clear_areas_with_tlb_grace() {
             warn!("AddrSpace::drop: failed to unmap all areas: {err:?}");
         }
@@ -4365,6 +4459,29 @@ mod tests {
                 .unwrap();
         }
         identities
+    }
+
+    #[test]
+    fn long_term_pin_policy_follows_exact_lower_owner_capability() {
+        let start = VirtAddr::from(0x4000);
+        let cow = Backend::new_alloc(start, PageSize::Size4K);
+        let linear = Backend::new_linear(start, PhysAddr::from(0x8000), PAGE_SIZE_4K);
+
+        assert_eq!(mapping_user_io_pin_policy(&cow), (true, false));
+        assert_eq!(mapping_user_io_pin_policy(&linear), (false, false));
+    }
+
+    #[test]
+    fn anonymous_shared_long_term_pin_does_not_claim_file_writeback() {
+        let shared = Backend::new_shared(
+            VirtAddr::from(0x4000),
+            Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap()),
+        );
+        assert_eq!(mapping_user_io_pin_policy(&shared), (true, false));
+
+        // SharedPages teardown takes the kernel mutex; the host unit-test
+        // environment has no current task even for this zero-page fixture.
+        core::mem::forget(shared);
     }
 
     #[test]

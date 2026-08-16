@@ -564,6 +564,7 @@ impl BackendOps for SharedBackend {
         _old_pt: &mut PageTableCursor,
         _new_pt: &mut PageTableCursor,
         _new_aspace: &Arc<Mutex<AddrSpace>>,
+        _active_long_term_cow_frames: &[PhysAddr],
     ) -> AxResult<Backend> {
         Ok(Backend::Shared(self.clone()))
     }
@@ -616,7 +617,7 @@ impl Backend {
 /// prevalidated ownership into the VMA backend and performs no allocation.
 pub(crate) struct PreparedFixedSharedMapping {
     pages: Arc<SharedPages>,
-    owner: DeferredFileLease,
+    owner: Option<DeferredFileLease>,
     ofd_key: u64,
     object_offset: u64,
     initial_flags: MappingFlags,
@@ -644,8 +645,12 @@ impl PreparedFixedSharedMapping {
             })
             .map_err(|_| AxError::TooManyOpenFiles)?;
         let ofd_key = handle.open_file_description_key();
-        let retained: Arc<dyn Any + Send + Sync> = pages.clone();
-        let owner = DeferredFileLease::try_new(handle, retained)?;
+        let owner = if plan.retains_description() {
+            let retained: Arc<dyn Any + Send + Sync> = pages.clone();
+            Some(DeferredFileLease::try_new(handle, retained)?)
+        } else {
+            None
+        };
         let may_protect = mapping_flags(plan.may_protect());
         Ok(Self {
             pages: plan.into_pages(),
@@ -668,15 +673,26 @@ impl PreparedFixedSharedMapping {
             may_protect,
             map_id,
         } = self;
-        let mapping = FileLikeMappingLease::new(
-            owner,
-            ofd_key,
-            start,
-            object_offset,
-            initial_flags,
-            may_protect,
-            FileMappingSharing::Shared,
-        );
+        let mapping = match owner {
+            Some(owner) => FileLikeMappingLease::new(
+                owner,
+                ofd_key,
+                start,
+                object_offset,
+                initial_flags,
+                may_protect,
+                FileMappingSharing::Shared,
+            ),
+            None => FileLikeMappingLease::new_detached(
+                map_id as usize,
+                ofd_key,
+                start,
+                object_offset,
+                initial_flags,
+                may_protect,
+                FileMappingSharing::Shared,
+            ),
+        };
         Backend::Shared(SharedBackend {
             start,
             page_offset: 0,

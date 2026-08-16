@@ -194,7 +194,8 @@ impl FileMappingLease {
 /// dropping the final fragment only publishes task-context cleanup work.
 #[derive(Clone)]
 pub(crate) struct FileLikeMappingLease {
-    owner: DeferredFileLease,
+    owner: Option<DeferredFileLease>,
+    owner_identity: usize,
     ofd_key: u64,
     initial_flags: MappingFlags,
     may_protect: MappingFlags,
@@ -215,7 +216,29 @@ impl FileLikeMappingLease {
         sharing: FileMappingSharing,
     ) -> Self {
         Self {
-            owner,
+            owner_identity: owner.identity(),
+            owner: Some(owner),
+            ofd_key,
+            initial_flags,
+            may_protect,
+            sharing,
+            mapping_start,
+            object_offset,
+        }
+    }
+
+    pub(crate) fn new_detached(
+        owner_identity: usize,
+        ofd_key: u64,
+        mapping_start: VirtAddr,
+        object_offset: u64,
+        initial_flags: MappingFlags,
+        may_protect: MappingFlags,
+        sharing: FileMappingSharing,
+    ) -> Self {
+        Self {
+            owner: None,
+            owner_identity,
             ofd_key,
             initial_flags,
             may_protect,
@@ -261,7 +284,10 @@ impl FileLikeMappingLease {
     }
 
     fn compatible_with(&self, other: &Self) -> bool {
-        self.owner.identity() == other.owner.identity()
+        matches!(
+            (&self.owner, &other.owner),
+            (Some(_), Some(_)) | (None, None)
+        ) && self.owner_identity == other.owner_identity
             && self.ofd_key == other.ofd_key
             && self.initial_flags == other.initial_flags
             && self.may_protect == other.may_protect
@@ -682,5 +708,32 @@ mod tests {
         assert!(drain_deferred_file_lease_for_test());
         assert_eq!(drops.load(Ordering::Acquire), 1);
         drain_deferred_description_resource_only_for_test();
+    }
+
+    #[test]
+    fn detached_file_like_mapping_preserves_sidecar_identity_without_an_ofd_owner() {
+        let mapping = FileLikeMappingLease::new_detached(
+            17,
+            29,
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            FileMappingSharing::Shared,
+        );
+        let fragment = mapping.clone();
+        let other_mapping = FileLikeMappingLease::new_detached(
+            18,
+            29,
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            FileMappingSharing::Shared,
+        );
+
+        assert!(mapping.owner.is_none());
+        assert!(mapping.compatible_with(&fragment));
+        assert!(!mapping.compatible_with(&other_mapping));
     }
 }
