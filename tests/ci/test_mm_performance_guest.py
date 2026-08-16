@@ -76,7 +76,7 @@ class MmPerformanceGuestTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=host "
+            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=x86_64 "
             "iterations=1 vmas=4 pin_iterations=1 pin_workers=2 "
             f"page_size={os.sysconf('SC_PAGESIZE')}",
             result.stdout,

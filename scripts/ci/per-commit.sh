@@ -11,10 +11,9 @@ LOG_DIR="$REPO_ROOT/.state/ci/per-commit/$default_log_id"
 STEP_TIMEOUT_SECS=${THEKERNEL_CI_STEP_TIMEOUT_SECS:-900}
 AX_REPO=${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}
 LINUX_ABI_REPO=${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}
-# Maintained Linux-ABI crates retain their own compatibility baseline. This is
-# deliberately independent of TheKernel's root nightly and must track the
-# sibling workspace's rust-toolchain.toml instead.
-LINUX_ABI_COMPAT_TOOLCHAIN=${THEKERNEL_LINUX_ABI_COMPAT_TOOLCHAIN:-nightly-2025-05-20}
+# Maintained Linux-ABI crates use the same rolling compiler channel as
+# TheKernel's root workspace. Keep the override for local compatibility checks.
+LINUX_ABI_COMPAT_TOOLCHAIN=${THEKERNEL_LINUX_ABI_COMPAT_TOOLCHAIN:-nightly}
 
 usage() {
     cat <<'EOF'
@@ -24,8 +23,8 @@ Runs the reusable per-commit gate: diff whitespace checks, rustfmt, vendored
 source provenance validation, project tool tests, a host kernel check, and
 focused tests for the maintained ax/Linux-ABI cores, local adapters, fallible
 lifecycle, VFS, signal, user-copy, and vendored UDP contracts that currently
-change most often. Broader network, filesystem, and cross-architecture behavior
-belongs to the PR and nightly gates.
+change most often. Broader network, filesystem, and boot behavior belongs to
+the PR and nightly gates.
 
 CI_DIFF_BASE may name a merge base. When absent, the committed HEAD^..HEAD
 diff is checked in addition to staged and unstaged changes.
@@ -156,14 +155,14 @@ ci_run_step kernel-full-suite "$STEP_TIMEOUT_SECS" \
     cargo test --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf,axtask/test --target x86_64-unknown-linux-gnu
 
-# Clippy runs on the host test profile and on one architecture. The two answer
-# different questions: `dead_code` and drop-glue lints are configuration
-# sensitive, and a `c_char` cast that is redundant on riscv64 is required on the
-# x86_64 host. The remaining architecture is covered by the PR gate.
+# Clippy runs on the host test profile and the x86_64 kernel profile. The two
+# answer different questions: `dead_code` and drop-glue lints are configuration
+# sensitive, and architecture-specific usercopy casts are load-bearing in the
+# kernel profile.
 ci_run_step clippy-host "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/clippy-gate.sh" --profile host
-ci_run_step clippy-rv "$STEP_TIMEOUT_SECS" \
-    "$SCRIPT_DIR/clippy-gate.sh" --profile rv
+ci_run_step clippy-x86_64 "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/clippy-gate.sh" --profile x86_64
 
 ci_run_step kernel-keyring-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
@@ -660,6 +659,10 @@ ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-process
+ci_run_step signal-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-signal --all-features
 ci_run_step linux-vfs-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
@@ -726,11 +729,5 @@ ci_run_step axnet-vsock-tests "$STEP_TIMEOUT_SECS" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
     "$SCRIPT_DIR/focused-cargo-test.sh" crates/axnet-ng/Cargo.toml \
     --features axtask/test,vsock -- --test-threads=1
-ci_run_step signal-tests "$STEP_TIMEOUT_SECS" \
-    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/starry-signal/Cargo.toml \
-    -- --test-threads=1
-ci_run_step usercopy-tests "$STEP_TIMEOUT_SECS" \
-    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/starry-vm/Cargo.toml
-
 printf 'per-commit gate: PASS\n'
 printf 'logs: %s\n' "$CI_LOG_DIR"

@@ -11,12 +11,12 @@ MEASUREMENT_MODES = frozenset({"product", "diagnostic"})
 # Where the measurement physically ran. QEMU TCG establishes correctness and
 # relative regression evidence only; absolute performance and architectural
 # event claims require `physical` evidence, which carries its own receipt
-# authority once the hardware bring-up lands (RFC 0008). The vocabulary is
+# authority once the hardware bring-up lands. The vocabulary is
 # reserved now so a TCG receipt can never masquerade as a physical one.
 PLATFORM_CLASSES = frozenset({"qemu-tcg", "physical"})
 # Which counter mechanism produced any PMU-derived numbers in the bundle.
-PMU_SOURCES = frozenset({"none", "sbi-pmu", "loongarch-pmcfg"})
-PMU_SOURCE_BY_ARCH = {"rv": "sbi-pmu", "la": "loongarch-pmcfg"}
+PMU_SOURCES = frozenset({"none", "platform"})
+PMU_SOURCE_BY_ARCH = {"x86_64": "platform"}
 # Sentinel for platform fields that do not apply to the row's platform class.
 PLATFORM_NOT_APPLICABLE = "not-applicable"
 # The only frequency policy under which physical latency numbers are

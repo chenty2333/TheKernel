@@ -30,7 +30,7 @@ def complete_log(
         f"cpu_ids={cpu_ids} cpu_ids_complete=1"
     )
     records.append(
-        "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=rv "
+        "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=x86_64 "
         f"iterations={iterations} vmas={vmas} "
         f"pin_iterations={pin_iterations} pin_workers={pin_workers} "
         "page_size=4096"
@@ -141,7 +141,7 @@ class MmPerformanceParserTests(unittest.TestCase):
                     str(PARSER),
                     str(log),
                     "--arch",
-                    "rv",
+                    "x86_64",
                     "--cpus",
                     str(cpus),
                 ]
@@ -173,7 +173,7 @@ class MmPerformanceParserTests(unittest.TestCase):
             lines[0].split("\t")[:5],
             ["arch", "requested_cpus", "online_cpus", "metric", "status"],
         )
-        self.assertIn("rv\t4\t4\tvma_scale\tok\t100\t10\t20\t30", lines[1])
+        self.assertIn("x86_64\t4\t4\tvma_scale\tok\t100\t10\t20\t30", lines[1])
         self.assertIn(
             "\tmremap_fixed_replace_latency\tok\t100\t10\t20\t30\t-\t512\t512",
             lines[3],
@@ -353,7 +353,7 @@ class MmPerformanceParserTests(unittest.TestCase):
 
     def test_rejects_missing_or_duplicate_run_record(self) -> None:
         record = (
-            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=rv "
+            "MM_PERF_RUN schema=thekernel-mm-performance-run-v3 arch=x86_64 "
             "iterations=100 vmas=512 pin_iterations=25 pin_workers=4 "
             "page_size=4096"
         )
@@ -366,7 +366,7 @@ class MmPerformanceParserTests(unittest.TestCase):
         self.assertIn("duplicate MM_PERF_RUN record", duplicate.stderr)
 
     def test_rejects_run_record_workload_or_arch_drift(self) -> None:
-        arch = self.run_parser(complete_log().replace("arch=rv", "arch=la", 1))
+        arch = self.run_parser(complete_log().replace("arch=x86_64", "arch=host", 1))
         self.assertEqual(arch.returncode, 1)
         self.assertIn("MM_PERF_RUN arch mismatch", arch.stderr)
 

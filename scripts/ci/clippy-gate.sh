@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci/clippy-gate.sh --profile host|rv|la [--target-dir DIR]
+Usage: scripts/ci/clippy-gate.sh --profile host|x86_64 [--target-dir DIR]
 
 Runs clippy over TheKernel-owned packages and fails on any remaining owned
 diagnostic. Vendored sources under third_party/rust-patches and the maintained
@@ -19,8 +19,7 @@ printed so that a clean owned report never implies a clean tree.
 Profiles:
   host  x86_64 host test build, including `--tests`. Answers lints about test
         code and about generic paths the architecture builds share.
-  rv    riscv64gc-unknown-none-elf kernel build.
-  la    loongarch64-unknown-none-softfloat kernel build.
+  x86_64 x86_64-unknown-none kernel build.
 
 Configuration-sensitive lints report different facts per profile: a symbol
 unreachable in the host test build is often the live architecture path, and
@@ -57,8 +56,8 @@ while (($#)); do
 done
 
 case "$PROFILE" in
-    host|rv|la) ;;
-    '') ci_die 'clippy-gate requires --profile host|rv|la' ;;
+    host|x86_64) ;;
+    '') ci_die 'clippy-gate requires --profile host|x86_64' ;;
     *) ci_die "unknown clippy profile: $PROFILE" ;;
 esac
 
@@ -116,13 +115,8 @@ fi
 # config, feature resolution, and RUSTFLAGS match the shipped image exactly.
 # A dedicated target directory keeps clippy from invalidating the build cache:
 # cargo fingerprints clippy-driver and rustc outputs into the same slots.
-if [ "$PROFILE" = rv ]; then
-    arch=riscv64
-    extra_make_args=(BUS=mmio)
-else
-    arch=loongarch64
-    extra_make_args=()
-fi
+arch=x86_64
+extra_make_args=(PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml)
 
 TARGET_DIR=${TARGET_DIR:-$REPO_ROOT/.state/$arch/clippy-target}
 mkdir -p -- "$TARGET_DIR" || ci_die "cannot create clippy target dir: $TARGET_DIR"

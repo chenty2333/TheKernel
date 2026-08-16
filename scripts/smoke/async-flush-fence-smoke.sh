@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ARCH=rv
+ARCH=x86_64
 WORKDIR=""
 ROOTFS_IMAGE=""
 ROOTFS_IMAGE_EXPLICIT=0
@@ -17,7 +17,7 @@ SKIP_KERNEL_BUILD=1
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
+Usage: $(basename "$0") [--arch x86_64] [--workdir DIR] [--rootfs IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
                          [--build-kernel]
 
@@ -76,8 +76,8 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la) ;;
-    *) die "--arch must be rv or la" ;;
+    x86_64) ;;
+    *) die "--arch must be x86_64" ;;
 esac
 case "$TIMEOUT_SECS" in
     ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
@@ -111,7 +111,6 @@ echo counters=on > /proc/io_test_control
 echo virtio_counters=on > /proc/io_test_control
 echo async_block=on > /proc/io_test_control
 echo async_block_depth=4 > /proc/io_test_control
-echo async_block_la_depth=2 > /proc/io_test_control
 echo async_block_wait=hybrid > /proc/io_test_control
 echo counters=reset > /proc/io_test_control
 rm -f /async_flush_fence

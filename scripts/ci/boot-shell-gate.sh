@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ARCH=both
+ARCH=x86_64
 default_log_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG_DIR="$REPO_ROOT/.state/ci/boot-shell/$default_log_id"
 TIMEOUT_SECS=${THEKERNEL_CI_BOOT_TIMEOUT_SECS:-300}
@@ -14,23 +14,21 @@ BUILD_TIMEOUT_SECS=${THEKERNEL_CI_BUILD_TIMEOUT_SECS:-3600}
 READY_TIMEOUT_SECS=${THEKERNEL_CI_READY_TIMEOUT_SECS:-120}
 LINE_DELAY_SECS=${THEKERNEL_CI_LINE_DELAY_SECS:-0.50}
 SKIP_BUILD=0
-RV_IMAGE=""
-LA_IMAGE=""
+X86_IMAGE=""
 
 usage() {
     cat <<'EOF'
 Usage: scripts/ci/boot-shell-gate.sh [OPTIONS]
 
 Options:
-  --arch {rv|la|both}    Architectures to gate (default: both)
+  --arch x86_64          Architecture to gate (default: x86_64)
   --log-dir DIR          Gate logs (default: unique run below .state/ci/boot-shell)
   --timeout SECS         QEMU timeout per architecture (default: 300)
   --build-timeout SECS   Shell-kernel build timeout per arch (default: 3600)
   --ready-timeout SECS   Fail unless the exact boot-shell marker appears (default: 120)
   --line-delay SECS      Delay between serial command lines (default: 0.50)
-  --rv-rootfs PATH       Explicit RISC-V root filesystem image
-  --la-rootfs PATH       Explicit LoongArch root filesystem image
-  --skip-build           Reuse .state/shell/kernel-{rv,la}
+  --x86-rootfs PATH      Explicit x86_64 root filesystem image
+  --skip-build           Reuse .state/shell/kernel-x86_64
 
 The gate uses repository-built root images unless explicit images are supplied.
 Every QEMU run is bounded and must emit all
@@ -46,8 +44,7 @@ while (($#)); do
         --build-timeout) BUILD_TIMEOUT_SECS=${2:-}; shift 2 ;;
         --ready-timeout) READY_TIMEOUT_SECS=${2:-}; shift 2 ;;
         --line-delay) LINE_DELAY_SECS=${2:-}; shift 2 ;;
-        --rv-rootfs) RV_IMAGE=${2:-}; shift 2 ;;
-        --la-rootfs) LA_IMAGE=${2:-}; shift 2 ;;
+        --x86-rootfs) X86_IMAGE=${2:-}; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) ci_die "unknown boot-shell argument: $1" ;;
@@ -55,8 +52,8 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la|both) ;;
-    *) ci_die "--arch must be rv, la, or both: $ARCH" ;;
+    x86|x86_64) ARCH=x86_64 ;;
+    *) ci_die "--arch must be x86_64: $ARCH" ;;
 esac
 ci_require_positive_int timeout "$TIMEOUT_SECS"
 ci_require_positive_int build_timeout "$BUILD_TIMEOUT_SECS"
@@ -109,21 +106,15 @@ EOF
 
 gate_arch() {
     local arch=$1
-    local kernel target rootfs_target image commands workdir
+    local kernel target rootfs_target image commands workdir esp
     case "$arch" in
-        rv)
-            kernel="$REPO_ROOT/.state/shell/kernel-rv"
-            target=kernel-rv-shell
-            rootfs_target=rootfs-rv
-            image=$RV_IMAGE
-            [ -n "$image" ] || image="$REPO_ROOT/.state/rootfs/rootfs-rv.img"
-            ;;
-        la)
-            kernel="$REPO_ROOT/.state/shell/kernel-la"
-            target=kernel-la-shell
-            rootfs_target=rootfs-la
-            image=$LA_IMAGE
-            [ -n "$image" ] || image="$REPO_ROOT/.state/rootfs/rootfs-la.img"
+        x86_64)
+            kernel="$REPO_ROOT/.state/shell/kernel-x86_64"
+            target=kernel-x86_64-shell
+            rootfs_target=rootfs-x86
+            image=$X86_IMAGE
+            [ -n "$image" ] || image="$REPO_ROOT/.state/rootfs/rootfs-x86.img"
+            esp="$REPO_ROOT/.state/uefi/shell-x86_64.esp"
             ;;
     esac
 
@@ -131,6 +122,7 @@ gate_arch() {
         ci_run_step "boot-build-$arch" "$BUILD_TIMEOUT_SECS" make "$target" "$rootfs_target"
     fi
     [ -s "$kernel" ] || ci_die "missing shell kernel for $arch: $kernel"
+    [ -s "$esp" ] || ci_die "missing shell kernel ESP for $arch: $esp"
 
     [ -s "$image" ] || ci_die "rootfs image is missing or empty: $image"
 
@@ -143,20 +135,13 @@ gate_arch() {
     ci_run_step "boot-qemu-$arch" "$((TIMEOUT_SECS + 90))" \
         "$SCRIPT_DIR/boot-shell-runner.sh" \
         "$arch" "$kernel" "$image" "$workdir" "$commands" \
-        "$TIMEOUT_SECS" "$READY_TIMEOUT_SECS" "$LINE_DELAY_SECS"
+        "$TIMEOUT_SECS" "$READY_TIMEOUT_SECS" "$LINE_DELAY_SECS" "" "" "$esp"
 
     ci_run_step "boot-validate-$arch" 30 \
         "$SCRIPT_DIR/validate-boot-log.sh" "$arch" "$workdir/qemu.log"
 }
 
-case "$ARCH" in
-    rv) gate_arch rv ;;
-    la) gate_arch la ;;
-    both)
-        gate_arch rv
-        gate_arch la
-        ;;
-esac
+gate_arch x86_64
 
 printf 'boot-shell gate: PASS (%s)\n' "$ARCH"
 printf 'logs: %s\n' "$LOG_DIR"

@@ -25,10 +25,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/pr-gate.sh [--log-dir DIR] [--skip-build]
 
-Validates the exact maintained-sibling release artifacts, builds both
-release-mode kernels, both boot-shell kernels, and the repository-built rootfs
-fixtures, then runs the strict dual-architecture boot-shell and semantic
-system-test gates.
+Validates the exact maintained-sibling release artifacts, builds the
+release-mode kernel, boot-shell kernel, and repository-built rootfs fixture,
+then runs the strict boot-shell and semantic system-test gates.
 
 The normal build path requires THEKERNEL_AX_REF and THEKERNEL_LINUX_ABI_REF to
 be the exact 40-hex commits provisioned by CI. --skip-build reuses existing
@@ -97,9 +96,9 @@ if [ "${THEKERNEL_PR_GATE_MATERIALIZED:-0}" != 1 ]; then
     materialized_repo="$materialization/sources/TheKernel"
     if [ "$SKIP_BUILD" -eq 1 ]; then
         for reuse_path in \
-            kernel-rv kernel-la \
-            .state/shell/kernel-rv .state/shell/kernel-la \
-            .state/rootfs/rootfs-rv.img .state/rootfs/rootfs-la.img
+            kernel-x86_64 \
+            .state/shell/kernel-x86_64 \
+            .state/rootfs/rootfs-x86.img
         do
             [ -s "$REPO_ROOT/$reuse_path" ] \
                 || ci_die "missing $reuse_path for --skip-build"
@@ -235,11 +234,9 @@ then
     ci_die 'PR gate requires clean TheKernel and maintained-sibling source worktrees'
 fi
 
-# The per-commit gate lints the host and riscv64 profiles. LoongArch closes the
-# remaining architecture here, where a cross toolchain is already required.
-# It runs before the build so a lint failure does not cost a full image.
-ci_run_step clippy-la "$BUILD_TIMEOUT_SECS" \
-    "$SCRIPT_DIR/clippy-gate.sh" --profile la
+# The per-commit gate lints the host and x86_64 profiles before the build.
+ci_run_step clippy-x86_64 "$BUILD_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/clippy-gate.sh" --profile x86_64
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     ci_require_positive_int release_consumer_timeout "$RELEASE_CONSUMER_TIMEOUT_SECS"
@@ -256,35 +253,29 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
     ci_run_step release-consumer "$RELEASE_CONSUMER_TIMEOUT_SECS" \
         "$SCRIPT_DIR/release-consumer-gate.sh" \
-        --arch both \
+        --arch x86_64 \
         --ax-head "$AX_REF" \
         --linux-abi-head "$LINUX_ABI_REF" \
         --output-release-set "$RELEASE_SET"
     ci_run_step release-kernels "$BUILD_TIMEOUT_SECS" make kernels
     ci_run_step release-shell-kernels "$BUILD_TIMEOUT_SECS" \
-        make kernel-rv-shell kernel-la-shell rootfs
+        make kernel-x86_64-shell rootfs-x86
 else
-    [ -s kernel-rv ] || ci_die 'missing kernel-rv for --skip-build'
-    [ -s kernel-la ] || ci_die 'missing kernel-la for --skip-build'
-    [ -s .state/shell/kernel-rv ] || ci_die 'missing shell RISC-V kernel for --skip-build'
-    [ -s .state/shell/kernel-la ] || ci_die 'missing shell LoongArch kernel for --skip-build'
-    [ -s .state/rootfs/rootfs-rv.img ] || ci_die 'missing RISC-V rootfs for --skip-build'
-    [ -s .state/rootfs/rootfs-la.img ] || ci_die 'missing LoongArch rootfs for --skip-build'
+    [ -s kernel-x86_64 ] || ci_die 'missing kernel-x86_64 for --skip-build'
+    [ -s .state/shell/kernel-x86_64 ] \
+        || ci_die 'missing x86_64 shell kernel for --skip-build'
+    [ -s .state/rootfs/rootfs-x86.img ] \
+        || ci_die 'missing x86_64 rootfs for --skip-build'
 fi
 
-ci_run_step dual-arch-boot "$BOOT_GATE_TIMEOUT_SECS" \
+ci_run_step boot-shell "$BOOT_GATE_TIMEOUT_SECS" \
     "$SCRIPT_DIR/boot-shell-gate.sh" \
-    --arch both --skip-build --log-dir "$LOG_DIR/boot"
+    --arch x86_64 --skip-build --log-dir "$LOG_DIR/boot"
 
-ci_run_step system-rv "$((SYSTEM_GATE_TIMEOUT_SECS + 90))" \
+ci_run_step system-x86_64 "$((SYSTEM_GATE_TIMEOUT_SECS + 90))" \
     "$REPO_ROOT/scripts/system-test.sh" \
-    --arch rv --skip-build --timeout "$SYSTEM_GATE_TIMEOUT_SECS" \
-    --workdir "$LOG_DIR/system/rv"
-ci_run_step system-la "$((SYSTEM_GATE_TIMEOUT_SECS + 90))" \
-    "$REPO_ROOT/scripts/system-test.sh" \
-    --arch la --skip-build --timeout "$SYSTEM_GATE_TIMEOUT_SECS" \
-    --workdir "$LOG_DIR/system/la"
-
+    --arch x86_64 --skip-build --timeout "$SYSTEM_GATE_TIMEOUT_SECS" \
+    --workdir "$LOG_DIR/system/x86_64"
 trap - EXIT
 if ! pr_evidence_finalize 0; then
     printf 'PR gate: FAIL (final evidence validation)\n' >&2

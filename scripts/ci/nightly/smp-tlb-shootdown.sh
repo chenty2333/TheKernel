@@ -124,11 +124,8 @@ while IFS= read -r arch; do
             nightly_run_guest "$arch" "$commands" "$run_dir"
         )
         case "$arch" in
-            rv)
+            x86_64)
                 setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT'
-                ;;
-            la)
-                setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent'
                 ;;
             *)
                 nightly_fail "unsupported architecture in wait-boundary gate: $arch"

@@ -10,6 +10,9 @@ trap 'rm -rf "$tmp"' EXIT
 
 bash -n "$CI_DIR/release-consumer-gate.sh"
 "$CI_DIR/release-consumer-gate.sh" --help >/dev/null
+grep -Fqx \
+    'PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly}' \
+    "$CI_DIR/release-consumer-gate.sh"
 if [ "$(grep -c '^    thekernel-axfault$' \
     "$CI_DIR/release-consumer-gate.sh")" -lt 2 ]; then
     printf 'test-release-consumer: axfault is absent from a release package set\n' >&2
@@ -37,13 +40,9 @@ grep -Fq -- '--locked --offline --no-verify --registry crates-io \' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- 'exec "$THEKERNEL_RELEASE_REAL_CARGO" "$@" --locked --offline' \
     "$CI_DIR/release-consumer-gate.sh"
-grep -Fq -- 'goal=kernel-rv-mm-performance' \
+grep -Fq -- 'goal=kernel-x86_64-mm-performance' \
     "$CI_DIR/release-consumer-gate.sh"
-grep -Fq -- 'goal=kernel-la-mm-performance' \
-    "$CI_DIR/release-consumer-gate.sh"
-grep -Fq -- 'build_diagnostics_arch rv' \
-    "$CI_DIR/release-consumer-gate.sh"
-grep -Fq -- 'build_diagnostics_arch la' \
+grep -Fq -- 'build_diagnostics_arch x86_64' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- 'CARGO_NET_OFFLINE=true \' "$CI_DIR/release-consumer-gate.sh"
 
@@ -318,7 +317,6 @@ fi
 # release workspaces.  A sensitive fake source verifies diagnostics never echo
 # registry or Git source values.
 mkdir -p \
-    "$tmp/consumer/crates/axtask-compat" \
     "$tmp/consumer/crates/process-adapter" \
     "$tmp/artifacts/thekernel-axsched-0.1.0" \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
@@ -367,21 +365,6 @@ packages = [
         "version": "0.1.0",
         "source": None,
         "manifest_path": str(root / "consumer/Cargo.toml"),
-    },
-    {
-        "id": "axtask 0.3.0 (path+facade)",
-        "name": "axtask",
-        "version": "0.3.0-preview.2",
-        "source": None,
-        "manifest_path": str(root / "consumer/crates/axtask-compat/Cargo.toml"),
-        "publish": [],
-        "dependencies": [
-            {
-                "name": "thekernel-axtask",
-                "rename": "axtask-core",
-                "req": "=0.1.0",
-            }
-        ],
     },
     {
         "id": "thekernel-linux-process-adapter 0.1.0 (path+adapter)",
@@ -439,7 +422,6 @@ PY
 graph_args=(
     --metadata "$tmp/metadata.json"
     --consumer-root "$tmp/consumer"
-    --allowed-axtask-facade "$tmp/consumer/crates/axtask-compat"
     --allowed-process-adapter "$tmp/consumer/crates/process-adapter"
     --release-source-root "$tmp/source-ax"
     --release-source-root "$tmp/source-linux-abi"
@@ -542,9 +524,21 @@ legacy = {
     "source": "SENSITIVE_SOURCE_VALUE_MUST_NOT_BE_ECHOED",
     "manifest_path": "/registry/axpoll-0.1.2/Cargo.toml",
 }
+legacy_axtask = {
+    "id": "axtask 0.3.0 (non-local)",
+    "name": "axtask",
+    "version": "0.3.0-preview.2",
+    "source": "SENSITIVE_SOURCE_VALUE_MUST_NOT_BE_ECHOED",
+    "manifest_path": "/registry/axtask-0.3.0-preview.2/Cargo.toml",
+}
 metadata["packages"].append(legacy)
 metadata["resolve"]["nodes"].append({"id": legacy["id"], "dependencies": []})
 metadata["resolve"]["nodes"][0]["dependencies"].append(legacy["id"])
+metadata["packages"].append(legacy_axtask)
+metadata["resolve"]["nodes"].append(
+    {"id": legacy_axtask["id"], "dependencies": []}
+)
+metadata["resolve"]["nodes"][0]["dependencies"].append(legacy_axtask["id"])
 pathlib.Path(sys.argv[2]).write_text(json.dumps(metadata))
 PY
 legacy_args=("${graph_args[@]}")
@@ -556,35 +550,6 @@ if python3 "$CI_DIR/release-dependency-graph.py" "${legacy_args[@]}" \
 fi
 if grep -Fq 'SENSITIVE_SOURCE_VALUE_MUST_NOT_BE_ECHOED' "$tmp/legacy.log"; then
     printf 'test-release-consumer: dependency diagnostic leaked credentials\n' >&2
-    exit 1
-fi
-
-python3 - "$tmp/metadata.json" "$tmp/legacy-process.json" <<'PY'
-import json
-import pathlib
-import sys
-
-metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
-legacy = {
-    "id": "starry-process 0.2.0 (path+legacy)",
-    "name": "starry-process",
-    "version": "0.2.0",
-    "source": None,
-    "manifest_path": str(
-        pathlib.Path(sys.argv[1]).parent
-        / "consumer/third_party/rust-patches/starry-process/Cargo.toml"
-    ),
-}
-metadata["packages"].append(legacy)
-metadata["resolve"]["nodes"].append({"id": legacy["id"], "dependencies": []})
-metadata["resolve"]["nodes"][0]["dependencies"].append(legacy["id"])
-pathlib.Path(sys.argv[2]).write_text(json.dumps(metadata))
-PY
-legacy_process_args=("${graph_args[@]}")
-legacy_process_args[1]="$tmp/legacy-process.json"
-if python3 "$CI_DIR/release-dependency-graph.py" "${legacy_process_args[@]}" \
-    >/dev/null 2>&1; then
-    printf 'test-release-consumer: legacy starry-process was accepted\n' >&2
     exit 1
 fi
 
@@ -642,7 +607,7 @@ import sys
 
 metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
 for package in metadata["packages"]:
-    if package["name"] == "axtask":
+    if package["name"] == "thekernel-axtask":
         package["manifest_path"] = str(
             pathlib.Path(sys.argv[3])
             / "third_party/rust-patches/axtask/Cargo.toml"

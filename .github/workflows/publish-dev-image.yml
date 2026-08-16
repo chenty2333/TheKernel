@@ -40,8 +40,6 @@ jobs:
             echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}"
             echo "QEMU_VERSION=${QEMU_VERSION}"
             echo "QEMU_SHA256=${QEMU_SHA256}"
-            echo "LOONGARCH64_MUSL_TOOLCHAIN_URL=${LOONGARCH64_MUSL_TOOLCHAIN_URL}"
-            echo "LOONGARCH64_MUSL_TOOLCHAIN_SHA256=${LOONGARCH64_MUSL_TOOLCHAIN_SHA256}"
             echo "IMAGE_NAME=ghcr.io/${owner}/${repo}-dev"
           } >> "$GITHUB_ENV"
 
@@ -78,5 +76,3 @@ jobs:
             RUST_TOOLCHAIN=${{ env.RUST_TOOLCHAIN }}
             QEMU_VERSION=${{ env.QEMU_VERSION }}
             QEMU_SHA256=${{ env.QEMU_SHA256 }}
-            LOONGARCH64_MUSL_TOOLCHAIN_URL=${{ env.LOONGARCH64_MUSL_TOOLCHAIN_URL }}
-            LOONGARCH64_MUSL_TOOLCHAIN_SHA256=${{ env.LOONGARCH64_MUSL_TOOLCHAIN_SHA256 }}

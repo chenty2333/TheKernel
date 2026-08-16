@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-ARCHES=both
+ARCHES=x86
 WORKDIR=
 
 usage() {
     cat <<'EOF'
 Usage: scripts/ci/check-rootfs-reproducibility.sh \
-  [--arch {rv|la|both}] --workdir NEW_DIR
+  [--arch x86|x86_64] --workdir NEW_DIR
 
 Build each selected rootfs twice with independent source caches, compiler work
 directories, output paths, and temporary staging trees. The gate succeeds only
@@ -28,8 +28,8 @@ while (($#)); do
 done
 
 case "$ARCHES" in
-    rv|la|both) ;;
-    *) printf '%s\n' '--arch must be rv, la, or both' >&2; exit 2 ;;
+    x86|x86_64) ARCHES=x86 ;;
+    *) printf '%s\n' '--arch must be x86 or x86_64' >&2; exit 2 ;;
 esac
 [ -n "$WORKDIR" ] || { printf '%s\n' '--workdir is required' >&2; exit 2; }
 case "$WORKDIR" in
@@ -52,11 +52,7 @@ repo_commit=$(git -C "$REPO_ROOT" rev-parse --verify HEAD)
 printf 'thekernel_commit\tarch\tsha256\tsize_bytes\timage_a\timage_b\n' \
     >"$WORKDIR/rootfs-reproducibility.tsv"
 
-case "$ARCHES" in
-    rv) selected=(rv) ;;
-    la) selected=(la) ;;
-    both) selected=(rv la) ;;
-esac
+selected=(x86)
 
 for arch in "${selected[@]}"; do
     images=()

@@ -20,7 +20,7 @@ EVENTS = (
 )
 
 
-def valid_log(source: str = "sbi-pmu") -> str:
+def valid_log(source: str = "platform") -> str:
     records = [
         "PMU_CAPABILITIES schema=thekernel-pmu-capabilities-v1 "
         f"source={source} counter_count=2 consistent_snapshot=0 "
@@ -33,7 +33,7 @@ def valid_log(source: str = "sbi-pmu") -> str:
 
 
 class PmuCapabilitiesParserTests(unittest.TestCase):
-    def run_parser(self, payload: str, arch: str = "rv") -> subprocess.CompletedProcess[str]:
+    def run_parser(self, payload: str, arch: str = "x86_64") -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "qemu.log"
             log.write_text(payload, encoding="utf-8")
@@ -48,7 +48,7 @@ class PmuCapabilitiesParserTests(unittest.TestCase):
     def test_accepts_five_unique_capability_only_events(self) -> None:
         result = self.run_parser(valid_log())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("thekernel-pmu-capabilities-v1\tsbi-pmu\t2\t0", result.stdout)
+        self.assertIn("thekernel-pmu-capabilities-v1\tplatform\t2\t0", result.stdout)
         self.assertIn("itlb_read_misses\t1\t0", result.stdout)
 
     def test_rejects_any_claimed_sample(self) -> None:
@@ -60,7 +60,7 @@ class PmuCapabilitiesParserTests(unittest.TestCase):
         self.assertEqual(event.returncode, 1)
         self.assertIn("sampled=0", event.stderr)
 
-    def test_rejects_duplicate_missing_or_wrong_arch_source(self) -> None:
+    def test_rejects_duplicate_missing_or_wrong_source(self) -> None:
         duplicate_line = "PMU_EVENT event=cpu_cycles requestable=1 sampled=0\n"
         duplicate = self.run_parser(valid_log() + duplicate_line)
         self.assertEqual(duplicate.returncode, 1)
@@ -74,7 +74,7 @@ class PmuCapabilitiesParserTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("event set mismatch", missing.stderr)
 
-        source = self.run_parser(valid_log(source="loongarch-pmcfg"), arch="rv")
+        source = self.run_parser(valid_log(source="invalid-source"))
         self.assertEqual(source.returncode, 1)
         self.assertIn("source mismatch", source.stderr)
 

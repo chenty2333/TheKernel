@@ -17,7 +17,7 @@ SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1704067200}
 usage() {
     cat <<'EOF'
 Usage: scripts/create-rootfs-image.sh \
-  --arch {rv|la} --stage DIR --output IMAGE [--size-mb N]
+  --arch {x86|x86_64} --stage DIR --output IMAGE [--size-mb N]
   [--owner-mode {root|preserve}]
 
 Create a byte-reproducible ext4 image from one completed staging tree. The
@@ -40,8 +40,8 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la) ;;
-    *) printf '%s\n' '--arch must be rv or la' >&2; exit 2 ;;
+    x86|x86_64) ARCH=x86 ;;
+    *) printf '%s\n' '--arch must be x86 or x86_64' >&2; exit 2 ;;
 esac
 [ -n "$STAGE" ] || { printf '%s\n' '--stage is required' >&2; exit 2; }
 [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
@@ -70,7 +70,7 @@ for command in debugfs find grep mke2fs mkdir mktemp mv realpath sha256sum \
     }
 done
 owner_runner=()
-if [ "$OWNER_MODE" = root ]; then
+if [ "$OWNER_MODE" = root ] && [ "$(id -u)" -ne 0 ]; then
     command -v fakeroot >/dev/null 2>&1 \
         || { printf '%s\n' 'required command not found: fakeroot' >&2; exit 1; }
     owner_runner=(fakeroot --)

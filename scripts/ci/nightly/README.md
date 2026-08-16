@@ -21,7 +21,7 @@ The repository-owned adapters cover:
   and host `e2fsck` verification;
 - `nonloopback-network.sh`: a nonce-authenticated TCP exchange from the guest
   VirtIO NIC through QEMU user networking to a one-shot host peer;
-- `smp-tlb-shootdown.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs.
+- `smp-tlb-shootdown.sh`: an x86_64 matrix at 4 and 8 requested CPUs.
   Before mutating page tables, it pins two syscall-free, non-yielding spin tasks
   to every online CPU and requires both to advance in each of three consecutive
   one-second windows. For every non-control CPU it then warms translations
@@ -31,7 +31,7 @@ The repository-owned adapters cover:
   replacement, fixed `mremap`, and fork COW transitions. Any stalled liveness
   window, stale access, incomplete CPU/case matrix, topology mismatch, or
   operational failure rejects the run;
-- `mm-performance.sh`: an RV/LoongArch matrix at 4 and 8 requested CPUs. It
+- `mm-performance.sh`: an x86_64 matrix at 4 and 8 requested CPUs. It
   records VMA-scale mapping latency, private-anonymous `mremap` resize latency,
   fixed replacement while retaining the declared sparse VMA fixture,
   two-CPU fixed `mremap` contention over disjoint slots in one address space,
@@ -100,7 +100,7 @@ red. Validate that expected-failure log with
 case matrix, at least one actual stale case, and an exact aggregate stale marker.
 It rejects timeouts and operational failures.
 
-`THEKERNEL_NIGHTLY_ARCHES` accepts `rv`, `la`, or `both` (the default). Missing
+`THEKERNEL_NIGHTLY_ARCHES` accepts `x86_64` (the default). Missing
 QEMU binaries, cross compilers, rootfs build tools, or filesystem tools cause
 exit `78`. A runner may provide a category-specific `*_COMMAND` override for
 hardware-only testing; its exit `78` retains the same unsupported meaning.
@@ -234,7 +234,7 @@ scripts/ci/compare-mm-performance.py \
 ```
 
 By default, every input bundle must contain exactly the release matrix
-`rv4`, `rv8`, `la4`, and `la8`. `--allow-partial` accepts only a nonempty
+x86_64 at 4 and 8 CPUs. `--allow-partial` accepts only a nonempty
 subset for local triage, prints `PARTIAL`, and records `release_gate=false`;
 its result is not publication evidence.
 
@@ -311,7 +311,7 @@ compiler work directories, staging trees, and output paths per architecture:
 
 ```sh
 scripts/ci/check-rootfs-reproducibility.sh \
-  --arch both --workdir .state/ci/rootfs-reproducibility
+  --arch x86_64 --workdir .state/ci/rootfs-reproducibility
 ```
 
 The image helper normalizes the staging tree, fixes UUID/hash seed and lazy

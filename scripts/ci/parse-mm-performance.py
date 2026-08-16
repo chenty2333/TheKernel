@@ -973,7 +973,7 @@ def main() -> int:
         description="validate and normalize TheKernel MM performance evidence"
     )
     parser.add_argument("log", type=Path)
-    parser.add_argument("--arch", required=True, choices=("rv", "la", "host"))
+    parser.add_argument("--arch", required=True, choices=("x86_64", "host"))
     parser.add_argument("--cpus", required=True, type=int)
     parser.add_argument("--iterations", required=True, type=int)
     parser.add_argument("--vmas", required=True, type=int)

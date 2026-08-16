@@ -50,7 +50,7 @@ class RootfsImageReproducibilityTests(unittest.TestCase):
             [
                 str(IMAGE_BUILDER),
                 "--arch",
-                "rv",
+                "x86_64",
                 "--stage",
                 str(stage),
                 "--output",
@@ -115,7 +115,7 @@ class RootfsImageReproducibilityTests(unittest.TestCase):
                 [
                     str(IMAGE_BUILDER),
                     "--arch",
-                    "rv",
+                    "x86_64",
                     "--stage",
                     str(stage),
                     "--output",

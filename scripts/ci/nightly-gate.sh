@@ -33,12 +33,12 @@ EOF
 
 list_categories() {
     cat <<'EOF'
-pressure	dual-architecture mixed task, memory, and filesystem pressure
+pressure	x86_64 mixed task, memory, and filesystem pressure
 oom-failpoint	deterministic ENOMEM admission and recovery replay
 fs-powercut	two-boot writable-ext4 crash recovery replay
-nonloopback-network	dual-architecture QEMU NIC to host-peer exchange
-smp-tlb-shootdown	RV/LA 4/8-CPU remote TLB invalidation and COW gate
-mm-performance	RV/LA 4/8-CPU MM latency, pin, and topology evidence matrix
+nonloopback-network	x86_64 QEMU NIC to host-peer exchange
+smp-tlb-shootdown	x86_64 4/8-CPU remote TLB invalidation and COW gate
+mm-performance	x86_64 4/8-CPU MM latency, pin, and topology evidence matrix
 EOF
 }
 

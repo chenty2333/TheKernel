@@ -27,7 +27,7 @@ jobs:
   per-commit:
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -118,7 +118,7 @@ jobs:
 
   # These portable cases need no elevated host capability. Run each against
   # the bare hosted Linux kernel, publish its source-exact receipt, and replay
-  # the same C source in the dual-architecture semantic rootfs below.
+  # the same C source in the x86_64 semantic rootfs below.
   host-portable-differentials:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -152,9 +152,9 @@ jobs:
           path: .state/ci/${{ matrix.case }}-host-differential/
           include-hidden-files: true
 
-  # Full dual-architecture boot remains on the self-hosted QEMU runner. Root
-  # images are built from this repository by the gate itself.
-  dual-arch-pr:
+  # Full x86_64 boot remains on the self-hosted QEMU runner. Root images are
+  # built from this repository by the gate itself.
+  x86_64-pr:
     if: >-
       ${{ vars.THEKERNEL_QEMU_CI == '1' &&
           (github.event_name == 'pull_request' || github.event_name == 'push' ||
@@ -164,7 +164,7 @@ jobs:
       - linux
       - thekernel-qemu
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly-2026-06-07', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -184,7 +184,7 @@ jobs:
       - name: Provision pinned maintained siblings
         run: ./scripts/ci/provision-maintained-siblings.sh
 
-      - name: Dual-architecture release and boot gate
+      - name: x86_64 release and boot gate
         id: gate
         run: ./scripts/ci/pr-gate.sh --log-dir "$RUNNER_TEMP/thekernel-pr-gate"
 
@@ -192,7 +192,7 @@ jobs:
         if: ${{ always() && steps.gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
-          name: dual-arch-pr-logs
+          name: x86_64-pr-logs
           # The gate seals kernels, rootfs images, receipts, consoles, and all
           # step logs into this external, self-contained evidence directory.
           path: ${{ runner.temp }}/thekernel-pr-gate/

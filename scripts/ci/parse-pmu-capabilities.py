@@ -17,7 +17,7 @@ EVENTS = (
     "dtlb_write_misses",
     "itlb_read_misses",
 )
-SOURCE_BY_ARCH = {"rv": "sbi-pmu", "la": "loongarch-pmcfg"}
+SOURCE_BY_ARCH = {"x86_64": "platform"}
 
 
 class EvidenceError(ValueError):

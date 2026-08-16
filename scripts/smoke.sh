@@ -11,8 +11,9 @@ Usage:
   scripts/smoke.sh list
   scripts/smoke.sh NAME [ARGS...]
 
-Semantic smokes build or reuse kernel-*-shell plus the repository-built rootfs,
-then drive commands through the generic QEMU runner.
+Semantic smokes build or reuse the x86_64 I/O-test shell kernel and its UEFI
+ESP plus the repository-built x86_64 rootfs, then drive commands through the
+q35 QEMU runner.
 
 Smoke names:
   async-block-queue

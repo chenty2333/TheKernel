@@ -13,10 +13,11 @@ LINUX_ABI_EXPECTED_HEAD=${THEKERNEL_LINUX_ABI_EXPECTED_HEAD:-}
 EXPECTED_RELEASE_SET=${THEKERNEL_EXPECTED_RELEASE_SET:-}
 OUTPUT_RELEASE_SET=${THEKERNEL_OUTPUT_RELEASE_SET:-$REPO_ROOT/.state/ci/release-consumer/release-set.tsv}
 WORK_ROOT=${THEKERNEL_RELEASE_GATE_WORK_ROOT:-$REPO_ROOT/.state/ci/release-consumer-work}
-ARCHES=${THEKERNEL_RELEASE_GATE_ARCHES:-both}
-# Packaging verifies the maintained sibling crates at their shared compatibility
-# nightly. It is intentionally not inherited from TheKernel's root compiler pin.
-PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly-2025-05-20}
+ARCHES=${THEKERNEL_RELEASE_GATE_ARCHES:-x86_64}
+# Packaging verifies the maintained sibling crates with the same rolling
+# compiler channel as TheKernel's root workspace. Keep the override for local
+# compatibility checks.
+PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly}
 
 VERSION=0.1.0
 AX_REPOSITORY=https://github.com/chenty2333/thekernel-ax
@@ -67,8 +68,8 @@ Usage: scripts/ci/release-consumer-gate.sh [OPTIONS]
 Packages the clean thekernel-ax and thekernel-linux-abi release workspaces,
 validates and safely extracts the exact .crate archives, retargets a temporary
 copy of TheKernel to those artifacts, rejects legacy or source-workspace
-instances, and builds the RISC-V and LoongArch release and MM-diagnostics
-kernels. The latter is compile coverage for target-specific ASID/PMU consumers,
+instances, and builds the x86_64 release and MM-diagnostics kernel. The latter
+is compile coverage for target-specific ASID/PMU consumers,
 not runtime or performance evidence.
 
 Options:
@@ -79,7 +80,7 @@ Options:
   --expected-release-set FILE   require package checksums and HEADs from FILE
   --output-release-set FILE     write the verified release-set TSV here
   --work-root DIR               parent for bounded temporary work directories
-  --arch rv|la|both             consumer build architecture set (default both)
+  --arch x86_64                 consumer build architecture set (default x86_64)
   --package-toolchain NAME      Cargo toolchain for workspace packaging
   -h, --help                    show this help
 
@@ -106,8 +107,8 @@ while (($#)); do
 done
 
 case "$ARCHES" in
-    rv|la|both) ;;
-    *) ci_die "--arch must be rv, la, or both: $ARCHES" ;;
+    x86|x86_64) ARCHES=x86_64 ;;
+    *) ci_die "--arch must be x86_64: $ARCHES" ;;
 esac
 [ -n "$PACKAGE_TOOLCHAIN" ] || ci_die '--package-toolchain must not be empty'
 [[ "$PACKAGE_TOOLCHAIN" =~ ^[A-Za-z0-9._-]+$ ]] \
@@ -442,7 +443,7 @@ done
 
 # Nightly's workspace packager records not-yet-published siblings as crates.io
 # packages.  Bind those lock checksums to the exact archives from this run so
-# axtask and signal cannot be tested against a different local sibling tree.
+# thekernel-axtask and signal cannot be tested against a different local sibling tree.
 python3 "$SCRIPT_DIR/release-lock-artifacts.py" \
     --lock "${ARTIFACT_DIRS[thekernel-axtask]}/Cargo.lock" \
     --artifact "thekernel-axsched=${ARCHIVE_PATHS[thekernel-axsched]}" \
@@ -463,8 +464,7 @@ rsync_args=(
     --exclude='/.git/'
     --exclude='/.state/'
     --exclude='/target/'
-    --exclude='/kernel-rv'
-    --exclude='/kernel-la'
+    --exclude='/kernel-x86_64'
 )
 case "$WORK_ROOT" in
     "$REPO_ROOT"/*)
@@ -511,7 +511,6 @@ lock_after_metadata=$(sha256sum "$consumer_root/Cargo.lock" | awk '{print $1}')
 graph_args=(
     --metadata "$metadata_path"
     --consumer-root "$consumer_root"
-    --allowed-axtask-facade "$consumer_root/crates/axtask-compat"
     --allowed-process-adapter "$consumer_root/crates/process-adapter"
     --release-source-root "$AX_REPO"
     --release-source-root "$LINUX_ABI_REPO"
@@ -544,8 +543,7 @@ build_arch() {
     local arch=$1
     local goal output
     case "$arch" in
-        rv) goal=kernel-rv; output=kernel-rv ;;
-        la) goal=kernel-la; output=kernel-la ;;
+        x86_64) goal=kernel-x86_64; output=kernel-x86_64 ;;
         *) ci_die "internal unsupported build architecture: $arch" ;;
     esac
     printf '[release-consumer] build %s from exact extracted artifacts\n' "$arch"
@@ -564,13 +562,9 @@ build_diagnostics_arch() {
     local arch=$1
     local goal output
     case "$arch" in
-        rv)
-            goal=kernel-rv-mm-performance
-            output=.state/mm-performance-shell/kernel-rv
-            ;;
-        la)
-            goal=kernel-la-mm-performance
-            output=.state/mm-performance-shell/kernel-la
+        x86_64)
+            goal=kernel-x86_64-mm-performance
+            output=.state/mm-performance-shell/kernel-x86_64
             ;;
         *) ci_die "internal unsupported diagnostics architecture: $arch" ;;
     esac
@@ -588,16 +582,8 @@ build_diagnostics_arch() {
         || ci_die "$arch diagnostics consumer build did not produce $output"
 }
 
-case "$ARCHES" in
-    rv) build_arch rv; build_diagnostics_arch rv ;;
-    la) build_arch la; build_diagnostics_arch la ;;
-    both)
-        build_arch rv
-        build_diagnostics_arch rv
-        build_arch la
-        build_diagnostics_arch la
-        ;;
-esac
+build_arch x86_64
+build_diagnostics_arch x86_64
 
 lock_after_build=$(sha256sum "$consumer_root/Cargo.lock" | awk '{print $1}')
 [ "$lock_after_build" = "$lock_before" ] \

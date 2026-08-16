@@ -295,7 +295,7 @@ def render_qemu_log(
                 "fallback_generation_mismatch=0 "
                 "fallback_same_id_different_root=0 saturated=0",
                 "PMU_CAPABILITIES schema=thekernel-pmu-capabilities-v1 "
-                "source=sbi-pmu counter_count=2 consistent_snapshot=0 "
+                "source=platform counter_count=2 consistent_snapshot=0 "
                 "samples_collected=0",
                 "PMU_EVENT event=cpu_cycles requestable=1 sampled=0",
                 "PMU_EVENT event=instructions requestable=1 sampled=0",
@@ -338,16 +338,13 @@ def make_bundle(
     manifest_overrides: dict[str, str] | None = None,
     kernel_content: bytes = b"fixture-kernel\n",
     measurement_mode: str = "product",
-    arch: str = "rv",
+    arch: str = "x86_64",
     requested_cpus: int = 4,
     capture_offset_secs: int = 0,
     capture_day: int = 1,
 ) -> None:
     run_name = f"{arch}-{requested_cpus}cpu"
-    qemu_binary = {
-        "rv": "qemu-system-riscv64",
-        "la": "qemu-system-loongarch64",
-    }[arch]
+    qemu_binary = "qemu-system-x86_64"
     host_cpu_set = "0" if requested_cpus == 1 else f"0-{requested_cpus - 1}"
     root.mkdir(parents=True)
     run = root / run_name
@@ -568,6 +565,7 @@ def make_bundle(
             kernel=kernel.resolve(),
             rootfs=Drive(fixture_rootfs, "snapshot"),
             extra_block=None,
+            direct_kernel=True,
             memory="1G",
             cpus=int(values["requested_cpus"]),
             qemu_binary=str(fixture_qemu),
@@ -584,6 +582,7 @@ def make_bundle(
                 "memory": "1G",
                 "rootfs_mode": "snapshot",
                 "extra_block_mode": "rw",
+                "direct_kernel": True,
                 "command": recorded_command,
                 "returncode": 0,
                 "error_message": None,
@@ -704,9 +703,7 @@ def make_release_bundle(
         "host_diagnostics_pre",
         "host_diagnostics_post",
     )
-    for index, (arch, cpus) in enumerate(
-        (("rv", 4), ("rv", 8), ("la", 4), ("la", 8))
-    ):
+    for index, (arch, cpus) in enumerate((("x86_64", 4), ("x86_64", 8))):
         source = root / f"source-{arch}-{cpus}"
         make_bundle(
             source,
@@ -740,8 +737,8 @@ def mutate_manifest(root: Path, mutator: Callable[[dict[str, str]], None]) -> No
 
 
 def refresh_qemu_receipt_log(root: Path) -> dict[str, str]:
-    qemu_log = root / "rv-4cpu" / "qemu.log"
-    qemu_receipt = root / "rv-4cpu" / "qemu-runner-receipt.json"
+    qemu_log = root / "x86_64-4cpu" / "qemu.log"
+    qemu_receipt = root / "x86_64-4cpu" / "qemu-runner-receipt.json"
     receipt = json.loads(qemu_receipt.read_text(encoding="utf-8"))
     receipt["log"]["sha256"] = sha256(qemu_log)
     receipt["log"]["size_bytes"] = qemu_log.stat().st_size
@@ -756,7 +753,7 @@ def refresh_qemu_receipt_log(root: Path) -> dict[str, str]:
 
 
 def receipt_artifact_fields(root: Path, name: str) -> dict[str, str]:
-    artifact = root / "rv-4cpu" / name
+    artifact = root / "x86_64-4cpu" / name
     prefix = "guest_inputs" if name == "guest-inputs.tsv" else "qemu_receipt"
     return {
         f"{prefix}_sha256": sha256(artifact),
@@ -776,7 +773,7 @@ def clone_bundle(source: Path, destination: Path, marker: str) -> None:
 def set_capture_interval(root: Path, start: dt.datetime, end: dt.datetime) -> None:
     updates: dict[str, str] = {}
     for phase, timestamp in (("pre", start), ("post", end)):
-        diagnostics = root / "rv-4cpu" / f"host-{phase}.tsv"
+        diagnostics = root / "x86_64-4cpu" / f"host-{phase}.tsv"
         columns, rows = read_tsv(diagnostics)
         next(row for row in rows if row["key"] == "timestamp_utc")[
             "value"
@@ -790,7 +787,7 @@ def set_capture_interval(root: Path, start: dt.datetime, end: dt.datetime) -> No
 
 
 def set_raw_capture_timestamp(root: Path, phase: str, value: str) -> None:
-    diagnostics = root / "rv-4cpu" / f"host-{phase}.tsv"
+    diagnostics = root / "x86_64-4cpu" / f"host-{phase}.tsv"
     columns, rows = read_tsv(diagnostics)
     next(row for row in rows if row["key"] == "timestamp_utc")["value"] = value
     write_tsv(diagnostics, columns, rows)
@@ -814,7 +811,7 @@ def mutate_metrics(
     update_matrix: bool = True,
     update_log: bool = True,
 ) -> None:
-    metrics = root / "rv-4cpu" / "mm-performance.tsv"
+    metrics = root / "x86_64-4cpu" / "mm-performance.tsv"
     columns, rows = read_tsv(metrics)
     mutator(rows)
     write_tsv(metrics, columns, rows)
@@ -826,7 +823,7 @@ def mutate_metrics(
     }
     if update_log:
         _, manifest_rows = read_tsv(root / "mm-performance-manifest.tsv")
-        qemu_log = root / "rv-4cpu" / "qemu.log"
+        qemu_log = root / "x86_64-4cpu" / "qemu.log"
         qemu_log.write_text(
             render_qemu_log(
                 rows,
@@ -1037,7 +1034,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertNotIn("PARTIAL", result.stdout)
         self.assertIn("release_gate=true", result.stdout)
         rows = self.report_rows(report)
-        self.assertEqual(len(rows), 100)
+        self.assertEqual(len(rows), 50)
         self.assertEqual({row["evidence_scope"] for row in rows}, {"release"})
         self.assertEqual({row["release_gate"] for row in rows}, {"true"})
 
@@ -1230,7 +1227,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         baseline = self.bundle("baseline")
 
         absolute = self.bundle("absolute")
-        absolute_metrics = absolute / "rv-4cpu" / "mm-performance.tsv"
+        absolute_metrics = absolute / "x86_64-4cpu" / "mm-performance.tsv"
         mutate_manifest(
             absolute,
             lambda row: row.update({"metrics_artifact": str(absolute_metrics)}),
@@ -1243,7 +1240,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         mutate_manifest(
             parent,
             lambda row: row.update(
-                {"metrics_artifact": "rv-4cpu/../rv-4cpu/mm-performance.tsv"}
+                {"metrics_artifact": "x86_64-4cpu/../x86_64-4cpu/mm-performance.tsv"}
             ),
         )
         result, _ = self.compare(baseline, parent)
@@ -1252,8 +1249,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
 
         symlink = self.bundle("symlink")
         outside = self.root / "outside-metrics.tsv"
-        shutil.copy2(symlink / "rv-4cpu" / "mm-performance.tsv", outside)
-        linked = symlink / "rv-4cpu" / "mm-performance.tsv"
+        shutil.copy2(symlink / "x86_64-4cpu" / "mm-performance.tsv", outside)
+        linked = symlink / "x86_64-4cpu" / "mm-performance.tsv"
         linked.unlink()
         linked.symlink_to(outside)
         result, _ = self.compare(baseline, symlink)
@@ -1263,13 +1260,13 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_missing_and_hash_mismatched_artifacts_are_rejected(self) -> None:
         baseline = self.bundle("baseline")
         missing = self.bundle("missing")
-        (missing / "rv-4cpu" / "qemu.log").unlink()
+        (missing / "x86_64-4cpu" / "qemu.log").unlink()
         result, _ = self.compare(baseline, missing)
         self.assertEqual(result.returncode, 2)
         self.assertIn("missing or inaccessible", result.stderr)
 
         corrupt = self.bundle("corrupt")
-        (corrupt / "rv-4cpu" / "kernel").write_bytes(b"corrupt\n")
+        (corrupt / "x86_64-4cpu" / "kernel").write_bytes(b"corrupt\n")
         result, _ = self.compare(baseline, corrupt)
         self.assertEqual(result.returncode, 2)
         self.assertRegex(result.stderr, r"kernel_artifact (size|SHA-256) mismatch")
@@ -1302,7 +1299,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
             "diagnostic-baseline", measurement_mode="diagnostic"
         )
         diagnostic = self.bundle("diagnostic-corrupt", measurement_mode="diagnostic")
-        lock_artifact = diagnostic / "rv-4cpu" / "mm-lock-diagnostics.tsv"
+        lock_artifact = diagnostic / "x86_64-4cpu" / "mm-lock-diagnostics.tsv"
         lock_artifact.write_text("corrupt\n", encoding="utf-8")
         result, report = self.compare(diagnostic_baseline, diagnostic)
         self.assertEqual(result.returncode, 2)
@@ -1328,7 +1325,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_product_raw_log_rejects_diagnostics(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate-product-lock-log")
-        qemu_log = candidate / "rv-4cpu" / "qemu.log"
+        qemu_log = candidate / "x86_64-4cpu" / "qemu.log"
         with qemu_log.open("a", encoding="utf-8") as output:
             output.write("MM_LOCK_FORGED status=present\n")
         receipt_updates = refresh_qemu_receipt_log(candidate)
@@ -1352,7 +1349,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_diagnostic_artifact_must_be_derived_from_raw_qemu_log(self) -> None:
         baseline = self.bundle("diagnostic-baseline", measurement_mode="diagnostic")
         candidate = self.bundle("diagnostic-spliced", measurement_mode="diagnostic")
-        diagnostics = candidate / "rv-4cpu" / "mm-lock-diagnostics.tsv"
+        diagnostics = candidate / "x86_64-4cpu" / "mm-lock-diagnostics.tsv"
         with diagnostics.open("a", encoding="utf-8") as output:
             output.write("forged\trow\n")
         mutate_manifest(
@@ -1379,7 +1376,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_diagnostic_bundle_rejects_pmu_sample_claims(self) -> None:
         baseline = self.bundle("diagnostic-pmu-baseline", measurement_mode="diagnostic")
         candidate = self.bundle("diagnostic-pmu-sampled", measurement_mode="diagnostic")
-        qemu_log = candidate / "rv-4cpu" / "qemu.log"
+        qemu_log = candidate / "x86_64-4cpu" / "qemu.log"
         qemu_log.write_text(
             qemu_log.read_text(encoding="utf-8").replace(
                 "samples_collected=0", "samples_collected=1", 1
@@ -1411,8 +1408,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
             "donor-guest-inputs", manifest_overrides={"iterations": "101"}
         )
         shutil.copy2(
-            donor / "rv-4cpu" / "guest-inputs.tsv",
-            candidate / "rv-4cpu" / "guest-inputs.tsv",
+            donor / "x86_64-4cpu" / "guest-inputs.tsv",
+            candidate / "x86_64-4cpu" / "guest-inputs.tsv",
         )
         updates = receipt_artifact_fields(candidate, "guest-inputs.tsv")
         mutate_manifest(candidate, lambda row: row.update(updates))
@@ -1430,8 +1427,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
             "donor-qemu-receipt", manifest_overrides={"iterations": "101"}
         )
         shutil.copy2(
-            donor / "rv-4cpu" / "qemu-runner-receipt.json",
-            candidate / "rv-4cpu" / "qemu-runner-receipt.json",
+            donor / "x86_64-4cpu" / "qemu-runner-receipt.json",
+            candidate / "x86_64-4cpu" / "qemu-runner-receipt.json",
         )
         updates = receipt_artifact_fields(candidate, "qemu-runner-receipt.json")
         mutate_manifest(candidate, lambda row: row.update(updates))
@@ -1448,7 +1445,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
             with self.subTest(key=key):
                 candidate = self.bundle(f"candidate-missing-{key}-size")
                 receipt_path = (
-                    candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+                    candidate / "x86_64-4cpu" / "qemu-runner-receipt.json"
                 )
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                 del receipt[key]["size_bytes"]
@@ -1470,9 +1467,9 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_truncated_forwarding_receipt_is_rejected(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate-truncated-stdin")
-        commands = candidate / "rv-4cpu" / "commands"
+        commands = candidate / "x86_64-4cpu" / "commands"
         prefix = commands.read_bytes().splitlines(keepends=True)[0]
-        receipt_path = candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+        receipt_path = candidate / "x86_64-4cpu" / "qemu-runner-receipt.json"
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         receipt["stdin"].update(
             {
@@ -1502,7 +1499,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_exact_stream_with_producer_141_is_not_exact_evidence(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate-producer-141")
-        receipt_path = candidate / "rv-4cpu" / "qemu-runner-receipt.json"
+        receipt_path = candidate / "x86_64-4cpu" / "qemu-runner-receipt.json"
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         receipt["stdin"].update(
             {
@@ -1790,8 +1787,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
             lambda row: row.update(
                 {
                     "platform_class": "physical",
-                    "pmu_source": "sbi-pmu",
-                    "cpu_model": "sifive-u74",
+                    "pmu_source": "platform",
+                    "cpu_model": "qemu64",
                     "firmware_version": "opensbi-1.4",
                     "cpu_freq_policy": "fixed-frequency",
                 }
@@ -1817,28 +1814,17 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertIn("invalid platform_class", result.stderr)
 
     def test_tcg_pmu_source_is_rejected(self) -> None:
-        for pmu_source, expected_error in (
-            ("loongarch-pmcfg", "pmu_source does not match arch"),
-            ("sbi-pmu", "qemu-tcg evidence must use pmu_source='none'"),
-        ):
-            with self.subTest(pmu_source=pmu_source):
-                baselines = [
-                    self.bundle(f"baseline-{pmu_source}-{index}")
-                    for index in range(3)
-                ]
-                candidates = [
-                    self.bundle(f"candidate-{pmu_source}-{index}")
-                    for index in range(3)
-                ]
-                mutate_manifest(
-                    candidates[0],
-                    lambda row: row.update({"pmu_source": pmu_source}),
-                )
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        mutate_manifest(
+            candidates[0],
+            lambda row: row.update({"pmu_source": "platform"}),
+        )
 
-                result, _ = self.compare_series(baselines, candidates)
+        result, _ = self.compare_series(baselines, candidates)
 
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(expected_error, result.stderr)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("qemu-tcg evidence must use pmu_source='none'", result.stderr)
 
     def test_tcg_rows_must_not_claim_platform_identity(self) -> None:
         # A TCG receipt carrying a CPU model would read as physical evidence.
@@ -1846,7 +1832,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
         candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
         mutate_manifest(
             candidates[0],
-            lambda row: row.update({"cpu_model": "sifive-u74"}),
+            lambda row: row.update({"cpu_model": "qemu64"}),
         )
 
         result, _ = self.compare_series(baselines, candidates)
@@ -1870,7 +1856,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
     def test_host_diagnostics_reject_unsafe_fields(self) -> None:
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate")
-        diagnostics = candidate / "rv-4cpu" / "host-pre.tsv"
+        diagnostics = candidate / "x86_64-4cpu" / "host-pre.tsv"
         columns, rows = read_tsv(diagnostics)
         rows.append({"key": "hostname", "value": "private-host"})
         write_tsv(diagnostics, columns, rows)
@@ -1901,7 +1887,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
                         {
                             "bundle_schema": f"thekernel-mm-performance-bundle-{version}",
                             "kernel_artifact": (
-                                "/workspace/rv-4cpu/kernel"
+                                "/workspace/x86_64-4cpu/kernel"
                                 if version == "v1"
                                 else row["kernel_artifact"]
                             ),

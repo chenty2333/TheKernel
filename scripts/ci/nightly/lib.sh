@@ -32,66 +32,62 @@ nightly_truthy() {
 }
 
 nightly_selected_arches() {
-    case "${THEKERNEL_NIGHTLY_ARCHES:-both}" in
-        rv|riscv64) printf 'rv\n' ;;
-        la|loongarch64) printf 'la\n' ;;
-        both) printf 'rv\nla\n' ;;
-        *) nightly_fail "THEKERNEL_NIGHTLY_ARCHES must be rv, la, or both" ;;
+    case "${THEKERNEL_NIGHTLY_ARCHES:-x86_64}" in
+        x86|x86_64) printf 'x86_64\n' ;;
+        *) nightly_fail "THEKERNEL_NIGHTLY_ARCHES must be x86_64" ;;
     esac
 }
 
 nightly_qemu_binary() {
     case "$1" in
-        rv) printf 'qemu-system-riscv64\n' ;;
-        la) printf 'qemu-system-loongarch64\n' ;;
+        x86_64) printf 'qemu-system-x86_64\n' ;;
         *) return 2 ;;
     esac
 }
 
 nightly_kernel_target() {
     case "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-shell}:$1" in
-        shell:rv) printf 'kernel-rv-shell\n' ;;
-        shell:la) printf 'kernel-la-shell\n' ;;
-        mm-performance:rv) printf 'kernel-rv-mm-performance\n' ;;
-        mm-performance:la) printf 'kernel-la-mm-performance\n' ;;
+        shell:x86_64) printf 'kernel-x86_64-shell\n' ;;
+        mm-performance:x86_64) printf 'kernel-x86_64-mm-performance\n' ;;
         *) return 2 ;;
     esac
 }
 
 nightly_kernel_path() {
     case "${THEKERNEL_NIGHTLY_KERNEL_PROFILE:-shell}:$1" in
-        shell:rv) printf '%s/.state/shell/kernel-rv\n' "$REPO_ROOT" ;;
-        shell:la) printf '%s/.state/shell/kernel-la\n' "$REPO_ROOT" ;;
-        mm-performance:rv)
-            printf '%s/.state/mm-performance-shell/kernel-rv\n' "$REPO_ROOT"
+        shell:x86_64) printf '%s/.state/shell/kernel-x86_64\n' "$REPO_ROOT" ;;
+        mm-performance:x86_64)
+            printf '%s/.state/mm-performance-shell/kernel-x86_64\n' "$REPO_ROOT"
             ;;
-        mm-performance:la)
-            printf '%s/.state/mm-performance-shell/kernel-la\n' "$REPO_ROOT"
-            ;;
+        *) return 2 ;;
+    esac
+}
+
+nightly_kernel_esp_path() {
+    case "$1" in
+        # All x86_64 shell profiles share the Makefile's SHELL_ESP_X86 output.
+        x86_64) printf '%s/.state/uefi/shell-x86_64.esp\n' "$REPO_ROOT" ;;
         *) return 2 ;;
     esac
 }
 
 nightly_rootfs_target() {
     case "$1" in
-        rv) printf 'rootfs-rv\n' ;;
-        la) printf 'rootfs-la\n' ;;
+        x86_64) printf 'rootfs-x86\n' ;;
         *) return 2 ;;
     esac
 }
 
 nightly_rootfs_path() {
     case "$1" in
-        rv) printf '%s/.state/rootfs/rootfs-rv.img\n' "$REPO_ROOT" ;;
-        la) printf '%s/.state/rootfs/rootfs-la.img\n' "$REPO_ROOT" ;;
+        x86_64) printf '%s/.state/rootfs/rootfs-x86.img\n' "$REPO_ROOT" ;;
         *) return 2 ;;
     esac
 }
 
 nightly_cross_compiler() {
     case "$1" in
-        rv) printf '%sgcc\n' "${THEKERNEL_RV_CROSS_COMPILE:-riscv64-linux-gnu-}" ;;
-        la) printf '%sgcc\n' "${THEKERNEL_LA_CROSS_COMPILE:-loongarch64-linux-musl-}" ;;
+        x86_64) printf '%sgcc\n' "${THEKERNEL_X86_CROSS_COMPILE:-x86_64-linux-gnu-}" ;;
         *) return 2 ;;
     esac
 }
@@ -161,9 +157,9 @@ nightly_prepare_guest_run() {
     local arch=$1
     local commands=$2
     local run_dir=$3
-    local rootfs kernel staged_commands staged_kernel
+    local rootfs kernel esp staged_commands staged_kernel staged_esp
     local qemu compiler qemu_path compiler_path rustc_path cargo_path
-    local kernel_sha commands_sha rootfs_sha qemu_sha compiler_sha
+    local kernel_sha commands_sha rootfs_sha qemu_sha compiler_sha esp_sha
     local qemu_version compiler_version rustc_version cargo_version
 
     run_dir=$(ci_prepare_owned_run_dir \
@@ -175,8 +171,13 @@ nightly_prepare_guest_run() {
     nightly_require_arch_infrastructure "$arch"
     kernel=$(nightly_ensure_shell_kernel "$arch")
     rootfs=$(nightly_ensure_rootfs "$arch")
+    esp=$(nightly_kernel_esp_path "$arch") \
+        || nightly_fail "invalid architecture: $arch"
     staged_kernel="$run_dir/kernel"
     cp -- "$kernel" "$staged_kernel"
+    [ -s "$esp" ] || nightly_fail "prepared guest ESP is missing: $esp"
+    staged_esp="$run_dir/esp"
+    cp -- "$esp" "$staged_esp"
 
     qemu=$(nightly_qemu_binary "$arch") || nightly_fail "invalid architecture: $arch"
     compiler=$(nightly_cross_compiler "$arch") || nightly_fail "invalid architecture: $arch"
@@ -189,6 +190,7 @@ nightly_prepare_guest_run() {
     kernel_sha=$(sha256sum "$staged_kernel" | awk '{ print $1 }')
     commands_sha=$(sha256sum "$staged_commands" | awk '{ print $1 }')
     rootfs_sha=$(sha256sum "$rootfs" | awk '{ print $1 }')
+    esp_sha=$(sha256sum "$staged_esp" | awk '{ print $1 }')
     qemu_sha=$(sha256sum "$qemu_path" | awk '{ print $1 }')
     compiler_sha=$(sha256sum "$compiler_path" | awk '{ print $1 }')
     qemu_version=$(nightly_command_identity "$qemu_path" --version)
@@ -211,6 +213,9 @@ nightly_prepare_guest_run() {
         printf 'kernel_path\t%s\n' "$staged_kernel"
         printf 'kernel_size_bytes\t%s\n' "$(stat -c %s "$staged_kernel")"
         printf 'kernel_sha256\t%s\n' "$kernel_sha"
+        printf 'esp_path\t%s\n' "$staged_esp"
+        printf 'esp_size_bytes\t%s\n' "$(stat -c %s "$staged_esp")"
+        printf 'esp_sha256\t%s\n' "$esp_sha"
         printf 'commands_path\t%s\n' "$staged_commands"
         printf 'commands_size_bytes\t%s\n' "$(stat -c %s "$staged_commands")"
         printf 'commands_line_count\t%s\n' \
@@ -250,9 +255,12 @@ nightly_execute_prepared_guest() {
     local stop_marker=${5:-}
     local staged_commands="$run_dir/commands"
     local staged_kernel="$run_dir/kernel"
+    local staged_esp="$run_dir/esp"
 
     [ -s "$staged_kernel" ] \
         || nightly_fail "prepared guest kernel is missing: $staged_kernel"
+    [ -s "$staged_esp" ] \
+        || nightly_fail "prepared guest ESP is missing: $staged_esp"
     [ -s "$rootfs" ] || nightly_fail "prepared guest rootfs is missing: $rootfs"
     [ -f "$staged_commands" ] \
         || nightly_fail "prepared guest command stream is missing: $staged_commands"
@@ -266,7 +274,8 @@ nightly_execute_prepared_guest() {
         "$CI_SCRIPT_DIR/boot-shell-runner.sh" \
             "$arch" "$staged_kernel" "$rootfs" "$run_dir" "$staged_commands" \
             "$NIGHTLY_GUEST_TIMEOUT_SECS" "$NIGHTLY_READY_TIMEOUT_SECS" \
-            "$NIGHTLY_LINE_DELAY_SECS" "$extra_block_image" "$stop_marker"
+            "$NIGHTLY_LINE_DELAY_SECS" "$extra_block_image" "$stop_marker" \
+            "$staged_esp"
     )
 }
 

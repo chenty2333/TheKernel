@@ -65,7 +65,7 @@ HOST_DIAGNOSTIC_MAX_BYTES = 64 * 1024
 MAX_PAIR_RATIO_SPREAD_PERCENT = 20
 PARSER_DIR = Path(__file__).resolve().parent
 REQUIRED_RELEASE_RUN_KEYS = frozenset(
-    {("rv", 4), ("rv", 8), ("la", 4), ("la", 8)}
+    {("x86_64", 4), ("x86_64", 8)}
 )
 
 
@@ -502,6 +502,7 @@ def validate_input_receipts(
         "cpus": int(row["requested_cpus"], 10),
         "memory": "1G",
         "rootfs_mode": "snapshot",
+        "direct_kernel": True,
         "returncode": 0,
         "error_message": None,
         "timed_out": False,
@@ -559,6 +560,7 @@ def validate_input_receipts(
             kernel=Path(kernel_evidence["path"]),
             rootfs=Drive(Path(runtime_evidence["path"]), "snapshot"),
             extra_block=None,
+            direct_kernel=True,
             memory="1G",
             cpus=int(row["requested_cpus"], 10),
             qemu_binary=qemu_evidence["path"],
@@ -596,7 +598,7 @@ def validate_manifest_row(
             f"expected={expected_kernel_profile!r} actual={row['kernel_profile']!r}"
         )
     arch = row["arch"]
-    if arch not in {"rv", "la"}:
+    if arch not in {"x86_64"}:
         raise EvidenceError(f"{context} has invalid arch: {arch!r}")
     platform_class = row["platform_class"]
     if platform_class not in PLATFORM_CLASSES:
@@ -604,7 +606,7 @@ def validate_manifest_row(
             f"{context} has invalid platform_class: {platform_class!r}"
         )
     if platform_class == "physical":
-        # RFC 0008: physical evidence needs its own receipt authority (PMU
+        # Physical evidence needs its own receipt authority (PMU
         # receipts, firmware identity, frequency pinning) before it can be
         # validated. Declaring the class now reserves the vocabulary; accepting
         # a half-validated row here would let TCG-grade evidence carry
@@ -664,10 +666,7 @@ def validate_manifest_row(
     ):
         if not HEX64_RE.fullmatch(row[field]):
             raise EvidenceError(f"{context} has invalid {field}: {row[field]!r}")
-    expected_qemu = {
-        "rv": "qemu-system-riscv64",
-        "la": "qemu-system-loongarch64",
-    }[arch]
+    expected_qemu = "qemu-system-x86_64"
     if row["qemu_binary"] != expected_qemu:
         raise EvidenceError(
             f"{context} has invalid qemu_binary for {arch}: {row['qemu_binary']!r}"
@@ -1637,7 +1636,7 @@ def compare_series(
             raise EvidenceError(f"pair {index} provenance mismatch: {error}") from error
 
     rows: list[ReportRow] = []
-    arch_order = {"rv": 0, "la": 1}
+    arch_order = {"x86_64": 0}
     metric_order = {metric: index for index, metric in enumerate(EXPECTED_METRICS)}
     keys = sorted(
         baselines[0].metrics,

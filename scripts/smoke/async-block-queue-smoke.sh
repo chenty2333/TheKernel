@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ARCH=rv
+ARCH=x86_64
 WORKDIR=""
 ROOTFS_IMAGE=""
 ROOTFS_IMAGE_EXPLICIT=0
@@ -18,7 +18,7 @@ SKIP_KERNEL_BUILD=1
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
+Usage: $(basename "$0") [--arch x86_64] [--workdir DIR] [--rootfs IMG]
                          [--extra-image IMG] [--timeout SECS] [--build-kernel]
 
 Runs a targeted async block queue smoke. It attaches a disposable extra raw
@@ -80,8 +80,8 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la) ;;
-    *) die "--arch must be rv or la" ;;
+    x86_64) ;;
+    *) die "--arch must be x86_64" ;;
 esac
 case "$TIMEOUT_SECS" in
     ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
@@ -125,7 +125,6 @@ echo counters=on > /proc/io_test_control
 echo virtio_counters=on > /proc/io_test_control
 echo async_block=on > /proc/io_test_control
 echo async_block_depth=4 > /proc/io_test_control
-echo async_block_la_depth=2 > /proc/io_test_control
 echo async_block_wait=hybrid > /proc/io_test_control
 echo async_dirty_flush_sg=on > /proc/io_test_control
 echo counters=reset > /proc/io_test_control
@@ -269,11 +268,7 @@ assert_counter_ge virtio.blk_async_merge_write_calls 1
 assert_counter_ge virtio.blk_async_merge_write_input_segments 64
 assert_counter_ge virtio.blk_async_merge_write_output_requests 1
 assert_counter_ge virtio.blk_async_merge_write_saved_requests 1
-if [ "$ARCH" = rv ]; then
-    assert_counter_ge virtio.blk_async_merge_write_max_segments 8
-else
-    assert_counter_ge virtio.blk_async_merge_write_max_segments 4
-fi
+assert_counter_ge virtio.blk_async_merge_write_max_segments 4
 assert_counter_ge virtio.blk_async_desc_budget 1
 assert_counter_ge virtio.blk_async_interrupt_drains 1
 assert_counter_ge cached.async_dirty_flush_hits 1

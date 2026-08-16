@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 8 ] || [ "$#" -gt 10 ]; then
+if [ "$#" -lt 8 ] || [ "$#" -gt 11 ]; then
     printf '%s\n' \
         "Usage: $(basename "$0") ARCH KERNEL ROOTFS WORKDIR COMMANDS TIMEOUT" \
-        '       READY_TIMEOUT LINE_DELAY [EXTRA_BLOCK_IMAGE [STOP_MARKER]]' >&2
+        '       READY_TIMEOUT LINE_DELAY [EXTRA_BLOCK_IMAGE [STOP_MARKER [ESP_IMAGE]]]' >&2
     exit 2
 fi
 
@@ -18,6 +18,7 @@ ready_timeout_secs=$7
 line_delay_secs=$8
 extra_block_image=${9:-}
 stop_marker=${10:-}
+esp_image=${11:-}
 ready_marker=THEKERNEL_SHELL_READY
 cpus=${THEKERNEL_QEMU_CPUS:-1}
 
@@ -56,6 +57,13 @@ runner_args=(
 )
 [ -z "$extra_block_image" ] || runner_args+=(--extra-block "$extra_block_image")
 [ -z "$stop_marker" ] || runner_args+=(--stop-after-marker "$stop_marker")
+if [ -n "$esp_image" ]; then
+    [ -s "$esp_image" ] || {
+        printf 'ESP image is missing or empty: %s\n' "$esp_image" >&2
+        exit 2
+    }
+    runner_args+=(--esp "$esp_image")
+fi
 
 set +e
 (

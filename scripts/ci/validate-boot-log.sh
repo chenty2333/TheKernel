@@ -2,14 +2,14 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-    printf 'Usage: %s {rv|la} LOG\n' "$(basename "$0")" >&2
+    printf 'Usage: %s x86_64 LOG\n' "$(basename "$0")" >&2
     exit 2
 fi
 
 arch=$1
 log=$2
 case "$arch" in
-    rv|la) ;;
+    x86_64) ;;
     *)
         printf 'boot-log: unsupported arch: %s\n' "$arch" >&2
         exit 2

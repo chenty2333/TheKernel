@@ -61,13 +61,11 @@ for invalid in 0 -1 invalid ''; do
     fi
 done
 
-[ "$(nightly_kernel_target rv)" = kernel-rv-shell ]
-[ "$(nightly_kernel_path la)" = "$REPO_ROOT/.state/shell/kernel-la" ]
+[ "$(nightly_kernel_target x86_64)" = kernel-x86_64-shell ]
 THEKERNEL_NIGHTLY_KERNEL_PROFILE=mm-performance
 export THEKERNEL_NIGHTLY_KERNEL_PROFILE
-[ "$(nightly_kernel_target la)" = kernel-la-mm-performance ]
-[ "$(nightly_kernel_path rv)" = \
-    "$REPO_ROOT/.state/mm-performance-shell/kernel-rv" ]
+[ "$(nightly_kernel_path x86_64)" = \
+    "$REPO_ROOT/.state/mm-performance-shell/kernel-x86_64" ]
 unset THEKERNEL_NIGHTLY_KERNEL_PROFILE
 
 reset_fixture() {
@@ -149,7 +147,7 @@ python3() {
 # and the other adapters keep their input and runner receipt contract.
 reset_fixture
 TEST_MODE=wrapper
-nightly_run_guest rv "$commands" "$tmp/run"
+nightly_run_guest x86_64 "$commands" "$tmp/run"
 printf 'wrapper-prepare\nwrapper-execute:%s\n' "$fixture_rootfs" \
     >"$tmp/wrapper.expected"
 diff -u "$tmp/wrapper.expected" "$trace"
@@ -170,7 +168,7 @@ reset_fixture
 TEST_MODE=boundary
 unset MM_BOUNDARY_MUTATE
 mm_perf_capture_prepared_run \
-    rv 4 "$commands" "$tmp/run" 0-3 \
+    x86_64 4 "$commands" "$tmp/run" 0-3 \
     explicit-homogeneous-v1 package:0,max_freq_khz:1 0
 cat >"$tmp/boundary.expected" <<'EOF'
 prepare-kernel:1
@@ -189,7 +187,7 @@ for mutation in commands kernel rootfs; do
     set +e
     (
         mm_perf_capture_prepared_run \
-            rv 4 "$commands" "$tmp/run" 0-3 \
+            x86_64 4 "$commands" "$tmp/run" 0-3 \
             explicit-homogeneous-v1 package:0,max_freq_khz:1 0
     ) >"$tmp/$mutation-drift.log" 2>&1
     status=$?

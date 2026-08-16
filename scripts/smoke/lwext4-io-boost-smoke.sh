@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ARCH=rv
+ARCH=x86_64
 WORKDIR=""
 ROOTFS_IMAGE=""
 ROOTFS_IMAGE_EXPLICIT=0
@@ -17,7 +17,7 @@ SKIP_KERNEL_BUILD=1
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
+Usage: $(basename "$0") [--arch x86_64] [--workdir DIR] [--rootfs IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
                          [--build-kernel]
 
@@ -33,7 +33,7 @@ Runs an automated lwext4 I/O boost boot-shell smoke. The smoke covers:
 
 Run from the repo root, typically through the dev container, for example:
 
-  make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch rv'
+  make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch x86_64'
 
 EOF
 }
@@ -85,8 +85,8 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv|la) ;;
-    *) die "--arch must be rv or la" ;;
+    x86_64) ;;
+    *) die "--arch must be x86_64" ;;
 esac
 
 case "$TIMEOUT_SECS" in
