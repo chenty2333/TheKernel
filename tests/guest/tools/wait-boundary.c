@@ -35,6 +35,10 @@
 #define FUTEX_PRIVATE_FLAG 128
 #endif
 
+#ifndef FUTEX_WAITV_MAX
+#define FUTEX_WAITV_MAX 128
+#endif
+
 #ifndef FUTEX_WAIT_PRIVATE
 #define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
 #endif
@@ -1441,6 +1445,14 @@ struct x86_futex2_shared_wait_case {
     int error;
 };
 
+struct x86_futex2_mixed_waitv_case {
+    _Atomic uint32_t private_word;
+    const void *shared_word;
+    _Atomic int ready;
+    long result;
+    int error;
+};
+
 static long raw_futex2_wake(const void *uaddr, uint64_t mask, int32_t nr,
                             uint32_t flags)
 {
@@ -1463,6 +1475,14 @@ static long raw_futex2_requeue(const struct local_futex_waitv *waiters,
                    nr_requeue);
 }
 
+static long raw_futex_waitv(const struct local_futex_waitv *waiters,
+                            uint32_t nr_futexes,
+                            const struct timespec *timeout, int clockid)
+{
+    return syscall(__NR_futex_waitv, waiters, nr_futexes, 0U, timeout,
+                   clockid);
+}
+
 static int expect_errno_result(const char *stage, long result,
                                int expected_errno)
 {
@@ -1474,7 +1494,7 @@ static int expect_errno_result(const char *stage, long result,
     return 0;
 }
 
-static int drive_futex2_wake(const void *uaddr)
+static int drive_futex2_wake_with_flags(const void *uaddr, uint32_t flags)
 {
     int64_t start = monotonic_ns();
     if (start < 0) {
@@ -1483,7 +1503,7 @@ static int drive_futex2_wake(const void *uaddr)
 
     for (;;) {
         errno = 0;
-        long result = raw_futex2_wake(uaddr, 1, 1, THEKERNEL_FUTEX2_FLAGS);
+        long result = raw_futex2_wake(uaddr, 1, 1, flags);
         if (result == 1) {
             return 0;
         }
@@ -1500,6 +1520,11 @@ static int drive_futex2_wake(const void *uaddr)
         }
         sched_yield();
     }
+}
+
+static int drive_futex2_wake(const void *uaddr)
+{
+    return drive_futex2_wake_with_flags(uaddr, THEKERNEL_FUTEX2_FLAGS);
 }
 
 static int drive_futex2_requeue(const struct local_futex_waitv *waiters)
@@ -1676,6 +1701,124 @@ static int create_x86_futex2_shared_file(size_t page_size)
         return -1;
     }
     return fd;
+}
+
+static void *x86_futex2_mixed_waitv_waiter(void *opaque)
+{
+    struct x86_futex2_mixed_waitv_case *test = opaque;
+    struct local_futex_waitv waiters[2] = {
+        {
+            .val = 0,
+            .uaddr = (uint64_t)(uintptr_t)&test->private_word,
+            .flags = THEKERNEL_FUTEX2_FLAGS,
+        },
+        {
+            .val = 0,
+            .uaddr = (uint64_t)(uintptr_t)test->shared_word,
+            .flags = THEKERNEL_FUTEX2_SHARED_FLAGS,
+        },
+    };
+
+    atomic_store_explicit(&test->ready, 1, memory_order_release);
+    errno = 0;
+    test->result = raw_futex_waitv(waiters, 2, NULL, CLOCK_MONOTONIC);
+    if (test->result < 0) {
+        test->error = errno;
+    }
+    return NULL;
+}
+
+static int test_x86_futex2_mixed_waitv(void)
+{
+    long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0) {
+        return fail("x86-futex2-mixed-waitv-page-size");
+    }
+    size_t page_size = (size_t)page_size_value;
+    int fd = -1;
+    void *shared_mapping = MAP_FAILED;
+    pthread_t waiter;
+    int waiter_started = 0;
+    int waiter_joined = 0;
+    struct x86_futex2_mixed_waitv_case test = {0};
+    const char *failure = NULL;
+    int failure_errno = 0;
+
+    fd = create_x86_futex2_shared_file(page_size);
+    if (fd < 0) {
+        failure = "x86-futex2-mixed-waitv-file";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    shared_mapping = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                          fd, 0);
+    if (shared_mapping == MAP_FAILED) {
+        failure = "x86-futex2-mixed-waitv-mmap";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    test.shared_word = shared_mapping;
+    test.private_word = 0;
+    *(uint32_t *)shared_mapping = 0;
+    int result = pthread_create(&waiter, NULL, x86_futex2_mixed_waitv_waiter,
+                                &test);
+    if (result != 0) {
+        failure = "x86-futex2-mixed-waitv-create";
+        failure_errno = result;
+        goto cleanup;
+    }
+    waiter_started = 1;
+    if (wait_until_ready(&test.ready) != 0) {
+        failure = "x86-futex2-mixed-waitv-ready";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    if (drive_futex2_wake_with_flags(test.shared_word,
+                                     THEKERNEL_FUTEX2_SHARED_FLAGS) != 0) {
+        failure = "x86-futex2-mixed-waitv-shared-wake";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    if (join_bounded(waiter) != 0) {
+        failure = "x86-futex2-mixed-waitv-join";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    waiter_joined = 1;
+    if (test.result != 1 || test.error != 0) {
+        failure = "x86-futex2-mixed-waitv-result";
+        failure_errno = test.error != 0 ? test.error : EIO;
+        goto cleanup;
+    }
+
+cleanup:
+    if (waiter_started && !waiter_joined) {
+        (void)raw_futex2_wake(&test.private_word, 1, 1,
+                              THEKERNEL_FUTEX2_FLAGS);
+        if (shared_mapping != MAP_FAILED) {
+            *(uint32_t *)shared_mapping = 1;
+            (void)raw_futex2_wake(shared_mapping, 1, 1,
+                                  THEKERNEL_FUTEX2_SHARED_FLAGS);
+        }
+        (void)join_bounded(waiter);
+        waiter_joined = 1;
+    }
+    if (shared_mapping != MAP_FAILED && munmap(shared_mapping, page_size) != 0 &&
+        failure == NULL) {
+        failure = "x86-futex2-mixed-waitv-munmap";
+        failure_errno = errno;
+    }
+    if (fd >= 0 && close(fd) != 0 && failure == NULL) {
+        failure = "x86-futex2-mixed-waitv-close";
+        failure_errno = errno;
+    }
+    if (failure != NULL) {
+        errno = failure_errno != 0 ? failure_errno : EIO;
+        return fail(failure);
+    }
+    puts("CI_WAIT_BOUNDARY_X86_FUTEX2_MIXED_WAITV_OK private_index=0 "
+         "shared_index=1");
+    return 0;
 }
 
 static void abort_x86_futex2_shared_wait(void *wake_addr,
@@ -2166,6 +2309,70 @@ static int test_x86_futex2_absolute_timeout(void)
     return 0;
 }
 
+static int test_x86_futex2_waitv_bounds(void)
+{
+    _Atomic uint32_t word = 0;
+    struct local_futex_waitv one = {
+        .val = 0,
+        .uaddr = (uint64_t)(uintptr_t)&word,
+        .flags = THEKERNEL_FUTEX2_FLAGS,
+    };
+    struct local_futex_waitv too_many[FUTEX_WAITV_MAX + 1] = {0};
+    for (unsigned int index = 0; index < FUTEX_WAITV_MAX + 1U; ++index) {
+        too_many[index] = one;
+    }
+
+    errno = 0;
+    if (expect_errno_result("x86-futex2-waitv-zero-einval",
+                            raw_futex_waitv(&one, 0, NULL, CLOCK_MONOTONIC),
+                            EINVAL) != 0) {
+        return 1;
+    }
+    /* Linux rejects an array larger than FUTEX_WAITV_MAX with EINVAL. */
+    errno = 0;
+    if (expect_errno_result(
+            "x86-futex2-waitv-too-many-einval",
+            raw_futex_waitv(too_many, FUTEX_WAITV_MAX + 1U, NULL,
+                            CLOCK_MONOTONIC),
+            EINVAL) != 0) {
+        return 1;
+    }
+
+    /* Linux accepts duplicate uaddr descriptors: both entries queue and
+     * the call blocks (verified on host: EAGAIN with mismatched values,
+     * blocking with matching values). An already-expired absolute timeout
+     * therefore must surface as ETIMEDOUT, not EINVAL. */
+    struct local_futex_waitv duplicate[2] = {
+        one,
+        one,
+    };
+    struct timespec expired = {0};
+    int64_t start = monotonic_ns();
+    errno = 0;
+    long duplicate_result =
+        raw_futex_waitv(duplicate, 2, &expired, CLOCK_MONOTONIC);
+    int duplicate_errno = errno;
+    int64_t end = monotonic_ns();
+    if (duplicate_result != -1 || duplicate_errno != ETIMEDOUT ||
+        end < 0 || end - start < 0) {
+        errno = duplicate_errno != 0 ? duplicate_errno : EIO;
+        return fail("x86-futex2-waitv-duplicate-etimedout");
+    }
+
+    struct local_futex_waitv reserved = one;
+    reserved.reserved = 1;
+    errno = 0;
+    if (expect_errno_result(
+            "x86-futex2-waitv-reserved-einval",
+            raw_futex_waitv(&reserved, 1, NULL, CLOCK_MONOTONIC), EINVAL) !=
+        0) {
+        return 1;
+    }
+
+    puts("CI_WAIT_BOUNDARY_X86_FUTEX2_WAITV_BOUNDS_OK");
+    return 0;
+}
+
 static int test_x86_futex2_validation(void)
 {
     _Atomic uint32_t word = 0;
@@ -2331,12 +2538,176 @@ static int test_x86_futex2_requeue(void)
     return 0;
 }
 
+static int run_x86_futex2_shared_requeue_case(const void *source_word,
+                                              const void *target_word)
+{
+    struct x86_futex2_shared_wait_case test = {0};
+    struct local_futex_waitv waiters[2] = {
+        {
+            .val = 0,
+            .uaddr = (uint64_t)(uintptr_t)source_word,
+            .flags = THEKERNEL_FUTEX2_SHARED_FLAGS,
+        },
+        {
+            .val = 0,
+            .uaddr = (uint64_t)(uintptr_t)target_word,
+            .flags = THEKERNEL_FUTEX2_SHARED_FLAGS,
+        },
+    };
+    pthread_t waiter;
+    int result = start_x86_futex2_shared_wait(&test, &waiter, source_word);
+    if (result != 0) {
+        return fail("x86-futex2-shared-requeue-create");
+    }
+    if (wait_until_ready(&test.ready) != 0 ||
+        wait_for_x86_futex2_shared_blocked(&test) != 0) {
+        (void)raw_futex2_wake(source_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)raw_futex2_wake(target_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)join_bounded(waiter);
+        return fail("x86-futex2-shared-requeue-admission");
+    }
+
+    errno = 0;
+    long requeue_count = raw_futex2_requeue(waiters, 0, 0, 1);
+    if (requeue_count != 1) {
+        (void)raw_futex2_wake(source_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)raw_futex2_wake(target_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)join_bounded(waiter);
+        return fail("x86-futex2-shared-requeue-count");
+    }
+    errno = 0;
+    long source_wake = raw_futex2_wake(source_word, 1, 1,
+                                       THEKERNEL_FUTEX2_SHARED_FLAGS);
+    if (source_wake != 0) {
+        (void)raw_futex2_wake(target_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)join_bounded(waiter);
+        return fail("x86-futex2-shared-requeue-source-isolation");
+    }
+    int target_wake_result = drive_futex2_wake_with_flags(
+        target_word, THEKERNEL_FUTEX2_SHARED_FLAGS);
+    int join_result = join_bounded(waiter);
+    if (target_wake_result != 0 || join_result != 0 || test.result != 0 ||
+        test.error != 0) {
+        (void)raw_futex2_wake(source_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        (void)raw_futex2_wake(target_word, 1, 1,
+                              THEKERNEL_FUTEX2_SHARED_FLAGS);
+        errno = test.error != 0 ? test.error : EIO;
+        return fail("x86-futex2-shared-requeue-target-wake");
+    }
+    return 0;
+}
+
+static int test_x86_futex2_shared_requeue(void)
+{
+    long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0) {
+        return fail("x86-futex2-shared-requeue-page-size");
+    }
+    size_t page_size = (size_t)page_size_value;
+    int source_fd = -1;
+    int target_fd = -1;
+    void *same_mapping = MAP_FAILED;
+    void *different_source_mapping = MAP_FAILED;
+    void *different_target_mapping = MAP_FAILED;
+    const char *failure = NULL;
+    int failure_errno = 0;
+
+    source_fd = create_x86_futex2_shared_file(page_size);
+    if (source_fd < 0) {
+        failure = "x86-futex2-shared-requeue-source-file";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    same_mapping = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        source_fd, 0);
+    if (same_mapping == MAP_FAILED) {
+        failure = "x86-futex2-shared-requeue-same-mmap";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    *(uint32_t *)same_mapping = 0;
+    *(uint32_t *)((unsigned char *)same_mapping + sizeof(uint32_t)) = 0;
+    if (run_x86_futex2_shared_requeue_case(
+            same_mapping,
+            (unsigned char *)same_mapping + sizeof(uint32_t)) != 0) {
+        failure = "x86-futex2-shared-requeue-same-case";
+        failure_errno = errno;
+        goto cleanup;
+    }
+
+    target_fd = create_x86_futex2_shared_file(page_size);
+    if (target_fd < 0) {
+        failure = "x86-futex2-shared-requeue-target-file";
+        failure_errno = errno;
+        goto cleanup;
+    }
+    different_source_mapping = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, source_fd, 0);
+    different_target_mapping = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, target_fd, 0);
+    if (different_source_mapping == MAP_FAILED ||
+        different_target_mapping == MAP_FAILED) {
+        failure = "x86-futex2-shared-requeue-different-mmap";
+        failure_errno = errno != 0 ? errno : EIO;
+        goto cleanup;
+    }
+    *(uint32_t *)different_source_mapping = 0;
+    *(uint32_t *)different_target_mapping = 0;
+    if (run_x86_futex2_shared_requeue_case(different_source_mapping,
+                                            different_target_mapping) != 0) {
+        failure = "x86-futex2-shared-requeue-different-case";
+        failure_errno = errno;
+        goto cleanup;
+    }
+
+cleanup:
+    if (same_mapping != MAP_FAILED && munmap(same_mapping, page_size) != 0 &&
+        failure == NULL) {
+        failure = "x86-futex2-shared-requeue-same-munmap";
+        failure_errno = errno;
+    }
+    if (different_source_mapping != MAP_FAILED &&
+        munmap(different_source_mapping, page_size) != 0 && failure == NULL) {
+        failure = "x86-futex2-shared-requeue-source-munmap";
+        failure_errno = errno;
+    }
+    if (different_target_mapping != MAP_FAILED &&
+        munmap(different_target_mapping, page_size) != 0 && failure == NULL) {
+        failure = "x86-futex2-shared-requeue-target-munmap";
+        failure_errno = errno;
+    }
+    if (source_fd >= 0 && close(source_fd) != 0 && failure == NULL) {
+        failure = "x86-futex2-shared-requeue-source-close";
+        failure_errno = errno;
+    }
+    if (target_fd >= 0 && close(target_fd) != 0 && failure == NULL) {
+        failure = "x86-futex2-shared-requeue-target-close";
+        failure_errno = errno;
+    }
+    if (failure != NULL) {
+        errno = failure_errno != 0 ? failure_errno : EIO;
+        return fail(failure);
+    }
+    puts("CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_REQUEUE_OK "
+         "same_backing=1 different_backing=1");
+    return 0;
+}
+
 static int test_x86_futex2(void)
 {
     if (test_x86_futex2_wake_wait() != 0 ||
         test_x86_futex2_absolute_timeout() != 0 ||
+        test_x86_futex2_waitv_bounds() != 0 ||
         test_x86_futex2_validation() != 0 ||
         test_x86_futex2_requeue() != 0 ||
+        test_x86_futex2_shared_requeue() != 0 ||
+        test_x86_futex2_mixed_waitv() != 0 ||
         test_x86_futex2_shared_alias() != 0 ||
         test_x86_futex2_shared_remap_isolation() != 0 ||
         test_x86_futex2_shared_remap_same_file() != 0) {
