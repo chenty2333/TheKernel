@@ -475,6 +475,27 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     return Ok(SubmissionOutcome::Accepted);
                 }
             };
+            let fixed_segments = if request.fixed_buffer().is_some() {
+                match buffer
+                    .as_ref()
+                    .ok_or(AxError::BadAddress)
+                    .and_then(IoUringBufferLease::physical_range)
+                {
+                    Ok(range) => Some(range),
+                    Err(_) => {
+                        drop((file, buffer));
+                        ring.complete_request(
+                            id,
+                            TerminalCause::PreparationFailed,
+                            -LinuxError::EFAULT.code(),
+                            0,
+                        )?;
+                        return Ok(SubmissionOutcome::Accepted);
+                    }
+                }
+            } else {
+                None
+            };
             let result = io_result(file.description().and_then(|description| {
                 io_uring_pread64(
                     &io_capability,
@@ -482,6 +503,7 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     io_address as *mut u8,
                     io_length,
                     request.offset(),
+                    fixed_segments,
                 )
             }));
             let completed = ring.complete_request(id, TerminalCause::Completed, result, 0);
@@ -541,6 +563,27 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     return Ok(SubmissionOutcome::Accepted);
                 }
             };
+            let fixed_segments = if request.fixed_buffer().is_some() {
+                match buffer
+                    .as_ref()
+                    .ok_or(AxError::BadAddress)
+                    .and_then(IoUringBufferLease::physical_range)
+                {
+                    Ok(range) => Some(range),
+                    Err(_) => {
+                        drop((file, buffer));
+                        ring.complete_request(
+                            id,
+                            TerminalCause::PreparationFailed,
+                            -LinuxError::EFAULT.code(),
+                            0,
+                        )?;
+                        return Ok(SubmissionOutcome::Accepted);
+                    }
+                }
+            } else {
+                None
+            };
             let result = io_result(file.description().and_then(|description| {
                 io_uring_pwrite64(
                     &io_capability,
@@ -548,6 +591,7 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     io_address as *const u8,
                     io_length,
                     request.offset(),
+                    fixed_segments,
                 )
             }));
             let completed = ring.complete_request(id, TerminalCause::Completed, result, 0);

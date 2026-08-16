@@ -481,39 +481,6 @@ static int submit_fixed(struct ring *ring, uint8_t opcode, int fd,
     return wait_cqe(ring, user_data, expected_result, stage);
 }
 
-static int submit_fixed_any(struct ring *ring, uint8_t opcode, int fd,
-                            uintptr_t address, uint32_t length, uint16_t slot,
-                            uint64_t user_data, int32_t *actual,
-                            const char *stage) {
-    if (queue_fixed(ring, opcode, fd, 0, address, length, slot, user_data) != 0) {
-        return fail_stage(stage);
-    }
-    errno = 0;
-    long submitted = syscall(SYS_io_uring_enter, ring->fd, 1U, 1U,
-                             IORING_ENTER_GETEVENTS, NULL, 0U);
-    if (submitted != 1) {
-        return fail_value(stage, submitted, 1);
-    }
-    for (unsigned int attempt = 0; attempt < WAIT_LOOPS; ++attempt) {
-        uint32_t head = load_u32(ring->cq_ring, ring->params.cq_off.head);
-        uint32_t tail = load_u32(ring->cq_ring, ring->params.cq_off.tail);
-        if (tail != head) {
-            const struct io_uring_cqe *cqe = next_cqe(ring, head);
-            if (cqe->user_data != user_data || cqe->flags != 0) {
-                errno = EIO;
-                return fail_stage(stage);
-            }
-            *actual = cqe->res;
-            store_u32(ring->cq_ring, ring->params.cq_off.head, head + 1);
-            return 0;
-        }
-        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
-        nanosleep(&pause, NULL);
-    }
-    errno = ETIMEDOUT;
-    return fail_stage(stage);
-}
-
 static int open_test_file(const char *path) {
     return open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
 }
@@ -1609,7 +1576,10 @@ static int test_unmap_after_registration(void) {
     memset(&ring, 0, sizeof(ring));
     ring.fd = -1;
     void *buffer = MAP_FAILED;
-    int file = -1;
+    void *replacement = MAP_FAILED;
+    unsigned char *verify = NULL;
+    int source = -1;
+    int output = -1;
     int result = 1;
     if (ring_setup(&ring) != 0) {
         return fail_stage("munmap-setup");
@@ -1624,12 +1594,15 @@ static int test_unmap_after_registration(void) {
         fail_stage("munmap-register");
         goto out;
     }
-    file = open_test_file("/tmp/thekernel-io-uring-buffers-munmap");
-    if (file < 0) {
-        fail_stage("munmap-file");
+    source = open_test_file("/tmp/thekernel-io-uring-buffers-munmap-source");
+    output = open_test_file("/tmp/thekernel-io-uring-buffers-munmap-output");
+    if (source < 0 || output < 0 ||
+        fill_test_file(source, 'S', page_bytes) != 0 ||
+        ftruncate(output, (off_t)page_bytes) != 0) {
+        fail_stage("munmap-files");
         goto out;
     }
-    memcpy(buffer, "M", 2);
+    memset(buffer, 'O', page_bytes);
     void *stale_address = buffer;
     if (munmap(buffer, page_bytes) != 0) {
         fail_stage("munmap-user-buffer");
@@ -1638,24 +1611,59 @@ static int test_unmap_after_registration(void) {
     buffer = MAP_FAILED;
     ring.buffer = NULL;
     ring.buffer_length = 0;
-    int32_t actual = 0;
-    if (submit_fixed_any(&ring, IORING_OP_READ_FIXED, file,
-                         (uintptr_t)stale_address, 1U, 0,
-                         0x4d554e4d41505f52ULL, &actual, "munmap-fixed-io")) {
+    replacement = mmap(stale_address, page_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (replacement != stale_address) {
+        if (replacement != MAP_FAILED) {
+            munmap(replacement, page_bytes);
+        }
+        replacement = MAP_FAILED;
+        errno = EFAULT;
+        fail_stage("munmap-va-reuse");
         goto out;
     }
-    if (actual >= 0) {
-        fprintf(stderr, "io_uring_buffers: linux_host=%d munmap_fixed_cqe=%d\n",
-                linux_host, actual);
-    } else {
-        fprintf(stderr, "io_uring_buffers: linux_host=%d munmap_fixed_cqe_error=%d\n",
-                linux_host, -actual);
+    memset(replacement, 'N', page_bytes);
+    /* The registration owns the old physical page. A fixed READ must update
+     * that page even though the same VA now names a new anonymous page. */
+    if (submit_fixed(&ring, IORING_OP_READ_FIXED, source, 0,
+                     (uintptr_t)stale_address, (uint32_t)page_bytes, 0,
+                     0x4d554e4d41505f52ULL, (int32_t)page_bytes,
+                     "munmap-fixed-read")) {
+        goto out;
+    }
+    if (memcmp(replacement, "NNNN", 4) != 0) {
+        errno = EIO;
+        fail_stage("munmap-new-va-unchanged");
+        goto out;
+    }
+    if (submit_fixed(&ring, IORING_OP_WRITE_FIXED, output, 0,
+                     (uintptr_t)stale_address, (uint32_t)page_bytes, 0,
+                     0x4d554e4d41505f57ULL, (int32_t)page_bytes,
+                     "munmap-fixed-write")) {
+        goto out;
+    }
+    verify = malloc(page_bytes);
+    if (verify == NULL || pread(output, verify, page_bytes, 0) != (ssize_t)page_bytes) {
+        fail_stage("munmap-fixed-output-read");
+        goto out;
+    }
+    for (size_t index = 0; index < page_bytes; ++index) {
+        if (verify[index] != 'S') {
+            errno = EIO;
+            fail_value("munmap-fixed-old-page", verify[index], 'S');
+            goto out;
+        }
     }
     result = 0;
 out:
-    if (file >= 0) {
-        close(file);
-        unlink("/tmp/thekernel-io-uring-buffers-munmap");
+    free(verify);
+    if (source >= 0) {
+        close(source);
+        unlink("/tmp/thekernel-io-uring-buffers-munmap-source");
+    }
+    if (output >= 0) {
+        close(output);
+        unlink("/tmp/thekernel-io-uring-buffers-munmap-output");
     }
     if (buffer != MAP_FAILED) {
         munmap(buffer, page_bytes);
@@ -1664,6 +1672,9 @@ out:
         observe_completions(&ring, "munmap-completion-observe");
     }
     ring_cleanup(&ring);
+    if (replacement != MAP_FAILED) {
+        munmap(replacement, page_bytes);
+    }
     return result;
 }
 

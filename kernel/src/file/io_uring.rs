@@ -37,8 +37,8 @@ use super::{
     FixedSharedMmapRegion, Kstat, PreparedFileMmap, SharedPages, anon_inode_stat,
 };
 use crate::mm::{
-    PinnedUserSegmentsMut, SharedAtomicU32, UserMemoryCapability,
-    try_pin_user_segments_to_user_longterm_with,
+    PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinSegment, UserMemoryCapability,
+    physical_segments_are_disjoint, try_pin_user_segments_to_user_longterm_with,
 };
 
 const RING_WAITER_SLOTS: usize = 64;
@@ -256,6 +256,10 @@ struct RegisteredFiles {
 struct RegisteredBuffer {
     address: usize,
     length: usize,
+    pin_start: usize,
+    pin_len: usize,
+    segment_ends: Vec<usize>,
+    pin_segments_disjoint: bool,
     capability: UserMemoryCapability,
     // Release the lower VM/frame/page-cache pin before making this ring's
     // admission charge reusable. A large unpin can yield enough observable
@@ -311,6 +315,15 @@ impl Drop for IoUringBufferLease {
     }
 }
 
+fn locate_physical_segment(segment_ends: &[usize], offset: usize) -> AxResult<(usize, usize)> {
+    let segment_index = segment_ends.partition_point(|segment_end| *segment_end <= offset);
+    let preceding = segment_index
+        .checked_sub(1)
+        .map_or(0, |index| segment_ends[index]);
+    let segment_offset = offset.checked_sub(preceding).ok_or(AxError::BadAddress)?;
+    Ok((segment_index, segment_offset))
+}
+
 impl IoUringBufferLease {
     /// Returns the address-space capability captured when this buffer was
     /// registered. Fixed I/O must never substitute the caller's current
@@ -334,6 +347,36 @@ impl IoUringBufferLease {
                 (range.address(), range.length())
             })
             .ok_or(AxError::BadState)
+    }
+
+    /// Returns the selected fixed-buffer bytes from the physical SG captured
+    /// at registration. The lease must remain alive while the returned view is
+    /// consumed; it is the owner of the underlying pin.
+    pub(crate) fn physical_range(&self) -> AxResult<(&[UserIoPinSegment], usize, usize, bool)> {
+        let lease = self.lease.as_ref().ok_or(AxError::BadState)?;
+        let range = lease.range();
+        let owner = lease.owner();
+        let address = usize::try_from(range.address()).map_err(|_| AxError::BadAddress)?;
+        let length = usize::try_from(range.length()).map_err(|_| AxError::BadAddress)?;
+        let offset = address
+            .checked_sub(owner.pin_start)
+            .ok_or(AxError::BadAddress)?;
+        let pin = owner._pin_owner.pin.as_ref().ok_or(AxError::BadState)?;
+        let end = offset.checked_add(length).ok_or(AxError::BadAddress)?;
+        if end > owner.pin_len {
+            return Err(AxError::BadAddress);
+        }
+        let (segment_index, segment_offset) = locate_physical_segment(&owner.segment_ends, offset)?;
+        let segments = pin
+            .segments()
+            .get(segment_index..)
+            .ok_or(AxError::BadAddress)?;
+        Ok((
+            segments,
+            segment_offset,
+            length,
+            owner.pin_segments_disjoint,
+        ))
     }
 }
 
@@ -1531,9 +1574,27 @@ impl IoUring {
                     return Err(AxError::ResourceBusy);
                 }
             };
+            let mut segment_ends = Vec::new();
+            segment_ends
+                .try_reserve_exact(pin.segments().len())
+                .map_err(|_| AxError::NoMemory)?;
+            let mut segment_end = 0usize;
+            for segment in pin.segments() {
+                segment_end = segment_end
+                    .checked_add(segment.len)
+                    .ok_or(AxError::BadAddress)?;
+                segment_ends.push(segment_end);
+            }
+            if segment_end != page_len {
+                return Err(AxError::BadState);
+            }
             let owner = Arc::try_new(RegisteredBuffer {
                 address,
                 length,
+                pin_start: page_start,
+                pin_len: page_len,
+                segment_ends,
+                pin_segments_disjoint: physical_segments_are_disjoint(pin.segments()),
                 capability: capability.clone(),
                 _pin_owner: PinBeforeCharge::new(pin, pin_charge),
             })
@@ -2280,6 +2341,17 @@ mod adapter_state_tests {
         drop(charge);
         assert_eq!(budget.pages.load(Ordering::Acquire), 0);
         assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn physical_segment_index_uses_prefix_boundaries() {
+        let ends = [4, 12, 20];
+        assert_eq!(locate_physical_segment(&ends, 0).unwrap(), (0, 0));
+        assert_eq!(locate_physical_segment(&ends, 3).unwrap(), (0, 3));
+        assert_eq!(locate_physical_segment(&ends, 4).unwrap(), (1, 0));
+        assert_eq!(locate_physical_segment(&ends, 11).unwrap(), (1, 7));
+        assert_eq!(locate_physical_segment(&ends, 12).unwrap(), (2, 0));
+        assert_eq!(locate_physical_segment(&ends, 20).unwrap(), (3, 0));
     }
 
     #[test]

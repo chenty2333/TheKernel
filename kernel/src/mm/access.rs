@@ -540,7 +540,7 @@ fn record_user_io_backend_pin_reject(backend: &Backend) {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct UserIoPinSegment {
     pub paddr: usize,
     pub len: usize,
@@ -1396,16 +1396,196 @@ pub fn pinned_user_mut_segments_are_disjoint(pins: &[PinnedUserSegmentsMut]) -> 
     physical_pin_segments_are_disjoint(pins.iter().flat_map(|pin| pin.segments.as_slice().iter()))
 }
 
+/// Returns whether a physical SG stream has no overlapping byte ranges.
+/// Mutable axfs pinned destinations require this property; callers can use
+/// the raw physical cursor when an intentionally aliased mapping is selected.
+pub fn physical_segments_are_disjoint(segments: &[UserIoPinSegment]) -> bool {
+    physical_pin_segments_are_disjoint(segments.iter())
+}
+
+struct PinnedPhysicalCursor<'a> {
+    segments: &'a [UserIoPinSegment],
+    index: usize,
+    offset: usize,
+    remaining: usize,
+}
+
+impl<'a> PinnedPhysicalCursor<'a> {
+    fn new(segments: &'a [UserIoPinSegment], offset: usize, len: usize) -> Option<Self> {
+        let total = segments
+            .iter()
+            .try_fold(0usize, |total, segment| total.checked_add(segment.len))?;
+        if offset.checked_add(len)? > total {
+            return None;
+        }
+        let mut cursor = Self {
+            segments,
+            index: 0,
+            offset: 0,
+            remaining: total,
+        };
+        let mut skipped = offset;
+        while skipped != 0 {
+            let (_, part) = cursor.take(skipped)?;
+            skipped -= part;
+        }
+        cursor.remaining = len;
+        Some(cursor)
+    }
+
+    fn take(&mut self, limit: usize) -> Option<(usize, usize)> {
+        while let Some(segment) = self.segments.get(self.index).copied() {
+            if self.offset == segment.len {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            }
+            let len = limit.min(segment.len.checked_sub(self.offset)?);
+            let paddr = segment.paddr.checked_add(self.offset)?;
+            paddr.checked_add(len)?;
+            self.offset = self.offset.checked_add(len)?;
+            self.remaining = self.remaining.checked_sub(len)?;
+            return Some((paddr, len));
+        }
+        None
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+}
+
+/// A raw physical scatter/gather source used while its MM pin owner is held.
+///
+/// This adapter is intentionally byte-oriented.  It does not expose a Rust
+/// slice into physical memory, avoiding a long-lived Rust alias while still
+/// allowing stream and generic file backends to consume registered pages
+/// without re-resolving their virtual addresses.
+pub struct PinnedPhysicalReader<'a> {
+    cursor: PinnedPhysicalCursor<'a>,
+}
+
+impl<'a> PinnedPhysicalReader<'a> {
+    pub fn new(segments: &'a [UserIoPinSegment], offset: usize, len: usize) -> Option<Self> {
+        Some(Self {
+            cursor: PinnedPhysicalCursor::new(segments, offset, len)?,
+        })
+    }
+
+    /// Constructs a cursor for a range already bounded by its pin owner.
+    /// The caller must retain that owner and provide a descriptor suffix that
+    /// covers `offset + len` bytes.
+    pub(crate) fn from_validated_range(
+        segments: &'a [UserIoPinSegment],
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            cursor: PinnedPhysicalCursor {
+                segments,
+                index: 0,
+                offset,
+                remaining: len,
+            },
+        }
+    }
+}
+
+impl axio::Read for PinnedPhysicalReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> axio::Result<usize> {
+        let target = buf.len().min(self.cursor.remaining());
+        let mut copied = 0usize;
+        while copied < target {
+            let (paddr, len) = self
+                .cursor
+                .take(target - copied)
+                .ok_or(AxError::InvalidInput)?;
+            let src = phys_to_virt(memory_addr::PhysAddr::from(paddr)).as_ptr();
+            // SAFETY: the caller holds the long-term pin for every descriptor
+            // and the physical addresses were produced by the MM pin scan.
+            unsafe { ptr::copy(src, buf.as_mut_ptr().add(copied), len) };
+            copied += len;
+        }
+        Ok(copied)
+    }
+}
+
+impl axio::IoBuf for PinnedPhysicalReader<'_> {
+    fn remaining(&self) -> usize {
+        self.cursor.remaining()
+    }
+}
+
+/// A raw physical scatter/gather destination used while its MM pin owner is
+/// held.  See [`PinnedPhysicalReader`] for the aliasing contract.
+pub struct PinnedPhysicalWriter<'a> {
+    cursor: PinnedPhysicalCursor<'a>,
+}
+
+impl<'a> PinnedPhysicalWriter<'a> {
+    pub fn new(segments: &'a [UserIoPinSegment], offset: usize, len: usize) -> Option<Self> {
+        Some(Self {
+            cursor: PinnedPhysicalCursor::new(segments, offset, len)?,
+        })
+    }
+
+    /// See [`PinnedPhysicalReader::from_validated_range`].
+    pub(crate) fn from_validated_range(
+        segments: &'a [UserIoPinSegment],
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            cursor: PinnedPhysicalCursor {
+                segments,
+                index: 0,
+                offset,
+                remaining: len,
+            },
+        }
+    }
+}
+
+impl axio::Write for PinnedPhysicalWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> axio::Result<usize> {
+        let target = buf.len().min(self.cursor.remaining());
+        let mut copied = 0usize;
+        while copied < target {
+            let (paddr, len) = self
+                .cursor
+                .take(target - copied)
+                .ok_or(AxError::InvalidInput)?;
+            let dst = phys_to_virt(memory_addr::PhysAddr::from(paddr)).as_mut_ptr();
+            // SAFETY: the caller holds the long-term pin for every descriptor
+            // and the physical addresses were produced by the MM pin scan.
+            unsafe { ptr::copy(buf.as_ptr().add(copied), dst, len) };
+            copied += len;
+        }
+        Ok(copied)
+    }
+
+    fn flush(&mut self) -> axio::Result<()> {
+        Ok(())
+    }
+}
+
+impl axio::IoBufMut for PinnedPhysicalWriter<'_> {
+    fn remaining_mut(&self) -> usize {
+        self.cursor.remaining()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axhal::paging::{MappingFlags, PageSize, PagingError};
+    use axio::{IoBuf, IoBufMut};
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
     use super::{
-        FutexMappingNamespace, USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments,
-        UserNofaultError, classify_nofault_page, classify_nofault_query,
-        futex_mapping_namespace_matches, physical_pin_segments_are_disjoint,
-        user_io_pin_scan_chunk_end,
+        FutexMappingNamespace, PinnedPhysicalCursor, PinnedPhysicalReader, PinnedPhysicalWriter,
+        USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments, UserNofaultError,
+        classify_nofault_page, classify_nofault_query, futex_mapping_namespace_matches,
+        physical_pin_segments_are_disjoint, user_io_pin_scan_chunk_end,
     };
 
     #[test]
@@ -1475,6 +1655,60 @@ mod tests {
             len: 2,
         }];
         assert!(!physical_pin_segments_are_disjoint(overflowing.iter()));
+    }
+
+    #[test]
+    fn physical_cursor_clips_edges_and_crosses_segments_without_allocation() {
+        let segments = [
+            UserIoPinSegment {
+                paddr: 0x1000,
+                len: 4,
+            },
+            UserIoPinSegment {
+                paddr: 0x9000,
+                len: 8,
+            },
+        ];
+        let mut cursor = PinnedPhysicalCursor::new(&segments, 2, 7).unwrap();
+        assert_eq!(cursor.take(7), Some((0x1002, 2)));
+        assert_eq!(cursor.take(7), Some((0x9000, 5)));
+        assert_eq!(cursor.remaining(), 0);
+        assert!(PinnedPhysicalCursor::new(&segments, usize::MAX, 1).is_none());
+        assert!(PinnedPhysicalCursor::new(&segments, 0, 13).is_none());
+        let overflowing = [UserIoPinSegment {
+            paddr: usize::MAX,
+            len: 2,
+        }];
+        let mut cursor = PinnedPhysicalCursor::new(&overflowing, 0, 2).unwrap();
+        assert_eq!(cursor.take(2), None);
+    }
+
+    #[test]
+    fn physical_adapters_keep_checked_cursor_bounds() {
+        let segments = [
+            UserIoPinSegment {
+                paddr: 0x1000,
+                len: 4,
+            },
+            UserIoPinSegment {
+                paddr: 0x9000,
+                len: 8,
+            },
+        ];
+        assert_eq!(
+            PinnedPhysicalReader::new(&segments, 3, 6)
+                .unwrap()
+                .remaining(),
+            6
+        );
+        assert_eq!(
+            PinnedPhysicalWriter::new(&segments, 3, 6)
+                .unwrap()
+                .remaining_mut(),
+            6
+        );
+        assert!(PinnedPhysicalReader::new(&segments, 13, 1).is_none());
+        assert!(PinnedPhysicalWriter::new(&segments, 0, usize::MAX).is_none());
     }
 
     #[test]
