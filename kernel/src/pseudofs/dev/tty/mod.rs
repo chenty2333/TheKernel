@@ -5,17 +5,21 @@ mod pty;
 mod terminal;
 
 use alloc::sync::{Arc, Weak};
-use core::{any::Any, ops::Deref, sync::atomic::Ordering, task::Context};
+use core::{
+    any::Any,
+    mem::{MaybeUninit, align_of, offset_of, size_of},
+    ops::Deref,
+    sync::atomic::Ordering,
+    task::Context,
+};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex;
-use axtask::current;
 use kspin::SpinNoIrq;
 use spin::Once;
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
@@ -33,11 +37,56 @@ use self::{
     },
 };
 use crate::{
+    file::IoctlContext,
+    mm::map_usercopy_error,
     pseudofs::DeviceOps,
-    task::{AsThread, Process, Session, get_process_group, send_signal_to_process_group},
+    task::{Process, Session, get_process_group, send_signal_to_process_group},
 };
 
 const N_TTY_LDISC: i32 = 0;
+
+const _: () = assert!(size_of::<WindowSize>() == 8 && align_of::<WindowSize>() == 2);
+
+fn window_size_to_user_bytes(window_size: WindowSize) -> [u8; size_of::<WindowSize>()] {
+    let mut bytes = [0u8; size_of::<WindowSize>()];
+    bytes[offset_of!(WindowSize, ws_row)..][..2].copy_from_slice(&window_size.ws_row.to_ne_bytes());
+    bytes[offset_of!(WindowSize, ws_col)..][..2].copy_from_slice(&window_size.ws_col.to_ne_bytes());
+    bytes[offset_of!(WindowSize, ws_xpixel)..][..2]
+        .copy_from_slice(&window_size.ws_xpixel.to_ne_bytes());
+    bytes[offset_of!(WindowSize, ws_ypixel)..][..2]
+        .copy_from_slice(&window_size.ws_ypixel.to_ne_bytes());
+    bytes
+}
+
+fn termios_user_bytes(termios: &Termios2) -> [u8; size_of::<Termios>()] {
+    termios.deref().to_user_bytes()
+}
+
+fn termios2_user_bytes(termios: &Termios2) -> [u8; size_of::<Termios2>()] {
+    termios.to_user_bytes()
+}
+
+fn read_user_bytes<const N: usize>(context: &IoctlContext, address: usize) -> AxResult<[u8; N]> {
+    let mut bytes = [MaybeUninit::<u8>::uninit(); N];
+    context
+        .user_memory()
+        .read_bytes(address, &mut bytes)
+        .map_err(map_usercopy_error)?;
+    Ok(core::array::from_fn(|index| {
+        // SAFETY: read_bytes initializes every byte before returning.
+        unsafe { bytes[index].assume_init() }
+    }))
+}
+
+fn window_size_from_user_bytes(bytes: [u8; size_of::<WindowSize>()]) -> WindowSize {
+    let read_u16 = |offset| u16::from_ne_bytes(bytes[offset..][..2].try_into().unwrap());
+    WindowSize {
+        ws_row: read_u16(offset_of!(WindowSize, ws_row)),
+        ws_col: read_u16(offset_of!(WindowSize, ws_col)),
+        ws_xpixel: read_u16(offset_of!(WindowSize, ws_xpixel)),
+        ws_ypixel: read_u16(offset_of!(WindowSize, ws_ypixel)),
+    }
+}
 
 /// Tty device
 pub struct Tty<R, W> {
@@ -109,14 +158,13 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         drop(lease);
     }
 
-    fn controlling_session_for_current(&self) -> AxResult<Arc<Session>> {
-        let session = current().as_thread().proc_data.proc.group().session();
+    fn controlling_session(&self, session: &Arc<Session>) -> AxResult<Arc<Session>> {
         let terminal_session = self
             .terminal
             .job_control
             .session()
             .ok_or(AxError::NotATty)?;
-        if !Arc::ptr_eq(&session, &terminal_session) {
+        if !Arc::ptr_eq(session, &terminal_session) {
             return Err(AxError::NotATty);
         }
         let tty: Arc<dyn Any + Send + Sync> = self.this_arc()?;
@@ -126,7 +174,7 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         {
             return Err(AxError::NotATty);
         }
-        Ok(session)
+        Ok(session.clone())
     }
 
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
@@ -259,24 +307,37 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
         self.writer.write(buf)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         use linux_raw_sys::{
             general::{CAP_SYS_ADMIN, TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON},
             ioctl::*,
         };
         match cmd {
             TCGETA => {
-                (arg as *mut Termio).vm_write(self.terminal.termios.lock().as_termio())?;
+                let bytes = self.terminal.termios.lock().as_termio().to_user_bytes();
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             TCGETS => {
                 let termios = *self.terminal.termios.lock();
-                (arg as *mut Termios).vm_write(*termios.deref())?;
+                let bytes = termios_user_bytes(&termios);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             TCGETS2 => {
-                (arg as *mut Termios2).vm_write(*self.terminal.termios.lock())?;
+                let termios = *self.terminal.termios.lock();
+                let bytes = termios2_user_bytes(&termios);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             TCSETA => {
-                let termio = (arg as *const Termio).vm_read()?;
+                let termio = Termio::from_user_bytes(read_user_bytes(context, arg)?);
                 let mut current = self.terminal.termios.lock();
                 let next = Termios2::from_termio(termio, &current);
                 next.validate_update(&current)?;
@@ -284,7 +345,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TCSETAF | TCSETAW => return Err(AxError::Unsupported),
             TCSETS => {
-                let termios = (arg as *const Termios).vm_read()?;
+                let termios = Termios::from_user_bytes(read_user_bytes(context, arg)?);
                 let mut current = self.terminal.termios.lock();
                 let next = Termios2::from_termios(termios, &current);
                 next.validate_update(&current)?;
@@ -292,23 +353,26 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TCSETSF | TCSETSW => return Err(AxError::Unsupported),
             TCSETS2 => {
-                let next = (arg as *const Termios2).vm_read()?;
+                let next = Termios2::from_user_bytes(read_user_bytes(context, arg)?);
                 let mut current = self.terminal.termios.lock();
                 next.validate_update(&current)?;
                 *current = next;
             }
             TCSETSF2 | TCSETSW2 => return Err(AxError::Unsupported),
-            FIONREAD => {
-                let readable = self.ldisc.lock().readable_len() as u32;
-                (arg as *mut u32).vm_write(readable)?;
-            }
+            FIONREAD => return Ok(self.ldisc.lock().readable_len()),
             TIOCOUTQ => return Err(AxError::Unsupported),
             TIOCGETD => {
                 let ldisc = self.terminal.line_discipline.load(Ordering::Acquire) as i32;
-                (arg as *mut i32).vm_write(ldisc)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &ldisc.to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             TIOCSETD => {
-                let ldisc = (arg as *const i32).vm_read()?;
+                let ldisc = context
+                    .user_memory()
+                    .read_value(arg as *const i32)
+                    .map_err(map_usercopy_error)?;
                 if ldisc != N_TTY_LDISC {
                     return Err(AxError::InvalidInput);
                 }
@@ -325,17 +389,23 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 _ => return Err(AxError::InvalidInput),
             },
             TIOCGPGRP => {
-                self.controlling_session_for_current()?;
+                self.controlling_session(context.caller_session())?;
                 let foreground = self
                     .terminal
                     .job_control
                     .foreground()
                     .ok_or(AxError::NoSuchProcess)?;
-                (arg as *mut u32).vm_write(foreground.pgid())?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &foreground.pgid().to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             TIOCSPGRP => {
-                self.controlling_session_for_current()?;
-                let pgid = (arg as *const i32).vm_read()?;
+                self.controlling_session(context.caller_session())?;
+                let pgid = context
+                    .user_memory()
+                    .read_value(arg as *const i32)
+                    .map_err(map_usercopy_error)?;
                 if pgid <= 0 {
                     return Err(AxError::InvalidInput);
                 }
@@ -343,16 +413,25 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 self.terminal.job_control.set_foreground(&foreground)?;
             }
             TIOCGWINSZ => {
-                (arg as *mut WindowSize).vm_write(*self.terminal.window_size.lock())?;
+                let bytes = window_size_to_user_bytes(*self.terminal.window_size.lock());
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             TIOCSWINSZ => {
-                *self.terminal.window_size.lock() = (arg as *const WindowSize).vm_read()?;
+                let window_size = window_size_from_user_bytes(read_user_bytes(context, arg)?);
+                *self.terminal.window_size.lock() = window_size;
             }
             TIOCSPTLCK => {
                 if !self.is_ptm {
                     return Err(AxError::NotATty);
                 }
-                let locked = (arg as *const i32).vm_read()? != 0;
+                let locked = context
+                    .user_memory()
+                    .read_value(arg as *const i32)
+                    .map_err(map_usercopy_error)?
+                    != 0;
                 self.terminal.pty_locked.store(locked, Ordering::Release);
             }
             TIOCGPTLCK => {
@@ -360,25 +439,29 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     return Err(AxError::NotATty);
                 }
                 let locked = self.terminal.pty_locked.load(Ordering::Acquire) as i32;
-                (arg as *mut i32).vm_write(locked)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &locked.to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             TIOCGPTN => {
                 if !self.is_ptm {
                     return Err(AxError::NotATty);
                 }
-                (arg as *mut u32).vm_write(self.pty_number())?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &self.pty_number().to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             TIOCSCTTY => {
                 if arg != 0 {
                     return Err(AxError::OperationNotSupported);
                 }
-                self.this_arc()?
-                    .bind_to(&current().as_thread().proc_data.proc)?;
+                self.this_arc()?.bind_to(&context.caller_process().proc)?;
             }
             TIOCNOTTY => {
-                let curr = current();
-                let proc = &curr.as_thread().proc_data.proc;
-                let session = proc.group().session();
+                let proc = &context.caller_process().proc;
+                let session = context.caller_session().clone();
                 let tty: Arc<dyn Any + Send + Sync> = self.this_arc()?;
                 if !session
                     .terminal()
@@ -416,11 +499,14 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .job_control
                     .session()
                     .ok_or(AxError::NotATty)?;
-                (arg as *mut u32).vm_write(session.sid())?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &session.sid().to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             TIOCVHANGUP => {
-                if !current()
-                    .as_thread()
+                if !context
+                    .caller_cred()
                     .has_effective_capability(CAP_SYS_ADMIN)
                 {
                     return Err(AxError::OperationNotPermitted);
@@ -538,7 +624,7 @@ impl DeviceOps for CurrentTty {
         Err(AxError::NotATty)
     }
 
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
     }
 
@@ -588,6 +674,45 @@ mod tests {
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
             Ok(())
         }
+    }
+
+    #[test]
+    fn termios_ioctl_codecs_use_linux_abi_sizes() {
+        let termios = Termios2::default();
+
+        assert_eq!(termios_user_bytes(&termios).len(), size_of::<Termios>());
+        assert_eq!(termios2_user_bytes(&termios).len(), size_of::<Termios2>());
+    }
+
+    #[test]
+    fn tcgets_branch_does_not_overwrite_termios2_tail() {
+        let termios = Termios2::default();
+        let bytes = termios_user_bytes(&termios);
+        let mut destination = [0xa5; size_of::<Termios2>()];
+
+        destination[..bytes.len()].copy_from_slice(&bytes);
+
+        assert!(
+            destination[size_of::<Termios>()..]
+                .iter()
+                .all(|&byte| byte == 0xa5)
+        );
+    }
+
+    #[test]
+    fn termio_input_codec_discards_abi_padding() {
+        let termio = Termios2::default().as_termio();
+        let mut bytes = termio.to_user_bytes();
+        bytes[size_of::<Termio>() - 1] = 0xa5;
+
+        let decoded = Termio::from_user_bytes(bytes);
+        let encoded = decoded.to_user_bytes();
+
+        assert_eq!(encoded[size_of::<Termio>() - 1], 0);
+        assert_eq!(
+            &encoded[..size_of::<Termio>() - 1],
+            &bytes[..size_of::<Termio>() - 1]
+        );
     }
 
     /// Drains the deferred description-cleanup queue to quiescence.

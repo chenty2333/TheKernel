@@ -1,5 +1,5 @@
-use alloc::sync::Arc;
-use core::{ffi::c_char, mem};
+use alloc::{string::String, sync::Arc};
+use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
@@ -15,14 +15,17 @@ use linux_raw_sys::{
     mempolicy::*,
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 use thekernel_linux_cred::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, CapsetRequest,
+};
+use thekernel_linux_signal::api::SharedSignalActions;
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul, vm_write_slice,
 };
 
 use crate::{
     file::{FD_TABLE, File, FileDescription, FileLike, replace_process_fd_table},
-    mm::vm_load_string,
+    mm::map_usercopy_error,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file,
@@ -42,6 +45,7 @@ const SUPPORTED_GET_MEMPOLICY_FLAGS: usize =
 const SUPPORTED_MODE_FLAGS: usize = MPOL_MODE_FLAGS as usize;
 const SUPPORTED_MBIND_FLAGS: usize = MPOL_MF_VALID as usize;
 const SUPPORTED_MOVE_PAGES_FLAGS: usize = (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) as usize;
+const MOVE_PAGES_SNAPSHOT_CHUNK: usize = 16;
 const MAX_NODEMASK_BITS: usize = 4096;
 const KCMP_FILE: i32 = 0;
 const KCMP_VM: i32 = 1;
@@ -77,7 +81,11 @@ fn mempolicy_mode_flags(mode_with_flags: usize) -> usize {
     mode_with_flags & SUPPORTED_MODE_FLAGS
 }
 
-fn read_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<usize> {
+fn read_nodemask<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    nodemask: *const usize,
+    maxnode: usize,
+) -> AxResult<usize> {
     if nodemask.is_null() || maxnode == 0 {
         return Ok(0);
     }
@@ -88,7 +96,10 @@ fn read_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<usize> {
     let words = maxnode.div_ceil(usize::BITS as usize);
     let mut result = 0usize;
     for index in 0..words {
-        let word = nodemask.wrapping_add(index).vm_read()?;
+        let word = nodemask
+            .wrapping_add(index)
+            .vm_read(memory)
+            .map_err(map_usercopy_error)?;
         if index == 0 {
             result = word;
         } else if word != 0 {
@@ -107,7 +118,12 @@ fn read_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<usize> {
     Ok(result)
 }
 
-fn write_nodemask(nodemask: *mut usize, maxnode: usize, value: usize) -> AxResult<()> {
+fn write_nodemask<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    nodemask: *mut usize,
+    maxnode: usize,
+    value: usize,
+) -> AxResult<()> {
     if nodemask.is_null() || maxnode == 0 {
         return Ok(());
     }
@@ -115,7 +131,8 @@ fn write_nodemask(nodemask: *mut usize, maxnode: usize, value: usize) -> AxResul
     let words = maxnode.div_ceil(usize::BITS as usize);
     for index in 0..words {
         let word = if index == 0 { value } else { 0 };
-        nodemask.wrapping_add(index).vm_write(word)?;
+        VmMutPtr::vm_write(nodemask.wrapping_add(index), memory, word)
+            .map_err(map_usercopy_error)?;
     }
     Ok(())
 }
@@ -228,6 +245,37 @@ fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
     }
 }
 
+fn checked_move_pages_element_address<T>(base: *const T, index: usize) -> AxResult<usize> {
+    let offset = index
+        .checked_mul(mem::size_of::<T>())
+        .ok_or(AxError::BadAddress)?;
+    (base as usize)
+        .checked_add(offset)
+        .ok_or(AxError::BadAddress)
+}
+
+fn snapshot_move_pages_array<M: UserMemory + ?Sized, T>(
+    memory: &mut UserMemoryContext<'_, M>,
+    base: *const T,
+    offset: usize,
+    destination: &mut [MaybeUninit<T>],
+) -> AxResult<()> {
+    let address = checked_move_pages_element_address(base, offset)?;
+    memory
+        .read_slice(address as *const T, destination)
+        .map_err(map_usercopy_error)
+}
+
+fn write_move_pages_status<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    status: *mut i32,
+    index: usize,
+    value: i32,
+) -> AxResult<()> {
+    let address = checked_move_pages_element_address(status as *const i32, index)?;
+    VmMutPtr::vm_write(address as *mut i32, memory, value).map_err(map_usercopy_error)
+}
+
 fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
     if pid <= 0 {
         return Err(AxError::NoSuchProcess);
@@ -329,9 +377,9 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
                 &*FS_CONTEXT.scope(&scope2),
             )))
         }
-        KCMP_SIGHAND => Ok(kcmp_result(Arc::ptr_eq(
-            &proc1.signal.actions,
-            &proc2.signal.actions,
+        KCMP_SIGHAND => Ok(kcmp_result(SharedSignalActions::ptr_eq(
+            proc1.signal.shared_actions(),
+            proc2.signal.shared_actions(),
         ))),
         KCMP_IO | KCMP_SYSVSEM => Err(LinuxError::EOPNOTSUPP.into()),
         KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
@@ -595,17 +643,25 @@ fn cap_data_words(version: u32) -> usize {
     }
 }
 
-fn validate_cap_version(
+fn validate_cap_version<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     header_ptr: *mut __user_cap_header_struct,
 ) -> AxResult<__user_cap_header_struct> {
     // FIXME: AnyBitPattern
-    let mut header = unsafe { header_ptr.vm_read_uninit()?.assume_init() };
+    let mut header = unsafe {
+        header_ptr
+            .vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     if !matches!(
         header.version,
         _LINUX_CAPABILITY_VERSION_1 | _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3
     ) {
         header.version = _LINUX_CAPABILITY_VERSION_3;
-        header_ptr.vm_write(header)?;
+        unsafe {
+            VmMutPtr::vm_write_unchecked(header_ptr, memory, header).map_err(map_usercopy_error)?;
+        }
         return Err(AxError::InvalidInput);
     }
     Ok(header)
@@ -622,15 +678,17 @@ fn resolve_cap_task(header: __user_cap_header_struct) -> AxResult<AxTaskRef> {
     }
 }
 
-fn validate_cap_header(
+fn validate_cap_header<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     header_ptr: *mut __user_cap_header_struct,
 ) -> AxResult<(__user_cap_header_struct, AxTaskRef)> {
-    let header = validate_cap_version(header_ptr)?;
+    let header = validate_cap_version(memory, header_ptr)?;
     let task = resolve_cap_task(header)?;
     Ok((header, task))
 }
 
-fn write_cap_data(
+fn write_cap_data<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     data: *mut __user_cap_data_struct,
     version: u32,
     state: CapabilitySets,
@@ -639,23 +697,38 @@ fn write_cap_data(
     let permitted = state.permitted();
     let inheritable = state.inheritable();
     for index in 0..cap_data_words(version) {
-        data.wrapping_add(index).vm_write(__user_cap_data_struct {
-            effective: effective[index],
-            permitted: permitted[index],
-            inheritable: inheritable[index],
-        })?;
+        unsafe {
+            VmMutPtr::vm_write_unchecked(
+                data.wrapping_add(index),
+                memory,
+                __user_cap_data_struct {
+                    effective: effective[index],
+                    permitted: permitted[index],
+                    inheritable: inheritable[index],
+                },
+            )
+            .map_err(map_usercopy_error)?;
+        }
     }
     Ok(())
 }
 
-fn read_cap_data(data: *mut __user_cap_data_struct, version: u32) -> AxResult<CapsetRequest> {
+fn read_cap_data<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    data: *mut __user_cap_data_struct,
+    version: u32,
+) -> AxResult<CapsetRequest> {
     let mut effective = [0; CAPABILITY_WORDS];
     let mut permitted = [0; CAPABILITY_WORDS];
     let mut inheritable = [0; CAPABILITY_WORDS];
 
     for index in 0..cap_data_words(version) {
-        let entry: __user_cap_data_struct =
-            unsafe { data.wrapping_add(index).vm_read_uninit()?.assume_init() };
+        let entry: __user_cap_data_struct = unsafe {
+            data.wrapping_add(index)
+                .vm_read_uninit(memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         let valid = CAPABILITY_VALID_MASK[index];
         effective[index] = entry.effective & valid;
         permitted[index] = entry.permitted & valid;
@@ -664,11 +737,12 @@ fn read_cap_data(data: *mut __user_cap_data_struct, version: u32) -> AxResult<Ca
     CapsetRequest::try_new(effective, permitted, inheritable).map_err(cred_error)
 }
 
-pub fn sys_capget(
+pub fn sys_capget<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let header = match validate_cap_version(header) {
+    let header = match validate_cap_version(memory, header) {
         Ok(header) => header,
         Err(err) if data.is_null() && err == AxError::InvalidInput => return Ok(0),
         Err(err) => return Err(err),
@@ -679,22 +753,23 @@ pub fn sys_capget(
 
     let task = resolve_cap_task(header)?;
     let cred = task.as_thread().current_cred();
-    write_cap_data(data, header.version, cred.capabilities())?;
+    write_cap_data(memory, data, header.version, cred.capabilities())?;
     Ok(0)
 }
 
-pub fn sys_capset(
+pub fn sys_capset<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
     let curr = current();
     let current_tid = curr.as_thread().tid();
-    let (header, task) = validate_cap_header(header)?;
+    let (header, task) = validate_cap_header(memory, header)?;
     if header.pid != 0 && header.pid as u32 != current_tid {
         return Err(AxError::OperationNotPermitted);
     }
 
-    let request = read_cap_data(data, header.version)?;
+    let request = read_cap_data(memory, data, header.version)?;
     task.as_thread().apply_capset(request)?;
 
     Ok(0)
@@ -758,7 +833,8 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_get_mempolicy(
+pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     policy: *mut i32,
     nodemask: *mut usize,
     maxnode: usize,
@@ -772,7 +848,7 @@ pub fn sys_get_mempolicy(
         if flags & (MPOL_F_ADDR | MPOL_F_NODE) as usize != 0 {
             return Err(AxError::InvalidInput);
         }
-        write_nodemask(nodemask, maxnode, ALLOWED_NODEMASK)?;
+        write_nodemask(memory, nodemask, maxnode, ALLOWED_NODEMASK)?;
         return Ok(0);
     }
     if addr != 0 && flags & MPOL_F_ADDR as usize == 0 {
@@ -800,39 +876,47 @@ pub fn sys_get_mempolicy(
         }
         if flags & MPOL_F_ADDR as usize != 0 {
             if !policy.is_null() {
-                policy.vm_write(numa_page_node(proc_data, addr)?)?;
+                VmMutPtr::vm_write(policy, memory, numa_page_node(proc_data, addr)?)
+                    .map_err(map_usercopy_error)?;
             }
             return Ok(0);
         }
         if !policy.is_null() {
-            policy.vm_write(mempolicy_preferred_node(selected))?;
+            VmMutPtr::vm_write(policy, memory, mempolicy_preferred_node(selected))
+                .map_err(map_usercopy_error)?;
         }
         return Ok(0);
     }
 
     if !policy.is_null() {
-        policy.vm_write(selected.mode as i32)?;
+        VmMutPtr::vm_write(policy, memory, selected.mode as i32).map_err(map_usercopy_error)?;
     }
     let returned_nodemask = if flags & MPOL_F_ADDR as usize == 0 && selected.nodemask == 0 {
         ALLOWED_NODEMASK
     } else {
         selected.nodemask
     };
-    write_nodemask(nodemask, maxnode, returned_nodemask)?;
+    write_nodemask(memory, nodemask, maxnode, returned_nodemask)?;
     Ok(0)
 }
 
-pub fn sys_set_mempolicy(mode: usize, nodemask: *const usize, maxnode: usize) -> AxResult<isize> {
+pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    mode: usize,
+    nodemask: *const usize,
+    maxnode: usize,
+) -> AxResult<isize> {
     if mempolicy_mode_flags(mode) & !SUPPORTED_MODE_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    let nodemask = read_nodemask(nodemask, maxnode)?;
+    let nodemask = read_nodemask(memory, nodemask, maxnode)?;
     let policy = validate_mempolicy(mode, nodemask, current_allowed_nodemask())?;
     current().as_thread().proc_data.set_mempolicy(policy);
     Ok(0)
 }
 
-pub fn sys_mbind(
+pub fn sys_mbind<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     start: usize,
     len: usize,
     mode: usize,
@@ -844,7 +928,7 @@ pub fn sys_mbind(
         return Err(AxError::InvalidInput);
     }
     let (start, len) = validate_mapped_user_range(start, len)?;
-    let nodemask = read_nodemask(nodemask, maxnode)?;
+    let nodemask = read_nodemask(memory, nodemask, maxnode)?;
     let policy = validate_mempolicy(mode, nodemask, current_allowed_nodemask())?;
     if flags & MPOL_MF_STRICT as usize != 0
         && flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) as usize == 0
@@ -858,7 +942,8 @@ pub fn sys_mbind(
     Ok(0)
 }
 
-pub fn sys_move_pages(
+pub fn sys_move_pages<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
     nr_pages: usize,
     pages: *const usize,
@@ -882,33 +967,53 @@ pub fn sys_move_pages(
     let target = numa_target_process(pid)?;
     check_numa_target_permission(&target)?;
 
-    for index in 0..nr_pages {
-        let page = pages.wrapping_add(index).vm_read()?;
-        let status_value = match numa_page_node(&target, page) {
-            Ok(current_node) if nodes.is_null() => current_node,
-            Ok(_) => {
-                let node = nodes.wrapping_add(index).vm_read()?;
-                validate_movable_node(node)?;
-                if flags & MPOL_MF_MOVE_ALL as usize == 0 && numa_page_is_shareable(&target, page) {
-                    -LinuxError::EACCES.code()
-                } else {
-                    target.bind_mempolicy_range(
-                        VirtAddr::from(page).align_down_4k().as_usize(),
-                        4096,
-                        Mempolicy::new(MPOL_BIND as u32, 1usize << node),
-                    );
-                    node
+    // Linux processes these arrays in small chunks.  Copy each chunk before
+    // applying its page operations, so a later user fault cannot make one
+    // chunk's inputs change underneath the corresponding target updates while
+    // keeping memory use independent of the user-controlled `nr_pages`.
+    let mut page_values = [const { MaybeUninit::<usize>::uninit() }; MOVE_PAGES_SNAPSHOT_CHUNK];
+    let mut node_values = [const { MaybeUninit::<i32>::uninit() }; MOVE_PAGES_SNAPSHOT_CHUNK];
+    let mut offset = 0;
+    while offset < nr_pages {
+        let chunk_len = (nr_pages - offset).min(MOVE_PAGES_SNAPSHOT_CHUNK);
+        snapshot_move_pages_array(memory, pages, offset, &mut page_values[..chunk_len])?;
+        if !nodes.is_null() {
+            snapshot_move_pages_array(memory, nodes, offset, &mut node_values[..chunk_len])?;
+        }
+
+        for chunk_index in 0..chunk_len {
+            let index = offset + chunk_index;
+            let page = unsafe { page_values[chunk_index].assume_init() };
+            let status_value = match numa_page_node(&target, page) {
+                Ok(current_node) if nodes.is_null() => current_node,
+                Ok(_) => {
+                    let node = unsafe { node_values[chunk_index].assume_init() };
+                    validate_movable_node(node)?;
+                    if flags & MPOL_MF_MOVE_ALL as usize == 0
+                        && numa_page_is_shareable(&target, page)
+                    {
+                        -LinuxError::EACCES.code()
+                    } else {
+                        target.bind_mempolicy_range(
+                            VirtAddr::from(page).align_down_4k().as_usize(),
+                            4096,
+                            Mempolicy::new(MPOL_BIND as u32, 1usize << node),
+                        );
+                        node
+                    }
                 }
-            }
-            Err(_) => -LinuxError::EFAULT.code(),
-        };
-        status.wrapping_add(index).vm_write(status_value)?;
+                Err(_) => -LinuxError::EFAULT.code(),
+            };
+            write_move_pages_status(memory, status, index, status_value)?;
+        }
+        offset += chunk_len;
     }
 
     Ok(0)
 }
 
-pub fn sys_migrate_pages(
+pub fn sys_migrate_pages<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
     maxnode: usize,
     old_nodes: *const usize,
@@ -917,8 +1022,8 @@ pub fn sys_migrate_pages(
     let target = numa_target_process(pid)?;
     check_numa_target_permission(&target)?;
 
-    let old_nodes = read_nodemask(old_nodes, maxnode)?;
-    let new_nodes = read_nodemask(new_nodes, maxnode)?;
+    let old_nodes = read_nodemask(memory, old_nodes, maxnode)?;
+    let new_nodes = read_nodemask(memory, new_nodes, maxnode)?;
     validate_migration_nodes(old_nodes)?;
     validate_migration_nodes(new_nodes)?;
     target.migrate_mempolicy_ranges(old_nodes, new_nodes);
@@ -950,7 +1055,8 @@ fn pr_get_dumpable_value(
 /// - PR_SET_NAME: set the name of the calling thread, using the value pointed to by `arg2`
 /// - PR_GET_NAME: get the name of the calling
 /// - PR_SET_MM options: set various memory management options (start/end code/data/brk/stack)
-pub fn sys_prctl(
+pub fn sys_prctl<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     option: u32,
     arg2: usize,
     arg3: usize,
@@ -963,7 +1069,10 @@ pub fn sys_prctl(
 
     match option {
         PR_SET_NAME => {
-            let s = vm_load_string(arg2 as *const c_char)?;
+            let s = String::from_utf8(
+                vm_load_until_nul(memory, arg2 as *const u8).map_err(map_usercopy_error)?,
+            )
+            .map_err(|_| AxError::IllegalBytes)?;
             drop(current().replace_name(s));
         }
         PR_GET_NAME => {
@@ -974,7 +1083,7 @@ pub fn sys_prctl(
             let len = name.len().min(15);
             let mut buf = [0; 16];
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
-            vm_write_slice(arg2 as _, &buf)?;
+            vm_write_slice(memory, arg2 as _, &buf).map_err(map_usercopy_error)?;
         }
         PR_SET_DUMPABLE => {
             current()
@@ -998,7 +1107,12 @@ pub fn sys_prctl(
             current().as_thread().set_pdeath_signal(arg2 as u32);
         }
         PR_GET_PDEATHSIG => {
-            (arg2 as *mut i32).vm_write(current().as_thread().pdeath_signal() as i32)?;
+            VmMutPtr::vm_write(
+                arg2 as *mut i32,
+                memory,
+                current().as_thread().pdeath_signal() as i32,
+            )
+            .map_err(map_usercopy_error)?;
         }
         PR_SET_CHILD_SUBREAPER => {
             current()
@@ -1008,8 +1122,12 @@ pub fn sys_prctl(
                 .set_child_subreaper(arg2 != 0);
         }
         PR_GET_CHILD_SUBREAPER => {
-            (arg2 as *mut i32)
-                .vm_write(current().as_thread().proc_data.proc.is_child_subreaper() as i32)?;
+            VmMutPtr::vm_write(
+                arg2 as *mut i32,
+                memory,
+                current().as_thread().proc_data.proc.is_child_subreaper() as i32,
+            )
+            .map_err(map_usercopy_error)?;
         }
         PR_SET_TIMERSLACK => {
             current().as_thread().proc_data.set_timerslack_ns(arg2);
@@ -1037,7 +1155,7 @@ pub fn sys_prctl(
             // Unlike PR_SET_NO_NEW_PRIVS, Linux treats arg4/arg5 as unused.
             // The common adapter maps the prctl mode values to seccomp(2)
             // operations and applies the exact same install transaction.
-            return crate::syscall::sys_prctl_set_seccomp(arg2, arg3 as *const ());
+            return crate::syscall::sys_prctl_set_seccomp(memory, arg2, arg3 as *const ());
         }
         PR_GET_KEEPCAPS => {
             return Ok(current().as_thread().keep_caps() as isize);
@@ -1182,5 +1300,30 @@ mod tests {
         let owner = unshare_namespace_owner(CLONE_NEWUTS | CLONE_NEWTIME, &actor).unwrap();
         assert!(Arc::ptr_eq(&owner, &child));
         assert!(!Arc::ptr_eq(&owner, &root));
+    }
+
+    #[test]
+    fn move_pages_snapshot_chunk_is_bounded() {
+        assert_eq!(MOVE_PAGES_SNAPSHOT_CHUNK, 16);
+        assert_eq!(0usize.min(MOVE_PAGES_SNAPSHOT_CHUNK), 0);
+        assert_eq!(1usize.min(MOVE_PAGES_SNAPSHOT_CHUNK), 1);
+        assert_eq!(MOVE_PAGES_SNAPSHOT_CHUNK.min(MOVE_PAGES_SNAPSHOT_CHUNK), 16);
+        assert_eq!(
+            (MOVE_PAGES_SNAPSHOT_CHUNK + 1).min(MOVE_PAGES_SNAPSHOT_CHUNK),
+            16
+        );
+        assert_eq!(usize::MAX.min(MOVE_PAGES_SNAPSHOT_CHUNK), 16);
+    }
+
+    #[test]
+    fn move_pages_snapshot_address_checks_element_arithmetic() {
+        assert_eq!(
+            checked_move_pages_element_address::<usize>(usize::MAX as *const usize, 1),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(
+            checked_move_pages_element_address::<usize>(0x1000 as *const usize, 2),
+            Ok(0x1010)
+        );
     }
 }

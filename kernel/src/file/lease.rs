@@ -13,7 +13,7 @@ use lazy_static::lazy_static;
 use linux_raw_sys::general::{
     CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
-use starry_signal::{SignalInfo, Signo};
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::File;
 use crate::{

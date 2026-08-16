@@ -7,7 +7,7 @@ use axtask::current_may_uninit;
 use hashbrown::{HashMap, HashSet};
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
 
 use crate::readiness::block_on_poll_set;
 

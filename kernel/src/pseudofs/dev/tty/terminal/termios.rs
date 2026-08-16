@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
-use core::ops::{Deref, DerefMut};
+use core::{
+    mem::{align_of, offset_of, size_of},
+    ops::{Deref, DerefMut},
+};
 
 use axerrno::{AxError, AxResult};
 use bytemuck::AnyBitPattern;
@@ -8,11 +11,23 @@ use linux_raw_sys::general::{
     B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, ONLCR, OPOST,
     VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, speed_t, tcflag_t,
 };
-use starry_signal::Signo;
+use thekernel_linux_signal::Signo;
 
 const SUPPORTED_IFLAG_CHANGES: tcflag_t = ICRNL | IGNCR;
 const SUPPORTED_OFLAG_CHANGES: tcflag_t = OPOST | ONLCR;
 const SUPPORTED_LFLAG_CHANGES: tcflag_t = ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL;
+
+const _: () = {
+    assert!(size_of::<Termio>() == 18);
+    assert!(align_of::<Termio>() == 2);
+    assert!(offset_of!(Termio, c_cc) == 9);
+    assert!(size_of::<Termios>() == 36);
+    assert!(align_of::<Termios>() == 4);
+    assert!(offset_of!(Termios, c_cc) == 17);
+    assert!(size_of::<Termios2>() == 44);
+    assert!(align_of::<Termios2>() == 4);
+    assert!(offset_of!(Termios2, c_ispeed) == 36);
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, AnyBitPattern)]
@@ -25,6 +40,42 @@ pub struct Termio {
     c_cc: [u8; 8usize],
 }
 
+impl Termio {
+    /// Decodes a complete Linux `termio` image from its wire representation.
+    ///
+    /// The syscall layer deliberately reads bytes instead of asking the
+    /// usercopy helper to reinterpret a Rust struct.  This keeps the ABI
+    /// padding byte out of the kernel value and makes the accepted layout
+    /// explicit at the boundary.
+    pub(crate) fn from_user_bytes(bytes: [u8; size_of::<Self>()]) -> Self {
+        let read_u16 = |offset| u16::from_ne_bytes(bytes[offset..][..2].try_into().unwrap());
+        let mut c_cc = [0; 8];
+        let c_cc_len = c_cc.len();
+        c_cc.copy_from_slice(&bytes[offset_of!(Self, c_cc)..][..c_cc_len]);
+        Self {
+            c_iflag: read_u16(offset_of!(Self, c_iflag)),
+            c_oflag: read_u16(offset_of!(Self, c_oflag)),
+            c_cflag: read_u16(offset_of!(Self, c_cflag)),
+            c_lflag: read_u16(offset_of!(Self, c_lflag)),
+            c_line: bytes[offset_of!(Self, c_line)],
+            c_cc,
+        }
+    }
+
+    /// Encodes the complete Linux `termio` image with its trailing padding
+    /// byte explicitly zeroed before copyout.
+    pub(crate) fn to_user_bytes(self) -> [u8; size_of::<Self>()] {
+        let mut bytes = [0u8; size_of::<Self>()];
+        bytes[offset_of!(Self, c_iflag)..][..2].copy_from_slice(&self.c_iflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_oflag)..][..2].copy_from_slice(&self.c_oflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_cflag)..][..2].copy_from_slice(&self.c_cflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_lflag)..][..2].copy_from_slice(&self.c_lflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_line)] = self.c_line;
+        bytes[offset_of!(Self, c_cc)..][..self.c_cc.len()].copy_from_slice(&self.c_cc);
+        bytes
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, AnyBitPattern)]
 pub struct Termios {
@@ -34,6 +85,42 @@ pub struct Termios {
     c_lflag: tcflag_t,
     c_line: u8,
     c_cc: [u8; 19usize],
+}
+
+impl Termios {
+    /// Decodes a complete Linux `termios` image from bytes at the UAPI
+    /// boundary.  Any representation padding is intentionally ignored.
+    pub(crate) fn from_user_bytes(bytes: [u8; size_of::<Self>()]) -> Self {
+        let read_u32 = |offset| u32::from_ne_bytes(bytes[offset..][..4].try_into().unwrap());
+        let mut c_cc = [0; 19];
+        let c_cc_len = c_cc.len();
+        c_cc.copy_from_slice(&bytes[offset_of!(Self, c_cc)..][..c_cc_len]);
+        Self {
+            c_iflag: read_u32(offset_of!(Self, c_iflag)),
+            c_oflag: read_u32(offset_of!(Self, c_oflag)),
+            c_cflag: read_u32(offset_of!(Self, c_cflag)),
+            c_lflag: read_u32(offset_of!(Self, c_lflag)),
+            c_line: bytes[offset_of!(Self, c_line)],
+            c_cc,
+        }
+    }
+
+    /// Encodes the complete Linux `termios` image. Any ABI tail padding is
+    /// zeroed rather than copied from a Rust struct representation.
+    pub(crate) fn to_user_bytes(self) -> [u8; size_of::<Self>()] {
+        let mut bytes = [0u8; size_of::<Self>()];
+        bytes[offset_of!(Self, c_iflag)..][..size_of::<tcflag_t>()]
+            .copy_from_slice(&self.c_iflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_oflag)..][..size_of::<tcflag_t>()]
+            .copy_from_slice(&self.c_oflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_cflag)..][..size_of::<tcflag_t>()]
+            .copy_from_slice(&self.c_cflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_lflag)..][..size_of::<tcflag_t>()]
+            .copy_from_slice(&self.c_lflag.to_ne_bytes());
+        bytes[offset_of!(Self, c_line)] = self.c_line;
+        bytes[offset_of!(Self, c_cc)..][..self.c_cc.len()].copy_from_slice(&self.c_cc);
+        bytes
+    }
 }
 
 impl Default for Termios {
@@ -177,6 +264,39 @@ pub struct Termios2 {
     termios: Termios,
     c_ispeed: speed_t,
     c_ospeed: speed_t,
+}
+
+impl Termios2 {
+    /// Decodes a complete Linux `termios2` image from its fixed wire layout.
+    /// The reserved representation bytes in the embedded `termios` image are
+    /// not interpreted as Rust state.
+    pub(crate) fn from_user_bytes(bytes: [u8; size_of::<Self>()]) -> Self {
+        let termios = Termios::from_user_bytes(
+            bytes[..size_of::<Termios>()]
+                .try_into()
+                .expect("termios2 wire prefix has the Linux termios size"),
+        );
+        let read_u32 = |offset| u32::from_ne_bytes(bytes[offset..][..4].try_into().unwrap());
+        Self {
+            termios,
+            c_ispeed: read_u32(offset_of!(Self, c_ispeed)) as speed_t,
+            c_ospeed: read_u32(offset_of!(Self, c_ospeed)) as speed_t,
+        }
+    }
+
+    /// Encodes `termios2` from field bytes and keeps every ABI byte
+    /// deterministic, including any representation padding.
+    pub(crate) fn to_user_bytes(self) -> [u8; size_of::<Self>()] {
+        let mut bytes = [0u8; size_of::<Self>()];
+        let termios = self.termios.to_user_bytes();
+        let termios_offset = offset_of!(Self, termios);
+        bytes[termios_offset..][..termios.len()].copy_from_slice(&termios);
+        bytes[offset_of!(Self, c_ispeed)..][..size_of::<speed_t>()]
+            .copy_from_slice(&self.c_ispeed.to_ne_bytes());
+        bytes[offset_of!(Self, c_ospeed)..][..size_of::<speed_t>()]
+            .copy_from_slice(&self.c_ospeed.to_ne_bytes());
+        bytes
+    }
 }
 
 impl Default for Termios2 {

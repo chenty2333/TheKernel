@@ -75,7 +75,7 @@ impl SimpleFs {
 
     fn try_alloc_ephemeral_inode(&self) -> VfsResult<u64> {
         self.next_ephemeral_inode
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| axfs_ng_vfs::VfsError::StorageFull)

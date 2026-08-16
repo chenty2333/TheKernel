@@ -16,7 +16,7 @@ use spin::Mutex;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
-    mm::UserPtr,
+    mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
     readiness::block_on_poll_io,
     task::NetworkNamespace,
 };
@@ -253,7 +253,12 @@ impl NetlinkSocket {
         }
     }
 
-    pub fn write_local_addr(&self, addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult {
+    pub fn write_local_addr(
+        &self,
+        capability: &UserMemoryCapability,
+        addr: UserPtr<sockaddr>,
+        addrlen: &mut socklen_t,
+    ) -> AxResult {
         let state = self.state.lock();
         let nl = SockaddrNl {
             nl_family: AF_NETLINK as _,
@@ -271,9 +276,9 @@ impl NetlinkSocket {
         };
         let copy_len = (*addrlen as usize).min(bytes.len());
         if copy_len != 0 {
-            addr.cast::<u8>()
-                .get_as_mut_slice(copy_len)?
-                .copy_from_slice(&bytes[..copy_len]);
+            capability
+                .write_bytes(addr.address().as_usize(), &bytes[..copy_len])
+                .map_err(map_usercopy_error)?;
         }
         *addrlen = bytes.len() as _;
         Ok(())
@@ -750,9 +755,31 @@ mod tests {
     extern crate std;
 
     use alloc::sync::Arc;
+    use core::mem::{MaybeUninit, size_of};
 
-    use super::NetlinkSocket;
-    use crate::task::{NetworkNamespace, UserNamespace};
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+    use super::{NetlinkSocket, SockaddrNl};
+    use crate::{
+        mm::{AddrSpace, Backend, UserMemoryCapability, UserPtr},
+        task::{NetworkNamespace, UserNamespace},
+    };
+
+    fn mapped_capability() -> UserMemoryCapability {
+        let mut address_space = AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
+        address_space
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
 
     #[test]
     fn namespace_owner_netlink_socket_retains_complete_network_namespace() {
@@ -765,5 +792,37 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(socket);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn local_addr_uses_explicit_capability_and_reports_native_length() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let socket = NetlinkSocket::try_new(0, net_ns).unwrap();
+        socket.bind(41, 7).unwrap();
+        let capability = mapped_capability();
+
+        let mut length = 4;
+        socket
+            .write_local_addr(&capability, UserPtr::from(0x1000), &mut length)
+            .unwrap();
+        assert_eq!(length as usize, size_of::<SockaddrNl>());
+
+        let mut bytes = [MaybeUninit::<u8>::uninit(); 4];
+        capability.read_bytes(0x1000, &mut bytes).unwrap();
+        let expected = SockaddrNl {
+            nl_family: linux_raw_sys::net::AF_NETLINK as _,
+            nl_pad: 0,
+            nl_pid: 41,
+            nl_groups: 7,
+        };
+        let expected_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&expected as *const SockaddrNl).cast::<u8>(),
+                size_of::<SockaddrNl>(),
+            )
+        };
+        let copied = unsafe { bytes.map(|byte| byte.assume_init()) };
+        assert_eq!(&copied, &expected_bytes[..4]);
     }
 }

@@ -20,7 +20,7 @@ use spin::Mutex;
 use super::{FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
     file::{FileHandle, get_typed_file},
-    mm::UserConstPtr,
+    mm::{UserConstPtr, UserMemoryCapability, map_usercopy_error},
 };
 
 pub const AF_ALG: u32 = 38;
@@ -77,12 +77,21 @@ pub struct SockAddrAlg {
 }
 
 impl SockAddrAlg {
-    pub fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
+    pub fn read_from_user(
+        capability: &UserMemoryCapability,
+        addr: UserConstPtr<sockaddr>,
+        addrlen: socklen_t,
+    ) -> AxResult<Self> {
         if (addrlen as usize) < size_of::<SockAddrAlgRaw>() {
             return Err(AxError::InvalidInput);
         }
 
-        let raw = addr.cast::<SockAddrAlgRaw>().get_as_ref()?;
+        let raw = unsafe {
+            capability
+                .read_value_uninit(addr.address().as_usize() as *const SockAddrAlgRaw)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         if raw.salg_family as u32 != AF_ALG {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
@@ -520,4 +529,90 @@ fn validate_key(binding: &AlgorithmBinding, key: &[u8]) -> AxResult<()> {
         return Err(AxError::InvalidInput);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use linux_raw_sys::net::AF_INET;
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+    use super::*;
+
+    fn mapped_capability() -> UserMemoryCapability {
+        let mut address_space =
+            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
+        address_space
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                crate::mm::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
+
+    fn raw_sockaddr(family: u16) -> SockAddrAlgRaw {
+        let mut alg_type = [0_u8; 14];
+        alg_type[..4].copy_from_slice(b"hash");
+        let mut alg_name = [0_u8; 64];
+        alg_name[..5].copy_from_slice(b"sha1");
+        SockAddrAlgRaw {
+            salg_family: family,
+            salg_type: alg_type,
+            salg_feat: 0,
+            salg_mask: 0,
+            salg_name: alg_name,
+        }
+    }
+
+    #[test]
+    fn sockaddr_alg_reads_from_the_explicit_capability() {
+        let capability = mapped_capability();
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_ALG as _))
+                .unwrap();
+        }
+
+        let address = SockAddrAlg::read_from_user(
+            &capability,
+            UserConstPtr::from(0x1000),
+            size_of::<SockAddrAlgRaw>() as socklen_t,
+        )
+        .unwrap();
+        assert_eq!(address.alg_type, "hash");
+        assert_eq!(address.alg_name, "sha1");
+    }
+
+    #[test]
+    fn sockaddr_alg_keeps_length_and_family_errors() {
+        let capability = mapped_capability();
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_INET as _))
+                .unwrap();
+        }
+
+        let short = SockAddrAlg::read_from_user(
+            &capability,
+            UserConstPtr::from(0x1000),
+            (size_of::<SockAddrAlgRaw>() - 1) as socklen_t,
+        )
+        .unwrap_err();
+        assert_eq!(short, AxError::InvalidInput);
+
+        let family = SockAddrAlg::read_from_user(
+            &capability,
+            UserConstPtr::from(0x1000),
+            size_of::<SockAddrAlgRaw>() as socklen_t,
+        )
+        .unwrap_err();
+        assert_eq!(family, AxError::from(LinuxError::EAFNOSUPPORT));
+    }
 }

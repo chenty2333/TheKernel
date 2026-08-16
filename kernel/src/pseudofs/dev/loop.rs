@@ -1,5 +1,9 @@
 use alloc::string::String;
-use core::{any::Any, cmp::min};
+use core::{
+    any::Any,
+    cmp::min,
+    mem::{MaybeUninit, align_of, offset_of, size_of, size_of_val},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
@@ -18,10 +22,10 @@ use linux_raw_sys::{
     },
 };
 use memory_addr::PAGE_SIZE_4K;
-use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    file::{File, FileLike, get_file_like, try_path_into_owned},
+    file::{File, FileLike, IoctlContext, try_path_into_owned},
+    mm::map_usercopy_error,
     pseudofs::DeviceOps,
 };
 
@@ -64,6 +68,314 @@ struct LoopState {
     sizelimit: u64,
     size_sectors: u64,
     block_size: u32,
+}
+
+#[derive(Clone, Copy)]
+enum LoopBlockOutput {
+    U32(u32),
+    U64(u64),
+}
+
+fn snapshot_block_output(state: &LoopState, cmd: u32) -> VfsResult<LoopBlockOutput> {
+    if !state.is_visible() {
+        return Err(AxError::NoSuchDevice);
+    }
+    match cmd {
+        BLKGETSIZE | BLKGETSIZE64 => {
+            if !state.is_bound() {
+                return Err(AxError::from(LinuxError::ENXIO));
+            }
+            if cmd == BLKGETSIZE {
+                Ok(LoopBlockOutput::U32(state.size_sectors as u32))
+            } else {
+                Ok(LoopBlockOutput::U64(state.size_bytes()))
+            }
+        }
+        BLKSSZGET => Ok(LoopBlockOutput::U32(state.block_size)),
+        BLKROGET => Ok(LoopBlockOutput::U32(state.read_only() as u32)),
+        _ => unreachable!(),
+    }
+}
+
+const _: () = {
+    assert!(align_of::<loop_info>() == 8);
+    assert!(size_of::<loop_info>() == 168 || size_of::<loop_info>() == 160);
+    assert!(offset_of!(loop_info, lo_number) == 0);
+    assert!(offset_of!(loop_info, lo_name) > offset_of!(loop_info, lo_flags));
+    assert!(size_of::<loop_info64>() == 232);
+    assert!(align_of::<loop_info64>() == 8);
+    assert!(offset_of!(loop_info64, lo_file_name) == 56);
+    assert!(offset_of!(loop_info64, lo_init) == 216);
+    assert!(offset_of!(loop_config, info) == 8);
+    assert!(size_of::<loop_config>() == 304);
+};
+
+fn read_user_bytes<const N: usize>(context: &IoctlContext, address: usize) -> AxResult<[u8; N]> {
+    let mut bytes = [MaybeUninit::<u8>::uninit(); N];
+    context
+        .user_memory()
+        .read_bytes(address, &mut bytes)
+        .map_err(map_usercopy_error)?;
+    Ok(core::array::from_fn(|index| {
+        // SAFETY: read_bytes initializes every byte before returning.
+        unsafe { bytes[index].assume_init() }
+    }))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(bytes[offset..][..4].try_into().unwrap())
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_ne_bytes(bytes[offset..][..4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_ne_bytes(bytes[offset..][..8].try_into().unwrap())
+}
+
+fn read_old_ulong(bytes: &[u8], offset: usize) -> u64 {
+    match size_of::<core::ffi::c_ulong>() {
+        4 => u64::from(read_u32(bytes, offset)),
+        8 => read_u64(bytes, offset),
+        _ => unreachable!(),
+    }
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..][..4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..][..8].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_old_dev(bytes: &mut [u8], offset: usize, value: u64, width: usize) {
+    match width {
+        4 => put_u32(bytes, offset, value as u32),
+        8 => put_u64(bytes, offset, value),
+        _ => unreachable!(),
+    }
+}
+
+fn loop_info_from_user_bytes(bytes: [u8; size_of::<loop_info>()]) -> loop_info {
+    let mut lo_name = [0i8; 64];
+    let lo_name_len = lo_name.len();
+    for (dst, src) in lo_name.iter_mut().zip(
+        bytes[offset_of!(loop_info, lo_name)..][..lo_name_len]
+            .iter()
+            .copied(),
+    ) {
+        *dst = src as i8;
+    }
+    let mut lo_encrypt_key = [0u8; 32];
+    let lo_encrypt_key_len = lo_encrypt_key.len();
+    lo_encrypt_key
+        .copy_from_slice(&bytes[offset_of!(loop_info, lo_encrypt_key)..][..lo_encrypt_key_len]);
+    let mut lo_init = [0u64; 2];
+    for (index, value) in lo_init.iter_mut().enumerate() {
+        *value = read_old_ulong(
+            &bytes,
+            offset_of!(loop_info, lo_init) + index * size_of::<core::ffi::c_ulong>(),
+        );
+    }
+    loop_info {
+        lo_number: read_i32(&bytes, offset_of!(loop_info, lo_number)),
+        lo_device: read_old_ulong(&bytes, offset_of!(loop_info, lo_device)) as _,
+        lo_inode: read_old_ulong(&bytes, offset_of!(loop_info, lo_inode)) as _,
+        lo_rdevice: read_old_ulong(&bytes, offset_of!(loop_info, lo_rdevice)) as _,
+        lo_offset: read_i32(&bytes, offset_of!(loop_info, lo_offset)),
+        lo_encrypt_type: read_i32(&bytes, offset_of!(loop_info, lo_encrypt_type)),
+        lo_encrypt_key_size: read_i32(&bytes, offset_of!(loop_info, lo_encrypt_key_size)),
+        lo_flags: read_i32(&bytes, offset_of!(loop_info, lo_flags)),
+        lo_name,
+        lo_encrypt_key,
+        lo_init: lo_init.map(|value| value as _),
+        // The ABI reserves these bytes; accept but do not retain them.
+        reserved: [0; 4],
+    }
+}
+
+fn loop_info64_from_user_bytes(bytes: [u8; size_of::<loop_info64>()]) -> loop_info64 {
+    let mut lo_file_name = [0u8; 64];
+    let lo_file_name_len = lo_file_name.len();
+    lo_file_name
+        .copy_from_slice(&bytes[offset_of!(loop_info64, lo_file_name)..][..lo_file_name_len]);
+    let mut lo_crypt_name = [0u8; 64];
+    let lo_crypt_name_len = lo_crypt_name.len();
+    lo_crypt_name
+        .copy_from_slice(&bytes[offset_of!(loop_info64, lo_crypt_name)..][..lo_crypt_name_len]);
+    let mut lo_encrypt_key = [0u8; 32];
+    let lo_encrypt_key_len = lo_encrypt_key.len();
+    lo_encrypt_key
+        .copy_from_slice(&bytes[offset_of!(loop_info64, lo_encrypt_key)..][..lo_encrypt_key_len]);
+    let mut lo_init = [0u64; 2];
+    for (index, value) in lo_init.iter_mut().enumerate() {
+        *value = read_u64(
+            &bytes,
+            offset_of!(loop_info64, lo_init) + index * size_of::<u64>(),
+        );
+    }
+    loop_info64 {
+        lo_device: read_u64(&bytes, offset_of!(loop_info64, lo_device)),
+        lo_inode: read_u64(&bytes, offset_of!(loop_info64, lo_inode)),
+        lo_rdevice: read_u64(&bytes, offset_of!(loop_info64, lo_rdevice)),
+        lo_offset: read_u64(&bytes, offset_of!(loop_info64, lo_offset)),
+        lo_sizelimit: read_u64(&bytes, offset_of!(loop_info64, lo_sizelimit)),
+        lo_number: read_u32(&bytes, offset_of!(loop_info64, lo_number)),
+        lo_encrypt_type: read_u32(&bytes, offset_of!(loop_info64, lo_encrypt_type)),
+        lo_encrypt_key_size: read_u32(&bytes, offset_of!(loop_info64, lo_encrypt_key_size)),
+        lo_flags: read_u32(&bytes, offset_of!(loop_info64, lo_flags)),
+        lo_file_name,
+        lo_crypt_name,
+        lo_encrypt_key,
+        lo_init,
+    }
+}
+
+fn loop_config_from_user_bytes(bytes: [u8; size_of::<loop_config>()]) -> loop_config {
+    let info_start = offset_of!(loop_config, info);
+    let info_end = info_start + size_of::<loop_info64>();
+    loop_config {
+        fd: read_u32(&bytes, offset_of!(loop_config, fd)),
+        block_size: read_u32(&bytes, offset_of!(loop_config, block_size)),
+        info: loop_info64_from_user_bytes(bytes[info_start..info_end].try_into().unwrap()),
+        __reserved: [0; 8],
+    }
+}
+
+fn loop_info_to_user_bytes(value: loop_info) -> [u8; size_of::<loop_info>()] {
+    let mut bytes = [0u8; size_of::<loop_info>()];
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info, lo_number),
+        value.lo_number as u32,
+    );
+    put_old_dev(
+        &mut bytes,
+        offset_of!(loop_info, lo_device),
+        value.lo_device,
+        size_of_val(&value.lo_device),
+    );
+    put_old_dev(
+        &mut bytes,
+        offset_of!(loop_info, lo_inode),
+        value.lo_inode,
+        size_of_val(&value.lo_inode),
+    );
+    put_old_dev(
+        &mut bytes,
+        offset_of!(loop_info, lo_rdevice),
+        value.lo_rdevice,
+        size_of_val(&value.lo_rdevice),
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info, lo_offset),
+        value.lo_offset as u32,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info, lo_encrypt_type),
+        value.lo_encrypt_type as u32,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info, lo_encrypt_key_size),
+        value.lo_encrypt_key_size as u32,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info, lo_flags),
+        value.lo_flags as u32,
+    );
+    for (index, field) in value.lo_name.into_iter().enumerate() {
+        bytes[offset_of!(loop_info, lo_name) + index] = field as u8;
+    }
+    bytes[offset_of!(loop_info, lo_encrypt_key)..]
+        .iter_mut()
+        .zip(value.lo_encrypt_key)
+        .for_each(|(dst, src)| *dst = src);
+    for (index, field) in value.lo_init.into_iter().enumerate() {
+        let width = size_of_val(&field);
+        put_old_dev(
+            &mut bytes,
+            offset_of!(loop_info, lo_init) + index * width,
+            field,
+            width,
+        );
+    }
+    // `reserved` is an ABI hole, so it remains explicitly zeroed.
+    bytes
+}
+
+fn loop_info64_to_user_bytes(value: loop_info64) -> [u8; size_of::<loop_info64>()] {
+    let mut bytes = [0u8; size_of::<loop_info64>()];
+    put_u64(
+        &mut bytes,
+        offset_of!(loop_info64, lo_device),
+        value.lo_device,
+    );
+    put_u64(
+        &mut bytes,
+        offset_of!(loop_info64, lo_inode),
+        value.lo_inode,
+    );
+    put_u64(
+        &mut bytes,
+        offset_of!(loop_info64, lo_rdevice),
+        value.lo_rdevice,
+    );
+    put_u64(
+        &mut bytes,
+        offset_of!(loop_info64, lo_offset),
+        value.lo_offset,
+    );
+    put_u64(
+        &mut bytes,
+        offset_of!(loop_info64, lo_sizelimit),
+        value.lo_sizelimit,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info64, lo_number),
+        value.lo_number,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info64, lo_encrypt_type),
+        value.lo_encrypt_type,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info64, lo_encrypt_key_size),
+        value.lo_encrypt_key_size,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(loop_info64, lo_flags),
+        value.lo_flags,
+    );
+    bytes[offset_of!(loop_info64, lo_file_name)..]
+        .iter_mut()
+        .zip(value.lo_file_name)
+        .for_each(|(dst, src)| *dst = src);
+    bytes[offset_of!(loop_info64, lo_crypt_name)..]
+        .iter_mut()
+        .zip(value.lo_crypt_name)
+        .for_each(|(dst, src)| *dst = src);
+    bytes[offset_of!(loop_info64, lo_encrypt_key)..]
+        .iter_mut()
+        .zip(value.lo_encrypt_key)
+        .for_each(|(dst, src)| *dst = src);
+    for (index, field) in value.lo_init.into_iter().enumerate() {
+        put_u64(
+            &mut bytes,
+            offset_of!(loop_info64, lo_init) + index * size_of::<u64>(),
+            field,
+        );
+    }
+    bytes
 }
 
 impl Default for LoopState {
@@ -359,7 +671,7 @@ impl DeviceOps for LoopControl {
         Err(AxError::InvalidInput)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             LOOP_CTL_GET_FREE => loop_control_get_free(),
             LOOP_CTL_ADD => loop_control_add(arg),
@@ -402,11 +714,11 @@ impl LoopDevice {
         &LOOP_STATES[self.number as usize]
     }
 
-    fn read_backing_fd(fd: i32) -> AxResult<(LoopBacking, bool)> {
+    fn read_backing_fd(context: &IoctlContext, fd: i32) -> AxResult<(LoopBacking, bool)> {
         if fd < 0 {
             return Err(AxError::BadFileDescriptor);
         }
-        let f = get_file_like(fd)?;
+        let f = context.get_file_like(fd)?;
         let Some(file) = f.downcast_ref::<File>() else {
             return Err(AxError::InvalidInput);
         };
@@ -471,10 +783,10 @@ impl DeviceOps for LoopDevice {
             .write_at_slice(&buf[..limit], state.offset + offset)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             LOOP_SET_FD => {
-                let (backing, read_only) = Self::read_backing_fd(arg as i32)?;
+                let (backing, read_only) = Self::read_backing_fd(context, arg as i32)?;
                 self.state().lock().bind(backing, read_only)?;
             }
             LOOP_CLR_FD => {
@@ -482,22 +794,30 @@ impl DeviceOps for LoopDevice {
             }
             LOOP_GET_STATUS => {
                 let info = self.state().lock().get_info(self.number, self.dev_id)?;
-                (arg as *mut loop_info).vm_write(info)?;
+                let bytes = loop_info_to_user_bytes(info);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             LOOP_GET_STATUS64 => {
                 let info = self.state().lock().get_info64(self.number, self.dev_id)?;
-                (arg as *mut loop_info64).vm_write(info)?;
+                let bytes = loop_info64_to_user_bytes(info);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             LOOP_SET_STATUS => {
-                let info = unsafe { (arg as *const loop_info).vm_read_uninit()?.assume_init() };
+                let info = loop_info_from_user_bytes(read_user_bytes(context, arg)?);
                 self.state().lock().set_info(info)?;
             }
             LOOP_SET_STATUS64 => {
-                let info = unsafe { (arg as *const loop_info64).vm_read_uninit()?.assume_init() };
+                let info = loop_info64_from_user_bytes(read_user_bytes(context, arg)?);
                 self.state().lock().set_info64(info)?;
             }
             LOOP_CHANGE_FD => {
-                let (backing, _) = Self::read_backing_fd(arg as i32)?;
+                let (backing, _) = Self::read_backing_fd(context, arg as i32)?;
                 self.state().lock().change_fd(backing)?;
             }
             LOOP_SET_CAPACITY => {
@@ -529,9 +849,9 @@ impl DeviceOps for LoopDevice {
                 state.block_size = block_size;
             }
             LOOP_CONFIGURE => {
-                let config = unsafe { (arg as *const loop_config).vm_read_uninit()?.assume_init() };
+                let config = loop_config_from_user_bytes(read_user_bytes(context, arg)?);
                 let fd = i32::try_from(config.fd).map_err(|_| AxError::BadFileDescriptor)?;
-                let (backing, backing_read_only) = Self::read_backing_fd(fd)?;
+                let (backing, backing_read_only) = Self::read_backing_fd(context, fd)?;
                 self.state().lock().configure(
                     backing,
                     backing_read_only,
@@ -540,36 +860,27 @@ impl DeviceOps for LoopDevice {
                 )?;
             }
             // TODO: the following should apply to any block devices
-            BLKGETSIZE | BLKGETSIZE64 => {
-                let state = self.state().lock();
-                if !state.is_visible() {
-                    return Err(AxError::NoSuchDevice);
+            BLKGETSIZE | BLKGETSIZE64 | BLKSSZGET | BLKROGET => {
+                let output = {
+                    let state = self.state().lock();
+                    snapshot_block_output(&state, cmd)?
+                };
+                match output {
+                    LoopBlockOutput::U32(value) => context
+                        .user_memory()
+                        .write_bytes(arg, &value.to_ne_bytes())
+                        .map_err(map_usercopy_error)?,
+                    LoopBlockOutput::U64(value) => context
+                        .user_memory()
+                        .write_bytes(arg, &value.to_ne_bytes())
+                        .map_err(map_usercopy_error)?,
                 }
-                if !state.is_bound() {
-                    return Err(AxError::from(LinuxError::ENXIO));
-                }
-                if cmd == BLKGETSIZE {
-                    (arg as *mut u32).vm_write(state.size_sectors as _)?;
-                } else {
-                    (arg as *mut u64).vm_write(state.size_bytes())?;
-                }
-            }
-            BLKSSZGET => {
-                let state = self.state().lock();
-                if !state.is_visible() {
-                    return Err(AxError::NoSuchDevice);
-                }
-                (arg as *mut u32).vm_write(state.block_size)?;
-            }
-            BLKROGET => {
-                let state = self.state().lock();
-                if !state.is_visible() {
-                    return Err(AxError::NoSuchDevice);
-                }
-                (arg as *mut u32).vm_write(state.read_only() as u32)?;
             }
             BLKROSET => {
-                let ro = (arg as *const u32).vm_read()?;
+                let ro = context
+                    .user_memory()
+                    .read_value(arg as *const u32)
+                    .map_err(map_usercopy_error)?;
                 if ro != 0 && ro != 1 {
                     return Err(AxError::InvalidInput);
                 }
@@ -668,4 +979,62 @@ fn copy_cstr_to_c_char<T: LoopChar>(src: &str, dst: &mut [T]) {
         *target = T::from_byte(byte);
     }
     dst[len] = T::from_byte(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::AsThread;
+
+    #[test]
+    fn scalar_outputs_are_snapshotted_before_usercopy() {
+        let state = Mutex::new(LoopState::default());
+        let output = {
+            let state = state.lock();
+            snapshot_block_output(&state, BLKSSZGET).unwrap()
+        };
+        assert!(matches!(output, LoopBlockOutput::U32(DEFAULT_BLOCK_SIZE)));
+
+        let mut state = LoopState::default();
+        state.flags = FLAG_READ_ONLY;
+        assert!(matches!(
+            snapshot_block_output(&state, BLKROGET),
+            Ok(LoopBlockOutput::U32(1))
+        ));
+        assert!(snapshot_block_output(&state, BLKGETSIZE).is_err());
+    }
+
+    #[test]
+    fn invisible_loop_rejects_every_scalar_output() {
+        let mut state = LoopState::default();
+        state.visible = false;
+        for cmd in [BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKROGET] {
+            assert!(snapshot_block_output(&state, cmd).is_err());
+        }
+    }
+
+    #[test]
+    fn loop_info_codec_zeroes_reserved_bytes() {
+        let decoded = loop_info_from_user_bytes([0xa5; size_of::<loop_info>()]);
+        let encoded = loop_info_to_user_bytes(decoded);
+        let reserved = offset_of!(loop_info, reserved);
+
+        assert!(
+            encoded[reserved..reserved + 4]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+    }
+
+    #[test]
+    fn scalar_copyout_fault_leaves_state_unchanged() {
+        let _test_context = crate::test_support::scheduler_test_context();
+        let aspace = axtask::current().as_thread().proc_data.aspace().clone();
+        let ioctl_context = IoctlContext::new(aspace);
+        let device = LoopDevice::new(0, DeviceId::new(7, 0));
+        let block_size = device.state().lock().block_size;
+
+        assert!(device.ioctl(&ioctl_context, BLKSSZGET, usize::MAX).is_err());
+        assert_eq!(device.state().lock().block_size, block_size);
+    }
 }

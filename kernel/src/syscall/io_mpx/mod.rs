@@ -14,7 +14,7 @@ use linux_raw_sys::general::{
     EPOLLRDNORM, EPOLLWRBAND, EPOLLWRNORM, POLLERR, POLLHUP, POLLIN, POLLMSG, POLLNVAL, POLLOUT,
     POLLPRI, POLLRDBAND, POLLRDHUP, POLLRDNORM, POLLREMOVE, POLLWRBAND, POLLWRNORM,
 };
-use starry_signal::SignalSet;
+use thekernel_linux_signal::SignalSet;
 
 pub use self::{epoll::*, poll::*, select::*};
 use crate::{

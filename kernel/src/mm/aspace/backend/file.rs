@@ -8,24 +8,21 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult};
 use axfs::{
-    CachedFile, CachedFileEvictionOwner, CachedFilePagePin, CachedFilePinWindow, EvictedPage,
-    FileFlags,
+    CachedFile, CachedFileEvictionOwner, CachedFileIdentity, CachedFilePagePin,
+    CachedFilePinWindow, EvictedPage, FileFlags,
 };
 use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateCallback,
-    PopulateOutcome, page_table_flags, pages_in, preflight_sparse_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId, FutexBackingIdentity,
+    FutexWordOffset, MappingStatus, PopulateCallback, PopulateOutcome, page_table_flags, pages_in,
+    preflight_sparse_unmap,
 };
 use crate::file::{executable, memfd};
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-struct FileFutexKey {
-    device: u64,
-    inode: u64,
-}
+type FileFutexKey = CachedFileIdentity;
 
 #[cfg(not(test))]
 type FileFutexHandlesMutex<T> = Mutex<T>;
@@ -46,14 +43,60 @@ const DEFERRED_EVICTION_FAIL_CALLBACK: u8 = 3;
 #[cfg(test)]
 static DEFERRED_EVICTION_PREPARE_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 
-struct FileFutexIdentity {
+pub(crate) struct FileFutexIdentity {
     key: FileFutexKey,
-    handle: Arc<()>,
+    /// Keep the real cache alive for the complete futex identity lease.  The
+    /// old implementation retained only a marker `Arc<()>`, which allowed a
+    /// closed/reopened inode to reuse the same numeric key while waiters from
+    /// the old mapping were still queued.
+    cache: CachedFile,
 }
 
 struct PreparedPopulateEvictions {
     state: Arc<spin::Mutex<Vec<EvictedPage>>>,
     callback: PopulateCallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilePopulatePlan {
+    page_count: usize,
+    missing_count: usize,
+    already_accessible: bool,
+}
+
+fn inspect_file_populate(
+    range: VirtAddrRange,
+    access_flags: MappingFlags,
+    mut query: impl FnMut(VirtAddr) -> Result<(MappingFlags, PageSize), PagingError>,
+) -> AxResult<FilePopulatePlan> {
+    let mut page_count = 0usize;
+    let mut missing_count = 0usize;
+    let mut already_accessible = true;
+
+    for addr in pages_in(range, PageSize::Size4K)? {
+        page_count = page_count.checked_add(1).ok_or(AxError::InvalidInput)?;
+        match query(addr) {
+            Ok((page_flags, page_size)) => {
+                if page_size != PageSize::Size4K {
+                    return Err(AxError::BadAddress);
+                }
+                if !page_flags.contains(access_flags) {
+                    already_accessible = false;
+                }
+            }
+            Err(PagingError::NotMapped) => {
+                missing_count = missing_count.checked_add(1).ok_or(AxError::InvalidInput)?;
+                already_accessible = false;
+            }
+            Err(_) => return Err(AxError::BadAddress),
+        }
+    }
+
+    Ok(FilePopulatePlan {
+        page_count,
+        missing_count,
+        already_accessible,
+    })
 }
 
 impl PreparedPopulateEvictions {
@@ -222,11 +265,7 @@ impl Drop for FileFutexIdentity {
 }
 
 fn file_futex_handle(cache: &CachedFile) -> Arc<FileFutexIdentity> {
-    let loc = cache.location();
-    let key = FileFutexKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
+    let key = cache.identity();
     let mut handles = FILE_FUTEX_HANDLES.lock();
     if let Some(handle) = handles.get(&key).and_then(Weak::upgrade) {
         return handle;
@@ -234,7 +273,7 @@ fn file_futex_handle(cache: &CachedFile) -> Arc<FileFutexIdentity> {
 
     let handle = Arc::new(FileFutexIdentity {
         key,
-        handle: Arc::new(()),
+        cache: cache.clone(),
     });
     handles.insert(key, Arc::downgrade(&handle));
     handle
@@ -905,14 +944,30 @@ impl FileBackend {
         Ok(())
     }
 
-    pub fn futex_handle(&self) -> Weak<()> {
-        Arc::downgrade(&self.0.futex_handle.handle)
+    pub(crate) fn futex_backing_identity(&self) -> FutexBackingIdentity {
+        FutexBackingIdentity::File(self.0.futex_handle.clone())
     }
 
-    pub fn futex_key(&self, address: usize) -> (Weak<()>, usize) {
-        let offset = (self.0.offset_page as usize * PAGE_SIZE_4K)
-            .saturating_add(address.saturating_sub(self.0.start.as_usize()));
-        (self.futex_handle(), offset)
+    pub(crate) fn futex_key(
+        &self,
+        address: usize,
+    ) -> Option<(FutexBackingIdentity, FutexWordOffset)> {
+        let relative = address.checked_sub(self.0.start.as_usize())?;
+        let offset = (self.0.offset_page as usize)
+            .checked_mul(PAGE_SIZE_4K)?
+            .checked_add(relative)?;
+        Some((self.futex_backing_identity(), FutexWordOffset::new(offset)))
+    }
+
+    pub(crate) fn futex_id(&self, address: usize) -> Option<(FutexBackingId, FutexWordOffset)> {
+        let relative = address.checked_sub(self.0.start.as_usize())?;
+        let offset = (self.0.offset_page as usize)
+            .checked_mul(PAGE_SIZE_4K)?
+            .checked_add(relative)?;
+        Some((
+            FutexBackingId::file(Arc::as_ptr(&self.0.futex_handle) as usize),
+            FutexWordOffset::new(offset),
+        ))
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {
@@ -1143,22 +1198,45 @@ impl BackendOps for FileBackend {
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> PopulateOutcome {
-        let page_count = match pages_in(range, PageSize::Size4K) {
-            Ok(pages) => pages.count(),
-            Err(error) => return PopulateOutcome::immediate(Err(error)),
-        };
-        let deferred_evictions =
-            match PreparedPopulateEvictions::try_new(self.0.clone(), page_count) {
-                Ok(evictions) => evictions,
-                Err(error) => return PopulateOutcome::immediate(Err(error)),
+        let (outcome, needs_tlb_sync) = self.0.cache.with_direct_io_excluded(|| {
+            let plan = match inspect_file_populate(range, access_flags, |addr| {
+                pt.query(addr)
+                    .map(|(_, page_flags, page_size)| (page_flags, page_size))
+            }) {
+                Ok(plan) => plan,
+                Err(error) => return (PopulateOutcome::immediate(Err(error)), false),
+            };
+            let start_page = match self.page_number_for(range.start) {
+                Ok(start_page) => start_page,
+                Err(error) => return (PopulateOutcome::immediate(Err(error)), false),
+            };
+            if let Some(last_index) = plan.page_count.checked_sub(1)
+                && u32::try_from(last_index)
+                    .ok()
+                    .and_then(|last_index| start_page.checked_add(last_index))
+                    .is_none()
+            {
+                return (
+                    PopulateOutcome::immediate(Err(AxError::InvalidInput)),
+                    false,
+                );
+            }
+            if plan.already_accessible {
+                return (PopulateOutcome::immediate(Ok(plan.page_count)), false);
+            }
+            let deferred_evictions = if plan.missing_count == 0 {
+                None
+            } else {
+                match PreparedPopulateEvictions::try_new(self.0.clone(), plan.missing_count) {
+                    Ok(evictions) => Some(evictions),
+                    Err(error) => return (PopulateOutcome::immediate(Err(error)), false),
+                }
             };
 
-        let (outcome, needs_tlb_sync) = self.0.cache.with_direct_io_excluded(|| {
             let owner = self.0.owner;
             let mut needs_tlb_sync = false;
             let result = (|| {
                 let mut pages = 0;
-                let start_page = self.page_number_for(range.start)?;
                 for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
                     let pn = u32::try_from(i)
                         .ok()
@@ -1189,6 +1267,14 @@ impl BackendOps for FileBackend {
                         }
                         // If the page is not mapped, try map it.
                         Err(PagingError::NotMapped) => {
+                            let Some(deferred_evictions) = deferred_evictions.as_ref() else {
+                                // The address-space lock makes page-table
+                                // residency stable between inspection and
+                                // mutation. Refuse an impossible late hole
+                                // rather than insert without preallocated
+                                // eviction ownership.
+                                return Err(AxError::BadAddress);
+                            };
                             let map_flags = flags - MappingFlags::WRITE;
                             self.0.cache.with_page_or_insert_for_owner(
                                 pn,
@@ -1220,7 +1306,10 @@ impl BackendOps for FileBackend {
                 Ok(pages)
             })();
             (
-                PopulateOutcome::new(result, deferred_evictions.into_callback()),
+                PopulateOutcome::new(
+                    result,
+                    deferred_evictions.and_then(PreparedPopulateEvictions::into_callback),
+                ),
                 needs_tlb_sync,
             )
         });
@@ -1364,6 +1453,65 @@ mod tests {
             MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
             FileMappingSharing::Shared,
         )
+    }
+
+    #[test]
+    fn resident_file_populate_plan_needs_no_eviction_preparation() {
+        let range = VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x3000));
+        let flags = MappingFlags::USER | MappingFlags::READ;
+        let mut queries = 0;
+
+        let plan = inspect_file_populate(range, MappingFlags::READ, |_| {
+            queries += 1;
+            Ok((flags, PageSize::Size4K))
+        })
+        .unwrap();
+
+        assert_eq!(queries, 2);
+        assert_eq!(
+            plan,
+            FilePopulatePlan {
+                page_count: 2,
+                missing_count: 0,
+                already_accessible: true,
+            }
+        );
+    }
+
+    #[test]
+    fn file_populate_plan_reserves_only_missing_page_evictions() {
+        let range = VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x4000));
+        let flags = MappingFlags::USER | MappingFlags::READ;
+
+        let plan = inspect_file_populate(range, MappingFlags::WRITE, |addr| {
+            if addr == VirtAddr::from(0x2000) {
+                Err(PagingError::NotMapped)
+            } else {
+                Ok((flags, PageSize::Size4K))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            FilePopulatePlan {
+                page_count: 3,
+                missing_count: 1,
+                already_accessible: false,
+            }
+        );
+    }
+
+    #[test]
+    fn file_populate_plan_rejects_non_4k_entries_before_mutation() {
+        let range = VirtAddrRange::new(VirtAddr::from(0x1000), VirtAddr::from(0x2000));
+
+        assert_eq!(
+            inspect_file_populate(range, MappingFlags::READ, |_| {
+                Ok((MappingFlags::READ, PageSize::Size2M))
+            }),
+            Err(AxError::BadAddress)
+        );
     }
 
     #[test]
@@ -1908,6 +2056,18 @@ mod tests {
                 .mapping_status()
                 .compatible_with(child.mapping_status())
         );
+    }
+
+    #[test]
+    fn file_futex_identity_tracks_cached_file_generation() {
+        let _context = test_context();
+        let loc = test_location("futex-file-generation");
+        let cache = CachedFile::get_or_create(loc);
+        let first = file_futex_handle(&cache);
+        let second = file_futex_handle(&cache);
+
+        assert_eq!(first.key, cache.identity());
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

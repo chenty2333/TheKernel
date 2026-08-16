@@ -33,8 +33,9 @@ use crate::{
     },
     mm::aspace::{AddrSpace, Backend},
     task::{
-        Cred, DacCredentialView, ExecAuxIdentity, ExecExecutableRole, ExecFileIdentity,
-        ExecFileOwner, ExecFileSecurityObject, Kgid, Kuid, UserNamespace,
+        AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE, Cred, DacCredentialView, ExecAuxIdentity,
+        ExecExecutableRole, ExecFileIdentity, ExecFileOwner, ExecFileSecurityObject, Kgid, Kuid,
+        UserNamespace,
         security::{ExecExecutableSecurityContext, dispatch_exec_executable},
     },
 };
@@ -208,28 +209,21 @@ pub fn new_user_aspace_empty() -> AxResult<AddrSpace> {
     AddrSpace::new_empty(VirtAddr::from_usize(USER_SPACE_BASE), USER_SPACE_SIZE)
 }
 
-/// If the target architecture requires it, the kernel portion of the address
-/// space will be copied to the user address space.
+/// Copies the kernel portion into the x86_64 user address space.
 pub fn copy_from_kernel(_aspace: &mut AddrSpace) -> AxResult {
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))]
-    {
-        // ARMv8 (aarch64) and LoongArch64 use separate page tables for user space
-        // (aarch64: TTBR0_EL1, LoongArch64: PGDL), so there is no need to copy the
-        // kernel portion to the user page table.
-        let kspace = axmm::kernel_aspace().lock();
-        _aspace.page_table_mut().cursor_no_flush().copy_from(
-            kspace.page_table(),
-            kspace.base(),
-            kspace.size(),
-        );
-    }
+    let kspace = axmm::kernel_aspace().lock();
+    _aspace.page_table_mut().cursor_no_flush().copy_from(
+        kspace.page_table(),
+        kspace.base(),
+        kspace.size(),
+    );
     Ok(())
 }
 
 /// Map the signal trampoline to the user address space.
 pub fn map_trampoline(aspace: &mut AddrSpace) -> AxResult {
     let signal_trampoline_paddr =
-        virt_to_phys(starry_signal::arch::signal_trampoline_address().into());
+        virt_to_phys(thekernel_linux_signal::arch::signal_trampoline_address().into());
     aspace.map_linear(
         crate::config::SIGNAL_TRAMPOLINE.into(),
         signal_trampoline_paddr,
@@ -570,6 +564,8 @@ impl ElfLoader {
             AuxEntry::new(AuxType::HWCAP, 0),
             AuxEntry::new(AuxType::CLKTCK, 100),
             AuxEntry::new(AuxType::PLATFORM, 0),
+            AuxEntry::new(AuxType::RSEQ_FEATURE_SIZE, AT_RSEQ_FEATURE_SIZE),
+            AuxEntry::new(AuxType::RSEQ_ALIGN, AT_RSEQ_ALIGN),
         ]);
 
         Ok(Ok(LoadedElfImage {

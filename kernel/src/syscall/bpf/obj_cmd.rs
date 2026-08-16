@@ -3,6 +3,7 @@
 use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{defs::*, read_bpf_attr, require_bpf_attr_range, write_bpf_attr_value},
@@ -12,27 +13,46 @@ use crate::{
     },
 };
 
-pub fn bpf_obj_get_info_by_fd(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
+pub fn bpf_obj_get_info_by_fd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    attr_ptr: usize,
+    attr_size: u32,
+) -> AxResult<isize> {
     require_bpf_attr_range::<BpfAttrGetInfoByFd>(
         attr_size,
         offset_of!(BpfAttrGetInfoByFd, info) + size_of::<u64>(),
     )?;
-    let attr: BpfAttrGetInfoByFd = read_bpf_attr(attr_ptr, attr_size)?;
+    let attr: BpfAttrGetInfoByFd = read_bpf_attr(memory, attr_ptr, attr_size)?;
     debug!("bpf_obj_get_info_by_fd: fd={}", attr.bpf_fd);
 
     let fd_obj = get_file_like(attr.bpf_fd as _)?;
 
     if let Some(map_fd) = fd_obj.downcast_ref::<BpfMapFd>() {
-        return write_map_info(map_fd, attr.info, attr.info_len, attr_ptr, attr_size);
+        return write_map_info(
+            memory,
+            map_fd,
+            attr.info,
+            attr.info_len,
+            attr_ptr,
+            attr_size,
+        );
     }
     if let Some(prog_fd) = fd_obj.downcast_ref::<BpfProgFd>() {
-        return write_prog_info(prog_fd, attr.info, attr.info_len, attr_ptr, attr_size);
+        return write_prog_info(
+            memory,
+            prog_fd,
+            attr.info,
+            attr.info_len,
+            attr_ptr,
+            attr_size,
+        );
     }
 
     Err(AxError::InvalidInput)
 }
 
-fn write_map_info(
+fn write_map_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     map_fd: &BpfMapFd,
     info_ptr: u64,
     info_len: u32,
@@ -52,18 +72,14 @@ fn write_map_info(
         ..Default::default()
     };
 
-    let info_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &info as *const BpfMapInfo as *const u8,
-            core::mem::size_of::<BpfMapInfo>(),
-        )
-    };
+    let copy_len = (info_len as usize).min(size_of::<BpfMapInfo>());
+    let info_bytes = bytemuck::bytes_of(&info);
+    memory
+        .write_bytes(info_ptr as usize, &info_bytes[..copy_len])
+        .map_err(crate::mm::map_usercopy_error)?;
 
-    let copy_len = (info_len as usize).min(info_bytes.len());
-    starry_vm::vm_write_slice(info_ptr as *mut u8, &info_bytes[..copy_len])
-        .map_err(|_| AxError::BadAddress)?;
-
-    write_bpf_attr_value::<BpfAttrGetInfoByFd, _>(
+    write_bpf_attr_value::<BpfAttrGetInfoByFd, _, _>(
+        memory,
         attr_ptr,
         attr_size,
         offset_of!(BpfAttrGetInfoByFd, info_len),
@@ -73,7 +89,8 @@ fn write_map_info(
     Ok(0)
 }
 
-fn write_prog_info(
+fn write_prog_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     prog_fd: &BpfProgFd,
     info_ptr: u64,
     info_len: u32,
@@ -112,18 +129,14 @@ fn write_prog_info(
         ..Default::default()
     };
 
-    let info_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &info as *const BpfProgInfo as *const u8,
-            core::mem::size_of::<BpfProgInfo>(),
-        )
-    };
+    let copy_len = (info_len as usize).min(size_of::<BpfProgInfo>());
+    let info_bytes = bytemuck::bytes_of(&info);
+    memory
+        .write_bytes(info_ptr as usize, &info_bytes[..copy_len])
+        .map_err(crate::mm::map_usercopy_error)?;
 
-    let copy_len = (info_len as usize).min(info_bytes.len());
-    starry_vm::vm_write_slice(info_ptr as *mut u8, &info_bytes[..copy_len])
-        .map_err(|_| AxError::BadAddress)?;
-
-    write_bpf_attr_value::<BpfAttrGetInfoByFd, _>(
+    write_bpf_attr_value::<BpfAttrGetInfoByFd, _, _>(
+        memory,
         attr_ptr,
         attr_size,
         offset_of!(BpfAttrGetInfoByFd, info_len),

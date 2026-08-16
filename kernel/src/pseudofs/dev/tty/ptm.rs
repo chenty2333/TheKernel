@@ -4,7 +4,10 @@ use core::any::Any;
 use axerrno::AxResult;
 use axfs_ng_vfs::{DeviceId, NodeType};
 
-use crate::pseudofs::{Device, DeviceOps, SimpleFs};
+use crate::{
+    file::IoctlContext,
+    pseudofs::{Device, DeviceOps, SimpleFs},
+};
 
 pub struct Ptmx(pub Arc<SimpleFs>);
 impl Ptmx {
@@ -37,7 +40,7 @@ impl DeviceOps for Ptmx {
         Err(axerrno::AxError::NotATty)
     }
 
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(axerrno::AxError::NotATty)
     }
 

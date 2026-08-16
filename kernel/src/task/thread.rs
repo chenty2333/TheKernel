@@ -5,18 +5,21 @@ use alloc::{
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use axsync::spin::SpinNoIrq;
-use axtask::{TaskExt, TaskInner};
+use axtask::{SchedClass, TaskExt, TaskInner, current_may_uninit, sched_state};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
-use starry_process::Pid;
-use starry_signal::api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_rseq::ThreadRseq;
 use thekernel_linux_seccomp::SeccompState;
+use thekernel_linux_signal::api::{
+    ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration,
+};
 
 use super::{
     ProcessData,
@@ -27,7 +30,8 @@ use super::{
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
-const TASK_PARENT_RELATION_HARD_LIMIT: usize = starry_process::PROCESS_MEMBERSHIP_LIMIT;
+const TASK_PARENT_RELATION_HARD_LIMIT: usize =
+    thekernel_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
 
@@ -60,7 +64,7 @@ pub(crate) fn lock_task_parent_publication() -> TaskParentPublicationGuard<'stat
 
 fn try_reserve_task_parent_relation(counter: &AtomicUsize, limit: usize) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1).filter(|next| *next <= limit)
         })
         .is_ok()
@@ -720,6 +724,14 @@ pub struct Thread {
     /// until their final owner exits.
     pub(in crate::task) seccomp: SpinNoIrq<SeccompState>,
 
+    /// Thread-local Linux restartable-sequence registration and event state.
+    ///
+    /// This deliberately lives on `Thread`, not `ProcessData`: rseq
+    /// registration is private to one Linux thread even when siblings share
+    /// an address space. Scheduler, signal, and final-return callers publish
+    /// observations through this state without resolving an implicit task.
+    pub(in crate::task) rseq: SpinNoIrq<ThreadRseq>,
+
     /// Negative fast-path for syscall entry.
     ///
     /// This bit is not a second writable seccomp state: the guarded
@@ -788,14 +800,18 @@ pub struct Thread {
     /// generic scheduler mechanism.
     sched_reset_on_fork: AtomicBool,
 
+    /// Linux per-task I/O priority context. Linux does not allocate an
+    /// `io_context` until a task first needs one; `None` is therefore a real
+    /// state, not an eagerly allocated `IOPRIO_CLASS_NONE` value. The
+    /// reference is shared by `CLONE_IO` children and copied for ordinary
+    /// fork/clone children.
+    io_context: SpinNoIrq<Option<Arc<AtomicU16>>>,
+
     /// The OOM score adjustment value.
     oom_score_adj: AtomicI32,
 
     /// Ready to exit
     pub exit: Arc<AtomicBool>,
-
-    /// Indicates whether the thread is currently accessing user memory.
-    accessing_user_memory: AtomicBool,
 
     /// Whether this thread currently owns the leaked active-scope read guard.
     active_scope_read_held: AtomicBool,
@@ -819,6 +835,45 @@ impl Thread {
         credential: Arc<CredentialSlot>,
         seccomp: SeccompState,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
+        Self::try_new_with_io_context(tid, proc_data, credential, seccomp, None)
+    }
+
+    /// Create a task with an explicitly selected Linux I/O-priority context.
+    /// Ordinary fork/clone callers pass an independent context, while
+    /// `CLONE_IO` passes the parent's shared reference.
+    pub(crate) fn try_new_with_io_context(
+        tid: u32,
+        proc_data: Arc<ProcessData>,
+        credential: Arc<CredentialSlot>,
+        seccomp: SeccompState,
+        io_context: Option<Arc<AtomicU16>>,
+    ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
+        // ProcessData is created before the child scheduler object. Seed its
+        // durable scheduler identity from the caller now, including Linux's
+        // reset-on-fork transformation; later scheduler syscalls keep this
+        // cell current and set_exit publishes one final authoritative sample.
+        if let Some(current_task) = current_may_uninit()
+            && let Some(parent) = current_task.try_as_thread()
+            && proc_data.proc.pid() == tid
+        {
+            let mut state = sched_state(&current_task);
+            if parent.sched_reset_on_fork() {
+                match state.class {
+                    SchedClass::Fifo | SchedClass::RoundRobin => {
+                        state.class = SchedClass::Normal;
+                        state.nice = 0;
+                        state.rt_priority = 0;
+                    }
+                    SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+                        if state.nice < 0 {
+                            state.nice = 0;
+                        }
+                        state.rt_priority = 0;
+                    }
+                }
+            }
+            proc_data.publish_scheduler_state(state);
+        }
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;
         let exit = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
@@ -835,6 +890,7 @@ impl Thread {
             proc_data,
             credential,
             seccomp: SpinNoIrq::new(seccomp),
+            rseq: SpinNoIrq::new(ThreadRseq::new()),
             seccomp_active: AtomicBool::new(seccomp_active),
             file_operation_credential: SpinNoIrq::new(None),
             file_write_credentials: SpinNoIrq::new(None),
@@ -848,9 +904,9 @@ impl Thread {
             live_usage: AtomicTaskUsage::new(),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             sched_reset_on_fork: AtomicBool::new(false),
+            io_context: SpinNoIrq::new(io_context),
             exit,
             oom_score_adj: AtomicI32::new(200),
-            accessing_user_memory: AtomicBool::new(false),
             active_scope_read_held: AtomicBool::new(false),
             restart: SpinNoIrq::new(restart),
             exit_event,
@@ -862,11 +918,41 @@ impl Thread {
             .try_register(tid)
             .map_err(|error| match error {
                 ThreadRegistrationError::NoMemory => AxError::NoMemory,
+                ThreadRegistrationError::Capacity => AxError::StorageFull,
                 ThreadRegistrationError::AlreadyRegistered
                 | ThreadRegistrationError::TidInUse
                 | ThreadRegistrationError::Cancelled => AxError::BadState,
             })?;
         Ok((thread, registration))
+    }
+
+    /// Returns the shared I/O-priority context used by `CLONE_IO`, if Linux
+    /// has already allocated one for this task.
+    pub(crate) fn io_context(&self) -> Option<Arc<AtomicU16>> {
+        self.io_context.lock().clone()
+    }
+
+    /// Returns the raw Linux `ioprio` value stored for this task.
+    pub(crate) fn io_priority_raw(&self) -> u16 {
+        self.io_context
+            .lock()
+            .as_ref()
+            .map(|context| context.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Publishes a raw Linux `ioprio` value, allocating the Linux context only
+    /// on the first setter that needs one.
+    pub(crate) fn set_io_priority_raw(&self, priority: u16) -> AxResult<()> {
+        let mut io_context = self.io_context.lock();
+        if let Some(context) = io_context.as_ref() {
+            context.store(priority, Ordering::Release);
+        } else {
+            let new_context =
+                Arc::try_new(AtomicU16::new(priority)).map_err(|_| AxError::NoMemory)?;
+            *io_context = Some(new_context);
+        }
+        Ok(())
     }
 
     pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
@@ -1110,18 +1196,11 @@ impl Thread {
 
     /// Set the thread to exit.
     pub fn set_exit(&self) {
+        // Final scheduler state is sampled before zombie publication. Keep
+        // this terminal flag idempotent and free of scheduler mutations: it
+        // is also used by non-final thread exits and may be called again by
+        // defensive teardown paths.
         self.exit.store(true, Ordering::Release);
-    }
-
-    /// Check if the thread is accessing user memory.
-    pub fn is_accessing_user_memory(&self) -> bool {
-        self.accessing_user_memory.load(Ordering::Acquire)
-    }
-
-    /// Set the accessing user memory flag.
-    pub fn set_accessing_user_memory(&self, accessing: bool) {
-        self.accessing_user_memory
-            .store(accessing, Ordering::Release);
     }
 
     /// Returns the last published CPU usage snapshot for this thread.
@@ -1234,12 +1313,23 @@ impl From<u8> for ProcStateHint {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self, _task: &TaskInner) {
+        let state = self.proc_data.aspace_tlb_state();
+        state.enter_current();
+        // A scheduler enter is the migration observation consumed by the
+        // final IRQ-disabled user-return gate.  The event publication is
+        // allocation-free and intentionally best-effort while a lifecycle
+        // transaction owns the rseq state.
+        let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::MIGRATE);
         self.acquire_active_scope_read();
         self.resume_cpu_accounting_after_switch();
     }
 
     fn on_leave(&self, task: &TaskInner) {
         let _ = task;
+        // Every scheduler leave is a preemption observation.  The final
+        // return gate decides whether the saved IP was in an active critical
+        // section and performs any abort before user entry.
+        let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::PREEMPT);
         self.pause_cpu_accounting_for_switch();
         ActiveScope::set_global();
         self.release_active_scope_read();

@@ -7,7 +7,7 @@ use alloc::{
 use core::{
     fmt,
     ops::DerefMut,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
 };
 
 use axerrno::{AxError, AxResult, ax_bail};
@@ -18,6 +18,7 @@ use axhal::{
 };
 use axsync::Mutex;
 use hashbrown::{HashMap, hash_map::Entry};
+use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
@@ -153,7 +154,7 @@ static USER_IO_PIN_BUDGET: SpinNoIrq<Option<UserIoPinBudget>> = SpinNoIrq::new(N
 
 fn allocate_nonwrapping_id(sequence: &AtomicU64) -> AxResult<u64> {
     sequence
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .map_err(|_| AxError::ResourceBusy)
@@ -782,11 +783,197 @@ impl Drop for UserIoSystemPinCharge {
     }
 }
 
+/// Registration and generation state for private expedited membarriers.
+///
+/// The registration bits are process-image state: ordinary fork copies them,
+/// while exec starts with a fresh address space and therefore a fresh state.
+/// The generation and acknowledgements are deliberately separate from the
+/// address-space TLB generation; a barrier must never be mistaken for a page
+/// table shootdown acknowledgement.
+pub(crate) struct MembarrierState {
+    registrations: AtomicU32,
+    generation: AtomicU64,
+    ack_generations: [AtomicU64; axconfig::plat::MAX_CPU_NUM],
+}
+
+impl MembarrierState {
+    const REGISTER_PRIVATE: u32 = 1 << 4;
+    const REGISTER_SYNC_CORE: u32 = 1 << 6;
+
+    pub(crate) const fn new() -> Self {
+        Self::with_registrations(0)
+    }
+
+    const fn with_registrations(registrations: u32) -> Self {
+        Self {
+            registrations: AtomicU32::new(registrations),
+            generation: AtomicU64::new(0),
+            ack_generations: [const { AtomicU64::new(0) }; axconfig::plat::MAX_CPU_NUM],
+        }
+    }
+
+    pub(crate) fn fork_clone(&self) -> Self {
+        Self::with_registrations(self.registrations.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn register_private(&self) {
+        self.registrations
+            .fetch_or(Self::REGISTER_PRIVATE, Ordering::AcqRel);
+    }
+
+    pub(crate) fn register_sync_core(&self) {
+        // Linux keeps the ordinary and sync-core private expedited
+        // registrations independent: registering sync-core alone must not
+        // authorize MEMBARRIER_CMD_PRIVATE_EXPEDITED.
+        self.registrations
+            .fetch_or(Self::REGISTER_SYNC_CORE, Ordering::AcqRel);
+    }
+
+    pub(crate) fn registrations(&self) -> u32 {
+        self.registrations.load(Ordering::Acquire)
+            & (Self::REGISTER_PRIVATE | Self::REGISTER_SYNC_CORE)
+    }
+
+    pub(crate) fn private_registered(&self) -> bool {
+        self.registrations() & Self::REGISTER_PRIVATE != 0
+    }
+
+    pub(crate) fn sync_core_registered(&self) -> bool {
+        self.registrations() & Self::REGISTER_SYNC_CORE != 0
+    }
+
+    /// Completes a barrier generation for a CPU that is entering this image
+    /// after an issuer took its resident snapshot. Entry hooks use the same
+    /// generation as the IPI path, and conservatively execute the x86
+    /// serializing primitive even when the original command was the cheaper
+    /// ordinary private barrier. This closes the admission/snapshot race
+    /// without taking a scheduler or address-space lock.
+    pub(crate) fn synchronize_entering_cpu(&self, cpu: usize) {
+        let generation = self.generation.load(Ordering::SeqCst);
+        if generation == 0 || self.acknowledged(cpu, generation) {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = core::arch::x86_64::__cpuid(0);
+        }
+        fence(Ordering::SeqCst);
+        self.acknowledge(cpu, generation);
+    }
+
+    pub(crate) fn next_generation(&self) -> AxResult<u64> {
+        self.generation
+            .try_update(Ordering::SeqCst, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| AxError::from(axerrno::LinuxError::EOVERFLOW))
+    }
+
+    pub(crate) fn acknowledged(&self, cpu: usize, generation: u64) -> bool {
+        assert!(
+            cpu < axconfig::plat::MAX_CPU_NUM,
+            "membarrier CPU index exceeds fixed capacity"
+        );
+        self.ack_generations[cpu].load(Ordering::Acquire) >= generation
+    }
+
+    pub(crate) fn acknowledge(&self, cpu: usize, generation: u64) {
+        assert!(
+            cpu < axconfig::plat::MAX_CPU_NUM,
+            "membarrier CPU index exceeds fixed capacity"
+        );
+        let _ = self.ack_generations[cpu].try_update(
+            Ordering::Release,
+            Ordering::Acquire,
+            |previous| Some(previous.max(generation)),
+        );
+    }
+}
+
 /// The virtual memory address space.
+pub(crate) struct TlbState {
+    generation: AtomicU64,
+    resident_cpus: [AtomicBool; axconfig::plat::MAX_CPU_NUM],
+    seen_generations: [AtomicU64; axconfig::plat::MAX_CPU_NUM],
+    membarrier: MembarrierState,
+}
+
+impl TlbState {
+    const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            resident_cpus: [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM],
+            seen_generations: [const { AtomicU64::new(0) }; axconfig::plat::MAX_CPU_NUM],
+            membarrier: MembarrierState::new(),
+        }
+    }
+
+    fn fork_clone(&self) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            generation: AtomicU64::new(0),
+            resident_cpus: [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM],
+            seen_generations: [const { AtomicU64::new(0) }; axconfig::plat::MAX_CPU_NUM],
+            membarrier: self.membarrier.fork_clone(),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    /// Publishes membership before sampling the generation. The returned
+    /// generation is acknowledged only after the caller has completed the
+    /// local flush, so a writer cannot mistake an entering CPU for one that
+    /// already repaired its translations.
+    fn admit_cpu(&self, cpu: usize) -> Option<u64> {
+        assert!(
+            cpu < axconfig::plat::MAX_CPU_NUM,
+            "address-space TLB CPU index exceeds fixed capacity"
+        );
+        self.resident_cpus[cpu].store(true, Ordering::SeqCst);
+        let generation = self.generation.load(Ordering::SeqCst);
+        let seen = self.seen_generations[cpu].load(Ordering::SeqCst);
+        (seen < generation).then_some(generation)
+    }
+
+    pub(crate) fn enter_current(&self) {
+        let _guard = NoPreemptIrqSave::new();
+        let cpu = axhal::percpu::this_cpu_id();
+        if let Some(generation) = self.admit_cpu(cpu) {
+            axhal::asm::flush_tlb(None);
+            self.seen_generations[cpu].store(generation, Ordering::SeqCst);
+        }
+        self.membarrier.synchronize_entering_cpu(cpu);
+    }
+
+    pub(crate) fn membarrier_state(&self) -> &MembarrierState {
+        &self.membarrier
+    }
+
+    pub(crate) fn membarrier_resident_on(&self, cpu: usize) -> bool {
+        assert!(
+            cpu < axconfig::plat::MAX_CPU_NUM,
+            "membarrier CPU index exceeds fixed capacity"
+        );
+        self.resident_cpus[cpu].load(Ordering::SeqCst)
+    }
+
+    fn synchronize_after_mutation(&self) -> impl Drop {
+        super::synchronize_tlb_for_addr_space(
+            &self.generation,
+            &self.resident_cpus,
+            &self.seen_generations,
+        )
+    }
+}
+
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     address_space_id: AddressSpaceId,
     hardware_asid: HardwareAddressSpaceId,
+    /// Monotonic PTE invalidation generation and bounded per-CPU residency.
+    /// The state is shared with scheduler hooks so they can publish residency
+    /// without taking the address-space mutex.
+    tlb: Arc<TlbState>,
     topology_mapping_id: MappingId,
     topology_generation: MappingGeneration,
     areas: MemorySet<Backend>,
@@ -965,6 +1152,7 @@ pub(crate) struct PreparedProtect<'a> {
     growdown_starts: &'a mut BTreeSet<VirtAddr>,
     topology_generation: &'a mut MappingGeneration,
     next_topology_generation: MappingGeneration,
+    tlb: &'a TlbState,
     mapping_identities: &'a mut MappingIdentityIndex,
     mapping_mutations: Vec<MappingIdentityMutation>,
     uffd_mutation: Option<PreparedUffdMutation<'a>>,
@@ -1102,6 +1290,7 @@ impl PreparedProtect<'_> {
             growdown_starts,
             topology_generation,
             next_topology_generation,
+            tlb,
             mapping_identities,
             mapping_mutations,
             uffd_mutation,
@@ -1112,7 +1301,7 @@ impl PreparedProtect<'_> {
                 if synchronize_instruction_stream {
                     let _ = super::synchronize_tlb_and_icache();
                 } else {
-                    let _ = super::synchronize_tlb();
+                    let _ = tlb.synchronize_after_mutation();
                 }
             })?;
         Self::refresh_growdown_starts(areas, growdown_starts);
@@ -1179,6 +1368,30 @@ impl AddrSpace {
         AddressSpaceToken::new(self.pt.root_paddr(), self.hardware_asid)
     }
 
+    /// Publishes this address space as active on the current CPU at a
+    /// scheduler context-switch boundary.
+    ///
+    /// Residency is published before sampling the generation. The bit is a
+    /// conservative, monotonic upper bound because task-extension hooks run
+    /// before the hardware page-table switch; clearing it there could let a
+    /// writer release mappings while the old CR3 is still live. If a page
+    /// table writer snapshots the CPU before this store, the generation load
+    /// observes the writer's subsequent publication and performs the local
+    /// repair itself; if it snapshots after the store, the CPU is included in
+    /// the targeted shootdown.
+    pub(crate) fn tlb_state(&self) -> Arc<TlbState> {
+        self.tlb.clone()
+    }
+
+    /// Completes one PTE mutation's full local flush and targeted grace.
+    ///
+    /// The helper advances the generation before taking the active snapshot;
+    /// callers must invoke it after publishing page-table stores but before
+    /// releasing any retired mapping/frame ownership.
+    fn synchronize_tlb_after_mutation(&self) -> impl Drop {
+        self.tlb.synchronize_after_mutation()
+    }
+
     /// Checks if the address space contains the given address range.
     pub fn contains_range(&self, start: VirtAddr, size: usize) -> bool {
         self.va_range.contains(start) && (self.va_range.end - start) >= size
@@ -1194,6 +1407,7 @@ impl AddrSpace {
             va_range,
             address_space_id,
             hardware_asid,
+            tlb: Arc::try_new(TlbState::new()).map_err(|_| AxError::NoMemory)?,
             topology_mapping_id,
             topology_generation,
             areas: MemorySet::new(),
@@ -2279,6 +2493,34 @@ impl AddrSpace {
         self.areas.find(vaddr)
     }
 
+    /// Returns the strong backing identity and byte offset for a mapped
+    /// process-shared futex word.  The caller must hold this address space's
+    /// mutex while using the result for a queue operation; a later no-fault
+    /// check compares the live mapping against this exact lease to reject
+    /// remap/unmap ABA races.
+    pub(crate) fn futex_shared_key_at(&self, address: usize) -> Option<SharedFutexKey> {
+        let end = address.checked_add(size_of::<u32>())?;
+        let area = self.find_area(VirtAddr::from_usize(address))?;
+        if address < area.start().as_usize() || end > area.end().as_usize() {
+            return None;
+        }
+        area.backend().futex_shared_key(address)
+    }
+
+    /// Gate-safe shared-futex identity lookup.  Unlike key derivation this
+    /// returns only copyable identity data and never clones the backing lease.
+    pub(crate) fn futex_shared_id_at(
+        &self,
+        address: usize,
+    ) -> Option<(crate::mm::FutexBackingId, crate::mm::FutexWordOffset)> {
+        let end = address.checked_add(size_of::<u32>())?;
+        let area = self.find_area(VirtAddr::from_usize(address))?;
+        if address < area.start().as_usize() || end > area.end().as_usize() {
+            return None;
+        }
+        area.backend().futex_shared_id(address)
+    }
+
     pub fn brk_growth_collides(&self, start: VirtAddr, end: VirtAddr, heap_base: VirtAddr) -> bool {
         if start >= end {
             return false;
@@ -2647,7 +2889,7 @@ impl AddrSpace {
         let retirement =
             self.areas
                 .unmap_deferred_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
-        let grace = super::synchronize_tlb();
+        let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
         Ok(())
@@ -2655,7 +2897,7 @@ impl AddrSpace {
 
     fn clear_areas_with_tlb_grace(&mut self) -> MappingResult {
         let retirement = self.areas.clear_deferred(&mut self.pt)?;
-        let grace = super::synchronize_tlb();
+        let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
         Ok(())
@@ -3304,7 +3546,9 @@ impl AddrSpace {
                 Ok(())
             })()
         };
-        super::retire_after_tlb_grace(retired);
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(retired);
+        drop(grace);
         result
     }
 
@@ -3541,6 +3785,7 @@ impl AddrSpace {
             growdown_starts,
             uffd,
             topology_generation,
+            tlb,
             pt,
             ..
         } = self;
@@ -3582,6 +3827,7 @@ impl AddrSpace {
             growdown_starts,
             topology_generation,
             next_topology_generation,
+            tlb,
             mapping_identities,
             mapping_mutations,
             uffd_mutation,
@@ -3921,6 +4167,11 @@ impl AddrSpace {
         child_parent_lineages.dedup();
 
         let mut guard = new_aspace.lock();
+        // Linux carries private membarrier registrations across an ordinary
+        // fork, but the child starts with no CPUs resident and a fresh
+        // barrier generation. CLONE_VM shares the address space (and hence
+        // this state) through the existing Arc path instead.
+        guard.tlb = self.tlb.fork_clone()?;
         guard.growdown_starts = self.growdown_starts.clone();
         let mut child_lineages = Vec::new();
         child_lineages
@@ -4029,7 +4280,7 @@ impl AddrSpace {
             .is_ok())
         );
         drop(self_modify);
-        drop(super::synchronize_tlb());
+        drop(self.synchronize_tlb_after_mutation());
         drop(guard);
 
         Ok(new_aspace)
@@ -4114,6 +4365,32 @@ mod tests {
                 .unwrap();
         }
         identities
+    }
+
+    #[test]
+    fn tlb_state_admits_before_generation_repair_and_bounds_membership() {
+        let state = TlbState::new();
+        assert!(
+            state
+                .resident_cpus
+                .iter()
+                .all(|cpu| !cpu.load(Ordering::Relaxed))
+        );
+        assert!(
+            state
+                .seen_generations
+                .iter()
+                .all(|generation| { generation.load(Ordering::Relaxed) == 0 })
+        );
+
+        state.generation.store(4, Ordering::SeqCst);
+        assert_eq!(state.admit_cpu(0), Some(4));
+        assert!(state.resident_cpus[0].load(Ordering::SeqCst));
+        assert_eq!(state.seen_generations[0].load(Ordering::SeqCst), 0);
+
+        state.seen_generations[0].store(4, Ordering::SeqCst);
+        assert_eq!(state.admit_cpu(0), None);
+        assert!(state.resident_cpus[0].load(Ordering::SeqCst));
     }
 
     fn map_mock_area(
@@ -4831,7 +5108,8 @@ mod tests {
         // RAII drop released the bounded UFFD plan slot. The helper below is
         // the same coordinator used by PreparedProtect::commit. Host axhal's
         // dummy address translation cannot safely instantiate a real
-        // AddrSpace PageTable; RV/LA runtime gates cover that final wiring.
+        // AddrSpace PageTable; runtime architecture gates cover that final
+        // wiring.
         let plan = uffd
             .preflight_protect(
                 0,

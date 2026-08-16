@@ -11,6 +11,7 @@ use inherit_methods_macro::inherit_methods;
 use memory_addr::PhysAddrRange;
 
 use super::{SimpleFs, SimpleFsNode};
+use crate::file::IoctlContext;
 
 /// Mmap behavior for devices.
 pub enum DeviceMmap {
@@ -33,7 +34,7 @@ pub trait DeviceOps: Send + Sync {
     /// Writes data to the device at the specified offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
     /// Manipulates the underlying device parameters of special files.
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> VfsResult<usize> {
         Err(VfsError::NotATty)
     }
 
@@ -181,10 +182,6 @@ impl FileNodeOps for Device {
 
     fn set_symlink(&self, _target: &str) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
-    }
-
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        self.ops.ioctl(cmd, arg)
     }
 }
 

@@ -1,37 +1,38 @@
-use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
+use axhal::uspace::{
+    ExceptionInfo, ExceptionKind, ReturnReason, UserContext, UserReturnHookResult,
+};
 use axtask::{TaskCreateError, TaskInner};
 use linux_raw_sys::general::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR};
-use starry_process::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmMutPtr;
+use thekernel_linux_process_adapter::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::{
-    AsThread, TimerState, check_signals, do_exit, fail_closed_exit, force_signal_current_thread,
-    has_pending_fatal_signal, set_timer_state, wait_if_stopped,
+    AsThread, TimerState, check_signals, do_exit, fail_closed_exit,
+    force_rseq_fault_signal_current_thread, force_signal_current_thread, has_pending_fatal_signal,
+    set_timer_state, terminate_rseq_fault_current_thread, wait_if_stopped,
 };
 use crate::{
-    mm::{PageFaultFailure, PageFaultResult, handle_user_page_fault},
+    mm::{
+        PageFaultFailure, PageFaultResult, UserMemoryCapability, handle_user_page_fault,
+        map_usercopy_error,
+    },
     syscall::handle_syscall,
 };
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
-/// arch-specific exception information.
-#[allow(unused_variables)]
+/// x86_64 exception information.
 fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // x86_64 exception vectors that map to specific signals:
-        match exc_info.vector {
-            // Division error, Overflow, x87 FP, SIMD FP → SIGFPE
-            0x00 | 0x04 | 0x10 | 0x13 => return Signo::SIGFPE,
-            // Debug → SIGTRAP
-            0x01 => return Signo::SIGTRAP,
-            // Segment not present, Stack fault, Alignment check → SIGBUS
-            0x0B | 0x0C | 0x11 => return Signo::SIGBUS,
-            // Bound range exceeded, General protection, Double fault → SIGSEGV
-            0x05 | 0x08 | 0x0D => return Signo::SIGSEGV,
-            _ => {}
-        }
+    // x86_64 exception vectors that map to specific signals:
+    match exc_info.vector {
+        // Division error, Overflow, x87 FP, SIMD FP → SIGFPE
+        0x00 | 0x04 | 0x10 | 0x13 => return Signo::SIGFPE,
+        // Debug → SIGTRAP
+        0x01 => return Signo::SIGTRAP,
+        // Segment not present, Stack fault, Alignment check → SIGBUS
+        0x0B | 0x0C | 0x11 => return Signo::SIGBUS,
+        // Bound range exceeded, General protection, Double fault → SIGSEGV
+        0x05 | 0x08 | 0x0D => return Signo::SIGSEGV,
+        _ => {}
     }
 
     // Default: unknown exceptions are most likely access violations.
@@ -62,14 +63,51 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
             if !child_tid.is_null() {
                 // Linux publishes CLONE_CHILD_SETTID from schedule_tail() in
                 // the child context. A copy fault does not cancel the clone.
-                let _ = child_tid.vm_write(thr.tid());
+                let capability = UserMemoryCapability::new(thr.proc_data.aspace());
+                let _ = capability
+                    .write_value(child_tid, thr.tid())
+                    .map_err(map_usercopy_error);
             }
             while !thr.pending_exit() {
-                #[cfg(target_arch = "loongarch64")]
-                super::restore_current_user_fpu_state();
-                let reason = uctx.run();
-                #[cfg(target_arch = "loongarch64")]
-                super::save_current_user_fpu_state();
+                // The final rseq gate runs while interrupts are disabled by
+                // `run_with_return_hook`; a Retry returns here with IRQs
+                // restored so task-context scheduling/fault handling can run
+                // before the next attempt.
+                let reason = loop {
+                    let aspace = thr.proc_data.aspace();
+                    match uctx.run_with_return_hook(|uctx| thr.rseq_return_gate(uctx, &aspace)) {
+                        UserReturnHookResult::Returned(reason) => break reason,
+                        UserReturnHookResult::Retry => {
+                            set_timer_state(&curr, TimerState::Kernel);
+                            if thr.pending_exit() {
+                                break ReturnReason::Interrupt;
+                            }
+                            // A nofault rseq snapshot may have observed a
+                            // missing PTE or a writable VMA's read-only COW
+                            // leaf. The hook has already restored IRQ state;
+                            // resolve the complete area/descriptor span in
+                            // task context before attempting the gate again.
+                            if thr.prepare_rseq_retry(&aspace).is_err() {
+                                if !force_rseq_fault_signal_current_thread() {
+                                    terminate_rseq_fault_current_thread();
+                                }
+                                break ReturnReason::Interrupt;
+                            }
+                            axtask::resched_if_needed();
+                        }
+                        UserReturnHookResult::Fault => {
+                            set_timer_state(&curr, TimerState::Kernel);
+                            // A registered area/descriptor which cannot be
+                            // observed without faulting is visible as a fatal
+                            // user-memory fault; signal processing remains in
+                            // the normal kernel return path.
+                            if !force_rseq_fault_signal_current_thread() {
+                                terminate_rseq_fault_current_thread();
+                            }
+                            break ReturnReason::Interrupt;
+                        }
+                    }
+                };
 
                 set_timer_state(&curr, TimerState::Kernel);
 
@@ -80,21 +118,6 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                         let result =
                             handle_user_page_fault(aspace_handle, addr, flags, uctx.sp().into());
                         if result != PageFaultResult::Handled {
-                            #[cfg(target_arch = "riscv64")]
-                            info!(
-                                "{:?}: user page fault at {:#x} {:?}, pc={:#x}, ra={:#x}, \
-                                 sp={:#x}, a0={:#x}, a1={:#x}, tp={:#x}",
-                                thr.proc_data.proc,
-                                addr,
-                                flags,
-                                uctx.ip(),
-                                uctx.regs.ra,
-                                uctx.sp(),
-                                uctx.regs.a0,
-                                uctx.regs.a1,
-                                uctx.regs.tp,
-                            );
-                            #[cfg(not(target_arch = "riscv64"))]
                             info!(
                                 "{:?}: user page fault at {:#x} {:?}, pc={:#x}, sp={:#x}",
                                 thr.proc_data.proc,
@@ -135,16 +158,9 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                         }
                     }
                     ReturnReason::Interrupt => {}
-                    #[allow(unused_labels)]
-                    ReturnReason::Exception(exc_info) => 'exc: {
+                    ReturnReason::Exception(exc_info) => {
                         let signo = match exc_info.kind() {
-                            ExceptionKind::Misaligned => {
-                                #[cfg(target_arch = "loongarch64")]
-                                if unsafe { uctx.emulate_unaligned() }.is_ok() {
-                                    break 'exc;
-                                }
-                                Signo::SIGBUS
-                            }
+                            ExceptionKind::Misaligned => Signo::SIGBUS,
                             ExceptionKind::Breakpoint => Signo::SIGTRAP,
                             ExceptionKind::IllegalInstruction => Signo::SIGILL,
                             ExceptionKind::Other => map_other_exception(&exc_info),

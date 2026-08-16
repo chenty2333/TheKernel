@@ -12,11 +12,10 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::CMsgData;
 use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
-use starry_vm::{VmMutPtr, vm_read_slice};
 
 use crate::{
     file::{FileDescription, Socket, epoll::Epoll, get_file_description, try_reserve_fd},
-    mm::UserPtr,
+    mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
 };
 
 /// Linux's per-message hard limit from `net/core/scm.c`.
@@ -36,7 +35,7 @@ static SCM_RIGHTS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 fn try_acquire_scm_rights(count: usize) -> AxResult<()> {
     SCM_RIGHTS_INFLIGHT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current
                 .checked_add(count)
                 .filter(|next| *next <= SCM_RIGHTS_INFLIGHT_LIMIT)
@@ -102,6 +101,7 @@ impl CMsg {
     /// Linux's single `scm_fp_list` and keeping metadata bounded by
     /// `SCM_MAX_FD` rather than by arbitrary header fragmentation.
     pub fn append_rights(
+        capability: &UserMemoryCapability,
         hdr_addr: usize,
         hdr: &cmsghdr,
         fds: &mut Vec<Arc<FileDescription>>,
@@ -142,12 +142,14 @@ impl CMsg {
             // address space may mutate or unmap the control buffer while the
             // syscall runs; take one bounded owned snapshot, then parse only
             // kernel memory.
-            vm_read_slice(data_addr as *const u8, unsafe {
-                core::slice::from_raw_parts_mut(
-                    raw_fds.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    data_bytes,
-                )
-            })?;
+            capability
+                .read_slice(data_addr as *const u8, unsafe {
+                    core::slice::from_raw_parts_mut(
+                        raw_fds.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                        data_bytes,
+                    )
+                })
+                .map_err(map_usercopy_error)?;
         }
         for fd in raw_fds {
             if fd < 0 {
@@ -204,16 +206,22 @@ pub struct RightsPushResult {
 }
 
 pub struct CMsgBuilder<'a> {
+    capability: UserMemoryCapability,
     hdr: UserPtr<cmsghdr>,
     len: &'a mut usize,
     capacity: usize,
 }
 
 impl<'a> CMsgBuilder<'a> {
-    pub fn new(msg: UserPtr<cmsghdr>, len: &'a mut usize) -> Self {
+    pub fn new(
+        capability: UserMemoryCapability,
+        msg: UserPtr<cmsghdr>,
+        len: &'a mut usize,
+    ) -> Self {
         let capacity = *len;
         *len = 0;
         Self {
+            capability,
             hdr: msg,
             len,
             capacity,
@@ -263,7 +271,7 @@ impl<'a> CMsgBuilder<'a> {
             let Some(dst) = data_addr.checked_add(offset) else {
                 break;
             };
-            if (dst as *mut i32).vm_write(fd).is_err()
+            if self.capability.write_value(dst as *mut i32, fd).is_err()
                 || reservation.publish(description.clone()).is_err()
             {
                 break;
@@ -302,7 +310,14 @@ impl<'a> CMsgBuilder<'a> {
             cmsg_level: SOL_SOCKET as _,
             cmsg_type: SCM_RIGHTS as _,
         };
-        if (base as *mut cmsghdr).vm_write(hdr).is_err() {
+        // `cmsghdr` has no Rust padding on the supported ABI; the source is
+        // fully initialized above, so use the audited byte-copy entry point.
+        if unsafe {
+            self.capability
+                .write_value_unchecked(base as *mut cmsghdr, hdr)
+        }
+        .is_err()
+        {
             // Linux has already installed the fd prefix at this point. Keep it
             // even though the control header itself could not be published;
             // msg_controllen remains zero.

@@ -3,6 +3,7 @@ use alloc::{
     sync::Arc,
 };
 use core::{
+    mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
@@ -20,14 +21,14 @@ use linux_raw_sys::general::__kernel_off_t;
 // the same critical sections with a spin mutex.
 #[cfg(test)]
 use spin::Mutex;
-use starry_process::Pid;
-use starry_signal::SignalSet;
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::SignalSet;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev};
 use crate::{
     file::{FileHandle, event::EventFd, get_typed_file},
-    mm::IoVec,
+    mm::{IoVec, UserMemoryCapability, map_usercopy_error},
     readiness::{block_on_poll_set_uninterruptible, block_on_poll_set_until},
     task::{AsThread, with_blocked_signals},
 };
@@ -95,6 +96,46 @@ pub struct KernelTimespec {
 pub struct AioSigset {
     sigmask: *const u8,
     sigsetsize: usize,
+}
+
+// These records are integer/pointer-only Linux UAPI mirrors.  Keep the
+// x86_64 layouts executable before using the one audited unchecked copyout
+// for `io_event`; no user-memory context is retained in an AIO object.
+const _: () = {
+    assert!(align_of::<IoEvent>() == 8);
+    assert!(size_of::<IoEvent>() == 32);
+    assert!(offset_of!(IoEvent, data) == 0);
+    assert!(offset_of!(IoEvent, obj) == 8);
+    assert!(offset_of!(IoEvent, res) == 16);
+    assert!(offset_of!(IoEvent, res2) == 24);
+    assert!(align_of::<Iocb>() == 8);
+    assert!(size_of::<Iocb>() == 64);
+    assert!(offset_of!(Iocb, aio_data) == 0);
+    assert!(offset_of!(Iocb, aio_key) == 8);
+    assert!(offset_of!(Iocb, aio_rw_flags) == 12);
+    assert!(offset_of!(Iocb, aio_lio_opcode) == 16);
+    assert!(offset_of!(Iocb, aio_reqprio) == 18);
+    assert!(offset_of!(Iocb, aio_fildes) == 20);
+    assert!(offset_of!(Iocb, aio_buf) == 24);
+    assert!(offset_of!(Iocb, aio_nbytes) == 32);
+    assert!(offset_of!(Iocb, aio_offset) == 40);
+    assert!(offset_of!(Iocb, aio_reserved2) == 48);
+    assert!(offset_of!(Iocb, aio_flags) == 56);
+    assert!(offset_of!(Iocb, aio_resfd) == 60);
+    assert!(align_of::<KernelTimespec>() == 8);
+    assert!(size_of::<KernelTimespec>() == 16);
+    assert!(align_of::<AioSigset>() == 8);
+    assert!(size_of::<AioSigset>() == 16);
+};
+
+fn write_io_event<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut IoEvent,
+    value: IoEvent,
+) -> AxResult<()> {
+    // SAFETY: `IoEvent` is four initialized 64-bit words with no padding on
+    // x86_64; the complete layout is asserted above.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
 }
 
 struct AioContext {
@@ -200,22 +241,37 @@ fn reserve_submission_slots(context: &AioContext, requested: usize) -> AxResult<
     Ok(reserved)
 }
 
-fn read_iocb_ptr(iocbpp: *const *const Iocb, index: usize) -> AxResult<*const Iocb> {
-    Ok(unsafe { iocbpp.wrapping_add(index).vm_read_uninit()?.assume_init() })
+fn read_iocb_ptr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    iocbpp: *const *const Iocb,
+    index: usize,
+) -> AxResult<*const Iocb> {
+    let ptr = unsafe {
+        VmPtr::vm_read_uninit(iocbpp.wrapping_add(index), memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    Ok(ptr)
 }
 
-fn write_iocb_key(iocb: *const Iocb) -> AxResult {
+fn write_iocb_key<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    iocb: *const Iocb,
+) -> AxResult {
     let key = unsafe { core::ptr::addr_of_mut!((*iocb.cast_mut()).aio_key) };
-    key.vm_write(KIOCB_KEY)?;
+    VmMutPtr::vm_write(key, memory, KIOCB_KEY).map_err(map_usercopy_error)?;
     Ok(())
 }
 
-fn read_optional_timespec(timeout: *const KernelTimespec) -> AxResult<Option<Duration>> {
+fn read_optional_timespec<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    timeout: *const KernelTimespec,
+) -> AxResult<Option<Duration>> {
     if timeout.is_null() {
         return Ok(None);
     }
 
-    let timeout = timeout.vm_read()?;
+    let timeout = VmPtr::vm_read(timeout, memory).map_err(map_usercopy_error)?;
     if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
         return Err(AxError::InvalidInput);
     }
@@ -225,25 +281,27 @@ fn read_optional_timespec(timeout: *const KernelTimespec) -> AxResult<Option<Dur
     )))
 }
 
-fn read_optional_sigset(sigset: *const AioSigset) -> AxResult<Option<SignalSet>> {
+fn read_optional_sigset<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    sigset: *const AioSigset,
+) -> AxResult<Option<SignalSet>> {
     if sigset.is_null() {
         return Ok(None);
     }
 
-    let sigset = sigset.vm_read()?;
+    let sigset = VmPtr::vm_read(sigset, memory).map_err(map_usercopy_error)?;
     if sigset.sigmask.is_null() {
         return Ok(None);
     }
     if sigset.sigsetsize != size_of::<SignalSet>() {
         return Err(AxError::InvalidInput);
     }
-    Ok(Some(unsafe {
-        sigset
-            .sigmask
-            .cast::<SignalSet>()
-            .vm_read_uninit()?
+    let signal_set = unsafe {
+        VmPtr::vm_read_uninit(sigset.sigmask.cast::<SignalSet>(), memory)
+            .map_err(map_usercopy_error)?
             .assume_init()
-    }))
+    };
+    Ok(Some(signal_set))
 }
 
 fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
@@ -286,7 +344,7 @@ fn maybe_sync_after_write(fd: i32, flags: u32) -> AxResult {
     Ok(())
 }
 
-fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
+fn execute_iocb(capability: &UserMemoryCapability, iocb: &Iocb) -> AxResult<isize> {
     validate_iocb_common(iocb)?;
 
     let fd = iocb.aio_fildes as i32;
@@ -295,6 +353,7 @@ fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
         IOCB_CMD_PREAD => {
             validate_aio_rw_flags(iocb.aio_rw_flags)?;
             sys_pread64(
+                capability.clone(),
                 fd,
                 iocb.aio_buf as *mut u8,
                 iocb.aio_nbytes as usize,
@@ -304,6 +363,7 @@ fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
         IOCB_CMD_PWRITE => {
             validate_aio_rw_flags(iocb.aio_rw_flags)?;
             let res = sys_pwrite64(
+                capability.clone(),
                 fd,
                 iocb.aio_buf as *const u8,
                 iocb.aio_nbytes as usize,
@@ -330,6 +390,7 @@ fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
         IOCB_CMD_PREADV => {
             validate_aio_rw_flags(iocb.aio_rw_flags)?;
             sys_preadv(
+                capability.clone(),
                 fd,
                 iocb.aio_buf as *const IoVec,
                 iocb.aio_nbytes as usize,
@@ -339,6 +400,7 @@ fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
         IOCB_CMD_PWRITEV => {
             validate_aio_rw_flags(iocb.aio_rw_flags)?;
             let res = sys_pwritev(
+                capability.clone(),
                 fd,
                 iocb.aio_buf as *const IoVec,
                 iocb.aio_nbytes as usize,
@@ -392,8 +454,12 @@ fn fail_io_submit(
     }
 }
 
-pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
-    let current = ctxp.vm_read()?;
+pub fn sys_io_setup<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    nr_events: u32,
+    ctxp: *mut u64,
+) -> AxResult<isize> {
+    let current = VmPtr::vm_read(ctxp, memory).map_err(map_usercopy_error)?;
     if current != 0 || nr_events == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -418,10 +484,10 @@ pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
             waiters: PollSet::new(),
         }),
     );
-    if let Err(err) = ctxp.vm_write(id) {
+    if let Err(err) = VmMutPtr::vm_write(ctxp, memory, id) {
         AIO_CONTEXTS.lock().contexts.remove(&id);
         release_aio_events(nr_events);
-        return Err(err.into());
+        return Err(map_usercopy_error(err));
     }
     Ok(0)
 }
@@ -453,7 +519,13 @@ pub fn sys_io_destroy(ctx: u64) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResult<isize> {
+pub fn sys_io_submit<M: UserMemory + ?Sized>(
+    capability: UserMemoryCapability,
+    memory: &mut UserMemoryContext<'_, M>,
+    ctx: u64,
+    nr: isize,
+    iocbpp: *const *const Iocb,
+) -> AxResult<isize> {
     if nr < 0 {
         return Err(AxError::InvalidInput);
     }
@@ -468,7 +540,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
     let mut completions = VecDeque::new();
 
     for index in 0..reserved {
-        let ptr = match read_iocb_ptr(iocbpp, index) {
+        let ptr = match read_iocb_ptr(memory, iocbpp, index) {
             Ok(ptr) if !ptr.is_null() => ptr,
             Ok(_) => {
                 return fail_io_submit(
@@ -483,7 +555,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
-        let iocb = match ptr.vm_read() {
+        let iocb = match VmPtr::vm_read(ptr, memory).map_err(map_usercopy_error) {
             Ok(iocb) => iocb,
             Err(err) => {
                 return fail_io_submit(&context, reserved, completions, submitted, err.into());
@@ -496,10 +568,10 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
-        if let Err(err) = write_iocb_key(ptr) {
+        if let Err(err) = write_iocb_key(memory, ptr) {
             return fail_io_submit(&context, reserved, completions, submitted, err);
         }
-        let res = match execute_iocb(&iocb) {
+        let res = match execute_iocb(&capability, &iocb) {
             Ok(res) => res,
             Err(err) => {
                 return fail_io_submit(&context, reserved, completions, submitted, err);
@@ -522,7 +594,8 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
     finish_io_submit(&context, reserved, completions, submitted)
 }
 
-pub fn sys_io_getevents(
+pub fn sys_io_getevents<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     ctx: u64,
     min_nr: isize,
     nr: isize,
@@ -532,7 +605,7 @@ pub fn sys_io_getevents(
     if min_nr < 0 || nr < 0 || min_nr > nr {
         return Err(AxError::InvalidInput);
     }
-    let timeout = read_optional_timespec(timeout)?;
+    let timeout = read_optional_timespec(memory, timeout)?;
     let context = context_for_current(ctx)?;
     let min_nr = min_nr as usize;
     let nr = nr as usize;
@@ -577,7 +650,7 @@ pub fn sys_io_getevents(
 
     for index in 0..count {
         let event = *state.events.get(index).ok_or(AxError::InvalidInput)?;
-        events.wrapping_add(index).vm_write(event)?;
+        write_io_event(memory, events.wrapping_add(index), event)?;
     }
     for _ in 0..count {
         state.events.pop_front();
@@ -585,7 +658,8 @@ pub fn sys_io_getevents(
     Ok(count as isize)
 }
 
-pub fn sys_io_pgetevents(
+pub fn sys_io_pgetevents<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     ctx: u64,
     min_nr: isize,
     nr: isize,
@@ -593,14 +667,19 @@ pub fn sys_io_pgetevents(
     timeout: *const KernelTimespec,
     sigset: *const AioSigset,
 ) -> AxResult<isize> {
-    let sigset = read_optional_sigset(sigset)?;
+    let sigset = read_optional_sigset(memory, sigset)?;
     with_blocked_signals(sigset, || {
-        sys_io_getevents(ctx, min_nr, nr, events, timeout)
+        sys_io_getevents(memory, ctx, min_nr, nr, events, timeout)
     })
 }
 
-pub fn sys_io_cancel(ctx: u64, iocb: *const Iocb, result: *mut IoEvent) -> AxResult<isize> {
-    let _ = iocb.vm_read()?;
+pub fn sys_io_cancel<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ctx: u64,
+    iocb: *const Iocb,
+    result: *mut IoEvent,
+) -> AxResult<isize> {
+    let _ = VmPtr::vm_read(iocb, memory).map_err(map_usercopy_error)?;
     if result.is_null() {
         return Err(AxError::BadAddress);
     }

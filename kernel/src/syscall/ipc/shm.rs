@@ -2,6 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Write as _,
     hash::Hash,
+    mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
@@ -19,7 +20,8 @@ use linux_raw_sys::{
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 #[cfg(all(test, not(target_os = "none")))]
 use spin::Mutex;
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
@@ -28,7 +30,7 @@ use super::{
     shmmax_limit, shmmni_limit,
 };
 use crate::{
-    mm::{Backend, DeferredUffdWake, SharedPages, UserPtr, nullable},
+    mm::{Backend, DeferredUffdWake, SharedPages, map_usercopy_error},
     task::AsThread,
     time::wall_time,
 };
@@ -36,9 +38,6 @@ use crate::{
 const IPC_MODE_MASK: __kernel_mode_t = 0o777;
 const SHM_HUGETLB_FLAG: usize = 0o4000;
 const MAX_SHM_ATTACHMENTS: usize = 65_536;
-#[cfg(target_arch = "loongarch64")]
-const SHMLBA: usize = 0x10000;
-#[cfg(not(target_arch = "loongarch64"))]
 const SHMLBA: usize = PAGE_SIZE_4K;
 
 fn align_down_to(value: usize, align: usize) -> usize {
@@ -115,6 +114,151 @@ pub struct ShmidDs {
     shm_nattch: c_ulong,
     unused4: c_ulong,
     unused5: c_ulong,
+}
+
+// These records contain Linux ABI padding through their embedded `IpcPerm`
+// and the native-word fields following the two PID values.  Keep the layout
+// explicit and materialize a zeroed mirror before copyout so no Rust padding
+// bytes are ever sent to userspace.
+const _: () = {
+    assert!(align_of::<IpcPerm>() == 8);
+    assert!(size_of::<IpcPerm>() == 48);
+    assert!(offset_of!(IpcPerm, key) == 0);
+    assert!(offset_of!(IpcPerm, mode) == 20);
+    assert!(offset_of!(IpcPerm, unused0) == 32);
+    assert!(offset_of!(IpcPerm, unused1) == 40);
+    assert!(align_of::<ShmidDs>() == 8);
+    assert!(size_of::<ShmidDs>() == 112);
+    assert!(offset_of!(ShmidDs, shm_perm) == 0);
+    assert!(offset_of!(ShmidDs, shm_segsz) == 48);
+    assert!(offset_of!(ShmidDs, shm_atime) == 56);
+    assert!(offset_of!(ShmidDs, shm_dtime) == 64);
+    assert!(offset_of!(ShmidDs, shm_ctime) == 72);
+    assert!(offset_of!(ShmidDs, shm_cpid) == 80);
+    assert!(offset_of!(ShmidDs, shm_lpid) == 84);
+    assert!(offset_of!(ShmidDs, shm_nattch) == 88);
+    assert!(offset_of!(ShmidDs, unused4) == 96);
+    assert!(offset_of!(ShmidDs, unused5) == 104);
+};
+
+const _: () = {
+    assert!(align_of::<IpcInfo>() == 8);
+    assert!(size_of::<IpcInfo>() == 72);
+    assert!(align_of::<ShmUsageInfo>() == 8);
+    assert!(size_of::<ShmUsageInfo>() == 48);
+    assert!(offset_of!(ShmUsageInfo, used_ids) == 0);
+    assert!(offset_of!(ShmUsageInfo, shm_tot) == 8);
+    assert!(offset_of!(ShmUsageInfo, shm_rss) == 16);
+    assert!(offset_of!(ShmUsageInfo, shm_swp) == 24);
+    assert!(offset_of!(ShmUsageInfo, swap_attempts) == 32);
+    assert!(offset_of!(ShmUsageInfo, swap_successes) == 40);
+};
+
+fn initialized_ipc_perm(value: &IpcPerm) -> IpcPerm {
+    // SAFETY: every field is an integer scalar and zero is a valid
+    // representation.  Starting from zero also initializes the implicit
+    // four-byte alignment hole before the native-word fields.
+    let mut result: IpcPerm = unsafe { core::mem::zeroed() };
+    result.key = value.key;
+    result.uid = value.uid;
+    result.gid = value.gid;
+    result.cuid = value.cuid;
+    result.cgid = value.cgid;
+    result.mode = value.mode;
+    result.pad1 = value.pad1;
+    result.seq = value.seq;
+    result.pad2 = value.pad2;
+    result.unused0 = value.unused0;
+    result.unused1 = value.unused1;
+    result
+}
+
+fn initialized_shmid_ds(value: &ShmidDs) -> ShmidDs {
+    // SAFETY: every field is an integer scalar and zero is a valid
+    // representation.  The zeroed value initializes the ABI alignment bytes
+    // that Rust does not expose as fields.
+    let mut result: ShmidDs = unsafe { core::mem::zeroed() };
+    result.shm_perm = initialized_ipc_perm(&value.shm_perm);
+    result.shm_segsz = value.shm_segsz;
+    result.shm_atime = value.shm_atime;
+    result.shm_dtime = value.shm_dtime;
+    result.shm_ctime = value.shm_ctime;
+    result.shm_cpid = value.shm_cpid;
+    result.shm_lpid = value.shm_lpid;
+    result.shm_nattch = value.shm_nattch;
+    result.unused4 = value.unused4;
+    result.unused5 = value.unused5;
+    result
+}
+
+fn initialized_ipc_info(value: &IpcInfo) -> IpcInfo {
+    // SAFETY: all fields are native-word integer scalars; zero initializes the
+    // complete object even on a target that inserts alignment bytes.
+    let mut result: IpcInfo = unsafe { core::mem::zeroed() };
+    result.shmmax = value.shmmax;
+    result.shmmin = value.shmmin;
+    result.shmmni = value.shmmni;
+    result.shmseg = value.shmseg;
+    result.shmall = value.shmall;
+    result.reserved1 = value.reserved1;
+    result.reserved2 = value.reserved2;
+    result.reserved3 = value.reserved3;
+    result.reserved4 = value.reserved4;
+    result
+}
+
+fn initialized_shm_usage_info(value: &ShmUsageInfo) -> ShmUsageInfo {
+    // SAFETY: zeroing initializes the four-byte alignment hole after
+    // `used_ids`; every other field is an integer scalar.
+    let mut result: ShmUsageInfo = unsafe { core::mem::zeroed() };
+    result.used_ids = value.used_ids;
+    result.shm_tot = value.shm_tot;
+    result.shm_rss = value.shm_rss;
+    result.shm_swp = value.shm_swp;
+    result.swap_attempts = value.swap_attempts;
+    result.swap_successes = value.swap_successes;
+    result
+}
+
+fn write_shmid_ds<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut ShmidDs,
+    value: &ShmidDs,
+) -> AxResult<()> {
+    // SAFETY: `initialized_shmid_ds` zeroes every padding byte and the layout
+    // assertions above cover the complete Linux object extent.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_shmid_ds(value)) }
+        .map_err(map_usercopy_error)
+}
+
+fn write_ipc_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut IpcInfo,
+    value: &IpcInfo,
+) -> AxResult<()> {
+    // SAFETY: the mirror is fully initialized, including any target padding.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_ipc_info(value)) }
+        .map_err(map_usercopy_error)
+}
+
+fn write_shm_usage_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut ShmUsageInfo,
+    value: &ShmUsageInfo,
+) -> AxResult<()> {
+    // SAFETY: `initialized_shm_usage_info` zeroes the ABI alignment hole and
+    // the layout assertions above cover the complete record.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_shm_usage_info(value)) }
+        .map_err(map_usercopy_error)
+}
+
+fn read_shmid_ds<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const ShmidDs,
+) -> AxResult<ShmidDs> {
+    let value = VmPtr::vm_read_uninit(ptr, memory).map_err(map_usercopy_error)?;
+    // SAFETY: `vm_read_uninit` initialized every byte of the complete object.
+    Ok(unsafe { value.assume_init() })
 }
 
 impl ShmidDs {
@@ -284,7 +428,7 @@ impl ShmInner {
     /// derived from published buckets so an in-flight fork reservation can
     /// never leak through IPC_STAT or /proc/sysvipc/shm.
     fn visible_snapshot(&self) -> ShmidDs {
-        let mut snapshot = self.shmid_ds;
+        let mut snapshot = initialized_shmid_ds(&self.shmid_ds);
         snapshot.shm_nattch = self.attach_count() as c_ulong;
         snapshot
     }
@@ -1645,23 +1789,6 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
         let candidate = VirtAddr::from(candidate_addr);
         let found = aspace.find_free_area(candidate, length, limit, PAGE_SIZE_4K);
 
-        #[cfg(target_arch = "loongarch64")]
-        let (candidate, found) = {
-            let mut candidate = candidate;
-            let mut found = found;
-            if shm_flg.contains(ShmAtFlags::SHM_RND) && found != Some(candidate) {
-                let compat_addr = memory_addr::align_down_4k(addr);
-                let compat = VirtAddr::from(compat_addr);
-                if compat_addr != candidate_addr
-                    && aspace.find_free_area(compat, length, limit, PAGE_SIZE_4K) == Some(compat)
-                {
-                    candidate = compat;
-                    found = Some(compat);
-                }
-            }
-            (candidate, found)
-        };
-
         if found != Some(candidate) {
             return Err(AxError::InvalidInput);
         }
@@ -1695,11 +1822,15 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     Ok(start_addr.as_usize() as isize)
 }
 
-pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
+pub fn sys_shmctl<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    shmid: i32,
+    cmd: u32,
+    buf: usize,
+) -> AxResult<isize> {
     let curr = current();
     let context = IpcAccessContext::for_initial_user_namespace(curr.as_thread().current_cred());
     let cmd = cmd as i32;
-    let _transaction = SHM_TRANSACTION.lock();
 
     if cmd == IPC_INFO {
         let info = IpcInfo {
@@ -1713,44 +1844,62 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
             reserved3: 0,
             reserved4: 0,
         };
-        let index = SHM_MANAGER.lock().max_active_index();
-        *buf.cast::<IpcInfo>().get_as_mut()? = info;
+        let index = {
+            let _transaction = SHM_TRANSACTION.lock();
+            SHM_MANAGER.lock().max_active_index()
+        };
+        write_ipc_info(memory, buf as *mut IpcInfo, &info)?;
         return Ok(index);
     }
     if cmd == SHM_INFO {
-        let manager = SHM_MANAGER.lock();
-        let pages = manager.total_page_count() as c_ulong;
-        let info = ShmUsageInfo {
-            used_ids: manager.active_segment_count() as i32,
-            shm_tot: pages,
-            shm_rss: pages,
-            shm_swp: 0,
-            swap_attempts: 0,
-            swap_successes: 0,
+        let (info, index) = {
+            let _transaction = SHM_TRANSACTION.lock();
+            let manager = SHM_MANAGER.lock();
+            let pages = manager.total_page_count() as c_ulong;
+            (
+                ShmUsageInfo {
+                    used_ids: manager.active_segment_count() as i32,
+                    shm_tot: pages,
+                    shm_rss: pages,
+                    shm_swp: 0,
+                    swap_attempts: 0,
+                    swap_successes: 0,
+                },
+                manager.max_active_index(),
+            )
         };
-        let index = manager.max_active_index();
-        drop(manager);
-        *buf.cast::<ShmUsageInfo>().get_as_mut()? = info;
+        write_shm_usage_info(memory, buf as *mut ShmUsageInfo, &info)?;
         return Ok(index);
     }
 
-    let shm_inner = SHM_MANAGER
-        .lock()
-        .get_inner_by_shmid(shmid)
-        .ok_or(AxError::InvalidInput)?;
     if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
-        let state = shm_inner.lock();
-        if cmd == SHM_STAT && !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
-            return Err(AxError::from(LinuxError::EACCES));
-        }
-        let snapshot = state.visible_snapshot();
-        drop(state);
-        *buf.get_as_mut()? = snapshot;
+        let snapshot = {
+            let _transaction = SHM_TRANSACTION.lock();
+            let shm_inner = SHM_MANAGER
+                .lock()
+                .get_inner_by_shmid(shmid)
+                .ok_or(AxError::InvalidInput)?;
+            let state = shm_inner.lock();
+            if cmd == SHM_STAT && !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
+                return Err(AxError::from(LinuxError::EACCES));
+            }
+            state.visible_snapshot()
+        };
+        write_shmid_ds(memory, buf as *mut ShmidDs, &snapshot)?;
         return Ok(shmid as isize);
     }
 
+    // Preserve the old lookup-before-copyin errno ordering, but do not keep
+    // the transaction lock while usercopy takes the address-space lock.
+    let shm_inner = {
+        let _transaction = SHM_TRANSACTION.lock();
+        SHM_MANAGER
+            .lock()
+            .get_inner_by_shmid(shmid)
+            .ok_or(AxError::InvalidInput)?
+    };
     let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
-        let user_ds = *buf.get_as_mut()?;
+        let user_ds = read_shmid_ds(memory, buf as *const ShmidDs)?;
         Some(context.map_permission_update(
             user_ds.shm_perm.uid,
             user_ds.shm_perm.gid,
@@ -1759,6 +1908,15 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
     } else {
         None
     };
+
+    let _transaction = SHM_TRANSACTION.lock();
+    let current_inner = SHM_MANAGER.lock().get_inner_by_shmid(shmid);
+    if current_inner
+        .as_ref()
+        .is_none_or(|current| !Arc::ptr_eq(current, &shm_inner))
+    {
+        return Err(AxError::InvalidInput);
+    }
 
     if cmd == IPC_SET {
         let mut state = shm_inner.lock();
@@ -1769,15 +1927,16 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         prepared.commit(&mut state.shmid_ds.shm_perm);
         state.shmid_ds.shm_ctime = wall_time().as_secs() as __kernel_time_t;
     } else if cmd == IPC_STAT {
-        let state = shm_inner.lock();
-        if !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
-            return Err(AxError::from(LinuxError::EACCES));
-        }
-        let snapshot = state.visible_snapshot();
-        drop(state);
-        if let Some(shmid_ds) = nullable!(buf.get_as_mut())? {
-            *shmid_ds = snapshot;
-        }
+        let snapshot = {
+            let state = shm_inner.lock();
+            if !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
+                return Err(AxError::from(LinuxError::EACCES));
+            }
+            state.visible_snapshot()
+        };
+        drop(_transaction);
+        write_shmid_ds(memory, buf as *mut ShmidDs, &snapshot)?;
+        return Ok(0);
     } else if cmd == IPC_RMID {
         let remove = {
             let mut state = shm_inner.lock();
@@ -1919,6 +2078,42 @@ mod tests {
                 unused5: 0,
             },
         }))
+    }
+
+    #[test]
+    fn shmctl_output_mirrors_initialize_abi_padding() {
+        let mut ds = ShmidDs::new(IPC_PRIVATE, PAGE_SIZE_4K, 0o600, 1, 2, 3);
+        ds.shm_perm.pad1 = 0x1111;
+        ds.shm_perm.seq = 0x2222;
+        ds.shm_perm.pad2 = 0x3333;
+        ds.shm_perm.unused0 = 0x4444;
+        ds.shm_perm.unused1 = 0x5555;
+        let ds = initialized_shmid_ds(&ds);
+        // SAFETY: `ds` is a live, fully initialized value for this test and
+        // the byte slice covers exactly its object representation.
+        let ds_bytes = unsafe {
+            core::slice::from_raw_parts((&ds as *const ShmidDs).cast::<u8>(), size_of::<ShmidDs>())
+        };
+        assert_eq!(&ds_bytes[28..32], &[0; 4]);
+
+        let usage = ShmUsageInfo {
+            used_ids: 1,
+            shm_tot: 2,
+            shm_rss: 3,
+            shm_swp: 4,
+            swap_attempts: 5,
+            swap_successes: 6,
+        };
+        let usage = initialized_shm_usage_info(&usage);
+        // SAFETY: `usage` is a live, fully initialized value for this test
+        // and the byte slice covers exactly its object representation.
+        let usage_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&usage as *const ShmUsageInfo).cast::<u8>(),
+                size_of::<ShmUsageInfo>(),
+            )
+        };
+        assert_eq!(&usage_bytes[4..8], &[0; 4]);
     }
 
     fn attachment_range() -> VirtAddrRange {

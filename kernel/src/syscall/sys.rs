@@ -1,24 +1,52 @@
 use alloc::{format, string::String, vec, vec::Vec};
-use core::ffi::c_char;
+use core::{
+    ffi::c_char,
+    mem::{align_of, offset_of, size_of},
+};
 
 use axconfig::ARCH;
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{time::monotonic_time, uspace::UserContext};
 use axtask::current;
-#[cfg(target_arch = "riscv64")]
-use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
-#[cfg(target_arch = "riscv64")]
-use starry_vm::VmPtr;
-use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, vm_load, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
-    mm::system_memory_stats,
+    mm::{map_usercopy_error, system_memory_stats},
     task::{AsThread, RestartBlock, UTS_FIELD_LEN, ns_capable, try_processes},
+};
+
+// These generated UAPI structs do not carry bytemuck's object-representation
+// markers.  Keep the x86_64 Linux layouts checked before using the explicit
+// usercopy unchecked path for their fully initialized values.
+const _: () = {
+    assert!(align_of::<new_utsname>() == 1);
+    assert!(size_of::<new_utsname>() == 390);
+    assert!(offset_of!(new_utsname, sysname) == 0);
+    assert!(offset_of!(new_utsname, nodename) == 65);
+    assert!(offset_of!(new_utsname, release) == 130);
+    assert!(offset_of!(new_utsname, version) == 195);
+    assert!(offset_of!(new_utsname, machine) == 260);
+    assert!(offset_of!(new_utsname, domainname) == 325);
+    assert!(align_of::<sysinfo>() == 8);
+    assert!(size_of::<sysinfo>() == 112);
+    assert!(offset_of!(sysinfo, uptime) == 0);
+    assert!(offset_of!(sysinfo, loads) == 8);
+    assert!(offset_of!(sysinfo, totalram) == 32);
+    assert!(offset_of!(sysinfo, freeram) == 40);
+    assert!(offset_of!(sysinfo, sharedram) == 48);
+    assert!(offset_of!(sysinfo, bufferram) == 56);
+    assert!(offset_of!(sysinfo, totalswap) == 64);
+    assert!(offset_of!(sysinfo, freeswap) == 72);
+    assert!(offset_of!(sysinfo, procs) == 80);
+    assert!(offset_of!(sysinfo, pad) == 82);
+    assert!(offset_of!(sysinfo, totalhigh) == 88);
+    assert!(offset_of!(sysinfo, freehigh) == 96);
+    assert!(offset_of!(sysinfo, mem_unit) == 104);
 };
 
 fn setfsid_abi<Id>(
@@ -45,19 +73,27 @@ pub fn sys_geteuid() -> AxResult<isize> {
     Ok(cred.user_ns().from_kuid_munged(cred.ids().euid) as isize)
 }
 
-pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult<isize> {
+pub fn sys_getresuid<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ruid: *mut u32,
+    euid: *mut u32,
+    suid: *mut u32,
+) -> AxResult<isize> {
     let curr = current();
     let cred = curr.as_thread().current_cred();
     let ids = cred.ids();
     let namespace = cred.user_ns();
     if !ruid.is_null() {
-        ruid.vm_write(namespace.from_kuid_munged(ids.ruid))?;
+        VmMutPtr::vm_write(ruid, memory, namespace.from_kuid_munged(ids.ruid))
+            .map_err(map_usercopy_error)?;
     }
     if !euid.is_null() {
-        euid.vm_write(namespace.from_kuid_munged(ids.euid))?;
+        VmMutPtr::vm_write(euid, memory, namespace.from_kuid_munged(ids.euid))
+            .map_err(map_usercopy_error)?;
     }
     if !suid.is_null() {
-        suid.vm_write(namespace.from_kuid_munged(ids.suid))?;
+        VmMutPtr::vm_write(suid, memory, namespace.from_kuid_munged(ids.suid))
+            .map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
@@ -72,19 +108,27 @@ pub fn sys_getegid() -> AxResult<isize> {
     Ok(cred.user_ns().from_kgid_munged(cred.ids().egid) as isize)
 }
 
-pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult<isize> {
+pub fn sys_getresgid<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    rgid: *mut u32,
+    egid: *mut u32,
+    sgid: *mut u32,
+) -> AxResult<isize> {
     let curr = current();
     let cred = curr.as_thread().current_cred();
     let ids = cred.ids();
     let namespace = cred.user_ns();
     if !rgid.is_null() {
-        rgid.vm_write(namespace.from_kgid_munged(ids.rgid))?;
+        VmMutPtr::vm_write(rgid, memory, namespace.from_kgid_munged(ids.rgid))
+            .map_err(map_usercopy_error)?;
     }
     if !egid.is_null() {
-        egid.vm_write(namespace.from_kgid_munged(ids.egid))?;
+        VmMutPtr::vm_write(egid, memory, namespace.from_kgid_munged(ids.egid))
+            .map_err(map_usercopy_error)?;
     }
     if !sgid.is_null() {
-        sgid.vm_write(namespace.from_kgid_munged(ids.sgid))?;
+        VmMutPtr::vm_write(sgid, memory, namespace.from_kgid_munged(ids.sgid))
+            .map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
@@ -135,7 +179,11 @@ pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
     )
 }
 
-pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
+pub fn sys_getgroups<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    size: usize,
+    list: *mut u32,
+) -> AxResult<isize> {
     debug!("sys_getgroups <= size: {size}");
     let cred = current().as_thread().current_cred();
     let groups = cred.groups().as_slice();
@@ -155,12 +203,16 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
                 .iter()
                 .map(|gid| cred.user_ns().from_kgid_munged(*gid)),
         );
-        vm_write_slice(list, &visible)?;
+        vm_write_slice(memory, list, &visible).map_err(map_usercopy_error)?;
     }
     Ok(groups.len() as isize)
 }
 
-pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
+pub fn sys_setgroups<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    size: usize,
+    list: *const u32,
+) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
     // Linux rejects missing CAP_SETGID before validating or reading the user
@@ -173,7 +225,7 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     let raw_groups = if size == 0 {
         vec![]
     } else {
-        vm_load(list, size)?
+        vm_load(memory, list, size).map_err(map_usercopy_error)?
     };
     let mut groups = Vec::new();
     groups
@@ -320,17 +372,26 @@ fn cstr_field_to_string(field: &[c_char; 65]) -> String {
         .collect();
 }
 
-pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
+pub fn sys_uname<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *mut new_utsname,
+) -> AxResult<isize> {
     let mut uts = current_utsname();
     if current().as_thread().proc_data.personality() & UNAME26 != 0 {
         uts.release = [0; 65];
         fill_uts_field(&mut uts.release, UNAME26_RELEASE);
     }
-    name.vm_write(uts)?;
+    // SAFETY: all fields in `uts` are initialized, including the zero-filled
+    // tail bytes, and the checked x86_64 layout has no padding.
+    unsafe { VmMutPtr::vm_write_unchecked(name, memory, uts) }.map_err(map_usercopy_error)?;
     Ok(0)
 }
 
-pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
+pub fn sys_sethostname<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const u8,
+    len: usize,
+) -> AxResult<isize> {
     if !current_can_administer_uts() {
         return Err(AxError::OperationNotPermitted);
     }
@@ -340,12 +401,16 @@ pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
     if name.is_null() {
         return Err(AxError::BadAddress);
     }
-    let hostname = vm_load(name, len)?;
+    let hostname = vm_load(memory, name, len).map_err(map_usercopy_error)?;
     set_hostname_bytes(&hostname);
     Ok(0)
 }
 
-pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
+pub fn sys_setdomainname<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const u8,
+    len: usize,
+) -> AxResult<isize> {
     if !current_can_administer_uts() {
         return Err(AxError::OperationNotPermitted);
     }
@@ -355,12 +420,15 @@ pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
     if name.is_null() {
         return Err(AxError::BadAddress);
     }
-    let domainname = vm_load(name, len)?;
+    let domainname = vm_load(memory, name, len).map_err(map_usercopy_error)?;
     set_domainname_bytes(&domainname);
     Ok(0)
 }
 
-pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
+pub fn sys_sysinfo<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    info: *mut sysinfo,
+) -> AxResult<isize> {
     // FIXME: Zeroable
     let mut kinfo: sysinfo = unsafe { core::mem::zeroed() };
     let stats = system_memory_stats();
@@ -379,7 +447,9 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     // axfs uses a page cache, not Linux's separate block-buffer cache.
     kinfo.bufferram = 0;
     kinfo.mem_unit = 1;
-    info.vm_write(kinfo)?;
+    // SAFETY: `kinfo` starts zeroed and every exported field is initialized;
+    // the checked x86_64 layout includes the ABI padding and tail exactly.
+    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(map_usercopy_error)?;
     Ok(0)
 }
 
@@ -413,7 +483,12 @@ bitflags::bitflags! {
     }
 }
 
-pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
+pub fn sys_getrandom<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    len: usize,
+    flags: u32,
+) -> AxResult<isize> {
     const GETRANDOM_CHUNK_SIZE: usize = 4096;
 
     let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
@@ -443,9 +518,11 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
                 Ok(total as isize)
             };
         }
-        if let Err(error) = vm_write_slice(buf.wrapping_add(total), &kbuf[..chunk]) {
+        if let Err(error) = vm_write_slice(memory, buf.wrapping_add(total), &kbuf[..chunk])
+            .map_err(map_usercopy_error)
+        {
             return if total == 0 {
-                Err(error.into())
+                Err(error)
             } else {
                 Ok(total as isize)
             };
@@ -463,90 +540,8 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     };
     match block {
-        RestartBlock::FutexWait(block) => restart_futex_wait(block),
+        RestartBlock::FutexWait(block) => restart_futex_wait(thr.proc_data.aspace(), block),
     }
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy, AnyBitPattern)]
-pub struct RiscvHwprobe {
-    key: i64,
-    value: u64,
-}
-
-#[cfg(target_arch = "riscv64")]
-const RISCV_HWPROBE_KEY_BASE_BEHAVIOR: i64 = 3;
-#[cfg(target_arch = "riscv64")]
-const RISCV_HWPROBE_BASE_BEHAVIOR_IMA: u64 = 1 << 0;
-#[cfg(target_arch = "riscv64")]
-const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
-
-#[cfg(target_arch = "riscv64")]
-pub fn sys_riscv_hwprobe(
-    pairs: *mut RiscvHwprobe,
-    pair_count: usize,
-    cpu_set_size: usize,
-    cpus: *mut usize,
-    flags: u32,
-) -> AxResult<isize> {
-    debug!(
-        "sys_riscv_hwprobe <= pairs: {pairs:p}, pair_count: {pair_count}, cpu_set_size: \
-         {cpu_set_size}, cpus: {cpus:p}, flags: {flags:#x}"
-    );
-
-    if flags != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if cpu_set_size != 0 || !cpus.is_null() {
-        return Err(AxError::Unsupported);
-    }
-    if pair_count == 0 {
-        return Ok(0);
-    }
-    if pairs.is_null() {
-        return Err(AxError::BadAddress);
-    }
-
-    for index in 0..pair_count {
-        let ptr = pairs.wrapping_add(index);
-        let mut pair = ptr.vm_read()?;
-        match pair.key {
-            RISCV_HWPROBE_KEY_BASE_BEHAVIOR => {
-                pair.value = RISCV_HWPROBE_BASE_BEHAVIOR_IMA;
-            }
-            RISCV_HWPROBE_KEY_IMA_EXT_0 => {
-                pair.value = 0;
-            }
-            _ => {
-                pair.key = -1;
-                pair.value = 0;
-            }
-        }
-        ptr.vm_write(pair)?;
-    }
-
-    Ok(0)
-}
-
-#[cfg(any(test, target_arch = "riscv64"))]
-const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
-
-#[cfg(any(test, target_arch = "riscv64"))]
-fn riscv_flush_icache_is_local(flags: usize) -> AxResult<bool> {
-    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(flags & SYS_RISCV_FLUSH_ICACHE_LOCAL != 0)
-}
-
-#[cfg(target_arch = "riscv64")]
-pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> AxResult<isize> {
-    let _local = riscv_flush_icache_is_local(flags)?;
-    // Until address-space context switches carry a stale-hart generation,
-    // conservatively synchronize every online CPU even for LOCAL requests.
-    drop(crate::mm::synchronize_icache());
-    Ok(0)
 }
 
 #[cfg(test)]
@@ -577,20 +572,6 @@ mod tests {
             )
             .unwrap();
         child
-    }
-
-    #[test]
-    fn riscv_flush_icache_accepts_only_all_or_local_scope() {
-        assert!(!riscv_flush_icache_is_local(0).unwrap());
-        assert!(riscv_flush_icache_is_local(SYS_RISCV_FLUSH_ICACHE_LOCAL).unwrap());
-        assert_eq!(
-            riscv_flush_icache_is_local(2).unwrap_err(),
-            AxError::InvalidInput
-        );
-        assert_eq!(
-            riscv_flush_icache_is_local(usize::MAX).unwrap_err(),
-            AxError::InvalidInput
-        );
     }
 
     #[test]

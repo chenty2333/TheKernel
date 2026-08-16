@@ -1,16 +1,18 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::{ffi::c_char, mem::size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{CAP_SETUID, CAP_SYS_ADMIN};
 use memory_addr::PAGE_SIZE_4K;
-use starry_vm::{vm_load, vm_write_slice};
 use thekernel_linux_cred::KeyPermissionMask;
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded, vm_write_slice,
+};
 
 use crate::{
     keyring::{self, KeyActor, KeyTypeKind, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
-    mm::vm_load_string_bounded,
+    mm::map_usercopy_error,
     task::{AsThread, Cred},
 };
 
@@ -59,6 +61,18 @@ const KEY_TYPE_STRING_MAX: usize = 32;
 const KEY_DESCRIPTION_STRING_MAX: usize = 4096;
 const KEY_CALLOUT_STRING_MAX: usize = 4096;
 
+fn load_user_string<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const c_char,
+    max_bytes: usize,
+) -> AxResult<String> {
+    String::from_utf8(
+        vm_load_until_nul_bounded(memory, ptr.cast::<u8>(), max_bytes)
+            .map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)
+}
+
 fn key_actor_capabilities(credential: &Cred) -> (bool, bool) {
     (
         credential.has_effective_capability_in_own_user_ns(CAP_SYS_ADMIN),
@@ -92,7 +106,8 @@ fn current_key_actor() -> KeyActor {
     )
 }
 
-fn validate_key_payload(
+fn validate_key_payload<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     kind: KeyTypeKind,
     description: &str,
     payload: *const u8,
@@ -112,47 +127,65 @@ fn validate_key_payload(
             if kind == KeyTypeKind::Logon && description.find(':').is_none_or(|colon| colon == 0) {
                 return Err(AxError::InvalidInput);
             }
-            load_payload(payload, plen)
+            load_payload(memory, payload, plen)
         }
         KeyTypeKind::BigKey => {
             if plen == 0 || plen > kind.payload_limit() {
                 return Err(AxError::InvalidInput);
             }
-            load_payload(payload, plen)
+            load_payload(memory, payload, plen)
         }
     }
 }
 
-fn load_payload(payload: *const u8, plen: usize) -> AxResult<Vec<u8>> {
+fn load_payload<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    payload: *const u8,
+    plen: usize,
+) -> AxResult<Vec<u8>> {
     if plen == 0 {
         return Ok(Vec::new());
     }
     if payload.is_null() {
         return Err(AxError::BadAddress);
     }
-    Ok(vm_load(payload, plen)?)
+    Ok(vm_load(memory, payload, plen).map_err(map_usercopy_error)?)
 }
 
-fn write_keyring_ids(buf: *mut u8, size: usize, ids: &[i32]) -> AxResult<isize> {
+fn write_keyring_ids<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    size: usize,
+    ids: &[i32],
+) -> AxResult<isize> {
     let full_size = core::mem::size_of_val(ids);
     if size != 0 && !buf.is_null() {
         let mut bytes = Vec::new();
         for id in ids.iter().take(size / size_of::<i32>()) {
             bytes.extend_from_slice(&id.to_ne_bytes());
         }
-        vm_write_slice(buf, &bytes[..bytes.len().min(size)])?;
+        vm_write_slice(memory, buf, &bytes[..bytes.len().min(size)]).map_err(map_usercopy_error)?;
     }
     Ok(full_size as isize)
 }
 
-fn write_counted_bytes_if_fits(buf: *mut u8, size: usize, bytes: &[u8]) -> AxResult<isize> {
+fn write_counted_bytes_if_fits<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    size: usize,
+    bytes: &[u8],
+) -> AxResult<isize> {
     if !buf.is_null() && size >= bytes.len() {
-        vm_write_slice(buf, bytes)?;
+        vm_write_slice(memory, buf, bytes).map_err(map_usercopy_error)?;
     }
     Ok(bytes.len() as isize)
 }
 
-fn write_keyctl_capabilities(buf: *mut u8, size: usize) -> AxResult<isize> {
+fn write_keyctl_capabilities<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    size: usize,
+) -> AxResult<isize> {
     if size == 0 {
         return Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize);
     }
@@ -161,45 +194,50 @@ fn write_keyctl_capabilities(buf: *mut u8, size: usize) -> AxResult<isize> {
     }
 
     let copy_len = KEYCTL_CAPABILITIES_BYTES.len().min(size);
-    vm_write_slice(buf, &KEYCTL_CAPABILITIES_BYTES[..copy_len])?;
+    vm_write_slice(memory, buf, &KEYCTL_CAPABILITIES_BYTES[..copy_len])
+        .map_err(map_usercopy_error)?;
 
     const ZERO_CHUNK: [u8; 64] = [0; 64];
     let mut zeroed = copy_len;
     while zeroed < size {
         let chunk_len = (size - zeroed).min(ZERO_CHUNK.len());
-        vm_write_slice(buf.wrapping_add(zeroed), &ZERO_CHUNK[..chunk_len])?;
+        vm_write_slice(memory, buf.wrapping_add(zeroed), &ZERO_CHUNK[..chunk_len])
+            .map_err(map_usercopy_error)?;
         zeroed += chunk_len;
     }
     Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
 }
 
-pub fn sys_add_key(
+pub fn sys_add_key<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     type_name: *const c_char,
     description: *const c_char,
     payload: *const u8,
     plen: usize,
     keyring: i32,
 ) -> AxResult<isize> {
-    let type_name = vm_load_string_bounded(type_name, KEY_TYPE_STRING_MAX)?;
-    let description = vm_load_string_bounded(description, KEY_DESCRIPTION_STRING_MAX)?;
+    let type_name = load_user_string(memory, type_name, KEY_TYPE_STRING_MAX)?;
+    let description = load_user_string(memory, description, KEY_DESCRIPTION_STRING_MAX)?;
     let kind = parse_add_key_kind(&type_name, &description)?;
-    let payload = validate_key_payload(kind, &description, payload, plen)?;
+    let payload = validate_key_payload(memory, kind, &description, payload, plen)?;
     keyring::add_key(&current_key_actor(), kind, description, payload, keyring)
 }
 
-pub fn sys_request_key(
+pub fn sys_request_key<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     type_name: *const c_char,
     description: *const c_char,
     callout_info: *const c_char,
     dest_keyring: i32,
 ) -> AxResult<isize> {
-    let type_name = vm_load_string_bounded(type_name, KEY_TYPE_STRING_MAX)?;
+    let type_name = load_user_string(memory, type_name, KEY_TYPE_STRING_MAX)?;
     let kind = KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?;
-    let description = vm_load_string_bounded(description, KEY_DESCRIPTION_STRING_MAX)?;
+    let description = load_user_string(memory, description, KEY_DESCRIPTION_STRING_MAX)?;
     let callout = if callout_info.is_null() {
         None
     } else {
-        Some(vm_load_string_bounded(
+        Some(load_user_string(
+            memory,
             callout_info,
             KEY_CALLOUT_STRING_MAX,
         )?)
@@ -213,7 +251,8 @@ pub fn sys_request_key(
     )
 }
 
-pub fn sys_keyctl(
+pub fn sys_keyctl<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     option: i32,
     arg2: usize,
     arg3: usize,
@@ -221,7 +260,7 @@ pub fn sys_keyctl(
     arg5: usize,
 ) -> AxResult<isize> {
     if option == KEYCTL_CAPABILITIES {
-        return write_keyctl_capabilities(arg2 as *mut u8, arg3);
+        return write_keyctl_capabilities(memory, arg2 as *mut u8, arg3);
     }
     if matches!(option, KEYCTL_INSTANTIATE | KEYCTL_NEGATE | KEYCTL_REJECT)
         || option == KEYCTL_GET_SECURITY
@@ -238,7 +277,8 @@ pub fn sys_keyctl(
             name: if arg2 == 0 {
                 None
             } else {
-                Some(vm_load_string_bounded(
+                Some(load_user_string(
+                    memory,
                     arg2 as *const c_char,
                     KEY_DESCRIPTION_STRING_MAX,
                 )?)
@@ -248,7 +288,7 @@ pub fn sys_keyctl(
             if arg4 > PAGE_SIZE_4K {
                 return Err(AxError::InvalidInput);
             }
-            let payload = load_payload(arg3 as *const u8, arg4)?;
+            let payload = load_payload(memory, arg3 as *const u8, arg4)?;
             KeyctlCommand::Update {
                 key: arg2 as i32,
                 payload,
@@ -279,8 +319,12 @@ pub fn sys_keyctl(
         },
         KEYCTL_SEARCH => KeyctlCommand::Search {
             keyring: arg2 as i32,
-            type_name: vm_load_string_bounded(arg3 as *const c_char, KEY_TYPE_STRING_MAX)?,
-            description: vm_load_string_bounded(arg4 as *const c_char, KEY_DESCRIPTION_STRING_MAX)?,
+            type_name: load_user_string(memory, arg3 as *const c_char, KEY_TYPE_STRING_MAX)?,
+            description: load_user_string(
+                memory,
+                arg4 as *const c_char,
+                KEY_DESCRIPTION_STRING_MAX,
+            )?,
             destination: (arg5 != 0).then_some(arg5 as i32),
         },
         KEYCTL_READ => KeyctlCommand::Read {
@@ -304,8 +348,9 @@ pub fn sys_keyctl(
                 return Err(AxError::InvalidInput);
             }
             if arg3 != 0 {
-                let _ = vm_load_string_bounded(arg3 as *const c_char, KEY_TYPE_STRING_MAX)?;
-                let _ = vm_load_string_bounded(arg4 as *const c_char, KEY_DESCRIPTION_STRING_MAX)?;
+                let _ = load_user_string(memory, arg3 as *const c_char, KEY_TYPE_STRING_MAX)?;
+                let _ =
+                    load_user_string(memory, arg4 as *const c_char, KEY_DESCRIPTION_STRING_MAX)?;
                 return Err(LinuxError::EOPNOTSUPP.into());
             }
             KeyctlCommand::Restrict {
@@ -330,12 +375,12 @@ pub fn sys_keyctl(
     match keyring::keyctl(&current_key_actor(), command)? {
         KeyctlOutput::Value(value) => Ok(value),
         KeyctlOutput::CountedBytes(bytes) => {
-            write_counted_bytes_if_fits(arg3 as *mut u8, arg4, &bytes)
+            write_counted_bytes_if_fits(memory, arg3 as *mut u8, arg4, &bytes)
         }
-        KeyctlOutput::KeyringIds(ids) => write_keyring_ids(arg3 as *mut u8, arg4, &ids),
+        KeyctlOutput::KeyringIds(ids) => write_keyring_ids(memory, arg3 as *mut u8, arg4, &ids),
         KeyctlOutput::Payload { full_len, bytes } => {
             if arg3 != 0 && arg4 != 0 {
-                vm_write_slice(arg3 as *mut u8, &bytes)?;
+                vm_write_slice(memory, arg3 as *mut u8, &bytes).map_err(map_usercopy_error)?;
             }
             Ok(full_len as isize)
         }
@@ -344,10 +389,25 @@ pub fn sys_keyctl(
 
 #[cfg(test)]
 mod tests {
-    use core::ptr;
+    use core::{mem::MaybeUninit, ptr};
+
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
     use crate::task::{Kgid, Kuid, UserNamespace, ns_capable};
+
+    struct NoMemory;
+
+    // SAFETY: this fixture never reports a successful read or write.
+    unsafe impl UserMemory for NoMemory {
+        fn read(&mut self, _start: usize, _dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
 
     #[test]
     fn key_actor_capabilities_are_relative_to_own_user_namespace_only() {
@@ -399,20 +459,24 @@ mod tests {
 
     #[test]
     fn keyctl_capabilities_requires_a_non_null_output_for_nonzero_size() {
+        let mut provider = NoMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            write_keyctl_capabilities(ptr::null_mut(), 1),
+            write_keyctl_capabilities(&mut memory, ptr::null_mut(), 1),
             Err(AxError::BadAddress)
         );
         assert_eq!(
-            write_keyctl_capabilities(ptr::null_mut(), 0),
+            write_keyctl_capabilities(&mut memory, ptr::null_mut(), 0),
             Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
         );
     }
 
     #[test]
     fn big_key_payload_must_be_nonempty() {
+        let mut provider = NoMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            validate_key_payload(KeyTypeKind::BigKey, "key", ptr::null(), 0),
+            validate_key_payload(&mut memory, KeyTypeKind::BigKey, "key", ptr::null(), 0),
             Err(AxError::InvalidInput)
         );
     }
@@ -420,8 +484,10 @@ mod tests {
     #[test]
     fn user_and_logon_payloads_must_be_nonempty() {
         for kind in [KeyTypeKind::User, KeyTypeKind::Logon] {
+            let mut provider = NoMemory;
+            let mut memory = UserMemoryContext::new(&mut provider);
             assert_eq!(
-                validate_key_payload(kind, "name:field", ptr::null(), 0),
+                validate_key_payload(&mut memory, kind, "name:field", ptr::null(), 0),
                 Err(AxError::InvalidInput)
             );
         }
@@ -429,16 +495,27 @@ mod tests {
 
     #[test]
     fn logon_description_requires_a_nonempty_prefix() {
+        let mut provider = NoMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            validate_key_payload(KeyTypeKind::Logon, ":secret", [1_u8].as_ptr(), 1),
+            validate_key_payload(
+                &mut memory,
+                KeyTypeKind::Logon,
+                ":secret",
+                [1_u8].as_ptr(),
+                1
+            ),
             Err(AxError::InvalidInput)
         );
     }
 
     #[test]
     fn keyctl_update_rejects_more_than_one_page_before_copying() {
+        let mut provider = NoMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
             sys_keyctl(
+                &mut memory,
                 KEYCTL_UPDATE,
                 1,
                 ptr::null::<u8>() as usize,

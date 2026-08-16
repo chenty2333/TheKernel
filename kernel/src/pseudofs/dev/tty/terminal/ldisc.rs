@@ -22,7 +22,7 @@ use ringbuf::{
     CachingCons, CachingProd,
     traits::{Consumer, Observer, Producer, Split},
 };
-use starry_signal::SignalInfo;
+use thekernel_linux_signal::SignalInfo;
 
 use super::{Terminal, termios::Termios2};
 use crate::task::send_signal_to_process_group;

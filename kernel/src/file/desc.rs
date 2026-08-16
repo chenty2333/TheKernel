@@ -24,9 +24,9 @@ use linux_raw_sys::general::{
     POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
-use starry_process::Pid;
-use starry_signal::{SignalInfo, Signo};
 use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::{SignalInfo, SignalPollPayload, Signo};
 
 use super::{
     executable::{self, ExecutableKey},
@@ -34,7 +34,7 @@ use super::{
     flock,
     fs::File,
     lease,
-    types::{FileLike, FileMmapRequest, IoDst, IoSrc, Kstat, PreparedFileMmap},
+    types::{FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap},
 };
 use crate::{
     deferred_work::DeferredWorkAccount,
@@ -108,7 +108,7 @@ impl DeferredFileLease {
         retained: Arc<dyn Any + Send + Sync>,
     ) -> AxResult<Self> {
         DEFERRED_FILE_LEASE_CREDITS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 (live < MAX_LIVE_DEFERRED_FILE_LEASES).then_some(live + 1)
             })
             .map_err(|_| AxError::NoMemory)?;
@@ -257,7 +257,7 @@ struct DescriptionCleanupWork {
 impl DescriptionCleanupWork {
     fn try_new(owner: u64) -> AxResult<Box<Self>> {
         DESCRIPTION_CLEANUP_CREDITS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 (live < MAX_LIVE_DESCRIPTION_CLEANUPS).then_some(live + 1)
             })
             .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -478,7 +478,7 @@ impl FileDescriptionId {
 
     fn allocate() -> AxResult<Self> {
         let raw = FILE_DESCRIPTION_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -851,13 +851,8 @@ fn sigio_info(signal: u8, fd: i32, reason: u32) -> SignalInfo {
     }
 
     let signo = Signo::from_repr(signal).unwrap_or(Signo::SIGIO);
-    let mut info = SignalInfo::new_kernel(signo);
+    let mut info = SignalInfo::new_poll(signo, SignalPollPayload::new(sigio_band(reason) as _, fd));
     info.set_code(sigio_code(signo, reason));
-    unsafe {
-        let sigpoll = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigpoll;
-        sigpoll._fd = fd;
-        sigpoll._band = sigio_band(reason) as _;
-    }
     info
 }
 
@@ -1424,8 +1419,8 @@ impl FileLike for FileDescription {
         self.inner.path()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        self.inner.ioctl(cmd, arg)
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        self.inner.ioctl(context, cmd, arg)
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {

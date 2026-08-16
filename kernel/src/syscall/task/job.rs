@@ -1,7 +1,7 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use axtask::current;
-use starry_process::{Pid, ProcessError};
+use thekernel_linux_process_adapter::{Pid, ProcessError};
 
 use crate::task::{
     AsThread, get_process_data, get_process_group, get_process_including_zombie, process_domain,

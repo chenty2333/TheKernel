@@ -2,7 +2,8 @@ use alloc::{boxed::Box, string::String, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
     fmt::Write as _,
-    mem::size_of,
+    mem::{MaybeUninit, size_of, size_of_val},
+    ptr, slice,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -21,8 +22,8 @@ use linux_vfs::{
     LimitKind, Openat2Policy, PathContext as LinuxPathContext, PathContextError, PathLimitError,
     PathLimits, ResolveFlags, TopologyEvent, WalkBudget, WalkError,
 };
-use starry_signal::Signo;
 use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
+use thekernel_linux_signal::Signo;
 
 use crate::{
     file::{
@@ -45,7 +46,7 @@ use crate::{
         prepare_file_description_with_open_lease, replace_process_fd_table, reserve_fd, resolve_at,
         with_path_fs,
     },
-    mm::{UserConstPtr, UserPtr, vm_load_string},
+    mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
     syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
     task::{AX_FILE_LIMIT, AsThread, Cred, linux_pid_from_task_id, ns_capable},
@@ -719,18 +720,28 @@ fn name_to_handle_resolve_flags(flags: i32) -> u32 {
     resolve_flags
 }
 
+fn load_user_string(capability: &UserMemoryCapability, path: *const c_char) -> AxResult<String> {
+    String::from_utf8(
+        capability
+            .load_until_nul(path.cast::<u8>())
+            .map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)
+}
+
 pub fn sys_name_to_handle_at(
+    capability: UserMemoryCapability,
     dirfd: c_int,
     path: *const c_char,
-    _handle: UserPtr<u8>,
-    _mount_id: UserPtr<i32>,
+    _handle: *mut u8,
+    _mount_id: *mut i32,
     flags: i32,
 ) -> AxResult<isize> {
     if flags & !NAME_TO_HANDLE_ALLOWED_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let path = vm_load_string(path)?;
+    let path = load_user_string(&capability, path)?;
     if !(path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD) {
         let _ = resolve_at(
             dirfd,
@@ -743,9 +754,19 @@ pub fn sys_name_to_handle_at(
     Err(LinuxError::EOPNOTSUPP.into())
 }
 
-pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, _flags: i32) -> AxResult<isize> {
-    let handle_addr = handle.address().as_usize();
-    let header = *UserConstPtr::<LinuxFileHandle>::from(handle_addr).get_as_ref()?;
+pub fn sys_open_by_handle_at(
+    capability: UserMemoryCapability,
+    mount_fd: c_int,
+    handle: *const u8,
+    _flags: i32,
+) -> AxResult<isize> {
+    let handle_addr = handle as usize;
+    let header = unsafe {
+        capability
+            .read_value_uninit(handle.cast::<LinuxFileHandle>())
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
 
     if header.handle_bytes > MAX_FILE_HANDLE_SZ
         || header.handle_bytes == 0
@@ -769,7 +790,10 @@ pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, _flags: i32) 
     let body_addr = handle_addr
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
-    UserConstPtr::<u8>::from(body_addr).get_as_slice(header.handle_bytes as usize)?;
+    let mut body = [MaybeUninit::<u8>::uninit(); MAX_FILE_HANDLE_SZ as usize];
+    capability
+        .read_bytes(body_addr, &mut body[..header.handle_bytes as usize])
+        .map_err(map_usercopy_error)?;
 
     // A well-formed handle cannot be decoded until the VFS exports stable IDs.
     Err(LinuxError::ESTALE.into())
@@ -1168,19 +1192,21 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
 }
 
 pub fn sys_openat(
+    capability: UserMemoryCapability,
     dirfd: c_int,
     path: *const c_char,
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+    let path = load_user_string(&capability, path)?;
     openat_inner(dirfd, &path, flags, mode)
 }
 
 pub fn sys_openat2(
+    capability: UserMemoryCapability,
     dirfd: c_int,
     path: *const c_char,
-    how_ptr: UserConstPtr<u8>,
+    how_ptr: *const u8,
     size: usize,
 ) -> AxResult<isize> {
     if size < OPENAT2_HOW_SIZE {
@@ -1189,18 +1215,24 @@ pub fn sys_openat2(
     if size > 4096 {
         return Err(AxError::from(LinuxError::E2BIG));
     }
-    let raw = how_ptr.get_as_slice(size)?;
+    let mut raw = [0u8; 4096];
+    let raw_destination =
+        unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), size) };
+    capability
+        .read_bytes(how_ptr as usize, raw_destination)
+        .map_err(map_usercopy_error)?;
+    let raw = &raw[..size];
     if size > OPENAT2_HOW_SIZE && raw[OPENAT2_HOW_SIZE..].iter().any(|&byte| byte != 0) {
         return Err(AxError::from(LinuxError::E2BIG));
     }
-    let how = unsafe { (raw.as_ptr() as *const open_how).read_unaligned() };
+    let how = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<open_how>()) };
     let flags = validate_openat2_how(&how)? as i32;
     let resolve_cached = how.resolve & RESOLVE_CACHED as u64 != 0;
     if resolve_cached && flags as u32 & (O_TRUNC | O_CREAT | __O_TMPFILE) != 0 {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
 
-    let path = vm_load_string(path)?;
+    let path = load_user_string(&capability, path)?;
     let path_ref = Path::new(&path);
     if path.is_empty() {
         return Err(AxError::NotFound);
@@ -1261,8 +1293,13 @@ pub fn sys_openat2(
 /// Return its index in the file table (`fd`). Return `EMFILE` if it already
 /// has the maximum number of files open.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_open(path: *const c_char, flags: i32, mode: __kernel_mode_t) -> AxResult<isize> {
-    sys_openat(AT_FDCWD as _, path, flags, mode)
+pub fn sys_open(
+    capability: UserMemoryCapability,
+    path: *const c_char,
+    flags: i32,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
+    sys_openat(capability, AT_FDCWD as _, path, flags, mode)
 }
 
 pub fn sys_close(fd: c_int) -> AxResult<isize> {
@@ -1349,6 +1386,54 @@ fn validate_flock(lock: &flock64) -> AxResult<()> {
         0..=2 => Ok(()),
         _ => Err(AxError::InvalidInput),
     }
+}
+
+fn read_user_flock64(
+    capability: &UserMemoryCapability,
+    address: usize,
+) -> AxResult<(flock64, [u8; size_of::<flock64>()])> {
+    let mut raw = [0u8; size_of::<flock64>()];
+    let destination =
+        unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), raw.len()) };
+    capability
+        .read_bytes(address, destination)
+        .map_err(map_usercopy_error)?;
+    // SAFETY: `read_bytes` initialized the complete object representation;
+    // `read_unaligned` handles the byte-aligned local buffer.
+    let lock = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<flock64>()) };
+    Ok((lock, raw))
+}
+
+fn flock64_bytes(
+    lock: &flock64,
+    mut raw: [u8; size_of::<flock64>()],
+) -> [u8; size_of::<flock64>()] {
+    let type_offset = core::mem::offset_of!(flock64, l_type);
+    raw[type_offset..type_offset + size_of_val(&lock.l_type)]
+        .copy_from_slice(&lock.l_type.to_ne_bytes());
+    let whence_offset = core::mem::offset_of!(flock64, l_whence);
+    raw[whence_offset..whence_offset + size_of_val(&lock.l_whence)]
+        .copy_from_slice(&lock.l_whence.to_ne_bytes());
+    let start_offset = core::mem::offset_of!(flock64, l_start);
+    raw[start_offset..start_offset + size_of_val(&lock.l_start)]
+        .copy_from_slice(&lock.l_start.to_ne_bytes());
+    let len_offset = core::mem::offset_of!(flock64, l_len);
+    raw[len_offset..len_offset + size_of_val(&lock.l_len)]
+        .copy_from_slice(&lock.l_len.to_ne_bytes());
+    let pid_offset = core::mem::offset_of!(flock64, l_pid);
+    raw[pid_offset..pid_offset + size_of_val(&lock.l_pid)]
+        .copy_from_slice(&lock.l_pid.to_ne_bytes());
+    raw
+}
+
+fn f_owner_ex_bytes(owner: &f_owner_ex) -> [u8; size_of::<f_owner_ex>()] {
+    let mut raw = [0u8; size_of::<f_owner_ex>()];
+    let type_offset = core::mem::offset_of!(f_owner_ex, type_);
+    raw[type_offset..type_offset + size_of_val(&owner.type_)]
+        .copy_from_slice(&owner.type_.to_ne_bytes());
+    let pid_offset = core::mem::offset_of!(f_owner_ex, pid);
+    raw[pid_offset..pid_offset + size_of_val(&owner.pid)].copy_from_slice(&owner.pid.to_ne_bytes());
+    raw
 }
 
 fn validate_getlk_type(lock: &flock64) -> AxResult<()> {
@@ -1446,7 +1531,12 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
     Ok(new_fd as _)
 }
 
-pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
+pub fn sys_fcntl(
+    capability: UserMemoryCapability,
+    fd: c_int,
+    cmd: c_int,
+    arg: usize,
+) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
     let cmd = cmd as u32;
 
@@ -1469,7 +1559,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
             let description = get_file_description(fd)?;
             let stat = description.inner.stat()?;
-            let lock = *UserConstPtr::<flock64>::from(arg as *const flock64).get_as_ref()?;
+            let (lock, _) = read_user_flock64(&capability, arg)?;
             validate_flock(&lock)?;
             if matches!(cmd, F_OFD_SETLK | F_OFD_SETLKW) {
                 validate_ofd_lock_pid(&lock)?;
@@ -1493,19 +1583,29 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         F_GETLK | F_OFD_GETLK => {
             let description = get_file_description(fd)?;
             let stat = description.inner.stat()?;
-            let lock = UserPtr::<flock64>::from(arg).get_as_mut()?;
-            validate_flock(lock)?;
-            validate_getlk_type(lock)?;
+            let (mut lock, original) = read_user_flock64(&capability, arg)?;
+            validate_flock(&lock)?;
+            validate_getlk_type(&lock)?;
             if cmd == F_OFD_GETLK {
-                validate_ofd_lock_pid(lock)?;
+                validate_ofd_lock_pid(&lock)?;
             }
-            let current_offset = record_lock_current_offset(&description, lock)?;
+            let current_offset = record_lock_current_offset(&description, &lock)?;
             let owner = if cmd == F_OFD_GETLK {
                 RecordLockOwner::Ofd(description.flock_owner())
             } else {
                 RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid())
             };
-            flock::get_record_lock((stat.dev, stat.ino), owner, stat.size, current_offset, lock)?;
+            flock::get_record_lock(
+                (stat.dev, stat.ino),
+                owner,
+                stat.size,
+                current_offset,
+                &mut lock,
+            )?;
+            let result = flock64_bytes(&lock, original);
+            capability
+                .write_bytes(arg, &result)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         F_SETLEASE => {
@@ -1543,7 +1643,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         F_SETOWN_EX => {
             let description = get_file_description(fd)?;
-            let owner = *UserConstPtr::<f_owner_ex>::from(arg as *const f_owner_ex).get_as_ref()?;
+            let owner = unsafe {
+                capability
+                    .read_value_uninit(arg as *const f_owner_ex)
+                    .map_err(map_usercopy_error)?
+                    .assume_init()
+            };
             if owner.pid < 0 {
                 return Err(AxError::NoSuchProcess);
             }
@@ -1559,18 +1664,23 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         F_GETOWN_EX => {
             let description = get_file_description(fd)?;
-            let owner = UserPtr::<f_owner_ex>::from(arg).get_as_mut()?;
             let state_owner = description.async_io_state().owner;
-            owner.type_ = match state_owner.owner_type() {
-                AsyncIoOwnerType::Tid => F_OWNER_TID as _,
-                AsyncIoOwnerType::Pid => F_OWNER_PID as _,
-                AsyncIoOwnerType::Pgrp => F_OWNER_PGRP as _,
+            let owner = f_owner_ex {
+                type_: match state_owner.owner_type() {
+                    AsyncIoOwnerType::Tid => F_OWNER_TID as _,
+                    AsyncIoOwnerType::Pid => F_OWNER_PID as _,
+                    AsyncIoOwnerType::Pgrp => F_OWNER_PGRP as _,
+                },
+                pid: if state_owner.is_live() {
+                    state_owner.id() as _
+                } else {
+                    0
+                },
             };
-            owner.pid = if state_owner.is_live() {
-                state_owner.id() as _
-            } else {
-                0
-            };
+            let owner_bytes = f_owner_ex_bytes(&owner);
+            capability
+                .write_bytes(arg, &owner_bytes)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         F_SETSIG => {

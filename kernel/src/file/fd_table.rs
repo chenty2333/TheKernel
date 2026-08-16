@@ -8,13 +8,13 @@ use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::RLIMIT_NOFILE;
 use spin::{Mutex, Once, RwLock};
-use starry_process::Pid;
 pub(crate) use thekernel_linux_fd::FdTableId;
 use thekernel_linux_fd::{
     CloseBatch as LinuxCloseBatch, DescriptorFlags, FdNumber, FdTable as LinuxFdTable,
     FdTableError, PreparedCloseOnExec as LinuxPreparedCloseOnExec,
     PreparedPublication as LinuxPreparedPublication, ReservationToken,
 };
+use thekernel_linux_process_adapter::Pid;
 
 use super::{
     desc::{
@@ -31,7 +31,7 @@ static FD_SCOPE_DEFAULT: Once<Arc<FdTable>> = Once::new();
 
 fn allocate_fd_table_id() -> AxResult<FdTableId> {
     let raw = NEXT_FD_TABLE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -383,6 +383,21 @@ impl FdTable {
             .map_err(map_fd_table_error)
     }
 
+    /// Publishes one file-like object into this exact files table.
+    ///
+    /// This is the table-bound counterpart of the scope-local convenience
+    /// function below and is used by ioctl paths which captured a files
+    /// snapshot at syscall entry.
+    pub(crate) fn add_file_like(
+        &self,
+        file: Arc<dyn FileLike>,
+        cloexec: bool,
+        max_nofile: usize,
+    ) -> AxResult<c_int> {
+        let description = FileDescription::new(file)?;
+        self.add_at_least(description, 0, max_nofile, cloexec)
+    }
+
     pub(crate) fn get_description_number(&self, fd: u32) -> AxResult<Arc<FileDescription>> {
         if fd as usize >= AX_FILE_LIMIT {
             return Err(AxError::BadFileDescriptor);
@@ -711,6 +726,15 @@ pub fn get_file_like(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
         file: description.inner.clone(),
         description,
     })
+}
+
+/// Returns the files table selected by the current process scope.
+///
+/// Syscall entry points that need a stable object graph snapshot must clone
+/// this once and carry it through the operation instead of resolving the
+/// scope-local table again in a leaf object.
+pub(crate) fn current_fd_table() -> Arc<FdTable> {
+    (*FD_TABLE).clone()
 }
 
 pub fn get_typed_file<T>(fd: c_int) -> AxResult<FileHandle<T>>

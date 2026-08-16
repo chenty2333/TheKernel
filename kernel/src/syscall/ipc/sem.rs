@@ -1,6 +1,7 @@
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Write as _,
+    mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
     time::Duration,
 };
@@ -13,7 +14,9 @@ use linux_raw_sys::{
     ctypes::{c_int, c_ulong, c_ushort},
     general::*,
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
+};
 
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
@@ -21,6 +24,7 @@ use super::{
     SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, next_ipc_id,
 };
 use crate::{
+    mm::map_usercopy_error,
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
     time::{TimeValueLike, wall_time},
 };
@@ -63,6 +67,82 @@ pub struct SemidDs {
     pub sem_nsems: c_ulong,
     pub unused3: c_ulong,
     pub unused4: c_ulong,
+}
+
+// These System V semaphore records contain Linux ABI padding through their
+// embedded `IpcPerm`.  Keep the x86_64 layout checked and serialize a zeroed
+// copy for output so implicit alignment bytes never escape to userspace.
+const _: () = {
+    assert!(align_of::<IpcPerm>() == 8);
+    assert!(size_of::<IpcPerm>() == 48);
+    assert!(offset_of!(IpcPerm, key) == 0);
+    assert!(offset_of!(IpcPerm, mode) == 20);
+    assert!(offset_of!(IpcPerm, unused0) == 32);
+    assert!(offset_of!(IpcPerm, unused1) == 40);
+    assert!(align_of::<SemidDs>() == 8);
+    assert!(size_of::<SemidDs>() == 88);
+    assert!(offset_of!(SemidDs, sem_perm) == 0);
+    assert!(offset_of!(SemidDs, sem_otime) == 48);
+    assert!(offset_of!(SemidDs, sem_ctime) == 56);
+    assert!(offset_of!(SemidDs, sem_nsems) == 64);
+    assert!(offset_of!(SemidDs, unused3) == 72);
+    assert!(offset_of!(SemidDs, unused4) == 80);
+};
+
+fn initialized_semid_ds(value: SemidDs) -> SemidDs {
+    // SAFETY: all fields are integer scalars; zero is valid and initializes
+    // both the embedded IpcPerm alignment hole and the complete record.
+    let mut result: SemidDs = unsafe { core::mem::zeroed() };
+    let mut perm: IpcPerm = unsafe { core::mem::zeroed() };
+    perm.key = value.sem_perm.key;
+    perm.uid = value.sem_perm.uid;
+    perm.gid = value.sem_perm.gid;
+    perm.cuid = value.sem_perm.cuid;
+    perm.cgid = value.sem_perm.cgid;
+    perm.mode = value.sem_perm.mode;
+    perm.pad1 = value.sem_perm.pad1;
+    perm.seq = value.sem_perm.seq;
+    perm.pad2 = value.sem_perm.pad2;
+    perm.unused0 = value.sem_perm.unused0;
+    perm.unused1 = value.sem_perm.unused1;
+    result.sem_perm = perm;
+    result.sem_otime = value.sem_otime;
+    result.sem_ctime = value.sem_ctime;
+    result.sem_nsems = value.sem_nsems;
+    result.unused3 = value.unused3;
+    result.unused4 = value.unused4;
+    result
+}
+
+const _: () = {
+    assert!(align_of::<SemInfo>() == 4);
+    assert!(size_of::<SemInfo>() == 40);
+    assert!(align_of::<Sembuf>() == 2);
+    assert!(size_of::<Sembuf>() == 6);
+    assert!(offset_of!(Sembuf, sem_num) == 0);
+    assert!(offset_of!(Sembuf, sem_op) == 2);
+    assert!(offset_of!(Sembuf, sem_flg) == 4);
+};
+
+fn write_semid_ds<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut SemidDs,
+    value: SemidDs,
+) -> AxResult<()> {
+    // SAFETY: `initialized_semid_ds` zeroes all padding and the assertions
+    // above cover the full Linux object extent.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_semid_ds(value)) }
+        .map_err(map_usercopy_error)
+}
+
+fn write_sem_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut SemInfo,
+    value: SemInfo,
+) -> AxResult<()> {
+    // SAFETY: `SemInfo` consists solely of ten initialized i32 words and has
+    // no padding on x86_64, as checked above.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
 }
 
 impl SemidDs {
@@ -383,13 +463,65 @@ pub(crate) fn sysvipc_sem_snapshot() -> String {
     out
 }
 
-fn copy_sem_values_to_user(ptr: usize, values: &[u16]) -> AxResult<()> {
-    vm_write_slice(ptr as *mut u16, values)?;
+fn copy_sem_values_to_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    values: &[u16],
+) -> AxResult<()> {
+    vm_write_slice(memory, ptr as *mut u16, values).map_err(map_usercopy_error)?;
     Ok(())
 }
 
-fn copy_sem_values_from_user(ptr: usize, nsems: usize) -> AxResult<Vec<u16>> {
-    vm_load(ptr as *const u16, nsems).map_err(Into::into)
+fn copy_sem_values_from_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    nsems: usize,
+) -> AxResult<Vec<u16>> {
+    vm_load(memory, ptr as *const u16, nsems).map_err(map_usercopy_error)
+}
+
+fn snapshot_setall_values<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    nsems: usize,
+) -> AxResult<Vec<u16>> {
+    // `vm_load` uses fallible bounded reservation, so the usercopy happens
+    // without holding the semaphore-array lock and reports allocation failure
+    // as ENOMEM instead of aborting the kernel.
+    let values = copy_sem_values_from_user(memory, ptr, nsems)?;
+    if values.iter().any(|value| *value as usize > SEMVMX) {
+        return Err(AxError::from(LinuxError::ERANGE));
+    }
+    Ok(values)
+}
+
+fn prepare_setall_values<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    array: &Arc<Mutex<SemArray>>,
+    context: &IpcAccessContext,
+) -> AxResult<Vec<u16>> {
+    let nsems = {
+        let array_guard = array.lock();
+        if array_guard.removed {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
+        if !array_guard.writable(context) {
+            return Err(AxError::from(LinuxError::EACCES));
+        }
+        array_guard.nsems()
+    };
+    // The guard above is deliberately out of scope before this call.  Keep
+    // the usercopy independent from the semaphore-array lock.
+    snapshot_setall_values(memory, ptr, nsems)
+}
+
+fn sem_array_is_current(semid: i32, array: &Arc<Mutex<SemArray>>) -> bool {
+    let manager = SEM_MANAGER.lock();
+    manager
+        .semid_arrays
+        .get(&semid)
+        .is_some_and(|current| Arc::ptr_eq(current, array))
 }
 
 fn notify_sem_waiters(waiters: Arc<axtask::WaitQueue>) {
@@ -467,7 +599,13 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     Ok(semid as isize)
 }
 
-pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isize> {
+pub fn sys_semctl<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    semid: i32,
+    semnum: i32,
+    cmd: i32,
+    arg: usize,
+) -> AxResult<isize> {
     let current_task = current();
     let context =
         IpcAccessContext::for_initial_user_namespace(current_task.as_thread().current_cred());
@@ -475,12 +613,12 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
 
     if cmd == IPC_INFO {
         let manager = SEM_MANAGER.lock();
-        (arg as *mut SemInfo).vm_write(SemInfo::ipc_info())?;
+        write_sem_info(memory, arg as *mut SemInfo, SemInfo::ipc_info())?;
         return Ok(manager.max_active_index());
     }
     if cmd == SEM_INFO {
         let manager = SEM_MANAGER.lock();
-        (arg as *mut SemInfo).vm_write(SemInfo::sem_info(&manager))?;
+        write_sem_info(memory, arg as *mut SemInfo, SemInfo::sem_info(&manager))?;
         return Ok(manager.max_active_index());
     }
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
@@ -495,7 +633,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
         if cmd == SEM_STAT && !array.readable(&context) {
             return Err(AxError::from(LinuxError::EACCES));
         }
-        (arg as *mut SemidDs).vm_write(array.semid_ds)?;
+        write_semid_ds(memory, arg as *mut SemidDs, array.semid_ds)?;
         return Ok(array.semid as isize);
     }
 
@@ -506,7 +644,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             .ok_or(AxError::from(LinuxError::EINVAL))?
     };
     let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
-        let user_ds = (arg as *const SemidDs).vm_read()?;
+        let user_ds = VmPtr::vm_read(arg as *const SemidDs, memory).map_err(map_usercopy_error)?;
         Some(context.map_permission_update(
             user_ds.sem_perm.uid,
             user_ds.sem_perm.gid,
@@ -515,6 +653,43 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
     } else {
         None
     };
+    // SETALL snapshots and validates the complete input before acquiring the
+    // array lock.  The lock is reacquired below only to revalidate identity,
+    // lifecycle, size, and permissions before atomically applying the values.
+    let setall_values = if cmd == SETALL {
+        Some(prepare_setall_values(memory, arg, &array, &context)?)
+    } else {
+        None
+    };
+
+    if let Some(values) = setall_values {
+        // The manager mapping may have been removed and replaced while the
+        // faulting usercopy was in progress.  Do not apply the snapshot to a
+        // stale Arc retained across IPC_RMID or an ID reuse.
+        if !sem_array_is_current(semid, &array) {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
+
+        let mut array = array.lock();
+        if array.removed || array.semid != semid || array.nsems() != values.len() {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
+        if !array.writable(&context) {
+            return Err(AxError::from(LinuxError::EACCES));
+        }
+
+        let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
+        for (sem, value) in array.sems.iter_mut().zip(values) {
+            sem.value = value;
+            sem.pid = pid;
+        }
+        array.mark_changed();
+        let waiters = array.waiters.clone();
+        drop(array);
+        notify_sem_waiters(waiters);
+        return Ok(0);
+    }
+
     let mut array = array.lock();
     if array.removed {
         return Err(AxError::from(LinuxError::EINVAL));
@@ -525,7 +700,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            (arg as *mut SemidDs).vm_write(array.semid_ds)?;
+            write_semid_ds(memory, arg as *mut SemidDs, array.semid_ds)?;
             Ok(0)
         }
         IPC_SET => {
@@ -583,7 +758,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             }
             let values = array.sems.iter().map(|sem| sem.value).collect::<Vec<_>>();
             drop(array);
-            copy_sem_values_to_user(arg, &values)?;
+            copy_sem_values_to_user(memory, arg, &values)?;
             Ok(0)
         }
         SETVAL => {
@@ -598,25 +773,6 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
             array.sems[index].value = value as u16;
             array.sems[index].pid = pid;
-            array.mark_changed();
-            let waiters = array.waiters.clone();
-            drop(array);
-            notify_sem_waiters(waiters);
-            Ok(0)
-        }
-        SETALL => {
-            if !array.writable(&context) {
-                return Err(AxError::from(LinuxError::EACCES));
-            }
-            let values = copy_sem_values_from_user(arg, array.nsems())?;
-            if values.iter().any(|value| *value as usize > SEMVMX) {
-                return Err(AxError::from(LinuxError::ERANGE));
-            }
-            let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
-            for (sem, value) in array.sems.iter_mut().zip(values) {
-                sem.value = value;
-                sem.pid = pid;
-            }
             array.mark_changed();
             let waiters = array.waiters.clone();
             drop(array);
@@ -752,11 +908,18 @@ fn try_apply_semops(
     Ok(SemTryResult::Ready)
 }
 
-fn validate_timeout(timeout: *const timespec) -> AxResult<Option<Duration>> {
+fn validate_timeout<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    timeout: *const timespec,
+) -> AxResult<Option<Duration>> {
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = unsafe { timeout.vm_read_uninit()?.assume_init() };
+    let timeout = unsafe {
+        VmPtr::vm_read_uninit(timeout, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let tv = timeout.try_into_time_value()?;
     let duration = Duration::from_nanos(tv.as_nanos().min(u64::MAX as u128) as u64);
     Ok(Some(wall_time_duration().saturating_add(duration)))
@@ -868,11 +1031,17 @@ fn op_has_nowait(ops: &[Sembuf]) -> bool {
     ops.iter().any(|op| op.sem_flg & IPC_NOWAIT != 0)
 }
 
-pub fn sys_semop(semid: i32, sops: *const Sembuf, nsops: usize) -> AxResult<isize> {
-    sys_semtimedop(semid, sops, nsops, core::ptr::null())
+pub fn sys_semop<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    semid: i32,
+    sops: *const Sembuf,
+    nsops: usize,
+) -> AxResult<isize> {
+    sys_semtimedop(memory, semid, sops, nsops, core::ptr::null())
 }
 
-pub fn sys_semtimedop(
+pub fn sys_semtimedop<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
     sops: *const Sembuf,
     nsops: usize,
@@ -885,8 +1054,8 @@ pub fn sys_semtimedop(
         return Err(AxError::from(LinuxError::E2BIG));
     }
 
-    let deadline = validate_timeout(timeout)?;
-    let ops = vm_load(sops, nsops)?;
+    let deadline = validate_timeout(memory, timeout)?;
+    let ops = vm_load(memory, sops, nsops).map_err(map_usercopy_error)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
     let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
@@ -948,4 +1117,73 @@ pub fn sys_semtimedop(
     }
     drop(wait_guard);
     Ok(0)
+}
+
+#[cfg(test)]
+mod setall_snapshot_tests {
+    use alloc::{sync::Arc, vec};
+    use core::{
+        mem::MaybeUninit,
+        ops::Range,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
+    use super::*;
+    use crate::task::{Cred, UserNamespace};
+
+    struct LockProbeMemory {
+        array: Arc<Mutex<SemArray>>,
+        bytes: Vec<u8>,
+        saw_unlocked: Arc<AtomicBool>,
+    }
+
+    impl LockProbeMemory {
+        fn range(&self, start: usize, len: usize) -> Result<Range<usize>, UserCopyError> {
+            let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+            (end <= self.bytes.len())
+                .then_some(start..end)
+                .ok_or(UserCopyError::BadAddress)
+        }
+    }
+
+    // SAFETY: LockProbeMemory bounds-checks the opaque address and initializes
+    // every destination byte before returning a successful read.
+    unsafe impl UserMemory for LockProbeMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            if self.array.try_lock().is_some() {
+                self.saw_unlocked.store(true, Ordering::Relaxed);
+            }
+            let range = self.range(start, dst.len())?;
+            for (output, input) in dst.iter_mut().zip(&self.bytes[range]) {
+                output.write(*input);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    #[test]
+    fn setall_snapshot_reads_user_values_after_array_unlock() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(root_ns.clone()).unwrap();
+        let context = IpcAccessContext::new(actor, root_ns);
+        let array = Arc::new(Mutex::new(SemArray::new(1, 1, 2, 0o600, 0, 0)));
+        let saw_unlocked = Arc::new(AtomicBool::new(false));
+        let mut provider = LockProbeMemory {
+            array: array.clone(),
+            bytes: vec![1, 0, 2, 0],
+            saw_unlocked: saw_unlocked.clone(),
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        let values = prepare_setall_values(&mut memory, 0, &array, &context).unwrap();
+
+        assert_eq!(values, vec![1, 2]);
+        assert!(saw_unlocked.load(Ordering::Relaxed));
+    }
 }

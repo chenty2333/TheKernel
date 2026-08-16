@@ -6,15 +6,71 @@
 //
 // This file has been modified by KylinSoft on 2025.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 use axhal::paging::MappingFlags;
-use axtask::current;
+use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_vm::vm_write_slice;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
 
-use crate::task::AsThread;
+use crate::mm::{AddrSpace, map_usercopy_error};
+
+fn mincore_snapshot(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    start_addr: VirtAddr,
+    rounded_len: usize,
+    page_count: usize,
+) -> AxResult<Vec<u8>> {
+    let aspace = aspace_handle.lock();
+
+    if !aspace.contains_range(start_addr, rounded_len) {
+        return Err(AxError::NoMemory);
+    }
+
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(page_count)
+        .map_err(|_| AxError::NoMemory)?;
+    result.resize(page_count, 0);
+    let mut i = 0;
+
+    while i < page_count {
+        let addr = start_addr + i * PAGE_SIZE_4K;
+
+        // ENOMEM: Check if this page is within a valid VMA
+        let area = aspace.find_area(addr).ok_or(AxError::NoMemory)?;
+
+        // Verify we have at least USER access permission
+        if !area.flags().contains(MappingFlags::USER) {
+            return Err(AxError::NoMemory);
+        }
+
+        // Query page table with batch awareness.
+        let (is_resident, size) = match aspace.page_table().query(addr) {
+            Ok((_, _, size)) => {
+                // Physical page exists and is resident.
+                (true, size as _)
+            }
+            Err(_) => {
+                // Linux also reports a file-backed page as resident when
+                // it is already in the shared file cache but this address
+                // space has not installed a PTE for it yet.
+                (area.backend().cached_page_resident(addr), PAGE_SIZE_4K)
+            }
+        };
+        let n = size / PAGE_SIZE_4K;
+
+        if is_resident {
+            let end = (i + n).min(page_count);
+            result[i..end].fill(1);
+        }
+
+        i += n;
+    }
+
+    Ok(result)
+}
 
 /// Check whether pages are resident in memory.
 ///
@@ -43,7 +99,13 @@ use crate::task::AsThread;
 /// - EFAULT: vec points to invalid address
 /// - EINVAL: addr not page-aligned
 /// - ENOMEM: length > (TASK_SIZE - addr), negative length, or unmapped memory
-pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> {
+pub fn sys_mincore<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    aspace_handle: Arc<Mutex<AddrSpace>>,
+    addr: usize,
+    length: usize,
+    vec: *mut u8,
+) -> AxResult<isize> {
     let start_addr = VirtAddr::from(addr);
 
     // EINVAL: addr must be a multiple of the page size
@@ -73,62 +135,15 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> 
         * PAGE_SIZE_4K;
     let page_count = rounded_len / PAGE_SIZE_4K;
 
-    let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
-    let result = {
-        let aspace = aspace_handle.lock();
+    // The supplied address-space handle is captured at dispatch entry and is
+    // also used by the explicit user-memory provider. Keep its lock scoped to
+    // the residency snapshot; copyout below must not hold it.
+    let result = mincore_snapshot(&aspace_handle, start_addr, rounded_len, page_count)?;
 
-        if !aspace.contains_range(start_addr, rounded_len) {
-            return Err(AxError::NoMemory);
-        }
-
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(page_count)
-            .map_err(|_| AxError::NoMemory)?;
-        result.resize(page_count, 0);
-        let mut i = 0;
-
-        while i < page_count {
-            let addr = start_addr + i * PAGE_SIZE_4K;
-
-            // ENOMEM: Check if this page is within a valid VMA
-            let area = aspace.find_area(addr).ok_or(AxError::NoMemory)?;
-
-            // Verify we have at least USER access permission
-            if !area.flags().contains(MappingFlags::USER) {
-                return Err(AxError::NoMemory);
-            }
-
-            // Query page table with batch awareness.
-            let (is_resident, size) = match aspace.page_table().query(addr) {
-                Ok((_, _, size)) => {
-                    // Physical page exists and is resident.
-                    (true, size as _)
-                }
-                Err(_) => {
-                    // Linux also reports a file-backed page as resident when
-                    // it is already in the shared file cache but this address
-                    // space has not installed a PTE for it yet.
-                    (area.backend().cached_page_resident(addr), PAGE_SIZE_4K)
-                }
-            };
-            let n = size / PAGE_SIZE_4K;
-
-            if is_resident {
-                let end = (i + n).min(page_count);
-                result[i..end].fill(1);
-            }
-
-            i += n;
-        }
-
-        result
-    };
-
-    // EFAULT: Write result to user space
-    // vm_write_slice will return EFAULT if vec is invalid
-    vm_write_slice(vec, result.as_slice())?;
+    // EFAULT: Write result to user space only after releasing the address
+    // space lock. The explicit provider reacquires the same selected address
+    // space for copyout without extending this inspection critical section.
+    vm_write_slice(memory, vec, result.as_slice()).map_err(map_usercopy_error)?;
 
     Ok(0)
 }

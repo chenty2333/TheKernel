@@ -10,9 +10,8 @@ use core::str;
 use axdriver::{
     AsyncBlockWaitPolicy, reset_virtio_async_block_adaptive_depth, reset_virtio_io_counters,
     set_virtio_async_block_adaptive_enabled, set_virtio_async_block_depth,
-    set_virtio_async_block_enabled, set_virtio_async_block_la_depth,
-    set_virtio_async_block_merge_write_enabled, set_virtio_async_block_wait_policy,
-    set_virtio_io_counters_enabled,
+    set_virtio_async_block_enabled, set_virtio_async_block_merge_write_enabled,
+    set_virtio_async_block_wait_policy, set_virtio_io_counters_enabled,
 };
 use axfs::{
     async_block_queue_interrupt_selftest, async_block_queue_irq_first_wait_selftest,
@@ -38,7 +37,6 @@ const CONTROL_HELP: &str = concat!(
     "virtio_counters=on|off\n",
     "async_block=on|off\n",
     "async_block_depth=<u64>\n",
-    "async_block_la_depth=<u64>\n",
     "async_block_wait=hybrid|sync|irq_first\n",
     "async_dirty_flush_sg=on|off\n",
     "cached_readahead=on|off\n",
@@ -88,7 +86,6 @@ enum TestIoCommand<'a> {
     VirtioCounters(Toggle),
     AsyncBlock(Toggle),
     AsyncBlockDepth(u64),
-    AsyncBlockLaDepth(u64),
     AsyncBlockWait(AsyncBlockWaitPolicy),
     AsyncDirtyFlushSg(Toggle),
     CachedReadahead(Toggle),
@@ -150,9 +147,6 @@ fn parse_command(text: &str) -> VfsResult<TestIoCommand<'_>> {
             TestIoCommand::AsyncBlock(parse_toggle(value).ok_or(VfsError::InvalidInput)?)
         }
         "async_block_depth" => TestIoCommand::AsyncBlockDepth(
-            value.parse::<u64>().map_err(|_| VfsError::InvalidInput)?,
-        ),
-        "async_block_la_depth" => TestIoCommand::AsyncBlockLaDepth(
             value.parse::<u64>().map_err(|_| VfsError::InvalidInput)?,
         ),
         "async_block_wait" => TestIoCommand::AsyncBlockWait(match value {
@@ -241,7 +235,6 @@ fn apply_command(command: TestIoCommand<'_>) -> VfsResult<()> {
             set_virtio_async_block_enabled(enabled(toggle));
         }
         TestIoCommand::AsyncBlockDepth(depth) => set_virtio_async_block_depth(depth),
-        TestIoCommand::AsyncBlockLaDepth(depth) => set_virtio_async_block_la_depth(depth),
         TestIoCommand::AsyncBlockWait(policy) => set_virtio_async_block_wait_policy(policy),
         TestIoCommand::AsyncDirtyFlushSg(toggle) => {
             set_async_dirty_flush_sg_enabled(enabled(toggle));

@@ -8,11 +8,11 @@ use linux_raw_sys::general::{
     CLD_TRAPPED, P_ALL, P_PGID, P_PID, P_PIDFD, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG,
     WNOWAIT, WUNTRACED, rusage, siginfo,
 };
-use starry_process::{Pid, ProcessError};
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_process_adapter::{Pid, ProcessError};
 
 use crate::{
     file::{FileHandle, FileLike, PidFd},
+    mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::cgroup,
     readiness::block_on_poll_set_interruptible_if,
     task::{
@@ -171,7 +171,7 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
         return true;
     }
 
-    let is_clone = child.exit_signal() != Some(starry_signal::Signo::SIGCHLD as u8);
+    let is_clone = child.exit_signal() != Some(thekernel_linux_signal::Signo::SIGCHLD as u8);
     if options.contains(WaitOptions::WCLONE) {
         is_clone
     } else {
@@ -351,34 +351,54 @@ fn wait_candidate_accepts_stop(
 }
 
 fn write_waitpid_event(
+    memory: &UserMemoryCapability,
     event: &WaitEvent,
     exit_code: *mut i32,
     rusage_ptr: *mut rusage,
 ) -> AxResult<()> {
-    if let Some(exit_code) = exit_code.nullable() {
-        exit_code.vm_write(event.waitpid_status())?;
+    if !exit_code.is_null() {
+        memory
+            .write_value(exit_code, event.waitpid_status())
+            .map_err(map_usercopy_error)?;
     }
-    if let Some(usage) = event.exited_usage()
-        && let Some(rusage_ptr) = rusage_ptr.nullable()
-    {
-        rusage_ptr.vm_write(usage.into())?;
+    if let Some(usage) = event.exited_usage() {
+        if !rusage_ptr.is_null() {
+            // TaskUsage's conversion starts from a zeroed rusage and fills
+            // every exposed field, so the complete ABI representation is
+            // initialized for this unchecked copyout.
+            unsafe {
+                memory
+                    .write_value_unchecked(rusage_ptr, usage.into())
+                    .map_err(map_usercopy_error)?;
+            }
+        }
     }
     Ok(())
 }
 
 fn write_waitid_event(
+    memory: &UserMemoryCapability,
     event: &WaitEvent,
     viewer_user_ns: &crate::task::UserNamespace,
     infop: *mut siginfo,
     rusage_ptr: *mut rusage,
 ) -> AxResult<()> {
-    if let Some(infop) = infop.nullable() {
-        infop.vm_write(event.waitid_siginfo(viewer_user_ns))?;
+    if !infop.is_null() {
+        // fill_siginfo starts from zero, including ABI padding/tail bytes.
+        unsafe {
+            memory
+                .write_value_unchecked(infop, event.waitid_siginfo(viewer_user_ns))
+                .map_err(map_usercopy_error)?;
+        }
     }
-    if let Some(usage) = event.exited_usage()
-        && let Some(rusage_ptr) = rusage_ptr.nullable()
-    {
-        rusage_ptr.vm_write(usage.into())?;
+    if let Some(usage) = event.exited_usage() {
+        if !rusage_ptr.is_null() {
+            unsafe {
+                memory
+                    .write_value_unchecked(rusage_ptr, usage.into())
+                    .map_err(map_usercopy_error)?;
+            }
+        }
     }
     Ok(())
 }
@@ -398,6 +418,7 @@ fn reap_child(child: &Process) -> AxResult<bool> {
 }
 
 pub fn sys_waitpid(
+    memory: UserMemoryCapability,
     pid: i32,
     exit_code: *mut i32,
     options: u32,
@@ -453,7 +474,7 @@ pub fn sys_waitpid(
                 WaitEvent::Exited { .. } => None,
             };
 
-            if let Err(err) = write_waitpid_event(&event, exit_code, rusage_ptr) {
+            if let Err(err) = write_waitpid_event(&memory, &event, exit_code, rusage_ptr) {
                 if let Some(claimed_event) = &claimed_event {
                     restore_wait_event(claimed_event);
                 }
@@ -523,6 +544,7 @@ fn fill_siginfo(pid: Pid, uid: u32, si_code: u32, si_status: i32) -> siginfo {
 }
 
 pub fn sys_waitid(
+    memory: UserMemoryCapability,
     idtype: u32,
     id: u32,
     infop: *mut siginfo,
@@ -621,7 +643,9 @@ pub fn sys_waitid(
                 }
             };
 
-            if let Err(err) = write_waitid_event(&event, &viewer_user_ns, infop, rusage_ptr) {
+            if let Err(err) =
+                write_waitid_event(&memory, &event, &viewer_user_ns, infop, rusage_ptr)
+            {
                 if let Some(claimed_event) = &claimed_event {
                     restore_wait_event(claimed_event);
                 }
@@ -646,8 +670,14 @@ pub fn sys_waitid(
             if pidfd_nonblocking && !explicit_nohang {
                 return Err(AxError::from(LinuxError::EAGAIN));
             }
-            if let Some(infop) = infop.nullable() {
-                infop.vm_write(unsafe { core::mem::zeroed::<siginfo>() })?;
+            if !infop.is_null() {
+                // The zeroed siginfo has a fully initialized ABI
+                // representation, including padding bytes.
+                unsafe {
+                    memory
+                        .write_value_unchecked(infop, core::mem::zeroed::<siginfo>())
+                        .map_err(map_usercopy_error)?;
+                }
             }
             Ok(Some(0))
         } else {

@@ -11,6 +11,7 @@ mod ops;
 mod process;
 mod resources;
 mod restart;
+mod rseq;
 mod seccomp;
 pub(crate) mod security;
 mod signal;
@@ -57,9 +58,11 @@ pub(crate) use self::{
         ProcessImageAccessSnapshot, ProcessReparentBatch, ProcessThreadAdmission,
         PtraceReverseLink, Session, ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN,
         UserNamespace, UserNamespaceId, UtsNamespace, ZombieSnapshot, init_process_domain,
-        process_domain, process_error, reap_process,
+        process_domain, process_error, reap_process, set_zombie_ioprio, zombie_ioprio,
+        zombie_pid_ns, zombie_scheduler_state,
     },
     restart::*,
+    rseq::{AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE},
     seccomp::{init_seccomp_filter_budget, seccomp_filter_budget},
     security::{PendingCredentialPublication, SignalTargetKind},
     thread::{

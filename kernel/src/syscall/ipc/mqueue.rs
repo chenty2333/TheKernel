@@ -7,6 +7,7 @@ use alloc::{
 };
 use core::{
     ffi::c_char,
+    mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Context,
     time::Duration,
@@ -28,20 +29,23 @@ use linux_raw_sys::general::{
 // mutex; blocking/wakeup behavior remains covered only by kernel/guest tests.
 #[cfg(test)]
 use spin::Mutex;
-use starry_signal::{PreparedSignal, SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
+use thekernel_linux_signal::{PreparedSignal, SignalInfo, SignalRtPayload, Signo};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_load_until_nul, vm_write_slice,
+};
 
 use crate::{
     file::{
         FileHandle, FileLike, Kstat, NetlinkSocket, PseudoInode, add_file_like_with_flags,
         get_typed_file,
     },
-    mm::vm_load_string,
+    mm::map_usercopy_error,
     readiness::block_on_poll_io_until,
     syscall::RawSigevent,
     task::{
-        AsThread, Kgid, Kuid, ProcStateHint, ProcessData, prepare_queued_signal_for_process,
-        send_prepared_signal_to_process_data, with_proc_state_hint,
+        AsThread, Kgid, Kuid, PidNamespace, ProcStateHint, ProcessData, UserNamespace,
+        prepare_queued_signal_for_process, send_prepared_signal_to_process_data,
+        with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -76,10 +80,31 @@ pub struct MqAttr {
     __reserved: [isize; 4],
 }
 
+// The queue attribute is a Linux ABI value made entirely of isize words. Keep
+// the unchecked copyout below tied to the actual repr(C) layout instead of
+// relying on a generated `Pod` marker.
+const _: () = {
+    assert!(align_of::<MqAttr>() == align_of::<isize>());
+    assert!(size_of::<MqAttr>() == size_of::<isize>() * 8);
+    assert!(offset_of!(MqAttr, mq_flags) == 0);
+    assert!(offset_of!(MqAttr, mq_maxmsg) == size_of::<isize>());
+    assert!(offset_of!(MqAttr, mq_msgsize) == size_of::<isize>() * 2);
+    assert!(offset_of!(MqAttr, mq_curmsgs) == size_of::<isize>() * 3);
+    assert!(offset_of!(MqAttr, __reserved) == size_of::<isize>() * 4);
+};
+
+#[derive(Clone)]
+struct MqSender {
+    pid: u32,
+    real_uid: Kuid,
+    pid_ns: Arc<PidNamespace>,
+}
+
 #[derive(Clone)]
 struct MqMessage {
     priority: u32,
     sequence: u64,
+    sender: MqSender,
     data: Vec<u8>,
 }
 
@@ -104,6 +129,8 @@ struct MqNotificationToken {
 
 struct MqSignalNotifier {
     target: Weak<ProcessData>,
+    target_user_ns: Arc<UserNamespace>,
+    target_pid_ns: Arc<PidNamespace>,
     info: SignalInfo,
     prepared: PreparedSignal,
 }
@@ -214,11 +241,12 @@ impl PosixMqueue {
         }
     }
 
-    fn insert_message(&mut self, priority: u32, data: Vec<u8>) -> bool {
+    fn insert_message(&mut self, priority: u32, sender: MqSender, data: Vec<u8>) -> bool {
         let was_empty = self.messages.is_empty();
         let message = MqMessage {
             priority,
             sequence: self.next_sequence,
+            sender,
             data,
         };
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -377,8 +405,22 @@ fn current_ids() -> (u32, u32) {
     (ids.fsuid.into_raw(), ids.fsgid.into_raw())
 }
 
-fn normalize_name(name: *const c_char) -> AxResult<String> {
-    let raw = vm_load_string(name)?;
+fn current_mq_sender() -> MqSender {
+    let curr = current();
+    let thread = curr.as_thread();
+    MqSender {
+        pid: thread.proc_data.proc.pid(),
+        real_uid: thread.current_cred().ids().ruid,
+        pid_ns: thread.proc_data.pid_ns(),
+    }
+}
+
+fn normalize_name<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const c_char,
+) -> AxResult<String> {
+    let raw = vm_load_until_nul(memory, name.cast::<u8>()).map_err(map_usercopy_error)?;
+    let raw = String::from_utf8(raw).map_err(|_| AxError::IllegalBytes)?;
     if raw.is_empty() {
         return Err(AxError::InvalidInput);
     }
@@ -402,11 +444,14 @@ fn default_attr() -> MqAttr {
     }
 }
 
-fn read_create_attr(attr: *const MqAttr) -> AxResult<MqAttr> {
+fn read_create_attr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    attr: *const MqAttr,
+) -> AxResult<MqAttr> {
     let attr = if attr.is_null() {
         default_attr()
     } else {
-        attr.vm_read()?
+        VmPtr::vm_read(attr, memory).map_err(map_usercopy_error)?
     };
 
     if attr.mq_maxmsg <= 0 || attr.mq_msgsize <= 0 {
@@ -465,11 +510,20 @@ fn nonblock_flags(file: &crate::file::FileHandle<MqFd>) -> isize {
     }
 }
 
-fn validate_timespec(timeout: *const timespec) -> AxResult<Option<Duration>> {
+fn validate_timespec<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    timeout: *const timespec,
+) -> AxResult<Option<Duration>> {
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = unsafe { timeout.vm_read_uninit()?.assume_init() };
+    // SAFETY: `VmPtr::vm_read_uninit` initializes the complete repr(C)
+    // `timespec` object before it is converted into a kernel value.
+    let timeout = unsafe {
+        VmPtr::vm_read_uninit(timeout, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let tv = timeout.try_into_time_value()?;
     Ok(Some(Duration::from_nanos(
         tv.as_nanos().min(u64::MAX as u128) as u64,
@@ -504,7 +558,10 @@ fn new_notification_token() -> AxResult<Arc<MqNotificationToken>> {
     .map_err(|_| AxError::NoMemory)
 }
 
-fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
+fn build_notifier<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    event: &RawSigevent,
+) -> AxResult<MqNotifier> {
     validate_notify_event(event)?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -520,7 +577,8 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
         let netlink =
             NetlinkSocket::from_fd(event.signo()).map_err(|_| AxError::BadFileDescriptor)?;
         let cookie_ptr = event.value_ptr_address() as *const u8;
-        let cookie_data = vm_load(cookie_ptr, NOTIFY_COOKIE_LEN)?;
+        let cookie_data =
+            vm_load(memory, cookie_ptr, NOTIFY_COOKIE_LEN).map_err(map_usercopy_error)?;
         let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
         cookie.copy_from_slice(&cookie_data);
         notifier.thread = Some(MqThreadNotifier { netlink, cookie });
@@ -529,21 +587,21 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
     {
         // Linux reserves a sigqueue record when mq_notify registers, not when
         // the empty->nonempty edge consumes the one-shot registration. This
-        // makes RT siginfo delivery allocation-free and preserves SI_MESGQ,
-        // sigev_value and the registering identity under queue pressure.
-        let mut info = SignalInfo::new_kernel(signo);
-        info.set_code(SI_MESGQ);
-        unsafe {
-            let rt = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt;
-            rt._pid = proc_data.proc.pid() as _;
-            rt._uid = curr.as_thread().current_cred().ids().ruid.into_raw() as _;
-            rt._sigval = linux_raw_sys::general::sigval_t {
-                sival_ptr: event.value_ptr_address() as *mut linux_raw_sys::ctypes::c_void,
-            };
-        }
+        // makes RT siginfo delivery allocation-free. The sender fields are
+        // filled from the message snapshot at the edge; only the target
+        // namespace and sigev_value belong to this registration.
+        let target_user_ns = curr.as_thread().current_cred().user_ns().clone();
+        let target_pid_ns = proc_data.pid_ns();
+        let info = SignalInfo::new_rt(
+            signo,
+            SI_MESGQ,
+            SignalRtPayload::new(0, 0, event.value_ptr_address()),
+        );
         let prepared = prepare_queued_signal_for_process(proc_data, info.clone())?;
         notifier.signal = Some(MqSignalNotifier {
             target: Arc::downgrade(proc_data),
+            target_user_ns,
+            target_pid_ns,
             info,
             prepared,
         });
@@ -601,7 +659,36 @@ fn remove_notification(notifier: Option<MqNotifier>) {
     }
 }
 
-fn maybe_notify(notifier: Option<MqNotifier>) {
+fn mq_signal_info_for_sender(
+    registration_info: &SignalInfo,
+    target_user_ns: &UserNamespace,
+    target_pid_ns: &Arc<PidNamespace>,
+    sender: MqSender,
+) -> SignalInfo {
+    let mut info = registration_info.clone();
+    let mut payload = info.rt_payload();
+    payload.pid = mq_sender_pid_in_namespace(&sender, target_pid_ns);
+    payload.uid = target_user_ns.from_kuid_munged(sender.real_uid);
+    info.set_rt_payload(payload);
+    info
+}
+
+fn mq_sender_pid_in_namespace(sender: &MqSender, target_pid_ns: &Arc<PidNamespace>) -> i32 {
+    // A task is visible in its own PID namespace and every ancestor, but not
+    // in a parent’s other descendants (or in a sibling namespace). Walk the
+    // sender's stable namespace ancestry rather than consulting `current()`
+    // when the one-shot notification is delivered.
+    let mut sender_pid_ns = Some(sender.pid_ns.clone());
+    while let Some(namespace) = sender_pid_ns {
+        if Arc::ptr_eq(&namespace, target_pid_ns) {
+            return target_pid_ns.visible_pid(sender.pid) as i32;
+        }
+        sender_pid_ns = namespace.parent();
+    }
+    0
+}
+
+fn maybe_notify(notifier: Option<MqNotifier>, sender: MqSender) {
     let Some(mut notifier) = notifier else {
         return;
     };
@@ -620,7 +707,21 @@ fn maybe_notify(notifier: Option<MqNotifier>) {
     let Some(target) = signal.target.upgrade() else {
         return;
     };
-    let _ = send_prepared_signal_to_process_data(&target, signal.info, signal.prepared);
+    let info = mq_signal_info_for_sender(
+        &signal.info,
+        &signal.target_user_ns,
+        &signal.target_pid_ns,
+        sender,
+    );
+
+    let mut prepared = signal.prepared;
+    // The queue record was reserved at registration, but SI_MESGQ's sender
+    // fields are defined by the message which crossed the empty edge. Update
+    // the already-accounted record so delivery remains allocation-free.
+    prepared
+        .replace_info(info.clone())
+        .expect("mq_notify sender attribution preserves the reserved signal number");
+    let _ = send_prepared_signal_to_process_data(&target, info, prepared);
 }
 
 /// Releases queue-notification reservations owned by an exiting process.
@@ -657,13 +758,14 @@ pub(crate) fn cleanup_process_mqueue_notifications(pid: u32) {
     }
 }
 
-pub fn sys_mq_open(
+pub fn sys_mq_open<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     name: *const c_char,
     oflag: i32,
     mode: __kernel_mode_t,
     attr: *const MqAttr,
 ) -> AxResult<isize> {
-    let name = normalize_name(name)?;
+    let name = normalize_name(memory, name)?;
     let access = MqAccess::from_flags(oflag)?;
     let create = (oflag as u32) & O_CREAT != 0;
     let excl = (oflag as u32) & O_EXCL != 0;
@@ -690,7 +792,7 @@ pub fn sys_mq_open(
             if manager.queues.len() >= mq_queues_max() {
                 return Err(LinuxError::ENOSPC.into());
             }
-            let attr = read_create_attr(attr)?;
+            let attr = read_create_attr(memory, attr)?;
             let (uid, gid) = current_ids();
             let create_mode = (mode & !current().as_thread().proc_data.umask()) & 0o777;
             let queue = Arc::try_new(Mutex::new(PosixMqueue::new(
@@ -726,8 +828,11 @@ pub fn sys_mq_open(
     }
 }
 
-pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
-    let name = normalize_name(name)?;
+pub fn sys_mq_unlink<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const c_char,
+) -> AxResult<isize> {
+    let name = normalize_name(memory, name)?;
     let queue = {
         let manager = MQ_MANAGER.lock();
         manager
@@ -751,7 +856,8 @@ pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_mq_timedsend(
+pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     msg_ptr: *const u8,
     msg_len: usize,
@@ -761,7 +867,7 @@ pub fn sys_mq_timedsend(
     if msg_prio >= MQ_PRIO_MAX {
         return Err(AxError::InvalidInput);
     }
-    let deadline = validate_timespec(abs_timeout)?;
+    let deadline = validate_timespec(memory, abs_timeout)?;
     let file = get_mq_fd(fd)?;
     if !file.access.can_write() {
         return Err(AxError::BadFileDescriptor);
@@ -773,39 +879,57 @@ pub fn sys_mq_timedsend(
             return Err(AxError::from(LinuxError::EMSGSIZE));
         }
         drop(queue);
-        vm_load(msg_ptr, msg_len)?
+        vm_load(memory, msg_ptr, msg_len).map_err(map_usercopy_error)?
     };
 
     let mut data = Some(data);
     wait_mq_operation(&file, IoEvents::WRITABLE, deadline, || {
-        let (notifier, readiness) = {
+        // Snapshot the sender for this successful insertion attempt. Do not
+        // retain `current()` in the queue or notification registration.
+        let sender = current_mq_sender();
+        let (notifier, readiness, sender) = {
             let mut queue = file.queue.lock();
             if queue.messages.len() >= queue.maxmsg {
                 return Err(AxError::WouldBlock);
             }
             let payload = data.take().ok_or(AxError::BadState)?;
-            let was_empty = queue.insert_message(msg_prio, payload);
+            let notification_sender = sender.clone();
+            let was_empty = queue.insert_message(msg_prio, sender, payload);
+            let notification_sender = if was_empty {
+                // Read the snapshot back from the message which crossed the
+                // empty edge, keeping notification attribution tied to queue
+                // state rather than to a later implicit `current()` lookup.
+                queue
+                    .messages
+                    .first()
+                    .expect("successful insertion makes the queue non-empty")
+                    .sender
+                    .clone()
+            } else {
+                notification_sender
+            };
             let notifier = if was_empty {
                 queue.notifier.take()
             } else {
                 None
             };
-            (notifier, Arc::clone(&queue.readiness))
+            (notifier, Arc::clone(&queue.readiness), notification_sender)
         };
         readiness.readable.wake();
-        maybe_notify(notifier);
+        maybe_notify(notifier, sender);
         Ok(0)
     })
 }
 
-pub fn sys_mq_timedreceive(
+pub fn sys_mq_timedreceive<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     msg_ptr: *mut u8,
     msg_len: usize,
     msg_prio: *mut u32,
     abs_timeout: *const timespec,
 ) -> AxResult<isize> {
-    let deadline = validate_timespec(abs_timeout)?;
+    let deadline = validate_timespec(memory, abs_timeout)?;
     let file = get_mq_fd(fd)?;
     if !file.access.can_read() {
         return Err(AxError::BadFileDescriptor);
@@ -823,21 +947,26 @@ pub fn sys_mq_timedreceive(
             let message = queue.pop_message().ok_or(AxError::BadState)?;
             (message, Arc::clone(&queue.readiness))
         };
-        vm_write_slice(msg_ptr, &message.data)?;
+        vm_write_slice(memory, msg_ptr, &message.data).map_err(map_usercopy_error)?;
         if !msg_prio.is_null() {
-            msg_prio.vm_write(message.priority)?;
+            VmMutPtr::vm_write(msg_prio, memory, message.priority).map_err(map_usercopy_error)?;
         }
         readiness.writable.wake();
         Ok(message.data.len() as isize)
     })
 }
 
-pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isize> {
+pub fn sys_mq_notify<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    notification: *const RawSigevent,
+) -> AxResult<isize> {
     let notifier = if notification.is_null() {
         None
     } else {
-        let event = RawSigevent::read_from_user(notification)?;
-        Some(build_notifier(&event)?)
+        let event =
+            RawSigevent::read_from_user(memory, notification).map_err(map_usercopy_error)?;
+        Some(build_notifier(memory, &event)?)
     };
     let file = get_mq_fd(fd)?;
 
@@ -894,7 +1023,8 @@ pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isiz
     Ok(0)
 }
 
-pub fn sys_mq_getsetattr(
+pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     new_attr: *const MqAttr,
     old_attr: *mut MqAttr,
@@ -903,7 +1033,7 @@ pub fn sys_mq_getsetattr(
     let new = if new_attr.is_null() {
         None
     } else {
-        let attr = new_attr.vm_read()?;
+        let attr = VmPtr::vm_read(new_attr, memory).map_err(map_usercopy_error)?;
         if attr.mq_flags & !(O_NONBLOCK as isize) != 0 {
             return Err(AxError::InvalidInput);
         }
@@ -913,7 +1043,10 @@ pub fn sys_mq_getsetattr(
     if !old_attr.is_null() {
         let flags = nonblock_flags(&file);
         let queue = file.queue.lock();
-        old_attr.vm_write(queue.attr(flags))?;
+        // SAFETY: `MqAttr` is a repr(C) array of initialized isize fields;
+        // its reserved words are explicitly zeroed by `attr`.
+        unsafe { VmMutPtr::vm_write_unchecked(old_attr, memory, queue.attr(flags)) }
+            .map_err(map_usercopy_error)?;
     }
     if let Some(attr) = new {
         let nonblocking = attr.mq_flags & O_NONBLOCK as isize != 0;
@@ -932,15 +1065,191 @@ pub fn sys_mq_getsetattr(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use core::{mem::MaybeUninit, ops::Range};
+
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
     use super::*;
+
+    struct TestMemory {
+        bytes: Vec<u8>,
+    }
+
+    impl TestMemory {
+        fn range(&self, start: usize, len: usize) -> Result<Range<usize>, UserCopyError> {
+            let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+            (end <= self.bytes.len())
+                .then_some(start..end)
+                .ok_or(UserCopyError::BadAddress)
+        }
+    }
+
+    // SAFETY: TestMemory bounds-checks the opaque user address and initializes
+    // every destination byte before returning a successful read.
+    unsafe impl UserMemory for TestMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            let range = self.range(start, dst.len())?;
+            for (output, input) in dst.iter_mut().zip(&self.bytes[range]) {
+                output.write(*input);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+            let range = self.range(start, src.len())?;
+            self.bytes[range].copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mqueue_usercopy_helpers_snapshot_unaligned_inputs() {
+        let mut provider = TestMemory {
+            bytes: vec![0; 128],
+        };
+        let name_addr = 3;
+        provider.bytes[name_addr..name_addr + 8].copy_from_slice(b"/queue\0\0");
+        let attr_addr = 19;
+        let attr = MqAttr {
+            mq_flags: O_NONBLOCK as isize,
+            mq_maxmsg: 4,
+            mq_msgsize: 64,
+            mq_curmsgs: 99,
+            __reserved: [7; 4],
+        };
+        let attr_bytes = unsafe {
+            core::slice::from_raw_parts((&attr as *const MqAttr).cast::<u8>(), size_of::<MqAttr>())
+        };
+        provider.bytes[attr_addr..attr_addr + attr_bytes.len()].copy_from_slice(attr_bytes);
+
+        let (name, copied_attr) = {
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let name = normalize_name(&mut memory, name_addr as *const c_char).unwrap();
+            let copied_attr = read_create_attr(&mut memory, attr_addr as *const MqAttr).unwrap();
+            (name, copied_attr)
+        };
+
+        assert_eq!(name, "queue");
+        assert_eq!(copied_attr.mq_flags, 0);
+        assert_eq!(copied_attr.mq_maxmsg, 4);
+        assert_eq!(copied_attr.mq_msgsize, 64);
+        assert_eq!(copied_attr.mq_curmsgs, 0);
+        assert_eq!(copied_attr.__reserved, [0; 4]);
+    }
+
+    #[test]
+    fn mqueue_usercopy_helper_preserves_error_mapping() {
+        let mut provider = TestMemory { bytes: vec![0; 8] };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            normalize_name(&mut memory, usize::MAX as *const c_char),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(
+            map_usercopy_error(UserCopyError::NoMemory),
+            AxError::NoMemory
+        );
+        assert_eq!(
+            map_usercopy_error(UserCopyError::TooLong),
+            AxError::NameTooLong
+        );
+    }
+
+    #[test]
+    fn mq_signal_info_uses_sender_snapshot_and_target_uid_mapping() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let target = root
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let target_pid_ns = PidNamespace::try_new_root(root.clone()).unwrap();
+        let uid_map = target
+            .try_build_uid_map(vec![crate::task::IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        target.publish_uid_map(uid_map).unwrap();
+
+        let registration_info = SignalInfo::new_rt(
+            Signo::SIGRTMIN,
+            SI_MESGQ,
+            SignalRtPayload::new(0, 0, 0xfeed),
+        );
+        let sender = MqSender {
+            pid: 4242,
+            real_uid: Kuid::from_raw(1000).unwrap(),
+            pid_ns: target_pid_ns.clone(),
+        };
+        let info = mq_signal_info_for_sender(&registration_info, &target, &target_pid_ns, sender);
+
+        assert_eq!(info.rt_payload(), SignalRtPayload::new(4242, 0, 0xfeed));
+    }
+
+    #[test]
+    fn mq_signal_info_maps_sender_pid_to_target_pid_namespace() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let root_pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let child_pid_ns = root_pid_ns.try_fork(100, user_ns.clone()).unwrap();
+        let registration_info = SignalInfo::new_rt(
+            Signo::SIGRTMIN,
+            SI_MESGQ,
+            SignalRtPayload::new(0, 0, 0xbeef),
+        );
+
+        let same_namespace = mq_signal_info_for_sender(
+            &registration_info,
+            &user_ns,
+            &root_pid_ns,
+            MqSender {
+                pid: 4242,
+                real_uid: Kuid::INITIAL_ROOT,
+                pid_ns: root_pid_ns.clone(),
+            },
+        );
+        assert_eq!(same_namespace.rt_payload().pid, 4242);
+
+        let invisible_external_sender = mq_signal_info_for_sender(
+            &registration_info,
+            &user_ns,
+            &child_pid_ns,
+            MqSender {
+                pid: 4242,
+                real_uid: Kuid::INITIAL_ROOT,
+                pid_ns: root_pid_ns.clone(),
+            },
+        );
+        assert_eq!(invisible_external_sender.rt_payload().pid, 0);
+
+        let visible_nested_sender = mq_signal_info_for_sender(
+            &registration_info,
+            &user_ns,
+            &child_pid_ns,
+            MqSender {
+                pid: 4242,
+                real_uid: Kuid::INITIAL_ROOT,
+                pid_ns: child_pid_ns.clone(),
+            },
+        );
+        assert_eq!(visible_nested_sender.rt_payload().pid, 4242);
+
+        let visible_nested_init = mq_signal_info_for_sender(
+            &registration_info,
+            &user_ns,
+            &child_pid_ns,
+            MqSender {
+                pid: 100,
+                real_uid: Kuid::INITIAL_ROOT,
+                pid_ns: child_pid_ns.clone(),
+            },
+        );
+        assert_eq!(visible_nested_init.rt_payload().pid, 1);
+    }
 
     fn install_accounted_notification(
         pid: u32,
     ) -> (
         Arc<Mutex<PosixMqueue>>,
         Arc<MqNotificationToken>,
-        Arc<starry_signal::SignalQueueAccount>,
-        Arc<starry_signal::SignalQueueAccount>,
+        Arc<thekernel_linux_signal::SignalQueueAccount>,
+        Arc<thekernel_linux_signal::SignalQueueAccount>,
     ) {
         let queue = Arc::new(Mutex::new(
             PosixMqueue::new(
@@ -953,17 +1262,20 @@ mod tests {
             .unwrap(),
         ));
         let token = new_notification_token().unwrap();
-        let per_user = starry_signal::SignalQueueAccount::try_new(4).unwrap();
-        let global = starry_signal::SignalQueueAccount::try_new(4).unwrap();
-        let mut info = SignalInfo::new_kernel(Signo::SIGRTMIN);
-        info.set_code(SI_MESGQ);
+        let per_user = thekernel_linux_signal::SignalQueueAccount::try_new(4).unwrap();
+        let global = thekernel_linux_signal::SignalQueueAccount::try_new(4).unwrap();
+        let info = SignalInfo::new_rt(Signo::SIGRTMIN, SI_MESGQ, SignalRtPayload::new(0, 0, 0));
         let prepared = PreparedSignal::try_accounted(info.clone(), &per_user, 4, &global).unwrap();
+        let target_user_ns = UserNamespace::try_new_root().unwrap();
+        let target_pid_ns = PidNamespace::try_new_root(target_user_ns.clone()).unwrap();
         queue.lock().notifier = Some(MqNotifier {
             pid,
             notify: SIGEV_SIGNAL as i32,
             thread: None,
             signal: Some(MqSignalNotifier {
                 target: Weak::new(),
+                target_user_ns,
+                target_pid_ns,
                 info,
                 prepared,
             }),

@@ -20,12 +20,11 @@ use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer},
 };
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmMutPtr;
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::{
-    AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat, send_sigio, try_owned_path,
-    try_pseudo_inode_path,
+    AsyncIoState, FileLike, IoctlContext, Kstat, PseudoInode, fs::location_to_kstat, send_sigio,
+    try_owned_path, try_pseudo_inode_path,
 };
 use crate::{
     file::{IoDst, IoSrc},
@@ -81,7 +80,7 @@ const fn pipe_write_is_complete(written: usize, requested: usize, nonblocking: b
 #[derive(Clone, Copy, Default)]
 struct PipeTransfer {
     len: usize,
-    became_readable: bool,
+    wake_readers: bool,
     became_writable: bool,
 }
 
@@ -89,14 +88,18 @@ impl PipeTransfer {
     const fn none() -> Self {
         Self {
             len: 0,
-            became_readable: false,
+            wake_readers: false,
             became_writable: false,
         }
     }
 }
 
 fn notify_pipe_readable(poll_rx: &PollSet, async_io: &Mutex<PipeAsyncIo>, transfer: PipeTransfer) {
-    if transfer.became_readable {
+    // Linux publishes a pipe read-side poll wake for every successful write,
+    // not only for an empty-to-nonempty readiness transition. EPOLLET uses
+    // that source notification to report newly appended data even when an
+    // earlier byte remains unread.
+    if transfer.wake_readers {
         poll_rx.wake();
     }
     if transfer.len > 0 {
@@ -151,7 +154,6 @@ fn write_pipe_buffer(
     atomic_len: Option<usize>,
 ) -> AxResult<PipeTransfer> {
     let mut prod = buffer.lock();
-    let was_empty = prod.occupied_len() == 0;
     if atomic_len.is_some_and(|len| prod.vacant_len() < len) {
         return Ok(PipeTransfer::none());
     }
@@ -169,7 +171,7 @@ fn write_pipe_buffer(
     unsafe { prod.advance_write_index(count) };
     Ok(PipeTransfer {
         len: count,
-        became_readable: was_empty && count > 0,
+        wake_readers: count > 0,
         became_writable: false,
     })
 }
@@ -185,7 +187,7 @@ fn read_pipe_buffer(buffer: &Mutex<HeapRb<u8>>, dst: &mut IoDst) -> AxResult<Pip
     unsafe { cons.advance_read_index(count) };
     Ok(PipeTransfer {
         len: count,
-        became_readable: false,
+        wake_readers: false,
         became_writable: !was_writable && pipe_poll_writable(&cons),
     })
 }
@@ -234,7 +236,7 @@ fn commit_pipe_prefix(
     unsafe { source.advance_read_index(written) };
     Ok(PipeTransfer {
         len: written,
-        became_readable: false,
+        wake_readers: false,
         became_writable: !reservation.was_writable && pipe_poll_writable(source),
     })
 }
@@ -258,7 +260,6 @@ fn transfer_pipe_prefix(
 }
 
 fn move_pipe_buffer(src: &mut HeapRb<u8>, dst: &mut HeapRb<u8>, max_len: usize) -> PipeTransfer {
-    let was_empty = dst.occupied_len() == 0;
     let (left, right) = src.as_slices();
     let written = copy_slices_to_ring(dst, &[left, right], max_len);
     // `written` came from the currently occupied source slices and therefore
@@ -266,18 +267,17 @@ fn move_pipe_buffer(src: &mut HeapRb<u8>, dst: &mut HeapRb<u8>, max_len: usize) 
     unsafe { src.advance_read_index(written) };
     PipeTransfer {
         len: written,
-        became_readable: was_empty && written > 0,
+        wake_readers: written > 0,
         became_writable: false,
     }
 }
 
 fn copy_pipe_buffer(src: &HeapRb<u8>, dst: &mut HeapRb<u8>, max_len: usize) -> PipeTransfer {
-    let was_empty = dst.occupied_len() == 0;
     let (left, right) = src.as_slices();
     let written = copy_slices_to_ring(dst, &[left, right], max_len);
     PipeTransfer {
         len: written,
-        became_readable: was_empty && written > 0,
+        wake_readers: written > 0,
         became_writable: false,
     }
 }
@@ -651,7 +651,7 @@ impl<'a> PipeEndpoint<'a> {
                     let moved = move_pipe_buffer(&mut source, &mut destination, count);
                     let source_wakeup = PipeTransfer {
                         len: moved.len,
-                        became_readable: false,
+                        wake_readers: false,
                         became_writable: !was_writable && pipe_poll_writable(&source),
                     };
                     (moved, source_wakeup, source_empty, destination_full)
@@ -667,7 +667,7 @@ impl<'a> PipeEndpoint<'a> {
                     let moved = move_pipe_buffer(&mut source, &mut destination, count);
                     let source_wakeup = PipeTransfer {
                         len: moved.len,
-                        became_readable: false,
+                        wake_readers: false,
                         became_writable: !was_writable && pipe_poll_writable(&source),
                     };
                     (moved, source_wakeup, source_empty, destination_full)
@@ -1296,12 +1296,9 @@ impl FileLike for Pipe {
         self.non_blocking.load(Ordering::Acquire)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, cmd: u32, _arg: usize) -> AxResult<usize> {
         match cmd {
-            FIONREAD => {
-                (arg as *mut u32).vm_write(self.shared.buffer.lock().occupied_len() as u32)?;
-                Ok(0)
-            }
+            FIONREAD => Ok(self.shared.buffer.lock().occupied_len()),
             _ => Err(AxError::NotATty),
         }
     }
@@ -1369,12 +1366,9 @@ impl FileLike for NamedPipe {
         self.non_blocking.load(Ordering::Acquire)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, cmd: u32, _arg: usize) -> AxResult<usize> {
         match cmd {
-            FIONREAD => {
-                (arg as *mut u32).vm_write(self.state.buffer.lock().occupied_len() as u32)?;
-                Ok(0)
-            }
+            FIONREAD => Ok(self.state.buffer.lock().occupied_len()),
             _ => Err(AxError::NotATty),
         }
     }
@@ -1425,9 +1419,44 @@ impl Pollable for NamedPipe {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{sync::Arc, task::Wake, vec::Vec};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Waker,
+    };
+
+    use axio::{IoBuf, Read};
 
     use super::*;
+
+    struct SliceSource {
+        bytes: &'static [u8],
+        position: usize,
+    }
+
+    impl Read for SliceSource {
+        fn read(&mut self, destination: &mut [u8]) -> axio::Result<usize> {
+            let source = &self.bytes[self.position..];
+            let copied = source.len().min(destination.len());
+            destination[..copied].copy_from_slice(&source[..copied]);
+            self.position += copied;
+            Ok(copied)
+        }
+    }
+
+    impl IoBuf for SliceSource {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.position
+        }
+    }
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn fifo_access_mode_three_is_rejected_instead_of_granting_both_ends() {
@@ -1457,6 +1486,29 @@ mod tests {
     }
 
     #[test]
+    fn appending_to_a_readable_pipe_wakes_a_rearmed_edge_waiter() {
+        let buffer = Mutex::new(HeapRb::new(8));
+        assert_eq!(buffer.lock().push_slice(b"old"), 3);
+
+        let poll_rx = PollSet::new();
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let _registration = poll_rx.register(&waker).unwrap();
+
+        let mut source = SliceSource {
+            bytes: b"new",
+            position: 0,
+        };
+        let transfer = write_pipe_buffer(&buffer, &mut source, Some(3)).unwrap();
+        assert_eq!(transfer.len, 3);
+        assert!(transfer.wake_readers);
+        assert_eq!(buffer.lock().occupied_len(), 6);
+
+        notify_pipe_readable(&poll_rx, &Mutex::new(PipeAsyncIo::default()), transfer);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn pipe_move_consumes_only_the_destination_prefix() {
         let mut source = HeapRb::new(8);
         assert_eq!(source.push_slice(b"abcdef"), 6);
@@ -1464,7 +1516,7 @@ mod tests {
 
         let moved = move_pipe_buffer(&mut source, &mut destination, 6);
         assert_eq!(moved.len, 2);
-        assert!(moved.became_readable);
+        assert!(moved.wake_readers);
 
         let (left, right) = source.as_slices();
         let remaining = left.iter().chain(right).copied().collect::<Vec<_>>();

@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -13,7 +13,6 @@ use linux_raw_sys::{
     net::MSG_DONTWAIT,
 };
 use spin::Lazy;
-use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 use crate::{
@@ -38,12 +37,14 @@ use crate::{
         },
     },
     mm::{
-        IoVec, IoVectorBuf, PinnedUserSegments, PinnedUserSegmentsMut, UserConstPtr,
-        UserIoPinSegment, VmBytes, VmBytesMut, pinned_user_mut_segments_are_disjoint,
-        prefault_user_io_from_user, prefault_user_io_to_user, record_user_io_direct_read,
+        IoVec, IoVectorBuf, PinnedUserSegments, PinnedUserSegmentsMut, UserIoPinSegment,
+        UserMemoryCapability, VmBytes, VmBytesMut, map_usercopy_error,
+        pinned_user_mut_segments_are_disjoint, prefault_user_io_from_user_with,
+        prefault_user_io_to_user_with, record_user_io_direct_read,
         record_user_io_direct_read_fallback, record_user_io_direct_write,
-        record_user_io_direct_write_fallback, try_pin_user_segments_from_user,
-        try_pin_user_segments_to_user, try_pin_user_slice_from_user, try_pin_user_slice_to_user,
+        record_user_io_direct_write_fallback, try_pin_user_segments_from_user_with,
+        try_pin_user_segments_to_user_with, try_pin_user_slice_from_user_with,
+        try_pin_user_slice_to_user_with,
     },
     mounts,
     pseudofs::tmp,
@@ -447,6 +448,7 @@ fn regular_file_read_prefault_len(file: &File, len: usize, offset: u64) -> AxRes
 }
 
 fn prefault_regular_file_read_fallback(
+    capability: &UserMemoryCapability,
     file: &File,
     buf: *mut u8,
     len: usize,
@@ -457,16 +459,21 @@ fn prefault_regular_file_read_fallback(
     }
     let len = regular_file_read_prefault_len(file, len, offset)?;
     if len >= USER_COPY_PREFAULT_MIN {
-        prefault_user_io_to_user(buf, len)?;
+        prefault_user_io_to_user_with(capability, buf, len)?;
     }
     Ok(())
 }
 
-fn prefault_regular_file_write_fallback(file: &File, buf: *const u8, len: usize) -> AxResult<()> {
+fn prefault_regular_file_write_fallback(
+    capability: &UserMemoryCapability,
+    file: &File,
+    buf: *const u8,
+    len: usize,
+) -> AxResult<()> {
     if len < USER_COPY_PREFAULT_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(());
     }
-    prefault_user_io_from_user(buf, len)?;
+    prefault_user_io_from_user_with(capability, buf, len)?;
     Ok(())
 }
 
@@ -546,6 +553,7 @@ fn reserve_memfd_positioned_write(
 }
 
 fn try_regular_file_read_user_slice(
+    capability: &UserMemoryCapability,
     file: &File,
     buf: *mut u8,
     len: usize,
@@ -554,7 +562,7 @@ fn try_regular_file_read_user_slice(
     if len < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_user_slice_to_user(buf, len) else {
+    let Some(pinned) = try_pin_user_slice_to_user_with(capability, buf, len) else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -567,6 +575,7 @@ fn try_regular_file_read_user_slice(
 }
 
 fn try_regular_file_read_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     buf: *mut u8,
     len: usize,
@@ -575,7 +584,7 @@ fn try_regular_file_read_user_segments(
     if len < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_user_segments_to_user(buf, len) else {
+    let Some(pinned) = try_pin_user_segments_to_user_with(capability, buf, len) else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -592,6 +601,7 @@ fn try_regular_file_read_user_segments(
 }
 
 fn try_regular_file_pread_user_slice(
+    capability: &UserMemoryCapability,
     file: &File,
     buf: *mut u8,
     len: usize,
@@ -600,7 +610,7 @@ fn try_regular_file_pread_user_slice(
     if len < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_user_slice_to_user(buf, len) else {
+    let Some(pinned) = try_pin_user_slice_to_user_with(capability, buf, len) else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -613,6 +623,7 @@ fn try_regular_file_pread_user_slice(
 }
 
 fn try_regular_file_pread_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     buf: *mut u8,
     len: usize,
@@ -621,7 +632,7 @@ fn try_regular_file_pread_user_segments(
     if len < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_user_segments_to_user(buf, len) else {
+    let Some(pinned) = try_pin_user_segments_to_user_with(capability, buf, len) else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -638,6 +649,7 @@ fn try_regular_file_pread_user_segments(
 }
 
 fn try_regular_file_write_user_slice(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -663,7 +675,7 @@ fn try_regular_file_write_user_slice(
     validate_direct_io(file, buf as usize, allowed, offset)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_user_slice_from_user(buf, allowed) else {
+    let Some(pinned) = try_pin_user_slice_from_user_with(capability, buf, allowed) else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -677,6 +689,7 @@ fn try_regular_file_write_user_slice(
 }
 
 fn try_regular_file_write_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -702,7 +715,7 @@ fn try_regular_file_write_user_segments(
     validate_direct_io(file, buf as usize, allowed, offset)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_user_segments_from_user(buf, allowed) else {
+    let Some(pinned) = try_pin_user_segments_from_user_with(capability, buf, allowed) else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -716,6 +729,7 @@ fn try_regular_file_write_user_segments(
 }
 
 fn try_regular_file_pwrite_user_slice(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -741,7 +755,7 @@ fn try_regular_file_pwrite_user_slice(
     validate_direct_io(file, buf as usize, allowed, offset)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_user_slice_from_user(buf, allowed) else {
+    let Some(pinned) = try_pin_user_slice_from_user_with(capability, buf, allowed) else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -755,6 +769,7 @@ fn try_regular_file_pwrite_user_slice(
 }
 
 fn try_regular_file_pwrite_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -780,7 +795,7 @@ fn try_regular_file_pwrite_user_segments(
     validate_direct_io(file, buf as usize, allowed, offset)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_user_segments_from_user(buf, allowed) else {
+    let Some(pinned) = try_pin_user_segments_from_user_with(capability, buf, allowed) else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -794,6 +809,7 @@ fn try_regular_file_pwrite_user_segments(
 }
 
 fn try_pin_iov_to_user(
+    capability: &UserMemoryCapability,
     iov: &IoVectorBuf,
     len: usize,
 ) -> AxResult<Option<Vec<PinnedUserSegmentsMut>>> {
@@ -813,7 +829,8 @@ fn try_pin_iov_to_user(
             continue;
         }
         let chunk = iov_len.min(remaining);
-        let Some(pin) = try_pin_user_segments_to_user(entry.iov_base, chunk) else {
+        let Some(pin) = try_pin_user_segments_to_user_with(capability, entry.iov_base, chunk)
+        else {
             return Ok(None);
         };
         segments += pin.segments().len();
@@ -830,6 +847,7 @@ fn try_pin_iov_to_user(
 }
 
 fn try_pin_iov_from_user(
+    capability: &UserMemoryCapability,
     iov: &IoVectorBuf,
     len: usize,
 ) -> AxResult<Option<Vec<PinnedUserSegments>>> {
@@ -849,7 +867,9 @@ fn try_pin_iov_from_user(
             continue;
         }
         let chunk = iov_len.min(remaining);
-        let Some(pin) = try_pin_user_segments_from_user(entry.iov_base as *const u8, chunk) else {
+        let Some(pin) =
+            try_pin_user_segments_from_user_with(capability, entry.iov_base as *const u8, chunk)
+        else {
             return Ok(None);
         };
         segments += pin.segments().len();
@@ -866,6 +886,7 @@ fn try_pin_iov_from_user(
 }
 
 fn try_regular_file_readv_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     iov: &IoVectorBuf,
     offset: u64,
@@ -873,7 +894,7 @@ fn try_regular_file_readv_user_segments(
     if iov.len() < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_iov_to_user(iov, iov.len())? else {
+    let Some(pinned) = try_pin_iov_to_user(capability, iov, iov.len())? else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -892,6 +913,7 @@ fn try_regular_file_readv_user_segments(
 }
 
 fn try_regular_file_preadv_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     iov: &IoVectorBuf,
     offset: u64,
@@ -899,7 +921,7 @@ fn try_regular_file_preadv_user_segments(
     if iov.len() < USER_SLICE_FAST_MIN || !regular_file_supports_user_slice_fast_path(file) {
         return Ok(None);
     }
-    let Some(pinned) = try_pin_iov_to_user(iov, iov.len())? else {
+    let Some(pinned) = try_pin_iov_to_user(capability, iov, iov.len())? else {
         record_user_io_direct_read_fallback();
         return Ok(None);
     };
@@ -918,6 +940,7 @@ fn try_regular_file_preadv_user_segments(
 }
 
 fn try_regular_file_writev_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -942,7 +965,7 @@ fn try_regular_file_writev_user_segments(
     validate_direct_iov_prefix(file, iov, offset, allowed)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_iov_from_user(iov, allowed)? else {
+    let Some(pinned) = try_pin_iov_from_user(capability, iov, allowed)? else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -958,6 +981,7 @@ fn try_regular_file_writev_user_segments(
 }
 
 fn try_regular_file_pwritev_user_segments(
+    capability: &UserMemoryCapability,
     file: &File,
     status: OfdIoStatus,
     security: &VfsSecurityContext,
@@ -982,7 +1006,7 @@ fn try_regular_file_pwritev_user_segments(
     validate_direct_iov_prefix(file, iov, offset, allowed)?;
     let _memfd_mutation = reserve_memfd_positioned_write(file, offset, allowed)?;
 
-    let Some(pinned) = try_pin_iov_from_user(iov, allowed)? else {
+    let Some(pinned) = try_pin_iov_from_user(capability, iov, allowed)? else {
         record_user_io_direct_write_fallback();
         return Ok(None);
     };
@@ -1005,7 +1029,12 @@ pub fn sys_unsupported_fd(sysno: Sysno) -> AxResult<isize> {
 /// Read data from the file indicated by `fd`.
 ///
 /// Return the read size if success.
-pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
+pub fn sys_read(
+    capability: UserMemoryCapability,
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
     let f = get_file_like(fd)?;
     let status = f.io_status_snapshot();
@@ -1031,29 +1060,48 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
                 {
                     with_current_position_io(file, len, |offset| {
                         validate_direct_io(file, buf as usize, len, offset)?;
-                        let fast_read =
-                            match try_regular_file_read_user_slice(file, buf, len, offset)? {
-                                Some(read) => Some(read),
-                                None => {
-                                    try_regular_file_read_user_segments(file, buf, len, offset)?
-                                }
-                            };
+                        let fast_read = match try_regular_file_read_user_slice(
+                            &capability,
+                            file,
+                            buf,
+                            len,
+                            offset,
+                        )? {
+                            Some(read) => Some(read),
+                            None => try_regular_file_read_user_segments(
+                                &capability,
+                                file,
+                                buf,
+                                len,
+                                offset,
+                            )?,
+                        };
                         let read = if let Some(read) = fast_read {
                             read
                         } else {
                             if len >= USER_COPY_PREFAULT_MIN {
-                                prefault_regular_file_read_fallback(file, buf, len, offset)?;
+                                prefault_regular_file_read_fallback(
+                                    &capability,
+                                    file,
+                                    buf,
+                                    len,
+                                    offset,
+                                )?;
                             }
                             file.read_at_with_status(
                                 status,
-                                &mut VmBytesMut::new(buf, len),
+                                &mut VmBytesMut::new(capability.clone(), buf, len),
                                 offset,
                             )?
                         };
                         Ok((read, read))
                     })?
                 } else {
-                    read_file_like_with_status(&f, status, &mut VmBytesMut::new(buf, len))?
+                    read_file_like_with_status(
+                        &f,
+                        status,
+                        &mut VmBytesMut::new(capability.clone(), buf, len),
+                    )?
                 } as isize;
                 if read > 0
                     && let Some(file) = f.downcast_ref::<File>()
@@ -1067,13 +1115,18 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     .map(|read| read.unwrap_or(0))
 }
 
-pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
+pub fn sys_readv(
+    capability: UserMemoryCapability,
+    fd: i32,
+    iov: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
     let f = get_file_like(fd)?;
     let status = f.io_status_snapshot();
     f.check_io_status(status)?;
     let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
-    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
     let len = iov.len();
     let imported_iov_count = iov.iovcnt();
     if socket.is_some() && len == 0 {
@@ -1097,7 +1150,7 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
                     with_current_position_io(file, iov.len(), |offset| {
                         validate_direct_iov(file, &iov, offset)?;
                         let read = if let Some(read) =
-                            try_regular_file_readv_user_segments(file, &iov, offset)?
+                            try_regular_file_readv_user_segments(&capability, file, &iov, offset)?
                         {
                             read
                         } else {
@@ -1123,7 +1176,12 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 /// Write data to the file indicated by `fd`.
 ///
 /// Return the written size if success.
-pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
+pub fn sys_write(
+    capability: UserMemoryCapability,
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let security = current_vfs_security();
     let f = get_file_like(fd)?;
@@ -1148,6 +1206,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
                         return with_current_position_io(file, len, |offset| {
                             let allowed = allowed_write_len(offset, len)?;
                             if let Some(written) = try_regular_file_write_user_slice(
+                                &capability,
                                 file,
                                 status,
                                 &security,
@@ -1158,6 +1217,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
                                 return Ok(((written, status), written));
                             }
                             if let Some(written) = try_regular_file_write_user_segments(
+                                &capability,
                                 file,
                                 status,
                                 &security,
@@ -1169,6 +1229,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
                             }
                             if len >= USER_COPY_PREFAULT_MIN {
                                 prefault_regular_file_write_fallback(
+                                    &capability,
                                     file,
                                     buf as *const u8,
                                     allowed,
@@ -1176,7 +1237,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
                             }
                             let written = file.write_at_with_status_and_direct_validation(
                                 status,
-                                &mut VmBytes::new(buf, len),
+                                &mut VmBytes::new(capability.clone(), buf, len),
                                 offset,
                                 &security,
                                 |write_offset, write_len| {
@@ -1189,14 +1250,19 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
                     let written = file.write_with_status_and_direct_validation(
                         status,
-                        &mut VmBytes::new(buf, len),
+                        &mut VmBytes::new(capability.clone(), buf, len),
                         &security,
                         |offset, allowed| validate_direct_io(file, buf as usize, allowed, offset),
                     )?;
                     return Ok((written, status));
                 }
-                write_file_like_with_status(&f, status, &mut VmBytes::new(buf, len), &security)
-                    .map(|written| (written, status))
+                write_file_like_with_status(
+                    &f,
+                    status,
+                    &mut VmBytes::new(capability.clone(), buf, len),
+                    &security,
+                )
+                .map(|written| (written, status))
             })
         },
     )?;
@@ -1210,10 +1276,15 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     Ok(written)
 }
 
-pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
+pub fn sys_writev(
+    capability: UserMemoryCapability,
+    fd: i32,
+    iov: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let security = current_vfs_security();
-    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
     let len = iov.len();
     let imported_iov_count = iov.iovcnt();
     let f = get_file_like(fd)?;
@@ -1235,6 +1306,7 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
                     if write_uses_current_position(file.inner(), status) {
                         return with_current_position_io(file.as_ref(), iov.len(), |offset| {
                             if let Some(written) = try_regular_file_writev_user_segments(
+                                &capability,
                                 file.as_ref(),
                                 status,
                                 &security,
@@ -1559,8 +1631,10 @@ pub(crate) fn check_mandatory_fd_truncate_lock(
     flock::wait_for_mandatory_access(wait)
 }
 
-fn checked_user_file_offset(ptr: *mut u64) -> AxResult<u64> {
-    let value = ptr.vm_read()?;
+fn checked_user_file_offset(capability: &UserMemoryCapability, ptr: *mut u64) -> AxResult<u64> {
+    let value = capability
+        .read_value(ptr as *const u64)
+        .map_err(map_usercopy_error)?;
     if value > MAX_FILE_OFFSET {
         return Err(AxError::InvalidInput);
     }
@@ -1674,6 +1748,7 @@ fn seek_file_like(
 }
 
 fn do_preadv(
+    capability: &UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
@@ -1694,7 +1769,7 @@ fn do_preadv(
     }
     let status = file.io_status_snapshot();
     file.check_io_status(status)?;
-    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
     if iov.len() != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
@@ -1703,7 +1778,7 @@ fn do_preadv(
             with_current_position_io(file.as_ref(), iov.len(), |offset| {
                 validate_direct_iov(file.as_ref(), &iov, offset)?;
                 let read = if let Some(read) =
-                    try_regular_file_readv_user_segments(file.as_ref(), &iov, offset)?
+                    try_regular_file_readv_user_segments(capability, file.as_ref(), &iov, offset)?
                 {
                     read
                 } else {
@@ -1715,9 +1790,12 @@ fn do_preadv(
             file.read_with_status(status, &mut iov.into_io())?
         } else {
             validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
-            if let Some(read) =
-                try_regular_file_preadv_user_segments(file.as_ref(), &iov, offset as u64)?
-            {
+            if let Some(read) = try_regular_file_preadv_user_segments(
+                capability,
+                file.as_ref(),
+                &iov,
+                offset as u64,
+            )? {
                 if read > 0 {
                     notify_read(fd);
                 }
@@ -1734,6 +1812,7 @@ fn do_preadv(
 }
 
 fn do_pwritev(
+    capability: &UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
@@ -1756,13 +1835,14 @@ fn do_pwritev(
     } else {
         positioned_write_file(fd)?
     };
-    let io = IoVectorBuf::new(iov, iovcnt)?;
+    let io = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
     let (written, status) = file.with_write_credentials(|status| {
         let direct_alignment_limit = direct_iov_alignment_limit(file.as_ref(), &io)?;
         if offset == -1 {
             if write_uses_current_position(file.inner(), status) {
                 return with_current_position_io(file.as_ref(), io.len(), |write_offset| {
                     if let Some(written) = try_regular_file_writev_user_segments(
+                        capability,
                         file.as_ref(),
                         status,
                         &security,
@@ -1818,6 +1898,7 @@ fn do_pwritev(
             )
         } else {
             if let Some(written) = try_regular_file_pwritev_user_segments(
+                capability,
                 file.as_ref(),
                 status,
                 &security,
@@ -1915,8 +1996,17 @@ fn generic_seek_data_or_hole(file: &axfs::File, offset: u64, seek_hole: bool) ->
     }
 }
 
-pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxResult<isize> {
-    let path = path.get_as_str()?;
+pub fn sys_truncate(
+    memory: UserMemoryCapability,
+    path: *const c_char,
+    length: __kernel_off_t,
+) -> AxResult<isize> {
+    let path = String::from_utf8(
+        memory
+            .load_until_nul(path.cast::<u8>())
+            .map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)?;
     debug!("sys_truncate <= {path:?} {length}");
     if path.is_empty() {
         return Err(AxError::NotFound);
@@ -2259,15 +2349,27 @@ pub fn sys_fadvise64(
     Ok(0)
 }
 
-pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) -> AxResult<isize> {
+pub fn sys_pread64(
+    capability: UserMemoryCapability,
+    fd: c_int,
+    buf: *mut u8,
+    len: usize,
+    offset: __kernel_off_t,
+) -> AxResult<isize> {
     if offset < 0 {
         return Err(AxError::InvalidInput);
     }
     let f = positioned_read_file(fd)?;
-    pread64_file(&f, buf, len, offset as u64)
+    pread64_file(&capability, &f, buf, len, offset as u64)
 }
 
-fn pread64_file(f: &FileHandle<File>, buf: *mut u8, len: usize, offset: u64) -> AxResult<isize> {
+fn pread64_file(
+    capability: &UserMemoryCapability,
+    f: &FileHandle<File>,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+) -> AxResult<isize> {
     validate_direct_io(f.as_ref(), buf as usize, len, offset)?;
     if len != 0 {
         crate::file::fanotify::permission_check_file_like(
@@ -2276,10 +2378,13 @@ fn pread64_file(f: &FileHandle<File>, buf: *mut u8, len: usize, offset: u64) -> 
         )?;
     }
     f.with_read_credentials(|| {
-        let fast_read = match try_regular_file_pread_user_slice(f.as_ref(), buf, len, offset)? {
-            Some(read) => Some(read),
-            None => try_regular_file_pread_user_segments(f.as_ref(), buf, len, offset)?,
-        };
+        let fast_read =
+            match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
+                Some(read) => Some(read),
+                None => {
+                    try_regular_file_pread_user_segments(capability, f.as_ref(), buf, len, offset)?
+                }
+            };
         if let Some(read) = fast_read {
             if read > 0 {
                 notify_read_file(f.as_ref());
@@ -2287,9 +2392,11 @@ fn pread64_file(f: &FileHandle<File>, buf: *mut u8, len: usize, offset: u64) -> 
             return Ok(read as _);
         }
         if len >= USER_COPY_PREFAULT_MIN {
-            prefault_regular_file_read_fallback(f.as_ref(), buf, len, offset)?;
+            prefault_regular_file_read_fallback(capability, f.as_ref(), buf, len, offset)?;
         }
-        let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
+        let read = f
+            .inner()
+            .read_at(VmBytesMut::new(capability.clone(), buf, len), offset as _)?;
         if read > 0 {
             notify_read_file(f.as_ref());
         }
@@ -2298,16 +2405,18 @@ fn pread64_file(f: &FileHandle<File>, buf: *mut u8, len: usize, offset: u64) -> 
 }
 
 pub(crate) fn io_uring_pread64(
+    capability: &UserMemoryCapability,
     description: &Arc<FileDescription>,
     buf: *mut u8,
     len: usize,
     offset: u64,
 ) -> AxResult<isize> {
     let file = positioned_read_file_handle(description.file_handle())?;
-    pread64_file(&file, buf, len, offset)
+    pread64_file(capability, &file, buf, len, offset)
 }
 
 pub fn sys_pwrite64(
+    capability: UserMemoryCapability,
     fd: c_int,
     buf: *const u8,
     len: usize,
@@ -2320,10 +2429,16 @@ pub fn sys_pwrite64(
     // for a zero-length request. Proc id-map controls return ESPIPE here
     // rather than a silent zero-byte success.
     let f = positioned_write_file(fd)?;
-    pwrite64_file(&f, buf, len, offset as u64)
+    pwrite64_file(&capability, &f, buf, len, offset as u64)
 }
 
-fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) -> AxResult<isize> {
+fn pwrite64_file(
+    capability: &UserMemoryCapability,
+    f: &FileHandle<File>,
+    buf: *const u8,
+    len: usize,
+    offset: u64,
+) -> AxResult<isize> {
     if len == 0 {
         return Ok(0);
     }
@@ -2332,7 +2447,7 @@ fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) 
         let written = if write_uses_inode_append(f.inner(), status) {
             f.write_at_end_with_status_and_direct_validation(
                 status,
-                &mut VmBytes::new(buf, len),
+                &mut VmBytes::new(capability.clone(), buf, len),
                 &security,
                 |append_offset, allowed| {
                     validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
@@ -2341,6 +2456,7 @@ fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) 
         } else {
             let allowed = allowed_write_len(offset, len)?;
             let fast_written = match try_regular_file_pwrite_user_slice(
+                capability,
                 f.as_ref(),
                 status,
                 &security,
@@ -2350,6 +2466,7 @@ fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) 
             )? {
                 Some(written) => Some(written),
                 None => try_regular_file_pwrite_user_segments(
+                    capability,
                     f.as_ref(),
                     status,
                     &security,
@@ -2362,11 +2479,11 @@ fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) 
                 return Ok((written, status));
             }
             if allowed >= USER_COPY_PREFAULT_MIN {
-                prefault_regular_file_write_fallback(f.as_ref(), buf, allowed)?;
+                prefault_regular_file_write_fallback(capability, f.as_ref(), buf, allowed)?;
             }
             f.write_at_with_status_and_direct_validation(
                 status,
-                &mut VmBytes::new(buf, len),
+                &mut VmBytes::new(capability.clone(), buf, len),
                 offset as _,
                 &security,
                 |write_offset, write_len| {
@@ -2384,34 +2501,38 @@ fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) 
 }
 
 pub(crate) fn io_uring_pwrite64(
+    capability: &UserMemoryCapability,
     description: &Arc<FileDescription>,
     buf: *const u8,
     len: usize,
     offset: u64,
 ) -> AxResult<isize> {
     let file = positioned_write_file_handle(description.file_handle())?;
-    pwrite64_file(&file, buf, len, offset)
+    pwrite64_file(capability, &file, buf, len, offset)
 }
 
 pub fn sys_preadv(
+    capability: UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
     offset: __kernel_off_t,
 ) -> AxResult<isize> {
-    do_preadv(fd, iov, iovcnt, offset, 0, false)
+    do_preadv(&capability, fd, iov, iovcnt, offset, 0, false)
 }
 
 pub fn sys_pwritev(
+    capability: UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
     offset: __kernel_off_t,
 ) -> AxResult<isize> {
-    do_pwritev(fd, iov, iovcnt, offset, 0, false)
+    do_pwritev(&capability, fd, iov, iovcnt, offset, 0, false)
 }
 
 pub fn sys_preadv2(
+    capability: UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
@@ -2424,10 +2545,11 @@ pub fn sys_preadv2(
         "sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
          {offset_high}, flags: {_flags}"
     );
-    do_preadv(fd, iov, iovcnt, offset, _flags, true)
+    do_preadv(&capability, fd, iov, iovcnt, offset, _flags, true)
 }
 
 pub fn sys_pwritev2(
+    capability: UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
@@ -2440,7 +2562,7 @@ pub fn sys_pwritev2(
         "sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
          {offset_high}, flags: {_flags}"
     );
-    do_pwritev(fd, iov, iovcnt, offset, _flags, true)
+    do_pwritev(&capability, fd, iov, iovcnt, offset, _flags, true)
 }
 
 enum SendFile {
@@ -2449,6 +2571,7 @@ enum SendFile {
         status: OfdIoStatus,
         nonblocking: bool,
         security: VfsSecurityContext,
+        capability: UserMemoryCapability,
     },
     Offset {
         file: FileHandle<File>,
@@ -2456,6 +2579,7 @@ enum SendFile {
         user_offset: *mut u64,
         status: OfdIoStatus,
         security: VfsSecurityContext,
+        capability: UserMemoryCapability,
     },
 }
 
@@ -2662,6 +2786,7 @@ impl SendFile {
                 file,
                 status,
                 security,
+                capability,
                 ..
             } => Ok(Self::Offset {
                 file: file.downcast::<File>()?,
@@ -2671,6 +2796,7 @@ impl SendFile {
                 user_offset: core::ptr::null_mut(),
                 status: *status,
                 security: security.clone(),
+                capability: capability.clone(),
             }),
             Self::Offset { .. } => Err(AxError::BadState),
         }
@@ -2908,6 +3034,7 @@ impl SendFile {
                 status,
                 nonblocking,
                 security,
+                ..
             } => {
                 let memfd_mutation = file
                     .downcast_ref::<File>()
@@ -2962,6 +3089,7 @@ impl SendFile {
                 user_offset,
                 status,
                 security,
+                ..
             } => {
                 let off = *offset;
                 check_writable_mount(file.inner().location())?;
@@ -3003,11 +3131,14 @@ impl SendFile {
         if let Self::Offset {
             offset,
             user_offset,
+            capability,
             ..
         } = self
             && !user_offset.is_null()
         {
-            user_offset.vm_write(*offset)?;
+            capability
+                .write_value(*user_offset, *offset)
+                .map_err(map_usercopy_error)?;
         }
         Ok(())
     }
@@ -3760,7 +3891,13 @@ fn pipe_from_fd(fd: c_int, non_pipe_error: AxError) -> AxResult<FileHandle<Pipe>
     file.downcast::<Pipe>().map_err(|_| non_pipe_error)
 }
 
-pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -> AxResult<isize> {
+pub fn sys_sendfile(
+    capability: UserMemoryCapability,
+    out_fd: c_int,
+    in_fd: c_int,
+    offset: *mut u64,
+    len: usize,
+) -> AxResult<isize> {
     debug!(
         "sys_sendfile <= out_fd: {}, in_fd: {}, offset: {}, len: {}",
         out_fd,
@@ -3776,7 +3913,11 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
     let explicit_offset = if offset.is_null() {
         None
     } else {
-        Some(offset.vm_read()?)
+        Some(
+            capability
+                .read_value(offset as *const u64)
+                .map_err(map_usercopy_error)?,
+        )
     };
 
     let mut committed_offset = explicit_offset;
@@ -3800,6 +3941,7 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
                     offset: explicit_offset,
                     user_offset: offset,
                     security: security.clone(),
+                    capability: capability.clone(),
                 }
             } else {
                 SendFile::Direct {
@@ -3807,6 +3949,7 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
                     file: src_file.clone().into_file_like(),
                     nonblocking: src_status.nonblocking(),
                     security: security.clone(),
+                    capability: capability.clone(),
                 }
             };
 
@@ -3815,6 +3958,7 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
                 status,
                 nonblocking: status.nonblocking(),
                 security: security.clone(),
+                capability: capability.clone(),
             };
             let sent = do_send_preserving_current_positions(
                 &mut src,
@@ -3838,12 +3982,15 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
     // therefore overrides a transfer or validation error; a successful store
     // leaves the original result intact.
     if let Some(committed_offset) = committed_offset {
-        offset.vm_write(committed_offset)?;
+        capability
+            .write_value(offset, committed_offset)
+            .map_err(map_usercopy_error)?;
     }
     result
 }
 
 pub fn sys_copy_file_range(
+    capability: UserMemoryCapability,
     fd_in: c_int,
     off_in: *mut u64,
     fd_out: c_int,
@@ -3872,12 +4019,12 @@ pub fn sys_copy_file_range(
     let src_offset = if off_in.is_null() {
         None
     } else {
-        Some(checked_user_file_offset(off_in)?)
+        Some(checked_user_file_offset(&capability, off_in)?)
     };
     let dst_offset = if off_out.is_null() {
         None
     } else {
-        Some(checked_user_file_offset(off_out)?)
+        Some(checked_user_file_offset(&capability, off_out)?)
     };
     if _flags != 0 {
         return Err(AxError::InvalidInput);
@@ -3900,6 +4047,7 @@ pub fn sys_copy_file_range(
             user_offset: off_in,
             status: src_status,
             security: security.clone(),
+            capability: capability.clone(),
         }
     } else {
         SendFile::Direct {
@@ -3907,6 +4055,7 @@ pub fn sys_copy_file_range(
             status: src_status,
             nonblocking: src_status.nonblocking(),
             security: security.clone(),
+            capability: capability.clone(),
         }
     };
 
@@ -3917,6 +4066,7 @@ pub fn sys_copy_file_range(
             user_offset: off_out,
             status: dst_status,
             security: security.clone(),
+            capability: capability.clone(),
         }
     } else {
         SendFile::Direct {
@@ -3924,6 +4074,7 @@ pub fn sys_copy_file_range(
             status: dst_status,
             nonblocking: dst_status.nonblocking(),
             security: security.clone(),
+            capability: capability.clone(),
         }
     };
 
@@ -3960,13 +4111,16 @@ pub fn sys_copy_file_range(
         // independent even when the first pointer is invalid.
         let src_commit = src.commit_user_offset();
         let dst_commit = dst.commit_user_offset();
-        src_commit?;
-        dst_commit?;
+        match (src_commit, dst_commit) {
+            (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
     }
     Ok(copied as _)
 }
 
 pub fn sys_splice(
+    capability: UserMemoryCapability,
     fd_in: c_int,
     off_in: *mut i64,
     fd_out: c_int,
@@ -4022,12 +4176,20 @@ pub fn sys_splice(
     let output_offset = if off_out.is_null() {
         None
     } else {
-        Some(off_out.vm_read()?)
+        Some(
+            capability
+                .read_value(off_out as *const i64)
+                .map_err(map_usercopy_error)?,
+        )
     };
     let input_offset = if off_in.is_null() {
         None
     } else {
-        Some(off_in.vm_read()?)
+        Some(
+            capability
+                .read_value(off_in as *const i64)
+                .map_err(map_usercopy_error)?,
+        )
     };
 
     validate_splice_endpoint(&src_handle, src_status, true)?;
@@ -4083,6 +4245,7 @@ pub fn sys_splice(
             offset: offset as u64,
             user_offset: off_in.cast(),
             security: security.clone(),
+            capability: capability.clone(),
         }
     } else {
         if let Some(file) = src_handle.downcast_ref::<File>()
@@ -4095,6 +4258,7 @@ pub fn sys_splice(
             file: src_handle,
             nonblocking: source_nonblocking,
             security: security.clone(),
+            capability: capability.clone(),
         }
     };
 
@@ -4109,6 +4273,7 @@ pub fn sys_splice(
             offset: offset as u64,
             user_offset: off_out.cast(),
             security: security.clone(),
+            capability: capability.clone(),
         }
     } else {
         SendFile::Direct {
@@ -4116,6 +4281,7 @@ pub fn sys_splice(
             status: dst_status,
             nonblocking: destination_nonblocking,
             security,
+            capability: capability.clone(),
         }
     };
 
@@ -4146,13 +4312,19 @@ pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<
     src.tee_to(&dst, len, nonblocking).map(|n| n as _)
 }
 
-pub fn sys_vmsplice(fd: c_int, iov: *const IoVec, nr_segs: usize, flags: u32) -> AxResult<isize> {
+pub fn sys_vmsplice(
+    capability: UserMemoryCapability,
+    fd: c_int,
+    iov: *const IoVec,
+    nr_segs: usize,
+    flags: u32,
+) -> AxResult<isize> {
     debug!("sys_vmsplice <= fd: {fd}, iov: {iov:p}, nr_segs: {nr_segs}, flags: {flags:#x}");
 
     validate_splice_flags(flags)?;
 
     let pipe = pipe_from_fd(fd, AxError::BadFileDescriptor)?;
-    let mut io = IoVectorBuf::new(iov, nr_segs)?.into_io();
+    let mut io = IoVectorBuf::new(capability, iov, nr_segs)?.into_io();
     let nonblocking = flags & SPLICE_F_NONBLOCK != 0 || pipe.io_status_snapshot().nonblocking();
 
     let result = if pipe.is_write() {

@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axhal::time::{NANOS_PER_SEC, TimeValue};
 use linux_raw_sys::general::{__kernel_old_timeval, rusage};
-use starry_process::ProcessUsage;
+use thekernel_linux_process_adapter::ProcessUsage;
 
 use super::{AsThread, Thread, get_task};
 use crate::time::TimeValueLike;

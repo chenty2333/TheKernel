@@ -1,3 +1,4 @@
+use alloc::string::String;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -11,7 +12,7 @@ use linux_raw_sys::general::{CAP_SYS_PACCT, O_APPEND, O_CLOEXEC, O_WRONLY};
 use super::super::fs::openat_inner;
 use crate::{
     file::{File, FileLike, close_file_like},
-    mm::vm_load_string,
+    mm::{UserMemoryCapability, map_usercopy_error},
     task::{AsThread, ProcessData, TaskUsage},
 };
 
@@ -147,7 +148,7 @@ pub fn acct_process_exit(proc_data: &ProcessData, exit_code: i32, usage: TaskUsa
     let _ = accounting.file.write(&mut cursor);
 }
 
-pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
+pub fn sys_acct(memory: UserMemoryCapability, name: *const c_char) -> AxResult<isize> {
     if !current_has_pacct_capability() {
         return Err(AxError::OperationNotPermitted);
     }
@@ -157,7 +158,12 @@ pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
         return Ok(0);
     }
 
-    let path = vm_load_string(name)?;
+    let path = String::from_utf8(
+        memory
+            .load_until_nul(name.cast::<u8>())
+            .map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)?;
     let fd = openat_inner(
         linux_raw_sys::general::AT_FDCWD as _,
         &path,

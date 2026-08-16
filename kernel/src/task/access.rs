@@ -5,7 +5,7 @@ use axtask::{AxTaskRef, current};
 use linux_raw_sys::general::{
     CAP_SETFCAP, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_RESOURCE,
 };
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
 
 use super::{
     AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, Process, ProcessData,

@@ -1,15 +1,40 @@
+use core::mem::{align_of, offset_of, size_of};
+
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{
     CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE, rlimit, rlimit64,
     rusage,
 };
-use starry_process::Pid;
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
-use crate::task::{
-    AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
-    nr_open_limit,
+use crate::{
+    mm::map_usercopy_error,
+    task::{
+        AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
+        nr_open_limit,
+    },
+};
+
+// `linux_raw_sys` does not expose bytemuck's `AnyBitPattern`/`NoUninit`
+// markers for these ABI structs.  The x86_64 Linux definitions are integer
+// fields only; keep their complete object layouts checked before using the
+// explicit usercopy unchecked path below.
+const _: () = {
+    assert!(align_of::<rlimit>() == 8);
+    assert!(size_of::<rlimit>() == 16);
+    assert!(offset_of!(rlimit, rlim_cur) == 0);
+    assert!(offset_of!(rlimit, rlim_max) == 8);
+    assert!(align_of::<rlimit64>() == 8);
+    assert!(size_of::<rlimit64>() == 16);
+    assert!(offset_of!(rlimit64, rlim_cur) == 0);
+    assert!(offset_of!(rlimit64, rlim_max) == 8);
+    assert!(align_of::<rusage>() == 8);
+    assert!(size_of::<rusage>() == 144);
+    assert!(offset_of!(rusage, ru_utime) == 0);
+    assert!(offset_of!(rusage, ru_stime) == 16);
+    assert!(offset_of!(rusage, ru_maxrss) == 32);
 };
 
 fn current_can_raise_hard_limit() -> bool {
@@ -66,7 +91,8 @@ fn update_resource_limit(
     Ok(old)
 }
 
-pub fn sys_prlimit64(
+pub fn sys_prlimit64<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     pid: Pid,
     resource: u32,
     new_limit: *const rlimit64,
@@ -75,9 +101,11 @@ pub fn sys_prlimit64(
     // Linux faults `new_limit` before PID lookup, permission checks, and
     // resource validation. Keep that observable precedence for combinations
     // of bad pointers, dead PIDs, and out-of-range resource numbers.
-    let new_limit = if let Some(new_limit) = new_limit.nullable() {
-        // FIXME: AnyBitPattern
-        Some(unsafe { new_limit.vm_read_uninit()?.assume_init() })
+    let new_limit = if let Some(new_limit) = VmPtr::nullable(new_limit) {
+        let value = VmPtr::vm_read_uninit(new_limit, memory).map_err(map_usercopy_error)?;
+        // SAFETY: the explicit provider initialized the complete value and
+        // rlimit64 contains only integer fields on the x86_64 Linux ABI.
+        Some(unsafe { value.assume_init() })
     } else {
         None
     };
@@ -89,17 +117,30 @@ pub fn sys_prlimit64(
     // Snapshot and optional replacement share one owner critical section, so
     // prlimit64(old,new) cannot report a value from a different generation.
     let old = update_resource_limit(&proc_data, resource, new_limit)?;
-    if let Some(old_limit) = old_limit.nullable() {
-        old_limit.vm_write(old)?;
+    if let Some(old_limit) = VmPtr::nullable(old_limit) {
+        // SAFETY: rlimit64 has no padding on the checked x86_64 ABI, and all
+        // fields in `old` are initialized before this copyout.
+        unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
+            .map_err(map_usercopy_error)?;
     }
 
     Ok(0)
 }
 
-pub fn sys_setrlimit(resource: u32, new_limit: *const rlimit) -> AxResult<isize> {
+pub fn sys_setrlimit<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    resource: u32,
+    new_limit: *const rlimit,
+) -> AxResult<isize> {
     // Linux copies the replacement before dispatching resource policy, so a
     // bad userspace pointer wins over an out-of-range resource number.
-    let new_limit = unsafe { new_limit.vm_read_uninit()?.assume_init() };
+    // SAFETY: the explicit provider initializes every byte and rlimit contains
+    // only integer fields on the checked x86_64 Linux ABI.
+    let new_limit = unsafe {
+        VmPtr::vm_read_uninit(new_limit, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     if resource >= RLIM_NLIMITS {
         return Err(AxError::InvalidInput);
     }
@@ -116,22 +157,33 @@ pub fn sys_setrlimit(resource: u32, new_limit: *const rlimit) -> AxResult<isize>
     Ok(0)
 }
 
-pub fn sys_getrlimit(resource: u32, old_limit: *mut rlimit) -> AxResult<isize> {
+pub fn sys_getrlimit<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    resource: u32,
+    old_limit: *mut rlimit,
+) -> AxResult<isize> {
     if resource >= RLIM_NLIMITS {
         return Err(AxError::InvalidInput);
     }
 
     let proc_data = current().as_thread().proc_data.clone();
     let limit = &proc_data.rlim.read()[resource];
-    old_limit.vm_write(rlimit {
+    let old = rlimit {
         rlim_cur: limit.current as _,
         rlim_max: limit.max as _,
-    })?;
+    };
+    // SAFETY: rlimit has no padding on the checked x86_64 ABI, and both
+    // fields in `old` are initialized before this copyout.
+    unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }.map_err(map_usercopy_error)?;
 
     Ok(0)
 }
 
-pub fn sys_getrusage(who: i32, usage: *mut rusage) -> AxResult<isize> {
+pub fn sys_getrusage<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    who: i32,
+    usage: *mut rusage,
+) -> AxResult<isize> {
     const RUSAGE_SELF: i32 = linux_raw_sys::general::RUSAGE_SELF as i32;
     const RUSAGE_CHILDREN: i32 = linux_raw_sys::general::RUSAGE_CHILDREN;
     const RUSAGE_THREAD: i32 = linux_raw_sys::general::RUSAGE_THREAD as i32;
@@ -145,7 +197,10 @@ pub fn sys_getrusage(who: i32, usage: *mut rusage) -> AxResult<isize> {
         RUSAGE_THREAD => TaskUsage::from_thread(thr),
         _ => return Err(AxError::InvalidInput),
     };
-    usage.vm_write(result.into())?;
+    let result: rusage = result.into();
+    // SAFETY: TaskUsage conversion starts from a zeroed rusage and fills the
+    // integer fields, so the full object representation is initialized.
+    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }.map_err(map_usercopy_error)?;
 
     Ok(0)
 }

@@ -1,18 +1,18 @@
 use axerrno::{AxError, AxResult, LinuxError};
-use axhal::paging::MappingFlags;
 use axtask::{TaskState, current, yield_now};
-use memory_addr::{MemoryAddr, VirtAddr};
-use starry_process::Pid;
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::{SignalInfo, Signo};
 
-use crate::task::{
-    AsThread, ProcessData, PtraceAccessMode, PtraceRelationshipOrigin, PtraceRelationshipSnapshot,
-    PtraceReverseLink, PtraceSession, TaskParentCredentialPin, Thread,
-    check_thread_ptrace_image_access_with_actor, get_task, get_visible_task,
-    notify_ptrace_attach_stop, reinject_ptrace_signal,
-    security::{ProcessImageSecurityRef, PtraceTracemeContext, dispatch_ptrace_traceme},
-    send_signal_to_process,
+use crate::{
+    mm::{UserMemoryCapability, map_usercopy_error},
+    task::{
+        AsThread, ProcessData, PtraceAccessMode, PtraceRelationshipOrigin,
+        PtraceRelationshipSnapshot, PtraceReverseLink, PtraceSession, TaskParentCredentialPin,
+        Thread, check_thread_ptrace_image_access_with_actor, get_task, get_visible_task,
+        notify_ptrace_attach_stop, reinject_ptrace_signal,
+        security::{ProcessImageSecurityRef, PtraceTracemeContext, dispatch_ptrace_traceme},
+        send_signal_to_process,
+    },
 };
 
 const PTRACE_TRACEME: u32 = 0;
@@ -125,16 +125,14 @@ fn check_inactive_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
 /// The owned address-space handle deliberately stays in this scope so an exec
 /// publication cannot make the operation re-sample a different image between
 /// validation/population and the final transfer.
-fn with_pinned_tracee_aspace<T>(
+fn pinned_tracee_memory(
     target: &ProcessData,
     session: PtraceSession,
-    operation: impl FnOnce(&mut crate::mm::AddrSpace) -> AxResult<T>,
-) -> AxResult<T> {
+) -> AxResult<UserMemoryCapability> {
     let aspace_handle = target
         .ptrace_inactive_image_if_session(session)
         .ok_or(AxError::NoSuchProcess)?;
-    let mut aspace = aspace_handle.lock();
-    operation(&mut aspace)
+    Ok(UserMemoryCapability::new(aspace_handle))
 }
 
 fn parse_signal(data: usize) -> AxResult<Option<SignalInfo>> {
@@ -243,35 +241,12 @@ impl PtraceContinueOutcome {
     }
 }
 
-fn validate_remote_access(
-    aspace: &mut crate::mm::AddrSpace,
-    addr: usize,
-    len: usize,
-    flags: MappingFlags,
-) -> AxResult<()> {
-    let start = VirtAddr::from_usize(addr);
-    let end = start.checked_add(len).ok_or_else(ptrace_io_error)?;
-    let page_start = start.align_down_4k();
-    let page_end = VirtAddr::from_usize(
-        crate::mm::checked_align_up_4k(end.as_usize()).ok_or_else(ptrace_io_error)?,
-    );
-    if !aspace.can_access_range(start, len, flags) {
-        return Err(ptrace_io_error());
-    }
-    aspace
-        .populate_area(page_start, page_end.sub_addr(page_start), flags)
-        .map_err(|_| ptrace_io_error())
-}
-
 fn peek_word(target: &ProcessData, session: PtraceSession, addr: usize) -> AxResult<isize> {
-    with_pinned_tracee_aspace(target, session, |aspace| {
-        let mut word = [0u8; size_of::<usize>()];
-        validate_remote_access(aspace, addr, word.len(), MappingFlags::READ)?;
-        aspace
-            .read(VirtAddr::from_usize(addr), &mut word)
-            .map_err(|_| ptrace_io_error())?;
-        Ok(usize::from_ne_bytes(word) as isize)
-    })
+    let memory = pinned_tracee_memory(target, session)?;
+    memory
+        .read_value(addr as *const usize)
+        .map(|word| word as isize)
+        .map_err(|_| ptrace_io_error())
 }
 
 fn poke_word(
@@ -280,14 +255,11 @@ fn poke_word(
     addr: usize,
     data: usize,
 ) -> AxResult<isize> {
-    with_pinned_tracee_aspace(target, session, |aspace| {
-        let word = data.to_ne_bytes();
-        validate_remote_access(aspace, addr, word.len(), MappingFlags::WRITE)?;
-        aspace
-            .write(VirtAddr::from_usize(addr), &word)
-            .map_err(|_| ptrace_io_error())?;
-        Ok(0)
-    })
+    let memory = pinned_tracee_memory(target, session)?;
+    memory
+        .write_value(addr as *mut usize, data)
+        .map_err(|_| ptrace_io_error())?;
+    Ok(0)
 }
 
 fn sys_ptrace_traceme() -> AxResult<isize> {
@@ -392,7 +364,13 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
     }
 }
 
-fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<isize> {
+fn sys_ptrace_for_target(
+    tracer_memory: &UserMemoryCapability,
+    request: u32,
+    pid: Pid,
+    addr: usize,
+    data: usize,
+) -> AxResult<isize> {
     let target_task = get_visible_task(pid)?;
     let target_thread = target_task.as_thread();
     let target = target_thread.proc_data.clone();
@@ -465,7 +443,9 @@ fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> Ax
             let event_message = target
                 .ptrace_event_message(session)
                 .ok_or(AxError::NoSuchProcess)?;
-            (data as *mut usize).vm_write(event_message)?;
+            tracer_memory
+                .write_value(data as *mut usize, event_message)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         PTRACE_INTERRUPT => {
@@ -491,12 +471,21 @@ fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> Ax
             let info = target
                 .ptrace_signal_info(session)
                 .ok_or_else(ptrace_io_error)?;
-            (data as *mut SignalInfo).vm_write(info)?;
+            unsafe {
+                tracer_memory
+                    .write_value_unchecked(data as *mut SignalInfo, info)
+                    .map_err(map_usercopy_error)?;
+            }
             Ok(0)
         }
         PTRACE_SETSIGINFO => {
             let session = check_inactive_tracee(&target)?;
-            let info = unsafe { (data as *const SignalInfo).vm_read_uninit()?.assume_init() };
+            let info = unsafe {
+                tracer_memory
+                    .read_value_uninit(data as *const SignalInfo)
+                    .map_err(map_usercopy_error)?
+                    .assume_init()
+            };
             target.replace_ptrace_signal_info(session, info)?;
             Ok(0)
         }
@@ -509,14 +498,20 @@ fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> Ax
     }
 }
 
-pub fn sys_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<isize> {
+pub fn sys_ptrace(
+    tracer_memory: UserMemoryCapability,
+    request: u32,
+    pid: i32,
+    addr: usize,
+    data: usize,
+) -> AxResult<isize> {
     match request {
         PTRACE_TRACEME => sys_ptrace_traceme(),
         _ => {
             if pid <= 0 {
                 return Err(AxError::NoSuchProcess);
             }
-            sys_ptrace_for_target(request, pid as Pid, addr, data)
+            sys_ptrace_for_target(&tracer_memory, request, pid as Pid, addr, data)
         }
     }
 }

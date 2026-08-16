@@ -59,6 +59,10 @@ pub enum AuxType {
     RANDOM            = 25,
     /// Extension of AT_HWCAP
     HWCAP2            = 26,
+    /// Size of the rseq ABI area understood by the kernel.
+    RSEQ_FEATURE_SIZE = 27,
+    /// Required alignment of the rseq ABI area.
+    RSEQ_ALIGN        = 28,
     /// Filename of program
     EXECFN            = 31,
     /// Address of the VDSO

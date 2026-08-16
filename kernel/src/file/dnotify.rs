@@ -601,7 +601,7 @@ mod tests {
     use core::task::Context;
 
     use axpoll::{IoEvents, Pollable};
-    use starry_signal::Signo;
+    use thekernel_linux_signal::Signo;
 
     use super::*;
     use crate::file::{FdTable, FileLike, Kstat};

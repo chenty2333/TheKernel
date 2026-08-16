@@ -11,13 +11,7 @@ use memory_addr::PhysAddr;
 
 const LEGACY_ASID: usize = 0;
 const LEGACY_GENERATION: u64 = 0;
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 const BOOT_GENERATION: u64 = 1;
 
 /// Hardware address-space identity carried by one user page-table root.
@@ -43,13 +37,7 @@ impl HardwareAddressSpaceId {
         }
     }
 
-    #[cfg(any(
-        test,
-        all(
-            feature = "asid-fast-switch",
-            any(target_arch = "riscv64", target_arch = "loongarch64")
-        )
-    ))]
+    #[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
     const fn new(asid: usize, generation: u64) -> Self {
         Self {
             asid,
@@ -116,26 +104,14 @@ impl AddressSpaceToken {
     }
 }
 
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReserveDecision {
     Assigned(HardwareAddressSpaceId),
     Legacy(AddressSpaceFallbackReason),
 }
 
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AllocatorStatus {
     Disabled,
@@ -144,13 +120,7 @@ enum AllocatorStatus {
     Exhausted,
 }
 
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 /// Pure bounded allocator state.  Numeric identifiers are never recycled.
 #[derive(Debug)]
 struct AllocatorState {
@@ -159,13 +129,7 @@ struct AllocatorState {
     status: AllocatorStatus,
 }
 
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 impl AllocatorState {
     const fn disabled() -> Self {
         Self {
@@ -222,20 +186,11 @@ impl AllocatorState {
     }
 }
 
-#[cfg(all(
-    feature = "asid-fast-switch",
-    any(target_arch = "riscv64", target_arch = "loongarch64")
-))]
+#[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
 static ALLOCATOR: kspin::SpinNoIrq<AllocatorState> =
     kspin::SpinNoIrq::new(AllocatorState::disabled());
 
-#[cfg(any(
-    test,
-    all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )
-))]
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
 fn capacity_for_width_and_max(width: usize, architectural_max: usize) -> usize {
     // Reject an unexpected report rather than silently truncating an identity
     // in the hardware register and colliding two page-table roots.
@@ -245,44 +200,36 @@ fn capacity_for_width_and_max(width: usize, architectural_max: usize) -> usize {
     (1usize << width) - 1
 }
 
-#[cfg(all(feature = "asid-fast-switch", target_arch = "riscv64"))]
-fn capacity_for_width(width: usize) -> usize {
-    capacity_for_width_and_max(width, 16)
-}
-
-#[cfg(all(feature = "asid-fast-switch", target_arch = "loongarch64"))]
-fn capacity_for_width(width: usize) -> usize {
-    capacity_for_width_and_max(width, 10)
+#[cfg(any(test, all(feature = "asid-fast-switch", target_arch = "x86_64")))]
+const fn capacity_for_width() -> usize {
+    // x86 PCIDs are architecturally twelve bits wide.  PCID 0 is reserved
+    // for the conservative legacy/kernel path, leaving 1..=4095.
+    4095
 }
 
 /// Initializes the opt-in hardware-ASID allocator after TLB shootdown setup.
 pub(crate) fn init() {
-    #[cfg(all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    ))]
+    #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
     {
-        let capacity = capacity_for_width(axhal::asm::probe_asid_width());
-        if capacity == 0 {
-            assert!(
-                ALLOCATOR.lock().reject_invalid_width(),
-                "hardware ASID allocator initialized more than once"
-            );
-        } else {
-            assert!(
-                ALLOCATOR.lock().enable(capacity),
-                "hardware ASID allocator initialized more than once"
-            );
+        let cpu_count = axhal::cpu_num();
+        if !axhal::asm::pcid_bootstrap_complete(cpu_count) {
+            warn!("PCID/INVPCID unavailable on all {cpu_count} boot CPUs; using PCID 0");
+            // Leave the allocator permanently disabled for this boot.  No
+            // address space may obtain a nonzero identity after a failed
+            // capability gate.
+            return;
         }
+        let capacity = capacity_for_width();
+        assert!(
+            ALLOCATOR.lock().enable(capacity),
+            "hardware PCID allocator initialized more than once"
+        );
     }
 }
 
 /// Reserves a unique nonzero identity or returns the safe ASID-0 fallback.
 pub(super) fn reserve_hardware_address_space_id() -> HardwareAddressSpaceId {
-    #[cfg(all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    ))]
+    #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
     {
         let decision = ALLOCATOR.lock().reserve();
         match decision {
@@ -394,6 +341,29 @@ mod tests {
         assert_eq!(capacity_for_width_and_max(17, 16), 0);
         assert_eq!(capacity_for_width_and_max(10, 10), 1_023);
         assert_eq!(capacity_for_width_and_max(11, 10), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_pcid_capacity_assigns_one_through_4095_and_never_reuses() {
+        assert_eq!(capacity_for_width(), 4095);
+        let mut allocator = AllocatorState::disabled();
+        assert!(allocator.enable(capacity_for_width()));
+        for expected in 1..=4095 {
+            assert_eq!(
+                allocator.reserve(),
+                ReserveDecision::Assigned(HardwareAddressSpaceId::new(expected, BOOT_GENERATION))
+            );
+        }
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
+        assert_eq!(allocator.status, AllocatorStatus::Exhausted);
+        assert_eq!(
+            allocator.reserve(),
+            ReserveDecision::Legacy(AddressSpaceFallbackReason::Exhausted)
+        );
     }
 
     #[test]

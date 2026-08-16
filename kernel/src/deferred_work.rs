@@ -25,7 +25,7 @@ impl DeferredWorkAccount {
     /// violated.
     pub(crate) fn begin(&self) -> bool {
         self.pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 pending.checked_add(1)
             })
             .is_ok()

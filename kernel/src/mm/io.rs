@@ -4,9 +4,10 @@ use core::mem::{self, MaybeUninit};
 use axerrno::{AxError, AxResult};
 use axio::prelude::*;
 use bytemuck::AnyBitPattern;
-use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
-use super::{check_user_readable, check_user_writable};
+use super::{
+    UserMemoryCapability, check_user_readable_with, check_user_writable_with, map_usercopy_error,
+};
 
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
@@ -66,12 +67,17 @@ impl ImportedIoVecs {
 }
 
 pub struct IoVectorBuf {
+    capability: UserMemoryCapability,
     iovs: ImportedIoVecs,
     len: usize,
 }
 
 impl IoVectorBuf {
-    pub fn new(iovs: *const IoVec, iovcnt: usize) -> AxResult<Self> {
+    pub fn new(
+        capability: UserMemoryCapability,
+        iovs: *const IoVec,
+        iovcnt: usize,
+    ) -> AxResult<Self> {
         if iovcnt > 1024 {
             return Err(AxError::InvalidInput);
         }
@@ -79,12 +85,14 @@ impl IoVectorBuf {
             let bytes = iovcnt
                 .checked_mul(mem::size_of::<IoVec>())
                 .ok_or(AxError::BadAddress)?;
-            check_user_readable(iovs as usize, bytes)?;
+            check_user_readable_with(&capability, iovs as usize, bytes)?;
         }
         let mut imported = ImportedIoVecs::with_capacity(iovcnt)?;
         let mut len: usize = 0;
         for i in 0..iovcnt {
-            let iov = iovs.wrapping_add(i).vm_read()?;
+            let iov = capability
+                .read_value(iovs.wrapping_add(i))
+                .map_err(map_usercopy_error)?;
             if iov.iov_len < 0 {
                 return Err(AxError::InvalidInput);
             }
@@ -94,6 +102,7 @@ impl IoVectorBuf {
             imported.push(iov);
         }
         Ok(Self {
+            capability,
             iovs: imported,
             len,
         })
@@ -151,7 +160,7 @@ impl IoVectorBuf {
             if len == 0 {
                 continue;
             }
-            check_user_readable(iov.iov_base as usize, len)?;
+            check_user_readable_with(&self.capability, iov.iov_base as usize, len)?;
         }
         Ok(())
     }
@@ -162,7 +171,7 @@ impl IoVectorBuf {
             if len == 0 {
                 continue;
             }
-            check_user_writable(iov.iov_base as usize, len)?;
+            check_user_writable_with(&self.capability, iov.iov_base as usize, len)?;
         }
         Ok(())
     }
@@ -173,6 +182,10 @@ impl IoVectorBuf {
             start: 0,
             offset: 0,
         }
+    }
+
+    pub fn capability(&self) -> &UserMemoryCapability {
+        &self.capability
     }
 }
 
@@ -214,9 +227,25 @@ impl Read for IoVectorBufIo {
             if len == 0 {
                 break;
             }
-            vm_read_slice(iov.iov_base.wrapping_add(self.offset), unsafe {
-                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buf[count..count + len])
-            })?;
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    buf[count..count + len]
+                        .as_mut_ptr()
+                        .cast::<MaybeUninit<u8>>(),
+                    len,
+                )
+            };
+            if let Err(error) = self
+                .inner
+                .capability
+                .read_slice(iov.iov_base.wrapping_add(self.offset), dst)
+                .map_err(map_usercopy_error)
+            {
+                // A successful prefix is observable progress for axio's
+                // read contract. Keep the failed iovec untouched so the
+                // caller can retry it on the next call.
+                return if count != 0 { Ok(count) } else { Err(error) };
+            }
             self.offset += len;
             self.inner.len -= len;
             count += len;
@@ -243,10 +272,19 @@ impl Write for IoVectorBufIo {
             if len == 0 {
                 break;
             }
-            vm_write_slice(
-                iov.iov_base.wrapping_add(self.offset),
-                &buf[count..count + len],
-            )?;
+            if let Err(error) = self
+                .inner
+                .capability
+                .write_bytes(
+                    iov.iov_base.wrapping_add(self.offset) as usize,
+                    &buf[count..count + len],
+                )
+                .map_err(map_usercopy_error)
+            {
+                // As with Read, report a completed prefix and leave the
+                // faulting iovec's offset/remaining state unchanged.
+                return if count != 0 { Ok(count) } else { Err(error) };
+            }
             self.offset += len;
             self.inner.len -= len;
             count += len;
@@ -273,10 +311,22 @@ impl IoBufMut for IoVectorBufIo {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
     use super::*;
 
     #[repr(align(512))]
     struct Aligned([u8; 2048]);
+
+    fn test_capability() -> UserMemoryCapability {
+        UserMemoryCapability::new(Arc::new(Mutex::new(
+            super::super::AddrSpace::new_empty(VirtAddr::from(0x1000), 0x1000).unwrap(),
+        )))
+    }
 
     fn imported_iov(entries: &[IoVec], len: usize) -> IoVectorBuf {
         let mut imported = ImportedIoVecs::with_capacity(entries.len()).unwrap();
@@ -284,9 +334,194 @@ mod tests {
             imported.push(*entry);
         }
         IoVectorBuf {
+            capability: test_capability(),
             iovs: imported,
             len,
         }
+    }
+
+    fn mapped_capability() -> UserMemoryCapability {
+        let mut address_space =
+            super::super::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 4).unwrap();
+        for base in [0x1000, 0x3000] {
+            address_space
+                .map(
+                    VirtAddr::from(base),
+                    PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                    false,
+                    super::super::Backend::new_alloc(VirtAddr::from(base), PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
+
+    #[test]
+    fn iovec_descriptor_and_payload_boundaries_use_the_capability() {
+        let capability = mapped_capability();
+        let descriptor = IoVec {
+            iov_base: 0x3000 as *mut u8,
+            iov_len: PAGE_SIZE_4K as isize,
+        };
+        // The descriptor page is mapped, and the payload page is mapped. The
+        // constructor must import both through the selected address space.
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
+                .unwrap();
+        }
+        let imported = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
+        assert_eq!(imported.entry(0).unwrap().iov_len, PAGE_SIZE_4K as isize);
+        imported.check_readable().unwrap();
+
+        // The descriptor itself crosses from the mapped 0x1000 page into an
+        // unmapped page, so it must fail before any payload validation.
+        assert!(matches!(
+            IoVectorBuf::new(capability.clone(), 0x1ff8 as *const IoVec, 1),
+            Err(AxError::BadAddress)
+        ));
+
+        // The descriptor is valid, but a payload one byte beyond the mapped
+        // page must be rejected by the separate payload check.
+        let crossing = IoVec {
+            iov_base: 0x3000 as *mut u8,
+            iov_len: PAGE_SIZE_4K as isize + 1,
+        };
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut IoVec, crossing)
+                .unwrap();
+        }
+        let imported = IoVectorBuf::new(capability, 0x1000 as *const IoVec, 1).unwrap();
+        assert!(matches!(
+            imported.check_readable(),
+            Err(AxError::BadAddress)
+        ));
+    }
+
+    fn imported_iov_with_capability(
+        capability: UserMemoryCapability,
+        entries: &[IoVec],
+    ) -> IoVectorBuf {
+        let mut imported = ImportedIoVecs::with_capacity(entries.len()).unwrap();
+        let mut len = 0;
+        for entry in entries {
+            imported.push(*entry);
+            len += entry.iov_len as usize;
+        }
+        IoVectorBuf {
+            capability,
+            iovs: imported,
+            len,
+        }
+    }
+
+    fn map_page(capability: &UserMemoryCapability, base: usize) {
+        capability
+            .address_space()
+            .lock()
+            .map(
+                VirtAddr::from(base),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                super::super::Backend::new_alloc(VirtAddr::from(base), PageSize::Size4K),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn read_reports_prefix_and_retries_the_failed_iovec() {
+        let capability = mapped_capability();
+        capability.write_bytes(0x1000, &[0x11]).unwrap();
+        let mut io = imported_iov_with_capability(
+            capability.clone(),
+            &[
+                IoVec {
+                    iov_base: 0x1000 as *mut u8,
+                    iov_len: 1,
+                },
+                IoVec {
+                    iov_base: 0x2000 as *mut u8,
+                    iov_len: 1,
+                },
+            ],
+        )
+        .into_io();
+
+        let mut output = [0u8; 2];
+        assert_eq!(io.read(&mut output), Ok(1));
+        assert_eq!(output[0], 0x11);
+        assert_eq!(io.remaining(), 1);
+
+        // The failed second iovec is not consumed, so a retry still reports
+        // its original usercopy error and leaves the state unchanged.
+        let mut retry = [0u8; 1];
+        assert_eq!(io.read(&mut retry), Err(AxError::BadAddress));
+        assert_eq!(io.remaining(), 1);
+
+        map_page(&capability, 0x2000);
+        capability.write_bytes(0x2000, &[0x22]).unwrap();
+        assert_eq!(io.read(&mut retry), Ok(1));
+        assert_eq!(retry[0], 0x22);
+        assert_eq!(io.remaining(), 0);
+    }
+
+    #[test]
+    fn write_reports_prefix_and_retries_the_failed_iovec() {
+        let capability = mapped_capability();
+        let mut io = imported_iov_with_capability(
+            capability.clone(),
+            &[
+                IoVec {
+                    iov_base: 0x1000 as *mut u8,
+                    iov_len: 1,
+                },
+                IoVec {
+                    iov_base: 0x2000 as *mut u8,
+                    iov_len: 1,
+                },
+            ],
+        )
+        .into_io();
+
+        assert_eq!(io.write(&[0x31, 0x32]), Ok(1));
+        assert_eq!(io.remaining(), 1);
+        let mut first = [MaybeUninit::<u8>::uninit()];
+        capability.read_bytes(0x1000, &mut first).unwrap();
+        // SAFETY: the explicit capability read initialized the byte.
+        assert_eq!(unsafe { first[0].assume_init() }, 0x31);
+
+        assert_eq!(io.write(&[0x32]), Err(AxError::BadAddress));
+        assert_eq!(io.remaining(), 1);
+
+        map_page(&capability, 0x2000);
+        assert_eq!(io.write(&[0x32]), Ok(1));
+        assert_eq!(io.remaining(), 0);
+        let mut second = [MaybeUninit::<u8>::uninit()];
+        capability.read_bytes(0x2000, &mut second).unwrap();
+        // SAFETY: the explicit capability read initialized the byte.
+        assert_eq!(unsafe { second[0].assume_init() }, 0x32);
+    }
+
+    #[test]
+    fn first_iovec_fault_preserves_error_and_state() {
+        let capability = mapped_capability();
+        let entries = [IoVec {
+            iov_base: 0x2000 as *mut u8,
+            iov_len: 1,
+        }];
+
+        let mut reader = imported_iov_with_capability(capability.clone(), &entries).into_io();
+        let mut output = [0xa5u8];
+        assert_eq!(reader.read(&mut output), Err(AxError::BadAddress));
+        assert_eq!(output, [0xa5]);
+        assert_eq!(reader.remaining(), 1);
+
+        let mut writer = imported_iov_with_capability(capability, &entries).into_io();
+        assert_eq!(writer.write(&[0x5a]), Err(AxError::BadAddress));
+        assert_eq!(writer.remaining(), 1);
     }
 
     #[test]

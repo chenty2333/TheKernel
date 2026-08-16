@@ -2,20 +2,18 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use axfs::FS_CONTEXT;
 use axhal::{power::system_off, uspace::UserContext};
-use axsync::{Mutex, spin::SpinNoIrq};
+use axsync::Mutex;
 use axtask::{
     AxTaskExt, SchedState, current, prepare_task_with_sched_from, publish_prepared_task,
     reserve_prepared_task,
 };
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_seccomp::SeccompState;
+use thekernel_linux_signal::api::{SharedSignalActions, SignalActions};
 
 use crate::{
     file::{FD_TABLE, FdTable, executable, init_fd_scope_default, try_new_process_scope},
-    mm::{
-        copy_from_kernel, load_user_app_trusted, mark_page_fault_thread_context_ready,
-        new_user_aspace_empty,
-    },
+    mm::{copy_from_kernel, load_user_app_trusted, new_user_aspace_empty},
     pseudofs::{self, dev::tty::N_TTY},
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
@@ -31,13 +29,13 @@ pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
     crate::mm::init_tlb_shootdown();
+    crate::syscall::init_membarrier_ipi();
     crate::mm::init_hardware_asids();
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
         system_off();
     }
-    mark_page_fault_thread_context_ready();
     init_fd_scope_default().expect("Failed to initialize real fd scope default");
 
     {
@@ -145,8 +143,8 @@ pub fn init(args: &[String], envs: &[String]) {
     let aspace = Arc::try_new(Mutex::new(uspace)).expect("Failed to allocate init address space");
     let access_state = ProcessAccessState::try_new(Dumpability::UserDumpable, user_ns.clone())
         .expect("Failed to allocate init process access state");
-    let signal_actions =
-        Arc::try_new(SpinNoIrq::new(Default::default())).expect("Failed to allocate init signals");
+    let signal_actions = SharedSignalActions::try_new(SignalActions::default())
+        .expect("Failed to allocate init signals");
     let init_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init fd-table identity"))
             .expect("Failed to allocate init fd table");

@@ -1,3 +1,4 @@
+use alloc::string::String;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult};
@@ -10,7 +11,7 @@ use linux_raw_sys::general::{
 
 use crate::{
     file::{FileLike, ResolveAtResult, add_file_like, inotify::InotifyFile, resolve_at},
-    mm::vm_load_string,
+    mm::{UserMemoryCapability, map_usercopy_error},
 };
 
 const ALL_INOTIFY_BITS: u32 = IN_ACCESS
@@ -49,7 +50,12 @@ pub fn sys_inotify_init1(flags: i32) -> AxResult<isize> {
     .map(|fd| fd as isize)
 }
 
-pub fn sys_inotify_add_watch(fd: i32, pathname: *const c_char, mask: u32) -> AxResult<isize> {
+pub fn sys_inotify_add_watch(
+    memory: UserMemoryCapability,
+    fd: i32,
+    pathname: *const c_char,
+    mask: u32,
+) -> AxResult<isize> {
     if mask & !ALL_INOTIFY_BITS != 0 || mask & ALL_INOTIFY_BITS == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -58,7 +64,12 @@ pub fn sys_inotify_add_watch(fd: i32, pathname: *const c_char, mask: u32) -> AxR
     }
 
     let inotify = crate::file::inotify::InotifyFile::from_fd(fd)?;
-    let pathname = vm_load_string(pathname)?;
+    let pathname = String::from_utf8(
+        memory
+            .load_until_nul(pathname.cast::<u8>())
+            .map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)?;
     let resolve_flags = if mask & IN_DONT_FOLLOW != 0 {
         AT_SYMLINK_NOFOLLOW
     } else {

@@ -13,13 +13,45 @@ use x86_64::{
 };
 
 use super::{
+    TrapFrame,
     asm::{read_thread_pointer, write_thread_pointer},
     gdt,
-    trap::{err_code_to_flags, IRQ_VECTOR_END, IRQ_VECTOR_START, LEGACY_SYSCALL_VECTOR},
-    TrapFrame,
+    trap::{IRQ_VECTOR_END, IRQ_VECTOR_START, LEGACY_SYSCALL_VECTOR, err_code_to_flags},
 };
-
 pub use crate::uspace_common::{ExceptionKind, ReturnReason};
+
+/// Action selected by a final-return hook while interrupts are disabled.
+///
+/// The hook is deliberately policy-neutral. A scheduler, signal layer, or
+/// restartable-sequence adapter may inspect its own state and choose whether
+/// this user return may proceed, but `axcpu` does not interpret that policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserReturnHookAction {
+    /// Continue directly into the assembly user-entry path.
+    EnterUser,
+    /// Abort this attempt and let the caller retry in kernel context.
+    Retry,
+    /// Abort this attempt because the caller needs to handle a fault in
+    /// kernel context.
+    Fault,
+}
+
+/// Result of one [`UserContext::run_with_return_hook`] attempt.
+#[derive(Debug, Clone, Copy)]
+pub enum UserReturnHookResult {
+    /// User mode returned through the normal trap/interrupt classifier.
+    Returned(ReturnReason),
+    /// The hook rejected this attempt as transient.
+    Retry,
+    /// The hook rejected this attempt because kernel-side fault handling is
+    /// required before another user return.
+    Fault,
+}
+
+/// Concise aliases for callers that use the shorter return-hook vocabulary.
+pub type ReturnHookAction = UserReturnHookAction;
+/// Concise alias for [`UserReturnHookResult`].
+pub type ReturnHookResult = UserReturnHookResult;
 
 /// Context to enter user space.
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +101,29 @@ impl UserContext {
     ///
     /// This function returns when an exception or syscall occurs.
     pub fn run(&mut self) -> ReturnReason {
+        match self.run_with_return_hook(|_| UserReturnHookAction::EnterUser) {
+            UserReturnHookResult::Returned(reason) => reason,
+            UserReturnHookResult::Retry | UserReturnHookResult::Fault => {
+                unreachable!("the unconditional user-entry hook cannot reject a return")
+            }
+        }
+    }
+
+    /// Runs one user-return attempt with a final-return hook.
+    ///
+    /// Interrupts are disabled before `hook` is called. If it returns
+    /// [`UserReturnHookAction::EnterUser`], this method enters user mode
+    /// immediately without reopening interrupts in between; the assembly
+    /// path and the subsequent trap classifier preserve the existing entry
+    /// semantics. [`UserReturnHookAction::Retry`] and
+    /// [`UserReturnHookAction::Fault`] restore interrupts before returning to
+    /// the caller, so policy code can perform blocking/faulting work in task
+    /// context. The hook runs exactly once; a retry loop belongs to its
+    /// scheduler or ABI owner.
+    pub fn run_with_return_hook(
+        &mut self,
+        hook: impl FnOnce(&mut Self) -> UserReturnHookAction,
+    ) -> UserReturnHookResult {
         extern "C" {
             fn enter_user(uctx: &mut UserContext);
         }
@@ -77,6 +132,18 @@ impl UserContext {
         assert_eq!(self.ss, gdt::UDATA.0 as _);
 
         crate::asm::disable_irqs();
+
+        match hook(self) {
+            UserReturnHookAction::Retry => {
+                crate::asm::enable_irqs();
+                return UserReturnHookResult::Retry;
+            }
+            UserReturnHookAction::Fault => {
+                crate::asm::enable_irqs();
+                return UserReturnHookResult::Fault;
+            }
+            UserReturnHookAction::EnterUser => {}
+        }
 
         let kernel_fs_base = read_thread_pointer();
         unsafe { write_thread_pointer(self.fs_base as _) };
@@ -108,7 +175,7 @@ impl UserContext {
         };
 
         crate::asm::enable_irqs();
-        ret
+        UserReturnHookResult::Returned(ret)
     }
 }
 

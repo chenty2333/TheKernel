@@ -6,6 +6,7 @@ use alloc::{
 };
 use core::{
     fmt::Write as _,
+    mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
@@ -14,8 +15,10 @@ use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::*;
-use starry_process::Pid;
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
+};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
@@ -23,6 +26,7 @@ use super::{
     PreparedIpcPermissionUpdate, next_ipc_id,
 };
 use crate::{
+    mm::map_usercopy_error,
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
     time::wall_time,
 };
@@ -54,6 +58,71 @@ pub struct msqid_ds {
     pub msg_lspid: __kernel_pid_t,
     /// pid of last msgrcv()
     pub msg_lrpid: __kernel_pid_t,
+}
+
+// These IPC records contain explicit Linux ABI padding (and `IpcPerm` has an
+// alignment hole before its two native-word fields).  Keep the x86_64 layout
+// checked and materialize a zeroed copy before the audited unchecked copyout
+// so no Rust padding bytes escape to userspace.
+const _: () = {
+    assert!(align_of::<IpcPerm>() == 8);
+    assert!(size_of::<IpcPerm>() == 48);
+    assert!(offset_of!(IpcPerm, key) == 0);
+    assert!(offset_of!(IpcPerm, mode) == 20);
+    assert!(offset_of!(IpcPerm, unused0) == 32);
+    assert!(offset_of!(IpcPerm, unused1) == 40);
+    assert!(align_of::<msqid_ds>() == 8);
+    assert!(size_of::<msqid_ds>() == 104);
+    assert!(offset_of!(msqid_ds, msg_perm) == 0);
+    assert!(offset_of!(msqid_ds, msg_stime) == 48);
+    assert!(offset_of!(msqid_ds, msg_rtime) == 56);
+    assert!(offset_of!(msqid_ds, msg_ctime) == 64);
+    assert!(offset_of!(msqid_ds, msg_cbytes) == 72);
+    assert!(offset_of!(msqid_ds, msg_qnum) == 80);
+    assert!(offset_of!(msqid_ds, msg_qbytes) == 88);
+    assert!(offset_of!(msqid_ds, msg_lspid) == 96);
+    assert!(offset_of!(msqid_ds, msg_lrpid) == 100);
+};
+
+fn initialized_msqid_ds(value: msqid_ds) -> msqid_ds {
+    // SAFETY: all fields are integer scalars; zero is a valid representation,
+    // and starting from zero also initializes the alignment padding.
+    let mut result: msqid_ds = unsafe { core::mem::zeroed() };
+    // SAFETY: `IpcPerm` is integer-only; zeroing first prevents its implicit
+    // four-byte alignment hole from containing uninitialized data.
+    let mut perm: IpcPerm = unsafe { core::mem::zeroed() };
+    perm.key = value.msg_perm.key;
+    perm.uid = value.msg_perm.uid;
+    perm.gid = value.msg_perm.gid;
+    perm.cuid = value.msg_perm.cuid;
+    perm.cgid = value.msg_perm.cgid;
+    perm.mode = value.msg_perm.mode;
+    perm.pad1 = value.msg_perm.pad1;
+    perm.seq = value.msg_perm.seq;
+    perm.pad2 = value.msg_perm.pad2;
+    perm.unused0 = value.msg_perm.unused0;
+    perm.unused1 = value.msg_perm.unused1;
+    result.msg_perm = perm;
+    result.msg_stime = value.msg_stime;
+    result.msg_rtime = value.msg_rtime;
+    result.msg_ctime = value.msg_ctime;
+    result.msg_cbytes = value.msg_cbytes;
+    result.msg_qnum = value.msg_qnum;
+    result.msg_qbytes = value.msg_qbytes;
+    result.msg_lspid = value.msg_lspid;
+    result.msg_lrpid = value.msg_lrpid;
+    result
+}
+
+fn write_msqid_ds<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut msqid_ds,
+    value: msqid_ds,
+) -> AxResult<()> {
+    // SAFETY: `initialized_msqid_ds` zeroes every byte, including the ABI
+    // alignment hole, and the layout assertions cover the complete record.
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_msqid_ds(value)) }
+        .map_err(map_usercopy_error)
 }
 
 impl msqid_ds {
@@ -91,6 +160,23 @@ pub struct Message {
     pub mtype: i64,
     /// message data
     pub data: Vec<u8>,
+}
+
+struct ReceivedMessage {
+    message: Message,
+    copy_len: usize,
+    removed_waiters: Option<Arc<axtask::WaitQueue>>,
+}
+
+fn snapshot_message(message: &Message) -> AxResult<Message> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(message.data.len())
+        .map_err(|_| AxError::NoMemory)?;
+    data.extend_from_slice(&message.data);
+    Ok(Message {
+        mtype: message.mtype,
+        data,
+    })
 }
 
 /// This struct is used to maintain the message queue in kernel.
@@ -454,7 +540,22 @@ struct MsgInfo {
     msgssz: i32,
     msgtql: i32,
     msgseg: u16,
+    __padding: u16,
 }
+
+const _: () = {
+    assert!(align_of::<MsgInfo>() == 4);
+    assert!(size_of::<MsgInfo>() == 32);
+    assert!(offset_of!(MsgInfo, msgpool) == 0);
+    assert!(offset_of!(MsgInfo, msgmap) == 4);
+    assert!(offset_of!(MsgInfo, msgmax) == 8);
+    assert!(offset_of!(MsgInfo, msgmnb) == 12);
+    assert!(offset_of!(MsgInfo, msgmni) == 16);
+    assert!(offset_of!(MsgInfo, msgssz) == 20);
+    assert!(offset_of!(MsgInfo, msgtql) == 24);
+    assert!(offset_of!(MsgInfo, msgseg) == 28);
+    assert!(offset_of!(MsgInfo, __padding) == 30);
+};
 
 impl MsgInfo {
     fn ipc_info() -> Self {
@@ -467,6 +568,7 @@ impl MsgInfo {
             msgssz: 16,
             msgtql: MSGMNB as i32,
             msgseg: u16::MAX,
+            __padding: 0,
         }
     }
 
@@ -591,7 +693,8 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
     Ok(msqid as isize)
 }
 
-pub fn sys_msgsnd(
+pub fn sys_msgsnd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     msqid: i32,
     msgp: *const UserMsgbuf,
     msgsz: usize,
@@ -617,7 +720,7 @@ pub fn sys_msgsnd(
 
     // read message from user space
     let mtype_ptr = unsafe { core::ptr::addr_of!((*msgp).mtype) };
-    let mtype: i64 = mtype_ptr.vm_read()?;
+    let mtype: i64 = VmPtr::vm_read(mtype_ptr, memory).map_err(map_usercopy_error)?;
 
     if mtype <= 0 {
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - invalid message type
@@ -625,7 +728,7 @@ pub fn sys_msgsnd(
 
     // read data part
     let mtext_ptr = unsafe { core::ptr::addr_of!((*msgp).mtext) };
-    let data_vec = vm_load(mtext_ptr.cast::<u8>(), msgsz)?;
+    let data_vec = vm_load(memory, mtext_ptr.cast::<u8>(), msgsz).map_err(map_usercopy_error)?;
 
     loop {
         let waiters = {
@@ -701,7 +804,76 @@ fn find_msgrcv_message(
     matched_message.map(|(index, ..)| (index, true))
 }
 
-pub fn sys_msgrcv(
+fn prepare_received_message(
+    msg_queue: &mut MessageQueue,
+    msgtyp: i64,
+    msgsz: usize,
+    flags: &MsgRcvFlags,
+    current_pid: __kernel_pid_t,
+) -> AxResult<Option<ReceivedMessage>> {
+    let Some((index, should_remove)) = find_msgrcv_message(msg_queue, msgtyp, flags) else {
+        return Ok(None);
+    };
+
+    let data_len = msg_queue
+        .get_message_by_index(index)
+        .ok_or(AxError::from(LinuxError::ENOMSG))?
+        .data
+        .len();
+    if data_len > msgsz && !flags.contains(MsgRcvFlags::MSG_NOERROR) {
+        return Err(AxError::from(LinuxError::E2BIG));
+    }
+
+    // Snapshot the selected message while the queue is locked, then perform
+    // all potentially faulting usercopy after the lock is released. A normal
+    // receive unlinks the message before copyout, so EFAULT still consumes it.
+    // MSG_COPY is nondestructive: retain an owned snapshot but leave queue
+    // contents and receive metadata unchanged even on EFAULT.
+    let message = if should_remove {
+        msg_queue.remove_message_by_index(index)?
+    } else {
+        snapshot_message(
+            msg_queue
+                .get_message_by_index(index)
+                .ok_or(AxError::from(LinuxError::ENOMSG))?,
+        )?
+    };
+
+    if should_remove {
+        msg_queue.msqid_ds.msg_lrpid = current_pid as _;
+        msg_queue.msqid_ds.msg_rtime = ipc_time_secs();
+    }
+
+    Ok(Some(ReceivedMessage {
+        copy_len: message.data.len().min(msgsz),
+        message,
+        removed_waiters: should_remove.then(|| msg_queue.waiters.clone()),
+    }))
+}
+
+fn copy_received_message<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    msgp: *mut UserMsgbuf,
+    received: ReceivedMessage,
+) -> AxResult<isize> {
+    // Keep mtype-before-payload order so a payload fault has the same
+    // partial-copy behavior as the old path.
+    let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
+    VmMutPtr::vm_write(mtype_ptr, memory, received.message.mtype).map_err(map_usercopy_error)?;
+
+    let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
+    vm_write_slice(
+        memory,
+        data_ptr.cast::<u8>(),
+        &received.message.data[..received.copy_len],
+    )
+    .map_err(map_usercopy_error)?;
+
+    Ok(received.copy_len as isize)
+}
+
+pub fn sys_msgrcv<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     msqid: i32,
     msgp: *mut UserMsgbuf,
     msgsz: usize,
@@ -736,7 +908,7 @@ pub fn sys_msgrcv(
     };
 
     loop {
-        let waiters = {
+        let (received, waiters) = {
             let mut msg_queue = msg_queue.lock();
 
             // Permission check
@@ -748,58 +920,32 @@ pub fn sys_msgrcv(
                 return Err(AxError::from(LinuxError::EIDRM)); // EIDRM
             }
 
-            if let Some((index, should_remove)) = find_msgrcv_message(&msg_queue, msgtyp, &flags) {
-                // Message size check
-                let data_len = msg_queue
-                    .get_message_by_index(index)
-                    .ok_or(AxError::from(LinuxError::ENOMSG))?
-                    .data
-                    .len();
-                if data_len > msgsz && !flags.contains(MsgRcvFlags::MSG_NOERROR) {
-                    return Err(AxError::from(LinuxError::E2BIG)); // E2BIG
-                }
-
-                let copy_len = {
-                    let message = msg_queue
-                        .get_message_by_index(index)
-                        .ok_or(AxError::from(LinuxError::ENOMSG))?;
-                    let copy_len = message.data.len().min(msgsz);
-
-                    // Write mtype
-                    let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
-                    mtype_ptr.vm_write(message.mtype)?;
-
-                    // Write data part
-                    let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
-                    vm_write_slice(data_ptr.cast::<u8>(), &message.data[..copy_len])?;
-
-                    copy_len
-                };
-
-                if should_remove {
-                    msg_queue.remove_message_by_index(index)?;
-                }
-
-                msg_queue.msqid_ds.msg_lrpid = current_pid as _;
-                msg_queue.msqid_ds.msg_rtime = ipc_time_secs();
-
-                if should_remove {
-                    msg_queue.waiters.notify_all(false);
-                }
-
-                return Ok(copy_len as isize);
-            }
-
-            if flags.contains(MsgRcvFlags::IPC_NOWAIT) {
+            if let Some(received) = prepare_received_message(
+                &mut msg_queue,
+                msgtyp,
+                msgsz,
+                &flags,
+                current_pid as __kernel_pid_t,
+            )? {
+                (Some(received), None)
+            } else if flags.contains(MsgRcvFlags::IPC_NOWAIT) {
                 return Err(AxError::from(LinuxError::ENOMSG)); // ENOMSG
+            } else {
+                (None, Some(msg_queue.waiters.clone()))
             }
-
-            msg_queue.waiters.clone()
         };
+
+        if let Some(received) = received {
+            if let Some(waiters) = received.removed_waiters.as_ref() {
+                waiters.notify_all(false);
+            }
+            return copy_received_message(memory, msgp, received);
+        }
 
         if has_pending_syscall_signal(thread) {
             return Err(AxError::Interrupted);
         }
+        let waiters = waiters.expect("blocking receive has a wait queue");
         with_proc_state_hint(ProcStateHint::Interruptible, || {
             waiters.wait_until_interruptible(|| {
                 let queue = msg_queue.lock();
@@ -812,7 +958,12 @@ pub fn sys_msgrcv(
     }
 }
 
-pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
+pub fn sys_msgctl<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    msqid: i32,
+    cmd: i32,
+    buf: usize,
+) -> AxResult<isize> {
     let current = current();
     let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
 
@@ -834,7 +985,10 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
         let msg_manager = MSG_MANAGER.lock();
         let info = MsgInfo::ipc_info();
         let ptr = buf as *mut MsgInfo;
-        ptr.vm_write(info)?;
+        // SAFETY: `MsgInfo` has an explicit initialized tail field for the
+        // Linux ABI's two-byte trailing padding; its integer layout is fixed
+        // by repr(C) and asserted below.
+        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, info) }.map_err(map_usercopy_error)?;
         return Ok(msg_manager.max_active_index());
     }
 
@@ -843,7 +997,8 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
         let msg_manager = MSG_MANAGER.lock();
         let info = MsgInfo::msg_info(&msg_manager);
         let ptr = buf as *mut MsgInfo;
-        ptr.vm_write(info)?;
+        // SAFETY: see the IPC_INFO copyout above.
+        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, info) }.map_err(map_usercopy_error)?;
         return Ok(msg_manager.max_active_index());
     }
     // MSG_STAT and MSG_STAT_ANY use an IPC index and return the real queue ID.
@@ -862,7 +1017,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
                 }
 
                 let ptr = buf as *mut msqid_ds;
-                ptr.vm_write(guard.msqid_ds)?;
+                write_msqid_ds(memory, ptr, guard.msqid_ds)?;
                 Ok(actual_msqid as isize)
             });
 
@@ -881,7 +1036,8 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     // usercopy and namespace ID mapping happen before the live queue lock is
     // acquired. No queue field is changed until every check has succeeded.
     let set_request = if cmd == IPC_SET {
-        let user_buf = (buf as *const msqid_ds).vm_read()?;
+        let user_buf =
+            VmPtr::vm_read(buf as *const msqid_ds, memory).map_err(map_usercopy_error)?;
         Some(MsgSetRequest {
             permission: context.map_permission_update(
                 user_buf.msg_perm.uid,
@@ -908,7 +1064,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
 
         // Copy queue status to user space
         let ptr = buf as *mut msqid_ds;
-        ptr.vm_write(msg_queue.msqid_ds)?;
+        write_msqid_ds(memory, ptr, msg_queue.msqid_ds)?;
 
         return Ok(0);
     }
@@ -1012,5 +1168,71 @@ mod credential_caller_tests {
             PreparedMsgSet::prepare(&context, &foreign.msqid_ds, request, 99),
             Err(AxError::OperationNotPermitted)
         ));
+    }
+}
+
+#[cfg(test)]
+mod receive_copyout_tests {
+    use core::mem::MaybeUninit;
+
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
+    use super::*;
+
+    struct FaultMemory;
+
+    // SAFETY: this provider deliberately faults every user access.
+    unsafe impl UserMemory for FaultMemory {
+        fn read(&mut self, _start: usize, _dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    fn queue_with_one_message() -> MessageQueue {
+        let mut queue = MessageQueue::new(1, 0o600, 1, 0, 0);
+        queue.enqueue_message(7, b"payload".to_vec()).unwrap();
+        queue
+    }
+
+    #[test]
+    fn receive_fault_consumes_normal_message_before_copyout() {
+        let mut queue = queue_with_one_message();
+        let flags = MsgRcvFlags::empty();
+        let received = prepare_received_message(&mut queue, 0, 64, &flags, 77)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.messages.len(), 0);
+
+        let mut provider = FaultMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            copy_received_message(&mut memory, 1 as *mut UserMsgbuf, received),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(queue.messages.len(), 0);
+    }
+
+    #[test]
+    fn msg_copy_fault_leaves_message_queued() {
+        let mut queue = queue_with_one_message();
+        let flags = MsgRcvFlags::MSG_COPY | MsgRcvFlags::IPC_NOWAIT;
+        let received = prepare_received_message(&mut queue, 0, 64, &flags, 77)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.messages.len(), 1);
+        assert_eq!(queue.total_bytes, b"payload".len());
+
+        let mut provider = FaultMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            copy_received_message(&mut memory, 1 as *mut UserMsgbuf, received),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(queue.messages.len(), 1);
+        assert_eq!(queue.total_bytes, b"payload".len());
     }
 }

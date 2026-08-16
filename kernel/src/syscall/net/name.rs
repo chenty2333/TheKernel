@@ -1,7 +1,6 @@
 use axerrno::{AxResult, LinuxError};
 use axnet::SocketOps;
 use linux_raw_sys::net::{sockaddr, socklen_t};
-use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
     SocketSyscallSnapshot, addr::SocketAddrExt, import_socket_output_after_policy,
@@ -9,25 +8,35 @@ use super::{
 };
 use crate::{
     file::{PinnedSocketDescription, SocketBackendKind},
-    mm::UserPtr,
+    mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
     task::security::{SocketSecurityContext, dispatch_socket},
 };
 
-fn read_socklen(addrlen: UserPtr<socklen_t>) -> AxResult<socklen_t> {
-    let addrlen = (addrlen.address().as_usize() as *mut socklen_t).vm_read()?;
+fn read_socklen(
+    capability: &UserMemoryCapability,
+    addrlen: UserPtr<socklen_t>,
+) -> AxResult<socklen_t> {
+    let addrlen = capability
+        .read_value(addrlen.address().as_usize() as *const socklen_t)
+        .map_err(map_usercopy_error)?;
     if addrlen > i32::MAX as socklen_t {
         return Err(axerrno::AxError::InvalidInput);
     }
     Ok(addrlen)
 }
 
-fn write_socklen(addrlen: UserPtr<socklen_t>, value: socklen_t) -> AxResult<()> {
-    (addrlen.address().as_usize() as *mut socklen_t)
-        .vm_write(value)
-        .map_err(Into::into)
+fn write_socklen(
+    capability: &UserMemoryCapability,
+    addrlen: UserPtr<socklen_t>,
+    value: socklen_t,
+) -> AxResult<()> {
+    capability
+        .write_value(addrlen.address().as_usize() as *mut socklen_t, value)
+        .map_err(map_usercopy_error)
 }
 
 pub fn sys_getsockname(
+    capability: UserMemoryCapability,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
@@ -43,9 +52,9 @@ pub fn sys_getsockname(
         // The backend result precedes output-capacity import, as in Linux's
         // getname -> move_addr_to_user sequence.
         let name = pinned.packet()?.get_name()?;
-        let mut length = read_socklen(addrlen)?;
-        write_socket_name(name, addr, &mut length)?;
-        write_socklen(addrlen, length)?;
+        let mut length = read_socklen(&capability, addrlen)?;
+        write_socket_name(&capability, name, addr, &mut length)?;
+        write_socklen(&capability, addrlen, length)?;
         return Ok(0);
     }
     let mut length = import_socket_output_after_policy(
@@ -55,11 +64,13 @@ pub fn sys_getsockname(
                 &socket_ref,
             ))
         },
-        || read_socklen(addrlen),
+        || read_socklen(&capability, addrlen),
     )?;
     if pinned.backend()? == SocketBackendKind::Netlink {
-        pinned.netlink()?.write_local_addr(addr, &mut length)?;
-        write_socklen(addrlen, length)?;
+        pinned
+            .netlink()?
+            .write_local_addr(&capability, addr, &mut length)?;
+        write_socklen(&capability, addrlen, length)?;
         return Ok(0);
     }
 
@@ -67,12 +78,13 @@ pub fn sys_getsockname(
     let local_addr = socket.local_addr()?;
     debug!("sys_getsockname <= fd: {fd}, addr: {local_addr:?}");
 
-    local_addr.write_to_user(addr, &mut length)?;
-    write_socklen(addrlen, length)?;
+    local_addr.write_to_user(&capability, addr, &mut length)?;
+    write_socklen(&capability, addrlen, length)?;
     Ok(0)
 }
 
 pub fn sys_getpeername(
+    capability: UserMemoryCapability,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
@@ -96,13 +108,13 @@ pub fn sys_getpeername(
                 &socket_ref,
             ))
         },
-        || read_socklen(addrlen),
+        || read_socklen(&capability, addrlen),
     )?;
     let socket = pinned.network()?;
     let peer_addr = socket.peer_addr()?;
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");
 
-    peer_addr.write_to_user(addr, &mut length)?;
-    write_socklen(addrlen, length)?;
+    peer_addr.write_to_user(&capability, addr, &mut length)?;
+    write_socklen(&capability, addrlen, length)?;
     Ok(0)
 }

@@ -1,17 +1,26 @@
+use core::mem::size_of;
+
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK};
-use starry_signal::SignalSet;
-use starry_vm::VmPtr;
+use thekernel_linux_signal::SignalSet;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
     file::{FileLike, add_file_like, signalfd::Signalfd},
-    syscall::signal::check_sigset_size,
+    mm::map_usercopy_error,
 };
 
 // SFD flag definitions (if not available in linux_raw_sys)
 const SFD_CLOEXEC: u32 = O_CLOEXEC;
 const SFD_NONBLOCK: u32 = O_NONBLOCK;
+
+fn check_signalfd_sigset_size(size: usize) -> AxResult<()> {
+    if size != size_of::<SignalSet>() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
 
 bitflags! {
     /// Flags for the `signalfd4` syscall.
@@ -37,13 +46,14 @@ bitflags! {
 /// * `mask` - Pointer to a signal set (sigset_t).
 /// * `sigsetsize` - The size (in bytes) of the mask pointed to by `mask`.
 /// * `flags` - Flags to control the operation.
-pub fn sys_signalfd4(
+pub fn sys_signalfd4<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     mask: *const SignalSet,
     sigsetsize: usize,
     flags: u32,
 ) -> AxResult<isize> {
-    check_sigset_size(sigsetsize)?;
+    check_signalfd_sigset_size(sigsetsize)?;
 
     let flags = SignalfdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
@@ -52,7 +62,11 @@ pub fn sys_signalfd4(
     }
 
     // Read the signal mask from user space before handling the request mode.
-    let mask = unsafe { mask.vm_read_uninit()?.assume_init() };
+    let mask = unsafe {
+        VmPtr::vm_read_uninit(mask, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
 
     // If fd is not -1, we should modify the existing signalfd
     if fd != -1 {
@@ -68,4 +82,16 @@ pub fn sys_signalfd4(
 
     // Add to file descriptor table
     add_file_like(signalfd as _, flags.contains(SignalfdFlags::CLOEXEC)).map(|fd| fd as _)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigset_size_must_match_kernel_signal_set() {
+        assert!(check_signalfd_sigset_size(0).is_err());
+        assert!(check_signalfd_sigset_size(size_of::<SignalSet>()).is_ok());
+        assert!(check_signalfd_sigset_size(size_of::<SignalSet>() + 1).is_err());
+    }
 }

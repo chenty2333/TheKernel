@@ -1,4 +1,8 @@
-use core::ffi::{c_char, c_int};
+use alloc::string::String;
+use core::{
+    ffi::{c_char, c_int},
+    mem::{align_of, size_of},
+};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{DeviceId, Location, NodePermission, NodeType, path::Path};
@@ -11,7 +15,7 @@ use linux_raw_sys::general::{
     STATX_SUBVOL, STATX_TYPE, STATX_UID, STATX_WRITE_ATOMIC, W_OK, X_OK, stat, statfs, statx,
     statx_timestamp,
 };
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul};
 
 use super::ctl::validate_pathname;
 use crate::{
@@ -23,7 +27,7 @@ use crate::{
         },
         resolve_at, resolve_at_with_security, resolve_at_with_synthetic_credentials, with_path_fs,
     },
-    mm::vm_load_string,
+    mm::map_usercopy_error,
     mounts,
     task::AsThread,
 };
@@ -56,6 +60,58 @@ const STATX_CHANGE_COOKIE: u32 = 0x4000_0000;
 const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
+
+// `linux_raw_sys` exposes these UAPI records without bytemuck's `NoUninit`
+// marker.  The x86_64 Linux layouts contain ABI padding/tail storage that is
+// part of the object copied by stat-family syscalls, so keep the unchecked
+// copyout below tied to the generated layouts instead of dropping the check.
+const _: () = {
+    assert!(align_of::<stat>() == 8);
+    assert!(size_of::<stat>() == 144);
+    assert!(align_of::<statx>() == 8);
+    assert!(size_of::<statx>() == 256);
+    assert!(align_of::<statfs>() == 8);
+    assert!(size_of::<statfs>() == 120);
+};
+
+fn load_user_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<String> {
+    String::from_utf8(vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?)
+        .map_err(|_| AxError::IllegalBytes)
+}
+
+fn write_stat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    statbuf: *mut stat,
+    value: stat,
+) -> AxResult<()> {
+    // SAFETY: `stat` is an integer-only x86_64 UAPI record.  The layout
+    // assertions above cover its complete initialized object representation,
+    // including ABI padding and tail bytes.
+    unsafe { VmMutPtr::vm_write_unchecked(statbuf, memory, value) }.map_err(map_usercopy_error)
+}
+
+fn write_statx<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    statxbuf: *mut statx,
+    value: statx,
+) -> AxResult<()> {
+    // SAFETY: `statx` is a fully initialized integer-only x86_64 UAPI record;
+    // its complete object extent is checked above before this raw copyout.
+    unsafe { VmMutPtr::vm_write_unchecked(statxbuf, memory, value) }.map_err(map_usercopy_error)
+}
+
+fn write_statfs<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut statfs,
+    value: statfs,
+) -> AxResult<()> {
+    // SAFETY: `statfs` is integer-only on the supported x86_64 ABI and its
+    // complete object size/alignment are asserted above.
+    unsafe { VmMutPtr::vm_write_unchecked(buf, memory, value) }.map_err(map_usercopy_error)
+}
 
 fn node_type_from_mode(mode: u32) -> NodeType {
     NodeType::from(((mode & S_IFMT) >> 12) as u8)
@@ -127,30 +183,43 @@ fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
 ///
 /// Return 0 if success.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_stat(path: *const c_char, statbuf: *mut stat) -> AxResult<isize> {
+pub fn sys_stat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    statbuf: *mut stat,
+) -> AxResult<isize> {
     use linux_raw_sys::general::AT_FDCWD;
 
-    sys_fstatat(AT_FDCWD, path, statbuf, 0)
+    sys_fstatat(memory, AT_FDCWD, path, statbuf, 0)
 }
 
 /// Get file metadata by `fd` and write into `statbuf`.
 ///
 /// Return 0 if success.
-pub fn sys_fstat(fd: i32, statbuf: *mut stat) -> AxResult<isize> {
-    sys_fstatat(fd, core::ptr::null(), statbuf, AT_EMPTY_PATH)
+pub fn sys_fstat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    statbuf: *mut stat,
+) -> AxResult<isize> {
+    sys_fstatat(memory, fd, core::ptr::null(), statbuf, AT_EMPTY_PATH)
 }
 
 /// Get the metadata of the symbolic link and write into `buf`.
 ///
 /// Return 0 if success.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_lstat(path: *const c_char, statbuf: *mut stat) -> AxResult<isize> {
+pub fn sys_lstat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    statbuf: *mut stat,
+) -> AxResult<isize> {
     use linux_raw_sys::general::{AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 
-    sys_fstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
+    sys_fstatat(memory, AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
 }
 
-pub fn sys_fstatat(
+pub fn sys_fstatat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
     statbuf: *mut stat,
@@ -162,7 +231,10 @@ pub fn sys_fstatat(
     if path.is_null() && flags & AT_EMPTY_PATH == 0 {
         return Err(AxError::BadAddress);
     }
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| load_user_path(memory, path))
+        .transpose()?;
     if let Some(path) = path.as_deref() {
         if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
@@ -173,12 +245,13 @@ pub fn sys_fstatat(
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
-    statbuf.vm_write(loc.stat()?.into())?;
+    write_stat(memory, statbuf, loc.stat()?.into())?;
 
     Ok(0)
 }
 
-pub fn sys_statx(
+pub fn sys_statx<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: c_int,
     path: *const c_char,
     flags: u32,
@@ -212,7 +285,10 @@ pub fn sys_statx(
     //        below), then the target file is the one referred to by the
     //        file descriptor dirfd.
 
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| load_user_path(memory, path))
+        .transpose()?;
     debug!("sys_statx <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
     if flags & !SUPPORTED_STATX_FLAGS != 0 {
         return Err(AxError::InvalidInput);
@@ -237,20 +313,29 @@ pub fn sys_statx(
     }
 
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
-    statxbuf.vm_write(statx_from_kstat(loc.stat()?, mask))?;
+    write_statx(memory, statxbuf, statx_from_kstat(loc.stat()?, mask))?;
 
     Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_access(path: *const c_char, mode: u32) -> AxResult<isize> {
+pub fn sys_access<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
     use linux_raw_sys::general::AT_FDCWD;
 
-    sys_faccessat2(AT_FDCWD, path, mode, 0)
+    sys_faccessat2(memory, AT_FDCWD, path, mode, 0)
 }
 
-pub fn sys_faccessat(dirfd: c_int, path: *const c_char, mode: u32) -> AxResult<isize> {
-    sys_faccessat2(dirfd, path, mode, 0)
+pub fn sys_faccessat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    sys_faccessat2(memory, dirfd, path, mode, 0)
 }
 
 fn check_readonly_write_access(loc: &Location) -> AxResult {
@@ -261,8 +346,17 @@ fn check_readonly_write_access(loc: &Location) -> AxResult {
     }
 }
 
-pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) -> AxResult<isize> {
-    let path = path.nullable().map(vm_load_string).transpose()?;
+pub fn sys_faccessat2<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+    flags: u32,
+) -> AxResult<isize> {
+    let path = path
+        .nullable()
+        .map(|path| load_user_path(memory, path))
+        .transpose()?;
     debug!("sys_faccessat2 <= dirfd: {dirfd}, path: {path:?}, mode: {mode}, flags: {flags}");
 
     if mode & !(R_OK | W_OK | X_OK) != 0 {
@@ -375,8 +469,12 @@ fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
     None
 }
 
-pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+pub fn sys_statfs<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    buf: *mut statfs,
+) -> AxResult<isize> {
+    let path = load_user_path(memory, path)?;
     debug!("sys_statfs <= path: {path:?}");
     if path.is_empty() {
         return Err(AxError::NotFound);
@@ -390,20 +488,24 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
         fs.resolve_security(path_ref, &security)
     })?;
 
-    buf.vm_write(statfs(&loc.mountpoint().root_location())?)?;
+    write_statfs(memory, buf, statfs(&loc.mountpoint().root_location())?)?;
     Ok(0)
 }
 
-pub fn sys_fstatfs(fd: i32, buf: *mut statfs) -> AxResult<isize> {
+pub fn sys_fstatfs<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    buf: *mut statfs,
+) -> AxResult<isize> {
     debug!("sys_fstatfs <= fd: {fd}");
 
     let file = get_file_like(fd)?;
     if let Some(file) = file.downcast_ref::<File>() {
-        buf.vm_write(statfs(file.inner().location())?)?;
+        write_statfs(memory, buf, statfs(file.inner().location())?)?;
     } else if let Some(dir) = file.downcast_ref::<Directory>() {
-        buf.vm_write(statfs(dir.inner())?)?;
+        write_statfs(memory, buf, statfs(dir.inner())?)?;
     } else if let Some(result) = special_fd_statfs(file.as_ref()) {
-        buf.vm_write(result?)?;
+        write_statfs(memory, buf, result?)?;
     } else {
         return Err(AxError::InvalidInput);
     }

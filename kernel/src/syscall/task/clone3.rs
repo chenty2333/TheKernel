@@ -1,11 +1,11 @@
-use core::mem::{self, MaybeUninit};
+use core::{mem::MaybeUninit, slice};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use bytemuck::AnyBitPattern;
-use starry_vm::vm_read_slice;
 
 use super::clone::{CloneApi, CloneArgs, CloneFlags};
+use crate::mm::{UserMemoryCapability, map_usercopy_error};
 
 /// Structure passed to clone3() system call.
 #[repr(C)]
@@ -34,7 +34,7 @@ fn validate_extra_bytes(bytes: &[u8]) -> AxResult<()> {
         // sign, so `LinuxError::E2BIG.into()` and
         // `AxError::ArgumentListTooLong` compare unequal despite mapping to
         // the same errno. Keep the semantic kind here and let the Linux
-        // adapter perform the errno mapping, per RFC 0000.
+        // adapter perform the errno mapping at the Linux ABI boundary.
         Err(AxError::ArgumentListTooLong)
     } else {
         Ok(())
@@ -81,7 +81,12 @@ impl TryFrom<Clone3Args> for CloneArgs {
     }
 }
 
-pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<isize> {
+pub fn sys_clone3(
+    memory: UserMemoryCapability,
+    uctx: &UserContext,
+    args: *const u8,
+    size: usize,
+) -> AxResult<isize> {
     debug!("sys_clone3 <= args: {args:p}, size: {size}");
 
     if size < MIN_CLONE_ARGS_SIZE {
@@ -97,19 +102,29 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
     let known_size = size.min(CLONE3_ARGS_SIZE);
     // SAFETY: MaybeUninit<T> is compatible with T, and we're filling in the
     // buffer with bytes read from the user
-    vm_read_slice(args, unsafe {
-        mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buffer[..known_size])
-    })?;
+    let buffer_bytes = unsafe {
+        slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<MaybeUninit<u8>>(), known_size)
+    };
+    memory
+        .read_bytes(args as usize, buffer_bytes)
+        .map_err(map_usercopy_error)?;
     let mut remaining = size - known_size;
-    let mut extra_ptr = args.wrapping_add(known_size);
+    let mut extra_address = (args as usize)
+        .checked_add(known_size)
+        .ok_or(AxError::BadAddress)?;
     while remaining > 0 {
         let chunk_len = remaining.min(32);
         let mut chunk = [0u8; 32];
-        vm_read_slice(extra_ptr, unsafe {
-            mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut chunk[..chunk_len])
-        })?;
+        let chunk_bytes = unsafe {
+            slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<MaybeUninit<u8>>(), chunk_len)
+        };
+        memory
+            .read_bytes(extra_address, chunk_bytes)
+            .map_err(map_usercopy_error)?;
         validate_extra_bytes(&chunk[..chunk_len])?;
-        extra_ptr = extra_ptr.wrapping_add(chunk_len);
+        extra_address = extra_address
+            .checked_add(chunk_len)
+            .ok_or(AxError::BadAddress)?;
         remaining -= chunk_len;
     }
     let clone3_args: Clone3Args =
@@ -121,7 +136,7 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
     }
 
     let clone_args = CloneArgs::try_from(clone3_args)?;
-    clone_args.do_clone(uctx, CloneApi::Clone3)
+    clone_args.do_clone(uctx, CloneApi::Clone3, &memory)
 }
 
 #[cfg(test)]

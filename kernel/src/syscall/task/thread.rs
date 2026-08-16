@@ -1,7 +1,10 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
 
-use crate::task::AsThread;
+use crate::{
+    mm::{UserMemoryCapability, map_usercopy_error},
+    task::AsThread,
+};
 
 pub fn sys_getpid() -> AxResult<isize> {
     let curr = current();
@@ -57,12 +60,11 @@ pub fn sys_set_tid_address(clear_child_tid: usize) -> AxResult<isize> {
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(
+    memory: UserMemoryCapability,
     uctx: &mut axhal::uspace::UserContext,
     code: i32,
     addr: usize,
 ) -> AxResult<isize> {
-    use starry_vm::VmMutPtr;
-
     let code = ArchPrctlCode::try_from(code).map_err(|_| AxError::InvalidInput)?;
     debug!("sys_arch_prctl: code = {code:?}, addr = {addr:#x}");
 
@@ -70,7 +72,9 @@ pub fn sys_arch_prctl(
         // According to Linux implementation, SetFs & SetGs does not return
         // error at all
         ArchPrctlCode::GetFs => {
-            (addr as *mut usize).vm_write(uctx.tls())?;
+            memory
+                .write_value(addr as *mut usize, uctx.tls())
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         ArchPrctlCode::SetFs => {
@@ -78,7 +82,9 @@ pub fn sys_arch_prctl(
             Ok(0)
         }
         ArchPrctlCode::GetGs => {
-            (addr as *mut usize).vm_write(uctx.gs_base as _)?;
+            memory
+                .write_value(addr as *mut usize, uctx.gs_base as _)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         ArchPrctlCode::SetGs => {

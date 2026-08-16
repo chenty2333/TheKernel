@@ -17,7 +17,7 @@ use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN, O_CLOEXEC,
     mount_attr,
 };
-use starry_vm::VmPtr;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul};
 
 use crate::{
     file::{
@@ -25,7 +25,7 @@ use crate::{
         permission::{SecurityFsContextExt, VfsSecurityContext},
         resolve_at_with_security, with_path_fs,
     },
-    mm::vm_load_string,
+    mm::map_usercopy_error,
     mounts,
     pseudofs::{MemoryFs, cgroup},
     task::{AsThread, DacCredentialView},
@@ -147,6 +147,14 @@ const MOUNT_SETATTR_FLAGS: u32 =
     AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW;
 const MOUNT_ATTR_SIZE_VER0: usize = core::mem::size_of::<mount_attr>();
 const PAGE_SIZE: usize = 4096;
+
+fn load_user_string<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const c_char,
+) -> AxResult<String> {
+    String::from_utf8(vm_load_until_nul(memory, ptr.cast::<u8>()).map_err(map_usercopy_error)?)
+        .map_err(|_| AxError::IllegalBytes)
+}
 
 fn try_string(value: &str) -> AxResult<String> {
     let mut owned = String::new();
@@ -583,8 +591,12 @@ impl Pollable for FsMountFd {
     }
 }
 
-pub fn sys_fsopen(fs_name: *const c_char, flags: u32) -> AxResult<isize> {
-    let fs_name = vm_load_string(fs_name)?;
+pub fn sys_fsopen<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fs_name: *const c_char,
+    flags: u32,
+) -> AxResult<isize> {
+    let fs_name = load_user_string(memory, fs_name)?;
     debug!("sys_fsopen <= fs_name: {fs_name:?}, flags: {flags:#x}");
 
     if flags & !FSOPEN_CLOEXEC != 0 {
@@ -608,7 +620,8 @@ pub fn sys_fsopen(fs_name: *const c_char, flags: u32) -> AxResult<isize> {
     .map(|fd| fd as isize)
 }
 
-pub fn sys_fsconfig(
+pub fn sys_fsconfig<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     cmd: u32,
     key: *const c_char,
@@ -679,8 +692,8 @@ pub fn sys_fsconfig(
     match cmd {
         FSCONFIG_SET_FLAG => Err(AxError::OperationNotSupported),
         FSCONFIG_SET_STRING => {
-            let key = vm_load_string(key)?;
-            let value = vm_load_string(value as *const c_char)?;
+            let key = load_user_string(memory, key)?;
+            let value = load_user_string(memory, value as *const c_char)?;
             let entry_len = key.len() + value.len() + 2;
             if state.config_len.saturating_add(entry_len) > 4096 {
                 return Err(AxError::InvalidInput);
@@ -764,8 +777,13 @@ pub fn sys_fspick(_dirfd: i32, _pathname: *const c_char, _flags: u32) -> AxResul
     Err(AxError::OperationNotSupported)
 }
 
-pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
-    let path = vm_load_string(pathname)?;
+pub fn sys_open_tree<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    pathname: *const c_char,
+    flags: u32,
+) -> AxResult<isize> {
+    let path = load_user_string(memory, pathname)?;
     debug!("sys_open_tree <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
 
     if flags & !OPEN_TREE__MASK != 0 {
@@ -803,14 +821,15 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
     .map(|new_fd| new_fd as isize)
 }
 
-pub fn sys_mount_setattr(
+pub fn sys_mount_setattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     pathname: *const c_char,
     flags: u32,
     attr: *const mount_attr,
     size: usize,
 ) -> AxResult<isize> {
-    let path = vm_load_string(pathname)?;
+    let path = load_user_string(memory, pathname)?;
     debug!("sys_mount_setattr <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}, size: {size}");
 
     if flags & !MOUNT_SETATTR_FLAGS != 0 {
@@ -828,7 +847,11 @@ pub fn sys_mount_setattr(
         return Err(LinuxError::EPERM.into());
     }
 
-    let attr = unsafe { attr.vm_read_uninit()?.assume_init() };
+    let attr = unsafe {
+        attr.vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     if attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation == 0 {
         return Ok(0);
     }
@@ -872,15 +895,16 @@ pub fn sys_mount_setattr(
     Ok(0)
 }
 
-pub fn sys_move_mount(
+pub fn sys_move_mount<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     from_dirfd: i32,
     from_pathname: *const c_char,
     to_dirfd: i32,
     to_pathname: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    let from_path = vm_load_string(from_pathname)?;
-    let to_path = vm_load_string(to_pathname)?;
+    let from_path = load_user_string(memory, from_pathname)?;
+    let to_path = load_user_string(memory, to_pathname)?;
     debug!(
         "sys_move_mount <= from_dirfd: {from_dirfd}, from_path: {from_path:?}, to_dirfd: \
          {to_dirfd}, to_path: {to_path:?}, flags: {flags:#x}"
@@ -931,7 +955,8 @@ pub fn sys_move_mount(
     Ok(0)
 }
 
-pub fn sys_mount(
+pub fn sys_mount<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     source: *const c_char,
     target: *const c_char,
     fs_type: *const c_char,
@@ -941,13 +966,13 @@ pub fn sys_mount(
     let source = if source.is_null() {
         String::new()
     } else {
-        vm_load_string(source)?
+        load_user_string(memory, source)?
     };
-    let target = vm_load_string(target)?;
+    let target = load_user_string(memory, target)?;
     let fs_type = if fs_type.is_null() {
         String::new()
     } else {
-        vm_load_string(fs_type)?
+        load_user_string(memory, fs_type)?
     };
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
@@ -969,7 +994,7 @@ pub fn sys_mount(
     };
     let data_is_ignored = flags_u32 & (MS_BIND | MS_MOVE | MS_PROPAGATION_FLAGS) != 0;
     let data = if !data_is_ignored && !data.is_null() {
-        vm_load_string(data as *const c_char)?
+        load_user_string(memory, data as *const c_char)?
     } else {
         String::new()
     };
@@ -1113,11 +1138,15 @@ pub fn sys_mount(
     Ok(0)
 }
 
-pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
+pub fn sys_umount2<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    target: *const c_char,
+    flags: i32,
+) -> AxResult<isize> {
     if flags & !UMOUNT_FLAGS_VALID != 0 {
         return Err(AxError::InvalidInput);
     }
-    let target = vm_load_string(target)?;
+    let target = load_user_string(memory, target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());

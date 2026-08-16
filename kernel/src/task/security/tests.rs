@@ -140,7 +140,7 @@ static REMOVAL_VERTICAL_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn append_trace(trace: &AtomicU32, value: u32) {
     trace
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
             Some(old * 10 + value)
         })
         .unwrap();
@@ -1729,7 +1729,7 @@ impl<const KEY: u64> Drop for DroppingModule<KEY> {
     fn drop(&mut self) {
         let key = u32::try_from(KEY).expect("test key fits u32");
         MODULE_DROP_TRACE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |trace| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |trace| {
                 Some(trace * 10 + key)
             })
             .unwrap();
@@ -1789,7 +1789,7 @@ impl ExecPathwalkSecurityTestProbe {
         assert_eq!(context.access(), InodePermissionAccess::EXECUTE);
         self.observe_actor(context.actor());
         self.denial_trace
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |trace| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |trace| {
                 Some(trace * 10 + order)
             })
             .unwrap();

@@ -2,12 +2,13 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+pub use linkme::{
+    distributed_slice as def_trap_handler, distributed_slice as register_trap_handler,
+};
 use memory_addr::VirtAddr;
+pub use page_table_entry::MappingFlags as PageFaultFlags;
 
 pub use crate::TrapFrame;
-pub use linkme::distributed_slice as def_trap_handler;
-pub use linkme::distributed_slice as register_trap_handler;
-pub use page_table_entry::MappingFlags as PageFaultFlags;
 
 /// A slice of IRQ handler functions.
 #[def_trap_handler]
@@ -40,12 +41,7 @@ static IRQ_BOUNDARY_HOOK: AtomicUsize = AtomicUsize::new(0);
 #[must_use]
 pub fn register_irq_boundary_hook(hook: fn(IrqBoundary)) -> bool {
     let address = hook as usize;
-    match IRQ_BOUNDARY_HOOK.compare_exchange(
-        0,
-        address,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
+    match IRQ_BOUNDARY_HOOK.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => true,
         Err(existing) => existing == address,
     }

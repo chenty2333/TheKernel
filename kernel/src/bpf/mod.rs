@@ -7,7 +7,17 @@ pub mod prog;
 pub mod verifier;
 pub mod vm;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::{vec, vec::Vec};
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, Ordering},
+};
+
+use axerrno::AxError;
+use bytemuck::AnyBitPattern;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+
+use crate::mm::map_usercopy_error;
 
 static NEXT_MAP_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_PROG_ID: AtomicU32 = AtomicU32::new(1);
@@ -23,14 +33,11 @@ pub fn alloc_prog_id() -> u32 {
 
 /// Read bpf attr from user space. Reads `min(attr_size, size_of::<T>())` bytes,
 /// zero-fills the rest. This provides forward/backward compatibility.
-pub fn read_bpf_attr<T: bytemuck::AnyBitPattern>(
+pub fn read_bpf_attr<M: UserMemory + ?Sized, T: AnyBitPattern>(
+    memory: &mut UserMemoryContext<'_, M>,
     attr_ptr: usize,
     attr_size: u32,
 ) -> axerrno::AxResult<T> {
-    use alloc::vec;
-
-    use axerrno::AxError;
-
     let attr_size = attr_size as usize;
     let want = core::mem::size_of::<T>();
     if attr_size > BPF_ATTR_MAX_SIZE {
@@ -42,12 +49,10 @@ pub fn read_bpf_attr<T: bytemuck::AnyBitPattern>(
         return Err(AxError::InvalidInput);
     }
 
-    let src =
-        starry_vm::vm_load(attr_ptr as *const u8, copy_len).map_err(|_| AxError::BadAddress)?;
+    let src = read_user_bytes(memory, attr_ptr, copy_len)?;
     if attr_size > want {
         let tail_ptr = attr_ptr.checked_add(want).ok_or(AxError::InvalidInput)?;
-        let tail = starry_vm::vm_load(tail_ptr as *const u8, attr_size - want)
-            .map_err(|_| AxError::BadAddress)?;
+        let tail = read_user_bytes(memory, tail_ptr, attr_size - want)?;
         if tail.iter().any(|&byte| byte != 0) {
             return Err(AxError::ArgumentListTooLong);
         }
@@ -66,7 +71,8 @@ pub fn require_bpf_attr_range<T>(attr_size: u32, end: usize) -> axerrno::AxResul
     Ok(())
 }
 
-pub fn write_bpf_attr_value<TAttr, TValue: bytemuck::NoUninit>(
+pub fn write_bpf_attr_value<TAttr, TValue: bytemuck::NoUninit, M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     attr_ptr: usize,
     attr_size: u32,
     offset: usize,
@@ -78,7 +84,54 @@ pub fn write_bpf_attr_value<TAttr, TValue: bytemuck::NoUninit>(
         .checked_add(core::mem::size_of::<TValue>())
         .ok_or(AxError::InvalidInput)?;
     require_bpf_attr_range::<TAttr>(attr_size, end)?;
-    starry_vm::vm_write_slice((attr_ptr + offset) as *mut u8, bytemuck::bytes_of(value))
-        .map_err(|_| AxError::BadAddress)?;
+    let destination = attr_ptr.checked_add(offset).ok_or(AxError::InvalidInput)?;
+    memory
+        .write_bytes(destination, bytemuck::bytes_of(value))
+        .map_err(map_usercopy_error)?;
     Ok(())
+}
+
+/// Copies a byte range from the address space bound to this operation.
+pub fn read_user_bytes<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    len: usize,
+) -> axerrno::AxResult<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the provider
+    // initializes every byte before this function returns successfully.
+    let destination = unsafe {
+        core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
+    };
+    memory
+        .read_bytes(ptr, destination)
+        .map_err(map_usercopy_error)?;
+    Ok(bytes)
+}
+
+/// Copies a typed slice from the address space bound to this operation.
+pub fn read_user_slice<M: UserMemory + ?Sized, T: AnyBitPattern>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    len: usize,
+) -> axerrno::AxResult<Vec<T>> {
+    let mut values = vec![T::zeroed(); len];
+    // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the provider
+    // initializes every element before this function returns successfully.
+    let destination = unsafe {
+        core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<MaybeUninit<T>>(), len)
+    };
+    memory
+        .read_slice(ptr as *const T, destination)
+        .map_err(map_usercopy_error)?;
+    Ok(values)
+}
+
+/// Copies a byte range into the address space bound to this operation.
+pub fn write_user_bytes<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: usize,
+    bytes: &[u8],
+) -> axerrno::AxResult<()> {
+    memory.write_bytes(ptr, bytes).map_err(map_usercopy_error)
 }

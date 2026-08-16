@@ -14,20 +14,24 @@ use axtask::{
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, RLIMIT_NICE, SCHED_BATCH,
-    SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL,
-    SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
+    PRIO_USER, RLIMIT_NICE, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK,
+    SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
-use starry_process::{Pid, ProcessError};
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
+use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
+};
 
 use crate::{
+    mm::map_usercopy_error,
     task::{
-        AlarmClock, AsThread, Cred, ProcStateHint, get_process_group, get_task,
-        prepare_clock_sleep, process_domain,
+        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, get_process_group,
+        get_process_including_zombie, get_task, get_visible_task, prepare_clock_sleep,
+        process_domain,
         security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
-        try_tasks, with_proc_state_hint,
+        try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
     time::TimeValueLike,
 };
@@ -200,25 +204,33 @@ fn state_nice(state: SchedState) -> i32 {
     }
 }
 
-fn write_sched_attr_kernel_size(attr: *const SchedAttr) -> AxResult<()> {
+fn write_sched_attr_kernel_size<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    attr: *const SchedAttr,
+) -> AxResult<()> {
     let size_ptr = attr as *mut u32;
-    size_ptr.vm_write(size_of::<SchedAttr>() as u32)?;
+    VmMutPtr::vm_write(size_ptr, memory, size_of::<SchedAttr>() as u32)
+        .map_err(map_usercopy_error)?;
     Ok(())
 }
 
-fn read_sched_attr(attr: *const SchedAttr) -> AxResult<SchedAttr> {
-    let mut attr_size = attr.cast::<u32>().vm_read()? as usize;
+fn read_sched_attr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    attr: *const SchedAttr,
+) -> AxResult<SchedAttr> {
+    let mut attr_size =
+        VmPtr::vm_read(attr.cast::<u32>(), memory).map_err(map_usercopy_error)? as usize;
     if attr_size == 0 {
         attr_size = SCHED_ATTR_SIZE_VER0;
     }
     if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&attr_size) {
-        write_sched_attr_kernel_size(attr)?;
+        write_sched_attr_kernel_size(memory, attr)?;
         return Err(LinuxError::E2BIG.into());
     }
 
     let mut out = SchedAttr::default();
     let copy_size = attr_size.min(size_of::<SchedAttr>());
-    let src = vm_load(attr.cast::<u8>(), copy_size)?;
+    let src = vm_load(memory, attr.cast::<u8>(), copy_size).map_err(map_usercopy_error)?;
     let dst = unsafe {
         core::slice::from_raw_parts_mut((&mut out as *mut SchedAttr).cast::<u8>(), copy_size)
     };
@@ -226,11 +238,13 @@ fn read_sched_attr(attr: *const SchedAttr) -> AxResult<SchedAttr> {
 
     if attr_size > size_of::<SchedAttr>() {
         let extra = vm_load(
+            memory,
             attr.cast::<u8>().wrapping_add(size_of::<SchedAttr>()),
             attr_size - size_of::<SchedAttr>(),
-        )?;
+        )
+        .map_err(map_usercopy_error)?;
         if extra.iter().any(|byte| *byte != 0) {
-            write_sched_attr_kernel_size(attr)?;
+            write_sched_attr_kernel_size(memory, attr)?;
             return Err(LinuxError::E2BIG.into());
         }
     }
@@ -271,6 +285,9 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
         TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
         TaskSchedError::Scheduler(_) => AxError::InvalidInput,
     })?;
+    if let Some(thread) = task.try_as_thread() {
+        thread.proc_data.publish_scheduler_state(state);
+    }
     Ok(0)
 }
 
@@ -494,17 +511,29 @@ fn remaining_relative_sleep(req: TimeValue, actual: TimeValue) -> Option<TimeVal
 }
 
 /// Sleep some nanoseconds
-pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize> {
+pub fn sys_nanosleep<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    req: *const timespec,
+    rem: *mut timespec,
+) -> AxResult<isize> {
     // FIXME: AnyBitPattern
-    let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let req = unsafe {
+        req.vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    }
+    .try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
     let actual = sleep_relative(req)?;
 
     if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
-        if let Some(rem) = rem.nullable() {
-            rem.vm_write(timespec::from_time_value(diff))?;
+        if !rem.is_null() {
+            unsafe {
+                VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
+                    .map_err(map_usercopy_error)?;
+            }
         }
         Err(AxError::Interrupted)
     } else {
@@ -512,7 +541,8 @@ pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize
     }
 }
 
-pub fn sys_clock_nanosleep(
+pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     clock_id: __kernel_clockid_t,
     flags: u32,
     req: *const timespec,
@@ -531,7 +561,12 @@ pub fn sys_clock_nanosleep(
         }
     };
 
-    let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let req = unsafe {
+        req.vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    }
+    .try_into_time_value()?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
     if absolute {
@@ -555,8 +590,11 @@ pub fn sys_clock_nanosleep(
 
         if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
-            if let Some(rem) = rem.nullable() {
-                rem.vm_write(timespec::from_time_value(diff))?;
+            if !rem.is_null() {
+                unsafe {
+                    VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
+                        .map_err(map_usercopy_error)?;
+                }
             }
             Err(AxError::Interrupted)
         } else {
@@ -565,7 +603,12 @@ pub fn sys_clock_nanosleep(
     }
 }
 
-pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) -> AxResult<isize> {
+pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    cpusetsize: usize,
+    user_mask: *mut u8,
+) -> AxResult<isize> {
     let cpu_count = axhal::cpu_num().max(1);
     let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
     if cpusetsize < kernel_mask_bytes {
@@ -584,7 +627,7 @@ pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) ->
         }
     }
 
-    vm_write_slice(user_mask, &mask_bytes)?;
+    vm_write_slice(memory, user_mask, &mask_bytes).map_err(map_usercopy_error)?;
 
     Ok(kernel_mask_bytes as _)
 }
@@ -593,14 +636,19 @@ fn linux_cpumask_bytes(cpu_count: usize) -> usize {
     cpu_count.max(1).div_ceil(usize::BITS as usize) * size_of::<usize>()
 }
 
-pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) -> AxResult<isize> {
+pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    cpusetsize: usize,
+    user_mask: *const u8,
+) -> AxResult<isize> {
     let cpu_count = axhal::cpu_num().max(1);
     let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
     if cpusetsize < kernel_mask_bytes {
         return Err(AxError::InvalidInput);
     }
 
-    let user_mask = vm_load(user_mask, kernel_mask_bytes)?;
+    let user_mask = vm_load(memory, user_mask, kernel_mask_bytes).map_err(map_usercopy_error)?;
     let mut cpu_mask = AxCpuMask::new();
 
     for i in 0..cpu_count {
@@ -621,17 +669,21 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
     Ok(0)
 }
 
-pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> AxResult<isize> {
+pub fn sys_getcpu<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    cpu: *mut u32,
+    node: *mut u32,
+) -> AxResult<isize> {
     // Linux reports the CPU on which this call is actually executing.  A
     // concurrent affinity change may have published a restrictive mask before
     // the target reaches its migration safe point; reporting an allowed-but-
     // fictional CPU during that window would expose shadow scheduler state.
     let cpu_id = axhal::percpu::this_cpu_id();
     if !cpu.is_null() {
-        cpu.vm_write(cpu_id as u32)?;
+        VmMutPtr::vm_write(cpu, memory, cpu_id as u32).map_err(map_usercopy_error)?;
     }
     if !node.is_null() {
-        node.vm_write(0)?;
+        VmMutPtr::vm_write(node, memory, 0).map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
@@ -641,32 +693,67 @@ pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     Ok(linux_policy_from_state(&task, sched_state(&task)) as isize)
 }
 
-pub fn sys_sched_setparam(pid: i32, param: *const SchedParam) -> AxResult<isize> {
+pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    param: *const SchedParam,
+) -> AxResult<isize> {
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
+    let priority = unsafe {
+        param
+            .vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    }
+    .sched_priority;
     let task = sched_target(pid)?;
     update_sched_param(&task, priority)
 }
 
-pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> AxResult<isize> {
+pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    policy: i32,
+    param: *const SchedParam,
+) -> AxResult<isize> {
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
+    let priority = unsafe {
+        param
+            .vm_read_uninit(memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    }
+    .sched_priority;
     let task = sched_target(pid)?;
     update_sched_policy(&task, policy, priority)
 }
 
-pub fn sys_sched_getparam(pid: i32, param: *mut SchedParam) -> AxResult<isize> {
+pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    param: *mut SchedParam,
+) -> AxResult<isize> {
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
     let task = sched_target(pid)?;
-    param.vm_write(SchedParam {
-        sched_priority: state_static_priority(sched_state(&task)),
-    })?;
+    // `SchedParam` is a complete `repr(C)` value containing only its i32
+    // priority field, so its initialized representation is safe to copy out
+    // through the explicitly bound user-memory context.
+    unsafe {
+        VmMutPtr::vm_write_unchecked(
+            param,
+            memory,
+            SchedParam {
+                sched_priority: state_static_priority(sched_state(&task)),
+            },
+        )
+        .map_err(map_usercopy_error)?;
+    }
     Ok(0)
 }
 
@@ -678,20 +765,34 @@ pub fn sys_sched_get_priority_min(policy: i32) -> AxResult<isize> {
     Ok(linux_priority_bounds(policy)?.0)
 }
 
-pub fn sys_sched_rr_get_interval(pid: i32, interval: *mut timespec) -> AxResult<isize> {
+pub fn sys_sched_rr_get_interval<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    interval: *mut timespec,
+) -> AxResult<isize> {
     let task = sched_target(pid)?;
-    interval.vm_write(timespec::from_time_value(rr_interval_for_state(
-        sched_state(&task),
-    )))?;
+    unsafe {
+        VmMutPtr::vm_write_unchecked(
+            interval,
+            memory,
+            timespec::from_time_value(rr_interval_for_state(sched_state(&task))),
+        )
+        .map_err(map_usercopy_error)?;
+    }
     Ok(0)
 }
 
-pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResult<isize> {
+pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    attr: *const SchedAttr,
+    flags: u32,
+) -> AxResult<isize> {
     if attr.is_null() || pid < 0 || flags != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let attr = read_sched_attr(attr)?;
+    let attr = read_sched_attr(memory, attr)?;
     if attr.sched_flags & !SUPPORTED_SCHED_ATTR_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
@@ -743,7 +844,13 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     )
 }
 
-pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: i32,
+    attr: *mut SchedAttr,
+    size: u32,
+    flags: u32,
+) -> AxResult<isize> {
     let out_size = size as usize;
     if attr.is_null()
         || pid < 0
@@ -774,9 +881,10 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
     out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
 
     let copy_size = out_size.min(size_of::<SchedAttr>());
-    vm_write_slice(attr.cast::<u8>(), unsafe {
+    vm_write_slice(memory, attr.cast::<u8>(), unsafe {
         core::slice::from_raw_parts((&out as *const SchedAttr).cast::<u8>(), copy_size)
-    })?;
+    })
+    .map_err(map_usercopy_error)?;
 
     Ok(0)
 }
@@ -902,12 +1010,401 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_ioprio_get(_which: u32, _who: u32) -> AxResult<isize> {
-    Err(LinuxError::ENOSYS.into())
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_CLASS_MASK: u32 = 0x7;
+const IOPRIO_PRIO_MASK: u32 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+const IOPRIO_LEVEL_MASK: u32 = 0x7;
+const IOPRIO_CLASS_NONE: u32 = 0;
+const IOPRIO_CLASS_RT: u32 = 1;
+const IOPRIO_CLASS_BE: u32 = 2;
+const IOPRIO_CLASS_IDLE: u32 = 3;
+const IOPRIO_WHO_PROCESS: u32 = 1;
+const IOPRIO_WHO_PGRP: u32 = 2;
+const IOPRIO_WHO_USER: u32 = 3;
+
+fn ioprio_class(ioprio: u32) -> u32 {
+    (ioprio >> IOPRIO_CLASS_SHIFT) & IOPRIO_CLASS_MASK
 }
 
-pub fn sys_ioprio_set(_which: u32, _who: u32, _ioprio: u32) -> AxResult<isize> {
-    Err(LinuxError::ENOSYS.into())
+fn ioprio_level(ioprio: u32) -> u32 {
+    ioprio & IOPRIO_LEVEL_MASK
+}
+
+fn ioprio_value(class: u32, level: u32) -> u16 {
+    ((class << IOPRIO_CLASS_SHIFT) | (level & IOPRIO_PRIO_MASK)) as u16
+}
+
+/// Validate the value shape accepted by Linux's direct `ioprio_set` path.
+/// The kernel checks only the low three data bits for CLASS_NONE, so the
+/// remaining data bits are retained as opaque hints just as they are in the
+/// Linux `io_context` ABI.
+fn validate_ioprio_shape(ioprio: u32) -> AxResult<()> {
+    match ioprio_class(ioprio) {
+        IOPRIO_CLASS_NONE if ioprio_level(ioprio) == 0 => Ok(()),
+        IOPRIO_CLASS_NONE => Err(AxError::InvalidInput),
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => Ok(()),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn validate_ioprio(actor: &Cred, ioprio: u32) -> AxResult<()> {
+    validate_ioprio_shape(ioprio)?;
+    if ioprio_class(ioprio) == IOPRIO_CLASS_RT
+        && !actor.has_effective_capability_in_own_user_ns(CAP_SYS_ADMIN)
+        && !actor.has_effective_capability_in_own_user_ns(CAP_SYS_NICE)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
+fn ioprio_default_for_sched(class: SchedClass, nice: i8) -> u16 {
+    let class = match class {
+        SchedClass::Idle => IOPRIO_CLASS_IDLE,
+        SchedClass::Fifo | SchedClass::RoundRobin => IOPRIO_CLASS_RT,
+        SchedClass::Normal | SchedClass::Batch => IOPRIO_CLASS_BE,
+    };
+    let level = ((nice as i32 + 20) / 5).clamp(0, 7) as u32;
+    ioprio_value(class, level)
+}
+
+fn ioprio_for_task(task: &AxTaskRef) -> AxResult<u16> {
+    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let raw = thread.io_priority_raw();
+    if ioprio_class(raw as u32) == IOPRIO_CLASS_NONE {
+        let state = sched_state(task);
+        Ok(ioprio_default_for_sched(state.class, state.nice))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn ioprio_raw_for_task(task: &AxTaskRef) -> AxResult<u16> {
+    task.try_as_thread()
+        .ok_or(AxError::NoSuchProcess)
+        .map(|thread| thread.io_priority_raw())
+}
+
+enum IoprioTarget {
+    Live(AxTaskRef),
+    Zombie(Arc<Process>),
+}
+
+impl IoprioTarget {
+    fn raw_priority(&self) -> AxResult<u16> {
+        match self {
+            Self::Live(task) => ioprio_raw_for_task(task),
+            Self::Zombie(process) => zombie_ioprio(process),
+        }
+    }
+
+    fn effective_priority(&self) -> AxResult<u16> {
+        match self {
+            Self::Live(task) => ioprio_for_task(task),
+            Self::Zombie(process) => {
+                let raw = zombie_ioprio(process)?;
+                if ioprio_class(raw as u32) == IOPRIO_CLASS_NONE {
+                    let state = zombie_scheduler_state(process)?;
+                    Ok(ioprio_default_for_sched(state.class, state.nice))
+                } else {
+                    Ok(raw)
+                }
+            }
+        }
+    }
+
+    fn credential(&self) -> AxResult<Arc<Cred>> {
+        match self {
+            Self::Live(task) => task
+                .try_as_thread()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|thread| thread.current_cred()),
+            Self::Zombie(process) => process
+                .zombie_payload()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|snapshot| snapshot.credential.clone()),
+        }
+    }
+
+    fn set_priority(&self, priority: u16) -> AxResult<()> {
+        match self {
+            Self::Live(task) => task.as_thread().set_io_priority_raw(priority),
+            Self::Zombie(process) => crate::task::set_zombie_ioprio(process, priority),
+        }
+    }
+}
+
+fn visible_tid_in_namespace(task: &AxTaskRef, caller_pid_ns: &Arc<PidNamespace>) -> Option<Pid> {
+    let thread = task.try_as_thread()?;
+    let target_pid_ns = thread.proc_data.pid_ns();
+    // After non-leader exec the visible TID is intentionally rebound to the
+    // process PID. Otherwise use the immutable kernel TID so PID-namespace
+    // init (whose vpid is one) is rendered correctly.
+    let tid = if thread.tid() != thread.kernel_tid() {
+        thread.tid()
+    } else {
+        thread.kernel_tid()
+    };
+    caller_pid_ns.visible_pid_for(&target_pid_ns, tid)
+}
+
+fn visible_process_pid_in_namespace(
+    process_pid: Pid,
+    target_pid_ns: &Arc<PidNamespace>,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> Option<Pid> {
+    caller_pid_ns.visible_pid_for(target_pid_ns, process_pid)
+}
+
+/// Reuse the live-task resolver used by signal/kill paths, then apply the
+/// caller's PID namespace rendering. The fallback is needed when a nested
+/// namespace has a vpid (for example its init task's `1`) that is also a
+/// different global PID; it still scans the authoritative task table rather
+/// than inventing a second task registry.
+fn visible_task_for_ioprio(who: Pid, caller_pid_ns: &Arc<PidNamespace>) -> AxResult<AxTaskRef> {
+    if let Ok(task) = get_visible_task(who)
+        && visible_tid_in_namespace(&task, caller_pid_ns) == Some(who)
+        && !task.as_thread().pending_exit()
+    {
+        return Ok(task);
+    }
+
+    try_tasks()?
+        .into_iter()
+        .find(|task| {
+            !task.as_thread().pending_exit()
+                && visible_tid_in_namespace(task, caller_pid_ns) == Some(who)
+        })
+        .ok_or(AxError::NoSuchProcess)
+}
+
+fn zombie_for_ioprio(who: Pid, caller_pid_ns: &Arc<PidNamespace>) -> AxResult<Arc<Process>> {
+    if let Ok(process) = get_process_including_zombie(who)
+        && process.is_zombie()
+        && zombie_pid_ns(&process).is_some_and(|target_pid_ns| {
+            visible_process_pid_in_namespace(process.pid(), &target_pid_ns, caller_pid_ns)
+                == Some(who)
+        })
+    {
+        return Ok(process);
+    }
+
+    for process in process_domain()?.registry().processes() {
+        if process.is_zombie()
+            && zombie_pid_ns(&process).is_some_and(|target_pid_ns| {
+                visible_process_pid_in_namespace(process.pid(), &target_pid_ns, caller_pid_ns)
+                    == Some(who)
+            })
+        {
+            return Ok(process);
+        }
+    }
+    Err(AxError::NoSuchProcess)
+}
+
+fn ioprio_process_target(
+    who: Pid,
+    actor_task: &AxTaskRef,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> AxResult<IoprioTarget> {
+    if who == 0 {
+        return Ok(IoprioTarget::Live(actor_task.clone()));
+    }
+    match visible_task_for_ioprio(who, caller_pid_ns) {
+        Ok(task) => Ok(IoprioTarget::Live(task)),
+        Err(AxError::NoSuchProcess) => {
+            zombie_for_ioprio(who, caller_pid_ns).map(IoprioTarget::Zombie)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Snapshot all matching tasks while retaining the exact task references.
+/// This avoids re-looking up numeric TIDs after the target selection and
+/// bounds the only allocation to the existing fallible task-table snapshot.
+fn ioprio_multi_targets(
+    which: u32,
+    who: u32,
+    actor_task: &AxTaskRef,
+    actor_cred: &Cred,
+) -> AxResult<Vec<IoprioTarget>> {
+    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let tasks = try_tasks()?;
+    let mut targets = Vec::new();
+    match which {
+        IOPRIO_WHO_PGRP => {
+            let actor_group = actor_task.as_thread().proc_data.proc.group();
+            // Resolve PGID in the caller's namespace by first finding a
+            // visible process in the authoritative task table. This handles
+            // a nested namespace's vpid without treating the global PGID as
+            // the caller's number.
+            let target_group = if who == 0 {
+                Some(actor_group)
+            } else {
+                let mut target_group = None;
+                for task in &tasks {
+                    let thread = task.as_thread();
+                    let group = thread.proc_data.proc.group();
+                    if visible_process_pid_in_namespace(
+                        group.pgid(),
+                        &thread.proc_data.pid_ns(),
+                        &caller_pid_ns,
+                    ) == Some(who)
+                    {
+                        target_group = Some(group);
+                        break;
+                    }
+                }
+                if target_group.is_none() {
+                    for process in process_domain()?.registry().processes() {
+                        if !process.is_zombie() {
+                            continue;
+                        }
+                        let Some(target_pid_ns) = zombie_pid_ns(&process) else {
+                            continue;
+                        };
+                        let group = process.group();
+                        if visible_process_pid_in_namespace(
+                            group.pgid(),
+                            &target_pid_ns,
+                            &caller_pid_ns,
+                        ) == Some(who)
+                        {
+                            target_group = Some(group);
+                            break;
+                        }
+                    }
+                }
+                target_group
+            };
+            let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
+            for task in tasks {
+                let thread = task.as_thread();
+                if !caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+                    continue;
+                }
+                let group = thread.proc_data.proc.group();
+                if Arc::ptr_eq(&group, &target_group) {
+                    targets.push(IoprioTarget::Live(task));
+                }
+            }
+            for process in process_domain()?.registry().processes() {
+                if !process.is_zombie() || !Arc::ptr_eq(&process.group(), &target_group) {
+                    continue;
+                }
+                if zombie_pid_ns(&process)
+                    .is_some_and(|target_pid_ns| caller_pid_ns.contains(&target_pid_ns))
+                {
+                    targets.push(IoprioTarget::Zombie(process));
+                }
+            }
+        }
+        IOPRIO_WHO_USER => {
+            let uid = if who == 0 {
+                actor_cred.ids().ruid
+            } else {
+                actor_cred
+                    .user_ns()
+                    .make_kuid(who)
+                    .ok_or(AxError::NoSuchProcess)?
+            };
+            for task in tasks {
+                let thread = task.as_thread();
+                if caller_pid_ns.contains(&thread.proc_data.pid_ns())
+                    && thread.current_cred().ids().ruid == uid
+                {
+                    targets.push(IoprioTarget::Live(task));
+                }
+            }
+            for process in process_domain()?.registry().processes() {
+                if !process.is_zombie() {
+                    continue;
+                }
+                let Some(target_pid_ns) = zombie_pid_ns(&process) else {
+                    continue;
+                };
+                let Some(snapshot) = process.zombie_payload() else {
+                    continue;
+                };
+                if caller_pid_ns.contains(&target_pid_ns) && snapshot.credential.ids().ruid == uid {
+                    targets.push(IoprioTarget::Zombie(process));
+                }
+            }
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+    if targets.is_empty() {
+        Err(AxError::NoSuchProcess)
+    } else {
+        Ok(targets)
+    }
+}
+
+fn ioprio_set_allowed(actor: &Cred, target: &IoprioTarget) -> AxResult<()> {
+    let target_cred = target.credential()?;
+    let actor_ids = actor.ids();
+    let target_uid = target_cred.ids().ruid;
+    if target_uid == actor_ids.ruid
+        || target_uid == actor_ids.euid
+        || actor.has_effective_capability_in_own_user_ns(CAP_SYS_NICE)
+    {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
+pub fn sys_ioprio_get(which: u32, who: u32) -> AxResult<isize> {
+    debug!("sys_ioprio_get <= which: {which}, who: {who}");
+    let actor_task = current().clone();
+    let actor_cred = actor_task.as_thread().current_cred();
+    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            Ok(ioprio_process_target(who, &actor_task, &caller_pid_ns)?.raw_priority()? as isize)
+        }
+        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => {
+            let targets = ioprio_multi_targets(which, who, &actor_task, &actor_cred)?;
+            let mut highest = None;
+            for target in &targets {
+                let priority = target.effective_priority()?;
+                highest = Some(highest.map_or(priority, |current: u16| current.min(priority)));
+            }
+            highest
+                .map(|priority| priority as isize)
+                .ok_or(AxError::NoSuchProcess)
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_ioprio_set(which: u32, who: u32, ioprio: u32) -> AxResult<isize> {
+    debug!("sys_ioprio_set <= which: {which}, who: {who}, ioprio: {ioprio:#x}");
+    let actor_task = current().clone();
+    let actor_cred = actor_task.as_thread().current_cred();
+    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    // Linux validates the requested class/capability before selecting a
+    // target, so an invalid realtime request wins over target lookup errors.
+    validate_ioprio(&actor_cred, ioprio)?;
+    let priority = ioprio as u16;
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            let target = ioprio_process_target(who, &actor_task, &caller_pid_ns)?;
+            ioprio_set_allowed(&actor_cred, &target)?;
+            target.set_priority(priority)?;
+        }
+        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => {
+            let targets = ioprio_multi_targets(which, who, &actor_task, &actor_cred)?;
+            // Preserve Linux's partial-update behavior if a later member is
+            // not writable: each already-authorized task remains updated.
+            for target in &targets {
+                ioprio_set_allowed(&actor_cred, target)?;
+                target.set_priority(priority)?;
+            }
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -1063,6 +1560,73 @@ mod tests {
         assert_eq!(
             linux_priority_bounds(SCHED_DEADLINE as i32).unwrap(),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn ioprio_values_match_linux_class_and_level_encoding() {
+        assert_eq!(ioprio_value(IOPRIO_CLASS_NONE, 0), 0);
+        assert_eq!(
+            ioprio_value(IOPRIO_CLASS_BE, 4),
+            (2 << IOPRIO_CLASS_SHIFT) | 4
+        );
+        assert_eq!(
+            ioprio_class(ioprio_value(IOPRIO_CLASS_RT, 6) as u32),
+            IOPRIO_CLASS_RT
+        );
+        assert_eq!(ioprio_level(ioprio_value(IOPRIO_CLASS_IDLE, 7) as u32), 7);
+    }
+
+    #[test]
+    fn ioprio_validation_preserves_direct_syscall_hint_bits() {
+        assert_eq!(
+            validate_ioprio_shape(ioprio_value(IOPRIO_CLASS_NONE, 0) as u32),
+            Ok(())
+        );
+        assert_eq!(
+            validate_ioprio_shape(ioprio_value(IOPRIO_CLASS_NONE, 0x100) as u32),
+            Ok(())
+        );
+        assert_eq!(
+            validate_ioprio_shape(ioprio_value(IOPRIO_CLASS_NONE, 1) as u32),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_ioprio_shape(ioprio_value(4, 0) as u32),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn ioprio_default_priority_derives_from_scheduler_class_and_nice() {
+        assert_eq!(
+            ioprio_default_for_sched(SchedClass::Normal, -20),
+            ioprio_value(IOPRIO_CLASS_BE, 0)
+        );
+        assert_eq!(
+            ioprio_default_for_sched(SchedClass::Batch, 19),
+            ioprio_value(IOPRIO_CLASS_BE, 7)
+        );
+        assert_eq!(
+            ioprio_default_for_sched(SchedClass::Idle, 19),
+            ioprio_value(IOPRIO_CLASS_IDLE, 7)
+        );
+        assert_eq!(
+            ioprio_default_for_sched(SchedClass::RoundRobin, 0),
+            ioprio_value(IOPRIO_CLASS_RT, 4)
+        );
+    }
+
+    #[test]
+    fn ioprio_highest_target_priority_is_the_lowest_encoded_value() {
+        let priorities = [
+            ioprio_value(IOPRIO_CLASS_BE, 7),
+            ioprio_value(IOPRIO_CLASS_RT, 4),
+            ioprio_value(IOPRIO_CLASS_IDLE, 0),
+        ];
+        assert_eq!(
+            priorities.into_iter().min(),
+            Some(ioprio_value(IOPRIO_CLASS_RT, 4))
         );
     }
 }

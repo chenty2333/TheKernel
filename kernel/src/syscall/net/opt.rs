@@ -1,3 +1,6 @@
+use alloc::vec::Vec;
+use core::mem::size_of;
+
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use bytemuck::AnyBitPattern;
@@ -12,7 +15,6 @@ use linux_raw_sys::{
         SOL_SOCKET, socklen_t,
     },
 };
-use starry_vm::vm_write_slice;
 use thekernel_linux_packet::{
     GetPacketOption, PacketError, PacketOption, PacketOptionOperation, PacketOptionValue,
     PacketSocketType, SetPacketOption,
@@ -23,7 +25,7 @@ use crate::{
     file::{
         FileLike, PinnedSocketDescription, SocketBackendKind, af_alg, packet_socket::packet_error,
     },
-    mm::{UserConstPtr, UserPtr},
+    mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
         ns_capable,
         security::{SocketOption, SocketSecurityContext, dispatch_socket},
@@ -114,19 +116,26 @@ fn packet_option_error(error: PacketError) -> AxError {
 }
 
 fn write_packet_option_bytes(
+    capability: &UserMemoryCapability,
     output: UserPtr<u8>,
     length: &mut socklen_t,
     bytes: &[u8],
 ) -> AxResult<()> {
     let copied = packet_option_copy_len(*length, bytes.len());
     if copied != 0 {
-        vm_write_slice(output.address().as_usize() as *mut u8, &bytes[..copied])?;
+        capability
+            .write_bytes(output.address().as_usize(), &bytes[..copied])
+            .map_err(map_usercopy_error)?;
     }
     *length = copied as socklen_t;
     Ok(())
 }
 
 fn packet_option_copy_len(requested: socklen_t, available: usize) -> usize {
+    (requested as usize).min(available)
+}
+
+fn option_copy_len(requested: socklen_t, available: usize) -> usize {
     (requested as usize).min(available)
 }
 
@@ -393,8 +402,44 @@ fn validate_ipt_replace_table(table: &[u8], num_entries: u32) -> AxResult<()> {
     Ok(())
 }
 
-fn handle_ipt_set_replace(optval: UserConstPtr<u8>) -> AxResult<isize> {
-    let header = optval.cast::<IptReplaceHeader>().get_as_ref()?;
+fn read_option<T: Copy>(
+    capability: &UserMemoryCapability,
+    val: UserConstPtr<u8>,
+    len: socklen_t,
+) -> AxResult<T> {
+    if len as usize != size_of::<T>() {
+        return Err(AxError::InvalidInput);
+    }
+    capability
+        .read_value_uninit(val.address().as_usize() as *const T)
+        .map_err(map_usercopy_error)
+        .map(|value| unsafe { value.assume_init() })
+}
+
+fn write_option<T: Copy>(
+    capability: &UserMemoryCapability,
+    val: UserPtr<u8>,
+    len: &mut socklen_t,
+    value: T,
+) -> AxResult<()> {
+    let copied = option_copy_len(*len, size_of::<T>());
+    if copied != 0 {
+        capability
+            .write_bytes(val.address().as_usize(), unsafe {
+                core::slice::from_raw_parts((&value as *const T).cast::<u8>(), copied)
+            })
+            .map_err(map_usercopy_error)?;
+    }
+    *len = copied as socklen_t;
+    Ok(())
+}
+
+fn handle_ipt_set_replace(
+    capability: &UserMemoryCapability,
+    optval: UserConstPtr<u8>,
+) -> AxResult<isize> {
+    let header =
+        read_option::<IptReplaceHeader>(capability, optval, size_of::<IptReplaceHeader>() as _)?;
     if header.num_counters == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -408,23 +453,36 @@ fn handle_ipt_set_replace(optval: UserConstPtr<u8>) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    let replace = optval.get_as_slice(total_len)?;
+    let mut replace = Vec::new();
+    replace
+        .try_reserve_exact(total_len)
+        .map_err(|_| AxError::NoMemory)?;
+    replace.resize(total_len, 0);
+    capability
+        .read_slice(optval.address().as_usize() as *const u8, unsafe {
+            core::slice::from_raw_parts_mut(
+                replace.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                total_len,
+            )
+        })
+        .map_err(map_usercopy_error)?;
     validate_ipt_replace_table(&replace[header_len..], header.num_entries)?;
 
     Err(AxError::from(LinuxError::ENOPROTOOPT))
 }
 
 pub fn sys_getsockopt(
+    capability: UserMemoryCapability,
     fd: i32,
     level: u32,
     optname: u32,
     optval: UserPtr<u8>,
-    optlen: UserPtr<socklen_t>,
+    optlen_ptr: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
-    let optlen = import_socket_output_after_policy(
+    let mut optlen = import_socket_output_after_policy(
         || {
             dispatch_socket(&SocketSecurityContext::get_option(
                 snapshot.actor(),
@@ -432,7 +490,11 @@ pub fn sys_getsockopt(
                 SocketOption::new(level as i32, optname as i32),
             ))
         },
-        || optlen.get_as_mut(),
+        || {
+            capability
+                .read_value(optlen_ptr.address().as_usize() as *const socklen_t)
+                .map_err(map_usercopy_error)
+        },
     )?;
     debug!(
         "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
@@ -443,29 +505,28 @@ pub fn sys_getsockopt(
         optlen,
     );
 
-    if *optlen > i32::MAX as socklen_t {
+    if optlen > i32::MAX as socklen_t {
         return Err(AxError::InvalidInput);
     }
-    fn get<'a, T: 'static>(val: UserPtr<u8>, len: &mut socklen_t) -> AxResult<&'a mut T> {
-        if (*len as usize) < size_of::<T>() {
-            return Err(AxError::InvalidInput);
-        }
-        *len = size_of::<T>() as socklen_t;
-        val.cast().get_as_mut()
-    }
-
     if pinned.backend()? == SocketBackendKind::Netlink {
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        *get::<u32>(optval, optlen)? = pinned.netlink()?.get_option(optname)?;
+        let value = pinned.netlink()?.get_option(optname)?;
+        write_option(&capability, optval, &mut optlen, value)?;
+        capability
+            .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+            .map_err(map_usercopy_error)?;
         return Ok(0);
     }
 
     if pinned.backend()? == SocketBackendKind::Packet {
         if level == SOL_SOCKET {
             let value = packet_sol_socket_value(pinned.packet()?.socket_type(), optname)?;
-            write_packet_option_bytes(optval, optlen, &value.to_ne_bytes())?;
+            write_packet_option_bytes(&capability, optval, &mut optlen, &value.to_ne_bytes())?;
+            capability
+                .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+                .map_err(map_usercopy_error)?;
             return Ok(0);
         }
         if level != SOL_PACKET {
@@ -478,7 +539,12 @@ pub fn sys_getsockopt(
         let value = pinned.packet()?.get_packet_option(option);
         match value {
             PacketOptionValue::IgnoreOutgoing(enabled) => {
-                write_packet_option_bytes(optval, optlen, &i32::from(enabled).to_ne_bytes())?;
+                write_packet_option_bytes(
+                    &capability,
+                    optval,
+                    &mut optlen,
+                    &i32::from(enabled).to_ne_bytes(),
+                )?;
             }
             PacketOptionValue::Statistics(statistics) => {
                 // Linux's native counters are u32 and wrap at that UAPI
@@ -488,21 +554,26 @@ pub fn sys_getsockopt(
                 let mut native = [0_u8; TPACKET_STATS_LEN];
                 native[..4].copy_from_slice(&(statistics.packets() as u32).to_ne_bytes());
                 native[4..].copy_from_slice(&(statistics.drops() as u32).to_ne_bytes());
-                write_packet_option_bytes(optval, optlen, &native)?;
+                write_packet_option_bytes(&capability, optval, &mut optlen, &native)?;
             }
         }
+        capability
+            .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+            .map_err(map_usercopy_error)?;
         return Ok(0);
     }
 
     let socket = pinned.network()?;
     macro_rules! dispatch {
         ($which:ident) => {
-            socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
+            let mut val = Default::default();
+            socket.get_option(GetSocketOption::$which(&mut val))?;
+            write_option(&capability, optval, &mut optlen, val)?;
         };
         ($which:ident as $conv:ty) => {
             let mut val = Default::default();
             socket.get_option(GetSocketOption::$which(&mut val))?;
-            *get(optval, optlen)? = <$conv>::rust_to_sys(val)?;
+            write_option(&capability, optval, &mut optlen, <$conv>::rust_to_sys(val)?)?;
         };
     }
     match level {
@@ -512,10 +583,14 @@ pub fn sys_getsockopt(
         _ => return Err(AxError::from(LinuxError::EOPNOTSUPP)),
     }
 
+    capability
+        .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+        .map_err(map_usercopy_error)?;
     Ok(0)
 }
 
 pub fn sys_setsockopt(
+    capability: UserMemoryCapability,
     fd: i32,
     level: u32,
     optname: u32,
@@ -532,13 +607,6 @@ pub fn sys_setsockopt(
         optlen
     );
 
-    fn get<'a, T: 'static>(val: UserConstPtr<u8>, len: socklen_t) -> AxResult<&'a T> {
-        if len as usize != size_of::<T>() {
-            return Err(AxError::InvalidInput);
-        }
-        val.cast().get_as_ref()
-    }
-
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
     dispatch_socket(&SocketSecurityContext::set_option(
@@ -553,8 +621,22 @@ pub fn sys_setsockopt(
         if optname != af_alg::ALG_SET_KEY {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        let key = optval.get_as_slice(optlen as usize)?;
-        pinned.af_alg()?.set_alg_key(key)?;
+        if optlen as usize > IPT_REPLACE_MAX_BYTES {
+            return Err(AxError::InvalidInput);
+        }
+        let mut key = Vec::new();
+        key.try_reserve_exact(optlen as usize)
+            .map_err(|_| AxError::NoMemory)?;
+        key.resize(optlen as usize, 0);
+        capability
+            .read_slice(optval.address().as_usize() as *const u8, unsafe {
+                core::slice::from_raw_parts_mut(
+                    key.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                    key.len(),
+                )
+            })
+            .map_err(map_usercopy_error)?;
+        pinned.af_alg()?.set_alg_key(&key)?;
         return Ok(0);
     }
 
@@ -564,7 +646,7 @@ pub fn sys_setsockopt(
         }
         pinned
             .netlink()?
-            .set_option(optname, *get::<u32>(optval, optlen)?)?;
+            .set_option(optname, read_option::<u32>(&capability, optval, optlen)?)?;
         return Ok(0);
     }
 
@@ -582,7 +664,7 @@ pub fn sys_setsockopt(
                 operation: PacketOptionOperation::Set,
             }));
         }
-        let value = *get::<i32>(optval, optlen)?;
+        let value = read_option::<i32>(&capability, optval, optlen)?;
         let option = SetPacketOption::decode(optname as i32, value).map_err(packet_option_error)?;
         pinned.packet()?.set_packet_option(option)?;
         return Ok(0);
@@ -590,14 +672,14 @@ pub fn sys_setsockopt(
 
     let socket = pinned.network()?;
     if level == SOL_IPV6 && optname == IPV6_ADDRFORM {
-        if *get::<i32>(optval, optlen)? as u32 != AF_INET {
+        if read_option::<i32>(&capability, optval, optlen)? as u32 != AF_INET {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
         socket.set_ipv6_addrform_to_ipv4()?;
         return Ok(0);
     }
     if level == PROTO_IP && optname == IPT_SO_SET_REPLACE {
-        return handle_ipt_set_replace(optval);
+        return handle_ipt_set_replace(&capability, optval);
     }
     if level == SOL_SOCKET {
         match optname {
@@ -609,7 +691,8 @@ pub fn sys_setsockopt(
                 ) {
                     return Err(LinuxError::EPERM.into());
                 }
-                let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
+                let size = (read_option::<u32>(&capability, optval, optlen)? as usize)
+                    .min(i32::MAX as usize);
                 socket.set_option(SetSocketOption::SendBufferForce(&size))?;
                 return Ok(0);
             }
@@ -621,12 +704,13 @@ pub fn sys_setsockopt(
                 ) {
                     return Err(LinuxError::EPERM.into());
                 }
-                let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
+                let size = (read_option::<u32>(&capability, optval, optlen)? as usize)
+                    .min(i32::MAX as usize);
                 socket.set_option(SetSocketOption::ReceiveBufferForce(&size))?;
                 return Ok(0);
             }
             SO_ATTACH_BPF => {
-                let prog_fd = *get::<i32>(optval, optlen)?;
+                let prog_fd = read_option::<i32>(&capability, optval, optlen)?;
                 let prog_fd = crate::file::bpf::BpfProgFd::from_fd(prog_fd)?;
                 if prog_fd.prog.prog_type != crate::bpf::defs::BPF_PROG_TYPE_SOCKET_FILTER {
                     return Err(AxError::InvalidInput);
@@ -643,10 +727,12 @@ pub fn sys_setsockopt(
     }
     macro_rules! dispatch {
         ($which:ident) => {
-            socket.set_option(SetSocketOption::$which(get(optval, optlen)?))?;
+            let val = read_option(&capability, optval, optlen)?;
+            socket.set_option(SetSocketOption::$which(&val))?;
         };
         ($which:ident as $conv:ty) => {
-            let mut val = <$conv>::sys_to_rust(*get(optval, optlen)?)?;
+            let raw = read_option(&capability, optval, optlen)?;
+            let mut val = <$conv>::sys_to_rust(raw)?;
             socket.set_option(SetSocketOption::$which(&mut val))?;
         };
     }
@@ -724,6 +810,50 @@ mod tests {
         assert_eq!(packet_option_copy_len(3, size_of::<i32>()), 3);
         assert_eq!(packet_option_copy_len(4, size_of::<i32>()), 4);
         assert_eq!(packet_option_copy_len(99, size_of::<i32>()), 4);
+    }
+
+    #[test]
+    fn generic_integer_options_accept_zero_and_short_optlen() {
+        assert_eq!(option_copy_len(0, size_of::<i32>()), 0);
+        assert_eq!(option_copy_len(1, size_of::<i32>()), 1);
+        assert_eq!(option_copy_len(2, size_of::<i32>()), 2);
+        assert_eq!(option_copy_len(3, size_of::<i32>()), 3);
+        assert_eq!(option_copy_len(4, size_of::<i32>()), 4);
+        assert_eq!(option_copy_len(99, size_of::<i32>()), 4);
+    }
+
+    #[test]
+    fn generic_option_copyout_reports_the_copied_short_or_zero_length() {
+        use alloc::sync::Arc;
+
+        use axhal::paging::{MappingFlags, PageSize};
+        use axsync::Mutex;
+        use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+        let mut address_space =
+            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
+        address_space
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                crate::mm::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        let capability = UserMemoryCapability::new(Arc::new(Mutex::new(address_space)));
+
+        let value = 0x0102_0304_i32;
+        let mut short = 1;
+        write_option(&capability, UserPtr::from(0x1000), &mut short, value).unwrap();
+        assert_eq!(short, 1);
+        let mut copied = [core::mem::MaybeUninit::<u8>::uninit(); 1];
+        capability.read_bytes(0x1000, &mut copied).unwrap();
+        assert_eq!(unsafe { copied[0].assume_init() }, value.to_ne_bytes()[0]);
+
+        let mut zero = 0;
+        write_option(&capability, UserPtr::from(usize::MAX), &mut zero, value).unwrap();
+        assert_eq!(zero, 0);
     }
 
     #[test]

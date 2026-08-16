@@ -2,8 +2,8 @@ use alloc::{collections::TryReserveError, vec::Vec};
 use core::time::Duration;
 
 use axhal::uspace::UserContext;
-use starry_signal::SignalOSAction;
 use syscalls::Sysno;
+use thekernel_linux_signal::SignalOSAction;
 
 use super::{AlarmClock, Thread};
 
@@ -30,6 +30,7 @@ pub(crate) struct FutexWaitRestart {
     pub bitset: u32,
     pub deadline: Duration,
     pub clock: AlarmClock,
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -92,9 +93,6 @@ pub(crate) struct RestartTracker {
     resume_restored_context: bool,
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-const SYSCALL_INSN_LEN: usize = 4;
-#[cfg(target_arch = "x86_64")]
 const SYSCALL_INSN_LEN: usize = 2;
 
 impl SavedSyscall {
@@ -524,6 +522,7 @@ mod tests {
             bitset: u32::MAX,
             deadline: Duration::from_millis(200),
             clock: AlarmClock::Monotonic,
+            private: false,
         });
 
         tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
@@ -549,6 +548,7 @@ mod tests {
             bitset: u32::MAX,
             deadline: Duration::from_millis(200),
             clock: AlarmClock::Monotonic,
+            private: false,
         });
         tracker.armed_restart_block = Some(block);
 

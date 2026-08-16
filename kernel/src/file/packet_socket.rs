@@ -34,7 +34,7 @@ use thekernel_linux_packet::{
 };
 
 use super::{
-    FileLike, FileMmapRequest, IoDst, IoSrc, Kstat, PreparedFileMmap, PseudoInode,
+    FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap, PseudoInode,
     packet::socket_ifreq_ioctl, try_pseudo_inode_path,
 };
 use crate::{readiness::block_on_poll_io, task::NetworkNamespace};
@@ -438,8 +438,8 @@ impl FileLike for PacketSocket {
         try_pseudo_inode_path("socket", self.inode.inode())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        socket_ifreq_ioctl(self.net_ns.stack(), cmd, arg)
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        socket_ifreq_ioctl(context, self.net_ns.stack(), cmd, arg)
     }
 
     fn prepare_mmap(&self, _request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {

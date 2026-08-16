@@ -192,7 +192,7 @@ mod tests {
                 .lock()
                 .evaluate(&thekernel_linux_seccomp::SeccompData {
                     number: 0,
-                    architecture: thekernel_linux_seccomp::AUDIT_ARCH_RISCV64,
+                    architecture: 0xc000_003e,
                     instruction_pointer: 0,
                     arguments: [0; 6],
                 })

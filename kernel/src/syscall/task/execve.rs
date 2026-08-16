@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::c_char,
-    mem::{self, size_of},
+    mem::{self, MaybeUninit, size_of},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -9,13 +9,11 @@ use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_PTRACE};
-use memory_addr::PAGE_SIZE_4K;
-use starry_process::Pid;
-use starry_signal::{SignalAction, SignalDisposition, Signo};
-use starry_vm::{VmError, vm_load_until_nul};
+use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::Signo;
+use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul};
 
-#[cfg(target_arch = "loongarch64")]
-use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
     file::{
@@ -25,7 +23,7 @@ use crate::{
     keyring::{self, KeyTaskOwner},
     mm::{
         ExecImageAccess, copy_from_kernel, finish_prepared_user_app, new_user_aspace_empty,
-        prepare_user_app_at, vm_load_string,
+        prepare_user_app_at,
     },
     readiness::block_on_poll_set,
     task::{
@@ -35,7 +33,8 @@ use crate::{
         check_signals, commit_exec_identity_handoff, fail_closed_exit, get_task,
         has_pending_fatal_signal, linux_pid_from_task_id, map_exec_dumpability,
         notify_ptrace_attach_stop, ns_capable, prepare_task_alias_admission, process_error,
-        release_exec_action_then_complete, set_current_user_address_space,
+        release_exec_action_then_complete, reset_current_task_extended_state,
+        set_current_user_address_space,
     },
 };
 
@@ -81,6 +80,17 @@ where
     I: Iterator<Item = Pid>,
 {
     current_count == snapshot.len() && current.eq(snapshot.iter().copied())
+}
+
+/// Installs the architectural entry state for a new process image.
+///
+/// An exec must not expose syscall arguments, TLS, or any other register state
+/// from the old image.  This is especially observable on x86_64, where the ELF
+/// entry ABI reserves RDX for the dynamic linker's finalizer.  Leaving the
+/// execve envp argument there makes a static libc register that user-stack
+/// pointer as `rtld_fini` and jump to it when `main` returns.
+fn install_exec_user_context(uctx: &mut UserContext, entry: usize, stack: VirtAddr) {
+    *uctx = UserContext::new(entry, stack, 0);
 }
 
 /// Owns the process-wide exec/attach/thread-admission gate.
@@ -160,20 +170,6 @@ fn exec_ptrace_relationship_is_stable(
     }
 }
 
-fn reset_exec_signal_state(thr: &Thread) {
-    let mut actions = thr.proc_data.signal.actions.lock();
-    for raw in 1..=64u8 {
-        let Some(signo) = Signo::from_repr(raw) else {
-            continue;
-        };
-        if matches!(actions[signo].disposition, SignalDisposition::Handler(_)) {
-            actions[signo] = SignalAction::default();
-        }
-    }
-    drop(actions);
-    thr.signal.set_stack(Default::default());
-}
-
 fn wait_for_exec_group(
     proc_data: &ProcessData,
     thr: &Thread,
@@ -233,16 +229,20 @@ fn try_copy_string(value: &str) -> AxResult<String> {
     Ok(copy)
 }
 
-fn map_exec_vm_error(err: VmError) -> AxError {
+fn map_exec_vm_error(err: UserCopyError) -> AxError {
     match err {
-        VmError::TooLong => exec_arg_too_big(),
-        _ => err.into(),
+        UserCopyError::TooLong => exec_arg_too_big(),
+        UserCopyError::BadAddress | UserCopyError::AccessDenied => AxError::BadAddress,
+        UserCopyError::NoMemory => AxError::NoMemory,
+        _ => AxError::BadAddress,
     }
 }
 
-fn vm_load_exec_string(ptr: *const c_char) -> AxResult<String> {
-    #[allow(clippy::unnecessary_cast)]
-    let bytes = vm_load_until_nul(ptr as *const u8).map_err(map_exec_vm_error)?;
+fn vm_load_exec_string<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const c_char,
+) -> AxResult<String> {
+    let bytes = vm_load_until_nul(memory, ptr.cast::<u8>()).map_err(map_exec_vm_error)?;
     String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
 }
 
@@ -267,44 +267,134 @@ impl ExecArgSizer {
         }
     }
 
-    fn push_str(&mut self, value: &str) -> AxResult {
-        let string_bytes = value.len().checked_add(1).ok_or_else(exec_arg_too_big)?;
-        if string_bytes > EXEC_MAX_ARG_STRLEN {
-            return Err(exec_arg_too_big());
-        }
-
-        let entry_bytes = string_bytes
-            .checked_add(size_of::<usize>())
-            .ok_or_else(exec_arg_too_big)?;
+    fn push_pointer_slot(&mut self) -> AxResult {
         self.bytes = self
             .bytes
-            .checked_add(entry_bytes)
+            .checked_add(size_of::<usize>())
             .ok_or_else(exec_arg_too_big)?;
         if self.bytes > self.limit {
             return Err(exec_arg_too_big());
         }
         Ok(())
     }
+
+    fn push_string_bytes(&mut self, value: &str) -> AxResult {
+        let string_bytes = value.len().checked_add(1).ok_or_else(exec_arg_too_big)?;
+        if string_bytes > EXEC_MAX_ARG_STRLEN {
+            return Err(exec_arg_too_big());
+        }
+
+        self.bytes = self
+            .bytes
+            .checked_add(string_bytes)
+            .ok_or_else(exec_arg_too_big)?;
+        if self.bytes > self.limit {
+            return Err(exec_arg_too_big());
+        }
+        Ok(())
+    }
+
+    fn push_str(&mut self, value: &str) -> AxResult {
+        self.push_pointer_slot()?;
+        self.push_string_bytes(value)
+    }
 }
 
-fn load_exec_string_vec(
+const EXEC_POINTER_ARRAY_CHUNK: usize = 256;
+
+fn exec_pointer_array_address(base: usize, index: usize) -> AxResult<usize> {
+    let offset = index
+        .checked_mul(size_of::<usize>())
+        .ok_or(AxError::BadAddress)?;
+    base.checked_add(offset).ok_or(AxError::BadAddress)
+}
+
+fn exec_pointer_array_chunk_len(address: usize, remaining: usize) -> usize {
+    let page_offset = address % PAGE_SIZE_4K;
+    let page_remaining = PAGE_SIZE_4K - page_offset;
+    // An unaligned pointer at the end of a page can cross into the next page.
+    // Read that one complete slot so the provider can report EFAULT rather
+    // than silently truncating the typed value.
+    let page_slots = (page_remaining / size_of::<usize>()).max(1);
+    remaining.min(EXEC_POINTER_ARRAY_CHUNK).min(page_slots)
+}
+
+fn snapshot_exec_pointer_array<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const *const c_char,
+    sizer: &mut ExecArgSizer,
+) -> AxResult<Vec<*const c_char>> {
+    // Each non-null pointer consumes one stack pointer slot. The initial
+    // sizer budget already accounts for argc and the two array sentinels, so
+    // permit one final read for the terminating null without charging it.
+    let pointer_slots = sizer
+        .limit
+        .saturating_sub(sizer.bytes)
+        .checked_div(size_of::<usize>())
+        .ok_or_else(exec_arg_too_big)?;
+    let max_elements = pointer_slots.checked_add(1).ok_or_else(exec_arg_too_big)?;
+
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < max_elements {
+        let address = exec_pointer_array_address(ptr as usize, index)?;
+        let chunk_len = exec_pointer_array_chunk_len(address, max_elements - index);
+        let mut chunk = [MaybeUninit::<usize>::uninit(); EXEC_POINTER_ARRAY_CHUNK];
+        memory
+            .read_slice(address as *const usize, &mut chunk[..chunk_len])
+            .map_err(map_exec_vm_error)?;
+
+        let non_null = chunk[..chunk_len]
+            .iter()
+            .position(|raw| {
+                // SAFETY: read_slice initialized every element in this chunk.
+                unsafe { raw.assume_init() == 0 }
+            })
+            .unwrap_or(chunk_len);
+        for _ in 0..non_null {
+            sizer.push_pointer_slot()?;
+        }
+        if non_null != 0 {
+            values
+                .try_reserve_exact(non_null)
+                .map_err(|_| AxError::NoMemory)?;
+            for raw in &chunk[..non_null] {
+                // SAFETY: read_slice initialized every element in this chunk.
+                values.push(unsafe { raw.assume_init() as *const c_char });
+            }
+        }
+        if non_null != chunk_len {
+            return Ok(values);
+        }
+
+        index = index.checked_add(chunk_len).ok_or(AxError::BadAddress)?;
+    }
+
+    Err(exec_arg_too_big())
+}
+
+fn load_exec_string_vec<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     ptr: *const *const c_char,
     sizer: &mut ExecArgSizer,
 ) -> AxResult<Vec<String>> {
-    let ptrs = vm_load_until_nul(ptr).map_err(map_exec_vm_error)?;
+    let ptrs = snapshot_exec_pointer_array(memory, ptr, sizer)?;
     let mut values = Vec::new();
-    values
-        .try_reserve_exact(ptrs.len())
-        .map_err(|_| AxError::NoMemory)?;
+    if !ptrs.is_empty() {
+        values
+            .try_reserve_exact(ptrs.len())
+            .map_err(|_| AxError::NoMemory)?;
+    }
     for ptr in ptrs {
-        let value = vm_load_exec_string(ptr)?;
-        sizer.push_str(&value)?;
+        let value = vm_load_exec_string(memory, ptr)?;
+        sizer.push_string_bytes(&value)?;
         values.push(value);
     }
     Ok(values)
 }
 
-fn load_exec_args_env(
+fn load_exec_args_env<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> AxResult<(Vec<String>, Vec<String>)> {
@@ -312,7 +402,7 @@ fn load_exec_args_env(
     let args = if argv.is_null() {
         Vec::new()
     } else {
-        load_exec_string_vec(argv, &mut sizer)?
+        load_exec_string_vec(memory, argv, &mut sizer)?
     };
     let args = if args.is_empty() {
         sizer.push_str("")?;
@@ -327,7 +417,7 @@ fn load_exec_args_env(
     let envs = if envp.is_null() {
         Vec::new()
     } else {
-        load_exec_string_vec(envp, &mut sizer)?
+        load_exec_string_vec(memory, envp, &mut sizer)?
     };
 
     Ok((args, envs))
@@ -361,6 +451,10 @@ fn do_execve(
 
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
+    // Keep the old registration/events intact through every fallible image
+    // preparation step. The reservation clears them only after the new image
+    // has crossed its irreversible publication boundary.
+    let rseq_exec = thr.prepare_rseq_exec()?;
     let mut new_aspace = new_user_aspace_empty()?;
     copy_from_kernel(&mut new_aspace)?;
     let mut prepared_app = prepare_user_app_at(
@@ -507,16 +601,28 @@ fn do_execve(
     )) {
         return Err(AxError::OperationNotPermitted);
     }
+    // Reserve the private sighand owner before interrupting or waiting for any
+    // sibling. Its commit re-snapshots the fixed action table under the source
+    // owner gate, so peer updates which linearize while siblings drain are
+    // retained without allowing an allocation failure after teardown.
+    let prepared_signal_unshare = proc_data
+        .signal
+        .try_prepare_exec_unshare()
+        .map_err(|_| AxError::NoMemory)?;
     sibling_tids.retain(|&tid| tid != curr_tid);
     interrupt_exec_siblings(&sibling_tids);
     wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids)?;
+    // No-failure commit: the manager retains its old queues/registrations,
+    // while the owner swap resets only caught dispositions and leaves
+    // sighand-sharing peers on the old owner.
+    prepared_signal_unshare.commit();
     if let Some(private) = private_fd_table {
         let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
         drop(previous);
     }
-    // The token owns the exact selected table plus full-capacity detach and
-    // cleanup storage. Commit covers flags/descriptors added after preparation
-    // and has no recoverable branch or runtime invariant panic.
+    // The selected table owns full-capacity detach and cleanup storage. Commit
+    // covers flags/descriptors added after preparation and has no recoverable
+    // branch or runtime invariant panic.
     cloexec.commit();
     crate::file::inotify::wait_current_close_notifications();
 
@@ -549,7 +655,8 @@ fn do_execve(
 
     // A non-leader exec adopts the thread-group ID. The visible TID, reserved
     // alias, credential/group-leader binding, address space, and access owner
-    // become visible as one composite transition. No fallible commit remains.
+    // become visible as one composite transition. No fallible commit remains;
+    // the signal-owner commit above deliberately precedes this image handoff.
     // Process lifecycle serialization also keeps a signal operation from
     // publishing through the old thread-pid identity after this handoff.
     // Security post-commit notification remains below, after the guard drops.
@@ -598,17 +705,15 @@ fn do_execve(
 
     proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
 
-    #[cfg(target_arch = "loongarch64")]
-    reset_current_user_fpu_state();
-
-    reset_exec_signal_state(thr);
+    thr.signal.set_stack(Default::default());
 
     // Clear clear_child_tid after exec since the original address is no longer valid.
     curr.as_thread().set_clear_child_tid(0);
     curr.as_thread().set_robust_list_head(0);
 
-    uctx.set_ip(entry_point.as_usize());
-    uctx.set_sp(user_stack_base.as_usize());
+    install_exec_user_context(uctx, entry_point.as_usize(), user_stack_base);
+    reset_current_task_extended_state();
+    let _ = rseq_exec.commit();
     if let Some(session) = exec_ptrace_session
         && proc_data.ptrace_stop(session, Signo::SIGTRAP as u8)
     {
@@ -629,14 +734,15 @@ fn do_execve(
     Ok(0)
 }
 
-pub fn sys_execve(
+pub fn sys_execve<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     uctx: &mut UserContext,
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
-    let (args, envs) = load_exec_args_env(argv, envp)?;
+    let path = vm_load_exec_string(memory, path)?;
+    let (args, envs) = load_exec_args_env(memory, argv, envp)?;
 
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
@@ -649,7 +755,8 @@ pub fn sys_execve(
     do_execve(uctx, loc, args, envs, &security)
 }
 
-pub fn sys_execveat(
+pub fn sys_execveat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     uctx: &mut UserContext,
     dirfd: i32,
     path: *const c_char,
@@ -661,8 +768,8 @@ pub fn sys_execveat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = vm_load_string(path)?;
-    let (args, envs) = load_exec_args_env(argv, envp)?;
+    let path = vm_load_exec_string(memory, path)?;
+    let (args, envs) = load_exec_args_env(memory, argv, envp)?;
     debug!(
         "sys_execveat <= dirfd: {dirfd}, path: {path:?}, args: {args:?}, envs: {envs:?}, flags: \
          {flags:#x}"
@@ -692,15 +799,21 @@ pub fn sys_execveat(
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use alloc::{sync::Arc, vec, vec::Vec};
+    use core::{
+        ffi::c_char,
+        mem::{MaybeUninit, size_of},
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use axerrno::AxError;
     use linux_raw_sys::general::CAP_SYS_PTRACE;
+    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
-        classify_exec_trace_state, exact_exec_thread_snapshot, exec_file_capabilities,
-        exec_mm_owner_user_ns, files_preparation_covers_thread_snapshot,
+        ExecArgSizer, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,
+        exact_exec_thread_snapshot, exec_arg_limit, exec_file_capabilities, exec_mm_owner_user_ns,
+        files_preparation_covers_thread_snapshot, install_exec_user_context, load_exec_string_vec,
     };
     use crate::{
         mm::ExecImageAccess,
@@ -714,6 +827,23 @@ mod tests {
         let slot = CredentialSlot::new(credential);
         slot.replace_capabilities_for_test(&[CAP_SYS_PTRACE], &[])
             .unwrap()
+    }
+
+    #[test]
+    fn exec_replaces_old_image_registers_and_tls() {
+        let old_stack = VirtAddr::from_usize(0x8000);
+        let mut context = UserContext::new(0x1111, old_stack, 7);
+        context.set_arg2(0x7fff_ffff_fe30);
+        context.set_tls(0xfeed_face);
+
+        let new_stack = VirtAddr::from_usize(0x20_0000);
+        install_exec_user_context(&mut context, 0x40_1000, new_stack);
+
+        assert_eq!(context.ip(), 0x40_1000);
+        assert_eq!(context.sp(), new_stack.as_usize());
+        assert_eq!(context.arg0(), 0);
+        assert_eq!(context.arg2(), 0);
+        assert_eq!(context.tls(), 0);
     }
 
     #[test]
@@ -830,7 +960,7 @@ mod tests {
         impl Drop for DropTrace<'_> {
             fn drop(&mut self) {
                 self.trace
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                         Some(old * 10 + self.value)
                     })
                     .unwrap();
@@ -854,5 +984,175 @@ mod tests {
         assert_eq!(trace.load(Ordering::SeqCst), 1);
         drop(retirement);
         assert_eq!(trace.load(Ordering::SeqCst), 12);
+    }
+
+    struct TestMemory {
+        bytes: Vec<u8>,
+    }
+
+    unsafe impl UserMemory for TestMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let src = self
+                .bytes
+                .get(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            for (slot, byte) in dst.iter_mut().zip(src) {
+                slot.write(*byte);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    struct PageBoundedTestMemory {
+        bytes: Vec<u8>,
+        blocked_page: usize,
+    }
+
+    unsafe impl UserMemory for PageBoundedTestMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            if !dst.is_empty()
+                && (start / PAGE_SIZE_4K == self.blocked_page
+                    || (end - 1) / PAGE_SIZE_4K == self.blocked_page)
+            {
+                return Err(UserCopyError::BadAddress);
+            }
+            let src = self
+                .bytes
+                .get(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            for (slot, byte) in dst.iter_mut().zip(src) {
+                slot.write(*byte);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    fn put_usize(bytes: &mut [u8], offset: usize, value: usize) {
+        bytes[offset..offset + size_of::<usize>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    #[test]
+    fn exec_pointer_array_allows_more_than_generic_scan_limit() {
+        let count = 17_000usize;
+        let base = 0x100usize;
+        let array_bytes = (count + 1) * size_of::<usize>();
+        let string = base + array_bytes;
+        let mut bytes = vec![0; string + 1];
+        for index in 0..count {
+            put_usize(&mut bytes, base + index * size_of::<usize>(), string);
+        }
+        put_usize(&mut bytes, base + count * size_of::<usize>(), 0);
+
+        let mut provider = TestMemory { bytes };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut sizer = ExecArgSizer::new().unwrap();
+        let values =
+            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+
+        assert_eq!(values.len(), count);
+        assert!(sizer.bytes < exec_arg_limit());
+    }
+
+    #[test]
+    fn exec_pointer_array_nul_at_page_tail_does_not_read_next_page() {
+        let base = PAGE_SIZE_4K + size_of::<usize>();
+        let count = PAGE_SIZE_4K / size_of::<usize>() - 2;
+        let string = 3 * PAGE_SIZE_4K;
+        let mut bytes = vec![0; string + 1];
+        for index in 0..count {
+            put_usize(&mut bytes, base + index * size_of::<usize>(), string);
+        }
+        put_usize(&mut bytes, base + count * size_of::<usize>(), 0);
+
+        let mut provider = PageBoundedTestMemory {
+            bytes,
+            blocked_page: 2,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut sizer = ExecArgSizer::new().unwrap();
+        let values =
+            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+
+        assert_eq!(values.len(), count);
+    }
+
+    #[test]
+    fn exec_empty_pointer_array_does_not_reserve_chunk() {
+        let base = 0x100usize;
+        let mut bytes = vec![0; base + PAGE_SIZE_4K];
+        put_usize(&mut bytes, base, 0);
+
+        let mut provider = TestMemory { bytes };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut sizer = ExecArgSizer::new().unwrap();
+        let values =
+            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+
+        assert!(values.is_empty());
+        assert_eq!(values.capacity(), 0);
+    }
+
+    #[test]
+    fn exec_pointer_array_without_nul_is_e2big() {
+        let base = 0x100usize;
+        let mut bytes = vec![0; base + 2 * size_of::<usize>()];
+        put_usize(&mut bytes, base, 1);
+        put_usize(&mut bytes, base + size_of::<usize>(), 1);
+
+        let mut provider = TestMemory { bytes };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut sizer = ExecArgSizer {
+            bytes: exec_arg_limit() - size_of::<usize>(),
+            limit: exec_arg_limit(),
+        };
+        let result = load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer);
+
+        assert_eq!(result, Err(super::exec_arg_too_big()));
+    }
+
+    #[test]
+    fn exec_pointer_array_address_overflow_is_efault() {
+        let mut provider = TestMemory { bytes: vec![0] };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut sizer = ExecArgSizer::new().unwrap();
+        let result =
+            load_exec_string_vec(&mut memory, usize::MAX as *const *const c_char, &mut sizer);
+
+        assert_eq!(result, Err(AxError::BadAddress));
+    }
+
+    #[test]
+    fn exec_pointer_and_string_budget_is_e2big() {
+        let base = 0x100usize;
+        let string = base + 2 * size_of::<usize>();
+        let mut bytes = vec![0; string + 2];
+        put_usize(&mut bytes, base, string);
+        put_usize(&mut bytes, base + size_of::<usize>(), 0);
+        bytes[string] = b'x';
+
+        let mut provider = TestMemory { bytes };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let limit = exec_arg_limit();
+        let mut sizer = ExecArgSizer {
+            bytes: limit - size_of::<usize>() - 1,
+            limit,
+        };
+        let result = load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer);
+
+        assert_eq!(result, Err(super::exec_arg_too_big()));
     }
 }

@@ -19,9 +19,9 @@ use linux_raw_sys::{
         MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::{vm_read_slice, vm_write_slice};
+use memory_addr::PAGE_SIZE_4K;
 use thekernel_linux_packet::ReceiveFlags as PacketReceiveFlags;
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::{
     SocketSyscallSnapshot,
@@ -34,8 +34,8 @@ use crate::{
         af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
     },
     mm::{
-        IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
-        check_user_writable,
+        IoVec, IoVectorBuf, IoVectorBufIo, UserConstPtr, UserMemoryCapability, UserPtr,
+        map_usercopy_error,
     },
     syscall::net::{CMsg, CMsgBuilder, SCM_MAX_FD},
     task::{
@@ -101,18 +101,19 @@ const fn recvmmsg_consumes_pending_error(flags: u32) -> bool {
     flags & MSG_ERRQUEUE == 0
 }
 
-fn read_user_copy<T: Copy>(ptr: UserConstPtr<T>) -> AxResult<T> {
-    let mut value = MaybeUninit::<T>::uninit();
-    vm_read_slice(ptr.address().as_usize() as *const u8, unsafe {
-        core::slice::from_raw_parts_mut(
-            value.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            size_of::<T>(),
-        )
-    })?;
-    Ok(unsafe { value.assume_init() })
+fn read_user_copy<T: Copy>(capability: &UserMemoryCapability, ptr: UserConstPtr<T>) -> AxResult<T> {
+    capability
+        .read_value_uninit(ptr.address().as_usize() as *const T)
+        .map_err(map_usercopy_error)
+        .map(|value| unsafe { value.assume_init() })
 }
 
-fn snapshot_user_bytes(ptr: *const u8, len: usize, limit: usize) -> AxResult<Vec<u8>> {
+fn snapshot_user_bytes(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+    limit: usize,
+) -> AxResult<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
     }
@@ -128,12 +129,14 @@ fn snapshot_user_bytes(ptr: *const u8, len: usize, limit: usize) -> AxResult<Vec
         .try_reserve_exact(len)
         .map_err(|_| AxError::NoMemory)?;
     snapshot.resize(len, 0);
-    vm_read_slice(ptr, unsafe {
-        core::slice::from_raw_parts_mut(
-            snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            snapshot.len(),
-        )
-    })?;
+    capability
+        .read_slice(ptr, unsafe {
+            core::slice::from_raw_parts_mut(
+                snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                snapshot.len(),
+            )
+        })
+        .map_err(map_usercopy_error)?;
     Ok(snapshot)
 }
 
@@ -151,16 +154,337 @@ fn snapshot_iov_payload(iov: IoVectorBuf) -> AxResult<Vec<u8>> {
     Ok(payload)
 }
 
-fn write_user_copy<T: Copy>(ptr: UserPtr<T>, value: T) -> AxResult {
-    Ok(vm_write_slice(
-        ptr.address().as_usize() as *mut u8,
-        unsafe { core::slice::from_raw_parts((&value as *const T).cast::<u8>(), size_of::<T>()) },
-    )?)
+fn write_user_copy<T: Copy>(
+    capability: &UserMemoryCapability,
+    ptr: UserPtr<T>,
+    value: T,
+) -> AxResult {
+    capability
+        .write_bytes(ptr.address().as_usize(), unsafe {
+            core::slice::from_raw_parts((&value as *const T).cast::<u8>(), size_of::<T>())
+        })
+        .map_err(map_usercopy_error)
 }
 
-fn write_user_field<T: Copy>(base: usize, offset: usize, value: T) -> AxResult {
+fn write_user_field<T: Copy>(
+    capability: &UserMemoryCapability,
+    base: usize,
+    offset: usize,
+    value: T,
+) -> AxResult {
     let address = base.checked_add(offset).ok_or(AxError::BadAddress)?;
-    write_user_copy(UserPtr::<T>::from(address), value)
+    write_user_copy(capability, UserPtr::<T>::from(address), value)
+}
+
+/// A userspace byte source that reports a successfully copied page prefix as
+/// ordinary I/O progress. The generic VM buffer performs one all-or-nothing
+/// range access; that is correct for snapshots but would make a TCP send lose
+/// bytes that preceded a later unmapped page.
+struct ProgressiveVmBytes {
+    capability: UserMemoryCapability,
+    ptr: usize,
+    len: usize,
+}
+
+impl ProgressiveVmBytes {
+    fn new(capability: UserMemoryCapability, ptr: *const u8, len: usize) -> Self {
+        Self {
+            capability,
+            ptr: ptr as usize,
+            len,
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.ptr = self.ptr.wrapping_add(count);
+        self.len -= count;
+    }
+}
+
+impl Read for ProgressiveVmBytes {
+    fn read(&mut self, output: &mut [u8]) -> AxResult<usize> {
+        let target = self.len.min(output.len());
+        let mut copied = 0;
+        while copied < target {
+            let address = match self.ptr.checked_add(copied) {
+                Some(address) => address,
+                None => {
+                    self.advance(copied);
+                    return if copied != 0 {
+                        Ok(copied)
+                    } else {
+                        Err(AxError::BadAddress)
+                    };
+                }
+            };
+            let page_offset = address & (PAGE_SIZE_4K - 1);
+            let chunk = (target - copied).min(PAGE_SIZE_4K - page_offset);
+            let destination = unsafe {
+                core::slice::from_raw_parts_mut(
+                    output[copied..copied + chunk]
+                        .as_mut_ptr()
+                        .cast::<MaybeUninit<u8>>(),
+                    chunk,
+                )
+            };
+            if let Err(error) = self
+                .capability
+                .read_slice(address as *const u8, destination)
+                .map_err(map_usercopy_error)
+            {
+                self.advance(copied);
+                return if copied != 0 { Ok(copied) } else { Err(error) };
+            }
+            copied += chunk;
+        }
+        self.advance(copied);
+        Ok(copied)
+    }
+}
+
+impl IoBuf for ProgressiveVmBytes {
+    fn remaining(&self) -> usize {
+        self.len
+    }
+}
+
+/// A userspace destination with page-granular progress. Stream receives use
+/// the short-count behavior, while datagram callers set `strict_fault` so a
+/// later copyout fault remains an error after the datagram has been consumed.
+struct ProgressiveVmBytesMut {
+    capability: UserMemoryCapability,
+    ptr: usize,
+    len: usize,
+    strict_fault: bool,
+}
+
+impl ProgressiveVmBytesMut {
+    fn new(capability: UserMemoryCapability, ptr: *mut u8, len: usize, strict_fault: bool) -> Self {
+        Self {
+            capability,
+            ptr: ptr as usize,
+            len,
+            strict_fault,
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.ptr = self.ptr.wrapping_add(count);
+        self.len -= count;
+    }
+}
+
+impl Write for ProgressiveVmBytesMut {
+    fn write(&mut self, input: &[u8]) -> AxResult<usize> {
+        let target = self.len.min(input.len());
+        let mut copied = 0;
+        while copied < target {
+            let address = match self.ptr.checked_add(copied) {
+                Some(address) => address,
+                None => {
+                    self.advance(copied);
+                    return if copied != 0 && !self.strict_fault {
+                        Ok(copied)
+                    } else {
+                        Err(AxError::BadAddress)
+                    };
+                }
+            };
+            let page_offset = address & (PAGE_SIZE_4K - 1);
+            let chunk = (target - copied).min(PAGE_SIZE_4K - page_offset);
+            if let Err(error) = self
+                .capability
+                .write_bytes(address, &input[copied..copied + chunk])
+                .map_err(map_usercopy_error)
+            {
+                self.advance(copied);
+                return if copied != 0 && !self.strict_fault {
+                    Ok(copied)
+                } else {
+                    Err(error)
+                };
+            }
+            copied += chunk;
+        }
+        self.advance(copied);
+        Ok(copied)
+    }
+
+    fn flush(&mut self) -> AxResult {
+        Ok(())
+    }
+}
+
+impl IoBufMut for ProgressiveVmBytesMut {
+    fn remaining_mut(&self) -> usize {
+        self.len
+    }
+}
+
+/// Adds page-sized read/write requests around the capability-backed iovec
+/// cursor. `IoVectorBufIo` already preserves progress at iovec boundaries;
+/// this adapter extends the same rule to a fault in the middle of one iovec.
+struct PageProgressIo {
+    inner: IoVectorBufIo,
+    entries: Vec<IoVec>,
+    position: usize,
+}
+
+impl PageProgressIo {
+    fn new(iov: IoVectorBuf) -> AxResult<Self> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(iov.iovcnt())
+            .map_err(|_| AxError::NoMemory)?;
+        for index in 0..iov.iovcnt() {
+            entries.push(iov.entry(index)?);
+        }
+        Ok(Self {
+            inner: iov.into_io(),
+            entries,
+            position: 0,
+        })
+    }
+
+    fn chunk_len(&self, requested: usize) -> usize {
+        let mut position = self.position;
+        for entry in &self.entries {
+            let len = entry.iov_len as usize;
+            if position >= len {
+                position -= len;
+                continue;
+            }
+            let address = (entry.iov_base as usize).wrapping_add(position);
+            let page_remaining = PAGE_SIZE_4K - (address & (PAGE_SIZE_4K - 1));
+            return requested.min(len - position).min(page_remaining);
+        }
+        0
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.position = self.position.saturating_add(count);
+    }
+}
+
+impl Read for PageProgressIo {
+    fn read(&mut self, output: &mut [u8]) -> AxResult<usize> {
+        let target = self.inner.remaining().min(output.len());
+        let mut copied = 0;
+        while copied < target {
+            let chunk = self.chunk_len(target - copied);
+            if chunk == 0 {
+                break;
+            }
+            match self.inner.read(&mut output[copied..copied + chunk]) {
+                Ok(count) => {
+                    self.advance(count);
+                    copied += count;
+                    if count < chunk {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    return if copied != 0 { Ok(copied) } else { Err(error) };
+                }
+            }
+        }
+        Ok(copied)
+    }
+}
+
+impl Write for PageProgressIo {
+    fn write(&mut self, input: &[u8]) -> AxResult<usize> {
+        let target = self.inner.remaining_mut().min(input.len());
+        let mut copied = 0;
+        while copied < target {
+            let chunk = self.chunk_len(target - copied);
+            if chunk == 0 {
+                break;
+            }
+            match self.inner.write(&input[copied..copied + chunk]) {
+                Ok(count) => {
+                    self.advance(count);
+                    copied += count;
+                    if count < chunk {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    return if copied != 0 { Ok(copied) } else { Err(error) };
+                }
+            }
+        }
+        Ok(copied)
+    }
+
+    fn flush(&mut self) -> AxResult {
+        self.inner.flush()
+    }
+}
+
+impl IoBuf for PageProgressIo {
+    fn remaining(&self) -> usize {
+        self.inner.remaining()
+    }
+}
+
+impl IoBufMut for PageProgressIo {
+    fn remaining_mut(&self) -> usize {
+        self.inner.remaining_mut()
+    }
+}
+
+/// `IoVectorBufIo` reports a prefix when a later iovec faults. Datagram
+/// transports must turn that prefix back into EFAULT (after consuming the
+/// datagram); a short destination caused solely by capacity remains valid.
+struct StrictDatagramWrite<T> {
+    inner: T,
+}
+
+impl<T> StrictDatagramWrite<T> {
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: Write + IoBufMut> Write for StrictDatagramWrite<T> {
+    fn write(&mut self, input: &[u8]) -> AxResult<usize> {
+        let copied = self.inner.write(input)?;
+        if copied < input.len() && self.inner.remaining_mut() != 0 {
+            return Err(AxError::BadAddress);
+        }
+        Ok(copied)
+    }
+
+    fn flush(&mut self) -> AxResult {
+        self.inner.flush()
+    }
+}
+
+impl<T: Write + IoBufMut> IoBufMut for StrictDatagramWrite<T> {
+    fn remaining_mut(&self) -> usize {
+        self.inner.remaining_mut()
+    }
+}
+
+fn recv_copyout_requires_error(socket: &PinnedSocketDescription) -> AxResult<bool> {
+    // axnet's UDP receive dequeues before invoking `dst.write`, while MSG_PEEK
+    // takes the non-consuming peek path. Unix datagrams follow the same
+    // consume-before-copy contract. Keep a usercopy fault an error here so a
+    // consumed datagram is not reported as a successful short message, while
+    // the lower peek path still retains its record.
+    match socket.backend()? {
+        SocketBackendKind::Packet | SocketBackendKind::Netlink => Ok(true),
+        SocketBackendKind::Network => {
+            let socket = socket.network()?;
+            Ok(match &socket.inner {
+                AxSocket::Udp(_) => true,
+                AxSocket::Unix(unix) => unix.is_datagram(),
+                _ => false,
+            })
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,7 +593,7 @@ fn cmsg_align(len: usize) -> Option<usize> {
         .map(|len| len & !(size_of::<usize>() - 1))
 }
 
-fn parse_send_control(msg: &msghdr) -> AxResult<Vec<CMsgData>> {
+fn parse_send_control(capability: &UserMemoryCapability, msg: &msghdr) -> AxResult<Vec<CMsgData>> {
     if msg.msg_controllen == 0 {
         return Ok(Vec::new());
     }
@@ -292,12 +616,12 @@ fn parse_send_control(msg: &msghdr) -> AxResult<Vec<CMsgData>> {
     let mut offset = 0usize;
     while msg.msg_controllen - offset >= size_of::<cmsghdr>() {
         let hdr_addr = base.checked_add(offset).ok_or(AxError::BadAddress)?;
-        let hdr = read_user_copy(UserConstPtr::<cmsghdr>::from(hdr_addr))?;
+        let hdr = read_user_copy(capability, UserConstPtr::<cmsghdr>::from(hdr_addr))?;
         let remaining = msg.msg_controllen - offset;
         if hdr.cmsg_len < size_of::<cmsghdr>() || hdr.cmsg_len > remaining {
             return Err(AxError::InvalidInput);
         }
-        CMsg::append_rights(hdr_addr, &hdr, &mut rights)?;
+        CMsg::append_rights(capability, hdr_addr, &hdr, &mut rights)?;
 
         let aligned = cmsg_align(hdr.cmsg_len).ok_or(AxError::InvalidInput)?;
         if aligned > remaining {
@@ -380,6 +704,7 @@ fn send_packet_after_security(
 }
 
 fn send_impl(
+    capability: &UserMemoryCapability,
     socket: &PinnedSocketDescription,
     snapshot: &SocketSyscallSnapshot,
     fd: i32,
@@ -399,11 +724,12 @@ fn send_impl(
         Some(validate_sendmsg_flags(flags)?)
     };
     let (network_addr, packet_address) = match backend {
-        SocketBackendKind::Network if !addr.is_null() && addrlen != 0 => {
-            (Some(SocketAddrEx::read_from_user(addr, addrlen)?), None)
-        }
+        SocketBackendKind::Network if !addr.is_null() && addrlen != 0 => (
+            Some(SocketAddrEx::read_from_user(capability, addr, addrlen)?),
+            None,
+        ),
         SocketBackendKind::Packet if !addr.is_null() => {
-            (None, Some(snapshot_address(addr, addrlen)?))
+            (None, Some(snapshot_address(capability, addr, addrlen)?))
         }
         _ => (None, None),
     };
@@ -505,6 +831,7 @@ fn send_impl(
 }
 
 pub fn sys_sendto(
+    capability: UserMemoryCapability,
     fd: i32,
     buf: *const u8,
     len: usize,
@@ -513,28 +840,17 @@ pub fn sys_sendto(
     addrlen: socklen_t,
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
-    let payload_admission = if len == 0 {
-        Ok(())
-    } else {
-        check_user_readable(buf as usize, len)
-    };
-    // Preserve the established eager-prefault errno order for every existing
-    // backend while deferring only AF_PACKET payload faults until after its
-    // security hook and device/MTU plan. The speculative fd classification is
-    // read-only; if it fails after an eager fault, the legacy fault still wins.
-    let socket = match payload_admission {
-        Ok(()) => PinnedSocketDescription::from_fd(fd)?,
-        Err(payload_error) => match PinnedSocketDescription::from_fd(fd) {
-            Ok(socket) if socket.backend()? == SocketBackendKind::Packet => socket,
-            _ => return Err(payload_error.into()),
-        },
-    };
+    // Payload access is deliberately deferred to the transport's actual
+    // read. Stream transports can then report bytes copied before a later page
+    // fault instead of turning the whole send into an eager EFAULT.
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
     send_impl(
+        &capability,
         &socket,
         &snapshot,
         fd,
-        VmBytes::new(buf, len),
+        ProgressiveVmBytes::new(capability.clone(), buf, len),
         flags,
         addr,
         addrlen,
@@ -551,11 +867,16 @@ struct ImportedAfAlgSend {
 }
 
 impl ImportedAfAlgSend {
-    fn import(msg: &msghdr, flags: u32) -> AxResult<Self> {
-        let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
+    fn import(capability: &UserMemoryCapability, msg: &msghdr, flags: u32) -> AxResult<Self> {
+        let send_iov = IoVectorBuf::new(
+            capability.clone(),
+            msg.msg_iov.cast::<IoVec>(),
+            msg.msg_iovlen,
+        )?;
         send_iov.check_readable()?;
         let iov_count = send_iov.iovcnt();
         let control = snapshot_user_bytes(
+            capability,
             msg.msg_control.cast::<u8>(),
             msg.msg_controllen,
             MAX_SENDMSG_CONTROL_LEN,
@@ -596,13 +917,14 @@ fn import_send_after_socket_hook<I, O>(
 }
 
 fn sendmsg_with_socket(
+    capability: &UserMemoryCapability,
     socket: &PinnedSocketDescription,
     snapshot: &SocketSyscallSnapshot,
     fd: i32,
     msg: UserConstPtr<msghdr>,
     flags: u32,
 ) -> AxResult<isize> {
-    let msg = read_user_copy(msg)?;
+    let msg = read_user_copy(capability, msg)?;
     if socket.backend()? == SocketBackendKind::AfAlg {
         let af_alg = socket.af_alg()?;
         debug!("sys_sendmsg <= fd: {fd}, flags: {flags}, af_alg");
@@ -611,7 +933,7 @@ fn sendmsg_with_socket(
         }
         let policy_socket = socket.security_ref()?;
         return import_send_after_socket_hook(
-            || ImportedAfAlgSend::import(&msg, flags),
+            || ImportedAfAlgSend::import(capability, &msg, flags),
             |imported| {
                 dispatch_socket(&SocketSecurityContext::send_message(
                     snapshot.actor(),
@@ -628,28 +950,31 @@ fn sendmsg_with_socket(
         );
     }
 
-    let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
-    if socket.backend()? != SocketBackendKind::Packet {
-        send_iov.check_readable()?;
-    }
+    let send_iov = IoVectorBuf::new(
+        capability.clone(),
+        msg.msg_iov.cast::<IoVec>(),
+        msg.msg_iovlen,
+    )?;
     let (cmsg, packet_control_length) = if socket.backend()? == SocketBackendKind::Packet {
         // Copy the bounded generic control buffer once, but defer semantic
         // cmsg parsing/support to the AF_PACKET mechanism phase after policy.
         let control = snapshot_user_bytes(
+            capability,
             msg.msg_control.cast::<u8>(),
             msg.msg_controllen,
             MAX_SENDMSG_CONTROL_LEN,
         )?;
         (Vec::new(), control.len())
     } else {
-        (parse_send_control(&msg)?, 0)
+        (parse_send_control(capability, &msg)?, 0)
     };
 
     send_impl(
+        capability,
         socket,
         snapshot,
         fd,
-        send_iov.into_io(),
+        PageProgressIo::new(send_iov)?,
         flags,
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
@@ -660,11 +985,16 @@ fn sendmsg_with_socket(
     )
 }
 
-pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<isize> {
+pub fn sys_sendmsg(
+    capability: UserMemoryCapability,
+    fd: i32,
+    msg: UserConstPtr<msghdr>,
+    flags: u32,
+) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
-    sendmsg_with_socket(&socket, &snapshot, fd, msg, flags)
+    sendmsg_with_socket(&capability, &socket, &snapshot, fd, msg, flags)
 }
 
 enum ReceivedSocketAddress {
@@ -674,9 +1004,14 @@ enum ReceivedSocketAddress {
 }
 
 impl ReceivedSocketAddress {
-    fn write_to_user(self, addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult<()> {
+    fn write_to_user(
+        self,
+        capability: &UserMemoryCapability,
+        addr: UserPtr<sockaddr>,
+        addrlen: &mut socklen_t,
+    ) -> AxResult<()> {
         match self {
-            Self::Network(addr_value) => addr_value.write_to_user(addr, addrlen),
+            Self::Network(addr_value) => addr_value.write_to_user(capability, addr, addrlen),
             Self::NetlinkKernel => {
                 let addr_value = SockaddrNl {
                     nl_family: AF_NETLINK as _,
@@ -692,12 +1027,14 @@ impl ReceivedSocketAddress {
                 };
                 let copy_len = (*addrlen as usize).min(bytes.len());
                 if copy_len != 0 {
-                    vm_write_slice(addr.address().as_usize() as *mut u8, &bytes[..copy_len])?;
+                    capability
+                        .write_bytes(addr.address().as_usize(), &bytes[..copy_len])
+                        .map_err(map_usercopy_error)?;
                 }
                 *addrlen = bytes.len() as _;
                 Ok(())
             }
-            Self::Packet(address) => write_received_address(address, addr, addrlen),
+            Self::Packet(address) => write_received_address(capability, address, addr, addrlen),
         }
     }
 }
@@ -710,6 +1047,7 @@ struct ReceiveOutcome {
 }
 
 fn recv_impl(
+    _capability: &UserMemoryCapability,
     socket: &PinnedSocketDescription,
     fd: i32,
     mut dst: impl Write + IoBufMut,
@@ -848,6 +1186,7 @@ fn recvmsg_security_message(
 }
 
 pub fn sys_recvfrom(
+    capability: UserMemoryCapability,
     fd: i32,
     buf: *mut u8,
     len: usize,
@@ -857,13 +1196,10 @@ pub fn sys_recvfrom(
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
-    // Linux packet receive claims an ordinary skb before payload copy.  Do
-    // not pre-fault packet destinations: a later EFAULT must consume ordinary
-    // receive while MSG_PEEK retains it. Other backends keep their established
-    // eager-writable admission.
-    if len != 0 && socket.backend()? != SocketBackendKind::Packet {
-        check_user_writable(buf as usize, len)?;
-    }
+    // Do not pre-fault destinations. Stream transports return a prefix when a
+    // later page faults; datagram transports use the strict adapter below so
+    // the consumed datagram still reports EFAULT.
+    let strict_copyout = recv_copyout_requires_error(&socket)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
     let recv_flags = validate_recvmsg_flags(flags, socket.backend()? == SocketBackendKind::Packet)?;
     let message = recvfrom_security_message(flags);
@@ -871,9 +1207,10 @@ pub fn sys_recvfrom(
         || dispatch_receive_message(&socket, &snapshot, &message, len, flags),
         || {
             recv_impl(
+                &capability,
                 &socket,
                 fd,
-                VmBytesMut::new(buf, len),
+                ProgressiveVmBytesMut::new(capability.clone(), buf, len, strict_copyout),
                 recv_flags,
                 !addr.is_null(),
                 None,
@@ -882,11 +1219,12 @@ pub fn sys_recvfrom(
         },
         |outcome| {
             if let Some(remote_addr) = outcome.address {
-                let mut user_addrlen = read_user_copy(UserConstPtr::<socklen_t>::from(
-                    addrlen.address().as_usize(),
-                ))?;
-                remote_addr.write_to_user(addr, &mut user_addrlen)?;
-                write_user_copy(addrlen, user_addrlen)?;
+                let mut user_addrlen = read_user_copy(
+                    &capability,
+                    UserConstPtr::<socklen_t>::from(addrlen.address().as_usize()),
+                )?;
+                remote_addr.write_to_user(&capability, addr, &mut user_addrlen)?;
+                write_user_copy(&capability, addrlen, user_addrlen)?;
             }
             Ok(outcome.returned_len)
         },
@@ -900,17 +1238,25 @@ struct ImportedRecvMessage {
 }
 
 impl ImportedRecvMessage {
-    fn import(user: UserPtr<msghdr>, defer_payload_fault: bool) -> AxResult<Self> {
-        let msg_hdr = read_user_copy(UserConstPtr::<msghdr>::from(user.address().as_usize()))?;
+    fn import(
+        capability: &UserMemoryCapability,
+        user: UserPtr<msghdr>,
+        _defer_payload_fault: bool,
+    ) -> AxResult<Self> {
+        let msg_hdr = read_user_copy(
+            capability,
+            UserConstPtr::<msghdr>::from(user.address().as_usize()),
+        )?;
         if (msg_hdr.msg_namelen as i32) < 0 || (msg_hdr.msg_controllen as isize) < 0 {
             return Err(AxError::InvalidInput);
         }
         validate_recvmsg_iovlen(msg_hdr.msg_iovlen)?;
 
-        let recv_iov = IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?;
-        if !defer_payload_fault {
-            recv_iov.check_writable()?;
-        }
+        let recv_iov = IoVectorBuf::new(
+            capability.clone(),
+            msg_hdr.msg_iov.cast::<IoVec>(),
+            msg_hdr.msg_iovlen,
+        )?;
         Ok(Self {
             user,
             header: msg_hdr,
@@ -936,11 +1282,13 @@ impl ImportedRecvMessage {
 }
 
 fn recvmsg_imported(
+    capability: &UserMemoryCapability,
     socket: &PinnedSocketDescription,
     fd: i32,
     imported: ImportedRecvMessage,
     flags: u32,
     recv_flags: ValidatedRecvFlags,
+    strict_copyout: bool,
 ) -> AxResult<isize> {
     let ImportedRecvMessage {
         user: msg,
@@ -955,23 +1303,43 @@ fn recvmsg_imported(
         None
     } else {
         Some(CMsgBuilder::new(
+            capability.clone(),
             UserPtr::from(msg_hdr.msg_control.cast::<cmsghdr>()),
             &mut msg_hdr.msg_controllen,
         ))
     };
-    let recv = recv_impl(
-        socket,
-        fd,
-        recv_iov.into_io(),
-        recv_flags,
-        !msg_hdr.msg_name.is_null(),
-        control,
-        flags & MSG_CMSG_CLOEXEC != 0,
-    )?;
+    let recv_iov = PageProgressIo::new(recv_iov)?;
+    let recv = if strict_copyout {
+        recv_impl(
+            capability,
+            socket,
+            fd,
+            StrictDatagramWrite::new(recv_iov),
+            recv_flags,
+            !msg_hdr.msg_name.is_null(),
+            control,
+            flags & MSG_CMSG_CLOEXEC != 0,
+        )?
+    } else {
+        recv_impl(
+            capability,
+            socket,
+            fd,
+            recv_iov,
+            recv_flags,
+            !msg_hdr.msg_name.is_null(),
+            control,
+            flags & MSG_CMSG_CLOEXEC != 0,
+        )?
+    };
     // Ancillary fd numbers are a Linux publication point. `recv_impl` handles
     // those first, so an invalid msg_name preserves already exposed fds.
     if let Some(remote_addr) = recv.address {
-        remote_addr.write_to_user(UserPtr::from(msg_hdr.msg_name as usize), &mut name_len)?;
+        remote_addr.write_to_user(
+            capability,
+            UserPtr::from(msg_hdr.msg_name as usize),
+            &mut name_len,
+        )?;
     }
     if recv.control_truncated {
         msg_hdr.msg_flags |= MSG_CTRUNC;
@@ -984,17 +1352,20 @@ fn recvmsg_imported(
     // of msghdr after the message has already been consumed.
     if !msg_hdr.msg_name.is_null() {
         write_user_field(
+            capability,
             msg_addr,
             core::mem::offset_of!(msghdr, msg_namelen),
             name_len as socklen_t,
         )?;
     }
     write_user_field(
+        capability,
         msg_addr,
         core::mem::offset_of!(msghdr, msg_flags),
         msg_hdr.msg_flags,
     )?;
     write_user_field(
+        capability,
         msg_addr,
         core::mem::offset_of!(msghdr, msg_controllen),
         msg_hdr.msg_controllen,
@@ -1002,13 +1373,22 @@ fn recvmsg_imported(
     Ok(recv.returned_len)
 }
 
-pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
+pub fn sys_recvmsg(
+    capability: UserMemoryCapability,
+    fd: i32,
+    msg: UserPtr<msghdr>,
+    flags: u32,
+) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
     let recv_flags = validate_recvmsg_flags(flags, socket.backend()? == SocketBackendKind::Packet)?;
-    let imported =
-        ImportedRecvMessage::import(msg, socket.backend()? == SocketBackendKind::Packet)?;
+    let strict_copyout = recv_copyout_requires_error(&socket)?;
+    let imported = ImportedRecvMessage::import(
+        &capability,
+        msg,
+        socket.backend()? == SocketBackendKind::Packet,
+    )?;
     receive_after_socket_hook(
         imported,
         |imported| {
@@ -1021,11 +1401,27 @@ pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize>
                 flags,
             )
         },
-        |imported| recvmsg_imported(&socket, fd, imported, flags, recv_flags),
+        |imported| {
+            recvmsg_imported(
+                &capability,
+                &socket,
+                fd,
+                imported,
+                flags,
+                recv_flags,
+                strict_copyout,
+            )
+        },
     )
 }
 
-pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_sendmmsg(
+    capability: UserMemoryCapability,
+    fd: i32,
+    msgvec: UserPtr<mmsghdr>,
+    vlen: u32,
+    flags: u32,
+) -> AxResult<isize> {
     // Linux validates and pins the socket even when there are no elements; a
     // zero vlen only suppresses access to msgvec itself.
     let snapshot = SocketSyscallSnapshot::capture();
@@ -1043,11 +1439,14 @@ pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) ->
             Err(err) => return Err(err),
         };
         let msg = UserConstPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
-        match sendmsg_with_socket(&socket, &snapshot, fd, msg, flags) {
+        match sendmsg_with_socket(&capability, &socket, &snapshot, fd, msg, flags) {
             Ok(len) => {
-                if let Err(err) =
-                    write_user_field(ptr, core::mem::offset_of!(mmsghdr, msg_len), len as u32)
-                {
+                if let Err(err) = write_user_field(
+                    &capability,
+                    ptr,
+                    core::mem::offset_of!(mmsghdr, msg_len),
+                    len as u32,
+                ) {
                     if sent != 0 {
                         return Ok(sent as isize);
                     }
@@ -1062,11 +1461,14 @@ pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) ->
     Ok(sent as isize)
 }
 
-fn recvmmsg_has_timeout(timeout: UserConstPtr<timespec>) -> AxResult<bool> {
+fn recvmmsg_has_timeout(
+    capability: &UserMemoryCapability,
+    timeout: UserConstPtr<timespec>,
+) -> AxResult<bool> {
     if timeout.is_null() {
         return Ok(false);
     }
-    let timeout = read_user_copy(timeout)?;
+    let timeout = read_user_copy(capability, timeout)?;
     if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
         return Err(AxError::InvalidInput);
     }
@@ -1074,6 +1476,7 @@ fn recvmmsg_has_timeout(timeout: UserConstPtr<timespec>) -> AxResult<bool> {
 }
 
 pub fn sys_recvmmsg(
+    capability: UserMemoryCapability,
     fd: i32,
     msgvec: UserPtr<mmsghdr>,
     vlen: u32,
@@ -1083,7 +1486,7 @@ pub fn sys_recvmmsg(
     let snapshot = SocketSyscallSnapshot::capture();
     // The timeout object is imported before Linux enters do_recvmmsg(), even
     // for vlen zero. Pin the endpoint next, then skip only msgvec processing.
-    let has_timeout = recvmmsg_has_timeout(timeout)?;
+    let has_timeout = recvmmsg_has_timeout(&capability, timeout)?;
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let Some(vlen) = admitted_recvmmsg_vlen(vlen) else {
         // A zero-length batch has no receive attempt and therefore no receive
@@ -1104,12 +1507,13 @@ pub fn sys_recvmmsg(
     let mut active_flags = effective_message_flags(flags & !MSG_WAITFORONE, socket.nonblocking());
     let mut recv_flags =
         validate_recvmsg_flags(active_flags, socket.backend()? == SocketBackendKind::Packet)?;
+    let strict_copyout = recv_copyout_requires_error(&socket)?;
     let mut received = 0usize;
     let defer_payload_fault = socket.backend()? == SocketBackendKind::Packet;
     let base = msgvec.address().as_usize();
     let first_ptr = mmsg_address(base, 0)?;
     let first_msg = UserPtr::<mmsghdr>::from(first_ptr).cast::<msghdr>();
-    let first_imported = ImportedRecvMessage::import(first_msg, defer_payload_fault)?;
+    let first_imported = ImportedRecvMessage::import(&capability, first_msg, defer_payload_fault)?;
     let message = first_imported.security_message(active_flags);
     dispatch_receive_message(
         &socket,
@@ -1140,7 +1544,7 @@ pub fn sys_recvmmsg(
                 .expect("first recvmmsg element was imported before dispatch")
         } else {
             let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
-            match ImportedRecvMessage::import(msg, defer_payload_fault) {
+            match ImportedRecvMessage::import(&capability, msg, defer_payload_fault) {
                 Ok(imported) => imported,
                 Err(err) if received != 0 => {
                     remember_recvmmsg_error(&socket, err);
@@ -1150,7 +1554,15 @@ pub fn sys_recvmmsg(
             }
         };
         let receive = if idx == 0 {
-            recvmsg_imported(&socket, fd, imported, active_flags, recv_flags)
+            recvmsg_imported(
+                &capability,
+                &socket,
+                fd,
+                imported,
+                active_flags,
+                recv_flags,
+                strict_copyout,
+            )
         } else {
             receive_after_socket_hook(
                 imported,
@@ -1164,14 +1576,27 @@ pub fn sys_recvmmsg(
                         active_flags,
                     )
                 },
-                |imported| recvmsg_imported(&socket, fd, imported, active_flags, recv_flags),
+                |imported| {
+                    recvmsg_imported(
+                        &capability,
+                        &socket,
+                        fd,
+                        imported,
+                        active_flags,
+                        recv_flags,
+                        strict_copyout,
+                    )
+                },
             )
         };
         match receive {
             Ok(len) => {
-                if let Err(err) =
-                    write_user_field(ptr, core::mem::offset_of!(mmsghdr, msg_len), len as u32)
-                {
+                if let Err(err) = write_user_field(
+                    &capability,
+                    ptr,
+                    core::mem::offset_of!(mmsghdr, msg_len),
+                    len as u32,
+                ) {
                     if received != 0 {
                         remember_recvmmsg_error(&socket, err);
                         return Ok(received as isize);
@@ -1198,6 +1623,46 @@ pub fn sys_recvmmsg(
 mod tests {
     use super::*;
 
+    fn mapped_io_capability() -> UserMemoryCapability {
+        use alloc::sync::Arc;
+
+        use axhal::paging::{MappingFlags, PageSize};
+        use axsync::Mutex;
+        use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+        let mut address_space =
+            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 4).unwrap();
+        for base in [0x1000, 0x3000] {
+            address_space
+                .map(
+                    VirtAddr::from(base),
+                    PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                    false,
+                    crate::mm::Backend::new_alloc(VirtAddr::from(base), PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
+
+    fn map_io_page(capability: &UserMemoryCapability, base: usize) {
+        use axhal::paging::{MappingFlags, PageSize};
+        use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+        capability
+            .address_space()
+            .lock()
+            .map(
+                VirtAddr::from(base),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                crate::mm::Backend::new_alloc(VirtAddr::from(base), PageSize::Size4K),
+            )
+            .unwrap();
+    }
+
     struct FaultingPayload<'a> {
         reads: &'a core::cell::Cell<usize>,
         len: usize,
@@ -1214,6 +1679,72 @@ mod tests {
         fn remaining(&self) -> usize {
             self.len
         }
+    }
+
+    #[test]
+    fn progressive_send_copy_returns_a_prefix_before_a_later_page_fault() {
+        let capability = mapped_io_capability();
+        let first_page = [0x5a_u8; 16];
+        capability.write_bytes(0x1ff0, &first_page).unwrap();
+        let mut source = ProgressiveVmBytes::new(capability.clone(), 0x1ff0 as *const u8, 32);
+        let mut output = [0_u8; 32];
+
+        assert_eq!(source.read(&mut output), Ok(16));
+        assert_eq!(&output[..16], &first_page);
+        assert_eq!(source.remaining(), 16);
+        assert_eq!(source.read(&mut output[..16]), Err(AxError::BadAddress));
+        assert_eq!(source.remaining(), 16);
+
+        map_io_page(&capability, 0x2000);
+        capability.write_bytes(0x2000, &[0x6b; 16]).unwrap();
+        assert_eq!(source.read(&mut output[..16]), Ok(16));
+        assert_eq!(&output[..16], &[0x6b; 16]);
+        assert_eq!(source.remaining(), 0);
+    }
+
+    #[test]
+    fn progressive_iovec_copy_returns_a_prefix_before_a_middle_page_fault() {
+        let capability = mapped_io_capability();
+        let descriptor = IoVec {
+            iov_base: 0x1ff0 as *mut u8,
+            iov_len: 32,
+        };
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
+                .unwrap();
+        }
+        let iov = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
+        let mut source = PageProgressIo::new(iov).unwrap();
+        let mut output = [0_u8; 32];
+        capability.write_bytes(0x1ff0, &[0x4d; 16]).unwrap();
+
+        assert_eq!(source.read(&mut output), Ok(16));
+        assert_eq!(source.remaining(), 16);
+        assert_eq!(source.read(&mut output[..16]), Err(AxError::BadAddress));
+        assert_eq!(source.remaining(), 16);
+
+        map_io_page(&capability, 0x2000);
+        capability.write_bytes(0x2000, &[0x4e; 16]).unwrap();
+        assert_eq!(source.read(&mut output[..16]), Ok(16));
+        assert_eq!(&output[..16], &[0x4e; 16]);
+        assert_eq!(source.remaining(), 0);
+    }
+
+    #[test]
+    fn stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault() {
+        let capability = mapped_io_capability();
+        let input = [0x7c_u8; 32];
+
+        let mut stream =
+            ProgressiveVmBytesMut::new(capability.clone(), 0x1ff0 as *mut u8, input.len(), false);
+        assert_eq!(stream.write(&input), Ok(16));
+        assert_eq!(stream.remaining_mut(), 16);
+
+        let mut datagram =
+            ProgressiveVmBytesMut::new(capability, 0x1ff0 as *mut u8, input.len(), true);
+        assert_eq!(datagram.write(&input), Err(AxError::BadAddress));
+        assert_eq!(datagram.remaining_mut(), 16);
     }
 
     #[test]

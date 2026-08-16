@@ -30,11 +30,13 @@ use linux_raw_sys::{
     ioctl::FIONREAD,
 };
 use spin::Mutex;
-use starry_vm::VmMutPtr;
 
 use crate::{
     deferred_work::DeferredWorkAccount,
-    file::{Directory, File, FileLike, IoDst, Kstat, fanotify::FanotifyEventActor, get_file_like},
+    file::{
+        Directory, File, FileLike, IoDst, IoctlContext, Kstat, fanotify::FanotifyEventActor,
+        get_file_like,
+    },
     readiness::block_on_poll_io,
     task::AsThread,
 };
@@ -779,12 +781,9 @@ impl FileLike for InotifyFile {
         Ok("anon_inode:[inotify]".into())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, cmd: u32, _arg: usize) -> AxResult<usize> {
         match cmd {
-            FIONREAD => {
-                (arg as *mut u32).vm_write(self.queued_bytes() as u32)?;
-                Ok(0)
-            }
+            FIONREAD => Ok(self.queued_bytes()),
             _ => Err(AxError::NotATty),
         }
     }

@@ -11,7 +11,7 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::{AxTaskRef, WeakAxTaskRef};
 use spin::Once;
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},

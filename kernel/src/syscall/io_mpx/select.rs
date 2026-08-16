@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::{fmt, time::Duration};
+use core::{fmt, mem::MaybeUninit, slice, time::Duration};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
@@ -9,12 +9,12 @@ use linux_raw_sys::{
     general::*,
     select_macros::{FD_ISSET, FD_SET, FD_ZERO},
 };
-use starry_signal::SignalSet;
+use thekernel_linux_signal::SignalSet;
 
 use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
-    mm::{UserConstPtr, UserPtr, nullable},
+    mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     syscall::signal::check_sigset_size,
     time::TimeValueLike,
 };
@@ -41,6 +41,55 @@ impl fmt::Debug for FdSet {
     }
 }
 
+fn read_user_value<T>(caller: &UserMemoryCapability, address: usize) -> AxResult<T> {
+    let value = caller
+        .read_value_uninit(address as *const T)
+        .map_err(map_usercopy_error)?;
+    // SAFETY: the explicit usercopy initialized the complete value before it
+    // is exposed to the kernel. The syscall mirror types used here contain
+    // only integer fields or opaque user pointers.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn snapshot_fd_set(
+    caller: &UserMemoryCapability,
+    fds: UserPtr<__kernel_fd_set>,
+    nfds: u32,
+) -> AxResult<Option<__kernel_fd_set>> {
+    if nfds == 0 || fds.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(read_user_value(caller, fds.address().as_usize())?))
+}
+
+fn copy_fd_set(
+    caller: &UserMemoryCapability,
+    destination: UserPtr<__kernel_fd_set>,
+    bitmap: Bitmap<{ __FD_SETSIZE as usize }>,
+) -> AxResult<()> {
+    if destination.is_null() {
+        return Ok(());
+    }
+
+    // Build a fully initialized kernel-owned mirror, then copy its bytes. No
+    // user pointer is ever converted to a Rust reference and fd_set padding
+    // is deterministically zeroed rather than copied from uninitialized data.
+    let mut set = unsafe { MaybeUninit::<__kernel_fd_set>::zeroed().assume_init() };
+    unsafe { FD_ZERO(&mut set) };
+    for fd in &bitmap {
+        unsafe { FD_SET(fd as _, &mut set) };
+    }
+    let bytes = unsafe {
+        slice::from_raw_parts(
+            (&set as *const __kernel_fd_set).cast::<u8>(),
+            core::mem::size_of::<__kernel_fd_set>(),
+        )
+    };
+    caller
+        .write_bytes(destination.address().as_usize(), bytes)
+        .map_err(map_usercopy_error)
+}
+
 fn select_ready_events(
     path_only: bool,
     interested: IoEvents,
@@ -57,6 +106,7 @@ fn select_ready_events(
 }
 
 fn do_select(
+    caller: &UserMemoryCapability,
     uctx: Option<&mut UserContext>,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
@@ -68,37 +118,27 @@ fn do_select(
     if nfds > __FD_SETSIZE {
         return Err(AxError::InvalidInput);
     }
-    let sigmask = if let Some(sigmask) = nullable!(sigmask.get_as_ref())? {
-        let set = sigmask.set;
-        if let Some(set) = nullable!(set.get_as_ref())? {
-            check_sigset_size(sigmask.sigsetsize)?;
-            Some(set)
-        } else {
+    let sigmask = if sigmask.is_null() {
+        None
+    } else {
+        let sigmask: SignalSetWithSize = read_user_value(caller, sigmask.address().as_usize())?;
+        if sigmask.set.is_null() {
             None
+        } else {
+            // As with ppoll, size validation must precede copying the actual
+            // mask so an invalid size takes precedence over EFAULT.
+            check_sigset_size(sigmask.sigsetsize)?;
+            Some(read_user_value(caller, sigmask.set.address().as_usize())?)
         }
-    } else {
-        None
     };
 
-    let mut readfds = if nfds == 0 {
-        None
-    } else {
-        nullable!(readfds.get_as_mut())?
-    };
-    let mut writefds = if nfds == 0 {
-        None
-    } else {
-        nullable!(writefds.get_as_mut())?
-    };
-    let mut exceptfds = if nfds == 0 {
-        None
-    } else {
-        nullable!(exceptfds.get_as_mut())?
-    };
+    let readfds_snapshot = snapshot_fd_set(caller, readfds, nfds)?;
+    let writefds_snapshot = snapshot_fd_set(caller, writefds, nfds)?;
+    let exceptfds_snapshot = snapshot_fd_set(caller, exceptfds, nfds)?;
 
-    let read_set = FdSet::new(nfds as _, readfds.as_deref());
-    let write_set = FdSet::new(nfds as _, writefds.as_deref());
-    let except_set = FdSet::new(nfds as _, exceptfds.as_deref());
+    let read_set = FdSet::new(nfds as _, readfds_snapshot.as_ref());
+    let write_set = FdSet::new(nfds as _, writefds_snapshot.as_ref());
+    let except_set = FdSet::new(nfds as _, exceptfds_snapshot.as_ref());
 
     debug!(
         "sys_select <= nfds: {nfds} sets: [read: {read_set:?}, write: {write_set:?}, except: \
@@ -125,43 +165,30 @@ fn do_select(
     }
 
     let fds = fds.finish();
-    if fds.is_empty() {
-        return wait_signal_only(uctx, timeout, sigmask.copied());
-    }
-
-    if let Some(readfds) = readfds.as_deref_mut() {
-        unsafe { FD_ZERO(readfds) };
-    }
-    if let Some(writefds) = writefds.as_deref_mut() {
-        unsafe { FD_ZERO(writefds) };
-    }
-    if let Some(exceptfds) = exceptfds.as_deref_mut() {
-        unsafe { FD_ZERO(exceptfds) };
-    }
+    let mut ready_read = Bitmap::new();
+    let mut ready_write = Bitmap::new();
+    let mut ready_except = Bitmap::new();
     let mut poll_once = || {
+        ready_read = Bitmap::new();
+        ready_write = Bitmap::new();
+        ready_except = Bitmap::new();
         let mut res = 0usize;
         for entry in fds.entries() {
             let index = fd_indices[entry.output_index];
             let events = select_ready_events(entry.file.is_path_only(), entry.events, || {
                 entry.file.poll()
             });
-            if events.contains(IoEvents::READABLE)
-                && let Some(set) = readfds.as_deref_mut()
-            {
+            if events.contains(IoEvents::READABLE) && !readfds.is_null() {
                 res += 1;
-                unsafe { FD_SET(index as _, set) };
+                ready_read.set(index, true);
             }
-            if events.contains(IoEvents::WRITABLE)
-                && let Some(set) = writefds.as_deref_mut()
-            {
+            if events.contains(IoEvents::WRITABLE) && !writefds.is_null() {
                 res += 1;
-                unsafe { FD_SET(index as _, set) };
+                ready_write.set(index, true);
             }
-            if events.contains(IoEvents::ERROR)
-                && let Some(set) = exceptfds.as_deref_mut()
-            {
+            if events.contains(IoEvents::ERROR) && !exceptfds.is_null() {
                 res += 1;
-                unsafe { FD_SET(index as _, set) };
+                ready_except.set(index, true);
             }
         }
         if res > 0 {
@@ -182,11 +209,25 @@ fn do_select(
         )
     };
 
-    wait_io_result(uctx, sigmask.copied(), &mut select_once)
+    let result = if fds.is_empty() {
+        wait_signal_only(uctx, timeout, sigmask)
+    } else {
+        wait_io_result(uctx, sigmask, &mut select_once)
+    };
+    match result {
+        Ok(result) => {
+            copy_fd_set(caller, readfds, ready_read)?;
+            copy_fd_set(caller, writefds, ready_write)?;
+            copy_fd_set(caller, exceptfds, ready_except)?;
+            Ok(result)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_select(
+    caller: UserMemoryCapability,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -194,15 +235,21 @@ pub fn sys_select(
     timeout: UserConstPtr<timeval>,
 ) -> AxResult<isize> {
     do_select(
+        &caller,
         None,
         nfds,
         readfds,
         writefds,
         exceptfds,
-        nullable!(timeout.get_as_ref())?
-            .map(|it| it.try_into_time_value())
-            .transpose()?,
-        0.into(),
+        if timeout.is_null() {
+            None
+        } else {
+            Some(
+                read_user_value::<timeval>(&caller, timeout.address().as_usize())?
+                    .try_into_time_value()?,
+            )
+        },
+        UserConstPtr::default(),
     )
 }
 
@@ -214,6 +261,7 @@ pub struct SignalSetWithSize {
 }
 
 pub fn sys_pselect6(
+    caller: UserMemoryCapability,
     uctx: &mut UserContext,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
@@ -223,14 +271,20 @@ pub fn sys_pselect6(
     sigmask: UserConstPtr<SignalSetWithSize>,
 ) -> AxResult<isize> {
     do_select(
+        &caller,
         Some(uctx),
         nfds,
         readfds,
         writefds,
         exceptfds,
-        nullable!(timeout.get_as_ref())?
-            .map(|ts| ts.try_into_time_value())
-            .transpose()?,
+        if timeout.is_null() {
+            None
+        } else {
+            Some(
+                read_user_value::<timespec>(&caller, timeout.address().as_usize())?
+                    .try_into_time_value()?,
+            )
+        },
         sigmask,
     )
 }

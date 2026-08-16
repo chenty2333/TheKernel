@@ -20,10 +20,10 @@ use axtask::current;
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE,
 };
-use starry_signal::{SignalInfo, Signo};
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::{
-    FileHandle, FileLike, Kstat, OfdIoStatus, get_file_like, get_typed_file,
+    FileHandle, FileLike, IoctlContext, Kstat, OfdIoStatus, get_file_like, get_typed_file,
     permission::{DacFsContextExt, SecurityFsContextExt, VfsSecurityContext},
     privilege_metadata::{
         ContentWriteCredentialView, ContentWritePrivilegeGuard,
@@ -34,6 +34,7 @@ use super::{
 use crate::{
     file::{IoDst, IoSrc, memfd},
     mounts,
+    pseudofs::Device,
     readiness::block_on_poll_io,
     task::{AsThread, DacCredentialView, send_signal_to_process},
 };
@@ -679,11 +680,16 @@ impl FileLike for File {
         location_to_kstat(self.inner().location())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         if let Some(result) = super::inode_flags::ioctl(self.inner().location(), cmd, arg) {
             return result;
         }
-        self.inner().backend()?.location().ioctl(cmd, arg)
+        let location = self.inner().backend()?.location();
+        let device = location
+            .entry()
+            .downcast::<Device>()
+            .map_err(|_| AxError::NotATty)?;
+        device.inner().ioctl(context, cmd, arg).map_err(Into::into)
     }
 
     fn set_nonblocking(&self, flag: bool) -> AxResult {
@@ -777,7 +783,7 @@ impl FileLike for Directory {
         location_to_kstat(&self.inner)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         super::inode_flags::ioctl(&self.inner, cmd, arg).unwrap_or(Err(AxError::NotATty))
     }
 

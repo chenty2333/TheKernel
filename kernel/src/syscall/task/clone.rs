@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicU16;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
@@ -8,18 +9,17 @@ use axtask::{
     reclaim_exited_tasks, reserve_prepared_task, sched_state, yield_now,
 };
 use bitflags::bitflags;
-use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
-use starry_process::{Pid, ProcessError};
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmMutPtr;
+use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_signal::{
+    SignalInfo, Signo,
+    api::{SharedSignalActions, SignalActions},
+};
 
-#[cfg(target_arch = "loongarch64")]
-use crate::task::copy_current_user_fpu_state_to;
 use crate::{
     file::{FD_TABLE, FdTable, FileDescription, PidFd, reserve_fd, try_new_process_scope},
     keyring::{self, KeyTaskOwner},
-    mm::copy_from_kernel,
+    mm::{UserMemoryCapability, copy_from_kernel, map_usercopy_error},
     pseudofs::cgroup,
     readiness::block_on_poll_set_uninterruptible,
     syscall::prepare_proc_shm_inheritance,
@@ -113,6 +113,49 @@ const fn clone_credential_publication_kind(
     } else {
         Some(CloneCredentialPublicationKind::Fork)
     }
+}
+
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+
+fn inherited_ioprio(raw: u16) -> Option<u16> {
+    let class = (raw as u32) >> IOPRIO_CLASS_SHIFT;
+    (1..=3).contains(&class).then_some(raw)
+}
+
+/// Select the child's Linux I/O-priority context before any child becomes
+/// visible. `CLONE_IO` shares the parent's context; ordinary fork/clone
+/// copies only an explicitly selected class and otherwise starts in
+/// `IOPRIO_CLASS_NONE`, matching Linux's `copy_io()` path.
+fn clone_io_context_snapshot(
+    flags: CloneFlags,
+    parent_context: Option<Arc<AtomicU16>>,
+) -> AxResult<Option<Arc<AtomicU16>>> {
+    if flags.contains(CloneFlags::IO) {
+        return Ok(parent_context);
+    }
+
+    let Some(parent_context) = parent_context else {
+        // Linux's copy_io() leaves a task with no io_context unallocated.
+        return Ok(None);
+    };
+    let raw = parent_context.load(core::sync::atomic::Ordering::Acquire);
+    let Some(raw) = inherited_ioprio(raw) else {
+        // A CLASS_NONE context carries no effective I/O priority. Linux's
+        // ordinary fork path copies only a valid class and keeps the child
+        // context unmaterialized, so a later CLONE_IO cannot accidentally
+        // share this empty snapshot.
+        return Ok(None);
+    };
+    Arc::try_new(AtomicU16::new(raw))
+        .map(Some)
+        .map_err(|_| AxError::NoMemory)
+}
+
+fn clone_io_context(
+    flags: CloneFlags,
+    parent: &crate::task::Thread,
+) -> AxResult<Option<Arc<AtomicU16>>> {
+    clone_io_context_snapshot(flags, parent.io_context())
 }
 
 /// Preserves the existing process-lifecycle protection through secondary
@@ -263,11 +306,7 @@ impl CloneArgs {
         let Self { flags, .. } = self;
 
         if flags.intersects(
-            CloneFlags::NEWNS
-                | CloneFlags::NEWIPC
-                | CloneFlags::IO
-                | CloneFlags::PTRACE
-                | CloneFlags::UNTRACED,
+            CloneFlags::NEWNS | CloneFlags::NEWIPC | CloneFlags::PTRACE | CloneFlags::UNTRACED,
         ) {
             return Err(AxError::OperationNotSupported);
         }
@@ -295,6 +334,12 @@ impl CloneArgs {
             return Err(AxError::OperationNotSupported);
         }
         if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
+            return Err(AxError::InvalidInput);
+        }
+        // Linux's CLONE_CLEAR_SIGHAND is an alternative to inheriting the
+        // caller's sighand table.  Asking for both modes at once is invalid;
+        // do not let the construction path choose one based on branch order.
+        if flags.contains(CloneFlags::SIGHAND | CloneFlags::CLEAR_SIGHAND) {
             return Err(AxError::InvalidInput);
         }
         // Linux forbids creating a user namespace inside an existing thread
@@ -336,7 +381,12 @@ impl CloneArgs {
         Ok(())
     }
 
-    pub(super) fn do_clone(self, uctx: &UserContext, api: CloneApi) -> AxResult<isize> {
+    pub(super) fn do_clone(
+        self,
+        uctx: &UserContext,
+        api: CloneApi,
+        caller_memory: &UserMemoryCapability,
+    ) -> AxResult<isize> {
         self.validate_for(api)?;
 
         let Self {
@@ -371,6 +421,10 @@ impl CloneArgs {
 
         let curr = current();
         let calling_thread = curr.as_thread();
+        // Reserve the Linux rseq child snapshot before any fallible clone
+        // construction. The guard cancels automatically on every error path
+        // and is committed only with the final child publication steps.
+        let rseq_fork = calling_thread.prepare_rseq_fork(flags.contains(CloneFlags::VM))?;
         let inherited_seccomp = calling_thread.seccomp_snapshot();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         let old_proc_data = &calling_thread.proc_data;
@@ -403,6 +457,7 @@ impl CloneArgs {
         if old_proc_data.exec_in_progress() {
             return Err(AxError::Interrupted);
         }
+        let child_io_context = clone_io_context(flags, calling_thread)?;
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
         // this CPU. Nudge its pinned recycler before allocating another child
@@ -433,10 +488,6 @@ impl CloneArgs {
 
         let task_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
         let mut new_task = try_new_user_task(task_name, new_uctx)?;
-        #[cfg(target_arch = "loongarch64")]
-        {
-            copy_current_user_fpu_state_to(new_task.ctx_mut());
-        }
 
         let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
         let child_credential = CredentialSlot::try_new(child_cred.clone())?;
@@ -511,12 +562,16 @@ impl CloneArgs {
             set_task_user_address_space(new_task.ctx_mut(), aspace.lock().address_space_token());
 
             let signal_actions = if flags.contains(CloneFlags::SIGHAND) {
-                old_proc_data.signal.actions.clone()
+                old_proc_data.signal.shared_actions().clone()
             } else if flags.contains(CloneFlags::CLEAR_SIGHAND) {
-                Arc::try_new(SpinNoIrq::new(Default::default())).map_err(|_| AxError::NoMemory)?
+                SharedSignalActions::try_new(SignalActions::default())
+                    .map_err(|_| AxError::NoMemory)?
             } else {
-                let actions = old_proc_data.signal.actions.lock().clone();
-                Arc::try_new(SpinNoIrq::new(actions)).map_err(|_| AxError::NoMemory)?
+                old_proc_data
+                    .signal
+                    .shared_actions()
+                    .try_snapshot()
+                    .map_err(|_| AxError::NoMemory)?
             };
 
             let net_ns = if flags.contains(CloneFlags::NEWNET) {
@@ -545,27 +600,6 @@ impl CloneArgs {
             };
             let time_ns = old_proc_data.time_ns_for_children();
 
-            #[cfg(target_arch = "loongarch64")]
-            let (child_exe_path, child_cmdline) = {
-                // On LoongArch, process-shared exec metadata can be transiently
-                // inconsistent during early shell-heavy bootstrap. Seed the child
-                // from the scheduler-visible task name; execve installs the final
-                // path/cmdline as soon as the child replaces its image.
-                let fallback_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
-                let mut child_exe_path = alloc::string::String::new();
-                child_exe_path
-                    .try_reserve_exact(fallback_name.len())
-                    .map_err(|_| AxError::NoMemory)?;
-                child_exe_path.push_str(&fallback_name);
-                let mut child_cmdline = alloc::vec::Vec::new();
-                child_cmdline
-                    .try_reserve_exact(1)
-                    .map_err(|_| AxError::NoMemory)?;
-                child_cmdline.push(fallback_name);
-                let child_cmdline = Arc::try_new(child_cmdline).map_err(|_| AxError::NoMemory)?;
-                (child_exe_path, child_cmdline)
-            };
-            #[cfg(not(target_arch = "loongarch64"))]
             let (child_exe_path, child_cmdline) = (
                 old_proc_data.try_exe_path()?,
                 old_proc_data.cmdline.read().clone(),
@@ -623,11 +657,12 @@ impl CloneArgs {
             let thread_admission = proc_data.prepare_initial_thread(process_admission)?;
             (proc_data, CloneThreadPublication::Initial(thread_admission))
         };
-        let (thr, signal_registration) = Thread::try_new(
+        let (thr, signal_registration) = Thread::try_new_with_io_context(
             tid,
             new_proc_data.clone(),
             child_credential,
             inherited_seccomp,
+            child_io_context,
         )?;
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
@@ -707,7 +742,9 @@ impl CloneArgs {
 
         if let Some((publication, _)) = pending_pidfd.as_ref() {
             let fd = publication.fd();
-            (pidfd as *mut i32).vm_write(fd)?;
+            caller_memory
+                .write_value(pidfd as *mut i32, fd)
+                .map_err(map_usercopy_error)?;
         }
 
         if flags.contains(CloneFlags::VFORK) {
@@ -724,6 +761,8 @@ impl CloneArgs {
         // infallible even for a root/no-parent inheritance relation. This is
         // deliberately after the last fallible admission and before the first
         // global identity publication.
+        let child_rseq = rseq_fork.commit();
+        task.as_thread().install_rseq_state(child_rseq);
         let task_parent_publication = lock_task_parent_publication();
         task.as_thread()
             .publish_task_parent(&task_parent_publication, task_parent_choice);
@@ -775,7 +814,9 @@ impl CloneArgs {
         // CHILD_SETTID address was attached to the private Thread above; the
         // child consumes it before first entering user mode, after publication.
         if flags.contains(CloneFlags::PARENT_SETTID) {
-            let _ = (parent_tid as *mut Pid).vm_write(tid);
+            let _ = caller_memory
+                .write_value(parent_tid as *mut Pid, tid)
+                .map_err(map_usercopy_error);
         }
         release_clone_lifecycle_then(fork_lifecycle, || {
             if let Some(publication) = credential_publication {
@@ -803,13 +844,13 @@ impl CloneArgs {
 }
 
 pub fn sys_clone(
+    caller_memory: UserMemoryCapability,
     uctx: &UserContext,
     flags: u32,
     stack: usize,
     parent_tid: usize,
-    #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))] child_tid: usize,
+    child_tid: usize,
     tls: usize,
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "loongarch64")))] child_tid: usize,
 ) -> AxResult<isize> {
     const FLAG_MASK: u32 = 0xff;
     let clone_flags =
@@ -836,26 +877,46 @@ pub fn sys_clone(
         cgroup_fd: None,
     };
 
-    args.do_clone(uctx, CloneApi::Clone)
+    args.do_clone(uctx, CloneApi::Clone, &caller_memory)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
-    sys_clone(uctx, SIGCHLD, 0, 0, 0, 0)
+pub fn sys_fork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxResult<isize> {
+    sys_clone(caller_memory, uctx, SIGCHLD, 0, 0, 0, 0)
+}
+
+/// Implements the x86_64 `vfork(2)` ABI through the common clone publication
+/// path. Linux's vfork flags share only the address space while the child is
+/// alive, and the parent remains blocked until the child's exec or final exit
+/// releases the `CLONE_VFORK` publication gate.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_vfork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxResult<isize> {
+    sys_clone(
+        caller_memory,
+        uctx,
+        (CLONE_VM | CLONE_VFORK | SIGCHLD) as u32,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::cell::Cell;
+    use core::{
+        cell::Cell,
+        sync::atomic::{AtomicU16, Ordering},
+    };
 
     use axerrno::AxError;
     use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
 
     use super::{
-        CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags,
-        clone_credential_publication_kind, clone_namespace_owner, clone_process_access_state,
-        release_clone_lifecycle_then,
+        CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
+        clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
+        clone_process_access_state, inherited_ioprio, release_clone_lifecycle_then,
     };
     use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
 
@@ -973,6 +1034,62 @@ mod tests {
     }
 
     #[test]
+    fn clone_validate_accepts_clone_io() {
+        let args = CloneArgs {
+            flags: CloneFlags::IO,
+            ..Default::default()
+        };
+        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+    }
+
+    #[test]
+    fn ordinary_fork_inherits_only_explicit_ioprio_classes() {
+        assert_eq!(inherited_ioprio(0), None);
+        assert_eq!(
+            inherited_ioprio((2 << IOPRIO_CLASS_SHIFT | 3) as u16),
+            Some(2 << 13 | 3)
+        );
+        assert_eq!(inherited_ioprio((4 << IOPRIO_CLASS_SHIFT) as u16), None);
+        assert!(
+            clone_io_context_snapshot(CloneFlags::empty(), Some(Arc::new(AtomicU16::new(0x100))))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clone_io_does_not_materialize_an_empty_parent_context() {
+        assert!(
+            clone_io_context_snapshot(CloneFlags::IO, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            clone_io_context_snapshot(CloneFlags::empty(), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clone_io_shares_existing_context_but_fork_copies_it() {
+        let parent = Arc::new(AtomicU16::new((2 << IOPRIO_CLASS_SHIFT) | 4));
+        let shared = clone_io_context_snapshot(CloneFlags::IO, Some(parent.clone()))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&parent, &shared));
+
+        let copied = clone_io_context_snapshot(CloneFlags::empty(), Some(parent.clone()))
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&parent, &copied));
+        assert_eq!(
+            copied.load(Ordering::Acquire),
+            parent.load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
     fn clone_validate_rejects_process_sysvsem_without_shared_undo_state() {
         let args = CloneArgs {
             flags: CloneFlags::SYSVSEM,
@@ -981,6 +1098,18 @@ mod tests {
         assert_eq!(
             args.validate_for(CloneApi::Clone),
             Err(AxError::OperationNotSupported)
+        );
+    }
+
+    #[test]
+    fn clone_validate_rejects_shared_and_clear_sighand_together() {
+        let args = CloneArgs {
+            flags: CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::CLEAR_SIGHAND,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone3),
+            Err(AxError::InvalidInput)
         );
     }
 

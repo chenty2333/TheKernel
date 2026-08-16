@@ -15,9 +15,14 @@ use axhal::power::system_off;
 use axtask::current;
 use linux_raw_sys::{
     general::*,
-    ioctl::{FIONBIO, NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ},
+    ioctl::{
+        FIONBIO, FIONREAD, NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS,
+        TIOCGWINSZ, TIOCINQ,
+    },
 };
-use starry_vm::{VmPtr, vm_write_slice};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_write_slice,
+};
 
 #[cfg(test)]
 use crate::file::permission::{
@@ -26,8 +31,8 @@ use crate::file::permission::{
 };
 use crate::{
     file::{
-        Directory, File, FileDescription, FileLike, add_file_like, executable,
-        get_file_description, get_file_like,
+        Directory, File, FileDescription, FileLike, IoctlContext, executable, get_file_description,
+        get_file_like,
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
@@ -38,7 +43,7 @@ use crate::{
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
         resolve_at_with_security, validate_symlink_target, with_fs, with_path_fs,
     },
-    mm::vm_load_string,
+    mm::map_usercopy_error,
     mounts,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
@@ -70,6 +75,14 @@ fn try_string(value: &str) -> AxResult<String> {
     Ok(owned)
 }
 
+fn load_user_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<String> {
+    String::from_utf8(vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?)
+        .map_err(|_| AxError::IllegalBytes)
+}
+
 fn warn_notification(context: &str, result: AxResult<()>) {
     if let Err(error) = result {
         warn!("{context} notification failed: {error}");
@@ -77,25 +90,29 @@ fn warn_notification(context: &str, result: AxResult<()>) {
 }
 
 fn add_proc_namespace_fd(
+    context: &IoctlContext,
     template: &Location,
     kind: ProcNamespaceKind,
     object: ProcNamespaceObject,
 ) -> AxResult<isize> {
     let loc = proc_namespace_location_from_object(template, kind, object)?;
     let file = axfs::File::new(FileBackend::Direct(loc), FileFlags::READ);
-    Ok(add_file_like(
+    Ok(context.add_file_like(
         Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?,
         false,
     )? as isize)
 }
 
-fn visible_pid_namespace_parent(ns: &Arc<PidNamespace>) -> Option<Arc<PidNamespace>> {
-    let cred = current().as_thread().current_cred();
-    if !ns_capable(&cred, ns.owner_user_ns(), CAP_SYS_ADMIN) {
+fn visible_pid_namespace_parent(
+    context: &IoctlContext,
+    ns: &Arc<PidNamespace>,
+) -> Option<Arc<PidNamespace>> {
+    let cred = context.caller_cred();
+    if !ns_capable(cred, ns.owner_user_ns(), CAP_SYS_ADMIN) {
         return None;
     }
     let parent = ns.parent()?;
-    let active = current().as_thread().proc_data.pid_ns();
+    let active = context.caller_process().pid_ns();
     let mut cursor = Some(parent.clone());
 
     while let Some(candidate) = cursor {
@@ -108,7 +125,12 @@ fn visible_pid_namespace_parent(ns: &Arc<PidNamespace>) -> Option<Arc<PidNamespa
     None
 }
 
-fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
+fn proc_namespace_ioctl(
+    context: &IoctlContext,
+    loc: &Location,
+    cmd: u32,
+    arg: usize,
+) -> Option<AxResult<isize>> {
     let ProcNamespaceTarget::Live(kind, object) = namespace_target_from_proc_file(loc) else {
         return None;
     };
@@ -116,9 +138,10 @@ fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
     let result = match cmd {
         NS_GET_PARENT => match (kind, object) {
             (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => {
-                visible_pid_namespace_parent(&ns)
+                visible_pid_namespace_parent(context, &ns)
                     .map(|parent| {
                         add_proc_namespace_fd(
+                            context,
                             loc,
                             ProcNamespaceKind::Pid,
                             ProcNamespaceObject::Pid(parent),
@@ -136,12 +159,33 @@ fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
             .owner_user_ns()
             .map(|owner| {
                 add_proc_namespace_fd(
+                    context,
                     loc,
                     ProcNamespaceKind::User,
                     ProcNamespaceObject::User(owner),
                 )
             })
             .unwrap_or(Err(AxError::OperationNotPermitted)),
+        NS_GET_OWNER_UID => match object {
+            ProcNamespaceObject::User(ns) => {
+                let owner = context
+                    .caller_cred()
+                    .user_ns()
+                    .from_kuid_munged(ns.owner_kuid());
+                context
+                    .user_memory()
+                    .write_bytes(arg, &owner.to_ne_bytes())
+                    .map_err(map_usercopy_error)
+                    .map(|_| 0)
+            }
+            _ => Err(AxError::InvalidInput),
+        },
+        NS_GET_NSTYPE => Ok(match kind {
+            ProcNamespaceKind::Pid => CLONE_NEWPID,
+            ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
+            ProcNamespaceKind::User => CLONE_NEWUSER,
+            ProcNamespaceKind::Uts => CLONE_NEWUTS,
+        } as isize),
         _ => return None,
     };
     Some(result)
@@ -412,40 +456,53 @@ const fn fionbio_enabled(value: c_int) -> bool {
     value != 0
 }
 
-pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
+pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
     debug!("sys_ioctl <= fd: {fd}, cmd: {cmd}, arg: {arg}");
-    let f = get_file_like(fd)?;
+    let f = context.get_file_like(fd)?;
     // O_PATH exposes pathname metadata, not the underlying object's ioctl
     // surface. Reject before FIONBIO reads its userspace argument.
     f.check_io_access()?;
     if cmd == FIONBIO {
         // Linux FIONBIO consumes an `int *`; every nonzero value enables the
         // flag. Reading the complete word also preserves cross-page EFAULT.
-        let val = (arg as *const c_int).vm_read()?;
+        let val: c_int = context
+            .user_memory()
+            .read_value(arg as *const c_int)
+            .map_err(map_usercopy_error)?;
         f.set_nonblocking_status(fionbio_enabled(val))?;
         return Ok(0);
     }
     if let Some(file) = f.downcast_ref::<File>()
-        && let Some(result) = proc_namespace_ioctl(file.inner().location(), cmd)
+        && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
     {
         return result;
     }
-    f.ioctl(cmd, arg)
-        .map(|result| result as isize)
-        .inspect_err(|err| {
-            if *err == AxError::NotATty {
-                // glibc likes to call TIOCGWINSZ on non-terminal files, just
-                // ignore it
-                if cmd == TIOCGWINSZ {
-                    return;
-                }
-                warn!("Unsupported ioctl command: {cmd} for fd: {fd}");
+    let result = f.ioctl(context, cmd, arg).inspect_err(|err| {
+        if *err == AxError::NotATty {
+            // glibc likes to call TIOCGWINSZ on non-terminal files, just
+            // ignore it
+            if cmd == TIOCGWINSZ {
+                return;
             }
-        })
+            warn!("Unsupported ioctl command: {cmd} for fd: {fd}");
+        }
+    })?;
+    if cmd == FIONREAD || cmd == TIOCINQ {
+        let value = i32::try_from(result).unwrap_or(i32::MAX);
+        context
+            .user_memory()
+            .write_bytes(arg, &value.to_ne_bytes())
+            .map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+    Ok(result as isize)
 }
 
-pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+pub fn sys_chdir<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<isize> {
+    let path = load_user_path(memory, path)?;
     debug!("sys_chdir <= path: {path}");
 
     let curr = current();
@@ -474,13 +531,19 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_mkdir(path: *const c_char, mode: u32) -> AxResult<isize> {
-    sys_mkdirat(AT_FDCWD, path, mode)
+pub fn sys_mkdir<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    sys_mkdirat(memory, AT_FDCWD, path, mode)
 }
 
-pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+pub fn sys_chroot<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<isize> {
+    let path = load_user_path(memory, path)?;
     debug!("sys_chroot <= path: {path}");
 
     let curr = current();
@@ -498,8 +561,13 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+pub fn sys_mkdirat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    let path = load_user_path(memory, path)?;
     debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
     if path.is_empty() {
         return Err(AxError::NotFound);
@@ -556,8 +624,14 @@ fn decode_mknod_node_type(mode: u32) -> AxResult<NodeType> {
     }
 }
 
-pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+pub fn sys_mknodat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+    dev: u64,
+) -> AxResult<isize> {
+    let path = load_user_path(memory, path)?;
     let path_ref = Path::new(&path);
     validate_pathname(path_ref)?;
     debug!("sys_mknodat <= dirfd: {dirfd}, path: {path}, mode: {mode:#o}, dev: {dev}");
@@ -655,7 +729,12 @@ impl DirBuffer {
     }
 }
 
-pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
+pub fn sys_getdents64<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+) -> AxResult<isize> {
     debug!("sys_getdents64 <= fd: {fd}, buf: {buf:?}, len: {len}");
 
     let dir = Directory::from_fd(fd)?;
@@ -691,7 +770,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         })?;
     }
 
-    vm_write_slice(buf, &buffer.buf[..buffer.offset])?;
+    vm_write_slice(memory, buf, &buffer.buf[..buffer.offset]).map_err(map_usercopy_error)?;
 
     Ok(buffer.offset as _)
 }
@@ -701,15 +780,16 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 /// new_path: new file path
 /// flags: link flags
 /// return value: return 0 when success, else return -1.
-pub fn sys_linkat(
+pub fn sys_linkat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     old_dirfd: c_int,
     old_path: *const c_char,
     new_dirfd: c_int,
     new_path: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    let old_path = vm_load_string(old_path)?;
-    let new_path = vm_load_string(new_path)?;
+    let old_path = load_user_path(memory, old_path)?;
+    let new_path = load_user_path(memory, new_path)?;
     debug!(
         "sys_linkat <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
          new_path: {new_path}, flags: {flags}"
@@ -772,9 +852,12 @@ pub fn sys_linkat(
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_link(old_path: *const c_char, new_path: *const c_char) -> AxResult<isize> {
-    sys_linkat(AT_FDCWD, old_path, AT_FDCWD, new_path, 0)
+pub fn sys_link<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> AxResult<isize> {
+    sys_linkat(memory, AT_FDCWD, old_path, AT_FDCWD, new_path, 0)
 }
 
 /// remove link of specific file (can be used to delete file)
@@ -852,9 +935,14 @@ fn resolve_unlink_target_in_fs(
     Ok((parent, name, target))
 }
 
-pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<isize> {
+pub fn sys_unlinkat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    path: *const c_char,
+    flags: usize,
+) -> AxResult<isize> {
     let remove_dir = unlinkat_remove_dir(flags)?;
-    let path = vm_load_string(path)?;
+    let path = load_user_path(memory, path)?;
     let path_ref = Path::new(&path);
     if path.is_empty() {
         return Err(AxError::NotFound);
@@ -912,17 +1000,25 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_rmdir(path: *const c_char) -> AxResult<isize> {
-    sys_unlinkat(AT_FDCWD, path, AT_REMOVEDIR as _)
+pub fn sys_rmdir<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<isize> {
+    sys_unlinkat(memory, AT_FDCWD, path, AT_REMOVEDIR as _)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_unlink(path: *const c_char) -> AxResult<isize> {
-    sys_unlinkat(AT_FDCWD, path, 0)
+pub fn sys_unlink<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+) -> AxResult<isize> {
+    sys_unlinkat(memory, AT_FDCWD, path, 0)
 }
 
-pub fn sys_getcwd(buf: *mut u8, size: usize) -> AxResult<isize> {
+pub fn sys_getcwd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    size: usize,
+) -> AxResult<isize> {
     let cwd = {
         let fs = FS_CONTEXT.lock();
         path_from_root(fs.current_dir().clone(), fs.root_dir())?
@@ -940,23 +1036,27 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> AxResult<isize> {
         return Err(AxError::BadAddress);
     }
 
-    vm_write_slice(buf, cwd)?;
+    vm_write_slice(memory, buf, cwd).map_err(map_usercopy_error)?;
     Ok(cwd.len() as isize)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_symlink(target: *const c_char, linkpath: *const c_char) -> AxResult<isize> {
-    sys_symlinkat(target, AT_FDCWD, linkpath)
+pub fn sys_symlink<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    target: *const c_char,
+    linkpath: *const c_char,
+) -> AxResult<isize> {
+    sys_symlinkat(memory, target, AT_FDCWD, linkpath)
 }
 
-pub fn sys_symlinkat(
+pub fn sys_symlinkat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     target: *const c_char,
     new_dirfd: i32,
     linkpath: *const c_char,
 ) -> AxResult<isize> {
-    let target = vm_load_string(target)?;
+    let target = load_user_path(memory, target)?;
     validate_symlink_target(&target)?;
-    let linkpath = vm_load_string(linkpath)?;
+    let linkpath = load_user_path(memory, linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
     if linkpath.is_empty() {
@@ -992,25 +1092,35 @@ pub fn sys_symlinkat(
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_readlink(path: *const c_char, buf: *mut u8, size: usize) -> AxResult<isize> {
-    sys_readlinkat(AT_FDCWD, path, buf, size)
+pub fn sys_readlink<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    buf: *mut u8,
+    size: usize,
+) -> AxResult<isize> {
+    sys_readlinkat(memory, AT_FDCWD, path, buf, size)
 }
 
-pub fn sys_readlinkat(
+pub fn sys_readlinkat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
     buf: *mut u8,
     size: usize,
 ) -> AxResult<isize> {
-    fn write_readlink_result(loc: &Location, buf: *mut u8, size: usize) -> AxResult<isize> {
+    fn write_readlink_result<M: UserMemory + ?Sized>(
+        memory: &mut UserMemoryContext<'_, M>,
+        loc: &Location,
+        buf: *mut u8,
+        size: usize,
+    ) -> AxResult<isize> {
         let link = loc.read_link()?;
         let read = size.min(link.len());
-        vm_write_slice(buf, &link.as_bytes()[..read])?;
+        vm_write_slice(memory, buf, &link.as_bytes()[..read]).map_err(map_usercopy_error)?;
         Ok(read as isize)
     }
 
-    let path = vm_load_string(path)?;
+    let path = load_user_path(memory, path)?;
 
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
     if size == 0 {
@@ -1024,7 +1134,7 @@ pub fn sys_readlinkat(
         if loc.node_type() != NodeType::Symlink {
             return Err(AxError::NotFound);
         }
-        return write_readlink_result(&loc, buf, size);
+        return write_readlink_result(memory, &loc, buf, size);
     }
     validate_pathname(Path::new(&path))?;
 
@@ -1033,19 +1143,27 @@ pub fn sys_readlinkat(
 
     with_path_fs(dirfd, Path::new(&path), |fs| {
         let entry = fs.resolve_no_follow_security(path.as_str(), &security)?;
-        write_readlink_result(&entry, buf, size)
+        write_readlink_result(memory, &entry, buf, size)
     })
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_chown(path: *const c_char, uid: i32, gid: i32) -> AxResult<isize> {
-    sys_fchownat(AT_FDCWD, path, uid, gid, 0)
+pub fn sys_chown<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    uid: i32,
+    gid: i32,
+) -> AxResult<isize> {
+    sys_fchownat(memory, AT_FDCWD, path, uid, gid, 0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_lchown(path: *const c_char, uid: i32, gid: i32) -> AxResult<isize> {
+pub fn sys_lchown<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    uid: i32,
+    gid: i32,
+) -> AxResult<isize> {
     use linux_raw_sys::general::AT_SYMLINK_NOFOLLOW;
-    sys_fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)
+    sys_fchownat(memory, AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)
 }
 
 pub fn sys_fchown(fd: i32, uid: i32, gid: i32) -> AxResult<isize> {
@@ -1059,7 +1177,8 @@ pub fn sys_fchown(fd: i32, uid: i32, gid: i32) -> AxResult<isize> {
     )
 }
 
-pub fn sys_fchownat(
+pub fn sys_fchownat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
     uid: i32,
@@ -1071,7 +1190,7 @@ pub fn sys_fchownat(
     if flags & !SUPPORTED_FCHOWNAT_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    let path = vm_load_string(path)?;
+    let path = load_user_path(memory, path)?;
     do_fchownat(
         dirfd,
         Some(path.as_str()),
@@ -1141,9 +1260,12 @@ fn do_fchownat(
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_chmod(path: *const c_char, mode: u32) -> AxResult<isize> {
-    sys_fchmodat(AT_FDCWD, path, mode, 0)
+pub fn sys_chmod<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    sys_fchmodat(memory, AT_FDCWD, path, mode, 0)
 }
 
 pub fn sys_fchmod(fd: i32, mode: u32) -> AxResult<isize> {
@@ -1156,12 +1278,18 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> AxResult<isize> {
     )
 }
 
-pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_fchmodat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+    flags: u32,
+) -> AxResult<isize> {
     // Match do_fchmodat(): flag validation precedes filename acquisition.
     if flags & !SUPPORTED_FCHMODAT_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    let path = vm_load_string(path)?;
+    let path = load_user_path(memory, path)?;
     do_fchmodat(
         dirfd,
         Some(path.as_str()),
@@ -1218,7 +1346,8 @@ fn do_fchmodat(
     Ok(0)
 }
 
-fn update_times(
+fn update_times<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
     atime: Option<Duration>,
@@ -1227,7 +1356,10 @@ fn update_times(
     mtime_intent: TimeUpdate,
     flags: u32,
 ) -> AxResult<()> {
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| load_user_path(memory, path))
+        .transpose()?;
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let credentials = security.credentials();
@@ -1264,7 +1396,6 @@ fn update_times(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 #[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct utimbuf {
@@ -1272,11 +1403,19 @@ pub struct utimbuf {
     modtime: linux_raw_sys::general::__kernel_old_time_t,
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> AxResult<isize> {
+pub fn sys_utime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    times: *const utimbuf,
+) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
-        let times = unsafe { times.vm_read_uninit()?.assume_init() };
+        let times = unsafe {
+            times
+                .vm_read_uninit(memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         (
             Duration::from_secs(times.actime as _),
             Duration::from_secs(times.modtime as _),
@@ -1290,18 +1429,32 @@ pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> AxResult<isize> 
     } else {
         TimeUpdate::Explicit
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), intent, intent, 0)?;
+    update_times(
+        memory,
+        AT_FDCWD,
+        path,
+        Some(atime),
+        Some(mtime),
+        intent,
+        intent,
+        0,
+    )?;
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_utimes(
+pub fn sys_utimes<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     times: *const [linux_raw_sys::general::timeval; 2],
 ) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
-        let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let [atime, mtime] = unsafe {
+            times
+                .vm_read_uninit(memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         (atime.try_into_time_value()?, mtime.try_into_time_value()?)
     } else {
         let time = wall_time();
@@ -1312,11 +1465,21 @@ pub fn sys_utimes(
     } else {
         TimeUpdate::Explicit
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), intent, intent, 0)?;
+    update_times(
+        memory,
+        AT_FDCWD,
+        path,
+        Some(atime),
+        Some(mtime),
+        intent,
+        intent,
+        0,
+    )?;
     Ok(0)
 }
 
-pub fn sys_utimensat(
+pub fn sys_utimensat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
     times: *const [timespec; 2],
@@ -1338,7 +1501,12 @@ pub fn sys_utimensat(
 
     let (atime, mtime, atime_intent, mtime_intent) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
-        let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let [atime, mtime] = unsafe {
+            times
+                .vm_read_uninit(memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         let (atime, atime_intent) = utime_to_duration(&atime);
         let (mtime, mtime_intent) = utime_to_duration(&mtime);
         (
@@ -1351,23 +1519,35 @@ pub fn sys_utimensat(
         let time = wall_time();
         (Some(time), Some(time), TimeUpdate::Now, TimeUpdate::Now)
     };
-    update_times(dirfd, path, atime, mtime, atime_intent, mtime_intent, flags)?;
+    update_times(
+        memory,
+        dirfd,
+        path,
+        atime,
+        mtime,
+        atime_intent,
+        mtime_intent,
+        flags,
+    )?;
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn sys_rename(old_path: *const c_char, new_path: *const c_char) -> AxResult<isize> {
-    sys_renameat(AT_FDCWD, old_path, AT_FDCWD, new_path)
+pub fn sys_rename<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> AxResult<isize> {
+    sys_renameat(memory, AT_FDCWD, old_path, AT_FDCWD, new_path)
 }
 
-#[cfg(not(target_arch = "riscv64"))]
-pub fn sys_renameat(
+pub fn sys_renameat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     old_dirfd: i32,
     old_path: *const c_char,
     new_dirfd: i32,
     new_path: *const c_char,
 ) -> AxResult<isize> {
-    sys_renameat2(old_dirfd, old_path, new_dirfd, new_path, 0)
+    sys_renameat2(memory, old_dirfd, old_path, new_dirfd, new_path, 0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1421,15 +1601,16 @@ fn validate_rename_directory_intent(
     Ok(())
 }
 
-pub fn sys_renameat2(
+pub fn sys_renameat2<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     old_dirfd: i32,
     old_path: *const c_char,
     new_dirfd: i32,
     new_path: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    let old_path = vm_load_string(old_path)?;
-    let new_path = vm_load_string(new_path)?;
+    let old_path = load_user_path(memory, old_path)?;
+    let new_path = load_user_path(memory, new_path)?;
     let old_path_ref = Path::new(&old_path);
     let new_path_ref = Path::new(&new_path);
     debug!(
@@ -1627,10 +1808,11 @@ pub fn sys_vhangup() -> AxResult<isize> {
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
-    use core::{cell::Cell, time::Duration};
+    use core::{cell::Cell, mem::MaybeUninit, time::Duration};
 
     use axfs_ng_vfs::{Metadata, Mountpoint};
     use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
+    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext};
 
     use super::*;
     use crate::task::DacCredentialView;
@@ -1638,6 +1820,24 @@ mod tests {
     fn linkat_test_security() -> VfsSecurityContext {
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         VfsSecurityContext::new(Cred::try_root(namespace).unwrap())
+    }
+
+    struct NoUserMemory;
+
+    // The metadata flag-order test must not touch its null pathname. Invalid
+    // flags are rejected before usercopy, so this provider is never called.
+    unsafe impl UserMemory for NoUserMemory {
+        fn read(
+            &mut self,
+            _start: usize,
+            _dst: &mut [MaybeUninit<u8>],
+        ) -> Result<(), UserCopyError> {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> Result<(), UserCopyError> {
+            Err(UserCopyError::BadAddress)
+        }
     }
 
     #[test]
@@ -2180,12 +2380,14 @@ mod tests {
     #[test]
     fn metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer() {
         let invalid = 1_u32 << 31;
+        let mut provider = NoUserMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            sys_fchownat(AT_FDCWD, core::ptr::null(), 0, 0, invalid),
+            sys_fchownat(&mut memory, AT_FDCWD, core::ptr::null(), 0, 0, invalid),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            sys_fchmodat(AT_FDCWD, core::ptr::null(), 0o600, invalid),
+            sys_fchmodat(&mut memory, AT_FDCWD, core::ptr::null(), 0o600, invalid),
             Err(AxError::InvalidInput)
         );
     }

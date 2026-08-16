@@ -5,14 +5,20 @@ use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::DeviceId;
 use axio::prelude::*;
 use axpoll::Pollable;
+use axsync::Mutex;
+use axtask::{AxTaskRef, current};
 use downcast_rs::{DowncastSync, impl_downcast};
 use linux_raw_sys::general::{
-    S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS, STATX_BTIME,
-    STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
+    RLIMIT_NOFILE, S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
+    STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
 };
 
-use super::{FileHandle, add_file_like, get_typed_file};
+use super::{FileHandle, add_file_like, current_fd_table, fd_table::FdTable, get_typed_file};
 pub use crate::mm::SharedPages;
+use crate::{
+    mm::{AddrSpace, UserMemoryCapability},
+    task::{AX_FILE_LIMIT, AsThread, Cred, ProcessData, Session},
+};
 
 // Match Linux's regular-file O_DIRECT floor: logical sector alignment, not
 // the filesystem's preferred st_blksize.
@@ -148,6 +154,79 @@ pub type IoDst<'a> = dyn WriteBuf + 'a;
 pub trait ReadBuf: Read + IoBuf {}
 impl<T: Read + IoBuf> ReadBuf for T {}
 pub type IoSrc<'a> = dyn ReadBuf + 'a;
+
+/// The immutable syscall-entry view carried through one ioctl operation.
+///
+/// Ioctl leaves must use this object for all caller-dependent state.  In
+/// particular, the user-memory capability and files table are selected once
+/// at dispatch and are never re-resolved through `current()` or a scope-local
+/// fd lookup while an object implementation is running.
+pub struct IoctlContext {
+    user_memory: UserMemoryCapability,
+    caller_task: AxTaskRef,
+    caller_cred: Arc<Cred>,
+    caller_process: Arc<ProcessData>,
+    caller_session: Arc<Session>,
+    files: Arc<FdTable>,
+}
+
+impl IoctlContext {
+    /// Captures the caller object graph and the explicitly selected address
+    /// space exactly once at syscall dispatch.
+    pub(crate) fn new(aspace: Arc<Mutex<AddrSpace>>) -> Self {
+        let caller_task = current().clone();
+        let thread = caller_task.as_thread();
+        let caller_process = thread.proc_data.clone();
+        let caller_session = caller_process.proc.group().session();
+        Self {
+            user_memory: UserMemoryCapability::new(aspace),
+            caller_cred: thread.current_cred(),
+            caller_process,
+            caller_session,
+            caller_task,
+            files: current_fd_table(),
+        }
+    }
+
+    pub(crate) fn user_memory(&self) -> &UserMemoryCapability {
+        &self.user_memory
+    }
+
+    pub(crate) fn caller_task(&self) -> &AxTaskRef {
+        &self.caller_task
+    }
+
+    pub(crate) fn caller_cred(&self) -> &Arc<Cred> {
+        &self.caller_cred
+    }
+
+    pub(crate) fn caller_process(&self) -> &Arc<ProcessData> {
+        &self.caller_process
+    }
+
+    pub(crate) fn caller_session(&self) -> &Arc<Session> {
+        &self.caller_session
+    }
+
+    pub(crate) fn files(&self) -> &Arc<FdTable> {
+        &self.files
+    }
+
+    pub(crate) fn get_file_like(&self, fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
+        let description = self.files.get_description(fd)?;
+        Ok(FileHandle {
+            file: description.inner.clone(),
+            description,
+        })
+    }
+
+    pub(crate) fn add_file_like(&self, file: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
+        let max_nofile = self.caller_process.rlim.read()[RLIMIT_NOFILE]
+            .current
+            .min(AX_FILE_LIMIT as u64) as usize;
+        self.files.add_file_like(file, cloexec, max_nofile)
+    }
+}
 
 bitflags::bitflags! {
     /// Access requested for one file-owned mapping.
@@ -356,7 +435,7 @@ pub trait FileLike: Pollable + DowncastSync {
     /// `format!`, `to_string`, or another abort-on-OOM allocation.
     fn path(&self) -> AxResult<Cow<'_, str>>;
 
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
     }
 

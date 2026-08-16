@@ -2,7 +2,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{
     any::Any,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
@@ -11,8 +11,9 @@ use axsync::Mutex;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateOutcome, alloc_frame,
-    dealloc_frame, divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
+    AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId, FutexBackingIdentity,
+    FutexWordOffset, MappingStatus, PopulateOutcome, SharedFutexKey, alloc_frame, dealloc_frame,
+    divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 use crate::{
     file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
@@ -23,6 +24,12 @@ static FIXED_SHARED_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct SharedPages {
     phys_pages: Mutex<Vec<PhysAddr>>,
+    // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
+    // the published length separate from `phys_pages`: taking that mutex in
+    // the gate would be a blocking operation. The backing only grows, so a
+    // stale (smaller) snapshot can cause a retry but can never expose a word
+    // beyond the live allocation.
+    published_len: AtomicUsize,
     pub size: PageSize,
     fixed: bool,
 }
@@ -59,6 +66,7 @@ impl SharedPages {
         }
         Ok(Self {
             phys_pages: Mutex::new(phys_pages),
+            published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
         })
@@ -123,7 +131,9 @@ impl SharedPages {
         }
         let unused = new_pages.split_off(needed);
         pages.extend(new_pages);
+        let published_len = pages.len();
         drop(pages);
+        self.published_len.store(published_len, Ordering::Release);
         for frame in unused {
             dealloc_frame(frame, self.size);
         }
@@ -132,6 +142,10 @@ impl SharedPages {
 
     pub fn total_bytes(&self) -> usize {
         self.len() * self.size as usize
+    }
+
+    fn total_bytes_snapshot(&self) -> usize {
+        self.published_len.load(Ordering::Acquire) * self.size as usize
     }
 
     pub fn read_bytes(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
@@ -342,6 +356,28 @@ impl SharedBackend {
         self.page_offset
             .checked_mul(self.pages.size as usize)?
             .checked_add(relative)
+    }
+
+    pub(crate) fn futex_key(&self, address: usize) -> Option<SharedFutexKey> {
+        let offset = self.backing_offset(address)?;
+        let end = offset.checked_add(size_of::<u32>())?;
+        (end <= self.pages.total_bytes()).then(|| {
+            SharedFutexKey::new(
+                FutexBackingIdentity::Shared(self.pages.clone()),
+                FutexWordOffset::new(offset),
+            )
+        })
+    }
+
+    pub(crate) fn futex_id(&self, address: usize) -> Option<(FutexBackingId, FutexWordOffset)> {
+        let offset = self.backing_offset(address)?;
+        let end = offset.checked_add(size_of::<u32>())?;
+        (end <= self.pages.total_bytes_snapshot()).then(|| {
+            (
+                FutexBackingId::shared(Arc::as_ptr(&self.pages) as usize),
+                FutexWordOffset::new(offset),
+            )
+        })
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {
@@ -603,7 +639,7 @@ impl PreparedFixedSharedMapping {
         }
 
         let map_id = FIXED_SHARED_MAPPING_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -700,6 +736,29 @@ mod tests {
         assert_eq!(atomic_load_acquire(address), 7);
         atomic_store_release(address, 29);
         assert_eq!(atomic.load(Ordering::Acquire), 29);
+    }
+
+    #[test]
+    fn futex_id_uses_published_length_without_taking_pages_lock() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Dynamic(Arc::new(())),
+            status: MappingStatus::default(),
+        };
+        // Holding the vector mutex proves that the gate-safe identity query
+        // does not fall back to `total_bytes()` and block on the same lock.
+        let pages_guard = pages.phys_pages.lock();
+        assert_eq!(backend.futex_id(0x4000), None);
+        drop(pages_guard);
+        // SharedPages teardown needs task context in host tests; this test is
+        // only about the nonblocking identity query.
+        core::mem::forget(backend);
+        core::mem::forget(pages);
     }
 
     #[test]

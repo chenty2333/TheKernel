@@ -20,17 +20,12 @@ use axsync::Mutex;
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
-    general::{
-        CAP_SYS_ADMIN, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER,
-        CLONE_NEWUTS, RLIM_INFINITY, RLIM_NLIMITS,
-    },
-    ioctl::{NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS},
+    general::{CAP_SYS_ADMIN, CLOCK_BOOTTIME, CLOCK_MONOTONIC, RLIM_INFINITY, RLIM_NLIMITS},
     mempolicy::{
         MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
     },
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_vm::VmMutPtr;
 
 #[cfg(feature = "asid-switch-diagnostics")]
 use crate::mm::asid_switch_diagnostics_snapshot;
@@ -376,11 +371,6 @@ fn render_proc_io_stats() -> Vec<u8> {
     );
     let _ = writeln!(out, "virtio.blk_async_enabled {}", virtio.blk_async_enabled);
     let _ = writeln!(out, "virtio.blk_async_depth {}", virtio.blk_async_depth);
-    let _ = writeln!(
-        out,
-        "virtio.blk_async_la_depth {}",
-        virtio.blk_async_la_depth
-    );
     let _ = writeln!(
         out,
         "virtio.blk_async_wait_policy {}",
@@ -1977,15 +1967,6 @@ impl ProcNamespaceFile {
         })
     }
 
-    fn nstype(&self) -> u32 {
-        match self.kind {
-            ProcNamespaceKind::Pid => CLONE_NEWPID,
-            ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
-            ProcNamespaceKind::User => CLONE_NEWUSER,
-            ProcNamespaceKind::Uts => CLONE_NEWUTS,
-        }
-    }
-
     fn namespace_inode(&self) -> Option<u64> {
         match &self.object {
             ProcNamespaceObject::Pid(ns) => Some(ns.proc_inode()),
@@ -2049,37 +2030,6 @@ impl FileNodeOps for ProcNamespaceFile {
 
     fn set_symlink(&self, _target: &str) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
-    }
-
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        match cmd {
-            NS_GET_PARENT => match self.kind {
-                ProcNamespaceKind::Pid => Err(VfsError::OperationNotPermitted),
-                ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => {
-                    Err(VfsError::InvalidInput)
-                }
-                ProcNamespaceKind::User => Err(VfsError::InvalidInput),
-                ProcNamespaceKind::Uts => Err(VfsError::InvalidInput),
-            },
-            NS_GET_USERNS => match self.kind {
-                ProcNamespaceKind::Pid
-                | ProcNamespaceKind::Time
-                | ProcNamespaceKind::TimeForChildren
-                | ProcNamespaceKind::User
-                | ProcNamespaceKind::Uts => Err(VfsError::OperationNotPermitted),
-            },
-            NS_GET_OWNER_UID => match &self.object {
-                ProcNamespaceObject::User(ns) => {
-                    let viewer = current().as_thread().current_cred();
-                    let owner = viewer.user_ns().from_kuid_munged(ns.owner_kuid());
-                    (arg as *mut u32).vm_write(owner)?;
-                    Ok(0)
-                }
-                _ => Err(VfsError::InvalidInput),
-            },
-            NS_GET_NSTYPE => Ok(self.nstype() as usize),
-            _ => Err(VfsError::NotATty),
-        }
     }
 }
 
@@ -2910,14 +2860,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "io_test_control",
         super::io_test_control::new_file(fs.clone()),
     );
-    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-    root.add(
-        "instret",
-        SimpleFile::new_regular(fs.clone(), || {
-            Ok(format!("{}\n", riscv::register::instret::read64()))
-        }),
-    );
-
     root.add(
         "cpuinfo",
         SimpleFile::new_regular(fs.clone(), || {

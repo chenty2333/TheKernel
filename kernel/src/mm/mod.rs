@@ -12,6 +12,7 @@ mod pressure;
 mod remap;
 mod stats;
 mod tlb;
+mod usercopy;
 mod userfaultfd;
 
 #[cfg(feature = "asid-switch-diagnostics")]
@@ -38,6 +39,10 @@ pub(crate) use self::{
     tlb::{
         init as init_tlb_shootdown, repair_local_spurious_fault, retire_after_tlb_grace,
         synchronize_icache, synchronize_tlb, synchronize_tlb_and_icache,
+        synchronize_tlb_for_addr_space,
+    },
+    usercopy::{
+        AddressSpaceUserMemory, UserMemoryCapability, map_usercopy_error, with_user_memory,
     },
     userfaultfd::*,
 };

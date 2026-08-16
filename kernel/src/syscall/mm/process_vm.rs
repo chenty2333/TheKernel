@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::mem::MaybeUninit;
 
 use axerrno::{AxError, AxResult};
@@ -6,12 +6,11 @@ use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{CAP_SYS_NICE, MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
-use memory_addr::{MemoryAddr, VirtAddr};
-use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 
 use crate::{
     file::{FileLike, PidFd},
-    mm::{AddrSpace, IoVec, check_user_readable, checked_align_up_4k},
+    mm::{AddrSpace, IoVec, UserMemoryCapability, checked_align_up_4k, map_usercopy_error},
     task::{
         AsThread, PtraceAccessMode, check_current_ptrace_image_snapshot,
         check_current_thread_ptrace_image_access, get_visible_task,
@@ -33,7 +32,11 @@ enum ProcessVmOp {
     WriteRemote,
 }
 
-fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, usize)> {
+fn read_iovecs(
+    caller: &UserMemoryCapability,
+    iovs: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<(Vec<UserIoVec>, usize)> {
     if iovcnt > PROCESS_VM_MAX_IOV {
         return Err(AxError::InvalidInput);
     }
@@ -48,13 +51,17 @@ fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, u
     result
         .try_reserve_exact(iovcnt)
         .map_err(|_| AxError::NoMemory)?;
-    let bytes = iovcnt
-        .checked_mul(core::mem::size_of::<IoVec>())
-        .ok_or(AxError::BadAddress)?;
-    check_user_readable(iovs as usize, bytes)?;
     let mut total = 0usize;
     for index in 0..iovcnt {
-        let iov = iovs.wrapping_add(index).vm_read()?;
+        let offset = index
+            .checked_mul(core::mem::size_of::<IoVec>())
+            .ok_or(AxError::BadAddress)?;
+        let address = (iovs as usize)
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        let iov = caller
+            .read_value(address as *const IoVec)
+            .map_err(map_usercopy_error)?;
         if iov.iov_len < 0 {
             return Err(AxError::InvalidInput);
         }
@@ -77,6 +84,25 @@ fn check_process_madvise_capability() -> AxResult<()> {
     }
 }
 
+fn check_process_madvise_capability_if_remote(
+    caller_aspace: &Arc<Mutex<AddrSpace>>,
+    target_aspace: &Arc<Mutex<AddrSpace>>,
+) -> AxResult<()> {
+    if !process_madvise_is_remote(caller_aspace, target_aspace) {
+        Ok(())
+    } else {
+        check_process_madvise_capability()
+    }
+}
+
+#[inline]
+fn process_madvise_is_remote(
+    caller_aspace: &Arc<Mutex<AddrSpace>>,
+    target_aspace: &Arc<Mutex<AddrSpace>>,
+) -> bool {
+    !Arc::ptr_eq(caller_aspace, target_aspace)
+}
+
 fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
     match behavior {
         MADV_WILLNEED => Ok(()),
@@ -85,7 +111,7 @@ fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
     }
 }
 
-fn validate_remote_range(
+fn validate_address_range(
     aspace: &mut AddrSpace,
     base: usize,
     len: usize,
@@ -96,13 +122,33 @@ fn validate_remote_range(
     }
     let start = VirtAddr::from(base);
     let end = start.checked_add(len).ok_or(AxError::BadAddress)?;
+    if !aspace.contains_range(start, len) {
+        return Err(AxError::BadAddress);
+    }
     if !aspace.can_access_range(start, len, access_flags) {
         return Err(AxError::BadAddress);
     }
     let page_start = start.align_down_4k();
     let page_end = VirtAddr::from(checked_align_up_4k(end.as_usize()).ok_or(AxError::BadAddress)?);
-    aspace.populate_area(page_start, page_end.sub_addr(page_start), access_flags)?;
+    match aspace.populate_area(page_start, page_end.sub_addr(page_start), access_flags) {
+        Ok(()) => {}
+        // The VMA and permissions were checked above. Preserve an allocation
+        // failure for a valid range instead of collapsing it into EFAULT.
+        Err(AxError::NoMemory) => return Err(AxError::NoMemory),
+        // Address/permission failures are user-range faults; only an
+        // allocation failure for an otherwise valid VMA remains ENOMEM.
+        Err(AxError::BadAddress | AxError::InvalidInput | AxError::PermissionDenied) => {
+            return Err(AxError::BadAddress);
+        }
+        Err(error) => return Err(error),
+    }
     Ok(())
+}
+
+#[inline]
+fn page_copy_len(address: usize, len: usize) -> usize {
+    let page_offset = address & (PAGE_SIZE_4K - 1);
+    len.min(PAGE_SIZE_4K - page_offset)
 }
 
 fn validate_remote_iovecs(
@@ -111,12 +157,13 @@ fn validate_remote_iovecs(
 ) -> AxResult<()> {
     let mut aspace = aspace_handle.lock();
     for iov in remote {
-        validate_remote_range(&mut aspace, iov.base, iov.len, MappingFlags::READ)?;
+        validate_address_range(&mut aspace, iov.base, iov.len, MappingFlags::READ)?;
     }
     Ok(())
 }
 
 fn copy_from_remote(
+    caller: &UserMemoryCapability,
     aspace_handle: &Arc<Mutex<AddrSpace>>,
     remote: usize,
     local: usize,
@@ -125,19 +172,28 @@ fn copy_from_remote(
 ) -> AxResult<()> {
     let mut copied = 0usize;
     while copied < len {
-        let chunk = (len - copied).min(scratch.len());
+        let remote_addr = remote.checked_add(copied).ok_or(AxError::BadAddress)?;
+        let local_addr = local.checked_add(copied).ok_or(AxError::BadAddress)?;
+        let chunk = (len - copied)
+            .min(scratch.len())
+            .min(page_copy_len(remote_addr, len - copied))
+            .min(page_copy_len(local_addr, len - copied));
+        debug_assert!(chunk != 0);
         {
             let mut aspace = aspace_handle.lock();
-            validate_remote_range(&mut aspace, remote + copied, chunk, MappingFlags::READ)?;
-            aspace.read(VirtAddr::from(remote + copied), &mut scratch[..chunk])?;
+            validate_address_range(&mut aspace, remote_addr, chunk, MappingFlags::READ)?;
+            aspace.read(VirtAddr::from(remote_addr), &mut scratch[..chunk])?;
         }
-        vm_write_slice((local + copied) as *mut u8, &scratch[..chunk])?;
+        caller
+            .write_bytes(local_addr, &scratch[..chunk])
+            .map_err(map_usercopy_error)?;
         copied += chunk;
     }
     Ok(())
 }
 
 fn copy_to_remote(
+    caller: &UserMemoryCapability,
     aspace_handle: &Arc<Mutex<AddrSpace>>,
     local: usize,
     remote: usize,
@@ -146,15 +202,23 @@ fn copy_to_remote(
 ) -> AxResult<()> {
     let mut copied = 0usize;
     while copied < len {
-        let chunk = (len - copied).min(scratch.len());
+        let local_addr = local.checked_add(copied).ok_or(AxError::BadAddress)?;
+        let remote_addr = remote.checked_add(copied).ok_or(AxError::BadAddress)?;
+        let chunk = (len - copied)
+            .min(scratch.len())
+            .min(page_copy_len(local_addr, len - copied))
+            .min(page_copy_len(remote_addr, len - copied));
+        debug_assert!(chunk != 0);
         let buf = unsafe {
             core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<MaybeUninit<u8>>(), chunk)
         };
-        vm_read_slice((local + copied) as *const u8, buf)?;
+        caller
+            .read_bytes(local_addr, buf)
+            .map_err(map_usercopy_error)?;
         {
             let mut aspace = aspace_handle.lock();
-            validate_remote_range(&mut aspace, remote + copied, chunk, MappingFlags::WRITE)?;
-            aspace.write(VirtAddr::from(remote + copied), &scratch[..chunk])?;
+            validate_address_range(&mut aspace, remote_addr, chunk, MappingFlags::WRITE)?;
+            aspace.write(VirtAddr::from(remote_addr), &scratch[..chunk])?;
         }
         copied += chunk;
     }
@@ -162,6 +226,7 @@ fn copy_to_remote(
 }
 
 fn process_vm_copy(
+    caller: &UserMemoryCapability,
     aspace_handle: &Arc<Mutex<AddrSpace>>,
     local: &[UserIoVec],
     remote: &[UserIoVec],
@@ -172,7 +237,11 @@ fn process_vm_copy(
         return Ok(0);
     }
 
-    let mut scratch = vec![0u8; PROCESS_VM_COPY_CHUNK.min(max_len)];
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(PROCESS_VM_COPY_CHUNK.min(max_len))
+        .map_err(|_| AxError::NoMemory)?;
+    scratch.resize(PROCESS_VM_COPY_CHUNK.min(max_len), 0);
     let mut local_index = 0usize;
     let mut remote_index = 0usize;
     let mut local_offset = 0usize;
@@ -196,17 +265,47 @@ fn process_vm_copy(
             .min(local[local_index].len - local_offset)
             .min(remote[remote_index].len - remote_offset)
             .min(scratch.len());
-        let local_addr = local[local_index]
-            .base
-            .checked_add(local_offset)
-            .ok_or(AxError::BadAddress)?;
-        let remote_addr = remote[remote_index]
-            .base
-            .checked_add(remote_offset)
-            .ok_or(AxError::BadAddress)?;
+        let Some(local_addr) = local[local_index].base.checked_add(local_offset) else {
+            return if copied_total == 0 {
+                Err(AxError::BadAddress)
+            } else {
+                Ok(copied_total as isize)
+            };
+        };
+        let Some(remote_addr) = remote[remote_index].base.checked_add(remote_offset) else {
+            return if copied_total == 0 {
+                Err(AxError::BadAddress)
+            } else {
+                Ok(copied_total as isize)
+            };
+        };
+        let copy_len = copy_len
+            .min(page_copy_len(local_addr, copy_len))
+            .min(page_copy_len(remote_addr, copy_len));
+        debug_assert!(copy_len != 0);
+
+        // Validate the caller-owned destination/source before touching the
+        // target image. This keeps a local fault from causing a remote access
+        // and preserves Linux's positive-prefix result after prior chunks.
+        let local_result = {
+            let mut caller_aspace = caller.address_space().lock();
+            let access_flags = match op {
+                ProcessVmOp::ReadRemote => MappingFlags::WRITE,
+                ProcessVmOp::WriteRemote => MappingFlags::READ,
+            };
+            validate_address_range(&mut caller_aspace, local_addr, copy_len, access_flags)
+        };
+        if let Err(err) = local_result {
+            return if copied_total == 0 {
+                Err(err)
+            } else {
+                Ok(copied_total as isize)
+            };
+        }
 
         let copy_result = match op {
             ProcessVmOp::ReadRemote => copy_from_remote(
+                caller,
                 aspace_handle,
                 remote_addr,
                 local_addr,
@@ -214,6 +313,7 @@ fn process_vm_copy(
                 &mut scratch,
             ),
             ProcessVmOp::WriteRemote => copy_to_remote(
+                caller,
                 aspace_handle,
                 local_addr,
                 remote_addr,
@@ -238,6 +338,7 @@ fn process_vm_copy(
 }
 
 fn sys_process_vm_rw(
+    caller_aspace: Arc<Mutex<AddrSpace>>,
     pid: i32,
     local_iov: *const IoVec,
     local_iovcnt: usize,
@@ -250,11 +351,12 @@ fn sys_process_vm_rw(
         return Err(AxError::InvalidInput);
     }
 
-    let (local, local_len) = read_iovecs(local_iov, local_iovcnt)?;
+    let caller = UserMemoryCapability::new(caller_aspace);
+    let (local, local_len) = read_iovecs(&caller, local_iov, local_iovcnt)?;
     if local_len == 0 {
         return Ok(0);
     }
-    let (remote, remote_len) = read_iovecs(remote_iov, remote_iovcnt)?;
+    let (remote, remote_len) = read_iovecs(&caller, remote_iov, remote_iovcnt)?;
     let copy_len = local_len.min(remote_len);
     if copy_len == 0 {
         return Ok(0);
@@ -268,10 +370,11 @@ fn sys_process_vm_rw(
     let target_image =
         check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
     let target_aspace = target_image.into_aspace();
-    process_vm_copy(&target_aspace, &local, &remote, copy_len, op)
+    process_vm_copy(&caller, &target_aspace, &local, &remote, copy_len, op)
 }
 
 pub fn sys_process_vm_readv(
+    caller_aspace: Arc<Mutex<AddrSpace>>,
     pid: i32,
     local_iov: *const IoVec,
     local_iovcnt: usize,
@@ -280,6 +383,7 @@ pub fn sys_process_vm_readv(
     flags: usize,
 ) -> AxResult<isize> {
     sys_process_vm_rw(
+        caller_aspace,
         pid,
         local_iov,
         local_iovcnt,
@@ -291,6 +395,7 @@ pub fn sys_process_vm_readv(
 }
 
 pub fn sys_process_vm_writev(
+    caller_aspace: Arc<Mutex<AddrSpace>>,
     pid: i32,
     local_iov: *const IoVec,
     local_iovcnt: usize,
@@ -299,6 +404,7 @@ pub fn sys_process_vm_writev(
     flags: usize,
 ) -> AxResult<isize> {
     sys_process_vm_rw(
+        caller_aspace,
         pid,
         local_iov,
         local_iovcnt,
@@ -310,6 +416,7 @@ pub fn sys_process_vm_writev(
 }
 
 pub fn sys_process_madvise(
+    caller_aspace: Arc<Mutex<AddrSpace>>,
     pidfd: i32,
     iovs: *const IoVec,
     iovcnt: usize,
@@ -326,16 +433,14 @@ pub fn sys_process_madvise(
     }
     validate_process_madvise_behavior(behavior)?;
 
-    let (remote, total_len) = read_iovecs(iovs, iovcnt)?;
-    if total_len == 0 {
-        return Ok(0);
-    }
+    let caller = UserMemoryCapability::new(caller_aspace);
+    let (remote, total_len) = read_iovecs(&caller, iovs, iovcnt)?;
 
     let pidfd = PidFd::from_fd(pidfd)?;
     let target = pidfd.process_data()?;
     let target_image = pidfd.image_access_snapshot()?;
     check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
-    check_process_madvise_capability()?;
+    check_process_madvise_capability_if_remote(caller.address_space(), target_image.aspace())?;
     let target_aspace = target_image.into_aspace();
     validate_remote_iovecs(&target_aspace, &remote)?;
     Ok(total_len as isize)
@@ -343,10 +448,157 @@ pub fn sys_process_madvise(
 
 #[cfg(test)]
 mod tests {
-    use axerrno::AxError;
-    use linux_raw_sys::general::{MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
+    use alloc::sync::Arc;
 
-    use super::validate_process_madvise_behavior;
+    use axerrno::AxError;
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use linux_raw_sys::general::{MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+    use super::{
+        IoVec, ProcessVmOp, UserIoVec, UserMemoryCapability, page_copy_len,
+        process_madvise_is_remote, process_vm_copy, read_iovecs, validate_process_madvise_behavior,
+    };
+    use crate::mm::{AddrSpace, Backend};
+
+    fn mapped_aspace(base: usize, mapped_pages: usize) -> Arc<Mutex<AddrSpace>> {
+        let mut aspace = AddrSpace::new_empty(VirtAddr::from(base), PAGE_SIZE_4K * 2).unwrap();
+        for page in 0..mapped_pages {
+            let address = base + page * PAGE_SIZE_4K;
+            aspace
+                .map(
+                    VirtAddr::from(address),
+                    PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                    false,
+                    Backend::new_alloc(VirtAddr::from(address), PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        Arc::new(Mutex::new(aspace))
+    }
+
+    fn mapped_capability() -> UserMemoryCapability {
+        UserMemoryCapability::new(mapped_aspace(0x1000, 1))
+    }
+
+    #[test]
+    fn process_vm_iov_descriptors_are_imported_from_explicit_caller_space() {
+        let capability = mapped_capability();
+        let descriptor = IoVec {
+            iov_base: 0x1000 as *mut u8,
+            iov_len: 37,
+        };
+        // SAFETY: IoVec is a complete initialized descriptor and the selected
+        // capability owns the mapped destination range.
+        unsafe {
+            capability
+                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
+                .unwrap();
+        }
+
+        let (iovecs, total) = read_iovecs(&capability, 0x1000 as *const IoVec, 1).unwrap();
+        assert_eq!(total, 37);
+        assert_eq!(iovecs[0].base, 0x1000);
+        assert_eq!(iovecs[0].len, 37);
+    }
+
+    #[test]
+    fn process_vm_descriptor_range_is_faulted_before_element_copyin() {
+        let capability = mapped_capability();
+        assert!(matches!(
+            read_iovecs(&capability, 0x1ff8 as *const IoVec, 1),
+            Err(AxError::BadAddress)
+        ));
+    }
+
+    #[test]
+    fn process_vm_copy_batches_stop_at_page_boundaries() {
+        assert_eq!(page_copy_len(0x1000, PAGE_SIZE_4K * 4), PAGE_SIZE_4K);
+        assert_eq!(page_copy_len(0x1fff, PAGE_SIZE_4K), 1);
+        assert_eq!(page_copy_len(0x2000, 37), 37);
+    }
+
+    #[test]
+    fn process_vm_copy_returns_prefix_when_remote_second_page_faults() {
+        let caller_aspace = mapped_aspace(0x1000, 2);
+        let target_aspace = mapped_aspace(0x4000, 1);
+        let caller = UserMemoryCapability::new(caller_aspace);
+        let local = [UserIoVec {
+            base: 0x1000,
+            len: PAGE_SIZE_4K * 2,
+        }];
+        let remote = [UserIoVec {
+            base: 0x4000,
+            len: PAGE_SIZE_4K * 2,
+        }];
+
+        assert_eq!(
+            process_vm_copy(
+                &caller,
+                &target_aspace,
+                &local,
+                &remote,
+                PAGE_SIZE_4K * 2,
+                ProcessVmOp::ReadRemote,
+            )
+            .unwrap(),
+            PAGE_SIZE_4K as isize
+        );
+
+        assert_eq!(
+            process_vm_copy(
+                &caller,
+                &target_aspace,
+                &local,
+                &remote,
+                PAGE_SIZE_4K * 2,
+                ProcessVmOp::WriteRemote,
+            )
+            .unwrap(),
+            PAGE_SIZE_4K as isize
+        );
+    }
+
+    #[test]
+    fn process_vm_copy_reports_efault_before_the_first_byte() {
+        let caller = UserMemoryCapability::new(mapped_aspace(0x1000, 0));
+        let target = mapped_aspace(0x4000, 1);
+        let local = [UserIoVec {
+            base: 0x1000,
+            len: PAGE_SIZE_4K,
+        }];
+        let remote = [UserIoVec {
+            base: 0x4000,
+            len: PAGE_SIZE_4K,
+        }];
+
+        assert_eq!(
+            process_vm_copy(
+                &caller,
+                &target,
+                &local,
+                &remote,
+                PAGE_SIZE_4K,
+                ProcessVmOp::ReadRemote,
+            ),
+            Err(AxError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn process_madvise_capability_gate_distinguishes_same_mm() {
+        let caller = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap(),
+        ));
+        let remote = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x4000), PAGE_SIZE_4K).unwrap(),
+        ));
+
+        assert!(!process_madvise_is_remote(&caller, &caller));
+        assert!(process_madvise_is_remote(&caller, &remote));
+    }
 
     #[test]
     fn process_madvise_only_accepts_implemented_behavior() {

@@ -4,7 +4,7 @@ use core::future::pending;
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{
     time::{TimeValue, wall_time},
-    uspace::UserContext,
+    uspace::{UserContext, UserReturnHookAction},
 };
 use axtask::{
     AxTaskRef, current,
@@ -14,34 +14,48 @@ use linux_raw_sys::general::{
     MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK,
     siginfo, timespec,
 };
-use starry_process::Pid;
-use starry_signal::{
-    RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, Signo,
-    api::{SignalFrame, SignalWaitObservation, ThreadSignalManager},
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::{
+    RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, SignalStackRestoreError,
+    Signo,
+    api::{SignalDeliveryPreflight, SignalFrame, SignalWaitObservation, ThreadSignalManager},
 };
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
+    mm::{AddressSpaceUserMemory, map_usercopy_error},
     task::{
         AsThread, Cred, ProcStateHint, Process, ProcessData, SignalDeliveryScope, SignalNumber,
-        SignalSecurityOperation, SignalSecuritySource, SignalTargetKind,
+        SignalSecurityOperation, SignalSecuritySource, SignalTargetKind, Thread,
         acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
         check_current_zombie_signal_access, check_signals, complete_signal_delivery,
-        force_signal_current_thread, generate_signal_for_exited_leader, get_process_data,
-        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
-        process_error, send_authorized_signal_thread_inner,
-        send_queued_signal_to_process_data_with_credential,
-        send_signal_to_process_data_with_credential, with_proc_state_hint,
+        force_rseq_fault_signal_current_thread, force_signal_current_thread,
+        generate_signal_for_exited_leader, get_process_data, get_process_group,
+        get_process_including_zombie, get_visible_task, process_domain, process_error,
+        send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
+        send_signal_to_process_data_with_credential, terminate_rseq_fault_current_thread,
+        with_proc_state_hint,
     },
     time::TimeValueLike,
 };
 
 pub(crate) fn check_sigset_size(size: usize) -> AxResult<()> {
-    if size != size_of::<SignalSet>() && size != 0 {
+    if size != size_of::<SignalSet>() {
         return Err(AxError::InvalidInput);
     }
     Ok(())
+}
+
+fn check_sigpending_size(size: usize) -> AxResult<()> {
+    if size > size_of::<SignalSet>() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn pending_mask_for_sigpending(pending: SignalSet, blocked: SignalSet) -> SignalSet {
+    pending & blocked
 }
 
 pub(crate) fn parse_signo(signo: u32) -> AxResult<Signo> {
@@ -55,7 +69,8 @@ fn current_visible_tid() -> Pid {
     current().as_thread().tid()
 }
 
-pub fn sys_rt_sigprocmask(
+pub fn sys_rt_sigprocmask<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     how: i32,
     set: *const SignalSet,
     oldset: *mut SignalSet,
@@ -70,8 +85,12 @@ pub fn sys_rt_sigprocmask(
     // Snapshot the requested mask before writing the old mask back. Linux
     // permits `set` and `oldset` to alias; BusyBox relies on that contract in
     // its wait path when it atomically blocks signals and saves the old mask.
-    let new = if let Some(set) = set.nullable() {
-        let set = unsafe { set.vm_read_uninit()?.assume_init() };
+    let new = if let Some(set) = VmPtr::nullable(set) {
+        let set = unsafe {
+            VmPtr::vm_read_uninit(set, memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         Some(match how as u32 {
             SIG_BLOCK => old | set,
             SIG_UNBLOCK => old & !set,
@@ -87,14 +106,17 @@ pub fn sys_rt_sigprocmask(
         sig.set_blocked(new);
     }
 
-    if let Some(oldset) = oldset.nullable() {
-        oldset.vm_write(old)?;
+    if let Some(oldset) = VmPtr::nullable(oldset) {
+        // SAFETY: SignalSet is repr(transparent) over a u64, so every byte
+        // of the value is initialized and safe to copy to userspace.
+        unsafe { VmMutPtr::vm_write_unchecked(oldset, memory, old).map_err(map_usercopy_error)? }
     }
 
     Ok(0)
 }
 
-pub fn sys_rt_sigaction(
+pub fn sys_rt_sigaction<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     signo: u32,
     act: *const RawSignalAction,
     oldact: *mut RawSignalAction,
@@ -107,8 +129,10 @@ pub fn sys_rt_sigaction(
         return Err(AxError::InvalidInput);
     }
 
-    let new_action = if let Some(act) = act.nullable() {
-        let mut action: SignalAction = RawSignalAction::read_from_user(act)?.into();
+    let new_action = if !act.is_null() {
+        let mut action: SignalAction = RawSignalAction::read_from_user(memory, act)
+            .map_err(map_usercopy_error)?
+            .into();
         action.mask.remove(Signo::SIGKILL);
         action.mask.remove(Signo::SIGSTOP);
         Some(action)
@@ -125,21 +149,46 @@ pub fn sys_rt_sigaction(
             .try_replace_action(signo, action)
             .map_err(|_| AxError::NoMemory)?
     } else {
-        proc_data.signal.actions.lock()[signo].clone()
+        proc_data.signal.action(signo)
     };
 
     // Linux commits the new action before copying the previous one out. If
     // this user copy faults, the action transition and required queue flush
     // therefore remain visible.
-    if let Some(oldact) = oldact.nullable() {
-        RawSignalAction::from(old_action).write_to_user(oldact)?;
+    if !oldact.is_null() {
+        RawSignalAction::from(old_action)
+            .write_to_user(memory, oldact)
+            .map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
 
-pub fn sys_rt_sigpending(set: *mut SignalSet, sigsetsize: usize) -> AxResult<isize> {
-    check_sigset_size(sigsetsize)?;
-    set.vm_write(current().as_thread().signal.pending())?;
+pub fn sys_rt_sigpending<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    set: *mut SignalSet,
+    sigsetsize: usize,
+) -> AxResult<isize> {
+    check_sigpending_size(sigsetsize)?;
+    if sigsetsize == 0 {
+        return Ok(0);
+    }
+    let curr = current();
+    let thread = curr.as_thread();
+    // `pending` is the canonical union of thread-private and process-shared
+    // queues, while `blocked` is the current thread's mask.  Take both through
+    // the signal manager accessors before applying the Linux pending-mask
+    // intersection.
+    let pending = pending_mask_for_sigpending(thread.signal.pending(), thread.signal.blocked());
+    // SAFETY: SignalSet is repr(transparent) over a u64, so every byte of
+    // the value is initialized and safe to copy to userspace. The Linux
+    // interface accepts a shorter pending-mask size and copies exactly that
+    // many leading bytes.
+    let bytes = unsafe {
+        core::slice::from_raw_parts((&pending as *const SignalSet).cast::<u8>(), sigsetsize)
+    };
+    memory
+        .write_bytes(set as usize, bytes)
+        .map_err(map_usercopy_error)?;
     Ok(0)
 }
 
@@ -148,10 +197,17 @@ fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
         return Ok(None);
     }
     let signo = parse_signo(signo)?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let credential = thread.current_cred();
+    // Linux's generated SI_USER/SI_TKILL records carry current_uid(), i.e.
+    // the sender's real UID, rendered in the sender's user namespace.
+    let uid = credential.user_ns().from_kuid_munged(credential.ids().ruid);
     Ok(Some(SignalInfo::new_user(
         signo,
         code,
-        current().as_thread().proc_data.proc.pid(),
+        thread.proc_data.proc.pid(),
+        uid,
     )))
 }
 
@@ -991,12 +1047,17 @@ struct QueuedSignalRequest {
     code: i32,
 }
 
-fn make_queue_signal_info(
+fn make_queue_signal_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     target_tid: Pid,
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<QueuedSignalRequest> {
-    let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
+    let mut sig = unsafe {
+        VmPtr::vm_read_uninit(sig, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
     if (sig.code() >= 0 || sig.code() == SI_TKILL) && current_visible_tid() != target_tid {
         return Err(AxError::OperationNotPermitted);
@@ -1013,8 +1074,13 @@ fn make_queue_signal_info(
     }
 }
 
-pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxResult<isize> {
-    let request = make_queue_signal_info(pid, signo, sig)?;
+pub fn sys_rt_sigqueueinfo<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid: Pid,
+    signo: u32,
+    sig: *const SignalInfo,
+) -> AxResult<isize> {
+    let request = make_queue_signal_info(memory, pid, signo, sig)?;
     let permission_signal = signal_signo(&request.signal);
     let operation = signal_operation(
         permission_signal,
@@ -1034,7 +1100,8 @@ pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxRe
     Ok(0)
 }
 
-pub fn sys_rt_tgsigqueueinfo(
+pub fn sys_rt_tgsigqueueinfo<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     tgid: i32,
     tid: i32,
     signo: u32,
@@ -1044,7 +1111,7 @@ pub fn sys_rt_tgsigqueueinfo(
         return Err(AxError::InvalidInput);
     }
 
-    let request = make_queue_signal_info(tid as Pid, signo, sig)?;
+    let request = make_queue_signal_info(memory, tid as Pid, signo, sig)?;
     let operation = signal_operation(
         signal_signo(&request.signal),
         SignalSecuritySource::Queued { code: request.code },
@@ -1057,16 +1124,7 @@ pub fn sys_rt_tgsigqueueinfo(
     Ok(0)
 }
 
-#[cfg(target_arch = "x86_64")]
 const SIGNAL_PC_ALIGNMENT: usize = 1;
-#[cfg(target_arch = "riscv64")]
-const SIGNAL_PC_ALIGNMENT: usize = 2;
-#[cfg(any(target_arch = "loongarch64", target_arch = "aarch64"))]
-const SIGNAL_PC_ALIGNMENT: usize = 4;
-
-#[cfg(target_arch = "aarch64")]
-const SIGNAL_SP_ALIGNMENT: usize = 16;
-#[cfg(not(target_arch = "aarch64"))]
 const SIGNAL_SP_ALIGNMENT: usize = 1;
 
 fn valid_signal_user_address(address: usize, alignment: usize) -> bool {
@@ -1080,7 +1138,38 @@ fn reject_bad_sigreturn(reason: &str) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
+fn validate_sigreturn_stack(
+    configured: &SignalStack,
+    syscall_sp: usize,
+    candidate: &SignalStack,
+) -> Result<(), SignalStackRestoreError> {
+    if configured.contains_sp(syscall_sp) {
+        return Err(SignalStackRestoreError::ActiveStack);
+    }
+    if candidate.disabled() {
+        return Ok(());
+    }
+    if candidate.size < MINSIGSTKSZ as usize {
+        return Err(SignalStackRestoreError::TooSmall);
+    }
+    let user_start = crate::config::USER_SPACE_BASE;
+    let user_end = user_start
+        .checked_add(crate::config::USER_SPACE_SIZE)
+        .ok_or(SignalStackRestoreError::InvalidAddress)?;
+    let candidate_end = candidate
+        .sp
+        .checked_add(candidate.size)
+        .ok_or(SignalStackRestoreError::InvalidAddress)?;
+    if candidate.sp < user_start || candidate_end > user_end {
+        return Err(SignalStackRestoreError::InvalidAddress);
+    }
+    Ok(())
+}
+
+pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    uctx: &mut UserContext,
+) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
 
@@ -1088,7 +1177,7 @@ pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
         return reject_bad_sigreturn("no active signal handler");
     }
 
-    let frame = match SignalFrame::read_from_user(uctx.sp() as *const SignalFrame) {
+    let frame = match SignalFrame::read_from_user(memory, uctx.sp() as *const SignalFrame) {
         Ok(frame) => frame,
         Err(_) => return reject_bad_sigreturn("frame copy-in fault"),
     };
@@ -1098,6 +1187,7 @@ pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
         frame,
         |pc| valid_signal_user_address(pc, SIGNAL_PC_ALIGNMENT),
         |sp| valid_signal_user_address(sp, SIGNAL_SP_ALIGNMENT),
+        validate_sigreturn_stack,
     ) {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -1124,6 +1214,10 @@ enum SignalWaitWake {
 enum SignalWaitStep<T> {
     Accepted(T),
     Delivered,
+    Retry,
+    Fault,
+    Replaced,
+    Fatal,
     Block,
     TimedOut,
     Failed(AxError),
@@ -1322,7 +1416,51 @@ impl SignalWaitBlock {
     }
 }
 
-pub fn sys_rt_sigtimedwait(
+/// Waits until one signal has actually entered a userspace handler.
+///
+/// Both `pause(2)` and `rt_sigsuspend(2)` use the same interruptible wait
+/// protocol.  The caller supplies the mask which a handler frame must restore;
+/// the visible mask itself is owned by the caller so `pause` can leave the
+/// current mask untouched while `sigsuspend` temporarily replaces it.
+fn wait_for_caught_signal(
+    thr: &Thread,
+    uctx: &mut UserContext,
+    restore_blocked: SignalSet,
+    on_handler: impl FnOnce(),
+) -> AxResult<()> {
+    with_proc_state_hint(ProcStateHint::Interruptible, || {
+        let mut block = SignalWaitBlock::new(None);
+        loop {
+            if thr.pending_exit() {
+                return Ok(());
+            }
+
+            let handler_depth = thr.signal_handler_depth();
+            if check_signals(thr, uctx, Some(restore_blocked)) {
+                if thr.signal_handler_depth() > handler_depth {
+                    on_handler();
+                    return Ok(());
+                }
+                if thr.pending_exit() {
+                    return Ok(());
+                }
+                // Default stop/continue actions do not complete either wait.
+                // A stopped task resumes here and keeps waiting until a
+                // userspace handler is actually entered.
+                continue;
+            }
+
+            match block.wait() {
+                SignalWaitWake::Interrupted => {}
+                SignalWaitWake::Failed(error) => return Err(error),
+                SignalWaitWake::TimedOut => return Err(AxError::BadState),
+            }
+        }
+    })
+}
+
+pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     uctx: &mut UserContext,
     set: *const SignalSet,
     info: *mut siginfo,
@@ -1331,10 +1469,18 @@ pub fn sys_rt_sigtimedwait(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let set = sanitize_synchronous_wait_set(unsafe { set.vm_read_uninit()?.assume_init() });
+    let set = sanitize_synchronous_wait_set(unsafe {
+        VmPtr::vm_read_uninit(set, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    });
 
-    let timeout = if let Some(ts) = timeout.nullable() {
-        let ts = unsafe { ts.vm_read_uninit()?.assume_init() };
+    let timeout = if let Some(ts) = VmPtr::nullable(timeout) {
+        let ts = unsafe {
+            VmPtr::vm_read_uninit(ts, memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         Some(ts.try_into_time_value()?)
     } else {
         None
@@ -1362,6 +1508,7 @@ pub fn sys_rt_sigtimedwait(
         with_proc_state_hint(ProcStateHint::Interruptible, || {
             let mut mask = SigtimedwaitMask::new(signal, set);
             let mut block = SignalWaitBlock::new(deadline);
+            let mut retry_delivery = false;
             loop {
                 mask.activate();
 
@@ -1373,7 +1520,16 @@ pub fn sys_rt_sigtimedwait(
                     return Ok(sig);
                 }
 
-                let wake = block.wait();
+                // A transient rseq pre-delivery rejection has already
+                // requeued an asynchronously deliverable signal and may have
+                // consumed its wake. Re-enter observation immediately instead
+                // of sleeping with that signal still pending.
+                let wake = if retry_delivery {
+                    retry_delivery = false;
+                    SignalWaitWake::Interrupted
+                } else {
+                    block.wait()
+                };
                 // Linux restores the real mask before its final selected
                 // dequeue. This also makes an unrelated handler's visible mask
                 // derive from old_blocked rather than the temporary wait mask.
@@ -1382,13 +1538,60 @@ pub fn sys_rt_sigtimedwait(
                 let step = sigtimedwait_post_wait_step(
                     wake,
                     || signal.dequeue_signal(&set),
-                    || match signal.observe_signal_wait(uctx, &set, mask.old_blocked()) {
-                        SignalWaitObservation::Accepted(sig) => SignalWaitStep::Accepted(sig),
-                        SignalWaitObservation::Delivered(delivered) => {
-                            complete_signal_delivery(thr, uctx, delivered);
-                            SignalWaitStep::Delivered
+                    || {
+                        let saved_uctx = *uctx;
+                        let aspace = thr.proc_data.aspace();
+                        let mut provider = AddressSpaceUserMemory::new(aspace.clone());
+                        let mut memory = UserMemoryContext::new(&mut provider);
+                        match signal.observe_signal_wait_with_pre_delivery(
+                            &mut memory,
+                            uctx,
+                            &set,
+                            mask.old_blocked(),
+                            |uctx, sig, _| {
+                                // Resolve the current image immediately before
+                                // this pre-delivery operation. The handle and
+                                // UserContext passed to rseq are then the same
+                                // pair for the complete nofault gate.
+                                if thr.signal.take_signal_delivery_bypass(sig.signo()) {
+                                    return SignalDeliveryPreflight::Proceed;
+                                }
+                                match thr.pre_signal_rseq_delivery(uctx, &aspace) {
+                                    UserReturnHookAction::EnterUser => {
+                                        SignalDeliveryPreflight::Proceed
+                                    }
+                                    UserReturnHookAction::Retry => SignalDeliveryPreflight::Retry,
+                                    UserReturnHookAction::Fault => {
+                                        if force_rseq_fault_signal_current_thread() {
+                                            SignalDeliveryPreflight::Replaced
+                                        } else {
+                                            SignalDeliveryPreflight::Fatal
+                                        }
+                                    }
+                                }
+                            },
+                        ) {
+                            SignalWaitObservation::Accepted(sig) => SignalWaitStep::Accepted(sig),
+                            SignalWaitObservation::Delivered(delivered) => {
+                                complete_signal_delivery(thr, uctx, delivered);
+                                SignalWaitStep::Delivered
+                            }
+                            SignalWaitObservation::Retry => {
+                                *uctx = saved_uctx;
+                                SignalWaitStep::Retry
+                            }
+                            SignalWaitObservation::Fault => {
+                                *uctx = saved_uctx;
+                                SignalWaitStep::Fault
+                            }
+                            SignalWaitObservation::Replaced => SignalWaitStep::Replaced,
+                            SignalWaitObservation::Fatal => {
+                                *uctx = saved_uctx;
+                                terminate_rseq_fault_current_thread();
+                                SignalWaitStep::Fatal
+                            }
+                            SignalWaitObservation::None => SignalWaitStep::Block,
                         }
-                        SignalWaitObservation::None => SignalWaitStep::Block,
                     },
                 );
                 match step {
@@ -1400,6 +1603,16 @@ pub fn sys_rt_sigtimedwait(
                         // not reblock.
                         return Err(AxError::Interrupted);
                     }
+                    SignalWaitStep::Retry => {
+                        retry_delivery = true;
+                        continue;
+                    }
+                    SignalWaitStep::Replaced => {
+                        retry_delivery = true;
+                        continue;
+                    }
+                    SignalWaitStep::Fatal => return Err(AxError::Interrupted),
+                    SignalWaitStep::Fault => return Err(AxError::BadAddress),
                     SignalWaitStep::Block if thr.pending_exit() => {
                         return Err(AxError::Interrupted);
                     }
@@ -1412,14 +1625,26 @@ pub fn sys_rt_sigtimedwait(
     };
     acknowledge_posix_timer_signal(&thr.proc_data, &sig);
 
-    if let Some(info) = info.nullable() {
-        info.vm_write(sig.0)?;
+    if let Some(info) = VmPtr::nullable(info) {
+        // SignalInfo owns a fully initialized Linux siginfo record. Copy its
+        // bytes through the explicit user-memory context rather than exposing
+        // the canonical crate's private storage.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (sig.as_raw() as *const siginfo).cast::<u8>(),
+                size_of::<siginfo>(),
+            )
+        };
+        memory
+            .write_bytes(info as usize, bytes)
+            .map_err(map_usercopy_error)?;
     }
 
     Ok(sig.signo() as _)
 }
 
-pub fn sys_rt_sigsuspend(
+pub fn sys_rt_sigsuspend<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     uctx: &mut UserContext,
     set: *const SignalSet,
     sigsetsize: usize,
@@ -1429,44 +1654,43 @@ pub fn sys_rt_sigsuspend(
     let curr = current();
     let thr = curr.as_thread();
 
-    let set = unsafe { set.vm_read_uninit()?.assume_init() };
+    let set = unsafe {
+        VmPtr::vm_read_uninit(set, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let mut suspended_mask = SigsuspendMask::install(&thr.signal, set);
 
     // sigsuspend always returns -EINTR when a signal is caught
     // We set this in uctx before check_signals so it's saved in SignalFrame
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
 
-    with_proc_state_hint(ProcStateHint::Interruptible, || {
-        let mut block = SignalWaitBlock::new(None);
-        loop {
-            if thr.pending_exit() {
-                return Ok(());
-            }
-
-            let handler_depth = thr.signal_handler_depth();
-            if check_signals(thr, uctx, Some(suspended_mask.old_blocked())) {
-                if thr.signal_handler_depth() > handler_depth {
-                    suspended_mask.hand_off_to_handler();
-                    return Ok(());
-                }
-                if thr.pending_exit() {
-                    return Ok(());
-                }
-                // Default stop/continue actions do not complete sigsuspend.
-                // After a stop is resumed, keep waiting with the temporary
-                // visible mask until a handler is actually entered.
-                continue;
-            }
-
-            match block.wait() {
-                SignalWaitWake::Interrupted => {}
-                SignalWaitWake::Failed(error) => return Err(error),
-                SignalWaitWake::TimedOut => return Err(AxError::BadState),
-            }
-        }
+    let old_blocked = suspended_mask.old_blocked();
+    wait_for_caught_signal(thr, uctx, old_blocked, || {
+        suspended_mask.hand_off_to_handler();
     })?;
 
     // sigsuspend always returns -EINTR
+    Err(AxError::Interrupted)
+}
+
+/// Implements Linux x86_64 `pause(2)`.
+///
+/// `pause` waits with the current signal mask in force. It completes only
+/// after a signal handler has been entered and always reports `EINTR`, even
+/// when that handler was installed with `SA_RESTART`; ignored, blocked,
+/// stop/continue, and fatal signals never manufacture a successful return.
+pub fn sys_pause(uctx: &mut UserContext) -> AxResult<isize> {
+    let curr = current();
+    let thr = curr.as_thread();
+    let restore_blocked = thr.signal.blocked();
+
+    // The return value must already be present in the saved context if a
+    // handler frame is published while pause is sleeping.
+    uctx.set_retval(-LinuxError::EINTR.code() as usize);
+    wait_for_caught_signal(thr, uctx, restore_blocked, || {})?;
+
+    // pause(2) is never restartable, including for SA_RESTART handlers.
     Err(AxError::Interrupted)
 }
 
@@ -1494,7 +1718,8 @@ fn prepare_sigaltstack_update(
     Ok(candidate)
 }
 
-pub fn sys_sigaltstack(
+pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     uctx: &UserContext,
     ss: *const SignalStack,
     old_ss: *mut SignalStack,
@@ -1507,8 +1732,12 @@ pub fn sys_sigaltstack(
     // keeping publication last, this gives overlapping `ss == old_ss` the
     // Linux ordering: the input value is captured before the old state is
     // copied back to the same userspace address.
-    let prepared = if let Some(ss) = ss.nullable() {
-        let candidate = unsafe { ss.vm_read_uninit()?.assume_init() };
+    let prepared = if let Some(ss) = VmPtr::nullable(ss) {
+        let candidate = unsafe {
+            VmPtr::vm_read_uninit(ss, memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
         Some(prepare_sigaltstack_update(
             &current_stack,
             uctx.sp(),
@@ -1518,10 +1747,16 @@ pub fn sys_sigaltstack(
         None
     };
 
-    if let Some(old_ss) = old_ss.nullable() {
-        let mut visible_stack = current_stack.clone();
+    if let Some(old_ss) = VmPtr::nullable(old_ss) {
+        let mut visible_stack = current_stack;
         visible_stack.flags = current_stack.flags_at(uctx.sp());
-        old_ss.vm_write(visible_stack)?;
+        // SAFETY: SignalStack::new/default construction initializes its
+        // explicit ABI padding, and the manager returns a fully initialized
+        // value before this copyout.
+        unsafe {
+            VmMutPtr::vm_write_unchecked(old_ss, memory, visible_stack)
+                .map_err(map_usercopy_error)?
+        }
     }
 
     if let Some(prepared) = prepared {
@@ -1532,20 +1767,90 @@ pub fn sys_sigaltstack(
 
 #[cfg(test)]
 mod tests {
-    use core::{cell::Cell, time::Duration};
+    use core::{cell::Cell, mem::size_of, time::Duration};
 
     use axerrno::AxError;
     use axtask::future::TimerRegistrationError;
     use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_DISABLE, SS_ONSTACK};
-    use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
+    use thekernel_linux_signal::{
+        RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalSet,
+        SignalStack, Signo,
+    };
 
     use super::{
         ProcessSignalPostHook, SignalTargetAggregation, SignalTargetAuthorizationError,
-        SignalTargetResultReducer, SignalWaitStep, SignalWaitWake, complete_specific_thread_signal,
-        exited_leader_identity_matches, parse_signo, prepare_sigaltstack_update,
+        SignalTargetResultReducer, SignalWaitStep, SignalWaitWake, check_sigpending_size,
+        check_sigset_size, complete_specific_thread_signal, exited_leader_identity_matches,
+        parse_signo, pending_mask_for_sigpending, prepare_sigaltstack_update,
         process_signal_post_hook, queued_signal_required, reduce_process_signal_delivery_result,
         sanitize_synchronous_wait_set, signal_wait_deadline, sigtimedwait_post_wait_step,
     };
+
+    #[test]
+    fn signal_set_size_rules_match_each_linux_syscall_contract() {
+        let native = size_of::<SignalSet>();
+        assert!(check_sigset_size(native).is_ok());
+        assert!(check_sigset_size(0).is_err());
+        assert!(check_sigset_size(native + 1).is_err());
+
+        assert!(check_sigpending_size(0).is_ok());
+        assert!(check_sigpending_size(native).is_ok());
+        assert!(check_sigpending_size(native + 1).is_err());
+    }
+
+    #[test]
+    fn sigpending_only_reports_blocked_pending_signals() {
+        let mut pending = SignalSet::default();
+        pending.add(Signo::SIGUSR1);
+        pending.add(Signo::SIGUSR2);
+
+        let mut blocked = SignalSet::default();
+        blocked.add(Signo::SIGUSR2);
+        blocked.add(Signo::SIGTERM);
+
+        let visible = pending_mask_for_sigpending(pending, blocked);
+        assert!(!visible.has(Signo::SIGUSR1));
+        assert!(visible.has(Signo::SIGUSR2));
+        assert!(!visible.has(Signo::SIGTERM));
+    }
+
+    #[test]
+    fn canonical_sigaction_raw_roundtrip_preserves_record_semantics() {
+        let mut mask = SignalSet::default();
+        mask.add(Signo::SIGUSR1);
+        mask.add(Signo::SIGRT32);
+        let action = SignalAction {
+            flags: SignalActionFlags::SIGINFO | SignalActionFlags::RESTORER,
+            mask,
+            disposition: SignalDisposition::Handler(0x1234_5678),
+            restorer: Some(0x8765_4321),
+        };
+
+        let raw = RawSignalAction::from(action);
+        let roundtrip = SignalAction::from(raw);
+        assert_eq!(roundtrip.flags.bits(), action.flags.bits());
+        assert!(roundtrip.mask.has(Signo::SIGUSR1));
+        assert!(roundtrip.mask.has(Signo::SIGRT32));
+        assert!(matches!(
+            roundtrip.disposition,
+            SignalDisposition::Handler(0x1234_5678)
+        ));
+        assert_eq!(roundtrip.restorer, action.restorer);
+    }
+
+    #[test]
+    fn canonical_signal_set_and_stack_records_are_explicitly_initialized() {
+        let mut set = SignalSet::default();
+        set.add(Signo::SIGKILL);
+        set.add(Signo::SIGSTOP);
+        set.add(Signo::SIGUSR1);
+        assert!(set.has(Signo::SIGKILL));
+        assert!(set.has(Signo::SIGSTOP));
+        assert!(set.has(Signo::SIGUSR1));
+
+        let stack = SignalStack::new(0x8000, 0, MINSIGSTKSZ as usize);
+        assert_eq!(stack, SignalStack::new(0x8000, 0, MINSIGSTKSZ as usize));
+    }
 
     fn reduce_target_results(
         aggregation: SignalTargetAggregation,
@@ -1690,16 +1995,19 @@ mod tests {
             Signo::SIGTERM,
             SI_TKILL,
             1,
+            1000,
         ))));
         assert!(!queued_signal_required(&Some(SignalInfo::new_user(
             Signo::SIGRTMIN,
             SI_USER as i32,
             1,
+            1000,
         ))));
         assert!(queued_signal_required(&Some(SignalInfo::new_user(
             Signo::SIGRTMIN,
             SI_TKILL,
             1,
+            1000,
         ))));
     }
 
@@ -1849,16 +2157,8 @@ mod tests {
 
     #[test]
     fn sigaltstack_update_rejects_onstack_mutation_and_wrapping_ranges() {
-        let current = SignalStack {
-            sp: 0x1000,
-            flags: 0,
-            size: 0x2000,
-        };
-        let replacement = SignalStack {
-            sp: 0x8000,
-            flags: 0,
-            size: MINSIGSTKSZ as usize,
-        };
+        let current = SignalStack::new(0x1000, 0, 0x2000);
+        let replacement = SignalStack::new(0x8000, 0, MINSIGSTKSZ as usize);
         assert_eq!(
             prepare_sigaltstack_update(&current, 0x1800, replacement.clone()).err(),
             Some(AxError::OperationNotPermitted)
@@ -1867,11 +2167,7 @@ mod tests {
             prepare_sigaltstack_update(
                 &current,
                 0x4000,
-                SignalStack {
-                    sp: usize::MAX - 8,
-                    flags: 0,
-                    size: MINSIGSTKSZ as usize,
-                },
+                SignalStack::new(usize::MAX - 8, 0, MINSIGSTKSZ as usize),
             )
             .err(),
             Some(AxError::InvalidInput)
@@ -1880,27 +2176,15 @@ mod tests {
             prepare_sigaltstack_update(
                 &current,
                 0x4000,
-                SignalStack {
-                    sp: 0x8000,
-                    flags: SS_ONSTACK,
-                    size: MINSIGSTKSZ as usize,
-                },
+                SignalStack::new(0x8000, SS_ONSTACK, MINSIGSTKSZ as usize),
             )
             .err(),
             Some(AxError::InvalidInput)
         );
         assert!(
-            prepare_sigaltstack_update(
-                &current,
-                0x4000,
-                SignalStack {
-                    sp: 1,
-                    flags: SS_DISABLE,
-                    size: 1,
-                },
-            )
-            .unwrap()
-            .disabled()
+            prepare_sigaltstack_update(&current, 0x4000, SignalStack::new(1, SS_DISABLE, 1),)
+                .unwrap()
+                .disabled()
         );
     }
 }

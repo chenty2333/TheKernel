@@ -188,7 +188,7 @@ impl MemoryFs {
         }
         inodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         self.next_inode
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| VfsError::StorageFull)

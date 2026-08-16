@@ -170,7 +170,7 @@ fn advance_sequence() {
     // Never wrap an evidence generation. Once exhausted, snapshots remain
     // explicitly invalid instead of becoming vulnerable to an ABA at zero.
     let _ =
-        MM_LOCK_DIAGNOSTICS_SEQUENCE.fetch_update(CONTROL_ORDERING, CONTROL_ORDERING, |sequence| {
+        MM_LOCK_DIAGNOSTICS_SEQUENCE.try_update(CONTROL_ORDERING, CONTROL_ORDERING, |sequence| {
             sequence.checked_add(1)
         });
 }
@@ -386,7 +386,7 @@ pub fn reset_mm_lock_diagnostics() -> Result<(), MmLockDiagnosticsResetError> {
     advance_sequence();
 
     if MM_LOCK_DIAGNOSTICS_EPOCH
-        .fetch_update(CONTROL_ORDERING, CONTROL_ORDERING, |epoch| {
+        .try_update(CONTROL_ORDERING, CONTROL_ORDERING, |epoch| {
             epoch.checked_add(1)
         })
         .is_err()

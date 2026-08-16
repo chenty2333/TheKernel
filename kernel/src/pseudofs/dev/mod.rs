@@ -21,7 +21,6 @@ use axdriver::{
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodePermission, NodeType, VfsResult};
-use axtask::current;
 use linux_raw_sys::{
     general::CAP_SYS_ADMIN,
     ioctl::{
@@ -30,12 +29,12 @@ use linux_raw_sys::{
 };
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
-use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
+    file::IoctlContext,
+    mm::map_usercopy_error,
     mounts,
     pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs},
-    task::AsThread,
 };
 
 pub(crate) fn new_devfs() -> Filesystem {
@@ -99,10 +98,13 @@ impl DeviceOps for Random {
         Err(AxError::OperationNotSupported)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             RNDGETENTCNT => {
-                (arg as *mut i32).vm_write(crate::random::entropy_bits())?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &crate::random::entropy_bits().to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),
@@ -189,29 +191,44 @@ impl DeviceOps for BlockDevice {
         self.device.write_at(offset, buf).map_err(Self::map_error)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             BLKGETSIZE => {
                 let sectors = self.info.byte_len() / 512;
-                (arg as *mut u32).vm_write(sectors as u32)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &(sectors as u32).to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             BLKGETSIZE64 => {
-                (arg as *mut u64).vm_write(self.info.byte_len())?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &self.info.byte_len().to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             BLKSSZGET => {
-                (arg as *mut u32).vm_write(self.info.block_size as u32)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &(self.info.block_size as u32).to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             BLKROGET => {
-                (arg as *mut u32).vm_write(self.read_only() as u32)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &(self.read_only() as u32).to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
             }
             BLKROSET => {
-                if !current()
-                    .as_thread()
+                if !context
+                    .caller_cred()
                     .has_effective_capability(CAP_SYS_ADMIN)
                 {
                     return Err(AxError::PermissionDenied);
                 }
-                let ro = (arg as *const u32).vm_read()?;
+                let ro = context
+                    .user_memory()
+                    .read_value(arg as *const u32)
+                    .map_err(map_usercopy_error)?;
                 if ro != 0 && ro != 1 {
                     return Err(AxError::InvalidInput);
                 }

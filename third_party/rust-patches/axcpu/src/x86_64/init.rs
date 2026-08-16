@@ -24,6 +24,8 @@ pub fn init_percpu(cpu_id: usize) {
 ///
 /// [`percpu`]: https://docs.rs/percpu/latest/percpu/index.html
 pub fn init_trap() {
+    #[cfg(feature = "asid-fast-switch")]
+    crate::asm::init_pcid();
     #[cfg(feature = "uspace")]
     crate::uspace_common::init_exception_table();
     super::gdt::init();

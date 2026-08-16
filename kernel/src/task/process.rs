@@ -19,16 +19,17 @@ use axhal::time::monotonic_time_nanos;
 use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
+use axtask::{SchedClass, SchedState};
 use hashbrown::HashMap;
 use scope_local::Scope;
 use spin::{Once, RwLock};
-use starry_process::{Pid, ProcessError};
-use starry_signal::{
-    SignalInfo, SignalQueueAccount, Signo,
-    api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
-};
 use thekernel_linux_cred::{
     USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain, UserNamespaceMapState,
+};
+use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_signal::{
+    SignalInfo, SignalQueueAccount, Signo,
+    api::{ProcessSignalManager, SharedSignalActions, ThreadSignalManager},
 };
 
 // Host unit tests do not initialize the kernel scheduler/current task. Keep
@@ -130,16 +131,46 @@ use crate::{
         FdTable,
         executable::{self, CredentialReadLease, ExecutableKey},
     },
-    mm::AddrSpace,
+    mm::{AddrSpace, TlbState},
     time::wall_time,
 };
 
 /// Immutable registration token for the private signal endpoint currently
 /// owning Linux thread-group-leader identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ZombieSchedulerSnapshot {
+    pub(crate) class: SchedClass,
+    pub(crate) nice: i8,
+}
+
+impl Default for ZombieSchedulerSnapshot {
+    fn default() -> Self {
+        Self {
+            class: SchedClass::Normal,
+            nice: 0,
+        }
+    }
+}
+
+impl From<SchedState> for ZombieSchedulerSnapshot {
+    fn from(state: SchedState) -> Self {
+        Self {
+            class: state.class,
+            nice: state.nice,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GroupLeaderSignalIdentity {
     registration_tid: Pid,
     manager: Arc<ThreadSignalManager>,
+    /// PID namespace in which the retained process identity lives. This is
+    /// needed to filter a zombie from callers in unrelated namespaces.
+    pid_ns: Option<Arc<PidNamespace>>,
+    /// Shared scheduler snapshot updated by the exiting task and retained by
+    /// the zombie owner after the live scheduler node disappears.
+    scheduler: Option<Arc<SpinNoIrq<ZombieSchedulerSnapshot>>>,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -147,6 +178,35 @@ impl GroupLeaderSignalIdentity {
         Self {
             registration_tid,
             manager,
+            pid_ns: None,
+            scheduler: None,
+        }
+    }
+
+    fn with_pid_namespace(
+        registration_tid: Pid,
+        manager: Arc<ThreadSignalManager>,
+        pid_ns: Option<Arc<PidNamespace>>,
+    ) -> Self {
+        Self {
+            registration_tid,
+            manager,
+            pid_ns,
+            scheduler: None,
+        }
+    }
+
+    fn with_pid_namespace_and_scheduler(
+        registration_tid: Pid,
+        manager: Arc<ThreadSignalManager>,
+        pid_ns: Option<Arc<PidNamespace>>,
+        scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
+    ) -> Self {
+        Self {
+            registration_tid,
+            manager,
+            pid_ns,
+            scheduler: Some(scheduler),
         }
     }
 
@@ -163,37 +223,43 @@ pub(crate) type GroupLeaderSignalOwner = Arc<SpinNoIrq<Option<GroupLeaderSignalI
 
 /// Linux process identity bound to immutable exit credential and signal-owner
 /// provenance retained in the durable zombie payload.
-pub(crate) type Process = starry_process::Process<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type Process =
+    thekernel_linux_process_adapter::Process<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Linux process-group identity in the kernel-owned process domain.
-pub(crate) type ProcessGroup = starry_process::ProcessGroup<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type ProcessGroup =
+    thekernel_linux_process_adapter::ProcessGroup<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Linux session identity in the kernel-owned process domain.
-pub(crate) type Session = starry_process::Session<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type Session =
+    thekernel_linux_process_adapter::Session<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Durable process-exit payload used by wait, procfs, and permission paths.
-pub(crate) type ZombieSnapshot = starry_process::ZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type ZombieSnapshot =
+    thekernel_linux_process_adapter::ZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Fallibly reserved storage consumed by the final process exit.
 pub(crate) type PreparedZombieSnapshot =
-    starry_process::PreparedZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::PreparedZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Prepared payload bound to a validated final-exit transaction.
 pub(crate) type PreparedZombieExit =
-    starry_process::PreparedZombieExit<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::PreparedZombieExit<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Fully validated final process-exit transaction.
 pub(crate) type ProcessExitAdmission =
-    starry_process::ProcessExitAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::ProcessExitAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Completed final-exit transaction with its linearized parent and reaper.
 pub(crate) type CommittedProcessExit =
-    starry_process::CommittedProcessExit<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::CommittedProcessExit<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Authoritative bounded process child-to-reaper handoff from the core.
 pub(crate) type ProcessReparentBatch =
-    starry_process::ProcessReparentBatch<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::ProcessReparentBatch<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Domain-coordinated thread removal and optional final-exit reservation.
 pub(crate) type ThreadExitTransition =
-    starry_process::ThreadExitTransition<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::ThreadExitTransition<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Type-bound unpublished process plus initial-thread publication transaction.
 pub(crate) type InitialProcessAdmission =
-    starry_process::InitialProcessAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
+    thekernel_linux_process_adapter::InitialProcessAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 /// The kernel's sole process lifecycle and topology owner.
-pub(crate) type ProcessDomain = starry_process::ProcessDomain<Arc<Cred>, GroupLeaderSignalOwner>;
-type StarryThreadAdmission = starry_process::ThreadAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type ProcessDomain =
+    thekernel_linux_process_adapter::ProcessDomain<Arc<Cred>, GroupLeaderSignalOwner>;
+type StarryThreadAdmission =
+    thekernel_linux_process_adapter::ThreadAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 
 static PROCESS_DOMAIN: Once<ProcessDomain> = Once::new();
 
@@ -225,6 +291,65 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     Ok(true)
 }
 
+/// Resolves the raw ioprio of an unreaped zombie process.
+pub(crate) fn zombie_ioprio(process: &Process) -> AxResult<u16> {
+    ensure_authoritative_zombie(process)?;
+    process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    // Linux drops the task's io_context while it exits. The unreaped
+    // task_struct remains addressable, but ioprio_get observes the default
+    // CLASS_NONE value rather than the last live priority.
+    Ok(0)
+}
+
+/// Applies Linux's successful-but-no-op zombie ioprio setter semantics.
+pub(crate) fn set_zombie_ioprio(process: &Process, priority: u16) -> AxResult<()> {
+    let _ = priority;
+    ensure_authoritative_zombie(process)?;
+    process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    // Linux accepts a setter for an unreaped zombie, but there is no live
+    // io_context left to mutate. Keep the authoritative zombie reachability
+    // check above and otherwise make this a successful no-op.
+    Ok(())
+}
+
+/// Returns the PID namespace retained by an unreaped zombie process.
+pub(crate) fn zombie_pid_ns(process: &Process) -> Option<Arc<PidNamespace>> {
+    let current = process_domain().ok()?.registry().get(process.pid())?;
+    if !core::ptr::eq(&*current, process) || !process.is_zombie() {
+        return None;
+    }
+    process
+        .zombie_payload()
+        .and_then(|snapshot| snapshot.reap_owner.lock().as_ref()?.pid_ns.clone())
+}
+
+/// Returns the scheduler state retained by an authoritative unreaped zombie.
+/// The live scheduler object is gone by this point, so the final thread
+/// publishes this compact class/nice snapshot through the durable group-leader
+/// identity before its task is marked terminal.
+pub(crate) fn zombie_scheduler_state(process: &Process) -> AxResult<ZombieSchedulerSnapshot> {
+    ensure_authoritative_zombie(process)?;
+    let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    snapshot
+        .reap_owner
+        .lock()
+        .as_ref()
+        .and_then(|identity| identity.scheduler.as_ref())
+        .map(|scheduler| *scheduler.lock())
+        .ok_or(AxError::NoSuchProcess)
+}
+
+fn ensure_authoritative_zombie(process: &Process) -> AxResult<()> {
+    let current = process_domain()?
+        .registry()
+        .get(process.pid())
+        .ok_or(AxError::NoSuchProcess)?;
+    if !core::ptr::eq(&*current, process) || !process.is_zombie() {
+        return Err(AxError::NoSuchProcess);
+    }
+    Ok(())
+}
+
 /// Releases the endpoint and both private/shared pending queues retained by a
 /// durable zombie payload. Taking the slot first makes duplicate release a
 /// no-op and ensures an independently retained snapshot Arc cannot prolong
@@ -252,7 +377,7 @@ static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
 
 fn try_allocate_namespace_id(counter: &AtomicU64) -> AxResult<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| axerrno::LinuxError::ENOSPC.into())
@@ -286,7 +411,7 @@ pub(crate) struct UserNamespaceId(u64);
 
 fn try_increment_bounded(counter: &AtomicUsize, limit: usize) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < limit).then_some(current + 1)
         })
         .is_ok()
@@ -342,7 +467,6 @@ impl CgroupNamespace {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct PidNamespace {
     id: u64,
     parent: Option<Arc<PidNamespace>>,
@@ -380,6 +504,36 @@ impl PidNamespace {
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
+    }
+
+    /// Returns whether `target` is this namespace or one of its descendants.
+    /// A caller can address tasks in descendants, but never tasks in an
+    /// unrelated or ancestor PID namespace.
+    pub(crate) fn contains(&self, target: &Arc<Self>) -> bool {
+        let mut candidate = Some(target.clone());
+        while let Some(namespace) = candidate {
+            if core::ptr::eq(self, &*namespace) {
+                return true;
+            }
+            candidate = namespace.parent();
+        }
+        false
+    }
+
+    /// Renders a global process/thread identifier in this caller namespace,
+    /// returning `None` when the target namespace is not visible here.
+    pub(crate) fn visible_pid_for(
+        &self,
+        target_namespace: &Arc<Self>,
+        global_pid: Pid,
+    ) -> Option<Pid> {
+        self.contains(target_namespace).then(|| {
+            if core::ptr::eq(self, &**target_namespace) {
+                self.visible_pid(global_pid)
+            } else {
+                global_pid
+            }
+        })
     }
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
@@ -1112,13 +1266,26 @@ impl MempolicyState {
 struct GroupLeaderIdentityBinding {
     current: SpinNoIrq<Arc<CredentialSlot>>,
     signal: GroupLeaderSignalOwner,
+    /// The process PID namespace copied into the durable owner identity.
+    pid_ns: Option<Arc<PidNamespace>>,
+    scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
 }
 
 impl GroupLeaderIdentityBinding {
     fn try_new(initial: Arc<CredentialSlot>) -> AxResult<Self> {
+        Self::try_new_with_pid_ns(initial, None)
+    }
+
+    fn try_new_with_pid_ns(
+        initial: Arc<CredentialSlot>,
+        pid_ns: Option<Arc<PidNamespace>>,
+    ) -> AxResult<Self> {
         Ok(Self {
             current: SpinNoIrq::new(initial),
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
+            pid_ns,
+            scheduler: Arc::try_new(SpinNoIrq::new(ZombieSchedulerSnapshot::default()))
+                .map_err(|_| AxError::NoMemory)?,
         })
     }
 
@@ -1136,7 +1303,12 @@ impl GroupLeaderIdentityBinding {
         if current.is_some() {
             return Err(AxError::BadState);
         }
-        *current = Some(GroupLeaderSignalIdentity::new(registration_tid, signal));
+        *current = Some(GroupLeaderSignalIdentity::with_pid_namespace_and_scheduler(
+            registration_tid,
+            signal,
+            self.pid_ns.clone(),
+            self.scheduler.clone(),
+        ));
         Ok(())
     }
 
@@ -1170,6 +1342,11 @@ impl GroupLeaderIdentityBinding {
         signal: Option<GroupLeaderSignalIdentity>,
         prepared: Option<PreparedCred<'a>>,
     ) -> GroupLeaderCommit<'a> {
+        let signal = signal.map(|mut signal| {
+            signal.pid_ns = self.pid_ns.clone();
+            signal.scheduler = Some(self.scheduler.clone());
+            signal
+        });
         let mut current = self.current.lock();
         let mut current_signal = signal.as_ref().map(|_| self.signal.lock());
         #[cfg(test)]
@@ -1690,6 +1867,11 @@ pub struct ProcessData {
     start_monotonic_ns: u64,
     /// Executable address space and its coherent process-access owner.
     image_binding: RwLock<LiveProcessImageBinding>,
+    /// Scheduler-facing TLB state for the image currently in
+    /// `image_binding`. The image lock is acquired before this lock whenever
+    /// the pair is replaced or sampled, keeping context-switch snapshots
+    /// coherent without taking the address-space mutex.
+    image_tlb_state: RwLock<Arc<TlbState>>,
     /// The resource scope
     pub scope: RwLock<Scope>,
     /// Real empty files table prepared at process creation for final exit swap.
@@ -2083,7 +2265,8 @@ impl ProcessThreadAdmission {
         let outcome = membership.commit_infallible();
         PendingThreadPublication {
             pending,
-            group_exited_at_core: outcome == starry_process::ThreadPublicationOutcome::GroupExited,
+            group_exited_at_core: outcome
+                == thekernel_linux_process_adapter::ThreadPublicationOutcome::GroupExited,
         }
     }
 }
@@ -2127,7 +2310,7 @@ impl ProcessData {
         access_state: Arc<ProcessAccessState>,
         scope: Scope,
         exit_fd_table: Arc<FdTable>,
-        signal_actions: Arc<SpinNoIrq<SignalActions>>,
+        signal_actions: Arc<SharedSignalActions>,
         exit_signal: Option<Signo>,
         net_ns: Arc<NetworkNamespace>,
         cgroup_ns: Arc<CgroupNamespace>,
@@ -2157,7 +2340,11 @@ impl ProcessData {
         let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
         let stop_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-        let group_leader_identity = GroupLeaderIdentityBinding::try_new(group_leader_credential)?;
+        let group_leader_identity = GroupLeaderIdentityBinding::try_new_with_pid_ns(
+            group_leader_credential,
+            Some(pid_ns.clone()),
+        )?;
+        let image_tlb_state = aspace.lock().tlb_state();
         let data = Self {
             proc,
             process_lifecycle: Mutex::new(()),
@@ -2172,6 +2359,7 @@ impl ProcessData {
                 aspace,
                 access_state,
             }),
+            image_tlb_state: RwLock::new(image_tlb_state),
             scope: RwLock::new(scope),
             exit_fd_table,
             heap_top: AtomicUsize::new(
@@ -2300,6 +2488,14 @@ impl ProcessData {
         self.group_leader_identity.signal_owner()
     }
 
+    /// Publishes the current scheduler policy for this process's durable
+    /// identity. The owner and its scheduler cell are shared with any
+    /// already-published zombie payload, so this remains valid even after the
+    /// runtime process membership is removed.
+    pub(crate) fn publish_scheduler_state(&self, state: SchedState) {
+        *self.group_leader_identity.scheduler.lock() = state.into();
+    }
+
     /// Takes process-directed identity, dumpability, and image through one
     /// coherent snapshot of the persistent group-leader binding.
     pub(crate) fn group_leader_image_access_snapshot(&self) -> ProcessImageAccessSnapshot {
@@ -2426,6 +2622,7 @@ impl ProcessData {
             // this credential transition, never its former siblings.
             thread.set_pdeath_signal(0);
         }
+        let new_tlb_state = new_aspace.lock().tlb_state();
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
             &self.group_leader_identity,
@@ -2439,7 +2636,10 @@ impl ProcessData {
                 aspace: new_aspace,
                 access_state: new_access_state,
             },
-            || self.mempolicy.lock().ranges.clear(),
+            || {
+                *self.image_tlb_state.write() = new_tlb_state;
+                self.mempolicy.lock().ranges.clear();
+            },
         );
         ExecImageCommit {
             group_leader,
@@ -2483,6 +2683,15 @@ impl ProcessData {
     /// Returns the current address-space handle for this process.
     pub fn aspace(&self) -> Arc<Mutex<AddrSpace>> {
         self.image_binding.read().aspace.clone()
+    }
+
+    /// Returns the lock-free scheduler TLB state for the current process
+    /// image. Context-switch hooks use this snapshot instead of taking the
+    /// address-space mutex, which may be held by a page-table writer waiting
+    /// for a remote shootdown acknowledgement.
+    pub(crate) fn aspace_tlb_state(&self) -> Arc<TlbState> {
+        let _image = self.image_binding.read();
+        self.image_tlb_state.read().clone()
     }
 
     pub(crate) fn image_matches(&self, aspace: &Arc<Mutex<AddrSpace>>) -> bool {
@@ -3724,10 +3933,11 @@ mod tests {
 
     use axerrno::AxError;
     use axsync::spin::SpinNoIrq;
+    use axtask::{SchedClass, SchedState};
     use linux_raw_sys::general::CAP_CHOWN;
-    use starry_signal::{
+    use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, Signo,
-        api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
+        api::{ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager},
     };
 
     use super::{
@@ -3736,10 +3946,11 @@ mod tests {
         PTRACE_REVERSE_LINK_HARD_LIMIT, PidNamespace, PreparedPtraceReverseLink,
         ProcessAccessState, ProcessImageBinding, PtraceReverseLinkDrain, PtraceReverseLinkNode,
         PtraceReverseLinks, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT,
-        TimeNamespace, UserNamespace, UtsNamespace, coredump_image_snapshot,
-        group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
-        ptrace_image_snapshot_if_session, ptrace_inactive_image_snapshot_if_session,
-        ptrace_lifecycle_first_key, release_exec_control_owner, release_vfork_control_parent,
+        TimeNamespace, UserNamespace, UtsNamespace, ZombieSchedulerSnapshot,
+        coredump_image_snapshot, group_exit_handoff_requires_kill, init_uts_state,
+        ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
+        ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
+        release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
         snapshot_credential_image, snapshot_group_credential_image, try_allocate_namespace_id,
         try_increment_bounded,
@@ -3782,7 +3993,7 @@ mod tests {
     }
 
     fn thread_signal_manager() -> Arc<ThreadSignalManager> {
-        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
         let process = Arc::new(ProcessSignalManager::new(actions, 0));
         ThreadSignalManager::try_new(process).unwrap()
     }
@@ -3803,7 +4014,7 @@ mod tests {
         global: &Arc<SignalQueueAccount>,
     ) {
         let outcome = thread
-            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1), |info| {
+            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1, 0), |info| {
                 PreparedSignal::try_accounted(info, per_user, u64::MAX, global)
             })
             .unwrap();
@@ -3817,7 +4028,7 @@ mod tests {
         global: &Arc<SignalQueueAccount>,
     ) {
         let outcome = process
-            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1), |info| {
+            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1, 0), |info| {
                 PreparedSignal::try_accounted(info, per_user, u64::MAX, global)
             })
             .unwrap();
@@ -4773,6 +4984,44 @@ mod tests {
     }
 
     #[test]
+    fn group_leader_scheduler_snapshot_retains_final_live_state() {
+        let group = GroupLeaderIdentityBinding::try_new(credential_slot(0)).unwrap();
+        group
+            .bind_initial_signal(41, thread_signal_manager())
+            .unwrap();
+        let owner = group.signal_owner();
+        let scheduler = owner
+            .lock()
+            .as_ref()
+            .and_then(|identity| identity.scheduler.clone())
+            .expect("initial group-leader signal owner has scheduler snapshot");
+
+        assert_eq!(*scheduler.lock(), ZombieSchedulerSnapshot::default());
+
+        *group.scheduler.lock() = SchedState {
+            class: SchedClass::Batch,
+            nice: -17,
+            rt_priority: 0,
+        }
+        .into();
+
+        let expected = ZombieSchedulerSnapshot {
+            class: SchedClass::Batch,
+            nice: -17,
+        };
+        assert_eq!(*scheduler.lock(), expected);
+        assert_eq!(
+            *owner
+                .lock()
+                .as_ref()
+                .and_then(|identity| identity.scheduler.clone())
+                .unwrap()
+                .lock(),
+            expected
+        );
+    }
+
+    #[test]
     fn user_namespace_admission_has_a_reusable_hard_ceiling() {
         let counter = AtomicUsize::new(0);
         assert!(try_increment_bounded(&counter, 2));
@@ -4839,7 +5088,7 @@ mod tests {
 
     #[test]
     fn group_leader_successful_reap_releases_private_and_shared_signal_charges_once() {
-        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
         let process = Arc::new(ProcessSignalManager::new(actions, 0));
         let leader = registered_thread_signal_manager(process.clone(), 9);
         let per_user = SignalQueueAccount::try_new(4).unwrap();
@@ -4868,7 +5117,7 @@ mod tests {
 
     #[test]
     fn group_leader_exec_replacement_retires_old_but_preserves_same_endpoint() {
-        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
         let process = Arc::new(ProcessSignalManager::new(actions, 0));
         let old_signal = registered_thread_signal_manager(process.clone(), 9);
         let new_signal = registered_thread_signal_manager(process, 10);
@@ -4905,7 +5154,7 @@ mod tests {
 
     #[test]
     fn group_leader_repeated_exec_handoffs_retire_each_registration_tid() {
-        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
         let process = Arc::new(ProcessSignalManager::new(actions, 0));
         let first = registered_thread_signal_manager(process.clone(), 9);
         let second = registered_thread_signal_manager(process.clone(), 10);
@@ -4932,9 +5181,9 @@ mod tests {
                 .complete_post_commit(),
         );
 
-        assert!(!first.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
-        assert!(!second.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
-        assert!(third.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
+        assert!(!first.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1, 0)));
+        assert!(!second.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1, 0)));
+        assert!(third.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1, 0)));
         third.retire_registration(11, false);
     }
 

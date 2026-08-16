@@ -49,10 +49,10 @@ impl MemoryCategory {
                 "starry_core::task::ProcessData::new" => {
                     return Some("process data");
                 }
-                "starry_process::process::Process::new" => {
+                "thekernel_linux_process_adapter::process::Process::new" => {
                     return Some("process");
                 }
-                "starry_process::process_group::ProcessGroup::new" => {
+                "thekernel_linux_process_adapter::process_group::ProcessGroup::new" => {
                     return Some("process group");
                 }
                 "axfs::fs::ext4::inode::Inode::new" => {

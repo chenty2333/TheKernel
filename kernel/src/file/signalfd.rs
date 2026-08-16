@@ -10,7 +10,7 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use linux_raw_sys::general::{SI_MESGQ, SI_QUEUE, SI_SIGIO, SI_TIMER};
 use spin::RwLock;
-use starry_signal::{SignalInfo, SignalSet};
+use thekernel_linux_signal::{SignalInfo, SignalSet, Signo};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::{
@@ -50,12 +50,18 @@ struct SignalfdSiginfo {
 
 const _: [(); SIGNALFD_SIGINFO_SIZE] = [(); mem::size_of::<SignalfdSiginfo>()];
 
+fn sanitize_mask(mut mask: SignalSet) -> SignalSet {
+    mask.remove(Signo::SIGKILL);
+    mask.remove(Signo::SIGSTOP);
+    mask
+}
+
 impl SignalfdSiginfo {
     /// Convert from SignalInfo to signalfd_siginfo
     fn from_signal_info(sig_info: &SignalInfo) -> Self {
         let errno = sig_info.errno();
         let mut result = SignalfdSiginfo {
-            ssi_signo: sig_info.signo() as u32,
+            ssi_signo: sig_info.try_signo().map_or(0, |signo| signo as u32),
             ssi_errno: errno,
             ssi_code: sig_info.code(),
             ssi_pid: 0,
@@ -77,37 +83,23 @@ impl SignalfdSiginfo {
 
         match sig_info.code() {
             SI_TIMER => {
-                let timer = unsafe {
-                    sig_info
-                        .0
-                        .__bindgen_anon_1
-                        .__bindgen_anon_1
-                        ._sifields
-                        ._timer
-                };
-                result.ssi_tid = timer._tid as u32;
-                result.ssi_overrun = timer._overrun.max(0) as u32;
-                result.ssi_int = unsafe { timer._sigval.sival_int };
-                result.ssi_ptr = unsafe { timer._sigval.sival_ptr } as usize as u64;
+                let timer = sig_info.timer_payload();
+                result.ssi_tid = timer.tid as u32;
+                result.ssi_overrun = timer.overrun.max(0) as u32;
+                result.ssi_int = timer.value as i32;
+                result.ssi_ptr = timer.value as u64;
             }
             SI_MESGQ | SI_QUEUE => {
-                let rt = unsafe { sig_info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt };
-                result.ssi_pid = rt._pid as u32;
-                result.ssi_uid = rt._uid;
-                result.ssi_int = unsafe { rt._sigval.sival_int };
-                result.ssi_ptr = unsafe { rt._sigval.sival_ptr } as usize as u64;
+                let rt = sig_info.rt_payload();
+                result.ssi_pid = rt.pid as u32;
+                result.ssi_uid = rt.uid;
+                result.ssi_int = rt.value as i32;
+                result.ssi_ptr = rt.value as u64;
             }
             SI_SIGIO => {
-                let poll = unsafe {
-                    sig_info
-                        .0
-                        .__bindgen_anon_1
-                        .__bindgen_anon_1
-                        ._sifields
-                        ._sigpoll
-                };
-                result.ssi_fd = poll._fd;
-                result.ssi_band = poll._band as u32;
+                let poll = sig_info.poll_payload();
+                result.ssi_fd = poll.fd;
+                result.ssi_band = poll.band as u32;
             }
             _ => {}
         }
@@ -124,14 +116,14 @@ pub struct Signalfd {
 impl Signalfd {
     pub fn new(mask: SignalSet) -> Arc<Self> {
         Arc::new(Self {
-            mask: RwLock::new(mask),
+            mask: RwLock::new(sanitize_mask(mask)),
             non_blocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
         })
     }
 
     pub fn update_mask(&self, mask: SignalSet) {
-        *self.mask.write() = mask;
+        *self.mask.write() = sanitize_mask(mask);
         self.poll_rx.wake();
     }
 
@@ -139,21 +131,23 @@ impl Signalfd {
         *self.mask.read()
     }
 
-    /// Check if there are any pending signals matching the mask
+    /// Check if there are any pending signals matching the fd mask and the
+    /// reader thread's current blocked mask.
     fn has_pending_signals(&self) -> bool {
-        let mask = self.mask();
+        let mask = self.mask.read();
         let curr = current();
         let signal = &curr.as_thread().signal;
-        let pending = signal.pending();
-        !(pending & mask).is_empty()
+        signal.has_pending_signal_for_signalfd(&mask)
     }
 
-    /// Dequeue a signal matching the mask
+    /// Dequeue a signal matching both the fd mask and the reader thread's
+    /// current blocked mask. The signal manager keeps the blocked-mask
+    /// snapshot and queue dequeue in one linearization domain.
     fn dequeue_signal(&self) -> Option<SignalInfo> {
-        let mask = self.mask();
+        let mask = self.mask.read();
         let curr = current();
         let signal = &curr.as_thread().signal;
-        signal.dequeue_signal(&mask)
+        signal.dequeue_signal_for_signalfd(&mask)
     }
 }
 
@@ -231,22 +225,14 @@ impl Pollable for Signalfd {
 
 #[cfg(test)]
 mod tests {
-    use linux_raw_sys::general::sigval_t;
-    use starry_signal::Signo;
+    use thekernel_linux_signal::{SignalPollPayload, SignalRtPayload, SignalTimerPayload, Signo};
 
     use super::*;
 
     #[test]
     fn timer_siginfo_projects_timer_fields() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGRTMIN);
-        info.set_code(SI_TIMER);
-        let timer = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
-        timer._tid = 17;
-        timer._overrun = 9;
         let value = 0x1234_5678_abcd_ef01usize;
-        timer._sigval = sigval_t {
-            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
-        };
+        let info = SignalInfo::new_timer(Signo::SIGRTMIN, SignalTimerPayload::new(17, 9, value, 0));
 
         let projected = SignalfdSiginfo::from_signal_info(&info);
         assert_eq!(projected.ssi_tid, 17);
@@ -257,15 +243,12 @@ mod tests {
 
     #[test]
     fn mqueue_siginfo_projects_registration_identity_and_value() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGRT1);
-        info.set_code(SI_MESGQ);
-        let rt = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt };
-        rt._pid = 42;
-        rt._uid = 1000;
         let value = 0x7654_3210_abcd_ef01usize;
-        rt._sigval = sigval_t {
-            sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
-        };
+        let info = SignalInfo::new_rt(
+            Signo::SIGRT1,
+            SI_MESGQ,
+            SignalRtPayload::new(42, 1000, value),
+        );
 
         let projected = SignalfdSiginfo::from_signal_info(&info);
         assert_eq!(projected.ssi_pid, 42);
@@ -276,14 +259,30 @@ mod tests {
 
     #[test]
     fn sigio_siginfo_projects_fd_and_band() {
-        let mut info = SignalInfo::new_kernel(Signo::SIGIO);
-        info.set_code(SI_SIGIO);
-        let poll = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigpoll };
-        poll._fd = 37;
-        poll._band = 0x1234;
+        let info = SignalInfo::new_poll(Signo::SIGIO, SignalPollPayload::new(0x1234, 37));
 
         let projected = SignalfdSiginfo::from_signal_info(&info);
         assert_eq!(projected.ssi_fd, 37);
         assert_eq!(projected.ssi_band, 0x1234);
+    }
+
+    #[test]
+    fn mask_excludes_uncatchable_signals_on_create_and_update() {
+        let mut requested = SignalSet::default();
+        requested.add(Signo::SIGKILL);
+        requested.add(Signo::SIGSTOP);
+        requested.add(Signo::SIGUSR1);
+
+        let signalfd = Signalfd::new(requested);
+        let mask = signalfd.mask();
+        assert!(!mask.has(Signo::SIGKILL));
+        assert!(!mask.has(Signo::SIGSTOP));
+        assert!(mask.has(Signo::SIGUSR1));
+
+        signalfd.update_mask(requested);
+        let mask = signalfd.mask();
+        assert!(!mask.has(Signo::SIGKILL));
+        assert!(!mask.has(Signo::SIGSTOP));
+        assert!(mask.has(Signo::SIGUSR1));
     }
 }

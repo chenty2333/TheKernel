@@ -25,9 +25,10 @@ use linux_raw_sys::general::{
 use ouroboros::self_referencing;
 use spin::Once;
 use thekernel_linux_io_uring::{
-    CancelSelector, CompletionPublication, CompletionToken, CopiedSubmission, FileSlot,
-    FileTableId, IoUringError, IssuedRequest, LeaseRelease, MappingRegion, ParsedSubmission,
-    PreparedRequest, RegisteredFileLease, RegisteredFileTable, RequestId, RequestIssueError,
+    BufferLeaseRelease, BufferSlot, BufferTableId, CancelSelector, CompletionPublication,
+    CompletionToken, CopiedSubmission, FileSlot, FileTableId, IoUringError, IssuedRequest,
+    LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest, RegisteredBufferLease,
+    RegisteredBufferTable, RegisteredFileLease, RegisteredFileTable, RequestId, RequestIssueError,
     RequestRegistry, RequestReservation, RingId, RingLayout, TerminalCause,
 };
 
@@ -35,18 +36,33 @@ use super::{
     DescriptionResource, FileDescription, FileHandle, FileLike, FileMmapRequest,
     FixedSharedMmapRegion, Kstat, PreparedFileMmap, SharedPages, anon_inode_stat,
 };
-use crate::mm::SharedAtomicU32;
+use crate::mm::{
+    PinnedUserSegmentsMut, SharedAtomicU32, UserMemoryCapability,
+    try_pin_user_segments_to_user_with,
+};
 
 const RING_WAITER_SLOTS: usize = 64;
 const PAGE_BYTES: usize = PageSize::Size4K as usize;
 const IO_URING_GLOBAL_REQUEST_SLOTS: usize = 65_536;
 const IO_URING_GLOBAL_FIXED_FILE_SLOTS: usize = 65_536;
+const IO_URING_GLOBAL_REGISTERED_BUFFER_SLOTS: usize = 65_536;
+// Registered fixed buffers retain MM pins until explicit unregister or ring
+// teardown. Keep this accounting independent from the slot count: a small
+// table must not be able to pin an unbounded virtual range. The global budget
+// is 64 MiB of page-cover, while one ring is limited to 16 MiB; each
+// descriptor is charged independently, so overlapping descriptors consume the
+// same page-cover twice as Linux's separate registered resources do.
+const IO_URING_GLOBAL_REGISTERED_BUFFER_PAGES: usize = 16_384;
+const IO_URING_RING_REGISTERED_BUFFER_PAGES: usize = 4_096;
 const FINAL_CLOSE_STEP_BUDGET: usize = 64;
 const POLL_ALWAYS_REPORTED: IoEvents = IoEvents::ALWAYS;
 
 static NEXT_RING_ID: AtomicU64 = AtomicU64::new(1);
 static IO_URING_REQUEST_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static IO_URING_FIXED_FILE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static IO_URING_REGISTERED_BUFFER_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static IO_URING_REGISTERED_BUFFER_PAGES: AtomicUsize = AtomicUsize::new(0);
+static IO_URING_REGISTERED_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DEFERRED_IO_URING_WORK: AtomicPtr<IoUring> = AtomicPtr::new(ptr::null_mut());
 
 struct RequestSlotCharge(usize);
@@ -54,7 +70,7 @@ struct RequestSlotCharge(usize);
 impl RequestSlotCharge {
     fn try_new(slots: usize) -> AxResult<Self> {
         IO_URING_REQUEST_SLOTS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(slots)
                     .filter(|next| *next <= IO_URING_GLOBAL_REQUEST_SLOTS)
             })
@@ -77,7 +93,7 @@ impl FixedFileSlotCharge {
             return Err(AxError::from(LinuxError::EMFILE));
         }
         IO_URING_FIXED_FILE_SLOTS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(slots)
                     .filter(|next| *next <= IO_URING_GLOBAL_FIXED_FILE_SLOTS)
             })
@@ -92,9 +108,149 @@ impl Drop for FixedFileSlotCharge {
     }
 }
 
+struct RegisteredBufferSlotCharge(usize);
+
+impl RegisteredBufferSlotCharge {
+    fn try_new(slots: usize) -> AxResult<Self> {
+        IO_URING_REGISTERED_BUFFER_SLOTS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(slots)
+                    .filter(|next| *next <= IO_URING_GLOBAL_REGISTERED_BUFFER_SLOTS)
+            })
+            .map_err(|_| AxError::from(LinuxError::ENFILE))?;
+        Ok(Self(slots))
+    }
+}
+
+impl Drop for RegisteredBufferSlotCharge {
+    fn drop(&mut self) {
+        IO_URING_REGISTERED_BUFFER_SLOTS.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+struct RegisteredBufferPinBudget {
+    pages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl RegisteredBufferPinBudget {
+    const fn new() -> Self {
+        Self {
+            pages: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_reserve(&self, pages: usize, bytes: usize, page_limit: usize) -> bool {
+        if self
+            .pages
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(pages).filter(|next| *next <= page_limit)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let byte_limit = page_limit.saturating_mul(PAGE_BYTES);
+        if self
+            .bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= byte_limit)
+            })
+            .is_err()
+        {
+            self.pages.fetch_sub(pages, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release(&self, pages: usize, bytes: usize) {
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.pages.fetch_sub(pages, Ordering::AcqRel);
+    }
+
+    fn try_charge(self: &Arc<Self>, pages: usize) -> AxResult<RegisteredBufferPinCharge> {
+        let bytes = pages.checked_mul(PAGE_BYTES).ok_or(AxError::NoMemory)?;
+        if !self.try_reserve(pages, bytes, IO_URING_RING_REGISTERED_BUFFER_PAGES) {
+            return Err(AxError::ResourceBusy);
+        }
+        if !try_reserve_global_registered_buffer_pin(pages, bytes) {
+            self.release(pages, bytes);
+            return Err(AxError::ResourceBusy);
+        }
+        Ok(RegisteredBufferPinCharge {
+            budget: Arc::clone(self),
+            pages,
+            bytes,
+        })
+    }
+}
+
+struct RegisteredBufferPinCharge {
+    budget: Arc<RegisteredBufferPinBudget>,
+    pages: usize,
+    bytes: usize,
+}
+
+impl Drop for RegisteredBufferPinCharge {
+    fn drop(&mut self) {
+        self.budget.release(self.pages, self.bytes);
+        IO_URING_REGISTERED_BUFFER_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        IO_URING_REGISTERED_BUFFER_PAGES.fetch_sub(self.pages, Ordering::AcqRel);
+    }
+}
+
+fn try_reserve_global_registered_buffer_pin(pages: usize, bytes: usize) -> bool {
+    if IO_URING_REGISTERED_BUFFER_PAGES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(pages)
+                .filter(|next| *next <= IO_URING_GLOBAL_REGISTERED_BUFFER_PAGES)
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let byte_limit = IO_URING_GLOBAL_REGISTERED_BUFFER_PAGES.saturating_mul(PAGE_BYTES);
+    if IO_URING_REGISTERED_BUFFER_BYTES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|next| *next <= byte_limit)
+        })
+        .is_err()
+    {
+        IO_URING_REGISTERED_BUFFER_PAGES.fetch_sub(pages, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
 struct RegisteredFiles {
     table: RegisteredFileTable<FileDescription>,
     _charge: FixedFileSlotCharge,
+}
+
+/// Registered-buffer owner. The pin is retained until the table owner and
+/// every request lease have retired. Actual file I/O still uses the existing
+/// direct-or-copy fallback; this pin establishes lifetime and mapping fences,
+/// not a claim of hardware DMA support.
+struct RegisteredBuffer {
+    address: usize,
+    length: usize,
+    capability: UserMemoryCapability,
+    _pin_charge: RegisteredBufferPinCharge,
+    _pin: PinnedUserSegmentsMut,
+}
+
+// The owner retains the explicit address-space capability alongside the
+// kernel-side pin/fence state and opaque userspace address. It never relies on
+// current-task state; the address-space pin registry serializes mapping
+// changes for the selected capability.
+unsafe impl Send for RegisteredBuffer {}
+unsafe impl Sync for RegisteredBuffer {}
+
+struct RegisteredBuffers {
+    table: RegisteredBufferTable<RegisteredBuffer>,
+    _charge: RegisteredBufferSlotCharge,
 }
 
 struct IoUringFinalizer {
@@ -116,6 +272,46 @@ pub(crate) enum IoUringFileLease {
         ring: Weak<IoUring>,
         lease: Option<RegisteredFileLease<FileDescription>>,
     },
+}
+
+pub(crate) struct IoUringBufferLease {
+    ring: Arc<IoUring>,
+    lease: Option<RegisteredBufferLease<RegisteredBuffer>>,
+}
+
+impl Drop for IoUringBufferLease {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        self.ring.release_registered_buffer(lease);
+    }
+}
+
+impl IoUringBufferLease {
+    /// Returns the address-space capability captured when this buffer was
+    /// registered. Fixed I/O must never substitute the caller's current
+    /// capability: the ring may be submitted through a shared descriptor by
+    /// another task or address space.
+    pub(crate) fn capability(&self) -> AxResult<UserMemoryCapability> {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.owner().capability.clone())
+            .ok_or(AxError::BadState)
+    }
+
+    /// Returns the exact subrange validated by the table lookup. Fixed I/O
+    /// must derive its address and length from this lease rather than reuse
+    /// the caller's raw SQE geometry after admission.
+    pub(crate) fn range(&self) -> AxResult<(u64, u32)> {
+        self.lease
+            .as_ref()
+            .map(|lease| {
+                let range = lease.range();
+                (range.address(), range.length())
+            })
+            .ok_or(AxError::BadState)
+    }
 }
 
 impl IoUringFileLease {
@@ -350,7 +546,7 @@ impl PollControl {
 
 fn allocate_ring_id() -> AxResult<RingId> {
     let raw = NEXT_RING_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .map_err(|_| AxError::OutOfRange)?;
@@ -372,6 +568,7 @@ fn map_core_error(error: IoUringError) -> AxError {
         IoUringError::CompletionQueueFull
         | IoUringError::RequestCapacityExceeded
         | IoUringError::FileLeaseCapacityExceeded
+        | IoUringError::BufferLeaseCapacityExceeded
         | IoUringError::Busy => AxError::ResourceBusy,
         IoUringError::Closing | IoUringError::Draining | IoUringError::Closed => {
             AxError::BadFileDescriptor
@@ -379,16 +576,29 @@ fn map_core_error(error: IoUringError) -> AxError {
         IoUringError::InvalidFileSlot
         | IoUringError::FileSlotEmpty
         | IoUringError::UnknownFileLease
-        | IoUringError::FileTableNotPublished => AxError::BadFileDescriptor,
+        | IoUringError::FileTableNotPublished
+        | IoUringError::InvalidBufferSlot
+        | IoUringError::BufferSlotEmpty
+        | IoUringError::UnknownBufferLease
+        | IoUringError::BufferTableNotPublished => AxError::BadFileDescriptor,
         IoUringError::CancellationTargetNotFound => AxError::NotFound,
-        IoUringError::RegisteredBuffersUnsupported
-        | IoUringError::UnsupportedOpcode
+        IoUringError::UnsupportedOpcode
         | IoUringError::UnsupportedSubmissionFlags
         | IoUringError::UnsupportedOperationFlags
         | IoUringError::CurrentPositionUnsupported
         | IoUringError::UnsupportedRegistration => AxError::OperationNotSupported,
         IoUringError::Overflow | IoUringError::GenerationExhausted => AxError::OutOfRange,
         _ => AxError::InvalidInput,
+    }
+}
+
+fn map_buffer_lease_error(error: IoUringError) -> AxError {
+    match error {
+        IoUringError::InvalidBufferRange
+        | IoUringError::InvalidBufferSlot
+        | IoUringError::BufferSlotEmpty => AxError::BadAddress,
+        IoUringError::BufferLeaseCapacityExceeded => AxError::ResourceBusy,
+        error => map_core_error(error),
     }
 }
 
@@ -452,6 +662,7 @@ enum FinalClosePhase {
     Begin,
     Polls,
     FixedFiles,
+    Buffers,
     Completions,
     Finished,
 }
@@ -489,7 +700,9 @@ struct RingState {
     sq_dropped: u32,
     admission_in_progress: bool,
     fixed_files: Option<RegisteredFiles>,
+    registered_buffers: Option<RegisteredBuffers>,
     next_file_table_id: u64,
+    next_buffer_table_id: u64,
     polls: Vec<Option<Arc<PollControl>>>,
     pending_publications: Vec<Option<CompletionToken>>,
     final_close: FinalCloseProgress,
@@ -500,6 +713,8 @@ pub(crate) struct SubmissionWork {
     prepared: PreparedRequest,
     parsed: Result<ParsedSubmission, IoUringError>,
     file: Option<IoUringFileLease>,
+    buffer: Option<IoUringBufferLease>,
+    capability: UserMemoryCapability,
 }
 
 impl SubmissionWork {
@@ -509,8 +724,16 @@ impl SubmissionWork {
         PreparedRequest,
         Result<ParsedSubmission, IoUringError>,
         Option<IoUringFileLease>,
+        Option<IoUringBufferLease>,
+        UserMemoryCapability,
     ) {
-        (self.prepared, self.parsed, self.file)
+        (
+            self.prepared,
+            self.parsed,
+            self.file,
+            self.buffer,
+            self.capability,
+        )
     }
 }
 
@@ -534,7 +757,12 @@ impl SubmissionAdmission<'_> {
         self.parsed
     }
 
-    pub(crate) fn commit(mut self, file: Option<IoUringFileLease>) -> AxResult<SubmissionWork> {
+    pub(crate) fn commit(
+        mut self,
+        file: Option<IoUringFileLease>,
+        buffer: Option<IoUringBufferLease>,
+        capability: UserMemoryCapability,
+    ) -> AxResult<SubmissionWork> {
         let _submission = self.ring.submission_serial.lock();
         let mut state = self.ring.state.lock();
         if !state.admission_in_progress {
@@ -550,12 +778,19 @@ impl SubmissionAdmission<'_> {
             prepared,
             parsed: self.parsed,
             file,
+            buffer,
+            capability,
         })
     }
 
-    pub(crate) fn commit_poll(self, lease: IoUringFileLease, linux_events: u32) -> AxResult<()> {
+    pub(crate) fn commit_poll(
+        self,
+        lease: IoUringFileLease,
+        linux_events: u32,
+        capability: UserMemoryCapability,
+    ) -> AxResult<()> {
         let ring = self.ring;
-        ring.commit_poll_admission(self, lease, linux_events)
+        ring.commit_poll_admission(self, lease, linux_events, capability)
     }
 }
 
@@ -598,6 +833,7 @@ pub(crate) struct IoUring {
     poll_hint_bits: Vec<AtomicUsize>,
     pending_publication_count: AtomicUsize,
     state: Mutex<RingState>,
+    registered_buffer_budget: Arc<RegisteredBufferPinBudget>,
     _request_charge: RequestSlotCharge,
 }
 
@@ -657,6 +893,8 @@ impl IoUring {
         for _ in 0..hint_words {
             poll_hint_bits.push(AtomicUsize::new(0));
         }
+        let registered_buffer_budget =
+            Arc::try_new(RegisteredBufferPinBudget::new()).map_err(|_| AxError::NoMemory)?;
 
         let ring = Arc::try_new(Self {
             id,
@@ -688,11 +926,14 @@ impl IoUring {
                 sq_dropped: 0,
                 admission_in_progress: false,
                 fixed_files: None,
+                registered_buffers: None,
                 next_file_table_id: 1,
+                next_buffer_table_id: 1,
                 polls,
                 pending_publications,
                 final_close: FinalCloseProgress::new(),
             }),
+            registered_buffer_budget,
             _request_charge: request_charge,
         })
         .map_err(|_| AxError::NoMemory)?;
@@ -896,7 +1137,7 @@ impl IoUring {
         };
         if self
             .pending_publication_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .is_err()
@@ -1009,6 +1250,35 @@ impl IoUring {
         })
     }
 
+    pub(crate) fn acquire_registered_buffer(
+        &self,
+        slot: BufferSlot,
+        address: u64,
+        length: u32,
+    ) -> AxResult<IoUringBufferLease> {
+        // Acquire the ring owner before taking a table lease. A failed weak
+        // upgrade must not strand the table's lease counter during teardown.
+        let ring = self
+            .self_weak
+            .get()
+            .ok_or(AxError::BadState)?
+            .upgrade()
+            .ok_or(AxError::BadState)?;
+        let lease = self
+            .state
+            .lock()
+            .registered_buffers
+            .as_mut()
+            .ok_or(AxError::BadFileDescriptor)?
+            .table
+            .acquire(slot, address, length)
+            .map_err(map_buffer_lease_error)?;
+        Ok(IoUringBufferLease {
+            ring,
+            lease: Some(lease),
+        })
+    }
+
     fn release_registered_file(&self, lease: RegisteredFileLease<FileDescription>) {
         let (retired, closed) = {
             let mut state = self.state.lock();
@@ -1037,6 +1307,43 @@ impl IoUring {
                     (retired, None)
                 } else {
                     (retired, state.fixed_files.take())
+                }
+            } else {
+                (retired, None)
+            }
+        };
+        drop(retired);
+        drop(closed);
+    }
+
+    fn release_registered_buffer(&self, lease: RegisteredBufferLease<RegisteredBuffer>) {
+        let (retired, closed) = {
+            let mut state = self.state.lock();
+            let Some(buffers) = state.registered_buffers.as_mut() else {
+                drop(state);
+                drop(lease);
+                return;
+            };
+            let retired = match buffers.table.release(lease) {
+                Ok(BufferLeaseRelease::Active) => None,
+                Ok(BufferLeaseRelease::Retired(retired)) => Some(retired),
+                Err(error) => {
+                    let kind = error.error();
+                    core::mem::forget(error.into_lease());
+                    error!("io_uring registered-buffer release lost ownership: {kind:?}");
+                    return;
+                }
+            };
+            let should_close = buffers
+                .table
+                .progress()
+                .is_ok_and(|progress| progress.empty());
+            if should_close {
+                if let Err(error) = buffers.table.finish_retire() {
+                    error!("io_uring registered-buffer retirement did not finish: {error:?}");
+                    (retired, None)
+                } else {
+                    (retired, state.registered_buffers.take())
                 }
             } else {
                 (retired, None)
@@ -1127,6 +1434,145 @@ impl IoUring {
         Ok(())
     }
 
+    pub(crate) fn register_buffers(
+        &self,
+        capability: &UserMemoryCapability,
+        buffers: Vec<(usize, usize)>,
+    ) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        if buffers.is_empty() {
+            return Err(AxError::InvalidInput);
+        }
+        let capacity = u32::try_from(buffers.len()).map_err(|_| AxError::InvalidInput)?;
+        // Validate every descriptor and its page-cover arithmetic before
+        // publishing or pinning any owner. The syscall adapter has already
+        // checked user write access; this second pass keeps the ring API
+        // transactional for future callers too.
+        for &(address, length) in &buffers {
+            if length == 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let end = address.checked_add(length).ok_or(AxError::BadAddress)?;
+            let page_start = address & !(PAGE_BYTES - 1);
+            let page_end = end
+                .checked_add(PAGE_BYTES - 1)
+                .map(|value| value & !(PAGE_BYTES - 1))
+                .ok_or(AxError::BadAddress)?;
+            if page_end <= page_start || page_end - page_start < PAGE_BYTES {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        let charge = RegisteredBufferSlotCharge::try_new(buffers.len())?;
+        let table_id = {
+            let mut state = self.state.lock();
+            if state.final_close.phase != FinalClosePhase::Begin {
+                return Err(AxError::BadFileDescriptor);
+            }
+            if state.registered_buffers.is_some() {
+                return Err(AxError::ResourceBusy);
+            }
+            let raw = state.next_buffer_table_id;
+            state.next_buffer_table_id = raw.checked_add(1).ok_or(AxError::OutOfRange)?;
+            BufferTableId::new(raw).map_err(map_core_error)?
+        };
+        let mut table =
+            RegisteredBufferTable::new(self.id, table_id, capacity, self.layout.sq_entries())
+                .map_err(map_core_error)?;
+        for (slot, (address, length)) in buffers.into_iter().enumerate() {
+            let end = address.checked_add(length).ok_or(AxError::BadAddress)?;
+            let page_start = address & !(PAGE_BYTES - 1);
+            let page_end = end
+                .checked_add(PAGE_BYTES - 1)
+                .map(|value| value & !(PAGE_BYTES - 1))
+                .ok_or(AxError::BadAddress)?;
+            let page_len = page_end - page_start;
+            let page_count = page_len / PAGE_BYTES;
+            let pin_charge = self.registered_buffer_budget.try_charge(page_count)?;
+            let pin = match try_pin_user_segments_to_user_with(
+                capability,
+                page_start as *mut u8,
+                page_len,
+            ) {
+                Some(pin) => pin,
+                None => {
+                    drop(pin_charge);
+                    return Err(AxError::ResourceBusy);
+                }
+            };
+            let owner = Arc::try_new(RegisteredBuffer {
+                address,
+                length,
+                capability: capability.clone(),
+                _pin_charge: pin_charge,
+                _pin: pin,
+            })
+            .map_err(|_| AxError::NoMemory)?;
+            if let Err(error) = table.install(
+                BufferSlot::new(u32::try_from(slot).map_err(|_| AxError::InvalidInput)?),
+                address as u64,
+                length as u64,
+                owner,
+            ) {
+                let kind = error.error();
+                drop(error.into_owner());
+                return Err(map_core_error(kind));
+            }
+        }
+        table.publish().map_err(map_core_error)?;
+        let mut state = self.state.lock();
+        if state.final_close.phase != FinalClosePhase::Begin {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if state.registered_buffers.is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        state.registered_buffers = Some(RegisteredBuffers {
+            table,
+            _charge: charge,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn unregister_buffers(&self) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        {
+            let mut state = self.state.lock();
+            let buffers = state
+                .registered_buffers
+                .as_mut()
+                .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;
+            buffers.table.begin_retire().map_err(map_core_error)?;
+        }
+        loop {
+            let retired = {
+                let mut state = self.state.lock();
+                let Some(buffers) = state.registered_buffers.as_mut() else {
+                    break;
+                };
+                let Some(token) = buffers.table.next_retirable().map_err(map_core_error)? else {
+                    break;
+                };
+                buffers.table.retire(token).map_err(map_core_error)?
+            };
+            drop(retired);
+        }
+        let closed = {
+            let mut state = self.state.lock();
+            if let Some(buffers) = state.registered_buffers.as_mut() {
+                if buffers.table.progress().map_err(map_core_error)?.empty() {
+                    buffers.table.finish_retire().map_err(map_core_error)?;
+                    state.registered_buffers.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        drop(closed);
+        Ok(())
+    }
+
     fn request_final_close(self: &Arc<Self>) {
         self.final_close_requested.store(true, Ordering::Release);
         self.enqueue_deferred();
@@ -1194,7 +1640,7 @@ impl IoUring {
                 let _registration = self.registration_serial.lock();
                 let mut state = self.state.lock();
                 let Some(files) = state.fixed_files.as_mut() else {
-                    state.final_close.enter(FinalClosePhase::Completions);
+                    state.final_close.enter(FinalClosePhase::Buffers);
                     return Ok(false);
                 };
                 files.table.begin_retire().map_err(map_core_error)?;
@@ -1208,6 +1654,43 @@ impl IoUring {
                         if files.table.progress().map_err(map_core_error)?.empty() {
                             files.table.finish_retire().map_err(map_core_error)?;
                             let closed = state.fixed_files.take();
+                            state.final_close.enter(FinalClosePhase::Buffers);
+                            (None, closed, true)
+                        } else {
+                            (None, None, true)
+                        }
+                    }
+                }
+            };
+            drop(retired);
+            drop(closed);
+            if stop {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    fn close_buffers_step(&self) -> AxResult<bool> {
+        for _ in 0..FINAL_CLOSE_STEP_BUDGET {
+            let (retired, closed, stop) = {
+                let _registration = self.registration_serial.lock();
+                let mut state = self.state.lock();
+                let Some(buffers) = state.registered_buffers.as_mut() else {
+                    state.final_close.enter(FinalClosePhase::Completions);
+                    return Ok(false);
+                };
+                buffers.table.begin_retire().map_err(map_core_error)?;
+                match buffers.table.next_retirable().map_err(map_core_error)? {
+                    Some(token) => (
+                        Some(buffers.table.retire(token).map_err(map_core_error)?),
+                        None,
+                        false,
+                    ),
+                    None => {
+                        if buffers.table.progress().map_err(map_core_error)?.empty() {
+                            buffers.table.finish_retire().map_err(map_core_error)?;
+                            let closed = state.registered_buffers.take();
                             state.final_close.enter(FinalClosePhase::Completions);
                             (None, closed, true)
                         } else {
@@ -1273,6 +1756,7 @@ impl IoUring {
             FinalClosePhase::Begin => self.begin_final_close_step(),
             FinalClosePhase::Polls => self.close_polls_step(),
             FinalClosePhase::FixedFiles => self.close_fixed_files_step(),
+            FinalClosePhase::Buffers => self.close_buffers_step(),
             FinalClosePhase::Completions => self.close_completions_step(),
             FinalClosePhase::Finished => Ok(true),
         }
@@ -1283,6 +1767,7 @@ impl IoUring {
         mut admission: SubmissionAdmission<'_>,
         lease: IoUringFileLease,
         linux_events: u32,
+        capability: UserMemoryCapability,
     ) -> AxResult<()> {
         let id = admission
             .reservation
@@ -1295,7 +1780,7 @@ impl IoUring {
             Ok(control) => control,
             Err((error, lease)) => {
                 drop(lease);
-                let work = admission.commit(None)?;
+                let work = admission.commit(None, None, capability.clone())?;
                 let (prepared, ..) = work.into_parts();
                 return self.complete_request(
                     prepared.id(),
@@ -1309,7 +1794,7 @@ impl IoUring {
             Ok(ready) => ready,
             Err(error) => {
                 drop(control.deactivate());
-                let work = admission.commit(None)?;
+                let work = admission.commit(None, None, capability)?;
                 let (prepared, ..) = work.into_parts();
                 return self.complete_request(
                     prepared.id(),
@@ -1698,5 +2183,26 @@ mod adapter_state_tests {
 
         progress.enter(FinalClosePhase::Completions);
         assert_eq!(progress.take_slots(1), 0..1);
+    }
+
+    #[test]
+    fn registered_buffer_pin_budget_checks_cover_and_refunds() {
+        let budget = Arc::new(RegisteredBufferPinBudget::new());
+        assert!(
+            budget
+                .try_charge(IO_URING_RING_REGISTERED_BUFFER_PAGES + 1)
+                .is_err()
+        );
+        assert!(matches!(
+            budget.try_charge(usize::MAX / PAGE_BYTES + 1),
+            Err(AxError::NoMemory)
+        ));
+
+        let charge = budget.try_charge(2).expect("small pin charge");
+        assert_eq!(budget.pages.load(Ordering::Acquire), 2);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 2 * PAGE_BYTES);
+        drop(charge);
+        assert_eq!(budget.pages.load(Ordering::Acquire), 0);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
     }
 }

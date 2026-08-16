@@ -4,9 +4,12 @@ use core::ffi::c_int;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_DIRECT, O_NONBLOCK, O_RDONLY, O_WRONLY};
-use starry_vm::VmMutPtr;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr};
 
-use crate::file::{FileLike, Pipe, add_file_like_with_flags, close_file_like};
+use crate::{
+    file::{FileLike, Pipe, add_file_like_with_flags, close_file_like},
+    mm::map_usercopy_error,
+};
 
 bitflags! {
     /// Flags for the `pipe2` syscall.
@@ -21,7 +24,11 @@ bitflags! {
     }
 }
 
-pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
+pub fn sys_pipe2<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fds: *mut [c_int; 2],
+    flags: u32,
+) -> AxResult<isize> {
     let flags = PipeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
     let cloexec = flags.contains(PipeFlags::CLOEXEC);
@@ -46,10 +53,10 @@ pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
             let _ = close_file_like(read_fd);
         })?;
 
-    if let Err(err) = fds.vm_write([read_fd, write_fd]) {
+    if let Err(err) = VmMutPtr::vm_write(fds, memory, [read_fd, write_fd]) {
         let _ = close_file_like(read_fd);
         let _ = close_file_like(write_fd);
-        return Err(err.into());
+        return Err(map_usercopy_error(err));
     }
 
     debug!(

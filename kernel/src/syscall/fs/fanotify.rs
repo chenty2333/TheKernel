@@ -1,3 +1,4 @@
+use alloc::string::String;
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
@@ -8,7 +9,7 @@ use crate::{
         FileLike, ResolveAtResult, add_file_like, fanotify::*, get_file_like,
         inotify::location_for_fd, resolve_at,
     },
-    mm::vm_load_string,
+    mm::{UserMemoryCapability, map_usercopy_error},
 };
 
 pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
@@ -22,6 +23,7 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
 }
 
 pub fn sys_fanotify_mark(
+    memory: UserMemoryCapability,
     fanotify_fd: c_int,
     flags: u32,
     mask: u64,
@@ -39,7 +41,12 @@ pub fn sys_fanotify_mark(
         file.stat()?;
         Some(location_for_fd(dirfd).ok_or(AxError::InvalidInput)?)
     } else {
-        let pathname = vm_load_string(pathname)?;
+        let pathname = String::from_utf8(
+            memory
+                .load_until_nul(pathname.cast::<u8>())
+                .map_err(map_usercopy_error)?,
+        )
+        .map_err(|_| AxError::IllegalBytes)?;
         let mut resolve_flags = 0;
         if flags & FAN_MARK_DONT_FOLLOW != 0 {
             resolve_flags |= AT_SYMLINK_NOFOLLOW;

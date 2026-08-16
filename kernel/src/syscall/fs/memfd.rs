@@ -13,7 +13,7 @@ use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, 
 use super::fd_ops::openat_inner;
 use crate::{
     file::{FD_TABLE, File, get_file_description, memfd},
-    mm::UserConstPtr,
+    mm::{UserMemoryCapability, map_usercopy_error},
 };
 
 const MEMFD_NAME_MAX: usize = 249;
@@ -33,10 +33,13 @@ fn memfd_path(id: u64) -> AxResult<String> {
     Ok(path)
 }
 
-fn validate_memfd_name(name: UserConstPtr<c_char>) -> AxResult<()> {
-    let start = name.address().as_usize();
+fn validate_memfd_name(capability: &UserMemoryCapability, name: *const c_char) -> AxResult<()> {
+    let start = name as usize;
     for offset in 0..=MEMFD_NAME_MAX {
-        let byte = *UserConstPtr::<u8>::from(start + offset).get_as_ref()?;
+        let address = start.checked_add(offset).ok_or(AxError::BadAddress)?;
+        let byte = capability
+            .read_value(address as *const u8)
+            .map_err(map_usercopy_error)?;
         if byte == 0 {
             return Ok(());
         }
@@ -57,8 +60,12 @@ fn ensure_memfd_dir() -> AxResult<()> {
     }
 }
 
-pub fn sys_memfd_create(name: UserConstPtr<c_char>, flags: u32) -> AxResult<isize> {
-    validate_memfd_name(name)?;
+pub fn sys_memfd_create(
+    capability: UserMemoryCapability,
+    name: *const c_char,
+    flags: u32,
+) -> AxResult<isize> {
+    validate_memfd_name(&capability, name)?;
     if flags & !memfd::MEMFD_SUPPORTED_CREATE_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }

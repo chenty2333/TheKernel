@@ -29,24 +29,8 @@ const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 const NT_PRSTATUS: u32 = 1;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_arch = "riscv64")] {
-        const EM_ARCH: u16 = 243; // EM_RISCV
-        const NUM_GREGS: usize = 32;
-    } else if #[cfg(target_arch = "aarch64")] {
-        const EM_ARCH: u16 = 183; // EM_AARCH64
-        const NUM_GREGS: usize = 32;
-    } else if #[cfg(target_arch = "x86_64")] {
-        const EM_ARCH: u16 = 62; // EM_X86_64
-        const NUM_GREGS: usize = 27;
-    } else if #[cfg(target_arch = "loongarch64")] {
-        const EM_ARCH: u16 = 258; // EM_LOONGARCH
-        const NUM_GREGS: usize = 32;
-    } else {
-        const EM_ARCH: u16 = 0;
-        const NUM_GREGS: usize = 32;
-    }
-}
+const EM_ARCH: u16 = 62; // EM_X86_64
+const NUM_GREGS: usize = 27;
 
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
@@ -165,53 +149,13 @@ fn mapping_flags_to_elf(flags: MappingFlags) -> u32 {
     pf
 }
 
-// ---- Core dump generation (RISC-V specific register extraction) ----
+// ---- Core dump generation (x86_64 register extraction) ----
 
-#[cfg(target_arch = "riscv64")]
 fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS + 1]) {
-    let r = &uctx.regs;
-    // RISC-V register ordering: x0..x31 then pc.
-    regs[0] = r.zero as u64;
-    regs[1] = r.ra as u64;
-    regs[2] = r.sp as u64;
-    regs[3] = r.gp as u64;
-    regs[4] = r.tp as u64;
-    regs[5] = r.t0 as u64;
-    regs[6] = r.t1 as u64;
-    regs[7] = r.t2 as u64;
-    regs[8] = r.s0 as u64;
-    regs[9] = r.s1 as u64;
-    regs[10] = r.a0 as u64;
-    regs[11] = r.a1 as u64;
-    regs[12] = r.a2 as u64;
-    regs[13] = r.a3 as u64;
-    regs[14] = r.a4 as u64;
-    regs[15] = r.a5 as u64;
-    regs[16] = r.a6 as u64;
-    regs[17] = r.a7 as u64;
-    regs[18] = r.s2 as u64;
-    regs[19] = r.s3 as u64;
-    regs[20] = r.s4 as u64;
-    regs[21] = r.s5 as u64;
-    regs[22] = r.s6 as u64;
-    regs[23] = r.s7 as u64;
-    regs[24] = r.s8 as u64;
-    regs[25] = r.s9 as u64;
-    regs[26] = r.s10 as u64;
-    regs[27] = r.s11 as u64;
-    regs[28] = r.t3 as u64;
-    regs[29] = r.t4 as u64;
-    regs[30] = r.t5 as u64;
-    regs[31] = r.t6 as u64;
-    regs[32] = uctx.sepc as u64; // PC
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS + 1]) {
-    // Fallback: store PC and SP in the first two slots.
+    // Keep the compact register view stable: the first slots carry the
+    // instruction and stack pointers, while the remaining slots are zero.
     regs[0] = uctx.ip() as u64;
     regs[1] = uctx.sp() as u64;
-    // Remaining registers left as zero.
 }
 
 // ---- Public API ----

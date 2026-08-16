@@ -201,9 +201,26 @@ impl ExtendedState {
     pub const fn default() -> Self {
         let mut area: FxsaveArea = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
         area.fcw = 0x37f;
-        area.ftw = 0xffff;
+        // FXSAVE stores the abridged tag word (one bit per non-empty x87
+        // register), so an FNINIT-equivalent state has every bit clear. The
+        // architectural x87 tag word's `0xffff` encoding must not be copied
+        // into this field: FXRSTOR would interpret it as eight non-empty
+        // registers.
+        area.ftw = 0;
         area.mxcsr = 0x1f80;
         Self { fxsave_area: area }
+    }
+
+    /// Replaces the saved state and the live CPU state with the architectural
+    /// reset values used by a newly created user image.
+    ///
+    /// The caller must invoke this only for the task currently executing on
+    /// this CPU. `restore` updates the live FPU/SIMD registers as well as the
+    /// saved image; a later context switch will therefore not save registers
+    /// belonging to the old executable.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+        self.restore();
     }
 }
 
@@ -213,6 +230,61 @@ impl fmt::Debug for ExtendedState {
             .field("fxsave_area", &self.fxsave_area)
             .finish()
     }
+}
+
+#[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+#[inline]
+fn legal_legacy_identity(
+    root: usize,
+    pcid: usize,
+    generation: u64,
+    fallback: crate::AddressSpaceFallbackReason,
+) -> bool {
+    pcid == 0
+        && root & 0xfff == 0
+        && root < (1usize << 52)
+        && generation == 0
+        && !matches!(fallback, crate::AddressSpaceFallbackReason::None)
+}
+
+#[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn user_address_space_identity_changed(
+    current_root: usize,
+    current_pcid: usize,
+    current_generation: u64,
+    current_fallback: crate::AddressSpaceFallbackReason,
+    next_root: usize,
+    next_pcid: usize,
+    next_generation: u64,
+    next_fallback: crate::AddressSpaceFallbackReason,
+) -> bool {
+    let metadata_invalid = (!legal_legacy_identity(
+        current_root,
+        current_pcid,
+        current_generation,
+        current_fallback,
+    ) && current_pcid == 0)
+        || (current_pcid != 0
+            && !crate::legal_nonzero_identity(
+                current_root,
+                current_pcid,
+                current_generation,
+                current_fallback,
+            ))
+        || (next_pcid != 0
+            && !crate::legal_nonzero_identity(
+                next_root,
+                next_pcid,
+                next_generation,
+                next_fallback,
+            ));
+    current_root != next_root
+        || current_pcid != next_pcid
+        || current_generation != next_generation
+        || current_fallback != next_fallback
+        || metadata_invalid
 }
 
 /// Saved hardware states of a task.
@@ -248,6 +320,15 @@ pub struct TaskContext {
     /// The `CR3` register value, i.e., the page table root.
     #[cfg(feature = "uspace")]
     pub cr3: memory_addr::PhysAddr,
+    /// The non-recycled PCID associated with [`Self::cr3`].
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub cr3_pcid: usize,
+    /// The boot-scoped allocator generation associated with [`Self::cr3_pcid`].
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub cr3_generation: u64,
+    /// Why [`Self::cr3_pcid`] is the conservative PCID-0 fallback.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub cr3_fallback_reason: crate::AddressSpaceFallbackReason,
 }
 
 impl TaskContext {
@@ -265,6 +346,12 @@ impl TaskContext {
             fs_base: 0,
             #[cfg(feature = "uspace")]
             cr3: crate::asm::read_kernel_page_table(),
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            cr3_pcid: 0,
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            cr3_generation: 0,
+            #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+            cr3_fallback_reason: crate::AddressSpaceFallbackReason::AsidZero,
             #[cfg(feature = "fp-simd")]
             ext_state: ExtendedState::default(),
         }
@@ -292,6 +379,16 @@ impl TaskContext {
         self.fs_base = tls_area.as_usize();
     }
 
+    /// Resets this task's saved and live FP/SIMD state.
+    ///
+    /// The context must belong to the task currently executing on this CPU.
+    /// This is used by `execve` after replacing a process image so the new
+    /// image cannot observe registers from the old image.
+    #[cfg(feature = "fp-simd")]
+    pub fn reset_extended_state(&mut self) {
+        self.ext_state.reset();
+    }
+
     /// Changes the page table root in this context.
     ///
     /// The hardware register for page table root (`CR3` for x86) will be
@@ -299,6 +396,32 @@ impl TaskContext {
     #[cfg(feature = "uspace")]
     pub fn set_page_table_root(&mut self, cr3: memory_addr::PhysAddr) {
         self.cr3 = cr3;
+        #[cfg(feature = "asid-fast-switch")]
+        {
+            self.cr3_pcid = 0;
+            self.cr3_generation = 0;
+            self.cr3_fallback_reason = crate::AddressSpaceFallbackReason::AsidZero;
+        }
+    }
+
+    /// Changes the user root and its bounded hardware PCID identity.
+    ///
+    /// # Safety
+    ///
+    /// The numeric PCID must identify this root for the entire boot and must
+    /// not be recycled while a CPU can still refill the old identity.
+    #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+    pub unsafe fn set_page_table_root_with_asid(
+        &mut self,
+        cr3: memory_addr::PhysAddr,
+        pcid: usize,
+        generation: u64,
+        fallback_reason: crate::AddressSpaceFallbackReason,
+    ) {
+        self.cr3 = cr3;
+        self.cr3_pcid = pcid;
+        self.cr3_generation = generation;
+        self.cr3_fallback_reason = fallback_reason;
     }
 
     /// Switches to another task.
@@ -316,11 +439,88 @@ impl TaskContext {
             self.fs_base = crate::asm::read_thread_pointer();
             crate::asm::write_thread_pointer(next_ctx.fs_base);
         }
-        #[cfg(feature = "uspace")]
+        #[cfg(all(feature = "uspace", not(feature = "asid-fast-switch")))]
         unsafe {
             if next_ctx.cr3 != self.cr3 {
                 crate::asm::write_user_page_table(next_ctx.cr3);
                 // writing to CR3 has flushed the TLB
+            }
+        }
+        #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
+        {
+            // The numeric PCID/root pair is not the complete identity.  A
+            // generation or fallback transition must still pass through the
+            // classifier so a stale/invalid identity cannot take NOFLUSH.
+            let identity_changed = user_address_space_identity_changed(
+                self.cr3.as_usize(),
+                self.cr3_pcid,
+                self.cr3_generation,
+                self.cr3_fallback_reason,
+                next_ctx.cr3.as_usize(),
+                next_ctx.cr3_pcid,
+                next_ctx.cr3_generation,
+                next_ctx.cr3_fallback_reason,
+            );
+            if identity_changed {
+                let decision = if self.cr3_pcid == 0
+                    && !legal_legacy_identity(
+                        self.cr3.as_usize(),
+                        self.cr3_pcid,
+                        self.cr3_generation,
+                        self.cr3_fallback_reason,
+                    ) {
+                    crate::TlbSwitchDecision::Flush(crate::AsidSwitchFallbackReason::InvalidWidth)
+                } else {
+                    crate::classify_user_tlb_switch(
+                        self.cr3.as_usize(),
+                        self.cr3_pcid,
+                        self.cr3_generation,
+                        self.cr3_fallback_reason,
+                        next_ctx.cr3.as_usize(),
+                        next_ctx.cr3_pcid,
+                        next_ctx.cr3_generation,
+                        next_ctx.cr3_fallback_reason,
+                    )
+                };
+                let target_is_legal = crate::legal_nonzero_identity(
+                    next_ctx.cr3.as_usize(),
+                    next_ctx.cr3_pcid,
+                    next_ctx.cr3_generation,
+                    next_ctx.cr3_fallback_reason,
+                );
+                // A legal never-reused target can always use NOFLUSH,
+                // including a transition from the kernel's PCID-0 context.
+                // A defensive flush is used for an invalid current identity
+                // or a same-PCID/root collision. PCID 0 is always entered by
+                // a flushing CR3 write and never with bit 63 set.
+                unsafe {
+                    if target_is_legal {
+                        if matches!(decision, crate::TlbSwitchDecision::Retain) {
+                            crate::asm::write_user_page_table_with_asid(
+                                next_ctx.cr3,
+                                next_ctx.cr3_pcid,
+                            );
+                        } else {
+                            crate::asm::write_user_page_table_with_asid_flush(
+                                next_ctx.cr3,
+                                next_ctx.cr3_pcid,
+                            );
+                        }
+                    } else if next_ctx.cr3_pcid != 0 {
+                        // Metadata is invalid, but a structurally valid
+                        // nonzero PCID can still be flushed defensively.  The
+                        // helper rejects malformed roots/PCIDs and falls back
+                        // to the PCID-0 full-flush write in that case.
+                        crate::asm::write_user_page_table_with_asid_flush(
+                            next_ctx.cr3,
+                            next_ctx.cr3_pcid,
+                        );
+                    } else {
+                        crate::asm::write_user_page_table(next_ctx.cr3);
+                    }
+                }
+                #[cfg(feature = "asid-switch-diagnostics")]
+                crate::record_asid_switch_decision(decision);
             }
         }
         unsafe { context_switch(&mut self.rsp, &next_ctx.rsp) }
@@ -349,4 +549,107 @@ unsafe extern "C" fn context_switch(_current_stack: &mut u64, _next_stack: &u64)
         pop     rbp
         ret",
     )
+}
+
+#[cfg(all(test, feature = "fp-simd"))]
+mod tests {
+    use super::ExtendedState;
+
+    #[test]
+    fn reset_replaces_saved_and_live_fxsave_image() {
+        let mut state = ExtendedState::default();
+        state.fxsave_area.fcw = 0;
+        state.fxsave_area.ftw = 0xff;
+        state.fxsave_area.mxcsr = 0;
+        state.fxsave_area.xmm[0] = u64::MAX;
+
+        state.reset();
+
+        assert_eq!(state.fxsave_area.fcw, 0x37f);
+        assert_eq!(state.fxsave_area.ftw, 0);
+        assert_eq!(state.fxsave_area.mxcsr, 0x1f80);
+        assert_eq!(state.fxsave_area.xmm[0], 0);
+
+        // Save the live CPU state after reset as well. This catches an
+        // implementation that only rewrites the scheduler copy.
+        state.save();
+        assert_eq!(state.fxsave_area.fcw, 0x37f);
+        assert_eq!(state.fxsave_area.ftw, 0);
+        assert_eq!(state.fxsave_area.mxcsr, 0x1f80);
+        assert_eq!(state.fxsave_area.xmm[0], 0);
+    }
+}
+
+#[cfg(all(test, feature = "uspace", feature = "asid-fast-switch"))]
+mod asid_tests {
+    use super::{legal_legacy_identity, user_address_space_identity_changed};
+    use crate::AddressSpaceFallbackReason;
+
+    #[test]
+    fn same_root_and_pcid_metadata_changes_enter_switch_path() {
+        assert!(user_address_space_identity_changed(
+            0x1000,
+            7,
+            1,
+            AddressSpaceFallbackReason::None,
+            0x1000,
+            7,
+            2,
+            AddressSpaceFallbackReason::None,
+        ));
+        assert!(user_address_space_identity_changed(
+            0x1000,
+            7,
+            1,
+            AddressSpaceFallbackReason::None,
+            0x1000,
+            7,
+            1,
+            AddressSpaceFallbackReason::Exhausted,
+        ));
+    }
+
+    #[test]
+    fn identical_invalid_nonzero_metadata_still_enters_defensive_path() {
+        assert!(user_address_space_identity_changed(
+            0x1000,
+            7,
+            0,
+            AddressSpaceFallbackReason::None,
+            0x1000,
+            7,
+            0,
+            AddressSpaceFallbackReason::None,
+        ));
+        assert!(!user_address_space_identity_changed(
+            0x1000,
+            7,
+            1,
+            AddressSpaceFallbackReason::None,
+            0x1000,
+            7,
+            1,
+            AddressSpaceFallbackReason::None,
+        ));
+    }
+
+    #[test]
+    fn legacy_identity_with_invalid_metadata_cannot_retain_a_target_pcid() {
+        assert!(!legal_legacy_identity(
+            0x1000,
+            0,
+            0,
+            AddressSpaceFallbackReason::None,
+        ));
+        assert!(user_address_space_identity_changed(
+            0x1000,
+            0,
+            0,
+            AddressSpaceFallbackReason::None,
+            0x2000,
+            7,
+            1,
+            AddressSpaceFallbackReason::None,
+        ));
+    }
 }

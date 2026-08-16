@@ -273,7 +273,7 @@ struct CleanupCreditGuard(bool);
 impl CleanupCreditGuard {
     fn reserve() -> AxResult<Self> {
         FANOTIFY_CLEANUP_WORKS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 (live < MAX_USER_GROUPS).then_some(live + 1)
             })
             .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -1017,7 +1017,7 @@ fn add_mark(
     }
     state.marks.try_reserve(1).map_err(|_| AxError::NoMemory)?;
     FANOTIFY_MARKS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |marks| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |marks| {
             (marks < MAX_USER_MARKS).then_some(marks + 1)
         })
         .map_err(|_| AxError::StorageFull)?;

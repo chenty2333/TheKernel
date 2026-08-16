@@ -3,20 +3,20 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 /// Repairs one current-CPU cached-invalid translation after another CPU has
 /// published a valid leaf.
 ///
-/// RISC-V and LoongArch may retain an invalid translation. The hardware fault
-/// receiver, rather than the publisher, owns this targeted local repair. It is
-/// intentionally not a global shootdown.
+/// The hardware fault receiver, rather than the publisher, owns this targeted
+/// local repair. It is intentionally not a global shootdown.
 pub(crate) fn repair_local_spurious_fault(vaddr: VirtAddr) {
     axhal::asm::flush_tlb(Some(vaddr.align_down(PAGE_SIZE_4K)));
 }
 
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use axhal::irq::{IpiReason, IpiTarget};
     use axtlb::{
-        CPU_MAINTENANCE_REASON, CpuMaintenance, ShootdownGrace, ShootdownRequest, TlbShootdown,
+        CPU_MAINTENANCE_REASON, CpuMaintenance, CpuSet, ShootdownGrace, ShootdownRequest,
+        TlbShootdown,
     };
     use kernel_guard::NoPreempt;
 
@@ -64,7 +64,7 @@ mod imp {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        let _ = self.retry_interval_ns.fetch_update(
+                        let _ = self.retry_interval_ns.try_update(
                             Ordering::AcqRel,
                             Ordering::Acquire,
                             |current| Some(current.saturating_mul(2).min(RETRY_MAX_NS)),
@@ -101,7 +101,11 @@ mod imp {
     }
 
     pub(crate) struct GlobalGrace {
-        _grace: ShootdownGrace<'static, { axconfig::plat::MAX_CPU_NUM }>,
+        _grace: Option<ShootdownGrace<'static, { axconfig::plat::MAX_CPU_NUM }>>,
+    }
+
+    impl Drop for GlobalGrace {
+        fn drop(&mut self) {}
     }
 
     pub(crate) fn init() {
@@ -195,12 +199,16 @@ mod imp {
                 grace
             };
             if let Some(grace) = grace {
-                return GlobalGrace { _grace: grace };
+                return GlobalGrace {
+                    _grace: Some(grace),
+                };
             }
             let now = axhal::time::monotonic_time_nanos();
             if now >= deadline {
                 if let Some(grace) = request.try_complete() {
-                    return GlobalGrace { _grace: grace };
+                    return GlobalGrace {
+                        _grace: Some(grace),
+                    };
                 }
                 shootdown_timeout(&request, issuer_cpu, started, &attempts);
             }
@@ -229,7 +237,9 @@ mod imp {
                 }
                 if retry_deadline_reached {
                     if let Some(grace) = request.try_complete() {
-                        return GlobalGrace { _grace: grace };
+                        return GlobalGrace {
+                            _grace: Some(grace),
+                        };
                     }
                     shootdown_timeout(&request, issuer_cpu, started, &attempts);
                 }
@@ -243,6 +253,184 @@ mod imp {
 
     pub(crate) fn synchronize_tlb() -> GlobalGrace {
         synchronize_cpu_maintenance(CpuMaintenance::TLB)
+    }
+
+    /// Advances one address space's translation generation, flushes the local
+    /// CPU, and acknowledges only CPUs that are active in that address space.
+    ///
+    /// The generation is published before the active-CPU snapshot. A CPU that
+    /// enters after the snapshot therefore observes the new generation and
+    /// repairs its own stale translations before becoming an active user of
+    /// the address space. CPUs present in the snapshot are acknowledged by the
+    /// bounded targeted shootdown below.
+    pub(crate) fn synchronize_tlb_for_addr_space(
+        generation: &AtomicU64,
+        resident_cpus: &[AtomicBool; axconfig::plat::MAX_CPU_NUM],
+        seen_generations: &[AtomicU64; axconfig::plat::MAX_CPU_NUM],
+    ) -> GlobalGrace {
+        let cpu_count = axhal::cpu_num();
+        let (issuer_cpu, generation, targets, request, mut attempts, started) = {
+            let _cpu_guard = NoPreempt::new();
+            let issuer_cpu = axhal::percpu::this_cpu_id();
+            let generation = generation
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+                .unwrap_or_else(|_| {
+                    panic!("address-space TLB generation exhausted after PTE mutation")
+                })
+                + 1;
+
+            let mut targets = CpuSet::new();
+            let mut attempts = ShootdownAttempts::new();
+            for cpu in 0..cpu_count {
+                attempts.ipi_entries_before[cpu] =
+                    CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+                #[cfg(feature = "irq-continuation-diagnostics")]
+                {
+                    attempts.irq_diagnostics_before[cpu] =
+                        axtask::irq_continuation_diagnostic_snapshot(cpu);
+                }
+                if cpu != issuer_cpu && resident_cpus[cpu].load(Ordering::SeqCst) {
+                    targets
+                        .try_insert(cpu)
+                        .expect("online CPU index exceeds targeted TLB capacity");
+                }
+            }
+
+            // The caller has already published its page-table stores. The
+            // issuer is not a remote target, but it must record this local
+            // flush so a later switch does not repeat it unnecessarily.
+            maintain_local(CpuMaintenance::TLB);
+            seen_generations[issuer_cpu].store(generation, Ordering::SeqCst);
+
+            if targets.is_empty() {
+                return GlobalGrace { _grace: None };
+            }
+
+            let request = SHOOTDOWN
+                .issue_after_local_flush_for_targets(issuer_cpu, targets)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to issue targeted address-space TLB shootdown from CPU \
+                         {issuer_cpu}: {error:?}"
+                    )
+                });
+            let started = axhal::time::monotonic_time_nanos();
+            for cpu in 0..cpu_count {
+                if request.needs_kick(cpu) {
+                    attempts.initial[cpu] = true;
+                    send_maintenance_ipi(cpu);
+                }
+            }
+            (issuer_cpu, generation, targets, request, attempts, started)
+        };
+
+        let deadline = started.saturating_add(SHOOTDOWN_TIMEOUT_NS);
+        let mut retry_interval = RETRY_INITIAL_NS;
+        let mut next_retry = started.saturating_add(retry_interval);
+        loop {
+            let grace = {
+                let _cpu_guard = NoPreempt::new();
+                service_cpu(axhal::percpu::this_cpu_id());
+                let mut grace = request.try_complete();
+                for _ in 1..SELF_SERVICE_SPINS {
+                    if grace.is_some() {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                    grace = request.try_complete();
+                }
+                grace
+            };
+            if let Some(grace) = grace {
+                // The remote handler has completed its local flush by the
+                // time grace is returned. Publish that fact with max rather
+                // than store: a newer concurrent mutation may have already
+                // acknowledged the same CPU before this issuer resumes.
+                acknowledge_target_generations(seen_generations, &targets, generation, cpu_count);
+                return GlobalGrace {
+                    _grace: Some(grace),
+                };
+            }
+
+            let now = axhal::time::monotonic_time_nanos();
+            if now >= deadline {
+                if let Some(grace) = request.try_complete() {
+                    acknowledge_target_generations(
+                        seen_generations,
+                        &targets,
+                        generation,
+                        cpu_count,
+                    );
+                    return GlobalGrace {
+                        _grace: Some(grace),
+                    };
+                }
+                shootdown_timeout(&request, issuer_cpu, started, &attempts);
+            }
+            if now >= next_retry && attempts.rounds < MAX_RETRY_ROUNDS {
+                let mut retry_deadline_reached = false;
+                for cpu in 0..cpu_count {
+                    if !targets.contains(cpu) {
+                        continue;
+                    }
+                    let sent = {
+                        let _cpu_guard = NoPreempt::new();
+                        let retry_now = axhal::time::monotonic_time_nanos();
+                        if retry_now >= deadline {
+                            retry_deadline_reached = true;
+                            false
+                        } else if request.target_pending(cpu) && claim_retry(cpu, retry_now) {
+                            send_maintenance_ipi(cpu);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if retry_deadline_reached {
+                        break;
+                    }
+                    if sent {
+                        attempts.retries[cpu] = attempts.retries[cpu].saturating_add(1);
+                    }
+                }
+                if retry_deadline_reached {
+                    if let Some(grace) = request.try_complete() {
+                        acknowledge_target_generations(
+                            seen_generations,
+                            &targets,
+                            generation,
+                            cpu_count,
+                        );
+                        return GlobalGrace {
+                            _grace: Some(grace),
+                        };
+                    }
+                    shootdown_timeout(&request, issuer_cpu, started, &attempts);
+                }
+                attempts.rounds += 1;
+                retry_interval = retry_interval.saturating_mul(2).min(RETRY_MAX_NS);
+                next_retry = axhal::time::monotonic_time_nanos().saturating_add(retry_interval);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn acknowledge_target_generations(
+        seen_generations: &[AtomicU64; axconfig::plat::MAX_CPU_NUM],
+        targets: &CpuSet<{ axconfig::plat::MAX_CPU_NUM }>,
+        generation: u64,
+        cpu_count: usize,
+    ) {
+        for cpu in 0..cpu_count {
+            if targets.contains(cpu) {
+                let _ =
+                    seen_generations[cpu].try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+                        Some(seen.max(generation))
+                    });
+            }
+        }
     }
 
     pub(crate) fn synchronize_icache() -> GlobalGrace {
@@ -518,7 +706,13 @@ mod imp {
 
 #[cfg(not(feature = "smp-tlb-shootdown"))]
 mod imp {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     pub(crate) struct GlobalGrace;
+
+    impl Drop for GlobalGrace {
+        fn drop(&mut self) {}
+    }
 
     pub(crate) fn init() {
         assert_eq!(
@@ -530,6 +724,25 @@ mod imp {
 
     pub(crate) fn synchronize_tlb() -> GlobalGrace {
         axhal::asm::flush_tlb(None);
+        GlobalGrace
+    }
+
+    pub(crate) fn synchronize_tlb_for_addr_space(
+        generation: &AtomicU64,
+        _resident_cpus: &[AtomicBool; axconfig::plat::MAX_CPU_NUM],
+        seen_generations: &[AtomicU64; axconfig::plat::MAX_CPU_NUM],
+    ) -> GlobalGrace {
+        let generation = generation
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!("address-space TLB generation exhausted after PTE mutation")
+            })
+            + 1;
+        axhal::asm::flush_tlb(None);
+        let cpu = axhal::percpu::this_cpu_id();
+        seen_generations[cpu].store(generation, Ordering::SeqCst);
         GlobalGrace
     }
 
@@ -552,4 +765,5 @@ mod imp {
 
 pub(crate) use imp::{
     init, retire_after_tlb_grace, synchronize_icache, synchronize_tlb, synchronize_tlb_and_icache,
+    synchronize_tlb_for_addr_space,
 };

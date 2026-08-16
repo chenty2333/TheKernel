@@ -169,7 +169,7 @@ static NEXT_UFFD_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_handler_id() -> AxResult<FaultHandlerId> {
     let raw = NEXT_UFFD_HANDLER_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .map_err(|_| AxError::NoMemory)?;

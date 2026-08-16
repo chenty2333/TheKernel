@@ -1,52 +1,33 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 #[cfg(feature = "test-io-control")]
 use core::time::Duration;
 use core::{
-    alloc::Layout,
-    cmp::min,
-    ffi::c_char,
     hint::unlikely,
-    mem::{MaybeUninit, transmute},
-    ptr::{self, NonNull},
-    slice, str,
+    mem::MaybeUninit,
+    ptr, slice,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
 use axfs::CachedFilePagePin;
 use axhal::{
-    asm::user_copy,
-    paging::{MappingFlags, PageSize},
-    trap::{PAGE_FAULT, register_trap_handler},
+    mem::phys_to_virt,
+    paging::{MappingFlags, PageSize, PagingError},
 };
 use axio::prelude::*;
 use axsync::Mutex;
 #[cfg(feature = "test-io-control")]
 use axtask::sleep;
-use axtask::{current, current_may_uninit};
-use extern_trait::extern_trait;
-use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_vm::{
-    VmError, VmIo, VmResult, vm_load_until_nul, vm_load_until_nul_bounded, vm_read_slice,
-    vm_write_slice,
-};
 use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
+use thekernel_linux_usercopy::{UserCopyError, VmResult};
 
 use super::{
-    AddrSpace, Backend, PhysicalFramePins, PreparedPhysicalFramePins, UserIoMappingExpectation,
+    AddrSpace, Backend, PhysicalFramePins, PreparedPhysicalFramePins, SharedFutexKey,
+    UserIoMappingExpectation, UserMemoryCapability, map_usercopy_error,
     prepare_physical_pin_registry,
 };
-use crate::{
-    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    task::{AsThread, Thread},
-};
-
-/// RAII guard that resets the `accessing_user_memory` flag on drop, ensuring
-/// cleanup even if the closure panics.
-struct UserMemoryAccessGuard<'a>(&'a Thread);
-
-static PAGE_FAULT_THREAD_CONTEXT_READY: AtomicBool = AtomicBool::new(false);
+use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
 static ENABLE_USER_IO_PIN_COUNTERS: AtomicBool = AtomicBool::new(false);
 static USER_IO_PIN_TO_USER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_TO_USER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -372,13 +353,17 @@ pub fn record_user_io_direct_write_fallback() {
     record_user_io_pin_counter(&USER_IO_PIN_DIRECT_WRITE_FALLBACKS, 1);
 }
 
-#[inline(always)]
-pub fn prefault_user_io_to_user(ptr: *mut u8, len: usize) -> VmResult {
+/// Prefaults a destination range in an explicitly selected address space.
+pub fn prefault_user_io_to_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *mut u8,
+    len: usize,
+) -> AxResult {
     if len == 0 {
         return Ok(());
     }
     record_user_io_pin_counter(&USER_IO_PREFAULT_TO_USER_ATTEMPTS, 1);
-    match populate_user_range(ptr as usize, len, MappingFlags::WRITE) {
+    match populate_user_range_with(capability, ptr as usize, len, MappingFlags::WRITE) {
         Ok(()) => {
             record_user_io_pin_counter(&USER_IO_PREFAULT_TO_USER_HITS, 1);
             record_user_io_pin_counter(&USER_IO_PREFAULT_TO_USER_BYTES, len as u64);
@@ -386,18 +371,22 @@ pub fn prefault_user_io_to_user(ptr: *mut u8, len: usize) -> VmResult {
         }
         Err(err) => {
             record_user_io_pin_counter(&USER_IO_PREFAULT_TO_USER_REJECTS, 1);
-            Err(err)
+            Err(map_usercopy_error(err))
         }
     }
 }
 
-#[inline(always)]
-pub fn prefault_user_io_from_user(ptr: *const u8, len: usize) -> VmResult {
+/// Prefaults a source range in an explicitly selected address space.
+pub fn prefault_user_io_from_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+) -> AxResult {
     if len == 0 {
         return Ok(());
     }
     record_user_io_pin_counter(&USER_IO_PREFAULT_FROM_USER_ATTEMPTS, 1);
-    match populate_user_range(ptr as usize, len, MappingFlags::READ) {
+    match populate_user_range_with(capability, ptr as usize, len, MappingFlags::READ) {
         Ok(()) => {
             record_user_io_pin_counter(&USER_IO_PREFAULT_FROM_USER_HITS, 1);
             record_user_io_pin_counter(&USER_IO_PREFAULT_FROM_USER_BYTES, len as u64);
@@ -405,109 +394,9 @@ pub fn prefault_user_io_from_user(ptr: *const u8, len: usize) -> VmResult {
         }
         Err(err) => {
             record_user_io_pin_counter(&USER_IO_PREFAULT_FROM_USER_REJECTS, 1);
-            Err(err)
+            Err(map_usercopy_error(err))
         }
     }
-}
-
-pub fn mark_page_fault_thread_context_ready() {
-    PAGE_FAULT_THREAD_CONTEXT_READY.store(true, Ordering::Release);
-}
-
-impl Drop for UserMemoryAccessGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set_accessing_user_memory(false);
-    }
-}
-
-/// Enables scoped access into user memory, allowing page faults to occur inside
-/// kernel.
-pub fn access_user_memory<R>(f: impl FnOnce() -> R) -> R {
-    let curr = current();
-    let Some(thr) = curr.try_as_thread() else {
-        panic!("access_user_memory called outside of thread context");
-    };
-
-    thr.set_accessing_user_memory(true);
-    let _guard = UserMemoryAccessGuard(thr);
-    f()
-}
-
-fn check_region(start: VirtAddr, layout: Layout, access_flags: MappingFlags) -> AxResult<()> {
-    let align = layout.align();
-    if start.as_usize() & (align - 1) != 0 {
-        return Err(AxError::BadAddress);
-    }
-
-    let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-
-    if !aspace.can_access_range(start, layout.size(), access_flags) {
-        return Err(AxError::BadAddress);
-    }
-
-    let page_start = start.align_down_4k();
-    let end = start
-        .checked_add(layout.size())
-        .ok_or(AxError::BadAddress)?;
-    let page_end =
-        VirtAddr::from(super::checked_align_up_4k(end.as_usize()).ok_or(AxError::BadAddress)?);
-    aspace.populate_area(page_start, page_end - page_start, access_flags)?;
-
-    Ok(())
-}
-
-fn check_null_terminated<T: PartialEq + Default>(
-    start: VirtAddr,
-    access_flags: MappingFlags,
-) -> AxResult<usize> {
-    let align = Layout::new::<T>().align();
-    if start.as_usize() & (align - 1) != 0 {
-        return Err(AxError::BadAddress);
-    }
-
-    let zero = T::default();
-
-    let mut page = start.align_down_4k();
-
-    let start = start.as_ptr_of::<T>();
-    let mut len = 0;
-
-    access_user_memory(|| {
-        loop {
-            // SAFETY: This won't overflow the address space since we'll check
-            // it below.
-            let ptr = unsafe { start.add(len) };
-            while ptr as usize >= page.as_ptr() as usize {
-                // We cannot prepare `aspace` outside of the loop, since holding
-                // aspace requires a mutex which would be required on page
-                // fault, and page faults can trigger inside the loop.
-
-                // TODO: this is inefficient, but we have to do this instead of
-                // querying the page table since the page might has not been
-                // allocated yet.
-                let curr = current();
-                let aspace_handle = curr.as_thread().proc_data.aspace();
-                let aspace = aspace_handle.lock();
-                if !aspace.can_access_range(page, PAGE_SIZE_4K, access_flags) {
-                    return Err(AxError::BadAddress);
-                }
-
-                page += PAGE_SIZE_4K;
-            }
-
-            // This might trigger a page fault
-            // SAFETY: The pointer is valid and points to a valid memory region.
-            if unsafe { ptr.read_volatile() } == zero {
-                break;
-            }
-            len += 1;
-        }
-        Ok(())
-    })?;
-
-    Ok(len)
 }
 
 /// A pointer to user space memory.
@@ -534,8 +423,6 @@ impl<T> Default for UserPtr<T> {
 }
 
 impl<T> UserPtr<T> {
-    const ACCESS_FLAGS: MappingFlags = MappingFlags::READ.union(MappingFlags::WRITE);
-
     pub fn address(&self) -> VirtAddr {
         VirtAddr::from_ptr_of(self.0)
     }
@@ -546,28 +433,6 @@ impl<T> UserPtr<T> {
 
     pub fn is_null(&self) -> bool {
         self.0.is_null()
-    }
-
-    pub fn get_as_mut(self) -> AxResult<&'static mut T> {
-        check_region(self.address(), Layout::new::<T>(), Self::ACCESS_FLAGS)?;
-        Ok(unsafe { &mut *self.0 })
-    }
-
-    pub fn get_as_mut_slice(self, len: usize) -> AxResult<&'static mut [T]> {
-        let layout = Layout::array::<T>(len).map_err(|_| AxError::BadAddress)?;
-        if len == 0 {
-            return Ok(unsafe { slice::from_raw_parts_mut(NonNull::<T>::dangling().as_ptr(), 0) });
-        }
-        check_region(self.address(), layout, Self::ACCESS_FLAGS)?;
-        Ok(unsafe { slice::from_raw_parts_mut(self.0, len) })
-    }
-
-    pub fn get_as_mut_null_terminated(self) -> AxResult<&'static mut [T]>
-    where
-        T: PartialEq + Default,
-    {
-        let len = check_null_terminated::<T>(self.address(), Self::ACCESS_FLAGS)?;
-        Ok(unsafe { slice::from_raw_parts_mut(self.0, len) })
     }
 }
 
@@ -595,8 +460,6 @@ impl<T> Default for UserConstPtr<T> {
 }
 
 impl<T> UserConstPtr<T> {
-    const ACCESS_FLAGS: MappingFlags = MappingFlags::READ;
-
     pub fn address(&self) -> VirtAddr {
         VirtAddr::from_ptr_of(self.0)
     }
@@ -608,158 +471,52 @@ impl<T> UserConstPtr<T> {
     pub fn is_null(&self) -> bool {
         self.0.is_null()
     }
-
-    pub fn get_as_ref(self) -> AxResult<&'static T> {
-        check_region(self.address(), Layout::new::<T>(), Self::ACCESS_FLAGS)?;
-        Ok(unsafe { &*self.0 })
-    }
-
-    pub fn get_as_slice(self, len: usize) -> AxResult<&'static [T]> {
-        let layout = Layout::array::<T>(len).map_err(|_| AxError::BadAddress)?;
-        if len == 0 {
-            return Ok(unsafe { slice::from_raw_parts(NonNull::<T>::dangling().as_ptr(), 0) });
-        }
-        check_region(self.address(), layout, Self::ACCESS_FLAGS)?;
-        Ok(unsafe { slice::from_raw_parts(self.0, len) })
-    }
-
-    pub fn get_as_null_terminated(self) -> AxResult<&'static [T]>
-    where
-        T: PartialEq + Default,
-    {
-        let len = check_null_terminated::<T>(self.address(), Self::ACCESS_FLAGS)?;
-        Ok(unsafe { slice::from_raw_parts(self.0, len) })
-    }
-}
-
-impl UserConstPtr<c_char> {
-    /// Get the pointer as `&str`, validating the memory region.
-    pub fn get_as_str(self) -> AxResult<&'static str> {
-        let slice = self.get_as_null_terminated()?;
-        // SAFETY: c_char is u8
-        let slice = unsafe { transmute::<&[c_char], &[u8]>(slice) };
-
-        str::from_utf8(slice).map_err(|_| AxError::IllegalBytes)
-    }
-}
-
-macro_rules! nullable {
-    ($ptr:ident.$func:ident($($arg:expr),*)) => {
-        if $ptr.is_null() {
-            Ok(None)
-        } else {
-            Some($ptr.$func($($arg),*)).transpose()
-        }
-    };
-}
-
-pub(crate) use nullable;
-
-#[register_trap_handler(PAGE_FAULT)]
-fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
-    if !PAGE_FAULT_THREAD_CONTEXT_READY.load(Ordering::Acquire) {
-        return false;
-    }
-
-    let Some(curr) = current_may_uninit() else {
-        return false;
-    };
-    let Some(thr) = curr.try_as_thread() else {
-        return false;
-    };
-
-    if unlikely(!thr.is_accessing_user_memory()) {
-        return false;
-    }
-
-    debug!("Page fault at {vaddr:#x}, access_flags: {access_flags:#x?}");
-
-    let aspace_handle = thr.proc_data.aspace();
-    aspace_handle.lock().handle_page_fault(vaddr, access_flags)
-}
-
-pub fn vm_load_string(ptr: *const c_char) -> AxResult<String> {
-    #[allow(clippy::unnecessary_cast)]
-    let bytes = vm_load_until_nul(ptr as *const u8)?;
-    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
-}
-
-/// Loads one NUL-terminated UTF-8 string within an explicit byte budget.
-///
-/// `scan_bytes` includes the terminating NUL, matching Linux's field-size
-/// limits for syscall strings.
-pub fn vm_load_string_bounded(ptr: *const c_char, scan_bytes: usize) -> AxResult<String> {
-    #[allow(clippy::unnecessary_cast)]
-    let bytes = vm_load_until_nul_bounded(ptr as *const u8, scan_bytes)?;
-    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
-}
-
-#[allow(dead_code)]
-struct Vm;
-
-/// Bound the duration of a single IRQ-masked user-copy operation.
-const USER_COPY_CHUNK: usize = 16 * 1024;
-
-fn copy_user_bytes(mut dst: *mut u8, mut src: *const u8, mut len: usize) -> VmResult {
-    while len != 0 {
-        let chunk = min(len, USER_COPY_CHUNK);
-        let failed_at = {
-            let _irq = IrqSave::new();
-            access_user_memory(|| unsafe { user_copy(dst, src, chunk) })
-        };
-        if unlikely(failed_at != 0) {
-            return Err(VmError::AccessDenied);
-        }
-
-        // SAFETY: `chunk <= len`, and the caller validated the entire range up
-        // front before entering this helper.
-        unsafe {
-            dst = dst.add(chunk);
-            src = src.add(chunk);
-        }
-        len -= chunk;
-    }
-
-    Ok(())
 }
 
 /// Briefly checks if the given memory region is valid user memory.
-pub fn check_access(start: usize, len: usize) -> VmResult {
+pub fn check_access(start: usize, len: usize) -> AxResult {
     const USER_SPACE_END: usize = USER_SPACE_BASE + USER_SPACE_SIZE;
     let ok = (USER_SPACE_BASE..USER_SPACE_END).contains(&start) && (USER_SPACE_END - start) >= len;
     if unlikely(!ok) {
-        Err(VmError::AccessDenied)
+        Err(AxError::BadAddress)
     } else {
         Ok(())
     }
 }
 
-fn populate_user_range(start: usize, len: usize, access_flags: MappingFlags) -> VmResult {
-    check_access(start, len)?;
+fn map_populate_error(error: AxError) -> UserCopyError {
+    match error {
+        AxError::NoMemory => UserCopyError::NoMemory,
+        AxError::BadAddress | AxError::InvalidInput => UserCopyError::BadAddress,
+        _ => UserCopyError::AccessDenied,
+    }
+}
+
+fn populate_user_range_with(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+) -> VmResult {
+    check_access(start, len).map_err(map_populate_error)?;
     if len == 0 {
         return Ok(());
     }
 
-    let Some(curr) = current_may_uninit() else {
-        return Err(VmError::AccessDenied);
-    };
-    let Some(thr) = curr.try_as_thread() else {
-        return Err(VmError::AccessDenied);
-    };
-
     let start = VirtAddr::from(start);
     let page_start = start.align_down_4k();
-    let end = start.checked_add(len).ok_or(VmError::AccessDenied)?;
-    let page_end =
-        VirtAddr::from(super::checked_align_up_4k(end.as_usize()).ok_or(VmError::AccessDenied)?);
-    let aspace_handle = thr.proc_data.aspace();
+    let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+    let page_end = VirtAddr::from(
+        super::checked_align_up_4k(end.as_usize()).ok_or(UserCopyError::BadAddress)?,
+    );
+    let aspace_handle = capability.address_space();
     let mut aspace = aspace_handle.lock();
     if !aspace.can_access_range(start, len, access_flags) {
-        return Err(VmError::AccessDenied);
+        return Err(UserCopyError::AccessDenied);
     }
     aspace
         .populate_area(page_start, page_end - page_start, access_flags)
-        .map_err(|_| VmError::AccessDenied)
+        .map_err(map_populate_error)
 }
 
 fn reject_user_io_pin(counter: &AtomicU64) {
@@ -1044,7 +801,8 @@ struct PreparedUserIoPin {
     range_pin: UserIoRangePin,
 }
 
-fn prepare_user_io_pin(
+fn prepare_user_io_pin_with(
+    capability: &UserMemoryCapability,
     start: usize,
     len: usize,
     access_flags: MappingFlags,
@@ -1067,15 +825,6 @@ fn prepare_user_io_pin(
         return None;
     };
 
-    let Some(curr) = current_may_uninit() else {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-        return None;
-    };
-    let Some(thr) = curr.try_as_thread() else {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-        return None;
-    };
-
     let start_addr = VirtAddr::from(start);
     let page_start = start_addr.align_down_4k();
     let Some(page_end) = super::checked_align_up_4k(end).map(VirtAddr::from) else {
@@ -1083,7 +832,7 @@ fn prepare_user_io_pin(
         return None;
     };
     let page_len = page_end - page_start;
-    let aspace_handle = thr.proc_data.aspace();
+    let aspace_handle = capability.address_space().clone();
     let admission = {
         let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinAdmission);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
@@ -1474,9 +1223,16 @@ impl Drop for PinnedUserSliceMut {
     }
 }
 
-pub fn try_pin_user_slice_from_user(ptr: *const u8, len: usize) -> Option<PinnedUserSlice> {
+/// Attempts a resident contiguous source pin in an explicitly selected
+/// address space.
+pub fn try_pin_user_slice_from_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+) -> Option<PinnedUserSlice> {
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_ATTEMPTS, 1);
-    let prepared = prepare_user_io_pin(ptr as usize, len, MappingFlags::READ, true)?;
+    let prepared =
+        prepare_user_io_pin_with(capability, ptr as usize, len, MappingFlags::READ, true)?;
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
@@ -1489,9 +1245,16 @@ pub fn try_pin_user_slice_from_user(ptr: *const u8, len: usize) -> Option<Pinned
     })
 }
 
-pub fn try_pin_user_slice_to_user(ptr: *mut u8, len: usize) -> Option<PinnedUserSliceMut> {
+/// Attempts a resident contiguous destination pin in an explicitly selected
+/// address space.
+pub fn try_pin_user_slice_to_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *mut u8,
+    len: usize,
+) -> Option<PinnedUserSliceMut> {
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_ATTEMPTS, 1);
-    let prepared = prepare_user_io_pin(ptr as usize, len, MappingFlags::WRITE, true)?;
+    let prepared =
+        prepare_user_io_pin_with(capability, ptr as usize, len, MappingFlags::WRITE, true)?;
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
@@ -1554,11 +1317,14 @@ pub fn pinned_user_mut_segments_are_disjoint(pins: &[PinnedUserSegmentsMut]) -> 
 
 #[cfg(test)]
 mod tests {
+    use axhal::paging::{MappingFlags, PageSize, PagingError};
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
     use super::{
-        USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments,
-        physical_pin_segments_are_disjoint, user_io_pin_scan_chunk_end,
+        FutexMappingNamespace, USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments,
+        UserNofaultError, classify_nofault_page, classify_nofault_query,
+        futex_mapping_namespace_matches, physical_pin_segments_are_disjoint,
+        user_io_pin_scan_chunk_end,
     };
 
     #[test]
@@ -1617,12 +1383,76 @@ mod tests {
         }];
         assert!(!physical_pin_segments_are_disjoint(overflowing.iter()));
     }
+
+    #[test]
+    fn nofault_missing_leaf_requires_task_context_progress() {
+        assert_eq!(
+            classify_nofault_query(PagingError::NotMapped),
+            UserNofaultError::Retry
+        );
+        for error in [
+            PagingError::NoMemory,
+            PagingError::NotAligned,
+            PagingError::AlreadyMapped,
+            PagingError::MappedToHugePage,
+        ] {
+            assert_eq!(classify_nofault_query(error), UserNofaultError::BadAddress);
+        }
+    }
+
+    #[test]
+    fn nofault_writable_cow_leaf_requests_write_fault() {
+        let cow_leaf = MappingFlags::USER | MappingFlags::READ;
+        assert_eq!(
+            classify_nofault_page(cow_leaf, PageSize::Size4K, MappingFlags::WRITE),
+            Err(UserNofaultError::Retry)
+        );
+        assert_eq!(
+            classify_nofault_page(cow_leaf, PageSize::Size4K, MappingFlags::READ),
+            Ok(())
+        );
+        assert_eq!(
+            classify_nofault_page(
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                PageSize::Size4K,
+                MappingFlags::WRITE,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            classify_nofault_page(cow_leaf, PageSize::Size2M, MappingFlags::READ),
+            Err(UserNofaultError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn futex_namespace_race_rejects_private_to_shared_or_unmapped() {
+        assert!(futex_mapping_namespace_matches(
+            FutexMappingNamespace::Private,
+            FutexMappingNamespace::Private,
+        ));
+        assert!(!futex_mapping_namespace_matches(
+            FutexMappingNamespace::Private,
+            FutexMappingNamespace::Shared,
+        ));
+        assert!(!futex_mapping_namespace_matches(
+            FutexMappingNamespace::Private,
+            FutexMappingNamespace::Unmapped,
+        ));
+    }
 }
 
 #[allow(dead_code)]
-pub fn try_pin_user_segments_from_user(ptr: *const u8, len: usize) -> Option<PinnedUserSegments> {
+/// Attempts a resident source scatter/gather pin in an explicitly selected
+/// address space.
+pub fn try_pin_user_segments_from_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+) -> Option<PinnedUserSegments> {
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_ATTEMPTS, 1);
-    let prepared = prepare_user_io_pin(ptr as usize, len, MappingFlags::READ, false)?;
+    let prepared =
+        prepare_user_io_pin_with(capability, ptr as usize, len, MappingFlags::READ, false)?;
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
@@ -1636,9 +1466,16 @@ pub fn try_pin_user_segments_from_user(ptr: *const u8, len: usize) -> Option<Pin
 }
 
 #[allow(dead_code)]
-pub fn try_pin_user_segments_to_user(ptr: *mut u8, len: usize) -> Option<PinnedUserSegmentsMut> {
+/// Attempts a resident destination scatter/gather pin in an explicitly
+/// selected address space.
+pub fn try_pin_user_segments_to_user_with(
+    capability: &UserMemoryCapability,
+    ptr: *mut u8,
+    len: usize,
+) -> Option<PinnedUserSegmentsMut> {
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_ATTEMPTS, 1);
-    let prepared = prepare_user_io_pin(ptr as usize, len, MappingFlags::WRITE, false)?;
+    let prepared =
+        prepare_user_io_pin_with(capability, ptr as usize, len, MappingFlags::WRITE, false)?;
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
@@ -1651,29 +1488,511 @@ pub fn try_pin_user_segments_to_user(ptr: *mut u8, len: usize) -> Option<PinnedU
     })
 }
 
-pub fn check_user_readable(start: usize, len: usize) -> VmResult {
-    populate_user_range(start, len, MappingFlags::READ)
+/// Checks and populates a readable range in an explicitly selected address
+/// space.
+pub fn check_user_readable_with(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+) -> AxResult {
+    populate_user_range_with(capability, start, len, MappingFlags::READ).map_err(map_usercopy_error)
 }
 
-pub fn check_user_writable(start: usize, len: usize) -> VmResult {
-    populate_user_range(start, len, MappingFlags::WRITE)
+/// Failure returned by the locked user-u32 nofault helpers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UserU32NofaultError {
+    /// The address-space/page-table snapshot raced with a mapping change or
+    /// could not be acquired without blocking. The caller must leave any
+    /// queue gates, fault/read in task context, and retry.
+    Retry,
+    /// The integer address is not an aligned, in-range user u32.
+    BadAddress,
 }
 
-#[extern_trait]
-unsafe impl VmIo for Vm {
-    fn new() -> Self {
-        Self
+/// Mapping namespace captured while resolving a non-PRIVATE futex.
+///
+/// A private/COW VMA intentionally produces an address-space-local futex key.
+/// Linux tags that non-PRIVATE resolution with `FUT_OFF_MMSHARED`, so it does
+/// not alias an explicit `FUTEX_PRIVATE_FLAG` key at the same address.  The
+/// mapping namespace is also kept separately so the former can be checked at
+/// publication time; `None` in the shared-backing field must not disable that
+/// check.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FutexMappingNamespace {
+    Private,
+    Shared,
+    Unmapped,
+}
+
+/// Resolves the namespace of one futex word under an already-held address
+/// space guard.  The result deliberately distinguishes an unmapped address
+/// from a private VMA, so a stale private resolution cannot be published
+/// after an unmap/remap race.
+pub fn futex_mapping_namespace_at(aspace: &AddrSpace, start: usize) -> FutexMappingNamespace {
+    let Some(end) = start.checked_add(size_of::<u32>()) else {
+        return FutexMappingNamespace::Unmapped;
+    };
+    let Some(area) = aspace.find_area(VirtAddr::from_usize(start)) else {
+        return FutexMappingNamespace::Unmapped;
+    };
+    if start < area.start().as_usize() || end > area.end().as_usize() {
+        return FutexMappingNamespace::Unmapped;
+    }
+    match area.backend() {
+        Backend::Shared(_) | Backend::File(_) => FutexMappingNamespace::Shared,
+        Backend::Linear(_) | Backend::Cow(_) => FutexMappingNamespace::Private,
+    }
+}
+
+#[inline]
+fn futex_mapping_namespace_matches(
+    expected: FutexMappingNamespace,
+    actual: FutexMappingNamespace,
+) -> bool {
+    expected == actual
+}
+
+/// Validates the mapping identity and reads one futex word while the caller's
+/// address-space guard is held.  A shared futex's expected backing/offset is
+/// part of the same snapshot as the page-table translation; if either changed
+/// after key derivation this returns `Retry`, never a value from the new
+/// mapping.
+pub fn try_read_user_u32_nofault_locked(
+    aspace: &AddrSpace,
+    start: usize,
+    expected_namespace: Option<FutexMappingNamespace>,
+    expected: Option<&SharedFutexKey>,
+) -> Result<u32, UserU32NofaultError> {
+    if start & (size_of::<u32>() - 1) != 0 {
+        return Err(UserU32NofaultError::BadAddress);
+    }
+    validate_futex_mapping_locked(aspace, start, expected_namespace, expected)?;
+    let mut bytes = [0; size_of::<u32>()];
+    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let page_count = prepare_user_nofault_span(
+        aspace,
+        start,
+        size_of::<u32>(),
+        MappingFlags::READ,
+        &mut pages,
+    )
+    .map_err(|error| match error {
+        UserNofaultError::Retry => UserU32NofaultError::Retry,
+        UserNofaultError::BadAddress => UserU32NofaultError::BadAddress,
+    })?;
+    copy_from_user_nofault_pages(start, &mut bytes, &pages[..page_count]);
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+/// Validates one futex mapping under an already-held address-space guard,
+/// without reading its user value.  Requeue/wake paths use this for the target
+/// address so an unconditional operation never faults or samples target data.
+pub fn try_validate_futex_mapping_nofault_locked(
+    aspace: &AddrSpace,
+    start: usize,
+    expected_namespace: Option<FutexMappingNamespace>,
+    expected: Option<&SharedFutexKey>,
+) -> Result<(), UserU32NofaultError> {
+    if start & (size_of::<u32>() - 1) != 0 {
+        return Err(UserU32NofaultError::BadAddress);
+    }
+    validate_futex_mapping_locked(aspace, start, expected_namespace, expected)?;
+    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    prepare_user_nofault_span(
+        aspace,
+        start,
+        size_of::<u32>(),
+        MappingFlags::READ,
+        &mut pages,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        UserNofaultError::Retry => UserU32NofaultError::Retry,
+        UserNofaultError::BadAddress => UserU32NofaultError::BadAddress,
+    })
+}
+
+fn validate_futex_mapping_locked(
+    aspace: &AddrSpace,
+    start: usize,
+    expected_namespace: Option<FutexMappingNamespace>,
+    expected: Option<&SharedFutexKey>,
+) -> Result<(), UserU32NofaultError> {
+    let Some(expected_namespace) = expected_namespace else {
+        // Explicit FUTEX_PRIVATE operations intentionally retain Linux's
+        // address-space/address semantics and do not inspect the VMA here.
+        return Ok(());
+    };
+
+    if !futex_mapping_namespace_matches(
+        expected_namespace,
+        futex_mapping_namespace_at(aspace, start),
+    ) {
+        return Err(UserU32NofaultError::Retry);
     }
 
-    fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
-        populate_user_range(start, buf.len(), MappingFlags::READ)?;
-        copy_user_bytes(buf.as_mut_ptr() as *mut _, start as _, buf.len())
+    if expected_namespace == FutexMappingNamespace::Shared {
+        let Some(expected) = expected else {
+            return Err(UserU32NofaultError::Retry);
+        };
+        let Some((actual_id, actual_offset)) = aspace.futex_shared_id_at(start) else {
+            return Err(UserU32NofaultError::Retry);
+        };
+        if actual_id != expected.backing().id() || actual_offset != expected.offset() {
+            return Err(UserU32NofaultError::Retry);
+        }
+    }
+    Ok(())
+}
+
+/// Maximum size accepted by the bounded fixed-span nofault helpers.
+pub const USER_NOFAULT_MAX_SPAN: usize = 32;
+
+const USER_NOFAULT_PAGE_SLOTS: usize = 2;
+
+/// Failure returned by the bounded fixed-span nofault helpers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UserNofaultError {
+    /// The address-space lock or a resident page could not be acquired
+    /// without blocking. The caller must return to task context and retry.
+    Retry,
+    /// The span is outside the selected user address space, has no suitable
+    /// VMA, has an unrecoverable page-table state, or lacks the requested
+    /// user/PTE permission.
+    BadAddress,
+}
+
+/// A translation captured while the selected address-space lock is held.
+#[derive(Clone, Copy)]
+struct NofaultPage {
+    start: usize,
+    paddr: memory_addr::PhysAddr,
+}
+
+impl NofaultPage {
+    const EMPTY: Self = Self {
+        start: 0,
+        paddr: memory_addr::PhysAddr::from_usize(0),
+    };
+}
+
+/// Only an absent leaf is recoverable by the task-context population pass.
+/// Other page-table errors are terminal for this bounded nofault operation.
+#[inline]
+fn classify_nofault_query(error: PagingError) -> UserNofaultError {
+    match error {
+        PagingError::NotMapped => UserNofaultError::Retry,
+        PagingError::NoMemory
+        | PagingError::NotAligned
+        | PagingError::AlreadyMapped
+        | PagingError::MappedToHugePage => UserNofaultError::BadAddress,
+    }
+}
+
+/// A writable VMA with a read-only user leaf is the post-fork COW state. It
+/// must leave the IRQ-safe transaction for `populate_area(WRITE)`; every other
+/// permission or page-size mismatch is a one-shot fault.
+#[inline]
+fn classify_nofault_page(
+    pte_flags: MappingFlags,
+    page_size: PageSize,
+    access_flags: MappingFlags,
+) -> Result<(), UserNofaultError> {
+    if page_size != PageSize::Size4K || !pte_flags.contains(MappingFlags::USER) {
+        return Err(UserNofaultError::BadAddress);
+    }
+    if pte_flags.contains(access_flags) {
+        return Ok(());
+    }
+    if access_flags.contains(MappingFlags::WRITE) {
+        return Err(UserNofaultError::Retry);
+    }
+    Err(UserNofaultError::BadAddress)
+}
+
+/// Checks and captures every page needed by one fixed-span operation.
+///
+/// The returned array is stack-backed and has exactly two slots. `len` is
+/// restricted to the rseq field sizes (4, 8, or 32 bytes), so a valid span
+/// can never need more than two 4 KiB pages. A missing PTE is intentionally a
+/// retry: this operation never populates or faults a page.
+fn prepare_user_nofault_span(
+    aspace: &AddrSpace,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+    pages: &mut [NofaultPage; USER_NOFAULT_PAGE_SLOTS],
+) -> Result<usize, UserNofaultError> {
+    if !matches!(len, 4 | 8 | USER_NOFAULT_MAX_SPAN) {
+        return Err(UserNofaultError::BadAddress);
+    }
+    let end = start.checked_add(len).ok_or(UserNofaultError::BadAddress)?;
+    if !aspace.contains_range(VirtAddr::from(start), len) {
+        return Err(UserNofaultError::BadAddress);
     }
 
-    fn write(&mut self, start: usize, buf: &[u8]) -> VmResult {
-        populate_user_range(start, buf.len(), MappingFlags::WRITE)?;
-        copy_user_bytes(start as _, buf.as_ptr() as *const _, buf.len())
+    // A VMA check is separate from PTE translation: a registered rseq area or
+    // descriptor may be in a valid VMA while one of its pages is still
+    // nonresident. Requiring USER here also prevents a kernel-only mapping
+    // accidentally exposed through a user virtual address from passing the
+    // nofault gate.
+    let required_vma_flags = access_flags | MappingFlags::USER;
+    if !aspace.can_access_range(VirtAddr::from(start), len, required_vma_flags) {
+        return Err(UserNofaultError::BadAddress);
     }
+
+    let first_page = start & !(PAGE_SIZE_4K - 1);
+    let last_page = (end - 1) & !(PAGE_SIZE_4K - 1);
+    let page_count = if first_page == last_page { 1 } else { 2 };
+    debug_assert!(page_count <= USER_NOFAULT_PAGE_SLOTS);
+
+    for (index, page) in pages[..page_count].iter_mut().enumerate() {
+        let page_start = first_page + index * PAGE_SIZE_4K;
+        let (paddr, pte_flags, page_size) =
+            match aspace.page_table().query(VirtAddr::from(page_start)) {
+                Ok(translation) => translation,
+                // A nonresident page is recoverable by a task-context fault, but
+                // this bounded operation must not perform that fault itself.
+                Err(error) => return Err(classify_nofault_query(error)),
+            };
+        classify_nofault_page(pte_flags, page_size, access_flags)?;
+        *page = NofaultPage {
+            start: page_start,
+            paddr,
+        };
+    }
+    Ok(page_count)
+}
+
+/// Copies one already-resident fixed-size user span into kernel storage.
+///
+/// The address-space `Arc<Mutex<AddrSpace>>` is explicit so callers can select
+/// the process image before entering an IRQ/queue gate. This helper uses
+/// `try_lock`, performs no allocation, blocking, population, or fault, and
+/// holds the same mutex guard across both translation and copy. Supported
+/// lengths are exactly 4, 8, and 32 bytes, covering rseq scalar fields and
+/// area/descriptor records.
+pub fn try_read_user_nofault(
+    start: usize,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    dst: &mut [u8],
+) -> Result<(), UserNofaultError> {
+    if !matches!(dst.len(), 4 | 8 | USER_NOFAULT_MAX_SPAN) {
+        return Err(UserNofaultError::BadAddress);
+    }
+    let Some(aspace) = aspace_handle.try_lock() else {
+        return Err(UserNofaultError::Retry);
+    };
+    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let page_count =
+        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, &mut pages)?;
+    copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
+    Ok(())
+}
+
+/// Commits one fixed-size kernel span into already-resident user memory.
+///
+/// Every VMA/PTE translation and write permission is checked before the first
+/// destination byte is changed. Consequently a missing or read-only second
+/// page cannot leave a prefix of a 32-byte descriptor or area update visible.
+/// The same address-space mutex guard remains held through validation and all
+/// copies, so concurrent unmap/remap cannot invalidate the captured physical
+/// addresses between the preflight and commit phases.
+pub fn try_write_user_nofault(
+    start: usize,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    src: &[u8],
+) -> Result<(), UserNofaultError> {
+    if !matches!(src.len(), 4 | 8 | USER_NOFAULT_MAX_SPAN) {
+        return Err(UserNofaultError::BadAddress);
+    }
+    let Some(aspace) = aspace_handle.try_lock() else {
+        return Err(UserNofaultError::Retry);
+    };
+    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let page_count =
+        prepare_user_nofault_span(&aspace, start, src.len(), MappingFlags::WRITE, &mut pages)?;
+    copy_to_user_nofault_pages(start, src, &pages[..page_count]);
+    Ok(())
+}
+
+/// A bounded user-memory transaction which keeps one address-space guard for
+/// every read, preflight, and write in the caller's operation.
+///
+/// The transaction is intentionally small and policy-neutral. It performs no
+/// allocation, population, blocking, or page fault. Callers must finish all
+/// reads before the first write and preflight every destination span before
+/// committing a multi-step protocol. Because the address-space guard remains
+/// held for the complete closure, an unmap/remap cannot invalidate a span
+/// between its preflight and copy.
+pub struct UserNofaultTransaction<'a> {
+    aspace: &'a AddrSpace,
+}
+
+impl UserNofaultTransaction<'_> {
+    /// Copies one fixed-size, resident user span into kernel storage.
+    pub fn read(&self, start: usize, dst: &mut [u8]) -> Result<(), UserNofaultError> {
+        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        let page_count = prepare_user_nofault_span(
+            self.aspace,
+            start,
+            dst.len(),
+            MappingFlags::READ,
+            &mut pages,
+        )?;
+        copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
+        Ok(())
+    }
+
+    /// Checks one fixed-size destination span without changing user memory.
+    pub fn preflight_write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
+        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        prepare_user_nofault_span(
+            self.aspace,
+            start,
+            src.len(),
+            MappingFlags::WRITE,
+            &mut pages,
+        )?;
+        Ok(())
+    }
+
+    /// Copies one fixed-size kernel span into a destination previously
+    /// preflighted by this transaction.
+    pub fn write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
+        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        let page_count = prepare_user_nofault_span(
+            self.aspace,
+            start,
+            src.len(),
+            MappingFlags::WRITE,
+            &mut pages,
+        )?;
+        copy_to_user_nofault_pages(start, src, &pages[..page_count]);
+        Ok(())
+    }
+}
+
+/// Executes one bounded user-memory transaction while holding one explicit
+/// address-space `try_lock` guard.
+pub fn try_user_nofault_transaction<R>(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    operation: impl FnOnce(&UserNofaultTransaction<'_>) -> Result<R, UserNofaultError>,
+) -> Result<R, UserNofaultError> {
+    let Some(aspace) = aspace_handle.try_lock() else {
+        return Err(UserNofaultError::Retry);
+    };
+    let transaction = UserNofaultTransaction { aspace: &aspace };
+    operation(&transaction)
+}
+
+/// Populates one bounded user span in task context for a nofault retry.
+///
+/// Unlike the nofault transaction, this helper may block, allocate page-table
+/// and data frames, and complete a writable COW fault. It is deliberately
+/// passed the address-space handle selected by the caller so a retry cannot
+/// accidentally fault an unrelated image after an exec transition. Any
+/// failure is terminal for the return hook; only the nofault snapshot itself
+/// reports [`UserNofaultError::Retry`].
+pub(crate) fn fault_user_range_task(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+) -> Result<(), UserNofaultError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = start.checked_add(len).ok_or(UserNofaultError::BadAddress)?;
+    check_access(start, len).map_err(|_| UserNofaultError::BadAddress)?;
+
+    let page_start = VirtAddr::from(start).align_down_4k();
+    let page_end =
+        VirtAddr::from(super::checked_align_up_4k(end).ok_or(UserNofaultError::BadAddress)?);
+    let mut aspace = aspace_handle.lock();
+    if !aspace.contains_range(VirtAddr::from(start), len)
+        || !aspace.can_access_range(
+            VirtAddr::from(start),
+            len,
+            access_flags | MappingFlags::USER,
+        )
+    {
+        return Err(UserNofaultError::BadAddress);
+    }
+    aspace
+        .populate_area(page_start, page_end - page_start, access_flags)
+        .map_err(|_| UserNofaultError::BadAddress)
+}
+
+/// Reads one bounded span after [`fault_user_range_task`] has completed.
+///
+/// This is the blocking/task-context counterpart to `try_read_user_nofault`.
+/// It keeps the address-space guard across translation and the physical copy,
+/// so recovery code can discover a newly resident descriptor without
+/// reopening the nofault race window.
+pub(crate) fn read_user_nofault_task(
+    start: usize,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    dst: &mut [u8],
+) -> Result<(), UserNofaultError> {
+    if !matches!(dst.len(), 4 | 8 | USER_NOFAULT_MAX_SPAN) {
+        return Err(UserNofaultError::BadAddress);
+    }
+    let aspace = aspace_handle.lock();
+    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let page_count =
+        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, &mut pages)?;
+    copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
+    Ok(())
+}
+
+fn copy_from_user_nofault_pages(start: usize, dst: &mut [u8], pages: &[NofaultPage]) {
+    let mut copied = 0;
+    for page in pages {
+        let offset = start.saturating_sub(page.start);
+        let count = (PAGE_SIZE_4K - offset).min(dst.len() - copied);
+        let source = phys_to_virt(page.paddr + offset).as_ptr();
+        // SAFETY: `prepare_user_nofault_span` validated every page and the
+        // caller still holds the address-space mutex guard.
+        unsafe {
+            ptr::copy_nonoverlapping(source, dst.as_mut_ptr().add(copied), count);
+        }
+        copied += count;
+        if copied == dst.len() {
+            break;
+        }
+    }
+    debug_assert_eq!(copied, dst.len());
+}
+
+fn copy_to_user_nofault_pages(start: usize, src: &[u8], pages: &[NofaultPage]) {
+    let mut copied = 0;
+    for page in pages {
+        let offset = start.saturating_sub(page.start);
+        let count = (PAGE_SIZE_4K - offset).min(src.len() - copied);
+        let destination = phys_to_virt(page.paddr + offset).as_mut_ptr();
+        // SAFETY: `prepare_user_nofault_span` prevalidated every page's write
+        // permission before this first or subsequent destination copy.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination, count);
+        }
+        copied += count;
+        if copied == src.len() {
+            break;
+        }
+    }
+    debug_assert_eq!(copied, src.len());
+}
+
+/// Checks and populates a writable range in an explicitly selected address
+/// space.
+pub fn check_user_writable_with(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+) -> AxResult {
+    populate_user_range_with(capability, start, len, MappingFlags::WRITE)
+        .map_err(map_usercopy_error)
 }
 
 /// A read-only buffer in the VM's memory.
@@ -1681,6 +2000,8 @@ unsafe impl VmIo for Vm {
 /// It implements the `axio::Read` trait, allowing it to be used with other I/O
 /// operations.
 pub struct VmBytes {
+    /// Explicit address-space capability used for every operation.
+    pub capability: UserMemoryCapability,
     /// The pointer to the start of the buffer in the VM's memory.
     pub ptr: *const u8,
     /// The length of the buffer.
@@ -1689,13 +2010,17 @@ pub struct VmBytes {
 
 impl VmBytes {
     /// Creates a new `VmBytes` from a raw pointer and a length.
-    pub fn new(ptr: *const u8, len: usize) -> Self {
-        Self { ptr, len }
+    pub fn new(capability: UserMemoryCapability, ptr: *const u8, len: usize) -> Self {
+        Self {
+            capability,
+            ptr,
+            len,
+        }
     }
 
     /// Casts the `VmBytes` to a mutable `VmBytesMut`.
     pub fn cast_mut(&self) -> VmBytesMut {
-        VmBytesMut::new(self.ptr as *mut u8, self.len)
+        VmBytesMut::new(self.capability.clone(), self.ptr as *mut u8, self.len)
     }
 }
 
@@ -1703,9 +2028,12 @@ impl Read for VmBytes {
     /// Reads bytes from the VM's memory into the provided buffer.
     fn read(&mut self, buf: &mut [u8]) -> axio::Result<usize> {
         let len = self.len.min(buf.len());
-        vm_read_slice(self.ptr, unsafe {
-            transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buf[..len])
-        })?;
+        let destination = unsafe {
+            slice::from_raw_parts_mut(buf[..len].as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
+        };
+        self.capability
+            .read_slice(self.ptr, destination)
+            .map_err(map_usercopy_error)?;
         self.ptr = self.ptr.wrapping_add(len);
         self.len -= len;
         Ok(len)
@@ -1723,6 +2051,8 @@ impl IoBuf for VmBytes {
 /// It implements the `axio::Write` trait, allowing it to be used with other I/O
 /// operations.
 pub struct VmBytesMut {
+    /// Explicit address-space capability used for every operation.
+    pub capability: UserMemoryCapability,
     /// The pointer to the start of the buffer in the VM's memory.
     pub ptr: *mut u8,
     /// The length of the buffer.
@@ -1731,13 +2061,17 @@ pub struct VmBytesMut {
 
 impl VmBytesMut {
     /// Creates a new `VmBytesMut` from a raw pointer and a length.
-    pub fn new(ptr: *mut u8, len: usize) -> Self {
-        Self { ptr, len }
+    pub fn new(capability: UserMemoryCapability, ptr: *mut u8, len: usize) -> Self {
+        Self {
+            capability,
+            ptr,
+            len,
+        }
     }
 
     /// Casts the `VmBytesMut` to a read-only `VmBytes`.
     pub fn cast_const(&self) -> VmBytes {
-        VmBytes::new(self.ptr, self.len)
+        VmBytes::new(self.capability.clone(), self.ptr, self.len)
     }
 }
 
@@ -1745,7 +2079,9 @@ impl Write for VmBytesMut {
     /// Writes bytes from the provided buffer into the VM's memory.
     fn write(&mut self, buf: &[u8]) -> axio::Result<usize> {
         let len = self.len.min(buf.len());
-        vm_write_slice(self.ptr, &buf[..len])?;
+        self.capability
+            .write_bytes(self.ptr as usize, &buf[..len])
+            .map_err(map_usercopy_error)?;
         self.ptr = self.ptr.wrapping_add(len);
         self.len -= len;
         Ok(len)

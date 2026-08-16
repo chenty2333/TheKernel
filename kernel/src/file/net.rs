@@ -7,9 +7,12 @@ use axnet::{
     options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::O_PATH;
+use linux_raw_sys::{
+    general::O_PATH,
+    ioctl::{FIONREAD, TIOCINQ},
+};
 
-use super::{File, FileHandle, FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
+use super::{File, FileHandle, FileLike, IoctlContext, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
     bpf::{prog::BpfProgram, vm::BpfVm},
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
@@ -159,8 +162,11 @@ impl FileLike for Socket {
             .set_option(SetSocketOption::NonBlocking(&nonblocking))
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        socket_ifreq_ioctl(self.net_ns.stack(), cmd, arg)
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if cmd == FIONREAD || cmd == TIOCINQ {
+            return self.inner.recv_pending_len();
+        }
+        socket_ifreq_ioctl(context, self.net_ns.stack(), cmd, arg)
     }
 
     fn path(&self) -> AxResult<Cow<'_, str>> {

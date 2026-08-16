@@ -26,8 +26,8 @@ use linux_raw_sys::general::CAP_SYS_ADMIN;
 use spin::Lazy;
 #[cfg(all(test, not(target_os = "none")))]
 use spin::Mutex;
-use starry_process::Pid;
-use starry_signal::{SignalInfo, Signo};
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::pseudo_stat_fs;
 use crate::{
@@ -319,7 +319,7 @@ impl CgroupFs {
         inodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         let ino = self
             .next_inode
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| VfsError::StorageFull)?;

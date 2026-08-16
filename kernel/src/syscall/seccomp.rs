@@ -10,8 +10,6 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axtask::current;
 use linux_raw_sys::general::CAP_SYS_ADMIN;
-use starry_signal::{SignalInfo, Signo};
-use starry_vm::vm_read_slice;
 use syscalls::Sysno;
 use thekernel_linux_seccomp::{
     ActionClass, BPF_MAXINSNS, ClassicBpfInstruction, FilterInstallError, FilterMetadata,
@@ -20,15 +18,18 @@ use thekernel_linux_seccomp::{
     SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT, SeccompData, SeccompMode,
     StateTransitionError, VerifiedProgram,
 };
+use thekernel_linux_signal::{SignalInfo, Signo};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
-use crate::task::{
-    AsThread, do_exit, fail_closed_exit, force_signal_current_thread, ns_capable,
-    seccomp_filter_budget,
+use crate::{
+    mm::map_usercopy_error,
+    task::{
+        AsThread, do_exit, fail_closed_exit, force_signal_current_thread, ns_capable,
+        seccomp_filter_budget,
+    },
 };
 
-/// Host-only audit architecture used by kernel unit builds. The released bare
-/// metal consumers use the RV64 and LoongArch64 constants from Layer 2.
-#[cfg(target_arch = "x86_64")]
+/// Audit architecture used by the x86_64 syscall ABI.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
 /// Global bound for seccomp diagnostic records emitted from syscall entry.
@@ -44,44 +45,37 @@ static SECCOMP_LOG_SUPPRESSION_REPORTED: AtomicBool = AtomicBool::new(false);
 /// All-integer mirror of Linux `struct sock_fprog` on the supported 64-bit
 /// architectures. Arbitrary userspace bytes are valid for every field.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
 struct RawSockFprog {
     length: u16,
     padding: [u8; 6],
-    filter: usize,
+    filter: u64,
 }
 
 const _: [(); 16] = [(); mem::size_of::<RawSockFprog>()];
 const _: [(); 8] = [(); mem::align_of::<RawSockFprog>()];
 const _: [(); 8] = [(); mem::offset_of!(RawSockFprog, filter)];
+const _: [(); 8] = [(); mem::size_of::<ClassicBpfInstruction>()];
+const _: [(); 4] = [(); mem::align_of::<ClassicBpfInstruction>()];
+const _: [(); 0] = [(); mem::offset_of!(ClassicBpfInstruction, code)];
+const _: [(); 2] = [(); mem::offset_of!(ClassicBpfInstruction, jt)];
+const _: [(); 3] = [(); mem::offset_of!(ClassicBpfInstruction, jf)];
+const _: [(); 4] = [(); mem::offset_of!(ClassicBpfInstruction, k)];
 
 impl RawSockFprog {
-    fn read_from_user(pointer: *const u8) -> AxResult<Self> {
-        let mut bytes = [0u8; mem::size_of::<Self>()];
+    fn read_from_user<M: UserMemory + ?Sized>(
+        memory: &mut UserMemoryContext<'_, M>,
+        pointer: usize,
+    ) -> AxResult<Self> {
         // Linux `copy_from_user` accepts unaligned fprog pointers. Copy as
         // bytes so the Rust adapter does not accidentally impose a stronger
-        // typed-pointer alignment contract.
-        // SAFETY: `MaybeUninit<u8>` and `u8` have identical layout, and the
-        // destination covers the complete local byte array.
-        vm_read_slice(pointer, unsafe {
-            core::slice::from_raw_parts_mut(
-                bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                bytes.len(),
-            )
-        })?;
-        let length = u16::from_ne_bytes([bytes[0], bytes[1]]);
-        let filter = usize::from_ne_bytes(
-            bytes[8..16]
-                .try_into()
-                .expect("64-bit fprog pointer occupies eight bytes"),
-        );
-        Ok(Self {
-            length,
-            padding: bytes[2..8]
-                .try_into()
-                .expect("fprog padding occupies six bytes"),
-            filter,
-        })
+        // typed-pointer alignment contract. `RawSockFprog` is an explicit
+        // integer/padding mirror of the 64-bit Linux UAPI object, so reading
+        // it through the byte-addressed context is valid even when `pointer`
+        // is unaligned.
+        (pointer as *const Self)
+            .vm_read(memory)
+            .map_err(map_usercopy_error)
     }
 }
 
@@ -110,7 +104,10 @@ fn map_transition_error(error: StateTransitionError) -> AxError {
     }
 }
 
-fn copy_filter_program(header: RawSockFprog) -> AxResult<Vec<ClassicBpfInstruction>> {
+fn copy_filter_program<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    header: RawSockFprog,
+) -> AxResult<Vec<ClassicBpfInstruction>> {
     let length = usize::from(header.length);
     // Linux's classic-BPF basic check rejects a NULL instruction pointer as
     // EINVAL before attempting copy_from_user. Non-NULL pointers remain byte
@@ -124,20 +121,24 @@ fn copy_filter_program(header: RawSockFprog) -> AxResult<Vec<ClassicBpfInstructi
         .try_reserve_exact(length)
         .map_err(|_| AxError::NoMemory)?;
     instructions.resize(length, ClassicBpfInstruction::default());
-    let byte_length = length
-        .checked_mul(mem::size_of::<ClassicBpfInstruction>())
-        .ok_or(AxError::NoMemory)?;
-    // SAFETY: the vector owns `length` initialized instructions, each raw
-    // instruction consists exclusively of integer fields, and the byte slice
-    // spans exactly that allocation. `vm_read_slice` overwrites every byte or
-    // returns an error; no reference to the buffer escapes during the copy.
+    // SAFETY: `ClassicBpfInstruction` is the eight-byte integer-only Linux
+    // `sock_filter` representation (layout asserted below). The provider
+    // initializes every byte or returns an error; no reference to the buffer
+    // escapes during the copy.
     let destination = unsafe {
         core::slice::from_raw_parts_mut(
-            instructions.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            byte_length,
+            instructions
+                .as_mut_ptr()
+                .cast::<MaybeUninit<ClassicBpfInstruction>>(),
+            length,
         )
     };
-    vm_read_slice(header.filter as *const u8, destination)?;
+    memory
+        .read_slice(
+            header.filter as usize as *const ClassicBpfInstruction,
+            destination,
+        )
+        .map_err(map_usercopy_error)?;
     Ok(instructions)
 }
 
@@ -148,7 +149,11 @@ fn filter_install_permitted() -> bool {
     credential.no_new_privs() || ns_capable(&credential, credential.user_ns(), CAP_SYS_ADMIN)
 }
 
-fn install_filter(flags: u32, args: *const ()) -> AxResult<isize> {
+fn install_filter<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    flags: u32,
+    args: *const (),
+) -> AxResult<isize> {
     // Phase one intentionally supports task-local installation only. TSYNC,
     // NEW_LISTENER, LOG-at-install and speculative flags require their full
     // transactions/lifecycles and are rejected rather than partially faked.
@@ -159,7 +164,7 @@ fn install_filter(flags: u32, args: *const ()) -> AxResult<isize> {
     // Linux copies the fprog header and validates its length before checking
     // no_new_privs/CAP_SYS_ADMIN, but performs that admission before copying
     // and verifying the instruction array.
-    let header = RawSockFprog::read_from_user(args.cast())?;
+    let header = RawSockFprog::read_from_user(memory, args as usize)?;
     let length = usize::from(header.length);
     if length == 0 || length > BPF_MAXINSNS {
         return Err(AxError::InvalidInput);
@@ -168,7 +173,7 @@ fn install_filter(flags: u32, args: *const ()) -> AxResult<isize> {
         return Err(LinuxError::EACCES.into());
     }
 
-    let instructions = copy_filter_program(header)?;
+    let instructions = copy_filter_program(memory, header)?;
     let program = VerifiedProgram::try_from_vec(instructions).map_err(map_program_error)?;
 
     let curr = current();
@@ -195,17 +200,18 @@ fn enter_strict(flags: u32, args: *const ()) -> AxResult<isize> {
     Ok(0)
 }
 
-fn get_action_available(flags: u32, args: *const ()) -> AxResult<isize> {
+fn get_action_available<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    flags: u32,
+    args: *const (),
+) -> AxResult<isize> {
     if flags != 0 {
         return Err(AxError::InvalidInput);
     }
-    let mut bytes = [0u8; mem::size_of::<u32>()];
     // As with the fprog header, Linux accepts an unaligned query pointer.
-    // SAFETY: the destination is the complete local byte array.
-    vm_read_slice(args.cast(), unsafe {
-        core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(), bytes.len())
-    })?;
-    let action = u32::from_ne_bytes(bytes);
+    let action = (args as usize as *const u32)
+        .vm_read(memory)
+        .map_err(map_usercopy_error)?;
     match action {
         SECCOMP_RET_KILL_PROCESS
         | SECCOMP_RET_KILL_THREAD
@@ -218,11 +224,16 @@ fn get_action_available(flags: u32, args: *const ()) -> AxResult<isize> {
 }
 
 /// Implements the Linux `seccomp(2)` operation boundary.
-pub fn sys_seccomp(op: u32, flags: u32, args: *const ()) -> AxResult<isize> {
+pub fn sys_seccomp<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    op: u32,
+    flags: u32,
+    args: *const (),
+) -> AxResult<isize> {
     match op {
         SECCOMP_SET_MODE_STRICT => enter_strict(flags, args),
-        SECCOMP_SET_MODE_FILTER => install_filter(flags, args),
-        SECCOMP_GET_ACTION_AVAIL => get_action_available(flags, args),
+        SECCOMP_SET_MODE_FILTER => install_filter(memory, flags, args),
+        SECCOMP_GET_ACTION_AVAIL => get_action_available(memory, flags, args),
         SECCOMP_GET_NOTIF_SIZES => {
             if flags != 0 {
                 Err(AxError::InvalidInput)
@@ -236,31 +247,24 @@ pub fn sys_seccomp(op: u32, flags: u32, args: *const ()) -> AxResult<isize> {
 }
 
 /// Implements the `PR_SET_SECCOMP` compatibility entry point.
-pub(crate) fn sys_prctl_set_seccomp(mode: usize, args: *const ()) -> AxResult<isize> {
+pub(crate) fn sys_prctl_set_seccomp<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    mode: usize,
+    args: *const (),
+) -> AxResult<isize> {
     match mode {
         value if value == SeccompMode::Strict as usize => {
             // Linux has always ignored prctl's optional filter argument for
             // strict mode, even though seccomp(2) requires a NULL `uargs`.
-            sys_seccomp(SECCOMP_SET_MODE_STRICT, 0, core::ptr::null())
+            sys_seccomp(memory, SECCOMP_SET_MODE_STRICT, 0, core::ptr::null())
         }
         value if value == SeccompMode::Filter as usize => {
-            sys_seccomp(SECCOMP_SET_MODE_FILTER, 0, args)
+            sys_seccomp(memory, SECCOMP_SET_MODE_FILTER, 0, args)
         }
         _ => Err(AxError::InvalidInput),
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-const fn current_audit_architecture() -> u32 {
-    thekernel_linux_seccomp::AUDIT_ARCH_RISCV64
-}
-
-#[cfg(target_arch = "loongarch64")]
-const fn current_audit_architecture() -> u32 {
-    thekernel_linux_seccomp::AUDIT_ARCH_LOONGARCH64
-}
-
-#[cfg(target_arch = "x86_64")]
 const fn current_audit_architecture() -> u32 {
     AUDIT_ARCH_X86_64
 }
@@ -295,7 +299,7 @@ fn strict_allows(raw_syscall: usize) -> bool {
 
 fn bounded_log(data: &SeccompData, action: u32) {
     if SECCOMP_LOG_RECORDS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             (used < SECCOMP_LOG_RECORD_LIMIT).then_some(used + 1)
         })
         .is_ok()
@@ -319,21 +323,11 @@ fn terminate_for_seccomp(signo: Signo, group_exit: bool) {
 }
 
 fn rollback_seccomp_syscall_frame(uctx: &mut UserContext, data: &SeccompData, _raw_syscall: usize) {
-    // TheKernel's stable RV64/LoongArch64 profile restores the architecture
-    // syscall frame before TRAP and every terminal filter-action KILL path.
-    // Linux restores TRAP and KILL branches that reach forced SIGSYS/core
-    // handling, but has a non-final KILL_THREAD shortcut which exits without
-    // rollback. Keeping one explicit TheKernel rule makes the observable frame
-    // contract independent of that core-selection detail. RV64 and
-    // LoongArch64 return the original first argument in a0; x86_64 exists only
-    // for host unit builds and restores the raw syscall-number register in RAX.
-    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-    uctx.set_arg0(data.arguments[0] as usize);
-    #[cfg(target_arch = "x86_64")]
-    {
-        let _ = data;
-        uctx.set_retval(_raw_syscall);
-    }
+    // Linux restores the syscall frame before TRAP and every terminal
+    // filter-action KILL path. Keep the x86_64 syscall-number register
+    // available to the signal/core handling path.
+    let _ = data;
+    uctx.set_retval(_raw_syscall);
 }
 
 /// Applies the calling task's exact immutable seccomp snapshot before syscall
@@ -478,9 +472,6 @@ mod tests {
 
         rollback_seccomp_syscall_frame(&mut context, &data, raw_syscall);
 
-        #[cfg(target_arch = "x86_64")]
         assert_eq!(context.retval(), Sysno::getppid as usize);
-        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-        assert_eq!(context.arg0(), 0xfeed_beef);
     }
 }

@@ -19,7 +19,6 @@ use linux_raw_sys::{
         SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use super::{
     SocketSyscallSnapshot,
@@ -33,7 +32,7 @@ use crate::{
         PreparedSocketAddress, Socket, SocketBackendKind, af_alg, close_file_like,
         packet_socket::packet_error, permission::VfsSecurityContext, reserve_fd,
     },
-    mm::{UserConstPtr, UserPtr},
+    mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
         NetworkNamespace, ns_capable,
         security::{SocketCreateSpec, SocketListenBacklog, SocketSecurityContext, dispatch_socket},
@@ -342,14 +341,19 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)
 }
 
-pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+pub fn sys_bind(
+    capability: UserMemoryCapability,
+    fd: i32,
+    addr: UserConstPtr<sockaddr>,
+    addrlen: u32,
+) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let actor = snapshot.actor();
     let socket_ref = pinned.security_ref()?;
     match pinned.backend()? {
         SocketBackendKind::AfAlg => {
-            let addr = af_alg::SockAddrAlg::read_from_user(addr, addrlen)?;
+            let addr = af_alg::SockAddrAlg::read_from_user(&capability, addr, addrlen)?;
             debug!("sys_bind <= fd: {fd}, af_alg: {addr:?}");
             let prepared = PreparedSocketAddress::AfAlg(addr);
             dispatch_socket(&SocketSecurityContext::bind(
@@ -371,8 +375,11 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
                 // Every byte is copied into the MaybeUninit storage before
                 // success, and SockaddrNl contains only integer fields for which
                 // every bit pattern is valid.
-                (addr.address().as_usize() as *const crate::file::netlink::SockaddrNl)
-                    .vm_read_uninit()?
+                capability
+                    .read_value_uninit(
+                        addr.address().as_usize() as *const crate::file::netlink::SockaddrNl
+                    )
+                    .map_err(map_usercopy_error)?
                     .assume_init()
             };
             if addr.nl_family as u32 != AF_NETLINK {
@@ -393,7 +400,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
             pinned.netlink()?.bind(port_id, addr.nl_groups)?;
         }
         SocketBackendKind::Packet => {
-            let address = snapshot_address(addr, addrlen)?;
+            let address = snapshot_address(&capability, addr, addrlen)?;
             let prepared = PreparedSocketAddress::Packet(address);
             dispatch_socket(&SocketSecurityContext::bind(
                 actor,
@@ -409,7 +416,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
-            let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
+            let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
             debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
             let prepared = PreparedSocketAddress::Network(addr);
             dispatch_socket(&SocketSecurityContext::bind(
@@ -443,7 +450,12 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
     Ok(0)
 }
 
-pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+pub fn sys_connect(
+    capability: UserMemoryCapability,
+    fd: i32,
+    addr: UserConstPtr<sockaddr>,
+    addrlen: u32,
+) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     // Pin the open file description once. Address decoding intentionally
     // remains before the ENOTSOCK downcast for the ordinary connect path, but
@@ -455,7 +467,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
         // Linux's generic connect layer copies the complete bounded address,
         // runs the security hook, and only then reaches sock_no_connect.
         // It does not impose sockaddr_ll bind/send validation here.
-        let address = snapshot_address(addr, addrlen)?;
+        let address = snapshot_address(&capability, addr, addrlen)?;
         let actor = snapshot.actor();
         let socket_ref = pinned.security_ref()?;
         let prepared = PreparedSocketAddress::Packet(address);
@@ -469,7 +481,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
     }
 
     if addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
-        && super::addr::read_family(addr, addrlen)? as u32 == AF_UNSPEC
+        && super::addr::read_family(&capability, addr, addrlen)? as u32 == AF_UNSPEC
     {
         debug!("sys_connect <= fd: {fd}, addr: AF_UNSPEC");
         let socket = pinned.network()?;
@@ -486,7 +498,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
         return Ok(0);
     }
 
-    let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
+    let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
     debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
 
     let socket = pinned.network()?;
@@ -599,14 +611,16 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
 }
 
 pub fn sys_accept(
+    capability: UserMemoryCapability,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    sys_accept4(fd, addr, addrlen, 0)
+    sys_accept4(capability, fd, addr, addrlen, 0)
 }
 
 pub fn sys_accept4(
+    capability: UserMemoryCapability,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
@@ -648,7 +662,9 @@ pub fn sys_accept4(
             &accepted_ref,
         ))?;
         if !addr.is_null() {
-            (addrlen.address().as_usize() as *mut socklen_t).vm_write(0)?;
+            capability
+                .write_value(addrlen.address().as_usize() as *mut socklen_t, 0)
+                .map_err(map_usercopy_error)?;
         }
         return publish_new_socket_like(request, cloexec).map(|fd| fd as isize);
     }
@@ -667,10 +683,13 @@ pub fn sys_accept4(
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
-        let addrlen_ptr = addrlen.address().as_usize() as *mut socklen_t;
-        let mut value = addrlen_ptr.vm_read()?;
-        remote_addr.write_to_user(addr, &mut value)?;
-        addrlen_ptr.vm_write(value)?;
+        let mut value = capability
+            .read_value(addrlen.address().as_usize() as *const socklen_t)
+            .map_err(map_usercopy_error)?;
+        remote_addr.write_to_user(&capability, addr, &mut value)?;
+        capability
+            .write_value(addrlen.address().as_usize() as *mut socklen_t, value)
+            .map_err(map_usercopy_error)?;
     }
 
     let socket = prepare_new_socket_like(socket, nonblocking)?;
@@ -706,6 +725,7 @@ pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
 }
 
 pub fn sys_socketpair(
+    capability: UserMemoryCapability,
     domain: u32,
     raw_ty: u32,
     proto: u32,
@@ -808,7 +828,9 @@ pub fn sys_socketpair(
     let reserved1 = reserve_fd(cloexec)?;
     let reserved2 = reserve_fd(cloexec)?;
     let fd_pair = [reserved1.fd(), reserved2.fd()];
-    vm_write_slice(fds.address().as_usize() as *mut i32, &fd_pair)?;
+    capability
+        .write_slice(fds.address().as_usize() as *mut i32, &fd_pair)
+        .map_err(map_usercopy_error)?;
 
     let fd1 = reserved1.publish(socket1.into_description())?;
     if let Err(error) = reserved2.publish(socket2.into_description()) {

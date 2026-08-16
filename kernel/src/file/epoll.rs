@@ -87,7 +87,7 @@ fn map_descriptor_close_error(error: DescriptorCloseRegistrationError) -> AxErro
 
 fn allocate_epoll_id() -> AxResult<EpollId> {
     let raw = NEXT_EPOLL_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
@@ -116,7 +116,7 @@ struct EpollCoreCharge(usize);
 impl EpollCoreCharge {
     fn try_new(slots: usize) -> AxResult<Self> {
         EPOLL_CORE_SLOTS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(slots)
                     .filter(|next| *next <= EPOLL_GLOBAL_CORE_SLOTS)
             })

@@ -12,18 +12,17 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axhal::power::system_off;
+use axhal::{mem::phys_to_virt, paging::MappingFlags, power::system_off};
 use axsync::Mutex;
-use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
+use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current, sched_state};
 use bytemuck::AnyBitPattern;
 use hashbrown::{HashMap, HashSet};
 use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
-use memory_addr::PhysAddr;
+use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use spin::Lazy;
-use starry_process::{ExitOutcome, Pid, ProcessError};
-use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_process_adapter::{ExitOutcome, Pid, ProcessError};
+use thekernel_linux_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 
 use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
@@ -35,7 +34,10 @@ use super::{
 };
 use crate::{
     keyring::{self, KeyTaskOwner},
-    mm::{AddrSpace, AddressSpaceToken, UserPtr, access_user_memory},
+    mm::{
+        AddrSpace, AddressSpaceToken, UserMemoryCapability, map_usercopy_error,
+        try_read_user_u32_nofault_locked,
+    },
     pseudofs::cgroup,
     syscall::acct_process_exit,
 };
@@ -245,8 +247,7 @@ fn sigchld_autoreap_policy(
 }
 
 fn parent_sigchld_autoreap(parent: &ProcessData) -> (bool, bool) {
-    let actions = parent.signal.actions.lock();
-    let action = &actions[Signo::SIGCHLD];
+    let action = parent.signal.action(Signo::SIGCHLD);
     sigchld_autoreap_policy(&action.disposition, action.flags)
 }
 
@@ -350,10 +351,7 @@ pub fn set_task_user_address_space(
     ctx: &mut axhal::context::TaskContext,
     token: AddressSpaceToken,
 ) {
-    #[cfg(all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    ))]
+    #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
     unsafe {
         ctx.set_page_table_root_with_asid(
             token.root(),
@@ -363,30 +361,80 @@ pub fn set_task_user_address_space(
         );
     }
 
-    #[cfg(not(all(
-        feature = "asid-fast-switch",
-        any(target_arch = "riscv64", target_arch = "loongarch64")
-    )))]
+    #[cfg(not(all(feature = "asid-fast-switch", target_arch = "x86_64")))]
     ctx.set_page_table_root(token.root());
 }
 
+#[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
+#[inline]
+fn legal_current_user_address_space_identity(token: AddressSpaceToken) -> bool {
+    let root = token.root().as_usize();
+    token.asid() != 0
+        && token.asid() < 4096
+        && token.generation() != 0
+        && matches!(
+            token.fallback_reason(),
+            axhal::context::AddressSpaceFallbackReason::None
+        )
+        && root & 0xfff == 0
+        && root < (1usize << 52)
+}
+
 fn install_current_user_address_space(curr_ptr: *mut TaskInner, token: AddressSpaceToken) {
+    #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
+    let (identity_is_legal, switch_decision) = {
+        // Snapshot the live context before replacing it.  Classifying only
+        // the target would let stale current generation/fallback metadata
+        // reach the NOFLUSH path.
+        let (current_root, current_pcid, current_generation, current_fallback) = unsafe {
+            let ctx = (*curr_ptr).ctx_mut();
+            (
+                ctx.cr3.as_usize(),
+                ctx.cr3_pcid,
+                ctx.cr3_generation,
+                ctx.cr3_fallback_reason,
+            )
+        };
+        let target_is_legal = legal_current_user_address_space_identity(token);
+        let decision = axhal::asm::classify_user_tlb_switch(
+            current_root,
+            current_pcid,
+            current_generation,
+            current_fallback,
+            token.root().as_usize(),
+            token.asid(),
+            token.generation(),
+            token.fallback_reason(),
+        );
+        (target_is_legal, decision)
+    };
+
     unsafe {
         set_task_user_address_space((*curr_ptr).ctx_mut(), token);
-        #[cfg(all(
-            feature = "asid-fast-switch",
-            any(target_arch = "riscv64", target_arch = "loongarch64")
-        ))]
-        axhal::asm::write_user_page_table_with_asid(token.root(), token.asid());
+        #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
+        match switch_decision {
+            axhal::asm::UserTlbSwitchDecision::Retain if identity_is_legal => {
+                axhal::asm::write_user_page_table_with_asid(token.root(), token.asid());
+            }
+            axhal::asm::UserTlbSwitchDecision::Flush(_)
+                if token.asid() != 0 && token.asid() < 4096 =>
+            {
+                // A structurally valid nonzero target uses the target-PCID
+                // flush form, even when its generation/fallback metadata is
+                // invalid. The low-level helper rejects malformed roots and
+                // falls back to the conservative PCID-0 full path.
+                axhal::asm::write_user_page_table_with_asid_flush(token.root(), token.asid());
+            }
+            _ => {
+                // ASID 0 or malformed target metadata takes the ordinary
+                // CR3=PCID-0 full-flush path; it never receives NOFLUSH.
+                axhal::asm::write_user_page_table(token.root());
+            }
+        }
 
-        #[cfg(not(all(
-            feature = "asid-fast-switch",
-            any(target_arch = "riscv64", target_arch = "loongarch64")
-        )))]
+        #[cfg(not(all(feature = "asid-fast-switch", target_arch = "x86_64")))]
         axhal::asm::write_user_page_table(token.root());
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    axhal::asm::flush_tlb(None);
 }
 
 /// Cleanup expired entries in the task tables.
@@ -869,10 +917,31 @@ pub fn set_current_user_page_table_root(root: PhysAddr) {
 pub fn set_current_user_address_space(token: AddressSpaceToken) {
     let _guard = NoPreemptIrqSave::new();
     let curr = current();
+    let tlb_state = curr.as_thread().proc_data.aspace_tlb_state();
     // SAFETY: this only mutates the current task's saved TaskContext while the task
     // is running on the current CPU, so no other code can access it concurrently.
     let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
     install_current_user_address_space(curr_ptr, token);
+    // Exec publishes the new image before changing the live hardware root.
+    // Re-admit the current CPU immediately; the regular scheduler hook will
+    // keep this membership idempotent on the next switch.
+    tlb_state.enter_current();
+}
+
+/// Resets the current task's saved and live FP/SIMD state after `execve`.
+///
+/// The no-preemption/IRQ guard is required because `TaskContext` is normally
+/// accessed by the scheduler during a context switch. The architecture hook
+/// updates both the saved scheduler image and the registers currently owned by
+/// this CPU, so the next executable cannot inherit the old image's FP state.
+pub fn reset_current_task_extended_state() {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: preemption and interrupts are disabled, and this is the task
+    // executing on the current CPU; no scheduler path can access its context
+    // concurrently while the reset is in progress.
+    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
+    unsafe { (*curr_ptr).ctx_mut().reset_extended_state() };
 }
 
 struct ProcessPtraceExitRetirements {
@@ -930,47 +999,6 @@ fn detach_ptrace_links_on_thread_exit(
     detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid))
 }
 
-#[cfg(target_arch = "loongarch64")]
-fn with_current_task_ctx_mut<R>(f: impl FnOnce(&mut axhal::context::TaskContext) -> R) -> R {
-    let _guard = NoPreemptIrqSave::new();
-    let curr = current();
-    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
-    unsafe { f((*curr_ptr).ctx_mut()) }
-}
-
-/// Copies the current task's saved user FPU state into another task context.
-#[cfg(target_arch = "loongarch64")]
-pub fn copy_current_user_fpu_state_to(dst: &mut axhal::context::TaskContext) {
-    with_current_task_ctx_mut(|ctx| {
-        dst.fpu = ctx.fpu;
-    });
-}
-
-/// Restores the current task's saved user FPU state to the CPU.
-#[cfg(target_arch = "loongarch64")]
-pub fn restore_current_user_fpu_state() {
-    with_current_task_ctx_mut(|ctx| {
-        ctx.fpu.restore();
-    });
-}
-
-/// Saves the CPU's current FPU state into the current task's saved context.
-#[cfg(target_arch = "loongarch64")]
-pub fn save_current_user_fpu_state() {
-    with_current_task_ctx_mut(|ctx| {
-        ctx.fpu.save();
-    });
-}
-
-/// Resets the current task's saved FPU state and restores the reset state to the CPU.
-#[cfg(target_arch = "loongarch64")]
-pub fn reset_current_user_fpu_state() {
-    with_current_task_ctx_mut(|ctx| {
-        ctx.fpu = Default::default();
-        ctx.fpu.restore();
-    });
-}
-
 /// Poll the timer
 pub fn poll_timer(task: &TaskInner) {
     let Some(thr) = task.try_as_thread() else {
@@ -1024,17 +1052,20 @@ pub struct RobustListHead {
     pub list_op_pending: *mut RobustList,
 }
 
-fn handle_futex_death(entry: *mut RobustList, offset: i64) -> AxResult<()> {
+fn handle_futex_death(
+    memory: &UserMemoryCapability,
+    entry: *mut RobustList,
+    offset: i64,
+) -> AxResult<()> {
     let address = (entry as u64)
         .checked_add_signed(offset)
         .ok_or(AxError::InvalidInput)?;
     let address: usize = address.try_into().map_err(|_| AxError::InvalidInput)?;
     let uaddr = address as *mut u32;
-    if !mark_robust_owner_died(uaddr, current().as_thread().tid())? {
+    let Some(key) = mark_robust_owner_died(memory, uaddr, current().as_thread().tid())? else {
         return Ok(());
-    }
+    };
 
-    let key = FutexKey::new_current(address);
     let futex_table = futex_table_for(&key);
     if let Some(futex) = futex_table.get(&key) {
         futex.wq.wake(1, u32::MAX);
@@ -1049,24 +1080,165 @@ fn robust_owner_died_word(value: u32, tid: Pid) -> Option<u32> {
     Some((value & FUTEX_WAITERS) | FUTEX_OWNER_DIED)
 }
 
-fn user_atomic_u32(uaddr: *mut u32) -> AxResult<&'static AtomicU32> {
-    Ok(UserPtr::<AtomicU32>::from(uaddr.cast()).get_as_mut()?)
+/// A robust-list exit must not spin forever behind a userspace futex updater.
+const ROBUST_CAS_RETRIES: usize = 8;
+const ROBUST_NOFAULT_RETRIES: usize = 4;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RobustOwnerDiedError {
+    Retry,
+    BadAddress,
+    Contended,
 }
 
-fn mark_robust_owner_died(uaddr: *mut u32, tid: Pid) -> AxResult<bool> {
-    let word = user_atomic_u32(uaddr)?;
-    let mut value = access_user_memory(|| word.load(Ordering::Acquire));
-    loop {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RobustOwnerDiedResult {
+    Updated,
+    NotOwner,
+    Contended,
+}
+
+/// Atomically changes one futex word to the owner-died state.
+///
+/// The caller has already resolved the user virtual address to a resident
+/// physical page while holding the selected address-space lock.  Operating on
+/// that page through an `AtomicU32` is the same compare/exchange protocol used
+/// by the userspace futex owner handoff; a read followed by an ordinary write
+/// could overwrite a new owner and lose its handoff.
+fn atomic_robust_owner_died(word: &AtomicU32, tid: Pid) -> RobustOwnerDiedResult {
+    let mut value = word.load(Ordering::Acquire);
+    for _ in 0..ROBUST_CAS_RETRIES {
         let Some(next_value) = robust_owner_died_word(value, tid) else {
-            return Ok(false);
+            return RobustOwnerDiedResult::NotOwner;
         };
-        match access_user_memory(|| {
-            word.compare_exchange(value, next_value, Ordering::AcqRel, Ordering::Acquire)
-        }) {
-            Ok(_) => return Ok(true),
+        match word.compare_exchange(value, next_value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return RobustOwnerDiedResult::Updated,
             Err(observed) => value = observed,
         }
     }
+    RobustOwnerDiedResult::Contended
+}
+
+/// Performs the resident part of the robust-list owner-died update through
+/// the exiting thread's explicitly selected image.  The image lock is held
+/// from mapping validation through the physical translation and CAS, so the
+/// futex key returned on success names the mapping that was actually updated.
+fn try_mark_robust_owner_died(
+    memory: &UserMemoryCapability,
+    uaddr: *mut u32,
+    tid: Pid,
+) -> Result<Option<FutexKey>, RobustOwnerDiedError> {
+    if !uaddr.is_aligned() {
+        return Err(RobustOwnerDiedError::BadAddress);
+    }
+    let address = uaddr as usize;
+    let Some(aspace) = memory.address_space().try_lock() else {
+        return Err(RobustOwnerDiedError::Retry);
+    };
+
+    let value = try_read_user_u32_nofault_locked(&aspace, address, None, None).map_err(
+        |error| match error {
+            crate::mm::UserU32NofaultError::Retry => RobustOwnerDiedError::Retry,
+            crate::mm::UserU32NofaultError::BadAddress => RobustOwnerDiedError::BadAddress,
+        },
+    )?;
+    if robust_owner_died_word(value, tid).is_none() {
+        return Ok(None);
+    }
+
+    if address.checked_add(core::mem::size_of::<u32>()).is_none() {
+        return Err(RobustOwnerDiedError::BadAddress);
+    }
+    if !aspace.can_access_range(
+        VirtAddr::from(address),
+        core::mem::size_of::<u32>(),
+        MappingFlags::USER | MappingFlags::WRITE,
+    ) {
+        return Err(RobustOwnerDiedError::BadAddress);
+    }
+
+    let page_start = VirtAddr::from(address).align_down_4k();
+    let (paddr, pte_flags, _) = aspace
+        .page_table()
+        .query(page_start)
+        .map_err(|_| RobustOwnerDiedError::BadAddress)?;
+    // A writable VMA with a read-only leaf is the post-fork COW state.  Let
+    // the bounded task-context recovery below populate it before retrying.
+    if !pte_flags.contains(MappingFlags::WRITE) {
+        return Err(RobustOwnerDiedError::Retry);
+    }
+
+    let page_offset = address - page_start.as_usize();
+    debug_assert!(page_offset <= memory_addr::PAGE_SIZE_4K - core::mem::size_of::<u32>());
+    let physical = paddr + page_offset;
+    let word = unsafe { &*phys_to_virt(physical).as_mut_ptr().cast::<AtomicU32>() };
+    match atomic_robust_owner_died(word, tid) {
+        RobustOwnerDiedResult::Updated => Ok(Some(FutexKey::new(&aspace, address))),
+        RobustOwnerDiedResult::NotOwner => Ok(None),
+        RobustOwnerDiedResult::Contended => Err(RobustOwnerDiedError::Contended),
+    }
+}
+
+/// Faults in one robust futex word in the explicitly selected image.  This is
+/// only used after the nofault snapshot reports a recoverable retry; it is
+/// bounded to the word's containing page and never consults `current()`.
+fn fault_robust_owner_died_word(memory: &UserMemoryCapability, address: usize) -> AxResult<()> {
+    let end = address
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(AxError::BadAddress)?;
+    let start = VirtAddr::from(address);
+    let page_start = start.align_down_4k();
+    let page_end = VirtAddr::from(crate::mm::checked_align_up_4k(end).ok_or(AxError::BadAddress)?);
+    let mut aspace = memory.address_space().lock();
+    if !aspace.contains_range(start, core::mem::size_of::<u32>())
+        || !aspace.can_access_range(
+            start,
+            core::mem::size_of::<u32>(),
+            MappingFlags::USER | MappingFlags::WRITE,
+        )
+    {
+        return Err(AxError::BadAddress);
+    }
+    aspace.populate_area(
+        page_start,
+        page_end.sub_addr(page_start),
+        MappingFlags::WRITE,
+    )
+}
+
+/// Performs the robust-list owner-died update with bounded recovery.
+///
+/// `Retry` is not an invalid user address: it means the selected image needs a
+/// task-context fault (or the address-space lock/CAS was contended).  Give it a
+/// bounded number of attempts and report resource pressure if the word never
+/// reaches a stable resident state; this keeps exit processing finite without
+/// silently discarding a recoverable robust entry as `BadAddress`.
+fn mark_robust_owner_died(
+    memory: &UserMemoryCapability,
+    uaddr: *mut u32,
+    tid: Pid,
+) -> AxResult<Option<FutexKey>> {
+    let address = uaddr as usize;
+    for attempt in 0..ROBUST_NOFAULT_RETRIES {
+        match try_mark_robust_owner_died(memory, uaddr, tid) {
+            Ok(result) => return Ok(result),
+            Err(RobustOwnerDiedError::BadAddress) => return Err(AxError::BadAddress),
+            Err(RobustOwnerDiedError::Retry) => {
+                if attempt + 1 == ROBUST_NOFAULT_RETRIES {
+                    return Err(AxError::ResourceBusy);
+                }
+                fault_robust_owner_died_word(memory, address)?;
+                axtask::yield_now();
+            }
+            Err(RobustOwnerDiedError::Contended) => {
+                if attempt + 1 == ROBUST_NOFAULT_RETRIES {
+                    return Err(AxError::ResourceBusy);
+                }
+                axtask::yield_now();
+            }
+        }
+    }
+    Err(AxError::ResourceBusy)
 }
 
 fn is_robust_list_error(err: AxError) -> bool {
@@ -1076,29 +1248,35 @@ fn is_robust_list_error(err: AxError) -> bool {
     )
 }
 
-pub fn exit_robust_list(head: *const RobustListHead) {
+pub fn exit_robust_list(memory: &UserMemoryCapability, head: *const RobustListHead) {
     // Reference: https://elixir.bootlin.com/linux/v6.13.6/source/kernel/futex/core.c#L777
 
     let mut limit = ROBUST_LIST_LIMIT;
 
-    let end_ptr = unsafe { &raw const (*head).list };
-    let head = match head.vm_read() {
+    let end_ptr = match (head as usize).checked_add(core::mem::offset_of!(RobustListHead, list)) {
+        Some(end_ptr) => end_ptr,
+        None => return,
+    };
+    let head = match memory.read_value(head).map_err(map_usercopy_error) {
         Ok(head) => head,
-        Err(err) if is_robust_list_error(err.into()) => return,
+        Err(err) if is_robust_list_error(err) => return,
         Err(_) => return,
     };
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     let pending = head.list_op_pending;
 
-    while !core::ptr::eq(entry, end_ptr) {
-        let next_entry = match entry.vm_read() {
+    while entry as usize != end_ptr {
+        let next_entry = match memory
+            .read_value(entry as *const RobustList)
+            .map_err(map_usercopy_error)
+        {
             Ok(next) => next.next,
-            Err(err) if is_robust_list_error(err.into()) => break,
+            Err(err) if is_robust_list_error(err) => break,
             Err(_) => break,
         };
         if entry != pending {
-            match handle_futex_death(entry, offset) {
+            match handle_futex_death(memory, entry, offset) {
                 Ok(()) => {}
                 Err(err) if is_robust_list_error(err) => break,
                 Err(_) => break,
@@ -1114,7 +1292,7 @@ pub fn exit_robust_list(head: *const RobustListHead) {
     }
 
     if !pending.is_null() {
-        let _ = handle_futex_death(pending, offset);
+        let _ = handle_futex_death(memory, pending, offset);
     }
 }
 
@@ -1140,6 +1318,12 @@ fn publish_final_process_exit(
     self_usage: TaskUsage,
     child_usage: TaskUsage,
 ) -> CommittedProcessExit {
+    // The live scheduler object disappears from process targeting as soon as
+    // this core commit publishes the zombie.  Sample it while the exiting
+    // task is still authoritative, so PGRP/USER ioprio readers cannot observe
+    // the retained default snapshot between those two publications.
+    let live_task = current();
+    proc_data.publish_scheduler_state(sched_state(&live_task));
     exit.commit_with_reparent_handoff(
         process.exit_code(),
         self_usage.into(),
@@ -1272,6 +1456,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     }
     let process = &thr.proc_data.proc;
     set_timer_state(&curr, TimerState::Kernel);
+    // rseq teardown is purely kernel state. Linux does not attempt to repair
+    // the registered user area while a task is exiting (the mapping may have
+    // already disappeared), so this path must not perform a user write.
+    thr.reset_rseq_on_exit();
     thr.proc_data.end_exec(tid);
     let started_group_exit = group_exit && begin_group_exit(&thr.proc_data, exit_code);
     if started_group_exit {
@@ -1374,11 +1562,16 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         drop(task_parent_publication.take());
     }
 
+    // Exit-time usercopy belongs to the image of the thread being torn down,
+    // not to whichever caller image happened to invoke this path.
+    let exit_memory = UserMemoryCapability::new(thr.proc_data.aspace());
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if !clear_child_tid.is_null() {
         // Linux attempts FUTEX_WAKE even when clearing the user word faults.
         // Both operations are best-effort during terminal task teardown.
-        let _ = clear_child_tid.vm_write(0u32);
+        let _ = exit_memory
+            .write_value(clear_child_tid, 0u32)
+            .map_err(map_usercopy_error);
         let key = FutexKey::new_current(clear_child_tid as usize);
         let table = futex_table_for(&key);
         let guard = table.get(&key);
@@ -1388,7 +1581,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     }
     let head = thr.robust_list_head() as *const RobustListHead;
     if !head.is_null() {
-        exit_robust_list(head);
+        exit_robust_list(&exit_memory, head);
     }
 
     thr.proc_data
@@ -1548,6 +1741,27 @@ mod tests {
     #[test]
     fn robust_owner_died_ignores_other_owner() {
         assert_eq!(robust_owner_died_word(7, 42), None);
+    }
+
+    #[test]
+    fn robust_owner_died_update_is_atomic_and_does_not_clobber_handoff() {
+        let tid = 42;
+        let word = AtomicU32::new(FUTEX_WAITERS | tid);
+        assert_eq!(
+            atomic_robust_owner_died(&word, tid),
+            RobustOwnerDiedResult::Updated
+        );
+        assert_eq!(
+            word.load(Ordering::Acquire),
+            FUTEX_WAITERS | FUTEX_OWNER_DIED
+        );
+
+        word.store(7, Ordering::Release);
+        assert_eq!(
+            atomic_robust_owner_died(&word, tid),
+            RobustOwnerDiedResult::NotOwner
+        );
+        assert_eq!(word.load(Ordering::Acquire), 7);
     }
 
     #[test]

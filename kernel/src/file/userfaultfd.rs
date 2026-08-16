@@ -11,7 +11,8 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    mem,
+    mem::{self, MaybeUninit},
+    slice,
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
 };
@@ -19,8 +20,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex as BlockingMutex;
-use axtask::current;
-use bytemuck::{Pod, Zeroable, pod_read_unaligned};
+use bytemuck::{Pod, Zeroable};
 use linux_raw_sys::{
     general::{
         UFFD_EVENT_PAGEFAULT, UFFD_PAGEFAULT_FLAG_WRITE, uffdio_api, uffdio_copy, uffdio_range,
@@ -33,7 +33,6 @@ use linux_raw_sys::{
     },
 };
 use memory_addr::PAGE_SIZE_4K;
-use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
 use thekernel_linux_mm::{
     FaultAccess, FaultDisposition, FaultHandlerId, MmError, PageRange, UffdApiNegotiation,
     UffdApiState, UffdCopyMode, UffdCopyRequest, UffdCreateFlags, UffdIoctls, UffdRegisterMode,
@@ -42,10 +41,11 @@ use thekernel_linux_mm::{
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    file::{FileLike, IoDst, Kstat, anon_inode_stat},
+    file::{FileLike, IoDst, IoctlContext, Kstat, anon_inode_stat},
     mm::{
         AddrSpace, DeliveredUffdEvent, PreparedCowPage, UffdAddressSpaceState,
-        UffdIcacheSynchronization, UffdPagePublication, UffdPollSet, uffd_policy_error,
+        UffdIcacheSynchronization, UffdPagePublication, UffdPollSet, UserMemoryCapability,
+        map_usercopy_error, uffd_policy_error,
     },
     readiness::block_on_poll_io,
     task::{AsThread, has_pending_sigkill},
@@ -183,18 +183,27 @@ impl UffdResolverData {
         }
     }
 
-    fn prepare(self, offset: usize, prepared: &mut PreparedCowPage) -> AxResult {
+    fn prepare(
+        self,
+        offset: usize,
+        prepared: &mut PreparedCowPage,
+        source_capability: Option<&UserMemoryCapability>,
+    ) -> AxResult {
         match self {
             Self::Copy(source) => {
                 let source = source
                     .start()
                     .checked_add(offset)
                     .ok_or(AxError::BadState)?;
-                // SAFETY: vm_read_slice returns success only after writing the
-                // complete PAGE_SIZE_4K destination slice.
+                let source_capability = source_capability.ok_or(AxError::BadState)?;
+                // SAFETY: read_bytes returns success only after writing the
+                // complete PAGE_SIZE_4K destination slice.  This copy is
+                // performed before the target address-space lock is taken.
                 unsafe {
                     prepared.prepare_uninitialized(|destination| {
-                        vm_read_slice(source as *const u8, destination)?;
+                        source_capability
+                            .read_bytes(source, destination)
+                            .map_err(map_usercopy_error)?;
                         Ok(())
                     })
                 }
@@ -202,6 +211,29 @@ impl UffdResolverData {
             Self::Zero => prepared.prepare_zeroed(),
         }
     }
+}
+
+fn read_user_pod<T: Pod>(context: &IoctlContext, address: usize) -> AxResult<T> {
+    let mut value = MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        slice::from_raw_parts_mut(
+            value.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            mem::size_of::<T>(),
+        )
+    };
+    context
+        .user_memory()
+        .read_bytes(address, bytes)
+        .map_err(map_usercopy_error)?;
+    // SAFETY: read_bytes initialized the complete Pod representation.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_user_bytes(context: &IoctlContext, address: usize, bytes: &[u8]) -> AxResult {
+    context
+        .user_memory()
+        .write_bytes(address, bytes)
+        .map_err(map_usercopy_error)
 }
 
 enum UffdHandlerBinding {
@@ -497,24 +529,22 @@ impl UserfaultFile {
         Ok(())
     }
 
-    fn ioctl_api(&self, arg: usize) -> AxResult<usize> {
-        let user = arg as *mut [u8; UFFD_API_SIZE];
-        let request: UffdApiRaw =
-            pod_read_unaligned(&(user as *const [u8; UFFD_API_SIZE]).vm_read()?);
+    fn ioctl_api(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
+        let request: UffdApiRaw = read_user_pod(context, arg)?;
         let cleared = UffdApiRaw::default();
 
         let (negotiation, response) = match self.prepare_api(request) {
             Ok(prepared) => prepared,
             Err(error) => {
-                user.vm_write(bytemuck::cast(cleared))?;
+                write_user_bytes(context, arg, bytemuck::bytes_of(&cleared))?;
                 return Err(uffd_policy_error(error));
             }
         };
         // UFFDIO_API is a copyout-before-commit transaction.  An EFAULT leaves
         // the context uninitialized so userspace may retry.
-        user.vm_write(bytemuck::cast(response))?;
+        write_user_bytes(context, arg, bytemuck::bytes_of(&response))?;
         if let Err(error) = self.commit_api(negotiation) {
-            user.vm_write(bytemuck::cast(cleared))?;
+            write_user_bytes(context, arg, bytemuck::bytes_of(&cleared))?;
             return Err(uffd_policy_error(error));
         }
         Ok(0)
@@ -564,18 +594,14 @@ impl UserfaultFile {
         Ok(0)
     }
 
-    fn ioctl_register(&self, arg: usize) -> AxResult<usize> {
+    fn ioctl_register(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
         self.register_with_usercopy(
-            || {
-                let input = arg as *const [u8; UFFD_REGISTER_INPUT_SIZE];
-                Ok(pod_read_unaligned(&input.vm_read()?))
-            },
+            || read_user_pod(context, arg),
             |ioctls| {
                 let output = arg
                     .checked_add(UFFD_REGISTER_IOCTLS_OFFSET)
-                    .ok_or(AxError::BadAddress)?
-                    as *mut [u8; mem::size_of::<u64>()];
-                Ok(output.vm_write(ioctls.to_ne_bytes())?)
+                    .ok_or(AxError::BadAddress)?;
+                write_user_bytes(context, output, &ioctls.to_ne_bytes())
             },
         )
     }
@@ -593,11 +619,8 @@ impl UserfaultFile {
         Ok(0)
     }
 
-    fn ioctl_unregister(&self, arg: usize) -> AxResult<usize> {
-        self.unregister_with_usercopy(|| {
-            let input = arg as *const [u8; UFFD_RANGE_SIZE];
-            Ok(pod_read_unaligned(&input.vm_read()?))
-        })
+    fn ioctl_unregister(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
+        self.unregister_with_usercopy(|| read_user_pod(context, arg))
     }
 
     fn checked_copy_request(request: UffdCopyInputRaw) -> AxResult<UffdCopyRequest> {
@@ -623,9 +646,11 @@ impl UserfaultFile {
     }
 
     fn install_resolver_pages(
+        caller_task: &axtask::AxTaskRef,
         target: &Arc<axsync::Mutex<AddrSpace>>,
         destination: PageRange,
         data: UffdResolverData,
+        source_capability: Option<&UserMemoryCapability>,
     ) -> AxResult<UffdResolverProgress> {
         // The raw geometry/mode gates have already passed. Destination
         // VMA/registration failure comes from Linux's mfill operation, so it
@@ -665,7 +690,7 @@ impl UserfaultFile {
                 progress.lower_error = Some(error);
                 break;
             }
-            if let Err(error) = data.prepare(progress.completed, &mut prepared) {
+            if let Err(error) = data.prepare(progress.completed, &mut prepared, source_capability) {
                 progress.lower_error = Some(error);
                 break;
             }
@@ -714,7 +739,7 @@ impl UserfaultFile {
                 // section, and a completed prefix remains reportable as
                 // positive progress.
                 axtask::resched_if_needed();
-                if has_pending_sigkill(current().as_thread()) {
+                if has_pending_sigkill(caller_task.as_thread()) {
                     progress.lower_error = Some(AxError::Interrupted);
                     break;
                 }
@@ -791,6 +816,7 @@ impl UserfaultFile {
 
     fn copy_with_usercopy(
         &self,
+        context: &IoctlContext,
         copyin: impl FnOnce() -> AxResult<UffdCopyInputRaw>,
         copyout: impl FnOnce(i64) -> AxResult,
     ) -> AxResult<usize> {
@@ -801,9 +827,11 @@ impl UserfaultFile {
             Self::reject_copy_wp_after_target_preflight(&target, request.destination())
         } else {
             Self::install_resolver_pages(
+                context.caller_task(),
                 &target,
                 request.destination(),
                 UffdResolverData::Copy(request.source()),
+                Some(context.user_memory()),
             )?
         };
         let result = if progress.completed == 0 {
@@ -816,32 +844,35 @@ impl UserfaultFile {
         self.finish_resolver(&target, result, progress.lower_error, copyout)
     }
 
-    fn ioctl_copy(&self, arg: usize) -> AxResult<usize> {
+    fn ioctl_copy(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
         self.copy_with_usercopy(
-            || {
-                let input = arg as *const [u8; UFFD_COPY_INPUT_SIZE];
-                Ok(pod_read_unaligned(&input.vm_read()?))
-            },
+            context,
+            || read_user_pod(context, arg),
             |result| {
                 let output = arg
                     .checked_add(UFFD_COPY_OUTPUT_OFFSET)
-                    .ok_or(AxError::BadAddress)?
-                    as *mut [u8; mem::size_of::<i64>()];
-                Ok(output.vm_write(result.to_ne_bytes())?)
+                    .ok_or(AxError::BadAddress)?;
+                write_user_bytes(context, output, &result.to_ne_bytes())
             },
         )
     }
 
     fn zeropage_with_usercopy(
         &self,
+        context: &IoctlContext,
         copyin: impl FnOnce() -> AxResult<UffdZeroPageInputRaw>,
         copyout: impl FnOnce(i64) -> AxResult,
     ) -> AxResult<usize> {
         let _api = self.api_snapshot()?;
         let request = Self::checked_zeropage_request(copyin()?)?;
         let target = self.binding.resolver_target()?;
-        let progress =
-            Self::install_resolver_pages(&target, request.destination(), UffdResolverData::Zero)?;
+        let progress = Self::install_resolver_pages(
+            context.caller_task(),
+            &target,
+            request.destination(),
+            UffdResolverData::Zero,
+            None,
+        )?;
         let result = if progress.completed == 0 {
             let error = progress.lower_error.ok_or(AxError::BadState)?;
             UffdResolverResult::failure(LinuxError::from(error).code())
@@ -853,18 +884,15 @@ impl UserfaultFile {
         self.finish_resolver(&target, result, progress.lower_error, copyout)
     }
 
-    fn ioctl_zeropage(&self, arg: usize) -> AxResult<usize> {
+    fn ioctl_zeropage(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
         self.zeropage_with_usercopy(
-            || {
-                let input = arg as *const [u8; UFFD_ZEROPAGE_INPUT_SIZE];
-                Ok(pod_read_unaligned(&input.vm_read()?))
-            },
+            context,
+            || read_user_pod(context, arg),
             |result| {
                 let output = arg
                     .checked_add(UFFD_ZEROPAGE_OUTPUT_OFFSET)
-                    .ok_or(AxError::BadAddress)?
-                    as *mut [u8; mem::size_of::<i64>()];
-                Ok(output.vm_write(result.to_ne_bytes())?)
+                    .ok_or(AxError::BadAddress)?;
+                write_user_bytes(context, output, &result.to_ne_bytes())
             },
         )
     }
@@ -879,11 +907,8 @@ impl UserfaultFile {
         Ok(0)
     }
 
-    fn ioctl_wake(&self, arg: usize) -> AxResult<usize> {
-        self.wake_with_usercopy(|| {
-            let input = arg as *const [u8; UFFD_RANGE_SIZE];
-            Ok(pod_read_unaligned(&input.vm_read()?))
-        })
+    fn ioctl_wake(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
+        self.wake_with_usercopy(|| read_user_pod(context, arg))
     }
 
     fn encode_pagefault(event: DeliveredUffdEvent) -> [u8; UFFD_MSG_SIZE] {
@@ -971,14 +996,14 @@ impl FileLike for UserfaultFile {
         Ok("anon_inode:[userfaultfd]".into())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
-            UFFDIO_API_CMD => self.ioctl_api(arg),
-            UFFDIO_REGISTER_CMD => self.ioctl_register(arg),
-            UFFDIO_UNREGISTER_CMD => self.ioctl_unregister(arg),
-            UFFDIO_WAKE_CMD => self.ioctl_wake(arg),
-            UFFDIO_COPY_CMD => self.ioctl_copy(arg),
-            UFFDIO_ZEROPAGE_CMD => self.ioctl_zeropage(arg),
+            UFFDIO_API_CMD => self.ioctl_api(context, arg),
+            UFFDIO_REGISTER_CMD => self.ioctl_register(context, arg),
+            UFFDIO_UNREGISTER_CMD => self.ioctl_unregister(context, arg),
+            UFFDIO_WAKE_CMD => self.ioctl_wake(context, arg),
+            UFFDIO_COPY_CMD => self.ioctl_copy(context, arg),
+            UFFDIO_ZEROPAGE_CMD => self.ioctl_zeropage(context, arg),
             // Linux v6.12 returns EINVAL both before initialization and for an
             // unsupported command after initialization.
             _ => Err(AxError::InvalidInput),
@@ -1048,6 +1073,11 @@ mod tests {
 
     fn test_context() -> MutexGuard<'static, ()> {
         crate::test_support::scheduler_test_context()
+    }
+
+    fn ioctl_context() -> IoctlContext {
+        let aspace = axtask::current().as_thread().proc_data.aspace().clone();
+        IoctlContext::new(aspace)
     }
 
     struct TestDst {
@@ -1309,25 +1339,26 @@ mod tests {
     fn range_ioctls_reject_uninitialized_context_before_usercopy() {
         let _context = test_context();
         let (_state, file) = new_file(true);
+        let ioctl_context = ioctl_context();
 
         assert_eq!(
-            file.ioctl(UFFDIO_REGISTER_CMD, usize::MAX),
+            file.ioctl(&ioctl_context, UFFDIO_REGISTER_CMD, usize::MAX),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(UFFDIO_UNREGISTER_CMD, usize::MAX),
+            file.ioctl(&ioctl_context, UFFDIO_UNREGISTER_CMD, usize::MAX),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(UFFDIO_WAKE_CMD, usize::MAX),
+            file.ioctl(&ioctl_context, UFFDIO_WAKE_CMD, usize::MAX),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(UFFDIO_COPY_CMD, usize::MAX),
+            file.ioctl(&ioctl_context, UFFDIO_COPY_CMD, usize::MAX),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(UFFDIO_ZEROPAGE_CMD, usize::MAX),
+            file.ioctl(&ioctl_context, UFFDIO_ZEROPAGE_CMD, usize::MAX),
             Err(AxError::InvalidInput)
         );
     }
@@ -1378,12 +1409,14 @@ mod tests {
 
     #[test]
     fn resolver_raw_preflight_and_retired_mm_leave_output_untouched() {
-        let _context = test_context();
+        let _test_context = test_context();
+        let ioctl_context = ioctl_context();
         let (_state, file) = new_file(true);
         initialize(&file);
         let copied_out = AtomicBool::new(false);
         assert_eq!(
             file.copy_with_usercopy(
+                &ioctl_context,
                 || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, u64::MAX)),
                 |_| {
                     copied_out.store(true, Ordering::Release);
@@ -1397,6 +1430,7 @@ mod tests {
         let dead = dead_address_space_file();
         assert_eq!(
             dead.copy_with_usercopy(
+                &ioctl_context,
                 || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 0)),
                 |_| {
                     copied_out.store(true, Ordering::Release);

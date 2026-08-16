@@ -1,5 +1,5 @@
-use alloc::{format, sync::Arc, task::Wake};
-use core::{any::Any, task::Context, time::Duration};
+use alloc::{format, string::String, sync::Arc, task::Wake, vec};
+use core::{any::Any, mem::size_of, task::Context, time::Duration};
 
 #[allow(unused_imports)]
 use axdriver::prelude::{
@@ -20,7 +20,8 @@ use linux_raw_sys::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
-    mm::UserPtr,
+    file::IoctlContext,
+    mm::map_usercopy_error,
     pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
     time::wall_time,
 };
@@ -153,13 +154,24 @@ impl EventDev {
         Ok(())
     }
 
-    fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> AxResult<usize> {
-        let bits = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
+    fn get_event_bits(
+        &self,
+        context: &IoctlContext,
+        arg: usize,
+        size: usize,
+        ty: u8,
+    ) -> AxResult<usize> {
+        let mut bits = vec![0; size];
         if ty == 0 {
-            Ok(copy_bytes(self.ev_bits.as_bytes(), bits))
+            let copied = copy_bytes(self.ev_bits.as_bytes(), &mut bits);
+            context
+                .user_memory()
+                .write_bytes(arg, &bits)
+                .map_err(map_usercopy_error)?;
+            Ok(copied)
         } else {
             let ty = EventType::from_repr(ty).ok_or(AxError::InvalidInput)?;
-            match self.inner.lock().device.get_event_bits(ty, bits) {
+            match self.inner.lock().device.get_event_bits(ty, &mut bits) {
                 Ok(true) => {}
                 Ok(false) => {
                     debug!("No events for {ty:?}");
@@ -168,6 +180,10 @@ impl EventDev {
                     warn!("Failed to get event bits: {err:?}");
                 }
             }
+            context
+                .user_memory()
+                .write_bytes(arg, &bits)
+                .map_err(map_usercopy_error)?;
             Ok(bits.len().min(ty.bits_count().div_ceil(8)))
         }
     }
@@ -179,14 +195,31 @@ fn copy_bytes(src: &[u8], dst: &mut [u8]) -> usize {
     len
 }
 
-fn return_str(arg: usize, size: usize, s: &str) -> AxResult<usize> {
-    let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-    Ok(copy_bytes(s.as_bytes(), slice))
+fn zero_bits_len(size: usize, bits: usize) -> usize {
+    bits.div_ceil(8).min(size)
 }
-fn return_zero_bits(arg: usize, size: usize, bits: usize) -> AxResult<usize> {
-    let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-    let len = bits.div_ceil(8).min(slice.len());
-    slice[..len].fill(0);
+
+fn return_str(context: &IoctlContext, arg: usize, size: usize, s: &str) -> AxResult<usize> {
+    let mut bytes = vec![0; size];
+    let copied = copy_bytes(s.as_bytes(), &mut bytes);
+    context
+        .user_memory()
+        .write_bytes(arg, &bytes)
+        .map_err(map_usercopy_error)?;
+    Ok(copied)
+}
+fn return_zero_bits(
+    context: &IoctlContext,
+    arg: usize,
+    size: usize,
+    bits: usize,
+) -> AxResult<usize> {
+    let len = zero_bits_len(size, bits);
+    let bytes = vec![0; len];
+    context
+        .user_memory()
+        .write_bytes(arg, &bytes)
+        .map_err(map_usercopy_error)?;
     Ok(len)
 }
 
@@ -262,15 +295,27 @@ impl DeviceOps for EventDev {
         Some(self)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, arg_cmd: u32, arg: usize) -> VfsResult<usize> {
+        let cmd = arg_cmd;
         match cmd {
             EVIOCGVERSION => {
-                *UserPtr::<u32>::from(arg).get_as_mut()? = 0x10001;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &0x10001u32.to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
                 Ok(0)
             }
             EVIOCGID => {
-                *UserPtr::<InputDeviceId>::from(arg).get_as_mut()? =
-                    self.inner.lock().device.device_id();
+                let id = self.inner.lock().device.device_id();
+                let mut bytes = [0u8; size_of::<InputDeviceId>()];
+                bytes[0..2].copy_from_slice(&id.bus_type.to_ne_bytes());
+                bytes[2..4].copy_from_slice(&id.vendor.to_ne_bytes());
+                bytes[4..6].copy_from_slice(&id.product.to_ne_bytes());
+                bytes[6..8].copy_from_slice(&id.version.to_ne_bytes());
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(map_usercopy_error)?;
                 Ok(0)
             }
             // Exclusive grabs require ownership per open file description. DeviceOps is
@@ -301,54 +346,83 @@ impl DeviceOps for EventDev {
                         match nr {
                             // EVIOCGNAME
                             0x06 => {
-                                return return_str(
-                                    arg,
-                                    size,
-                                    self.inner.lock().device.device_name(),
-                                );
+                                let name = {
+                                    let inner = self.inner.lock();
+                                    String::from(inner.device.device_name())
+                                };
+                                return return_str(context, arg, size, &name);
                             }
                             // EVIOCGPHYS
                             0x07 => {
-                                return return_str(
-                                    arg,
-                                    size,
-                                    self.inner.lock().device.physical_location(),
-                                );
+                                let physical_location = {
+                                    let inner = self.inner.lock();
+                                    String::from(inner.device.physical_location())
+                                };
+                                return return_str(context, arg, size, &physical_location);
                             }
                             // EVIOCGUNIQ
                             0x08 => {
-                                return return_str(arg, size, self.inner.lock().device.unique_id());
+                                let unique_id = {
+                                    let inner = self.inner.lock();
+                                    String::from(inner.device.unique_id())
+                                };
+                                return return_str(context, arg, size, &unique_id);
                             }
                             // EVIOCGPROP
                             0x09 => {
                                 // For some reasons virtio does not provide prop
-                                // bits for now
-                                return Ok(0);
+                                // bits for now. The command encodes the output
+                                // length in bytes, so clear exactly that many
+                                // bytes without exposing any padding.
+                                return return_zero_bits(
+                                    context,
+                                    arg,
+                                    size,
+                                    size.saturating_mul(8),
+                                );
                             }
                             // EVIOCGKEY
                             0x18 => {
-                                let bits = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-                                return Ok(copy_bytes(
-                                    self.inner.lock().key_state.as_bytes(),
-                                    bits,
-                                ));
+                                let mut bits = vec![0; size];
+                                let copied =
+                                    copy_bytes(self.inner.lock().key_state.as_bytes(), &mut bits);
+                                context
+                                    .user_memory()
+                                    .write_bytes(arg, &bits)
+                                    .map_err(map_usercopy_error)?;
+                                return Ok(copied);
                             }
                             // EVIOCGLED
                             0x19 => {
-                                return return_zero_bits(arg, size, EventType::Led.bits_count());
+                                return return_zero_bits(
+                                    context,
+                                    arg,
+                                    size,
+                                    EventType::Led.bits_count(),
+                                );
                             }
                             // EVIOCGSND
                             0x1a => {
-                                return return_zero_bits(arg, size, EventType::Sound.bits_count());
+                                return return_zero_bits(
+                                    context,
+                                    arg,
+                                    size,
+                                    EventType::Sound.bits_count(),
+                                );
                             }
                             // EVIOCGSW
                             0x1b => {
-                                return return_zero_bits(arg, size, EventType::Switch.bits_count());
+                                return return_zero_bits(
+                                    context,
+                                    arg,
+                                    size,
+                                    EventType::Switch.bits_count(),
+                                );
                             }
                             _ => {}
                         }
                         if nr & !EventType::MAX == EventType::COUNT {
-                            return self.get_event_bits(arg, size, nr & EventType::MAX);
+                            return self.get_event_bits(context, arg, size, nr & EventType::MAX);
                         }
                         const ABS_CNT: u8 = 0x40;
                         if nr & !(ABS_CNT - 1) == ABS_CNT {
@@ -422,4 +496,23 @@ pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
         }
     }
     inputs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn property_bitmap_uses_the_encoded_byte_length() {
+        for size in [0, 1, 2, 7, 8, 9, 0x3fff] {
+            assert_eq!(zero_bits_len(size, size.saturating_mul(8)), size);
+        }
+    }
+
+    #[test]
+    fn variable_bitmaps_are_clamped_without_padding() {
+        assert_eq!(zero_bits_len(1, 1), 1);
+        assert_eq!(zero_bits_len(2, 9), 2);
+        assert_eq!(zero_bits_len(8, 9), 2);
+    }
 }

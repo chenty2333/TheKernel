@@ -1,4 +1,7 @@
-use core::time::Duration;
+use core::{
+    mem::{align_of, offset_of, size_of},
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos};
@@ -12,10 +15,11 @@ use linux_raw_sys::general::{
     SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, timespec,
     timeval, timezone,
 };
-use starry_signal::Signo;
-use starry_vm::{VmMutPtr, VmPtr};
+use thekernel_linux_signal::Signo;
+use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
+    mm::map_usercopy_error,
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
@@ -451,7 +455,8 @@ fn update_timex_state(state: &mut TimexState, timex: &KernelOldTimex) -> AxResul
     Ok(())
 }
 
-fn sys_do_clock_adjtime(
+fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     clock_id: __kernel_clockid_t,
     timex_ptr: *mut KernelOldTimex,
 ) -> AxResult<isize> {
@@ -459,7 +464,11 @@ fn sys_do_clock_adjtime(
         return Err(AxError::InvalidInput);
     }
 
-    let mut timex = unsafe { timex_ptr.vm_read_uninit()?.assume_init() };
+    let mut timex = unsafe {
+        VmPtr::vm_read_uninit(timex_ptr, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let modes = timex.modes;
     if timex_invalid_adjadjtime_mode(modes) {
         return Err(AxError::InvalidInput);
@@ -476,7 +485,10 @@ fn sys_do_clock_adjtime(
     }
 
     fill_timex_output(&mut timex, *state);
-    timex_ptr.vm_write(timex)?;
+    // SAFETY: `timex` was initialized by the preceding copy-in and every
+    // field update preserves its fully initialized object representation.
+    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
+        .map_err(map_usercopy_error)?;
     Ok(state.time_state())
 }
 
@@ -603,7 +615,113 @@ fn timer_remaining(timer: &PosixTimer) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-pub fn sys_timer_create(
+/// Converts the process ITIMER_REAL remainder to the unsigned-seconds result
+/// required by alarm(2). Linux rounds a non-integral remainder up and caps the
+/// result at UINT_MAX because the syscall's return type is unsigned int.
+fn alarm_remaining_seconds_from_nanos(nanos: u128) -> u32 {
+    let seconds = nanos / NANOS_PER_SEC as u128;
+    let rounded = seconds.saturating_add(u128::from(!nanos.is_multiple_of(NANOS_PER_SEC as u128)));
+    u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
+fn alarm_remaining_seconds(value: TimeValue) -> u32 {
+    alarm_remaining_seconds_from_nanos(value.as_nanos())
+}
+
+fn alarm_seconds_to_nanos(seconds: u32) -> AxResult<usize> {
+    let nanos = u128::from(seconds).saturating_mul(NANOS_PER_SEC as u128);
+    usize::try_from(nanos).map_err(|_| AxError::OutOfRange)
+}
+
+// `write_timer_spec` copies the complete initialized object representation.
+// Keep the x86_64 Linux ABI premise executable instead of relying on the
+// generated binding's shape by inspection.
+const _: () = {
+    assert!(align_of::<timeval>() == 8);
+    assert!(size_of::<timeval>() == 16);
+    assert!(offset_of!(timeval, tv_sec) == 0);
+    assert!(offset_of!(timeval, tv_usec) == 8);
+    assert!(align_of::<timezone>() == 4);
+    assert!(size_of::<timezone>() == 8);
+    assert!(offset_of!(timezone, tz_minuteswest) == 0);
+    assert!(offset_of!(timezone, tz_dsttime) == 4);
+    assert!(align_of::<itimerval>() == 8);
+    assert!(size_of::<itimerval>() == 32);
+    assert!(offset_of!(itimerval, it_interval) == 0);
+    assert!(offset_of!(itimerval, it_value) == 16);
+    assert!(align_of::<timespec>() == 8);
+    assert!(size_of::<timespec>() == 16);
+    assert!(offset_of!(timespec, tv_sec) == 0);
+    assert!(offset_of!(timespec, tv_nsec) == 8);
+    assert!(align_of::<itimerspec>() == 8);
+    assert!(size_of::<itimerspec>() == 32);
+    assert!(offset_of!(itimerspec, it_interval) == 0);
+    assert!(offset_of!(itimerspec, it_value) == 16);
+};
+
+fn map_timer_usercopy_error(_error: UserCopyError) -> AxError {
+    // Linux's POSIX timer entry points map failed get/put/copy_user operations
+    // to EFAULT. Provider-side page population failure is part of that copy,
+    // not the timer object's own fallible allocation path.
+    AxError::BadAddress
+}
+
+fn read_timer_spec<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const itimerspec,
+) -> AxResult<itimerspec> {
+    let value = thekernel_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
+        .map_err(map_timer_usercopy_error)?;
+    // SAFETY: the explicit provider initialized every byte of the value, and
+    // `itimerspec` contains only integer fields on the supported x86_64 ABI.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_timer_id<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut i32,
+    timerid: i32,
+) -> AxResult<()> {
+    thekernel_linux_usercopy::VmMutPtr::vm_write(ptr, memory, timerid)
+        .map_err(map_timer_usercopy_error)
+}
+
+fn write_timer_spec<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut itimerspec,
+    value: itimerspec,
+) -> AxResult<()> {
+    // `linux_raw_sys` does not expose bytemuck's `NoUninit` marker for its
+    // repr(C) ABI structs.  The x86_64 `itimerspec` is four integer words with
+    // no padding, so its complete object representation is initialized here.
+    unsafe { thekernel_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+        .map_err(map_timer_usercopy_error)
+}
+
+fn read_itimer_value<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const itimerval,
+) -> AxResult<itimerval> {
+    let value = thekernel_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
+        .map_err(map_timer_usercopy_error)?;
+    // SAFETY: the explicit provider initialized every byte of the value, and
+    // `itimerval` contains only integer fields on the supported x86_64 ABI.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_itimer_value<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut itimerval,
+    value: itimerval,
+) -> AxResult<()> {
+    // `itimerval` has no padding on the x86_64 Linux ABI, so its complete
+    // object representation is initialized and safe to copy out.
+    unsafe { thekernel_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+        .map_err(map_timer_usercopy_error)
+}
+
+pub fn sys_timer_create<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     clock_id: __kernel_clockid_t,
     sigevent_ptr: *const RawSigevent,
     timerid_ptr: *mut i32,
@@ -613,8 +731,10 @@ pub fn sys_timer_create(
     }
 
     let clock = posix_timer_clock(clock_id)?;
-    let notify = if let Some(ptr) = sigevent_ptr.nullable() {
-        decode_timer_notify(Some(RawSigevent::read_from_user(ptr)?))?
+    let notify = if let Some(ptr) = thekernel_linux_usercopy::VmPtr::nullable(sigevent_ptr) {
+        decode_timer_notify(Some(
+            RawSigevent::read_from_user(memory, ptr).map_err(map_timer_usercopy_error)?,
+        ))?
     } else {
         decode_timer_notify(None)?
     };
@@ -640,7 +760,7 @@ pub fn sys_timer_create(
         }
     };
 
-    if let Err(error) = timerid_ptr.vm_write(timerid as i32) {
+    if let Err(error) = write_timer_id(memory, timerid_ptr, timerid as i32) {
         // The slot remains deliberately unpublished while copyout may fault.
         // Other threads reject operations on it, so rollback cannot delete a
         // timer that another thread has observed or recreated.
@@ -653,7 +773,7 @@ pub fn sys_timer_create(
             slot.take()
         };
         drop(retired);
-        return Err(error.into());
+        return Err(error);
     }
     {
         let mut timers = proc_data.posix_timers.lock();
@@ -666,7 +786,8 @@ pub fn sys_timer_create(
     Ok(0)
 }
 
-pub fn sys_timer_settime(
+pub fn sys_timer_settime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     timerid: i32,
     flags: i32,
     new_value: *const itimerspec,
@@ -676,7 +797,7 @@ pub fn sys_timer_settime(
         return Err(AxError::InvalidInput);
     }
 
-    let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
+    let new_value = read_timer_spec(memory, new_value)?;
     let (interval, value) = itimerspec_to_durations(&new_value)?;
     if timerid < 0 {
         return Err(AxError::InvalidInput);
@@ -735,17 +856,25 @@ pub fn sys_timer_settime(
     retry_publication.publish();
     main_publication.publish();
 
-    if let Some(old_value) = old_value.nullable() {
-        old_value.vm_write(itimerspec {
-            it_interval: duration_to_timespec(old_interval),
-            it_value: duration_to_timespec(old_remaining),
-        })?;
+    if !old_value.is_null() {
+        write_timer_spec(
+            memory,
+            old_value,
+            itimerspec {
+                it_interval: duration_to_timespec(old_interval),
+                it_value: duration_to_timespec(old_remaining),
+            },
+        )?;
     }
 
     Ok(0)
 }
 
-pub fn sys_timer_gettime(timerid: i32, curr_value: *mut itimerspec) -> AxResult<isize> {
+pub fn sys_timer_gettime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    timerid: i32,
+    curr_value: *mut itimerspec,
+) -> AxResult<isize> {
     if timerid < 0 {
         return Err(AxError::InvalidInput);
     }
@@ -761,10 +890,14 @@ pub fn sys_timer_gettime(timerid: i32, curr_value: *mut itimerspec) -> AxResult<
         (timer.interval, timer_remaining(timer))
     };
 
-    curr_value.vm_write(itimerspec {
-        it_interval: duration_to_timespec(interval),
-        it_value: duration_to_timespec(remaining),
-    })?;
+    write_timer_spec(
+        memory,
+        curr_value,
+        itimerspec {
+            it_interval: duration_to_timespec(interval),
+            it_value: duration_to_timespec(remaining),
+        },
+    )?;
     Ok(0)
 }
 
@@ -808,35 +941,70 @@ pub fn sys_timer_delete(timerid: i32) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxResult<isize> {
+pub fn sys_clock_gettime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    clock_id: __kernel_clockid_t,
+    ts: *mut timespec,
+) -> AxResult<isize> {
     let now = clock_now(clock_id)?;
-    ts.vm_write(timespec::from_time_value(now))?;
+    // SAFETY: `timespec` is two initialized integer words on the x86_64 Linux
+    // ABI; the layout assertions above cover the complete object extent.
+    unsafe { VmMutPtr::vm_write_unchecked(ts, memory, timespec::from_time_value(now)) }
+        .map_err(map_usercopy_error)?;
     Ok(0)
 }
 
-pub fn sys_gettimeofday(ts: *mut timeval, tz: *mut timezone) -> AxResult<isize> {
+pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ts: *mut timeval,
+    tz: *mut timezone,
+) -> AxResult<isize> {
     let now = wall_time();
-    if let Some(ts) = ts.nullable() {
-        ts.vm_write(timeval::from_time_value(now))?;
+    if let Some(ts) = VmPtr::nullable(ts) {
+        // SAFETY: `timeval` is two initialized integer words on the x86_64
+        // Linux ABI; the layout assertions above cover the object extent.
+        unsafe { VmMutPtr::vm_write_unchecked(ts, memory, timeval::from_time_value(now)) }
+            .map_err(map_usercopy_error)?;
     }
-    if let Some(tz) = tz.nullable() {
-        tz.vm_write(timezone {
-            tz_minuteswest: 0,
-            tz_dsttime: 0,
-        })?;
+    if let Some(tz) = VmPtr::nullable(tz) {
+        // SAFETY: `timezone` contains only its two initialized i32 fields;
+        // generated linux_raw_sys layout is asserted by the compiler below.
+        unsafe {
+            VmMutPtr::vm_write_unchecked(
+                tz,
+                memory,
+                timezone {
+                    tz_minuteswest: 0,
+                    tz_dsttime: 0,
+                },
+            )
+        }
+        .map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
 
-pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isize> {
-    let ts = if let Some(ts) = ts.nullable() {
-        Some(unsafe { ts.vm_read_uninit()?.assume_init() })
+pub fn sys_settimeofday<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ts: *const timeval,
+    tz: *const timezone,
+) -> AxResult<isize> {
+    let ts = if let Some(ts) = VmPtr::nullable(ts) {
+        Some(unsafe {
+            VmPtr::vm_read_uninit(ts, memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        })
     } else {
         None
     };
 
-    let tz = if let Some(tz) = tz.nullable() {
-        Some(unsafe { tz.vm_read_uninit()?.assume_init() })
+    let tz = if let Some(tz) = VmPtr::nullable(tz) {
+        Some(unsafe {
+            VmPtr::vm_read_uninit(tz, memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        })
     } else {
         None
     };
@@ -858,18 +1026,33 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
     Ok(0)
 }
 
-pub fn sys_clock_getres(clock_id: __kernel_clockid_t, res: *mut timespec) -> AxResult<isize> {
+pub fn sys_clock_getres<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    clock_id: __kernel_clockid_t,
+    res: *mut timespec,
+) -> AxResult<isize> {
     let resolution = clock_resolution(clock_id)?;
-    if let Some(res) = res.nullable() {
-        res.vm_write(timespec::from_time_value(resolution))?;
+    if let Some(res) = VmPtr::nullable(res) {
+        // SAFETY: `timespec` is a fully initialized two-word ABI value.
+        unsafe { VmMutPtr::vm_write_unchecked(res, memory, timespec::from_time_value(resolution)) }
+            .map_err(map_usercopy_error)?;
     }
     Ok(0)
 }
 
-pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> AxResult<isize> {
+pub fn sys_clock_settime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    clock_id: __kernel_clockid_t,
+    ts: *const timespec,
+) -> AxResult<isize> {
     match clock_id as u32 {
         CLOCK_REALTIME => {
-            let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+            let ts = unsafe {
+                VmPtr::vm_read_uninit(ts, memory)
+                    .map_err(map_usercopy_error)?
+                    .assume_init()
+            }
+            .try_into_time_value()?;
             if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
                 return Err(AxError::OperationNotPermitted);
             }
@@ -880,15 +1063,19 @@ pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> A
     }
 }
 
-pub fn sys_clock_adjtime(
+pub fn sys_clock_adjtime<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     clock_id: __kernel_clockid_t,
     timex_ptr: *mut KernelOldTimex,
 ) -> AxResult<isize> {
-    sys_do_clock_adjtime(clock_id, timex_ptr)
+    sys_do_clock_adjtime(memory, clock_id, timex_ptr)
 }
 
-pub fn sys_adjtimex(timex_ptr: *mut KernelOldTimex) -> AxResult<isize> {
-    sys_do_clock_adjtime(CLOCK_REALTIME as _, timex_ptr)
+pub fn sys_adjtimex<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    timex_ptr: *mut KernelOldTimex,
+) -> AxResult<isize> {
+    sys_do_clock_adjtime(memory, CLOCK_REALTIME as _, timex_ptr)
 }
 
 #[repr(C)]
@@ -903,36 +1090,74 @@ pub struct Tms {
     tms_cstime: usize,
 }
 
-pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
-    if let Some(tms) = tms.nullable() {
+pub fn sys_times<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    tms: *mut Tms,
+) -> AxResult<isize> {
+    if let Some(tms) = VmPtr::nullable(tms) {
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
         let self_usage = proc_data.self_usage();
         let child_usage = proc_data.children_usage();
-        tms.vm_write(Tms {
-            tms_utime: self_usage.utime_ticks() as usize,
-            tms_stime: self_usage.stime_ticks() as usize,
-            tms_cutime: child_usage.utime_ticks() as usize,
-            tms_cstime: child_usage.stime_ticks() as usize,
-        })?;
+        // SAFETY: `Tms` is repr(C) over four initialized usize words and has
+        // no implicit padding on the supported x86_64 ABI.
+        unsafe {
+            VmMutPtr::vm_write_unchecked(
+                tms,
+                memory,
+                Tms {
+                    tms_utime: self_usage.utime_ticks() as usize,
+                    tms_stime: self_usage.stime_ticks() as usize,
+                    tms_cutime: child_usage.utime_ticks() as usize,
+                    tms_cstime: child_usage.stime_ticks() as usize,
+                },
+            )
+        }
+        .map_err(map_usercopy_error)?;
     }
     Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
 }
 
-pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {
+/// Implements Linux alarm(2) by replacing the process-wide ITIMER_REAL with
+/// a one-shot timer. The existing process timer lease and publication path are
+/// deliberately shared with setitimer(2), so the two interfaces replace one
+/// another without introducing a second timer registry.
+pub fn sys_alarm(seconds: u32) -> AxResult<isize> {
+    let remaining_ns = alarm_seconds_to_nanos(seconds)?;
+    let curr = current();
+    poll_timer(&curr);
+    let ((_, old_remaining), _) = set_process_itimer(
+        &curr.as_thread().proc_data,
+        ITimerType::Real,
+        0,
+        remaining_ns,
+    )?;
+    Ok(alarm_remaining_seconds(old_remaining) as isize)
+}
+
+pub fn sys_getitimer<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    which: i32,
+    value: *mut itimerval,
+) -> AxResult<isize> {
     let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
     let curr = current();
     poll_timer(&curr);
     let (it_interval, it_value) = get_process_itimer(&curr.as_thread().proc_data, ty);
 
-    value.vm_write(itimerval {
-        it_interval: timeval::from_time_value(it_interval),
-        it_value: timeval::from_time_value(it_value),
-    })?;
+    write_itimer_value(
+        memory,
+        value,
+        itimerval {
+            it_interval: timeval::from_time_value(it_interval),
+            it_value: timeval::from_time_value(it_value),
+        },
+    )?;
     Ok(0)
 }
 
-pub fn sys_setitimer(
+pub fn sys_setitimer<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     which: i32,
     new_value: *const itimerval,
     old_value: *mut itimerval,
@@ -940,17 +1165,15 @@ pub fn sys_setitimer(
     // Linux copies and validates the replacement before dispatching `which`.
     // Preserve EFAULT/EINVAL precedence for combined bad-pointer/bad-selector
     // calls instead of rejecting the selector before touching userspace.
-    let (interval, remained) = match new_value.nullable() {
-        Some(new_value) => {
-            // FIXME: AnyBitPattern
-            let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
-            let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
-                .map_err(|_| AxError::OutOfRange)?;
-            let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
-                .map_err(|_| AxError::OutOfRange)?;
-            (interval, remaining)
-        }
-        None => (0, 0),
+    let (interval, remained) = if !new_value.is_null() {
+        let new_value = read_itimer_value(memory, new_value)?;
+        let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
+            .map_err(|_| AxError::OutOfRange)?;
+        let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
+            .map_err(|_| AxError::OutOfRange)?;
+        (interval, remaining)
+    } else {
+        (0, 0)
     };
     let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
     let curr = current();
@@ -973,22 +1196,178 @@ pub fn sys_setitimer(
             .sync_process_cpu_timer_epoch(ty, epoch);
     }
 
-    if let Some(old_value) = old_value.nullable() {
-        old_value.vm_write(itimerval {
-            it_interval: timeval::from_time_value(old_interval),
-            it_value: timeval::from_time_value(old_remaining),
-        })?;
+    if !old_value.is_null() {
+        write_itimer_value(
+            memory,
+            old_value,
+            itimerval {
+                it_interval: timeval::from_time_value(old_interval),
+                it_value: timeval::from_time_value(old_remaining),
+            },
+        )?;
     }
     Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use core::{mem::MaybeUninit, ops::Range};
+
     use linux_raw_sys::general::{
         CLOCK_BOOTTIME_ALARM, CLOCK_REALTIME_ALARM, CLOCK_TAI, MAX_CLOCKS,
     };
+    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::*;
+
+    struct TestMemory {
+        bytes: alloc::vec::Vec<u8>,
+        reject_writes: bool,
+    }
+
+    impl TestMemory {
+        fn range(&self, start: usize, len: usize) -> Result<Range<usize>, UserCopyError> {
+            let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+            (end <= self.bytes.len())
+                .then_some(start..end)
+                .ok_or(UserCopyError::BadAddress)
+        }
+    }
+
+    // SAFETY: TestMemory treats user addresses as checked byte offsets and
+    // initializes every destination byte before returning a successful read.
+    unsafe impl UserMemory for TestMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            let range = self.range(start, dst.len())?;
+            for (output, input) in dst.iter_mut().zip(&self.bytes[range]) {
+                output.write(*input);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+            if self.reject_writes {
+                return Err(UserCopyError::BadAddress);
+            }
+            let range = self.range(start, src.len())?;
+            self.bytes[range].copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn timer_usercopy_helpers_bind_one_provider_at_unaligned_addresses() {
+        let mut provider = TestMemory {
+            bytes: vec![0; 128],
+            reject_writes: false,
+        };
+        let input = itimerspec {
+            it_interval: timespec {
+                tv_sec: 11,
+                tv_nsec: 22,
+            },
+            it_value: timespec {
+                tv_sec: 33,
+                tv_nsec: 44,
+            },
+        };
+        let input_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&input as *const itimerspec).cast::<u8>(),
+                core::mem::size_of::<itimerspec>(),
+            )
+        };
+        let input_addr = 5;
+        let timerid_addr = 3;
+        let output_addr = 37;
+        provider.bytes[input_addr..input_addr + input_bytes.len()].copy_from_slice(input_bytes);
+
+        let copied = {
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let copied = read_timer_spec(&mut memory, input_addr as *const itimerspec).unwrap();
+            write_timer_id(&mut memory, timerid_addr as *mut i32, 17).unwrap();
+            write_timer_spec(&mut memory, output_addr as *mut itimerspec, copied).unwrap();
+            copied
+        };
+
+        assert_eq!(copied.it_interval.tv_sec, input.it_interval.tv_sec);
+        assert_eq!(copied.it_interval.tv_nsec, input.it_interval.tv_nsec);
+        assert_eq!(copied.it_value.tv_sec, input.it_value.tv_sec);
+        assert_eq!(copied.it_value.tv_nsec, input.it_value.tv_nsec);
+        assert_eq!(
+            i32::from_ne_bytes(
+                provider.bytes[timerid_addr..timerid_addr + core::mem::size_of::<i32>()]
+                    .try_into()
+                    .unwrap()
+            ),
+            17
+        );
+        assert_eq!(
+            &provider.bytes[output_addr..output_addr + input_bytes.len()],
+            input_bytes
+        );
+    }
+
+    #[test]
+    fn itimer_usercopy_helpers_bind_one_provider_at_unaligned_addresses() {
+        let mut provider = TestMemory {
+            bytes: vec![0; 128],
+            reject_writes: false,
+        };
+        let input = itimerval {
+            it_interval: timeval {
+                tv_sec: 11,
+                tv_usec: 22,
+            },
+            it_value: timeval {
+                tv_sec: 33,
+                tv_usec: 44,
+            },
+        };
+        let input_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&input as *const itimerval).cast::<u8>(),
+                core::mem::size_of::<itimerval>(),
+            )
+        };
+        let input_addr = 5;
+        let output_addr = 37;
+        provider.bytes[input_addr..input_addr + input_bytes.len()].copy_from_slice(input_bytes);
+
+        let copied = {
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let copied = read_itimer_value(&mut memory, input_addr as *const itimerval).unwrap();
+            write_itimer_value(&mut memory, output_addr as *mut itimerval, copied).unwrap();
+            copied
+        };
+
+        assert_eq!(copied.it_interval.tv_sec, input.it_interval.tv_sec);
+        assert_eq!(copied.it_interval.tv_usec, input.it_interval.tv_usec);
+        assert_eq!(copied.it_value.tv_sec, input.it_value.tv_sec);
+        assert_eq!(copied.it_value.tv_usec, input.it_value.tv_usec);
+        assert_eq!(
+            &provider.bytes[output_addr..output_addr + input_bytes.len()],
+            input_bytes
+        );
+    }
+
+    #[test]
+    fn timer_usercopy_helper_maps_copyout_failure() {
+        let mut provider = TestMemory {
+            bytes: vec![0; 32],
+            reject_writes: true,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            write_timer_id(&mut memory, 3 as *mut i32, 1),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(
+            map_timer_usercopy_error(UserCopyError::NoMemory),
+            AxError::BadAddress
+        );
+    }
 
     #[test]
     fn clock_domain_accepts_supported_ids() {
@@ -1150,6 +1529,32 @@ mod tests {
         assert_eq!(
             posix_timer_clock(CLOCK_THREAD_CPUTIME_ID as _),
             Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn alarm_remaining_seconds_rounds_up_and_saturates() {
+        let second = NANOS_PER_SEC as u128;
+        assert_eq!(alarm_remaining_seconds_from_nanos(0), 0);
+        assert_eq!(alarm_remaining_seconds_from_nanos(second), 1);
+        assert_eq!(alarm_remaining_seconds_from_nanos(second - 1), 1);
+        assert_eq!(
+            alarm_remaining_seconds_from_nanos(u128::from(u32::MAX - 1) * second + 1),
+            u32::MAX
+        );
+        assert_eq!(
+            alarm_remaining_seconds_from_nanos(u128::from(u32::MAX) * second),
+            u32::MAX
+        );
+        assert_eq!(alarm_remaining_seconds_from_nanos(u128::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn alarm_seconds_to_nanos_accepts_the_unsigned_api_boundary() {
+        assert_eq!(alarm_seconds_to_nanos(0), Ok(0));
+        assert_eq!(
+            alarm_seconds_to_nanos(u32::MAX),
+            Ok(u64::from(u32::MAX) as usize * NANOS_PER_SEC as usize)
         );
     }
 }

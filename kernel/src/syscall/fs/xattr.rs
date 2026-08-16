@@ -1,11 +1,14 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, AT_SYMLINK_NOFOLLOW};
-use starry_vm::{VmError, vm_load_until_nul_bounded, vm_write_slice};
+use thekernel_linux_usercopy::{
+    UserCopyError, UserMemory, UserMemoryContext, vm_load, vm_load_until_nul,
+    vm_load_until_nul_bounded, vm_write_slice,
+};
 
 use super::ctl::validate_pathname;
 use crate::{
@@ -19,7 +22,7 @@ use crate::{
             remove_xattr_with_security, set_xattr_with_security,
         },
     },
-    mm::{UserConstPtr, vm_load_string},
+    mm::map_usercopy_error,
     task::{AsThread, XATTR_NAME_MAX, security::XattrSetFlags},
 };
 
@@ -34,40 +37,51 @@ fn validate_xattr_flags(flags: u32) -> AxResult<XattrSetFlags> {
     XattrSetFlags::try_from_bits(flags).ok_or(AxError::InvalidInput)
 }
 
-fn map_xattr_name_load_error(error: VmError) -> AxError {
+fn map_xattr_name_load_error(error: UserCopyError) -> AxError {
     match error {
-        VmError::TooLong => LinuxError::ERANGE.into(),
-        other => other.into(),
+        UserCopyError::TooLong => LinuxError::ERANGE.into(),
+        other => map_usercopy_error(other),
     }
 }
 
-fn read_xattr_name(name: *const c_char) -> AxResult<Vec<u8>> {
-    let name = vm_load_until_nul_bounded(name.cast::<u8>(), XATTR_NAME_MAX + 1)
+fn read_xattr_name<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const c_char,
+) -> AxResult<Vec<u8>> {
+    let name = vm_load_until_nul_bounded(memory, name.cast::<u8>(), XATTR_NAME_MAX + 1)
         .map_err(map_xattr_name_load_error)?;
     validate_xattr_name(&name)?;
     Ok(name)
 }
 
-fn read_xattr_value(value: *const u8, size: usize) -> AxResult<Vec<u8>> {
+fn read_xattr_value<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    value: *const u8,
+    size: usize,
+) -> AxResult<Vec<u8>> {
     if size > XATTR_SIZE_MAX {
         return Err(LinuxError::E2BIG.into());
     }
     if size == 0 {
         return Ok(Vec::new());
     }
-    Ok(UserConstPtr::from(value).get_as_slice(size)?.to_vec())
+    Ok(vm_load(memory, value, size).map_err(map_usercopy_error)?)
 }
 
 fn current_vfs_security_context() -> VfsSecurityContext {
     VfsSecurityContext::new(current().as_thread().current_cred())
 }
 
-fn resolve_xattr_path(
+fn resolve_xattr_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     no_follow: bool,
     security: &VfsSecurityContext,
 ) -> AxResult<Location> {
-    let path = vm_load_string(path)?;
+    let path = String::from_utf8(
+        vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?,
+    )
+    .map_err(|_| AxError::IllegalBytes)?;
     let path_ref = Path::new(&path);
     validate_pathname(path_ref)?;
 
@@ -104,29 +118,40 @@ fn resolve_xattr_fd(fd: i32) -> AxResult<ResolveAtResult> {
     })
 }
 
-fn write_xattr_value(buf: *mut u8, size: usize, value: &[u8]) -> AxResult<isize> {
+fn write_xattr_value<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    size: usize,
+    value: &[u8],
+) -> AxResult<isize> {
     if size == 0 {
         return Ok(value.len() as isize);
     }
     if size < value.len() {
         return Err(LinuxError::ERANGE.into());
     }
-    vm_write_slice(buf, value)?;
+    vm_write_slice(memory, buf, value).map_err(map_usercopy_error)?;
     Ok(value.len() as isize)
 }
 
-fn write_xattr_list(buf: *mut c_char, size: usize, value: &[u8]) -> AxResult<isize> {
+fn write_xattr_list<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut c_char,
+    size: usize,
+    value: &[u8],
+) -> AxResult<isize> {
     if size == 0 {
         return Ok(value.len() as isize);
     }
     if size < value.len() {
         return Err(LinuxError::ERANGE.into());
     }
-    vm_write_slice(buf.cast::<u8>(), value)?;
+    vm_write_slice(memory, buf.cast::<u8>(), value).map_err(map_usercopy_error)?;
     Ok(value.len() as isize)
 }
 
-fn xattr_set_by_path(
+fn xattr_set_by_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     path: *const c_char,
     name: *const c_char,
@@ -136,14 +161,15 @@ fn xattr_set_by_path(
     no_follow: bool,
 ) -> AxResult<isize> {
     let flags = validate_xattr_flags(flags)?;
-    let name = read_xattr_name(name)?;
-    let value = read_xattr_value(value, size)?;
-    let loc = resolve_xattr_path(path, no_follow, security)?;
+    let name = read_xattr_name(memory, name)?;
+    let value = read_xattr_value(memory, value, size)?;
+    let loc = resolve_xattr_path(memory, path, no_follow, security)?;
     set_xattr_with_security(security, &loc, &name, &value, flags)?;
     Ok(0)
 }
 
-fn xattr_set_by_fd(
+fn xattr_set_by_fd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     fd: i32,
     name: *const c_char,
@@ -152,8 +178,8 @@ fn xattr_set_by_fd(
     flags: u32,
 ) -> AxResult<isize> {
     let flags = validate_xattr_flags(flags)?;
-    let name = read_xattr_name(name)?;
-    let value = read_xattr_value(value, size)?;
+    let name = read_xattr_name(memory, name)?;
+    let value = read_xattr_value(memory, value, size)?;
 
     match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => {
@@ -164,7 +190,8 @@ fn xattr_set_by_fd(
     }
 }
 
-fn xattr_get_by_path(
+fn xattr_get_by_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     path: *const c_char,
     name: *const c_char,
@@ -172,40 +199,43 @@ fn xattr_get_by_path(
     size: usize,
     no_follow: bool,
 ) -> AxResult<isize> {
-    let name = read_xattr_name(name)?;
-    let loc = resolve_xattr_path(path, no_follow, security)?;
+    let name = read_xattr_name(memory, name)?;
+    let loc = resolve_xattr_path(memory, path, no_follow, security)?;
     let value_bytes = get_xattr_with_security(security, &loc, &name)?;
-    write_xattr_value(value, size, &value_bytes)
+    write_xattr_value(memory, value, size, &value_bytes)
 }
 
-fn xattr_get_by_fd(
+fn xattr_get_by_fd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     fd: i32,
     name: *const c_char,
     value: *mut u8,
     size: usize,
 ) -> AxResult<isize> {
-    let name = read_xattr_name(name)?;
+    let name = read_xattr_name(memory, name)?;
     let value_bytes = match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => get_xattr_with_security(security, &loc, &name)?,
         ResolveAtResult::Other(_) => return Err(LinuxError::EOPNOTSUPP.into()),
     };
-    write_xattr_value(value, size, &value_bytes)
+    write_xattr_value(memory, value, size, &value_bytes)
 }
 
-fn xattr_list_by_path(
+fn xattr_list_by_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     path: *const c_char,
     list: *mut c_char,
     size: usize,
     no_follow: bool,
 ) -> AxResult<isize> {
-    let loc = resolve_xattr_path(path, no_follow, security)?;
+    let loc = resolve_xattr_path(memory, path, no_follow, security)?;
     let names = list_xattrs_with_security(security, &loc)?;
-    write_xattr_list(list, size, &names)
+    write_xattr_list(memory, list, size, &names)
 }
 
-fn xattr_list_by_fd(
+fn xattr_list_by_fd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     fd: i32,
     list: *mut c_char,
@@ -215,27 +245,29 @@ fn xattr_list_by_fd(
         ResolveAtResult::File(loc) => list_xattrs_with_security(security, &loc)?,
         ResolveAtResult::Other(_) => return Err(LinuxError::EOPNOTSUPP.into()),
     };
-    write_xattr_list(list, size, &names)
+    write_xattr_list(memory, list, size, &names)
 }
 
-fn xattr_remove_by_path(
+fn xattr_remove_by_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     path: *const c_char,
     name: *const c_char,
     no_follow: bool,
 ) -> AxResult<isize> {
-    let name = read_xattr_name(name)?;
-    let loc = resolve_xattr_path(path, no_follow, security)?;
+    let name = read_xattr_name(memory, name)?;
+    let loc = resolve_xattr_path(memory, path, no_follow, security)?;
     remove_xattr_with_security(security, &loc, &name)?;
     Ok(0)
 }
 
-fn xattr_remove_by_fd(
+fn xattr_remove_by_fd<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     security: &VfsSecurityContext,
     fd: i32,
     name: *const c_char,
 ) -> AxResult<isize> {
-    let name = read_xattr_name(name)?;
+    let name = read_xattr_name(memory, name)?;
     match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => {
             remove_xattr_with_security(security, &loc, &name)?;
@@ -245,7 +277,8 @@ fn xattr_remove_by_fd(
     }
 }
 
-pub fn sys_setxattr(
+pub fn sys_setxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     name: *const c_char,
     value: *const u8,
@@ -253,10 +286,11 @@ pub fn sys_setxattr(
     flags: u32,
 ) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_set_by_path(&security, path, name, value, size, flags, false)
+    xattr_set_by_path(memory, &security, path, name, value, size, flags, false)
 }
 
-pub fn sys_lsetxattr(
+pub fn sys_lsetxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     name: *const c_char,
     value: *const u8,
@@ -264,10 +298,11 @@ pub fn sys_lsetxattr(
     flags: u32,
 ) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_set_by_path(&security, path, name, value, size, flags, true)
+    xattr_set_by_path(memory, &security, path, name, value, size, flags, true)
 }
 
-pub fn sys_fsetxattr(
+pub fn sys_fsetxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
     name: *const c_char,
     value: *const u8,
@@ -275,62 +310,97 @@ pub fn sys_fsetxattr(
     flags: u32,
 ) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_set_by_fd(&security, fd, name, value, size, flags)
+    xattr_set_by_fd(memory, &security, fd, name, value, size, flags)
 }
 
-pub fn sys_getxattr(
+pub fn sys_getxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     name: *const c_char,
     value: *mut u8,
     size: usize,
 ) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_get_by_path(&security, path, name, value, size, false)
+    xattr_get_by_path(memory, &security, path, name, value, size, false)
 }
 
-pub fn sys_lgetxattr(
+pub fn sys_lgetxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
     name: *const c_char,
     value: *mut u8,
     size: usize,
 ) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_get_by_path(&security, path, name, value, size, true)
+    xattr_get_by_path(memory, &security, path, name, value, size, true)
 }
 
-pub fn sys_fgetxattr(fd: i32, name: *const c_char, value: *mut u8, size: usize) -> AxResult<isize> {
+pub fn sys_fgetxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    name: *const c_char,
+    value: *mut u8,
+    size: usize,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_get_by_fd(&security, fd, name, value, size)
+    xattr_get_by_fd(memory, &security, fd, name, value, size)
 }
 
-pub fn sys_listxattr(path: *const c_char, list: *mut c_char, size: usize) -> AxResult<isize> {
+pub fn sys_listxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    list: *mut c_char,
+    size: usize,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_list_by_path(&security, path, list, size, false)
+    xattr_list_by_path(memory, &security, path, list, size, false)
 }
 
-pub fn sys_llistxattr(path: *const c_char, list: *mut c_char, size: usize) -> AxResult<isize> {
+pub fn sys_llistxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    list: *mut c_char,
+    size: usize,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_list_by_path(&security, path, list, size, true)
+    xattr_list_by_path(memory, &security, path, list, size, true)
 }
 
-pub fn sys_flistxattr(fd: i32, list: *mut c_char, size: usize) -> AxResult<isize> {
+pub fn sys_flistxattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    list: *mut c_char,
+    size: usize,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_list_by_fd(&security, fd, list, size)
+    xattr_list_by_fd(memory, &security, fd, list, size)
 }
 
-pub fn sys_removexattr(path: *const c_char, name: *const c_char) -> AxResult<isize> {
+pub fn sys_removexattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    name: *const c_char,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_remove_by_path(&security, path, name, false)
+    xattr_remove_by_path(memory, &security, path, name, false)
 }
 
-pub fn sys_lremovexattr(path: *const c_char, name: *const c_char) -> AxResult<isize> {
+pub fn sys_lremovexattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    path: *const c_char,
+    name: *const c_char,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_remove_by_path(&security, path, name, true)
+    xattr_remove_by_path(memory, &security, path, name, true)
 }
 
-pub fn sys_fremovexattr(fd: i32, name: *const c_char) -> AxResult<isize> {
+pub fn sys_fremovexattr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    name: *const c_char,
+) -> AxResult<isize> {
     let security = current_vfs_security_context();
-    xattr_remove_by_fd(&security, fd, name)
+    xattr_remove_by_fd(memory, &security, fd, name)
 }
 
 #[cfg(test)]
@@ -368,11 +438,11 @@ mod tests {
             Err(LinuxError::ERANGE.into())
         );
         assert_eq!(
-            map_xattr_name_load_error(VmError::TooLong),
+            map_xattr_name_load_error(UserCopyError::TooLong),
             LinuxError::ERANGE.into()
         );
         assert_eq!(
-            map_xattr_name_load_error(VmError::BadAddress),
+            map_xattr_name_load_error(UserCopyError::BadAddress),
             AxError::BadAddress
         );
     }

@@ -33,6 +33,144 @@ use super::{
     mapping::{FileLikeMappingLease, FileMappingLease, MappingStatus, relocate_affine_origin},
 };
 
+/// The byte offset of a futex word within a shared backing.
+///
+/// Keeping the offset typed prevents a virtual address (or a page number) from
+/// accidentally being used as a shared-futex table key.  Alignment is checked
+/// at the syscall boundary; this type only represents the arithmetic result of
+/// translating a mapped address into its backing.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FutexWordOffset(usize);
+
+impl FutexWordOffset {
+    pub const fn new(offset: usize) -> Self {
+        Self(offset)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// A lifetime lease for the object which gives a shared futex its identity.
+///
+/// The lease is deliberately strong.  A weak pointer or its numeric address
+/// is not a valid identity: after the last mapping disappears the allocator
+/// may reuse that address for a different backing while an old futex waiter is
+/// still present.  File identities retain the actual cached file object, and
+/// anonymous shared identities retain their page allocation.
+#[derive(Clone)]
+pub enum FutexBackingIdentity {
+    Shared(Arc<SharedPages>),
+    File(Arc<file::FileFutexIdentity>),
+}
+
+/// A non-owning, typed table discriminator for a backing identity.
+///
+/// The global shared-futex table may outlive a particular entry.  Keeping an
+/// `Arc` in that table's key would pin the backing forever, so only this typed
+/// discriminator is stored there; the corresponding `FutexEntry` carries the
+/// strong lease which makes the pointer value safe while it is in use.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FutexBackingId {
+    kind: u8,
+    address: usize,
+}
+
+impl FutexBackingId {
+    pub(crate) const fn shared(address: usize) -> Self {
+        Self { kind: 0, address }
+    }
+
+    pub(crate) const fn file(address: usize) -> Self {
+        Self { kind: 1, address }
+    }
+}
+
+impl FutexBackingIdentity {
+    pub fn is_shared_pages(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+
+    fn identity_ptr(&self) -> usize {
+        match self {
+            Self::Shared(pages) => Arc::as_ptr(pages) as usize,
+            Self::File(file) => Arc::as_ptr(file) as usize,
+        }
+    }
+
+    pub(crate) fn id(&self) -> FutexBackingId {
+        FutexBackingId {
+            kind: matches!(self, Self::File(_)) as u8,
+            address: self.identity_ptr(),
+        }
+    }
+}
+
+impl core::fmt::Debug for FutexBackingIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple(match self {
+            Self::Shared(_) => "Shared",
+            Self::File(_) => "File",
+        })
+        .field(&self.identity_ptr())
+        .finish()
+    }
+}
+
+impl PartialEq for FutexBackingIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Shared(lhs), Self::Shared(rhs)) => Arc::ptr_eq(lhs, rhs),
+            (Self::File(lhs), Self::File(rhs)) => Arc::ptr_eq(lhs, rhs),
+            (Self::Shared(_), Self::File(_)) | (Self::File(_), Self::Shared(_)) => false,
+        }
+    }
+}
+
+impl Eq for FutexBackingIdentity {}
+
+impl PartialOrd for FutexBackingIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FutexBackingIdentity {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let lhs_kind = matches!(self, Self::File(_)) as u8;
+        let rhs_kind = matches!(other, Self::File(_)) as u8;
+        lhs_kind
+            .cmp(&rhs_kind)
+            .then_with(|| self.identity_ptr().cmp(&other.identity_ptr()))
+    }
+}
+
+/// A complete, strongly typed identity for a process-shared futex word.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SharedFutexKey {
+    backing: FutexBackingIdentity,
+    offset: FutexWordOffset,
+}
+
+impl SharedFutexKey {
+    pub const fn new(backing: FutexBackingIdentity, offset: FutexWordOffset) -> Self {
+        Self { backing, offset }
+    }
+
+    pub fn backing(&self) -> &FutexBackingIdentity {
+        &self.backing
+    }
+
+    pub const fn offset(&self) -> FutexWordOffset {
+        self.offset
+    }
+}
+
 fn divide_page(size: usize, page_size: PageSize) -> AxResult<usize> {
     if !page_size.is_aligned(size) {
         return Err(AxError::InvalidInput);
@@ -101,9 +239,9 @@ fn preflight_dense_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTab
 }
 
 fn page_table_flags(flags: MappingFlags) -> MappingFlags {
-    // RISC-V and LoongArch PTEs cannot represent writable-without-readable.
-    // Keep VMA flags exact for /proc/maps and mprotect, but normalize the
-    // hardware permissions when touching page tables.
+    // x86 writable user pages are inherently readable in hardware. Keep VMA
+    // flags exact for /proc/maps and mprotect, but normalize the hardware
+    // permissions when touching page tables.
     if flags.contains(MappingFlags::WRITE) && !flags.contains(MappingFlags::READ) {
         flags | MappingFlags::READ
     } else {
@@ -456,6 +594,34 @@ impl Backend {
         match self {
             Self::File(backend) => Some(backend.location()),
             Self::Linear(_) | Self::Cow(_) | Self::Shared(_) => None,
+        }
+    }
+
+    /// Resolves a process-shared futex address to its backing lease and byte
+    /// offset.  Private/anonymous mappings intentionally return `None`; they
+    /// remain in the process-private futex namespace.
+    pub(crate) fn futex_shared_key(&self, address: usize) -> Option<SharedFutexKey> {
+        match self {
+            Self::Shared(backend) => backend.futex_key(address),
+            Self::File(backend) => backend
+                .futex_key(address)
+                .map(|(backing, offset)| SharedFutexKey::new(backing, offset)),
+            Self::Linear(_) | Self::Cow(_) => None,
+        }
+    }
+
+    /// Returns the non-owning discriminator and offset for a mapped shared
+    /// futex word.  This is the gate-safe form of `futex_shared_key`: it never
+    /// clones an `Arc`; the caller must already hold the backing lease captured
+    /// when the key was derived.
+    pub(crate) fn futex_shared_id(
+        &self,
+        address: usize,
+    ) -> Option<(FutexBackingId, FutexWordOffset)> {
+        match self {
+            Self::Shared(backend) => backend.futex_id(address),
+            Self::File(backend) => backend.futex_id(address),
+            Self::Linear(_) | Self::Cow(_) => None,
         }
     }
 

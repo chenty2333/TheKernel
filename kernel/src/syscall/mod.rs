@@ -13,7 +13,6 @@ mod sync;
 mod sys;
 mod task;
 mod time;
-mod usercopy;
 
 use core::time::Duration;
 
@@ -26,14 +25,16 @@ use linux_raw_sys::general::{
     FUTEX_WAIT_BITSET,
 };
 use syscalls::Sysno;
-pub(crate) use usercopy::RawSigevent;
+pub(crate) use thekernel_linux_usercopy::RawSigevent;
 
+pub(crate) use self::sync::init_membarrier_ipi;
 pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, seccomp::*, signal::*, sync::*, sys::*,
     task::*, time::*,
 };
 use crate::{
     file::{FileLike, Socket},
+    mm::with_user_memory,
     task::{AsThread, RestartClass, Thread, has_pending_syscall_signal},
 };
 
@@ -93,17 +94,13 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
         Sysno::accept | Sysno::accept4 | Sysno::recvfrom | Sysno::recvmsg | Sysno::recvmmsg => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
         }
-        #[cfg(target_arch = "loongarch64")]
-        Sysno::recvmmsg_time64 => {
-            restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
-        }
         Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
         }
         Sysno::futex => restart_class_for_futex(uctx),
-        #[cfg(target_arch = "loongarch64")]
-        Sysno::futex_time64 => restart_class_for_futex(uctx),
         Sysno::futex_waitv => Some(RestartClass::Sys),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::futex_wait => Some(RestartClass::Sys),
         _ => None,
     }
 }
@@ -165,23 +162,20 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     // still run in the user-mode loop after handle_syscall returns.
     match sysno {
         Sysno::gettimeofday => {
-            let r = sys_gettimeofday(uctx.arg0() as _, uctx.arg1() as _);
+            let aspace = current().as_thread().proc_data.aspace();
+            let r = with_user_memory(aspace, |memory| {
+                sys_gettimeofday(memory, uctx.arg0() as _, uctx.arg1() as _)
+            });
             uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
             return;
         }
         Sysno::clock_gettime => {
             let clockid = uctx.arg0() as u32;
             if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
-                let r = sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _);
-                uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
-                return;
-            }
-        }
-        #[cfg(target_arch = "loongarch64")]
-        Sysno::clock_gettime64 => {
-            let clockid = uctx.arg0() as u32;
-            if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
-                let r = sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _);
+                let aspace = current().as_thread().proc_data.aspace();
+                let r = with_user_memory(aspace, |memory| {
+                    sys_clock_gettime(memory, uctx.arg0() as _, uctx.arg1() as _)
+                });
                 uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
                 return;
             }
@@ -195,7 +189,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     let preserve_restart_state = matches!(sysno, Sysno::rt_sigreturn) || thr.in_signal_handler();
     thr.enter_syscall(uctx, preserve_restart_state, restart_class);
 
-    let result = dispatch::dispatch_syscall(sysno, uctx);
+    let result = dispatch::dispatch_syscall(sysno, uctx, || thr.proc_data.aspace());
     // Syscalls such as close, munmap, execve, and umount may release the final
     // filesystem identity. All syscall-local handles have been dropped by this
     // point, and policy work is safe in the current task context.

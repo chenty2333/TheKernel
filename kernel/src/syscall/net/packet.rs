@@ -12,12 +12,11 @@ use linux_raw_sys::{
     if_packet::sockaddr_ll,
     net::{AF_PACKET, sockaddr, socklen_t},
 };
-use starry_vm::{vm_read_slice, vm_write_slice};
 use thekernel_linux_packet::{PacketBindRequest, PacketError, PacketSendAddress, SockAddrLl};
 
 use crate::{
     file::{PACKET_SOCKADDR_STORAGE_LEN, PacketSockaddrSnapshot, packet_socket::packet_error},
-    mm::{UserConstPtr, UserPtr},
+    mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
 };
 
 pub(super) const SOCKADDR_LL_LEN: usize = core::mem::size_of::<sockaddr_ll>();
@@ -37,17 +36,24 @@ const _: [(); 11] = [(); SOCKADDR_LL_HALEN_OFFSET];
 const _: [(); 12] = [(); SOCKADDR_LL_ADDR_OFFSET];
 
 pub(super) fn snapshot_address(
+    capability: &UserMemoryCapability,
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
 ) -> AxResult<PacketSockaddrSnapshot> {
     let len = validate_snapshot_len(addrlen)?;
     let mut snapshot = [0_u8; PACKET_SOCKADDR_STORAGE_LEN];
     if len != 0 {
-        vm_read_slice(addr.address().as_usize() as *const u8, unsafe {
-            // SAFETY: `MaybeUninit<u8>` and `u8` have identical layouts.  The
-            // VM initializes every byte in the requested prefix on success.
-            core::slice::from_raw_parts_mut(snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
-        })?;
+        capability
+            .read_slice(addr.address().as_usize() as *const u8, unsafe {
+                // SAFETY: `MaybeUninit<u8>` and `u8` have identical
+                // layouts. The provider initializes every byte in the
+                // requested prefix on success.
+                core::slice::from_raw_parts_mut(
+                    snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                    len,
+                )
+            })
+            .map_err(map_usercopy_error)?;
     }
     PacketSockaddrSnapshot::new(snapshot, len)
 }
@@ -141,6 +147,7 @@ fn native_address_bytes(address: SockAddrLl) -> [u8; SOCKADDR_LL_LEN] {
 }
 
 fn write_native_address(
+    capability: &UserMemoryCapability,
     address: SockAddrLl,
     addr: UserPtr<sockaddr>,
     addrlen: &mut socklen_t,
@@ -152,7 +159,9 @@ fn write_native_address(
     let bytes = native_address_bytes(address);
     let copied = (*addrlen as usize).min(true_len);
     if copied != 0 {
-        vm_write_slice(addr.address().as_usize() as *mut u8, &bytes[..copied])?;
+        capability
+            .write_bytes(addr.address().as_usize(), &bytes[..copied])
+            .map_err(map_usercopy_error)?;
     }
     *addrlen = true_len as socklen_t;
     Ok(())
@@ -161,22 +170,24 @@ fn write_native_address(
 /// Exports Linux `packet_getname`: the true length ends after the live link
 /// address (12 bytes unbound, 18 for the six-byte loopback address).
 pub(super) fn write_socket_name(
+    capability: &UserMemoryCapability,
     address: SockAddrLl,
     addr: UserPtr<sockaddr>,
     addrlen: &mut socklen_t,
 ) -> AxResult<()> {
     let true_len = SOCKADDR_LL_ADDR_OFFSET + usize::from(address.address().len());
-    write_native_address(address, addr, addrlen, true_len)
+    write_native_address(capability, address, addr, addrlen, true_len)
 }
 
 /// Exports packet receive metadata.  Linux zero-fills the unused address tail
 /// and reports the complete 20-byte `sockaddr_ll` record for ordinary receive.
 pub(super) fn write_received_address(
+    capability: &UserMemoryCapability,
     address: SockAddrLl,
     addr: UserPtr<sockaddr>,
     addrlen: &mut socklen_t,
 ) -> AxResult<()> {
-    write_native_address(address, addr, addrlen, SOCKADDR_LL_LEN)
+    write_native_address(capability, address, addr, addrlen, SOCKADDR_LL_LEN)
 }
 
 #[cfg(test)]

@@ -28,9 +28,9 @@ use kernel_guard::NoPreempt;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
-use starry_process::Pid;
-use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::{SignalInfo, SignalTimerPayload, Signo};
 
 use super::{
     ProcessData, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
@@ -538,7 +538,8 @@ impl<const CAPACITY: usize> AlarmRegistry<CAPACITY> {
         let clock = self.slots[slot_index].clock;
         let heap_index = self.slots[slot_index].heap_index;
         let (heap, slots) = self.heap_mut(clock);
-        debug_assert_eq!(heap.remove_at(heap_index, slots), slot_index);
+        let removed = heap.remove_at(heap_index, slots);
+        debug_assert_eq!(removed, slot_index);
         let slot = &mut self.slots[slot_index];
         slot.active = false;
         slot.action.take()
@@ -791,6 +792,41 @@ mod alarm_registry_tests {
         assert_eq!(registry.realtime.len + registry.monotonic.len, 0);
         assert!(registry.release(owner).is_none());
         assert!(registry.release(blocker).is_none());
+        assert_eq!(Arc::strong_count(&source), 1);
+    }
+
+    #[test]
+    fn rearm_removes_the_previous_heap_node_before_inserting() {
+        let mut registry = AlarmRegistry::<2>::new();
+        let owner = registry.reserve().unwrap();
+        let source = Arc::new(PollSet::new());
+
+        registry
+            .arm(
+                owner,
+                AlarmClock::Monotonic,
+                Duration::from_secs(1),
+                wake_action(&source),
+            )
+            .unwrap_or_else(|_| panic!("live lease rejected arm"));
+        let (retired, _) = registry
+            .arm(
+                owner,
+                AlarmClock::Monotonic,
+                Duration::from_secs(2),
+                wake_action(&source),
+            )
+            .unwrap_or_else(|_| panic!("live lease rejected rearm"));
+
+        assert!(retired.is_some());
+        assert_eq!(registry.monotonic.len, 1);
+        assert_eq!(
+            registry.next_deadline(AlarmClock::Monotonic),
+            Some(Duration::from_secs(2))
+        );
+
+        drop(retired);
+        assert!(registry.release(owner).is_none());
         assert_eq!(Arc::strong_count(&source), 1);
     }
 
@@ -3171,16 +3207,10 @@ fn posix_timer_signal_info(
     value: usize,
     token: u32,
 ) -> SignalInfo {
-    let mut info = SignalInfo::new_kernel(signo);
-    info.set_code(SI_TIMER);
-    let timer = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
-    timer._tid = timerid as _;
-    timer._overrun = overrun;
-    timer._sigval = linux_raw_sys::general::sigval_t {
-        sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
-    };
-    timer._sys_private = token as i32;
-    info
+    SignalInfo::new_timer(
+        signo,
+        SignalTimerPayload::new(timerid as i32, overrun, value, token as i32),
+    )
 }
 
 fn timer_signal_identity(sig: &SignalInfo) -> Option<(usize, u32)> {
@@ -3188,8 +3218,8 @@ fn timer_signal_identity(sig: &SignalInfo) -> Option<(usize, u32)> {
         return None;
     }
 
-    let timer = unsafe { sig.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
-    Some((usize::try_from(timer._tid).ok()?, timer._sys_private as u32))
+    let timer = sig.timer_payload();
+    Some((usize::try_from(timer.tid).ok()?, timer.sys_private as u32))
 }
 
 pub(crate) fn acknowledge_posix_timer_signal(proc_data: &ProcessData, sig: &SignalInfo) {

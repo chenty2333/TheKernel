@@ -377,7 +377,7 @@ pub struct BpfAttrGetInfoByFd {
 
 /// Info structure returned for a BPF map.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, bytemuck::NoUninit)]
 pub struct BpfMapInfo {
     pub type_: u32,
     pub id: u32,
@@ -399,7 +399,7 @@ pub struct BpfMapInfo {
 
 /// Info structure returned for a BPF program.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, bytemuck::NoUninit)]
 pub struct BpfProgInfo {
     pub type_: u32,
     pub id: u32,
@@ -441,3 +441,15 @@ pub struct BpfProgInfo {
     pub attach_btf_id: u32,
     pub _pad0: u32,
 }
+
+// These command views mirror arms of Linux's `union bpf_attr`. Keep the
+// padding explicit: values are copied from arbitrary userspace bytes, and the
+// output info records may be copied back byte-for-byte.
+const _: [(); 96] = [(); core::mem::size_of::<BpfAttrMapCreate>()];
+const _: [(); 64] = [(); core::mem::offset_of!(BpfAttrMapCreate, map_extra)];
+const _: [(); 32] = [(); core::mem::size_of::<BpfAttrMapElem>()];
+const _: [(); 168] = [(); core::mem::size_of::<BpfAttrProgLoad>()];
+const _: [(); 80] = [(); core::mem::size_of::<BpfAttrTestRun>()];
+const _: [(); 16] = [(); core::mem::size_of::<BpfAttrGetInfoByFd>()];
+const _: [(); 88] = [(); core::mem::size_of::<BpfMapInfo>()];
+const _: [(); 232] = [(); core::mem::size_of::<BpfProgInfo>()];

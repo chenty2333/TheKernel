@@ -1,0 +1,374 @@
+//! Explicit userspace providers for address-space-bound usercopy operations.
+
+use alloc::sync::Arc;
+use core::{mem::MaybeUninit, slice};
+
+use axerrno::AxError;
+use axhal::paging::MappingFlags;
+use axsync::Mutex;
+use bytemuck::NoUninit;
+use memory_addr::{MemoryAddr, VirtAddr};
+use thekernel_linux_usercopy::{
+    UserCopyError, UserMemory, UserMemoryContext, VmResult, vm_load_until_nul,
+    vm_load_until_nul_bounded,
+};
+
+use super::AddrSpace;
+
+/// A user-memory provider bound to one explicitly selected address space.
+///
+/// The provider walks and populates the supplied address space directly. It
+/// never consults the current task or dereferences the userspace virtual
+/// address through the kernel's current page table.
+pub(crate) struct AddressSpaceUserMemory {
+    address_space: Arc<Mutex<AddrSpace>>,
+}
+
+/// Capability for accessing one explicitly selected userspace address space.
+///
+/// The capability is captured at syscall entry and is cloneable so synchronous
+/// I/O objects can retain the selection while they are passed through an
+/// object-safe `FileLike`/`axio` call.  It intentionally contains no task or
+/// `current()` reference: every operation constructs a short-lived provider
+/// and [`UserMemoryContext`] from this handle.
+#[derive(Clone)]
+pub struct UserMemoryCapability {
+    address_space: Arc<Mutex<AddrSpace>>,
+}
+
+impl UserMemoryCapability {
+    /// Binds a capability to the supplied address-space handle.
+    pub fn new(address_space: Arc<Mutex<AddrSpace>>) -> Self {
+        Self { address_space }
+    }
+
+    /// Returns the selected address-space handle for MM operations such as
+    /// direct-I/O pinning.  The handle is still explicit; callers must not
+    /// replace it with an address space obtained from `current()`.
+    pub fn address_space(&self) -> &Arc<Mutex<AddrSpace>> {
+        &self.address_space
+    }
+
+    /// Runs one operation with a fresh provider and user-memory context.
+    pub fn with_memory<T>(
+        &self,
+        operation: impl for<'a> FnOnce(&mut UserMemoryContext<'a, AddressSpaceUserMemory>) -> T,
+    ) -> T {
+        with_user_memory(self.clone(), operation)
+    }
+
+    /// Reads an opaque byte range from this capability.
+    pub fn read_bytes(&self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+        self.with_memory(|memory| memory.read_bytes(start, dst))
+    }
+
+    /// Writes an opaque byte range to this capability.
+    pub fn write_bytes(&self, start: usize, src: &[u8]) -> VmResult {
+        self.with_memory(|memory| memory.write_bytes(start, src))
+    }
+
+    /// Reads a typed value without dereferencing the userspace pointer.
+    pub fn read_value<T: bytemuck::AnyBitPattern>(&self, ptr: *const T) -> VmResult<T> {
+        self.with_memory(|memory| {
+            let mut value = MaybeUninit::<T>::uninit();
+            memory.read_slice(ptr, slice::from_mut(&mut value))?;
+            // SAFETY: the context initialized the complete object and
+            // `AnyBitPattern` makes every representation valid.
+            Ok(unsafe { value.assume_init() })
+        })
+    }
+
+    /// Reads an unaligned typed value without assuming its bit pattern.
+    pub fn read_value_uninit<T>(&self, ptr: *const T) -> VmResult<MaybeUninit<T>> {
+        self.with_memory(|memory| {
+            let mut value = MaybeUninit::<T>::uninit();
+            memory.read_slice(ptr, slice::from_mut(&mut value))?;
+            Ok(value)
+        })
+    }
+
+    /// Writes a typed value whose complete representation is initialized.
+    pub fn write_value<T: NoUninit>(&self, ptr: *mut T, value: T) -> VmResult {
+        self.with_memory(|memory| memory.write_slice(ptr, slice::from_ref(&value)))
+    }
+
+    /// Writes a typed value with an audited complete object representation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that every byte of `value`, including padding,
+    /// is initialized.
+    pub unsafe fn write_value_unchecked<T>(&self, ptr: *mut T, value: T) -> VmResult {
+        self.with_memory(|memory| {
+            // SAFETY: forwarded from this function's caller.
+            unsafe { memory.write_slice_unchecked(ptr, slice::from_ref(&value)) }
+        })
+    }
+
+    /// Reads a typed slice through a fresh user-memory context.
+    pub fn read_slice<T>(&self, ptr: *const T, dst: &mut [MaybeUninit<T>]) -> VmResult {
+        self.with_memory(|memory| memory.read_slice(ptr, dst))
+    }
+
+    /// Writes a typed slice whose complete representations are initialized.
+    pub fn write_slice<T: NoUninit>(&self, ptr: *mut T, src: &[T]) -> VmResult {
+        self.with_memory(|memory| memory.write_slice(ptr, src))
+    }
+
+    /// Writes an audited typed slice with arbitrary element types.
+    ///
+    /// # Safety
+    ///
+    /// Every byte in each source value, including padding, must be initialized.
+    pub unsafe fn write_slice_unchecked<T>(&self, ptr: *mut T, src: &[T]) -> VmResult {
+        self.with_memory(|memory| {
+            // SAFETY: forwarded from this function's caller.
+            unsafe { memory.write_slice_unchecked(ptr, src) }
+        })
+    }
+
+    /// Loads a NUL-terminated typed vector through a fresh context.
+    pub fn load_until_nul<T: bytemuck::Pod>(&self, ptr: *const T) -> VmResult<alloc::vec::Vec<T>> {
+        self.with_memory(|memory| vm_load_until_nul(memory, ptr))
+    }
+
+    /// Loads a bounded NUL-terminated typed vector through a fresh context.
+    pub fn load_until_nul_bounded<T: bytemuck::Pod>(
+        &self,
+        ptr: *const T,
+        scan_elements: usize,
+    ) -> VmResult<alloc::vec::Vec<T>> {
+        self.with_memory(|memory| vm_load_until_nul_bounded(memory, ptr, scan_elements))
+    }
+}
+
+impl From<Arc<Mutex<AddrSpace>>> for UserMemoryCapability {
+    fn from(address_space: Arc<Mutex<AddrSpace>>) -> Self {
+        Self::new(address_space)
+    }
+}
+
+impl AddressSpaceUserMemory {
+    pub(crate) fn new(address_space: Arc<Mutex<AddrSpace>>) -> Self {
+        Self { address_space }
+    }
+}
+
+/// Runs one usercopy operation against the explicitly supplied address space.
+///
+/// A provider and operation context are created for this call only; no
+/// current-task or global address-space state is consulted or cached.
+pub(crate) fn with_user_memory<T>(
+    capability: impl Into<UserMemoryCapability>,
+    operation: impl for<'a> FnOnce(&mut UserMemoryContext<'a, AddressSpaceUserMemory>) -> T,
+) -> T {
+    let capability = capability.into();
+    let mut provider = AddressSpaceUserMemory::new(capability.address_space.clone());
+    let mut memory = UserMemoryContext::new(&mut provider);
+    operation(&mut memory)
+}
+
+fn map_address_space_error(error: AxError) -> UserCopyError {
+    match error {
+        AxError::NoMemory => UserCopyError::NoMemory,
+        AxError::BadAddress | AxError::InvalidInput => UserCopyError::BadAddress,
+        _ => UserCopyError::AccessDenied,
+    }
+}
+
+fn prepare_range(
+    address_space: &mut AddrSpace,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+) -> Result<VirtAddr, UserCopyError> {
+    let start = VirtAddr::from(start);
+    if len == 0 {
+        return Ok(start);
+    }
+    if !address_space.contains_range(start, len) {
+        return Err(UserCopyError::BadAddress);
+    }
+    if !address_space.can_access_range(start, len, access_flags) {
+        return Err(UserCopyError::AccessDenied);
+    }
+
+    let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+    let page_start = start.align_down_4k();
+    let page_end = VirtAddr::from(
+        super::checked_align_up_4k(end.as_usize()).ok_or(UserCopyError::BadAddress)?,
+    );
+    address_space
+        .populate_area(page_start, page_end.sub_addr(page_start), access_flags)
+        .map_err(map_address_space_error)?;
+    Ok(start)
+}
+
+// SAFETY: all accesses are range-checked against the explicitly selected
+// address space, and successful reads initialize every destination byte.
+unsafe impl UserMemory for AddressSpaceUserMemory {
+    fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+        let mut address_space = self.address_space.lock();
+        let start = prepare_range(&mut address_space, start, dst.len(), MappingFlags::READ)?;
+        // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the address
+        // space read initializes the complete slice before returning `Ok`.
+        let dst = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
+        address_space
+            .read(start, dst)
+            .map_err(map_address_space_error)
+    }
+
+    fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+        let mut address_space = self.address_space.lock();
+        let start = prepare_range(&mut address_space, start, src.len(), MappingFlags::WRITE)?;
+        address_space
+            .write(start, src)
+            .map_err(map_address_space_error)
+    }
+}
+
+pub(crate) fn map_usercopy_error(error: UserCopyError) -> AxError {
+    match error {
+        UserCopyError::BadAddress | UserCopyError::AccessDenied => AxError::BadAddress,
+        UserCopyError::TooLong => AxError::NameTooLong,
+        UserCopyError::NoMemory => AxError::NoMemory,
+        _ => AxError::BadAddress,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::mem::MaybeUninit;
+
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+    use thekernel_linux_usercopy::{UserCopyError, UserMemoryContext};
+
+    use super::{
+        AddrSpace, AddressSpaceUserMemory, AxError, UserMemoryCapability, map_address_space_error,
+        map_usercopy_error, with_user_memory,
+    };
+
+    #[test]
+    fn provider_scope_uses_the_supplied_address_space() {
+        let first = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), 0x1000).unwrap(),
+        ));
+        let second = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x4000), 0x1000).unwrap(),
+        ));
+
+        let mut first_byte = [MaybeUninit::uninit(); 1];
+        let first_result =
+            with_user_memory(first, |memory| memory.read_bytes(0x1000, &mut first_byte));
+        assert_eq!(first_result, Err(UserCopyError::AccessDenied));
+
+        let mut second_byte = [MaybeUninit::uninit(); 1];
+        let second_result =
+            with_user_memory(second, |memory| memory.read_bytes(0x1000, &mut second_byte));
+        assert_eq!(second_result, Err(UserCopyError::BadAddress));
+    }
+
+    #[test]
+    fn provider_can_be_constructed_for_two_explicit_address_spaces() {
+        let first = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), 0x1000).unwrap(),
+        ));
+        let second = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x4000), 0x1000).unwrap(),
+        ));
+
+        let mut first_provider = AddressSpaceUserMemory::new(first);
+        let mut second_provider = AddressSpaceUserMemory::new(second);
+        let _first_context = UserMemoryContext::new(&mut first_provider);
+        let _second_context = UserMemoryContext::new(&mut second_provider);
+    }
+
+    #[test]
+    fn capability_reads_the_selected_address_space() {
+        let mut selected = AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap();
+        selected
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                super::super::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        let selected = Arc::new(Mutex::new(selected));
+        let other = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap(),
+        ));
+
+        let capability = UserMemoryCapability::new(selected);
+        capability.write_bytes(0x1000, &[0x5a]).unwrap();
+        let mut value = [MaybeUninit::<u8>::uninit()];
+        capability.read_bytes(0x1000, &mut value).unwrap();
+        // SAFETY: the capability read initialized the complete byte.
+        assert_eq!(unsafe { value[0].assume_init() }, 0x5a);
+
+        // A second address-space handle covers the same virtual range but has
+        // no mapping. This is the current-space stand-in: the capability must
+        // continue using its captured selection instead of reselecting it.
+        let other = UserMemoryCapability::new(other);
+        let mut ignored = [MaybeUninit::<u8>::uninit()];
+        assert_eq!(
+            other.read_bytes(0x1000, &mut ignored),
+            Err(UserCopyError::AccessDenied)
+        );
+        capability.read_bytes(0x1000, &mut ignored).unwrap();
+        // SAFETY: the second read also initialized the byte.
+        assert_eq!(unsafe { ignored[0].assume_init() }, 0x5a);
+    }
+
+    #[test]
+    fn provider_range_and_address_space_errors_map_to_usercopy_errors() {
+        assert_eq!(
+            map_address_space_error(AxError::NoMemory),
+            UserCopyError::NoMemory
+        );
+        assert_eq!(
+            map_address_space_error(AxError::BadAddress),
+            UserCopyError::BadAddress
+        );
+        assert_eq!(
+            map_address_space_error(AxError::InvalidInput),
+            UserCopyError::BadAddress
+        );
+        assert_eq!(
+            map_address_space_error(AxError::PermissionDenied),
+            UserCopyError::AccessDenied
+        );
+
+        assert_eq!(
+            map_usercopy_error(UserCopyError::BadAddress),
+            AxError::BadAddress
+        );
+        assert_eq!(
+            map_usercopy_error(UserCopyError::AccessDenied),
+            AxError::BadAddress
+        );
+        assert_eq!(
+            map_usercopy_error(UserCopyError::TooLong),
+            AxError::NameTooLong
+        );
+        assert_eq!(
+            map_usercopy_error(UserCopyError::NoMemory),
+            AxError::NoMemory
+        );
+    }
+
+    #[test]
+    fn empty_usercopy_ranges_do_not_require_address_space_access() {
+        let address_space = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), 0x1000).unwrap(),
+        ));
+        let result = with_user_memory(address_space, |memory| {
+            memory.read_bytes(usize::MAX, &mut [])
+        });
+        assert_eq!(result, Ok(()));
+    }
+}

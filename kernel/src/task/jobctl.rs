@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use starry_process::Pid;
+use thekernel_linux_process_adapter::Pid;
 
 use super::Cred;
 

@@ -1,4 +1,8 @@
-use core::{any::Any, slice};
+use core::{
+    any::Any,
+    mem::{align_of, offset_of, size_of},
+    slice,
+};
 
 #[allow(unused_imports)]
 use axdriver::prelude::DisplayDriverOps;
@@ -6,9 +10,11 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axhal::mem::virt_to_phys;
 use memory_addr::{PhysAddrRange, VirtAddr};
-use starry_vm::VmMutPtr;
 
-use crate::pseudofs::{DeviceMmap, DeviceOps};
+use crate::{
+    file::IoctlContext,
+    pseudofs::{DeviceMmap, DeviceOps},
+};
 
 // Types from https://github.com/Tangzh33/asterinas
 
@@ -78,6 +84,164 @@ struct FixScreenInfo {
     pub reserved: [u16; 2], // Reserved for future compatibility
 }
 
+const _: () = {
+    assert!(size_of::<FrameBufferBitfield>() == 12);
+    assert!(align_of::<FrameBufferBitfield>() == 4);
+    assert!(offset_of!(FrameBufferBitfield, offset) == 0);
+    assert!(offset_of!(FrameBufferBitfield, length) == 4);
+    assert!(offset_of!(FrameBufferBitfield, msb_right) == 8);
+    assert!(size_of::<VarScreenInfo>() == 160);
+    assert!(align_of::<VarScreenInfo>() == 4);
+    assert!(size_of::<FixScreenInfo>() == 80);
+    assert!(align_of::<FixScreenInfo>() == 8);
+    assert!(offset_of!(FixScreenInfo, smem_start) == 16);
+    assert!(offset_of!(FixScreenInfo, line_length) == 48);
+    assert!(offset_of!(FixScreenInfo, mmio_start) == 56);
+};
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..][..2].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..][..4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..][..8].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_bitfield(bytes: &mut [u8], offset: usize, value: FrameBufferBitfield) {
+    put_u32(
+        bytes,
+        offset + offset_of!(FrameBufferBitfield, offset),
+        value.offset,
+    );
+    put_u32(
+        bytes,
+        offset + offset_of!(FrameBufferBitfield, length),
+        value.length,
+    );
+    put_u32(
+        bytes,
+        offset + offset_of!(FrameBufferBitfield, msb_right),
+        value.msb_right,
+    );
+}
+
+fn var_screen_info_to_user_bytes(value: VarScreenInfo) -> [u8; size_of::<VarScreenInfo>()] {
+    let mut bytes = [0u8; size_of::<VarScreenInfo>()];
+    for (offset, field) in [
+        (offset_of!(VarScreenInfo, xres), value.xres),
+        (offset_of!(VarScreenInfo, yres), value.yres),
+        (offset_of!(VarScreenInfo, xres_virtual), value.xres_virtual),
+        (offset_of!(VarScreenInfo, yres_virtual), value.yres_virtual),
+        (offset_of!(VarScreenInfo, xoffset), value.xoffset),
+        (offset_of!(VarScreenInfo, yoffset), value.yoffset),
+        (
+            offset_of!(VarScreenInfo, bits_per_pixel),
+            value.bits_per_pixel,
+        ),
+        (offset_of!(VarScreenInfo, grayscale), value.grayscale),
+        (offset_of!(VarScreenInfo, nonstd), value.nonstd),
+        (offset_of!(VarScreenInfo, activate), value.activate),
+        (offset_of!(VarScreenInfo, height), value.height),
+        (offset_of!(VarScreenInfo, width), value.width),
+        (offset_of!(VarScreenInfo, accel_flags), value.accel_flags),
+        (offset_of!(VarScreenInfo, pixclock), value.pixclock),
+        (offset_of!(VarScreenInfo, left_margin), value.left_margin),
+        (offset_of!(VarScreenInfo, right_margin), value.right_margin),
+        (offset_of!(VarScreenInfo, upper_margin), value.upper_margin),
+        (offset_of!(VarScreenInfo, lower_margin), value.lower_margin),
+        (offset_of!(VarScreenInfo, hsync_len), value.hsync_len),
+        (offset_of!(VarScreenInfo, vsync_len), value.vsync_len),
+        (offset_of!(VarScreenInfo, sync), value.sync),
+        (offset_of!(VarScreenInfo, vmode), value.vmode),
+        (offset_of!(VarScreenInfo, rotate), value.rotate),
+        (offset_of!(VarScreenInfo, colorspace), value.colorspace),
+    ] {
+        put_u32(&mut bytes, offset, field);
+    }
+    for (index, field) in value.reserved.into_iter().enumerate() {
+        put_u32(
+            &mut bytes,
+            offset_of!(VarScreenInfo, reserved) + index * size_of::<u32>(),
+            field,
+        );
+    }
+    put_bitfield(&mut bytes, offset_of!(VarScreenInfo, red), value.red);
+    put_bitfield(&mut bytes, offset_of!(VarScreenInfo, green), value.green);
+    put_bitfield(&mut bytes, offset_of!(VarScreenInfo, blue), value.blue);
+    put_bitfield(&mut bytes, offset_of!(VarScreenInfo, transp), value.transp);
+    bytes
+}
+
+fn fix_screen_info_to_user_bytes(value: FixScreenInfo) -> [u8; size_of::<FixScreenInfo>()] {
+    let mut bytes = [0u8; size_of::<FixScreenInfo>()];
+    bytes[offset_of!(FixScreenInfo, id)..][..value.id.len()].copy_from_slice(&value.id);
+    put_u64(
+        &mut bytes,
+        offset_of!(FixScreenInfo, smem_start),
+        value.smem_start,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(FixScreenInfo, smem_len),
+        value.smem_len,
+    );
+    put_u32(&mut bytes, offset_of!(FixScreenInfo, type_), value.type_);
+    put_u32(
+        &mut bytes,
+        offset_of!(FixScreenInfo, type_aux),
+        value.type_aux,
+    );
+    put_u32(&mut bytes, offset_of!(FixScreenInfo, visual), value.visual);
+    put_u16(
+        &mut bytes,
+        offset_of!(FixScreenInfo, xpanstep),
+        value.xpanstep,
+    );
+    put_u16(
+        &mut bytes,
+        offset_of!(FixScreenInfo, ypanstep),
+        value.ypanstep,
+    );
+    put_u16(
+        &mut bytes,
+        offset_of!(FixScreenInfo, ywrapstep),
+        value.ywrapstep,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(FixScreenInfo, line_length),
+        value.line_length,
+    );
+    put_u64(
+        &mut bytes,
+        offset_of!(FixScreenInfo, mmio_start),
+        value.mmio_start,
+    );
+    put_u32(
+        &mut bytes,
+        offset_of!(FixScreenInfo, mmio_len),
+        value.mmio_len,
+    );
+    put_u32(&mut bytes, offset_of!(FixScreenInfo, accel), value.accel);
+    put_u16(
+        &mut bytes,
+        offset_of!(FixScreenInfo, capabilities),
+        value.capabilities,
+    );
+    for (index, field) in value.reserved.into_iter().enumerate() {
+        put_u16(
+            &mut bytes,
+            offset_of!(FixScreenInfo, reserved) + index * size_of::<u16>(),
+            field,
+        );
+    }
+    bytes
+}
+
 fn refresh_task() -> Result<AxResult<()>, axtask::future::BlockOnError> {
     let delay = core::time::Duration::from_secs_f32(1. / 60.);
     loop {
@@ -142,14 +306,14 @@ impl DeviceOps for FrameBuffer {
         Ok(len)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             // FBIOGET_VSCREENINFO
             0x4600 => {
                 let info = axdisplay::framebuffer_info();
                 let line_length = (info.fb_size / info.height as usize) as u32;
                 let bpp = line_length / info.width;
-                (arg as *mut VarScreenInfo).vm_write(VarScreenInfo {
+                let value = VarScreenInfo {
                     xres: info.width,
                     yres: info.height,
                     xres_virtual: info.width,
@@ -195,7 +359,12 @@ impl DeviceOps for FrameBuffer {
                     rotate: 0,
                     colorspace: 0,
                     reserved: [0; 4],
-                })?;
+                };
+                let bytes = var_screen_info_to_user_bytes(value);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(crate::mm::map_usercopy_error)?;
                 Ok(0)
             }
             // FBIOPUT_VSCREENINFO
@@ -203,7 +372,7 @@ impl DeviceOps for FrameBuffer {
             // FBIOGET_FSCREENINFO
             0x4602 => {
                 let info = axdisplay::framebuffer_info();
-                (arg as *mut FixScreenInfo).vm_write(FixScreenInfo {
+                let value = FixScreenInfo {
                     id: *b"Virtio Framebuf\0",
                     smem_start: virt_to_phys(VirtAddr::from(info.fb_base_vaddr)).as_usize() as u64,
                     smem_len: info.fb_size as u32,
@@ -219,7 +388,12 @@ impl DeviceOps for FrameBuffer {
                     accel: 0,
                     capabilities: 0,
                     reserved: [0; 2],
-                })?;
+                };
+                let bytes = fix_screen_info_to_user_bytes(value);
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes)
+                    .map_err(crate::mm::map_usercopy_error)?;
                 Ok(0)
             }
             // FBIOGETCMAP

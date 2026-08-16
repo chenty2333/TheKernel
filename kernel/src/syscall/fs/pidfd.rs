@@ -4,11 +4,12 @@ use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, current};
 use bitflags::bitflags;
 use linux_raw_sys::general::SI_TKILL;
-use starry_signal::{SignalInfo, api::ThreadSignalManager};
-use starry_vm::VmPtr;
+use thekernel_linux_signal::{SignalInfo, api::ThreadSignalManager};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
     file::{Directory, FD_TABLE, FileHandle, FileLike, PidFd, add_file_description},
+    mm::map_usercopy_error,
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::{
         parse_signo, queued_signal_required, send_signal_to_authorized_thread, signal_operation,
@@ -464,17 +465,22 @@ struct PidFdSignalRequest {
     code: i32,
 }
 
-fn make_pidfd_signal_info(
+fn make_pidfd_signal_info<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     target_id: u32,
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<PidFdSignalRequest> {
-    let sig = unsafe { sig.vm_read_uninit()?.assume_init() };
+    // `SignalInfo` is the signal crate's fixed-size, layout-checked mirror of
+    // Linux siginfo_t (including its union storage).  Read the complete record
+    // through the explicit address-space context before interpreting fields.
+    let sig = unsafe {
+        VmPtr::vm_read_uninit(sig, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let parsed_signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
-    // SAFETY: `sig` is a fully initialized local copy of the userspace
-    // `siginfo_t`; reading the bindgen-exposed common header field is valid for
-    // every union variant.
-    let raw_signo = unsafe { sig.0.__bindgen_anon_1.__bindgen_anon_1.si_signo };
+    let raw_signo = sig.try_signo().ok_or(AxError::InvalidInput)? as i32;
     if i32::try_from(signo).ok() != Some(raw_signo) {
         return Err(AxError::InvalidInput);
     }
@@ -488,7 +494,8 @@ fn make_pidfd_signal_info(
     })
 }
 
-pub fn sys_pidfd_send_signal(
+pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
     pidfd: i32,
     signo: u32,
     sig: *mut SignalInfo,
@@ -507,17 +514,27 @@ pub fn sys_pidfd_send_signal(
         } else {
             let signo = parse_signo(signo)?;
             let code = target.synthesized_code();
-            let sender = current().as_thread().proc_data.proc.pid();
+            let curr = current();
+            let thread = curr.as_thread();
+            let credential = thread.current_cred();
+            // Match Linux prepare_kill_siginfo(): generated SI_USER/SI_TKILL
+            // records report the sender's real UID, not the effective UID.
+            let sender_uid = credential.user_ns().from_kuid_munged(credential.ids().ruid);
             PidFdSignalRequest {
-                signal: Some(SignalInfo::new_user(signo, code, sender)),
+                signal: Some(SignalInfo::new_user(
+                    signo,
+                    code,
+                    thread.proc_data.proc.pid(),
+                    sender_uid,
+                )),
                 code,
             }
         }
     } else {
-        make_pidfd_signal_info(target.visible_id(), signo, sig)?
+        make_pidfd_signal_info(memory, target.visible_id(), signo, sig)?
     };
     let operation = signal_operation(
-        request.signal.as_ref().map(SignalInfo::signo),
+        request.signal.as_ref().and_then(SignalInfo::try_signo),
         SignalSecuritySource::PidFd { code: request.code },
         target.delivery_scope(),
     )?;
