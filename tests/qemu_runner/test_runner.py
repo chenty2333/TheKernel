@@ -16,6 +16,75 @@ from tools.qemu_runner.runner import RunConfig, RunnerError, run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_x86_default_requires_esp_instead_of_falling_back_to_kernel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="x86_64",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+            )
+            with self.assertRaisesRegex(RunnerError, "requires a GPT ESP"):
+                run(config)
+
+    def test_x86_uefi_copies_vars_and_attaches_snapshot_esp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            esp = root / "esp.img"
+            ovmf_code = root / "OVMF_CODE.fd"
+            ovmf_vars = root / "OVMF_VARS.fd"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            esp.write_bytes(b"esp")
+            ovmf_code.write_bytes(b"code")
+            ovmf_vars.write_bytes(b"vars")
+            config = RunConfig(
+                arch="x86_64",
+                kernel=kernel,
+                rootfs=rootfs,
+                esp=esp,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                cache_dir=root / "cache",
+                qemu_binary=sys.executable,
+                ovmf_code=ovmf_code,
+                ovmf_vars=ovmf_vars,
+            )
+            expected = RunResult(
+                arch="x86_64",
+                command=("qemu",),
+                returncode=0,
+                duration_ms=1,
+                log_path=config.log_path,
+                workdir=config.workdir,
+            )
+
+            def complete_run(**kwargs):
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch(
+                "tools.qemu_runner.runner.run_process", side_effect=complete_run
+            ) as mocked:
+                run(config)
+
+            command = " ".join(mocked.call_args.kwargs["command"])
+            self.assertNotIn("-kernel", command)
+            self.assertIn(",if=ide,format=raw,snapshot=on", command)
+            self.assertIn("virtio-blk-pci,drive=rootfs", command)
+            vars_runtime = config.workdir / "firmware" / "OVMF_VARS.fd"
+            self.assertEqual(vars_runtime.read_bytes(), ovmf_vars.read_bytes())
+            self.assertNotEqual(vars_runtime.resolve(), ovmf_vars.resolve())
+
     def test_external_producer_receipt_is_finalized_from_forwarded_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,19 +106,20 @@ class RunnerTests(unittest.TestCase):
                 relay_complete=True,
             )
             config = RunConfig(
-                arch="rv",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=receipt_path,
                 interaction=Interaction(interactive=True, input_after_marker="READY"),
                 external_input_producer=True,
             )
             expected = RunResult(
-                arch="rv",
+                arch="x86_64",
                 command=("qemu",),
                 returncode=0,
                 duration_ms=1,
@@ -92,7 +162,8 @@ class RunnerTests(unittest.TestCase):
                 "--receipt",
                 str(receipt_path),
                 "--arch",
-                "rv",
+                "x86_64",
+                "--direct-kernel",
                 "--cpus",
                 "1",
                 "--kernel",
@@ -214,7 +285,7 @@ class RunnerTests(unittest.TestCase):
             with gzip.open(extra, "wb") as output:
                 output.write(b"extra")
             config = RunConfig(
-                arch="rv",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 extra_block=extra,
@@ -222,10 +293,11 @@ class RunnerTests(unittest.TestCase):
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=root / "run" / "receipt.json",
             )
             expected = RunResult(
-                arch="rv",
+                arch="x86_64",
                 command=("qemu",),
                 returncode=0,
                 duration_ms=1,
@@ -242,7 +314,7 @@ class RunnerTests(unittest.TestCase):
             command = " ".join(mocked.call_args.kwargs["command"])
             self.assertIn(str(rootfs.resolve()), command)
             self.assertIn("writable-images/extra-extra.img", command)
-            self.assertIn("bus=virtio-mmio-bus.1", command)
+            self.assertIn("virtio-blk-pci,drive=extra", command)
             self.assertNotIn(str((root / "cache").resolve()) + ",if=none", command)
             receipt = json.loads(config.receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(receipt["state"], "complete")
@@ -261,7 +333,8 @@ class RunnerTests(unittest.TestCase):
                 "--receipt",
                 str(config.receipt_path),
                 "--arch",
-                "rv",
+                "x86_64",
+                "--direct-kernel",
                 "--cpus",
                 "1",
                 "--kernel",
@@ -318,7 +391,7 @@ class RunnerTests(unittest.TestCase):
             rootfs.write_bytes(b"rootfs-before")
             extra.write_bytes(b"extra-before")
             config = RunConfig(
-                arch="la",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 rootfs_mode="rw",
@@ -328,10 +401,11 @@ class RunnerTests(unittest.TestCase):
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=root / "run" / "receipt.json",
             )
             expected = RunResult(
-                arch="la",
+                arch="x86_64",
                 command=("qemu",),
                 returncode=0,
                 duration_ms=1,
@@ -355,7 +429,8 @@ class RunnerTests(unittest.TestCase):
                 "--receipt",
                 str(config.receipt_path),
                 "--arch",
-                "la",
+                "x86_64",
+                "--direct-kernel",
                 "--cpus",
                 "1",
                 "--kernel",
@@ -395,13 +470,14 @@ class RunnerTests(unittest.TestCase):
             kernel.write_bytes(b"kernel")
             rootfs.write_bytes(b"rootfs")
             config = RunConfig(
-                arch="la",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=receipt_path,
             )
             with patch(
@@ -422,13 +498,14 @@ class RunnerTests(unittest.TestCase):
             kernel.write_bytes(b"kernel")
             rootfs.write_bytes(b"rootfs")
             config = RunConfig(
-                arch="rv",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=kernel,
             )
             with self.assertRaisesRegex(RunnerError, "receipt aliases"):
@@ -445,13 +522,14 @@ class RunnerTests(unittest.TestCase):
             rootfs.write_bytes(b"rootfs")
             receipt_path.hardlink_to(kernel)
             config = RunConfig(
-                arch="rv",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
                 receipt_path=receipt_path,
             )
             with self.assertRaisesRegex(RunnerError, "receipt aliases"):
@@ -466,13 +544,14 @@ class RunnerTests(unittest.TestCase):
             kernel.write_bytes(b"kernel")
             rootfs.write_bytes(b"rootfs")
             config = RunConfig(
-                arch="rv",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=rootfs,
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
             )
             with patch("tools.qemu_runner.runner.run_process") as mocked:
                 with self.assertRaisesRegex(RunnerError, "log aliases"):
@@ -490,13 +569,14 @@ class RunnerTests(unittest.TestCase):
             rootfs.write_bytes(b"rootfs")
             log_path.hardlink_to(kernel)
             config = RunConfig(
-                arch="la",
+                arch="x86_64",
                 kernel=kernel,
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=log_path,
                 cache_dir=root / "cache",
                 qemu_binary=sys.executable,
+                direct_kernel=True,
             )
             with patch("tools.qemu_runner.runner.run_process") as mocked:
                 with self.assertRaisesRegex(RunnerError, "log aliases"):
@@ -510,7 +590,7 @@ class RunnerTests(unittest.TestCase):
             rootfs = root / "root.img"
             rootfs.write_bytes(b"rootfs")
             config = RunConfig(
-                arch="la",
+                arch="x86_64",
                 kernel=root / "missing-kernel",
                 rootfs=rootfs,
                 workdir=root / "run",

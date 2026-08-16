@@ -9,7 +9,6 @@ use heapless::Vec;
 pub use memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange, pa, va};
 use spin::Lazy;
 
-#[allow(unused_imports)]
 use crate::addr_of_sym;
 
 const MAX_REGIONS: usize = 128;
@@ -22,40 +21,37 @@ static ALL_MEM_REGIONS: Lazy<Vec<PhysMemRegion, MAX_REGIONS>> = Lazy::new(|| {
         }
     };
 
-    #[cfg(not(feature = "plat-dyn"))]
-    {
-        // Push regions in kernel image
-        push(PhysMemRegion {
-            paddr: virt_to_phys(addr_of_sym!(_stext).into()),
-            size: addr_of_sym!(_etext) - addr_of_sym!(_stext),
-            flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::EXECUTE,
-            name: ".text",
-        });
-        push(PhysMemRegion {
-            paddr: virt_to_phys(addr_of_sym!(_srodata).into()),
-            size: addr_of_sym!(_erodata) - addr_of_sym!(_srodata),
-            flags: MemRegionFlags::RESERVED | MemRegionFlags::READ,
-            name: ".rodata",
-        });
-        push(PhysMemRegion {
-            paddr: virt_to_phys(addr_of_sym!(_sdata).into()),
-            size: addr_of_sym!(_edata) - addr_of_sym!(_sdata),
-            flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
-            name: ".data .tdata .tbss .percpu",
-        });
-        push(PhysMemRegion {
-            paddr: virt_to_phys(addr_of_sym!(boot_stack).into()),
-            size: addr_of_sym!(boot_stack_top) - addr_of_sym!(boot_stack),
-            flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
-            name: "boot stack",
-        });
-        push(PhysMemRegion {
-            paddr: virt_to_phys(addr_of_sym!(_sbss).into()),
-            size: addr_of_sym!(_ebss) - addr_of_sym!(_sbss),
-            flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
-            name: ".bss",
-        });
-    }
+    // Push regions in kernel image
+    push(PhysMemRegion {
+        paddr: virt_to_phys(addr_of_sym!(_stext).into()),
+        size: addr_of_sym!(_etext) - addr_of_sym!(_stext),
+        flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::EXECUTE,
+        name: ".text",
+    });
+    push(PhysMemRegion {
+        paddr: virt_to_phys(addr_of_sym!(_srodata).into()),
+        size: addr_of_sym!(_erodata) - addr_of_sym!(_srodata),
+        flags: MemRegionFlags::RESERVED | MemRegionFlags::READ,
+        name: ".rodata",
+    });
+    push(PhysMemRegion {
+        paddr: virt_to_phys(addr_of_sym!(_sdata).into()),
+        size: addr_of_sym!(_edata) - addr_of_sym!(_sdata),
+        flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
+        name: ".data .tdata .tbss .percpu",
+    });
+    push(PhysMemRegion {
+        paddr: virt_to_phys(addr_of_sym!(boot_stack).into()),
+        size: addr_of_sym!(boot_stack_top) - addr_of_sym!(boot_stack),
+        flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
+        name: "boot stack",
+    });
+    push(PhysMemRegion {
+        paddr: virt_to_phys(addr_of_sym!(_sbss).into()),
+        size: addr_of_sym!(_ebss) - addr_of_sym!(_sbss),
+        flags: MemRegionFlags::RESERVED | MemRegionFlags::READ | MemRegionFlags::WRITE,
+        name: ".bss",
+    });
 
     // Push MMIO & reserved regions
     for &(start, size) in mmio_ranges() {
@@ -78,15 +74,12 @@ static ALL_MEM_REGIONS: Lazy<Vec<PhysMemRegion, MAX_REGIONS>> = Lazy::new(|| {
         .iter()
         .cloned()
         .collect::<Vec<_, MAX_REGIONS>>();
-    #[cfg(not(feature = "plat-dyn"))]
-    {
-        // Combine kernel image range and reserved ranges
-        let kernel_start = virt_to_phys(addr_of_sym!(_skernel).into()).as_usize();
-        let kernel_size = addr_of_sym!(_ekernel) - addr_of_sym!(_skernel);
-        reserved_ranges
-            .push((kernel_start, kernel_size))
-            .expect("too many memory regions"); // kernel image range is also reserved
-    }
+    // Combine kernel image range and reserved ranges
+    let kernel_start = virt_to_phys(addr_of_sym!(_skernel).into()).as_usize();
+    let kernel_size = addr_of_sym!(_ekernel) - addr_of_sym!(_skernel);
+    reserved_ranges
+        .push((kernel_start, kernel_size))
+        .expect("too many memory regions"); // kernel image range is also reserved
 
     // Remove all reserved ranges from RAM ranges, and push the remaining as free memory
     reserved_ranges.sort_unstable_by_key(|&(start, _size)| start);

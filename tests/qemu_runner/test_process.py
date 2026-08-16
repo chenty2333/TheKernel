@@ -31,7 +31,7 @@ class ProcessTests(unittest.TestCase):
         input_file.seek(0)
         console = io.BytesIO()
         result = run_process(
-            arch="rv",
+            arch="x86_64",
             command=(sys.executable, "-c", script),
             workdir=root,
             log_path=root / "console.log",
@@ -101,7 +101,7 @@ class ProcessTests(unittest.TestCase):
         console = io.BytesIO()
 
         result = run_process(
-            arch="rv",
+            arch="x86_64",
             command=(
                 sys.executable,
                 "-c",

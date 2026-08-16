@@ -1,6 +1,6 @@
 # Available arguments:
 # * General options:
-#     - `ARCH`: Target architecture: x86_64, riscv64, aarch64, loongarch64
+#     - `ARCH`: Target architecture: x86_64
 #     - `MYPLAT`: Package name of the target platform crate.
 #     - `PLAT_CONFIG`: Path to the platform configuration file.
 #     - `SMP`: Override maximum CPU number specified in the platform config. For
@@ -118,14 +118,8 @@ endif
 # Target
 ifeq ($(ARCH), x86_64)
   TARGET := x86_64-unknown-none
-else ifeq ($(ARCH), aarch64)
-  TARGET := aarch64-unknown-none-softfloat
-else ifeq ($(ARCH), riscv64)
-  TARGET := riscv64gc-unknown-none-elf
-else ifeq ($(ARCH), loongarch64)
-  TARGET := loongarch64-unknown-none-softfloat
 else
-  $(error "ARCH" must be one of "x86_64", "riscv64", "aarch64" or "loongarch64")
+  $(error "ARCH" must be "x86_64")
 endif
 
 export AX_ARCH=$(ARCH)
@@ -148,7 +142,7 @@ else
 endif
 
 # Binutils
-CROSS_COMPILE ?= $(ARCH)-linux-musl-
+CROSS_COMPILE ?= x86_64-linux-musl-
 CC := $(CROSS_COMPILE)gcc
 AR := $(CROSS_COMPILE)ar
 RANLIB := $(CROSS_COMPILE)ranlib

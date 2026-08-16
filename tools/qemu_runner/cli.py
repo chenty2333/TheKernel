@@ -40,6 +40,7 @@ def run_cmd(args: argparse.Namespace) -> int:
         arch=arch,
         kernel=Path(args.kernel),
         rootfs=Path(args.rootfs),
+        esp=Path(args.esp) if args.esp else None,
         rootfs_mode=args.rootfs_mode,
         extra_block=Path(args.extra_block) if args.extra_block else None,
         extra_block_mode=args.extra_block_mode,
@@ -59,6 +60,9 @@ def run_cmd(args: argparse.Namespace) -> int:
         memory=args.memory,
         cpus=args.cpus,
         qemu_binary=args.qemu_binary,
+        ovmf_code=Path(args.ovmf_code) if args.ovmf_code else None,
+        ovmf_vars=Path(args.ovmf_vars) if args.ovmf_vars else None,
+        direct_kernel=args.direct_kernel,
         receipt_path=Path(args.receipt) if args.receipt else None,
         external_input_producer=args.external_input_producer,
     )
@@ -106,13 +110,20 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--arch",
         required=True,
-        choices=("rv", "la", "riscv64", "loongarch64"),
+        choices=("x86", "x86_64"),
     )
     run_parser.add_argument("--kernel", required=True, help="kernel ELF or platform boot image")
     run_parser.add_argument(
         "--rootfs",
         required=True,
         help="raw root filesystem image, optionally .xz/.gz",
+    )
+    run_parser.add_argument(
+        "--esp",
+        help=(
+            "GPT/FAT32 x86_64 EFI system partition image; required for the "
+            "default x86_64 UEFI path (build with scripts/build-x86-uefi-esp.sh)"
+        ),
     )
     run_parser.add_argument("--extra-block", help="optional additional raw block image")
     run_parser.add_argument(
@@ -162,6 +173,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--memory", default="1G")
     run_parser.add_argument("--cpus", type=int, default=1)
     run_parser.add_argument("--qemu-binary", help="explicit QEMU executable")
+    run_parser.add_argument(
+        "--ovmf-code",
+        help="OVMF_CODE.fd path (or set THEKERNEL_OVMF_CODE)",
+    )
+    run_parser.add_argument(
+        "--ovmf-vars",
+        help="OVMF_VARS.fd template (or set THEKERNEL_OVMF_VARS)",
+    )
+    run_parser.add_argument(
+        "--direct-kernel",
+        action="store_true",
+        help="debug-only x86_64 q35 -kernel path; bypasses UEFI and ESP",
+    )
     run_parser.add_argument(
         "--receipt",
         help="write an atomic JSON receipt before launch and after completion",

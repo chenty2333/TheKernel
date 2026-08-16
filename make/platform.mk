@@ -8,8 +8,8 @@ endif
 
 define vendored_platform_config
   $(strip \
-    $(if $(filter axplat-riscv64-qemu-virt,$(1)),$(ROOT_DIR)/make/platforms/axplat-riscv64-qemu-virt.toml) \
-    $(if $(filter axplat-loongarch64-qemu-virt,$(1)),$(ROOT_DIR)/make/platforms/axplat-loongarch64-qemu-virt.toml))
+    $(if $(filter axplat-x86-pc,$(1)),$(ROOT_DIR)/make/platforms/axplat-x86-q35-uefi.toml) \
+    )
 endef
 
 define resolve_config
@@ -28,17 +28,11 @@ define validate_config
 endef
 
 ifeq ($(MYPLAT),)
-  # `MYPLAT` is not specified, use the default platform for each architecture
+  # `MYPLAT` is not specified, use the product q35/UEFI platform.
   ifeq ($(ARCH), x86_64)
     PLAT_PACKAGE := axplat-x86-pc
-  else ifeq ($(ARCH), aarch64)
-    PLAT_PACKAGE := axplat-aarch64-qemu-virt
-  else ifeq ($(ARCH), riscv64)
-    PLAT_PACKAGE := axplat-riscv64-qemu-virt
-  else ifeq ($(ARCH), loongarch64)
-    PLAT_PACKAGE := axplat-loongarch64-qemu-virt
   else
-    $(error "ARCH" must be one of "x86_64", "riscv64", "aarch64" or "loongarch64")
+    $(error "ARCH" must be "x86_64")
   endif
   PLAT_CONFIG := $(strip $(call resolve_config))
   # We don't need to check whether `PLAT_CONFIG` is valid here, as the `PLAT_PACKAGE`

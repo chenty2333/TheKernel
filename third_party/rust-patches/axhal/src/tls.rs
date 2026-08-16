@@ -23,31 +23,8 @@
 //!             +-------------------------+- (total length: tls_area_size)
 //! ```
 //!
-//! ## TLS layout for AArch64 and RISC-V
-//!
-//! ```text
-//!             +-------------------------+
-//!             |                         | \
-//!             | Custom TCB format       |  |
-//!             | (might be used          |   > Thread Control Block (TCB)
-//!             |  by a libC)             |  |  (length: TCB_SIZE)
-//!             |                         | /
-//!    tls_ptr -+-------------------------+
-//! (tp_offset) | GAP_ABOVE_TP            |
-//!             +-------------------------+- static_tls_offset
-//!             |                         | \
-//!             | .tdata                  |  |
-//!             |                         |  |
-//!             + - - - - - - - - - - - - +   > Static TLS block
-//!             |                         |  |  (length: static_tls_size)
-//!             | .tbss                   |  |
-//!             |                         | /
-//!             +-------------------------+- (total length: tls_area_size)
-//! ```
-//!
 //! Reference:
 //! 1. <https://github.com/unikraft/unikraft/blob/staging/arch/x86/x86_64/tls.c>
-//! 2. <https://github.com/unikraft/unikraft/blob/staging/arch/arm/arm64/tls.c>
 
 extern crate alloc;
 
@@ -58,22 +35,7 @@ use memory_addr::align_up;
 use crate::addr_of_sym;
 
 const TLS_ALIGN: usize = 0x10;
-
-cfg_if::cfg_if! {
-    if #[cfg(target_arch = "x86_64")] {
-        const TCB_SIZE: usize = 8; // to store TLS self pointer
-        const GAP_ABOVE_TP: usize = 0;
-    } else if #[cfg(target_arch = "aarch64")] {
-        const TCB_SIZE: usize = 0;
-        const GAP_ABOVE_TP: usize = 16;
-    } else if #[cfg(target_arch = "riscv64")] {
-        const TCB_SIZE: usize = 0;
-        const GAP_ABOVE_TP: usize = 0;
-    } else if #[cfg(target_arch = "loongarch64")] {
-        const TCB_SIZE: usize = 0;
-        const GAP_ABOVE_TP: usize = 0;
-    }
-}
+const TCB_SIZE: usize = 8; // to store the TLS self pointer
 
 unsafe extern "C" {
     fn _stdata();
@@ -133,52 +95,20 @@ fn static_tls_size() -> usize {
 }
 
 fn static_tls_offset() -> usize {
-    if cfg!(target_arch = "x86_64") {
-        0
-    } else if cfg!(any(
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )) {
-        TCB_SIZE + GAP_ABOVE_TP
-    } else {
-        unreachable!()
-    }
+    0
 }
 
 fn tp_offset() -> usize {
-    if cfg!(target_arch = "x86_64") {
-        static_tls_size()
-    } else if cfg!(any(
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )) {
-        TCB_SIZE
-    } else {
-        unreachable!()
-    }
+    static_tls_size()
 }
 
 fn tls_area_size() -> usize {
-    if cfg!(target_arch = "x86_64") {
-        static_tls_size() + TCB_SIZE
-    } else if cfg!(any(
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )) {
-        TCB_SIZE + GAP_ABOVE_TP + static_tls_size()
-    } else {
-        unreachable!()
-    }
+    static_tls_size() + TCB_SIZE
 }
 
 unsafe fn init_tcb(tls_area: *mut u8) {
-    if cfg!(target_arch = "x86_64") {
-        unsafe {
-            let tp_addr = tls_area.add(tp_offset()).cast::<usize>();
-            tp_addr.write(tp_addr as usize); // write self pointer
-        }
+    unsafe {
+        let tp_addr = tls_area.add(tp_offset()).cast::<usize>();
+        tp_addr.write(tp_addr as usize); // write self pointer
     }
 }

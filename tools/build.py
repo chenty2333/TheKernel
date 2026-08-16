@@ -72,16 +72,15 @@ class BuildResult:
 @dataclass(frozen=True)
 class KernelRequest:
     name: str
-    arch: Literal["riscv64", "loongarch64"]
+    arch: Literal["x86_64"]
     make_args: tuple[str, ...]
     app_features: str
-    patch_script: str
     root: Path
 
 
 @dataclass(frozen=True)
 class RootfsRequest:
-    arch: Literal["rv", "la"]
+    arch: Literal["x86"]
     root: Path
 
 
@@ -157,8 +156,46 @@ class FileDigestStore:
             self._local.conn = None
 
 
+def state_root(root: Path | None = None) -> Path:
+    """Return the resolved state root used by all generated build artifacts.
+
+    ``THEKERNEL_STATE_DIR`` is the process-level override used by the shell
+    gates and Makefile.  Relative overrides are rooted at the repository, so
+    callers do not accidentally interpret them relative to an unrelated
+    working directory.
+    """
+
+    repo = (root or find_repo_root()).expanduser().resolve()
+    configured = os.environ.get("THEKERNEL_STATE_DIR", "").strip()
+    state = Path(configured).expanduser() if configured else repo / ".state"
+    if not state.is_absolute():
+        state = repo / state
+    return state.resolve()
+
+
+def state_path(
+    root: Path | None = None, *parts: str | os.PathLike[str]
+) -> Path:
+    """Resolve a path below the configured state root.
+
+    Build paths are fixed subdirectories, but resolving and checking them here
+    also prevents an existing symlink component from redirecting generated
+    state outside the selected root.
+    """
+
+    state = state_root(root)
+    candidate = state.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(state)
+    except ValueError as error:
+        raise BuildError(
+            f"state path escapes configured state directory: {candidate}"
+        ) from error
+    return candidate
+
+
 def build_cache_root(root: Path | None = None) -> Path:
-    return (root or find_repo_root()) / ".state" / "build-cache"
+    return state_path(root, "build-cache")
 
 
 def digests_db_path(root: Path | None = None) -> Path:
@@ -369,7 +406,6 @@ def kernel_params(req: KernelRequest) -> dict[str, str]:
         "arch": req.arch,
         "make_args": " ".join(req.make_args),
         "app_features": " ".join(req.app_features.split()),
-        "patch_script": req.patch_script,
         "strip": "rust-objcopy --strip-all",
         "rustc": capture(["rustc", "-Vv"]),
         "cargo": capture(["cargo", "-V"]),
@@ -457,13 +493,12 @@ def external_kernel_input_specs(root: Path) -> list[InputSpec]:
 
 
 def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
-    return [
+    specs = [
         InputSpec("file", "Cargo.toml"),
         InputSpec("file", "Cargo.lock"),
         InputSpec("file", "rust-toolchain.toml"),
         InputSpec("file", "tools/build.py"),
         InputSpec("file", "kernel/Cargo.toml"),
-        InputSpec("file", req.patch_script),
         InputSpec("optional_file", ".cargo/config.toml"),
         InputSpec("tree", "src"),
         InputSpec("tree", "kernel/src"),
@@ -473,8 +508,10 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
         # External Cargo path dependencies are build inputs, not merely
         # repositories mentioned by release tooling. Their live manifest
         # roots must be part of the content-addressed identity.
-        *external_kernel_input_specs(req.root),
     ]
+    specs.insert(5, InputSpec("file", "scripts/build-x86-uefi-esp.sh"))
+    specs.insert(6, InputSpec("file", "scripts/check-x86-multiboot.sh"))
+    return [*specs, *external_kernel_input_specs(req.root)]
 
 
 def _parse_kernel_cpu_count(value: str, variable: str) -> int | None:
@@ -548,9 +585,9 @@ def make_kernel_request(
     arch: str,
     root: Path,
 ) -> KernelRequest:
-    arch_alias = normalize_short_arch(arch)
-    full_arch: Literal["riscv64", "loongarch64"] = "riscv64" if arch_alias == "rv" else "loongarch64"
-    name = "kernel-rv" if arch_alias == "rv" else "kernel-la"
+    normalize_short_arch(arch)
+    full_arch: Literal["x86_64"] = "x86_64"
+    name = "kernel-x86_64"
     features = "qemu"
     if mode in ("shell", "io-test-shell", "mm-performance-shell"):
         name = f"{name}-shell"
@@ -564,12 +601,13 @@ def make_kernel_request(
             f"{features} test-io-control mm-lock-diagnostics "
             "asid-switch-diagnostics pmu-diagnostics"
         )
-    make_args = ["BUS=mmio"] if arch_alias == "rv" else []
+    make_args = ["PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml"]
     requested_cpus = requested_kernel_cpu_count()
-    if requested_cpus is not None:
-        make_args.append(f"SMP={requested_cpus}")
-        if requested_cpus > 1:
-            features = f"{features} smp"
+    if requested_cpus is None:
+        requested_cpus = 4
+    make_args.append(f"SMP={requested_cpus}")
+    if requested_cpus > 1:
+        features = f"{features} smp"
     requested_memory = requested_kernel_memory()
     if requested_memory is not None:
         make_args.append(f"MEM={requested_memory}")
@@ -580,19 +618,23 @@ def make_kernel_request(
         arch=full_arch,
         make_args=tuple(make_args),
         app_features=features,
-        patch_script=(
-            "scripts/patch-riscv-kernel-elf.py"
-            if arch_alias == "rv"
-            else "scripts/patch-loongarch-kernel-elf.py"
-        ),
         root=root,
     )
 
 
 def kernel_build(req: KernelRequest, output: Path) -> None:
     root = req.root
-    out_dir = root / ".state" / req.arch / "out"
-    common = ["make", "-C", str(root / "make"), f"A={root}", f"ARCH={req.arch}", *_kernel_make_var_args(req)]
+    state = state_root(root)
+    out_dir = state_path(root, req.arch, "out")
+    common = [
+        "make",
+        "-C",
+        str(root / "make"),
+        f"A={root}",
+        f"ARCH={req.arch}",
+        *_kernel_make_var_args(req),
+        f"STATE_DIR={state}",
+    ]
     env = kernel_build_env(req)
     for goal in ("defconfig", "build-elf-fast"):
         argv = [*common, f"APP_FEATURES={req.app_features}", goal]
@@ -606,10 +648,9 @@ def kernel_build(req: KernelRequest, output: Path) -> None:
     kernel_elf = max(elfs, key=lambda path: path.stat().st_mtime_ns)
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    patch_argv = ["python3", str(root / req.patch_script), str(kernel_elf), str(output)]
-    completed = subprocess.run(patch_argv, cwd=root, env=env, check=False)
-    if completed.returncode != 0:
-        raise BuildError(f"kernel patch failed: {' '.join(patch_argv)}")
+    # x86_64's linker output is already the bootable Multiboot ELF. Keep that
+    # format intact; it does not need architecture-specific address rewriting.
+    shutil.copy2(kernel_elf, output)
 
     stripped = output.with_name(output.name + ".stripped")
     strip_argv = ["rust-objcopy", "--strip-all", str(output), str(stripped)]
@@ -618,6 +659,61 @@ def kernel_build(req: KernelRequest, output: Path) -> None:
         stripped.unlink(missing_ok=True)
         raise BuildError(f"rust-objcopy strip failed: {' '.join(strip_argv)}")
     stripped.replace(output)
+
+    # The stripped ELF is the exact artifact GRUB loads from the ESP, so the
+    # Multiboot1/2 header gate must run on it after stripping.
+    multiboot_argv = [
+        "bash",
+        str(root / "scripts" / "check-x86-multiboot.sh"),
+        str(output),
+    ]
+    completed = subprocess.run(
+        multiboot_argv,
+        cwd=root,
+        env=env,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stdout.strip() if completed.stdout else ""
+        raise BuildError(
+            f"x86_64 Multiboot header gate failed: {' '.join(multiboot_argv)}"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def build_x86_uefi_esp(*, root: Path, kernel: Path, output: Path, verbose: bool = False) -> None:
+    """Build the GPT/FAT32 ESP consumed by the default x86_64 runner."""
+
+    if not kernel.is_file():
+        raise BuildError(f"x86_64 kernel does not exist: {kernel}")
+    command = [
+        "bash",
+        str(root / "scripts" / "build-x86-uefi-esp.sh"),
+        "--kernel",
+        str(kernel),
+        "--output",
+        str(output),
+    ]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        check=False,
+        stdout=None if verbose else subprocess.PIPE,
+        stderr=None if verbose else subprocess.STDOUT,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = ""
+        if not verbose and completed.stdout:
+            detail = f": {completed.stdout.strip()}"
+        raise BuildError(
+            f"x86_64 ESP builder failed ({completed.returncode}): {' '.join(command)}{detail}"
+        )
 
 
 def _kernel_make_var_args(req: KernelRequest) -> list[str]:
@@ -631,6 +727,7 @@ def _kernel_make_var_args(req: KernelRequest) -> list[str]:
 
 def kernel_build_env(req: KernelRequest) -> dict[str, str]:
     env = os.environ.copy()
+    state = state_root(req.root)
     env.update(KERNEL_ENV)
     for argument in req.make_args:
         key, separator, value = argument.partition("=")
@@ -638,6 +735,8 @@ def kernel_build_env(req: KernelRequest) -> dict[str, str]:
             env[key] = value
     env["ARCH"] = req.arch
     env["APP_FEATURES"] = req.app_features
+    env["THEKERNEL_STATE_DIR"] = str(state)
+    env["STATE_DIR"] = str(state)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
@@ -650,6 +749,7 @@ def ensure_kernel(
     arch: str,
     root: Path | None = None,
     output: Path | None = None,
+    esp_output: Path | None = None,
     verbose: bool = False,
 ) -> BuildResult:
     root = (root or find_repo_root()).resolve()
@@ -666,31 +766,29 @@ def ensure_kernel(
         verbose=verbose,
     )
     if output is None:
+        output_name = "kernel-x86_64"
         if mode == "release":
-            output = root / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
+            output = root / output_name
         elif mode == "shell":
-            output = root / ".state" / "shell" / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
+            output = state_path(root, "shell", output_name)
         elif mode == "io-test-shell":
-            output = root / ".state" / "io-test-shell" / (
-                "kernel-rv" if arch_alias == "rv" else "kernel-la"
-            )
+            output = state_path(root, "io-test-shell", output_name)
         else:
-            output = root / ".state" / "mm-performance-shell" / (
-                "kernel-rv" if arch_alias == "rv" else "kernel-la"
-            )
+            output = state_path(root, "mm-performance-shell", output_name)
     materialize_file(result.cache_path, output, prefer_hardlink=True, root=root)
+    if esp_output is not None:
+        esp_path = esp_output.expanduser()
+        if not esp_path.is_absolute():
+            esp_path = root / esp_path
+        build_x86_uefi_esp(
+            root=root, kernel=output, output=esp_path.resolve(), verbose=verbose
+        )
     return BuildResult(result.kind, result.name, result.cache_path, output, result.identity, result.hit)
 
 
 def rootfs_params(req: RootfsRequest) -> dict[str, str]:
-    prefix_name = (
-        "THEKERNEL_RV_CROSS_COMPILE"
-        if req.arch == "rv"
-        else "THEKERNEL_LA_CROSS_COMPILE"
-    )
-    default_prefix = (
-        "riscv64-linux-gnu-" if req.arch == "rv" else "loongarch64-linux-musl-"
-    )
+    prefix_name = "THEKERNEL_X86_CROSS_COMPILE"
+    default_prefix = "x86_64-linux-gnu-"
     prefix = os.environ.get(prefix_name, default_prefix)
     return {
         "arch": req.arch,
@@ -726,10 +824,20 @@ def rootfs_build(req: RootfsRequest, output: Path, *, verbose: bool = False) -> 
         str(output),
     ]
     output.parent.mkdir(parents=True, exist_ok=True)
+    state = state_root(req.root)
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "THEKERNEL_STATE_DIR": str(state),
+    }
+    env.setdefault("THEKERNEL_SOURCE_CACHE", str(state_path(req.root, "source-cache")))
+    env.setdefault(
+        "THEKERNEL_ROOTFS_BUILD_DIR", str(state_path(req.root, "rootfs-build"))
+    )
     completed = subprocess.run(
         command,
         cwd=req.root,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env=env,
         check=False,
         text=True,
         stdout=None if verbose else subprocess.PIPE,
@@ -752,7 +860,7 @@ def ensure_rootfs(
     verbose: bool = False,
 ) -> BuildResult:
     root = (root or find_repo_root()).resolve()
-    arch_alias = normalize_short_arch(arch)
+    arch_alias = normalize_rootfs_arch(arch)
     req = RootfsRequest(arch=arch_alias, root=root)
     result = ensure_cached_artifact(
         kind="rootfs",
@@ -766,7 +874,7 @@ def ensure_rootfs(
         verbose=verbose,
     )
     if output is None:
-        output = root / ".state" / "rootfs" / f"rootfs-{arch_alias}.img"
+        output = state_path(root, "rootfs", f"rootfs-{arch_alias}.img")
     materialize_file(result.cache_path, output, prefer_hardlink=False, root=root)
     return BuildResult(
         result.kind,
@@ -855,12 +963,14 @@ def capture(argv: list[str], *, max_lines: int | None = None) -> str:
     return text.strip()
 
 
-def normalize_short_arch(value: str) -> Literal["rv", "la"]:
-    if value in ("rv", "riscv64"):
-        return "rv"
-    if value in ("la", "loongarch64"):
-        return "la"
+def normalize_short_arch(value: str) -> Literal["x86"]:
+    if value in ("x86", "x86_64"):
+        return "x86"
     raise ValueError(f"unsupported arch: {value}")
+
+
+def normalize_rootfs_arch(value: str) -> Literal["x86"]:
+    return normalize_short_arch(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -868,21 +978,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     kernel = sub.add_parser("kernel", help="build or reuse a release kernel")
-    kernel.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
+    kernel.add_argument("arch", choices=("x86", "x86_64"))
+    kernel.add_argument(
+        "--esp",
+        help="for x86_64, build a GPT/FAT32 ESP at this path using the UEFI loader",
+    )
     kernel.add_argument("--verbose", action="store_true")
     kernel.set_defaults(func=kernel_cmd)
 
     shell = sub.add_parser("shell", help="build/reuse interactive shell kernel")
-    shell.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
+    shell.add_argument("arch", choices=("x86", "x86_64"))
+    shell.add_argument("--esp", help="for x86_64, build a GPT/FAT32 ESP at this path")
     shell.add_argument("--verbose", action="store_true")
     shell.set_defaults(func=shell_cmd)
 
     io_test_shell = sub.add_parser(
         "io-test-shell", help="build/reuse a test-only I/O control shell kernel"
     )
-    io_test_shell.add_argument(
-        "arch", choices=("rv", "la", "riscv64", "loongarch64")
-    )
+    io_test_shell.add_argument("arch", choices=("x86", "x86_64"))
+    io_test_shell.add_argument("--esp", help="for x86_64, build a GPT/FAT32 ESP at this path")
     io_test_shell.add_argument("--verbose", action="store_true")
     io_test_shell.set_defaults(func=io_test_shell_cmd)
 
@@ -890,8 +1004,9 @@ def build_parser() -> argparse.ArgumentParser:
         "mm-performance-shell",
         help="build/reuse an MM performance diagnostics shell kernel",
     )
+    mm_performance_shell.add_argument("arch", choices=("x86", "x86_64"))
     mm_performance_shell.add_argument(
-        "arch", choices=("rv", "la", "riscv64", "loongarch64")
+        "--esp", help="for x86_64, build a GPT/FAT32 ESP at this path"
     )
     mm_performance_shell.add_argument("--verbose", action="store_true")
     mm_performance_shell.set_defaults(func=mm_performance_shell_cmd)
@@ -899,7 +1014,7 @@ def build_parser() -> argparse.ArgumentParser:
     rootfs = sub.add_parser(
         "rootfs", help="build or reuse a project test root filesystem"
     )
-    rootfs.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
+    rootfs.add_argument("arch", choices=("x86", "x86_64"))
     rootfs.add_argument("--output", help="materialize the image at an explicit path")
     rootfs.add_argument("--verbose", action="store_true")
     rootfs.set_defaults(func=rootfs_cmd)
@@ -908,21 +1023,36 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def kernel_cmd(args: argparse.Namespace) -> int:
-    result = ensure_kernel(mode="release", arch=args.arch, verbose=args.verbose)
+    result = ensure_kernel(
+        mode="release",
+        arch=args.arch,
+        esp_output=Path(args.esp).expanduser() if args.esp else None,
+        verbose=args.verbose,
+    )
     if args.verbose:
         print(result.output_path)
     return 0
 
 
 def shell_cmd(args: argparse.Namespace) -> int:
-    result = ensure_kernel(mode="shell", arch=args.arch, verbose=args.verbose)
+    result = ensure_kernel(
+        mode="shell",
+        arch=args.arch,
+        esp_output=Path(args.esp).expanduser() if args.esp else None,
+        verbose=args.verbose,
+    )
     if args.verbose:
         print(result.output_path)
     return 0
 
 
 def io_test_shell_cmd(args: argparse.Namespace) -> int:
-    result = ensure_kernel(mode="io-test-shell", arch=args.arch, verbose=args.verbose)
+    result = ensure_kernel(
+        mode="io-test-shell",
+        arch=args.arch,
+        esp_output=Path(args.esp).expanduser() if args.esp else None,
+        verbose=args.verbose,
+    )
     if args.verbose:
         print(result.output_path)
     return 0
@@ -930,7 +1060,10 @@ def io_test_shell_cmd(args: argparse.Namespace) -> int:
 
 def mm_performance_shell_cmd(args: argparse.Namespace) -> int:
     result = ensure_kernel(
-        mode="mm-performance-shell", arch=args.arch, verbose=args.verbose
+        mode="mm-performance-shell",
+        arch=args.arch,
+        esp_output=Path(args.esp).expanduser() if args.esp else None,
+        verbose=args.verbose,
     )
     if args.verbose:
         print(result.output_path)

@@ -1,6 +1,6 @@
 # QEMU arguments
 
-QEMU := qemu-system-$(ARCH)
+QEMU := qemu-system-x86_64
 
 ifeq ($(BUS), mmio)
   vdev-suffix := device
@@ -10,37 +10,11 @@ else
   $(error "BUS" must be one of "mmio" or "pci")
 endif
 
-ifeq ($(ARCH), x86_64)
-  machine := q35
-else ifeq ($(ARCH), riscv64)
-  machine := virt
-else ifeq ($(ARCH), aarch64)
-  ifeq ($(PLAT_NAME), aarch64-raspi4)
-    machine := raspi4b
-  else
-    machine := virt
-  endif
-else ifeq ($(ARCH), loongarch64)
-  machine := virt
-endif
+machine := q35
 
 qemu_args-x86_64 := \
   -machine $(machine) \
   -kernel $(OUT_ELF)
-
-qemu_args-riscv64 := \
-  -machine $(machine) \
-  -bios default \
-  -kernel $(FINAL_IMG)
-
-qemu_args-aarch64 := \
-  -cpu cortex-a72 \
-  -machine $(machine) \
-  -kernel $(FINAL_IMG)
-
-qemu_args-loongarch64 := \
-  -machine $(machine) \
-  -kernel $(FINAL_IMG)
 
 qemu_args-y := -m $(MEM) -smp $(SMP) $(qemu_args-$(ARCH))
 
@@ -99,12 +73,8 @@ qemu_args-debug := $(qemu_args-y) -s -S
 ifeq ($(ACCEL),)
   ifneq ($(findstring -microsoft, $(shell uname -r | tr '[:upper:]' '[:lower:]')),)
     ACCEL := n  # Don't enable kvm for WSL/WSL2
-  else ifeq ($(ARCH), x86_64)
-    ACCEL := $(if $(filter $(shell uname -m),x86_64),y,n)
-  else ifeq ($(ARCH), aarch64)
-    ACCEL := $(if $(filter $(shell uname -m),arm64 aarch64),y,n)
   else
-    ACCEL := n
+    ACCEL := $(if $(filter $(shell uname -m),x86_64),y,n)
   endif
 endif
 

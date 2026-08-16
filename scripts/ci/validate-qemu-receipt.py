@@ -39,6 +39,97 @@ def evidence_record(value: Any, label: str) -> dict[str, Any]:
         raise ValueError(str(error)) from error
 
 
+def current_evidence(record: dict[str, Any], label: str) -> dict[str, Any]:
+    path = record.get("path")
+    require(isinstance(path, str), f"missing {label} path")
+    try:
+        return file_evidence(Path(path))
+    except (OSError, FileEvidenceError) as error:
+        raise ValueError(str(error)) from error
+
+
+def validate_boot_mode(
+    args: argparse.Namespace, receipt: dict[str, Any]
+) -> tuple[Drive | None, Path | None, Path | None]:
+    direct_kernel = receipt.get("direct_kernel")
+    require(type(direct_kernel) is bool, "invalid receipt direct-kernel boot mode")
+    require(
+        direct_kernel == args.direct_kernel,
+        "direct-kernel mode does not match the receipt",
+    )
+
+    uefi_keys = (
+        "esp_source",
+        "esp_runtime",
+        "ovmf_code",
+        "ovmf_vars_source",
+        "ovmf_vars_runtime",
+    )
+    if direct_kernel:
+        require(
+            all(key not in receipt for key in uefi_keys),
+            "direct-kernel receipt unexpectedly contains UEFI evidence",
+        )
+        require(
+            args.esp is None and args.ovmf_code is None and args.ovmf_vars is None,
+            "UEFI inputs are not valid with --direct-kernel",
+        )
+        return None, None, None
+
+    esp_source = evidence_record(receipt.get("esp_source"), "ESP source")
+    esp_runtime = evidence_record(receipt.get("esp_runtime"), "ESP runtime")
+    ovmf_code = evidence_record(receipt.get("ovmf_code"), "OVMF code")
+    ovmf_vars_source = evidence_record(
+        receipt.get("ovmf_vars_source"), "OVMF vars source"
+    )
+    ovmf_vars_runtime = evidence_record(
+        receipt.get("ovmf_vars_runtime"), "OVMF vars runtime"
+    )
+
+    for record, label in (
+        (esp_source, "ESP source"),
+        (esp_runtime, "ESP runtime"),
+        (ovmf_code, "OVMF code"),
+        (ovmf_vars_source, "OVMF vars source"),
+    ):
+        require(
+            current_evidence(record, label) == record,
+            f"{label} evidence mismatch",
+        )
+    # OVMF writes its variable store while the guest runs.  The runner records
+    # the runtime path before launch, so only require that the recorded path is
+    # still a file; its post-boot contents are guest-owned state.
+    current_evidence(ovmf_vars_runtime, "OVMF vars runtime")
+
+    if args.esp is not None:
+        require(
+            esp_source == file_evidence(Path(args.esp)),
+            "ESP source evidence mismatch",
+        )
+    if args.ovmf_code is not None:
+        require(
+            ovmf_code == file_evidence(Path(args.ovmf_code)),
+            "OVMF code evidence mismatch",
+        )
+    if args.ovmf_vars is not None:
+        require(
+            ovmf_vars_source == file_evidence(Path(args.ovmf_vars)),
+            "OVMF vars source evidence mismatch",
+        )
+
+    esp_runtime_path = esp_runtime.get("path")
+    ovmf_code_path = ovmf_code.get("path")
+    ovmf_vars_runtime_path = ovmf_vars_runtime.get("path")
+    require(isinstance(esp_runtime_path, str), "missing ESP runtime path")
+    require(isinstance(ovmf_code_path, str), "missing OVMF code path")
+    require(isinstance(ovmf_vars_runtime_path, str), "missing OVMF vars runtime path")
+    return (
+        Drive(Path(esp_runtime_path), "snapshot"),
+        Path(ovmf_code_path),
+        Path(ovmf_vars_runtime_path),
+    )
+
+
 def validate(args: argparse.Namespace) -> None:
     receipt_path = Path(args.receipt).expanduser().resolve()
     with receipt_path.open(encoding="utf-8") as source:
@@ -73,6 +164,8 @@ def validate(args: argparse.Namespace) -> None:
         type(receipt.get("duration_ms")) is int and receipt["duration_ms"] >= 0,
         "invalid QEMU duration",
     )
+
+    esp, ovmf_code, ovmf_vars = validate_boot_mode(args, receipt)
 
     receipt_evidence = validate_receipt_file_evidence(receipt)
     kernel = file_evidence(Path(args.kernel))
@@ -154,6 +247,10 @@ def validate(args: argparse.Namespace) -> None:
             kernel=Path(str(kernel["path"])),
             rootfs=Drive(Path(rootfs_runtime_path), args.rootfs_mode),
             extra_block=extra_block,
+            esp=esp,
+            ovmf_code=ovmf_code,
+            ovmf_vars=ovmf_vars,
+            direct_kernel=args.direct_kernel,
             memory=args.memory,
             cpus=args.cpus,
             qemu_binary=qemu_path,
@@ -179,10 +276,18 @@ def validate(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--receipt", required=True)
-    parser.add_argument("--arch", choices=("rv", "la"), required=True)
+    parser.add_argument("--arch", choices=("x86_64",), required=True)
+    parser.add_argument(
+        "--direct-kernel",
+        action="store_true",
+        help="validate the debug-only direct-kernel boot topology",
+    )
     parser.add_argument("--cpus", type=int, required=True)
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--rootfs", required=True)
+    parser.add_argument("--esp", help="expected GPT/FAT32 ESP source for UEFI receipts")
+    parser.add_argument("--ovmf-code", help="expected OVMF code image for UEFI receipts")
+    parser.add_argument("--ovmf-vars", help="expected OVMF vars template for UEFI receipts")
     parser.add_argument(
         "--rootfs-mode",
         choices=("snapshot", "readonly", "rw"),

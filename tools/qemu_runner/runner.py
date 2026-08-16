@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ class RunConfig:
     workdir: Path
     log_path: Path
     cache_dir: Path
+    esp: Path | None = None
     rootfs_mode: DriveMode = "snapshot"
     extra_block: Path | None = None
     extra_block_mode: DriveMode = "rw"
@@ -38,16 +40,52 @@ class RunConfig:
     memory: str = "1G"
     cpus: int = 1
     qemu_binary: str | None = None
+    ovmf_code: Path | None = None
+    ovmf_vars: Path | None = None
+    direct_kernel: bool = False
     receipt_path: Path | None = None
     external_input_producer: bool = False
 
 
 def normalize_arch(value: str) -> Arch:
-    if value in {"rv", "riscv64"}:
-        return "rv"
-    if value in {"la", "loongarch64"}:
-        return "la"
+    if value in {"x86", "x86_64"}:
+        return "x86_64"
     raise RunnerError(f"unsupported architecture: {value}")
+
+
+def _resolve_ovmf_image(
+    configured: Path | None,
+    environment: str,
+    candidates: tuple[str, ...],
+    label: str,
+) -> Path:
+    raw = configured or (Path(os.environ[environment]) if os.environ.get(environment) else None)
+    if raw is None:
+        raw = next((Path(path) for path in candidates if Path(path).is_file()), None)
+    if raw is None:
+        option = environment.removeprefix("THEKERNEL_").lower().replace("_", "-")
+        raise RunnerError(
+            f"x86_64 UEFI requires {label}; pass --{option} "
+            f"or set {environment}"
+        )
+    path = raw.expanduser().resolve()
+    if not path.is_file():
+        raise RunnerError(f"{label} does not exist: {path}")
+    return path
+
+
+def _copy_ovmf_vars(source: Path, workdir: Path) -> Path:
+    destination = workdir / "firmware" / "OVMF_VARS.fd"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+        destination.chmod(destination.stat().st_mode | 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def _validate_mode(name: str, mode: str) -> DriveMode:
@@ -146,11 +184,53 @@ def run(
         else None
     )
 
+    esp = None
+    ovmf_code = None
+    ovmf_vars_source = None
+    ovmf_vars_runtime = None
+    if not config.direct_kernel:
+        if config.esp is None:
+            raise RunnerError(
+                "x86_64 UEFI boot requires a GPT ESP; pass --esp or use --direct-kernel"
+            )
+        esp = _prepare_drive(
+            config.esp,
+            mode="snapshot",
+            label="esp",
+            cache_dir=cache_dir,
+            workdir=workdir,
+        )
+        ovmf_code = _resolve_ovmf_image(
+            config.ovmf_code,
+            "THEKERNEL_OVMF_CODE",
+            (
+                "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+                "/usr/share/edk2/ovmf/OVMF_CODE_4M.fd",
+                "/usr/share/OVMF/OVMF_CODE.fd",
+            ),
+            "OVMF code",
+        )
+        ovmf_vars_source = _resolve_ovmf_image(
+            config.ovmf_vars,
+            "THEKERNEL_OVMF_VARS",
+            (
+                "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+                "/usr/share/edk2/ovmf/OVMF_VARS_4M.fd",
+                "/usr/share/OVMF/OVMF_VARS.fd",
+            ),
+            "OVMF vars",
+        )
+        ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, workdir)
+
     command = build_qemu_command(
         arch=config.arch,
         kernel=kernel,
         rootfs=rootfs,
         extra_block=extra_block,
+        esp=esp,
+        ovmf_code=ovmf_code,
+        ovmf_vars=ovmf_vars_runtime,
+        direct_kernel=config.direct_kernel,
         memory=config.memory,
         cpus=config.cpus,
         qemu_binary=config.qemu_binary,
@@ -161,6 +241,12 @@ def run(
     rootfs_source_path = config.rootfs.expanduser().resolve()
     rootfs_runtime_path = rootfs.path.resolve()
     run_input_paths = [kernel, rootfs_source_path, rootfs_runtime_path]
+    if config.esp is not None and esp is not None:
+        run_input_paths.extend([config.esp.expanduser().resolve(), esp.path.resolve()])
+    if ovmf_code is not None:
+        run_input_paths.append(ovmf_code)
+    if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
+        run_input_paths.extend([ovmf_vars_source, ovmf_vars_runtime])
     if qemu["path"] is not None:
         run_input_paths.append(Path(str(qemu["path"])))
     if config.extra_block is not None and extra_block is not None:
@@ -192,6 +278,7 @@ def run(
         "workdir": str(workdir),
         "log_path": str(log_path),
         "rootfs_mode": rootfs_mode,
+        "direct_kernel": config.direct_kernel,
         "extra_block_mode": extra_mode,
         "interaction": {
             "interactive": config.interaction.interactive,
@@ -200,6 +287,14 @@ def run(
             "external_input_producer": config.external_input_producer,
         },
     }
+    if config.esp is not None and esp is not None:
+        receipt["esp_source"] = file_evidence(config.esp.expanduser().resolve())
+        receipt["esp_runtime"] = file_evidence(esp.path.resolve())
+    if ovmf_code is not None:
+        receipt["ovmf_code"] = file_evidence(ovmf_code)
+    if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
+        receipt["ovmf_vars_source"] = file_evidence(ovmf_vars_source)
+        receipt["ovmf_vars_runtime"] = file_evidence(ovmf_vars_runtime)
     if config.extra_block is not None and extra_block is not None:
         receipt["extra_block_source"] = file_evidence(config.extra_block.expanduser().resolve())
         receipt["extra_block_runtime_before"] = file_evidence(extra_block.path.resolve())

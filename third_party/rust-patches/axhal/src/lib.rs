@@ -7,10 +7,6 @@
 //! Currently supported platforms (specify by cargo features):
 //!
 //! - `x86-pc`: Standard PC with x86_64 ISA.
-//! - `riscv64-qemu-virt`: QEMU virt machine with RISC-V ISA.
-//! - `aarch64-qemu-virt`: QEMU virt machine with AArch64 ISA.
-//! - `aarch64-raspi`: Raspberry Pi with AArch64 ISA.
-//! - `loongarch64-qemu-virt`: QEMU virt machine with LoongArch64 ISA.
 //! - `dummy`: If none of the above platform is selected, the dummy platform
 //!   will be used. In this platform, most of the operations are no-op or
 //!   `unimplemented!()`. This platform is mainly used for [cargo test].
@@ -32,6 +28,9 @@
 #![no_std]
 #![feature(doc_cfg)]
 
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("axhal supports x86_64 targets only");
+
 #[cfg(test)]
 extern crate std;
 
@@ -47,18 +46,8 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "myplat")] {
         // link the custom platform crate in your application.
     }
-    else if #[cfg(plat_dyn)] {
-        extern crate axplat_dyn;
-    }
     else if #[cfg(all(target_os = "none", feature = "defplat"))] {
-        #[cfg(target_arch = "x86_64")]
         extern crate axplat_x86_pc;
-        #[cfg(target_arch = "aarch64")]
-        extern crate axplat_aarch64_qemu_virt;
-        #[cfg(target_arch = "riscv64")]
-        extern crate axplat_riscv64_qemu_virt;
-        #[cfg(target_arch = "loongarch64")]
-        extern crate axplat_loongarch64_qemu_virt;
     } else {
         // Link the dummy platform implementation to pass cargo test.
         mod dummy;

@@ -1,8 +1,10 @@
 # axhal
 
-ArceOS hardware abstraction layer: unified APIs for platform-specific operations (CPU, platform, paging, IRQ, etc.).
+ArceOS hardware abstraction layer for TheKernel's x86_64 platform: unified
+APIs for CPU, platform, paging, IRQ, and related hardware operations.
 
-Depends on axconfig, axplat, and axcpu for platform and architecture support.
+Depends on axconfig, axplat, and axcpu. TheKernel maintains the x86_64 path;
+the host-test dummy backend remains available for Cargo tests.
 
 ## License
 

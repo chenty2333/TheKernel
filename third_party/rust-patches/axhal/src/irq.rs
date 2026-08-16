@@ -68,11 +68,18 @@ pub enum IpiReason {
     Reschedule     = 1,
     /// Reserved for a bounded cross-CPU call-function consumer.
     CallFunction   = 2,
+    /// Acknowledge one private expedited membarrier generation.
+    Membarrier     = 3,
 }
 
 #[cfg(feature = "ipi")]
 impl IpiReason {
-    const ALL: [Self; 3] = [Self::CpuMaintenance, Self::Reschedule, Self::CallFunction];
+    const ALL: [Self; 4] = [
+        Self::CpuMaintenance,
+        Self::Reschedule,
+        Self::CallFunction,
+        Self::Membarrier,
+    ];
 
     #[inline]
     const fn index(self) -> usize {
@@ -668,7 +675,8 @@ mod tests {
         super::visit_pending_reasons(
             super::IpiReason::CallFunction.bit()
                 | super::IpiReason::CpuMaintenance.bit()
-                | super::IpiReason::Reschedule.bit(),
+                | super::IpiReason::Reschedule.bit()
+                | super::IpiReason::Membarrier.bit(),
             |reason| visited.push(reason),
         )
         .unwrap();

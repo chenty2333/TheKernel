@@ -6,12 +6,11 @@
 **/target/
 /.axconfig.*
 *.img
-/kernel-rv
-/kernel-la
 /.cargo
 /.crates*
 /.state
 /.tmp
+/kernel-x86_64
 /.direnv
 /mnt
 *.swp

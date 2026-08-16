@@ -25,6 +25,10 @@ linkable on a host without changing the bare-metal feature graph.
 
 ## TheKernel patch ledger
 
+- Narrows the maintained HAL architecture to x86_64. Platform dispatch,
+  page-table aliases, per-CPU current-task access, TLS layout, and linker
+  script generation now contain only x86_64 branches.
+
 - Adds a bounded Layer 0 IRQ-boundary transport through the maintained `axcpu`
   fork.
 - Pins `axcpu` to the exact published `0.3.0-preview.8` baseline so Cargo cannot

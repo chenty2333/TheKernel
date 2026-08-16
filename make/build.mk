@@ -33,17 +33,6 @@ else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build build-el
     $(if $(V), $(info CFLAGS: "$(CFLAGS)") $(info LDFLAGS: "$(LDFLAGS)"))
   else ifeq ($(APP_TYPE), rust)
     RUSTFLAGS += $(RUSTFLAGS_LINK_ARGS)
-    ifeq ($(ARCH), loongarch64)
-      # The default loongarch64 target exposes LSX, which lets LLVM emit
-      # kernel-space vector ops before we have any vr* save/restore support.
-      RUSTFLAGS += -C target-feature=-lsx,-lasx
-      ifeq ($(TARGET), loongarch64-unknown-none)
-        # Hard-float prebuilt core may still contain LSX with this toolchain.
-        # The default LA target is softfloat, so this network-sensitive path is
-        # only used by explicit hard-float builds.
-        CARGO_BUILD_STD_ARGS += -Z build-std=core,alloc,compiler_builtins
-      endif
-    endif
   endif
   ifneq ($(filter y,$(DEBUGINFO) $(DWARF)),)
     RUSTFLAGS += -C force-frame-pointers -C debuginfo=2 -C strip=none
@@ -101,13 +90,7 @@ $(OUT_BIN): $(OUT_ELF) _dwarf
 		exit 1; \
 	fi
 
-ifeq ($(ARCH), aarch64)
-  uimg_arch := arm64
-else ifeq ($(ARCH), riscv64)
-  uimg_arch := riscv
-else
-  uimg_arch := $(ARCH)
-endif
+uimg_arch := x86_64
 
 $(OUT_UIMG): $(OUT_BIN)
 	$(call run_cmd,mkimage,\

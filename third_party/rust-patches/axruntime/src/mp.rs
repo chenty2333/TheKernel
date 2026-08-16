@@ -74,7 +74,14 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     }
 
     #[cfg(feature = "irq")]
-    axhal::asm::enable_irqs();
+    {
+        // Legacy one-shot LAPIC initialization leaves the initial count at
+        // zero, so every secondary must arm its own periodic chain before it
+        // can enter the idle wait. Otherwise remotely placed work can remain
+        // stranded forever because that CPU has no interrupt to leave idle.
+        super::rearm_timer(axhal::time::monotonic_time_nanos());
+        axhal::asm::enable_irqs();
+    }
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     super::init_tls();

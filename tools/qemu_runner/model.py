@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 
-Arch = Literal["rv", "la"]
+Arch = Literal["x86_64"]
 DriveMode = Literal["snapshot", "readonly", "rw"]
 
 INTENTIONAL_STOP_RETURN_CODE = 75

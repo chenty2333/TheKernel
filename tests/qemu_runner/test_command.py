@@ -15,41 +15,59 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("snapshot=on", drive_options(path, "rootfs", mode="rw"))
         self.assertIn("root,,image.img", drive_options(path, "rootfs", mode="rw"))
 
-    def test_riscv_command_has_stable_mmio_drive_slots(self) -> None:
+    def test_x86_direct_command_uses_stable_pci_drive_slots(self) -> None:
         command = build_qemu_command(
-            arch="rv",
-            kernel=Path("kernel-rv"),
+            arch="x86_64",
+            kernel=Path("kernel-x86_64"),
             rootfs=Drive(Path("root.img"), "snapshot"),
             extra_block=Drive(Path("extra.img"), "rw"),
+            direct_kernel=True,
         )
         text = " ".join(command)
-        self.assertEqual(command[0], "qemu-system-riscv64")
+        self.assertEqual(command[0], "qemu-system-x86_64")
+        self.assertIn("-kernel", command)
         self.assertIn("id=rootfs,snapshot=on", text)
         self.assertIn("id=extra", text)
-        self.assertIn("bus=virtio-mmio-bus.0", text)
-        self.assertIn("bus=virtio-mmio-bus.1", text)
-        self.assertNotIn("bus=virtio-mmio-bus.2", text)
-        self.assertLess(
-            command.index("virtio-blk-device,drive=extra,bus=virtio-mmio-bus.1"),
-            command.index("virtio-net-device,netdev=net0"),
-        )
+        self.assertIn("virtio-blk-pci,drive=rootfs", text)
+        self.assertIn("virtio-blk-pci,drive=extra", text)
+        self.assertNotIn("virtio-blk-device", text)
 
-    def test_loongarch_command_uses_pci_devices(self) -> None:
+    def test_x86_64_command_uses_ovmf_esp_and_pci_devices(self) -> None:
         command = build_qemu_command(
-            arch="la",
-            kernel=Path("kernel-la"),
-            rootfs=Drive(Path("root.img"), "readonly"),
-            qemu_binary="custom-qemu",
-            cpus=2,
-            memory="2G",
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            extra_block=Drive(Path("extra.img"), "readonly"),
+            esp=Drive(Path("esp.img"), "snapshot"),
+            ovmf_code=Path("OVMF_CODE.fd"),
+            ovmf_vars=Path("OVMF_VARS.fd"),
         )
         text = " ".join(command)
-        self.assertEqual(command[0], "custom-qemu")
-        self.assertIn("-machine virt", text)
+        self.assertEqual(command[0], "qemu-system-x86_64")
+        self.assertIn("-machine q35", text)
+        self.assertNotIn("-kernel", command)
+        self.assertIn("if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd", text)
+        self.assertIn("if=pflash,format=raw,file=OVMF_VARS.fd", text)
+        self.assertIn("file=esp.img,if=ide,format=raw,snapshot=on", text)
+        self.assertIn("id=rootfs,snapshot=on", text)
         self.assertIn("virtio-blk-pci,drive=rootfs", text)
-        self.assertIn("virtio-rng-pci", text)
-        self.assertIn("-smp 2", text)
-        self.assertIn("-m 2G", text)
+        self.assertIn("id=extra,readonly=on", text)
+        self.assertIn("virtio-blk-pci,drive=extra", text)
+        self.assertIn("virtio-rng-pci,rng=rng0", text)
+        self.assertIn("virtio-net-pci,netdev=net0", text)
+        self.assertIn("-netdev user,id=net0", text)
+        self.assertNotIn("-bios", command)
+        self.assertNotIn("-net none", text)
+
+    def test_x86_64_direct_kernel_mode_is_explicit_debug_path(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+        )
+        self.assertIn("-kernel", command)
+        self.assertNotIn("if=pflash", " ".join(command))
 
 
 if __name__ == "__main__":

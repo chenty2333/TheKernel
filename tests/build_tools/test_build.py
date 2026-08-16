@@ -9,25 +9,64 @@ from unittest.mock import patch
 
 from tools.build import (
     BuildError,
+    BuildResult,
     FileDigestStore,
     InputSpec,
     KernelRequest,
     RootfsRequest,
+    build_cache_root,
+    build_parser,
+    build_x86_uefi_esp,
+    ensure_kernel,
     ensure_rootfs,
     external_kernel_input_specs,
     fingerprint_inputs,
     hash_params,
-    kernel_input_specs,
+    kernel_build,
     kernel_build_env,
+    kernel_input_specs,
     kernel_params,
     make_kernel_request,
     _kernel_make_var_args,
     rootfs_params,
+    rootfs_build,
+    state_path,
+    state_root,
 )
 from tools.project_paths import repo_root
 
 
 class BuildCacheTests(unittest.TestCase):
+    def test_state_root_defaults_and_resolves_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(state_root(root), root / ".state")
+
+            with patch.dict(
+                "os.environ",
+                {"THEKERNEL_STATE_DIR": "custom/../selected-state"},
+                clear=True,
+            ):
+                selected = (root / "selected-state").resolve()
+                self.assertEqual(state_root(root), selected)
+                self.assertEqual(build_cache_root(root), selected / "build-cache")
+
+    def test_state_path_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            state = root / "state"
+            outside = Path(tmp) / "outside"
+            state.mkdir(parents=True)
+            outside.mkdir()
+            (state / "escape").symlink_to(outside, target_is_directory=True)
+            with patch.dict(
+                "os.environ", {"THEKERNEL_STATE_DIR": str(state)}, clear=True
+            ):
+                with self.assertRaises(BuildError):
+                    state_path(root, "escape", "artifact")
+
     def test_external_tree_fingerprint_includes_relative_file_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             parent = Path(tmp)
@@ -102,12 +141,12 @@ class BuildCacheTests(unittest.TestCase):
                 output.write_bytes(b"rootfs")
 
             with patch("tools.build.rootfs_build", side_effect=fake_build):
-                first = ensure_rootfs(arch="rv", root=root, output=root / "a.img")
-                second = ensure_rootfs(arch="rv", root=root, output=root / "b.img")
+                first = ensure_rootfs(arch="x86", root=root, output=root / "a.img")
+                second = ensure_rootfs(arch="x86", root=root, output=root / "b.img")
                 busybox_config.write_text(
                     "CONFIG_STATIC=y\nCONFIG_FEATURE_TEST=y\n", encoding="utf-8"
                 )
-                third = ensure_rootfs(arch="rv", root=root, output=root / "c.img")
+                third = ensure_rootfs(arch="x86", root=root, output=root / "c.img")
 
             self.assertEqual(first.identity, second.identity)
             self.assertEqual(first.cache_path, second.cache_path)
@@ -119,6 +158,161 @@ class BuildCacheTests(unittest.TestCase):
 
 
 class BuildKernelParamTests(unittest.TestCase):
+    def test_x86_aliases_select_the_multiboot_kernel_profile(self) -> None:
+        root = repo_root()
+        with patch.dict("os.environ", {}, clear=True):
+            requests = [
+                make_kernel_request("release", alias, root)
+                for alias in ("x86", "x86_64")
+            ]
+
+        for request in requests:
+            with self.subTest(request=request):
+                self.assertEqual(request.name, "kernel-x86_64")
+                self.assertEqual(request.arch, "x86_64")
+                self.assertEqual(
+                    request.make_args,
+                    (
+                        "PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml",
+                        "SMP=4",
+                    ),
+                )
+                self.assertIn("smp", request.app_features.split())
+                self.assertNotIn(
+                    InputSpec("file", ""), kernel_input_specs(request)
+                )
+
+        self.assertEqual(requests[0], requests[1])
+
+    def test_x86_kernel_build_keeps_bootable_elf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "selected-state"
+            out_dir = state / "x86_64" / "out"
+            out_dir.mkdir(parents=True)
+            source = out_dir / "TheKernel_x86-pc.elf"
+            elf = b"\x7fELF\x02\x01\x01\x00multiboot\n"
+            source.write_bytes(elf)
+            output = root / "kernel-x86_64"
+            request = KernelRequest(
+                name="kernel-x86_64",
+                arch="x86_64",
+                make_args=(),
+                app_features="qemu",
+                root=root,
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[object]:
+                calls.append(argv)
+                if argv[0] == "rust-objcopy":
+                    Path(argv[-1]).write_bytes(Path(argv[-2]).read_bytes())
+                return subprocess.CompletedProcess(argv, 0)
+
+            with patch.dict(
+                "os.environ", {"THEKERNEL_STATE_DIR": str(state)}, clear=True
+            ), patch("tools.build.subprocess.run", side_effect=fake_run):
+                kernel_build(request, output)
+
+            self.assertEqual(output.read_bytes(), elf)
+            self.assertTrue(output.read_bytes().startswith(b"\x7fELF"))
+            self.assertEqual(
+                [call[0] for call in calls],
+                ["make", "make", "rust-objcopy", "bash"],
+            )
+            self.assertIn(f"STATE_DIR={state.resolve()}", calls[0])
+
+    def test_default_kernel_and_rootfs_outputs_honor_state_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = repo_root()
+            state = Path(tmp) / "selected-state"
+            cached = BuildResult(
+                kind="artifact",
+                name="artifact",
+                cache_path=root / "cache" / "artifact",
+                output_path=root / "cache" / "artifact",
+                identity="identity",
+                hit=True,
+            )
+            with patch.dict(
+                "os.environ", {"THEKERNEL_STATE_DIR": str(state)}, clear=True
+            ), patch("tools.build.ensure_cached_artifact", return_value=cached), patch(
+                "tools.build.materialize_file"
+            ):
+                for mode, directory in (
+                    ("shell", "shell"),
+                    ("io-test-shell", "io-test-shell"),
+                    ("mm-performance-shell", "mm-performance-shell"),
+                ):
+                    with self.subTest(mode=mode):
+                        result = ensure_kernel(mode=mode, arch="x86", root=root)
+                        self.assertEqual(
+                            result.output_path,
+                            state / directory / "kernel-x86_64",
+                        )
+
+                rootfs = ensure_rootfs(arch="x86", root=root)
+                self.assertEqual(
+                    rootfs.output_path,
+                    state / "rootfs" / "rootfs-x86.img",
+                )
+
+    def test_rootfs_builder_state_overrides_follow_selected_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            state = root / "selected-state"
+            root.mkdir()
+            request = RootfsRequest(arch="x86", root=root)
+            with patch.dict(
+                "os.environ", {"THEKERNEL_STATE_DIR": str(state)}, clear=True
+            ), patch("tools.build.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess([], 0, stdout="")
+                rootfs_build(request, state / "rootfs.img")
+
+            env = run_mock.call_args.kwargs["env"]
+            self.assertEqual(env["THEKERNEL_STATE_DIR"], str(state.resolve()))
+            self.assertEqual(
+                env["THEKERNEL_SOURCE_CACHE"], str((state / "source-cache").resolve())
+            )
+            self.assertEqual(
+                env["THEKERNEL_ROOTFS_BUILD_DIR"],
+                str((state / "rootfs-build").resolve()),
+            )
+
+    def test_x86_default_output_name_is_canonical(self) -> None:
+        cache_path = Path("/tmp/kernel-x86-cache")
+        cached = BuildResult(
+            kind="kernel",
+            name="kernel-x86_64",
+            cache_path=cache_path,
+            output_path=cache_path,
+            identity="identity",
+            hit=True,
+        )
+        with patch("tools.build.ensure_cached_artifact", return_value=cached), patch(
+            "tools.build.materialize_file"
+        ):
+            result = ensure_kernel(mode="release", arch="x86", root=repo_root())
+        self.assertEqual(result.output_path, repo_root() / "kernel-x86_64")
+
+    def test_x86_uefi_esp_builder_delegates_to_project_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kernel = root / "kernel-x86_64"
+            output = root / "esp.img"
+            script = root / "scripts" / "build-x86-uefi-esp.sh"
+            script.parent.mkdir()
+            script.write_text("#!/bin/sh\n", encoding="utf-8")
+            kernel.write_bytes(b"kernel")
+            with patch("tools.build.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess([], 0, stdout="")
+                build_x86_uefi_esp(root=root, kernel=kernel, output=output)
+
+            argv = run_mock.call_args.args[0]
+            self.assertEqual(argv[:2], ["bash", str(script)])
+            self.assertIn("--kernel", argv)
+            self.assertIn("--output", argv)
+
     def test_release_artifact_paths_replace_sibling_workspace_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -153,11 +347,10 @@ class BuildKernelParamTests(unittest.TestCase):
 
     def test_kernel_identity_includes_maintained_path_dependency_sources(self) -> None:
         request = KernelRequest(
-            name="kernel-rv",
-            arch="riscv64",
-            make_args=("BUS=mmio",),
+            name="kernel-x86_64",
+            arch="x86_64",
+            make_args=("PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml",),
             app_features="qemu",
-            patch_script="scripts/patch-riscv-kernel-elf.py",
             root=repo_root(),
         )
         specs = set(kernel_input_specs(request))
@@ -188,11 +381,10 @@ class BuildKernelParamTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base = dict(
-                name="kernel-rv",
-                arch="riscv64",
-                make_args=("BUS=mmio",),
+                name="kernel-x86_64",
+                arch="x86_64",
+                make_args=("PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml",),
                 app_features="qemu",
-                patch_script="scripts/patch-riscv-kernel-elf.py",
                 root=root,
             )
             params = kernel_params(KernelRequest(**base))
@@ -205,27 +397,41 @@ class BuildKernelParamTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "tools.build.capture", return_value="tool-version"
         ):
-            request = RootfsRequest(arch="rv", root=Path(tmp))
+            request = RootfsRequest(arch="x86", root=Path(tmp))
             with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": ""}):
                 self.assertEqual(rootfs_params(request)["source_date_epoch"], "1704067200")
             with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "123456789"}):
                 self.assertEqual(rootfs_params(request)["source_date_epoch"], "123456789")
 
+    def test_x86_rootfs_uses_the_native_cross_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tools.build.capture", return_value="tool-version"
+        ), patch.dict("os.environ", {}, clear=True):
+            params = rootfs_params(RootfsRequest(arch="x86", root=Path(tmp)))
+
+        self.assertEqual(params["arch"], "x86")
+        self.assertEqual(params["cross_compile"], "x86_64-linux-gnu-")
+
+    def test_rootfs_cli_accepts_both_x86_aliases(self) -> None:
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(["rootfs", "x86"]).arch, "x86")
+        self.assertEqual(parser.parse_args(["rootfs", "x86_64"]).arch, "x86_64")
+
     def test_io_test_control_is_absent_from_product_kernel_profiles(self) -> None:
         root = repo_root()
         for mode in ("release", "shell"):
-            request = make_kernel_request(mode, "rv", root)
+            request = make_kernel_request(mode, "x86", root)
             self.assertNotIn("test-io-control", request.app_features.split())
             self.assertNotIn("mm-lock-diagnostics", request.app_features.split())
 
-        test_request = make_kernel_request("io-test-shell", "rv", root)
+        test_request = make_kernel_request("io-test-shell", "x86", root)
         self.assertIn("test-io-control", test_request.app_features.split())
         self.assertNotIn("mm-lock-diagnostics", test_request.app_features.split())
         self.assertNotEqual(
-            test_request.name, make_kernel_request("shell", "rv", root).name
+            test_request.name, make_kernel_request("shell", "x86", root).name
         )
 
-        mm_request = make_kernel_request("mm-performance-shell", "rv", root)
+        mm_request = make_kernel_request("mm-performance-shell", "x86", root)
         self.assertEqual(
             {"test-io-control", "mm-lock-diagnostics"}
             & set(mm_request.app_features.split()),
@@ -233,7 +439,7 @@ class BuildKernelParamTests(unittest.TestCase):
         )
         self.assertNotEqual(mm_request.name, test_request.name)
         self.assertNotEqual(
-            mm_request.name, make_kernel_request("shell", "rv", root).name
+            mm_request.name, make_kernel_request("shell", "x86", root).name
         )
 
     def test_requested_kernel_cpu_count_is_part_of_build_identity(self) -> None:
@@ -241,22 +447,27 @@ class BuildKernelParamTests(unittest.TestCase):
         with patch.dict(
             "os.environ", {"THEKERNEL_KERNEL_CPUS": "8"}, clear=True
         ):
-            request = make_kernel_request("shell", "rv", root)
+            request = make_kernel_request("shell", "x86", root)
         self.assertIn("SMP=8", request.make_args)
         self.assertIn("smp", request.app_features.split())
         self.assertIn("SMP=8", kernel_params(request)["make_args"])
 
         with patch.dict("os.environ", {"SMP": "4"}, clear=True):
-            make_request = make_kernel_request("shell", "la", root)
+            make_request = make_kernel_request("shell", "x86", root)
         self.assertIn("SMP=4", make_request.make_args)
         self.assertIn("smp", make_request.app_features.split())
 
         with patch.dict(
             "os.environ", {"THEKERNEL_KERNEL_CPUS": "1"}, clear=True
         ):
-            single_cpu_request = make_kernel_request("shell", "rv", root)
+            single_cpu_request = make_kernel_request("shell", "x86", root)
         self.assertIn("SMP=1", single_cpu_request.make_args)
         self.assertNotIn("smp", single_cpu_request.app_features.split())
+
+        with patch.dict("os.environ", {"SMP": "1"}, clear=True):
+            x86_single_cpu_request = make_kernel_request("release", "x86", root)
+        self.assertIn("SMP=1", x86_single_cpu_request.make_args)
+        self.assertNotIn("smp", x86_single_cpu_request.app_features.split())
 
     def test_conflicting_kernel_cpu_inputs_are_rejected(self) -> None:
         root = repo_root()
@@ -266,12 +477,12 @@ class BuildKernelParamTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaises(BuildError):
-                make_kernel_request("shell", "rv", root)
+                make_kernel_request("shell", "x86", root)
 
     def test_requested_kernel_memory_overrides_the_product_default(self) -> None:
         root = repo_root()
         with patch.dict("os.environ", {"MEM": "128m"}, clear=True):
-            request = make_kernel_request("release", "rv", root)
+            request = make_kernel_request("release", "x86", root)
         self.assertIn("MEM=128M", request.make_args)
         make_args = _kernel_make_var_args(request)
         self.assertEqual(make_args.count("MEM=128M"), 1)
@@ -286,14 +497,14 @@ class BuildKernelParamTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaises(BuildError):
-                make_kernel_request("release", "rv", root)
+                make_kernel_request("release", "x86", root)
 
     def test_asid_fast_switch_is_an_explicit_cache_identity_feature(self) -> None:
         root = repo_root()
         with patch.dict(
             "os.environ", {"THEKERNEL_KERNEL_ASID_FAST_SWITCH": "1"}, clear=True
         ):
-            request = make_kernel_request("release", "rv", root)
+            request = make_kernel_request("release", "x86", root)
         self.assertIn("asid-fast-switch", request.app_features.split())
         self.assertIn("asid-fast-switch", kernel_params(request)["app_features"].split())
 
@@ -304,7 +515,7 @@ class BuildKernelParamTests(unittest.TestCase):
                 clear=True,
             ):
                 with self.assertRaises(BuildError):
-                    make_kernel_request("release", "rv", root)
+                    make_kernel_request("release", "x86", root)
 
     def test_requested_kernel_cpu_count_is_strictly_validated(self) -> None:
         root = repo_root()
@@ -313,7 +524,7 @@ class BuildKernelParamTests(unittest.TestCase):
                 "os.environ", {"THEKERNEL_KERNEL_CPUS": value}, clear=True
             ):
                 with self.assertRaises(BuildError):
-                    make_kernel_request("shell", "rv", root)
+                    make_kernel_request("shell", "x86", root)
 
 
 class ProductBootBoundaryTests(unittest.TestCase):
@@ -382,7 +593,11 @@ class ProductBootBoundaryTests(unittest.TestCase):
         scripts = sorted((root / "scripts" / "smoke").glob("*-smoke.sh"))
         for script in scripts:
             for args, error in (
-                (("--arch", "invalid"), "--arch must be rv or la"),
+                (("--arch", "x86"), "--arch must be x86_64"),
+                (("--arch", "rv"), "--arch must be x86_64"),
+                (("--arch", "la"), "--arch must be x86_64"),
+                (("--arch", "aarch64"), "--arch must be x86_64"),
+                (("--arch", "invalid"), "--arch must be x86_64"),
                 (("--timeout", "invalid"), "--timeout must be a non-negative integer"),
             ):
                 result = subprocess.run(
@@ -431,7 +646,7 @@ class ProductBootBoundaryTests(unittest.TestCase):
                     "bash",
                     "-c",
                     'set -euo pipefail; source "$1"; REPO_ROOT="$2"; '
-                    "smoke_runner_artifact_args rv 0",
+                    "smoke_runner_artifact_args x86_64 0",
                     "smoke-helper-test",
                     str(root / "scripts" / "smoke" / "lib.sh"),
                     str(fake_repo),
@@ -446,7 +661,9 @@ class ProductBootBoundaryTests(unittest.TestCase):
             self.assertEqual(
                 result.stdout,
                 b"--kernel\0"
-                + str(fake_repo / ".state/io-test-shell/kernel-rv").encode()
+                + str(fake_repo / ".state/io-test-shell/kernel-x86_64").encode()
+                + b"\0--esp\0"
+                + str(fake_repo / ".state/uefi/shell-x86_64.esp").encode()
                 + b"\0",
             )
             self.assertIn(b"fake make stdout", result.stderr)
@@ -475,7 +692,7 @@ class ProductBootBoundaryTests(unittest.TestCase):
                     "bash",
                     "-c",
                     'set -euo pipefail; source "$1"; REPO_ROOT="$2"; '
-                    "smoke_runner_artifact_args rv 0",
+                    "smoke_runner_artifact_args x86_64 0",
                     "smoke-helper-test",
                     str(root / "scripts" / "smoke" / "lib.sh"),
                     str(fake_repo),
@@ -493,6 +710,42 @@ class ProductBootBoundaryTests(unittest.TestCase):
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_make_state_dir_reaches_build_outputs(self) -> None:
+        root = repo_root()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = (Path(tmp) / "selected-state").resolve()
+            for make_args, env in (
+                ([f"STATE_DIR={state}"], None),
+                ([], {**os.environ, "THEKERNEL_STATE_DIR": str(state)}),
+            ):
+                with self.subTest(make_args=make_args):
+                    result = subprocess.run(
+                        [
+                            "make",
+                            "--no-print-directory",
+                            "-n",
+                            *make_args,
+                            "rootfs-x86",
+                        ],
+                        cwd=root,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, msg=result.stderr)
+                    self.assertIn(
+                        str(state / "rootfs" / "rootfs-x86.img"), result.stdout
+                    )
+
+    def test_kernel_cli_accepts_x86_aliases(self) -> None:
+        parser = build_parser()
+        for alias in ("x86", "x86_64"):
+            with self.subTest(alias=alias):
+                args = parser.parse_args(["kernel", alias])
+                self.assertEqual(args.arch, alias)
+
     def test_help_documents_product_commands(self) -> None:
         root = repo_root()
         result = subprocess.run(
@@ -525,18 +778,12 @@ class BuildCliTests(unittest.TestCase):
             root / ".state" / "rootfs",
             root / ".state" / "rootfs-build",
             root / ".state" / "system-test",
-            root / ".state" / "riscv64" / ".axconfig.toml",
-            root / ".state" / "riscv64" / ".axconfig.old.toml",
-            root / ".state" / "loongarch64" / ".axconfig.toml",
-            root / ".state" / "loongarch64" / ".axconfig.old.toml",
         ):
             self.assertIn(str(path), result.stdout)
         self.assertIn(str(root / ".state" / "*-current"), result.stdout)
         for path in (
             root / ".state" / "build-cache",
             root / ".state" / "source-cache",
-            root / ".state" / "riscv64" / "target",
-            root / ".state" / "loongarch64" / "target",
         ):
             self.assertNotIn(str(path), result.stdout)
 
