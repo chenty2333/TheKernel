@@ -41,6 +41,24 @@ static atomic_int worker_ready;
 static atomic_int worker_stop;
 static atomic_int barrier_failures;
 
+/* Dekker-style store-load ordering probe: two threads pinned to distinct
+ * CPUs each publish a per-round value and then issue a private expedited
+ * barrier before loading the peer's value. Without a real cross-CPU
+ * rendezvous, store buffering lets both loads observe the previous round.
+ * The barrier contract guarantees at least one side observes the fresh
+ * value, so `dekker_violations` must stay zero. */
+static atomic_int dekker_x;
+static atomic_int dekker_y;
+static atomic_int dekker_peer_ready;
+#define DEKKER_ROUNDS 512
+static atomic_int dekker_main_done;
+static atomic_int dekker_peer_done;
+static atomic_int dekker_barrier_errors;
+/* Per-round staleness records so a both-stale round can be attributed
+ * exactly; single-sided staleness in different rounds is not a violation. */
+static unsigned char dekker_main_stale_round[DEKKER_ROUNDS];
+static unsigned char dekker_peer_stale_round[DEKKER_ROUNDS];
+
 #define BARRIER_ISSUER_COUNT 4
 #define BARRIER_ISSUER_ROUNDS 16
 
@@ -129,6 +147,126 @@ static void *barrier_issuer(void *unused)
     return NULL;
 }
 
+static int online_cpu_count(void)
+{
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0) {
+        return -1;
+    }
+    return CPU_COUNT(&mask);
+}
+
+static int pin_to_cpu(int cpu)
+{
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    return sched_setaffinity(0, sizeof(mask), &mask);
+}
+
+static void *dekker_peer(void *unused)
+{
+    (void)unused;
+    atomic_store_explicit(&dekker_peer_ready, 1, memory_order_release);
+    for (int round = 1; round <= DEKKER_ROUNDS; ++round) {
+        /* Do not overrun the main thread: each round needs both stores to
+         * race only inside one round window. */
+        while (atomic_load_explicit(&dekker_main_done, memory_order_acquire) <
+               round - 1) {
+            sched_yield();
+        }
+        atomic_store_explicit(&dekker_y, round, memory_order_relaxed);
+        if (membarrier_call(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, -1) != 0) {
+            atomic_fetch_add_explicit(&dekker_barrier_errors, 1,
+                                      memory_order_relaxed);
+        }
+        int seen = atomic_load_explicit(&dekker_x, memory_order_relaxed);
+        /* Single-sided staleness is permitted by the barrier contract; only
+         * the both-stale combination within one round is a violation. */
+        dekker_peer_stale_round[round - 1] = seen < round;
+        atomic_store_explicit(&dekker_peer_done, round, memory_order_release);
+    }
+    return NULL;
+}
+
+static int run_pinned_ordering_check(void)
+{
+    int cpus = online_cpu_count();
+    if (cpus < 2) {
+        fprintf(stderr,
+                "THEKERNEL_MEMBARRIER_PINNED_SKIP online_cpus=%d\n", cpus);
+        return 0;
+    }
+
+    if (pin_to_cpu(0) != 0) {
+        return fail("dekker-pin-main");
+    }
+    pthread_t peer;
+    if (pthread_create(&peer, NULL, dekker_peer, NULL) != 0) {
+        return fail("dekker-pthread-create");
+    }
+    while (atomic_load_explicit(&dekker_peer_ready, memory_order_acquire) ==
+           0) {
+        sched_yield();
+    }
+    /* The peer inherits the creator's CPU 0 affinity; move it to CPU 1 so
+     * the store-load rounds race across distinct CPUs. */
+    cpu_set_t peer_mask;
+    CPU_ZERO(&peer_mask);
+    CPU_SET(1, &peer_mask);
+    if (pthread_setaffinity_np(peer, sizeof(peer_mask), &peer_mask) != 0) {
+        return fail("dekker-pin-peer");
+    }
+
+    for (int round = 1; round <= DEKKER_ROUNDS; ++round) {
+        while (atomic_load_explicit(&dekker_peer_done, memory_order_acquire) <
+               round - 1) {
+            sched_yield();
+        }
+        atomic_store_explicit(&dekker_x, round, memory_order_relaxed);
+        if (membarrier_call(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, -1) != 0) {
+            atomic_fetch_add_explicit(&dekker_barrier_errors, 1,
+                                      memory_order_relaxed);
+        }
+        int seen = atomic_load_explicit(&dekker_y, memory_order_relaxed);
+        dekker_main_stale_round[round - 1] = seen < round;
+        atomic_store_explicit(&dekker_main_done, round, memory_order_release);
+    }
+    while (atomic_load_explicit(&dekker_peer_done, memory_order_acquire) <
+           DEKKER_ROUNDS) {
+        sched_yield();
+    }
+    if (pthread_join(peer, NULL) != 0) {
+        return fail("dekker-pthread-join");
+    }
+
+    int errors = atomic_load_explicit(&dekker_barrier_errors,
+                                      memory_order_relaxed);
+    if (errors != 0) {
+        return fail_value("dekker-barrier-errors", errors, 0);
+    }
+    int main_stale = 0;
+    int peer_stale = 0;
+    int both_stale = 0;
+    for (int i = 0; i < DEKKER_ROUNDS; ++i) {
+        main_stale += dekker_main_stale_round[i];
+        peer_stale += dekker_peer_stale_round[i];
+        both_stale += dekker_main_stale_round[i] && dekker_peer_stale_round[i];
+    }
+    if (both_stale != 0) {
+        fprintf(stderr,
+                "THEKERNEL_MEMBARRIER_FAIL dekker-both-stale rounds=%d\n",
+                both_stale);
+        return 1;
+    }
+    fprintf(stderr, "membarrier pinned ordering: main_stale=%d peer_stale=%d\n",
+            main_stale, peer_stale);
+    printf("THEKERNEL_MEMBARRIER_PINNED_ORDERING_OK rounds=%d\n",
+           DEKKER_ROUNDS);
+    return 0;
+}
+
 static int run_exec_check(int linux_host)
 {
     (void)linux_host;
@@ -149,6 +287,51 @@ static int run_exec_check(int linux_host)
                        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, -1) != 0) {
         return 1;
     }
+    return 0;
+}
+
+static int run_errno_matrix(int linux_host)
+{
+    /* Commands this kernel does not advertise must fail with EINVAL, which
+     * is Linux's errno for a command outside the advertised QUERY mask.
+     * Linux hosts advertise (and implement) the global/rseq commands, so
+     * those assertions are TheKernel-only by design. */
+    int guest_only_failed =
+        !linux_host &&
+        (expect_errno("matrix-global-expedited", MEMBARRIER_CMD_GLOBAL_EXPEDITED,
+                      0, -1, EINVAL) != 0 ||
+         expect_errno("matrix-register-global-expedited",
+                      MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, -1,
+                      EINVAL) != 0 ||
+         expect_errno("matrix-private-rseq",
+                      MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, -1,
+                      EINVAL) != 0 ||
+         expect_errno("matrix-register-private-rseq",
+                      MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, -1,
+                      EINVAL) != 0 ||
+         expect_errno("matrix-private-cpu-flag",
+                      MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+                      MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0);
+    if (guest_only_failed) {
+        return 1;
+    }
+    /* Both platforms must reject multi-bit command combinations, negative
+     * commands, and the CPU flag on commands that never accept it. */
+    if (expect_errno("matrix-combined-private-get-registrations",
+                     MEMBARRIER_CMD_PRIVATE_EXPEDITED |
+                         MEMBARRIER_CMD_GET_REGISTRATIONS,
+                     0, -1, EINVAL) != 0 ||
+        expect_errno("matrix-combined-register-private-sync-core",
+                     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED |
+                         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
+                     0, -1, EINVAL) != 0 ||
+        expect_errno("matrix-negative-command", -1, 0, -1, EINVAL) != 0 ||
+        expect_errno("matrix-get-registrations-cpu-flag",
+                     MEMBARRIER_CMD_GET_REGISTRATIONS,
+                     MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_MEMBARRIER_ERRNO_MATRIX_OK");
     return 0;
 }
 
@@ -188,6 +371,9 @@ static int run_smoke(const char *self, int linux_host)
                      MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, -1, EPERM) != 0 ||
         expect_success("sync-core-after-sync-core-only",
                        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, -1) != 0) {
+        return 1;
+    }
+    if (run_errno_matrix(linux_host) != 0) {
         return 1;
     }
     errno = 0;
@@ -259,6 +445,10 @@ static int run_smoke(const char *self, int linux_host)
         return fail("pthread-join");
     }
     if (result != 0) {
+        return 1;
+    }
+
+    if (run_pinned_ordering_check() != 0) {
         return 1;
     }
 
