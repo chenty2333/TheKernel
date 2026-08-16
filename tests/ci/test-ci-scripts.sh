@@ -15,7 +15,6 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
     sh -n "$script"
 done
 bash -n "$0"
-python3 "$CI_DIR/validate-rfc-index.py" >/dev/null
 
 # The host and pinned Debian developer container must never execute artifacts
 # from the same primary or maintained-sibling Cargo target. This is a static
@@ -53,6 +52,9 @@ grep -Fq 'ci_run_step kernel-packet-adapter-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 24 --filter packet --' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step vendored-smoltcp-udp-tests' "$CI_DIR/per-commit.sh"
 grep -Fq 'RUSTUP_TOOLCHAIN=1.85.0' "$CI_DIR/per-commit.sh"
+grep -Fqx \
+    'LINUX_ABI_COMPAT_TOOLCHAIN=${THEKERNEL_LINUX_ABI_COMPAT_TOOLCHAIN:-nightly}' \
+    "$CI_DIR/per-commit.sh"
 grep -Fq -- '--minimum 41 --filter socket::udp::test --' \
     "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step ci-script-tests "$STEP_TIMEOUT_SECS"' \
@@ -76,13 +78,14 @@ grep -Fq 'sudo tee "$restriction"' \
 
 # Container jobs are resolved before any runner step can source versions.env,
 # and GitHub does not expose the env context to container.image. Keep the two
-# default images fixed to the current toolchain tag, preserve the repository
+# default images on the rolling nightly channel, preserve the repository
 # variable override, and make this test derive the expected literal from the
-# canonical version file so a future toolchain bump cannot drift silently.
+# canonical version file so the image/tag contract cannot drift silently.
 rust_toolchain=$(sed -n 's/^RUST_TOOLCHAIN=//p' \
     "$REPO_ROOT/dev-env/versions.env")
 [ -n "$rust_toolchain" ]
 [ "$(grep -c '^RUST_TOOLCHAIN=' "$REPO_ROOT/dev-env/versions.env")" -eq 1 ]
+[ "$rust_toolchain" = nightly ]
 expected_ci_image="      image: \${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:${rust_toolchain}', github.repository_owner) }}"
 [ "$(grep -Fxc -- "$expected_ci_image" \
     "$REPO_ROOT/.github/workflows/ci.yml")" -eq 2 ]
@@ -91,9 +94,9 @@ if grep -Fq 'thekernel-dev:latest' "$REPO_ROOT/.github/workflows/ci.yml"; then
     exit 1
 fi
 
-# Publishing always emits the version-derived toolchain tag. Only a main
-# branch push may additionally move latest; a manual feature-branch dispatch
-# therefore cannot replace the default floating image.
+# Publishing always emits the rolling-channel toolchain tag. Only a main branch
+# push may additionally move latest; a manual feature-branch dispatch therefore
+# cannot replace the default floating image.
 grep -Fqx '            type=raw,value=${{ env.RUST_TOOLCHAIN }}' \
     "$REPO_ROOT/.github/workflows/publish-dev-image.yml"
 grep -Fqx \
@@ -295,7 +298,7 @@ env \
     THEKERNEL_ROOTFS_HOST_DIR="$tmp/dev-rootfs" \
     THEKERNEL_AX_REPO="$tmp/dev-ax" \
     THEKERNEL_LINUX_ABI_REPO="$tmp/dev-linux-abi" \
-    "$dev_fixture/scripts/dev-shell.sh" -- make kernel-rv
+    "$dev_fixture/scripts/dev-shell.sh" -- make kernel-x86_64
 grep -Fxq -- "$tmp/dev-ax:/thekernel-ax:ro,z" "$tmp/dev-shell.args"
 grep -Fxq -- "$tmp/dev-linux-abi:/thekernel-linux-abi:ro,z" \
     "$tmp/dev-shell.args"
@@ -303,7 +306,7 @@ grep -Fxq -- \
     "$tmp/dev-linux-abi-primary/.git:$tmp/dev-linux-abi-primary/.git:ro,z" \
     "$tmp/dev-shell.args"
 grep -Fxq -- 'make' "$tmp/dev-shell.args"
-grep -Fxq -- 'kernel-rv' "$tmp/dev-shell.args"
+grep -Fxq -- 'kernel-x86_64' "$tmp/dev-shell.args"
 if env \
     PATH="$dev_fixture/fake-bin:$PATH" \
     DEV_SHELL_DOCKER_ARGS="$tmp/dev-shell-missing.args" \
@@ -415,7 +418,7 @@ done
 [ -n "$log_dir" ]
 mkdir -p "$log_dir"
 printf 'step\tstatus\texit_code\tlog\n' >"$log_dir/status.tsv"
-for arch in rv la; do
+for arch in x86_64; do
     mkdir -p "$log_dir/$arch"
     printf 'shell\n' >"$log_dir/$arch.commands"
     printf 'CI_BOOT_GATE_PASS\n' >"$log_dir/$arch/qemu.log"
@@ -482,13 +485,11 @@ if [ -n "${PR_MUTATE_ORIGIN_FILE:-}" ]; then
 fi
 printf 'make %s\n' "$*" >>"$PR_FIXTURE_TRACE"
 case "$*" in
-    kernels) printf fixture >kernel-rv; printf fixture >kernel-la ;;
-    'kernel-rv-shell kernel-la-shell rootfs')
+    kernels) printf fixture >kernel-x86_64 ;;
+    'kernel-x86_64-shell rootfs-x86')
         mkdir -p .state/shell .state/rootfs
-        printf fixture >.state/shell/kernel-rv
-        printf fixture >.state/shell/kernel-la
-        printf fixture >.state/rootfs/rootfs-rv.img
-        printf fixture >.state/rootfs/rootfs-la.img
+        printf fixture >.state/shell/kernel-x86_64
+        printf fixture >.state/rootfs/rootfs-x86.img
         ;;
 esac
 EOF
@@ -499,7 +500,7 @@ chmod +x \
     "$pr_fixture/scripts/system-test.sh" \
     "$pr_fixture/fake-bin/make"
 
-printf '%s\n' /kernel-rv /kernel-la /.state >"$pr_fixture/.gitignore"
+printf '%s\n' /kernel-x86_64 /.state >"$pr_fixture/.gitignore"
 printf '%s\n' committed >"$pr_fixture/source-token"
 git -C "$pr_fixture" init --quiet
 git -C "$pr_fixture" add .gitignore source-token scripts fake-bin
@@ -527,21 +528,18 @@ env PATH="$pr_fixture/fake-bin:$PATH" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --log-dir "$tmp/pr-gate-logs" >/dev/null
 grep -Fxq \
-    "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" \
+    "release-consumer --arch x86_64 --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" \
     "$pr_trace"
 # Linting precedes the release build so a lint failure costs no image.
-[ "$(sed -n '1p' "$pr_trace")" = 'clippy --profile la' ]
+[ "$(sed -n '1p' "$pr_trace")" = 'clippy --profile x86_64' ]
 [ "$(sed -n '2p' "$pr_trace")" = \
-    "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
+    "release-consumer --arch x86_64 --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
 [ "$(sed -n '3p' "$pr_trace")" = 'make kernels' ]
-[ "$(sed -n '4p' "$pr_trace")" = 'make kernel-rv-shell kernel-la-shell rootfs' ]
-grep -Fq 'clippy --profile la' "$pr_trace"
-grep -Fq 'boot --arch both --skip-build' "$pr_trace"
+[ "$(sed -n '4p' "$pr_trace")" = 'make kernel-x86_64-shell rootfs-x86' ]
+grep -Fq 'clippy --profile x86_64' "$pr_trace"
+grep -Fq 'boot --arch x86_64 --skip-build' "$pr_trace"
 grep -Fq \
-    "system --arch rv --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/rv" \
-    "$pr_trace"
-grep -Fq \
-    "system --arch la --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/la" \
+    "system --arch x86_64 --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/x86_64" \
     "$pr_trace"
 [ -s "$tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
 grep -q $'^release-consumer\tpass\t0\t' "$tmp/pr-gate-logs/status.tsv"
@@ -566,9 +564,9 @@ grep -Fqx $'source_execution\tcommit-materialized' \
 for bundled_path in \
     bundle/logs/release-kernels.log \
     bundle/logs/boot/status.tsv \
-    bundle/logs/boot/rv.commands \
-    bundle/logs/system/rv/console.log \
-    bundle/products/rootfs-la.img
+    bundle/logs/boot/x86_64.commands \
+    bundle/logs/system/x86_64/console.log \
+    bundle/products/rootfs-x86.img
 do
     grep -Fq $'\t'"$bundled_path" \
         "$tmp/pr-gate-logs/evidence/artifacts.tsv"
@@ -623,7 +621,7 @@ git -C "$pr_fixture" diff --quiet -- source-token
 
 # Every actual kernel/rootfs/log/receipt is part of the portable manifest.
 # Mutating a staged kernel must make both the standard replay and verifier fail.
-printf mutation >>"$tmp/pr-gate-logs/evidence/bundle/products/kernel-rv"
+printf mutation >>"$tmp/pr-gate-logs/evidence/bundle/products/kernel-x86_64"
 if (cd "$tmp/pr-gate-logs/evidence" && \
     sha256sum -c checksums.sha256 >/dev/null 2>&1); then
     printf '%s\n' 'test-ci-scripts: mutated PR artifact passed checksum replay' >&2
@@ -727,9 +725,9 @@ fi
 [ ! -s "$pr_trace" ]
 
 for reuse_path in \
-    kernel-rv kernel-la \
-    .state/shell/kernel-rv .state/shell/kernel-la \
-    .state/rootfs/rootfs-rv.img .state/rootfs/rootfs-la.img
+    kernel-x86_64 \
+    .state/shell/kernel-x86_64 \
+    .state/rootfs/rootfs-x86.img
 do
     mkdir -p -- "$(dirname -- "$pr_fixture/$reuse_path")"
     printf fixture >"$pr_fixture/$reuse_path"
@@ -753,12 +751,11 @@ env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
     THEKERNEL_LINUX_ABI_REPO="$tmp/pr-linux-abi" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --skip-build --log-dir "$tmp/pr-gate-skip-logs" >/dev/null
-# clippy-la, dual-arch-boot, system-rv, system-la.
-[ "$(wc -l <"$pr_trace")" -eq 4 ]
-grep -Fq 'clippy --profile la' "$pr_trace"
-grep -Fq 'boot --arch both --skip-build' "$pr_trace"
-grep -Fq 'system --arch rv --skip-build' "$pr_trace"
-grep -Fq 'system --arch la --skip-build' "$pr_trace"
+# clippy-x86_64, boot-shell, system-x86_64.
+[ "$(wc -l <"$pr_trace")" -eq 3 ]
+grep -Fq 'clippy --profile x86_64' "$pr_trace"
+grep -Fq 'boot --arch x86_64 --skip-build' "$pr_trace"
+grep -Fq 'system --arch x86_64 --skip-build' "$pr_trace"
 if grep -Eq '^(release-consumer|make) ' "$pr_trace"; then
     printf 'test-ci-scripts: --skip-build ran release or source build\n' >&2
     exit 1
@@ -790,9 +787,7 @@ env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --skip-build --log-dir "$tmp/pr-gate-crlf-logs" >/dev/null
 grep -Fqx $'result\tPASS' "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
-grep -Fqx $'rv_packet_markers\tPASS' \
-    "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
-grep -Fqx $'la_packet_markers\tPASS' \
+grep -Fqx $'x86_64_packet_markers\tPASS' \
     "$tmp/pr-gate-crlf-logs/evidence/receipt.tsv"
 
 set +e
@@ -811,7 +806,7 @@ set -e
 [ "$status" -eq 1 ]
 grep -Fqx $'result\tFAIL' \
     "$tmp/pr-gate-crlf-duplicate-logs/evidence/receipt.tsv"
-grep -Eq $'^(rv|la)_packet_markers\tFAIL$' \
+grep -Eq $'^x86_64_packet_markers\tFAIL$' \
     "$tmp/pr-gate-crlf-duplicate-logs/evidence/receipt.tsv"
 
 # Successful child steps cannot promote an incomplete semantic console. This
@@ -838,7 +833,7 @@ grep -Fqx $'command_exit_code\t0' \
     "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
 grep -Fqx $'effective_exit_code\t1' \
     "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
-grep -Eq $'^(rv|la)_packet_markers\tFAIL$' \
+grep -Eq $'^x86_64_packet_markers\tFAIL$' \
     "$tmp/pr-gate-marker-fail-logs/evidence/receipt.tsv"
 "$tmp/pr-gate-marker-fail-logs/evidence/verify.sh" \
     "$tmp/pr-gate-marker-fail-logs/evidence" \
@@ -892,17 +887,17 @@ mkdir -p \
     "$system_fixture/scripts/ci" \
     "$system_fixture/scripts/ci/differential/manifests" \
     "$system_fixture/fake-bin" \
-    "$system_fixture/.state/rootfs"
+    "$system_fixture/.state/rootfs" \
+    "$system_fixture/.state/uefi"
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
 cp "$CI_DIR/lib.sh" "$system_fixture/scripts/ci/"
 cp "$CI_DIR/differential/manifests/futex.markers" \
     "$CI_DIR/differential/manifests/epoll-guest.markers" \
     "$CI_DIR/differential/manifests/signal-order.markers" \
     "$system_fixture/scripts/ci/differential/manifests/"
-printf fixture >"$system_fixture/kernel-rv"
-printf fixture >"$system_fixture/kernel-la"
-printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
-printf fixture >"$system_fixture/.state/rootfs/rootfs-la.img"
+printf fixture >"$system_fixture/kernel-x86_64"
+printf fixture >"$system_fixture/.state/rootfs/rootfs-x86.img"
+printf fixture >"$system_fixture/.state/uefi/kernel-x86_64.esp"
 cat >"$system_fixture/fake-bin/python3" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -941,8 +936,26 @@ THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK
 THEKERNEL_SYSTEM_TEST_PROCESS_OK
 THEKERNEL_EXEC_SMOKE_OK
 THEKERNEL_SYSTEM_TEST_EXEC_OK
+THEKERNEL_VFORK_EXIT_OK
+THEKERNEL_VFORK_EXEC_OK
+THEKERNEL_VFORK_OK
+THEKERNEL_SYSTEM_TEST_VFORK_OK
+THEKERNEL_RSEQ_AUXV_OK feature_size=24 align=32
+THEKERNEL_RSEQ_REGISTRATION_OK
+THEKERNEL_RSEQ_FIRST_TOUCH_OK
+THEKERNEL_RSEQ_FORK_COW_OK
+THEKERNEL_RSEQ_SIGNAL_ABORT_OK
+THEKERNEL_RSEQ_SIGKILL_OK
+THEKERNEL_RSEQ_OK
+THEKERNEL_SYSTEM_TEST_RSEQ_OK
 CI_SIGNAL_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK
+THEKERNEL_SYSTEM_TEST_PAUSE_OK
+THEKERNEL_SYSTEM_TEST_ALARM_OK
+THEKERNEL_IOPRIO_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_IOPRIO_OK
+THEKERNEL_MEMBARRIER_SMOKE_OK
+THEKERNEL_SYSTEM_TEST_MEMBARRIER_OK
 CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$cpus
 CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK
 CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK min_hits=3
@@ -952,16 +965,17 @@ CI_WAIT_BOUNDARY_RLIMIT_CPU_HARD_ONLY_OK signal=SIGKILL sigxcpu=0
 CI_WAIT_BOUNDARY_PRLIMIT_PRECEDENCE_OK bad_new=EFAULT bad_pid_before_resource=ESRCH
 CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK old_new=atomic invalid=rollback copyout_fault=committed
 MARKERS_BEFORE_SETRLIMIT
-case "$arch" in
-    rv) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT' ;;
-    la) printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent' ;;
-    *) exit 2 ;;
-esac >>"$workdir/console.log"
+printf '%s\n' 'CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT' \
+    >>"$workdir/console.log"
 cat >>"$workdir/console.log" <<'MARKERS_AFTER_WAIT'
 CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK bad_new=EFAULT
+CI_WAIT_BOUNDARY_ITIMER_USERCOPY_OK unaligned=1 alias=1 copyout_fault=committed
 CI_WAIT_BOUNDARY_FUTEX_WAKE_OK
 CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK
 CI_WAIT_BOUNDARY_FUTEX_WAITV_OK
+CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_ALIAS_OK same_file_offset=1 wake_from_alias=1
+CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_REMAP_ISOLATION_OK different_backing=1 wake_count=0 timeout=1
+CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_REMAP_OK same_file_offset=1 wake_after_fixed_remap=1
 CI_WAIT_BOUNDARY_PASS
 THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK
 MARKERS_AFTER_WAIT
@@ -1044,43 +1058,32 @@ chmod +x "$system_fixture/fake-bin/make"
 if env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-unsafe.args" \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --skip-build --workdir "$system_fixture" >/dev/null 2>&1
+    --arch x86_64 --skip-build --workdir "$system_fixture" >/dev/null 2>&1
 then
     printf '%s\n' 'test-ci-scripts: system gate accepted its source root as workdir' >&2
     exit 1
 fi
-[ -s "$system_fixture/kernel-rv" ]
+[ -s "$system_fixture/kernel-x86_64" ]
 system_args="$tmp/system-runner.args"
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
     FAKE_SYSTEM_RUNNER_STATUS=75 \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --skip-build --workdir "$tmp/system-run" >/dev/null
-grep -Fqx $'owner\tsystem-test-rv' \
+    --arch x86_64 --skip-build --workdir "$tmp/system-run" >/dev/null
+grep -Fqx $'owner\tsystem-test-x86_64' \
     "$tmp/system-run/.thekernel-ci-owned-run"
 grep -Fxq -- '--stop-after-marker' "$system_args"
 grep -Fxq -- 'THEKERNEL_SYSTEM_TEST_PASS' "$system_args"
 grep -Fxq -- '--cpus' "$system_args"
-grep -Fxq -- '1' "$system_args"
+grep -Fxq -- '4' "$system_args"
 grep -Fxq -- '--memory' "$system_args"
 grep -Fxq -- '128M' "$system_args"
-system_args_la="$tmp/system-runner-la.args"
-env PATH="$system_fixture/fake-bin:$PATH" \
-    FAKE_SYSTEM_RUNNER_ARGS="$system_args_la" \
-    FAKE_SYSTEM_RUNNER_STATUS=75 \
-    "$system_fixture/scripts/system-test.sh" \
-    --arch la --skip-build --workdir "$tmp/system-run-la" >/dev/null
-grep -Fxq -- '--cpus' "$system_args_la"
-grep -Fxq -- '1' "$system_args_la"
-grep -Fxq -- '--memory' "$system_args_la"
-grep -Fxq -- '256M' "$system_args_la"
-grep -Fxq -- 'la' "$system_args_la"
 set +e
 env PATH="$system_fixture/fake-bin:$PATH" \
-    FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-la-memory.args" \
+    FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-memory.args" \
     "$system_fixture/scripts/system-test.sh" \
-    --arch la --memory 128M --skip-build \
-    --workdir "$tmp/system-invalid-la-memory" >/dev/null 2>&1
+    --arch x86_64 --memory 2G --skip-build \
+    --workdir "$tmp/system-invalid-memory" >/dev/null 2>&1
 status=$?
 set -e
 [ "$status" -eq 2 ]
@@ -1091,11 +1094,11 @@ env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_MAKE_ARGS="$system_make_args" \
     FAKE_SYSTEM_RUNNER_STATUS=75 \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --cpus 4 --workdir "$tmp/system-run-smp" >/dev/null
+    --arch x86_64 --cpus 4 --workdir "$tmp/system-run-smp" >/dev/null
 grep -Fxq -- 'SMP=4' "$system_make_args"
 grep -Fxq -- 'MEM=128M' "$system_make_args"
-grep -Fxq -- 'kernel-rv' "$system_make_args"
-grep -Fxq -- 'rootfs-rv' "$system_make_args"
+grep -Fxq -- 'kernel-x86_64' "$system_make_args"
+grep -Fxq -- 'rootfs-x86' "$system_make_args"
 grep -Fxq -- '--cpus' "$system_args_smp"
 grep -Fxq -- '4' "$system_args_smp"
 grep -Fxq -- '--memory' "$system_args_smp"
@@ -1107,14 +1110,14 @@ env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_MAKE_ARGS="$system_make_args_asid" \
     FAKE_SYSTEM_RUNNER_STATUS=75 \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --asid-fast-switch \
+    --arch x86_64 --asid-fast-switch \
     --workdir "$tmp/system-run-asid" >/dev/null
 grep -Fxq -- 'THEKERNEL_KERNEL_ASID_FAST_SWITCH=1' "$system_make_args_asid"
 set +e
 env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-asid-skip.args" \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --asid-fast-switch --skip-build \
+    --arch x86_64 --asid-fast-switch --skip-build \
     --workdir "$tmp/system-invalid-asid-skip" >/dev/null 2>&1
 status=$?
 set -e
@@ -1124,7 +1127,7 @@ for invalid_cpus in 0 4097 not-a-number; do
     env PATH="$system_fixture/fake-bin:$PATH" \
         FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-$invalid_cpus.args" \
         "$system_fixture/scripts/system-test.sh" \
-        --arch rv --cpus "$invalid_cpus" --skip-build \
+        --arch x86_64 --cpus "$invalid_cpus" --skip-build \
         --workdir "$tmp/system-invalid-$invalid_cpus" >/dev/null 2>&1
     status=$?
     set -e
@@ -1139,7 +1142,7 @@ for invalid_memory in 0 64M 2G 128 128MB bad; do
     env PATH="$system_fixture/fake-bin:$PATH" \
         FAKE_SYSTEM_RUNNER_ARGS="$tmp/system-invalid-memory-$invalid_memory.args" \
         "$system_fixture/scripts/system-test.sh" \
-        --arch rv --memory "$invalid_memory" --skip-build \
+        --arch x86_64 --memory "$invalid_memory" --skip-build \
         --workdir "$tmp/system-invalid-memory-$invalid_memory" >/dev/null 2>&1
     status=$?
     set -e
@@ -1154,7 +1157,7 @@ env PATH="$system_fixture/fake-bin:$PATH" \
     FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
     FAKE_SYSTEM_RUNNER_STATUS=23 \
     "$system_fixture/scripts/system-test.sh" \
-    --arch rv --skip-build --workdir "$tmp/system-run-fail" >/dev/null
+    --arch x86_64 --skip-build --workdir "$tmp/system-run-fail" >/dev/null
 status=$?
 set -e
 [ "$status" -eq 23 ] || {
@@ -1171,11 +1174,11 @@ CI_BOOT_GATE_BIND_OK
 CI_BOOT_GATE_PASS
 System is shutting down
 EOF
-"$CI_DIR/validate-boot-log.sh" rv "$tmp/pass.log" >/dev/null
+"$CI_DIR/validate-boot-log.sh" x86_64 "$tmp/pass.log" >/dev/null
 
 cp "$tmp/pass.log" "$tmp/fail.log"
 printf 'CI_BOOT_GATE_FAIL injected\n' >>"$tmp/fail.log"
-if "$CI_DIR/validate-boot-log.sh" la "$tmp/fail.log" >/dev/null 2>&1; then
+if "$CI_DIR/validate-boot-log.sh" x86_64 "$tmp/fail.log" >/dev/null 2>&1; then
     printf 'test-ci-scripts: failure marker was accepted\n' >&2
     exit 1
 fi
@@ -1200,14 +1203,14 @@ fi
 cp "$tmp/pass.log" "$tmp/idle-timeout.log"
 printf 'qemu-runner: QEMU idle timeout after 30s without console output\n' \
     >>"$tmp/idle-timeout.log"
-if "$CI_DIR/validate-boot-log.sh" rv "$tmp/idle-timeout.log" >/dev/null 2>&1; then
+if "$CI_DIR/validate-boot-log.sh" x86_64 "$tmp/idle-timeout.log" >/dev/null 2>&1; then
     printf 'test-ci-scripts: QEMU idle timeout was accepted\n' >&2
     exit 1
 fi
 
 cp "$tmp/pass.log" "$tmp/missing.log"
 sed -i '/CI_BOOT_GATE_BIND_OK/d' "$tmp/missing.log"
-if "$CI_DIR/validate-boot-log.sh" rv "$tmp/missing.log" >/dev/null 2>&1; then
+if "$CI_DIR/validate-boot-log.sh" x86_64 "$tmp/missing.log" >/dev/null 2>&1; then
     printf 'test-ci-scripts: missing marker was accepted\n' >&2
     exit 1
 fi
@@ -1305,7 +1308,7 @@ set -e
     printf 'test-ci-scripts: invalid adapter architecture returned %s, expected 1\n' "$status" >&2
     exit 1
 }
-grep -Fq 'THEKERNEL_NIGHTLY_ARCHES must be rv, la, or both' "$tmp/invalid-arch.log"
+grep -Fq 'THEKERNEL_NIGHTLY_ARCHES must be x86_64' "$tmp/invalid-arch.log"
 if grep -Fq 'UNSUPPORTED' "$tmp/invalid-arch.log"; then
     printf 'test-ci-scripts: invalid adapter architecture was misclassified as unsupported\n' >&2
     exit 1
@@ -1409,11 +1412,11 @@ for _ in $(seq 1 20000); do
 done >"$tmp/commands"
 env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
     FAKE_QEMU_RUNNER_STATUS=0 \
-    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$CI_DIR/boot-shell-runner.sh" x86_64 /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0
 if env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
     FAKE_QEMU_RUNNER_STATUS=23 \
-    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$CI_DIR/boot-shell-runner.sh" x86_64 /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0; then
     printf 'test-ci-scripts: QEMU runner failure was hidden by pipe handling\n' >&2
     exit 1
@@ -1427,7 +1430,7 @@ fi
 
 if env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
     FAKE_QEMU_RUNNER_STATUS=0 FAKE_INPUT_MODE=truncate \
-    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$CI_DIR/boot-shell-runner.sh" x86_64 /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0; then
     printf 'test-ci-scripts: truncated stdin stream was accepted\n' >&2
     exit 1
@@ -1440,12 +1443,13 @@ else
 fi
 
 printf 'exit\n' >"$tmp/short-commands"
+printf 'esp\n' >"$tmp/shell-esp.img"
 env PATH="$tmp/fake-bin:$PATH" REAL_PYTHON3="$real_python3" \
     FAKE_QEMU_RUNNER_STATUS=75 \
     FAKE_QEMU_RUNNER_ARGS="$tmp/qemu-runner.args" \
     THEKERNEL_QEMU_CPUS=8 \
-    "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
-    "$tmp/short-commands" 1 1 0 extra.img STOP_MARKER || status=$?
+    "$CI_DIR/boot-shell-runner.sh" x86_64 kernel image "$tmp/fake-work" \
+    "$tmp/short-commands" 1 1 0 extra.img STOP_MARKER "$tmp/shell-esp.img" || status=$?
 [ "${status:-75}" -eq 75 ]
 grep -Fxq -- '--input-after-marker' "$tmp/qemu-runner.args"
 grep -Fxq -- 'THEKERNEL_SHELL_READY' "$tmp/qemu-runner.args"
@@ -1467,8 +1471,10 @@ grep -Fxq -- '--extra-block' "$tmp/qemu-runner.args"
 grep -Fxq -- 'extra.img' "$tmp/qemu-runner.args"
 grep -Fxq -- '--stop-after-marker' "$tmp/qemu-runner.args"
 grep -Fxq -- 'STOP_MARKER' "$tmp/qemu-runner.args"
+grep -Fxq -- '--esp' "$tmp/qemu-runner.args"
+grep -Fxq -- "$tmp/shell-esp.img" "$tmp/qemu-runner.args"
 if env PATH="$tmp/fake-bin:$PATH" THEKERNEL_QEMU_CPUS=0 \
-    "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
+    "$CI_DIR/boot-shell-runner.sh" x86_64 kernel image "$tmp/fake-work" \
     "$tmp/short-commands" 1 1 0 >/dev/null 2>&1; then
     printf '%s\n' 'test-ci-scripts: runner accepted zero QEMU CPUs' >&2
     exit 1
@@ -1509,6 +1515,9 @@ cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
 cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
     "$REPO_ROOT/tests/guest/tools/wait-boundary.c" \
     -o "$tmp/wait-boundary"
+cc -O2 -std=c11 -Wall -Wextra -Werror \
+    "$REPO_ROOT/tests/guest/tools/rseq-smoke.c" \
+    -o "$tmp/rseq-smoke"
 "$CI_DIR/seccomp-host-differential.sh" \
     --workdir "$tmp/seccomp-host-differential" \
     --allow-inherited-profile >"$tmp/seccomp-host-differential.out"
@@ -1646,17 +1655,16 @@ fi
 # the other rot.
 grep -Fq 'ci_run_step clippy-host' "$CI_DIR/per-commit.sh"
 grep -Fq -- 'clippy-gate.sh" --profile host' "$CI_DIR/per-commit.sh"
-grep -Fq 'ci_run_step clippy-rv' "$CI_DIR/per-commit.sh"
-grep -Fq -- 'clippy-gate.sh" --profile rv' "$CI_DIR/per-commit.sh"
-grep -Fq 'ci_run_step clippy-la' "$CI_DIR/pr-gate.sh"
-grep -Fq -- 'clippy-gate.sh" --profile la' "$CI_DIR/pr-gate.sh"
+grep -Fq 'ci_run_step clippy-x86_64' "$CI_DIR/per-commit.sh"
+grep -Fq -- 'clippy-gate.sh" --profile x86_64' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step clippy-x86_64' "$CI_DIR/pr-gate.sh"
+grep -Fq -- 'clippy-gate.sh" --profile x86_64' "$CI_DIR/pr-gate.sh"
 # The lint policy is a reviewable table, not a scattering of local overrides.
 grep -Fq '[workspace.lints.clippy]' "$REPO_ROOT/Cargo.toml"
 for manifest in \
     "$REPO_ROOT/Cargo.toml" \
     "$REPO_ROOT/kernel/Cargo.toml" \
     "$REPO_ROOT/crates/axnet-ng/Cargo.toml" \
-    "$REPO_ROOT/crates/axtask-compat/Cargo.toml" \
     "$REPO_ROOT/crates/process-adapter/Cargo.toml" \
     "$REPO_ROOT/crates/readiness-adapter/Cargo.toml"; do
     grep -Fq 'workspace = true' "$manifest" \

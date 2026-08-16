@@ -44,12 +44,10 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
-#if defined(__riscv)
-#define MM_PERF_COMPILED_ARCH "rv"
-#elif defined(__loongarch__)
-#define MM_PERF_COMPILED_ARCH "la"
+#if defined(__x86_64__)
+#define MM_PERF_COMPILED_ARCH "x86_64"
 #else
-#define MM_PERF_COMPILED_ARCH "host"
+#error "MM performance helper requires the x86_64 Linux ABI"
 #endif
 
 #define MM_PERF_RUN_SCHEMA "thekernel-mm-performance-run-v3"

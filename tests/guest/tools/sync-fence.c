@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 
+#if !defined(__x86_64__)
+#error "sync-fence smoke test requires the x86_64 Linux ABI"
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -14,6 +18,10 @@
 
 #ifndef SYNC_FILE_RANGE_WAIT_AFTER
 #define SYNC_FILE_RANGE_WAIT_AFTER 4
+#endif
+
+#ifndef __NR_sync_file_range
+#define __NR_sync_file_range 277
 #endif
 
 static int write_full(int fd, const void *buf, size_t len)
@@ -47,20 +55,12 @@ static void fill_pattern(uint8_t *buf, size_t len, uint8_t seed)
 
 static int call_sync_file_range(int fd, off_t offset, off_t len)
 {
-#ifdef __NR_sync_file_range
     long rc = syscall(__NR_sync_file_range, fd, offset, len,
                       SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
     if (rc == 0) {
         return 0;
     }
     return -1;
-#else
-    errno = ENOSYS;
-    (void)fd;
-    (void)offset;
-    (void)len;
-    return -1;
-#endif
 }
 
 int main(int argc, char **argv)

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifndef SYS_io_uring_setup
@@ -33,6 +34,8 @@
 #define IORING_UNREGISTER_FILES 3U
 #define IORING_REGISTER_PROBE 8U
 #define IORING_OP_NOP 0U
+#define IORING_OP_READ_FIXED 4U
+#define IORING_OP_WRITE_FIXED 5U
 #define IORING_OP_FSYNC 3U
 #define IORING_OP_POLL_ADD 6U
 #define IORING_OP_ASYNC_CANCEL 14U
@@ -156,6 +159,10 @@ static void store_release(unsigned char *base, uint32_t offset, uint32_t value) 
 }
 
 static void write_u32(unsigned char *bytes, size_t offset, uint32_t value) {
+    memcpy(bytes + offset, &value, sizeof(value));
+}
+
+static void write_u16(unsigned char *bytes, size_t offset, uint16_t value) {
     memcpy(bytes + offset, &value, sizeof(value));
 }
 
@@ -555,7 +562,8 @@ static int test_probe(struct ring *ring) {
                           IORING_OP_LAST_LINUX_6_12 - 1);
     }
     for (uint32_t opcode = 0; opcode < IORING_PROBE_OPS; ++opcode) {
-        int supported = opcode == IORING_OP_NOP || opcode == IORING_OP_POLL_ADD ||
+        int supported = opcode == IORING_OP_NOP || opcode == IORING_OP_READ_FIXED ||
+                        opcode == IORING_OP_WRITE_FIXED || opcode == IORING_OP_POLL_ADD ||
                         opcode == IORING_OP_ASYNC_CANCEL || opcode == IORING_OP_READ ||
                         opcode == IORING_OP_WRITE;
         uint16_t expected = supported ? IORING_OP_SUPPORTED : 0;
@@ -577,63 +585,138 @@ static int expect_register_error(struct ring *ring, uint32_t opcode,
     return 0;
 }
 
-static int test_unsupported_buffers(struct ring *ring) {
-    uint64_t dummy_iovec[2] = {0};
-    return expect_register_error(ring, IORING_REGISTER_BUFFERS, NULL, 1U,
-                                 EINVAL, "buffers-malformed") ||
-           expect_register_error(ring, IORING_REGISTER_BUFFERS, dummy_iovec, 1U,
-                                 EOPNOTSUPP, "buffers-unsupported") ||
-           expect_register_error(ring, IORING_UNREGISTER_BUFFERS, NULL, 0U,
-                                 EOPNOTSUPP, "unregister-buffers-unsupported");
-}
-
-static int test_fixed_positioned_io(struct ring *ring) {
+static int test_registered_buffers(struct ring *ring) {
     static const char payload[] = "thekernel-io-uring\n";
-    char output[sizeof(payload)] = {0};
-    int file = open("/tmp/thekernel-io-uring", O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
+    long page_value = sysconf(_SC_PAGESIZE);
+    if (page_value <= 0) {
+        errno = EINVAL;
+        return fail("buffers-page-size");
+    }
+    size_t page = (size_t)page_value;
+    char *input = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *output = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (input == MAP_FAILED || output == MAP_FAILED) {
+        if (input != MAP_FAILED) {
+            munmap(input, page);
+        }
+        if (output != MAP_FAILED) {
+            munmap(output, page);
+        }
+        return fail("buffers-mmap");
+    }
+    memset(input, 0, page);
+    memset(output, 0, page);
+    memcpy(input + 7, payload, sizeof(payload));
+
+    int result = 1;
+    int file = -1;
+    int files_registered = 0;
+    int buffers_registered = 0;
+    struct iovec iov[2] = {
+        {.iov_base = input, .iov_len = page},
+        {.iov_base = output, .iov_len = page},
+    };
+    if (expect_register_error(ring, IORING_REGISTER_BUFFERS, NULL, 1U,
+                              EFAULT, "buffers-null")) {
+        goto out;
+    }
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_BUFFERS,
+                iov, 2U) != 0) {
+        fail("buffers-register");
+        goto out;
+    }
+    buffers_registered = 1;
+
+    file = open("/tmp/thekernel-io-uring", O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
     if (file < 0) {
-        return fail("fixed-file-open");
+        fail("fixed-file-open");
+        goto out;
     }
     if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_FILES,
                 &file, 1U) != 0) {
-        close(file);
-        return fail("register-files");
+        fail("register-files");
+        goto out;
     }
+    files_registered = 1;
     if (close(file) != 0) {
-        return fail("fixed-file-close-original");
+        fail("fixed-file-close-original");
+        file = -1;
+        goto out;
     }
+    file = -1;
 
-    struct raw_sqe write_sqe = make_sqe(IORING_OP_WRITE, 0x5752495445ULL);
+    struct raw_sqe write_sqe = make_sqe(IORING_OP_WRITE_FIXED, 0x5752495445ULL);
     write_sqe.bytes[1] = IOSQE_FIXED_FILE;
     write_i32(write_sqe.bytes, 4, 0);
     write_u64(write_sqe.bytes, 8, 0);
-    write_u64(write_sqe.bytes, 16, (uintptr_t)payload);
+    write_u64(write_sqe.bytes, 16, (uintptr_t)(input + 7));
     write_u32(write_sqe.bytes, 24, (uint32_t)sizeof(payload));
+    write_u16(write_sqe.bytes, 40, 0);
     if (submit_one(ring, &write_sqe, 0x5752495445ULL, (int32_t)sizeof(payload))) {
-        return 1;
+        goto out;
     }
 
-    struct raw_sqe read_sqe = make_sqe(IORING_OP_READ, 0x52454144ULL);
+    struct raw_sqe read_sqe = make_sqe(IORING_OP_READ_FIXED, 0x52454144ULL);
     read_sqe.bytes[1] = IOSQE_FIXED_FILE;
     write_i32(read_sqe.bytes, 4, 0);
     write_u64(read_sqe.bytes, 8, 0);
-    write_u64(read_sqe.bytes, 16, (uintptr_t)output);
-    write_u32(read_sqe.bytes, 24, (uint32_t)sizeof(output));
-    if (submit_one(ring, &read_sqe, 0x52454144ULL, (int32_t)sizeof(output))) {
-        return 1;
+    write_u64(read_sqe.bytes, 16, (uintptr_t)(output + 11));
+    write_u32(read_sqe.bytes, 24, (uint32_t)sizeof(payload));
+    write_u16(read_sqe.bytes, 40, 1);
+    if (submit_one(ring, &read_sqe, 0x52454144ULL, (int32_t)sizeof(payload))) {
+        goto out;
     }
-    if (memcmp(output, payload, sizeof(payload)) != 0) {
+    if (memcmp(output + 11, payload, sizeof(payload)) != 0) {
         errno = EIO;
-        return fail("fixed-file-contents");
+        fail("fixed-buffer-contents");
+        goto out;
+    }
+
+    struct raw_sqe bad_index = make_sqe(IORING_OP_READ_FIXED, 0x424144494458ULL);
+    bad_index.bytes[1] = IOSQE_FIXED_FILE;
+    write_i32(bad_index.bytes, 4, 0);
+    write_u64(bad_index.bytes, 8, 0);
+    write_u64(bad_index.bytes, 16, (uintptr_t)output);
+    write_u32(bad_index.bytes, 24, 1U);
+    write_u16(bad_index.bytes, 40, 2U);
+    if (submit_one(ring, &bad_index, 0x424144494458ULL, -EFAULT)) {
+        goto out;
     }
     if (syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_FILES,
                 NULL, 0U) != 0) {
-        return fail("unregister-files");
+        fail("unregister-files");
+        goto out;
     }
+    files_registered = 0;
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_BUFFERS,
+                NULL, 0U) != 0) {
+        fail("unregister-buffers");
+        goto out;
+    }
+    buffers_registered = 0;
     if (unlink("/tmp/thekernel-io-uring") != 0) {
-        return fail("fixed-file-unlink");
+        fail("fixed-file-unlink");
+        goto out;
     }
-    return 0;
+    result = 0;
+out:
+    if (file >= 0) {
+        close(file);
+    }
+    if (files_registered) {
+        syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_FILES,
+                NULL, 0U);
+    }
+    if (buffers_registered) {
+        syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_BUFFERS,
+                NULL, 0U);
+    }
+    if (munmap(input, page) != 0 || munmap(output, page) != 0) {
+        return fail("buffers-munmap");
+    }
+    return result;
 }
 
 static int test_ring(void) {
@@ -668,8 +751,7 @@ static int test_ring(void) {
     struct raw_sqe nop = make_sqe(IORING_OP_NOP, 0x4e4f50ULL);
     if (submit_one(&ring, &nop, 0x4e4f50ULL, 0) ||
         test_default_batch_stops_on_submission_failure(&ring) ||
-        test_probe(&ring) || test_unsupported_buffers(&ring) ||
-        test_fixed_positioned_io(&ring) ||
+        test_probe(&ring) || test_registered_buffers(&ring) ||
         test_immediate_poll(&ring) || test_deferred_poll_and_cancel(&ring) ||
         test_cq_backpressure(&ring)) {
         return 1;

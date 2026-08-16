@@ -24,14 +24,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef SYS_capset
-#if defined(__x86_64__)
-#define SYS_capset 126
-#elif defined(__riscv) || defined(__loongarch__)
-#define SYS_capset 91
-#else
-#error unsupported packet smoke-test architecture
+#if !defined(__x86_64__)
+#error "packet smoke test requires the x86_64 Linux ABI"
 #endif
+#ifndef SYS_capset
+#define SYS_capset 126
 #endif
 
 #ifndef PACKET_IGNORE_OUTGOING

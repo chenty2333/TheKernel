@@ -22,14 +22,13 @@ umask 022
 
 usage() {
     cat <<'EOF'
-Usage: scripts/build-rootfs.sh --arch {rv|la} --output IMAGE [--size-mb N]
+Usage: scripts/build-rootfs.sh --arch {x86|x86_64} --output IMAGE [--size-mb N]
 
 Build a project test ext4 root image containing a pinned static BusyBox
 userspace, TheKernel's system init, boot-shell entrypoint, and semantic helpers.
 
 Environment overrides:
-  THEKERNEL_RV_CROSS_COMPILE  RISC-V tool prefix (default: riscv64-linux-gnu-)
-  THEKERNEL_LA_CROSS_COMPILE  LoongArch tool prefix (default: loongarch64-linux-musl-)
+  THEKERNEL_X86_CROSS_COMPILE x86_64 tool prefix (default: x86_64-linux-gnu-)
   THEKERNEL_SOURCE_CACHE      Download cache
   THEKERNEL_ROOTFS_BUILD_DIR  Per-architecture compiler work directory
 EOF
@@ -46,15 +45,12 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv)
-        CROSS_COMPILE=${THEKERNEL_RV_CROSS_COMPILE:-riscv64-linux-gnu-}
-        BUSYBOX_ARCH=riscv
+    x86|x86_64)
+        ARCH=x86
+        CROSS_COMPILE=${THEKERNEL_X86_CROSS_COMPILE:-x86_64-linux-gnu-}
+        BUSYBOX_ARCH=x86_64
         ;;
-    la)
-        CROSS_COMPILE=${THEKERNEL_LA_CROSS_COMPILE:-loongarch64-linux-musl-}
-        BUSYBOX_ARCH=loongarch
-        ;;
-    *) printf '%s\n' '--arch must be rv or la' >&2; exit 2 ;;
+    *) printf '%s\n' '--arch must be x86 or x86_64' >&2; exit 2 ;;
 esac
 [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
 case "$SIZE_MB" in
@@ -62,7 +58,7 @@ case "$SIZE_MB" in
 esac
 [ "$SIZE_MB" -ge 32 ] || { printf '%s\n' '--size-mb must be at least 32' >&2; exit 2; }
 
-for command in "${CROSS_COMPILE}gcc" curl debugfs fakeroot find make mke2fs \
+for command in "${CROSS_COMPILE}gcc" curl debugfs find make mke2fs \
     realpath sha256sum tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
@@ -158,14 +154,20 @@ build_guest_tool memory-pressure-smoke.c thekernel-memory-pressure-smoke
 build_guest_tool mm-performance.c thekernel-mm-performance -pthread
 build_guest_tool smp-tlb-shootdown.c thekernel-smp-tlb-shootdown -pthread
 build_guest_tool oom-admission.c thekernel-oom-admission
+build_guest_tool alarm-smoke.c thekernel-alarm-smoke
 build_guest_tool packet-socket-smoke.c thekernel-packet-socket-smoke
+build_guest_tool ioprio-smoke.c thekernel-ioprio-smoke
+build_guest_tool membarrier-smoke.c thekernel-membarrier-smoke -pthread
+build_guest_tool rseq-smoke.c thekernel-rseq-smoke
 build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias
 build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
+build_guest_tool pause-smoke.c thekernel-pause-smoke
 build_guest_tool seccomp-smoke.c thekernel-seccomp-smoke -pthread
 build_guest_tool signal-order-smoke.c thekernel-signal-order-smoke
 build_guest_tool sync-fence.c thekernel-sync-fence
 build_guest_tool userfaultfd-smoke.c thekernel-userfaultfd-smoke -pthread
 build_guest_tool wait-boundary.c thekernel-wait-boundary -pthread
+build_guest_tool vfork-smoke.c thekernel-vfork-smoke
 
 for script in "$REPO_ROOT"/tests/guest/nightly/*; do
     install -m 0755 "$script" \

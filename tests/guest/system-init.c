@@ -155,9 +155,27 @@ static int test_procfs(void) {
 
 static int wait_for_success(pid_t child, const char *stage) {
     int status = 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        errno = ECHILD;
+    pid_t waited = waitpid(child, &status, 0);
+    if (waited != child) {
         return fail(stage);
+    }
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL %s signal=%d\n",
+                stage, WTERMSIG(status));
+        return 1;
+    }
+    if (!WIFEXITED(status)) {
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL %s wait-status=0x%x\n",
+                stage, status);
+        return 1;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL %s exit-status=%d\n",
+                stage, WEXITSTATUS(status));
+        return 1;
     }
     return 0;
 }
@@ -254,6 +272,14 @@ static int test_process_pipe_and_exec(void) {
     return 0;
 }
 
+static int test_vfork(void) {
+    return test_portable_differential(
+        "/opt/thekernel-tests/bin/thekernel-vfork-smoke",
+        NULL,
+        "vfork-child",
+        "THEKERNEL_SYSTEM_TEST_VFORK_OK");
+}
+
 static int test_io_uring(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -270,6 +296,46 @@ static int test_io_uring(void) {
         return 1;
     }
     puts("THEKERNEL_SYSTEM_TEST_IO_URING_OK");
+    return 0;
+}
+
+static int test_ioprio(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("ioprio-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
+              "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
+              "--linux-host", (char *)NULL);
+        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL ioprio-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "ioprio-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_IOPRIO_OK");
+    return 0;
+}
+
+static int test_membarrier(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("membarrier-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-membarrier-smoke",
+              "/opt/thekernel-tests/bin/thekernel-membarrier-smoke",
+              "--thekernel", (char *)NULL);
+        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL membarrier-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "membarrier-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_MEMBARRIER_OK");
     return 0;
 }
 
@@ -357,6 +423,34 @@ static int test_signal_wait_boundary(void) {
     return 0;
 }
 
+static int test_pause(void) {
+    return test_portable_differential(
+        "/opt/thekernel-tests/bin/thekernel-pause-smoke",
+        NULL,
+        "pause-child",
+        "THEKERNEL_SYSTEM_TEST_PAUSE_OK");
+}
+
+static int test_alarm(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("alarm-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-alarm-smoke",
+              "thekernel-alarm-smoke", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL alarm-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "alarm-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_ALARM_OK");
+    return 0;
+}
+
 static int test_wait_boundary(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -374,6 +468,32 @@ static int test_wait_boundary(void) {
         return 1;
     }
     puts("THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK");
+    return 0;
+}
+
+static int test_rseq(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("rseq-fork");
+    }
+    if (child == 0) {
+        if (setenv("GLIBC_TUNABLES", "glibc.pthread.rseq=0", 1) != 0) {
+            fprintf(stderr,
+                    "THEKERNEL_SYSTEM_TEST_FAIL rseq-tunable errno=%d (%s)\n",
+                    errno, strerror(errno));
+            _exit(127);
+        }
+        execl("/opt/thekernel-tests/bin/thekernel-rseq-smoke",
+              "thekernel-rseq-smoke", (char *)NULL);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL rseq-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "rseq-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_RSEQ_OK");
     return 0;
 }
 
@@ -422,8 +542,10 @@ int main(int argc, char **argv) {
     puts("THEKERNEL_SYSTEM_TEST_START");
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
-        test_memory_pressure_reclaim() || test_process_pipe_and_exec() || test_signal_wait_boundary() ||
+        test_memory_pressure_reclaim() || test_process_pipe_and_exec() ||
+        test_vfork() || test_signal_wait_boundary() || test_pause() || test_alarm() ||
         test_wait_boundary() ||
+        test_rseq() ||
         test_portable_differential(
             "/opt/thekernel-tests/bin/thekernel-futex-smoke",
             NULL,
@@ -439,7 +561,8 @@ int main(int argc, char **argv) {
             NULL,
             "signal-order-differential-child",
             "THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK") ||
-        test_io_uring() || test_userfaultfd() || test_packet_socket() ||
+        test_io_uring() || test_ioprio() || test_membarrier() || test_userfaultfd() ||
+        test_packet_socket() ||
         test_seccomp()) {
         return 1;
     }

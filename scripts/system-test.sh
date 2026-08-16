@@ -5,32 +5,34 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/ci/lib.sh"
+THEKERNEL_STATE_DIR=${THEKERNEL_STATE_DIR:-"$REPO_ROOT/.state"}
 
 ARCH=""
+ROOTFS_ARCH="x86"
 WORKDIR=""
 TIMEOUT_SECS=300
-CPUS=1
+CPUS=4
 MEMORY=""
 ASID_FAST_SWITCH=0
 SKIP_BUILD=0
 
 usage() {
     cat <<'EOF'
-Usage: scripts/system-test.sh --arch {rv|la} [OPTIONS]
+Usage: scripts/system-test.sh --arch {x86|x86_64} [OPTIONS]
 
 Options:
   --workdir DIR   Run directory (default: unique run below .state/system-test/ARCH)
   --timeout SECS  QEMU timeout (default: 300)
-  --cpus N        Build and boot with N CPUs, from 1 through 4096 (default: 1)
-  --memory SIZE   Build and boot with 128M..1G (RV) or 256M..1G (LA)
-                  (defaults: rv=128M, la=256M for the LA DMA carveout)
+  --cpus N        Build and boot with N CPUs, from 1 through 4096 (default: 4)
+  --memory SIZE   Build and boot with 128M..1G (default: 128M)
   --asid-fast-switch
                   Build the opt-in hardware-ASID context-switch path
   --skip-build    Reuse existing kernel and rootfs artifacts
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
 program to complete rootfs, tmpfs, procfs, process, pipe, futex, epoll, signal
-ordering, raw io_uring, userfaultfd, AF_PACKET, and seccomp ABI checks. QEMU
+ordering, rseq, vfork/pause/alarm wait semantics, ioprio and membarrier, raw
+io_uring, userfaultfd, AF_PACKET, and seccomp ABI checks. QEMU
 stops after the final success marker; platform shutdown is tested separately
 from this semantic gate.
 EOF
@@ -51,10 +53,12 @@ while (($#)); do
 done
 
 case "$ARCH" in
-    rv) DEFAULT_MEMORY=128M ;;
-    la) DEFAULT_MEMORY=256M ;;
-    *) printf '%s\n' 'system-test: --arch must be rv or la' >&2; exit 2 ;;
+    x86|x86_64)
+        ARCH=x86_64
+        ;;
+    *) printf '%s\n' 'system-test: --arch must be x86 or x86_64' >&2; exit 2 ;;
 esac
+DEFAULT_MEMORY=128M
 if [ -z "$MEMORY" ]; then
     MEMORY=$DEFAULT_MEMORY
 fi
@@ -78,10 +82,7 @@ case "$memory_unit" in
     M) memory_kib=$((10#$memory_value * 1024)) ;;
     G) memory_kib=$((10#$memory_value * 1024 * 1024)) ;;
 esac
-case "$ARCH" in
-    rv) minimum_memory_kib=$((128 * 1024)) ;;
-    la) minimum_memory_kib=$((256 * 1024)) ;;
-esac
+minimum_memory_kib=$((128 * 1024))
 maximum_memory_kib=$((1024 * 1024))
 if ((memory_kib < minimum_memory_kib || memory_kib > maximum_memory_kib)); then
     printf 'system-test: %s memory must be between %s and 1G for the bounded pressure profile: %s\n' \
@@ -95,29 +96,33 @@ fi
 
 if [ -z "$WORKDIR" ]; then
     default_run_id="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)-${CPUS}cpu-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    WORKDIR="$REPO_ROOT/.state/system-test/$ARCH/$default_run_id"
+    WORKDIR="$THEKERNEL_STATE_DIR/system-test/$ARCH/$default_run_id"
 elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
 fi
 
-KERNEL="$REPO_ROOT/kernel-$ARCH"
-ROOTFS="$REPO_ROOT/.state/rootfs/rootfs-$ARCH.img"
+KERNEL="$REPO_ROOT/kernel-x86_64"
+ROOTFS="$THEKERNEL_STATE_DIR/rootfs/rootfs-$ROOTFS_ARCH.img"
+ESP="$THEKERNEL_STATE_DIR/uefi/kernel-x86_64.esp"
 if [ "$SKIP_BUILD" -eq 0 ]; then
     THEKERNEL_KERNEL_ASID_FAST_SWITCH="$ASID_FAST_SWITCH" \
-    make -C "$REPO_ROOT" SMP="$CPUS" MEM="$MEMORY" \
-        "kernel-$ARCH" "rootfs-$ARCH"
+    make -C "$REPO_ROOT" STATE_DIR="$THEKERNEL_STATE_DIR" \
+        SMP="$CPUS" MEM="$MEMORY" \
+        kernel-x86_64 "rootfs-$ROOTFS_ARCH"
 fi
 [ -s "$KERNEL" ] || { printf 'system-test: missing kernel: %s\n' "$KERNEL" >&2; exit 1; }
 [ -s "$ROOTFS" ] || { printf 'system-test: missing rootfs: %s\n' "$ROOTFS" >&2; exit 1; }
+[ -s "$ESP" ] || { printf 'system-test: missing UEFI ESP: %s\n' "$ESP" >&2; exit 1; }
 
 WORKDIR=$(ci_prepare_owned_run_dir \
-    "system-test-$ARCH" "$WORKDIR" "$REPO_ROOT" "$REPO_ROOT/.state")
+    "system-test-$ARCH" "$WORKDIR" "$REPO_ROOT" "$THEKERNEL_STATE_DIR")
 set +e
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m tools.qemu_runner run \
-        --arch "$ARCH" \
+        --arch x86_64 \
         --kernel "$KERNEL" \
         --rootfs "$ROOTFS" \
+        --esp "$ESP" \
         --cpus "$CPUS" \
         --memory "$MEMORY" \
         --workdir "$WORKDIR" \
@@ -138,14 +143,7 @@ log_has_exact_line() {
     grep -Fqx -- "$expected" "$LOG" || grep -Fqx -- "${expected}"$'\r' "$LOG"
 }
 
-case "$ARCH" in
-    rv)
-        setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT'
-        ;;
-    la)
-        setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_NA syscall=absent'
-        ;;
-esac
+setrlimit_precedence_marker='CI_WAIT_BOUNDARY_SETRLIMIT_PRECEDENCE_OK bad_new=EFAULT'
 
 for marker in \
     THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK \
@@ -163,8 +161,26 @@ for marker in \
     THEKERNEL_SYSTEM_TEST_PROCESS_OK \
     THEKERNEL_EXEC_SMOKE_OK \
     THEKERNEL_SYSTEM_TEST_EXEC_OK \
+    THEKERNEL_VFORK_EXIT_OK \
+    THEKERNEL_VFORK_EXEC_OK \
+    THEKERNEL_VFORK_OK \
+    THEKERNEL_SYSTEM_TEST_VFORK_OK \
+    "THEKERNEL_RSEQ_AUXV_OK feature_size=24 align=32" \
+    THEKERNEL_RSEQ_REGISTRATION_OK \
+    THEKERNEL_RSEQ_FIRST_TOUCH_OK \
+    THEKERNEL_RSEQ_FORK_COW_OK \
+    THEKERNEL_RSEQ_SIGNAL_ABORT_OK \
+    THEKERNEL_RSEQ_SIGKILL_OK \
+    THEKERNEL_RSEQ_OK \
+    THEKERNEL_SYSTEM_TEST_RSEQ_OK \
     CI_SIGNAL_WAIT_BOUNDARY_PASS \
     THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK \
+    THEKERNEL_SYSTEM_TEST_PAUSE_OK \
+    THEKERNEL_SYSTEM_TEST_ALARM_OK \
+    THEKERNEL_IOPRIO_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_IOPRIO_OK \
+    THEKERNEL_MEMBARRIER_SMOKE_OK \
+    THEKERNEL_SYSTEM_TEST_MEMBARRIER_OK \
     "CI_WAIT_BOUNDARY_CLOCK_PERCPU_OK online_cpus=$CPUS" \
     CI_WAIT_BOUNDARY_TIMERFD_CANCEL_OK \
     CI_WAIT_BOUNDARY_ITIMER_PERIODIC_OK\ min_hits=3 \
@@ -175,9 +191,13 @@ for marker in \
     CI_WAIT_BOUNDARY_PRLIMIT_TRANSACTION_OK\ old_new=atomic\ invalid=rollback\ copyout_fault=committed \
     "$setrlimit_precedence_marker" \
     CI_WAIT_BOUNDARY_SETITIMER_PRECEDENCE_OK\ bad_new=EFAULT \
+    CI_WAIT_BOUNDARY_ITIMER_USERCOPY_OK\ unaligned=1\ alias=1\ copyout_fault=committed \
     CI_WAIT_BOUNDARY_FUTEX_WAKE_OK \
     CI_WAIT_BOUNDARY_FUTEX_TIMEOUT_OK \
     CI_WAIT_BOUNDARY_FUTEX_WAITV_OK \
+    CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_ALIAS_OK\ same_file_offset=1\ wake_from_alias=1 \
+    CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_REMAP_ISOLATION_OK\ different_backing=1\ wake_count=0\ timeout=1 \
+    CI_WAIT_BOUNDARY_X86_FUTEX2_SHARED_REMAP_OK\ same_file_offset=1\ wake_after_fixed_remap=1 \
     CI_WAIT_BOUNDARY_PASS \
     THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK \
     THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK \
@@ -260,7 +280,7 @@ do
     done <"$manifest"
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_FUTEX_FAIL|THEKERNEL_EPOLL_FAIL|THEKERNEL_SIGORDER_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_FUTEX_FAIL|THEKERNEL_EPOLL_FAIL|THEKERNEL_SIGORDER_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|THEKERNEL_IOPRIO_FAIL|THEKERNEL_MEMBARRIER_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

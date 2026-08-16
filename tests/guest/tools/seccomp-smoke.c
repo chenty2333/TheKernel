@@ -19,12 +19,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef SYS_seccomp
-#if defined(__x86_64__)
-#define SYS_seccomp 317
-#else
-#define SYS_seccomp 277
+#if !defined(__x86_64__)
+#error "seccomp smoke test requires the x86_64 Linux ABI"
 #endif
+#ifndef SYS_seccomp
+#define SYS_seccomp 317
 #endif
 
 #ifndef SECCOMP_RET_KILL_PROCESS
@@ -77,26 +76,14 @@
 #define SYS_SECCOMP 1
 #endif
 
-#if defined(__riscv) && __riscv_xlen == 64
-#define EXPECTED_AUDIT_ARCH 0xc00000f3U
-#elif defined(__loongarch_lp64)
-#define EXPECTED_AUDIT_ARCH 0xc0000102U
-#elif defined(__x86_64__)
 #define EXPECTED_AUDIT_ARCH 0xc000003eU
-#else
-#error unsupported seccomp smoke-test architecture
-#endif
 
 #define UNKNOWN_SYSCALL_NR 0x3fffffffL
 #define TRAP_ARGUMENT_SENTINEL 0x13579L
 #define FULL_FILTER_LENGTH 4096U
 #define FINAL_FILTER_LENGTH 4036U
 
-#if defined(__x86_64__)
 #define EXPECTED_TRAP_ROLLBACK SYS_getppid
-#else
-#define EXPECTED_TRAP_ROLLBACK TRAP_ARGUMENT_SENTINEL
-#endif
 
 static const char *self_path;
 static int require_exact_path_limit;
@@ -406,9 +393,9 @@ static int test_trap(void) {
 
     errno = 0;
     long result = syscall(SYS_getppid, TRAP_ARGUMENT_SENTINEL);
-    /* Linux rolls the syscall frame back before SIGSYS. RV64/LoongArch64
-     * expose the original a0 while x86_64 exposes the original syscall number
-     * after the handler returns; either result proves getppid was skipped. */
+    /* Linux rolls the syscall frame back before SIGSYS; x86_64 exposes the
+     * original syscall number after the handler returns, proving getppid was
+     * skipped. */
     if (!trap_seen || !trap_valid) {
         return fail("trap-payload");
     }

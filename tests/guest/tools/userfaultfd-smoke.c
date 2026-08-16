@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 
+#if !defined(__x86_64__)
+#error "userfaultfd smoke test requires the x86_64 Linux ABI"
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>
@@ -21,7 +25,6 @@
 #define SYS_userfaultfd 282
 #endif
 
-/* The pinned LoongArch musl headers predate this creation flag. */
 #ifndef UFFD_USER_MODE_ONLY
 #define UFFD_USER_MODE_ONLY 1
 #endif
@@ -51,24 +54,10 @@ _Static_assert(sizeof(void *) == 8, "executable UFFD smoke requires a 64-bit ABI
 #error "executable UFFD smoke requires the supported little-endian ABI"
 #endif
 
-#if defined(__riscv) && __riscv_xlen == 64
-/* addi a0, zero, 42; jalr zero, 0(ra) */
-static const unsigned char executable_code[] = {
-    0x13, 0x05, 0xa0, 0x02, 0x67, 0x80, 0x00, 0x00,
-};
-#elif defined(__loongarch__) && __loongarch_grlen == 64
-/* ori $a0, $zero, 42; jirl $zero, $ra, 0 */
-static const unsigned char executable_code[] = {
-    0x04, 0xa8, 0x80, 0x03, 0x20, 0x00, 0x00, 0x4c,
-};
-#elif defined(__x86_64__)
 /* endbr64; mov eax, 42; ret */
 static const unsigned char executable_code[] = {
     0xf3, 0x0f, 0x1e, 0xfa, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3,
 };
-#else
-#error "missing executable UFFD smoke code for this architecture"
-#endif
 
 _Static_assert(sizeof(executable_code) <= TEST_PAGE_SIZE,
                "executable UFFD smoke code exceeds one page");
@@ -181,11 +170,6 @@ static void *exec_fault_worker_main(void *opaque)
 {
     struct exec_fault_worker *worker = opaque;
 
-    /*
-     * LoongArch caches adjacent even/odd leaves in one TLB entry. Prime the
-     * valid even half on the faulting CPU before fetching from the missing odd
-     * half, so resolver publication must repair that cached-invalid pair.
-     */
     worker->pair_observed = *worker->pair_even;
     atomic_store_explicit(&worker->entered, 1, memory_order_release);
     worker->result = worker->entry();

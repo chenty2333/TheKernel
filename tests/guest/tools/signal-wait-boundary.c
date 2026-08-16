@@ -49,6 +49,63 @@ static long long monotonic_ns(const struct timespec *value)
     return (long long)value->tv_sec * 1000000000LL + value->tv_nsec;
 }
 
+static int test_unaligned_posix_timer_usercopy(void)
+{
+    _Alignas(16) unsigned char event_storage[sizeof(struct sigevent) + 1];
+    _Alignas(16) unsigned char id_storage[sizeof(int) + 1];
+    _Alignas(16) unsigned char new_storage[sizeof(struct itimerspec) + 1];
+    _Alignas(16) unsigned char old_storage[sizeof(struct itimerspec) + 1];
+    struct sigevent event;
+    struct itimerspec new_value;
+    struct itimerspec old_value;
+    void *event_ptr = event_storage + 1;
+    void *id_ptr = id_storage + 1;
+    void *new_ptr = new_storage + 1;
+    void *old_ptr = old_storage + 1;
+    int timerid;
+
+    memset(&event, 0, sizeof(event));
+    event.sigev_notify = SIGEV_NONE;
+    memcpy(event_ptr, &event, sizeof(event));
+    memset(id_storage, 0, sizeof(id_storage));
+    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, event_ptr, id_ptr) != 0)
+        return fail("unaligned-timer-create");
+    memcpy(&timerid, id_ptr, sizeof(timerid));
+
+    memset(&new_value, 0, sizeof(new_value));
+    new_value.it_value.tv_nsec = 1000000;
+    memcpy(new_ptr, &new_value, sizeof(new_value));
+    memset(old_storage, 0xa5, sizeof(old_storage));
+    if (syscall(SYS_timer_settime, timerid, 0, new_ptr, old_ptr) != 0) {
+        syscall(SYS_timer_delete, timerid);
+        return fail("unaligned-timer-settime");
+    }
+    memcpy(&old_value, old_ptr, sizeof(old_value));
+    if (old_value.it_value.tv_sec != 0 || old_value.it_value.tv_nsec != 0 ||
+        old_value.it_interval.tv_sec != 0 || old_value.it_interval.tv_nsec != 0) {
+        syscall(SYS_timer_delete, timerid);
+        errno = EPROTO;
+        return fail("unaligned-timer-old-value");
+    }
+
+    memset(old_storage, 0xa5, sizeof(old_storage));
+    if (syscall(SYS_timer_gettime, timerid, old_ptr) != 0) {
+        syscall(SYS_timer_delete, timerid);
+        return fail("unaligned-timer-gettime");
+    }
+    memcpy(&old_value, old_ptr, sizeof(old_value));
+    if (old_value.it_value.tv_sec < 0 || old_value.it_value.tv_nsec < 0 ||
+        old_value.it_value.tv_nsec >= 1000000000L) {
+        syscall(SYS_timer_delete, timerid);
+        errno = EPROTO;
+        return fail("unaligned-timer-visible-value");
+    }
+    if (syscall(SYS_timer_delete, timerid) != 0)
+        return fail("unaligned-timer-delete");
+
+    return 0;
+}
+
 int main(void)
 {
     struct sigaction action;
@@ -101,6 +158,9 @@ int main(void)
     }
     if (mask_has(SIGUSR1) != 1)
         return fail("ready-mask-restore");
+
+    if (test_unaligned_posix_timer_usercopy() != 0)
+        return 1;
 
     /* With no pending member, the same zero timeout must report EAGAIN. */
     errno = 0;
