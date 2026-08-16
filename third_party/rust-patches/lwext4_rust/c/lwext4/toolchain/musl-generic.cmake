@@ -60,20 +60,13 @@ set(CMAKE_C_FLAGS   "-std=gnu99 -fdata-sections -ffunction-sections" CACHE INTER
 set(CMAKE_CXX_FLAGS "-fdata-sections -ffunction-sections" CACHE INTERNAL "cxx compiler flags")
 set(CMAKE_ASM_FLAGS "" CACHE INTERNAL "asm compiler flags")
 
+if(NOT ARCH STREQUAL "x86_64")
+    message(FATAL_ERROR "lwext4_rust supports x86_64 targets only")
+endif()
+
 if(ARCH STREQUAL "x86_64")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mno-sse")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mno-sse")
-elseif (ARCH STREQUAL "aarch64")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mgeneral-regs-only")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mgeneral-regs-only")
-elseif (ARCH STREQUAL "riscv64")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gc -mabi=lp64d -mcmodel=medany")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc -mabi=lp64d -mcmodel=medany")
-elseif (ARCH STREQUAL "loongarch64")
-    # Some environments expose LoongArch through a GNU hard-float cross
-    # toolchain wrapper under the musl-compatible name. For lwext4's
-    # freestanding C code we avoid forcing the soft-float ABI here so the
-    # headers and sysroot stay consistent with the available toolchain.
 endif()
 
 set(CMAKE_C_FLAGS "-fPIC -fno-builtin -ffreestanding -fno-omit-frame-pointer ${CMAKE_C_FLAGS}")

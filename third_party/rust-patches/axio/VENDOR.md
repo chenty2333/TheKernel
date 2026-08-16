@@ -21,15 +21,19 @@ The manifest declares `GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0`, but the 
 
 ## Upstream tests
 
-All published test paths are restored. Two inferred array lengths in
-`tests/iofn.rs` are written explicitly as 5 because generic array-length
-inference is unavailable on TheKernel's pinned nightly; behavior is unchanged.
+All published test paths are restored. The two inferred array lengths in
+`tests/iofn.rs` remain written explicitly as 5, and the `core_io_borrowed_buf`
+test annotations spell out their `u8` element type as required by the rolling
+nightly API; behavior is unchanged.
 
 ## TheKernel patch ledger
 
-- `9d4a335` replaced the unavailable integer checked-difference API for the pinned 2025-05-20 toolchain.
+- `9d4a335` replaced the unavailable integer checked-difference API while the
+  source was first adapted to the nightly standard-library I/O traits.
 - `aa98717` trimmed unrelated compatibility patches while retaining that equivalent checked arithmetic.
-- Maintained delta: one toolchain-compatible checked signed-difference helper in `Take`; all eight published integration-test paths are retained with the two pinned-toolchain adapters described above.
+- Maintained delta: one checked signed-difference helper in `Take`; all eight
+  published integration-test paths are retained with the explicit array-length
+  and `BorrowedBuf`/`BorrowedCursor<u8>` test adapters described above.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

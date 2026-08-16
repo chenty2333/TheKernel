@@ -1,7 +1,6 @@
 #![no_std]
 #![feature(linkage)]
-#![feature(c_variadic, c_size_t)]
-#![feature(associated_type_defaults)]
+#![feature(c_size_t)]
 #![feature(allocator_api)]
 
 extern crate alloc;

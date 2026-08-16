@@ -16,34 +16,35 @@ expect_target() {
 }
 
 QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-9.2.1}"
-RUST_TOOLCHAIN_EXPECTED="${RUSTUP_TOOLCHAIN:-nightly-2026-06-07}"
+RUST_TOOLCHAIN_EXPECTED="${RUSTUP_TOOLCHAIN:-nightly}"
 
 for cmd in \
     cargo rustc rustup python3 \
     cargo-axplat axconfig-gen rust-objcopy rust-objdump \
-    qemu-system-riscv64 qemu-system-loongarch64 \
+    qemu-system-x86_64 \
     mke2fs debugfs fakeroot truncate mkfs.vfat mkimage \
-    riscv64-linux-gnu-gcc riscv64-linux-gnu-objcopy \
-    riscv64-linux-musl-gcc riscv64-linux-musl-objcopy \
-    loongarch64-linux-musl-gcc loongarch64-linux-musl-objcopy
+    parted mcopy mmd \
+    x86_64-linux-gnu-gcc x86_64-linux-gnu-objcopy
 do
     expect_cmd "$cmd"
 done
 
+# GRUB tools ship under different names depending on the distro.
+command -v grub-file >/dev/null 2>&1 || command -v grub2-file >/dev/null 2>&1 \
+    || { printf 'missing grub-file/grub2-file\n' >&2; exit 1; }
+command -v grub-mkstandalone >/dev/null 2>&1 \
+    || command -v grub2-mkstandalone >/dev/null 2>&1 \
+    || { printf 'missing grub-mkstandalone/grub2-mkstandalone\n' >&2; exit 1; }
+
 cargo axplat --version >/dev/null
 axconfig-gen --version >/dev/null
 
-qemu-system-riscv64 --version | grep -q "version ${QEMU_EXPECTED_VERSION}"
-qemu-system-loongarch64 --version | grep -q "version ${QEMU_EXPECTED_VERSION}"
+qemu-system-x86_64 --version | grep -q "version ${QEMU_EXPECTED_VERSION}"
 
 rustup show active-toolchain | grep -q "^${RUST_TOOLCHAIN_EXPECTED}"
 
 expect_target x86_64-unknown-none
-expect_target riscv64gc-unknown-none-elf
-expect_target aarch64-unknown-none-softfloat
-expect_target loongarch64-unknown-none-softfloat
 
-riscv64-linux-musl-gcc -print-sysroot >/dev/null
-loongarch64-linux-musl-gcc -print-sysroot >/dev/null
+x86_64-linux-gnu-gcc -print-sysroot >/dev/null
 
 printf 'TheKernel development image check: ok\n'

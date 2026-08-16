@@ -23,6 +23,7 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    assert_eq!(arch, "x86_64", "lwext4_rust supports x86_64 targets only");
     let toolchain = discover_cross_toolchain(&arch, &out_dir);
     let lwext4_lib = &format!("lwext4-{arch}");
     {
@@ -280,60 +281,56 @@ int fflush(FILE *stream);
     )
 }
 
-fn discover_llvm_loongarch_toolchain(arch: &str, out_dir: &Path) -> Option<CrossToolchain> {
-    if arch != "loongarch64" {
+fn discover_llvm_freestanding_toolchain(arch: &str, out_dir: &Path) -> Option<CrossToolchain> {
+    if arch != "x86_64" {
         return None;
     }
 
     let clang = find_tool_by_names(&["clang"])?;
     let clangxx = find_tool_by_names(&["clang++"]).unwrap_or_else(|| clang.clone());
-    let ar = find_tool_by_names(&["llvm-ar"])?;
-    let objcopy = find_tool_by_names(&["llvm-objcopy"])?;
-    let objdump = find_tool_by_names(&["llvm-objdump"])?;
-    let size = find_tool_by_names(&["llvm-size"])?;
+    let ar = find_tool_by_names(&["llvm-ar", "rust-ar"])?;
+    let objcopy = find_tool_by_names(&["llvm-objcopy", "rust-objcopy"])?;
+    let objdump = find_tool_by_names(&["llvm-objdump", "rust-objdump"])?;
+    let size = find_tool_by_names(&["llvm-size", "rust-size"])?;
     let resource_include =
         PathBuf::from(command_stdout(&clang, &["-print-resource-dir"])?).join("include");
 
-    let target = env::var("TARGET").unwrap_or_else(|_| "loongarch64-unknown-none".to_string());
+    let target = env::var("TARGET").unwrap_or_else(|_| format!("{arch}-unknown-none"));
     let clang_target = target.strip_suffix("-softfloat").unwrap_or(&target);
-    let mut common_args = vec![format!("--target={clang_target}")];
-    if target.ends_with("-softfloat") {
-        common_args.push("-mabi=lp64s".to_string());
-    }
-
-    let wrapper_dir = out_dir.join("llvm-loongarch-toolchain");
+    let wrapper_dir = out_dir.join(format!("llvm-{arch}-toolchain"));
     let include_dir = wrapper_dir.join("include");
     write_freestanding_headers(&include_dir)?;
-    common_args.extend([
+    let common_args = vec![
+        format!("--target={clang_target}"),
         "-ffreestanding".to_string(),
         "-nostdinc".to_string(),
         format!("-I{}", include_dir.display()),
         format!("-isystem{}", resource_include.display()),
-    ]);
+    ];
     let common_arg_refs = common_args.iter().map(String::as_str).collect::<Vec<_>>();
 
     let cc = write_tool_wrapper(
         &wrapper_dir,
-        "loongarch64-clang-cc",
+        &format!("{arch}-clang-cc"),
         &clang,
         &common_arg_refs,
     )?;
     let cxx = write_tool_wrapper(
         &wrapper_dir,
-        "loongarch64-clang-cxx",
+        &format!("{arch}-clang-cxx"),
         &clangxx,
         &common_arg_refs,
     )?;
     let as_ = write_tool_wrapper(
         &wrapper_dir,
-        "loongarch64-clang-as",
+        &format!("{arch}-clang-as"),
         &clang,
         &common_arg_refs,
     )?;
 
     println!(
-        "cargo:warning=lwext4_rust falling back to LLVM LoongArch toolchain wrappers in {}",
-        wrapper_dir.display()
+        "cargo:warning=lwext4_rust falling back to LLVM {arch} toolchain wrappers in {}",
+        wrapper_dir.display(),
     );
 
     Some(CrossToolchain {
@@ -347,64 +344,9 @@ fn discover_llvm_loongarch_toolchain(arch: &str, out_dir: &Path) -> Option<Cross
     })
 }
 
-fn target_needs_loongarch_softfloat_abi(arch: &str) -> bool {
-    arch == "loongarch64"
-        && env::var("TARGET")
-            .map(|target| target.ends_with("-softfloat"))
-            .unwrap_or(false)
-}
-
-fn wrap_loongarch_softfloat_toolchain(
-    arch: &str,
-    out_dir: &Path,
-    toolchain: CrossToolchain,
-) -> CrossToolchain {
-    if !target_needs_loongarch_softfloat_abi(arch) {
-        return toolchain;
-    }
-
-    let wrapper_dir = out_dir.join("loongarch-softfloat-toolchain");
-    let cc = write_tool_wrapper(
-        &wrapper_dir,
-        "loongarch64-softfloat-cc",
-        &toolchain.cc,
-        &["-mabi=lp64s"],
-    )
-    .expect("failed to write LoongArch soft-float C compiler wrapper");
-    let cxx = write_tool_wrapper(
-        &wrapper_dir,
-        "loongarch64-softfloat-cxx",
-        &toolchain.cxx,
-        &["-mabi=lp64s"],
-    )
-    .expect("failed to write LoongArch soft-float C++ compiler wrapper");
-    let as_ = write_tool_wrapper(
-        &wrapper_dir,
-        "loongarch64-softfloat-as",
-        &toolchain.as_,
-        &["-mabi=lp64s"],
-    )
-    .expect("failed to write LoongArch soft-float assembler wrapper");
-
-    println!(
-        "cargo:warning=lwext4_rust forcing LoongArch soft-float ABI wrappers in {}",
-        wrapper_dir.display()
-    );
-
-    CrossToolchain {
-        cc,
-        cxx,
-        ar: toolchain.ar,
-        as_,
-        objcopy: toolchain.objcopy,
-        objdump: toolchain.objdump,
-        size: toolchain.size,
-    }
-}
-
 fn discover_cross_toolchain(arch: &str, out_dir: &Path) -> CrossToolchain {
     if let Some(toolchain) = discover_env_toolchain() {
-        return wrap_loongarch_softfloat_toolchain(arch, out_dir, toolchain);
+        return toolchain;
     }
 
     for family in [format!("{arch}-linux-musl"), format!("{arch}-linux-gnu")] {
@@ -434,11 +376,11 @@ fn discover_cross_toolchain(arch: &str, out_dir: &Path) -> CrossToolchain {
                 objdump,
                 size,
             };
-            return wrap_loongarch_softfloat_toolchain(arch, out_dir, toolchain);
+            return toolchain;
         }
     }
 
-    if let Some(toolchain) = discover_llvm_loongarch_toolchain(arch, out_dir) {
+    if let Some(toolchain) = discover_llvm_freestanding_toolchain(arch, out_dir) {
         return toolchain;
     }
 
@@ -477,32 +419,15 @@ fn add_existing_include_dir(builder: bindgen::Builder, path: PathBuf) -> bindgen
 
 fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Path) {
     let target = env::var("TARGET").unwrap();
-    let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".to_string());
-    let llvm_loongarch_wrapper_dir = out_dir.join("llvm-loongarch-toolchain");
-    let using_llvm_loongarch_wrapper =
-        arch == "loongarch64" && Path::new(cc).starts_with(&llvm_loongarch_wrapper_dir);
-    let mut bindgen_target = if target.ends_with("-softfloat") {
+    let llvm_wrapper_dir = out_dir.join(format!("llvm-{arch}-toolchain"));
+    let using_llvm_wrapper = arch == "x86_64" && Path::new(cc).starts_with(&llvm_wrapper_dir);
+    let bindgen_target = if target.ends_with("-softfloat") {
         target.replace("-softfloat", "")
     } else {
         target.clone()
     };
     if target.ends_with("-softfloat") {
         // Clang does not recognize the `-softfloat` suffix
-        unsafe { env::set_var("TARGET", &bindgen_target) };
-    }
-
-    if arch == "loongarch64"
-        && let Some(triple) = command_stdout(cc, &["-dumpmachine"])
-        && !command_succeeds(
-            "clang",
-            &[&format!("--target={triple}"), "-dM", "-E", "-x", "c", "-"],
-        )
-    {
-        println!(
-            "cargo:warning=clang does not support target triple {triple}; generating lwext4 \
-             bindings with fallback host target {host}"
-        );
-        bindgen_target = host.clone();
         unsafe { env::set_var("TARGET", &bindgen_target) };
     }
 
@@ -526,23 +451,13 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Pat
             &[&format!("--target={triple}"), "-dM", "-E", "-x", "c", "-"],
         ) {
             builder = builder.clang_arg(format!("--target={triple}"));
-            if arch == "loongarch64" && target.ends_with("-softfloat") {
-                builder = builder.clang_arg("-mabi=lp64s");
-            }
             if !sysroot.is_empty() {
                 builder = builder.clang_arg(format!("--sysroot={sysroot}"));
             }
-        } else if arch == "loongarch64" {
-            println!(
-                "cargo:warning=clang does not support target triple {triple}; generating lwext4 \
-                 bindings with fallback host target {host}"
-            );
-            bindgen_target = host.clone();
-            unsafe { env::set_var("TARGET", &bindgen_target) };
         }
 
-        if using_llvm_loongarch_wrapper {
-            let include_dir = llvm_loongarch_wrapper_dir.join("include");
+        if using_llvm_wrapper {
+            let include_dir = llvm_wrapper_dir.join("include");
             if let Some(resource_dir) = command_stdout(cc, &["-print-resource-dir"]) {
                 builder = builder
                     .clang_arg("-ffreestanding")
