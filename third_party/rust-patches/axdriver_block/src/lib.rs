@@ -50,6 +50,20 @@ pub struct BlockSegment {
     pub direction: BlockSegmentDirection,
 }
 
+/// One pinned physical-memory segment for a synchronous direct block request.
+///
+/// The caller owns the pin and must keep the physical range valid, pinned, and
+/// exclusively accessible for the entire synchronous driver call.  Drivers
+/// submit this range directly to the device; they do not construct a Rust
+/// slice from the physical address or copy the payload through a bounce buffer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BlockPhysicalSegment {
+    /// Physical address of the first byte in the segment.
+    pub paddr: usize,
+    /// Segment length in bytes.
+    pub len: usize,
+}
+
 impl BlockSegment {
     /// Creates a read segment backed by a mutable buffer.
     pub fn from_read_buf(buf: &mut [u8]) -> Self {
@@ -188,6 +202,47 @@ pub trait BlockDriverOps: BaseDriverOps {
         Ok(())
     }
 
+    /// Reads blocks directly into caller-owned pinned physical segments.
+    ///
+    /// The default is deliberately unsupported.  A driver may implement this
+    /// only when it can validate the physical SG request and keep every DMA
+    /// mapping alive until the synchronous request has been consumed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every segment pinned and valid for the entire
+    /// synchronous call, must not access the ranges concurrently with the
+    /// device, and must give ownership in the direction implied by this
+    /// method (the device writes the segments for a read).
+    unsafe fn read_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult {
+        let _ = (block_id, segments);
+        Err(DevError::Unsupported)
+    }
+
+    /// Writes blocks directly from caller-owned pinned physical segments.
+    ///
+    /// The default is deliberately unsupported.  Virtual [`BlockSegment`]
+    /// requests remain the fallback API for drivers without this capability.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every segment pinned and valid for the entire
+    /// synchronous call, must not access or modify the ranges concurrently
+    /// with the device, and must give ownership in the direction implied by
+    /// this method (the device reads the segments for a write).
+    unsafe fn write_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult {
+        let _ = (block_id, segments);
+        Err(DevError::Unsupported)
+    }
+
     /// Flushes the device to write all pending data to the storage.
     fn flush(&mut self) -> DevResult;
 
@@ -253,5 +308,61 @@ pub trait BlockDriverOps: BaseDriverOps {
     /// Fences previously submitted async writes without forcing a device-cache flush.
     fn fence_async(&mut self) -> DevResult {
         Err(DevError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Stub;
+
+    impl BaseDriverOps for Stub {
+        fn device_name(&self) -> &str {
+            "stub"
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Block
+        }
+    }
+
+    impl BlockDriverOps for Stub {
+        fn num_blocks(&self) -> u64 {
+            1
+        }
+
+        fn block_size(&self) -> usize {
+            512
+        }
+
+        fn read_block(&mut self, _block_id: u64, _buf: &mut [u8]) -> DevResult {
+            Ok(())
+        }
+
+        fn write_block(&mut self, _block_id: u64, _buf: &[u8]) -> DevResult {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> DevResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn physical_sg_defaults_to_unsupported() {
+        let mut stub = Stub;
+        let segment = BlockPhysicalSegment {
+            paddr: 0x2000,
+            len: 512,
+        };
+        assert!(matches!(
+            unsafe { stub.read_block_physical_sg(0, &[segment]) },
+            Err(DevError::Unsupported)
+        ));
+        assert!(matches!(
+            unsafe { stub.write_block_physical_sg(0, &[segment]) },
+            Err(DevError::Unsupported)
+        ));
     }
 }

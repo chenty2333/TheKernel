@@ -10,8 +10,8 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
     Error, Result,
-    hal::Hal,
-    queue::VirtQueue,
+    hal::{BufferDirection, DmaMapping, Hal},
+    queue::{PhysicalBuffer, VirtQueue},
     stats::{
         record_blk_async_adaptive_completion, record_blk_async_admission_stall,
         record_blk_async_completion, record_blk_async_completion_error,
@@ -33,6 +33,8 @@ const QUEUE_SIZE: u16 = 16;
 /// this crate makes it impossible for a caller to accidentally turn a
 /// completion notification into an unbounded queue walk.
 pub const PENDING_COMPLETION_DRAIN_BUDGET: usize = 4;
+/// Maximum number of pinned physical payload segments in one direct request.
+pub const MAX_PHYSICAL_SG: usize = 4;
 const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
     .union(BlkFeature::FLUSH)
     .union(BlkFeature::RING_INDIRECT_DESC)
@@ -78,6 +80,19 @@ pub struct VirtIOBlk<H: Hal, T: Transport> {
     negotiated_features: BlkFeature,
 }
 
+/// One caller-owned physical payload segment for a synchronous direct request.
+///
+/// The caller must keep this physical range pinned and valid, and must not
+/// access it concurrently with DMA, until the corresponding read/write method
+/// returns. A read is device-to-driver and a write is driver-to-device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalSegment {
+    /// Physical address of the first byte.
+    pub paddr: usize,
+    /// Segment length in bytes.
+    pub len: usize,
+}
+
 enum PendingBlkBuffer {
     Read {
         buf: *mut u8,
@@ -94,6 +109,16 @@ enum PendingBlkBuffer {
     #[cfg(feature = "alloc")]
     WriteVectored {
         bufs: Vec<PendingWriteSegment>,
+    },
+    PhysicalRead {
+        mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
+        count: usize,
+    },
+    PhysicalWrite {
+        mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
+        count: usize,
     },
     Flush,
 }
@@ -309,6 +334,58 @@ impl PendingBlkRequest {
         }
     }
 
+    fn physical_read(
+        block_id: u64,
+        mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
+        count: usize,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            req: BlkReq {
+                type_: ReqType::In,
+                reserved: 0,
+                sector: block_id,
+            },
+            resp: BlkResp::default(),
+            buffer: PendingBlkBuffer::PhysicalRead {
+                mappings,
+                buffers,
+                count,
+            },
+            token: None,
+            bytes,
+            done: false,
+            async_accounted: false,
+        }
+    }
+
+    fn physical_write(
+        block_id: u64,
+        mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
+        count: usize,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            req: BlkReq {
+                type_: ReqType::Out,
+                reserved: 0,
+                sector: block_id,
+            },
+            resp: BlkResp::default(),
+            buffer: PendingBlkBuffer::PhysicalWrite {
+                mappings,
+                buffers,
+                count,
+            },
+            token: None,
+            bytes,
+            done: false,
+            async_accounted: false,
+        }
+    }
+
     #[cfg(feature = "alloc")]
     fn read_vectored(block_id: usize, bufs: &mut [&mut [u8]]) -> Self {
         let bytes = bufs.iter().map(|buf| buf.len()).sum();
@@ -371,6 +448,54 @@ impl PendingBlkRequest {
 
     fn is_flush(&self) -> bool {
         self.req.type_ == ReqType::Flush
+    }
+
+    fn data_segments(&self) -> usize {
+        match &self.buffer {
+            PendingBlkBuffer::Read { .. } | PendingBlkBuffer::Write { .. } => 1,
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::ReadVectored { bufs } => bufs.len(),
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::WriteVectored { bufs } => bufs.len(),
+            PendingBlkBuffer::PhysicalRead { count, .. }
+            | PendingBlkBuffer::PhysicalWrite { count, .. } => *count,
+            PendingBlkBuffer::Flush => 0,
+        }
+    }
+
+    fn descriptor_cost(&self, indirect: bool) -> usize {
+        let full_chain = self.data_segments() + 2;
+        let physical = matches!(
+            &self.buffer,
+            PendingBlkBuffer::PhysicalRead { .. } | PendingBlkBuffer::PhysicalWrite { .. }
+        );
+        if indirect && !physical && full_chain > 1 {
+            1
+        } else {
+            full_chain
+        }
+    }
+
+    /// Releases physical mappings after a pre-publish submission failure.
+    ///
+    /// This is only used before the descriptor is visible to the device. Once
+    /// published, mappings are released by `complete` after the used entry is
+    /// reaped.
+    fn unmap_physical<H: Hal>(self) {
+        let (mappings, count, direction) = match self.buffer {
+            PendingBlkBuffer::PhysicalRead {
+                mappings, count, ..
+            } => (mappings, count, BufferDirection::DeviceToDriver),
+            PendingBlkBuffer::PhysicalWrite {
+                mappings, count, ..
+            } => (mappings, count, BufferDirection::DriverToDevice),
+            _ => return,
+        };
+        for mapping in mappings[..count].iter().rev().flatten().copied() {
+            // SAFETY: This method is called only before publication, or from
+            // completion after the matching used entry has been reaped.
+            unsafe { H::unmap_physical(mapping, direction) };
+        }
     }
 
     unsafe fn complete<H: Hal, const SIZE: usize>(
@@ -450,6 +575,48 @@ impl PendingBlkRequest {
                         &[self.req.as_bytes()],
                         &mut [self.resp.as_bytes_mut()],
                     )?;
+                }
+            }
+            PendingBlkBuffer::PhysicalRead {
+                mappings,
+                buffers,
+                count,
+            } => {
+                let result = unsafe {
+                    queue.pop_used_physical(
+                        token,
+                        &[self.req.as_bytes()],
+                        &[],
+                        &buffers[..*count],
+                        &mut [self.resp.as_bytes_mut()],
+                    )
+                };
+                result?;
+                for mapping in mappings[..*count].iter().rev().flatten().copied() {
+                    // SAFETY: `pop_used_physical` proved that the device has
+                    // consumed this descriptor chain.
+                    unsafe { H::unmap_physical(mapping, BufferDirection::DeviceToDriver) };
+                }
+            }
+            PendingBlkBuffer::PhysicalWrite {
+                mappings,
+                buffers,
+                count,
+            } => {
+                let result = unsafe {
+                    queue.pop_used_physical(
+                        token,
+                        &[self.req.as_bytes()],
+                        &buffers[..*count],
+                        &[],
+                        &mut [self.resp.as_bytes_mut()],
+                    )
+                };
+                result?;
+                for mapping in mappings[..*count].iter().rev().flatten().copied() {
+                    // SAFETY: `pop_used_physical` proved that the device has
+                    // consumed this descriptor chain.
+                    unsafe { H::unmap_physical(mapping, BufferDirection::DriverToDevice) };
                 }
             }
         }
@@ -584,6 +751,30 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 unsafe {
                     self.queue
                         .add_unpublished(inputs.as_slice(), &mut [request.resp.as_bytes_mut()])
+                }
+            }
+            PendingBlkBuffer::PhysicalRead { buffers, count, .. } => {
+                // SAFETY: The request owns the header/status storage and the
+                // HAL mappings remain active until the matching completion.
+                unsafe {
+                    self.queue.add_unpublished_physical(
+                        &[request.req.as_bytes()],
+                        &[],
+                        &buffers[..*count],
+                        &mut [request.resp.as_bytes_mut()],
+                    )
+                }
+            }
+            PendingBlkBuffer::PhysicalWrite { buffers, count, .. } => {
+                // SAFETY: The request owns the header/status storage and the
+                // HAL mappings remain active until the matching completion.
+                unsafe {
+                    self.queue.add_unpublished_physical(
+                        &[request.req.as_bytes()],
+                        &buffers[..*count],
+                        &[],
+                        &mut [request.resp.as_bytes_mut()],
+                    )
                 }
             }
             PendingBlkBuffer::Flush => {
@@ -890,6 +1081,236 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             },
             bufs,
         )
+    }
+
+    fn validate_physical_segments(
+        &self,
+        block_id: u64,
+        segments: &[PhysicalSegment],
+    ) -> Result<usize> {
+        if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+            return Err(Error::InvalidParam);
+        }
+        let mut total = 0usize;
+        for segment in segments {
+            if segment.paddr == 0
+                || segment.paddr % SECTOR_SIZE != 0
+                || segment.len == 0
+                || segment.len % SECTOR_SIZE != 0
+                || segment.paddr.checked_add(segment.len).is_none()
+            {
+                return Err(Error::InvalidParam);
+            }
+            total = total.checked_add(segment.len).ok_or(Error::InvalidParam)?;
+        }
+        let sectors = u64::try_from(total / SECTOR_SIZE).map_err(|_| Error::InvalidParam)?;
+        let end = block_id.checked_add(sectors).ok_or(Error::InvalidParam)?;
+        if end > self.capacity {
+            return Err(Error::InvalidParam);
+        }
+        Ok(total)
+    }
+
+    fn map_physical_segments(
+        &self,
+        segments: &[PhysicalSegment],
+        direction: BufferDirection,
+    ) -> Result<(
+        [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        [PhysicalBuffer; MAX_PHYSICAL_SG],
+    )> {
+        let mut mappings = [None; MAX_PHYSICAL_SG];
+        let mut buffers = [PhysicalBuffer { addr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        for (index, segment) in segments.iter().enumerate() {
+            let mapping = match unsafe { H::map_physical(segment.paddr, segment.len, direction) } {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    Self::unmap_physical_mappings(&mappings, index, direction);
+                    return Err(error);
+                }
+            };
+            if mapping.source != segment.paddr || mapping.len != segment.len || mapping.device == 0
+            {
+                unsafe { H::unmap_physical(mapping, direction) };
+                Self::unmap_physical_mappings(&mappings, index, direction);
+                return Err(Error::DmaError);
+            }
+            buffers[index] = PhysicalBuffer {
+                addr: mapping.device,
+                len: mapping.len,
+            };
+            mappings[index] = Some(mapping);
+        }
+        Ok((mappings, buffers))
+    }
+
+    fn unmap_physical_mappings(
+        mappings: &[Option<DmaMapping>; MAX_PHYSICAL_SG],
+        count: usize,
+        direction: BufferDirection,
+    ) {
+        for mapping in mappings[..count].iter().rev().flatten().copied() {
+            unsafe { H::unmap_physical(mapping, direction) };
+        }
+    }
+
+    fn tracked_pending_descriptor_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|entry| !entry.done)
+            .map(|entry| {
+                entry.descriptor_cost(
+                    self.negotiated_features
+                        .contains(BlkFeature::RING_INDIRECT_DESC),
+                )
+            })
+            .sum()
+    }
+
+    fn reject_untracked_queue_users(&self) -> Result {
+        // The public *_nb APIs have no pending metadata, so their tokens
+        // cannot safely be reaped by the bounded pending drain. Refuse to
+        // publish a physical request while such a chain is outstanding; all
+        // requests tracked by this driver remain eligible and are drained in
+        // used-ring order.
+        if self.queue.outstanding_descriptor_count() != self.tracked_pending_descriptor_count() {
+            return Err(Error::QueueFull);
+        }
+        Ok(())
+    }
+
+    /// Submits a read into pinned physical SG payload buffers.
+    ///
+    /// The returned handle is completed through the normal pending/token-slot
+    /// path. The payload is mapped by the HAL using physical addresses; no
+    /// Rust slice is constructed from those addresses.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every segment pinned and valid until the returned
+    /// handle is completed, must not access the ranges concurrently with DMA,
+    /// and must provide ranges in the device-write direction of a read.
+    pub unsafe fn submit_read_blocks_physical_pending(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalSegment],
+    ) -> Result<PendingBlkHandle> {
+        self.reject_untracked_queue_users()?;
+        self.drain_pending_completions()?;
+        let bytes = self.validate_physical_segments(block_id, segments)?;
+        let (mappings, buffers) =
+            self.map_physical_segments(segments, BufferDirection::DeviceToDriver)?;
+        let slot = match self.alloc_pending_slot() {
+            Ok(slot) => slot,
+            Err(error) => {
+                Self::unmap_physical_mappings(
+                    &mappings,
+                    segments.len(),
+                    BufferDirection::DeviceToDriver,
+                );
+                return Err(error);
+            }
+        };
+        self.pending[slot] = Some(PendingBlkRequest::physical_read(
+            block_id,
+            mappings,
+            buffers,
+            segments.len(),
+            bytes,
+        ));
+        let token = match self.add_pending_slot_unpublished(slot) {
+            Ok(token) => token,
+            Err(error) => {
+                let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+                request.unmap_physical::<H>();
+                return Err(error);
+            }
+        };
+        let token_idx = usize::from(token);
+        debug_assert!(self.token_slots[token_idx].is_none());
+        self.token_slots[token_idx] = Some(slot);
+        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
+        self.pending_count += 1;
+        record_blk_pending_depth(self.pending_count);
+        self.queue.publish_unpublished(token);
+        record_blk_read(bytes, segments.len());
+        let notified = self.queue.should_notify();
+        if notified {
+            self.transport.notify(QUEUE);
+        }
+        Ok(PendingBlkHandle {
+            slot: slot as u16,
+            token,
+            notified,
+        })
+    }
+
+    /// Submits a write from pinned physical SG payload buffers.
+    ///
+    /// The returned handle is completed through the normal pending/token-slot
+    /// path. The payload is mapped by the HAL using physical addresses; no
+    /// Rust slice is constructed from those addresses.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every segment pinned and valid until the returned
+    /// handle is completed, must not access or modify the ranges concurrently
+    /// with DMA, and must provide ranges in the device-read direction of a
+    /// write.
+    pub unsafe fn submit_write_blocks_physical_pending(
+        &mut self,
+        block_id: u64,
+        segments: &[PhysicalSegment],
+    ) -> Result<PendingBlkHandle> {
+        self.reject_untracked_queue_users()?;
+        self.drain_pending_completions()?;
+        let bytes = self.validate_physical_segments(block_id, segments)?;
+        let (mappings, buffers) =
+            self.map_physical_segments(segments, BufferDirection::DriverToDevice)?;
+        let slot = match self.alloc_pending_slot() {
+            Ok(slot) => slot,
+            Err(error) => {
+                Self::unmap_physical_mappings(
+                    &mappings,
+                    segments.len(),
+                    BufferDirection::DriverToDevice,
+                );
+                return Err(error);
+            }
+        };
+        self.pending[slot] = Some(PendingBlkRequest::physical_write(
+            block_id,
+            mappings,
+            buffers,
+            segments.len(),
+            bytes,
+        ));
+        let token = match self.add_pending_slot_unpublished(slot) {
+            Ok(token) => token,
+            Err(error) => {
+                let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+                request.unmap_physical::<H>();
+                return Err(error);
+            }
+        };
+        let token_idx = usize::from(token);
+        debug_assert!(self.token_slots[token_idx].is_none());
+        self.token_slots[token_idx] = Some(slot);
+        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
+        self.pending_count += 1;
+        record_blk_pending_depth(self.pending_count);
+        self.queue.publish_unpublished(token);
+        record_blk_write(bytes, segments.len());
+        let notified = self.queue.should_notify();
+        if notified {
+            self.transport.notify(QUEUE);
+        }
+        Ok(PendingBlkHandle {
+            slot: slot as u16,
+            token,
+            notified,
+        })
     }
 
     /// Submits a request to read one or more blocks, but returns immediately without waiting for
@@ -1501,6 +1922,18 @@ impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
         self.transport.set_status(DeviceStatus::empty());
         while !self.transport.get_status().is_empty() {
             spin_loop();
+        }
+        // Physical mappings are owned by their pending entries until the
+        // used-ring reap. After reset the device is quiescent, so release any
+        // still-live mappings exactly once; completed entries already unmapped
+        // themselves in `PendingBlkRequest::complete`.
+        for entry in &mut self.pending {
+            let Some(request) = entry.take() else {
+                continue;
+            };
+            if !request.done {
+                request.unmap_physical::<H>();
+            }
         }
         // Clear any queue pointers after the device has acknowledged reset.
         self.transport.queue_unset(QUEUE);

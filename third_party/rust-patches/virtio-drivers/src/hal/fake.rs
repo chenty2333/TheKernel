@@ -2,13 +2,15 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::{BufferDirection, Hal, PhysAddr, PAGE_SIZE};
 use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
 use core::{
     alloc::Layout,
     ptr::{self, NonNull},
 };
+
 use zerocopy::FromZeroes;
+
+use crate::{BufferDirection, DmaMapping, Hal, PAGE_SIZE, PhysAddr};
 
 #[derive(Debug)]
 pub struct FakeHal;
@@ -37,6 +39,19 @@ unsafe impl Hal for FakeHal {
         }
         0
     }
+
+    unsafe fn map_physical(
+        paddr: PhysAddr,
+        len: usize,
+        _direction: BufferDirection,
+    ) -> crate::Result<DmaMapping> {
+        if paddr == 0 || len == 0 {
+            return Err(crate::Error::DmaError);
+        }
+        Ok(DmaMapping::identity(paddr, len))
+    }
+
+    unsafe fn unmap_physical(_mapping: DmaMapping, _direction: BufferDirection) {}
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
         NonNull::new(paddr as _).unwrap()

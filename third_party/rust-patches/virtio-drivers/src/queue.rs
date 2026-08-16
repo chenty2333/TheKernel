@@ -75,6 +75,15 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     indirect_lists: [Option<NonNull<[Descriptor]>>; SIZE],
 }
 
+/// A descriptor payload that has already been mapped from a pinned physical
+/// range.  This type is crate-private so callers cannot bypass the block
+/// driver's validation and mapping lifetime rules.
+#[derive(Clone, Copy)]
+pub(crate) struct PhysicalBuffer {
+    pub(crate) addr: PhysAddr,
+    pub(crate) len: usize,
+}
+
 impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     const SIZE_OK: () = assert!(SIZE.is_power_of_two() && SIZE <= u16::MAX as usize);
 
@@ -220,6 +229,129 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let head = self.add_direct(inputs, outputs);
 
         Ok(head)
+    }
+
+    /// Adds a direct descriptor chain containing normal virtual header/status
+    /// buffers and already-mapped physical payload buffers.
+    ///
+    /// This is intentionally crate-private.  The block device validates and
+    /// maps the physical ranges before constructing [`PhysicalBuffer`] values;
+    /// this method only installs the resulting device addresses and never
+    /// calls [`Hal::share`] or creates a Rust slice for a physical payload.
+    ///
+    /// # Safety
+    ///
+    /// Virtual buffers and physical mappings must remain valid and untouched
+    /// until [`Self::pop_used_physical`] succeeds. The physical input ranges
+    /// are device-readable and the physical output ranges are device-writable;
+    /// their owner must keep the ranges pinned, avoid CPU access during DMA,
+    /// and unmap them only after the matching pop. The physical mapping owner
+    /// is responsible for unmapping after that point.
+    pub(crate) unsafe fn add_unpublished_physical<'a, 'b>(
+        &mut self,
+        inputs: &'a [&'b [u8]],
+        physical_inputs: &[PhysicalBuffer],
+        physical_outputs: &[PhysicalBuffer],
+        outputs: &'a mut [&'b mut [u8]],
+    ) -> Result<u16> {
+        let descriptors_needed =
+            inputs.len() + physical_inputs.len() + physical_outputs.len() + outputs.len();
+        if descriptors_needed == 0
+            || descriptors_needed > SIZE
+            || usize::from(self.num_used) + descriptors_needed > SIZE
+        {
+            return Err(if descriptors_needed == 0 {
+                Error::InvalidParam
+            } else {
+                Error::QueueFull
+            });
+        }
+        if inputs
+            .iter()
+            .any(|input| input.is_empty() || input.len() > u32::MAX as usize)
+            || outputs
+                .iter()
+                .any(|output| output.is_empty() || output.len() > u32::MAX as usize)
+            || physical_inputs
+                .iter()
+                .chain(physical_outputs)
+                .any(|buffer| buffer.addr == 0 || buffer.len == 0 || buffer.len > u32::MAX as usize)
+        {
+            return Err(Error::InvalidParam);
+        }
+
+        let head = self.free_head;
+        let mut current = head;
+        let mut last = head;
+
+        for input in inputs {
+            // SAFETY: The caller promises the virtual header remains valid
+            // until the matching physical pop.
+            unsafe {
+                self.desc_shadow[usize::from(current)].set_buf::<H>(
+                    (*input).into(),
+                    BufferDirection::DriverToDevice,
+                    DescFlags::NEXT,
+                );
+            }
+            last = current;
+            current = self.desc_shadow[usize::from(current)].next;
+            self.write_desc(last);
+        }
+
+        for buffer in physical_inputs {
+            self.install_physical_descriptor(current, *buffer, false);
+            last = current;
+            current = self.desc_shadow[usize::from(current)].next;
+        }
+
+        for buffer in physical_outputs {
+            self.install_physical_descriptor(current, *buffer, true);
+            last = current;
+            current = self.desc_shadow[usize::from(current)].next;
+        }
+
+        for output in outputs {
+            // SAFETY: The caller promises the virtual status remains valid
+            // until the matching physical pop.
+            unsafe {
+                self.desc_shadow[usize::from(current)].set_buf::<H>(
+                    (*output).into(),
+                    BufferDirection::DeviceToDriver,
+                    DescFlags::NEXT,
+                );
+            }
+            last = current;
+            current = self.desc_shadow[usize::from(current)].next;
+            self.write_desc(last);
+        }
+
+        self.desc_shadow[usize::from(last)]
+            .flags
+            .remove(DescFlags::NEXT);
+        self.write_desc(last);
+        self.num_used += descriptors_needed as u16;
+        self.free_head = current;
+        Ok(head)
+    }
+
+    fn install_physical_descriptor(
+        &mut self,
+        index: u16,
+        buffer: PhysicalBuffer,
+        device_writes: bool,
+    ) {
+        debug_assert!(buffer.addr != 0 && buffer.len != 0 && buffer.len <= u32::MAX as usize);
+        let descriptor = &mut self.desc_shadow[usize::from(index)];
+        descriptor.addr = buffer.addr as u64;
+        descriptor.len = buffer.len as u32;
+        descriptor.flags = DescFlags::NEXT
+            | if device_writes {
+                DescFlags::WRITE
+            } else {
+                DescFlags::empty()
+            };
+        self.write_desc(index);
     }
 
     /// Publishes a descriptor chain previously returned by
@@ -426,6 +558,23 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.last_used_idx != unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) }
     }
 
+    /// Returns whether this queue has no descriptor chains awaiting device
+    /// completion or driver-side reaping.
+    ///
+    /// This intentionally checks the driver's descriptor accounting rather
+    /// than [`Self::available_desc`], whose indirect-descriptor mode can hide
+    /// outstanding chains behind one table descriptor.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.num_used == 0
+    }
+
+    /// Returns the number of descriptor-table entries currently owned by the
+    /// device or awaiting driver-side reaping. In indirect mode this is one
+    /// entry per indirect chain.
+    pub(crate) fn outstanding_descriptor_count(&self) -> usize {
+        usize::from(self.num_used)
+    }
+
     /// Returns the descriptor index (a.k.a. token) of the next used element without popping it, or
     /// `None` if the used ring is empty.
     pub fn peek_used(&self) -> Option<u16> {
@@ -543,6 +692,87 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
     }
 
+    /// Recycles a direct chain containing virtual header/status buffers and
+    /// mapped physical payload buffers. Physical payloads are deliberately
+    /// not passed to [`Hal::unshare`]; their owner performs the matching
+    /// physical unmap after this method returns.
+    unsafe fn recycle_physical_descriptors<'a, 'b>(
+        &mut self,
+        head: u16,
+        inputs: &'a [&'b [u8]],
+        physical_inputs: &[PhysicalBuffer],
+        physical_outputs: &[PhysicalBuffer],
+        outputs: &'a mut [&'b mut [u8]],
+    ) {
+        let original_free_head = self.free_head;
+        self.free_head = head;
+        let mut next = Some(head);
+
+        for input in inputs {
+            // SAFETY: The descriptor chain was built from these exact
+            // buffers and the device has completed it.
+            unsafe {
+                self.recycle_one_physical_descriptor(
+                    &mut next,
+                    original_free_head,
+                    Some(((*input).into(), BufferDirection::DriverToDevice)),
+                );
+            }
+        }
+        for _ in physical_inputs {
+            // SAFETY: The physical mapping remains owned by the caller and is
+            // unmapped after the queue has released the descriptor.
+            unsafe {
+                self.recycle_one_physical_descriptor(&mut next, original_free_head, None);
+            }
+        }
+        for _ in physical_outputs {
+            // SAFETY: The physical mapping remains owned by the caller and is
+            // unmapped after the queue has released the descriptor.
+            unsafe {
+                self.recycle_one_physical_descriptor(&mut next, original_free_head, None);
+            }
+        }
+        for output in outputs {
+            // SAFETY: The descriptor chain was built from these exact
+            // buffers and the device has completed it.
+            unsafe {
+                self.recycle_one_physical_descriptor(
+                    &mut next,
+                    original_free_head,
+                    Some(((*output).into(), BufferDirection::DeviceToDriver)),
+                );
+            }
+        }
+        assert!(next.is_none(), "Descriptor chain was longer than expected.");
+    }
+
+    unsafe fn recycle_one_physical_descriptor(
+        &mut self,
+        next: &mut Option<u16>,
+        original_free_head: u16,
+        virtual_buffer: Option<(NonNull<[u8]>, BufferDirection)>,
+    ) {
+        let desc_index = next
+            .take()
+            .expect("Descriptor chain was shorter than expected.");
+        let desc = &mut self.desc_shadow[usize::from(desc_index)];
+        let paddr = desc.addr as usize;
+        let following = desc.next();
+        desc.unset_buf();
+        self.num_used -= 1;
+        *next = following;
+        if following.is_none() {
+            desc.next = original_free_head;
+        }
+        self.write_desc(desc_index);
+        if let Some((buffer, direction)) = virtual_buffer {
+            // SAFETY: The caller supplied the exact virtual buffer used when
+            // the descriptor was installed, and the device is quiescent.
+            unsafe { H::unshare(paddr, buffer, direction) };
+        }
+    }
+
     /// If the given token is next on the device used queue, pops it and returns the total buffer
     /// length which was used (written) by the device.
     ///
@@ -593,6 +823,61 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             }
         }
 
+        Ok(len)
+    }
+
+    /// Pops a completed direct chain created by
+    /// [`Self::add_unpublished_physical`].
+    ///
+    /// # Safety
+    ///
+    /// The buffers and physical descriptors must exactly match the submitted
+    /// chain. The physical mappings must remain active until this succeeds;
+    /// their pinned ranges must not be accessed concurrently with DMA. Physical
+    /// inputs are device-readable and physical outputs are device-writable.
+    pub(crate) unsafe fn pop_used_physical<'a, 'b>(
+        &mut self,
+        token: u16,
+        inputs: &'a [&'b [u8]],
+        physical_inputs: &[PhysicalBuffer],
+        physical_outputs: &[PhysicalBuffer],
+        outputs: &'a mut [&'b mut [u8]],
+    ) -> Result<u32> {
+        if !self.can_pop() {
+            return Err(Error::NotReady);
+        }
+
+        let last_used_slot = self.last_used_idx & (SIZE as u16 - 1);
+        let (index, len) = unsafe {
+            let used = &*self.used.as_ptr();
+            (
+                used.ring[last_used_slot as usize].id as u16,
+                used.ring[last_used_slot as usize].len,
+            )
+        };
+        if index != token {
+            return Err(Error::WrongToken);
+        }
+
+        // SAFETY: The caller guarantees these are the exact submitted
+        // buffers and all device access has completed.
+        unsafe {
+            self.recycle_physical_descriptors(
+                index,
+                inputs,
+                physical_inputs,
+                physical_outputs,
+                outputs,
+            );
+        }
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        if self.event_idx {
+            unsafe {
+                (*self.avail.as_ptr())
+                    .used_event
+                    .store(self.last_used_idx, Ordering::Release);
+            }
+        }
         Ok(len)
     }
 }
@@ -1144,6 +1429,46 @@ mod tests {
                 (*queue.desc.as_ptr())[fourth_descriptor_index as usize].flags,
                 DescFlags::WRITE
             );
+        }
+    }
+
+    #[test]
+    fn physical_buffers_use_mapped_addresses_and_direction_flags() {
+        let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 4);
+        let mut transport = unsafe { MmioTransport::new(NonNull::from(&mut header)) }.unwrap();
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, false).unwrap();
+        let request = [0u8; 16];
+        let mut status = [0u8; 1];
+        let read_payload = PhysicalBuffer {
+            addr: 0x1234_0000,
+            len: 512,
+        };
+        let write_payload = PhysicalBuffer {
+            addr: 0x5678_0000,
+            len: 512,
+        };
+
+        let token = unsafe {
+            queue.add_unpublished_physical(
+                &[&request],
+                &[read_payload],
+                &[write_payload],
+                &mut [&mut status],
+            )
+        }
+        .unwrap();
+        assert!(!queue.is_empty());
+
+        unsafe {
+            let first = &(*queue.desc.as_ptr())[token as usize];
+            let second = &(*queue.desc.as_ptr())[first.next as usize];
+            let third = &(*queue.desc.as_ptr())[second.next as usize];
+            let fourth = &(*queue.desc.as_ptr())[third.next as usize];
+            assert_eq!(second.addr, read_payload.addr as u64);
+            assert_eq!(third.addr, write_payload.addr as u64);
+            assert!(!second.flags.contains(DescFlags::WRITE));
+            assert!(third.flags.contains(DescFlags::WRITE));
+            assert!(fourth.flags.contains(DescFlags::WRITE));
         }
     }
 

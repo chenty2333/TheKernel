@@ -192,6 +192,36 @@ impl BlockDriverOps for SharedBlockDevice {
         self.lock().write_block_vectored(block_id, bufs)
     }
 
+    /// # Safety
+    ///
+    /// The caller must keep the physical segments pinned and valid, avoid
+    /// concurrent CPU access, and obey the device-write direction of a read.
+    unsafe fn read_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[crate::prelude::BlockPhysicalSegment],
+    ) -> DevResult {
+        // SAFETY: The shared lock serializes access to the wrapped driver; the
+        // caller's pin, direction, and no-CPU-race contract is forwarded
+        // unchanged to that driver.
+        unsafe { self.lock().read_block_physical_sg(block_id, segments) }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep the physical segments pinned and valid, avoid
+    /// concurrent CPU access, and obey the device-read direction of a write.
+    unsafe fn write_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[crate::prelude::BlockPhysicalSegment],
+    ) -> DevResult {
+        // SAFETY: The shared lock serializes access to the wrapped driver; the
+        // caller's pin, direction, and no-CPU-race contract is forwarded
+        // unchanged to that driver.
+        unsafe { self.lock().write_block_physical_sg(block_id, segments) }
+    }
+
     fn flush(&mut self) -> DevResult {
         self.lock().flush()
     }

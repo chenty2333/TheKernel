@@ -2,7 +2,9 @@ use core::{marker::PhantomData, ptr, ptr::NonNull};
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
-use axdriver_virtio::{BufferDirection, PhysAddr, VirtIoHal};
+use axdriver_virtio::{
+    BufferDirection, DmaMapping, PhysAddr, VirtIoError, VirtIoHal, VirtIoResult,
+};
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use cfg_if::cfg_if;
 use spin::Mutex;
@@ -270,6 +272,22 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         global_allocator().dealloc_pages(vaddr.as_ptr() as usize, pages, UsageKind::Dma);
         0
     }
+
+    unsafe fn map_physical(
+        paddr: PhysAddr,
+        len: usize,
+        _direction: BufferDirection,
+    ) -> VirtIoResult<DmaMapping> {
+        if paddr == 0 || len == 0 || paddr.checked_add(len).is_none() {
+            return Err(VirtIoError::DmaError);
+        }
+        // q35 currently exposes coherent identity DMA. Keep this explicit in
+        // the mapping API so an IOMMU-capable HAL can return a distinct device
+        // address without changing the block descriptor path.
+        Ok(DmaMapping::identity(paddr, len))
+    }
+
+    unsafe fn unmap_physical(_mapping: DmaMapping, _direction: BufferDirection) {}
 
     #[inline]
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {

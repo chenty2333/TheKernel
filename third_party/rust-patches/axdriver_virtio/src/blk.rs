@@ -7,8 +7,8 @@ use core::{
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use axdriver_block::{
-    BlockAsyncOp, BlockDriverOps, BlockQueueCaps, BlockQueueRequest, BlockRequestHandle,
-    BlockSegment, BlockSegmentDirection, BlockSubmitReport,
+    BlockAsyncOp, BlockDriverOps, BlockPhysicalSegment, BlockQueueCaps, BlockQueueRequest,
+    BlockRequestHandle, BlockSegment, BlockSegmentDirection, BlockSubmitReport,
 };
 use axtask::{
     WaitError, WaitQueue,
@@ -18,8 +18,9 @@ use spin::Mutex;
 use virtio_drivers::{
     Hal,
     device::blk::{
-        PENDING_COMPLETION_DRAIN_BUDGET, PendingBlkBatchBuffer, PendingBlkBatchRequest,
-        PendingBlkDrainStatus, PendingBlkHandle, VirtIOBlk as InnerDev,
+        MAX_PHYSICAL_SG, PENDING_COMPLETION_DRAIN_BUDGET, PendingBlkBatchBuffer,
+        PendingBlkBatchRequest, PendingBlkDrainStatus, PendingBlkHandle,
+        PhysicalSegment as VirtioPhysicalSegment, VirtIOBlk as InnerDev,
     },
     stats::{
         AsyncBlockWaitPolicy, async_block_enabled, async_block_merge_write_enabled,
@@ -1191,6 +1192,73 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         inner
             .write_blocks_vectored(block_id as _, bufs)
             .map_err(as_dev_err)
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep all physical segments pinned and valid until this
+    /// synchronous operation returns, must not access them concurrently with
+    /// DMA, and must obey the device-write direction of a read.
+    unsafe fn read_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult {
+        if segments.len() > MAX_PHYSICAL_SG {
+            return Err(DevError::InvalidParam);
+        }
+        let mut physical = [VirtioPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        for (index, segment) in segments.iter().copied().enumerate() {
+            physical[index] = VirtioPhysicalSegment {
+                paddr: segment.paddr,
+                len: segment.len,
+            };
+        }
+        let handle = {
+            let mut inner = self.inner.lock();
+            // SAFETY: The method's caller owns the pin and no-CPU-race
+            // contract; the inner driver retains each mapping until the
+            // returned pending handle is completed.
+            unsafe {
+                inner.submit_read_blocks_physical_pending(block_id, &physical[..segments.len()])
+            }
+            .map_err(as_dev_err)?
+        };
+        self.wait_for_pending_done(handle)
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep all physical segments pinned and valid until this
+    /// synchronous operation returns, must not access or modify them
+    /// concurrently with DMA, and must obey the device-read direction of a
+    /// write.
+    unsafe fn write_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult {
+        if segments.len() > MAX_PHYSICAL_SG {
+            return Err(DevError::InvalidParam);
+        }
+        let mut physical = [VirtioPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        for (index, segment) in segments.iter().copied().enumerate() {
+            physical[index] = VirtioPhysicalSegment {
+                paddr: segment.paddr,
+                len: segment.len,
+            };
+        }
+        let handle = {
+            let mut inner = self.inner.lock();
+            // SAFETY: The method's caller owns the pin and no-CPU-race
+            // contract; the inner driver retains each mapping until the
+            // returned pending handle is completed.
+            unsafe {
+                inner.submit_write_blocks_physical_pending(block_id, &physical[..segments.len()])
+            }
+            .map_err(as_dev_err)?
+        };
+        self.wait_for_pending_done(handle)
     }
 
     fn flush(&mut self) -> DevResult {

@@ -12,6 +12,7 @@
 //!
 //! ```
 //! use core::ptr::NonNull;
+//!
 //! use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 //!
 //! # fn example(mmio_device_address: usize) {
@@ -30,7 +31,6 @@
 //!     transport::{mmio::MmioTransport, DeviceType, Transport},
 //! };
 
-//!
 //! # #[cfg(feature = "alloc")]
 //! # fn example<HalImpl: Hal>(transport: MmioTransport) {
 //! if transport.device_type() == DeviceType::Console {
@@ -61,7 +61,7 @@ use core::{
     ptr::{self, NonNull},
 };
 
-pub use self::hal::{BufferDirection, Hal, PhysAddr};
+pub use self::hal::{BufferDirection, DmaMapping, Hal, PhysAddr};
 
 /// The page size in bytes supported by the library (4 KiB).
 pub const PAGE_SIZE: usize = 0x1000;

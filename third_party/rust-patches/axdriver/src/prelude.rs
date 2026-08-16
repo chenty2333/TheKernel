@@ -5,8 +5,8 @@ pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 pub use {
     crate::structs::AxBlockDevice,
     axdriver_block::{
-        BlockAsyncOp, BlockDriverOps, BlockQueueCaps, BlockQueueRequest, BlockRequestHandle,
-        BlockSegment, BlockSegmentDirection, BlockSubmitReport,
+        BlockAsyncOp, BlockDriverOps, BlockPhysicalSegment, BlockQueueCaps, BlockQueueRequest,
+        BlockRequestHandle, BlockSegment, BlockSegmentDirection, BlockSubmitReport,
     },
 };
 #[cfg(feature = "display")]

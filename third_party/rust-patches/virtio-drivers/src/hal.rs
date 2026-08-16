@@ -1,11 +1,40 @@
 #[cfg(test)]
 pub mod fake;
 
-use crate::{Error, Result, PAGE_SIZE};
 use core::{marker::PhantomData, ptr::NonNull};
+
+use crate::{Error, PAGE_SIZE, Result};
 
 /// A physical address as used for virtio.
 pub type PhysAddr = usize;
+
+/// A physical range mapped for device DMA.
+///
+/// `source` is the caller-owned physical range. `device` is the address that
+/// may be placed in a VirtIO descriptor.  On the current q35 identity-
+/// coherent platform these values are equal, but keeping both values in the
+/// mapping type prevents callers from silently treating a CPU physical address
+/// as an I/O address on a platform that needs an IOMMU mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaMapping {
+    /// Original caller-owned physical address.
+    pub source: PhysAddr,
+    /// Device-visible DMA address.
+    pub device: PhysAddr,
+    /// Length of the mapped range in bytes.
+    pub len: usize,
+}
+
+impl DmaMapping {
+    /// Creates an identity, coherent mapping for a physical range.
+    pub const fn identity(source: PhysAddr, len: usize) -> Self {
+        Self {
+            source,
+            device: source,
+            len,
+        }
+    }
+}
 
 /// A region of contiguous physical memory used for DMA.
 #[derive(Debug)]
@@ -98,6 +127,32 @@ pub unsafe trait Hal {
     /// yet deallocated. `pages` must be the same number passed to `dma_alloc` originally, and both
     /// `paddr` and `vaddr` must be the values returned by `dma_alloc`.
     unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32;
+
+    /// Maps a caller-owned physical range for direct device DMA.
+    ///
+    /// Unlike [`Self::share`], this operation never receives or fabricates a
+    /// virtual slice.  The returned mapping must remain active until the
+    /// matching [`Self::unmap_physical`] call after the device has consumed the
+    /// descriptor.  Implementations may reject a range before any descriptor
+    /// is published.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep the physical range pinned and valid for the
+    /// direction until it is unmapped.  No CPU access may race device access.
+    unsafe fn map_physical(
+        paddr: PhysAddr,
+        len: usize,
+        direction: BufferDirection,
+    ) -> Result<DmaMapping>;
+
+    /// Unmaps a previously returned physical DMA mapping.
+    ///
+    /// # Safety
+    ///
+    /// `mapping` must be returned by [`Self::map_physical`] on this HAL and
+    /// the device must no longer access the corresponding descriptor.
+    unsafe fn unmap_physical(mapping: DmaMapping, direction: BufferDirection);
 
     /// Converts a physical address used for MMIO to a virtual address which the driver can access.
     ///
