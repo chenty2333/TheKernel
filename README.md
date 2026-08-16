@@ -1,15 +1,20 @@
 # TheKernel
 
-TheKernel is a Rust operating-system kernel that provides a Linux-compatible
-userspace ABI on top of ArceOS components. It targets RISC-V and LoongArch QEMU
-platforms and is being evolved toward reusable, explicitly layered kernel
-components rather than syscall-local implementations.
+TheKernel is a personal Rust operating-system project that provides a
+Linux-compatible userspace ABI on top of ArceOS components. Its target is a
+high-performance, production-usable x86_64 kernel. It is being evolved toward
+reusable, explicitly layered kernel components rather than syscall-local
+implementations.
 
 The repository is currently a preview. It has broad syscall and subsystem
 coverage, but it is not yet a drop-in Linux replacement and its public crate
 boundaries are still being stabilized.
 
 ## Architecture
+
+x86_64 is the only product architecture. The reference virtual machine is
+QEMU `q35` with UEFI/OVMF; builds, boot gates, and system tests all use this
+platform.
 
 The code follows five ownership layers:
 
@@ -22,6 +27,12 @@ The code follows five ownership layers:
 
 Linux-visible policy should not leak into generic `ax-*` mechanisms, and
 syscall bodies should not duplicate rules owned by the ABI-support layer.
+
+The project's durable design, selected direction, current position, and known
+pitfalls live respectively in [`maproom/terrain.md`](maproom/terrain.md),
+[`maproom/route.md`](maproom/route.md),
+[`maproom/basecamp.md`](maproom/basecamp.md), and
+[`maproom/hazards.md`](maproom/hazards.md).
 
 ## Development Environment
 
@@ -45,7 +56,7 @@ directly.
 
 ## Build
 
-Build both release-mode kernel images:
+Build the release-mode x86_64 kernel image:
 
 ```bash
 make all
@@ -53,21 +64,18 @@ make all
 
 The materialized artifacts are:
 
-- `kernel-rv`
-- `kernel-la`
+- `kernel-x86_64`
 
-Build one architecture or the complete kernel artifact set explicitly:
+Build the kernel or complete artifact set explicitly:
 
 ```bash
-make kernel-rv
-make kernel-la
+make kernel-x86_64
 make artifacts
 ```
 
-`make artifacts` produces only those two kernel images; it does not build or
-publish test fixtures. Kernel and rootfs outputs use a content-addressed cache
-under `.state/build-cache/`; Cargo target caches remain under
-`.state/<arch>/target`.
+`make artifacts` produces the kernel image; it does not build or publish test
+fixtures. Kernel and rootfs outputs use a content-addressed cache under
+`.state/build-cache/`; Cargo target caches remain under `.state/x86_64/target`.
 
 ## Root Filesystem
 
@@ -76,8 +84,7 @@ TheKernel-owned init and guest test programs:
 
 ```bash
 make test-fixtures
-make rootfs-rv
-make rootfs-la
+make rootfs-x86
 ```
 
 The first build downloads BusyBox 1.36.1 into `.state/source-cache/`. The
@@ -90,11 +97,10 @@ and BusyBox notices; see
 
 ## Boot
 
-Boot an interactive project rootfs on either architecture:
+Boot an interactive x86_64 project rootfs:
 
 ```bash
-make shell-rv
-make shell-la
+make shell-x86_64
 ```
 
 Exit the guest shell to trigger a clean kernel shutdown. Additional generic
@@ -106,15 +112,15 @@ test policy:
 
 ```bash
 python3 -m tools.qemu_runner run \
-  --arch rv \
-  --kernel kernel-rv \
-  --rootfs .state/rootfs/rootfs-rv.img \
+  --arch x86_64 \
+  --kernel kernel-x86_64 \
+  --rootfs .state/rootfs/rootfs-x86.img \
   --timeout 300
 ```
 
 ## Verification
 
-Run the project semantic init on both architectures:
+Run the project semantic init on x86_64:
 
 ```bash
 make system-test
@@ -127,7 +133,7 @@ writeback, interrupt, mapped-I/O, pinning, and page-cache contracts:
 
 ```bash
 make smoke-list
-make smoke NAME=lwext4-io-boost ARCH=rv
+make smoke NAME=lwext4-io-boost ARCH=x86
 ```
 
 Run host-side tool and contract tests:
@@ -147,18 +153,17 @@ interference between tests that share kernel globals.
 
 `cargo fmt` and `cargo clippy` both gate. Clippy runs per build profile,
 because several lints answer a different question in each one: a symbol that is
-unreachable in the `x86_64` host test build is often the live architecture
-path, `GlobalGrace` only carries drop glue when `smp-tlb-shootdown` is enabled,
-and a `c_char` cast that is redundant on RISC-V is required on the host.
+unreachable in the x86_64 host test build is often the live kernel path,
+`GlobalGrace` only carries drop glue when `smp-tlb-shootdown` is enabled, and
+architecture-specific usercopy casts are load-bearing in the kernel profile.
 
 ```bash
 scripts/ci/clippy-gate.sh --profile host
-scripts/ci/clippy-gate.sh --profile rv
-scripts/ci/clippy-gate.sh --profile la
+scripts/ci/clippy-gate.sh --profile x86_64
 ```
 
-The per-commit gate runs the `host` and `rv` profiles; the PR gate adds `la`.
-Only TheKernel-owned packages are linted. Vendored sources under
+The per-commit gate runs the `host` and `x86_64` profiles. Only TheKernel-owned
+packages are linted. Vendored sources under
 `third_party/rust-patches/` keep their upstream lint posture; their diagnostics
 are counted and printed but never fail the gate, so a clean owned report never
 implies a clean tree.
@@ -167,13 +172,13 @@ The lint policy lives in `[workspace.lints]` in the root `Cargo.toml`, so
 editors and a bare `cargo clippy` enforce exactly what CI does. Every allowance
 there records the mechanism that makes the lint wrong for this codebase.
 
-The PR gate builds both architectures and boots the project rootfs. Its release
-consumer subgate also compiles the RV and LoongArch MM-diagnostics profiles with
+The PR gate builds and boots the x86_64 project rootfs. Its release consumer
+subgate also compiles the x86_64 MM-diagnostics profile with
 `asid-switch-diagnostics` and `pmu-diagnostics` from the normalized sibling
 `.crate` artifacts, with Cargo locked and offline. That is target-specific
-archive/API compile coverage; it does not boot those diagnostic kernels or
-claim PMU samples. Nightly adapters add mixed pressure, deterministic
-allocation failure, ext4 power-cut recovery, and non-loopback network coverage.
+archive/API compile coverage; it does not claim PMU samples. Nightly adapters
+add mixed pressure, deterministic allocation failure, ext4 power-cut recovery,
+and non-loopback network coverage.
 
 ## Repository Layout
 
@@ -182,7 +187,7 @@ allocation failure, ext4 power-cut recovery, and non-loopback network coverage.
 - `third_party/rust-patches/`: pinned upstream sources with provenance records.
 - `make/`: architecture build machinery.
 - `tools/build.py`: content-addressed kernel and rootfs builder.
-- `tools/qemu_runner/`: policy-neutral dual-architecture QEMU runner.
+- `tools/qemu_runner/`: policy-neutral x86_64 QEMU runner.
 - `tests/guest/`: project init, guest helpers, and nightly programs.
 - `scripts/ci/` and `scripts/smoke/`: repository verification workflows.
 
