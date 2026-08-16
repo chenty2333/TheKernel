@@ -1438,6 +1438,7 @@ struct x86_futex2_requeue_case {
 struct x86_futex2_shared_wait_case {
     const void *uaddr;
     int64_t timeout_ns;
+    int64_t started_ns;
     _Atomic int ready;
     _Atomic int done;
     _Atomic pid_t tid;
@@ -1655,6 +1656,7 @@ static void *x86_futex2_shared_waiter(void *opaque)
         atomic_store_explicit(&test->done, 1, memory_order_release);
         return NULL;
     }
+    test->started_ns = (int64_t)timeout.tv_sec * 1000000000LL + timeout.tv_nsec;
     timeout = timespec_add_ns(timeout, test->timeout_ns);
     atomic_store_explicit(&test->ready, 1, memory_order_release);
     errno = 0;
@@ -2037,6 +2039,11 @@ static int test_x86_futex2_shared_remap_isolation(void)
     }
     *(uint32_t *)wait_mapping = 0;
 
+    if (atomic_load_explicit(&test.done, memory_order_acquire) != 0) {
+        failure = "x86-futex2-shared-remap-isolation-timeout-before-wake";
+        failure_errno = ETIME;
+        goto cleanup;
+    }
     errno = 0;
     long wake_count = raw_futex2_wake(wait_mapping, 1, 1,
                                       THEKERNEL_FUTEX2_SHARED_FLAGS);
@@ -2052,6 +2059,12 @@ static int test_x86_futex2_shared_remap_isolation(void)
         goto cleanup;
     }
     waiter_joined = 1;
+    int64_t end = monotonic_ns();
+    if (end < 0 || end - test.started_ns < X86_FUTEX2_SHARED_WAIT_NS - 50000000LL) {
+        failure = "x86-futex2-shared-remap-isolation-timeout-elapsed";
+        failure_errno = ETIME;
+        goto cleanup;
+    }
     if (test.result != -1 || test.error != ETIMEDOUT) {
         failure = "x86-futex2-shared-remap-isolation-result";
         failure_errno = test.error != 0 ? test.error : EIO;

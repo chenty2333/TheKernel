@@ -508,6 +508,8 @@ static int run_shared_remap_case(size_t page_size, int original_fd,
     struct waiter entry;
     int waiter_started = 0;
     int waiter_joined = 0;
+    struct timespec start;
+    struct timespec end;
     const struct timespec timeout = {.tv_sec = 0, .tv_nsec = WAIT_TIMEOUT_NS};
     const char *failure = NULL;
     int failure_errno = 0;
@@ -528,6 +530,11 @@ static int run_shared_remap_case(size_t page_size, int original_fd,
         goto cleanup;
     }
     *(uint32_t *)wait_mapping = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        failure = "shared-remap-timeout-clock-start";
+        failure_errno = errno;
+        goto cleanup;
+    }
     if (start_waiter_with_timeout(&entry, wait_mapping, FUTEX_WAIT, 0, 0,
                                   &timeout)) {
         failure = "shared-remap-create";
@@ -555,6 +562,12 @@ static int run_shared_remap_case(size_t page_size, int original_fd,
         goto cleanup;
     }
     *(uint32_t *)wait_mapping = 0;
+    if (expected_wake == 0 &&
+        atomic_load_explicit(&entry.done, memory_order_acquire) != 0) {
+        failure = "shared-remap-timeout-before-remap";
+        failure_errno = ETIME;
+        goto cleanup;
+    }
     errno = 0;
     long wake_count = sys_futex(wait_mapping, FUTEX_WAKE, 1, NULL, NULL, 0);
     if (wake_count != expected_wake) {
@@ -568,6 +581,19 @@ static int run_shared_remap_case(size_t page_size, int original_fd,
         goto cleanup;
     }
     waiter_joined = 1;
+    if (expected_wake == 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+            failure = "shared-remap-timeout-clock-end";
+            failure_errno = errno;
+            goto cleanup;
+        }
+        long spent = elapsed_ms(&start, &end);
+        if (spent < WAIT_TIMEOUT_MIN_MS || spent > WAIT_TIMEOUT_MAX_MS) {
+            failure = "shared-remap-timeout-elapsed";
+            failure_errno = ETIME;
+            goto cleanup;
+        }
+    }
     if (expected_wake != 0) {
         if (entry.result != 0) {
             failure = "shared-remap-same-file-result";
