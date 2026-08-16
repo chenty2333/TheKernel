@@ -546,6 +546,40 @@ pub struct UserIoPinSegment {
     pub len: usize,
 }
 
+/// Provenance of the pages covered by a user-I/O pin.
+///
+/// This is an aggregate observation captured while the pin owns the address
+/// space's mapping snapshot.  `PrivateAnonymous` is reported only when every
+/// covered page came from an anonymous private COW backend; callers must not
+/// use it to bypass the pin owner or its lifetime.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum UserIoPinProvenance {
+    PrivateAnonymous,
+    #[default]
+    Ineligible,
+}
+
+fn user_io_pin_provenance_for_backend(backend: &Backend) -> UserIoPinProvenance {
+    if backend.is_private_anonymous() {
+        UserIoPinProvenance::PrivateAnonymous
+    } else {
+        UserIoPinProvenance::Ineligible
+    }
+}
+
+fn join_user_io_pin_provenance(
+    aggregate: Option<UserIoPinProvenance>,
+    page: UserIoPinProvenance,
+) -> Option<UserIoPinProvenance> {
+    Some(match (aggregate, page) {
+        (None, page) => page,
+        (Some(UserIoPinProvenance::PrivateAnonymous), UserIoPinProvenance::PrivateAnonymous) => {
+            UserIoPinProvenance::PrivateAnonymous
+        }
+        _ => UserIoPinProvenance::Ineligible,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct UserIoPinSegments {
     segments: Vec<UserIoPinSegment>,
@@ -705,6 +739,7 @@ struct UnpublishedUserIoPin {
     cow_frames: Vec<PhysAddr>,
     charged_pages: usize,
     frame_pages_admitted: usize,
+    provenance: Option<UserIoPinProvenance>,
 }
 
 impl UnpublishedUserIoPin {
@@ -724,6 +759,7 @@ impl UnpublishedUserIoPin {
             cow_frames: Vec::new(),
             charged_pages: page_count,
             frame_pages_admitted: 0,
+            provenance: None,
         };
         let frame_batches = page_count.div_ceil(USER_IO_PIN_SCAN_CHUNK_PAGES);
         if preparation
@@ -771,6 +807,17 @@ impl UnpublishedUserIoPin {
         &self.expectations
     }
 
+    fn observe_backend(&mut self, backend: &Backend) {
+        self.provenance = join_user_io_pin_provenance(
+            self.provenance,
+            user_io_pin_provenance_for_backend(backend),
+        );
+    }
+
+    fn provenance(&self) -> UserIoPinProvenance {
+        self.provenance.unwrap_or_default()
+    }
+
     fn finish(mut self, segments: UserIoPinSegments, token: PinToken) -> PreparedUserIoPin {
         self.reservation = None;
         let system_charge = self
@@ -786,6 +833,7 @@ impl UnpublishedUserIoPin {
         };
         PreparedUserIoPin {
             segments,
+            provenance: self.provenance(),
             frame_pins,
             page_cache_pins,
             range_pin,
@@ -809,6 +857,7 @@ impl Drop for UnpublishedUserIoPin {
 
 struct PreparedUserIoPin {
     segments: UserIoPinSegments,
+    provenance: UserIoPinProvenance,
     frame_pins: UserIoFramePins,
     page_cache_pins: UserIoPageCachePins,
     range_pin: UserIoRangePin,
@@ -1057,6 +1106,7 @@ fn prepare_user_io_pin_with_duration(
                         return None;
                     };
                     let backend = area.backend();
+                    preparation.observe_backend(backend);
                     if backend.supports_user_io_frame_pin() {
                         match backend {
                             Backend::Cow(_) => {
@@ -1374,6 +1424,7 @@ impl Drop for PinnedUserSegments {
 pub struct PinnedUserSegmentsMut {
     _ptr: *mut u8,
     segments: UserIoPinSegments,
+    provenance: UserIoPinProvenance,
     _frame_pins: UserIoFramePins,
     _page_cache_pins: UserIoPageCachePins,
     _range_pin: UserIoRangePin,
@@ -1383,6 +1434,11 @@ pub struct PinnedUserSegmentsMut {
 impl PinnedUserSegmentsMut {
     pub fn segments(&self) -> &[UserIoPinSegment] {
         self.segments.as_slice()
+    }
+
+    /// Returns the aggregate provenance captured by this pin's page scan.
+    pub fn provenance(&self) -> UserIoPinProvenance {
+        self.provenance
     }
 }
 
@@ -1577,16 +1633,101 @@ impl axio::IoBufMut for PinnedPhysicalWriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
     use axhal::paging::{MappingFlags, PageSize, PagingError};
     use axio::{IoBuf, IoBufMut};
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
     use super::{
-        FutexMappingNamespace, PinnedPhysicalCursor, PinnedPhysicalReader, PinnedPhysicalWriter,
-        USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments, UserNofaultError,
-        classify_nofault_page, classify_nofault_query, futex_mapping_namespace_matches,
-        physical_pin_segments_are_disjoint, user_io_pin_scan_chunk_end,
+        Backend, FutexMappingNamespace, PinnedPhysicalCursor, PinnedPhysicalReader,
+        PinnedPhysicalWriter, USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinProvenance, UserIoPinSegment,
+        UserIoPinSegments, UserNofaultError, classify_nofault_page, classify_nofault_query,
+        futex_mapping_namespace_matches, join_user_io_pin_provenance,
+        physical_pin_segments_are_disjoint, user_io_pin_provenance_for_backend,
+        user_io_pin_scan_chunk_end,
     };
+    use crate::mm::SharedPages;
+
+    #[test]
+    fn user_io_pin_provenance_is_private_only_for_anonymous_cow() {
+        let anonymous = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K);
+        assert_eq!(
+            user_io_pin_provenance_for_backend(&anonymous),
+            UserIoPinProvenance::PrivateAnonymous
+        );
+
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "pin-provenance-file-cow",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file_private = Backend::new_cow(
+            VirtAddr::from(0x8000),
+            PageSize::Size4K,
+            location,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(
+            user_io_pin_provenance_for_backend(&file_private),
+            UserIoPinProvenance::Ineligible
+        );
+    }
+
+    #[test]
+    fn user_io_pin_provenance_rejects_other_and_mixed_backends() {
+        let shared = Backend::new_shared(
+            VirtAddr::from(0x4000),
+            Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap()),
+        );
+        let linear = Backend::new_linear(
+            VirtAddr::from(0x8000),
+            memory_addr::PhysAddr::from(0x10_000),
+            PAGE_SIZE_4K,
+        );
+        assert_eq!(
+            user_io_pin_provenance_for_backend(&shared),
+            UserIoPinProvenance::Ineligible
+        );
+        assert_eq!(
+            user_io_pin_provenance_for_backend(&linear),
+            UserIoPinProvenance::Ineligible
+        );
+        assert_eq!(
+            join_user_io_pin_provenance(
+                join_user_io_pin_provenance(None, UserIoPinProvenance::PrivateAnonymous),
+                UserIoPinProvenance::PrivateAnonymous,
+            ),
+            Some(UserIoPinProvenance::PrivateAnonymous)
+        );
+        assert_eq!(
+            join_user_io_pin_provenance(
+                Some(UserIoPinProvenance::PrivateAnonymous),
+                UserIoPinProvenance::Ineligible,
+            ),
+            Some(UserIoPinProvenance::Ineligible)
+        );
+    }
+
+    #[test]
+    fn user_io_pin_provenance_defaults_conservatively() {
+        assert_eq!(
+            UserIoPinProvenance::default(),
+            UserIoPinProvenance::Ineligible
+        );
+        assert_eq!(
+            join_user_io_pin_provenance(None, UserIoPinProvenance::Ineligible),
+            Some(UserIoPinProvenance::Ineligible)
+        );
+    }
 
     #[test]
     fn user_io_pin_scan_windows_never_exceed_the_page_bound() {
@@ -1809,6 +1950,7 @@ pub fn try_pin_user_segments_to_user_with(
     Some(PinnedUserSegmentsMut {
         _ptr: ptr,
         segments: prepared.segments,
+        provenance: prepared.provenance,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
         _range_pin: prepared.range_pin,
@@ -1840,6 +1982,7 @@ pub fn try_pin_user_segments_to_user_longterm_with(
     Some(PinnedUserSegmentsMut {
         _ptr: ptr,
         segments: prepared.segments,
+        provenance: prepared.provenance,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
         _range_pin: prepared.range_pin,
