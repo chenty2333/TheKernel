@@ -63,7 +63,7 @@ struct WaiterInterest<'a>(&'a AtomicUsize);
 impl<'a> WaiterInterest<'a> {
     fn new(waiters: &'a AtomicUsize) -> Self {
         waiters
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_add(1)
             })
             .expect("mutex waiter count overflow");
@@ -116,12 +116,16 @@ unsafe impl lock_api::RawMutex for RawMutex {
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);
 
         loop {
-            assert_ne!(
-                owner_id,
-                current_id,
-                "{} tried to acquire mutex it already owns.",
-                current().id_name()
-            );
+            if owner_id == current_id {
+                let task = current();
+                match task.id_name() {
+                    Ok(name) => panic!("{name} tried to acquire mutex it already owns."),
+                    Err(error) => panic!(
+                        "Task({current_id}) (name unavailable: {error}) tried to acquire mutex it \
+                         already owns."
+                    ),
+                }
+            }
 
             if owner_id == 0 {
                 match self.owner_id.compare_exchange_weak(
@@ -136,11 +140,18 @@ unsafe impl lock_api::RawMutex for RawMutex {
                 continue;
             }
 
-            assert!(
-                can_block_current(),
-                "{} attempted to wait on a sleeping mutex from a non-blockable context",
-                current().id_name()
-            );
+            if !can_block_current() {
+                let task = current();
+                match task.id_name() {
+                    Ok(name) => panic!(
+                        "{name} attempted to wait on a sleeping mutex from a non-blockable context"
+                    ),
+                    Err(error) => panic!(
+                        "Task({current_id}) (name unavailable: {error}) attempted to wait on a \
+                         sleeping mutex from a non-blockable context"
+                    ),
+                }
+            }
 
             if spin.spin() {
                 owner_id = self.owner_id.load(Ordering::Relaxed);
@@ -161,7 +172,15 @@ unsafe impl lock_api::RawMutex for RawMutex {
             }
 
             block_on(listener).unwrap_or_else(|error| {
-                panic!("sleeping mutex wait failed for {}: {error}", current().id_name())
+                let task = current();
+                match task.id_name() {
+                    Ok(name) => panic!("sleeping mutex wait failed for {name}: {error}"),
+                    Err(name_error) => panic!(
+                        "sleeping mutex wait failed for Task({}) (name unavailable: \
+                         {name_error}): {error}",
+                        task.id().as_u64()
+                    ),
+                }
             });
             owner_id = self.owner_id.load(Ordering::Acquire);
         }
@@ -180,12 +199,17 @@ unsafe impl lock_api::RawMutex for RawMutex {
     #[inline(always)]
     unsafe fn unlock(&self) {
         let owner_id = self.owner_id.swap(0, Ordering::SeqCst);
-        assert_eq!(
-            owner_id,
-            current().id().as_u64(),
-            "{} tried to release mutex it doesn't own",
-            current().id_name()
-        );
+        let task = current();
+        let current_id = task.id().as_u64();
+        if owner_id != current_id {
+            match task.id_name() {
+                Ok(name) => panic!("{name} tried to release mutex it doesn't own"),
+                Err(error) => panic!(
+                    "Task({current_id}) (name unavailable: {error}) tried to release mutex it \
+                     doesn't own"
+                ),
+            }
+        }
 
         // A waiter publishes this count only after Event initialization and
         // listener registration. The SeqCst ordering with the slow-path owner

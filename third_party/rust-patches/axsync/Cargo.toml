@@ -35,7 +35,8 @@ name = "axsync"
 path = "src/lib.rs"
 
 [dependencies.axtask]
-version = "=0.3.0-preview.2"
+package = "thekernel-axtask"
+version = "=0.1.0"
 
 [dependencies.event-listener]
 version = "5.4.0"
@@ -49,7 +50,8 @@ version = "0.4"
 default-features = false
 
 [dev-dependencies.axtask]
-version = "=0.3.0-preview.2"
+package = "thekernel-axtask"
+version = "=0.1.0"
 features = ["test"]
 
 [dev-dependencies.fastrand]
