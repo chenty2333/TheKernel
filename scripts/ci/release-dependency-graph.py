@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 
-LEGACY_PACKAGES = frozenset({"axpoll", "axsched", "starry-process"})
+LEGACY_PACKAGES = frozenset({"axtask", "axpoll", "axsched"})
 
 
 def fail(message: str) -> NoReturn:
@@ -85,7 +85,6 @@ def main() -> None:
     parser.add_argument(
         "--release-source-root", action="append", default=[], type=Path
     )
-    parser.add_argument("--allowed-axtask-facade", required=True, type=Path)
     parser.add_argument("--allowed-process-adapter", required=True, type=Path)
     args = parser.parse_args()
 
@@ -112,13 +111,10 @@ def main() -> None:
 
     reachable = reachable_package_ids(metadata)
     consumer_root = args.consumer_root.resolve()
-    facade_root = args.allowed_axtask_facade.resolve()
     process_adapter_root = args.allowed_process_adapter.resolve()
     release_source_roots = [path.resolve() for path in args.release_source_root]
     if not consumer_root.is_dir():
         fail("consumer root does not exist")
-    if not facade_root.is_dir():
-        fail("allowed axtask facade directory does not exist")
     if not process_adapter_root.is_dir():
         fail("allowed process adapter directory does not exist")
     if any(not path.is_dir() for path in release_source_roots):
@@ -127,7 +123,6 @@ def main() -> None:
         consumer_root / "third_party/rust-patches/axpoll",
         consumer_root / "third_party/rust-patches/axsched",
         consumer_root / "third_party/rust-patches/axtask",
-        consumer_root / "third_party/rust-patches/starry-process",
     )
 
     errors: list[str] = []
@@ -140,26 +135,6 @@ def main() -> None:
                 f"legacy package {name} resolved from "
                 f"{'a non-local source' if source is not None else root.as_posix()}"
             )
-        if name == "axtask" and (source is not None or root != facade_root):
-            errors.append(
-                "legacy axtask resolved instead of the one-state compatibility "
-                f"facade: {'non-local source' if source is not None else root.as_posix()}"
-            )
-        elif name == "axtask":
-            dependencies = package.get("dependencies", [])
-            core_dependencies = [
-                dependency
-                for dependency in dependencies
-                if isinstance(dependency, dict)
-                and dependency.get("name") == "thekernel-axtask"
-                and dependency.get("rename") == "axtask-core"
-                and dependency.get("req") == "=0.1.0"
-            ]
-            if package.get("publish") != [] or len(core_dependencies) != 1:
-                errors.append(
-                    "local axtask facade is publishable or does not re-export "
-                    "the exact thekernel-axtask 0.1.0 package"
-                )
         if any(is_within(root, legacy_root) for legacy_root in legacy_vendor_roots):
             errors.append(f"legacy vendored package is reachable: {root}")
         for source_root in release_source_roots:

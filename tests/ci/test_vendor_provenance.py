@@ -292,7 +292,7 @@ class VendorProvenanceTests(unittest.TestCase):
             selected.errors,
         )
 
-    def test_maintained_sibling_and_local_adapter_are_classified_separately(self) -> None:
+    def test_maintained_sibling_is_classified_directly(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         fixture = Fixture(Path(temporary.name) / "consumer")
@@ -306,25 +306,22 @@ class VendorProvenanceTests(unittest.TestCase):
             '[package]\nname = "thekernel-axtask"\nversion = "0.1.0"\n',
             encoding="utf-8",
         )
-        adapter = fixture.root / "crates/axtask-compat/Cargo.toml"
-        adapter.parent.mkdir(parents=True)
-        adapter.write_text(
-            '[package]\nname = "axtask"\nversion = "0.3.0-preview.2"\n'
-            'publish = false\n',
+        (fixture.root / "Cargo.toml").write_text(
+            '[workspace]\n'
+            '[workspace.dependencies]\n'
+            'axtask = { package = "thekernel-axtask", version = "=0.1.0" }\n'
+            '[patch.crates-io]\n'
+            'foo = { path = "vendor/foo" }\n'
+            'thekernel-axtask = { path = '
+            '"../thekernel-ax/crates/thekernel-axtask" }\n',
             encoding="utf-8",
         )
-        with (fixture.root / "Cargo.toml").open("a", encoding="utf-8") as manifest:
-            manifest.write(
-                'thekernel-axtask = { path = '
-                '"../thekernel-ax/crates/thekernel-axtask" }\n'
-            )
-            manifest.write('axtask = { path = "crates/axtask-compat" }\n')
 
         result = validator.validate_repository(fixture.root, archive_policy="skip")
         self.assertEqual(result.errors, ())
         self.assertEqual(result.package_checks, 1)
         self.assertEqual(result.maintained_checks, 1)
-        self.assertEqual(result.adapter_checks, 1)
+        self.assertEqual(result.adapter_checks, 0)
 
     def test_maintained_sibling_exemption_requires_the_exact_path(self) -> None:
         temporary, fixture = self.make_fixture()
@@ -790,8 +787,11 @@ class VendorProvenanceTests(unittest.TestCase):
             linux_abi_repo=(Path(linux_abi_repo) if linux_abi_repo else None),
         )
         self.assertEqual(result.errors, ())
-        self.assertEqual(result.package_checks, 28)
-        self.assertEqual(result.maintained_checks, 15)
+        # The x86_64-only inventory contains 24 active vendored packages:
+        # the retired LoongArch/RISC-V platforms and migrated starry process,
+        # signal, and VM crates are gone, while axplat-x86-pc is now local.
+        self.assertEqual(result.package_checks, 24)
+        self.assertEqual(result.maintained_checks, 18)
 
 
 if __name__ == "__main__":

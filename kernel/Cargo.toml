@@ -19,7 +19,7 @@ dev-log = []
 input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 mm-lock-diagnostics = []
-pmu-diagnostics = ["dep:axpmu", "axpmu/riscv-sbi"]
+pmu-diagnostics = ["dep:axpmu"]
 test-io-control = ["axfs/test-io-control"]
 vsock = ["axfeat/vsock"]
 smp-tlb-shootdown = ["axruntime/ipi"]
@@ -72,7 +72,10 @@ thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true
 thekernel-linux-mm.workspace = true
 thekernel-linux-packet.workspace = true
+thekernel-linux-rseq.workspace = true
 thekernel-linux-seccomp.workspace = true
+thekernel-linux-signal.workspace = true
+thekernel-linux-usercopy = { workspace = true, features = ["alloc"] }
 axtlb.workspace = true
 bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
@@ -118,9 +121,7 @@ ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 scope-local = "0.1"
 slab = { version = "0.4.9", default-features = false }
 spin = "0.10"
-starry-process.workspace = true
-starry-signal = "0.3"
-starry-vm = "0.3"
+thekernel-linux-process-adapter.workspace = true
 strum = { version = "0.28", default-features = false, features = ["derive"] }
 syscalls = { version = "0.8", default-features = false }
 
@@ -129,23 +130,12 @@ weak-map = "0.1.1"
 xmas-elf = "0.9"
 zerocopy = { version = "0.8", features = ["derive"] }
 
-# Kernel targets use the sleepable signal action/registry mutex. Host unit
-# tests cannot initialize an ArceOS scheduler safely because task-context
-# construction reads privileged page-table state, so they explicitly override
-# starry-signal's `action_update` lock with its spin-backed host implementation.
+# Kernel targets use the sleepable signal action/registry mutex.
 [target.'cfg(target_os = "none")'.dependencies]
-starry-signal = { version = "0.3", features = ["multitask"] }
-
-[target.'cfg(not(target_os = "none"))'.dependencies]
-starry-signal = { version = "0.3", features = ["spin-action-update"] }
+thekernel-linux-signal = { workspace = true, features = ["multitask"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86 = "0.52"
-
-[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
-riscv = "0.16"
-
-[target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 page_table_multiarch = { version = "0.6", features = ["copy-from"] }
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]

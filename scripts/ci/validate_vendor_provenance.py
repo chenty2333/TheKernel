@@ -37,6 +37,9 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
     "thekernel-linux-fd": ("../thekernel-linux-abi/crates/fd", "0.1.0"),
     "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
+    "thekernel-linux-rseq": ("../thekernel-linux-abi/crates/rseq", "0.1.0"),
+    "thekernel-linux-signal": ("../thekernel-linux-abi/crates/signal", "0.1.0"),
+    "thekernel-linux-usercopy": ("../thekernel-linux-abi/crates/usercopy", "0.1.0"),
     "thekernel-linux-cred": ("../thekernel-linux-abi/crates/cred", "0.1.0"),
     "thekernel-linux-mm": ("../thekernel-linux-abi/crates/mm", "0.1.0"),
     "thekernel-linux-packet": ("../thekernel-linux-abi/crates/packet", "0.1.0"),
@@ -54,6 +57,9 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-linux-vfs": ("linux-abi", Path("crates/vfs")),
     "thekernel-linux-fd": ("linux-abi", Path("crates/fd")),
     "thekernel-linux-process": ("linux-abi", Path("crates/process")),
+    "thekernel-linux-rseq": ("linux-abi", Path("crates/rseq")),
+    "thekernel-linux-signal": ("linux-abi", Path("crates/signal")),
+    "thekernel-linux-usercopy": ("linux-abi", Path("crates/usercopy")),
     "thekernel-linux-cred": ("linux-abi", Path("crates/cred")),
     "thekernel-linux-mm": ("linux-abi", Path("crates/mm")),
     "thekernel-linux-packet": ("linux-abi", Path("crates/packet")),
@@ -64,6 +70,7 @@ MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "axcbpf": ("thekernel-axcbpf", "=0.1.0"),
     "axfault": ("thekernel-axfault", "=0.1.0"),
     "axpmu": ("thekernel-axpmu", "=0.1.0"),
+    "axtask": ("thekernel-axtask", "=0.1.0"),
     "axtlb": ("thekernel-axtlb", "=0.1.0"),
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
@@ -71,6 +78,9 @@ MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "thekernel-linux-packet": ("thekernel-linux-packet", "=0.1.0"),
     "thekernel-linux-io-uring": ("thekernel-linux-io-uring", "=0.1.0"),
     "thekernel-linux-seccomp": ("thekernel-linux-seccomp", "=0.1.0"),
+    "thekernel-linux-rseq": ("thekernel-linux-rseq", "=0.1.0"),
+    "thekernel-linux-signal": ("thekernel-linux-signal", "=0.1.0"),
+    "thekernel-linux-usercopy": ("thekernel-linux-usercopy", "=0.1.0"),
 }
 MAINTAINED_SIBLING_LIB_NAMES = {
     "thekernel-axcbpf": "axcbpf",
@@ -79,17 +89,12 @@ MAINTAINED_SIBLING_LIB_NAMES = {
     "thekernel-axtlb": "axtlb",
 }
 LOCAL_ADAPTER_PATCHES = {
-    "axtask": ("crates/axtask-compat", "0.3.0-preview.2"),
     "thekernel-readiness-adapter": ("crates/readiness-adapter", "0.1.0"),
 }
 
-# The active `axtask` patch is now a local facade, while the former crates.io
-# source remains intentionally retained for historical baseline auditing.
-# No other maintained sibling or adapter may acquire a provenance record merely
-# to bypass its exact non-vendor classification.
-RETAINED_NON_VENDOR_BASELINES = {
-    "axtask": "third_party/rust-patches/axtask",
-}
+# No maintained sibling or local adapter may acquire a provenance record merely
+# to bypass its exact non-vendor classification.  Inactive historical records
+# are still audited as ordinary vendored packages.
 
 
 @dataclass(frozen=True)
@@ -533,12 +538,9 @@ def validate_repository(
         maintained_patches.keys() | adapter_patches.keys()
     ) & records.keys()
     for patch_name in sorted(non_vendor_records):
-        recorded_path = records[patch_name].get("path")
-        allowed_path = RETAINED_NON_VENDOR_BASELINES.get(patch_name)
-        if recorded_path != allowed_path:
-            errors.append(
-                f"{patch_name}: non-vendor patch has an unexpected provenance record"
-            )
+        errors.append(
+            f"{patch_name}: non-vendor patch has an unexpected provenance record"
+        )
     missing = vendored_patches.keys() - records.keys()
     if missing:
         errors.append(f"missing provenance records: {', '.join(sorted(missing))}")

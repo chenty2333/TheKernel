@@ -19,10 +19,8 @@ license status, and maintained differences.
 ## Development toolchains
 
 `dev-env/versions.env` and `dev-env/Dockerfile` pin the development image,
-QEMU source release, Rust toolchain, and LoongArch cross-toolchain archive by
-version and checksum. These are external build tools, not source incorporated
-into TheKernel. Their upstream names and URLs are retained as provenance even
-when they contain terminology unrelated to the product workflow.
+QEMU source release, and Rust toolchain by version and checksum. These are
+external build tools, not source incorporated into TheKernel.
 
 ## Generated test root filesystem
 

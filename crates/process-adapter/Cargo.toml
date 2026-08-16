@@ -10,7 +10,7 @@ license = "Apache-2.0"
 workspace = true
 
 [lib]
-name = "starry_process"
+name = "thekernel_linux_process_adapter"
 path = "src/lib.rs"
 
 [dependencies]

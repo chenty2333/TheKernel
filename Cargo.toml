@@ -2,10 +2,6 @@
 resolver = "2"
 members = [
     "kernel",
-    "crates/axplat-bcm2837-zero2w",
-    "crates/axtask-compat",
-    "crates/bcm283x-hvs",
-    "crates/bcm283x-v3d",
     "crates/process-adapter",
     "crates/readiness-adapter",
 ]
@@ -21,9 +17,9 @@ exclude = ["arceos"]
 # codebase, not merely that it is inconvenient.
 [workspace.lints.rust]
 # `dead_code` answers a different question in every build configuration: a
-# symbol unreachable in the riscv64 `qemu` profile is frequently live under
-# `smp`, `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. The
-# host/RISC-V/LoongArch gates still do not span the full feature power set, so
+# symbol unreachable in the qemu profile is frequently live under `smp`,
+# `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. The host
+# gate still does not span the full feature power set, so
 # they cannot classify reachability truthfully. Keep this rustc lint outside
 # the zero-owned-Clippy-diagnostic contract; feature-local cleanup must use a
 # narrow `cfg` or a separately reviewed allowance rather than inferred removal.
@@ -38,8 +34,8 @@ dead_code = "allow"
 # correctness regression rather than a cleanup.
 drop_non_drop = "allow"
 
-# RFC 0000's public-API freeze gate requires callers to pass immutable
-# snapshots, capabilities, and operation context explicitly instead of reading
+# Public component contracts require callers to pass immutable snapshots,
+# capabilities, and operation context explicitly instead of reading
 # implicit kernel globals such as the current task or the global FD table.
 # Wide signatures are the intended consequence of that rule; collapsing them
 # into context structs purely to satisfy an arity threshold would re-introduce
@@ -90,16 +86,15 @@ thekernel-linux-io-uring = { version = "=0.1.0", default-features = false }
 thekernel-linux-mm = { version = "=0.1.0", default-features = false }
 thekernel-linux-packet = { version = "=0.1.0", default-features = false }
 thekernel-linux-process = { version = "=0.1.0", default-features = false }
+thekernel-linux-rseq = { version = "=0.1.0", default-features = false }
 thekernel-linux-seccomp = { version = "=0.1.0", default-features = false }
+thekernel-linux-signal = { version = "=0.1.0", default-features = false }
+thekernel-linux-usercopy = { version = "=0.1.0", default-features = false }
 axtlb = { package = "thekernel-axtlb", version = "=0.1.0", default-features = false }
-starry-process = { package = "thekernel-linux-process-adapter", version = "=0.1.0", path = "crates/process-adapter" }
+thekernel-linux-process-adapter = { version = "=0.1.0", path = "crates/process-adapter" }
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
-# Raspberry Pi Zero 2W platform and VideoCore IV GPU drivers.
-axplat-bcm2837-zero2w = { path = "crates/axplat-bcm2837-zero2w", default-features = false }
-bcm283x-hvs = { path = "crates/bcm283x-hvs" }
-bcm283x-v3d = { path = "crates/bcm283x-v3d" }
 log = "0.4"
 rdif-base = { version = "0.8.3" }
 rdif-display = { version = "0.2.0" }
@@ -142,19 +137,6 @@ smp = [
     "axfeat/smp",
     "thekernel-kernel/smp-tlb-shootdown",
     "thekernel-kernel/irq-continuation-diagnostics",
-    "axplat-riscv64-visionfive2?/smp",
-]
-
-vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
-
-# Raspberry Pi Zero 2W (aarch64). The platform package exposes the legacy
-# `axplat` interface; the GPU driver crates plug in through axdriver/axdisplay
-# once aarch64 support lands in TheKernel's axhal.
-zero2w = [
-    "dep:axplat-bcm2837-zero2w",
-    "axplat-bcm2837-zero2w/legacy",
-    "bcm283x-hvs",
-    "bcm283x-v3d",
 ]
 
 [[bin]]
@@ -166,29 +148,9 @@ required-features = ["qemu"]
 axfeat.workspace = true
 thekernel-kernel.workspace = true
 
-[dependencies.axplat-riscv64-visionfive2]
-version = "0.1.0-pre.1"
-features = ["fp-simd", "irq", "rtc"]
-optional = true
-
-[dependencies.axplat-bcm2837-zero2w]
-workspace = true
-default-features = false
-optional = true
-
-[dependencies.bcm283x-hvs]
-workspace = true
-optional = true
-
-[dependencies.bcm283x-v3d]
-workspace = true
-optional = true
-
 [package.metadata.vendor-filter]
 platforms = [
-    "aarch64-unknown-none-softfloat",
-    "riscv64gc-unknown-none-elf",
-    "loongarch64-unknown-none",
+    "x86_64-unknown-none",
 ]
 all-features = true
 
@@ -203,16 +165,12 @@ axdriver_block = { path = "third_party/rust-patches/axdriver_block" }
 axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
 axio = { path = "third_party/rust-patches/axio" }
 axcpu = { path = "third_party/rust-patches/axcpu" }
+axplat-x86-pc = { path = "third_party/rust-patches/axplat-x86-pc" }
 axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
 axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
-starry-vm = { path = "third_party/rust-patches/starry-vm" }
 scope-local = { path = "third_party/rust-patches/scope-local" }
-starry-signal = { path = "third_party/rust-patches/starry-signal" }
-axtask = { path = "crates/axtask-compat" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
 axsync = { path = "third_party/rust-patches/axsync" }
-axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongarch64-qemu-virt" }
-axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qemu-virt" }
 thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
 thekernel-axcbpf = { path = "../thekernel-ax/crates/thekernel-axcbpf" }
@@ -227,7 +185,10 @@ thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
 thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
 thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
 thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process" }
+thekernel-linux-rseq = { path = "../thekernel-linux-abi/crates/rseq" }
 thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp" }
+thekernel-linux-signal = { path = "../thekernel-linux-abi/crates/signal" }
+thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
 thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
