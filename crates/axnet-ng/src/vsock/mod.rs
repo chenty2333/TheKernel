@@ -72,6 +72,12 @@ impl Pollable for VsockTransport {
 }
 
 impl VsockTransport {
+    fn recv_pending_len(&self) -> AxResult<usize> {
+        match self {
+            Self::Stream(stream) => stream.recv_pending_len(),
+        }
+    }
+
     fn retry_transfer<T>(
         &self,
         direction: crate::SocketTransferDirection,
@@ -119,6 +125,10 @@ impl VsockSocket {
 
     pub fn set_filter(&self, _filter: Option<Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
         Err(AxError::Unsupported)
+    }
+
+    pub(crate) fn recv_pending_len(&self) -> AxResult<usize> {
+        self.transport.recv_pending_len()
     }
 
     pub fn prepare_accept(&self) -> AxResult<VsockSocketAcceptReservation> {

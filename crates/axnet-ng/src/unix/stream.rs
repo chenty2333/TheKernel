@@ -140,7 +140,7 @@ impl Channel {
 
     fn take_peer_reset(&self) -> bool {
         self.peer_close
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & STREAM_RESET_OCCURRED != 0 && state & STREAM_RESET_OBSERVED == 0)
                     .then_some(state | STREAM_RESET_OBSERVED)
             })
@@ -419,7 +419,7 @@ struct StreamCleanupAdmission;
 impl StreamCleanupAdmission {
     fn try_acquire() -> AxResult<Self> {
         STREAM_CLEANUP_ADMISSIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < UNIX_STREAM_CLEANUP_SLOTS).then_some(current + 1)
             })
             .map_err(|_| AxError::NoMemory)?;
@@ -587,6 +587,18 @@ impl StreamTransport {
 
     pub fn is_connected(&self) -> bool {
         self.connect_state.load(Ordering::Acquire) == CONNECT_CONNECTED
+    }
+
+    /// Returns the number of stream bytes currently available to receive.
+    ///
+    /// This is a non-consuming snapshot of the receive ring. The channel lock
+    /// is released before the caller can perform any userspace copyout.
+    pub(super) fn recv_pending_len(&self) -> AxResult<usize> {
+        let channel = self.channel.lock();
+        Ok(channel
+            .as_ref()
+            .and_then(|channel| channel.rx.as_ref())
+            .map_or(0, |rx| rx.occupied_len()))
     }
 
     #[cfg(test)]
@@ -1342,6 +1354,44 @@ mod tests {
             0
         );
 
+        drop(right);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
+
+    #[test]
+    fn recv_pending_len_is_a_non_consuming_stream_snapshot() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
+        assert_eq!(right.recv_pending_len().unwrap(), 0);
+        assert_eq!(
+            left.send(&b"stream-data"[..], SendOptions::default()),
+            Ok(11)
+        );
+        assert_eq!(right.recv_pending_len().unwrap(), 11);
+        assert_eq!(right.recv_pending_len().unwrap(), 11);
+
+        let mut bytes = [0u8; 11];
+        assert_eq!(
+            right.recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                },
+            ),
+            Ok(11)
+        );
+        assert_eq!(&bytes, b"stream-data");
+        assert_eq!(right.recv_pending_len().unwrap(), 0);
+
+        drop(left);
         drop(right);
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();

@@ -107,6 +107,13 @@ impl Pollable for Transport {
 }
 
 impl Transport {
+    fn recv_pending_len(&self) -> AxResult<usize> {
+        match self {
+            Self::Stream(stream) => stream.recv_pending_len(),
+            Self::Dgram(dgram) => dgram.recv_pending_len(),
+        }
+    }
+
     fn retry_transfer<T>(
         &self,
         direction: crate::SocketTransferDirection,
@@ -333,7 +340,7 @@ struct EndpointCleanupAdmission;
 impl EndpointCleanupAdmission {
     fn try_acquire() -> AxResult<Self> {
         ENDPOINT_CLEANUP_ADMISSIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < UNIX_ENDPOINT_CLEANUP_SLOTS).then_some(current + 1)
             })
             .map_err(|_| AxError::NoMemory)?;
@@ -939,6 +946,10 @@ impl UnixSocket {
     /// Reports whether this socket preserves datagram message boundaries.
     pub fn is_datagram(&self) -> bool {
         matches!(&self.transport, Transport::Dgram(_))
+    }
+
+    pub(crate) fn recv_pending_len(&self) -> AxResult<usize> {
+        self.transport.recv_pending_len()
     }
 
     pub(crate) fn set_pending_error(&self, error: LinuxError) {

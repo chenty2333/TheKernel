@@ -305,6 +305,20 @@ impl<T> Receiver<T> {
         self.shared.state.lock().items.is_empty()
     }
 
+    /// Inspects the queue head without reserving or removing it.
+    ///
+    /// A receive reservation makes the head temporarily unavailable to a
+    /// second reader, so report no head while that reservation is active.
+    /// Callers must keep the closure side-effect-free: it runs under the
+    /// queue's bounded, non-sleeping state lock.
+    pub(super) fn with_front<R>(&self, inspect: impl FnOnce(&T) -> R) -> Option<R> {
+        let state = self.shared.state.lock();
+        if state.receive_reserved {
+            return None;
+        }
+        state.items.front().map(inspect)
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.shared.state.lock().items.len()

@@ -82,7 +82,7 @@ struct DeferredCleanupAdmission;
 impl DeferredCleanupAdmission {
     fn try_acquire() -> AxResult<Self> {
         DEFERRED_CLEANUP_ADMISSIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < UNIX_DGRAM_CLEANUP_SLOTS).then_some(current + 1)
             })
             .map_err(|_| AxError::NoMemory)?;
@@ -848,6 +848,22 @@ impl DgramTransport {
         drop(retired_address);
         self.poll_state.wake();
     }
+
+    /// Returns the next queued datagram's payload length without consuming it.
+    ///
+    /// The queue-head inspection is performed under the queue's bounded
+    /// non-sleeping state lock and the transport lock is released before any
+    /// caller can perform userspace copyout.
+    pub(super) fn recv_pending_len(&self) -> AxResult<usize> {
+        if self.rx_shutdown.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        let guard = self.data_rx.lock();
+        Ok(guard
+            .receiver()
+            .and_then(|receiver| receiver.with_front(|packet| packet.data.len()))
+            .unwrap_or(0))
+    }
 }
 
 impl Configurable for DgramTransport {
@@ -1361,6 +1377,57 @@ mod tests {
         right.shutdown(Shutdown::Read).unwrap();
         assert!(right.rx_shutdown.load(Ordering::Acquire));
         assert!(right.poll().contains(IoEvents::READ_HANGUP));
+    }
+
+    #[test]
+    fn recv_pending_len_reports_only_the_next_datagram_without_consuming() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        drain_all_deferred_cleanup();
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = DgramTransport::new_pair(credentials).unwrap();
+        assert_eq!(right.recv_pending_len().unwrap(), 0);
+        assert_eq!(left.send(&b"first"[..], SendOptions::default()), Ok(5));
+        assert_eq!(
+            left.send(&b"second-packet"[..], SendOptions::default()),
+            Ok(13)
+        );
+
+        // FIONREAD/TIOCINQ on a datagram socket reports the first complete
+        // payload, not the aggregate number of bytes queued.
+        assert_eq!(right.recv_pending_len().unwrap(), 5);
+        assert_eq!(right.recv_pending_len().unwrap(), 5);
+
+        let mut bytes = [0u8; 32];
+        assert_eq!(
+            right.recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                },
+            ),
+            Ok(5)
+        );
+        assert_eq!(&bytes[..5], b"first");
+        assert_eq!(right.recv_pending_len().unwrap(), 13);
+
+        assert_eq!(
+            right.recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                },
+            ),
+            Ok(13)
+        );
+        assert_eq!(&bytes[..13], b"second-packet");
+        assert_eq!(right.recv_pending_len().unwrap(), 0);
+
+        drop(left);
+        drop(right);
+        drain_all_deferred_cleanup();
     }
 
     struct DropProbe(Arc<AtomicUsize>);

@@ -1136,7 +1136,7 @@ impl PacketBroker {
             if previous == 1 {
                 if self
                     .subscription_epoch
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                         epoch.checked_add(1)
                     })
                     .is_err()
@@ -1171,7 +1171,7 @@ impl PacketBroker {
     fn record_unattributed_drop(&self) {
         let _ =
             self.unattributed_drops
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_add(1))
                 });
     }
@@ -1255,7 +1255,7 @@ impl PacketBroker {
         let sequence =
             match self
                 .next_sequence
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_add(1)
                 }) {
                 Ok(sequence) => sequence,

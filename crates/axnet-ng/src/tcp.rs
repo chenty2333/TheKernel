@@ -123,6 +123,12 @@ impl TcpSocket {
         self.general.set_pending_error(error);
     }
 
+    /// Returns the currently queued TCP receive bytes without consuming them.
+    pub(crate) fn recv_pending_len(&self) -> AxResult<usize> {
+        self.stack.poll_interfaces();
+        Ok(self.with_smol_socket(|socket| socket.recv_queue()))
+    }
+
     pub(crate) fn retry_transfer<T>(
         &self,
         direction: crate::SocketTransferDirection,
@@ -360,9 +366,11 @@ impl TcpSocket {
                 .lock(State::Closed)
                 .map_err(|_| ax_err_type!(InvalidInput, "busy"))?,
             Err(State::Idle) => return Ok(()),
-            Err(State::Connecting) => ax_bail!(InvalidInput, "connect in progress"),
+            Err(State::Connecting) => {
+                ax_bail!(InvalidInput, "connect in progress");
+            }
             Err(State::Connected) | Err(State::Listening) | Err(State::Busy) => {
-                ax_bail!(InvalidInput, "busy")
+                ax_bail!(InvalidInput, "busy");
             }
         };
 
@@ -649,7 +657,9 @@ impl SocketOps for TcpSocket {
         }
         match self.state() {
             State::Idle | State::Connecting => return Err(AxError::NotConnected),
-            State::Listening => ax_bail!(InvalidInput, "not connected"),
+            State::Listening => {
+                ax_bail!(InvalidInput, "not connected");
+            }
             State::Connected | State::Closed | State::Busy => {}
         }
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());

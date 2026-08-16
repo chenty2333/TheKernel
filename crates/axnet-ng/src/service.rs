@@ -10,7 +10,7 @@ use axhal::time::{NANOS_PER_MICROS, TimeValue, wall_time_nanos};
 use axpoll::PollRegistrationError;
 use axtask::future::{TimerRegistrationError, sleep_until};
 use smoltcp::{
-    iface::{Interface, SocketSet},
+    iface::{Interface, PollIngressSingleResult, SocketSet},
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpListenEndpoint},
 };
@@ -18,7 +18,7 @@ use smoltcp::{
 use crate::{
     device::PacketSendProgress,
     packet::{PacketEndpoint, PacketSendRequest},
-    router::{Router, Rule},
+    router::{RX_PASS_BUDGET, Router, Rule},
     wrapper::SocketSetWrapper,
 };
 
@@ -37,6 +37,15 @@ pub struct Service {
     pub(crate) router: Router,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     timeout: Option<ServiceTimeout>,
+}
+
+/// Result of one bounded task-context network pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServicePoll {
+    /// No bounded source retained work for a subsequent pass.
+    Quiescent,
+    /// At least one bounded source retained work for a subsequent pass.
+    Continuation,
 }
 
 struct ServiceTimeout {
@@ -60,12 +69,45 @@ impl Service {
         })
     }
 
-    pub fn poll(&mut self, sockets: &mut SocketSet) -> bool {
+    /// Runs exactly one bounded network pass.
+    ///
+    /// Ingress is admitted by the router's fixed link-frame budget and then
+    /// consumed through smoltcp's single-packet ingress API.  Egress uses the
+    /// API's bounded `poll_egress` operation and a bounded router dispatch;
+    /// the unbounded `Interface::poll` entry point is intentionally not used.
+    pub fn poll(&mut self, sockets: &mut SocketSet) -> ServicePoll {
         let timestamp = now();
 
-        self.router.poll(timestamp);
-        self.iface.poll(timestamp, &mut self.router, sockets);
-        self.router.dispatch(timestamp)
+        let rx = self.router.poll(timestamp);
+        let mut ingress = 0;
+        while ingress < RX_PASS_BUDGET {
+            match self
+                .iface
+                .poll_ingress_single(timestamp, &mut self.router, sockets)
+            {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => ingress += 1,
+                PollIngressSingleResult::SocketStateChanged => {
+                    ingress += 1;
+                }
+            }
+        }
+
+        self.iface.poll_egress(timestamp, &mut self.router, sockets);
+        let tx = self.router.dispatch(timestamp);
+
+        if rx.is_continuation()
+            || tx.is_continuation()
+            || ingress == RX_PASS_BUDGET
+            // Ingress can stop while the router's TX queue is full.  The
+            // dispatch pass frees that queue, but must not make this pass
+            // quiescent while a packet remains in the software RX queue.
+            || self.router.has_rx_backlog()
+        {
+            ServicePoll::Continuation
+        } else {
+            ServicePoll::Quiescent
+        }
     }
 
     pub(crate) fn send_packet(
@@ -76,6 +118,22 @@ impl Service {
     ) -> AxResult<PacketSendProgress> {
         self.router
             .send_packet(interface_index, origin, request, now())
+    }
+
+    pub(crate) fn has_rx_backlog(&self) -> bool {
+        self.router.has_rx_backlog()
+    }
+
+    pub(crate) fn has_rx_wake_capable_device(&self) -> bool {
+        self.router.has_rx_wake_capable_device()
+    }
+
+    pub(crate) fn register_rx_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+        self.router.register_rx_waker(waker)
+    }
+
+    pub(crate) fn stop_rx_waker(&self) {
+        self.router.stop_rx_waker();
     }
 
     fn route_for(&self, dst_addr: &IpAddress) -> AxResult<&Rule> {
@@ -151,6 +209,7 @@ impl Service {
         &mut self,
         mask: u64,
         waker: &Waker,
+        rx_worker_active: bool,
     ) -> Result<(), PollRegistrationError> {
         let next = self.iface.poll_at(now(), &self.socket_set.inner.lock());
 
@@ -191,7 +250,9 @@ impl Service {
         }
 
         for (i, device) in self.router.devices.iter().enumerate() {
-            if i >= 64 || mask & (1u64 << i) != 0 {
+            if (i >= 64 || mask & (1u64 << i) != 0)
+                && !(rx_worker_active && device.rx_wake_capable())
+            {
                 device.register_waker(waker)?;
             }
         }
@@ -210,10 +271,76 @@ fn map_timer_registration_error(error: TimerRegistrationError) -> PollRegistrati
 
 #[cfg(test)]
 mod tests {
-    use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Cidr};
+    use core::task::Waker;
+
+    use smoltcp::{
+        phy::{Device as SmoltcpDevice, TxToken as SmoltcpTxToken},
+        storage::PacketBuffer,
+        wire::{IpAddress, Ipv4Address, Ipv4Cidr},
+    };
 
     use super::*;
-    use crate::{device::LoopbackDevice, listen_table::ListenTable};
+    use crate::{
+        consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
+        device::{Device, DeviceStats, InterfaceKind, LoopbackDevice, RxStep},
+        listen_table::ListenTable,
+        packet::PacketDeviceContext,
+    };
+
+    struct OnePacketDevice {
+        pending: bool,
+    }
+
+    impl Device for OnePacketDevice {
+        fn name(&self) -> &str {
+            "test0"
+        }
+
+        fn stats(&self) -> DeviceStats {
+            DeviceStats::default()
+        }
+
+        fn interface_kind(&self) -> InterfaceKind {
+            InterfaceKind::Loopback
+        }
+
+        fn mtu(&self) -> usize {
+            LOOPBACK_MTU
+        }
+
+        fn has_rx_backlog(&self) -> bool {
+            self.pending
+        }
+
+        fn recv(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            buffer: &mut PacketBuffer<()>,
+            _timestamp: Instant,
+        ) -> RxStep {
+            if !self.pending {
+                return RxStep::Idle;
+            }
+            self.pending = false;
+            let packet = buffer.enqueue(1, ()).unwrap();
+            packet[0] = 0;
+            RxStep::Delivered
+        }
+
+        fn send(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _next_hop: IpAddress,
+            _packet: &[u8],
+            _timestamp: Instant,
+        ) -> bool {
+            false
+        }
+
+        fn register_waker(&self, _waker: &Waker) -> Result<(), PollRegistrationError> {
+            Ok(())
+        }
+    }
 
     fn test_service() -> Service {
         let socket_set = Arc::new(SocketSetWrapper::new());
@@ -317,5 +444,29 @@ mod tests {
             .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::new(10, 255, 254, 253)))
             .unwrap_err();
         assert_eq!(err, AxError::from(LinuxError::EADDRNOTAVAIL));
+    }
+
+    #[test]
+    fn software_rx_backlog_continues_after_full_tx_queue_drains() {
+        let socket_set = Arc::new(SocketSetWrapper::new());
+        let listen_table = Arc::new(ListenTable::new());
+        let mut router = Router::new_loopback_only(listen_table);
+        router.add_device(Box::new(OnePacketDevice { pending: true }));
+        let mut service = Service::try_new(router, socket_set.clone()).unwrap();
+        assert!(!service.has_rx_wake_capable_device());
+
+        for _ in 0..PACKET_QUEUE_LEN {
+            SmoltcpDevice::transmit(&mut service.router, Instant::ZERO)
+                .unwrap()
+                .consume(1, |packet| packet[0] = 0);
+        }
+        assert!(service.has_rx_backlog());
+
+        let mut sockets = socket_set.inner.lock();
+        assert_eq!(service.poll(&mut sockets), ServicePoll::Continuation);
+        assert!(service.has_rx_backlog());
+
+        assert_eq!(service.poll(&mut sockets), ServicePoll::Quiescent);
+        assert!(!service.has_rx_backlog());
     }
 }

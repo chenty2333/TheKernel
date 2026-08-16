@@ -1,6 +1,8 @@
+#[cfg(target_os = "none")]
+use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, task::Wake, vec::Vec};
 use core::{
-    sync::atomic::{AtomicI32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     task::{Context, Waker},
 };
 
@@ -23,7 +25,7 @@ use crate::{
         PacketSelector, PacketSendRequest,
     },
     router::{RouteInfo, Router, Rule},
-    service::Service,
+    service::{Service, ServicePoll},
     unix::UnixNamespace,
     wrapper::{SocketSetWrapper, Transport},
 };
@@ -45,10 +47,71 @@ pub struct NetStack {
     pub(crate) service: Mutex<Service>,
     poll_source: Arc<PollSet>,
     poll_waker: Waker,
+    rx_worker: Option<Arc<NetRxWorker>>,
     pub(crate) tcp_ephemeral_port: Mutex<u16>,
     pub(crate) udp_ephemeral_port: Mutex<u16>,
     ipv4_conf_default_tag: AtomicI32,
     ipv4_conf_lo_tag: AtomicI32,
+}
+
+/// Result of one public [`NetStack::poll_interfaces`] pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetPollStatus {
+    Quiescent,
+    Continuation,
+}
+
+struct NetRxWorker {
+    state: Arc<NetRxWorkerState>,
+    irq_waker: Waker,
+}
+
+struct NetRxWorkerState {
+    generation: AtomicU64,
+    stopping: AtomicBool,
+    wait: axtask::WaitQueue,
+}
+
+impl NetRxWorkerState {
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wait.notify_all(false);
+    }
+
+    fn publish_irq(&self) {
+        if self.stopping.load(Ordering::Acquire) {
+            self.wait.notify_all(false);
+            return;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wait.notify_all(false);
+    }
+}
+
+struct NetRxIrqWake(Arc<NetRxWorkerState>);
+
+impl Wake for NetRxIrqWake {
+    fn wake(self: Arc<Self>) {
+        self.0.publish_irq();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.publish_irq();
+    }
+}
+
+impl NetRxWorker {
+    fn try_new() -> AxResult<Arc<Self>> {
+        let state = Arc::try_new(NetRxWorkerState {
+            generation: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+            wait: axtask::WaitQueue::new(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let wake = Arc::try_new(NetRxIrqWake(state.clone())).map_err(|_| AxError::NoMemory)?;
+        let irq_waker = Waker::from(wake);
+        Arc::try_new(Self { state, irq_waker }).map_err(|_| AxError::NoMemory)
+    }
 }
 
 struct NetPollWake(Arc<PollSet>);
@@ -78,6 +141,11 @@ impl NetStack {
         let poll_wake =
             Arc::try_new(NetPollWake(poll_source.clone())).map_err(|_| AxError::NoMemory)?;
         let poll_waker = Waker::from(poll_wake);
+        let rx_worker = if service.has_rx_wake_capable_device() {
+            Some(NetRxWorker::try_new()?)
+        } else {
+            None
+        };
         let stack = Arc::try_new(Self {
             unix_namespace,
             packet_broker,
@@ -86,6 +154,7 @@ impl NetStack {
             service: Mutex::new(service),
             poll_source,
             poll_waker,
+            rx_worker,
             tcp_ephemeral_port: Mutex::new(PORT_START),
             udp_ephemeral_port: Mutex::new(PORT_START),
             ipv4_conf_default_tag: AtomicI32::new(0),
@@ -94,6 +163,10 @@ impl NetStack {
         .map_err(|_| AxError::NoMemory)?;
         #[cfg(target_os = "none")]
         stack.packet_broker.start_drain_worker()?;
+        #[cfg(target_os = "none")]
+        if let Some(worker) = stack.rx_worker.clone() {
+            Self::start_rx_worker(&stack, worker)?;
+        }
         Ok(stack)
     }
 
@@ -257,10 +330,10 @@ impl NetStack {
         }
         if network_interest {
             self.arm_readiness(&mut prepared, u64::MAX, context.waker())?;
-            // Close the device-bridge -> stack-source arm window. A device
-            // wake that arrived before the stack source was armed leaves real
-            // receive work behind; polling after both registrations converts
-            // that work into endpoint readiness before publication.
+            // Close the registration window for software devices too. A
+            // device wake that arrived before this call leaves real receive
+            // work behind; polling after both registrations converts that
+            // work into endpoint readiness before publication.
             self.poll_interfaces();
         }
         prepared.commit()
@@ -283,13 +356,16 @@ impl NetStack {
     }
 
     /// Poll all network interfaces owned by this stack.
-    pub fn poll_interfaces(&self) {
-        loop {
-            let progressed = self.service.lock().poll(&mut self.socket_set.inner.lock());
-            self.packet_broker.drain_staged();
-            if !progressed {
-                break;
-            }
+    pub fn poll_interfaces(&self) -> NetPollStatus {
+        let status = {
+            let mut service = self.service.lock();
+            let mut sockets = self.socket_set.inner.lock();
+            service.poll(&mut sockets)
+        };
+        self.packet_broker.drain_staged();
+        match status {
+            ServicePoll::Quiescent => NetPollStatus::Quiescent,
+            ServicePoll::Continuation => NetPollStatus::Continuation,
         }
     }
 
@@ -322,7 +398,9 @@ impl NetStack {
         match iface {
             "default" => self.ipv4_conf_default_tag.store(value, Ordering::Release),
             "lo" => self.ipv4_conf_lo_tag.store(value, Ordering::Release),
-            _ => ax_bail!(NotFound, "unknown IPv4 interface sysctl"),
+            _ => {
+                ax_bail!(NotFound, "unknown IPv4 interface sysctl");
+            }
         }
         Ok(())
     }
@@ -340,11 +418,47 @@ impl NetStack {
         device_mask: u64,
         waker: &Waker,
     ) -> Result<(), PollRegistrationError> {
-        self.service
-            .lock()
-            .register_waker(device_mask, &self.poll_waker)?;
+        // Arm the stable stack source before refreshing device bridges. The
+        // worker may finish a task-context pass while a user registration is
+        // being assembled; publishing the source first prevents that wake
+        // from landing in an unarmed window.
         prepared.arm(&self.poll_source, waker)?;
+        self.service.lock().register_waker(
+            device_mask,
+            &self.poll_waker,
+            self.rx_worker_active(),
+        )?;
         Ok(())
+    }
+
+    fn rx_worker_active(&self) -> bool {
+        #[cfg(target_os = "none")]
+        {
+            self.rx_worker.is_some()
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            false
+        }
+    }
+
+    fn arm_rx_worker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+        self.service.lock().register_rx_waker(waker)
+    }
+
+    #[cfg(target_os = "none")]
+    fn start_rx_worker(stack: &Arc<Self>, worker: Arc<NetRxWorker>) -> AxResult {
+        let weak = Arc::downgrade(stack);
+        let mut name = String::new();
+        name.try_reserve_exact("net-rx".len())
+            .map_err(|_| AxError::NoMemory)?;
+        name.push_str("net-rx");
+        axtask::try_spawn_with_name(move || net_rx_worker_loop(weak, worker), name).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_rx_worker(&self) -> bool {
+        self.rx_worker.is_some()
     }
 
     /// Lock the service before the socket set to avoid AB-BA deadlocks.
@@ -401,10 +515,84 @@ impl NetStack {
     }
 }
 
+impl Drop for NetStack {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.rx_worker {
+            // Stop publication first and wake a task that is already waiting.
+            worker.state.stop();
+            // Mask and cancel the dedicated IRQ token while device ownership
+            // is still live; the concrete device destructor handles the
+            // remaining readiness bridge before its buffers are destroyed.
+            self.service.lock().stop_rx_waker();
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+fn net_rx_worker_loop(stack: Weak<NetStack>, worker: Arc<NetRxWorker>) {
+    loop {
+        let Some(stack_ref) = stack.upgrade() else {
+            return;
+        };
+        if worker.state.stopping.load(Ordering::Acquire) {
+            return;
+        }
+
+        let status = stack_ref.poll_interfaces();
+        // Hardware IRQs owned by this worker never invoke a user readiness
+        // waker directly.  Publish readiness only after the bounded pass has
+        // run in task context and socket state is observable.
+        stack_ref.poll_source.as_ref().wake();
+        if status == NetPollStatus::Continuation {
+            // A budget-exhausted pass owns the next continuation itself; it
+            // must not wait for another IRQ edge to make progress.  Yield
+            // between fixed-size passes so sustained ingress cannot turn the
+            // worker into an unbounded task-context busy loop.
+            drop(stack_ref);
+            axtask::yield_now();
+            continue;
+        }
+
+        // Snapshot after the pass, then rearm the one-shot IRQ token before
+        // checking device state.  Any IRQ racing this sequence advances the
+        // generation and wakes the wait queue without touching device data.
+        let snapshot = worker.state.generation.load(Ordering::Acquire);
+        if stack_ref.arm_rx_worker(&worker.irq_waker).is_err() {
+            worker.state.stop();
+            stack_ref.service.lock().stop_rx_waker();
+            return;
+        }
+        let backlog = stack_ref.service.lock().has_rx_backlog();
+        let generation = worker.state.generation.load(Ordering::Acquire);
+        drop(stack_ref);
+
+        if backlog || generation != snapshot {
+            continue;
+        }
+
+        let state = worker.state.clone();
+        let weak_stack = stack.clone();
+        let _ = state.wait.wait_until(|| {
+            if state.stopping.load(Ordering::Acquire) {
+                return true;
+            }
+            if state.generation.load(Ordering::Acquire) != snapshot {
+                return true;
+            }
+            weak_stack
+                .upgrade()
+                .is_some_and(|stack_ref| stack_ref.service.lock().has_rx_backlog())
+        });
+        if state.stopping.load(Ordering::Acquire) {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::task::Wake;
-    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::{
@@ -473,6 +661,7 @@ mod tests {
     #[test]
     fn loopback_stack_reports_real_interface_and_routes() {
         let stack = NetStack::new_loopback_only();
+        assert!(!stack.has_rx_worker());
         let interfaces = stack.interfaces();
         assert_eq!(interfaces.len(), 1);
         assert_eq!(interfaces[0].index, 1);
@@ -484,6 +673,22 @@ mod tests {
         assert_eq!(routes.len(), 2);
         assert!(routes.iter().all(|route| route.interface_index == 1));
         assert!(routes.iter().all(|route| route.gateway.is_none()));
+    }
+
+    #[test]
+    fn irq_wake_only_publishes_generation_and_notifies() {
+        let state = Arc::new(NetRxWorkerState {
+            generation: core::sync::atomic::AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+            wait: axtask::WaitQueue::new(),
+        });
+        let wake = Arc::new(NetRxIrqWake(state.clone()));
+        Wake::wake_by_ref(&wake);
+        assert_eq!(state.generation.load(Ordering::Acquire), 1);
+
+        state.stop();
+        Wake::wake_by_ref(&wake);
+        assert_eq!(state.generation.load(Ordering::Acquire), 1);
     }
 
     #[test]

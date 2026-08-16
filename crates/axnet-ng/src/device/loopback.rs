@@ -12,7 +12,7 @@ use smoltcp::{
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
     device::{
-        Device, DevicePollBridge, DeviceStats, InterfaceKind, PacketSendProgress,
+        Device, DevicePollBridge, DeviceStats, InterfaceKind, PacketSendProgress, RxStep,
         classify_ethernet_ingress_protocol,
     },
     packet::{
@@ -179,6 +179,10 @@ impl Device for LoopbackDevice {
         LOOPBACK_MTU
     }
 
+    fn has_rx_backlog(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     fn hardware_address(&self) -> Option<[u8; 6]> {
         Some([0; 6])
     }
@@ -199,9 +203,9 @@ impl Device for LoopbackDevice {
         context: PacketDeviceContext<'_>,
         buffer: &mut PacketBuffer<()>,
         _timestamp: Instant,
-    ) -> bool {
+    ) -> RxStep {
         let Ok((metadata, rx_buf)) = self.buffer.dequeue() else {
-            return false;
+            return RxStep::Idle;
         };
         let len = rx_buf.len();
         let ingress_context = if metadata.origin.is_some() {
@@ -224,11 +228,11 @@ impl Device for LoopbackDevice {
         );
         let Ok(dst) = buffer.enqueue(len, ()) else {
             self.stats.record_rx_drop();
-            return false;
+            return RxStep::Consumed;
         };
         dst.copy_from_slice(rx_buf);
         self.stats.record_rx(len);
-        true
+        RxStep::Delivered
     }
 
     fn send(
@@ -345,7 +349,10 @@ mod tests {
 
         let mut ingress =
             PacketBuffer::new(vec![SmolPacketMetadata::EMPTY; 1], vec![0u8; packet.len()]);
-        assert!(device.recv(context, &mut ingress, Instant::ZERO));
+        assert_eq!(
+            device.recv(context, &mut ingress, Instant::ZERO),
+            RxStep::Delivered
+        );
         broker.drain_staged();
 
         let host = endpoint.try_receive(false).unwrap();
@@ -412,7 +419,10 @@ mod tests {
             vec![SmolPacketMetadata::EMPTY; 1],
             vec![0u8; frame.len() - LOOPBACK_HEADER_LEN],
         );
-        assert!(device.recv(ingress, &mut ip_ingress, Instant::ZERO));
+        assert_eq!(
+            device.recv(ingress, &mut ip_ingress, Instant::ZERO),
+            RxStep::Delivered
+        );
         broker.drain_staged();
 
         let source_host = source.try_receive(false).unwrap();
@@ -468,7 +478,10 @@ mod tests {
 
         let mut ingress =
             PacketBuffer::new(vec![SmolPacketMetadata::EMPTY; 1], vec![0u8; payload.len()]);
-        assert!(device.recv(context, &mut ingress, Instant::ZERO));
+        assert_eq!(
+            device.recv(context, &mut ingress, Instant::ZERO),
+            RxStep::Delivered
+        );
         broker.drain_staged();
 
         let host = endpoint.try_receive(false).unwrap();

@@ -40,6 +40,22 @@ pub enum PacketSendProgress {
     ImmediateIngressQueued,
 }
 
+/// Result of one bounded link-layer receive attempt.
+///
+/// A receive step owns at most one link frame.  A frame that is malformed,
+/// addressed to another host, handled by ARP, or dropped because a higher
+/// layer queue is full is still [`Consumed`]; only a frame copied into the
+/// router's IP queue is [`Delivered`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxStep {
+    /// No link frame was available.
+    Idle,
+    /// One link frame was consumed without producing an IP packet.
+    Consumed,
+    /// One link frame was consumed and an IP packet was queued.
+    Delivered,
+}
+
 /// Classifies a received Ethernet frame independently of transmit metadata.
 ///
 /// Values below the Ethernet-II type range are length fields.  A leading
@@ -184,6 +200,22 @@ pub trait Device: Send + Sync {
         Vec::new()
     }
 
+    /// Returns whether task-context polling can observe pending link input.
+    ///
+    /// The default is conservative for devices whose receive queue cannot be
+    /// queried without consuming a frame.  It is used only to preserve a
+    /// continuation after a bounded pass; the next pass still performs the
+    /// authoritative receive attempt.
+    fn has_rx_backlog(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this device owns a hardware IRQ suitable for the
+    /// network receive worker.
+    fn rx_wake_capable(&self) -> bool {
+        false
+    }
+
     /// Reports the packet-observation and injection operations this concrete
     /// device can actually perform.
     ///
@@ -203,7 +235,7 @@ pub trait Device: Send + Sync {
         context: PacketDeviceContext<'_>,
         buffer: &mut PacketBuffer<()>,
         timestamp: Instant,
-    ) -> bool;
+    ) -> RxStep;
     /// Sends a packet to the next hop.
     ///
     /// Returns `true` if this operation resulted in the readiness of receive
@@ -234,6 +266,18 @@ pub trait Device: Send + Sync {
     /// Refreshes the retained bridge from this device's wake source to the
     /// stack readiness source.
     fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError>;
+
+    /// Registers the dedicated task-context receive worker waker.  This is
+    /// separate from [`register_waker`](Self::register_waker), whose source
+    /// feeds user readiness registrations.
+    fn register_rx_waker(&self, _waker: &Waker) -> Result<(), PollRegistrationError> {
+        Ok(())
+    }
+
+    /// Tears down the dedicated receive-worker registration while the device
+    /// is still alive.  Final IRQ masking remains owned by the concrete
+    /// device's destructor.
+    fn stop_rx_waker(&self) {}
 }
 
 #[cfg(test)]

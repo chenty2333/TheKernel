@@ -106,6 +106,13 @@ impl VsockStreamTransport {
         self.connection.lock().clone().ok_or(AxError::NotConnected)
     }
 
+    pub(super) fn recv_pending_len(&self) -> AxResult<usize> {
+        let Some(connection) = self.connection.lock().clone() else {
+            return Ok(0);
+        };
+        Ok(connection.lock().rx_buffer_used())
+    }
+
     pub fn prepare_accept(&self) -> AxResult<VsockAcceptReservation> {
         if self.state.get() != State::Listening {
             ax_bail!(InvalidInput, "not listening");

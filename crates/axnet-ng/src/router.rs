@@ -11,7 +11,7 @@ use smoltcp::{
 
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
-    device::{Device, DeviceStats, InterfaceInfo, PacketSendProgress},
+    device::{Device, DeviceStats, InterfaceInfo, PacketSendProgress, RxStep},
     listen_table::ListenTable,
     packet::{
         PacketBroker, PacketDeviceCapabilities, PacketDeviceContext, PacketEndpoint, PacketError,
@@ -53,6 +53,51 @@ impl Rule {
 
 type PacketBuffer = smoltcp::storage::PacketBuffer<'static, ()>;
 
+/// Maximum number of link frames admitted to one task-context receive pass.
+pub const RX_PASS_BUDGET: usize = 32;
+
+/// Maximum number of queued IP packets dispatched by one task-context egress
+/// pass.
+pub const EGRESS_PASS_BUDGET: usize = 32;
+
+/// Result of one bounded router receive pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxPass {
+    Quiescent { consumed: usize, delivered: usize },
+    Continuation { consumed: usize, delivered: usize },
+}
+
+impl RxPass {
+    pub(crate) const fn consumed(self) -> usize {
+        match self {
+            Self::Quiescent { consumed, .. } | Self::Continuation { consumed, .. } => consumed,
+        }
+    }
+
+    pub(crate) const fn delivered(self) -> usize {
+        match self {
+            Self::Quiescent { delivered, .. } | Self::Continuation { delivered, .. } => delivered,
+        }
+    }
+
+    pub(crate) const fn is_continuation(self) -> bool {
+        matches!(self, Self::Continuation { .. })
+    }
+}
+
+/// Result of one bounded router egress pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EgressPass {
+    Quiescent { dispatched: usize },
+    Continuation { dispatched: usize },
+}
+
+impl EgressPass {
+    pub(crate) const fn is_continuation(self) -> bool {
+        matches!(self, Self::Continuation { .. })
+    }
+}
+
 // TODO(mivik): optimize
 pub struct RouteTable {
     rules: Vec<Rule>,
@@ -84,6 +129,7 @@ pub struct Router {
     pub(crate) devices: Vec<Box<dyn Device>>,
     pub(crate) table: RouteTable,
     pub(crate) listen_table: Arc<ListenTable>,
+    rx_cursor: usize,
 }
 impl Router {
     pub fn new_loopback_only(listen_table: Arc<ListenTable>) -> Self {
@@ -140,6 +186,7 @@ impl Router {
             devices: Vec::new(),
             table: RouteTable::new(),
             listen_table,
+            rx_cursor: 0,
         })
     }
 
@@ -150,6 +197,34 @@ impl Router {
     pub fn add_device(&mut self, device: Box<dyn Device>) -> usize {
         self.devices.push(device);
         self.devices.len() - 1
+    }
+
+    pub(crate) fn has_rx_backlog(&self) -> bool {
+        !self.rx_buffer.is_empty() || self.devices.iter().any(|device| device.has_rx_backlog())
+    }
+
+    pub(crate) fn has_rx_wake_capable_device(&self) -> bool {
+        self.devices.iter().any(|device| device.rx_wake_capable())
+    }
+
+    pub(crate) fn register_rx_waker(
+        &self,
+        waker: &core::task::Waker,
+    ) -> Result<(), axpoll::PollRegistrationError> {
+        for device in &self.devices {
+            if device.rx_wake_capable() {
+                device.register_rx_waker(waker)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stop_rx_waker(&self) {
+        for device in &self.devices {
+            if device.rx_wake_capable() {
+                device.stop_rx_waker();
+            }
+        }
     }
 
     pub(crate) fn packet_broker(&self) -> Arc<PacketBroker> {
@@ -224,17 +299,66 @@ impl Router {
             .collect()
     }
 
-    pub fn poll(&mut self, timestamp: Instant) {
-        for (index, dev) in self.devices.iter_mut().enumerate() {
+    /// Consume at most [`RX_PASS_BUDGET`] link frames, starting at the
+    /// persistent round-robin cursor.  A frame is counted even when the
+    /// device drops it or handles it in ARP, so malformed traffic cannot
+    /// bypass the task-context budget.
+    pub fn poll(&mut self, timestamp: Instant) -> RxPass {
+        let device_count = self.devices.len();
+        if device_count == 0 {
+            return RxPass::Quiescent {
+                consumed: 0,
+                delivered: 0,
+            };
+        }
+
+        let mut consumed = 0;
+        let mut delivered = 0;
+        let mut idle_devices = 0;
+        while consumed < RX_PASS_BUDGET && idle_devices < device_count {
+            let index = self.rx_cursor % device_count;
+            self.rx_cursor = (index + 1) % device_count;
             let context =
                 PacketDeviceContext::new(index as u32 + 1, self.packet_broker.as_ref(), None);
-            while !self.rx_buffer.is_full() && dev.recv(context, &mut self.rx_buffer, timestamp) {}
+            let step = self.devices[index].recv(context, &mut self.rx_buffer, timestamp);
+            match step {
+                RxStep::Idle => idle_devices += 1,
+                RxStep::Consumed => {
+                    consumed += 1;
+                    idle_devices = 0;
+                }
+                RxStep::Delivered => {
+                    consumed += 1;
+                    delivered += 1;
+                    idle_devices = 0;
+                }
+            }
+        }
+
+        if consumed == RX_PASS_BUDGET {
+            RxPass::Continuation {
+                consumed,
+                delivered,
+            }
+        } else {
+            RxPass::Quiescent {
+                consumed,
+                delivered,
+            }
         }
     }
 
-    pub fn dispatch(&mut self, timestamp: Instant) -> bool {
+    /// Dispatch at most [`EGRESS_PASS_BUDGET`] queued IP packets.  The
+    /// returned continuation also covers synchronous loopback ingress made by
+    /// a send, so callers do not need to rely on another interrupt.
+    pub fn dispatch(&mut self, timestamp: Instant) -> EgressPass {
         let mut poll_next = false;
-        while let Ok(((), packet)) = self.tx_buffer.dequeue() {
+        let mut dispatched = 0;
+        while dispatched < EGRESS_PASS_BUDGET {
+            let Ok(((), packet)) = self.tx_buffer.dequeue() else {
+                break;
+            };
+            dispatched += 1;
             let Ok(version) = IpVersion::of_packet(packet) else {
                 warn!("Dropping malformed IP packet from transmit queue");
                 continue;
@@ -330,7 +454,11 @@ impl Router {
                 }
             }
         }
-        poll_next
+        if poll_next || !self.tx_buffer.is_empty() {
+            EgressPass::Continuation { dispatched }
+        } else {
+            EgressPass::Quiescent { dispatched }
+        }
     }
 }
 
@@ -449,5 +577,163 @@ impl smoltcp::phy::Device for Router {
         caps.max_transmission_unit = self.mtu;
         caps.max_burst_size = Some(PACKET_QUEUE_LEN);
         caps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{collections::VecDeque, sync::Arc, vec};
+    use core::task::Waker;
+    use std::sync::Mutex;
+
+    use smoltcp::{storage::PacketBuffer, wire::IpAddress};
+
+    use super::*;
+    use crate::packet::PacketDeviceContext;
+
+    struct FakeDevice {
+        name: &'static str,
+        steps: VecDeque<RxStep>,
+        seen: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl FakeDevice {
+        fn new(
+            name: &'static str,
+            steps: impl IntoIterator<Item = RxStep>,
+        ) -> (Self, Arc<Mutex<Vec<u32>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    name,
+                    steps: steps.into_iter().collect(),
+                    seen: seen.clone(),
+                },
+                seen,
+            )
+        }
+    }
+
+    impl Device for FakeDevice {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn stats(&self) -> DeviceStats {
+            DeviceStats::default()
+        }
+
+        fn interface_kind(&self) -> crate::device::InterfaceKind {
+            crate::device::InterfaceKind::Ethernet
+        }
+
+        fn mtu(&self) -> usize {
+            LOOPBACK_MTU
+        }
+
+        fn recv(
+            &mut self,
+            context: PacketDeviceContext<'_>,
+            buffer: &mut PacketBuffer<()>,
+            _timestamp: Instant,
+        ) -> RxStep {
+            self.seen.lock().unwrap().push(context.interface_index());
+            let Some(step) = self.steps.pop_front() else {
+                return RxStep::Idle;
+            };
+            if step == RxStep::Delivered {
+                let dst = buffer.enqueue(1, ()).unwrap();
+                dst[0] = 0;
+            }
+            step
+        }
+
+        fn send(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _next_hop: IpAddress,
+            _packet: &[u8],
+            _timestamp: Instant,
+        ) -> bool {
+            false
+        }
+
+        fn register_waker(&self, _waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+            Ok(())
+        }
+    }
+
+    fn router_with_devices(devices: impl IntoIterator<Item = Box<dyn Device>>) -> Router {
+        let listen_table = Arc::new(ListenTable::new());
+        let mut router = Router::new_loopback_only(listen_table);
+        for device in devices {
+            router.add_device(device);
+        }
+        router
+    }
+
+    #[test]
+    fn receive_budget_counts_mixed_deliveries_and_drops() {
+        let steps = (0..40).map(|index| {
+            if index % 3 == 0 {
+                RxStep::Delivered
+            } else {
+                RxStep::Consumed
+            }
+        });
+        let (device, seen) = FakeDevice::new("fake0", steps);
+        let mut router = router_with_devices([Box::new(device) as Box<dyn Device>]);
+
+        let first = router.poll(Instant::ZERO);
+        assert_eq!(first.consumed(), RX_PASS_BUDGET);
+        assert_eq!(first.delivered(), 11);
+        assert!(first.is_continuation());
+        assert_eq!(seen.lock().unwrap().len(), RX_PASS_BUDGET);
+
+        let second = router.poll(Instant::ZERO);
+        assert_eq!(
+            second,
+            RxPass::Quiescent {
+                consumed: 8,
+                delivered: 3
+            }
+        );
+        assert_eq!(seen.lock().unwrap().len(), 41);
+    }
+
+    #[test]
+    fn software_receive_queue_counts_as_backlog_without_device_input() {
+        let mut router = router_with_devices(core::iter::empty::<Box<dyn Device>>());
+        assert!(!router.has_rx_backlog());
+
+        let packet = router.rx_buffer.enqueue(1, ()).unwrap();
+        packet[0] = 0;
+
+        assert!(router.devices.is_empty());
+        assert!(router.has_rx_backlog());
+    }
+
+    #[test]
+    fn receive_round_robin_prevents_one_device_from_monopolizing_budget() {
+        let (first, first_seen) = FakeDevice::new("first", vec![RxStep::Consumed; 40]);
+        let (second, second_seen) = FakeDevice::new("second", vec![RxStep::Consumed; 40]);
+        let mut router = router_with_devices([
+            Box::new(first) as Box<dyn Device>,
+            Box::new(second) as Box<dyn Device>,
+        ]);
+
+        assert!(router.poll(Instant::ZERO).is_continuation());
+        assert_eq!(first_seen.lock().unwrap().len(), 16);
+        assert_eq!(second_seen.lock().unwrap().len(), 16);
+
+        // The persistent cursor keeps the same fairness on the next bounded
+        // pass rather than restarting a device-local drain loop.
+        assert!(router.poll(Instant::ZERO).is_continuation());
+        assert_eq!(
+            first_seen.lock().unwrap().len() + second_seen.lock().unwrap().len(),
+            64
+        );
+        assert_eq!(first_seen.lock().unwrap().len(), 32);
+        assert_eq!(second_seen.lock().unwrap().len(), 32);
     }
 }

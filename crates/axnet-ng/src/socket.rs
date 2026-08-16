@@ -343,6 +343,24 @@ impl Pollable for Socket {
 }
 
 impl Socket {
+    /// Returns a side-effect-free snapshot of data available to receive.
+    ///
+    /// Stream sockets report all currently queued bytes. Datagram-oriented
+    /// sockets report only the payload length of the next queued datagram,
+    /// never the sum of multiple queued datagrams. An empty receive queue is
+    /// reported as zero. Implementations release their internal state locks
+    /// before returning, so callers may safely fault while copying this value
+    /// to userspace.
+    pub fn recv_pending_len(&self) -> AxResult<usize> {
+        match self {
+            Self::Tcp(tcp) => tcp.recv_pending_len(),
+            Self::Udp(udp) => udp.recv_pending_len(),
+            Self::Unix(unix) => unix.recv_pending_len(),
+            #[cfg(feature = "vsock")]
+            Self::Vsock(vsock) => vsock.recv_pending_len(),
+        }
+    }
+
     /// Retains the exact next accepted transport before queue mutation becomes
     /// visible. Policy can inspect this opaque reservation and then either drop
     /// it or commit the same backend object.

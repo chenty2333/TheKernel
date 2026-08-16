@@ -22,7 +22,8 @@ use smoltcp::{
 use crate::{
     consts::{ETHERNET_MAX_PENDING_PACKETS, STANDARD_MTU},
     device::{
-        Device, DeviceStats, InterfaceKind, PacketSendProgress, classify_ethernet_ingress_protocol,
+        Device, DeviceStats, InterfaceKind, PacketSendProgress, RxStep,
+        classify_ethernet_ingress_protocol,
     },
     packet::{
         LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
@@ -45,6 +46,7 @@ pub struct EthernetDevice {
     ip: Ipv4Cidr,
     stats: DeviceStats,
     irq_registration: SpinNoIrq<Option<IrqWakerToken>>,
+    rx_irq_registration: SpinNoIrq<Option<IrqWakerToken>>,
 
     pending_packets: PacketBuffer<'static, IpAddress>,
 }
@@ -75,6 +77,7 @@ impl EthernetDevice {
             ip,
             stats: DeviceStats::default(),
             irq_registration: SpinNoIrq::new(None),
+            rx_irq_registration: SpinNoIrq::new(None),
 
             pending_packets,
         }
@@ -247,13 +250,13 @@ impl EthernetDevice {
         frame: &[u8],
         buffer: &mut PacketBuffer<()>,
         timestamp: Instant,
-    ) -> bool {
+    ) -> RxStep {
         let frame = EthernetFrame::new_unchecked(frame);
         let Ok(repr) = EthernetRepr::parse(&frame) else {
             self.stats.record_rx_error();
             self.stats.record_rx_drop();
             warn!("Dropping malformed Ethernet frame");
-            return false;
+            return RxStep::Consumed;
         };
 
         Self::stage_frame(
@@ -270,25 +273,25 @@ impl EthernetDevice {
             && repr.dst_addr != self.hardware_address()
         {
             self.stats.record_rx_drop();
-            return false;
+            return RxStep::Consumed;
         }
 
         match repr.ethertype {
             EthernetProtocol::Ipv4 => {
                 let Ok(dst) = buffer.enqueue(frame.payload().len(), ()) else {
                     self.stats.record_rx_drop();
-                    return false;
+                    return RxStep::Consumed;
                 };
                 dst.copy_from_slice(frame.payload());
-                true
+                RxStep::Delivered
             }
             EthernetProtocol::Arp => {
                 self.process_arp(context, frame.payload(), timestamp);
-                false
+                RxStep::Consumed
             }
             _ => {
                 self.stats.record_rx_drop();
-                false
+                RxStep::Consumed
             }
         }
     }
@@ -438,6 +441,14 @@ impl Device for EthernetDevice {
         STANDARD_MTU
     }
 
+    fn has_rx_backlog(&self) -> bool {
+        self.inner.can_receive()
+    }
+
+    fn rx_wake_capable(&self) -> bool {
+        self.irq.is_some()
+    }
+
     fn hardware_address(&self) -> Option<[u8; 6]> {
         Some(self.hardware_address().0)
     }
@@ -455,35 +466,30 @@ impl Device for EthernetDevice {
         context: PacketDeviceContext<'_>,
         buffer: &mut PacketBuffer<()>,
         timestamp: Instant,
-    ) -> bool {
-        loop {
-            let rx_buf = match self.inner.receive() {
-                Ok(buf) => buf,
-                Err(err) => {
-                    if !matches!(err, DevError::Again) {
-                        self.stats.record_rx_error();
-                        warn!("receive failed: {err:?}");
-                    }
-                    return false;
+    ) -> RxStep {
+        let rx_buf = match self.inner.receive() {
+            Ok(buf) => buf,
+            Err(err) => {
+                if !matches!(err, DevError::Again) {
+                    self.stats.record_rx_error();
+                    warn!("receive failed: {err:?}");
                 }
-            };
-            trace!(
-                "RECV {} bytes: {:02X?}",
-                rx_buf.packet_len(),
-                rx_buf.packet()
-            );
-            self.stats.record_rx(rx_buf.packet_len());
+                return RxStep::Idle;
+            }
+        };
+        trace!(
+            "RECV {} bytes: {:02X?}",
+            rx_buf.packet_len(),
+            rx_buf.packet()
+        );
+        self.stats.record_rx(rx_buf.packet_len());
 
-            let result = self.handle_frame(&context, rx_buf.packet(), buffer, timestamp);
-            if let Err(err) = self.inner.recycle_rx_buffer(rx_buf) {
-                self.stats.record_rx_error();
-                warn!("recycle_rx_buffer failed: {err:?}");
-                return false;
-            }
-            if result {
-                return true;
-            }
+        let result = self.handle_frame(&context, rx_buf.packet(), buffer, timestamp);
+        if let Err(err) = self.inner.recycle_rx_buffer(rx_buf) {
+            self.stats.record_rx_error();
+            warn!("recycle_rx_buffer failed: {err:?}");
         }
+        result
     }
 
     fn send(
@@ -623,6 +629,45 @@ impl Device for EthernetDevice {
         *registration = Some(register_irq_waker(irq, waker).map_err(map_irq_register_error)?);
         Ok(())
     }
+
+    fn register_rx_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+        let Some(irq) = self.irq else {
+            return Ok(());
+        };
+
+        let mut registration = self.rx_irq_registration.lock();
+        if let Some(token) = *registration {
+            match update_irq_waker(token, waker) {
+                Ok(()) => return Ok(()),
+                Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
+                    *registration = None;
+                }
+                Err(IrqWakerUpdateError::Registration(UpdateError::Closed)) => {
+                    return Err(PollRegistrationError::Source {
+                        index: 0,
+                        error: RegisterError::Closed,
+                    });
+                }
+                Err(IrqWakerUpdateError::InvalidSource) => {
+                    return Err(PollRegistrationError::InvalidState);
+                }
+            }
+        }
+
+        *registration = Some(register_irq_waker(irq, waker).map_err(map_irq_register_error)?);
+        Ok(())
+    }
+
+    fn stop_rx_waker(&self) {
+        if let Some(irq) = self.irq {
+            // Teardown masks the source before cancelling its one-shot
+            // registration, so no final interrupt can race token removal.
+            axhal::irq::set_enable(irq, false);
+        }
+        if let Some(token) = self.rx_irq_registration.lock().take() {
+            cancel_irq_waker(token);
+        }
+    }
 }
 
 fn map_irq_register_error(error: IrqWakerRegisterError) -> PollRegistrationError {
@@ -636,11 +681,16 @@ fn map_irq_register_error(error: IrqWakerRegisterError) -> PollRegistrationError
 
 impl Drop for EthernetDevice {
     fn drop(&mut self) {
-        if let Some(token) = self.irq_registration.get_mut().take() {
+        if let Some(irq) = self.irq {
+            // Mask before removing registrations so no new interrupt can
+            // race the final token cancellation.
+            axhal::irq::set_enable(irq, false);
+        }
+        if let Some(token) = self.rx_irq_registration.get_mut().take() {
             cancel_irq_waker(token);
         }
-        if let Some(irq) = self.irq {
-            axhal::irq::set_enable(irq, false);
+        if let Some(token) = self.irq_registration.get_mut().take() {
+            cancel_irq_waker(token);
         }
     }
 }

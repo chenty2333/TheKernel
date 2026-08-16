@@ -140,6 +140,15 @@ impl UdpSocket {
         self.general.set_pending_error(error);
     }
 
+    /// Returns the next queued UDP payload length without consuming it.
+    pub(crate) fn recv_pending_len(&self) -> AxResult<usize> {
+        if self.rx_shutdown.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        self.stack.poll_interfaces();
+        Ok(self.with_smol_socket(|socket| socket.peek().map_or(0, |(data, _)| data.len())))
+    }
+
     pub(crate) fn retry_transfer<T>(
         &self,
         direction: crate::SocketTransferDirection,
@@ -330,7 +339,7 @@ impl UdpSocket {
 
     fn note_udp_send_progress(&self, sent: usize) {
         let mut should_yield = false;
-        let _ = self.send_bytes_since_yield.fetch_update(
+        let _ = self.send_bytes_since_yield.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| {
@@ -817,6 +826,50 @@ mod tests {
         );
         assert_eq!(&second[..b"with-address".len()], b"with-address");
         assert!(matches!(source, SocketAddrEx::Ip(address) if address.ip() == LOOPBACK));
+    }
+
+    #[test]
+    fn udp_recv_pending_len_reports_only_the_next_datagram_without_consuming() {
+        let stack = NetStack::new_loopback_only();
+        let receiver = UdpSocket::new(stack.clone()).unwrap();
+        let sender = UdpSocket::new(stack).unwrap();
+        receiver.bind(endpoint(31_130)).unwrap();
+
+        send_datagram(&sender, 31_130, b"first");
+        send_datagram(&sender, 31_130, b"second-packet");
+        assert_eq!(receiver.recv_pending_len().unwrap(), 5);
+        assert_eq!(receiver.recv_pending_len().unwrap(), 5);
+
+        let mut bytes = [0u8; 32];
+        assert_eq!(
+            receiver
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    },
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(&bytes[..5], b"first");
+        assert_eq!(receiver.recv_pending_len().unwrap(), 13);
+
+        assert_eq!(
+            receiver
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    },
+                )
+                .unwrap(),
+            13
+        );
+        assert_eq!(&bytes[..13], b"second-packet");
+        assert_eq!(receiver.recv_pending_len().unwrap(), 0);
     }
 
     #[test]

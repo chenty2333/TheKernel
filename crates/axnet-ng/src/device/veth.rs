@@ -11,7 +11,7 @@ use smoltcp::{
 
 use crate::{
     consts::{PACKET_QUEUE_LEN, STANDARD_MTU},
-    device::{Device, DevicePollBridge, DeviceStats, InterfaceKind},
+    device::{Device, DevicePollBridge, DeviceStats, InterfaceKind, RxStep},
     packet::PacketDeviceContext,
 };
 
@@ -93,19 +93,23 @@ impl Device for VethEnd {
         _context: PacketDeviceContext<'_>,
         buffer: &mut PacketBuffer<()>,
         _timestamp: Instant,
-    ) -> bool {
+    ) -> RxStep {
         let mut rx_buffer = self.rx_buffer.lock();
         let Ok((_, rx_buf)) = rx_buffer.dequeue() else {
-            return false;
+            return RxStep::Idle;
         };
         let len = rx_buf.len();
         let Ok(dst) = buffer.enqueue(len, ()) else {
             self.stats.record_rx_drop();
-            return false;
+            return RxStep::Consumed;
         };
         dst.copy_from_slice(rx_buf);
         self.stats.record_rx(len);
-        true
+        RxStep::Delivered
+    }
+
+    fn has_rx_backlog(&self) -> bool {
+        !self.rx_buffer.lock().is_empty()
     }
 
     fn send(

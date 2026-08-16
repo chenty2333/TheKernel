@@ -63,9 +63,9 @@ use self::{
     wrapper::SocketSetWrapper,
 };
 pub use self::{
-    device::{DeviceStats, InterfaceInfo, InterfaceKind, VethEnd},
-    net_stack::NetStack,
-    router::{RouteInfo, Rule},
+    device::{DeviceStats, InterfaceInfo, InterfaceKind, RxStep, VethEnd},
+    net_stack::{NetPollStatus, NetStack},
+    router::{EgressPass, RouteInfo, Rule, RxPass},
     socket::*,
 };
 
