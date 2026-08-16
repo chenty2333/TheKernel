@@ -84,40 +84,6 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
-    if #[cfg(block_dev = "sdmmc")] {
-        pub struct SdMmcDriver;
-        register_block_driver!(SdMmcDriver, axdriver_block::sdmmc::SdMmcDriver);
-
-        impl DriverProbe for SdMmcDriver {
-            fn probe_global() -> Option<AxDeviceEnum> {
-                let sdmmc = unsafe {
-                    axdriver_block::sdmmc::SdMmcDriver::new(
-                        axhal::mem::phys_to_virt(axconfig::devices::SDMMC_PADDR.into()).into(),
-                    )
-                };
-                Some(AxDeviceEnum::from_block(sdmmc))
-            }
-        }
-    }
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(block_dev = "bcm2835-sdhci")]{
-        pub struct BcmSdhciDriver;
-        register_block_driver!(BcmSdhciDriver, axdriver_block::bcm2835sdhci::SDHCIDriver);
-
-        impl DriverProbe for BcmSdhciDriver {
-            fn probe_global() -> Option<AxDeviceEnum> {
-                debug!("mmc probe");
-                axdriver_block::bcm2835sdhci::SDHCIDriver::try_new()
-                    .ok()
-                    .map(AxDeviceEnum::from_block)
-            }
-        }
-    }
-}
-
-cfg_if::cfg_if! {
     if #[cfg(net_dev = "ixgbe")] {
         use crate::ixgbe::IxgbeHalImpl;
         pub struct IxgbeDriver;
@@ -156,55 +122,6 @@ cfg_if::cfg_if! {
                     }
                 }
                 None
-            }
-        }
-    }
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(net_dev = "fxmac")]{
-        use axalloc::{UsageKind, global_allocator};
-        use axhal::mem::PAGE_SIZE_4K;
-
-        #[crate_interface::impl_interface]
-        impl axdriver_net::fxmac::KernelFunc for FXmacDriver {
-            fn virt_to_phys(addr: usize) -> usize {
-                axhal::mem::virt_to_phys(addr.into()).into()
-            }
-
-            fn phys_to_virt(addr: usize) -> usize {
-                axhal::mem::phys_to_virt(addr.into()).into()
-            }
-
-            fn dma_alloc_coherent(pages: usize) -> (usize, usize) {
-                let Ok(vaddr) = global_allocator().alloc_pages(pages, PAGE_SIZE_4K, UsageKind::Dma)
-                else {
-                    error!("failed to alloc pages");
-                    return (0, 0);
-                };
-                let paddr = axhal::mem::virt_to_phys((vaddr).into());
-                debug!("alloc pages @ vaddr={:#x}, paddr={:#x}", vaddr, paddr);
-                (vaddr, paddr.as_usize())
-            }
-
-            fn dma_free_coherent(vaddr: usize, pages: usize) {
-                global_allocator().dealloc_pages(vaddr, pages, UsageKind::Dma);
-            }
-
-            fn dma_request_irq(_irq: usize, _handler: fn()) {
-                warn!("unimplemented dma_request_irq for fxmax");
-            }
-        }
-
-        register_net_driver!(FXmacDriver, axdriver_net::fxmac::FXmacNic);
-
-        pub struct FXmacDriver;
-        impl DriverProbe for FXmacDriver {
-            fn probe_global() -> Option<AxDeviceEnum> {
-                info!("fxmac for phytiumpi probe global");
-                axdriver_net::fxmac::FXmacNic::init(0)
-                    .ok()
-                    .map(AxDeviceEnum::from_net)
             }
         }
     }

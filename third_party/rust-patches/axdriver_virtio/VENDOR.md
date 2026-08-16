@@ -25,7 +25,7 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired VirtIO device construction and LoongArch integration.
+- `2aee666` repaired VirtIO device construction and platform integration.
 - `c52dc6f` added async block submission/completion and interrupt-backed drain support.
 - `96df7d9` tightened ownership, queue admission, fallible allocation, and cleanup.
 - The current I/O integration validates every driver-reported accepted prefix,

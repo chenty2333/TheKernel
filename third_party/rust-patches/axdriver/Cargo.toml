@@ -36,16 +36,13 @@ ahci = [
     "dep:axhal",
     "dep:axconfig",
 ]
-bcm2835-sdhci = [
-    "block",
-    "axdriver_block/bcm2835-sdhci",
-]
 block = ["dep:axdriver_block"]
 bus-mmio = []
 bus-pci = [
     "dep:axdriver_pci",
     "dep:axhal",
     "dep:axconfig",
+    "dep:axklib",
 ]
 default = ["bus-pci"]
 display = ["dep:axdriver_display"]
@@ -58,13 +55,6 @@ dyn = [
     "dep:rd-block",
     "dep:rdrive",
     "dep:spin",
-]
-fxmac = [
-    "net",
-    "axdriver_net/fxmac",
-    "dep:axalloc",
-    "dep:axhal",
-    "dep:axdma",
 ]
 input = ["dep:axdriver_input"]
 irq = ["axdriver_virtio?/irq"]
@@ -80,12 +70,6 @@ ramdisk = [
     "block",
     "axdriver_block/ramdisk",
 ]
-sdmmc = [
-    "block",
-    "axdriver_block/sdmmc",
-    "dep:axhal",
-    "dep:axconfig",
-]
 shared-block = [
     "block",
     "dep:axsync",
@@ -95,7 +79,6 @@ virtio = [
     "dep:axalloc",
     "dep:axhal",
     "dep:axconfig",
-    "dep:axmm",
     "dep:spin",
 ]
 virtio-blk = [
@@ -178,10 +161,6 @@ version = "0.2"
 optional = true
 
 [dependencies.axhal]
-version = "=0.3.0-preview.2"
-optional = true
-
-[dependencies.axmm]
 version = "=0.3.0-preview.2"
 optional = true
 

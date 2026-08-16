@@ -18,15 +18,6 @@ use core::{
     ptr::{addr_of_mut, NonNull},
 };
 
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn dma_sync_barrier() {
-    unsafe {
-        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
 #[inline]
 fn dma_sync_barrier() {}
 
@@ -240,12 +231,6 @@ impl Transport for PciTransport {
                 driver_feature,
                 (driver_features >> 32) as u32
             );
-            #[cfg(target_arch = "loongarch64")]
-            {
-                dma_sync_barrier();
-                let _ = volread!(self.common_cfg, driver_feature_select);
-                dma_sync_barrier();
-            }
         }
     }
 
@@ -270,8 +255,6 @@ impl Transport for PciTransport {
             let index = offset_bytes / size_of::<u16>();
             dma_sync_barrier();
             addr_of_mut!((*self.notify_region.as_ptr())[index]).vwrite(queue);
-            #[cfg(target_arch = "loongarch64")]
-            dma_sync_barrier();
         }
     }
 
@@ -287,12 +270,6 @@ impl Transport for PciTransport {
         // was aligned.
         unsafe {
             volwrite!(self.common_cfg, device_status, status.bits() as u8);
-            #[cfg(target_arch = "loongarch64")]
-            {
-                dma_sync_barrier();
-                let _ = volread!(self.common_cfg, device_status);
-                dma_sync_barrier();
-            }
         }
     }
 
@@ -321,12 +298,6 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
             volwrite!(self.common_cfg, queue_enable, 1);
-            #[cfg(target_arch = "loongarch64")]
-            {
-                dma_sync_barrier();
-                let _ = volread!(self.common_cfg, queue_enable);
-                dma_sync_barrier();
-            }
         }
     }
 

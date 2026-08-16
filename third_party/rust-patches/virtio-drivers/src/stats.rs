@@ -25,7 +25,6 @@ static BLK_PENDING_DRAIN_BATCHES: AtomicU64 = AtomicU64::new(0);
 static BLK_PENDING_DRAINED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static ASYNC_BLOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static ASYNC_BLOCK_DEPTH: AtomicU64 = AtomicU64::new(0);
-static ASYNC_BLOCK_LA_DEPTH: AtomicU64 = AtomicU64::new(1);
 static ASYNC_BLOCK_WAIT_POLICY: AtomicU64 = AtomicU64::new(AsyncBlockWaitPolicy::Hybrid as u64);
 static ASYNC_BLOCK_ADAPTIVE_ENABLED: AtomicBool = AtomicBool::new(false);
 static ASYNC_BLOCK_ADAPTIVE_CURRENT_DEPTH: AtomicU64 = AtomicU64::new(1);
@@ -145,10 +144,8 @@ pub struct VirtioIoCounters {
     pub blk_pending_drained_requests: u64,
     /// Whether the async block queue is enabled at runtime.
     pub blk_async_enabled: u64,
-    /// Experimental RISC-V/default async queue depth cap.
+    /// Runtime async queue depth cap.
     pub blk_async_depth: u64,
-    /// Experimental LoongArch64 async queue depth cap.
-    pub blk_async_la_depth: u64,
     /// Runtime wait policy encoded as [`AsyncBlockWaitPolicy`].
     pub blk_async_wait_policy: u64,
     /// Whether adaptive queue-depth tuning is enabled.
@@ -335,24 +332,14 @@ pub fn async_block_enabled() -> bool {
     ASYNC_BLOCK_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Sets the default/RISC-V async queue depth cap used by experiments.
+/// Sets the async block queue depth cap.
 pub fn set_async_block_depth(depth: u64) {
     ASYNC_BLOCK_DEPTH.store(depth, Ordering::Relaxed);
 }
 
-/// Returns the default/RISC-V async queue depth cap used by experiments.
+/// Returns the configured async block queue depth cap.
 pub fn async_block_depth() -> u64 {
     ASYNC_BLOCK_DEPTH.load(Ordering::Relaxed)
-}
-
-/// Sets the LoongArch64 async queue depth cap used by experiments.
-pub fn set_async_block_la_depth(depth: u64) {
-    ASYNC_BLOCK_LA_DEPTH.store(depth, Ordering::Relaxed);
-}
-
-/// Returns the LoongArch64 async queue depth cap used by experiments.
-pub fn async_block_la_depth() -> u64 {
-    ASYNC_BLOCK_LA_DEPTH.load(Ordering::Relaxed)
 }
 
 /// Sets the async block wait policy.
@@ -430,7 +417,6 @@ pub fn io_counters_snapshot() -> VirtioIoCounters {
             0
         },
         blk_async_depth: ASYNC_BLOCK_DEPTH.load(Ordering::Relaxed),
-        blk_async_la_depth: ASYNC_BLOCK_LA_DEPTH.load(Ordering::Relaxed),
         blk_async_wait_policy: ASYNC_BLOCK_WAIT_POLICY.load(Ordering::Relaxed),
         blk_async_adaptive_enabled: if ASYNC_BLOCK_ADAPTIVE_ENABLED.load(Ordering::Relaxed) {
             1

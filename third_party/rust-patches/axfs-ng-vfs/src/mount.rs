@@ -80,7 +80,7 @@ fn entry_is_same_or_ancestor_by_inode(ancestor: &DirEntry, descendant: &DirEntry
 
 fn reserve_non_root_mount() -> VfsResult<()> {
     ACTIVE_NON_ROOT_MOUNTS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < MAX_ACTIVE_NON_ROOT_MOUNTS).then_some(active + 1)
         })
         .map(|_| ())
@@ -796,7 +796,7 @@ impl Drop for Location {
         let Ok(previous) =
             self.mount
                 .users
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |users| {
                     users.checked_sub(1)
                 })
         else {
@@ -835,8 +835,6 @@ impl Location {
     pub fn node_type(&self) -> NodeType;
 
     pub fn read_link(&self) -> VfsResult<String>;
-
-    pub fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize>;
 
     pub fn flags(&self) -> NodeFlags;
 

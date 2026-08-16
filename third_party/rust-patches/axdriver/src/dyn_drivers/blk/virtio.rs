@@ -107,14 +107,14 @@ impl rd_block::Interface for BlockDivce {
     }
 
     fn handle_irq(&mut self) -> rd_block::Event {
-        let drained = match self.dev.lock().handle_irq() {
-            Ok(drained) => drained,
+        let published = match self.dev.lock().handle_irq() {
+            Ok(published) => published,
             Err(err) => {
                 warn!("virtio block irq handling failed: {err:?}");
                 0
             }
         };
-        if drained == 0 {
+        if published == 0 {
             return rd_block::Event::none();
         }
 

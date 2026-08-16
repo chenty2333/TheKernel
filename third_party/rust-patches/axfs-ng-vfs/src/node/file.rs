@@ -117,11 +117,6 @@ pub trait FileNodeOps: NodeOps + Pollable {
 
     /// Sets the file's symlink target.
     fn set_symlink(&self, target: &str) -> VfsResult<()>;
-
-    /// Manipulates the underlying device parameters of special files.
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
-        Err(VfsError::NotATty)
-    }
 }
 
 #[repr(transparent)]

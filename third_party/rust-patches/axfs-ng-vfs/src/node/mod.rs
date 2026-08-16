@@ -918,13 +918,6 @@ impl DirEntry {
         String::from_utf8(buf).map_err(|_| VfsError::InvalidData)
     }
 
-    pub fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        match &self.0.node {
-            Node::File(file) => file.ioctl(cmd, arg),
-            Node::Dir(_) => Err(VfsError::NotATty),
-        }
-    }
-
     pub fn user_data(&self) -> MutexGuard<'_, TypeMap> {
         self.0
             .node

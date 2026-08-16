@@ -25,7 +25,7 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired cross-architecture VirtIO discovery, IRQ, and DMA integration.
+- `2aee666` repaired VirtIO discovery, IRQ, and DMA integration.
 - `c52dc6f` introduced shared/async block-device plumbing and diagnostics.
 - `96df7d9` tightened request ownership, fallible construction, and bounded resource behavior.
 - Maintained delta: generic driver enumeration, shared block wrapping, VirtIO DMA/IRQ wiring, and default-off queue diagnostics.

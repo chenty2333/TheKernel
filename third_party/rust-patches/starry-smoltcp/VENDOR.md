@@ -55,11 +55,10 @@ is not an accepted cancellation mechanism.
 The per-commit gate tests an exact copied source snapshot with stable Rust
 1.85.0, inside this package's declared Rust 1.81-or-newer range, and accepts the
 run only when the same successful harness invocation reports at least 41 UDP
-tests. The pinned
-`nightly-2025-05-20` standalone test remains blocked before reaching smoltcp by
-`zerocopy 0.8.41` using the newer `stdarch_x86_avx512` API. This toolchain
-boundary is distinct from the lifecycle result and must not be reported as a
-pinned-nightly pass.
+tests. A historical standalone nightly test was blocked before reaching
+smoltcp by `zerocopy 0.8.41` using the newer `stdarch_x86_avx512` API. That
+historical toolchain boundary is distinct from the lifecycle result and must
+not be reported as validation of the current rolling nightly.
 
 When rebasing, compare against the archive checksum rather than the dirty VCS
 context commit, retain 0BSD attribution, and independently revalidate every

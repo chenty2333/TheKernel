@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -18,11 +18,12 @@ use spin::Mutex;
 use virtio_drivers::{
     Hal,
     device::blk::{
-        PendingBlkBatchBuffer, PendingBlkBatchRequest, PendingBlkHandle, VirtIOBlk as InnerDev,
+        PENDING_COMPLETION_DRAIN_BUDGET, PendingBlkBatchBuffer, PendingBlkBatchRequest,
+        PendingBlkDrainStatus, PendingBlkHandle, VirtIOBlk as InnerDev,
     },
     stats::{
         AsyncBlockWaitPolicy, async_block_enabled, async_block_merge_write_enabled,
-        async_block_wait_policy, record_blk_async_interrupt_drain, record_blk_async_irq_first_arm,
+        async_block_wait_policy, record_blk_async_irq_first_arm,
         record_blk_async_irq_first_fallback, record_blk_async_irq_first_fallback_cannot_block,
         record_blk_async_irq_first_fallback_feature_disabled,
         record_blk_async_irq_first_fallback_no_irq,
@@ -45,7 +46,69 @@ const ASYNC_WRITE_SEGMENTS_INDIRECT_MERGED: usize = 8;
 
 static IRQ_FIRST_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 #[cfg(feature = "irq")]
-static REGISTERED_IRQS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const IRQ_SLOT_EMPTY: usize = usize::MAX;
+#[cfg(feature = "irq")]
+const IRQ_SLOT_COUNT: usize = 16;
+#[cfg(feature = "irq")]
+struct IrqEndpoint {
+    irq: AtomicUsize,
+    ptr: AtomicUsize,
+    callback: AtomicUsize,
+    active: AtomicBool,
+    readers: AtomicUsize,
+}
+
+#[cfg(feature = "irq")]
+impl IrqEndpoint {
+    const fn new() -> Self {
+        Self {
+            irq: AtomicUsize::new(IRQ_SLOT_EMPTY),
+            ptr: AtomicUsize::new(0),
+            callback: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+            readers: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "irq")]
+static IRQ_ENDPOINTS: [IrqEndpoint; IRQ_SLOT_COUNT] =
+    [const { IrqEndpoint::new() }; IRQ_SLOT_COUNT];
+#[cfg(feature = "irq")]
+static IRQ_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(feature = "irq")]
+const REGISTERED_IRQ_CAPACITY: usize = 256;
+#[cfg(feature = "irq")]
+struct RegisteredIrqs {
+    entries: [usize; REGISTERED_IRQ_CAPACITY],
+    len: usize,
+}
+
+#[cfg(feature = "irq")]
+impl RegisteredIrqs {
+    const fn new() -> Self {
+        Self {
+            entries: [0; REGISTERED_IRQ_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn contains(&self, irq: usize) -> bool {
+        self.entries[..self.len].contains(&irq)
+    }
+
+    fn insert(&mut self, irq: usize) -> bool {
+        if self.len == self.entries.len() {
+            return false;
+        }
+        self.entries[self.len] = irq;
+        self.len += 1;
+        true
+    }
+}
+
+#[cfg(feature = "irq")]
+static REGISTERED_IRQS: Mutex<RegisteredIrqs> = Mutex::new(RegisteredIrqs::new());
 
 fn reap_all_async_handles<Handle: Copy>(
     handles: &[Handle],
@@ -78,6 +141,14 @@ fn accepted_pending_handles<'a>(
             .handle
             .expect("accepted asynchronous block request is missing its handle")
     })
+}
+
+fn drain_requires_continuation(
+    status: PendingBlkDrainStatus,
+    observed_irq_generation: u64,
+    current_irq_generation: u64,
+) -> bool {
+    status.has_continuation() || current_irq_generation != observed_irq_generation
 }
 
 fn accepted_request_handles<'a>(
@@ -123,25 +194,24 @@ enum IrqFirstArmState {
 
 #[cfg(feature = "irq")]
 fn virtio_blk_irq_wake_handler() {
+    // The platform callback has no IRQ argument.  It therefore dispatches
+    // every live VirtIO block endpoint; each transport's acknowledge is the
+    // authoritative filter for the line that actually raised the interrupt.
+    // Completion draining remains exclusively in task context.
+    dispatch_registered_irq(None);
     notify_irq_first_waiters();
 }
 
 #[cfg(feature = "irq")]
-fn arm_irq_first_wait(irq: Option<usize>) -> IrqFirstArmState {
-    let Some(irq) = irq else {
-        return IrqFirstArmState::NoIrq;
-    };
-
+fn ensure_platform_irq_handler(irq: usize) -> bool {
     let mut registered = REGISTERED_IRQS.lock();
-    if registered.contains(&irq) {
-        return IrqFirstArmState::Armed;
+    if registered.contains(irq) {
+        return true;
     }
-    if axhal::irq::register(irq, virtio_blk_irq_wake_handler) {
-        registered.push(irq);
-        IrqFirstArmState::Armed
-    } else {
-        IrqFirstArmState::RegisterFailed
+    if !axhal::irq::register(irq, virtio_blk_irq_wake_handler) {
+        return false;
     }
+    registered.insert(irq)
 }
 
 #[cfg(not(feature = "irq"))]
@@ -152,6 +222,63 @@ fn arm_irq_first_wait(irq: Option<usize>) -> IrqFirstArmState {
         IrqFirstArmState::NoIrq
     }
 }
+
+#[cfg(feature = "irq")]
+fn dispatch_registered_irq(irq: Option<usize>) {
+    for endpoint in &IRQ_ENDPOINTS {
+        if !endpoint.active.load(Ordering::Acquire) {
+            continue;
+        }
+        if let Some(irq) = irq {
+            if endpoint.irq.load(Ordering::Acquire) != irq {
+                continue;
+            }
+        }
+
+        // Pin the endpoint before loading its pointer.  Teardown marks the
+        // endpoint inactive and waits for this reader count to reach zero
+        // before clearing the callback and allowing the object to drop.
+        endpoint.readers.fetch_add(1, Ordering::AcqRel);
+        if endpoint.active.load(Ordering::Acquire)
+            && irq.map_or(true, |irq| endpoint.irq.load(Ordering::Acquire) == irq)
+        {
+            let ptr = endpoint.ptr.load(Ordering::Acquire);
+            let callback = endpoint.callback.load(Ordering::Acquire);
+            if ptr != 0 && callback != 0 {
+                // SAFETY: registration stores a callback whose concrete
+                // generic type matches the pointer in this endpoint.  The
+                // reader count keeps that object alive through the call.
+                let callback =
+                    unsafe { core::mem::transmute::<usize, unsafe fn(*const ())>(callback) };
+                unsafe { callback(ptr as *const ()) };
+            }
+        }
+        endpoint.readers.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "irq")]
+unsafe fn irq_callback<H: Hal, T: Transport>(ptr: *const ()) {
+    // SAFETY: `ptr` was captured from a live `VirtIoBlkDev<H, T>` by
+    // `arm_irq_first_wait`, and the endpoint reader count keeps it alive
+    // until this callback returns.
+    let dev = unsafe { &*(ptr as *const VirtIoBlkDev<H, T>) };
+    let _ = dev.handle_irq();
+}
+
+/// Dispatches a platform IRQ to registered VirtIO block devices.
+///
+/// The top-level IRQ dispatcher may call this hook when it owns a shared
+/// IRQ-hook chain.  The direct platform registration above also calls the
+/// same endpoint path for kernels without such a chain.
+#[cfg(feature = "irq")]
+pub fn dispatch_irq(irq: usize) {
+    dispatch_registered_irq(Some(irq));
+}
+
+#[cfg(not(feature = "irq"))]
+#[allow(dead_code)]
+pub fn dispatch_irq(_irq: usize) {}
 
 fn notify_irq_first_waiters() {
     if IRQ_FIRST_WAIT_QUEUE.notify_many(usize::MAX, false) > 0 {
@@ -166,6 +293,10 @@ pub struct VirtIoBlkDev<H: Hal, T: Transport> {
     irq: Option<usize>,
     irq_enabled: AtomicBool,
     irq_wait_armed: AtomicBool,
+    irq_generation: AtomicU64,
+    continuation_pending: AtomicBool,
+    #[cfg(feature = "irq")]
+    irq_slot: AtomicUsize,
 }
 
 impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
@@ -184,13 +315,104 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             irq,
             irq_enabled: AtomicBool::new(false),
             irq_wait_armed: AtomicBool::new(false),
+            irq_generation: AtomicU64::new(0),
+            continuation_pending: AtomicBool::new(false),
+            #[cfg(feature = "irq")]
+            irq_slot: AtomicUsize::new(IRQ_SLOT_EMPTY),
         })
+    }
+
+    #[cfg(feature = "irq")]
+    fn arm_irq_first_wait(&self) -> IrqFirstArmState {
+        let Some(irq) = self.irq else {
+            return IrqFirstArmState::NoIrq;
+        };
+
+        let ptr = self as *const Self as *const ();
+        let callback = irq_callback::<H, T> as *const () as usize;
+        let current = self.irq_slot.load(Ordering::Acquire);
+        if current < IRQ_SLOT_COUNT {
+            let endpoint = &IRQ_ENDPOINTS[current];
+            if endpoint.active.load(Ordering::Acquire)
+                && endpoint.irq.load(Ordering::Acquire) == irq
+                && endpoint.ptr.load(Ordering::Acquire) == ptr as usize
+            {
+                return IrqFirstArmState::Armed;
+            }
+        }
+
+        let _registry = IRQ_REGISTRY_LOCK.lock();
+        // The fast path above is only an optimization; re-check under the
+        // registry lock before creating a second endpoint for this device.
+        for (index, endpoint) in IRQ_ENDPOINTS.iter().enumerate() {
+            if endpoint.active.load(Ordering::Acquire)
+                && endpoint.irq.load(Ordering::Acquire) == irq
+                && endpoint.ptr.load(Ordering::Acquire) == ptr as usize
+            {
+                self.irq_slot.store(index, Ordering::Release);
+                return IrqFirstArmState::Armed;
+            }
+        }
+        let Some((index, endpoint)) = IRQ_ENDPOINTS
+            .iter()
+            .enumerate()
+            .find(|(_, endpoint)| !endpoint.active.load(Ordering::Acquire))
+        else {
+            return IrqFirstArmState::RegisterFailed;
+        };
+
+        if !ensure_platform_irq_handler(irq) {
+            return IrqFirstArmState::RegisterFailed;
+        }
+
+        endpoint.irq.store(irq, Ordering::Relaxed);
+        endpoint.ptr.store(ptr as usize, Ordering::Relaxed);
+        endpoint.callback.store(callback, Ordering::Relaxed);
+        endpoint.active.store(true, Ordering::Release);
+        self.irq_slot.store(index, Ordering::Release);
+        IrqFirstArmState::Armed
+    }
+
+    #[cfg(not(feature = "irq"))]
+    fn arm_irq_first_wait(&self) -> IrqFirstArmState {
+        arm_irq_first_wait(self.irq)
+    }
+
+    #[cfg(feature = "irq")]
+    fn disarm_irq_endpoint(&self) {
+        let index = self.irq_slot.swap(IRQ_SLOT_EMPTY, Ordering::AcqRel);
+        if index >= IRQ_SLOT_COUNT {
+            return;
+        }
+        let endpoint = &IRQ_ENDPOINTS[index];
+        endpoint.active.store(false, Ordering::Release);
+        while endpoint.readers.load(Ordering::Acquire) != 0 {
+            if axtask::can_block_current() {
+                axtask::yield_now();
+            } else {
+                axtask::resched_if_needed();
+            }
+        }
+        endpoint.ptr.store(0, Ordering::Relaxed);
+        endpoint.callback.store(0, Ordering::Relaxed);
+        endpoint.irq.store(IRQ_SLOT_EMPTY, Ordering::Release);
     }
 
     /// Enables device-to-driver notifications for completion interrupts.
     pub fn enable_irq(&self) {
-        let wait_armed = arm_irq_first_wait(self.irq) == IrqFirstArmState::Armed;
-        self.inner.lock().enable_interrupts();
+        let wait_armed = self.arm_irq_first_wait() == IrqFirstArmState::Armed;
+        // Arm the platform callback before unmasking the queue.  Then perform
+        // one task-context acknowledgement to cover an interrupt that was
+        // raised before the arm point (or that raced the callback install).
+        let pending = {
+            let mut inner = self.inner.lock();
+            inner.enable_interrupts();
+            inner.ack_interrupt()
+        };
+        if pending {
+            self.publish_irq_token();
+            notify_irq_first_waiters();
+        }
         self.irq_enabled.store(true, Ordering::Release);
         let was_armed = self.irq_wait_armed.swap(wait_armed, Ordering::AcqRel);
         if wait_armed && !was_armed {
@@ -203,6 +425,8 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         self.inner.lock().disable_interrupts();
         self.irq_enabled.store(false, Ordering::Release);
         self.irq_wait_armed.store(false, Ordering::Release);
+        #[cfg(feature = "irq")]
+        self.disarm_irq_endpoint();
     }
 
     /// Returns whether completion interrupts are enabled in the wrapper.
@@ -221,23 +445,94 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         }
     }
 
-    /// Acknowledges a block interrupt, drains completions, and wakes waiters.
+    fn publish_irq_token(&self) {
+        self.irq_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("VirtIO block IRQ generation exhausted"));
+        // The generation is useful for detecting an IRQ which races a task
+        // snapshot, but it is not itself a work queue.  Keep one coalesced
+        // ownership token per device so duplicate IRQs cannot create an
+        // unbounded continuation backlog.
+        self.continuation_pending.store(true, Ordering::Release);
+    }
+
+    /// Acknowledges a block interrupt and publishes a task token.
     ///
-    /// The VirtIO queue lock is dropped before notifying the shared wait queue,
-    /// keeping interrupt wakeup order consistent with the hybrid wait path.
+    /// Completion ownership stays with task-context poll/wait paths.  This
+    /// entry point deliberately does not inspect used-ring entries or touch
+    /// completion buffers. Every recognized IRQ advances a generation so a
+    /// task drain cannot erase an IRQ that raced with its used-ring snapshot;
+    /// the downstream queue event and wait queues provide coalescing.
     pub fn handle_irq(&self) -> DevResult<usize> {
-        let drained = {
-            let mut inner = self.inner.lock();
-            let _ = inner.ack_interrupt();
-            let drained = inner.drain_pending_completions().map_err(as_dev_err)?;
-            drained
+        let published = if let Some(mut inner) = self.inner.try_lock() {
+            inner.ack_interrupt()
+        } else {
+            // The IRQ-facing path cannot wait for the task-side queue lock.
+            // The task continuation will perform the deferred acknowledge.
+            true
         };
-        if drained > 0 {
-            record_blk_async_interrupt_drain();
+        if published {
+            self.publish_irq_token();
+            notify_irq_first_waiters();
         }
-        Self::notify_completion_waiters(&self.wait_queue, drained);
-        notify_irq_first_waiters();
-        Ok(drained)
+        Ok(usize::from(published))
+    }
+
+    fn ack_task_irq(&self, inner: &mut InnerDev<H, T>) {
+        if inner.ack_interrupt() {
+            self.publish_irq_token();
+        }
+    }
+
+    fn note_drain_status(
+        &self,
+        status: PendingBlkDrainStatus,
+        observed_irq_generation: u64,
+    ) -> (usize, bool) {
+        let drained = status.drained();
+        let mut continuation = drain_requires_continuation(
+            status,
+            observed_irq_generation,
+            self.irq_generation.load(Ordering::Acquire),
+        );
+        if continuation {
+            self.continuation_pending.store(true, Ordering::Release);
+        } else {
+            // Clear only the token observed by this pass, then re-check the
+            // generation.  An IRQ arriving between the first generation read
+            // and the clear must leave a token for the next task pass even if
+            // that IRQ did not find a waiter to wake.
+            self.continuation_pending
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            if self.irq_generation.load(Ordering::Acquire) != observed_irq_generation {
+                self.continuation_pending.store(true, Ordering::Release);
+                continuation = true;
+            }
+        }
+        (drained, continuation)
+    }
+
+    fn continue_pending_drain(&self) -> bool {
+        if !self.continuation_pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        if axtask::can_block_current() {
+            record_blk_async_wait_yield();
+            axtask::yield_now();
+        } else {
+            // A preemption-disabled task cannot switch voluntarily.  Still
+            // run the scheduler boundary so a pending reschedule/deferred
+            // action is serviced before the next bounded drain pass.  The
+            // normal task path above performs a real yield; this fallback is
+            // only for the non-blocking context required by synchronous
+            // callers.
+            record_blk_async_wait_yield();
+            axtask::resched_if_needed();
+        }
+        true
     }
 
     fn wait_for_pending_done(&self, handle: PendingBlkHandle) -> DevResult
@@ -247,9 +542,14 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         let mut polls = 0u64;
         loop {
             let mut inner = self.inner.lock();
-            let drained = inner.drain_pending_completions().unwrap_or_else(|error| {
-                panic!("lost asynchronous block completion state while reaping: {error}")
-            });
+            self.ack_task_irq(&mut inner);
+            let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+            let status = inner
+                .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                .unwrap_or_else(|error| {
+                    panic!("lost asynchronous block completion state while reaping: {error}")
+                });
+            let (drained, continuation) = self.note_drain_status(status, observed_irq_generation);
             if inner.pending_request_done(handle) {
                 inner.record_external_queue_wait(polls, handle.notified());
                 Self::record_wait_hit(polls);
@@ -264,6 +564,10 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             // the consumer phase.
             drop(inner);
             Self::notify_completion_waiters(&self.wait_queue, drained);
+            if continuation {
+                self.continue_pending_drain();
+                continue;
+            }
             match self.wait_backoff(&mut polls, |inner| Ok(inner.pending_request_done(handle))) {
                 Ok(()) | Err(DevError::Again | DevError::ResourceBusy) => {}
                 Err(error) => {
@@ -280,7 +584,12 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         let mut polls = 0u64;
         loop {
             let mut inner = self.inner.lock();
-            let drained = inner.drain_pending_completions().map_err(as_dev_err)?;
+            self.ack_task_irq(&mut inner);
+            let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+            let status = inner
+                .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                .map_err(as_dev_err)?;
+            let (drained, continuation) = self.note_drain_status(status, observed_irq_generation);
             if inner.pending_request_count() == 0 {
                 Self::record_wait_hit(polls);
                 drop(inner);
@@ -289,6 +598,10 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             }
             drop(inner);
             Self::notify_completion_waiters(&self.wait_queue, drained);
+            if continuation {
+                self.continue_pending_drain();
+                continue;
+            }
             self.wait_backoff(&mut polls, |inner| Ok(inner.pending_request_count() == 0))?;
         }
     }
@@ -347,6 +660,9 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         T: Send,
     {
         *polls = polls.saturating_add(1);
+        if self.continue_pending_drain() {
+            return Ok(());
+        }
         if *polls <= ASYNC_WAIT_SPIN_BUDGET {
             record_blk_async_wait_spin();
             spin_loop();
@@ -389,7 +705,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
 
     fn ensure_irq_first_wait_armed(&self) -> IrqFirstArmState {
         if !self.irq_wait_armed.load(Ordering::Acquire) {
-            let arm_state = arm_irq_first_wait(self.irq);
+            let arm_state = self.arm_irq_first_wait();
             if arm_state != IrqFirstArmState::Armed {
                 return arm_state;
             }
@@ -430,11 +746,15 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             .wait_queue
             .wait_timeout_until(Duration::from_micros(ASYNC_WAIT_TIMEOUT_US), || {
                 let mut inner = self.inner.lock();
-                let drained = match inner.drain_pending_completions() {
-                    Ok(drained) => drained,
+                self.ack_task_irq(&mut inner);
+                let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+                let (drained, continuation) = match inner
+                    .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                {
+                    Ok(status) => self.note_drain_status(status, observed_irq_generation),
                     Err(err) => {
                         wait_error = Some(as_dev_err(err));
-                        0
+                        (0, false)
                     }
                 };
                 let is_ready = if wait_error.is_none() {
@@ -450,7 +770,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 };
                 drop(inner);
                 Self::notify_completion_waiters(&self.wait_queue, drained);
-                is_ready || wait_error.is_some()
+                is_ready || continuation || wait_error.is_some()
             })
             .map_err(wait_error_to_dev)?;
         if let Some(err) = wait_error {
@@ -473,12 +793,15 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         IRQ_FIRST_WAIT_QUEUE
             .wait_until(|| {
                 let mut inner = self.inner.lock();
-                let _ = inner.ack_interrupt();
-                let drained = match inner.drain_pending_completions() {
-                    Ok(drained) => drained,
+                self.ack_task_irq(&mut inner);
+                let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+                let (drained, continuation) = match inner
+                    .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                {
+                    Ok(status) => self.note_drain_status(status, observed_irq_generation),
                     Err(err) => {
                         wait_error = Some(as_dev_err(err));
-                        0
+                        (0, false)
                     }
                 };
                 let is_ready = if wait_error.is_none() {
@@ -494,7 +817,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 };
                 drop(inner);
                 Self::notify_completion_waiters(&self.wait_queue, drained);
-                is_ready || wait_error.is_some()
+                is_ready || continuation || wait_error.is_some()
             })
             .map_err(wait_error_to_dev)?;
         if let Some(err) = wait_error {
@@ -955,12 +1278,18 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
     }
 
     fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
-        let _ = budget;
-        let drained = self
-            .inner
-            .lock()
-            .drain_pending_completions()
-            .map_err(as_dev_err)?;
+        if budget == 0 {
+            return Ok(0);
+        }
+        let (drained, _) = {
+            let mut inner = self.inner.lock();
+            self.ack_task_irq(&mut inner);
+            let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+            let status = inner
+                .drain_pending_completions_bounded(budget)
+                .map_err(as_dev_err)?;
+            self.note_drain_status(status, observed_irq_generation)
+        };
         Self::notify_completion_waiters(&self.wait_queue, drained);
         Ok(drained)
     }
@@ -994,9 +1323,32 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
     }
 }
 
+impl<H: Hal, T: Transport> Drop for VirtIoBlkDev<H, T> {
+    fn drop(&mut self) {
+        // Stop device notifications and retire the IRQ endpoint before the
+        // inner VirtIO object tears down its queue.  A late IRQ can therefore
+        // only observe an inactive slot, never a pointer to this object.
+        self.irq_enabled.store(false, Ordering::Release);
+        self.irq_wait_armed.store(false, Ordering::Release);
+        #[cfg(feature = "irq")]
+        self.disarm_irq_endpoint();
+        self.inner.lock().disable_interrupts();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn irq_generation_race_preserves_task_continuation() {
+        let complete = PendingBlkDrainStatus::Complete { drained: 1 };
+        assert!(!drain_requires_continuation(complete, 7, 7));
+        assert!(drain_requires_continuation(complete, 7, 8));
+
+        let backlog = PendingBlkDrainStatus::Continuation { drained: 4 };
+        assert!(drain_requires_continuation(backlog, 8, 8));
+    }
 
     #[test]
     fn reap_all_keeps_waiting_after_completed_request_errors() {

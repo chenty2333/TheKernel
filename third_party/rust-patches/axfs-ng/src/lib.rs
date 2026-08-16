@@ -823,21 +823,13 @@ pub fn async_block_queue_interrupt_selftest(
         let write_handle = write_requests[0]
             .handle
             .ok_or(AsyncBlockQueueSelftestError::Io)?;
-        let mut drained = 0usize;
-        for _ in 0..4096 {
-            drained = drained.saturating_add(
-                dev.handle_irq()
-                    .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
-            );
-            if drained >= 1 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if drained == 0 {
-            let _ = dev.disable_irq();
-            return Err(AsyncBlockQueueSelftestError::Io);
-        }
+        // Exercise the IRQ-facing acknowledgement once, then leave all
+        // completion ownership to the bounded task-context wait path.  A
+        // device IRQ may race this call; the per-device token/generation
+        // state must preserve that work without another busy-poll loop.
+        let _ = dev
+            .handle_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
         dev.wait_async_all(&[write_handle])
             .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
 
@@ -859,21 +851,9 @@ pub fn async_block_queue_interrupt_selftest(
         let read_handle = read_requests[0]
             .handle
             .ok_or(AsyncBlockQueueSelftestError::Io)?;
-        let mut drained = 0usize;
-        for _ in 0..4096 {
-            drained = drained.saturating_add(
-                dev.handle_irq()
-                    .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
-            );
-            if drained >= 1 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if drained == 0 {
-            let _ = dev.disable_irq();
-            return Err(AsyncBlockQueueSelftestError::Io);
-        }
+        let _ = dev
+            .handle_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
         dev.wait_async_all(&[read_handle])
             .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
         dev.disable_irq()

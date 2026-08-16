@@ -56,7 +56,6 @@
 
 #![no_std]
 #![feature(doc_cfg)]
-#![feature(used_with_arg)]
 #![feature(associated_type_defaults)]
 
 #[macro_use]
@@ -150,10 +149,8 @@ pub struct VirtioIoCounters {
     pub blk_pending_drained_requests: u64,
     /// Whether the async block queue is enabled at runtime.
     pub blk_async_enabled: u64,
-    /// Experimental RISC-V/default async queue depth cap.
+    /// Runtime async queue depth cap.
     pub blk_async_depth: u64,
-    /// Experimental LoongArch64 async queue depth cap.
-    pub blk_async_la_depth: u64,
     /// Runtime async wait policy.
     pub blk_async_wait_policy: u64,
     /// Whether adaptive queue-depth tuning is enabled.
@@ -299,18 +296,10 @@ pub fn virtio_async_block_enabled() -> bool {
     }
 }
 
-/// Sets the default/RISC-V async block queue depth cap.
+/// Sets the async block queue depth cap.
 pub fn set_virtio_async_block_depth(depth: u64) {
     #[cfg(feature = "virtio-blk")]
     axdriver_virtio::set_virtio_async_block_depth(depth);
-    #[cfg(not(feature = "virtio-blk"))]
-    let _ = depth;
-}
-
-/// Sets the LoongArch64 async block queue depth cap.
-pub fn set_virtio_async_block_la_depth(depth: u64) {
-    #[cfg(feature = "virtio-blk")]
-    axdriver_virtio::set_virtio_async_block_la_depth(depth);
     #[cfg(not(feature = "virtio-blk"))]
     let _ = depth;
 }

@@ -1,11 +1,44 @@
 use axdriver_pci::{
     BarInfo, Cam, Command, DeviceFunction, HeaderType, MemoryBarType, PciRangeAllocator, PciRoot,
 };
-use axhal::mem::phys_to_virt;
+use axhal::mem::{PAGE_SIZE_4K, PhysAddr, phys_to_virt};
 
 use crate::{AllDevices, drivers::BusProbeResult, prelude::*};
 
 const PCI_BAR_NUM: u8 = 6;
+
+/// Return the smallest page-aligned physical range containing one PCI memory
+/// BAR. Invalid or unrepresentable BARs are rejected before they can reach the
+/// MMIO mapper.
+fn memory_bar_mapping_range(address: u64, size: u64) -> Option<(PhysAddr, usize)> {
+    if address == 0 || size == 0 {
+        return None;
+    }
+
+    let start = usize::try_from(address).ok()?;
+    let end = usize::try_from(address.checked_add(size)?).ok()?;
+    let aligned_start = start & !(PAGE_SIZE_4K - 1);
+    let aligned_end = end.checked_add(PAGE_SIZE_4K - 1)? & !(PAGE_SIZE_4K - 1);
+    let aligned_size = aligned_end.checked_sub(aligned_start)?;
+    if aligned_size == 0 {
+        return None;
+    }
+    Some((PhysAddr::from_usize(aligned_start), aligned_size))
+}
+
+fn map_memory_bar(address: u64, size: u64) -> DevResult {
+    let (start, size) = memory_bar_mapping_range(address, size).ok_or(DevError::InvalidParam)?;
+    axklib::mem::iomap(start, size).map_err(|error| {
+        warn!(
+            "failed to map PCI memory BAR [{:#x}, {:#x}): {:?}",
+            start.as_usize(),
+            start.as_usize() + size,
+            error
+        );
+        DevError::Io
+    })?;
+    Ok(())
+}
 
 fn config_pci_device(
     root: &mut PciRoot,
@@ -42,7 +75,8 @@ fn config_pci_device(
         match info {
             BarInfo::IO { address, size } => {
                 if address > 0 && size > 0 {
-                    debug!("  BAR {}: IO  [{:#x}, {:#x})", bar, address, address + size);
+                    let end = address.checked_add(size).ok_or(DevError::InvalidParam)?;
+                    debug!("  BAR {}: IO  [{:#x}, {:#x})", bar, address, end);
                 }
             }
             BarInfo::Memory {
@@ -52,11 +86,14 @@ fn config_pci_device(
                 size,
             } => {
                 if address > 0 && size > 0 {
+                    let end = address
+                        .checked_add(size as u64)
+                        .ok_or(DevError::InvalidParam)?;
                     debug!(
                         "  BAR {}: MEM [{:#x}, {:#x}){}{}",
                         bar,
                         address,
-                        address + size as u64,
+                        end,
                         if address_type == MemoryBarType::Width64 {
                             " 64bit"
                         } else {
@@ -64,6 +101,7 @@ fn config_pci_device(
                         },
                         if prefetchable { " pref" } else { "" },
                     );
+                    map_memory_bar(address, size as u64)?;
                 }
             }
         }
@@ -120,5 +158,32 @@ impl AllDevices {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memory_bar_mapping_range;
+
+    #[test]
+    fn memory_bar_range_is_page_exact() {
+        let (start, size) = memory_bar_mapping_range(0x3800_0000_0123, 0x2345).unwrap();
+        assert_eq!(start.as_usize(), 0x3800_0000_0000);
+        assert_eq!(size, 0x3000);
+    }
+
+    #[test]
+    fn memory_bar_range_preserves_aligned_bounds() {
+        let (start, size) = memory_bar_mapping_range(0xc000_0000_00, 0x1000).unwrap();
+        assert_eq!(start.as_usize(), 0xc000_0000_00);
+        assert_eq!(size, 0x1000);
+    }
+
+    #[test]
+    fn memory_bar_range_rejects_empty_and_overflow() {
+        assert!(memory_bar_mapping_range(0, 0x1000).is_none());
+        assert!(memory_bar_mapping_range(0x1000, 0).is_none());
+        assert!(memory_bar_mapping_range(u64::MAX - 0x7ff, 0x1000).is_none());
+        assert!(memory_bar_mapping_range(u64::MAX - 0xfff, 0xfff).is_none());
     }
 }

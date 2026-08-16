@@ -502,7 +502,51 @@ const GLOBAL_FILE_CACHE_RECLAIM_SCAN_PER_FILE: usize = 128;
 /// Bound the number of pages inspected per inode while estimating
 /// MemAvailable.  Truncation only under-estimates reclaimable memory.
 const GLOBAL_FILE_CACHE_ESTIMATE_PER_FILE: usize = 128;
-type CachedFileRegistryKey = (u64, u64);
+
+/// Stable identity for one cached inode generation.
+///
+/// The device/inode pair is only a filesystem-visible slot and can be reused
+/// after unlink.  `object` is a monotonically allocated generation token
+/// carried by the identity lease in both the per-inode user data and the cache
+/// shared state.  The key itself is copyable and non-owning so global
+/// registries cannot pin an inode or leak an idle cache entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CachedFileIdentity {
+    device: u64,
+    inode: u64,
+    object: u64,
+}
+
+impl CachedFileIdentity {
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    pub const fn object(self) -> u64 {
+        self.object
+    }
+}
+
+/// The identity generation lease carries no filesystem state.  Its strong
+/// reference only keeps the generation attached to a live cache/futex lease;
+/// the token itself is never recycled, even if a stale copy remains in a
+/// bounded scan cursor.
+struct CachedFileIdentityLease {
+    object: u64,
+}
+
+impl CachedFileIdentityLease {
+    const fn object(&self) -> u64 {
+        self.object
+    }
+}
+
+type CachedFileRegistryKey = CachedFileIdentity;
+static NEXT_CACHED_FILE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<CachedFileRegistryKey, FileUserData>>> =
     Once::new();
 static FILE_CACHE_ESTIMATE_CURSOR: Once<Mutex<Option<CachedFileRegistryKey>>> = Once::new();
@@ -809,7 +853,12 @@ fn remove_released_cached_file_registry_entry(
 }
 
 fn cached_file_registry_key(location: &Location) -> CachedFileRegistryKey {
-    (location.mountpoint().device(), location.inode())
+    cached_file_user_data(location).identity()
+}
+
+fn cached_file_user_data(location: &Location) -> Arc<FileUserData> {
+    let mut data = location.user_data();
+    data.get_or_insert_with(|| FileUserData::new_identity(location))
 }
 
 fn cached_file_is_in_memory(location: &Location) -> bool {
@@ -817,25 +866,25 @@ fn cached_file_is_in_memory(location: &Location) -> bool {
 }
 
 fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFileShared>> {
-    let key = cached_file_registry_key(location);
+    let user_data = location.user_data().get::<FileUserData>()?;
+    let key = user_data.identity();
     let registry_shared = {
         let registry = file_cache_registry().lock();
         registry.get(&key).and_then(FileUserData::shared)
     };
-    registry_shared.or_else(|| {
-        location
-            .user_data()
-            .get::<FileUserData>()
-            .and_then(|it| it.shared())
-    })
+    registry_shared.or_else(|| user_data.shared())
 }
 
 fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedFileShared> {
-    let key = cached_file_registry_key(location);
-    let user_data_shared = location
-        .user_data()
-        .get::<FileUserData>()
-        .and_then(|it| it.shared());
+    // `TypeMap` is the inode-generation synchronization point.  It is shared
+    // by hard-link aliases on backends that expose persistent inode data, and
+    // falls back to the exact dentry for backends without that capability.
+    // Installing the identity before taking the global registry lock makes
+    // concurrent first opens observe the same lease rather than allocating
+    // two identities for one inode generation.
+    let user_data = cached_file_user_data(location);
+    let key = user_data.identity();
+    let identity_lease = user_data.identity_lease.clone();
     let (shared, retired_entry, released_retained, install_user_data) = 'registry: {
         let mut registry = file_cache_registry().lock();
         let mut released_retained = None;
@@ -849,13 +898,17 @@ fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedF
             }
         }
 
-        if let Some(shared) = user_data_shared {
+        // A cache shared state can outlive its registry slot while a caller
+        // still owns the per-inode user-data attachment.  Restore that exact
+        // state instead of manufacturing a second cache for the generation.
+        if let Some(shared) = user_data.shared() {
             let retired_entry = registry.insert(key, FileUserData::new(location, &shared));
             break 'registry (shared, retired_entry, released_retained, false);
         }
 
-        let shared = Arc::new(CachedFileShared::new(
+        let shared = Arc::new(CachedFileShared::with_identity(
             key,
+            identity_lease,
             cached_file_is_in_memory(location),
         ));
         let retired_entry = registry.insert(key, FileUserData::new(location, &shared));
@@ -999,7 +1052,17 @@ fn cached_file_writeback_snapshot() -> Vec<CachedFileWritebackSnapshotEntry> {
 pub fn remove_cached_file_registry_entry(device: u64, inode: u64) {
     let retired = {
         let mut registry = file_cache_registry().lock();
-        registry.remove(&(device, inode))
+        // This legacy raw-slot cleanup has no generation token.  Never
+        // remove a live entry: an old inode generation may be finishing
+        // after a replacement has already occupied the same device/inode
+        // slot.  The exact identity path removes live entries on last close;
+        // the caller follows this helper with the inode-scoped dead-entry
+        // prune.
+        let key = registry.iter().find_map(|(key, entry)| {
+            (key.device() == device && key.inode() == inode && !entry.has_live_shared())
+                .then_some(*key)
+        });
+        key.and_then(|key| registry.remove(&key))
     };
     drop(retired);
 }
@@ -1010,8 +1073,8 @@ pub fn prune_dead_cached_file_registry_entries_for_inode(inode: u64) {
         let mut registry = file_cache_registry().lock();
         let dead_keys = registry
             .iter()
-            .filter_map(|(key @ (_, entry_inode), entry)| {
-                (*entry_inode == inode && !entry.has_live_shared()).then_some(*key)
+            .filter_map(|(key, entry)| {
+                (key.inode() == inode && !entry.has_live_shared()).then_some(*key)
             })
             .collect::<Vec<_>>();
         dead_keys
@@ -1170,9 +1233,7 @@ pub fn cached_file_reclaim_estimate() -> CachedFileReclaimEstimate {
             cache
                 .iter()
                 .take(GLOBAL_FILE_CACHE_ESTIMATE_PER_FILE)
-                .filter(|(_pn, page)| {
-                    !page.is_dirty() && !page.is_pinned() && !page.is_writeback()
-                })
+                .filter(|(_pn, page)| !page.is_dirty() && !page.is_pinned() && !page.is_writeback())
                 .count(),
         );
     }
@@ -1268,7 +1329,9 @@ fn reclaim_clean_pages_from_shared_with_scan_budget(
 
         let scan_epoch = FILE_CACHE_RECLAIM_SCAN_EPOCH.load(Ordering::Acquire);
         let inode_scan_epoch = shared.pressure_reclaim_scan_epoch.load(Ordering::Acquire);
-        let mut cycle_scan_remaining = shared.pressure_reclaim_scan_remaining.load(Ordering::Acquire);
+        let mut cycle_scan_remaining = shared
+            .pressure_reclaim_scan_remaining
+            .load(Ordering::Acquire);
         if inode_scan_epoch == scan_epoch && cycle_scan_remaining == 0 {
             // This inode has already completed a full LRU traversal in the
             // current system-wide epoch. Do not silently start another cycle:
@@ -1323,12 +1386,8 @@ fn reclaim_clean_pages_from_shared_with_scan_budget(
             drop(page);
             reclaimed += 1;
         }
-        if reclaimed < target_pages
-            && remaining_scan_budget == 0
-            && cycle_scan_remaining != 0
-        {
-            stats.scan_budget_exhausted_files =
-                stats.scan_budget_exhausted_files.saturating_add(1);
+        if reclaimed < target_pages && remaining_scan_budget == 0 && cycle_scan_remaining != 0 {
+            stats.scan_budget_exhausted_files = stats.scan_budget_exhausted_files.saturating_add(1);
         }
 
         if let (true, Some(remaining_pages)) = (reclaimed != 0, remaining_pages_after_reclaim) {
@@ -1344,9 +1403,8 @@ fn reclaim_clean_pages_from_shared_with_scan_budget(
 /// non-writeback pages from ordinary disk-backed files.  The operation never
 /// waits for a contended cache/direct-I/O path and never initiates writeback.
 pub fn reclaim_clean_cached_file_pages(target_pages: usize) -> CachedFileReclaimStats {
-    let bounded_target = target_pages.min(
-        GLOBAL_FILE_CACHE_SCAN_LIMIT.saturating_mul(GLOBAL_FILE_CACHE_RECLAIM_PER_FILE),
-    );
+    let bounded_target = target_pages
+        .min(GLOBAL_FILE_CACHE_SCAN_LIMIT.saturating_mul(GLOBAL_FILE_CACHE_RECLAIM_PER_FILE));
     let mut stats = CachedFileReclaimStats {
         requested_pages: bounded_target,
         ..CachedFileReclaimStats::default()
@@ -1366,9 +1424,14 @@ pub fn reclaim_clean_cached_file_pages(target_pages: usize) -> CachedFileReclaim
         let per_file_target = bounded_target
             .saturating_sub(stats.reclaimed_pages)
             .min(GLOBAL_FILE_CACHE_RECLAIM_PER_FILE);
-        stats.reclaimed_pages = stats.reclaimed_pages.saturating_add(
-            reclaim_clean_pages_from_shared(&shared, per_file_target, &mut stats),
-        );
+        stats.reclaimed_pages =
+            stats
+                .reclaimed_pages
+                .saturating_add(reclaim_clean_pages_from_shared(
+                    &shared,
+                    per_file_target,
+                    &mut stats,
+                ));
     }
     stats
 }
@@ -1378,7 +1441,7 @@ pub fn reclaim_clean_cached_file_pages(target_pages: usize) -> CachedFileReclaim
 /// lazily, so advancing the epoch is constant-time and allocation-free.
 pub fn advance_clean_cached_file_reclaim_scan_epoch() {
     FILE_CACHE_RECLAIM_SCAN_EPOCH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
             epoch.checked_add(1)
         })
         .expect("clean file-cache reclaim scan epoch exhausted");
@@ -2852,6 +2915,9 @@ struct CachedFileShared {
     /// Registry slot owned weakly by this shared state. Final release removes
     /// it only when both this key and this allocation still match.
     registry_key: CachedFileRegistryKey,
+    /// Keeps the non-owning registry key unique for this inode generation
+    /// while a retained cache or futex lease is still alive.
+    identity_lease: Arc<CachedFileIdentityLease>,
     /// tmpfs and ALWAYS_CACHE files have no lower storage from which clean
     /// pages can be faulted back, so global pressure reclaim must skip them.
     in_memory: bool,
@@ -2874,7 +2940,22 @@ struct CachedFileShared {
 }
 
 impl CachedFileShared {
-    pub fn new(registry_key: CachedFileRegistryKey, in_memory: bool) -> Self {
+    #[cfg(test)]
+    fn new(registry_key: CachedFileRegistryKey, in_memory: bool) -> Self {
+        Self::with_identity(
+            registry_key,
+            Arc::new(CachedFileIdentityLease {
+                object: registry_key.object(),
+            }),
+            in_memory,
+        )
+    }
+
+    fn with_identity(
+        registry_key: CachedFileRegistryKey,
+        identity_lease: Arc<CachedFileIdentityLease>,
+        in_memory: bool,
+    ) -> Self {
         let capacity = if in_memory {
             in_memory_page_cache_capacity()
         } else {
@@ -2882,6 +2963,7 @@ impl CachedFileShared {
         };
         Self {
             registry_key,
+            identity_lease,
             in_memory,
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
             pressure_reclaim_scan_remaining: AtomicUsize::new(0),
@@ -3054,7 +3136,7 @@ impl Drop for CachedFileShared {
     fn drop(&mut self) {
         // Final Arc release makes the registered Weak impossible to upgrade.
         // The pointer check prevents a stale release from deleting a newer
-        // shared state installed for the same filesystem/inode key.
+        // shared state installed for the same inode-generation identity.
         remove_released_cached_file_registry_entry(self.registry_key, core::ptr::from_ref(self));
     }
 }
@@ -3082,6 +3164,8 @@ impl Clone for CachedFile {
 }
 
 struct FileUserData {
+    registry_key: CachedFileRegistryKey,
+    identity_lease: Arc<CachedFileIdentityLease>,
     shared: Weak<CachedFileShared>,
     retained: Option<Arc<CachedFileShared>>,
     writeback_anchor: Option<WritebackAnchor>,
@@ -3092,8 +3176,35 @@ struct FileUserData {
 }
 
 impl FileUserData {
+    fn new_identity(location: &Location) -> Self {
+        let object = NEXT_CACHED_FILE_IDENTITY
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("cached file identity generation exhausted");
+        let identity_lease = Arc::new(CachedFileIdentityLease { object });
+        let registry_key = CachedFileIdentity {
+            device: location.mountpoint().device(),
+            inode: location.inode(),
+            object: identity_lease.object(),
+        };
+        Self {
+            registry_key,
+            identity_lease,
+            shared: Weak::new(),
+            retained: None,
+            writeback_anchor: None,
+            retained_pages: 0,
+            retained_epoch: 0,
+            mountpoint: Arc::downgrade(location.mountpoint()),
+            entry: location.entry().downgrade(),
+        }
+    }
+
     fn new(location: &Location, shared: &Arc<CachedFileShared>) -> Self {
         Self {
+            registry_key: shared.registry_key,
+            identity_lease: shared.identity_lease.clone(),
             shared: Arc::downgrade(shared),
             retained: None,
             writeback_anchor: None,
@@ -3102,6 +3213,10 @@ impl FileUserData {
             mountpoint: Arc::downgrade(location.mountpoint()),
             entry: location.entry().downgrade(),
         }
+    }
+
+    fn identity(&self) -> CachedFileRegistryKey {
+        self.registry_key
     }
 
     pub fn shared(&self) -> Option<Arc<CachedFileShared>> {
@@ -3190,6 +3305,12 @@ impl CachedFile {
     /// Returns `true` if both handles refer to the same shared state.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// Returns the stable identity shared by the page cache and external
+    /// users (for example shared-futex wait queues).
+    pub fn identity(&self) -> CachedFileIdentity {
+        self.shared.registry_key
     }
 
     /// Opens a short preparation window for pinning file-backed user I/O pages.
@@ -6006,15 +6127,14 @@ mod tests {
         CachedFileEvictionOwner, CachedFileReclaimStats, CachedFileShared,
         CachedPageInvalidationTransaction, File, FileBackend, FileFlags, FileUserData,
         MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PinnedPhysicalSegment,
-        WritePlacement,
-        acknowledge_cached_page_eviction, cached_file_registry_key,
+        WritePlacement, acknowledge_cached_page_eviction,
+        advance_clean_cached_file_reclaim_scan_epoch, cached_file_registry_key,
         cached_file_shared_for_location_or_create, discard_cached_pages, file_cache_registry,
-        advance_clean_cached_file_reclaim_scan_epoch, physical_to_virtual,
-        reclaim_clean_pages_from_shared,
+        physical_to_virtual, reclaim_clean_pages_from_shared,
         reclaim_clean_pages_from_shared_with_scan_budget,
-        release_unlinked_cached_file_registry_ownership, try_zeroed_pinned_io_bounce,
-        synchronize_retained_page_count, validate_pinned_physical_segments,
-        with_sync_and_invalidate_cached_file_pages,
+        release_unlinked_cached_file_registry_ownership, remove_cached_file_registry_entry,
+        synchronize_retained_page_count, try_zeroed_pinned_io_bounce,
+        validate_pinned_physical_segments, with_sync_and_invalidate_cached_file_pages,
     };
 
     static PRESSURE_RECLAIM_EPOCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
@@ -6377,8 +6497,7 @@ mod tests {
         let _epoch_guard = PRESSURE_RECLAIM_EPOCH_TEST_LOCK.lock().unwrap();
         const TEST_SCAN_BUDGET: usize = 2;
         let pages = TEST_SCAN_BUDGET + 1;
-        let (cached, _location, _state) =
-            cached_append_test_file((pages * PAGE_SIZE) as u64);
+        let (cached, _location, _state) = cached_append_test_file((pages * PAGE_SIZE) as u64);
         for page in 0..TEST_SCAN_BUDGET {
             seed_cached_page(&cached, page as u32, 0x61, true);
         }
@@ -6423,9 +6542,7 @@ mod tests {
                 .load(Ordering::Acquire),
             0
         );
-        cached.with_page(TEST_SCAN_BUDGET as u32, |page| {
-            assert!(page.is_none())
-        });
+        cached.with_page(TEST_SCAN_BUDGET as u32, |page| assert!(page.is_none()));
     }
 
     #[test]
@@ -6501,14 +6618,14 @@ mod tests {
             let registry = file_cache_registry().lock();
             let entry = registry.get(&key).unwrap();
             assert_eq!(entry.retained_pages, 1);
-            assert!(entry
-                .retained
-                .as_ref()
-                .is_some_and(|retained| Arc::ptr_eq(retained, &cached.shared)));
+            assert!(
+                entry
+                    .retained
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, &cached.shared))
+            );
         }
-        cached.with_page(1, |page| {
-            assert!(page.is_some_and(|page| page.is_dirty()))
-        });
+        cached.with_page(1, |page| assert!(page.is_some_and(|page| page.is_dirty())));
 
         let retired = file_cache_registry().lock().remove(&key);
         drop(retired);
@@ -8466,6 +8583,44 @@ mod tests {
         drop(cached);
 
         assert!(!file_cache_registry().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn inode_generation_replacement_gets_distinct_cache_identity() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+
+        let first = CachedFile::get_or_create(location.clone());
+        let first_identity = first.identity();
+
+        // Model the backend publishing a new inode-generation attachment in
+        // the same device/inode slot after unlink.  The old cache remains
+        // live, so a raw pair key would incorrectly merge the two states.
+        let replacement = FileUserData::new_identity(&location);
+        assert_eq!(replacement.registry_key.device(), first_identity.device());
+        assert_eq!(replacement.registry_key.inode(), first_identity.inode());
+        assert_ne!(replacement.registry_key.object(), first_identity.object());
+        location.user_data().insert(replacement);
+
+        let second = CachedFile::get_or_create(location);
+        assert_ne!(first.identity(), second.identity());
+        assert!(!first.ptr_eq(&second));
+        {
+            let registry = file_cache_registry().lock();
+            assert!(registry.contains_key(&first_identity));
+            assert!(registry.contains_key(&second.identity()));
+        }
+        remove_cached_file_registry_entry(first_identity.device(), first_identity.inode());
+        assert!(
+            file_cache_registry()
+                .lock()
+                .contains_key(&second.identity())
+        );
+
+        drop(first);
+        drop(second);
+        assert!(!file_cache_registry().lock().contains_key(&first_identity));
     }
 
     #[test]

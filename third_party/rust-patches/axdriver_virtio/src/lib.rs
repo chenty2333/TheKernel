@@ -19,7 +19,7 @@ extern crate alloc;
 #[cfg(feature = "block")]
 mod blk;
 #[cfg(feature = "block")]
-pub use self::blk::VirtIoBlkDev;
+pub use self::blk::{VirtIoBlkDev, dispatch_irq};
 
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -52,7 +52,6 @@ pub use virtio_drivers::{
         set_async_block_adaptive_enabled as set_virtio_async_block_adaptive_enabled,
         set_async_block_depth as set_virtio_async_block_depth,
         set_async_block_enabled as set_virtio_async_block_enabled,
-        set_async_block_la_depth as set_virtio_async_block_la_depth,
         set_async_block_merge_write_enabled as set_virtio_async_block_merge_write_enabled,
         set_async_block_wait_policy as set_virtio_async_block_wait_policy,
         set_io_counters_enabled as set_virtio_io_counters_enabled,
@@ -110,12 +109,6 @@ pub fn probe_pci_device<H: VirtIoHal>(
 
     #[cfg(target_arch = "x86_64")]
     const PCI_IRQ_BASE: usize = 0x20;
-    #[cfg(target_arch = "riscv64")]
-    const PCI_IRQ_BASE: usize = 0x20;
-    #[cfg(target_arch = "loongarch64")]
-    const PCI_IRQ_BASE: usize = 0x10;
-    #[cfg(target_arch = "aarch64")]
-    const PCI_IRQ_BASE: usize = 0x23;
 
     let dev_type = virtio_device_type(dev_info).and_then(as_dev_type)?;
     let transport = PciTransport::new::<H>(root, bdf).ok()?;

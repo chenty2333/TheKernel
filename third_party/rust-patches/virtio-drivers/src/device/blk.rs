@@ -21,19 +21,18 @@ use crate::{
         record_blk_pending_depth, record_blk_pending_drain, record_blk_pending_queue_full,
         record_blk_read, record_blk_write, record_queue_sync_wait,
     },
-    transport::Transport,
+    transport::{DeviceStatus, Transport},
     volatile::{Volatile, volread},
 };
 
 const QUEUE: u16 = 0;
 const QUEUE_SIZE: u16 = 16;
-// LA currently uses a bounce-buffered HAL for block I/O. Keep the block queue on the
-// simple split-ring path there; indirect descriptors and event-index are optional and
-// have been the source of corrupted request chains under QEMU.
-#[cfg(target_arch = "loongarch64")]
-const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO.union(BlkFeature::FLUSH);
-
-#[cfg(not(target_arch = "loongarch64"))]
+/// Fixed number of used-ring entries consumed by one task-context drain.
+///
+/// The interrupt path never calls the drain routine.  Keeping the credit in
+/// this crate makes it impossible for a caller to accidentally turn a
+/// completion notification into an unbounded queue walk.
+pub const PENDING_COMPLETION_DRAIN_BUDGET: usize = 4;
 const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
     .union(BlkFeature::FLUSH)
     .union(BlkFeature::RING_INDIRECT_DESC)
@@ -213,6 +212,35 @@ pub struct PendingBlkBatchReport {
     pub queue_full: bool,
     /// Whether the batch submit notified the device.
     pub notified: bool,
+}
+
+/// Result of one bounded pending-completion drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingBlkDrainStatus {
+    /// The used ring was empty after consuming `drained` entries.
+    Complete {
+        /// Number of requests completed by this drain.
+        drained: usize,
+    },
+    /// The fixed credit was exhausted and at least one used-ring entry remains.
+    Continuation {
+        /// Number of requests completed by this drain.
+        drained: usize,
+    },
+}
+
+impl PendingBlkDrainStatus {
+    /// Returns the number of completions consumed by this drain.
+    pub const fn drained(self) -> usize {
+        match self {
+            Self::Complete { drained } | Self::Continuation { drained } => drained,
+        }
+    }
+
+    /// Returns whether the caller must schedule another task-context drain.
+    pub const fn has_continuation(self) -> bool {
+        matches!(self, Self::Continuation { .. })
+    }
 }
 
 // SAFETY: Pending requests carry raw identities for caller/user buffers that
@@ -586,20 +614,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     }
 
     fn configured_async_depth_cap(&self) -> usize {
-        #[cfg(target_arch = "loongarch64")]
-        {
-            (crate::stats::async_block_la_depth() as usize).clamp(1, QUEUE_SIZE as usize)
+        let configured = crate::stats::async_block_depth() as usize;
+        if configured == 0 {
+            usize::from(QUEUE_SIZE / 2)
+        } else {
+            configured
         }
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let configured = crate::stats::async_block_depth() as usize;
-            if configured == 0 {
-                usize::from(QUEUE_SIZE / 2)
-            } else {
-                configured
-            }
-            .clamp(1, QUEUE_SIZE as usize)
-        }
+        .clamp(1, QUEUE_SIZE as usize)
     }
 
     fn default_async_depth(&self) -> usize {
@@ -1353,12 +1374,33 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         self.queue.peek_used()
     }
 
-    /// Drains all currently completed pending block requests.
-    pub fn drain_pending_completions(&mut self) -> Result<usize> {
+    /// Drains at most `budget` completed pending block requests.
+    ///
+    /// The budget is capped at [`PENDING_COMPLETION_DRAIN_BUDGET`] so every
+    /// caller gets the same bounded task-context work unit.  A continuation is
+    /// reported when another used-ring entry is still available; callers must
+    /// invoke this method again without waiting for another interrupt.
+    /// A zero budget performs no work and reports whether a continuation is
+    /// already available.
+    pub fn drain_pending_completions_bounded(
+        &mut self,
+        budget: usize,
+    ) -> Result<PendingBlkDrainStatus> {
+        if budget == 0 {
+            return Ok(if self.queue.peek_used().is_some() {
+                PendingBlkDrainStatus::Continuation { drained: 0 }
+            } else {
+                PendingBlkDrainStatus::Complete { drained: 0 }
+            });
+        }
+        let budget = budget.min(PENDING_COMPLETION_DRAIN_BUDGET);
         let mut drained = 0;
         let mut async_drained = 0;
         let mut async_drained_bytes = 0;
-        while let Some(token) = self.queue.peek_used() {
+        while drained < budget {
+            let Some(token) = self.queue.peek_used() else {
+                break;
+            };
             let idx = usize::from(token);
             let Some(slot) = self.token_slots[idx] else {
                 return Err(Error::WrongToken);
@@ -1388,7 +1430,18 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         record_blk_pending_drain(drained);
         record_blk_async_completion(async_drained, async_drained_bytes, self.async_pending_count);
         record_blk_async_adaptive_completion(async_drained, self.configured_async_depth_cap());
-        Ok(drained)
+        Ok(if self.queue.peek_used().is_some() {
+            PendingBlkDrainStatus::Continuation { drained }
+        } else {
+            PendingBlkDrainStatus::Complete { drained }
+        })
+    }
+
+    /// Drains one fixed task-context completion credit.
+    pub fn drain_pending_completions(&mut self) -> Result<usize> {
+        Ok(self
+            .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)?
+            .drained())
     }
 
     /// Returns whether a pending block request has completed.
@@ -1440,9 +1493,16 @@ impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
     fn drop(&mut self) {
         let live_pending = self.pending.iter().filter(|entry| entry.is_some()).count();
         record_blk_async_resource_leaks(live_pending);
-        debug_assert_eq!(live_pending, 0, "dropping VirtIOBlk with live requests");
-        // Clear any pointers pointing to DMA regions, so the device doesn't try to access them
-        // after they have been freed.
+        // A pending request still contains caller-owned DMA pointers.  Reset
+        // the device before tearing down the queue so it cannot touch those
+        // pointers after this object is gone.  The pending requests are
+        // deliberately not reported as completed; teardown is fail-closed.
+        self.queue.set_dev_notify(false);
+        self.transport.set_status(DeviceStatus::empty());
+        while !self.transport.get_status().is_empty() {
+            spin_loop();
+        }
+        // Clear any queue pointers after the device has acknowledged reset.
         self.transport.queue_unset(QUEUE);
     }
 }
@@ -1653,6 +1713,147 @@ mod tests {
 
         assert_eq!(blk.capacity(), 0x02_0000_0042);
         assert_eq!(blk.readonly(), true);
+    }
+
+    #[test]
+    fn bounded_pending_drain_requires_task_continuation() {
+        let mut config_space = BlkConfig {
+            capacity_low: Volatile::new(66),
+            capacity_high: Volatile::new(0),
+            size_max: Volatile::new(0),
+            seg_max: Volatile::new(0),
+            cylinders: Volatile::new(0),
+            heads: Volatile::new(0),
+            sectors: Volatile::new(0),
+            blk_size: Volatile::new(0),
+            physical_block_exp: Volatile::new(0),
+            alignment_offset: Volatile::new(0),
+            min_io_size: Volatile::new(0),
+            opt_io_size: Volatile::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: QUEUE_SIZE.into(),
+            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
+        let buffers = (0..6).map(|_| [0u8; SECTOR_SIZE]).collect::<Vec<_>>();
+        let mut requests = buffers
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| PendingBlkBatchRequest {
+                block_id: index,
+                buffer: PendingBlkBatchBuffer::Write(buffer),
+                handle: None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            blk.drain_pending_completions_bounded(0).unwrap(),
+            PendingBlkDrainStatus::Complete { drained: 0 }
+        );
+        let report = unsafe { blk.submit_pending_batch(requests.as_mut_slice()) }.unwrap();
+        assert_eq!(report.submitted, buffers.len());
+        let handles = requests
+            .iter()
+            .map(|request| request.handle.expect("submitted request lost handle"))
+            .collect::<Vec<_>>();
+
+        let mut error_first = true;
+        for _ in 0..report.submitted {
+            let status = if error_first {
+                error_first = false;
+                RespStatus::IO_ERR
+            } else {
+                RespStatus::OK
+            };
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| BlkResp { status }
+                        .as_bytes()
+                        .to_vec(),)
+            );
+        }
+
+        assert_eq!(
+            blk.drain_pending_completions_bounded(0).unwrap(),
+            PendingBlkDrainStatus::Continuation { drained: 0 }
+        );
+        assert_eq!(blk.pending_request_count(), buffers.len());
+        assert_eq!(
+            blk.drain_pending_completions_bounded(2).unwrap(),
+            PendingBlkDrainStatus::Continuation { drained: 2 }
+        );
+        assert_eq!(
+            blk.drain_pending_completions_bounded(2).unwrap(),
+            PendingBlkDrainStatus::Continuation { drained: 2 }
+        );
+        assert_eq!(
+            blk.drain_pending_completions_bounded(2).unwrap(),
+            PendingBlkDrainStatus::Complete { drained: 2 }
+        );
+        assert_eq!(blk.pending_request_count(), 0);
+        for (index, handle) in handles.into_iter().enumerate() {
+            if index == 0 {
+                assert!(matches!(
+                    blk.complete_pending_request(handle),
+                    Err(Error::IoError)
+                ));
+            } else {
+                blk.complete_pending_request(handle).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inflight_drop_resets_transport_before_queue_teardown() {
+        let mut config_space = BlkConfig {
+            capacity_low: Volatile::new(66),
+            capacity_high: Volatile::new(0),
+            size_max: Volatile::new(0),
+            seg_max: Volatile::new(0),
+            cylinders: Volatile::new(0),
+            heads: Volatile::new(0),
+            sectors: Volatile::new(0),
+            blk_size: Volatile::new(0),
+            physical_block_exp: Volatile::new(0),
+            alignment_offset: Volatile::new(0),
+            min_io_size: Volatile::new(0),
+            opt_io_size: Volatile::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: QUEUE_SIZE.into(),
+            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut buffer = [0u8; SECTOR_SIZE];
+        let mut request = PendingBlkBatchRequest {
+            block_id: 0,
+            buffer: PendingBlkBatchBuffer::Read(&mut buffer),
+            handle: None,
+        };
+        {
+            let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
+            let report = unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut request)) };
+            assert_eq!(report.unwrap().submitted, 1);
+        }
+        let state = state.lock().unwrap();
+        assert!(state.status.is_empty());
+        assert_eq!(state.queues[QUEUE as usize].descriptors, 0);
     }
 
     #[test]
