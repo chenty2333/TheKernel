@@ -82,9 +82,9 @@ pub struct VirtIOBlk<H: Hal, T: Transport> {
 
 /// One caller-owned physical payload segment for a synchronous direct request.
 ///
-/// The caller must keep this physical range pinned and valid, and must not
-/// access it concurrently with DMA, until the corresponding read/write method
-/// returns. A read is device-to-driver and a write is driver-to-device.
+/// The caller must keep this physical range pinned and valid until the
+/// corresponding read/write method returns. A read is device-to-driver and a
+/// write is driver-to-device; concurrent CPU/device access races on contents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalSegment {
     /// Physical address of the first byte.
@@ -1189,8 +1189,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// # Safety
     ///
     /// The caller must keep every segment pinned and valid until the returned
-    /// handle is completed, must not access the ranges concurrently with DMA,
-    /// and must provide ranges in the device-write direction of a read.
+    /// handle is completed and must provide ranges in the device-write
+    /// direction of a read. Concurrent CPU/device access races on contents.
     pub unsafe fn submit_read_blocks_physical_pending(
         &mut self,
         block_id: u64,
@@ -1255,9 +1255,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// # Safety
     ///
     /// The caller must keep every segment pinned and valid until the returned
-    /// handle is completed, must not access or modify the ranges concurrently
-    /// with DMA, and must provide ranges in the device-read direction of a
-    /// write.
+    /// handle is completed and must provide ranges in the device-read direction
+    /// of a write. Concurrent CPU/device access races on contents.
     pub unsafe fn submit_write_blocks_physical_pending(
         &mut self,
         block_id: u64,

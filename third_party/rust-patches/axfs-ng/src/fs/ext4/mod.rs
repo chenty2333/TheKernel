@@ -121,8 +121,9 @@ impl BlockDevice for Ext4Disk {
         }
         let mut dev = self.inner.device().lock();
         match unsafe { dev.read_block_physical_sg(block_id, &physical[..segments.len()]) } {
-            Ok(()) => Ok(Some(bytes)),
-            Err(DevError::Unsupported) => Ok(None),
+            Ok(outcome) if outcome.is_completed() => Ok(Some(bytes)),
+            Ok(outcome) if outcome.is_not_submitted() => Ok(None),
+            Ok(_) => Err(Ext4Error::new(EIO as _, Some("unknown physical SG outcome"))),
             Err(_) => Err(Ext4Error::new(EIO as _, Some("physical SG read failed"))),
         }
     }
@@ -332,8 +333,9 @@ impl BlockDevice for Ext4Disk {
         }
         let mut dev = self.inner.device().lock();
         match unsafe { dev.write_block_physical_sg(block_id, &physical[..segments.len()]) } {
-            Ok(()) => Ok(Some(bytes)),
-            Err(DevError::Unsupported) => Ok(None),
+            Ok(outcome) if outcome.is_completed() => Ok(Some(bytes)),
+            Ok(outcome) if outcome.is_not_submitted() => Ok(None),
+            Ok(_) => Err(Ext4Error::new(EIO as _, Some("unknown physical SG outcome"))),
             Err(_) => Err(Ext4Error::new(EIO as _, Some("physical SG write failed"))),
         }
     }

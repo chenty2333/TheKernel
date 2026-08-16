@@ -139,7 +139,8 @@ pub unsafe trait Hal {
     /// # Safety
     ///
     /// The caller must keep the physical range pinned and valid for the
-    /// direction until it is unmapped.  No CPU access may race device access.
+    /// direction until it is unmapped. Concurrent CPU/device access races on
+    /// contents; no Rust reference is constructed from this physical range.
     unsafe fn map_physical(
         paddr: PhysAddr,
         len: usize,

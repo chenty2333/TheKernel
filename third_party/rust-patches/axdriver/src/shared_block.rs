@@ -200,9 +200,9 @@ impl BlockDriverOps for SharedBlockDevice {
         &mut self,
         block_id: u64,
         segments: &[crate::prelude::BlockPhysicalSegment],
-    ) -> DevResult {
+    ) -> DevResult<axdriver_block::BlockPhysicalSgOutcome> {
         // SAFETY: The shared lock serializes access to the wrapped driver; the
-        // caller's pin, direction, and no-CPU-race contract is forwarded
+        // caller's pin and direction contract is forwarded
         // unchanged to that driver.
         unsafe { self.lock().read_block_physical_sg(block_id, segments) }
     }
@@ -215,9 +215,9 @@ impl BlockDriverOps for SharedBlockDevice {
         &mut self,
         block_id: u64,
         segments: &[crate::prelude::BlockPhysicalSegment],
-    ) -> DevResult {
+    ) -> DevResult<axdriver_block::BlockPhysicalSgOutcome> {
         // SAFETY: The shared lock serializes access to the wrapped driver; the
-        // caller's pin, direction, and no-CPU-race contract is forwarded
+        // caller's pin and direction contract is forwarded
         // unchanged to that driver.
         unsafe { self.lock().write_block_physical_sg(block_id, segments) }
     }

@@ -832,9 +832,9 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     /// # Safety
     ///
     /// The buffers and physical descriptors must exactly match the submitted
-    /// chain. The physical mappings must remain active until this succeeds;
-    /// their pinned ranges must not be accessed concurrently with DMA. Physical
-    /// inputs are device-readable and physical outputs are device-writable.
+    /// chain. The physical mappings must remain active until this succeeds.
+    /// Physical inputs are device-readable and physical outputs are
+    /// device-writable; concurrent CPU/device access races on contents.
     pub(crate) unsafe fn pop_used_physical<'a, 'b>(
         &mut self,
         token: u16,

@@ -64,6 +64,27 @@ pub struct BlockPhysicalSegment {
     pub len: usize,
 }
 
+/// Outcome of a synchronous physical scatter-gather request.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockPhysicalSgOutcome {
+    /// The driver submitted and completed the request successfully.
+    Completed,
+    /// The driver did not publish a request, so the caller may use a fallback.
+    NotSubmitted,
+}
+
+impl BlockPhysicalSgOutcome {
+    /// Returns whether the physical request completed successfully.
+    pub const fn is_completed(self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    /// Returns whether the driver left the request unpublished.
+    pub const fn is_not_submitted(self) -> bool {
+        matches!(self, Self::NotSubmitted)
+    }
+}
+
 impl BlockSegment {
     /// Creates a read segment backed by a mutable buffer.
     pub fn from_read_buf(buf: &mut [u8]) -> Self {
@@ -204,43 +225,45 @@ pub trait BlockDriverOps: BaseDriverOps {
 
     /// Reads blocks directly into caller-owned pinned physical segments.
     ///
-    /// The default is deliberately unsupported.  A driver may implement this
-    /// only when it can validate the physical SG request and keep every DMA
-    /// mapping alive until the synchronous request has been consumed.
+    /// The default does not publish a request. A driver may implement this only
+    /// when it can validate the physical SG request and keep every DMA mapping
+    /// alive until the synchronous request has been consumed.
     ///
     /// # Safety
     ///
     /// The caller must keep every segment pinned and valid for the entire
-    /// synchronous call, must not access the ranges concurrently with the
-    /// device, and must give ownership in the direction implied by this
-    /// method (the device writes the segments for a read).
+    /// synchronous call and must give access in the direction implied by this
+    /// method (the device writes the segments for a read). Concurrent CPU and
+    /// device accesses race on contents; this API never creates Rust references
+    /// from the physical addresses.
     unsafe fn read_block_physical_sg(
         &mut self,
         block_id: u64,
         segments: &[BlockPhysicalSegment],
-    ) -> DevResult {
+    ) -> DevResult<BlockPhysicalSgOutcome> {
         let _ = (block_id, segments);
-        Err(DevError::Unsupported)
+        Ok(BlockPhysicalSgOutcome::NotSubmitted)
     }
 
     /// Writes blocks directly from caller-owned pinned physical segments.
     ///
-    /// The default is deliberately unsupported.  Virtual [`BlockSegment`]
+    /// The default does not publish a request. Virtual [`BlockSegment`]
     /// requests remain the fallback API for drivers without this capability.
     ///
     /// # Safety
     ///
     /// The caller must keep every segment pinned and valid for the entire
-    /// synchronous call, must not access or modify the ranges concurrently
-    /// with the device, and must give ownership in the direction implied by
-    /// this method (the device reads the segments for a write).
+    /// synchronous call and must give access in the direction implied by this
+    /// method (the device reads the segments for a write). Concurrent CPU and
+    /// device accesses race on contents; this API never creates Rust references
+    /// from the physical addresses.
     unsafe fn write_block_physical_sg(
         &mut self,
         block_id: u64,
         segments: &[BlockPhysicalSegment],
-    ) -> DevResult {
+    ) -> DevResult<BlockPhysicalSgOutcome> {
         let _ = (block_id, segments);
-        Err(DevError::Unsupported)
+        Ok(BlockPhysicalSgOutcome::NotSubmitted)
     }
 
     /// Flushes the device to write all pending data to the storage.
@@ -350,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_sg_defaults_to_unsupported() {
+    fn physical_sg_defaults_to_not_submitted() {
         let mut stub = Stub;
         let segment = BlockPhysicalSegment {
             paddr: 0x2000,
@@ -358,11 +381,11 @@ mod tests {
         };
         assert!(matches!(
             unsafe { stub.read_block_physical_sg(0, &[segment]) },
-            Err(DevError::Unsupported)
+            Ok(BlockPhysicalSgOutcome::NotSubmitted)
         ));
         assert!(matches!(
             unsafe { stub.write_block_physical_sg(0, &[segment]) },
-            Err(DevError::Unsupported)
+            Ok(BlockPhysicalSgOutcome::NotSubmitted)
         ));
     }
 }
