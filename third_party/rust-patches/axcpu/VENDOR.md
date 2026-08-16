@@ -25,26 +25,20 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `7f198eb` repaired and optimized the LoongArch user-copy path.
-- `2aee666` corrected the LoongArch docs.rs target triple.
-- `5641ef3` retained architecture-level copy/alignment improvements.
-- The current MM integration adds a current-CPU executable-publication
-  primitive: LoongArch issues `dbar` plus `ibar`, RISC-V first publishes data
-  stores with `fence rw, rw` and then issues `fence.i`, and x86 records its
-  coherent-cache no-op. Remote execution remains the responsibility of the
+- The maintained source is narrowed to x86_64; the retained architecture
+  implementation includes context switching, user-copy assembly, trap setup,
+  and instruction-cache publication.
+- x86_64 address-space switching adds bounded PCID/INVPCID capability probing,
+  per-CPU bootstrap accounting, generation-aware identities, and defensive
+  CR3 fallback behavior. Remote execution remains the responsibility of the
   higher-level maintenance broker.
-- LoongArch single-address TLB invalidation aligns the requested address to
-  the architecture's adjacent even/odd 8-KiB pair before `INVTLB`.
 - Adds a fixed-capacity `IrqBoundary` transport around the existing
   `handle_trap!(IRQ, ...)` dispatch. It reports enter/exit only; platform IRQ
   acknowledgement and scheduler policy remain in `axhal`/higher layers.
 - `host-test-context` disables exception-table recovery in hosted unit tests,
   which cannot route CPU faults through the kernel trap entry or use the
   production linker script; the `target_os = "none"` kernel path is unchanged.
-- Maintained delta: LoongArch user-copy assembly, unaligned access handling,
-  architecture initialization, pair-granular local TLB invalidation, and
-  current-CPU instruction-cache publication primitives only; Linux user-copy
-  and MM policy remain above this crate.
+- Linux user-copy and MM policy remain above this crate.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

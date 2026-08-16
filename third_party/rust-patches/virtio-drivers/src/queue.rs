@@ -28,15 +28,6 @@ use crate::{
     transport::Transport,
 };
 
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn dma_sync_barrier() {
-    unsafe {
-        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
 #[inline]
 fn dma_sync_barrier() {}
 
@@ -124,18 +115,6 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             layout.driver_area_paddr(),
             layout.device_area_paddr(),
         );
-        #[cfg(target_arch = "loongarch64")]
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "LA virtio queue new q={} size={} desc_paddr={:#x} avail_paddr={:#x} \
-                 used_paddr={:#x}",
-                idx,
-                size,
-                layout.descriptors_paddr(),
-                layout.driver_area_paddr(),
-                layout.device_area_paddr(),
-            );
-        }
 
         let desc =
             nonnull_slice_from_raw_parts(layout.descriptors_vaddr().cast::<Descriptor>(), SIZE);
@@ -149,12 +128,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // Safe because `desc` is properly aligned, dereferenceable, initialised, and the device
             // won't access the descriptors for the duration of this unsafe block.
             unsafe {
-                #[cfg(target_arch = "loongarch64")]
-                core::ptr::addr_of_mut!((*desc.as_ptr())[i as usize].next).write_volatile(i + 1);
-                #[cfg(not(target_arch = "loongarch64"))]
-                {
-                    (*desc.as_ptr())[i as usize].next = i + 1;
-                }
+                (*desc.as_ptr())[i as usize].next = i + 1;
             }
         }
 
@@ -254,13 +228,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let avail_slot = self.avail_idx & (SIZE as u16 - 1);
         // Safe because self.avail is properly aligned, dereferenceable and initialised.
         unsafe {
-            #[cfg(target_arch = "loongarch64")]
-            core::ptr::addr_of_mut!((*self.avail.as_ptr()).ring[avail_slot as usize])
-                .write_volatile(head);
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
-                (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
-            }
+            (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
         }
 
         // Write barrier so that device sees changes to descriptor table and available ring before
@@ -387,93 +355,16 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             notified = true;
         }
 
-        macro_rules! report_loongarch_stall {
-            ($spin_count:ident, $next_report:ident) => {{
-                #[cfg(target_arch = "loongarch64")]
-                {
-                    $spin_count += 1;
-                    if $spin_count == $next_report {
-                        let used_idx = unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) };
-                        let d0 = &self.desc_shadow[usize::from(token)];
-                        let d1_index = d0.next;
-                        let d1 = &self.desc_shadow[usize::from(d1_index)];
-                        let d2_index = d1.next;
-                        let d2 = &self.desc_shadow[usize::from(d2_index)];
-                        let hw0 = unsafe { &(*self.desc.as_ptr())[usize::from(token)] };
-                        let hw1 = unsafe { &(*self.desc.as_ptr())[usize::from(d1_index)] };
-                        let hw2 = unsafe { &(*self.desc.as_ptr())[usize::from(d2_index)] };
-                        let req_bytes = unsafe {
-                            let ptr =
-                                H::mmio_phys_to_virt(d0.addr as usize, d0.len as usize).as_ptr();
-                            core::slice::from_raw_parts(ptr as *const u8, d0.len as usize)
-                        };
-                        let req_type = u32::from_le_bytes(req_bytes[0..4].try_into().unwrap());
-                        let req_reserved = u32::from_le_bytes(req_bytes[4..8].try_into().unwrap());
-                        let req_sector = u64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-                        log::warn!(
-                            "LA virtio queue stall q={} token={} avail={} used={} last_used={} \
-                             num_used={} free_head={} req=({:#x},{:#x},{}) \
-                             shadow=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},\
-                             {})] hw=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},\
-                             {})]",
-                            self.queue_idx,
-                            token,
-                            self.avail_idx,
-                            used_idx,
-                            self.last_used_idx,
-                            self.num_used,
-                            self.free_head,
-                            req_type,
-                            req_reserved,
-                            req_sector,
-                            d0.addr,
-                            d0.len,
-                            d0.flags.bits(),
-                            d0.next,
-                            d1.addr,
-                            d1.len,
-                            d1.flags.bits(),
-                            d1.next,
-                            d2.addr,
-                            d2.len,
-                            d2.flags.bits(),
-                            d2.next,
-                            hw0.addr,
-                            hw0.len,
-                            hw0.flags.bits(),
-                            hw0.next,
-                            hw1.addr,
-                            hw1.len,
-                            hw1.flags.bits(),
-                            hw1.next,
-                            hw2.addr,
-                            hw2.len,
-                            hw2.flags.bits(),
-                            hw2.next,
-                        );
-                        $next_report = $next_report.saturating_mul(4);
-                    }
-                }
-            }};
-        }
-
         // Wait until there is at least one element in the used ring.
-        #[allow(unused_mut, unused_variables)]
-        let mut spin_count = 0usize;
-        #[allow(unused_mut, unused_variables)]
-        let mut next_report = 1_000_000usize;
-
         if count_io_stats {
             let mut wait_polls = 0u64;
             while !self.can_pop() {
                 wait_polls = wait_polls.saturating_add(1);
-                report_loongarch_stall!(spin_count, next_report);
                 spin_loop();
             }
             record_queue_sync_wait(wait_polls, notified);
         } else {
             while !self.can_pop() {
-                report_loongarch_stall!(spin_count, next_report);
                 spin_loop();
             }
         }
@@ -523,13 +414,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // Safe because self.desc is properly aligned, dereferenceable and initialised, and nothing
         // else reads or writes the descriptor during this block.
         unsafe {
-            #[cfg(target_arch = "loongarch64")]
-            core::ptr::addr_of_mut!((*self.desc.as_ptr())[index])
-                .write_volatile(self.desc_shadow[index].clone());
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
-                (*self.desc.as_ptr())[index] = self.desc_shadow[index].clone();
-            }
+            (*self.desc.as_ptr())[index] = self.desc_shadow[index].clone();
         }
     }
 

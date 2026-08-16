@@ -31,14 +31,11 @@ dma = [
     "paging",
 ]
 driver-ahci = ["axdriver?/ahci"]
-driver-bcm2835-sdhci = ["axdriver?/bcm2835-sdhci"]
-driver-fxmac = ["axdriver?/fxmac"]
 driver-ixgbe = ["axdriver?/ixgbe"]
 driver-ramdisk = [
     "axdriver?/ramdisk",
     "axfs?/use-ramdisk",
 ]
-driver-sdmmc = ["axdriver?/sdmmc"]
 dwarf = [
     "alloc",
     "axbacktrace/dwarf",

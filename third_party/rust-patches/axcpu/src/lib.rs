@@ -16,22 +16,17 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 ///
 /// The value is carried with the identity so the switch path never has to
 /// reconstruct allocator history from an ASID-0 number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AddressSpaceFallbackReason {
     /// The identity has a valid nonzero hardware ASID.
     None,
     /// The caller deliberately requested the conservative ASID-0 path.
+    #[default]
     AsidZero,
     /// Hardware reported an unusable ASID field width.
     InvalidWidth,
     /// The boot-scoped, non-recycling ASID allocator is exhausted.
     Exhausted,
-}
-
-impl Default for AddressSpaceFallbackReason {
-    fn default() -> Self {
-        Self::AsidZero
-    }
 }
 
 /// Classified reason that one address-space switch required a full TLB flush.
@@ -49,31 +44,32 @@ pub enum AsidSwitchFallbackReason {
     SameIdDifferentRoot,
 }
 
-#[cfg(all(
-    feature = "asid-fast-switch",
-    any(
-        test,
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )
-))]
+#[cfg(feature = "asid-fast-switch")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlbSwitchDecision {
     Retain,
     Flush(AsidSwitchFallbackReason),
 }
 
-#[cfg(all(
-    feature = "asid-fast-switch",
-    any(
-        test,
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )
-))]
+#[cfg(feature = "asid-fast-switch")]
 #[inline]
+const fn legal_nonzero_identity(
+    root: usize,
+    asid: usize,
+    generation: u64,
+    fallback: AddressSpaceFallbackReason,
+) -> bool {
+    asid < 4096
+        && asid != 0
+        && generation != 0
+        && matches!(fallback, AddressSpaceFallbackReason::None)
+        && root & 0xfff == 0
+        && root < (1usize << 52)
+}
+
+#[cfg(feature = "asid-fast-switch")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
 const fn classify_user_tlb_switch(
     current_root: usize,
     current_asid: usize,
@@ -87,8 +83,11 @@ const fn classify_user_tlb_switch(
     // This predicate relies on the caller never recycling a nonzero numeric
     // ASID during the boot.  TheKernel's bounded allocator permanently falls
     // back to ASID 0 on exhaustion because its current global TLB grace is not
-    // a quiescence protocol.
-    if current_asid == 0 || next_asid == 0 {
+    // a quiescence protocol.  A legal target identity is safe to enter with
+    // CR3.NOFLUSH even when the old context is legacy PCID 0: no old PCID-0
+    // translation can be selected by the new nonzero PCID.
+    let next_is_legacy = next_asid == 0;
+    if next_is_legacy {
         let reason = if matches!(current_fallback, AddressSpaceFallbackReason::InvalidWidth)
             || matches!(next_fallback, AddressSpaceFallbackReason::InvalidWidth)
         {
@@ -102,10 +101,24 @@ const fn classify_user_tlb_switch(
         };
         return TlbSwitchDecision::Flush(reason);
     }
-    if current_generation == 0 || current_generation != next_generation {
+
+    if !legal_nonzero_identity(next_root, next_asid, next_generation, next_fallback) {
+        return TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth);
+    }
+    if current_asid != 0
+        && !legal_nonzero_identity(
+            current_root,
+            current_asid,
+            current_generation,
+            current_fallback,
+        )
+    {
+        return TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth);
+    }
+    if current_asid != 0 && current_generation != next_generation {
         return TlbSwitchDecision::Flush(AsidSwitchFallbackReason::GenerationMismatch);
     }
-    if current_asid == next_asid && current_root != next_root {
+    if current_asid != 0 && current_asid == next_asid && current_root != next_root {
         return TlbSwitchDecision::Flush(AsidSwitchFallbackReason::SameIdDifferentRoot);
     }
     TlbSwitchDecision::Retain
@@ -193,15 +206,9 @@ impl AsidSwitchDiagnostics {
         }
     }
 
-    #[cfg(any(
-        test,
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    ))]
     fn increment(&self, counter: &AtomicUsize) {
         if counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .is_err()
@@ -210,12 +217,6 @@ impl AsidSwitchDiagnostics {
         }
     }
 
-    #[cfg(any(
-        test,
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    ))]
     #[inline]
     fn record(&self, decision: TlbSwitchDecision) {
         match decision {
@@ -290,15 +291,7 @@ pub fn reset_asid_switch_diagnostics() {
     ASID_SWITCH_DIAGNOSTICS.reset();
 }
 
-#[cfg(all(
-    feature = "asid-switch-diagnostics",
-    any(
-        test,
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64"
-    )
-))]
+#[cfg(feature = "asid-switch-diagnostics")]
 #[inline]
 fn record_asid_switch_decision(decision: TlbSwitchDecision) {
     ASID_SWITCH_DIAGNOSTICS.record(decision);
@@ -310,21 +303,13 @@ pub mod trap;
 #[cfg(feature = "uspace")]
 mod uspace_common;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_arch = "x86_64")] {
-        mod x86_64;
-        pub use self::x86_64::*;
-    } else if #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))] {
-        mod riscv;
-        pub use self::riscv::*;
-    } else if #[cfg(target_arch = "aarch64")]{
-        mod aarch64;
-        pub use self::aarch64::*;
-    } else if #[cfg(any(target_arch = "loongarch64"))] {
-        mod loongarch64;
-        pub use self::loongarch64::*;
-    }
-}
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::*;
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("axcpu supports only x86_64");
 
 #[cfg(all(test, feature = "asid-fast-switch"))]
 mod tests {
@@ -360,7 +345,7 @@ mod tests {
                 1,
                 AddressSpaceFallbackReason::None,
             ),
-            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::AsidZero)
+            TlbSwitchDecision::Retain
         );
         assert_eq!(
             classify_user_tlb_switch(
@@ -433,7 +418,80 @@ mod tests {
                 1,
                 AddressSpaceFallbackReason::None,
             ),
-            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::Exhausted)
+            TlbSwitchDecision::Retain
+        );
+    }
+
+    #[test]
+    fn legacy_targets_and_invalid_current_identities_flush_defensively() {
+        assert_eq!(
+            classify_user_tlb_switch(
+                0x1000,
+                1,
+                1,
+                AddressSpaceFallbackReason::None,
+                0x2000,
+                0,
+                0,
+                AddressSpaceFallbackReason::AsidZero,
+            ),
+            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::AsidZero)
+        );
+        assert_eq!(
+            classify_user_tlb_switch(
+                0x1000,
+                4096,
+                1,
+                AddressSpaceFallbackReason::None,
+                0x2000,
+                2,
+                1,
+                AddressSpaceFallbackReason::None,
+            ),
+            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth)
+        );
+    }
+
+    #[test]
+    fn target_pcids_require_aligned_roots_and_twelve_bit_values() {
+        assert_eq!(
+            classify_user_tlb_switch(
+                0x1000,
+                1,
+                1,
+                AddressSpaceFallbackReason::None,
+                0x1000,
+                4096,
+                1,
+                AddressSpaceFallbackReason::None,
+            ),
+            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth)
+        );
+        assert_eq!(
+            classify_user_tlb_switch(
+                0x1000,
+                1,
+                1,
+                AddressSpaceFallbackReason::None,
+                0x1001,
+                2,
+                1,
+                AddressSpaceFallbackReason::None,
+            ),
+            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth)
+        );
+        assert_eq!(
+            classify_user_tlb_switch(
+                0x1000,
+                1,
+                1,
+                AddressSpaceFallbackReason::None,
+                1usize << 52,
+                2,
+                1,
+                AddressSpaceFallbackReason::None,
+            ),
+            TlbSwitchDecision::Flush(AsidSwitchFallbackReason::InvalidWidth)
         );
     }
 

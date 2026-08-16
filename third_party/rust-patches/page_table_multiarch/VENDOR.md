@@ -37,11 +37,9 @@ All published test paths are present but adapted to the maintained fork: `tests/
   three zeroed intermediate-table frames outside the page-table critical
   section. A failed replenish reclaims only its unpublished prefix and leaves
   the reusable reservation unchanged.
-- LoongArch single-address invalidation aligns to the hardware's adjacent
-  even/odd 8-KiB TLB pair before `INVTLB`.
-- Maintained delta: multi-architecture page-table traversal, failure-atomic
-  prepared publication/drain, and architecture-correct TLB primitives with
-  focused allocation tests.
+- Maintained delta: x86_64 page-table traversal, failure-atomic prepared
+  publication/drain, and architecture-correct TLB primitives with focused
+  allocation tests.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

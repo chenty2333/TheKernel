@@ -3,9 +3,6 @@
 #![no_std]
 #![cfg_attr(doc, feature(doc_cfg))]
 
-#[cfg(feature = "bcm2835-sdhci")]
-pub mod bcm2835sdhci;
-
 #[cfg(feature = "ramdisk")]
 pub mod ramdisk;
 
@@ -14,8 +11,6 @@ pub mod ramdisk_static;
 
 #[cfg(feature = "ahci")]
 pub mod ahci;
-#[cfg(feature = "sdmmc")]
-pub mod sdmmc;
 
 #[doc(no_inline)]
 pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
@@ -214,7 +209,8 @@ pub trait BlockDriverOps: BaseDriverOps {
         Err(DevError::Unsupported)
     }
 
-    /// Drains completed async block requests without blocking.
+    /// Drains at most `budget` completed async block requests without
+    /// blocking. A zero budget is a no-op and returns `Ok(0)`.
     fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
         let _ = budget;
         Err(DevError::Unsupported)
@@ -248,7 +244,8 @@ pub trait BlockDriverOps: BaseDriverOps {
         false
     }
 
-    /// Handles a completion IRQ by acknowledging the device and draining completions.
+    /// Handles a completion IRQ by acknowledging the device and publishing a
+    /// coalesced task-context completion token.
     fn handle_irq(&mut self) -> DevResult<usize> {
         Err(DevError::Unsupported)
     }

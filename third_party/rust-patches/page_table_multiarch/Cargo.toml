@@ -21,7 +21,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Generic page table structures for various hardware architectures"
+description = "Generic page table structures for x86_64"
 homepage = "https://github.com/arceos-org/arceos"
 documentation = "https://docs.rs/page_table_multiarch"
 readme = "README.md"
@@ -88,9 +88,10 @@ version = "0.6"
 version = "0.10"
 default-features = false
 
-[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64", doc, docsrs))'.dependencies.riscv]
-version = "0.16"
-default-features = false
-
 [target.'cfg(any(target_arch = "x86_64", doc, docsrs))'.dependencies.x86]
 version = "0.52"
+
+[target.'cfg(any(target_arch = "x86_64", doc, docsrs))'.dependencies.x86_64]
+version = "0.15"
+features = ["instructions"]
+default-features = false

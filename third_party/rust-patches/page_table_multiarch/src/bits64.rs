@@ -986,15 +986,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             return Err(PagingError::AlreadyMapped);
         }
         *entry = GenericPTE::new_page(target.align_down(page_size), flags, page_size.is_huge());
-        #[cfg(target_arch = "loongarch64")]
-        if flags.contains(MappingFlags::USER) {
-            self.push(vaddr);
-        }
-        // No TLB flush for non-user fresh mappings: the entry was unused, so no
-        // CPU can hold a stale TLB entry for this VA. LoongArch user mappings are
-        // the exception: hardware page-walk may cache invalid user TLB entries
-        // before the kernel populates the PTE, so flush only those faulted user
-        // VAs while keeping the RV/non-user fresh-map optimization.
+        // No TLB flush for fresh mappings: the entry was unused, so no CPU can
+        // hold a stale TLB entry for this VA.
         Ok(())
     }
 
@@ -1020,10 +1013,6 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         let committed = self
             .inner
             .commit_prepared_map(vaddr, target, page_size, flags, prepared)?;
-        #[cfg(target_arch = "loongarch64")]
-        if flags.contains(MappingFlags::USER) {
-            self.push(vaddr);
-        }
         Ok(committed)
     }
 

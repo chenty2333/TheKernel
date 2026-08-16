@@ -32,7 +32,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Privileged instruction and structure abstractions for various CPU architectures"
+description = "Privileged instruction and structure abstractions for x86_64"
 homepage = "https://github.com/arceos-org/axcpu"
 documentation = "https://docs.rs/axcpu"
 readme = "README.md"
@@ -55,13 +55,9 @@ repository = "https://github.com/arceos-org/axcpu/tree/dev"
 all-features = true
 targets = [
     "x86_64-unknown-none",
-    "aarch64-unknown-none-softfloat",
-    "riscv64gc-unknown-none-elf",
-    "loongarch64-unknown-none",
 ]
 
 [features]
-arm-el2 = ["page_table_entry/arm-el2"]
 asid-fast-switch = []
 asid-switch-diagnostics = ["asid-fast-switch", "dep:axpmu"]
 default = []
@@ -100,21 +96,6 @@ version = "0.6"
 
 [dependencies.static_assertions]
 version = "1.1"
-
-[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies.riscv]
-version = "0.16"
-
-[target.'cfg(target_arch = "aarch64")'.dependencies.aarch64-cpu]
-version = "11.0"
-
-[target.'cfg(target_arch = "aarch64")'.dependencies.tock-registers]
-version = "0.10"
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies.loongArch64]
-version = "0.2"
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies.page_table_multiarch]
-version = "0.6"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies.lazyinit]
 version = "0.2"

@@ -4,33 +4,23 @@
 [![Docs.rs](https://docs.rs/page_table_multiarch/badge.svg)](https://docs.rs/page_table_multiarch)
 [![CI](https://github.com/arceos-org/page_table_multiarch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/arceos-org/page_table_multiarch/actions/workflows/ci.yml)
 
-This crate provides generic, unified, architecture-independent, and OS-free page table structures for various hardware architectures.
+This crate provides generic, unified, and OS-free page table structures for x86_64.
 
-The core structs are [`PageTable64<M, PTE, H>`][1] (for 64-bit) and [`PageTable32<M, PTE, H>`][2] (for 32-bit). OS-functions and architecture-dependent types are provided by generic parameters:
+The core struct is [`PageTable64<M, PTE, H>`][1]. OS-functions and architecture-dependent types are provided by generic parameters:
 
 - `M`: The architecture-dependent metadata, requires to implement the [`PagingMetaData`][3] trait.
 - `PTE`: The architecture-dependent page table entry, requires to implement the [`GenericPTE`][4] trait.
 - `H`: OS-functions such as physical memory allocation, requires to implement the [`PagingHandler`][5] trait.
 
-Currently supported architectures and page table structures:
+The supported architecture and page table structure is:
 
-- x86: [`x86_64::X64PageTable`][6]
-- ARM (64-bit): [`aarch64::A64PageTable`][7]
-- ARM (32-bit): [`arm::A32PageTable`][8]
-- RISC-V: [`riscv::Sv39PageTable`][9], [`riscv::Sv48PageTable`][10]
-- LoongArch64: [`loongarch64:LA64PageTable`][11]
+- x86_64: [`x86_64::X64PageTable`][2]
 
 [1]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/struct.PageTable64.html
-[2]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/struct.PageTable32.html
+[2]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/x86_64/type.X64PageTable.html
 [3]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/trait.PagingMetaData.html
 [4]: https://docs.rs/page_table_entry/latest/page_table_entry/trait.GenericPTE.html
 [5]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/trait.PagingHandler.html
-[6]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/x86_64/type.X64PageTable.html
-[7]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/aarch64/type.A64PageTable.html
-[8]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/arm/type.A32PageTable.html
-[9]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/riscv/type.Sv39PageTable.html
-[10]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/riscv/type.Sv48PageTable.html
-[11]: https://docs.rs/page_table_multiarch/latest/page_table_multiarch/loongarch64/type.LA64PageTable.html
 
 
 ## Examples (x86_64)
