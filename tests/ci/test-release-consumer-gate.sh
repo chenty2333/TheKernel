@@ -14,6 +14,9 @@ grep -Fqx \
     'PACKAGE_TOOLCHAIN=${THEKERNEL_RELEASE_PACKAGE_TOOLCHAIN:-nightly}' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fqx \
+    "    --exclude='/.tmp/'" \
+    <(sed -n '/^rsync_args=(/,/^)/p' "$CI_DIR/release-consumer-gate.sh")
+grep -Fqx \
     'export AX_LINKER_SCRIPT_OUTPUT := $(abspath $(LD_SCRIPT))' \
     "$REPO_ROOT/make/cargo.mk"
 grep -Fq \

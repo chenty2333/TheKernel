@@ -472,6 +472,7 @@ rsync_args=(
     -a
     --exclude='/.git/'
     --exclude='/.state/'
+    --exclude='/.tmp/'
     --exclude='/target/'
     --exclude='/kernel-x86_64'
 )
