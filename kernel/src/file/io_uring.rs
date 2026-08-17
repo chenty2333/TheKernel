@@ -37,9 +37,121 @@ use super::{
     FixedSharedMmapRegion, Kstat, PreparedFileMmap, SharedPages, anon_inode_stat,
 };
 use crate::mm::{
-    PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinSegment, UserMemoryCapability,
-    physical_segments_are_disjoint, try_pin_user_segments_to_user_longterm_with,
+    PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinProvenance, UserIoPinSegment,
+    UserMemoryCapability, physical_segments_are_disjoint,
+    try_pin_user_segments_to_user_longterm_with,
 };
+
+/// Counters for the synchronous physical-DMA fast path used by fixed-buffer
+/// io_uring requests.  The counters are deliberately kept next to the ring
+/// lease because the path is a lease-owned optimization rather than a generic
+/// user-I/O property.
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_READ_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_READ_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_WRITE_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
+static IO_URING_DMA_DIRECT_WRITE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "test-io-control")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IoUringDmaDirectStats {
+    pub read_hits: u64,
+    pub read_bytes: u64,
+    pub read_fallbacks: u64,
+    pub write_hits: u64,
+    pub write_bytes: u64,
+    pub write_fallbacks: u64,
+}
+
+#[cfg(feature = "test-io-control")]
+pub(crate) fn set_io_uring_dma_direct_stats_enabled(enabled: bool) {
+    IO_URING_DMA_DIRECT_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(feature = "test-io-control")]
+pub(crate) fn reset_io_uring_dma_direct_stats() {
+    for counter in [
+        &IO_URING_DMA_DIRECT_READ_HITS,
+        &IO_URING_DMA_DIRECT_READ_BYTES,
+        &IO_URING_DMA_DIRECT_READ_FALLBACKS,
+        &IO_URING_DMA_DIRECT_WRITE_HITS,
+        &IO_URING_DMA_DIRECT_WRITE_BYTES,
+        &IO_URING_DMA_DIRECT_WRITE_FALLBACKS,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "test-io-control")]
+pub(crate) fn io_uring_dma_direct_stats_snapshot() -> IoUringDmaDirectStats {
+    IoUringDmaDirectStats {
+        read_hits: IO_URING_DMA_DIRECT_READ_HITS.load(Ordering::Relaxed),
+        read_bytes: IO_URING_DMA_DIRECT_READ_BYTES.load(Ordering::Relaxed),
+        read_fallbacks: IO_URING_DMA_DIRECT_READ_FALLBACKS.load(Ordering::Relaxed),
+        write_hits: IO_URING_DMA_DIRECT_WRITE_HITS.load(Ordering::Relaxed),
+        write_bytes: IO_URING_DMA_DIRECT_WRITE_BYTES.load(Ordering::Relaxed),
+        write_fallbacks: IO_URING_DMA_DIRECT_WRITE_FALLBACKS.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "test-io-control")]
+#[inline]
+pub(crate) fn record_io_uring_dma_direct_read_hit(bytes: usize) {
+    if IO_URING_DMA_DIRECT_STATS_ENABLED.load(Ordering::Relaxed) && bytes != 0 {
+        IO_URING_DMA_DIRECT_READ_HITS.fetch_add(1, Ordering::Relaxed);
+        IO_URING_DMA_DIRECT_READ_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "test-io-control"))]
+#[inline(always)]
+pub(crate) fn record_io_uring_dma_direct_read_hit(_bytes: usize) {}
+
+#[cfg(feature = "test-io-control")]
+#[inline]
+pub(crate) fn record_io_uring_dma_direct_read_fallback() {
+    if IO_URING_DMA_DIRECT_STATS_ENABLED.load(Ordering::Relaxed) {
+        IO_URING_DMA_DIRECT_READ_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "test-io-control"))]
+#[inline(always)]
+pub(crate) fn record_io_uring_dma_direct_read_fallback() {}
+
+#[cfg(feature = "test-io-control")]
+#[inline]
+pub(crate) fn record_io_uring_dma_direct_write_hit(bytes: usize) {
+    if IO_URING_DMA_DIRECT_STATS_ENABLED.load(Ordering::Relaxed) && bytes != 0 {
+        IO_URING_DMA_DIRECT_WRITE_HITS.fetch_add(1, Ordering::Relaxed);
+        IO_URING_DMA_DIRECT_WRITE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "test-io-control"))]
+#[inline(always)]
+pub(crate) fn record_io_uring_dma_direct_write_hit(_bytes: usize) {}
+
+#[cfg(feature = "test-io-control")]
+#[inline]
+pub(crate) fn record_io_uring_dma_direct_write_fallback() {
+    if IO_URING_DMA_DIRECT_STATS_ENABLED.load(Ordering::Relaxed) {
+        IO_URING_DMA_DIRECT_WRITE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "test-io-control"))]
+#[inline(always)]
+pub(crate) fn record_io_uring_dma_direct_write_fallback() {}
 
 const RING_WAITER_SLOTS: usize = 64;
 const PAGE_BYTES: usize = PageSize::Size4K as usize;
@@ -377,6 +489,20 @@ impl IoUringBufferLease {
             length,
             owner.pin_segments_disjoint,
         ))
+    }
+
+    /// Returns the provenance captured by the registered-buffer pin.  The
+    /// direct physical-DMA path only accepts private anonymous pages; callers
+    /// must continue to hold this lease while the lower filesystem call runs.
+    pub(crate) fn physical_provenance(&self) -> AxResult<UserIoPinProvenance> {
+        let lease = self.lease.as_ref().ok_or(AxError::BadState)?;
+        let pin = lease
+            .owner()
+            ._pin_owner
+            .pin
+            .as_ref()
+            .ok_or(AxError::BadState)?;
+        Ok(pin.provenance())
     }
 }
 

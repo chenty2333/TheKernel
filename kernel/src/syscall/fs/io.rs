@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions, PinnedPhysicalSegment};
-use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags};
+use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, PhysicalIoSegment};
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
 use axpoll::{IoEvents, Pollable};
@@ -38,9 +38,9 @@ use crate::{
     },
     mm::{
         IoVec, IoVectorBuf, PinnedPhysicalReader, PinnedPhysicalWriter, PinnedUserSegments,
-        PinnedUserSegmentsMut, UserIoPinSegment, UserMemoryCapability, VmBytes, VmBytesMut,
-        map_usercopy_error, pinned_user_mut_segments_are_disjoint, prefault_user_io_from_user_with,
-        prefault_user_io_to_user_with, record_user_io_direct_read,
+        PinnedUserSegmentsMut, UserIoPinProvenance, UserIoPinSegment, UserMemoryCapability,
+        VmBytes, VmBytesMut, map_usercopy_error, pinned_user_mut_segments_are_disjoint,
+        prefault_user_io_from_user_with, prefault_user_io_to_user_with, record_user_io_direct_read,
         record_user_io_direct_read_fallback, record_user_io_direct_write,
         record_user_io_direct_write_fallback, try_pin_user_segments_from_user_with,
         try_pin_user_segments_to_user_with, try_pin_user_slice_from_user_with,
@@ -81,6 +81,79 @@ const USER_SLICE_FAST_MIN: usize = 4096;
 const USER_IOV_FAST_MAX_SEGMENTS: usize = 64;
 const USER_COPY_PREFAULT_MIN: usize = 16 * 1024;
 const TRANSFER_ATTEMPT_LOCK_COUNT: usize = 64;
+const IO_URING_DMA_MAX_SEGMENTS: usize = 4;
+
+type IoUringFixedSegments<'a> = (
+    &'a [UserIoPinSegment],
+    usize,
+    usize,
+    bool,
+    UserIoPinProvenance,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedDmaOutcome {
+    Completed(usize),
+    Fallback,
+}
+
+fn fixed_dma_geometry_eligible(
+    addr: usize,
+    len: usize,
+    file_offset: u64,
+    segments_disjoint: bool,
+    provenance: UserIoPinProvenance,
+) -> bool {
+    segments_disjoint
+        && len != 0
+        && provenance == UserIoPinProvenance::PrivateAnonymous
+        && addr.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        && len.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        && file_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+}
+
+fn classify_fixed_dma_result(result: Option<usize>, len: usize) -> AxResult<FixedDmaOutcome> {
+    match result {
+        Some(bytes) if bytes == len => Ok(FixedDmaOutcome::Completed(bytes)),
+        Some(_) => Err(AxError::Io),
+        None => Ok(FixedDmaOutcome::Fallback),
+    }
+}
+
+/// Clips a borrowed registered-buffer physical range into the fixed-size SG
+/// descriptor array consumed by the filesystem DMA hook.  This never allocates
+/// and deliberately rejects ranges requiring more than four descriptors so the
+/// caller can use its existing pinned bounce path.
+fn clip_io_uring_dma_segments(
+    segments: &[UserIoPinSegment],
+    offset: usize,
+    len: usize,
+    output: &mut [PhysicalIoSegment; IO_URING_DMA_MAX_SEGMENTS],
+) -> Option<usize> {
+    let end = offset.checked_add(len)?;
+    let mut logical = 0usize;
+    let mut count = 0usize;
+    for segment in segments.iter().copied() {
+        let segment_end = logical.checked_add(segment.len)?;
+        let clip_start = offset.max(logical);
+        let clip_end = end.min(segment_end);
+        if clip_start < clip_end {
+            let paddr = segment
+                .paddr
+                .checked_add(clip_start.checked_sub(logical)?)?;
+            if count == output.len() {
+                return None;
+            }
+            output[count] = PhysicalIoSegment::new(paddr, clip_end - clip_start);
+            count += 1;
+        }
+        logical = segment_end;
+        if logical >= end {
+            break;
+        }
+    }
+    (logical >= end && count != 0).then_some(count)
+}
 
 static TRANSFER_ATTEMPT_LOCKS: Lazy<[Mutex<()>; TRANSFER_ATTEMPT_LOCK_COUNT]> =
     Lazy::new(|| core::array::from_fn(|_| Mutex::new(())));
@@ -207,7 +280,7 @@ fn io_uring_stream_read(
     file_handle: &FileHandle<dyn FileLike>,
     buf: *mut u8,
     len: usize,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     let status = file_handle.io_status_snapshot();
     file_handle.check_io_status(status)?;
@@ -227,7 +300,7 @@ fn io_uring_stream_read(
         |socket| dispatch_generic_socket_receive(socket, status, 1, len),
         || {
             file_handle.with_read_credentials(|| {
-                let read = if let Some((segments, offset, fixed_len, _)) = fixed_segments {
+                let read = if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
                     let mut destination =
                         PinnedPhysicalWriter::from_validated_range(segments, offset, fixed_len);
                     read_file_like_with_status(file_handle, status, &mut destination)?
@@ -255,7 +328,7 @@ fn io_uring_stream_write(
     file_handle: &FileHandle<dyn FileLike>,
     buf: *const u8,
     len: usize,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     let security = current_vfs_security();
     let status = file_handle.io_status_snapshot();
@@ -269,7 +342,7 @@ fn io_uring_stream_write(
                 if let Some(file) = file_handle.downcast_ref::<File>() {
                     check_file_write_admission(file, len)?;
                 }
-                if let Some((segments, offset, fixed_len, _)) = fixed_segments {
+                if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
                     let mut source =
                         PinnedPhysicalReader::from_validated_range(segments, offset, fixed_len);
                     write_file_like_with_status(file_handle, status, &mut source, &security)
@@ -743,6 +816,84 @@ fn write_at_fixed_user_segments(
         };
     record_user_io_direct_write(written, segments.len());
     Ok(written)
+}
+
+fn try_fixed_dma_read(
+    file: &File,
+    addr: usize,
+    segments: &[UserIoPinSegment],
+    offset_in_segments: usize,
+    len: usize,
+    file_offset: u64,
+    segments_disjoint: bool,
+    provenance: UserIoPinProvenance,
+) -> AxResult<FixedDmaOutcome> {
+    let fallback = || {
+        crate::file::io_uring::record_io_uring_dma_direct_read_fallback();
+        FixedDmaOutcome::Fallback
+    };
+    if !fixed_dma_geometry_eligible(addr, len, file_offset, segments_disjoint, provenance)
+        || !file_uses_direct_io(file)
+    {
+        return Ok(fallback());
+    }
+
+    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+    let Some(count) = clip_io_uring_dma_segments(segments, offset_in_segments, len, &mut physical)
+    else {
+        return Ok(fallback());
+    };
+    let result = unsafe {
+        file.inner()
+            .try_read_at_dma_segments(&physical[..count], file_offset)
+    }?;
+    match classify_fixed_dma_result(result, len)? {
+        FixedDmaOutcome::Completed(read) => {
+            crate::file::io_uring::record_io_uring_dma_direct_read_hit(read);
+            Ok(FixedDmaOutcome::Completed(read))
+        }
+        FixedDmaOutcome::Fallback => Ok(fallback()),
+    }
+}
+
+fn try_fixed_dma_write(
+    file: &File,
+    addr: usize,
+    segments: &[UserIoPinSegment],
+    offset_in_segments: usize,
+    len: usize,
+    file_offset: u64,
+    segments_disjoint: bool,
+    provenance: UserIoPinProvenance,
+) -> AxResult<FixedDmaOutcome> {
+    let fallback = || {
+        crate::file::io_uring::record_io_uring_dma_direct_write_fallback();
+        FixedDmaOutcome::Fallback
+    };
+    let geometry =
+        fixed_dma_geometry_eligible(addr, len, file_offset, segments_disjoint, provenance);
+    let direct = file_uses_direct_io(file);
+    let append = file.inner().flags().contains(FileFlags::APPEND);
+    if !geometry || !direct || append {
+        return Ok(fallback());
+    }
+
+    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+    let Some(count) = clip_io_uring_dma_segments(segments, offset_in_segments, len, &mut physical)
+    else {
+        return Ok(fallback());
+    };
+    let result = unsafe {
+        file.inner()
+            .try_write_at_dma_segments(&physical[..count], file_offset)
+    }?;
+    match classify_fixed_dma_result(result, len)? {
+        FixedDmaOutcome::Completed(written) => {
+            crate::file::io_uring::record_io_uring_dma_direct_write_hit(written);
+            Ok(FixedDmaOutcome::Completed(written))
+        }
+        FixedDmaOutcome::Fallback => Ok(fallback()),
+    }
 }
 
 fn reserve_memfd_positioned_write(
@@ -2567,7 +2718,7 @@ fn pread64_file(
     buf: *mut u8,
     len: usize,
     offset: u64,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     validate_direct_io(f.as_ref(), buf as usize, len, offset)?;
     if len != 0 {
@@ -2577,25 +2728,42 @@ fn pread64_file(
         )?;
     }
     f.with_read_credentials(|| {
-        let fast_read = if let Some((segments, offset_in_segments, fixed_len, disjoint)) =
-            fixed_segments
-        {
-            Some(read_at_fixed_user_segments(
-                f.as_ref(),
-                segments,
-                offset_in_segments,
-                fixed_len,
-                offset,
-                disjoint,
-            )?)
-        } else {
-            match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
-                Some(read) => Some(read),
-                None => {
-                    try_regular_file_pread_user_segments(capability, f.as_ref(), buf, len, offset)?
+        let fast_read =
+            if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+                fixed_segments
+            {
+                match try_fixed_dma_read(
+                    f.as_ref(),
+                    buf as usize,
+                    segments,
+                    offset_in_segments,
+                    fixed_len,
+                    offset,
+                    disjoint,
+                    provenance,
+                )? {
+                    FixedDmaOutcome::Completed(read) => Some(read),
+                    FixedDmaOutcome::Fallback => Some(read_at_fixed_user_segments(
+                        f.as_ref(),
+                        segments,
+                        offset_in_segments,
+                        fixed_len,
+                        offset,
+                        disjoint,
+                    )?),
                 }
-            }
-        };
+            } else {
+                match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
+                    Some(read) => Some(read),
+                    None => try_regular_file_pread_user_segments(
+                        capability,
+                        f.as_ref(),
+                        buf,
+                        len,
+                        offset,
+                    )?,
+                }
+            };
         if let Some(read) = fast_read {
             if read > 0 {
                 notify_read_file(f.as_ref());
@@ -2621,7 +2789,7 @@ pub(crate) fn io_uring_pread64(
     buf: *mut u8,
     len: usize,
     offset: u64,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     let file_handle = description.file_handle();
     // Linux's io_uring rw path treats a zero offset on a non-seekable file
@@ -2658,7 +2826,7 @@ fn pwrite64_file(
     buf: *const u8,
     len: usize,
     offset: u64,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     if len == 0 {
         return Ok(0);
@@ -2666,7 +2834,7 @@ fn pwrite64_file(
     let security = current_vfs_security();
     let (write, status) = f.with_write_credentials(|status| {
         let written = if write_uses_inode_append(f.inner(), status) {
-            if let Some((segments, offset_in_segments, fixed_len, _)) = fixed_segments {
+            if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
                 let mut source = PinnedPhysicalReader::from_validated_range(
                     segments,
                     offset_in_segments,
@@ -2693,7 +2861,9 @@ fn pwrite64_file(
         } else {
             let allowed = allowed_write_len(offset, len)?;
             let fast_written =
-                if let Some((segments, offset_in_segments, fixed_len, _)) = fixed_segments {
+                if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+                    fixed_segments
+                {
                     if regular_file_supports_user_slice_fast_path(f.as_ref()) {
                         executable::check_not_active(f.inner().location())?;
                         if allowed == 0 {
@@ -2705,13 +2875,25 @@ fn pwrite64_file(
                             let _privilege_guard = f
                                 .as_ref()
                                 .begin_content_write_privilege_cleanup(&security)?;
-                            Some(write_at_fixed_user_segments(
+                            match try_fixed_dma_write(
                                 f.as_ref(),
+                                buf as usize,
                                 segments,
                                 offset_in_segments,
                                 allowed.min(fixed_len),
                                 offset,
-                            )?)
+                                disjoint,
+                                provenance,
+                            )? {
+                                FixedDmaOutcome::Completed(written) => Some(written),
+                                FixedDmaOutcome::Fallback => Some(write_at_fixed_user_segments(
+                                    f.as_ref(),
+                                    segments,
+                                    offset_in_segments,
+                                    allowed.min(fixed_len),
+                                    offset,
+                                )?),
+                            }
                         }
                     } else {
                         None
@@ -2746,7 +2928,7 @@ fn pwrite64_file(
                     prefault_regular_file_write_fallback(capability, f.as_ref(), buf, allowed)?;
                 }
             }
-            if let Some((segments, offset_in_segments, fixed_len, _)) = fixed_segments {
+            if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
                 let mut source = PinnedPhysicalReader::from_validated_range(
                     segments,
                     offset_in_segments,
@@ -2788,7 +2970,7 @@ pub(crate) fn io_uring_pwrite64(
     buf: *const u8,
     len: usize,
     offset: u64,
-    fixed_segments: Option<(&[UserIoPinSegment], usize, usize, bool)>,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
     let file_handle = description.file_handle();
     // Mirror the pread64 treatment: a zero offset on a non-seekable file
@@ -5144,6 +5326,103 @@ mod tests {
         assert_eq!(
             axfs_pinned_segments(&overflow).err(),
             Some(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn io_uring_dma_clip_keeps_exact_subrange_without_allocating() {
+        let segments = [
+            UserIoPinSegment {
+                paddr: 0x10_000,
+                len: 0x800,
+            },
+            UserIoPinSegment {
+                paddr: 0x20_000,
+                len: 0x800,
+            },
+            UserIoPinSegment {
+                paddr: 0x30_000,
+                len: 0x800,
+            },
+        ];
+        let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+        let count = clip_io_uring_dma_segments(&segments, 0x200, 0x1_000, &mut physical);
+        assert_eq!(count, Some(2));
+        assert_eq!(
+            &physical[..2],
+            &[
+                PhysicalIoSegment::new(0x10_200, 0x600),
+                PhysicalIoSegment::new(0x20_000, 0x400),
+            ]
+        );
+    }
+
+    #[test]
+    fn io_uring_dma_clip_rejects_more_than_four_physical_ranges() {
+        let segments: [UserIoPinSegment; IO_URING_DMA_MAX_SEGMENTS + 1] =
+            core::array::from_fn(|index| UserIoPinSegment {
+                paddr: 0x10_000 + index * 0x1_000,
+                len: 0x1_000,
+            });
+        let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+        assert_eq!(
+            clip_io_uring_dma_segments(&segments, 0, segments.len() * 0x1_000, &mut physical),
+            None
+        );
+    }
+
+    #[test]
+    fn io_uring_dma_geometry_requires_private_aligned_nonzero_range() {
+        assert!(fixed_dma_geometry_eligible(
+            0x2000,
+            0x1000,
+            0x4000,
+            true,
+            UserIoPinProvenance::PrivateAnonymous,
+        ));
+        assert!(!fixed_dma_geometry_eligible(
+            0x2000,
+            0x1000,
+            0x4000,
+            true,
+            UserIoPinProvenance::Ineligible,
+        ));
+        assert!(!fixed_dma_geometry_eligible(
+            0x2200,
+            0x1000,
+            0x4000,
+            true,
+            UserIoPinProvenance::PrivateAnonymous,
+        ));
+        assert!(!fixed_dma_geometry_eligible(
+            0x2000,
+            0,
+            0x4000,
+            true,
+            UserIoPinProvenance::PrivateAnonymous,
+        ));
+        assert!(!fixed_dma_geometry_eligible(
+            0x2000,
+            0x1000,
+            0x4000,
+            false,
+            UserIoPinProvenance::PrivateAnonymous,
+        ));
+    }
+
+    #[test]
+    fn io_uring_dma_result_requires_full_completion_and_never_bounces_errors() {
+        assert_eq!(
+            classify_fixed_dma_result(Some(0x1000), 0x1000),
+            Ok(FixedDmaOutcome::Completed(0x1000))
+        );
+        assert_eq!(
+            classify_fixed_dma_result(None, 0x1000),
+            Ok(FixedDmaOutcome::Fallback)
+        );
+        assert_eq!(
+            classify_fixed_dma_result(Some(0x200), 0x1000),
+            Err(AxError::Io)
         );
     }
 

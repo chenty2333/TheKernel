@@ -22,14 +22,17 @@ use axfs::{
 use axfs_ng_vfs::{NodePermission, VfsError, VfsResult};
 
 use super::{RwFile, SimpleFile, SimpleFileOperation, SimpleFs};
-use crate::mm::{
-    USER_IO_PIN_TEST_DELAY_MS_MAX, reset_user_io_pin_counters, set_user_io_pin_counters_enabled,
-    set_user_io_pin_test_delay_ms,
-};
 #[cfg(feature = "asid-switch-diagnostics")]
 use crate::mm::{reset_asid_switch_diagnostics, set_asid_switch_diagnostics_enabled};
 #[cfg(feature = "mm-lock-diagnostics")]
 use crate::mm::{reset_mm_lock_diagnostics, set_mm_lock_diagnostics_enabled};
+use crate::{
+    file::io_uring::{reset_io_uring_dma_direct_stats, set_io_uring_dma_direct_stats_enabled},
+    mm::{
+        USER_IO_PIN_TEST_DELAY_MS_MAX, reset_user_io_pin_counters,
+        set_user_io_pin_counters_enabled, set_user_io_pin_test_delay_ms,
+    },
+};
 
 const CONTROL_HELP: &str = concat!(
     "test-only I/O control; write exactly one key=value command\n",
@@ -200,6 +203,7 @@ fn enabled(toggle: Toggle) -> bool {
 
 fn reset_test_policy() -> VfsResult<()> {
     set_io_stats_counters_enabled(false);
+    set_io_uring_dma_direct_stats_enabled(false);
     set_user_io_pin_counters_enabled(false);
     set_virtio_io_counters_enabled(false);
     set_virtio_async_block_enabled(false);
@@ -221,10 +225,12 @@ fn apply_command(command: TestIoCommand<'_>) -> VfsResult<()> {
         TestIoCommand::Counters(CounterCommand::Set(toggle)) => {
             let enabled = enabled(toggle);
             set_io_stats_counters_enabled(enabled);
+            set_io_uring_dma_direct_stats_enabled(enabled);
             set_user_io_pin_counters_enabled(enabled);
         }
         TestIoCommand::Counters(CounterCommand::Reset) => {
             reset_io_stats_counters();
+            reset_io_uring_dma_direct_stats();
             reset_user_io_pin_counters();
             reset_virtio_io_counters();
         }

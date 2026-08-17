@@ -12,6 +12,10 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#ifndef O_DIRECT
+#define O_DIRECT 040000
+#endif
+
 #ifndef SYS_io_uring_setup
 #define SYS_io_uring_setup 425
 #endif
@@ -585,6 +589,78 @@ static int expect_register_error(struct ring *ring, uint32_t opcode,
     return 0;
 }
 
+static long long read_io_counter(const char *key) {
+    char line[256];
+    char buffer[512];
+    size_t key_len = strlen(key);
+    size_t line_len = 0;
+    int line_overflow = 0;
+    int fd = open("/proc/io_stats", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        ssize_t length = read(fd, buffer, sizeof(buffer));
+        if (length < 0 && errno == EINTR) {
+            continue;
+        }
+        if (length < 0) {
+            close(fd);
+            return -1;
+        }
+        if (length == 0) {
+            break;
+        }
+        for (ssize_t index = 0; index < length; ++index) {
+            char value = buffer[index];
+            if (value == '\n') {
+                if (!line_overflow) {
+                    line[line_len] = '\0';
+                    if (strncmp(line, key, key_len) == 0 && line[key_len] == ' ') {
+                        long long result = strtoll(line + key_len + 1, NULL, 10);
+                        close(fd);
+                        return result;
+                    }
+                }
+                line_len = 0;
+                line_overflow = 0;
+            } else if (!line_overflow) {
+                if (line_len + 1 < sizeof(line)) {
+                    line[line_len++] = value;
+                } else {
+                    line_overflow = 1;
+                }
+            }
+        }
+    }
+    if (!line_overflow && line_len != 0) {
+        line[line_len] = '\0';
+        if (strncmp(line, key, key_len) == 0 && line[key_len] == ' ') {
+            long long result = strtoll(line + key_len + 1, NULL, 10);
+            close(fd);
+            return result;
+        }
+    }
+    close(fd);
+    return -1;
+}
+
+enum { IO_DIAGNOSTICS_OK = 0, IO_DIAGNOSTICS_UNAVAILABLE = 1 };
+
+static int write_io_test_control_command(const char *command) {
+    size_t length = strlen(command);
+    int fd = open("/proc/io_test_control", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return IO_DIAGNOSTICS_UNAVAILABLE;
+        }
+        return -1;
+    }
+    ssize_t written = write(fd, command, length);
+    close(fd);
+    return written == (ssize_t)length ? 0 : -1;
+}
+
 static int test_registered_buffers(struct ring *ring) {
     static const char payload[] = "thekernel-io-uring\n";
     long page_value = sysconf(_SC_PAGESIZE);
@@ -719,7 +795,319 @@ out:
     return result;
 }
 
-static int test_ring(void) {
+static int test_dma_direct_fixed_buffers(struct ring *ring,
+                                         int *diagnostics_available) {
+    enum { DMA_BYTES = 4096 };
+    static const char path[] = "/thekernel-io-uring-dma-direct";
+    unsigned char *private_buffer = MAP_FAILED;
+    unsigned char *shared_buffer = MAP_FAILED;
+    struct iovec iov;
+    int file = -1;
+    int files_registered = 0;
+    int buffers_registered = 0;
+    int diagnostics_enabled = 0;
+    int result = 1;
+    *diagnostics_available = 0;
+
+    long page_value = sysconf(_SC_PAGESIZE);
+    if (page_value <= 0 || (size_t)page_value < DMA_BYTES) {
+        errno = EINVAL;
+        return fail("dma-page-size");
+    }
+    private_buffer = mmap(NULL, DMA_BYTES, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (private_buffer == MAP_FAILED ||
+        ((uintptr_t)private_buffer % DMA_BYTES) != 0) {
+        if (private_buffer != MAP_FAILED) {
+            munmap(private_buffer, DMA_BYTES);
+        }
+        errno = EFAULT;
+        return fail("dma-private-buffer-alignment");
+    }
+
+    memset(private_buffer, 0xa5, DMA_BYTES);
+    int ordinary = open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
+    if (ordinary < 0) {
+        fail("dma-seed-open");
+        goto out;
+    }
+    size_t written = 0;
+    while (written < DMA_BYTES) {
+        ssize_t count = write(ordinary, private_buffer + written, DMA_BYTES - written);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            fail("dma-seed-write");
+            close(ordinary);
+            goto out;
+        }
+        written += (size_t)count;
+    }
+    if (fsync(ordinary) != 0 || close(ordinary) != 0) {
+        fail("dma-seed-fsync");
+        goto out;
+    }
+
+    file = open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
+    if (file < 0) {
+        fail("dma-direct-open");
+        goto out;
+    }
+    int control_result = write_io_test_control_command("counters=on\n");
+    if (control_result == IO_DIAGNOSTICS_OK) {
+        diagnostics_enabled = 1;
+        control_result = write_io_test_control_command("counters=reset\n");
+    }
+    if (control_result == IO_DIAGNOSTICS_UNAVAILABLE) {
+        *diagnostics_available = 0;
+    } else if (control_result != IO_DIAGNOSTICS_OK) {
+        fail("dma-counter-control");
+        goto out;
+    } else {
+        *diagnostics_available = 1;
+    }
+
+    iov.iov_base = private_buffer;
+    iov.iov_len = DMA_BYTES;
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_BUFFERS,
+                &iov, 1U) != 0) {
+        fail("dma-private-register-buffer");
+        goto out;
+    }
+    buffers_registered = 1;
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_FILES,
+                &file, 1U) != 0) {
+        fail("dma-register-file");
+        goto out;
+    }
+    files_registered = 1;
+    if (close(file) != 0) {
+        fail("dma-close-original");
+        file = -1;
+        goto out;
+    }
+    file = -1;
+
+    memset(private_buffer, 0x5a, DMA_BYTES);
+    long long write_hits_before = 0;
+    long long write_bytes_before = 0;
+    if (*diagnostics_available) {
+        write_hits_before = read_io_counter("io_uring.dma_direct_write_hits");
+        write_bytes_before = read_io_counter("io_uring.dma_direct_write_bytes");
+        if (write_hits_before < 0 || write_bytes_before < 0) {
+            fail("dma-write-counter-read");
+            goto out;
+        }
+    }
+    struct raw_sqe write_sqe = make_sqe(IORING_OP_WRITE_FIXED, 0x444d41574f495445ULL);
+    write_sqe.bytes[1] = IOSQE_FIXED_FILE;
+    write_i32(write_sqe.bytes, 4, 0);
+    write_u64(write_sqe.bytes, 8, 0);
+    write_u64(write_sqe.bytes, 16, (uintptr_t)private_buffer);
+    write_u32(write_sqe.bytes, 24, DMA_BYTES);
+    write_u16(write_sqe.bytes, 40, 0);
+    if (submit_one(ring, &write_sqe, 0x444d41574f495445ULL, DMA_BYTES) != 0) {
+        goto out;
+    }
+    if (*diagnostics_available) {
+        long long write_hits_after =
+            read_io_counter("io_uring.dma_direct_write_hits");
+        long long write_bytes_after =
+            read_io_counter("io_uring.dma_direct_write_bytes");
+        if (write_hits_after <= write_hits_before ||
+            write_bytes_after < write_bytes_before + DMA_BYTES) {
+            fail_value("dma-write-counter", write_hits_after, write_hits_before + 1);
+            goto out;
+        }
+    }
+
+    memset(private_buffer, 0, DMA_BYTES);
+    long long read_hits_before = 0;
+    long long read_bytes_before = 0;
+    if (*diagnostics_available) {
+        read_hits_before = read_io_counter("io_uring.dma_direct_read_hits");
+        read_bytes_before = read_io_counter("io_uring.dma_direct_read_bytes");
+        if (read_hits_before < 0 || read_bytes_before < 0) {
+            fail("dma-read-counter-read");
+            goto out;
+        }
+    }
+    struct raw_sqe read_sqe = make_sqe(IORING_OP_READ_FIXED, 0x444d4152494f5554ULL);
+    read_sqe.bytes[1] = IOSQE_FIXED_FILE;
+    write_i32(read_sqe.bytes, 4, 0);
+    write_u64(read_sqe.bytes, 8, 0);
+    write_u64(read_sqe.bytes, 16, (uintptr_t)private_buffer);
+    write_u32(read_sqe.bytes, 24, DMA_BYTES);
+    write_u16(read_sqe.bytes, 40, 0);
+    if (submit_one(ring, &read_sqe, 0x444d4152494f5554ULL, DMA_BYTES) != 0) {
+        goto out;
+    }
+    for (size_t index = 0; index < DMA_BYTES; ++index) {
+        if (private_buffer[index] != 0x5a) {
+            errno = EIO;
+            fail("dma-read-contents");
+            goto out;
+        }
+    }
+    if (*diagnostics_available) {
+        long long read_hits_after = read_io_counter("io_uring.dma_direct_read_hits");
+        long long read_bytes_after = read_io_counter("io_uring.dma_direct_read_bytes");
+        if (read_hits_after <= read_hits_before ||
+            read_bytes_after < read_bytes_before + DMA_BYTES) {
+            fail_value("dma-read-counter", read_hits_after, read_hits_before + 1);
+            goto out;
+        }
+    }
+
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_BUFFERS,
+                NULL, 0U) != 0) {
+        fail("dma-private-unregister-buffer");
+        goto out;
+    }
+    buffers_registered = 0;
+    shared_buffer = mmap(NULL, DMA_BYTES, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared_buffer == MAP_FAILED ||
+        ((uintptr_t)shared_buffer % DMA_BYTES) != 0) {
+        if (shared_buffer != MAP_FAILED) {
+            munmap(shared_buffer, DMA_BYTES);
+        }
+        errno = EFAULT;
+        fail("dma-shared-buffer-alignment");
+        goto out;
+    }
+    memset(shared_buffer, 0x3c, DMA_BYTES);
+    iov.iov_base = shared_buffer;
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_REGISTER_BUFFERS,
+                &iov, 1U) != 0) {
+        fail("dma-shared-register-buffer");
+        goto out;
+    }
+    buffers_registered = 1;
+    long long write_hits_ineligible = 0;
+    long long write_fallbacks_ineligible = 0;
+    if (*diagnostics_available) {
+        write_hits_ineligible = read_io_counter("io_uring.dma_direct_write_hits");
+        write_fallbacks_ineligible =
+            read_io_counter("io_uring.dma_direct_write_fallbacks");
+        if (write_hits_ineligible < 0 || write_fallbacks_ineligible < 0) {
+            fail("dma-ineligible-write-counter-read");
+            goto out;
+        }
+    }
+    struct raw_sqe shared_write = make_sqe(IORING_OP_WRITE_FIXED, 0x444d415348525754ULL);
+    shared_write.bytes[1] = IOSQE_FIXED_FILE;
+    write_i32(shared_write.bytes, 4, 0);
+    write_u64(shared_write.bytes, 8, 0);
+    write_u64(shared_write.bytes, 16, (uintptr_t)shared_buffer);
+    write_u32(shared_write.bytes, 24, DMA_BYTES);
+    write_u16(shared_write.bytes, 40, 0);
+    if (submit_one(ring, &shared_write, 0x444d415348525754ULL, DMA_BYTES) != 0) {
+        goto out;
+    }
+    if (*diagnostics_available) {
+        long long write_hits_after =
+            read_io_counter("io_uring.dma_direct_write_hits");
+        long long write_fallbacks_after =
+            read_io_counter("io_uring.dma_direct_write_fallbacks");
+        if (write_hits_after != write_hits_ineligible ||
+            write_fallbacks_after != write_fallbacks_ineligible + 1) {
+            errno = EIO;
+            fail("dma-ineligible-write-counters");
+            goto out;
+        }
+    }
+    memset(shared_buffer, 0, DMA_BYTES);
+    long long read_hits_ineligible = 0;
+    long long read_fallbacks_ineligible = 0;
+    if (*diagnostics_available) {
+        read_hits_ineligible = read_io_counter("io_uring.dma_direct_read_hits");
+        read_fallbacks_ineligible =
+            read_io_counter("io_uring.dma_direct_read_fallbacks");
+        if (read_hits_ineligible < 0 || read_fallbacks_ineligible < 0) {
+            fail("dma-ineligible-read-counter-read");
+            goto out;
+        }
+    }
+    struct raw_sqe shared_read = make_sqe(IORING_OP_READ_FIXED, 0x444d415348524454ULL);
+    shared_read.bytes[1] = IOSQE_FIXED_FILE;
+    write_i32(shared_read.bytes, 4, 0);
+    write_u64(shared_read.bytes, 8, 0);
+    write_u64(shared_read.bytes, 16, (uintptr_t)shared_buffer);
+    write_u32(shared_read.bytes, 24, DMA_BYTES);
+    write_u16(shared_read.bytes, 40, 0);
+    if (submit_one(ring, &shared_read, 0x444d415348524454ULL, DMA_BYTES) != 0) {
+        goto out;
+    }
+    for (size_t index = 0; index < DMA_BYTES; ++index) {
+        if (shared_buffer[index] != 0x3c) {
+            errno = EIO;
+            fail("dma-ineligible-read-contents");
+            goto out;
+        }
+    }
+    if (*diagnostics_available) {
+        long long read_hits_after =
+            read_io_counter("io_uring.dma_direct_read_hits");
+        long long read_fallbacks_after =
+            read_io_counter("io_uring.dma_direct_read_fallbacks");
+        if (read_hits_after != read_hits_ineligible ||
+            read_fallbacks_after != read_fallbacks_ineligible + 1) {
+            errno = EIO;
+            fail("dma-ineligible-read-counters");
+            goto out;
+        }
+    }
+
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_FILES,
+                NULL, 0U) != 0) {
+        fail("dma-unregister-files");
+        goto out;
+    }
+    files_registered = 0;
+    if (syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_BUFFERS,
+                NULL, 0U) != 0) {
+        fail("dma-shared-unregister-buffer");
+        goto out;
+    }
+    buffers_registered = 0;
+    result = 0;
+out:
+    if (file >= 0) {
+        close(file);
+    }
+    if (files_registered) {
+        syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_FILES,
+                NULL, 0U);
+    }
+    if (buffers_registered) {
+        syscall(SYS_io_uring_register, ring->fd, IORING_UNREGISTER_BUFFERS,
+                NULL, 0U);
+    }
+    if (private_buffer != MAP_FAILED) {
+        munmap(private_buffer, DMA_BYTES);
+    }
+    if (shared_buffer != MAP_FAILED) {
+        munmap(shared_buffer, DMA_BYTES);
+    }
+    if (diagnostics_enabled) {
+        int control_result = write_io_test_control_command("counters=off\n");
+        if (result == 0 && control_result != IO_DIAGNOSTICS_OK) {
+            fail("dma-counter-off");
+            result = 1;
+        }
+    }
+    if (unlink(path) != 0 && errno != ENOENT) {
+        if (result == 0) {
+            return fail("dma-unlink");
+        }
+        return result;
+    }
+    return result;
+}
+
+static int test_ring(int *dma_direct_diagnostics_available) {
     struct io_uring_params invalid;
     memset(&invalid, 0, sizeof(invalid));
     if (expect_setup_error(0, &invalid, EINVAL, "setup-zero")) {
@@ -752,6 +1140,7 @@ static int test_ring(void) {
     if (submit_one(&ring, &nop, 0x4e4f50ULL, 0) ||
         test_default_batch_stops_on_submission_failure(&ring) ||
         test_probe(&ring) || test_registered_buffers(&ring) ||
+        test_dma_direct_fixed_buffers(&ring, dma_direct_diagnostics_available) ||
         test_immediate_poll(&ring) || test_deferred_poll_and_cancel(&ring) ||
         test_cq_backpressure(&ring)) {
         return 1;
@@ -780,9 +1169,13 @@ static int test_ring(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
-    if (test_ring()) {
+    int dma_direct_diagnostics_available = 0;
+    if (test_ring(&dma_direct_diagnostics_available)) {
         return 1;
     }
     puts("THEKERNEL_IO_URING_OK");
+    if (dma_direct_diagnostics_available) {
+        puts("THEKERNEL_IO_URING_DMA_DIRECT_OK");
+    }
     return 0;
 }

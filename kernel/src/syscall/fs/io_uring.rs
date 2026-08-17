@@ -479,8 +479,11 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 match buffer
                     .as_ref()
                     .ok_or(AxError::BadAddress)
-                    .and_then(IoUringBufferLease::physical_range)
-                {
+                    .and_then(|lease| {
+                        let (segments, offset, length, disjoint) = lease.physical_range()?;
+                        let provenance = lease.physical_provenance()?;
+                        Ok((segments, offset, length, disjoint, provenance))
+                    }) {
                     Ok(range) => Some(range),
                     Err(_) => {
                         drop((file, buffer));
@@ -567,8 +570,11 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 match buffer
                     .as_ref()
                     .ok_or(AxError::BadAddress)
-                    .and_then(IoUringBufferLease::physical_range)
-                {
+                    .and_then(|lease| {
+                        let (segments, offset, length, disjoint) = lease.physical_range()?;
+                        let provenance = lease.physical_provenance()?;
+                        Ok((segments, offset, length, disjoint, provenance))
+                    }) {
                     Ok(range) => Some(range),
                     Err(_) => {
                         drop((file, buffer));

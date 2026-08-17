@@ -27,6 +27,8 @@ use linux_raw_sys::{
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 
+#[cfg(feature = "test-io-control")]
+use crate::file::io_uring::io_uring_dma_direct_stats_snapshot;
 #[cfg(feature = "asid-switch-diagnostics")]
 use crate::mm::asid_switch_diagnostics_snapshot;
 #[cfg(feature = "mm-lock-diagnostics")]
@@ -129,6 +131,40 @@ fn try_pid_name(pid: u32) -> VfsResult<String> {
 
 fn render_proc_io_stats() -> Vec<u8> {
     let mut out = render_io_stats_counters();
+    #[cfg(feature = "test-io-control")]
+    {
+        let io_uring_dma = io_uring_dma_direct_stats_snapshot();
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_hits {}",
+            io_uring_dma.read_hits
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_bytes {}",
+            io_uring_dma.read_bytes
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_fallbacks {}",
+            io_uring_dma.read_fallbacks
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_hits {}",
+            io_uring_dma.write_hits
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_bytes {}",
+            io_uring_dma.write_bytes
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallbacks {}",
+            io_uring_dma.write_fallbacks
+        );
+    }
     let pin = user_io_pin_counters_snapshot();
     let _ = writeln!(out, "user_pin.to_user_attempts {}", pin.to_user_attempts);
     let _ = writeln!(out, "user_pin.to_user_hits {}", pin.to_user_hits);
