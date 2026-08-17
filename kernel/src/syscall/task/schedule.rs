@@ -93,7 +93,7 @@ fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
         // Linux rejects SCHED_DEADLINE through sched_setscheduler(2) as an
         // invalid request. sched_setattr(2) can express the request, but this
         // kernel has no EDF/CBS class or bandwidth admission yet; report that
-        // known capability as unsupported instead of running it as CFS.
+        // known capability as unsupported instead of running it as EEVDF.
         SCHED_DEADLINE => match abi {
             SchedSetAbi::Legacy => Err(AxError::InvalidInput),
             SchedSetAbi::Attr => Err(AxError::OperationNotSupported),

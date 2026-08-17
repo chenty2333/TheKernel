@@ -829,7 +829,7 @@ impl CloneArgs {
         thread_completion.finish();
         // Thread/vfork-style clones often rely on immediate child progress for
         // futex or parent/child tid handshakes. Plain fork children are seeded
-        // behind the parent in CFS, so the parent can finish post-fork setup
+        // behind the parent in EEVDF, so the parent can finish post-fork setup
         // before a newly-created child runs unbounded user code.
         if should_yield_after_clone(flags) {
             yield_now();

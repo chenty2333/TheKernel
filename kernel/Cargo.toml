@@ -36,7 +36,7 @@ axfeat = { workspace = true, features = [
 
     "multitask",
     "task-ext",
-    "sched-cfs",
+    "sched-eevdf",
 
     "rtc",
     "rng",

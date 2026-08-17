@@ -140,8 +140,8 @@ rng = [
     "paging",
     "axdriver/virtio-rng",
 ]
-sched-cfs = [
-    "axtask/sched-cfs",
+sched-eevdf = [
+    "axtask/sched-eevdf",
     "irq",
 ]
 sched-fifo = ["axtask/sched-fifo"]

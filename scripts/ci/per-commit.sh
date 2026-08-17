@@ -612,7 +612,7 @@ ci_run_step axtask-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axtask --no-default-features --all-targets \
-    --features multitask,sched-cfs,smp,test,irq-continuation-diagnostics,irq-exit
+    --features multitask,sched-eevdf,smp,test,irq-continuation-diagnostics,irq-exit
 ci_run_step credential-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
