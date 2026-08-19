@@ -4,7 +4,7 @@
 pub mod owning;
 
 #[cfg(feature = "alloc")]
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 #[cfg(test)]
 use core::cmp::min;
 #[cfg(test)]
@@ -69,6 +69,13 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     last_used_idx: u16,
     /// Whether the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     event_idx: bool,
+    /// Whether used-buffer notifications are currently enabled.
+    ///
+    /// With `VIRTIO_F_EVENT_IDX`, the suppression state lives in
+    /// `AvailRing::used_event` rather than in `AvailRing::flags`.  Keep the
+    /// driver's state here so popping or publishing a descriptor cannot
+    /// accidentally re-enable interrupts after a terminal disable.
+    dev_notify_enabled: bool,
     #[cfg(feature = "alloc")]
     indirect: bool,
     #[cfg(feature = "alloc")]
@@ -155,6 +162,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             avail_idx: 0,
             last_used_idx: 0,
             event_idx,
+            dev_notify_enabled: true,
             #[cfg(feature = "alloc")]
             indirect,
             #[cfg(feature = "alloc")]
@@ -256,9 +264,17 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     ) -> Result<u16> {
         let descriptors_needed =
             inputs.len() + physical_inputs.len() + physical_outputs.len() + outputs.len();
+        #[cfg(feature = "alloc")]
+        let queue_descriptors = if self.indirect && descriptors_needed > 1 {
+            1
+        } else {
+            descriptors_needed
+        };
+        #[cfg(not(feature = "alloc"))]
+        let queue_descriptors = descriptors_needed;
         if descriptors_needed == 0
             || descriptors_needed > SIZE
-            || usize::from(self.num_used) + descriptors_needed > SIZE
+            || usize::from(self.num_used) + queue_descriptors > SIZE
         {
             return Err(if descriptors_needed == 0 {
                 Error::InvalidParam
@@ -278,6 +294,11 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 .any(|buffer| buffer.addr == 0 || buffer.len == 0 || buffer.len > u32::MAX as usize)
         {
             return Err(Error::InvalidParam);
+        }
+
+        #[cfg(feature = "alloc")]
+        if self.indirect && descriptors_needed > 1 {
+            return self.add_indirect_physical(inputs, physical_inputs, physical_outputs, outputs);
         }
 
         let head = self.free_head;
@@ -330,9 +351,116 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             .flags
             .remove(DescFlags::NEXT);
         self.write_desc(last);
-        self.num_used += descriptors_needed as u16;
+        self.num_used = self
+            .num_used
+            .checked_add(descriptors_needed as u16)
+            .expect("virtqueue descriptor count overflow");
         self.free_head = current;
         Ok(head)
+    }
+
+    #[cfg(feature = "alloc")]
+    fn add_indirect_physical<'a, 'b>(
+        &mut self,
+        inputs: &'a [&'b [u8]],
+        physical_inputs: &[PhysicalBuffer],
+        physical_outputs: &[PhysicalBuffer],
+        outputs: &'a mut [&'b mut [u8]],
+    ) -> Result<u16> {
+        let descriptors_needed =
+            inputs.len() + physical_inputs.len() + physical_outputs.len() + outputs.len();
+        let head = self.free_head;
+        let mut indirect_list = Self::try_new_box_slice_zeroed(descriptors_needed)?;
+        let mut index = 0usize;
+        for input in inputs {
+            // SAFETY: the caller keeps virtual buffers valid until the used
+            // entry is popped.
+            unsafe {
+                indirect_list[index].set_buf::<H>(
+                    (*input).into(),
+                    BufferDirection::DriverToDevice,
+                    DescFlags::NEXT,
+                );
+            }
+            index += 1;
+        }
+        for buffer in physical_inputs {
+            Self::install_indirect_physical_descriptor(&mut indirect_list[index], *buffer, false);
+            index += 1;
+        }
+        for buffer in physical_outputs {
+            Self::install_indirect_physical_descriptor(&mut indirect_list[index], *buffer, true);
+            index += 1;
+        }
+        for output in outputs {
+            // SAFETY: the caller keeps virtual buffers valid until the used
+            // entry is popped.
+            unsafe {
+                indirect_list[index].set_buf::<H>(
+                    (*output).into(),
+                    BufferDirection::DeviceToDriver,
+                    DescFlags::NEXT,
+                );
+            }
+            index += 1;
+        }
+        // Physical descriptors do not pass through `set_buf`, so their
+        // `next` fields were zeroed by allocation. Build the complete table
+        // links explicitly before publishing the indirect head.
+        for (entry, next) in indirect_list
+            .iter_mut()
+            .zip((1..descriptors_needed).map(|next| next as u16))
+        {
+            entry.next = next;
+        }
+        indirect_list[descriptors_needed - 1].next = 0;
+        indirect_list[descriptors_needed - 1]
+            .flags
+            .remove(DescFlags::NEXT);
+
+        assert!(self.indirect_lists[usize::from(head)].is_none());
+        self.indirect_lists[usize::from(head)] = Some(indirect_list.as_mut().into());
+        let direct_desc = &mut self.desc_shadow[usize::from(head)];
+        self.free_head = direct_desc.next;
+        // SAFETY: the indirect list remains owned by the queue until the
+        // matching pop/discard path recycles it.
+        unsafe {
+            direct_desc.set_buf::<H>(
+                Box::leak(indirect_list).as_bytes().into(),
+                BufferDirection::DriverToDevice,
+                DescFlags::INDIRECT,
+            );
+        }
+        self.write_desc(head);
+        self.num_used = self
+            .num_used
+            .checked_add(1)
+            .expect("virtqueue descriptor count overflow");
+        Ok(head)
+    }
+
+    #[cfg(feature = "alloc")]
+    fn install_indirect_physical_descriptor(
+        descriptor: &mut Descriptor,
+        buffer: PhysicalBuffer,
+        device_writes: bool,
+    ) {
+        descriptor.addr = buffer.addr as u64;
+        descriptor.len = buffer.len as u32;
+        descriptor.flags = DescFlags::NEXT
+            | if device_writes {
+                DescFlags::WRITE
+            } else {
+                DescFlags::empty()
+            };
+    }
+
+    #[cfg(feature = "alloc")]
+    fn try_new_box_slice_zeroed(len: usize) -> Result<Box<[Descriptor]>> {
+        let mut descriptors = Vec::new();
+        descriptors.try_reserve(len).map_err(|_| Error::DmaError)?;
+        descriptors.resize_with(len, Descriptor::new_zeroed);
+        Ok(descriptors.into_boxed_slice())
     }
 
     fn install_physical_descriptor(
@@ -376,6 +504,13 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 .idx
                 .store(self.avail_idx, Ordering::Release);
         }
+
+        // A queue may continue to be drained/refilled while callbacks are
+        // disabled. Extend the EVENT_IDX holdoff after publishing so the
+        // newly admitted descriptor cannot re-enable used interrupts.
+        if self.event_idx && !self.dev_notify_enabled {
+            self.refresh_used_event_suppression();
+        }
     }
 
     fn add_direct<'a, 'b>(
@@ -409,7 +544,10 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             .remove(DescFlags::NEXT);
         self.write_desc(last);
 
-        self.num_used += (inputs.len() + outputs.len()) as u16;
+        self.num_used = self
+            .num_used
+            .checked_add((inputs.len() + outputs.len()) as u16)
+            .expect("virtqueue descriptor count overflow");
 
         head
     }
@@ -457,7 +595,10 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             );
         }
         self.write_desc(head);
-        self.num_used += 1;
+        self.num_used = self
+            .num_used
+            .checked_add(1)
+            .expect("virtqueue descriptor count overflow");
 
         head
     }
@@ -511,7 +652,29 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     /// See Virtio v1.1 2.6.7 Used Buffer Notification Suppression
     pub fn set_dev_notify(&mut self, enable: bool) {
         let avail_ring_flags = if enable { 0x0000 } else { 0x0001 };
-        if !self.event_idx {
+        self.dev_notify_enabled = enable;
+        if self.event_idx {
+            // The device applies `vring_need_event(used_event, new, old)`;
+            // an interrupt is requested only once `new` advances *past*
+            // `used_event`.  Set the event at the furthest used index that
+            // the currently outstanding chains can reach. This suppresses
+            // every completion the device can produce without a new driver
+            // submission, including a u16 wrap. `publish_unpublished` and
+            // the pop paths refresh this bound while notifications remain
+            // disabled.
+            let used_event = if enable {
+                self.last_used_idx
+            } else {
+                self.suppressed_used_event()
+            };
+            // Safe because self.avail points to a valid, aligned,
+            // initialised, dereferenceable instance of AvailRing.
+            unsafe {
+                (*self.avail.as_ptr())
+                    .used_event
+                    .store(used_event, Ordering::Release)
+            }
+        } else {
             // Safe because self.avail points to a valid, aligned, initialised, dereferenceable, readable
             // instance of AvailRing.
             unsafe {
@@ -519,6 +682,32 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     .flags
                     .store(avail_ring_flags, Ordering::Release)
             }
+        }
+    }
+
+    /// Compute the next used-event threshold while callbacks are disabled.
+    ///
+    /// A split virtqueue can expose at most `num_used` additional used
+    /// entries before the driver must reclaim or stop submitting descriptors.
+    /// The event index is therefore placed at that upper bound (or one entry
+    /// ahead for an empty queue); virtio's wrapping arithmetic makes this
+    /// correct when the 16-bit used index crosses zero.
+    #[inline]
+    fn suppressed_used_event(&self) -> u16 {
+        let used_idx = unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) };
+        used_idx.wrapping_add(self.num_used.max(1))
+    }
+
+    #[inline]
+    fn refresh_used_event_suppression(&self) {
+        debug_assert!(self.event_idx);
+        let used_event = self.suppressed_used_event();
+        // Safe because self.avail points to a valid, aligned, initialised,
+        // dereferenceable instance of AvailRing.
+        unsafe {
+            (*self.avail.as_ptr())
+                .used_event
+                .store(used_event, Ordering::Release)
         }
     }
 
@@ -558,6 +747,16 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.last_used_idx != unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_used_for_test(&mut self, slot: usize, id: u32, len: u32, idx: u16) {
+        assert!(slot < SIZE);
+        // Safe because tests exclusively own the fake device's used ring.
+        unsafe {
+            (*self.used.as_ptr()).ring[slot] = UsedElem { id, len };
+            (*self.used.as_ptr()).idx.store(idx, Ordering::Release);
+        }
+    }
+
     /// Returns whether this queue has no descriptor chains awaiting device
     /// completion or driver-side reaping.
     ///
@@ -573,6 +772,21 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     /// entry per indirect chain.
     pub(crate) fn outstanding_descriptor_count(&self) -> usize {
         usize::from(self.num_used)
+    }
+
+    /// Returns whether an indirect descriptor allocation is still owned by the
+    /// queue.  The descriptor count alone is not sufficient after a failed
+    /// reset/rollback: an indirect table remains a DMA owner until its exact
+    /// chain has been recycled.
+    pub(crate) fn has_live_indirect_lists(&self) -> bool {
+        #[cfg(feature = "alloc")]
+        {
+            self.indirect_lists.iter().any(Option::is_some)
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            false
+        }
     }
 
     /// Returns the descriptor index (a.k.a. token) of the next used element without popping it, or
@@ -612,11 +826,11 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     ///
     /// The buffers in `inputs` and `outputs` must match the set of buffers originally added to the
     /// queue by `add`.
-    unsafe fn recycle_descriptors<'a>(
+    unsafe fn recycle_descriptors<'a, 'b>(
         &mut self,
         head: u16,
-        inputs: &'a [&'a [u8]],
-        outputs: &'a mut [&'a mut [u8]],
+        inputs: &'a [&'b [u8]],
+        outputs: &'a mut [&'b mut [u8]],
     ) {
         let original_free_head = self.free_head;
         self.free_head = head;
@@ -706,6 +920,61 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     ) {
         let original_free_head = self.free_head;
         self.free_head = head;
+
+        #[cfg(feature = "alloc")]
+        if self.desc_shadow[usize::from(head)]
+            .flags
+            .contains(DescFlags::INDIRECT)
+        {
+            let head_desc = &mut self.desc_shadow[usize::from(head)];
+            let indirect_list = self.indirect_lists[usize::from(head)]
+                .take()
+                .expect("missing physical indirect descriptor list");
+            // SAFETY: the device has consumed the indirect list because the
+            // used entry is being reaped (or the caller explicitly discarded
+            // an unpublished chain).
+            let mut indirect_list = unsafe { Box::from_raw(indirect_list.as_ptr()) };
+            let paddr = head_desc.addr;
+            head_desc.unset_buf();
+            self.num_used -= 1;
+            head_desc.next = original_free_head;
+            unsafe {
+                H::unshare(
+                    paddr as usize,
+                    indirect_list.as_bytes_mut().into(),
+                    BufferDirection::DriverToDevice,
+                );
+            }
+
+            let expected =
+                inputs.len() + physical_inputs.len() + physical_outputs.len() + outputs.len();
+            assert_eq!(indirect_list.len(), expected);
+            let mut index = 0usize;
+            for input in inputs {
+                unsafe {
+                    H::unshare(
+                        indirect_list[index].addr as usize,
+                        (*input).into(),
+                        BufferDirection::DriverToDevice,
+                    );
+                }
+                index += 1;
+            }
+            index += physical_inputs.len() + physical_outputs.len();
+            for output in outputs {
+                unsafe {
+                    H::unshare(
+                        indirect_list[index].addr as usize,
+                        (*output).into(),
+                        BufferDirection::DeviceToDriver,
+                    );
+                }
+                index += 1;
+            }
+            self.write_desc(head);
+            return;
+        }
+
         let mut next = Some(head);
 
         for input in inputs {
@@ -745,6 +1014,59 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             }
         }
         assert!(next.is_none(), "Descriptor chain was longer than expected.");
+    }
+
+    /// Discards a descriptor chain which was prepared but never published.
+    /// No used-ring index is advanced; all queue-owned virtual and indirect
+    /// mappings are released and the caller may then release physical DMA
+    /// mappings.
+    pub(crate) unsafe fn discard_unpublished_physical<'a, 'b>(
+        &mut self,
+        head: u16,
+        inputs: &'a [&'b [u8]],
+        physical_inputs: &[PhysicalBuffer],
+        physical_outputs: &[PhysicalBuffer],
+        outputs: &'a mut [&'b mut [u8]],
+    ) {
+        // SAFETY: the caller proves this chain was installed by
+        // add_unpublished_physical and is not visible to the device.
+        unsafe {
+            self.recycle_physical_descriptors(
+                head,
+                inputs,
+                physical_inputs,
+                physical_outputs,
+                outputs,
+            );
+        }
+    }
+
+    /// Discards a normal virtual-buffer chain which was prepared but never
+    /// published.  This is the rollback counterpart to [`Self::add_unpublished`]
+    /// and deliberately does not advance the used ring.
+    pub(crate) unsafe fn discard_unpublished<'a, 'b>(
+        &mut self,
+        head: u16,
+        inputs: &'a [&'b [u8]],
+        outputs: &'a mut [&'b mut [u8]],
+    ) {
+        // SAFETY: the caller proves this chain was installed by
+        // add_unpublished and has not been exposed to the device.
+        unsafe { self.recycle_descriptors(head, inputs, outputs) };
+    }
+
+    /// Recycles a published descriptor chain after the transport has already
+    /// proved that the device is quiescent.  No used-ring index is consumed;
+    /// this is the reset/teardown counterpart to [`Self::pop_used`].
+    pub(crate) unsafe fn discard_quiesced<'a, 'b>(
+        &mut self,
+        head: u16,
+        inputs: &'a [&'b [u8]],
+        outputs: &'a mut [&'b mut [u8]],
+    ) {
+        // SAFETY: the caller proved quiescence and supplies the exact buffers
+        // used to install this chain.
+        unsafe { self.recycle_descriptors(head, inputs, outputs) };
     }
 
     unsafe fn recycle_one_physical_descriptor(
@@ -800,7 +1122,11 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // instance of UsedRing.
         dma_sync_barrier();
         unsafe {
-            index = (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16;
+            let raw_index = (*self.used.as_ptr()).ring[last_used_slot as usize].id;
+            if raw_index > u32::from(u16::MAX) || raw_index as usize >= SIZE {
+                return Err(Error::WrongToken);
+            }
+            index = raw_index as u16;
             len = (*self.used.as_ptr()).ring[last_used_slot as usize].len;
         }
 
@@ -816,10 +1142,14 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         if self.event_idx {
-            unsafe {
-                (*self.avail.as_ptr())
-                    .used_event
-                    .store(self.last_used_idx, Ordering::Release);
+            if self.dev_notify_enabled {
+                unsafe {
+                    (*self.avail.as_ptr())
+                        .used_event
+                        .store(self.last_used_idx, Ordering::Release);
+                }
+            } else {
+                self.refresh_used_event_suppression();
             }
         }
 
@@ -850,10 +1180,11 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let last_used_slot = self.last_used_idx & (SIZE as u16 - 1);
         let (index, len) = unsafe {
             let used = &*self.used.as_ptr();
-            (
-                used.ring[last_used_slot as usize].id as u16,
-                used.ring[last_used_slot as usize].len,
-            )
+            let raw_index = used.ring[last_used_slot as usize].id;
+            if raw_index > u32::from(u16::MAX) || raw_index as usize >= SIZE {
+                return Err(Error::WrongToken);
+            }
+            (raw_index as u16, used.ring[last_used_slot as usize].len)
         };
         if index != token {
             return Err(Error::WrongToken);
@@ -872,10 +1203,14 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         if self.event_idx {
-            unsafe {
-                (*self.avail.as_ptr())
-                    .used_event
-                    .store(self.last_used_idx, Ordering::Release);
+            if self.dev_notify_enabled {
+                unsafe {
+                    (*self.avail.as_ptr())
+                        .used_event
+                        .store(self.last_used_idx, Ordering::Release);
+                }
+            } else {
+                self.refresh_used_event_suppression();
             }
         }
         Ok(len)
@@ -1209,7 +1544,6 @@ pub(crate) fn fake_read_write_queue<const QUEUE_SIZE: usize>(
         let head_descriptor_index = (*available_ring).ring[next_slot as usize];
         let mut descriptor = &(*descriptors)[head_descriptor_index as usize];
 
-        let input_length;
         let output;
         if descriptor.flags.contains(DescFlags::INDIRECT) {
             // The descriptor shouldn't have any other flags if it is indirect.
@@ -1237,8 +1571,6 @@ pub(crate) fn fake_read_write_queue<const QUEUE_SIZE: usize>(
 
                 indirect_descriptor_index += 1;
             }
-            input_length = input.len();
-
             // Let the test handle the request.
             output = handler(input);
 
@@ -1274,8 +1606,6 @@ pub(crate) fn fake_read_write_queue<const QUEUE_SIZE: usize>(
                     break;
                 }
             }
-            input_length = input.len();
-
             // Let the test handle the request.
             output = handler(input);
 
@@ -1305,7 +1635,9 @@ pub(crate) fn fake_read_write_queue<const QUEUE_SIZE: usize>(
 
         // Mark the buffer as used.
         (*used_ring).ring[next_slot as usize].id = head_descriptor_index.into();
-        (*used_ring).ring[next_slot as usize].len = (input_length + output.len()) as u32;
+        // VirtIO's used length counts bytes written through device-writable
+        // descriptors, not bytes consumed from driver-readable descriptors.
+        (*used_ring).ring[next_slot as usize].len = output.len() as u32;
         (*used_ring).idx.fetch_add(1, Ordering::AcqRel);
 
         true
@@ -1330,7 +1662,7 @@ mod tests {
 
     #[test]
     fn queue_too_big() {
-        let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 4);
+        let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 8);
         let mut transport = unsafe { MmioTransport::new(NonNull::from(&mut header)) }.unwrap();
         assert_eq!(
             VirtQueue::<FakeHal, 8>::new(&mut transport, 0, false, false).unwrap_err(),
@@ -1358,6 +1690,25 @@ mod tests {
             unsafe { queue.add(&[], &mut []) }.unwrap_err(),
             Error::InvalidParam
         );
+    }
+
+    #[test]
+    fn pop_rejects_used_id_outside_queue() {
+        let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 4);
+        let mut transport = unsafe { MmioTransport::new(NonNull::from(&mut header)) }.unwrap();
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, false).unwrap();
+        let input = [1u8];
+        let token = unsafe { queue.add_unpublished(&[&input], &mut []) }.unwrap();
+        queue.publish_unpublished(token);
+        unsafe {
+            (*queue.used.as_ptr()).ring[0].id = 4;
+            (*queue.used.as_ptr()).idx.store(1, Ordering::Release);
+        }
+        assert_eq!(
+            unsafe { queue.pop_used(token, &[&input], &mut []) },
+            Err(Error::WrongToken)
+        );
+        assert_eq!(queue.outstanding_descriptor_count(), 1);
     }
 
     #[test]
@@ -1470,6 +1821,66 @@ mod tests {
             assert!(third.flags.contains(DescFlags::WRITE));
             assert!(fourth.flags.contains(DescFlags::WRITE));
         }
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn indirect_physical_chain_links_every_entry() {
+        use core::ptr::slice_from_raw_parts;
+
+        let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 8);
+        let mut transport = unsafe { MmioTransport::new(NonNull::from(&mut header)) }.unwrap();
+        let mut queue = VirtQueue::<FakeHal, 8>::new(&mut transport, 0, true, false).unwrap();
+        let request = [0u8; 16];
+        let mut status = [0u8; 1];
+        let physical = [
+            PhysicalBuffer {
+                addr: 0x1000,
+                len: 512,
+            },
+            PhysicalBuffer {
+                addr: 0x2000,
+                len: 512,
+            },
+            PhysicalBuffer {
+                addr: 0x3000,
+                len: 512,
+            },
+        ];
+        let token = unsafe {
+            queue.add_unpublished_physical(
+                &[&request],
+                &physical[..2],
+                &physical[2..],
+                &mut [&mut status],
+            )
+        }
+        .unwrap();
+
+        unsafe {
+            let head = &(*queue.desc.as_ptr())[token as usize];
+            let table = slice_from_raw_parts(head.addr as *const Descriptor, 5);
+            for index in 0..4 {
+                assert!(
+                    (*table)[index].flags.contains(DescFlags::NEXT),
+                    "entry {index} must link to the next indirect descriptor"
+                );
+                assert_eq!((*table)[index].next, (index + 1) as u16);
+            }
+            assert!(!(*table)[4].flags.contains(DescFlags::NEXT));
+            assert_eq!((*table)[4].next, 0);
+        }
+
+        unsafe {
+            queue.discard_unpublished_physical(
+                token,
+                &[&request],
+                &physical[..2],
+                &physical[2..],
+                &mut [&mut status],
+            );
+        }
+        assert!(queue.is_empty());
     }
 
     #[cfg(feature = "alloc")]
@@ -1641,5 +2052,50 @@ mod tests {
 
         // Check that the transport should be notified again now.
         assert_eq!(queue.should_notify(), true);
+    }
+
+    /// Device-side EVENT_IDX suppression uses wrapping u16 arithmetic. A
+    /// fixed sentinel (for example, `u16::MAX`) would spuriously interrupt as
+    /// the used index crosses zero, while enabling callbacks must point back
+    /// at the driver's next expected used entry.
+    #[test]
+    fn dev_notify_event_idx_suppresses_wrap_and_reenables() {
+        fn device_needs_event(event_idx: u16, new_idx: u16, old_idx: u16) -> bool {
+            new_idx.wrapping_sub(event_idx).wrapping_sub(1) < new_idx.wrapping_sub(old_idx)
+        }
+
+        let mut config_space = ();
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: 4,
+            device_features: Feature::RING_EVENT_IDX.bits(),
+            config_space: NonNull::from(&mut config_space),
+            state,
+        };
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, true).unwrap();
+
+        // Place both sides immediately before the u16 wrap. Suppression must
+        // cover the first post-wrap completion, not only ordinary indices.
+        unsafe {
+            (*queue.used.as_ptr())
+                .idx
+                .store(u16::MAX, Ordering::Release);
+        }
+        queue.last_used_idx = u16::MAX;
+        queue.set_dev_notify(false);
+        let used_event = unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) };
+        assert_eq!(used_event, 0);
+        assert!(!device_needs_event(used_event, 0, u16::MAX));
+
+        // Re-enabling points the device at the next entry expected by the
+        // driver, so a subsequent completion is observable again.
+        queue.set_dev_notify(true);
+        let used_event = unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) };
+        assert_eq!(used_event, u16::MAX);
+        assert!(device_needs_event(used_event, 0, u16::MAX));
     }
 }

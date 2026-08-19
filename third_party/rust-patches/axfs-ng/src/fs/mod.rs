@@ -22,7 +22,7 @@ impl Default for FatMountOptions {
 }
 
 #[cfg(feature = "ext4")]
-mod ext4;
+pub(crate) mod ext4;
 #[cfg(feature = "fat")]
 mod fat;
 

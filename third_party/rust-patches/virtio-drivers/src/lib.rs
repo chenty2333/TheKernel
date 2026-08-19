@@ -86,6 +86,8 @@ pub enum Error {
     DmaError,
     /// I/O Error
     IoError,
+    /// Device reset quiescence could not be proven; DMA owners are retained.
+    Quarantined,
     /// The request was not supported by the device.
     Unsupported,
     /// The config space advertised by the device is smaller than the driver expected.
@@ -116,6 +118,7 @@ impl Display for Error {
             Self::InvalidParam => write!(f, "Invalid parameter"),
             Self::DmaError => write!(f, "Failed to allocate DMA memory"),
             Self::IoError => write!(f, "I/O Error"),
+            Self::Quarantined => write!(f, "Device reset quarantined outstanding DMA"),
             Self::Unsupported => write!(f, "Request not supported by device"),
             Self::ConfigSpaceTooSmall => write!(
                 f,

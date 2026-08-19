@@ -16,11 +16,21 @@ use thekernel_linux_io_uring::{
 };
 use thekernel_linux_signal::SignalSet;
 
-use super::{io_uring_pread64, io_uring_pwrite64};
+use super::{
+    IoUringWorkerResult, capture_io_operation_context, io_uring_pread64_submission,
+    io_uring_pread64_submission_nonblocking_stream, io_uring_pread64_worker,
+    io_uring_pwrite64_submission, io_uring_pwrite64_worker, physical_effect_admission_enabled,
+    prepare_physical_io_effect, prepare_physical_io_plan, prepare_physical_io_write_memfd_guard,
+    prepare_physical_io_write_privilege_guard,
+};
 use crate::{
     file::{
-        FileDescription, FileHandle, FileLike, get_file_description, get_file_like,
-        io_uring::{IoUring, IoUringBufferLease, IoUringFileLease, SubmissionStep, SubmissionWork},
+        FileDescription, FileHandle, FileLike, FileLikeKind, get_file_description, get_file_like,
+        io_uring::{
+            IoUring, IoUringBufferLease, IoUringFileLease, PendingStreamAdmissionError,
+            PreparedPhysicalIoAdmission, PreparedPhysicalIoOperation, SubmissionStep,
+            SubmissionWork,
+        },
         prepare_file_description_with_resource, reserve_fd,
     },
     mm::{IoVec, UserMemoryCapability, check_user_writable_with, map_usercopy_error},
@@ -347,6 +357,17 @@ fn submission_io_range(
     ))
 }
 
+fn pending_stream_read_supported(file: &IoUringFileLease, request: ReadWriteRequest) -> bool {
+    request.fixed_buffer().is_some()
+        && request.offset() == 0
+        && file.description().is_ok_and(|description| {
+            matches!(
+                FileLikeKind::from_file_like(description.file_handle().as_ref()),
+                FileLikeKind::Fifo
+            )
+        })
+}
+
 fn issue_prepared(
     ring: &IoUring,
     prepared: PreparedRequest,
@@ -397,6 +418,141 @@ enum SubmissionOutcome {
     FailedDuringSubmission,
 }
 
+/// Result of the submitter-side physical publication hand-off.  The
+/// `NotSubmitted` arm retains both proofs so the caller can execute the
+/// existing synchronous fallback while the issued request remains its sole
+/// terminal owner.  Published/Terminal effects have already transferred all
+/// ownership to the bounded worker queue and cannot fall back.
+enum PhysicalPublishDecision {
+    NotSubmitted {
+        issued: thekernel_linux_io_uring::IssuedRequest,
+        admission: PreparedPhysicalIoAdmission,
+    },
+    /// The fixed logical owner is queued before lower publication and will
+    /// be retried when the device returns completion credit.
+    Pending,
+    Queued,
+    /// Publication returned an error after ownership could no longer prove
+    /// that no descriptor was visible. The reservation commit has transferred
+    /// the issued request and every physical lease to the fixed worker slot;
+    /// reset/quarantine custody, not a CQE or synchronous fallback, owns the
+    /// next transition.
+    Quarantined,
+    /// The effect was not published because the prepared admission was
+    /// malformed/internal-invalid.  The issued proof has already been
+    /// consumed into a typed CQE; this is not a fallback opportunity.
+    Completed,
+}
+
+fn publish_physical_admission(
+    ring: &IoUring,
+    issued: thekernel_linux_io_uring::IssuedRequest,
+    mut admission: PreparedPhysicalIoAdmission,
+) -> AxResult<PhysicalPublishDecision> {
+    let device_identity = admission.plan().device_identity();
+    let mut reservation = match ring.reserve_physical_worker_slot_for_device(device_identity) {
+        Ok(reservation) => reservation,
+        Err(AxError::ResourceBusy) => {
+            return Ok(PhysicalPublishDecision::NotSubmitted { issued, admission });
+        }
+        Err(error) => {
+            // No effect has been published, so an internal ring metadata
+            // failure may still be represented by the issued request's
+            // ordinary terminal CQE. It is not a fallback opportunity after
+            // publication, but neither may an accepted SQE be silently
+            // dropped when reservation setup itself fails.
+            drop(admission);
+            ring.complete_issued(issued, TerminalCause::Completed, negative_errno(error), 0)?;
+            return Ok(PhysicalPublishDecision::Completed);
+        }
+    };
+    let extent_count = match admission.physical_extent_count() {
+        Ok(count) => count,
+        Err(error) => {
+            drop(admission);
+            ring.complete_issued(issued, TerminalCause::Completed, negative_errno(error), 0)?;
+            return Ok(PhysicalPublishDecision::Completed);
+        }
+    };
+    if let Err(error) = reservation.bind_admission(&mut admission) {
+        drop(admission);
+        ring.complete_issued(issued, TerminalCause::Completed, negative_errno(error), 0)?;
+        return Ok(PhysicalPublishDecision::Completed);
+    }
+    match reservation.reserve_completion_routes(extent_count) {
+        Ok(()) => {}
+        Err(AxError::ResourceBusy) => {
+            return match reservation.commit_pending(issued, admission) {
+                Ok(()) => Ok(PhysicalPublishDecision::Pending),
+                Err((AxError::ResourceBusy, issued, admission)) => {
+                    Ok(PhysicalPublishDecision::NotSubmitted { issued, admission })
+                }
+                Err((error, issued, admission)) => {
+                    drop(admission);
+                    ring.complete_issued(
+                        issued,
+                        TerminalCause::Completed,
+                        negative_errno(error),
+                        0,
+                    )?;
+                    Ok(PhysicalPublishDecision::Completed)
+                }
+            };
+        }
+        Err(error) => {
+            drop(admission);
+            ring.complete_issued(issued, TerminalCause::Completed, negative_errno(error), 0)?;
+            return Ok(PhysicalPublishDecision::Completed);
+        }
+    }
+    let outcome = match reservation.with_physical_publish(|| unsafe { admission.publish() }) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            // A vendor error is not proof of non-publication. Keep the
+            // issued token and all leases in the bounded work owner; the
+            // completion/reset worker must quarantine it instead of taking
+            // the synchronous fallback.
+            reservation.commit(issued, admission)?;
+            error!("io_uring physical publication entered quarantine: {error:?}");
+            return Ok(PhysicalPublishDecision::Quarantined);
+        }
+        Err(_) => {
+            // The worker/device generation closed before the publication
+            // window.  The effect is still unpublished, so release the
+            // reservation and use the explicitly proven synchronous path.
+            drop(reservation);
+            return Ok(PhysicalPublishDecision::NotSubmitted { issued, admission });
+        }
+    };
+    match outcome {
+        axfs::PhysicalIoPublishOutcome::NotSubmitted(
+            axfs::PhysicalIoNotSubmittedReason::Backpressure,
+        ) => match reservation.commit_pending(issued, admission) {
+            Ok(()) => Ok(PhysicalPublishDecision::Pending),
+            Err((AxError::ResourceBusy, issued, admission)) => {
+                Ok(PhysicalPublishDecision::NotSubmitted { issued, admission })
+            }
+            Err((error, issued, admission)) => {
+                drop(admission);
+                ring.complete_issued(issued, TerminalCause::Completed, negative_errno(error), 0)?;
+                Ok(PhysicalPublishDecision::Completed)
+            }
+        },
+        axfs::PhysicalIoPublishOutcome::NotSubmitted(_) => {
+            drop(reservation);
+            Ok(PhysicalPublishDecision::NotSubmitted { issued, admission })
+        }
+        axfs::PhysicalIoPublishOutcome::Published(_)
+        | axfs::PhysicalIoPublishOutcome::Terminal(_) => {
+            // Reservation commit only moves already-owned values into the
+            // preallocated slot.  After this point an enqueue failure cannot
+            // select the generic fallback.
+            reservation.commit(issued, admission)?;
+            Ok(PhysicalPublishDecision::Queued)
+        }
+    }
+}
+
 impl SubmissionOutcome {
     const fn stops_default_batch(self) -> bool {
         matches!(self, Self::FailedDuringSubmission)
@@ -404,7 +560,8 @@ impl SubmissionOutcome {
 }
 
 fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<SubmissionOutcome> {
-    let (prepared, parsed, file, buffer, capability) = work.into_parts();
+    let (prepared, parsed, file, buffer, mut context, physical, admission_error, capability) =
+        work.into_parts();
     let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -417,6 +574,12 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
         return Ok(SubmissionOutcome::Accepted);
     };
 
+    if let Some(error) = admission_error {
+        drop((issued, file, buffer, context, physical));
+        ring.complete_request(id, TerminalCause::Completed, negative_errno(error), 0)?;
+        return Ok(SubmissionOutcome::Accepted);
+    }
+
     match parsed.operation() {
         SubmissionOperation::Nop => {
             drop(issued);
@@ -424,11 +587,26 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
             ring.complete_request(id, TerminalCause::Completed, 0, 0)
         }
         SubmissionOperation::Read(request) => {
-            drop(issued);
+            if let Some(admission) = physical {
+                return match publish_physical_admission(ring, issued, admission)? {
+                    PhysicalPublishDecision::NotSubmitted { issued, admission } => {
+                        let result = match io_uring_pread64_worker(admission)? {
+                            IoUringWorkerResult::Completed(result) => result,
+                            IoUringWorkerResult::Failed(error) => negative_errno(error) as isize,
+                        };
+                        ring.complete_issued(issued, TerminalCause::Completed, result as i32, 0)
+                            .map(|_| SubmissionOutcome::Accepted)
+                    }
+                    PhysicalPublishDecision::Pending
+                    | PhysicalPublishDecision::Queued
+                    | PhysicalPublishDecision::Quarantined
+                    | PhysicalPublishDecision::Completed => Ok(SubmissionOutcome::Accepted),
+                };
+            }
             let Some(file) = file else {
                 drop(buffer);
-                ring.complete_request(
-                    id,
+                ring.complete_issued(
+                    issued,
                     TerminalCause::PreparationFailed,
                     -LinuxError::EBADF.code(),
                     0,
@@ -437,8 +615,8 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
             };
             if request.fixed_buffer().is_some() && buffer.is_none() {
                 drop(file);
-                ring.complete_request(
-                    id,
+                ring.complete_issued(
+                    issued,
                     TerminalCause::PreparationFailed,
                     -LinuxError::EFAULT.code(),
                     0,
@@ -453,8 +631,8 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 Ok(capability) => capability,
                 Err(_) => {
                     drop((file, buffer));
-                    ring.complete_request(
-                        id,
+                    ring.complete_issued(
+                        issued,
                         TerminalCause::PreparationFailed,
                         -LinuxError::EFAULT.code(),
                         0,
@@ -462,12 +640,13 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     return Ok(SubmissionOutcome::Accepted);
                 }
             };
+            let pending_stream = pending_stream_read_supported(&file, request);
             let (io_address, io_length) = match submission_io_range(request, buffer.as_ref()) {
                 Ok(range) => range,
                 Err(_) => {
                     drop((file, buffer));
-                    ring.complete_request(
-                        id,
+                    ring.complete_issued(
+                        issued,
                         TerminalCause::PreparationFailed,
                         -LinuxError::EFAULT.code(),
                         0,
@@ -487,8 +666,8 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     Ok(range) => Some(range),
                     Err(_) => {
                         drop((file, buffer));
-                        ring.complete_request(
-                            id,
+                        ring.complete_issued(
+                            issued,
                             TerminalCause::PreparationFailed,
                             -LinuxError::EFAULT.code(),
                             0,
@@ -499,23 +678,78 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
             } else {
                 None
             };
-            let result = io_result(file.description().and_then(|description| {
-                io_uring_pread64(
+            let attempt = file.description().and_then(|description| {
+                let context = context.as_ref().ok_or(AxError::BadState)?;
+                let submit = if pending_stream {
+                    io_uring_pread64_submission_nonblocking_stream
+                } else {
+                    io_uring_pread64_submission
+                };
+                submit(
                     &io_capability,
                     description,
+                    context,
                     io_address as *mut u8,
                     io_length,
                     request.offset(),
                     fixed_segments,
                 )
-            }));
-            let completed = ring.complete_request(id, TerminalCause::Completed, result, 0);
+            });
+            if pending_stream && attempt == Err(AxError::WouldBlock) {
+                let buffer = buffer.ok_or(AxError::BadAddress)?;
+                let context = context.take().ok_or(AxError::BadState)?;
+                return match ring
+                    .admit_pending_stream(issued, file, buffer, request, context, capability)
+                {
+                    Ok(()) => Ok(SubmissionOutcome::Accepted),
+                    Err(PendingStreamAdmissionError {
+                        error,
+                        issued,
+                        file,
+                        buffer,
+                        context: _,
+                        capability: _,
+                    }) => {
+                        drop((file, buffer));
+                        ring.complete_issued(
+                            issued,
+                            TerminalCause::Completed,
+                            negative_errno(error),
+                            0,
+                        )
+                        .map(|_| SubmissionOutcome::Accepted)
+                    }
+                };
+            }
+            let result = io_result(attempt);
+            let completed = ring.complete_issued(issued, TerminalCause::Completed, result, 0);
             drop(file);
             drop(buffer);
             completed
         }
         SubmissionOperation::Write(request) => {
+            if let Some(admission) = physical {
+                return match publish_physical_admission(ring, issued, admission)? {
+                    PhysicalPublishDecision::NotSubmitted { issued, admission } => {
+                        let result = match io_uring_pwrite64_worker(admission)? {
+                            IoUringWorkerResult::Completed(result) => result,
+                            IoUringWorkerResult::Failed(error) => negative_errno(error) as isize,
+                        };
+                        ring.complete_issued(issued, TerminalCause::Completed, result as i32, 0)
+                            .map(|_| SubmissionOutcome::Accepted)
+                    }
+                    PhysicalPublishDecision::Pending
+                    | PhysicalPublishDecision::Queued
+                    | PhysicalPublishDecision::Quarantined
+                    | PhysicalPublishDecision::Completed => Ok(SubmissionOutcome::Accepted),
+                };
+            }
             drop(issued);
+            // Physical writes intentionally remain on the submission task.
+            // axfs-ng does not expose a side-effect-free device-admission
+            // token, so setid/capability cleanup and RLIMIT_FSIZE handling
+            // must retain their Linux task-local ordering here.
+            drop(physical);
             let Some(file) = file else {
                 drop(buffer);
                 ring.complete_request(
@@ -591,9 +825,11 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 None
             };
             let result = io_result(file.description().and_then(|description| {
-                io_uring_pwrite64(
+                let context = context.as_ref().ok_or(AxError::BadState)?;
+                io_uring_pwrite64_submission(
                     &io_capability,
                     description,
+                    context,
                     io_address as *const u8,
                     io_length,
                     request.offset(),
@@ -651,11 +887,18 @@ fn submit_entries(
             SubmissionStep::Admission(admission) => {
                 examined += 1;
                 let parsed = admission.parsed();
-                let lease = match parsed.ok().and_then(submission_file) {
+                let mut lease = match parsed.ok().and_then(submission_file) {
                     Some(target) => match retain_submission_file(ring, target) {
                         Ok(lease) => Some(lease),
                         Err(error) => {
-                            let work = match admission.commit(None, None, capability.clone()) {
+                            let work = match admission.commit(
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                capability.clone(),
+                            ) {
                                 Ok(work) => work,
                                 Err(commit_error) if submitted != 0 => {
                                     error!(
@@ -686,12 +929,19 @@ fn submit_entries(
                     None => None,
                 };
 
-                let buffer = match parsed.ok().and_then(submission_buffer) {
+                let mut buffer = match parsed.ok().and_then(submission_buffer) {
                     Some(fixed) => match retain_submission_buffer(ring, fixed) {
                         Ok(buffer) => Some(buffer),
                         Err(error) => {
                             drop(lease);
-                            let work = match admission.commit(None, None, capability.clone()) {
+                            let work = match admission.commit(
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                capability.clone(),
+                            ) {
                                 Ok(work) => work,
                                 Err(commit_error) if submitted != 0 => {
                                     error!(
@@ -722,6 +972,108 @@ fn submit_entries(
                     None => None,
                 };
 
+                // Capture the immutable actor/OFD snapshot while the SQE is
+                // still being admitted.  The retained lease supplies the
+                // exact description; execution must not recreate this from
+                // whichever task happens to drain a future work item.
+                let mut context = match parsed.ok().map(ParsedSubmission::operation) {
+                    Some(SubmissionOperation::Read(_)) | Some(SubmissionOperation::Write(_)) => {
+                        lease
+                            .as_ref()
+                            .map(|lease| lease.description().map(capture_io_operation_context))
+                            .transpose()?
+                    }
+                    _ => None,
+                };
+
+                // Only a fixed-buffer regular ext4 O_DIRECT request can
+                // receive an owned worker token. Policy failures are carried
+                // into the accepted CQE so execution does not repeat a
+                // fanotify wait or RLIMIT_FSIZE signal.
+                let mut physical = None;
+                let mut admission_error = None;
+                if physical_effect_admission_enabled()
+                    && let Ok(parsed) = parsed
+                {
+                    let operation = match parsed.operation() {
+                        SubmissionOperation::Read(request) if request.fixed_buffer().is_some() => {
+                            Some((PreparedPhysicalIoOperation::Read, request))
+                        }
+                        SubmissionOperation::Write(request) if request.fixed_buffer().is_some() => {
+                            Some((PreparedPhysicalIoOperation::Write, request))
+                        }
+                        _ => None,
+                    };
+                    if let Some((operation, request)) = operation {
+                        if let (Some(file_lease), Some(buffer_lease), Some(context_ref)) =
+                            (lease.as_ref(), buffer.as_ref(), context.as_ref())
+                        {
+                            match prepare_physical_io_plan(
+                                file_lease,
+                                buffer_lease,
+                                context_ref,
+                                operation,
+                                request.offset(),
+                            ) {
+                                Ok(Some(plan)) => {
+                                    match prepare_physical_io_write_memfd_guard(
+                                        file_lease,
+                                        context_ref,
+                                        &plan,
+                                    ) {
+                                        Ok(memfd) => {
+                                            match prepare_physical_io_effect(file_lease, &plan) {
+                                                Ok(Some(effect)) => {
+                                                    match prepare_physical_io_write_privilege_guard(
+                                                        file_lease,
+                                                        context_ref,
+                                                        &plan,
+                                                    ) {
+                                                        Ok(privilege) => {
+                                                            let file_lease = lease
+                                                                .take()
+                                                                .ok_or(AxError::BadState)?;
+                                                            let buffer_lease = buffer
+                                                                .take()
+                                                                .ok_or(AxError::BadState)?;
+                                                            let prepared =
+                                                                PreparedPhysicalIoAdmission::new(
+                                                                    file_lease,
+                                                                    buffer_lease,
+                                                                    context
+                                                                        .take()
+                                                                        .ok_or(AxError::BadState)?,
+                                                                    plan,
+                                                                    memfd,
+                                                                    privilege,
+                                                                    effect,
+                                                                );
+                                                            match prepared {
+                                                                Ok(prepared) => {
+                                                                    physical = Some(prepared)
+                                                                }
+                                                                Err(error) => {
+                                                                    admission_error = Some(error)
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(error) => admission_error = Some(error),
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(error) => admission_error = Some(error),
+                                            }
+                                        }
+                                        Err(error) => admission_error = Some(error),
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => admission_error = Some(error),
+                            }
+                        }
+                    }
+                }
+
                 if let Ok(parsed) = parsed
                     && let SubmissionOperation::PollAdd(request) = parsed.operation()
                 {
@@ -739,7 +1091,14 @@ fn submit_entries(
                     continue;
                 }
 
-                let work = match admission.commit(lease, buffer, capability.clone()) {
+                let work = match admission.commit(
+                    lease,
+                    buffer,
+                    context,
+                    physical,
+                    admission_error,
+                    capability.clone(),
+                ) {
                     Ok(work) => work,
                     Err(error) if submitted != 0 => {
                         error!("io_uring stopped before SQ admission commit: {error:?}");

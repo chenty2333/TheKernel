@@ -68,6 +68,21 @@ use self::pci::{DeviceFunction, DeviceFunctionInfo, PciRoot};
 #[cfg(feature = "socket")]
 pub use self::socket::VirtIoSocketDev;
 
+/// x86 external-interrupt vectors start after the architectural exception
+/// range.  PCI configuration space reports the legacy INTx line/GSI, while
+/// the x86 platform IRQ API consumes the corresponding CPU vector.
+#[cfg(target_arch = "x86_64")]
+const PCI_IRQ_VECTOR_BASE: usize = 0x20;
+
+/// Translate a firmware PCI INTx line/GSI into the x86 vector accepted by
+/// `axhal::irq`.  Keep the LAPIC-reserved vector range unavailable to PCI
+/// devices; such a route is not usable by the current platform contract.
+#[cfg(target_arch = "x86_64")]
+const fn pci_irq_vector_from_line(line: u8) -> Option<usize> {
+    let vector = PCI_IRQ_VECTOR_BASE + line as usize;
+    if vector < 0xf0 { Some(vector) } else { None }
+}
+
 /// Try to probe a VirtIO MMIO device from the given memory region.
 ///
 /// If the device is recognized, returns the device type and a transport object
@@ -108,12 +123,11 @@ pub fn probe_pci_device<H: VirtIoHal>(
 ) -> Option<(DeviceType, PciTransport, usize)> {
     use virtio_drivers::transport::pci::virtio_device_type;
 
-    #[cfg(target_arch = "x86_64")]
-    const PCI_IRQ_BASE: usize = 0x20;
-
     let dev_type = virtio_device_type(dev_info).and_then(as_dev_type)?;
+    let (line, _pin) = root.interrupt_line_and_pin(bdf)?;
+    #[cfg(target_arch = "x86_64")]
+    let irq = pci_irq_vector_from_line(line)?;
     let transport = PciTransport::new::<H>(root, bdf).ok()?;
-    let irq = PCI_IRQ_BASE + (bdf.device & 3) as usize;
     Some((dev_type, transport, irq))
 }
 
@@ -154,6 +168,7 @@ const fn as_dev_err(e: virtio_drivers::Error) -> DevError {
         InvalidParam => DevError::InvalidParam,
         DmaError => DevError::NoMemory,
         IoError => DevError::Io,
+        Quarantined => DevError::BadState,
         Unsupported => DevError::Unsupported,
         ConfigSpaceTooSmall => DevError::BadState,
         ConfigSpaceMissing => DevError::BadState,
@@ -168,5 +183,24 @@ const fn as_dev_err(e: virtio_drivers::Error) -> DevError {
             InsufficientBufferSpaceInPeer => DevError::Again,
             RecycledWrongBuffer => DevError::BadState,
         },
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::pci_irq_vector_from_line;
+
+    #[test]
+    fn pci_irq_vector_uses_firmware_line_not_bdf_bits() {
+        // q35/OVMF assigns the VirtIO block device GSI/line 4, which the
+        // x86 platform delivers as vector 0x24 (36), regardless of BDF.
+        assert_eq!(pci_irq_vector_from_line(4), Some(0x24));
+        assert_eq!(pci_irq_vector_from_line(0), Some(0x20));
+    }
+
+    #[test]
+    fn pci_irq_vector_rejects_platform_reserved_vectors() {
+        assert_eq!(pci_irq_vector_from_line(0xd0), None);
+        assert_eq!(pci_irq_vector_from_line(0xff), None);
     }
 }

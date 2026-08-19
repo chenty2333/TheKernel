@@ -1,11 +1,12 @@
 //! Module for dealing with a PCI bus in general, without anything specific to VirtIO.
 
-use bitflags::bitflags;
 use core::{
     array,
     convert::TryFrom,
     fmt::{self, Display, Formatter},
 };
+
+use bitflags::bitflags;
 use log::warn;
 
 const INVALID_READ: u32 = 0xffffffff;
@@ -19,6 +20,8 @@ const MAX_FUNCTIONS: u8 = 8;
 const STATUS_COMMAND_OFFSET: u8 = 0x04;
 /// The offset in bytes to BAR0 within PCI configuration space.
 const BAR0_OFFSET: u8 = 0x10;
+/// The offset in bytes to the legacy INTx line/pin configuration register.
+const INTERRUPT_LINE_PIN_OFFSET: u8 = 0x3c;
 
 /// ID for vendor-specific PCI capabilities.
 pub const PCI_CAP_ID_VNDR: u8 = 0x09;
@@ -229,6 +232,20 @@ impl PciRoot {
         (status, command)
     }
 
+    /// Returns the firmware-provided legacy INTx line and pin for a device.
+    ///
+    /// The line is the PCI configuration-space routing value (normally the
+    /// GSI/IOAPIC pin on x86), not an architecture-specific CPU interrupt
+    /// vector.  A line of `0xff` means that no line was assigned, and a pin
+    /// of zero means that the device does not expose a legacy interrupt pin.
+    /// MSI/MSI-X devices may also leave this register unpopulated; callers
+    /// that require INTx must treat `None` as an unavailable interrupt route.
+    pub fn interrupt_line_and_pin(&self, device_function: DeviceFunction) -> Option<(u8, u8)> {
+        decode_interrupt_line_and_pin(
+            self.config_read_word(device_function, INTERRUPT_LINE_PIN_OFFSET),
+        )
+    }
+
     /// Sets the command register of the given device function.
     pub fn set_command(&mut self, device_function: DeviceFunction, command: Command) {
         self.config_write_word(
@@ -330,6 +347,20 @@ impl PciRoot {
         } else {
             None
         }
+    }
+}
+
+/// Decodes the PCI configuration-space dword at offset `0x3c`.
+///
+/// Kept separate from [`PciRoot::interrupt_line_and_pin`] so the validity
+/// contract is testable without constructing an MMIO-backed root complex.
+const fn decode_interrupt_line_and_pin(config: u32) -> Option<(u8, u8)> {
+    let line = config as u8;
+    let pin = (config >> 8) as u8;
+    if line == 0xff || pin == 0 || pin > 4 {
+        None
+    } else {
+        Some((line, pin))
     }
 }
 
@@ -623,5 +654,23 @@ impl From<u8> for HeaderType {
             0x02 => Self::PciCardbusBridge,
             _ => Self::Unrecognised(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_interrupt_line_and_pin;
+
+    #[test]
+    fn interrupt_line_and_pin_accepts_firmware_route() {
+        assert_eq!(decode_interrupt_line_and_pin(4 | (1 << 8)), Some((4, 1)));
+        assert_eq!(decode_interrupt_line_and_pin(0 | (2 << 8)), Some((0, 2)));
+    }
+
+    #[test]
+    fn interrupt_line_and_pin_rejects_unrouted_intx() {
+        assert_eq!(decode_interrupt_line_and_pin(0xff | (1 << 8)), None);
+        assert_eq!(decode_interrupt_line_and_pin(4), None);
+        assert_eq!(decode_interrupt_line_and_pin(4 | (5 << 8)), None);
     }
 }

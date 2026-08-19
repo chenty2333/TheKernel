@@ -62,6 +62,21 @@ int ext4_extent_get_blocks_status(struct ext4_inode_ref *inode_ref,
 				  uint32_t *blocks_count,
 				  bool *metadata_may_have_changed);
 
+/**@brief Look up one extent-tree run without changing the inode.
+ *
+ * Unlike ext4_extent_get_blocks_status(), this query preserves the physical
+ * block number of an unwritten extent and reports its state separately.  A
+ * hole is returned as result == 0, with blocks_count covering the run up to
+ * the next allocated extent.  The helper is intended for FIEMAP and never
+ * converts or allocates an extent.
+ */
+int ext4_extent_get_blocks_fiemap(struct ext4_inode_ref *inode_ref,
+				  ext4_lblk_t iblock,
+				  uint32_t max_blocks,
+				  ext4_fsblk_t *result,
+				  uint32_t *blocks_count,
+				  bool *unwritten);
+
 
 /**@brief Release all data blocks starting from specified logical block.
  * @param inode_ref   I-node to release blocks from

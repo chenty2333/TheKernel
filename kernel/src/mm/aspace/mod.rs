@@ -144,7 +144,7 @@ type UserIoPolicy = (
     AddressSpaceId,
     MappingId,
     MappingGeneration,
-    UserIoPinRegistry,
+    Box<UserIoPinRegistry>,
 );
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -217,7 +217,16 @@ fn new_user_io_policy() -> AxResult<UserIoPolicy> {
         USER_IO_PIN_MAX_BYTES,
         USER_IO_PIN_MAX_TOKENS,
     );
-    let mut user_io_pins = UserIoPinRegistry::new(PAGE_SIZE_4K, pin_quota, 1).map_err(mm_error)?;
+    // Keep the fixed-capacity pin ledger out of `AddrSpace` itself.  The
+    // registry is intentionally allocation-free internally, but its 64
+    // records are cold policy state and keeping them inline made every
+    // address-space value roughly 10 KiB.  Early boot retains one such value
+    // across the deep ELF/filesystem loader call chain, which can exhaust the
+    // fixed BSP stack.  The one allocation belongs to address-space creation,
+    // before the object is published or any pin can exist.
+    let mut user_io_pins =
+        Box::try_new(UserIoPinRegistry::new(PAGE_SIZE_4K, pin_quota, 1).map_err(mm_error)?)
+            .map_err(|_| AxError::NoMemory)?;
     user_io_pins
         .configure_owner(
             PinOwner::new(address_space_id.get()).map_err(mm_error)?,
@@ -1011,13 +1020,18 @@ pub struct AddrSpace {
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
-    user_io_pins: UserIoPinRegistry,
+    user_io_pins: Box<UserIoPinRegistry>,
     active_long_term_cow_pins: Vec<ActiveLongTermCowPin>,
     pub(super) uffd: Option<Box<super::userfaultfd::UffdAddressSpaceState>>,
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
 }
+
+// `AddrSpace` is constructed by value during early boot and fork preparation.
+// Keep the long-lived object below one base page so fixed-capacity policy
+// sidecars cannot silently turn those call chains into large stack frames.
+const _: () = assert!(core::mem::size_of::<AddrSpace>() <= PAGE_SIZE_4K);
 
 /// The generic, testable core of one linear protection transaction.
 ///
@@ -4432,6 +4446,12 @@ mod tests {
     use crate::mm::{UffdAddressSpaceState, UffdPollSet};
 
     const TEST_SPACE_SIZE: usize = 0x6000;
+
+    #[test]
+    fn address_space_keeps_the_fixed_pin_ledger_off_stack() {
+        assert!(core::mem::size_of::<UserIoPinRegistry>() > PAGE_SIZE_4K);
+        assert!(core::mem::size_of::<AddrSpace>() <= PAGE_SIZE_4K);
+    }
 
     fn mock_lineage(raw: u64) -> MappingLineage {
         MappingLineage::new(raw).unwrap()

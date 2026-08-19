@@ -9,6 +9,7 @@ use alloc::{
 use core::sync::atomic::AtomicU8;
 use core::{
     hint::spin_loop,
+    mem::ManuallyDrop,
     num::NonZeroUsize,
     ops::Range,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -16,14 +17,18 @@ use core::{
 };
 
 use axalloc::{UsageKind, global_allocator};
-use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
+use axdriver::{
+    AsyncBlockWaitPolicy, prelude::BlockResetOutcome, virtio_async_block_enabled,
+    virtio_async_block_wait_policy,
+};
 #[cfg(feature = "times")]
 use axfs_ng_vfs::MetadataUpdate;
-pub use axfs_ng_vfs::PhysicalIoSegment;
 use axfs_ng_vfs::{
-    FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
-    VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
+    FileExtentMap, FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission,
+    NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
 };
+pub use axfs_ng_vfs::{PhysicalIoAttempt, PhysicalIoSegment};
+use axfs_ng_vfs::PhysicalIoNotSubmittedReason as PhysicalIoAttemptNotSubmittedReason;
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size};
 #[cfg(target_os = "none")]
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -33,6 +38,16 @@ use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex;
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
+#[cfg(feature = "ext4")]
+use lwext4_rust::PhysicalIoEffect as Ext4PhysicalIoEffect;
+#[cfg(feature = "ext4")]
+pub use lwext4_rust::{
+    PhysicalIoCompletion, PhysicalIoCompletionOutcome, PhysicalIoEffectState, PhysicalIoOperation,
+    PhysicalIoNotSubmittedReason, PhysicalIoPendingReason, PhysicalIoPlan, PhysicalIoPublication,
+    PhysicalIoPublishOutcome, PhysicalIoSettlement,
+};
+#[cfg(not(feature = "ext4"))]
+pub use axfs_ng_vfs::PhysicalIoNotSubmittedReason;
 #[cfg(not(target_os = "none"))]
 use spin::Mutex;
 use spin::{Once, RwLock};
@@ -482,6 +497,12 @@ impl Default for OpenOptions {
 }
 
 const PAGE_SIZE: usize = 4096;
+
+fn page_range(page: u64, count: u64) -> Range<u64> {
+    let start = page.saturating_mul(PAGE_SIZE as u64);
+    let end = start.saturating_add(count.saturating_mul(PAGE_SIZE as u64));
+    start..end.max(start.saturating_add(1))
+}
 /// Maximum sequential-read readahead window in pages.
 const READAHEAD_PAGES: usize = 64;
 const MAX_DIRTY_WRITEBACK_PAGES: usize = 64;
@@ -1007,6 +1028,25 @@ fn release_unlinked_cached_file_registry_ownership(
     };
     // Retention and writeback anchors can own filesystem or inode state whose
     // teardown re-enters cache bookkeeping.
+    drop(retired);
+}
+
+/// Removes the registry ownership after an unlinked cache has been discarded.
+///
+/// This variant is used by a range-lease drop, where retaining the original
+/// `Location` would defeat the purpose of making the last lease the cleanup
+/// trigger. The shared identity is the same generation-checked key used by
+/// the location-based helper above.
+fn release_unlinked_cached_file_registry_ownership_for_shared(shared: &Arc<CachedFileShared>) {
+    let retired = {
+        let mut registry = file_cache_registry().lock();
+        let matches_shared = registry
+            .get(&shared.registry_key)
+            .is_some_and(|entry| entry.references_shared(shared));
+        matches_shared
+            .then(|| registry.remove(&shared.registry_key))
+            .flatten()
+    };
     drop(retired);
 }
 
@@ -1705,6 +1745,50 @@ fn with_cache_invalidating_file_operation_after_preflight<R>(
     result.map(Some)
 }
 
+/// Acquires a direct range lease, stages overlapping cache pages, and only
+/// then runs the filesystem preflight. Once the preflight accepts, all cache
+/// locks and staged-page bookkeeping are released before the lower operation
+/// can wait on a synchronous device; the owned range lease remains the sole
+/// exclusion token until the operation has revalidated its mapping.
+fn with_direct_range_operation_after_preflight<R>(
+    location: &Location,
+    offset: u64,
+    len: usize,
+    kind: RangeCacheLeaseKind,
+    preflight: impl FnOnce(&Arc<CachedFileShared>, &FileNode) -> VfsResult<bool>,
+    operation: impl FnOnce(&Arc<CachedFileShared>, &FileNode) -> VfsResult<R>,
+) -> VfsResult<Option<R>> {
+    let shared = cached_file_shared_for_location_or_create(location);
+    let end = offset
+        .checked_add(u64::try_from(len).map_err(|_| VfsError::InvalidInput)?)
+        .ok_or(VfsError::InvalidInput)?;
+    let range_lease = CachedFileShared::try_range_cache_lease(&shared, offset..end, kind)?;
+    let invalidation = {
+        let _direct_guard = shared.direct_io_lock.write();
+        let _writeback_guard = shared.writeback_lock.write();
+        wait_for_all_writeback_clear(&shared);
+        let file = location.entry().as_file()?;
+        let first_page = offset / PAGE_SIZE as u64;
+        let last_page = end.div_ceil(PAGE_SIZE as u64);
+        let first_page = u32::try_from(first_page).map_err(|_| VfsError::InvalidInput)?;
+        let last_page = u32::try_from(last_page).map_err(|_| VfsError::InvalidInput)?;
+        let mut invalidation = CachedPageInvalidationTransaction::new_shared(shared.clone());
+        invalidation.stage_range(first_page..last_page)?;
+        invalidation.writeback(file, true)?;
+        invalidation
+    };
+    let file = location.entry().as_file()?;
+    if !preflight(&shared, file)? {
+        // Drop without commit restores clean and dirty pages exactly as they
+        // were observed before this unpublished direct attempt.
+        return Ok(None);
+    }
+    debug_assert!(range_lease.revalidate());
+    invalidation.commit_discard();
+    let file = location.entry().as_file()?;
+    operation(&shared, file).map(Some)
+}
+
 fn with_cache_invalidating_truncate(location: &Location, len: u64) -> VfsResult<()> {
     let shared = cached_file_shared_for_location_or_create(location);
     let _direct_guard = shared.direct_io_lock.write();
@@ -1758,6 +1842,65 @@ fn discard_cached_pages(shared: &Arc<CachedFileShared>) -> VfsResult<()> {
     invalidation.stage_all()?;
     invalidation.commit_discard();
     Ok(())
+}
+
+/// Tries one task-context cleanup after unlinking has made the file eligible
+/// for whole-file discard. The range-lease table is the synchronization
+/// authority: a `ResourceBusy` result means another exact lease is still
+/// live, so the request remains pending until that lease's Drop calls this
+/// helper again. Other errors remain terminal and are not silently swallowed.
+fn attempt_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool {
+    if !shared.unlinked.load(Ordering::Acquire) || shared.open_handles.load(Ordering::Acquire) != 0
+    {
+        return false;
+    }
+    // Serialize the synchronous attempts themselves. A last range lease can
+    // clear its table slot while an earlier attempt is still observing the
+    // old conflict; keeping the request bit pending behind this guard lets
+    // that lease-drop attempt run immediately after the earlier Busy result.
+    let _cleanup_guard = shared.unlinked_cleanup_lock.lock();
+    if shared
+        .unlinked_cleanup_pending
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    match discard_cached_pages(shared) {
+        Ok(()) => {
+            release_cached_file_writeback_anchor_if_clean(shared);
+            release_unlinked_cached_file_registry_ownership_for_shared(shared);
+            true
+        }
+        Err(VfsError::ResourceBusy) => {
+            // The exact lease owner will synchronously retry when it drops.
+            shared
+                .unlinked_cleanup_pending
+                .store(true, Ordering::Release);
+            false
+        }
+        Err(error) => {
+            // Busy is the only expected transient outcome. Preserve the
+            // existing fail-stop behavior for an actual cache/metadata error
+            // rather than converting it into a silent cleanup success.
+            shared
+                .unlinked_cleanup_pending
+                .store(true, Ordering::Release);
+            panic!("failed to discard unlinked cached pages: {error:?}");
+        }
+    }
+}
+
+fn request_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool {
+    if !shared.unlinked.load(Ordering::Acquire) || shared.open_handles.load(Ordering::Acquire) != 0
+    {
+        return false;
+    }
+    shared
+        .unlinked_cleanup_pending
+        .store(true, Ordering::Release);
+    attempt_unlinked_cached_file_cleanup(shared)
 }
 
 fn pop_unpinned_lru_page(
@@ -1849,10 +1992,7 @@ pub fn mark_cached_file_unlinked(location: &Location) {
     if let Some(shared) = cached_file_shared_for_location(location) {
         shared.unlinked.store(true, Ordering::Release);
         if shared.open_handles.load(Ordering::Acquire) == 0 {
-            discard_cached_pages(&shared).unwrap_or_else(|error| {
-                panic!("failed to discard unlinked cached pages without live handles: {error:?}")
-            });
-            release_cached_file_writeback_anchor_if_clean(&shared);
+            request_unlinked_cached_file_cleanup(&shared);
         }
         release_closed_cached_file_retention(location);
     }
@@ -2286,6 +2426,7 @@ pub struct CachedFilePagePin {
     cache: CachedFile,
     pn: u32,
     dirty_on_release: bool,
+    _range_lease: Option<RangeCacheLease>,
 }
 
 impl Drop for CachedFilePagePin {
@@ -2312,6 +2453,7 @@ impl Drop for CachedFilePagePin {
 /// A conservative preparation window for file-backed user I/O pins.
 pub struct CachedFilePinWindow {
     cache: CachedFile,
+    _range_lease: Option<RangeCacheLease>,
 }
 
 impl Drop for CachedFilePinWindow {
@@ -2335,6 +2477,7 @@ struct CachedFilePinAdmission {
 /// Shared admission for ordinary page-cache users that may need an LRU slot.
 struct CachedFileCacheUserGuard {
     shared: Arc<CachedFileShared>,
+    _range_lease: Option<RangeCacheLease>,
 }
 
 impl Drop for CachedFileCacheUserGuard {
@@ -2355,6 +2498,7 @@ impl Drop for CachedFileCacheUserGuard {
 /// pins fail without observing a half-published cache transition.
 struct CachedFileMutationGuard {
     shared: Arc<CachedFileShared>,
+    _range_lease: Option<RangeCacheLease>,
 }
 
 impl Drop for CachedFileMutationGuard {
@@ -2915,11 +3059,16 @@ fn flush_dirty_page_list_locked(
 }
 
 fn flush_dirty_page_list(
-    shared: &CachedFileShared,
+    shared: &Arc<CachedFileShared>,
     file: &FileNode,
     dirty_pages: Vec<u32>,
     range_flush: bool,
 ) -> VfsResult<()> {
+    let _range_lease = CachedFileShared::try_range_cache_lease(
+        shared,
+        0..u64::MAX,
+        RangeCacheLeaseKind::CachedWrite,
+    )?;
     let _writeback_guard = shared.writeback_lock.read();
     flush_dirty_page_list_locked(shared, file, dirty_pages, range_flush)
 }
@@ -2935,7 +3084,12 @@ fn flush_dirty_cache_shared_locked(shared: &CachedFileShared, file: &FileNode) -
     flush_dirty_page_list_locked(shared, file, dirty_pages, false)
 }
 
-fn flush_dirty_cache_shared(shared: &CachedFileShared, file: &FileNode) -> VfsResult<()> {
+fn flush_dirty_cache_shared(shared: &Arc<CachedFileShared>, file: &FileNode) -> VfsResult<()> {
+    let _range_lease = CachedFileShared::try_range_cache_lease(
+        shared,
+        0..u64::MAX,
+        RangeCacheLeaseKind::CachedWrite,
+    )?;
     let _writeback_guard = shared.writeback_lock.read();
     flush_dirty_cache_shared_locked(shared, file)
 }
@@ -2987,6 +3141,106 @@ struct EvictListener {
 
 intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { link: LinkedListAtomicLink });
 
+const RANGE_CACHE_LEASE_SLOTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeCacheLeaseKind {
+    DirectRead,
+    DirectWrite,
+    CachedRead,
+    CachedWrite,
+    WholeFileMutation,
+}
+
+#[inline]
+fn range_lease_drop_requests_unlinked_cleanup(kind: RangeCacheLeaseKind) -> bool {
+    matches!(
+        kind,
+        RangeCacheLeaseKind::DirectRead | RangeCacheLeaseKind::DirectWrite
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RangeCacheLeaseRecord {
+    start: u64,
+    end: u64,
+    generation: u64,
+    kind: RangeCacheLeaseKind,
+}
+
+struct RangeCacheLeaseTable {
+    slots: [Option<RangeCacheLeaseRecord>; RANGE_CACHE_LEASE_SLOTS],
+    generations: [u64; RANGE_CACHE_LEASE_SLOTS],
+}
+
+impl RangeCacheLeaseTable {
+    const fn new() -> Self {
+        Self {
+            slots: [None; RANGE_CACHE_LEASE_SLOTS],
+            generations: [0; RANGE_CACHE_LEASE_SLOTS],
+        }
+    }
+
+    fn conflicts(candidate: RangeCacheLeaseRecord, active: RangeCacheLeaseRecord) -> bool {
+        if candidate.end <= active.start || active.end <= candidate.start {
+            return false;
+        }
+        match (candidate.kind, active.kind) {
+            (RangeCacheLeaseKind::CachedRead, RangeCacheLeaseKind::CachedRead)
+            | (RangeCacheLeaseKind::CachedRead, RangeCacheLeaseKind::CachedWrite)
+            | (RangeCacheLeaseKind::CachedWrite, RangeCacheLeaseKind::CachedRead)
+            | (RangeCacheLeaseKind::CachedWrite, RangeCacheLeaseKind::CachedWrite) => false,
+            _ => true,
+        }
+    }
+}
+
+/// A fixed-capacity, generation-checked lease for one file-cache byte range.
+/// The token owns the slot; callers may release all cache locks before a
+/// synchronous device wait and retain only this lease while the request is
+/// live.
+struct RangeCacheLease {
+    shared: Arc<CachedFileShared>,
+    slot: usize,
+    generation: u64,
+    record: RangeCacheLeaseRecord,
+}
+
+impl RangeCacheLease {
+    fn revalidate(&self) -> bool {
+        self.shared
+            .range_cache_leases
+            .lock()
+            .slots
+            .get(self.slot)
+            .and_then(|slot| *slot)
+            .is_some_and(|active| active == self.record && active.generation == self.generation)
+    }
+}
+
+impl Drop for RangeCacheLease {
+    fn drop(&mut self) {
+        let request_cleanup = range_lease_drop_requests_unlinked_cleanup(self.record.kind);
+        let mut table = self.shared.range_cache_leases.lock();
+        if table
+            .slots
+            .get(self.slot)
+            .and_then(|slot| *slot)
+            .is_some_and(|active| active == self.record && active.generation == self.generation)
+        {
+            table.slots[self.slot] = None;
+        }
+        drop(table);
+        // An effect/direct-I/O lease can be the only thing keeping an
+        // unlinked file from acquiring its whole-file mutation lease. Do the
+        // cleanup from this exact last-lease transition instead of panicking
+        // in the unlink path or relying on open-handle accounting.
+        if request_cleanup {
+            request_unlinked_cached_file_cleanup(&self.shared);
+        }
+    }
+}
+
 struct CachedFileShared {
     /// Registry slot owned weakly by this shared state. Final release removes
     /// it only when both this key and this allocation still match.
@@ -3005,6 +3259,13 @@ struct CachedFileShared {
     pressure_reclaim_scan_epoch: AtomicU64,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     unlinked: AtomicBool,
+    /// Set once an unlinked inode has no open handles but a direct/effect
+    /// range lease still prevents whole-file cache discard. The last
+    /// relevant lease drop synchronously retries the bounded cleanup.
+    unlinked_cleanup_pending: AtomicBool,
+    /// Serializes cleanup attempts so a lease drop racing an earlier Busy
+    /// observation cannot lose the deferred request.
+    unlinked_cleanup_lock: Mutex<()>,
     open_handles: AtomicUsize,
     user_io_pin_admission: Mutex<CachedFilePinAdmission>,
     /// Serializes cached page-cache users with direct-I/O cache drains.
@@ -3013,6 +3274,9 @@ struct CachedFileShared {
     writeback_lock: RwLock<()>,
     /// Serializes O_APPEND transaction boundaries across handles for this inode.
     append_lock: RwLock<()>,
+    /// Fixed-capacity range ownership used to arbitrate cache aliases and
+    /// direct I/O without holding a lock across device completion.
+    range_cache_leases: Mutex<RangeCacheLeaseTable>,
 }
 
 impl CachedFileShared {
@@ -3046,12 +3310,59 @@ impl CachedFileShared {
             pressure_reclaim_scan_epoch: AtomicU64::new(0),
             evict_listeners: Mutex::new(LinkedList::default()),
             unlinked: AtomicBool::new(false),
+            unlinked_cleanup_pending: AtomicBool::new(false),
+            unlinked_cleanup_lock: Mutex::new(()),
             open_handles: AtomicUsize::new(0),
             user_io_pin_admission: Mutex::new(CachedFilePinAdmission::default()),
             direct_io_lock: RwLock::new(()),
             writeback_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
+            range_cache_leases: Mutex::new(RangeCacheLeaseTable::new()),
         }
+    }
+
+    fn try_range_cache_lease(
+        shared: &Arc<Self>,
+        range: Range<u64>,
+        kind: RangeCacheLeaseKind,
+    ) -> VfsResult<RangeCacheLease> {
+        if range.start >= range.end {
+            return Err(VfsError::InvalidInput);
+        }
+        let record = RangeCacheLeaseRecord {
+            start: range.start,
+            end: range.end,
+            generation: 0,
+            kind,
+        };
+        let mut table = shared.range_cache_leases.lock();
+        if table
+            .slots
+            .iter()
+            .flatten()
+            .any(|active| RangeCacheLeaseTable::conflicts(record, *active))
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+        let Some(slot) = table.slots.iter().position(Option::is_none) else {
+            return Err(VfsError::ResourceBusy);
+        };
+        let generation = table.generations[slot]
+            .checked_add(1)
+            .ok_or(VfsError::NoMemory)?;
+        table.generations[slot] = generation;
+        let record = RangeCacheLeaseRecord {
+            generation,
+            ..record
+        };
+        table.slots[slot] = Some(record);
+        drop(table);
+        Ok(RangeCacheLease {
+            shared: shared.clone(),
+            slot,
+            generation,
+            record,
+        })
     }
 }
 
@@ -3063,8 +3374,12 @@ struct CachedPageInvalidationTransaction {
 
 impl CachedPageInvalidationTransaction {
     fn new(mutation: &CachedFileMutationGuard) -> Self {
+        Self::new_shared(mutation.shared.clone())
+    }
+
+    fn new_shared(shared: Arc<CachedFileShared>) -> Self {
         Self {
-            shared: mutation.shared.clone(),
+            shared,
             pages: Vec::new(),
             committed: false,
         }
@@ -3204,6 +3519,337 @@ impl Drop for CachedPageInvalidationTransaction {
                 "cache invalidation rollback replaced page {pn}"
             );
             cache.demote(&pn);
+        }
+    }
+}
+
+/// Owned high-level physical effect for a direct ext4 regular-file request.
+///
+/// Result of attempting to settle an owned effect.  `Retain` is deliberately
+/// not a normal I/O error: the caller must keep the effect (and therefore its
+/// range lease, staged cache transaction, and pin owner) until exact device
+/// retirement is observed.  `Settled` or an exact reset proof permits the
+/// owner to be dropped.
+#[cfg(feature = "ext4")]
+pub enum PhysicalIoSettleOutcome {
+    Settled {
+        result: VfsResult<usize>,
+    },
+    Retain {
+        reason: PhysicalIoPendingReason,
+    },
+    /// Every published device handle has retired, but filesystem
+    /// revalidation observed a transient `ResourceBusy`. The effect remains
+    /// physically owned and must be retried by the task-context completion
+    /// worker without submitting the device request again.
+    RetryFinalization,
+}
+
+/// Proof that the lower block queue has stopped all access to a published
+/// physical effect.  The proof is intentionally not constructible from the
+/// public fields of [`BlockResetOutcome`]; callers must obtain it from the
+/// lower reset result and a quarantined queue never produces one.
+#[cfg(feature = "ext4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoResetProof {
+    kind: PhysicalIoResetProofKind,
+}
+
+#[cfg(feature = "ext4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalIoResetProofKind {
+    Quiesced,
+    Retired,
+}
+
+#[cfg(feature = "ext4")]
+impl PhysicalIoResetProof {
+    /// Converts an exact lower reset result into the upper-layer quiescence
+    /// proof.  `Quarantined` deliberately has no conversion: upper owners
+    /// must remain in typed custody until a later reset proves quiescence.
+    pub fn from_lower_reset(outcome: BlockResetOutcome) -> Option<Self> {
+        let kind = match outcome {
+            BlockResetOutcome::Quiesced => PhysicalIoResetProofKind::Quiesced,
+            BlockResetOutcome::Retired => PhysicalIoResetProofKind::Retired,
+            BlockResetOutcome::Quarantined => return None,
+        };
+        Some(Self { kind })
+    }
+}
+
+/// The exact inode reference, lower filesystem effect, range lease, and
+/// staged cache pages all move together across a worker boundary.  No user
+/// SG borrow or filesystem spin guard is retained.  A published request can
+/// never become a fallback: abandoning it before exact retirement is a
+/// fail-stop quarantine, and its owner fields are intentionally leaked rather
+/// than released while device DMA may still be active.
+#[cfg(feature = "ext4")]
+pub struct PhysicalIoEffect {
+    location: ManuallyDrop<Location>,
+    inode: ManuallyDrop<Arc<crate::fs::ext4::Inode>>,
+    effect: Ext4PhysicalIoEffect,
+    range_lease: Option<RangeCacheLease>,
+    invalidation: Option<CachedPageInvalidationTransaction>,
+    published: bool,
+    quarantined: bool,
+    finalized: bool,
+}
+
+#[cfg(feature = "ext4")]
+pub type PreparedPhysicalIoEffect = PhysicalIoEffect;
+
+#[cfg(feature = "ext4")]
+impl PhysicalIoEffect {
+    fn new(
+        location: Location,
+        inode: Arc<crate::fs::ext4::Inode>,
+        effect: Ext4PhysicalIoEffect,
+        range_lease: RangeCacheLease,
+        invalidation: CachedPageInvalidationTransaction,
+    ) -> Self {
+        Self {
+            location: ManuallyDrop::new(location),
+            inode: ManuallyDrop::new(inode),
+            effect,
+            range_lease: Some(range_lease),
+            invalidation: Some(invalidation),
+            published: false,
+            quarantined: false,
+            finalized: false,
+        }
+    }
+
+    pub fn plan(&self) -> PhysicalIoPlan {
+        self.effect.plan()
+    }
+
+    pub fn state(&self) -> PhysicalIoEffectState {
+        // Reset retirement is a high-level terminal transition.  The lower
+        // effect has no logical completion to mark, but the reset proof is
+        // enough to make all physical access impossible, so expose the same
+        // drop-safe terminal state as an exact settled effect.
+        if self.finalized {
+            PhysicalIoEffectState::Finalized
+        } else {
+            self.effect.state()
+        }
+    }
+
+    pub fn publication(&self) -> Option<PhysicalIoPublication> {
+        self.effect.publication()
+    }
+
+    pub fn is_published(&self) -> bool {
+        self.published
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    unsafe fn publish_route(&mut self, kernel_worker: bool) -> VfsResult<PhysicalIoPublishOutcome> {
+        let submitted = if kernel_worker {
+            unsafe {
+                self.inode
+                    .publish_owned_physical_effect_kernel(&mut self.effect)
+            }
+        } else {
+            unsafe { self.inode.publish_owned_physical_effect(&mut self.effect) }
+        };
+        let outcome = match submitted {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A lower error is not enough evidence that a driver did not
+                // expose a descriptor.  Keep every owner in fail-stop mode;
+                // adapters that can prove queue-full/unsupported return the
+                // explicit NotSubmitted outcome instead.
+                self.published = true;
+                self.quarantined = true;
+                return Err(error);
+            }
+        };
+        match outcome {
+            PhysicalIoPublishOutcome::NotSubmitted(_) => {}
+            PhysicalIoPublishOutcome::Published(_) => self.published = true,
+            PhysicalIoPublishOutcome::Terminal(_) => {
+                self.published = true;
+                self.quarantined = true;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Publishes all mapped extents in one atomic exact-route batch. The
+    /// caller remains the exact completion waiter for this compatibility path.
+    pub unsafe fn publish(&mut self) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe { self.publish_route(false) }
+    }
+
+    /// Publishes an io_uring-owned effect to the device-global task-context
+    /// completion worker. The lower broker still authenticates completion by
+    /// raw handle and cookie; this route is distinct from synchronous exact
+    /// waiters so the worker cannot steal their mailbox records.
+    pub unsafe fn publish_kernel(&mut self) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe { self.publish_route(true) }
+    }
+
+    /// Settles after observing exact handle/cookie completions.  Device
+    /// failures and terminal partial publications are settled logical
+    /// failures once every accepted handle has retired; malformed/missing
+    /// observations return `Retain` and keep all owners live.
+    pub fn settle(&mut self, completions: &[PhysicalIoCompletion]) -> PhysicalIoSettleOutcome {
+        if self.finalized {
+            return PhysicalIoSettleOutcome::Retain {
+                reason: PhysicalIoPendingReason::NotPublished,
+            };
+        }
+        if !self.published {
+            return PhysicalIoSettleOutcome::Retain {
+                reason: PhysicalIoPendingReason::NotPublished,
+            };
+        }
+        if self.quarantined && self.effect.publication().is_none() {
+            return PhysicalIoSettleOutcome::Retain {
+                reason: PhysicalIoPendingReason::MalformedPublication,
+            };
+        }
+        match self
+            .inode
+            .settle_owned_physical_effect(&mut self.effect, completions)
+        {
+            PhysicalIoSettlement::Retain(reason) => PhysicalIoSettleOutcome::Retain { reason },
+            PhysicalIoSettlement::Settled { plan, success } => self.finalize_settled(plan, success),
+        }
+    }
+
+    /// Retries only the filesystem finalization phase after all exact device
+    /// handles have already retired. This path never records another device
+    /// completion and never republishes the effect.
+    pub fn retry_finalization(&mut self) -> PhysicalIoSettleOutcome {
+        let (plan, success) = match self.effect.state() {
+            PhysicalIoEffectState::Completed => (self.effect.plan(), true),
+            PhysicalIoEffectState::SettledFailure => (self.effect.plan(), false),
+            _ => {
+                return PhysicalIoSettleOutcome::Retain {
+                    reason: PhysicalIoPendingReason::NotPublished,
+                };
+            }
+        };
+        self.finalize_settled(plan, success)
+    }
+
+    fn finalize_settled(&mut self, plan: PhysicalIoPlan, success: bool) -> PhysicalIoSettleOutcome {
+        let result = self
+            .inode
+            .finalize_settled_physical_effect(&mut self.effect, plan, success);
+        if matches!(result, Err(VfsError::ResourceBusy)) {
+            // The lower effect remains Completed/SettledFailure until the
+            // filesystem can revalidate it. Keep every owner, including the
+            // issued request token in io_uring, live for a bounded retry.
+            // The range lease excludes cache-side mutation, but it cannot
+            // replace this extent rewalk: mapping_seq is local to an
+            // InodeRef, and hard-link aliases may carry distinct shared
+            // leases. Keep this typed retry until the filesystem proves the
+            // mapping terminally.
+            return PhysicalIoSettleOutcome::RetryFinalization;
+        }
+        if self.effect.state() != PhysicalIoEffectState::Finalized {
+            // A settlement proof without the lower finalization transition
+            // is an internal protocol failure. Keep all owners quarantined
+            // instead of allowing Drop to infer that physical retirement was
+            // complete.
+            return PhysicalIoSettleOutcome::Retain {
+                reason: PhysicalIoPendingReason::NotPublished,
+            };
+        }
+        // The lower effect has proved exact physical retirement and the
+        // filesystem finalization is now terminal. It is therefore safe to
+        // release the range/pin owners even when the logical result is EIO.
+        self.finalized = true;
+        if success {
+            // A completed physical write makes the old cache copy stale even
+            // when mapping revalidation fails. Never restore it after this
+            // point.
+            if let Some(invalidation) = self.invalidation.take() {
+                invalidation.commit_discard();
+            }
+        } else {
+            // A failed device request is logically unsuccessful; its exact
+            // retirement is proven, so restoring the staged cache transaction
+            // is safe for reads. A failed write may have reached the medium
+            // before reporting an error, so retaining the old cache would
+            // expose stale data.
+            self.abort_cache_transaction_after_failure();
+        }
+        PhysicalIoSettleOutcome::Settled { result }
+    }
+
+    fn abort_cache_transaction_after_failure(&mut self) {
+        if self.effect.plan().operation() == PhysicalIoOperation::Write {
+            if let Some(invalidation) = self.invalidation.take() {
+                invalidation.commit_discard();
+            }
+        } else {
+            // Dropping an uncommitted transaction restores the exact staged
+            // pages, which is the read-failure behavior.
+            let _ = self.invalidation.take();
+        }
+    }
+
+    /// Aborts a published effect after the lower device has provided an
+    /// exact reset/quiescence proof.  This is the only reset path that may
+    /// turn a published-but-unsettled effect into a releasable terminal
+    /// state.  The logical result remains EIO at the io_uring layer; this
+    /// method only closes the high-level ownership transition.
+    pub fn abort_after_reset(&mut self, proof: PhysicalIoResetProof) {
+        let _reset_kind = proof.kind;
+        if self.finalized || !self.published {
+            return;
+        }
+        self.finalized = true;
+        self.abort_cache_transaction_after_failure();
+    }
+
+    /// Compatibility spelling for callers that used the old finalization
+    /// verb.  The return type is intentionally typed so a caller cannot
+    /// mistake a retained/quarantined effect for a finalized I/O error.
+    pub fn finalize(&mut self, completions: &[PhysicalIoCompletion]) -> PhysicalIoSettleOutcome {
+        self.settle(completions)
+    }
+}
+
+#[cfg(feature = "ext4")]
+fn drop_prepared_physical_effect_owners(
+    invalidation: &mut Option<CachedPageInvalidationTransaction>,
+    range_lease: &mut Option<RangeCacheLease>,
+) {
+    // An exact direct lease drop can synchronously discard an unlinked file's
+    // cache. Roll back staged pages first so that cleanup cannot run before
+    // the invalidation transaction restores them.
+    let _ = invalidation.take();
+    let _ = range_lease.take();
+}
+
+#[cfg(feature = "ext4")]
+impl Drop for PhysicalIoEffect {
+    fn drop(&mut self) {
+        if (self.published || self.quarantined) && !self.finalized {
+            // Published-but-unretired effects are fail-stop.  In particular,
+            // do not drop the range lease or let the staged invalidation
+            // transaction restore cache pages while DMA may still run.  The
+            // owner must be transferred to a reset/quarantine supervisor;
+            // this Drop path intentionally leaks it if no supervisor exists.
+            let _ = self.range_lease.take().map(core::mem::forget);
+            let _ = self.invalidation.take().map(core::mem::forget);
+            return;
+        }
+        // ManuallyDrop makes the fail-stop branch above explicit.  In the
+        // ordinary prepared or settled path these two owners still need a
+        // normal destructor call.
+        drop_prepared_physical_effect_owners(&mut self.invalidation, &mut self.range_lease);
+        unsafe {
+            ManuallyDrop::drop(&mut self.inode);
+            ManuallyDrop::drop(&mut self.location);
         }
     }
 }
@@ -3395,6 +4041,11 @@ impl CachedFile {
     /// are conservatively rejected for this cached file. Precise page pins take
     /// over once the caller has identified the exact cached pages.
     pub fn begin_user_io_pin_window(&self) -> VfsResult<CachedFilePinWindow> {
+        let range_lease = Some(CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            0..u64::MAX,
+            RangeCacheLeaseKind::CachedWrite,
+        )?);
         let mut admission = self.shared.user_io_pin_admission.lock();
         if admission.invalidating || admission.cache_users != 0 {
             return Err(VfsError::ResourceBusy);
@@ -3406,6 +4057,7 @@ impl CachedFile {
         drop(admission);
         Ok(CachedFilePinWindow {
             cache: self.clone(),
+            _range_lease: range_lease,
         })
     }
 
@@ -3429,11 +4081,21 @@ impl CachedFile {
         if page.paddr() != paddr {
             return Err(VfsError::BadAddress);
         }
+        let range_lease = Some(CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            page_range(u64::from(pn), 1),
+            if dirty_on_release {
+                RangeCacheLeaseKind::CachedWrite
+            } else {
+                RangeCacheLeaseKind::CachedRead
+            },
+        )?);
         page.pin()?;
         Ok(CachedFilePagePin {
             cache: self.clone(),
             pn,
             dirty_on_release,
+            _range_lease: range_lease,
         })
     }
 
@@ -3442,6 +4104,19 @@ impl CachedFile {
     }
 
     fn begin_cache_user(&self) -> VfsResult<CachedFileCacheUserGuard> {
+        self.begin_cache_user_range(0..u64::MAX, RangeCacheLeaseKind::CachedRead)
+    }
+
+    fn begin_cache_user_range(
+        &self,
+        range: Range<u64>,
+        kind: RangeCacheLeaseKind,
+    ) -> VfsResult<CachedFileCacheUserGuard> {
+        let range_lease = Some(CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            range,
+            kind,
+        )?);
         let mut admission = self.shared.user_io_pin_admission.lock();
         if admission.invalidating || admission.pin_windows != 0 {
             return Err(VfsError::ResourceBusy);
@@ -3453,12 +4128,18 @@ impl CachedFile {
         drop(admission);
         Ok(CachedFileCacheUserGuard {
             shared: self.shared.clone(),
+            _range_lease: range_lease,
         })
     }
 
     fn begin_shared_cache_invalidating_mutation(
         shared: &Arc<CachedFileShared>,
     ) -> VfsResult<CachedFileMutationGuard> {
+        let range_lease = Some(CachedFileShared::try_range_cache_lease(
+            shared,
+            0..u64::MAX,
+            RangeCacheLeaseKind::WholeFileMutation,
+        )?);
         let mut admission = shared.user_io_pin_admission.lock();
         if admission.invalidating || admission.cache_users != 0 || admission.pin_windows != 0 {
             return Err(VfsError::ResourceBusy);
@@ -3467,12 +4148,18 @@ impl CachedFile {
         drop(admission);
         Ok(CachedFileMutationGuard {
             shared: shared.clone(),
+            _range_lease: range_lease,
         })
     }
 
     fn try_begin_shared_cache_invalidating_mutation(
         shared: &Arc<CachedFileShared>,
     ) -> VfsResult<CachedFileMutationGuard> {
+        let range_lease = Some(CachedFileShared::try_range_cache_lease(
+            shared,
+            0..u64::MAX,
+            RangeCacheLeaseKind::WholeFileMutation,
+        )?);
         let Some(mut admission) = shared.user_io_pin_admission.try_lock() else {
             return Err(VfsError::ResourceBusy);
         };
@@ -3483,6 +4170,7 @@ impl CachedFile {
         drop(admission);
         Ok(CachedFileMutationGuard {
             shared: shared.clone(),
+            _range_lease: range_lease,
         })
     }
 
@@ -4275,6 +4963,14 @@ impl CachedFile {
     /// Invokes `f` with the cached page at `pn`, or `None` if it is not cached.
     pub fn with_page<R>(&self, pn: u32, f: impl FnOnce(Option<&mut PageCache>) -> R) -> R {
         let mut f = Some(f);
+        let _range_lease = match CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            page_range(u64::from(pn), 1),
+            RangeCacheLeaseKind::CachedWrite,
+        ) {
+            Ok(lease) => Some(lease),
+            Err(_) => return f.take().unwrap()(None),
+        };
         loop {
             let mut guard = self.shared.page_cache.lock();
             if guard.get(&pn).is_some_and(PageCache::is_writeback) {
@@ -4301,7 +4997,10 @@ impl CachedFile {
         pn: u32,
         f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
     ) -> VfsResult<R> {
-        let _cache_user = self.begin_cache_user()?;
+        let _cache_user = self.begin_cache_user_range(
+            page_range(u64::from(pn), 1),
+            RangeCacheLeaseKind::CachedWrite,
+        )?;
         let mut f = Some(f);
         loop {
             let mut guard = self.shared.page_cache.lock();
@@ -4334,7 +5033,10 @@ impl CachedFile {
         owner: CachedFileEvictionOwner,
         f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
     ) -> VfsResult<R> {
-        let _cache_user = self.begin_cache_user()?;
+        let _cache_user = self.begin_cache_user_range(
+            page_range(u64::from(pn), 1),
+            RangeCacheLeaseKind::CachedWrite,
+        )?;
         let mut f = Some(f);
         loop {
             let mut guard = self.shared.page_cache.lock();
@@ -4376,7 +5078,8 @@ impl CachedFile {
         wait_writeback: bool,
         allow_async_page_fill: bool,
     ) -> VfsResult<T> {
-        let _cache_user = self.begin_cache_user()?;
+        let _cache_user =
+            self.begin_cache_user_range(range.clone(), RangeCacheLeaseKind::CachedWrite)?;
         let file = self.inner.entry().as_file()?;
         let mut initial = page_initial(file)?;
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
@@ -4434,6 +5137,11 @@ impl CachedFile {
                 wait_for_page_writeback_clear(&self.shared, pn);
                 continue;
             }
+            let range_lease = Some(CachedFileShared::try_range_cache_lease(
+                &self.shared,
+                page_range(u64::from(pn), 1),
+                RangeCacheLeaseKind::CachedWrite,
+            )?);
             guard
                 .get_mut(&pn)
                 .expect("prepared cache page disappeared while locked")
@@ -4444,6 +5152,7 @@ impl CachedFile {
                 cache: self.clone(),
                 pn,
                 dirty_on_release: false,
+                _range_lease: range_lease,
             });
         }
     }
@@ -4914,18 +5623,15 @@ impl CachedFile {
         wait_for_all_writeback_clear(&self.shared);
         let file = self.inner.entry().as_file()?;
         let old_len = file.len()?;
-        let mutation = (len < old_len)
-            .then(|| self.begin_cache_invalidating_mutation())
-            .transpose()?;
+        // Length changes can relocate, allocate, or release extents even when
+        // no cached page is currently discarded. Keep the whole-file mutation
+        // token through the lower operation in both directions.
+        let mutation = self.begin_cache_invalidating_mutation()?;
         self.admit_truncate(old_len, len)?;
         let partial_page = (old_len > len && len % PAGE_SIZE as u64 != 0)
             .then_some((len / PAGE_SIZE as u64) as u32);
         let mut discarded = if old_len > len {
-            let mut invalidation = CachedPageInvalidationTransaction::new(
-                mutation
-                    .as_ref()
-                    .expect("shrinking truncate owns a cache mutation"),
-            );
+            let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
             // Include the boundary page. A lower filesystem that reports a
             // non-atomic failure may already have changed its tail; on success
             // the retained prefix is restored below with a zeroed suffix.
@@ -5003,10 +5709,11 @@ impl Drop for CachedFile {
             return;
         }
         if self.shared.unlinked.load(Ordering::Acquire) {
-            self.discard_cache().unwrap_or_else(|error| {
-                panic!("failed to discard unlinked cached pages on last close: {error:?}")
-            });
-            release_unlinked_cached_file_registry_ownership(&self.inner, &self.shared);
+            // The last open handle is not necessarily the last physical
+            // owner. Keep registry/cache ownership deferred while an exact
+            // direct/effect range lease is live; that lease's Drop performs
+            // the final synchronous cleanup.
+            request_unlinked_cached_file_cleanup(&self.shared);
             return;
         }
         if try_retain_closed_cached_file(&self.inner, &self.shared) {
@@ -5127,6 +5834,81 @@ impl FileBackend {
         }
     }
 
+    /// Prepares an owned ext4 physical effect.  Filesystem mapping admission
+    /// runs before cache staging, so an unsupported/hole/unwritten/EOF or
+    /// non-regular request returns without device or cache side effects.
+    #[cfg(feature = "ext4")]
+    pub fn prepare_physical_io_effect(
+        &self,
+        operation: PhysicalIoOperation,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<PhysicalIoEffect>> {
+        let total = validate_physical_io_segments(segments, offset)?;
+        let Self::Direct(location) = self else {
+            return Ok(None);
+        };
+        let end = offset
+            .checked_add(u64::try_from(total).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?;
+        let file = location.entry().as_file()?;
+        let inode = match file.downcast_owned::<crate::fs::ext4::Inode>() {
+            Ok(inode) => inode,
+            Err(_) => return Ok(None),
+        };
+        let Some(effect) = inode.prepare_owned_physical_effect(operation, segments, offset)? else {
+            return Ok(None);
+        };
+
+        // Do not create a cached-file registry entry or a range lease until
+        // filesystem admission has succeeded.  The lower planner uses its
+        // non-caching mapping view, so rejected eligibility remains
+        // side-effect free and can synchronously select the fallback.
+        let shared = cached_file_shared_for_location_or_create(location);
+        let range_lease = match CachedFileShared::try_range_cache_lease(
+            &shared,
+            offset..end,
+            if operation == PhysicalIoOperation::Write {
+                RangeCacheLeaseKind::DirectWrite
+            } else {
+                RangeCacheLeaseKind::DirectRead
+            },
+        ) {
+            Ok(lease) => lease,
+            Err(VfsError::ResourceBusy | VfsError::Unsupported) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        // Only the short cache staging window holds the direct/writeback
+        // locks.  The returned transaction and range lease are owned by the
+        // effect and survive device submission/completion waits.
+        let invalidation_result = (|| -> VfsResult<CachedPageInvalidationTransaction> {
+            let _direct_guard = shared.direct_io_lock.write();
+            let _writeback_guard = shared.writeback_lock.write();
+            wait_for_all_writeback_clear(&shared);
+            let first_page = offset / PAGE_SIZE as u64;
+            let last_page = end.div_ceil(PAGE_SIZE as u64);
+            let first_page = u32::try_from(first_page).map_err(|_| VfsError::InvalidInput)?;
+            let last_page = u32::try_from(last_page).map_err(|_| VfsError::InvalidInput)?;
+            let mut invalidation = CachedPageInvalidationTransaction::new_shared(shared.clone());
+            invalidation.stage_range(first_page..last_page)?;
+            invalidation.writeback(file, true)?;
+            Ok(invalidation)
+        })();
+        let invalidation = match invalidation_result {
+            Ok(invalidation) => invalidation,
+            Err(VfsError::ResourceBusy | VfsError::Unsupported) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(PhysicalIoEffect::new(
+            location.clone(),
+            inode,
+            effect,
+            range_lease,
+            invalidation,
+        )))
+    }
+
     /// Attempts direct I/O into caller-pinned physical SG memory.
     ///
     /// `Ok(None)` is the capability/fallback result.  Validation failures and
@@ -5138,25 +5920,47 @@ impl FileBackend {
     /// writable, and disjoint for the complete call. Concurrent CPU/device
     /// access may race on contents and is the caller's responsibility; this
     /// path does not construct Rust references from physical addresses.
+    pub unsafe fn try_read_at_dma_segments_with_reason(
+        &self,
+        dst: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        let total = validate_physical_io_segments(dst, offset)?;
+        let result = match self {
+            Self::Cached(_) => {
+                PhysicalIoAttempt::NotSubmitted(PhysicalIoAttemptNotSubmittedReason::Extent)
+            }
+            Self::Direct(loc) => with_direct_range_operation_after_preflight(
+                loc,
+                offset,
+                total,
+                RangeCacheLeaseKind::DirectRead,
+                |_, file| file.physical_read_eligible(dst, offset),
+                |_, file| unsafe { file.try_read_at_physical_with_reason(dst, offset) },
+            )?
+            .unwrap_or(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoAttemptNotSubmittedReason::Extent,
+            )),
+        };
+        if let PhysicalIoAttempt::Completed(bytes) = result {
+            if bytes == 0 || bytes > total {
+                return Err(VfsError::Io);
+            }
+        }
+        Ok(result)
+    }
+
     pub unsafe fn try_read_at_dma_segments(
         &self,
         dst: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
-        let total = validate_physical_io_segments(dst, offset)?;
-        let result = match self {
-            Self::Cached(_) => Ok(None),
-            Self::Direct(loc) => with_cache_invalidating_file_operation_after_preflight(
-                loc,
-                |_, file| file.physical_read_eligible(dst, offset),
-                |_, file| unsafe { file.try_read_at_physical(dst, offset) },
-            )
-            .map(|result| result.flatten()),
-        }?;
-        if result.is_some_and(|bytes| bytes != total) {
-            return Err(VfsError::Io);
-        }
-        Ok(result)
+        Ok(
+            match unsafe { self.try_read_at_dma_segments_with_reason(dst, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     /// Performs positioned I/O into pinned physical destination segments.
@@ -5254,28 +6058,47 @@ impl FileBackend {
     /// readable, and disjoint for the complete call. Concurrent CPU/device
     /// access may race on contents and is the caller's responsibility; this
     /// path does not construct Rust references from physical addresses.
+    pub unsafe fn try_write_at_dma_segments_with_reason(
+        &self,
+        src: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        let total = validate_physical_io_segments(src, offset)?;
+        let result = match self {
+            Self::Cached(_) => {
+                PhysicalIoAttempt::NotSubmitted(PhysicalIoAttemptNotSubmittedReason::Extent)
+            }
+            Self::Direct(loc) => with_direct_range_operation_after_preflight(
+                loc,
+                offset,
+                total,
+                RangeCacheLeaseKind::DirectWrite,
+                |_, file| file.physical_write_eligible(src, offset),
+                |_, file| unsafe { file.try_write_at_physical_with_reason(src, offset) },
+            )?
+            .unwrap_or(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoAttemptNotSubmittedReason::Extent,
+            )),
+        };
+        if let PhysicalIoAttempt::Completed(bytes) = result {
+            if bytes != total {
+                return Err(VfsError::Io);
+            }
+        }
+        Ok(result)
+    }
+
     pub unsafe fn try_write_at_dma_segments(
         &self,
         src: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
-        let total = validate_physical_io_segments(src, offset)?;
-        let result = match self {
-            Self::Cached(_) => Ok(None),
-            Self::Direct(loc) => with_cache_invalidating_file_operation_after_preflight(
-                loc,
-                |_, file| file.physical_write_eligible(src, offset),
-                |shared, file| {
-                    let _append_guard = shared.append_lock.read();
-                    unsafe { file.try_write_at_physical(src, offset) }
-                },
-            )
-            .map(|result| result.flatten()),
-        }?;
-        if result.is_some_and(|bytes| bytes != total) {
-            return Err(VfsError::Io);
-        }
-        Ok(result)
+        Ok(
+            match unsafe { self.try_write_at_dma_segments_with_reason(src, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     /// Performs positioned I/O from pinned physical source segments.
@@ -5619,20 +6442,22 @@ impl File {
     /// until the call returns. Concurrent CPU/device content races are the
     /// caller's responsibility and do not make physical addresses into Rust
     /// references.
-    pub unsafe fn try_read_at_dma_segments(
+    pub unsafe fn try_read_at_dma_segments_with_reason(
         &self,
         dst: &[PhysicalIoSegment],
         offset: u64,
-    ) -> VfsResult<Option<usize>> {
+    ) -> VfsResult<PhysicalIoAttempt> {
         if !self.supports_positioned_read() {
-            return Ok(None);
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoAttemptNotSubmittedReason::Extent,
+            ));
         }
         let result = unsafe {
             self.access(FileFlags::READ)?
-                .try_read_at_dma_segments(dst, offset)
+                .try_read_at_dma_segments_with_reason(dst, offset)
         }?;
         #[cfg(feature = "times")]
-        if result.is_some_and(|bytes| bytes != 0)
+        if matches!(result, PhysicalIoAttempt::Completed(bytes) if bytes != 0)
             && !self.flags.contains(FileFlags::NOATIME)
             && FsContext::should_update_atime(self.location())
         {
@@ -5640,6 +6465,19 @@ impl File {
             self.flush_times();
         }
         Ok(result)
+    }
+
+    pub unsafe fn try_read_at_dma_segments(
+        &self,
+        dst: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        Ok(
+            match unsafe { self.try_read_at_dma_segments_with_reason(dst, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     pub fn read_at_slice(&self, dst: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -5773,24 +6611,39 @@ impl File {
     /// until the call returns. Concurrent CPU/device content races are the
     /// caller's responsibility and do not make physical addresses into Rust
     /// references.
+    pub unsafe fn try_write_at_dma_segments_with_reason(
+        &self,
+        src: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        if self.append_enabled() || !self.supports_positioned_write() {
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoAttemptNotSubmittedReason::DeviceAdmission,
+            ));
+        }
+        let result = unsafe {
+            self.access(FileFlags::WRITE)?
+                .try_write_at_dma_segments_with_reason(src, offset)
+        }?;
+        #[cfg(feature = "times")]
+        if matches!(result, PhysicalIoAttempt::Completed(bytes) if bytes != 0) {
+            self.record_time_flags(2);
+            self.flush_times();
+        }
+        Ok(result)
+    }
+
     pub unsafe fn try_write_at_dma_segments(
         &self,
         src: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
-        if self.append_enabled() || !self.supports_positioned_write() {
-            return Ok(None);
-        }
-        let result = unsafe {
-            self.access(FileFlags::WRITE)?
-                .try_write_at_dma_segments(src, offset)
-        }?;
-        #[cfg(feature = "times")]
-        if result.is_some_and(|bytes| bytes != 0) {
-            self.record_time_flags(2);
-            self.flush_times();
-        }
-        Ok(result)
+        Ok(
+            match unsafe { self.try_write_at_dma_segments_with_reason(src, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     fn write_at_end_with_admission_and_new_end(
@@ -5874,6 +6727,23 @@ impl File {
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         self.access(FileFlags::empty())?;
         self.inner.sync(data_only)
+    }
+
+    /// Returns a typed map of allocated extents for this open file.  Access is
+    /// checked before an optional synchronous flush; the flush completes and
+    /// releases all cached-file/filesystem locks before the inode query starts.
+    pub fn map_extents(
+        &self,
+        start: u64,
+        length: u64,
+        max_extents: usize,
+        sync: bool,
+    ) -> VfsResult<FileExtentMap> {
+        self.access(FileFlags::empty())?;
+        if sync {
+            self.sync(false)?;
+        }
+        self.location().entry().as_file()?.map_extents(start, length, max_extents)
     }
 
     /// Reads data from the current position, advancing the cursor.
@@ -6329,11 +7199,12 @@ mod tests {
         ALIGNED_BYPASS_CHUNK, CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile,
         CachedFileEvictionOwner, CachedFileReclaimStats, CachedFileShared,
         CachedPageInvalidationTransaction, File, FileBackend, FileFlags, FileUserData,
-        MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PhysicalIoSegment,
-        PinnedPhysicalSegment, WritePlacement, acknowledge_cached_page_eviction,
+        MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions, PAGE_SIZE, PageCache, PhysicalIoEffect,
+        PhysicalIoResetProof, PhysicalIoSegment, PinnedPhysicalSegment, RANGE_CACHE_LEASE_SLOTS,
+        RangeCacheLease, RangeCacheLeaseKind, WritePlacement, acknowledge_cached_page_eviction,
         advance_clean_cached_file_reclaim_scan_epoch, cached_file_registry_key,
         cached_file_shared_for_location_or_create, discard_cached_pages, file_cache_registry,
-        physical_to_virtual, reclaim_clean_pages_from_shared,
+        mark_cached_file_unlinked, physical_to_virtual, reclaim_clean_pages_from_shared,
         reclaim_clean_pages_from_shared_with_scan_budget,
         release_unlinked_cached_file_registry_ownership, remove_cached_file_registry_entry,
         synchronize_retained_page_count, try_zeroed_pinned_io_bounce,
@@ -6342,7 +7213,201 @@ mod tests {
         with_sync_and_invalidate_cached_file_pages,
     };
 
+    #[cfg(feature = "ext4")]
+    #[test]
+    fn prepared_physical_effect_is_worker_send() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PhysicalIoEffect>();
+    }
+
     static PRESSURE_RECLAIM_EPOCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn range_cache_leases_enforce_overlap_modes_and_allow_disjoint_direct_io() {
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 1,
+                inode: 2,
+                object: 3,
+            },
+            false,
+        ));
+        let cached = CachedFileShared::try_range_cache_lease(
+            &shared,
+            0..PAGE_SIZE as u64,
+            RangeCacheLeaseKind::CachedWrite,
+        )
+        .unwrap();
+        assert!(matches!(
+            CachedFileShared::try_range_cache_lease(
+                &shared,
+                PAGE_SIZE as u64 / 2..PAGE_SIZE as u64 * 2,
+                RangeCacheLeaseKind::DirectWrite,
+            ),
+            Err(VfsError::ResourceBusy)
+        ));
+        let disjoint = CachedFileShared::try_range_cache_lease(
+            &shared,
+            PAGE_SIZE as u64 * 2..PAGE_SIZE as u64 * 3,
+            RangeCacheLeaseKind::DirectRead,
+        )
+        .unwrap();
+        assert!(cached.revalidate());
+        assert!(disjoint.revalidate());
+        drop(disjoint);
+        drop(cached);
+        assert!(
+            CachedFileShared::try_range_cache_lease(
+                &shared,
+                0..PAGE_SIZE as u64,
+                RangeCacheLeaseKind::DirectRead,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_direct_range_lease_drop_requests_unlinked_cleanup() {
+        assert!(super::range_lease_drop_requests_unlinked_cleanup(
+            RangeCacheLeaseKind::DirectRead
+        ));
+        assert!(super::range_lease_drop_requests_unlinked_cleanup(
+            RangeCacheLeaseKind::DirectWrite
+        ));
+        assert!(!super::range_lease_drop_requests_unlinked_cleanup(
+            RangeCacheLeaseKind::CachedRead
+        ));
+        assert!(!super::range_lease_drop_requests_unlinked_cleanup(
+            RangeCacheLeaseKind::CachedWrite
+        ));
+        assert!(!super::range_lease_drop_requests_unlinked_cleanup(
+            RangeCacheLeaseKind::WholeFileMutation
+        ));
+    }
+
+    #[test]
+    fn range_cache_lease_capacity_is_bounded_and_stale_generation_cannot_clear_reuse() {
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 3,
+                inode: 4,
+                object: 5,
+            },
+            false,
+        ));
+        let mut leases = Vec::new();
+        for index in 0..RANGE_CACHE_LEASE_SLOTS {
+            leases.push(
+                CachedFileShared::try_range_cache_lease(
+                    &shared,
+                    index as u64 * PAGE_SIZE as u64..(index as u64 + 1) * PAGE_SIZE as u64,
+                    RangeCacheLeaseKind::DirectRead,
+                )
+                .unwrap(),
+            );
+        }
+        assert!(matches!(
+            CachedFileShared::try_range_cache_lease(
+                &shared,
+                128 * PAGE_SIZE as u64..129 * PAGE_SIZE as u64,
+                RangeCacheLeaseKind::DirectRead,
+            ),
+            Err(VfsError::ResourceBusy)
+        ));
+        let stale = RangeCacheLease {
+            shared: shared.clone(),
+            slot: leases[0].slot,
+            generation: leases[0].generation,
+            record: leases[0].record,
+        };
+        drop(leases.remove(0));
+        let replacement = CachedFileShared::try_range_cache_lease(
+            &shared,
+            0..PAGE_SIZE as u64,
+            RangeCacheLeaseKind::DirectWrite,
+        )
+        .unwrap();
+        drop(stale);
+        assert!(replacement.revalidate());
+    }
+
+    #[cfg(feature = "ext4")]
+    #[test]
+    fn physical_reset_proof_rejects_unproven_quarantine() {
+        use axdriver::prelude::BlockResetOutcome;
+
+        assert!(PhysicalIoResetProof::from_lower_reset(BlockResetOutcome::Quiesced).is_some());
+        assert!(PhysicalIoResetProof::from_lower_reset(BlockResetOutcome::Retired).is_some());
+        assert!(PhysicalIoResetProof::from_lower_reset(BlockResetOutcome::Quarantined).is_none());
+    }
+
+    #[cfg(feature = "ext4")]
+    #[test]
+    fn prepared_physical_effect_rolls_back_cache_before_direct_lease_cleanup() {
+        init_test_page_allocator();
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 9,
+                inode: 10,
+                object: 11,
+            },
+            false,
+        ));
+        let mut page = PageCache::new().unwrap();
+        page.data().fill(0x5a);
+        assert!(shared.page_cache.lock().put(0, page).is_none());
+        shared.unlinked.store(true, Ordering::Release);
+
+        let mut invalidation = CachedPageInvalidationTransaction::new_shared(shared.clone());
+        assert_eq!(invalidation.stage_all(), Ok(()));
+        let mut range_lease = Some(
+            CachedFileShared::try_range_cache_lease(
+                &shared,
+                0..PAGE_SIZE as u64,
+                RangeCacheLeaseKind::DirectWrite,
+            )
+            .unwrap(),
+        );
+        let mut invalidation = Some(invalidation);
+
+        super::drop_prepared_physical_effect_owners(&mut invalidation, &mut range_lease);
+
+        assert!(invalidation.is_none());
+        assert!(range_lease.is_none());
+        assert!(shared.page_cache.lock().is_empty());
+    }
+
+    #[test]
+    fn range_cache_lease_slots_recycle_across_repeated_reset_cycles() {
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 6,
+                inode: 7,
+                object: 8,
+            },
+            false,
+        ));
+        for cycle in 0..(RANGE_CACHE_LEASE_SLOTS * 4) {
+            let start = (cycle % RANGE_CACHE_LEASE_SLOTS) as u64 * PAGE_SIZE as u64;
+            let lease = CachedFileShared::try_range_cache_lease(
+                &shared,
+                start..start + PAGE_SIZE as u64,
+                RangeCacheLeaseKind::DirectRead,
+            )
+            .unwrap();
+            assert!(lease.revalidate());
+            drop(lease);
+        }
+        assert!(
+            shared
+                .range_cache_leases
+                .lock()
+                .slots
+                .iter()
+                .all(Option::is_none)
+        );
+    }
 
     #[test]
     fn physical_sg_validation_requires_nonempty_aligned_disjoint_ranges() {
@@ -8804,6 +9869,38 @@ mod tests {
             retained_pages_before
         );
         assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn unlinked_cleanup_waits_for_live_direct_range_lease() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let shared = Arc::new(CachedFileShared::new(key, true));
+        let retired = file_cache_registry()
+            .lock()
+            .insert(key, FileUserData::new(&location, &shared));
+        assert!(retired.is_none());
+
+        let lease = CachedFileShared::try_range_cache_lease(
+            &shared,
+            0..PAGE_SIZE as u64,
+            RangeCacheLeaseKind::DirectWrite,
+        )
+        .unwrap();
+        mark_cached_file_unlinked(&location);
+        assert!(shared.unlinked_cleanup_pending.load(Ordering::Acquire));
+        assert!(file_cache_registry().lock().contains_key(&key));
+
+        // The unlink path must not panic or discard around a live direct
+        // effect. The exact lease drop is the synchronous cleanup trigger.
+        drop(lease);
+        assert!(!shared.unlinked_cleanup_pending.load(Ordering::Acquire));
+        assert!(!file_cache_registry().lock().contains_key(&key));
+
+        drop(mountpoint);
+        drop(fs);
     }
 
     #[test]

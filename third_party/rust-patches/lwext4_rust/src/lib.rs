@@ -29,7 +29,10 @@ mod iomap;
 mod util;
 
 pub use blockdev::{
-    AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, EXT4_DEV_BSIZE, PhysicalIoSegment,
+    AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, EXT4_DEV_BSIZE,
+    PhysicalIoBatchRequest, PhysicalIoBatchSubmission, PhysicalIoBatchSubmitOutcome,
+    PhysicalIoCompletionDrain, PhysicalIoNotSubmittedReason, PhysicalIoSegment,
+    PhysicalIoSgOutcome,
 };
 pub use error::{Ext4Error, Ext4Result};
 pub use fs::*;
@@ -39,3 +42,7 @@ pub use hot::{
     set_io_counters_enabled,
 };
 pub use inode::*;
+pub use iomap::{
+    FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNWRITTEN, FIEMAP_MAX_BYTES, FiemapExtent, FiemapResult,
+    MAX_FIEMAP_EXTENTS,
+};

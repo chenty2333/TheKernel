@@ -1,20 +1,26 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
     task::Context,
 };
 
+use axdriver::prelude::BlockPhysicalCompletionRoute;
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
-    FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags,
-    NodeOps, NodePermission, NodeType, NodeUserData, PhysicalIoSegment, Reference, RenameRequest,
-    UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    FileExtent, FileExtentMap, FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate,
+    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
+    PhysicalIoAttempt,
+    PhysicalIoNotSubmittedReason, PhysicalIoSegment, Reference, RenameRequest, UnlinkRequest,
+    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    FILE_EXTENT_MAX, FILE_EXTENT_SCAN_CHUNK_BYTES,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use lwext4_rust::{
-    BlockDevice, Ext4Error, FileAttr, InodeToken, InodeType,
+    BlockDevice, Ext4Error, FileAttr, InodeToken, InodeType, PhysicalIoCompletion,
+    PhysicalIoEffect, PhysicalIoOperation, PhysicalIoPlan, PhysicalIoPublishOutcome,
+    PhysicalIoSettlement,
     ffi::{EEXIST, ENODATA, ENOENT},
 };
 use spin::Once;
@@ -24,23 +30,26 @@ use super::{
     util::{into_vfs_err, into_vfs_type},
 };
 
-const MAX_PHYSICAL_SG: usize = 4;
+const MAX_PHYSICAL_INPUT_SG: usize = 64;
+const MAX_PHYSICAL_IO_BYTES: usize = 256 * 1024;
 const PHYSICAL_IO_ALIGNMENT: usize = 512;
+const FILE_EXTENT_LAST_FLAG: u32 = 1;
 
 fn to_lwext4_physical_segments(
     segments: &[PhysicalIoSegment],
 ) -> Option<(
-    [lwext4_rust::PhysicalIoSegment; MAX_PHYSICAL_SG],
+    [lwext4_rust::PhysicalIoSegment; MAX_PHYSICAL_INPUT_SG],
     usize,
     usize,
 )> {
-    if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+    if segments.is_empty() || segments.len() > MAX_PHYSICAL_INPUT_SG {
         return None;
     }
-    let mut result = [lwext4_rust::PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
-    let mut ranges = [(0usize, 0usize); MAX_PHYSICAL_SG];
+    let mut result = [lwext4_rust::PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_INPUT_SG];
+    let mut ranges = [(0usize, 0usize); MAX_PHYSICAL_INPUT_SG];
     let mut total = 0usize;
-    for (index, segment) in segments.iter().copied().enumerate() {
+    let mut count = 0usize;
+    for segment in segments.iter().copied() {
         if segment.len == 0
             || segment.paddr % PHYSICAL_IO_ALIGNMENT != 0
             || segment.len % PHYSICAL_IO_ALIGNMENT != 0
@@ -49,23 +58,34 @@ fn to_lwext4_physical_segments(
         }
         let end = segment.paddr.checked_add(segment.len)?;
         total = total.checked_add(segment.len)?;
-        result[index] = lwext4_rust::PhysicalIoSegment {
-            paddr: segment.paddr,
-            len: segment.len,
-        };
-        ranges[index] = (segment.paddr, end);
+        if total > MAX_PHYSICAL_IO_BYTES {
+            return None;
+        }
+        if let Some(previous) = count.checked_sub(1).and_then(|index| result.get_mut(index))
+            && previous.paddr.checked_add(previous.len) == Some(segment.paddr)
+        {
+            previous.len = previous.len.checked_add(segment.len)?;
+            ranges[count - 1].1 = previous.paddr.checked_add(previous.len)?;
+        } else {
+            if count == MAX_PHYSICAL_INPUT_SG {
+                return None;
+            }
+            result[count] = lwext4_rust::PhysicalIoSegment {
+                paddr: segment.paddr,
+                len: segment.len,
+            };
+            ranges[count] = (segment.paddr, end);
+            count += 1;
+        }
     }
-    if total == 0 || total % PHYSICAL_IO_ALIGNMENT != 0 {
+    if total == 0 || total % PHYSICAL_IO_ALIGNMENT != 0 || count == 0 {
         return None;
     }
-    ranges[..segments.len()].sort_unstable_by_key(|range| range.0);
-    if ranges[..segments.len()]
-        .windows(2)
-        .any(|pair| pair[0].1 > pair[1].0)
-    {
+    ranges[..count].sort_unstable_by_key(|range| range.0);
+    if ranges[..count].windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return None;
     }
-    Some((result, segments.len(), total))
+    Some((result, count, total))
 }
 
 fn combine_vfs_cleanup<T>(operation: VfsResult<T>, cleanup: VfsResult<()>) -> VfsResult<T> {
@@ -415,7 +435,333 @@ impl Drop for Inode {
     }
 }
 
+impl Inode {
+    /// Builds and publishes one all-extents physical batch without retaining
+    /// the ext4 filesystem lock while the device is allowed to run.
+    ///
+    /// `None` is the only pre-publication fallback result.  A returned
+    /// submission, including a terminal partial publication, must be kept by
+    /// the caller until its handles have quiesced.
+    unsafe fn submit_prepared_physical_effect_route(
+        &self,
+        effect: &mut PhysicalIoEffect,
+        route: BlockPhysicalCompletionRoute,
+    ) -> VfsResult<PhysicalIoPublishOutcome> {
+        let mut disk = self.fs.physical_disk();
+        unsafe {
+            effect.publish_with(|requests| match route {
+                BlockPhysicalCompletionRoute::Exact => disk.submit_physical_batch(requests),
+                BlockPhysicalCompletionRoute::Kernel => disk.submit_physical_batch_kernel(requests),
+            })
+        }
+        .map_err(into_vfs_err)
+    }
+
+    unsafe fn submit_prepared_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+    ) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe {
+            self.submit_prepared_physical_effect_route(effect, BlockPhysicalCompletionRoute::Exact)
+        }
+    }
+
+    unsafe fn submit_prepared_physical_effect_kernel(
+        &self,
+        effect: &mut PhysicalIoEffect,
+    ) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe {
+            self.submit_prepared_physical_effect_route(effect, BlockPhysicalCompletionRoute::Kernel)
+        }
+    }
+
+    fn finalize_prepared_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+        outcome: PhysicalIoPublishOutcome,
+    ) -> VfsResult<usize> {
+        let publication = match outcome {
+            PhysicalIoPublishOutcome::Published(publication)
+            | PhysicalIoPublishOutcome::Terminal(publication) => publication,
+            PhysicalIoPublishOutcome::NotSubmitted(_) => return Err(VfsError::Io),
+        };
+        let disk = self.fs.physical_disk();
+        let mut completions = [PhysicalIoCompletion {
+            handle: 0,
+            cookie: 0,
+            bytes: 0,
+            success: false,
+        }; 32];
+        let mut retired = 0usize;
+        while retired < publication.count() {
+            let drain = disk
+                .wait_physical_completions_exact(publication, &mut completions)
+                .map_err(into_vfs_err)?;
+            if drain.completed == 0 || drain.completed > completions.len() {
+                return Err(VfsError::Io);
+            }
+            for completion in completions.iter().copied().take(drain.completed) {
+                // The shared device owner has already demultiplexed by this
+                // effect's exact raw handle/cookie.  A foreign completion is
+                // retained in the device mailbox and never reaches this
+                // state machine; status is the concrete lower observation,
+                // never a count-only synthetic completion.
+                match effect.record_completion(completion) {
+                    lwext4_rust::PhysicalIoCompletionOutcome::Accepted => {
+                        retired = retired.saturating_add(1);
+                    }
+                    lwext4_rust::PhysicalIoCompletionOutcome::Retain(_) => {
+                        let _ = self.fs.physical_disk().reset_device();
+                        return Err(VfsError::Io);
+                    }
+                }
+                if retired == publication.count() {
+                    break;
+                }
+            }
+        }
+        let settlement = effect.settle();
+        let success = match settlement {
+            PhysicalIoSettlement::Settled { success, .. } => success,
+            PhysicalIoSettlement::Retain(_) => return Err(VfsError::Io),
+        };
+        let plan = effect.mark_finalized().map_err(into_vfs_err)?;
+        if success {
+            self.fs.finalize_physical_io_plan(plan, true)?;
+            Ok(plan.bytes())
+        } else {
+            Err(VfsError::Io)
+        }
+    }
+
+    fn prepare_physical_plan(
+        &self,
+        operation: PhysicalIoOperation,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<PhysicalIoPlan>> {
+        let Some((physical, count, total)) = to_lwext4_physical_segments(segments) else {
+            return Ok(None);
+        };
+        self.fs
+            .prepare_physical_io_plan(self.ino(), operation, offset, total, &physical[..count])
+    }
+
+    pub(crate) fn prepare_owned_physical_effect(
+        &self,
+        operation: PhysicalIoOperation,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<Option<PhysicalIoEffect>> {
+        Ok(self
+            .prepare_physical_plan(operation, segments, offset)?
+            .map(PhysicalIoEffect::new))
+    }
+
+    pub(crate) unsafe fn publish_owned_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+    ) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe { self.submit_prepared_physical_effect(effect) }
+    }
+
+    /// Publishes an io_uring-owned effect to the device-global completion
+    /// worker. Synchronous direct effects continue to use the exact route.
+    pub(crate) unsafe fn publish_owned_physical_effect_kernel(
+        &self,
+        effect: &mut PhysicalIoEffect,
+    ) -> VfsResult<PhysicalIoPublishOutcome> {
+        unsafe { self.submit_prepared_physical_effect_kernel(effect) }
+    }
+
+    pub(crate) fn finalize_owned_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+        completions: &[PhysicalIoCompletion],
+    ) -> VfsResult<usize> {
+        let settlement = self.settle_owned_physical_effect(effect, completions);
+        let PhysicalIoSettlement::Settled { plan, success } = settlement else {
+            return Err(VfsError::Io);
+        };
+        debug_assert_eq!(plan, effect.plan());
+        let plan = effect.mark_finalized().map_err(into_vfs_err)?;
+        if success {
+            self.fs.finalize_physical_io_plan(plan, true)?;
+            Ok(plan.bytes())
+        } else {
+            Err(VfsError::Io)
+        }
+    }
+
+    /// Applies exact completion observations without releasing the upper
+    /// owner's range/cache/pin resources.  A malformed observation is a
+    /// quarantine reason; later exact completions may still retire the
+    /// published handles, at which point settlement is a typed failure.
+    pub(crate) fn settle_owned_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+        completions: &[PhysicalIoCompletion],
+    ) -> PhysicalIoSettlement {
+        for completion in completions.iter().copied() {
+            let _ = effect.record_completion(completion);
+        }
+        effect.settle()
+    }
+
+    /// Revalidates a physically retired effect, then marks it finalized.  A
+    /// successful physical write keeps its staged cache invalidation committed
+    /// even when metadata/mapping revalidation reports an error; restoring
+    /// that old cache would be stale.
+    pub(crate) fn finalize_settled_physical_effect(
+        &self,
+        effect: &mut PhysicalIoEffect,
+        plan: PhysicalIoPlan,
+        success: bool,
+    ) -> VfsResult<usize> {
+        debug_assert_eq!(plan, effect.plan());
+        // Revalidation/commit can report a transient ResourceBusy while a
+        // nested filesystem operation is still in flight. Leave the lower
+        // effect in Completed/SettledFailure for that typed retry; marking it
+        // Finalized before the filesystem call would drop the DMA/cache
+        // owners and turn the Busy into a terminal CQE.
+        let result = if success {
+            self.fs.finalize_physical_io_plan(plan, true)
+        } else {
+            Err(VfsError::Io)
+        };
+        if matches!(&result, Err(VfsError::ResourceBusy)) {
+            return result.map(|()| plan.bytes());
+        }
+        let plan = effect.mark_finalized().map_err(into_vfs_err)?;
+        result.map(|()| plan.bytes())
+    }
+}
+
 impl FileNodeOps for Inode {
+    fn map_extents(
+        &self,
+        start: u64,
+        length: u64,
+        max_extents: usize,
+    ) -> VfsResult<FileExtentMap> {
+        if max_extents > FILE_EXTENT_MAX {
+            return Err(VfsError::InvalidInput);
+        }
+
+        let file_size = <Self as NodeOps>::len(self)?;
+        let requested_end = start.checked_add(length).unwrap_or(u64::MAX);
+        let end = requested_end.min(file_size);
+        if length == 0 || start >= file_size || end <= start {
+            return Ok(FileExtentMap::new(Vec::new(), 0, true));
+        }
+
+        let mut retained: Vec<FileExtent> = Vec::new();
+        if max_extents != 0 {
+            retained
+                .try_reserve_exact(max_extents.min(FILE_EXTENT_MAX))
+                .map_err(|_| VfsError::NoMemory)?;
+        }
+        let mut count_only_last = None;
+        let mut count_only_total = 0u32;
+        let mut complete = true;
+        let mut cursor = start;
+
+        while cursor < end {
+            let chunk_end = cursor
+                .checked_add(FILE_EXTENT_SCAN_CHUNK_BYTES)
+                .unwrap_or(end)
+                .min(end);
+            let chunk_length = chunk_end - cursor;
+            let remaining_capacity = max_extents.saturating_sub(retained.len());
+            let chunk_capacity = if max_extents == 0 {
+                0
+            } else {
+                remaining_capacity
+            };
+            let result = self
+                .fs
+                .lock()
+                .map_extents(self.ino(), cursor, chunk_length, chunk_capacity)
+                .map_err(into_vfs_err)?;
+            let lwext4_rust::FiemapResult {
+                extents: lower_extents,
+                mapped_extents: chunk_mapped,
+                complete: chunk_complete,
+                first_extent,
+                last_extent,
+            } = result;
+
+            if max_extents == 0 {
+                count_only_total = count_only_total
+                    .checked_add(chunk_mapped)
+                    .ok_or(VfsError::InvalidInput)?;
+            } else if chunk_capacity == 0 {
+                if chunk_mapped != 0 {
+                    complete = false;
+                    break;
+                }
+            } else {
+                for extent in lower_extents {
+                    let extent = FileExtent::new(
+                        extent.logical,
+                        extent.physical,
+                        extent.length,
+                        extent.flags,
+                    );
+                    if let Some(previous) = retained.last_mut()
+                        && previous.logical.checked_add(previous.length) == Some(extent.logical)
+                        && previous.physical.checked_add(previous.length)
+                            == Some(extent.physical)
+                        && previous.flags & !FILE_EXTENT_LAST_FLAG
+                            == extent.flags & !FILE_EXTENT_LAST_FLAG
+                    {
+                        previous.length = previous
+                            .length
+                            .checked_add(extent.length)
+                            .ok_or(VfsError::InvalidInput)?;
+                        previous.flags |= extent.flags & FILE_EXTENT_LAST_FLAG;
+                    } else if retained.len() < max_extents {
+                        retained.push(extent);
+                    }
+                }
+                if !chunk_complete {
+                    complete = false;
+                    break;
+                }
+            }
+
+            if max_extents == 0 {
+                // Count-only results do not allocate an extent vector. Keep
+                // just the previous chunk's tail so a split extent is counted
+                // once when the next bounded lock-held chunk starts.
+                let previous = count_only_last;
+                let first = first_extent.map(|extent| {
+                    FileExtent::new(extent.logical, extent.physical, extent.length, extent.flags)
+                });
+                count_only_last = last_extent.map(|extent| {
+                    FileExtent::new(extent.logical, extent.physical, extent.length, extent.flags)
+                });
+                if let (Some(previous), Some(first)) = (previous, first)
+                    && previous.logical.checked_add(previous.length) == Some(first.logical)
+                    && previous.physical.checked_add(previous.length) == Some(first.physical)
+                    && previous.flags & !FILE_EXTENT_LAST_FLAG
+                        == first.flags & !FILE_EXTENT_LAST_FLAG
+                    && chunk_mapped != 0
+                {
+                    count_only_total = count_only_total.saturating_sub(1);
+                }
+            }
+
+            cursor = chunk_end;
+        }
+
+        if max_extents == 0 {
+            return Ok(FileExtentMap::new(Vec::new(), count_only_total, complete));
+        }
+        let mapped_extents = u32::try_from(retained.len()).map_err(|_| VfsError::InvalidInput)?;
+        Ok(FileExtentMap::new(retained, mapped_extents, complete))
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         if {
             let fs = self.fs.lock();
@@ -488,35 +834,40 @@ impl FileNodeOps for Inode {
         Ok(Some(submission.bytes))
     }
 
+    unsafe fn try_read_at_physical_with_reason(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        let Some(plan) = self.prepare_physical_plan(PhysicalIoOperation::Read, segments, offset)?
+        else {
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::Extent,
+            ));
+        };
+        let mut effect = PhysicalIoEffect::new(plan);
+        let outcome = unsafe { self.submit_prepared_physical_effect(&mut effect) }?;
+        if matches!(outcome, PhysicalIoPublishOutcome::NotSubmitted(_)) {
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::DeviceAdmission,
+            ));
+        }
+        Ok(PhysicalIoAttempt::Completed(
+            self.finalize_prepared_physical_effect(&mut effect, outcome)?,
+        ))
+    }
+
     unsafe fn try_read_at_physical(
         &self,
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
-        let Some((physical, count, total)) = to_lwext4_physical_segments(segments) else {
-            return Ok(None);
-        };
-
-        // FileBackend::Direct holds CachedFileShared::direct_io_lock across
-        // this complete hook. Extent-changing file operations use the same
-        // lock, so the mapping sequence remains stable while the plan is
-        // detached and the synchronous device call runs without the ext4
-        // filesystem spin lock.
-        let Some(plan) = self.fs.plan_physical_io(self.ino(), offset, total, false)? else {
-            return Ok(None);
-        };
-        let mut disk = self.fs.physical_disk();
-        let Some(read) =
-            (unsafe { disk.read_blocks_physical_sg(plan.physical_block_id(), &physical[..count]) })
-                .map_err(into_vfs_err)?
-        else {
-            return Ok(None);
-        };
-        if read != total || read != plan.bytes() {
-            return Err(VfsError::Io);
-        }
-        self.fs.validate_physical_io_plan(plan)?;
-        Ok(Some(total))
+        Ok(
+            match unsafe { self.try_read_at_physical_with_reason(segments, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     fn physical_read_eligible(
@@ -524,12 +875,8 @@ impl FileNodeOps for Inode {
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<bool> {
-        let Some((_physical, _count, total)) = to_lwext4_physical_segments(segments) else {
-            return Ok(false);
-        };
         Ok(self
-            .fs
-            .plan_physical_io(self.ino(), offset, total, false)?
+            .prepare_physical_plan(PhysicalIoOperation::Read, segments, offset)?
             .is_some())
     }
 
@@ -589,34 +936,41 @@ impl FileNodeOps for Inode {
         Ok(Some(submission.bytes))
     }
 
+    unsafe fn try_write_at_physical_with_reason(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        let Some(plan) =
+            self.prepare_physical_plan(PhysicalIoOperation::Write, segments, offset)?
+        else {
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::Extent,
+            ));
+        };
+        let mut effect = PhysicalIoEffect::new(plan);
+        let outcome = unsafe { self.submit_prepared_physical_effect(&mut effect) }?;
+        if matches!(outcome, PhysicalIoPublishOutcome::NotSubmitted(_)) {
+            return Ok(PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::DeviceAdmission,
+            ));
+        }
+        Ok(PhysicalIoAttempt::Completed(
+            self.finalize_prepared_physical_effect(&mut effect, outcome)?,
+        ))
+    }
+
     unsafe fn try_write_at_physical(
         &self,
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<Option<usize>> {
-        let Some((physical, count, total)) = to_lwext4_physical_segments(segments) else {
-            return Ok(None);
-        };
-        let Some(plan) = self.fs.plan_physical_io(self.ino(), offset, total, true)? else {
-            return Ok(None);
-        };
-
-        // As with reads, the high-level direct-I/O exclusion keeps the extent
-        // identity stable. The ext4 lock is released before the synchronous
-        // driver call, and reacquired only to validate and invalidate cache.
-        let mut disk = self.fs.physical_disk();
-        let Some(written) = (unsafe {
-            disk.write_blocks_physical_sg(plan.physical_block_id(), &physical[..count])
-        })
-        .map_err(into_vfs_err)?
-        else {
-            return Ok(None);
-        };
-        if written != total || written != plan.bytes() {
-            return Err(VfsError::Io);
-        }
-        self.fs.commit_physical_io_write(plan)?;
-        Ok(Some(total))
+        Ok(
+            match unsafe { self.try_write_at_physical_with_reason(segments, offset)? } {
+                PhysicalIoAttempt::Completed(bytes) => Some(bytes),
+                PhysicalIoAttempt::NotSubmitted(_) => None,
+            },
+        )
     }
 
     fn physical_write_eligible(
@@ -624,12 +978,8 @@ impl FileNodeOps for Inode {
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<bool> {
-        let Some((_physical, _count, total)) = to_lwext4_physical_segments(segments) else {
-            return Ok(false);
-        };
         Ok(self
-            .fs
-            .plan_physical_io(self.ino(), offset, total, true)?
+            .prepare_physical_plan(PhysicalIoOperation::Write, segments, offset)?
             .is_some())
     }
 
@@ -1044,6 +1394,26 @@ mod tests {
                 .code,
             ENODATA as i32
         );
+    }
+
+    #[test]
+    fn physical_sg_coalesces_adjacent_ranges_before_the_four_entry_cap() {
+        let segments = [
+            PhysicalIoSegment::new(0x20_000, 64 * 1024),
+            PhysicalIoSegment::new(0x30_000, 64 * 1024),
+            PhysicalIoSegment::new(0x40_000, 64 * 1024),
+            PhysicalIoSegment::new(0x50_000, 64 * 1024 - 512),
+            PhysicalIoSegment::new(0x5f_c00, 512),
+        ];
+        let (_, count, total) = to_lwext4_physical_segments(&segments).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(total, 256 * 1024);
+    }
+
+    #[test]
+    fn physical_sg_rejects_more_than_the_bounded_request_size() {
+        let segments = [PhysicalIoSegment::new(0x20_000, 256 * 1024 + 512)];
+        assert!(to_lwext4_physical_segments(&segments).is_none());
     }
 
     #[cfg(feature = "test-ramdisk")]

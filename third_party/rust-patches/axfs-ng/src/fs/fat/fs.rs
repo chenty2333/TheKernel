@@ -6,7 +6,7 @@ use core::{
     time::Duration,
 };
 
-use axdriver::{SharedBlockDevice, prelude::BlockDriverOps};
+use axdriver::SharedBlockDevice;
 use axfs_ng_vfs::{
     DirEntry, Filesystem, FilesystemOps, MetadataUpdateCapabilities, Reference, StatFs, VfsError,
     VfsResult, path::MAX_NAME_LEN,

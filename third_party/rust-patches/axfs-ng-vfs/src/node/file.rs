@@ -1,10 +1,70 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::ops::Deref;
 
 use axpoll::Pollable;
 
 use super::NodeOps;
 use crate::{VfsError, VfsResult};
+
+/// Maximum number of file extents a normal FIEMAP caller retains in one
+/// query.  The typed VFS API still accepts a caller supplied `max_extents`;
+/// this constant is available to adapters which want to impose the Linux
+/// ioctl's bounded capacity before entering a filesystem implementation.
+pub const FILE_EXTENT_MAX: usize = 4096;
+
+/// Maximum logical range mapped while a filesystem-specific spin lock is
+/// held.  Callers release and reacquire the backend lock between chunks.
+pub const FILE_EXTENT_SCAN_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// One allocated file extent returned by a filesystem mapping query.  This
+/// includes unwritten allocations; the kernel adapter preserves their typed
+/// FIEMAP flag and performs usercopy only after the filesystem lock has been
+/// released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileExtent {
+    pub logical: u64,
+    pub physical: u64,
+    pub length: u64,
+    /// Filesystem-independent FIEMAP flags.  The VFS does not define Linux
+    /// userspace structs, but bit 0 is reserved for `FIEMAP_EXTENT_LAST` by
+    /// the typed lower contract.
+    pub flags: u32,
+}
+
+impl FileExtent {
+    pub const fn new(logical: u64, physical: u64, length: u64, flags: u32) -> Self {
+        Self {
+            logical,
+            physical,
+            length,
+            flags,
+        }
+    }
+}
+
+/// Typed result of one file extent mapping query.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FileExtentMap {
+    /// The retained prefix.  It is empty for a count-only query.
+    pub extents: Vec<FileExtent>,
+    /// For a non-zero capacity this is the number of retained extents, not
+    /// the total discovered count.  A zero-capacity query returns the exact
+    /// discovered count here without allocating `extents`.
+    pub mapped_extents: u32,
+    /// Whether the complete range was scanned and all mapped extents were
+    /// retained.  Count-only scans are complete by definition.
+    pub complete: bool,
+}
+
+impl FileExtentMap {
+    pub fn new(extents: Vec<FileExtent>, mapped_extents: u32, complete: bool) -> Self {
+        Self {
+            extents,
+            mapped_extents,
+            complete,
+        }
+    }
+}
 
 /// One caller-owned physical-memory range used by a synchronous direct I/O
 /// request.
@@ -32,7 +92,46 @@ impl PhysicalIoSegment {
     }
 }
 
+/// Result of attempting a synchronous physical direct-I/O request.
+///
+/// `NotSubmitted` is deliberately typed: callers may use their pre-publish
+/// fallback only for an operation which never reached the device.  Once a
+/// lower layer returns `Completed`, later validation errors remain terminal
+/// and must not be retried through a bounce buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoAttempt {
+    Completed(usize),
+    NotSubmitted(PhysicalIoNotSubmittedReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoNotSubmittedReason {
+    /// The filesystem mapping or direct-I/O preflight did not admit the
+    /// request (for example a hole, fragmented extent, or EOF range).
+    Extent,
+    /// The request was eligible in the filesystem, but device admission did
+    /// not publish a descriptor (for example queue capacity or unsupported
+    /// physical SG geometry).
+    DeviceAdmission,
+}
+
 pub trait FileNodeOps: NodeOps + Pollable {
+    /// Collects allocated file extents intersecting `[start, start + length)`.
+    /// Holes are omitted.  A zero capacity is a complete count-only scan and
+    /// must not allocate an extent buffer; a non-zero capacity retains only a
+    /// prefix and reports the retained count in `mapped_extents`.
+    ///
+    /// No userspace pointers or Linux ABI structs cross this VFS boundary.
+    fn map_extents(
+        &self,
+        start: u64,
+        length: u64,
+        max_extents: usize,
+    ) -> VfsResult<FileExtentMap> {
+        let _ = (start, length, max_extents);
+        Err(VfsError::OperationNotSupported)
+    }
+
     /// Reads a number of bytes starting from a given offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
 
@@ -97,6 +196,23 @@ pub trait FileNodeOps: NodeOps + Pollable {
     ) -> VfsResult<Option<usize>> {
         let _ = (segments, offset);
         Ok(None)
+    }
+
+    /// Typed form of [`Self::try_read_at_physical`].  The default adapter is
+    /// intentionally conservative: an implementation which has no physical
+    /// hook reports device admission failure, which is still unpublished and
+    /// therefore safe for the caller's fallback path.
+    unsafe fn try_read_at_physical_with_reason(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        Ok(match unsafe { self.try_read_at_physical(segments, offset)? } {
+            Some(bytes) => PhysicalIoAttempt::Completed(bytes),
+            None => PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::DeviceAdmission,
+            ),
+        })
     }
 
     /// Performs a side-effect-free capability and mapping preflight for a
@@ -170,6 +286,21 @@ pub trait FileNodeOps: NodeOps + Pollable {
         Ok(None)
     }
 
+    /// Typed form of [`Self::try_write_at_physical`]; see the read-side
+    /// contract for the publish boundary and fallback rule.
+    unsafe fn try_write_at_physical_with_reason(
+        &self,
+        segments: &[PhysicalIoSegment],
+        offset: u64,
+    ) -> VfsResult<PhysicalIoAttempt> {
+        Ok(match unsafe { self.try_write_at_physical(segments, offset)? } {
+            Some(bytes) => PhysicalIoAttempt::Completed(bytes),
+            None => PhysicalIoAttempt::NotSubmitted(
+                PhysicalIoNotSubmittedReason::DeviceAdmission,
+            ),
+        })
+    }
+
     /// Performs a side-effect-free capability and mapping preflight for a
     /// physical overwrite.  It must not publish a descriptor or touch file
     /// data; the high-level direct backend calls the unsafe hook only after a
@@ -238,6 +369,17 @@ impl FileNode {
     }
 
     pub fn downcast<T: FileNodeOps>(self: &Arc<Self>) -> VfsResult<Arc<T>> {
+        self.0
+            .clone()
+            .into_any()
+            .downcast()
+            .map_err(|_| VfsError::InvalidInput)
+    }
+
+    /// Clones the node's owned trait object and downcasts it without requiring
+    /// an `Arc<FileNode>` at the call site.  The returned `Arc` is an owned
+    /// worker-safe inode reference; no VFS borrow crosses an await boundary.
+    pub fn downcast_owned<T: FileNodeOps>(&self) -> VfsResult<Arc<T>> {
         self.0
             .clone()
             .into_any()

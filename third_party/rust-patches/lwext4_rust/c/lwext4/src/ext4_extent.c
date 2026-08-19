@@ -1993,6 +1993,68 @@ static int ext4_ext_zero_unwritten_range(struct ext4_inode_ref *inode_ref,
 	return err;
 }
 
+int ext4_extent_get_blocks_fiemap(struct ext4_inode_ref *inode_ref,
+				  ext4_lblk_t iblock,
+				  uint32_t max_blocks,
+				  ext4_fsblk_t *result,
+				  uint32_t *blocks_count,
+				  bool *unwritten)
+{
+	struct ext4_extent_path *path = NULL;
+	struct ext4_extent *ex;
+	ext4_lblk_t next;
+	ext4_lblk_t ee_block;
+	ext4_fsblk_t ee_start;
+	uint32_t allocated = 0;
+	uint16_t ee_len;
+	int32_t depth;
+	int err;
+
+	if (result)
+		*result = 0;
+	if (blocks_count)
+		*blocks_count = 0;
+	if (unwritten)
+		*unwritten = false;
+	if (max_blocks == 0)
+		return EOK;
+
+	err = ext4_find_extent(inode_ref, iblock, &path, 0);
+	if (err != EOK)
+		goto out;
+
+	depth = ext_depth(inode_ref->inode);
+	ex = path[depth].extent;
+	if (ex) {
+		ee_block = to_le32(ex->first_block);
+		ee_len = ext4_ext_get_actual_len(ex);
+		if (IN_RANGE(iblock, ee_block, ee_len)) {
+			allocated = ee_len - (iblock - ee_block);
+			ee_start = ext4_ext_pblock(ex);
+			if (result)
+				*result = ee_start + (iblock - ee_block);
+			if (unwritten)
+				*unwritten = ext4_ext_is_unwritten(ex);
+			goto out;
+		}
+	}
+
+	/* No extent covers iblock: skip the complete hole to the next leaf run. */
+	next = ext4_ext_next_allocated_block(path);
+	allocated = next > iblock ? next - iblock : 1;
+
+out:
+	if (allocated > max_blocks)
+		allocated = max_blocks;
+	if (blocks_count)
+		*blocks_count = allocated;
+	if (path) {
+		ext4_ext_drop_refs(inode_ref, path, 0);
+		ext4_free(path);
+	}
+	return err;
+}
+
 __unused static void print_path(struct ext4_extent_path *path)
 {
 	int32_t i = path->depth;

@@ -7,9 +7,10 @@ use core::{
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use axdriver_block::{
-    BlockAsyncOp, BlockDriverOps, BlockPhysicalSegment, BlockPhysicalSgOutcome, BlockQueueCaps,
-    BlockQueueRequest, BlockRequestHandle, BlockSegment, BlockSegmentDirection,
-    BlockSubmitReport,
+    BlockAsyncOp, BlockCompletion, BlockCompletionDrain, BlockCompletionNotifier,
+    BlockCompletionOwner, BlockDriverOps, BlockPhysicalRequest, BlockPhysicalSegment,
+    BlockPhysicalSgOutcome, BlockQueueCaps, BlockQueueRequest, BlockRequestHandle, BlockSegment,
+    BlockSegmentDirection, BlockSubmitReport, MAX_PHYSICAL_COALESCED_SG,
 };
 use axtask::{
     WaitError, WaitQueue,
@@ -19,9 +20,11 @@ use spin::Mutex;
 use virtio_drivers::{
     Hal,
     device::blk::{
-        MAX_PHYSICAL_SG, PENDING_COMPLETION_DRAIN_BUDGET, PendingBlkBatchBuffer,
-        PendingBlkBatchRequest, PendingBlkDrainStatus, PendingBlkHandle,
-        PhysicalSegment as VirtioPhysicalSegment, VirtIOBlk as InnerDev,
+        BlockCompletion as VirtioBlockCompletion, MAX_PHYSICAL_BATCH_REQUESTS,
+        PENDING_COMPLETION_DRAIN_BUDGET, PendingBlkBatchBuffer, PendingBlkBatchRequest,
+        PendingBlkDrainStatus, PendingBlkHandle, PendingBlkPhysicalBatchBuffer,
+        PendingBlkPhysicalBatchRequest, PhysicalSegment as VirtioPhysicalSegment,
+        VirtIOBlk as InnerDev,
     },
     stats::{
         AsyncBlockWaitPolicy, async_block_enabled, async_block_merge_write_enabled,
@@ -153,6 +156,16 @@ fn drain_requires_continuation(
     status.has_continuation() || current_irq_generation != observed_irq_generation
 }
 
+#[inline]
+fn completion_recheck_requires_continuation(
+    lower_continuation: bool,
+    used_after_rearm: bool,
+    observed_irq_generation: u64,
+    current_irq_generation: u64,
+) -> bool {
+    lower_continuation || used_after_rearm || current_irq_generation != observed_irq_generation
+}
+
 fn accepted_request_handles<'a>(
     requests: &'a [BlockQueueRequest<'_>],
     submitted: usize,
@@ -185,6 +198,22 @@ fn wait_error_to_dev(error: WaitError) -> DevError {
     }
 }
 
+/// Maps errors from used-ring consumption, where protocol/ownership failures
+/// are reset-required even when the lower VirtIO helper uses `IoError` for a
+/// malformed used length.  Device response statuses are produced only after
+/// a successful drain and continue through `as_dev_err` as ordinary `Io`.
+#[inline]
+fn completion_drain_error(error: virtio_drivers::Error) -> DevError {
+    match error {
+        virtio_drivers::Error::IoError
+        | virtio_drivers::Error::WrongToken
+        | virtio_drivers::Error::AlreadyUsed
+        | virtio_drivers::Error::Quarantined => DevError::BadState,
+        error => as_dev_err(error),
+    }
+}
+
+#[cfg(test)]
 fn physical_submit_error(error: virtio_drivers::Error) -> DevResult<BlockPhysicalSgOutcome> {
     match error {
         // These errors are returned before publish_unpublished, so no device
@@ -203,6 +232,17 @@ enum IrqFirstArmState {
     NoIrq,
     RegisterFailed,
     FeatureDisabled,
+}
+
+/// Converts an IRQ admission result into the public driver error without
+/// allowing the caller to unmask the device on a failed arm.
+#[inline]
+fn require_irq_first_arm(state: IrqFirstArmState) -> DevResult {
+    match state {
+        IrqFirstArmState::Armed => Ok(()),
+        IrqFirstArmState::NoIrq | IrqFirstArmState::FeatureDisabled => Err(DevError::Unsupported),
+        IrqFirstArmState::RegisterFailed => Err(DevError::Io),
+    }
 }
 
 #[cfg(feature = "irq")]
@@ -224,7 +264,15 @@ fn ensure_platform_irq_handler(irq: usize) -> bool {
     if !axhal::irq::register(irq, virtio_blk_irq_wake_handler) {
         return false;
     }
-    registered.insert(irq)
+    if registered.insert(irq) {
+        true
+    } else {
+        // `axhal::irq::register` enables the platform line as part of
+        // registration.  Roll it back when the bounded registry is full so
+        // a failed arm cannot leave an unowned, unmasked vector behind.
+        let _ = axhal::irq::unregister(irq);
+        false
+    }
 }
 
 #[cfg(not(feature = "irq"))]
@@ -308,6 +356,9 @@ pub struct VirtIoBlkDev<H: Hal, T: Transport> {
     irq_wait_armed: AtomicBool,
     irq_generation: AtomicU64,
     continuation_pending: AtomicBool,
+    completion_notifier: AtomicUsize,
+    completion_notifier_context: AtomicUsize,
+    completion_notifier_readers: AtomicUsize,
     #[cfg(feature = "irq")]
     irq_slot: AtomicUsize,
 }
@@ -330,6 +381,9 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             irq_wait_armed: AtomicBool::new(false),
             irq_generation: AtomicU64::new(0),
             continuation_pending: AtomicBool::new(false),
+            completion_notifier: AtomicUsize::new(0),
+            completion_notifier_context: AtomicUsize::new(0),
+            completion_notifier_readers: AtomicUsize::new(0),
             #[cfg(feature = "irq")]
             irq_slot: AtomicUsize::new(IRQ_SLOT_EMPTY),
         })
@@ -412,8 +466,14 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
     }
 
     /// Enables device-to-driver notifications for completion interrupts.
-    pub fn enable_irq(&self) {
-        let wait_armed = self.arm_irq_first_wait() == IrqFirstArmState::Armed;
+    pub fn enable_irq(&self) -> DevResult {
+        // Admission is deliberately completed before touching the VirtIO
+        // interrupt-enable bit.  No-IRQ, feature-disabled, and registration
+        // failures must remain polling-only states rather than reporting an
+        // enabled wrapper with no platform wake path.
+        let arm_state = self.arm_irq_first_wait();
+        require_irq_first_arm(arm_state)?;
+        let wait_armed = true;
         // Arm the platform callback before unmasking the queue.  Then perform
         // one task-context acknowledgement to cover an interrupt that was
         // raised before the arm point (or that raced the callback install).
@@ -431,6 +491,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         if wait_armed && !was_armed {
             record_blk_async_irq_first_arm();
         }
+        Ok(())
     }
 
     /// Disables device-to-driver completion interrupts.
@@ -469,6 +530,35 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         // ownership token per device so duplicate IRQs cannot create an
         // unbounded continuation backlog.
         self.continuation_pending.store(true, Ordering::Release);
+        self.notify_completion_notifier();
+    }
+
+    fn notify_completion_notifier(&self) {
+        // Pair callback teardown with an in-flight reader count. The shared
+        // owner context points into an Arc allocation; unregister must wait
+        // for a callback that already loaded the old function/context before
+        // the final Arc drop can invalidate that pointer.
+        self.completion_notifier_readers
+            .fetch_add(1, Ordering::AcqRel);
+        let callback = self.completion_notifier.load(Ordering::Acquire);
+        if callback == 0 {
+            self.completion_notifier_readers
+                .fetch_sub(1, Ordering::Release);
+            return;
+        }
+        let context = self.completion_notifier_context.load(Ordering::Acquire);
+        if context == 0 {
+            self.completion_notifier_readers
+                .fetch_sub(1, Ordering::Release);
+            return;
+        }
+        // SAFETY: `install_completion_notifier` stores only a function pointer
+        // supplied by the shared owner and its context remains live until the
+        // owner unregisters it before dropping the device.
+        let callback = unsafe { core::mem::transmute::<usize, BlockCompletionNotifier>(callback) };
+        callback(context);
+        self.completion_notifier_readers
+            .fetch_sub(1, Ordering::Release);
     }
 
     /// Acknowledges a block interrupt and publishes a task token.
@@ -479,6 +569,12 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
     /// task drain cannot erase an IRQ that raced with its used-ring snapshot;
     /// the downstream queue event and wait queues provide coalescing.
     pub fn handle_irq(&self) -> DevResult<usize> {
+        // A callback racing reset is stale once notifications are disabled;
+        // it must not publish a new generation or wake a waiter for a retired
+        // queue.
+        if !self.irq_enabled.load(Ordering::Acquire) {
+            return Ok(0);
+        }
         let published = if let Some(mut inner) = self.inner.try_lock() {
             inner.ack_interrupt()
         } else {
@@ -528,6 +624,59 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         (drained, continuation)
     }
 
+    /// Applies the generation/token part of a concrete completion drain.
+    /// Physical drains use a different lower-level result type than the
+    /// count-only path, but they must obey the same IRQ race protocol.
+    fn note_completion_drain(&self, continuation: bool, observed_irq_generation: u64) -> bool {
+        let mut continuation =
+            continuation || self.irq_generation.load(Ordering::Acquire) != observed_irq_generation;
+        if continuation {
+            self.continuation_pending.store(true, Ordering::Release);
+        } else {
+            // Clear only the token observed by this pass, then re-check the
+            // generation.  An IRQ arriving between the first generation read
+            // and the clear must leave a token for the next task pass.
+            self.continuation_pending
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            if self.irq_generation.load(Ordering::Acquire) != observed_irq_generation {
+                self.continuation_pending.store(true, Ordering::Release);
+                continuation = true;
+            }
+        }
+        continuation
+    }
+
+    /// Re-arm used-buffer notifications and perform the second check required
+    /// by EVENT_IDX.  The caller holds `inner` for the whole check-arm-check
+    /// sequence, so a used entry cannot be consumed or observed through a
+    /// different queue owner between the two checks.
+    fn finish_completion_drain_check(
+        &self,
+        inner: &mut InnerDev<H, T>,
+        lower_continuation: bool,
+        observed_irq_generation: u64,
+    ) -> bool {
+        // A driver without an admitted platform IRQ must remain polling-only;
+        // enabling the VirtIO queue here would otherwise create an interrupt
+        // source with no registered wake path.
+        if self.irq_enabled.load(Ordering::Acquire) {
+            inner.enable_interrupts();
+        }
+        // Catch an interrupt raised while the bounded drain/peek was running.
+        // `ack_task_irq` also advances the generation used by the final race
+        // check and coalesces the continuation token.
+        self.ack_task_irq(inner);
+        let used_after_rearm = inner.peek_used().is_some();
+        let continuation = completion_recheck_requires_continuation(
+            lower_continuation,
+            used_after_rearm,
+            observed_irq_generation,
+            self.irq_generation.load(Ordering::Acquire),
+        );
+        self.note_completion_drain(continuation, observed_irq_generation)
+    }
+
     fn continue_pending_drain(&self) -> bool {
         if !self.continuation_pending.swap(false, Ordering::AcqRel) {
             return false;
@@ -548,20 +697,93 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         true
     }
 
+    fn wait_for_physical_handle_done(&self, handle: PendingBlkHandle) -> DevResult
+    where
+        T: Send,
+    {
+        loop {
+            let (drained, continuation, target_ready) = {
+                let mut inner = self.inner.lock();
+                self.ack_task_irq(&mut inner);
+                let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+                let status = inner
+                    .drain_pending_completions_for_handle(handle, PENDING_COMPLETION_DRAIN_BUDGET)
+                    .map_err(completion_drain_error)?;
+                let (drained, continuation) =
+                    self.note_drain_status(status, observed_irq_generation);
+                let (drained, continuation) = if !inner.physical_completion_ready_for_handle(handle)
+                    && !inner.physical_completion_ready()
+                    && continuation
+                {
+                    // The exact physical handle is behind an ordinary used
+                    // entry. Advance only the ordinary entry to `done`; its
+                    // handle owner still performs the later slot retirement.
+                    // This closes the mixed FIFO case without letting a
+                    // physical waiter sleep forever behind ordinary work.
+                    let ordinary = inner
+                        .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                        .map_err(completion_drain_error)?;
+                    let (ordinary_drained, ordinary_continuation) =
+                        self.note_drain_status(ordinary, observed_irq_generation);
+                    (
+                        drained.saturating_add(ordinary_drained),
+                        ordinary_continuation,
+                    )
+                } else {
+                    (drained, continuation)
+                };
+                let done = inner.pending_request_done(handle);
+                let target_ready = inner.physical_completion_ready_for_handle(handle);
+                if done {
+                    inner.record_external_queue_wait(0, handle.notified());
+                    let result = inner.complete_pending_request(handle).map_err(as_dev_err);
+                    drop(inner);
+                    Self::notify_completion_waiters(&self.wait_queue, drained);
+                    return result;
+                }
+                (drained, continuation, target_ready)
+            };
+            Self::notify_completion_waiters(&self.wait_queue, drained);
+            if continuation && target_ready && self.continue_pending_drain() {
+                continue;
+            }
+            self.wait_for_physical_handle_wakeup(handle)?;
+        }
+    }
+
     fn wait_for_pending_done(&self, handle: PendingBlkHandle) -> DevResult
     where
         T: Send,
     {
+        if self
+            .inner
+            .lock()
+            .pending_request_owner(handle)
+            .is_some_and(|owner| {
+                owner == virtio_drivers::device::blk::BlockCompletionOwner::Physical
+            })
+        {
+            return self.wait_for_physical_handle_done(handle);
+        }
         let mut polls = 0u64;
         loop {
             let mut inner = self.inner.lock();
             self.ack_task_irq(&mut inner);
             let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
-            let status = inner
-                .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
-                .unwrap_or_else(|error| {
-                    panic!("lost asynchronous block completion state while reaping: {error}")
-                });
+            let status = match inner
+                .drain_pending_completions_for_handle(handle, PENDING_COMPLETION_DRAIN_BUDGET)
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    // A malformed/duplicate used entry quarantines the
+                    // queue.  Preserve that typed failure for the caller;
+                    // never turn it into a panic that can obscure the
+                    // reset-required owner state.
+                    drop(inner);
+                    Self::notify_completion_waiters(&self.wait_queue, 0);
+                    return Err(completion_drain_error(error));
+                }
+            };
             let (drained, continuation) = self.note_drain_status(status, observed_irq_generation);
             if inner.pending_request_done(handle) {
                 inner.record_external_queue_wait(polls, handle.notified());
@@ -583,9 +805,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             }
             match self.wait_backoff(&mut polls, |inner| Ok(inner.pending_request_done(handle))) {
                 Ok(()) | Err(DevError::Again | DevError::ResourceBusy) => {}
-                Err(error) => {
-                    panic!("lost asynchronous block wait state before completion: {error}")
-                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -598,16 +818,23 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         loop {
             let mut inner = self.inner.lock();
             self.ack_task_irq(&mut inner);
+            if inner.physical_pending() {
+                return Err(DevError::BadState);
+            }
             let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
             let status = inner
                 .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
-                .map_err(as_dev_err)?;
+                .map_err(completion_drain_error)?;
             let (drained, continuation) = self.note_drain_status(status, observed_irq_generation);
             if inner.pending_request_count() == 0 {
+                let completion_status = inner.retire_completion_records();
                 Self::record_wait_hit(polls);
                 drop(inner);
                 Self::notify_completion_waiters(&self.wait_queue, drained);
-                return Ok(());
+                return completion_status.map_or(Ok(()), |status| {
+                    let result: virtio_drivers::Result = status.into();
+                    result.map_err(as_dev_err)
+                });
             }
             drop(inner);
             Self::notify_completion_waiters(&self.wait_queue, drained);
@@ -716,6 +943,204 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         self.wait_hybrid(ready)
     }
 
+    /// Checks physical readiness after arming/entering a wait.  The task
+    /// acknowledges a raced interrupt before taking its generation snapshot;
+    /// the second generation check closes the IRQ-before-arm and
+    /// arm-check-wait windows without making the IRQ path inspect the used
+    /// ring.
+    fn physical_wait_ready(&self) -> bool
+    where
+        T: Send,
+    {
+        let mut inner = self.inner.lock();
+        self.ack_task_irq(&mut inner);
+        let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+        let ready = inner.physical_completion_ready();
+        let raced = self.irq_generation.load(Ordering::Acquire) != observed_irq_generation;
+        // A continuation token may belong to an ordinary used-ring owner.
+        // Never treat that token alone as physical readiness: doing so would
+        // repeatedly wake this owner while an ordinary FIFO head remains.
+        ready || raced
+    }
+
+    fn physical_handle_wait_ready(&self, handle: PendingBlkHandle) -> bool
+    where
+        T: Send,
+    {
+        let mut inner = self.inner.lock();
+        self.ack_task_irq(&mut inner);
+        let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+        let ready = inner.physical_completion_ready_for_handle(handle);
+        let raced = self.irq_generation.load(Ordering::Acquire) != observed_irq_generation;
+        ready || raced
+    }
+
+    fn physical_completion_ready(&self) -> bool
+    where
+        T: Send,
+    {
+        self.inner.lock().physical_completion_ready()
+    }
+
+    /// Waits for the next physical-owner wake without polling the used ring.
+    /// A non-blocking caller receives `Again` and can explicitly schedule the
+    /// continuation; no hidden busy loop is permitted on this API.
+    fn wait_for_physical_wakeup(&self) -> DevResult
+    where
+        T: Send,
+    {
+        if !axtask::can_block_current() {
+            return Err(DevError::Again);
+        }
+
+        if async_block_enabled()
+            && async_block_wait_policy() == AsyncBlockWaitPolicy::InterruptFirst
+        {
+            if self.ensure_irq_first_wait_armed() == IrqFirstArmState::Armed {
+                record_blk_async_irq_first_wait();
+                record_blk_async_wait_sleep();
+                IRQ_FIRST_WAIT_QUEUE
+                    .wait_until(|| self.physical_wait_ready())
+                    .map_err(wait_error_to_dev)?;
+                return Ok(());
+            }
+        }
+
+        record_blk_async_wait_sleep();
+        let timed_out = self
+            .wait_queue
+            .wait_timeout_until(Duration::from_micros(ASYNC_WAIT_TIMEOUT_US), || {
+                self.physical_wait_ready()
+            })
+            .map_err(wait_error_to_dev)?;
+        if timed_out {
+            record_blk_async_wait_timeout();
+        }
+        Ok(())
+    }
+
+    fn wait_for_physical_handle_wakeup(&self, handle: PendingBlkHandle) -> DevResult
+    where
+        T: Send,
+    {
+        if !axtask::can_block_current() {
+            return Err(DevError::Again);
+        }
+
+        if async_block_enabled()
+            && async_block_wait_policy() == AsyncBlockWaitPolicy::InterruptFirst
+        {
+            if self.ensure_irq_first_wait_armed() == IrqFirstArmState::Armed {
+                record_blk_async_irq_first_wait();
+                record_blk_async_wait_sleep();
+                IRQ_FIRST_WAIT_QUEUE
+                    .wait_until(|| self.physical_handle_wait_ready(handle))
+                    .map_err(wait_error_to_dev)?;
+                return Ok(());
+            }
+        }
+
+        record_blk_async_wait_sleep();
+        let timed_out = self
+            .wait_queue
+            .wait_timeout_until(Duration::from_micros(ASYNC_WAIT_TIMEOUT_US), || {
+                self.physical_handle_wait_ready(handle)
+            })
+            .map_err(wait_error_to_dev)?;
+        if timed_out {
+            record_blk_async_wait_timeout();
+        }
+        Ok(())
+    }
+
+    /// Waits for and returns at least one concrete physical completion.  The
+    /// output capacity is the caller's bounded drain credit; ordinary async
+    /// entries remain untouched for their owner.
+    fn wait_any_physical_completion_inner(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain>
+    where
+        T: Send,
+    {
+        if output.is_empty() {
+            if self.inner.lock().queue_handle().is_none() {
+                return Err(DevError::BadState);
+            }
+            return Ok(BlockCompletionDrain::default());
+        }
+
+        let mut virtio_output = [VirtioBlockCompletion {
+            handle: PendingBlkHandle::from_raw(0),
+            cookie: 0,
+            owner: virtio_drivers::device::blk::BlockCompletionOwner::Physical,
+            status: virtio_drivers::device::blk::RespStatus::NOT_READY,
+            bytes: 0,
+        }; MAX_PHYSICAL_BATCH_REQUESTS];
+        let output_len = output.len().min(MAX_PHYSICAL_BATCH_REQUESTS);
+
+        loop {
+            let (completed, continuation) = {
+                let mut inner = self.inner.lock();
+                self.ack_task_irq(&mut inner);
+                if !inner.physical_pending() {
+                    return Err(DevError::Again);
+                }
+                let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+                let (completed, continuation) = if inner.physical_completion_ready() {
+                    let drain = inner
+                        .drain_pending_completions_into(&mut virtio_output[..output_len])
+                        .map_err(completion_drain_error)?;
+                    let continuation =
+                        self.note_completion_drain(drain.continuation, observed_irq_generation);
+                    (drain.completed, continuation)
+                } else {
+                    // Used-ring FIFO order may expose an ordinary request
+                    // before the first physical request. Reap only its
+                    // device-visible completion (leaving the ordinary slot
+                    // for its exact handle owner), then retry physical
+                    // ownership in task context.
+                    let ordinary = inner
+                        .drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                        .map_err(completion_drain_error)?;
+                    let (_, continuation) =
+                        self.note_drain_status(ordinary, observed_irq_generation);
+                    (0, continuation)
+                };
+                for (dst, src) in output.iter_mut().zip(virtio_output.iter()).take(completed) {
+                    let status = match src.status {
+                        virtio_drivers::device::blk::RespStatus::OK => {
+                            axdriver_block::BlockCompletionStatus::Success
+                        }
+                        status => axdriver_block::BlockCompletionStatus::DeviceError(status.raw()),
+                    };
+                    *dst = BlockCompletion {
+                        handle: BlockRequestHandle {
+                            raw: src.handle.into_raw(),
+                        },
+                        owner: BlockCompletionOwner::Physical,
+                        cookie: src.cookie,
+                        status,
+                        bytes: src.bytes,
+                    };
+                }
+                (completed, continuation)
+            };
+
+            Self::notify_completion_waiters(&self.wait_queue, completed);
+            if completed != 0 {
+                return Ok(BlockCompletionDrain {
+                    completed,
+                    continuation,
+                });
+            }
+            if continuation && self.physical_completion_ready() && self.continue_pending_drain() {
+                continue;
+            }
+            self.wait_for_physical_wakeup()?;
+        }
+    }
+
     fn ensure_irq_first_wait_armed(&self) -> IrqFirstArmState {
         if !self.irq_wait_armed.load(Ordering::Acquire) {
             let arm_state = self.arm_irq_first_wait();
@@ -766,7 +1191,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 {
                     Ok(status) => self.note_drain_status(status, observed_irq_generation),
                     Err(err) => {
-                        wait_error = Some(as_dev_err(err));
+                        wait_error = Some(completion_drain_error(err));
                         (0, false)
                     }
                 };
@@ -813,7 +1238,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 {
                     Ok(status) => self.note_drain_status(status, observed_irq_generation),
                     Err(err) => {
-                        wait_error = Some(as_dev_err(err));
+                        wait_error = Some(completion_drain_error(err));
                         (0, false)
                     }
                 };
@@ -1127,6 +1552,74 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         }
         Ok(true)
     }
+
+    /// Publishes one bounded ordinary batch without applying the optional
+    /// asynchronous-I/O policy gate. Shared synchronous adapters use this
+    /// submit-only phase so they can release their outer device mutex before
+    /// waiting for the exact handle.
+    fn submit_batch_unchecked(
+        &mut self,
+        requests: &mut [BlockQueueRequest<'_>],
+    ) -> DevResult<BlockSubmitReport>
+    where
+        T: Send,
+    {
+        if requests.is_empty() {
+            return Ok(BlockSubmitReport::default());
+        }
+
+        let (depth_available, block_size) = {
+            let inner = self.inner.lock();
+            let default_depth = inner.async_default_depth();
+            let depth = match async_block_wait_policy() {
+                AsyncBlockWaitPolicy::Sync => 1,
+                AsyncBlockWaitPolicy::Hybrid | AsyncBlockWaitPolicy::InterruptFirst => {
+                    default_depth
+                }
+            };
+            (
+                depth.saturating_sub(inner.async_pending_request_count()),
+                virtio_drivers::device::blk::SECTOR_SIZE,
+            )
+        };
+        if depth_available == 0 {
+            return Ok(BlockSubmitReport {
+                queue_full: true,
+                ..BlockSubmitReport::default()
+            });
+        }
+
+        let limit = requests.len().min(depth_available);
+        let mut accepted_handles = Vec::with_capacity(limit);
+        let mut pending = Self::build_pending_batch(requests, limit, block_size)?;
+        let report = {
+            let mut inner = self.inner.lock();
+            // SAFETY: The `BlockQueueRequest` contract requires segment
+            // lifetime to cover completion; the driver stores only raw segment
+            // identities in owned request slots.
+            unsafe { inner.submit_pending_batch_no_drain(pending.as_mut_slice()) }
+                .map_err(as_dev_err)?
+        };
+        let submitted = report.submitted;
+        for handle in accepted_pending_handles(&pending, submitted) {
+            assert!(
+                accepted_handles.len() < accepted_handles.capacity(),
+                "preallocated accepted-handle storage exhausted"
+            );
+            accepted_handles.push(handle.into_raw());
+        }
+        drop(pending);
+
+        for (request, raw) in requests.iter_mut().zip(accepted_handles) {
+            request.handle = Some(BlockRequestHandle { raw });
+        }
+
+        Ok(BlockSubmitReport {
+            submitted,
+            bytes: report.bytes,
+            queue_full: report.queue_full,
+        })
+    }
 }
 
 impl<H: Hal, T: Transport + Send> BaseDriverOps for VirtIoBlkDev<H, T> {
@@ -1216,31 +1709,55 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         block_id: u64,
         segments: &[BlockPhysicalSegment],
     ) -> DevResult<BlockPhysicalSgOutcome> {
-        if segments.len() > MAX_PHYSICAL_SG {
-            return Err(DevError::InvalidParam);
+        let mut request = BlockPhysicalRequest {
+            block_id,
+            op: BlockAsyncOp::Read,
+            segments,
+            handle: None,
+            cookie: None,
+        };
+        // SAFETY: this adapter waits for the concrete completion before
+        // returning, so the caller's pinned ranges remain valid throughout
+        // the prepared batch and its task-side drain.
+        let result = unsafe { self.submit_physical_batch(core::slice::from_mut(&mut request)) };
+        let report = match result {
+            Ok(report) => report,
+            Err(DevError::ResourceBusy | DevError::NoMemory | DevError::Unsupported) => {
+                return Ok(BlockPhysicalSgOutcome::NotSubmitted);
+            }
+            Err(DevError::BadState) => return Ok(BlockPhysicalSgOutcome::Quarantined),
+            Err(error) => return Err(error),
+        };
+        if report.submitted == 0 {
+            return Ok(BlockPhysicalSgOutcome::NotSubmitted);
         }
-        let mut physical = [VirtioPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
-        for (index, segment) in segments.iter().copied().enumerate() {
-            physical[index] = VirtioPhysicalSegment {
-                paddr: segment.paddr,
-                len: segment.len,
-            };
+        if report.submitted != 1 {
+            let _ = self.reset_device();
+            return Ok(BlockPhysicalSgOutcome::Quarantined);
         }
-        let handle = {
-            let mut inner = self.inner.lock();
-            // SAFETY: The method's caller owns the pin and direction contract;
-            // the inner driver retains each mapping until the returned pending
-            // handle is completed.
-            let result = unsafe {
-                inner.submit_read_blocks_physical_pending(block_id, &physical[..segments.len()])
-            };
-            match result {
-                Ok(handle) => handle,
-                Err(error) => return physical_submit_error(error),
+        let handle = match (request.handle, request.cookie) {
+            (Some(handle), Some(cookie)) if handle.raw != 0 && cookie != 0 => {
+                PendingBlkHandle::from_raw(handle.raw)
+            }
+            _ => {
+                // Publication has already occurred.  A missing returned
+                // identity is an internal ownership failure, so close the
+                // queue through the typed reset/quarantine path before
+                // exposing an error to the caller.
+                let _ = self.reset_device();
+                return Ok(BlockPhysicalSgOutcome::Quarantined);
             }
         };
-        self.wait_for_pending_done(handle)
-            .map(|()| BlockPhysicalSgOutcome::Completed)
+        match self.wait_for_pending_done(handle) {
+            Ok(()) => Ok(BlockPhysicalSgOutcome::Completed),
+            Err(DevError::Io) => Err(DevError::Io),
+            Err(DevError::BadState) => Ok(BlockPhysicalSgOutcome::Quarantined),
+            Err(error) => {
+                let _ = self.reset_device();
+                let _ = error;
+                Ok(BlockPhysicalSgOutcome::Quarantined)
+            }
+        }
     }
 
     /// # Safety
@@ -1253,31 +1770,51 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         block_id: u64,
         segments: &[BlockPhysicalSegment],
     ) -> DevResult<BlockPhysicalSgOutcome> {
-        if segments.len() > MAX_PHYSICAL_SG {
-            return Err(DevError::InvalidParam);
+        let mut request = BlockPhysicalRequest {
+            block_id,
+            op: BlockAsyncOp::Write,
+            segments,
+            handle: None,
+            cookie: None,
+        };
+        // SAFETY: see the read adapter above.
+        let result = unsafe { self.submit_physical_batch(core::slice::from_mut(&mut request)) };
+        let report = match result {
+            Ok(report) => report,
+            Err(DevError::ResourceBusy | DevError::NoMemory | DevError::Unsupported) => {
+                return Ok(BlockPhysicalSgOutcome::NotSubmitted);
+            }
+            Err(DevError::BadState) => return Ok(BlockPhysicalSgOutcome::Quarantined),
+            Err(error) => return Err(error),
+        };
+        if report.submitted == 0 {
+            return Ok(BlockPhysicalSgOutcome::NotSubmitted);
         }
-        let mut physical = [VirtioPhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
-        for (index, segment) in segments.iter().copied().enumerate() {
-            physical[index] = VirtioPhysicalSegment {
-                paddr: segment.paddr,
-                len: segment.len,
-            };
+        if report.submitted != 1 {
+            let _ = self.reset_device();
+            return Ok(BlockPhysicalSgOutcome::Quarantined);
         }
-        let handle = {
-            let mut inner = self.inner.lock();
-            // SAFETY: The method's caller owns the pin and direction contract;
-            // the inner driver retains each mapping until the returned pending
-            // handle is completed.
-            let result = unsafe {
-                inner.submit_write_blocks_physical_pending(block_id, &physical[..segments.len()])
-            };
-            match result {
-                Ok(handle) => handle,
-                Err(error) => return physical_submit_error(error),
+        let handle = match (request.handle, request.cookie) {
+            (Some(handle), Some(cookie)) if handle.raw != 0 && cookie != 0 => {
+                PendingBlkHandle::from_raw(handle.raw)
+            }
+            _ => {
+                // Publication has already occurred; fail closed through
+                // reset/quarantine before returning an ownership error.
+                let _ = self.reset_device();
+                return Ok(BlockPhysicalSgOutcome::Quarantined);
             }
         };
-        self.wait_for_pending_done(handle)
-            .map(|()| BlockPhysicalSgOutcome::Completed)
+        match self.wait_for_pending_done(handle) {
+            Ok(()) => Ok(BlockPhysicalSgOutcome::Completed),
+            Err(DevError::Io) => Err(DevError::Io),
+            Err(DevError::BadState) => Ok(BlockPhysicalSgOutcome::Quarantined),
+            Err(error) => {
+                let _ = self.reset_device();
+                let _ = error;
+                Ok(BlockPhysicalSgOutcome::Quarantined)
+            }
+        }
     }
 
     fn flush(&mut self) -> DevResult {
@@ -1292,6 +1829,12 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
         let inner = self.inner.lock();
+        // A reset/quarantine clears the lower queue handle.  Do not expose
+        // stale queue depth/capability data to a new admission while any
+        // published DMA owner still belongs to the terminal generation.
+        if inner.queue_handle().is_none() {
+            return None;
+        }
         Some(BlockQueueCaps {
             max_requests: inner.virt_queue_size() as usize,
             max_descriptors: inner.virt_queue_size() as usize,
@@ -1308,59 +1851,106 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         if !async_block_enabled() {
             return Err(DevError::Unsupported);
         }
+        self.submit_batch_unchecked(requests)
+    }
+
+    fn submit_sync_batch(
+        &mut self,
+        requests: &mut [BlockQueueRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
+        self.submit_batch_unchecked(requests)
+    }
+
+    unsafe fn submit_physical_batch(
+        &mut self,
+        requests: &mut [BlockPhysicalRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
         if requests.is_empty() {
             return Ok(BlockSubmitReport::default());
         }
-
-        let (depth_available, block_size) = {
-            let inner = self.inner.lock();
-            let default_depth = inner.async_default_depth();
-            let depth = match async_block_wait_policy() {
-                AsyncBlockWaitPolicy::Sync => 1,
-                AsyncBlockWaitPolicy::Hybrid | AsyncBlockWaitPolicy::InterruptFirst => {
-                    default_depth
-                }
-            };
-            (
-                depth.saturating_sub(inner.async_pending_request_count()),
-                virtio_drivers::device::blk::SECTOR_SIZE,
-            )
-        };
-        if depth_available == 0 {
-            return Ok(BlockSubmitReport {
-                queue_full: true,
-                ..BlockSubmitReport::default()
+        if requests.len() > MAX_PHYSICAL_BATCH_REQUESTS {
+            return Err(DevError::InvalidParam);
+        }
+        // Admit every allocation before preparing any queue state.  The
+        // physical batch has fixed request/SG bounds, so a failed reservation
+        // can still return without publishing a descriptor or taking an
+        // ownership path that cannot be rolled back.
+        let mut physical_storage = Vec::new();
+        physical_storage
+            .try_reserve(requests.len())
+            .map_err(|_| DevError::NoMemory)?;
+        for request in requests.iter_mut() {
+            request.handle = None;
+            request.cookie = None;
+            if matches!(request.op, BlockAsyncOp::Flush) {
+                return Err(DevError::InvalidParam);
+            }
+            if request.segments.is_empty() || request.segments.len() > MAX_PHYSICAL_COALESCED_SG {
+                return Err(DevError::InvalidParam);
+            }
+            let mut segments = Vec::new();
+            segments
+                .try_reserve(request.segments.len())
+                .map_err(|_| DevError::NoMemory)?;
+            for segment in request.segments.iter().copied() {
+                segments.push(VirtioPhysicalSegment {
+                    paddr: segment.paddr,
+                    len: segment.len,
+                });
+            }
+            physical_storage.push(segments);
+        }
+        let mut pending = Vec::new();
+        pending
+            .try_reserve(requests.len())
+            .map_err(|_| DevError::NoMemory)?;
+        for (request, segments) in requests.iter().zip(physical_storage.iter()) {
+            pending.push(PendingBlkPhysicalBatchRequest {
+                block_id: request.block_id,
+                buffer: match request.op {
+                    BlockAsyncOp::Read => PendingBlkPhysicalBatchBuffer::Read(segments.as_slice()),
+                    BlockAsyncOp::Write => {
+                        PendingBlkPhysicalBatchBuffer::Write(segments.as_slice())
+                    }
+                    BlockAsyncOp::Flush => unreachable!(),
+                },
+                handle: None,
             });
         }
 
-        let limit = requests.len().min(depth_available);
-        let mut accepted_handles = Vec::with_capacity(limit);
-        let mut pending = Self::build_pending_batch(requests, limit, block_size)?;
         let report = {
             let mut inner = self.inner.lock();
-            // SAFETY: The `BlockQueueRequest` contract requires segment
-            // lifetime to cover completion; the driver stores only raw segment
-            // identities in owned request slots.
-            unsafe { inner.submit_pending_batch(pending.as_mut_slice()) }.map_err(as_dev_err)?
+            // SAFETY: the caller's physical pin/lifetime contract is exactly
+            // the contract of the prepared pending batch.  No descriptor is
+            // published until all mappings and slots have been prepared.
+            // The SharedBlockDevice route owner is the sole used-ring
+            // consumer once its broker is installed. Do not let lower
+            // physical preparation perform its historical ordinary drain;
+            // that would bypass the shared mailbox and leak completion
+            // credits. Admission remains pre-publication and all-or-nothing.
+            let prepared = unsafe {
+                inner.prepare_physical_batch_no_drain(pending.as_mut_slice())
+            }
+                .map_err(|error| match error {
+                    // This is an admission failure before publication; keep
+                    // it distinguishable from a post-publication bad state so
+                    // synchronous consumers may still choose their fallback.
+                    virtio_drivers::Error::QueueFull => DevError::ResourceBusy,
+                    error => as_dev_err(error),
+                })?;
+            let (report, handles, count) = prepared.publish_with_handles();
+            for (request, handle) in requests.iter_mut().zip(handles.into_iter()).take(count) {
+                request.handle = Some(BlockRequestHandle {
+                    raw: handle.into_raw(),
+                });
+                request.cookie = Some(handle.completion_cookie());
+            }
+            report
         };
-        let submitted = report.submitted;
-        for handle in accepted_pending_handles(&pending, submitted) {
-            assert!(
-                accepted_handles.len() < accepted_handles.capacity(),
-                "preallocated accepted-handle storage exhausted"
-            );
-            accepted_handles.push(handle.into_raw());
-        }
-        drop(pending);
-
-        for (request, raw) in requests.iter_mut().zip(accepted_handles) {
-            request.handle = Some(BlockRequestHandle { raw });
-        }
-
         Ok(BlockSubmitReport {
-            submitted,
+            submitted: report.submitted,
             bytes: report.bytes,
-            queue_full: report.queue_full,
+            queue_full: false,
         })
     }
 
@@ -1368,17 +1958,183 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         if budget == 0 {
             return Ok(0);
         }
-        let (drained, _) = {
+        // This legacy count-only surface gets one fixed lower-ring credit per
+        // invocation.  A physical-only head belongs to the typed broker and
+        // must not cause an arbitrary-budget loop or yield storm here.
+        let budget = budget.min(PENDING_COMPLETION_DRAIN_BUDGET);
+        let (drained, completion_status) = {
             let mut inner = self.inner.lock();
             self.ack_task_irq(&mut inner);
             let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
             let status = inner
                 .drain_pending_completions_bounded(budget)
-                .map_err(as_dev_err)?;
-            self.note_drain_status(status, observed_irq_generation)
+                .map_err(completion_drain_error)?;
+            let (drained, _) = self.note_drain_status(status, observed_irq_generation);
+            // This legacy/count-only surface has no way to return an exact
+            // owner to the caller. Retire every ordinary record it just
+            // consumed while the queue lock is held, so repeated polling
+            // cannot saturate the pending-slot table. Physical records are
+            // deliberately excluded and remain owned by the concrete drain.
+            (drained, inner.retire_completion_records_bounded(budget))
         };
         Self::notify_completion_waiters(&self.wait_queue, drained);
+        if let Some(status) = completion_status {
+            let result: virtio_drivers::Result = status.into();
+            result.map_err(as_dev_err)?;
+        }
         Ok(drained)
+    }
+
+    fn drain_async_completions(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain> {
+        let mut inner = self.inner.lock();
+        self.ack_task_irq(&mut inner);
+        // Snapshot after the first acknowledge: an interrupt already pending
+        // at entry belongs to this pass, while any later generation change is
+        // a race that must survive the final check.
+        let observed_irq_generation = self.irq_generation.load(Ordering::Acquire);
+
+        if output.is_empty() {
+            // Probe-only callers must not consume a used entry.  The initial
+            // peek is still part of the check-arm-check protocol so an
+            // already available completion keeps the continuation alive.
+            let used_before_rearm = inner.peek_used().is_some();
+            let continuation = self.finish_completion_drain_check(
+                &mut inner,
+                used_before_rearm,
+                observed_irq_generation,
+            );
+            return Ok(BlockCompletionDrain {
+                completed: 0,
+                continuation,
+            });
+        }
+
+        let mut virtio_output = [VirtioBlockCompletion {
+            handle: PendingBlkHandle::from_raw(0),
+            cookie: 0,
+            owner: virtio_drivers::device::blk::BlockCompletionOwner::Physical,
+            status: virtio_drivers::device::blk::RespStatus::NOT_READY,
+            bytes: 0,
+        }; MAX_PHYSICAL_BATCH_REQUESTS];
+        let output_len = output.len().min(MAX_PHYSICAL_BATCH_REQUESTS);
+        let drain = inner
+            .drain_pending_completions_all_into(&mut virtio_output[..output_len])
+            .map_err(completion_drain_error)?;
+        for (dst, src) in output
+            .iter_mut()
+            .zip(virtio_output.iter())
+            .take(drain.completed)
+        {
+            let status = match src.status {
+                virtio_drivers::device::blk::RespStatus::OK => {
+                    axdriver_block::BlockCompletionStatus::Success
+                }
+                status => axdriver_block::BlockCompletionStatus::DeviceError(status.raw()),
+            };
+            *dst = BlockCompletion {
+                handle: BlockRequestHandle {
+                    raw: src.handle.into_raw(),
+                },
+                owner: match src.owner {
+                    virtio_drivers::device::blk::BlockCompletionOwner::Ordinary => {
+                        BlockCompletionOwner::Ordinary
+                    }
+                    virtio_drivers::device::blk::BlockCompletionOwner::Legacy => {
+                        BlockCompletionOwner::Legacy
+                    }
+                    virtio_drivers::device::blk::BlockCompletionOwner::Physical => {
+                        BlockCompletionOwner::Physical
+                    }
+                },
+                cookie: src.cookie,
+                status,
+                bytes: src.bytes,
+            };
+        }
+        let continuation = self.finish_completion_drain_check(
+            &mut inner,
+            drain.continuation,
+            observed_irq_generation,
+        );
+        Ok(BlockCompletionDrain {
+            completed: drain.completed,
+            continuation,
+        })
+    }
+
+    fn wait_any_physical_completion(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain> {
+        self.wait_any_physical_completion_inner(output)
+    }
+
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<BlockCompletionNotifier>,
+        context: usize,
+    ) -> DevResult {
+        let (callback, context) = match notifier {
+            Some(notifier) if context != 0 => (notifier as usize, context),
+            None => (0, 0),
+            Some(_) => return Err(DevError::InvalidParam),
+        };
+        // Publish the context before the callback.  Clearing the callback
+        // first makes an in-flight IRQ harmless during unregister; the shared
+        // owner remains alive until the enclosing Arc is dropped.
+        if callback == 0 {
+            self.completion_notifier.store(0, Ordering::Release);
+            while self.completion_notifier_readers.load(Ordering::Acquire) != 0 {
+                spin_loop();
+            }
+            self.completion_notifier_context.store(0, Ordering::Release);
+        } else {
+            // Publish a replacement as a quiescent pair.  A concurrent IRQ
+            // must never observe the new function with the old context (or
+            // vice versa); reset already uses this same close/readers edge.
+            self.completion_notifier.store(0, Ordering::Release);
+            while self.completion_notifier_readers.load(Ordering::Acquire) != 0 {
+                spin_loop();
+            }
+            self.completion_notifier_context
+                .store(context, Ordering::Release);
+            self.completion_notifier.store(callback, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn reset_device(&mut self) -> DevResult<axdriver_block::BlockResetOutcome> {
+        // Close the IRQ endpoint before touching queue ownership. Any late
+        // callback observes the disabled bit and becomes a stale no-op; the
+        // generation bump below invalidates a waiter that already captured a
+        // pre-reset token.
+        self.irq_enabled.store(false, Ordering::Release);
+        self.irq_wait_armed.store(false, Ordering::Release);
+        #[cfg(feature = "irq")]
+        self.disarm_irq_endpoint();
+        self.irq_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("VirtIO block IRQ generation exhausted during reset"));
+        self.continuation_pending.store(false, Ordering::Release);
+        let outcome = self.inner.lock().reset_device();
+        self.wait_queue.notify_many(usize::MAX, false);
+        IRQ_FIRST_WAIT_QUEUE.notify_many(usize::MAX, false);
+        Ok(match outcome {
+            virtio_drivers::device::blk::ResetOutcome::Quiesced => {
+                axdriver_block::BlockResetOutcome::Quiesced
+            }
+            virtio_drivers::device::blk::ResetOutcome::Retired => {
+                axdriver_block::BlockResetOutcome::Retired
+            }
+            virtio_drivers::device::blk::ResetOutcome::Quarantined => {
+                axdriver_block::BlockResetOutcome::Quarantined
+            }
+        })
     }
 
     fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
@@ -1388,8 +2144,7 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
     }
 
     fn enable_irq(&mut self) -> DevResult {
-        VirtIoBlkDev::enable_irq(self);
-        Ok(())
+        VirtIoBlkDev::enable_irq(self)
     }
 
     fn disable_irq(&mut self) -> DevResult {
@@ -1428,6 +2183,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn irq_arm_failure_never_admits_device_interrupts() {
+        assert!(require_irq_first_arm(IrqFirstArmState::Armed).is_ok());
+        for state in [
+            IrqFirstArmState::NoIrq,
+            IrqFirstArmState::RegisterFailed,
+            IrqFirstArmState::FeatureDisabled,
+        ] {
+            assert!(require_irq_first_arm(state).is_err());
+        }
+        assert!(matches!(
+            require_irq_first_arm(IrqFirstArmState::NoIrq),
+            Err(DevError::Unsupported)
+        ));
+        assert!(matches!(
+            require_irq_first_arm(IrqFirstArmState::FeatureDisabled),
+            Err(DevError::Unsupported)
+        ));
+        assert!(matches!(
+            require_irq_first_arm(IrqFirstArmState::RegisterFailed),
+            Err(DevError::Io)
+        ));
+    }
+
+    #[test]
     fn irq_generation_race_preserves_task_continuation() {
         let complete = PendingBlkDrainStatus::Complete { drained: 1 };
         assert!(!drain_requires_continuation(complete, 7, 7));
@@ -1435,6 +2214,16 @@ mod tests {
 
         let backlog = PendingBlkDrainStatus::Continuation { drained: 4 };
         assert!(drain_requires_continuation(backlog, 8, 8));
+    }
+
+    #[test]
+    fn completion_recheck_keeps_used_and_irq_races_alive() {
+        assert!(!completion_recheck_requires_continuation(
+            false, false, 7, 7
+        ));
+        assert!(completion_recheck_requires_continuation(true, false, 7, 7));
+        assert!(completion_recheck_requires_continuation(false, true, 7, 7));
+        assert!(completion_recheck_requires_continuation(false, false, 7, 8));
     }
 
     #[test]
@@ -1478,6 +2267,24 @@ mod tests {
         assert!(matches!(
             physical_submit_error(virtio_drivers::Error::IoError),
             Err(DevError::Io)
+        ));
+    }
+
+    #[test]
+    fn used_ring_protocol_errors_are_typed_quarantine() {
+        for error in [
+            virtio_drivers::Error::IoError,
+            virtio_drivers::Error::WrongToken,
+            virtio_drivers::Error::AlreadyUsed,
+            virtio_drivers::Error::Quarantined,
+        ] {
+            assert!(matches!(completion_drain_error(error), DevError::BadState));
+        }
+        // A concrete device response is converted only after a successful
+        // used-ring drain and therefore remains an ordinary logical error.
+        assert!(matches!(
+            completion_drain_error(virtio_drivers::Error::NotReady),
+            DevError::Again
         ));
     }
 

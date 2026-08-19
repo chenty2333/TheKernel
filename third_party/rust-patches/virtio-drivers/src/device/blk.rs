@@ -1,8 +1,8 @@
 //! Driver for VirtIO block devices.
 
 #[cfg(feature = "alloc")]
-use alloc::vec::Vec;
-use core::hint::spin_loop;
+use alloc::{boxed::Box, vec::Vec};
+use core::{hint::spin_loop, mem::ManuallyDrop};
 
 use bitflags::bitflags;
 use log::info;
@@ -14,19 +14,18 @@ use crate::{
     queue::{PhysicalBuffer, VirtQueue},
     stats::{
         record_blk_async_adaptive_completion, record_blk_async_admission_stall,
-        record_blk_async_completion, record_blk_async_completion_error,
-        record_blk_async_flush_completion, record_blk_async_flush_request,
-        record_blk_async_queue_full, record_blk_async_resource_leaks,
-        record_blk_async_submit_batch, record_blk_flush, record_blk_flush_unsupported,
-        record_blk_pending_depth, record_blk_pending_drain, record_blk_pending_queue_full,
-        record_blk_read, record_blk_write, record_queue_sync_wait,
+        record_blk_async_completion, record_blk_async_flush_completion,
+        record_blk_async_flush_request, record_blk_async_queue_full,
+        record_blk_async_resource_leaks, record_blk_async_submit_batch, record_blk_flush,
+        record_blk_flush_unsupported, record_blk_pending_depth, record_blk_pending_drain,
+        record_blk_pending_queue_full, record_blk_read, record_blk_write, record_queue_sync_wait,
     },
     transport::{DeviceStatus, Transport},
     volatile::{Volatile, volread},
 };
 
 const QUEUE: u16 = 0;
-const QUEUE_SIZE: u16 = 16;
+const QUEUE_SIZE: u16 = 128;
 /// Fixed number of used-ring entries consumed by one task-context drain.
 ///
 /// The interrupt path never calls the drain routine.  Keeping the credit in
@@ -34,11 +33,62 @@ const QUEUE_SIZE: u16 = 16;
 /// completion notification into an unbounded queue walk.
 pub const PENDING_COMPLETION_DRAIN_BUDGET: usize = 4;
 /// Maximum number of pinned physical payload segments in one direct request.
-pub const MAX_PHYSICAL_SG: usize = 4;
+pub const MAX_PHYSICAL_SG: usize = 16;
+/// Maximum requests admitted by one prepared physical batch.
+pub const MAX_PHYSICAL_BATCH_REQUESTS: usize = 32;
+const RESET_POLL_BUDGET: usize = 1024;
+
+/// Result of a device reset attempt.  `Quarantined` means the driver retained
+/// all pending request owners and DMA mappings because quiescence was not
+/// proven; callers must not turn it into a synthetic I/O status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetOutcome {
+    /// The transport acknowledged reset and all outstanding device access was
+    /// proven quiescent.
+    Quiesced,
+    /// The transport acknowledged reset and all outstanding device access was
+    /// proven quiescent, but queue ownership was retired.  A complete
+    /// transport reinitialization is required before submission can resume.
+    Retired,
+    /// The transport did not acknowledge reset within the bounded proof
+    /// window; pending owners remain retained by the device object.
+    Quarantined,
+}
+
+/// Generation-safe identity of the block device's sole virtqueue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockQueueHandle {
+    /// Device/queue lifetime generation.
+    pub generation: u64,
+    /// VirtIO queue number.
+    pub queue: u16,
+}
 const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
     .union(BlkFeature::FLUSH)
     .union(BlkFeature::RING_INDIRECT_DESC)
     .union(BlkFeature::RING_EVENT_IDX);
+
+// Raw handles reserve their low bit for the notification hint.  The remaining
+// bits carry an opaque request cookie; once this space is exhausted the queue
+// must fail closed instead of wrapping back into an earlier request identity.
+const MAX_REQUEST_COOKIE: u64 = u64::MAX >> 1;
+
+/// The completion owner selected at publication time.
+///
+/// Ordinary requests are retained for their exact waiter (or legacy caller),
+/// while physical-effect requests are consumed only by the physical drain.
+/// Keeping this class in the pending entry prevents a count-only consumer from
+/// stealing a completion that still owns a caller-visible handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockCompletionOwner {
+    /// A normal async/legacy request completed by its exact handle owner.
+    Ordinary,
+    /// A legacy `*_nb` request whose exact `complete_*` call still owns the
+    /// terminal slot after a count-only drain reaps its used entry.
+    Legacy,
+    /// A physical DMA effect completed by the physical completion consumer.
+    Physical,
+}
 
 /// Driver for a VirtIO block device.
 ///
@@ -70,14 +120,33 @@ const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
 /// # }
 /// ```
 pub struct VirtIOBlk<H: Hal, T: Transport> {
-    transport: T,
-    queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
-    pending: [Option<PendingBlkRequest>; QUEUE_SIZE as usize],
+    // These resources are manually dropped so a failed reset can retain the
+    // complete DMA owner without relying on panic/unwind behavior. The
+    // quarantine branch of Drop intentionally leaves these values in place.
+    transport: ManuallyDrop<T>,
+    queue: ManuallyDrop<VirtQueue<H, { QUEUE_SIZE as usize }>>,
+    #[cfg(feature = "alloc")]
+    pending: ManuallyDrop<Box<[Option<PendingBlkRequest>]>>,
+    #[cfg(not(feature = "alloc"))]
+    pending: ManuallyDrop<[Option<PendingBlkRequest>; QUEUE_SIZE as usize]>,
+    /// Submission-time notification bits retained with each slot so a raw
+    /// completion handle is byte-for-byte identical to the handle returned
+    /// to the caller (including its low notification hint bit).
+    notified_slots: [bool; QUEUE_SIZE as usize],
     token_slots: [Option<usize>; QUEUE_SIZE as usize],
     pending_count: usize,
     async_pending_count: usize,
+    physical_pending_count: usize,
     capacity: u64,
     negotiated_features: BlkFeature,
+    /// Monotonic generation for this device/queue lifetime.  Handles carry
+    /// this generation and are rejected after reset or teardown.
+    generation: u64,
+    /// Monotonic request identity. It is deliberately not reset with the
+    /// transport generation, so a released slot/token pair can never ABA.
+    next_cookie: u64,
+    quarantined: bool,
+    retired: bool,
 }
 
 /// One caller-owned physical payload segment for a synchronous direct request.
@@ -143,11 +212,29 @@ struct PendingBlkRequest {
     bytes: usize,
     done: bool,
     async_accounted: bool,
+    completion_cookie: u64,
+    completion_owner: BlockCompletionOwner,
+    /// Optional caller-owned legacy response destination. It is written only
+    /// after the matching used element has been reaped.
+    legacy_resp: Option<*mut BlkResp>,
+    /// Optional caller-owned legacy request identity used to reject a stale
+    /// `complete_*` call for a reused token.
+    legacy_req: Option<*const BlkReq>,
+    /// Data bytes reported by the device used length after protocol
+    /// validation. This is populated exactly once when `done` becomes true.
+    completion_bytes: u32,
+    /// A physical completion may be reaped by its exact handle waiter, but
+    /// ordinary/count-only paths must not retire it.  This bit records that
+    /// explicit owner claim before `complete_pending_request` is allowed to
+    /// release the slot.
+    completion_claimed: bool,
 }
 
 /// Handle for a submitted pending block request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingBlkHandle {
+    generation: u64,
+    cookie: u64,
     slot: u16,
     token: u16,
     notified: bool,
@@ -161,15 +248,40 @@ impl PendingBlkHandle {
 
     /// Encodes this handle for cross-crate async block APIs.
     pub fn into_raw(self) -> u64 {
-        u64::from(self.slot) | (u64::from(self.token) << 16) | ((self.notified as u64) << 32)
+        // All handles produced by the driver have a non-zero cookie bounded
+        // by MAX_REQUEST_COOKIE. Raw transport APIs intentionally carry only
+        // this opaque identity plus the notification hint; slot/token are an
+        // implementation detail and must not be used for ABA validation.
+        debug_assert!(self.cookie != 0 && self.cookie <= MAX_REQUEST_COOKIE);
+        (self.cookie << 1) | u64::from(self.notified)
     }
 
     /// Decodes a handle previously returned by [`Self::into_raw`].
     pub fn from_raw(raw: u64) -> Self {
         Self {
-            slot: raw as u16,
-            token: (raw >> 16) as u16,
-            notified: ((raw >> 32) & 1) != 0,
+            generation: 0,
+            cookie: raw >> 1,
+            slot: 0,
+            token: 0,
+            notified: (raw & 1) != 0,
+        }
+    }
+
+    /// Returns the generation captured when this request was submitted.
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the completion cookie assigned to this request.
+    pub fn completion_cookie(self) -> u64 {
+        self.cookie
+    }
+
+    /// Returns the queue generation captured by this request.
+    pub fn queue_handle(self) -> BlockQueueHandle {
+        BlockQueueHandle {
+            generation: self.generation,
+            queue: QUEUE,
         }
     }
 }
@@ -188,6 +300,42 @@ pub enum PendingBlkBatchBuffer<'a> {
     WriteVectored(Vec<&'a [u8]>),
     /// Flush previously completed writes to stable backend storage.
     Flush,
+}
+
+/// Physical payload offered to the atomic device-side batch preparer.
+pub enum PendingBlkPhysicalBatchBuffer<'a> {
+    /// Device writes into the pinned ranges.
+    Read(&'a [PhysicalSegment]),
+    /// Device reads from the pinned ranges.
+    Write(&'a [PhysicalSegment]),
+}
+
+/// One pinned physical request in a [`PreparedBlockBatch`].
+pub struct PendingBlkPhysicalBatchRequest<'a> {
+    /// First 512-byte sector for this request.
+    pub block_id: u64,
+    /// Pinned physical scatter-gather payload.
+    pub buffer: PendingBlkPhysicalBatchBuffer<'a>,
+    /// Filled only when the prepared batch is consumed by `publish`.
+    pub handle: Option<PendingBlkHandle>,
+}
+
+/// An all-or-nothing prepared physical block batch.
+///
+/// Preparation owns every queue slot, descriptor chain, request header/status
+/// object, and DMA mapping.  Dropping this value before [`Self::publish`] never
+/// exposes a descriptor to the device and returns all ownership to the caller.
+pub struct PreparedBlockBatch<'dev, 'req, H: Hal, T: Transport> {
+    device: &'dev mut VirtIOBlk<H, T>,
+    requests: *mut PendingBlkPhysicalBatchRequest<'req>,
+    request_count: usize,
+    prepared_count: usize,
+    total_bytes: usize,
+    heads: [u16; MAX_PHYSICAL_BATCH_REQUESTS],
+    slots: [u16; MAX_PHYSICAL_BATCH_REQUESTS],
+    tokens: [u16; MAX_PHYSICAL_BATCH_REQUESTS],
+    published: bool,
+    _request_lifetime: core::marker::PhantomData<&'req mut [PendingBlkPhysicalBatchRequest<'req>]>,
 }
 
 impl PendingBlkBatchBuffer<'_> {
@@ -254,6 +402,30 @@ pub enum PendingBlkDrainStatus {
     },
 }
 
+/// A concrete completion returned by the bounded task-side drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockCompletion {
+    /// Generation-safe pending handle.
+    pub handle: PendingBlkHandle,
+    /// Completion cookie initialized before publication.
+    pub cookie: u64,
+    /// Completion class selected when the request was published.
+    pub owner: BlockCompletionOwner,
+    /// Raw VirtIO block status.
+    pub status: RespStatus,
+    /// Bytes reported by the used element.
+    pub bytes: u32,
+}
+
+/// Result metadata for a bounded completion drain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockCompletionDrain {
+    /// Number of entries written to the caller's output slice.
+    pub completed: usize,
+    /// Whether another used-ring entry remains ready.
+    pub continuation: bool,
+}
+
 impl PendingBlkDrainStatus {
     /// Returns the number of completions consumed by this drain.
     pub const fn drained(self) -> usize {
@@ -296,6 +468,12 @@ impl PendingBlkRequest {
             bytes: buf.len(),
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -315,6 +493,12 @@ impl PendingBlkRequest {
             bytes: buf.len(),
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -331,6 +515,12 @@ impl PendingBlkRequest {
             bytes: 0,
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -357,6 +547,12 @@ impl PendingBlkRequest {
             bytes,
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -383,6 +579,12 @@ impl PendingBlkRequest {
             bytes,
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -409,6 +611,12 @@ impl PendingBlkRequest {
             bytes,
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
@@ -435,11 +643,85 @@ impl PendingBlkRequest {
             bytes,
             done: false,
             async_accounted: false,
+            completion_cookie: 0,
+            completion_owner: BlockCompletionOwner::Ordinary,
+            legacy_resp: None,
+            legacy_req: None,
+            completion_bytes: 0,
+            completion_claimed: false,
         }
     }
 
     fn mark_async_accounted(&mut self) {
         self.async_accounted = true;
+    }
+
+    fn mark_physical_owner(&mut self) {
+        self.completion_owner = BlockCompletionOwner::Physical;
+    }
+
+    fn legacy_read(
+        block_id: usize,
+        req: *const BlkReq,
+        buf: &mut [u8],
+        resp: *mut BlkResp,
+    ) -> Self {
+        let mut pending = Self::read(block_id, buf);
+        // The queue owns the stable request header/status in `pending`; the
+        // caller-owned legacy objects are only an identity/output bridge.
+        pending.legacy_req = Some(req);
+        pending.legacy_resp = Some(resp);
+        pending.completion_owner = BlockCompletionOwner::Legacy;
+        pending
+    }
+
+    fn legacy_write(block_id: usize, req: *const BlkReq, buf: &[u8], resp: *mut BlkResp) -> Self {
+        let mut pending = Self::write(block_id, buf);
+        pending.legacy_req = Some(req);
+        pending.legacy_resp = Some(resp);
+        pending.completion_owner = BlockCompletionOwner::Legacy;
+        pending
+    }
+
+    fn legacy_matches(
+        &self,
+        req: *const BlkReq,
+        buf: *const u8,
+        len: usize,
+        resp: *mut BlkResp,
+        read: bool,
+    ) -> bool {
+        if self.legacy_req != Some(req)
+            || self.legacy_resp != Some(resp)
+            || self.completion_cookie == 0
+        {
+            return false;
+        }
+        // The caller-owned request object carries the full monotonic cookie
+        // after submission.  The queue uses the driver's private request
+        // header, so this marker never reaches the device.  Comparing the
+        // full cookie closes the u16 token ABA hole even when the caller
+        // reuses the same request/buffer variables for a later operation.
+        let cookie_matches =
+            unsafe { req.as_ref() }.is_some_and(|request| request.sector == self.completion_cookie);
+        let buffer_matches = match (&self.buffer, read) {
+            (
+                PendingBlkBuffer::Read {
+                    buf: stored,
+                    len: stored_len,
+                },
+                true,
+            ) => (*stored as *const u8) == buf && *stored_len == len,
+            (
+                PendingBlkBuffer::Write {
+                    buf: stored,
+                    len: stored_len,
+                },
+                false,
+            ) => *stored == buf && *stored_len == len,
+            _ => false,
+        };
+        cookie_matches && buffer_matches
     }
 
     fn bytes(&self) -> usize {
@@ -448,6 +730,43 @@ impl PendingBlkRequest {
 
     fn is_flush(&self) -> bool {
         self.req.type_ == ReqType::Flush
+    }
+
+    fn is_read(&self) -> bool {
+        match &self.buffer {
+            PendingBlkBuffer::Read { .. } | PendingBlkBuffer::PhysicalRead { .. } => true,
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::ReadVectored { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Convert a VirtIO used length into payload bytes. A malformed device
+    /// length is a protocol violation: the used entry has already been
+    /// reaped, but the request owner must remain retained under typed
+    /// quarantine rather than being released as an ordinary I/O error.
+    fn validate_completion_bytes(&mut self, used_len: u32) -> Result<u32> {
+        let used_len = usize::try_from(used_len).unwrap_or(usize::MAX);
+        let valid = if self.is_read() {
+            // The block read chain includes the complete device-written
+            // payload followed by its one-byte status. Any status-only,
+            // short, or oversized used length is malformed, even when the
+            // status reports an I/O error.
+            used_len == self.bytes.checked_add(1).unwrap_or(usize::MAX)
+        } else {
+            // Writes and flushes have no device-writable payload beyond
+            // status, regardless of the returned status code.
+            used_len == 1
+        };
+        if !valid {
+            self.resp.status = RespStatus::IO_ERR;
+            return Err(Error::Quarantined);
+        }
+        if self.is_read() {
+            Ok((used_len - 1) as u32)
+        } else {
+            Ok(0)
+        }
     }
 
     fn data_segments(&self) -> usize {
@@ -465,11 +784,11 @@ impl PendingBlkRequest {
 
     fn descriptor_cost(&self, indirect: bool) -> usize {
         let full_chain = self.data_segments() + 2;
-        let physical = matches!(
-            &self.buffer,
-            PendingBlkBuffer::PhysicalRead { .. } | PendingBlkBuffer::PhysicalWrite { .. }
-        );
-        if indirect && !physical && full_chain > 1 {
+        // Physical chains use the same indirect-table path as virtual
+        // chains.  Keeping them out of this accounting makes the reset
+        // ownership proof think that an otherwise tracked request is an
+        // untracked descriptor.
+        if indirect && full_chain > 1 {
             1
         } else {
             full_chain
@@ -479,8 +798,8 @@ impl PendingBlkRequest {
     /// Releases physical mappings after a pre-publish submission failure.
     ///
     /// This is only used before the descriptor is visible to the device. Once
-    /// published, mappings are released by `complete` after the used entry is
-    /// reaped.
+    /// published, mappings are released by `complete` only after the used
+    /// entry has also passed protocol validation.
     fn unmap_physical<H: Hal>(self) {
         let (mappings, count, direction) = match self.buffer {
             PendingBlkBuffer::PhysicalRead {
@@ -492,9 +811,231 @@ impl PendingBlkRequest {
             _ => return,
         };
         for mapping in mappings[..count].iter().rev().flatten().copied() {
-            // SAFETY: This method is called only before publication, or from
-            // completion after the matching used entry has been reaped.
+            // SAFETY: This method is called only before publication.
             unsafe { H::unmap_physical(mapping, direction) };
+        }
+    }
+
+    /// Releases mappings after a used entry has been consumed and transport
+    /// quiescence has been proven.  A malformed used length deliberately keeps
+    /// these slots populated while the device is quarantined; dropping or
+    /// unmapping them before reset would turn a protocol violation into an
+    /// ordinary completion and could let the device retain an untracked DMA
+    /// owner.
+    fn release_physical_mappings<H: Hal>(&mut self) {
+        let (mappings, count, direction) = match &mut self.buffer {
+            PendingBlkBuffer::PhysicalRead {
+                mappings, count, ..
+            } => (mappings, *count, BufferDirection::DeviceToDriver),
+            PendingBlkBuffer::PhysicalWrite {
+                mappings, count, ..
+            } => (mappings, *count, BufferDirection::DriverToDevice),
+            _ => return,
+        };
+        for mapping in mappings[..count].iter_mut().rev() {
+            let Some(mapping_value) = mapping.take() else {
+                continue;
+            };
+            // SAFETY: the caller invokes this only after a valid used entry or
+            // a reset proof has stopped device access to the mapping.
+            unsafe { H::unmap_physical(mapping_value, direction) };
+        }
+    }
+
+    /// Rolls back a descriptor chain that was installed but not published.
+    /// This is used when request identity allocation fails after descriptor
+    /// preparation; no caller-visible fallback is allowed to observe a live
+    /// queue owner in that case.
+    unsafe fn discard_unpublished<H: Hal, const SIZE: usize>(
+        self,
+        queue: &mut VirtQueue<H, SIZE>,
+        token: u16,
+    ) {
+        let mut this = self;
+        match &this.buffer {
+            PendingBlkBuffer::Read { buf, len } => {
+                let data = unsafe { core::slice::from_raw_parts_mut(*buf, *len) };
+                // SAFETY: this chain has not been published and these are its
+                // exact virtual buffers.
+                unsafe {
+                    queue.discard_unpublished(
+                        token,
+                        &[this.req.as_bytes()],
+                        &mut [data, this.resp.as_bytes_mut()],
+                    )
+                };
+            }
+            PendingBlkBuffer::Write { buf, len } => {
+                let data = unsafe { core::slice::from_raw_parts(*buf, *len) };
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_unpublished(
+                        token,
+                        &[this.req.as_bytes(), data],
+                        &mut [this.resp.as_bytes_mut()],
+                    )
+                };
+            }
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::ReadVectored { bufs } => {
+                let mut outputs = Vec::with_capacity(bufs.len() + 1);
+                for segment in bufs {
+                    outputs
+                        .push(unsafe { core::slice::from_raw_parts_mut(segment.buf, segment.len) });
+                }
+                outputs.push(this.resp.as_bytes_mut());
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_unpublished(token, &[this.req.as_bytes()], outputs.as_mut_slice())
+                };
+            }
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::WriteVectored { bufs } => {
+                let mut inputs = Vec::with_capacity(bufs.len() + 1);
+                inputs.push(this.req.as_bytes());
+                for segment in bufs {
+                    inputs.push(unsafe { core::slice::from_raw_parts(segment.buf, segment.len) });
+                }
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_unpublished(
+                        token,
+                        inputs.as_slice(),
+                        &mut [this.resp.as_bytes_mut()],
+                    )
+                };
+            }
+            PendingBlkBuffer::Flush => {
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_unpublished(
+                        token,
+                        &[this.req.as_bytes()],
+                        &mut [this.resp.as_bytes_mut()],
+                    )
+                };
+            }
+            PendingBlkBuffer::PhysicalRead { .. } | PendingBlkBuffer::PhysicalWrite { .. } => {
+                // SAFETY: this is the physical-chain rollback path.
+                unsafe { this.discard_unpublished_physical(queue, token) };
+                return;
+            }
+        }
+    }
+
+    unsafe fn discard_unpublished_physical<H: Hal, const SIZE: usize>(
+        self,
+        queue: &mut VirtQueue<H, SIZE>,
+        token: u16,
+    ) {
+        let mut this = self;
+        match &this.buffer {
+            PendingBlkBuffer::PhysicalRead { buffers, count, .. } => {
+                // SAFETY: the descriptor chain was installed by this request
+                // and has not been published to the device.
+                unsafe {
+                    queue.discard_unpublished_physical(
+                        token,
+                        &[this.req.as_bytes()],
+                        &[],
+                        &buffers[..*count],
+                        &mut [this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            PendingBlkBuffer::PhysicalWrite { buffers, count, .. } => {
+                // SAFETY: the descriptor chain was installed by this request
+                // and has not been published to the device.
+                unsafe {
+                    queue.discard_unpublished_physical(
+                        token,
+                        &[this.req.as_bytes()],
+                        &buffers[..*count],
+                        &[],
+                        &mut [this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            _ => unreachable!("prepared physical batch contains virtual request"),
+        }
+        this.unmap_physical::<H>();
+    }
+
+    unsafe fn recycle_after_quiescence<H: Hal, const SIZE: usize>(
+        self,
+        queue: &mut VirtQueue<H, SIZE>,
+        token: u16,
+    ) {
+        let mut this = self;
+        match &this.buffer {
+            PendingBlkBuffer::Read { buf, len } => {
+                let data = unsafe { core::slice::from_raw_parts_mut(*buf, *len) };
+                // SAFETY: the transport reset proved that the device no
+                // longer accesses this chain; the buffers match publication.
+                unsafe {
+                    queue.discard_quiesced(
+                        token,
+                        &[this.req.as_bytes()],
+                        &mut [data, this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            PendingBlkBuffer::Write { buf, len } => {
+                let data = unsafe { core::slice::from_raw_parts(*buf, *len) };
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_quiesced(
+                        token,
+                        &[this.req.as_bytes(), data],
+                        &mut [this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::ReadVectored { bufs } => {
+                let mut outputs = Vec::with_capacity(bufs.len() + 1);
+                for segment in bufs {
+                    outputs
+                        .push(unsafe { core::slice::from_raw_parts_mut(segment.buf, segment.len) });
+                }
+                outputs.push(this.resp.as_bytes_mut());
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_quiesced(token, &[this.req.as_bytes()], outputs.as_mut_slice());
+                }
+            }
+            #[cfg(feature = "alloc")]
+            PendingBlkBuffer::WriteVectored { bufs } => {
+                let mut inputs = Vec::with_capacity(bufs.len() + 1);
+                inputs.push(this.req.as_bytes());
+                for segment in bufs {
+                    inputs.push(unsafe { core::slice::from_raw_parts(segment.buf, segment.len) });
+                }
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_quiesced(
+                        token,
+                        inputs.as_slice(),
+                        &mut [this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            PendingBlkBuffer::Flush => {
+                // SAFETY: see the read branch above.
+                unsafe {
+                    queue.discard_quiesced(
+                        token,
+                        &[this.req.as_bytes()],
+                        &mut [this.resp.as_bytes_mut()],
+                    );
+                }
+            }
+            PendingBlkBuffer::PhysicalRead { .. } | PendingBlkBuffer::PhysicalWrite { .. } => {
+                // SAFETY: the transport reset proved quiescence, so the
+                // published physical chain can use the same descriptor
+                // recycling path as an unpublished chain.
+                unsafe { this.discard_unpublished_physical(queue, token) };
+            }
         }
     }
 
@@ -502,11 +1043,11 @@ impl PendingBlkRequest {
         &mut self,
         queue: &mut VirtQueue<H, SIZE>,
         token: u16,
-    ) -> Result {
+    ) -> Result<u32> {
         if self.token != Some(token) {
             return Err(Error::WrongToken);
         }
-        match &self.buffer {
+        let used_len = match &self.buffer {
             PendingBlkBuffer::Read { buf, len } => {
                 // SAFETY: The caller that submitted the pending request promised
                 // this buffer remains valid until the returned handle completes.
@@ -518,7 +1059,7 @@ impl PendingBlkRequest {
                         token,
                         &[self.req.as_bytes()],
                         &mut [buf, self.resp.as_bytes_mut()],
-                    )?;
+                    )
                 }
             }
             PendingBlkBuffer::Write { buf, len } => {
@@ -532,7 +1073,7 @@ impl PendingBlkRequest {
                         token,
                         &[self.req.as_bytes(), buf],
                         &mut [self.resp.as_bytes_mut()],
-                    )?;
+                    )
                 }
             }
             #[cfg(feature = "alloc")]
@@ -547,9 +1088,7 @@ impl PendingBlkRequest {
                 outputs.push(self.resp.as_bytes_mut());
                 // SAFETY: These are exactly the buffers passed to
                 // `add_unpublished` for this token.
-                unsafe {
-                    queue.pop_used(token, &[self.req.as_bytes()], outputs.as_mut_slice())?;
-                }
+                unsafe { queue.pop_used(token, &[self.req.as_bytes()], outputs.as_mut_slice()) }
             }
             #[cfg(feature = "alloc")]
             PendingBlkBuffer::WriteVectored { bufs } => {
@@ -562,9 +1101,7 @@ impl PendingBlkRequest {
                 }
                 // SAFETY: These are exactly the buffers passed to
                 // `add_unpublished` for this token.
-                unsafe {
-                    queue.pop_used(token, inputs.as_slice(), &mut [self.resp.as_bytes_mut()])?;
-                }
+                unsafe { queue.pop_used(token, inputs.as_slice(), &mut [self.resp.as_bytes_mut()]) }
             }
             PendingBlkBuffer::Flush => {
                 // SAFETY: These are exactly the buffers passed to
@@ -574,15 +1111,15 @@ impl PendingBlkRequest {
                         token,
                         &[self.req.as_bytes()],
                         &mut [self.resp.as_bytes_mut()],
-                    )?;
+                    )
                 }
             }
             PendingBlkBuffer::PhysicalRead {
-                mappings,
                 buffers,
                 count,
+                ..
             } => {
-                let result = unsafe {
+                unsafe {
                     queue.pop_used_physical(
                         token,
                         &[self.req.as_bytes()],
@@ -590,20 +1127,14 @@ impl PendingBlkRequest {
                         &buffers[..*count],
                         &mut [self.resp.as_bytes_mut()],
                     )
-                };
-                result?;
-                for mapping in mappings[..*count].iter().rev().flatten().copied() {
-                    // SAFETY: `pop_used_physical` proved that the device has
-                    // consumed this descriptor chain.
-                    unsafe { H::unmap_physical(mapping, BufferDirection::DeviceToDriver) };
                 }
             }
             PendingBlkBuffer::PhysicalWrite {
-                mappings,
                 buffers,
                 count,
+                ..
             } => {
-                let result = unsafe {
+                unsafe {
                     queue.pop_used_physical(
                         token,
                         &[self.req.as_bytes()],
@@ -611,22 +1142,48 @@ impl PendingBlkRequest {
                         &[],
                         &mut [self.resp.as_bytes_mut()],
                     )
-                };
-                result?;
-                for mapping in mappings[..*count].iter().rev().flatten().copied() {
-                    // SAFETY: `pop_used_physical` proved that the device has
-                    // consumed this descriptor chain.
-                    unsafe { H::unmap_physical(mapping, BufferDirection::DriverToDevice) };
                 }
             }
-        }
+        }?;
 
+        let completion_bytes = self.validate_completion_bytes(used_len)?;
+        // Do not mark the request done or release a physical mapping until the
+        // used length has passed protocol validation.  A malformed entry has
+        // already been consumed, but `done` must remain false so reset can
+        // recycle the retained pending owner after transport quiescence.
+        self.release_physical_mappings::<H>();
+        self.completion_bytes = completion_bytes;
         self.done = true;
-        Ok(())
+        if let Some(resp) = self.legacy_resp {
+            // SAFETY: a legacy caller promises this response remains valid
+            // until it calls the matching complete_* method. The used entry
+            // has already retired the device's descriptor access.
+            unsafe {
+                *resp = BlkResp {
+                    status: self.resp.status(),
+                };
+            }
+        }
+        Ok(self.completion_bytes)
     }
 }
 
 impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
+    fn validate_sync_used_len(
+        _status: RespStatus,
+        payload_len: Option<usize>,
+        used_len: u32,
+    ) -> Result<()> {
+        let used_len = usize::try_from(used_len).unwrap_or(usize::MAX);
+        let valid = match payload_len {
+            Some(payload_len) => {
+                used_len == payload_len.checked_add(1).ok_or(Error::InvalidParam)?
+            }
+            None => used_len == 1,
+        };
+        if valid { Ok(()) } else { Err(Error::IoError) }
+    }
+
     /// Create a new VirtIO-Blk driver.
     pub fn new(mut transport: T) -> Result<Self> {
         let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
@@ -648,15 +1205,34 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         )?;
         transport.finish_init();
 
+        #[cfg(feature = "alloc")]
+        let pending = {
+            let pending_len = QUEUE_SIZE as usize;
+            let mut pending = Vec::new();
+            pending
+                .try_reserve_exact(pending_len)
+                .map_err(|_| Error::DmaError)?;
+            pending.resize_with(pending_len, || None);
+            pending.into_boxed_slice()
+        };
+        #[cfg(not(feature = "alloc"))]
+        let pending = core::array::from_fn(|_| None);
+
         Ok(VirtIOBlk {
-            transport,
-            queue,
-            pending: core::array::from_fn(|_| None),
+            transport: ManuallyDrop::new(transport),
+            queue: ManuallyDrop::new(queue),
+            pending: ManuallyDrop::new(pending),
+            notified_slots: [false; QUEUE_SIZE as usize],
             token_slots: [None; QUEUE_SIZE as usize],
             pending_count: 0,
             async_pending_count: 0,
+            physical_pending_count: 0,
             capacity,
             negotiated_features,
+            generation: 1,
+            next_cookie: 1,
+            quarantined: false,
+            retired: false,
         })
     }
 
@@ -665,6 +1241,156 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             .iter()
             .position(Option::is_none)
             .ok_or(Error::QueueFull)
+    }
+
+    fn ensure_live(&self) -> Result {
+        if self.quarantined || self.retired {
+            Err(Error::Quarantined)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn pending_handle(&self, slot: usize, notified: bool) -> Result<PendingBlkHandle> {
+        let request = self.pending[slot].as_ref().ok_or(Error::WrongToken)?;
+        let token = request.token.ok_or(Error::WrongToken)?;
+        Ok(PendingBlkHandle {
+            generation: self.generation,
+            cookie: request.completion_cookie,
+            slot: slot as u16,
+            token,
+            notified: notified || self.notified_slots[slot],
+        })
+    }
+
+    fn find_pending_cookie(&self, cookie: u64) -> Option<usize> {
+        if cookie == 0 {
+            return None;
+        }
+        self.pending.iter().enumerate().find_map(|(slot, entry)| {
+            entry
+                .as_ref()
+                .and_then(|entry| (entry.completion_cookie == cookie).then_some(slot))
+        })
+    }
+
+    fn pending_slot_for_token(&self, token: u16) -> Result<usize> {
+        self.token_slots
+            .get(usize::from(token))
+            .copied()
+            .flatten()
+            .ok_or(Error::WrongToken)
+    }
+
+    fn retire_pending_slot(&mut self, slot: usize) -> Result<RespStatus> {
+        let token = match self
+            .pending
+            .get(slot)
+            .and_then(Option::as_ref)
+            .and_then(|entry| entry.token)
+        {
+            Some(token) => token,
+            None => {
+                // Never take/drop a pending owner until its token binding is
+                // proven. A malformed owner must remain retained for the
+                // typed quarantine/reset path rather than becoming an EIO
+                // after its DMA mappings have been released by Drop.
+                if self.pending.get(slot).and_then(Option::as_ref).is_some() {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::WrongToken);
+            }
+        };
+        let Some(token_slot) = self.token_slots.get(usize::from(token)) else {
+            self.quarantined = true;
+            return Err(Error::Quarantined);
+        };
+        if *token_slot != Some(slot) {
+            self.quarantined = true;
+            return Err(Error::Quarantined);
+        }
+        let entry = self.pending[slot].take().ok_or(Error::WrongToken)?;
+        self.token_slots[usize::from(token)] = None;
+        self.notified_slots[slot] = false;
+        if entry.async_accounted {
+            self.async_pending_count = self
+                .async_pending_count
+                .checked_sub(1)
+                .expect("async pending-count underflow");
+        }
+        if entry.completion_owner == BlockCompletionOwner::Physical {
+            self.physical_pending_count = self
+                .physical_pending_count
+                .checked_sub(1)
+                .expect("physical pending-count underflow");
+        }
+        Ok(entry.resp.status())
+    }
+
+    /// Retires at most `budget` done requests for a bounded count-only pass.
+    /// Exact waiters retain their done entries until they call
+    /// `complete_pending_request`; this method is the explicit owner for the
+    /// count-only terminal path and therefore does not need a FIFO.
+    pub fn retire_completion_records_bounded(&mut self, budget: usize) -> Option<RespStatus> {
+        let mut first_error = None;
+        let mut retired = 0usize;
+        for slot in 0..self.pending.len() {
+            if retired >= budget {
+                break;
+            }
+            if self.quarantined {
+                break;
+            }
+            let retire = self.pending[slot].as_ref().is_some_and(|entry| {
+                entry.done && entry.completion_owner == BlockCompletionOwner::Ordinary
+            });
+            if retire {
+                match self.retire_pending_slot(slot) {
+                    Ok(status) if status != RespStatus::OK => {
+                        first_error.get_or_insert(status);
+                    }
+                    Ok(_) => {}
+                    Err(Error::Quarantined) => break,
+                    Err(_) => {}
+                }
+                retired = retired.saturating_add(1);
+            }
+        }
+        first_error
+    }
+
+    /// Retires every done request for callers that deliberately use a
+    /// count-only fence.  Task polling uses the bounded variant above so an
+    /// arbitrarily large caller budget cannot turn one invocation into an
+    /// unbounded pending-slot walk.
+    pub fn retire_completion_records(&mut self) -> Option<RespStatus> {
+        self.retire_completion_records_bounded(self.pending.len())
+    }
+
+    fn assign_pending_token(&mut self, slot: usize, token: u16) -> Result<u64> {
+        let token_idx = usize::from(token);
+        let token_slot = self
+            .token_slots
+            .get_mut(token_idx)
+            .ok_or(Error::WrongToken)?;
+        if token_slot.is_some() {
+            return Err(Error::WrongToken);
+        }
+        let cookie = self.next_cookie;
+        if cookie == 0 || cookie > MAX_REQUEST_COOKIE {
+            self.retired = true;
+            return Err(Error::Quarantined);
+        }
+        self.next_cookie = self
+            .next_cookie
+            .checked_add(1)
+            .unwrap_or(MAX_REQUEST_COOKIE.saturating_add(1));
+        *token_slot = Some(slot);
+        let request = self.pending[slot].as_mut().ok_or(Error::WrongToken)?;
+        request.token = Some(token);
+        request.completion_cookie = cookie;
+        Ok(cookie)
     }
 
     fn pending_descriptor_cost(&self, data_segments: usize) -> usize {
@@ -692,6 +1418,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     }
 
     fn add_pending_slot_unpublished(&mut self, slot: usize) -> Result<u16> {
+        self.ensure_live()?;
         let request = self.pending[slot].as_mut().ok_or(Error::WrongToken)?;
         match &request.buffer {
             PendingBlkBuffer::Read { buf, len } => {
@@ -790,11 +1517,65 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         }
     }
 
+    fn rollback_unpublished_slot(&mut self, slot: usize, token: u16) -> Result {
+        let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+        // SAFETY: callers invoke this only before publish_unpublished.  The
+        // request owns the exact buffers/mappings used to install `token`.
+        unsafe { request.discard_unpublished(&mut self.queue, token) };
+        Ok(())
+    }
+
+    fn rollback_assigned_unpublished_slot(&mut self, slot: usize, token: u16) -> Result {
+        if self.token_slots.get(usize::from(token)).copied() != Some(Some(slot)) {
+            self.quarantined = true;
+            return Err(Error::Quarantined);
+        }
+        self.rollback_unpublished_slot(slot, token)?;
+        self.token_slots[usize::from(token)] = None;
+        Ok(())
+    }
+
+    fn rollback_unpublished_batch(
+        &mut self,
+        requests: &mut [PendingBlkBatchRequest<'_>],
+        slots: &[u16],
+        tokens: &[u16],
+        count: usize,
+    ) -> Result {
+        for index in (0..count).rev() {
+            let slot = usize::from(slots[index]);
+            let token = tokens[index];
+            if self.token_slots.get(usize::from(token)).copied() != Some(Some(slot)) {
+                self.quarantined = true;
+                return Err(Error::Quarantined);
+            }
+            let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+            // SAFETY: batch publication has not started. The request owns the
+            // exact buffers used by this unpublished descriptor chain.
+            unsafe { request.discard_unpublished(&mut self.queue, token) };
+            self.token_slots[usize::from(token)] = None;
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("batch rollback pending-count underflow");
+            self.async_pending_count = self
+                .async_pending_count
+                .checked_sub(1)
+                .expect("batch rollback async-count underflow");
+            requests[index].handle = None;
+        }
+        Ok(())
+    }
+
     /// Waits for a pending request handle and reaps its response.
     pub fn wait_pending_request(&mut self, handle: PendingBlkHandle) -> Result {
+        self.ensure_live()?;
         let mut polls = 0u64;
         loop {
-            self.drain_pending_completions()?;
+            // A handle waiter is an exact completion consumer. This path must
+            // also work for physical requests; the count-only drain is
+            // deliberately barred from claiming their used-ring entries.
+            self.drain_pending_completions_for_handle(handle, PENDING_COMPLETION_DRAIN_BUDGET)?;
             if self.pending_request_done(handle) {
                 self.record_external_queue_wait(polls, handle.notified());
                 return self.complete_pending_request(handle);
@@ -880,62 +1661,75 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
     /// Sends the given request to the device and waits for a response, with no extra data.
     fn request(&mut self, request: BlkReq) -> Result {
+        self.ensure_live()?;
         let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
+        let used_len = self.queue.add_notify_wait_pop(
             &[request.as_bytes()],
             &mut [resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
+        Self::validate_sync_used_len(resp.status(), None, used_len)?;
         resp.status.into()
     }
 
     /// Sends the given request to the device and waits for a response, including the given data.
     fn request_read(&mut self, request: BlkReq, data: &mut [u8]) -> Result {
+        self.ensure_live()?;
         let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
+        let used_len = self.queue.add_notify_wait_pop(
             &[request.as_bytes()],
             &mut [data, resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
+        Self::validate_sync_used_len(resp.status(), Some(data.len()), used_len)?;
         resp.status.into()
     }
 
     #[cfg(feature = "alloc")]
     fn request_read_vectored(&mut self, request: BlkReq, data: &mut [&mut [u8]]) -> Result {
+        self.ensure_live()?;
         let mut resp = BlkResp::default();
         let mut outputs = Vec::with_capacity(data.len() + 1);
         outputs.extend(data.iter_mut().map(|buf| &mut **buf));
         outputs.push(resp.as_bytes_mut());
-        self.queue.add_notify_wait_pop(
+        let used_len = self.queue.add_notify_wait_pop(
             &[request.as_bytes()],
             outputs.as_mut_slice(),
-            &mut self.transport,
+            &mut *self.transport,
         )?;
+        let payload_len = data.iter().try_fold(0usize, |total, buf| {
+            total.checked_add(buf.len()).ok_or(Error::InvalidParam)
+        })?;
+        Self::validate_sync_used_len(resp.status(), Some(payload_len), used_len)?;
         resp.status.into()
     }
 
     /// Sends the given request and data to the device and waits for a response.
     fn request_write(&mut self, request: BlkReq, data: &[u8]) -> Result {
+        self.ensure_live()?;
         let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
+        let used_len = self.queue.add_notify_wait_pop(
             &[request.as_bytes(), data],
             &mut [resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
+        Self::validate_sync_used_len(resp.status(), None, used_len)?;
         resp.status.into()
     }
 
     #[cfg(feature = "alloc")]
     fn request_write_vectored(&mut self, request: BlkReq, data: &[&[u8]]) -> Result {
+        self.ensure_live()?;
         let mut resp = BlkResp::default();
         let mut inputs = Vec::with_capacity(data.len() + 1);
         inputs.push(request.as_bytes());
         inputs.extend(data.iter().copied());
-        self.queue.add_notify_wait_pop(
+        let used_len = self.queue.add_notify_wait_pop(
             inputs.as_slice(),
             &mut [resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
+        Self::validate_sync_used_len(resp.status(), None, used_len)?;
         resp.status.into()
     }
 
@@ -1009,6 +1803,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         block_id: usize,
         buf: &mut [u8],
     ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.drain_pending_completions()?;
@@ -1035,24 +1830,33 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 return Err(err);
             }
         };
-        let token_idx = usize::from(token);
-        debug_assert!(self.token_slots[token_idx].is_none());
-        self.token_slots[token_idx] = Some(slot);
-        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
-        self.pending_count += 1;
+        if let Err(error) = self.assign_pending_token(slot, token) {
+            self.rollback_unpublished_slot(slot, token)?;
+            return Err(error);
+        }
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
         record_blk_pending_depth(self.pending_count);
         self.queue.publish_unpublished(token);
         record_blk_read(buf.len(), 0);
 
         let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
+        handle.notified = notified;
         if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(PendingBlkHandle {
-            slot: slot as u16,
-            token,
-            notified,
-        })
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Reads one or more blocks into a scatter list.
@@ -1087,11 +1891,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         &self,
         block_id: u64,
         segments: &[PhysicalSegment],
-    ) -> Result<usize> {
-        if segments.is_empty() || segments.len() > MAX_PHYSICAL_SG {
+        coalesced: &mut [PhysicalSegment; MAX_PHYSICAL_SG],
+    ) -> Result<(usize, usize)> {
+        if segments.is_empty() {
             return Err(Error::InvalidParam);
         }
         let mut total = 0usize;
+        let mut count = 0usize;
         for segment in segments {
             if segment.paddr == 0
                 || segment.paddr % SECTOR_SIZE != 0
@@ -1102,13 +1908,30 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 return Err(Error::InvalidParam);
             }
             total = total.checked_add(segment.len).ok_or(Error::InvalidParam)?;
+            if count != 0
+                && coalesced[count - 1]
+                    .paddr
+                    .checked_add(coalesced[count - 1].len)
+                    == Some(segment.paddr)
+            {
+                coalesced[count - 1].len = coalesced[count - 1]
+                    .len
+                    .checked_add(segment.len)
+                    .ok_or(Error::InvalidParam)?;
+            } else {
+                if count == MAX_PHYSICAL_SG {
+                    return Err(Error::InvalidParam);
+                }
+                coalesced[count] = *segment;
+                count = count.checked_add(1).expect("physical SG count overflow");
+            }
         }
         let sectors = u64::try_from(total / SECTOR_SIZE).map_err(|_| Error::InvalidParam)?;
         let end = block_id.checked_add(sectors).ok_or(Error::InvalidParam)?;
         if end > self.capacity {
             return Err(Error::InvalidParam);
         }
-        Ok(total)
+        Ok((total, count))
     }
 
     fn map_physical_segments(
@@ -1154,6 +1977,328 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         }
     }
 
+    fn install_prepared_physical_request(
+        &mut self,
+        slot: usize,
+        request: &PendingBlkPhysicalBatchRequest<'_>,
+        coalesced: &[PhysicalSegment],
+        mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
+        buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
+        bytes: usize,
+    ) -> Result<u16> {
+        let pending = match request.buffer {
+            PendingBlkPhysicalBatchBuffer::Read(_) => PendingBlkRequest::physical_read(
+                request.block_id,
+                mappings,
+                buffers,
+                coalesced.len(),
+                bytes,
+            ),
+            PendingBlkPhysicalBatchBuffer::Write(_) => PendingBlkRequest::physical_write(
+                request.block_id,
+                mappings,
+                buffers,
+                coalesced.len(),
+                bytes,
+            ),
+        };
+        self.pending[slot] = Some(pending);
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_physical_owner();
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_async_accounted();
+        let token = match self.add_pending_slot_unpublished(slot) {
+            Ok(token) => token,
+            Err(error) => {
+                let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+                request.unmap_physical::<H>();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.assign_pending_token(slot, token) {
+            let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+            // SAFETY: publication has not happened, so the queue chain can be
+            // discarded before releasing its physical mappings.
+            unsafe { request.discard_unpublished_physical(&mut self.queue, token) };
+            return Err(error);
+        }
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
+        self.async_pending_count = self
+            .async_pending_count
+            .checked_add(1)
+            .expect("async pending-count overflow");
+        self.physical_pending_count = self
+            .physical_pending_count
+            .checked_add(1)
+            .expect("physical pending-count overflow");
+        Ok(token)
+    }
+
+    /// Prepares an all-or-nothing physical batch.  No descriptor is published
+    /// until the returned [`PreparedBlockBatch`] is consumed by `publish`.
+    /// Any validation, queue, slot, or DMA mapping failure leaves the device
+    /// queue and every caller range untouched.
+    pub unsafe fn prepare_physical_batch<'dev, 'req>(
+        &'dev mut self,
+        requests: &'req mut [PendingBlkPhysicalBatchRequest<'req>],
+    ) -> Result<PreparedBlockBatch<'dev, 'req, H, T>> {
+        // SAFETY: this preserves the historical standalone entry point. Its
+        // caller owns the lower used-ring drain and may reap ordinary
+        // completions before preparing a physical batch.
+        unsafe { self.prepare_physical_batch_inner(requests, true) }
+    }
+
+    /// Prepares a physical batch without touching the used ring.
+    ///
+    /// A shared block wrapper uses this entry point after installing its
+    /// device-global completion broker. The broker is then the sole task
+    /// context allowed to consume used entries; a synchronous physical
+    /// submitter may reserve/publish descriptors under the wrapper route lock
+    /// but must not perform a hidden ordinary drain here. Admission remains
+    /// all-or-nothing and no descriptor is visible until the returned batch is
+    /// published.
+    ///
+    /// # Safety
+    ///
+    /// The caller must serialize this operation with the same device owner
+    /// that drains the used ring and must keep every request range pinned until
+    /// the returned batch is completed or reset proves quiescence.
+    pub unsafe fn prepare_physical_batch_no_drain<'dev, 'req>(
+        &'dev mut self,
+        requests: &'req mut [PendingBlkPhysicalBatchRequest<'req>],
+    ) -> Result<PreparedBlockBatch<'dev, 'req, H, T>> {
+        // SAFETY: the caller supplies the single completion-owner guarantee
+        // documented above; preparation itself is identical to the regular
+        // all-or-nothing path except for the used-ring drain.
+        unsafe { self.prepare_physical_batch_inner(requests, false) }
+    }
+
+    unsafe fn prepare_physical_batch_inner<'dev, 'req>(
+        &'dev mut self,
+        requests: &'req mut [PendingBlkPhysicalBatchRequest<'req>],
+        drain_used_ring: bool,
+    ) -> Result<PreparedBlockBatch<'dev, 'req, H, T>> {
+        self.ensure_live()?;
+        if requests.is_empty() || requests.len() > MAX_PHYSICAL_BATCH_REQUESTS {
+            return Err(Error::InvalidParam);
+        }
+        for request in requests.iter_mut() {
+            request.handle = None;
+        }
+        self.reject_untracked_queue_users()?;
+        if drain_used_ring {
+            self.drain_pending_completions()?;
+        }
+
+        let mut coalesced =
+            [[PhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG]; MAX_PHYSICAL_BATCH_REQUESTS];
+        let mut counts = [0usize; MAX_PHYSICAL_BATCH_REQUESTS];
+        let mut bytes = [0usize; MAX_PHYSICAL_BATCH_REQUESTS];
+        let mut descriptors = 0usize;
+        let mut total_bytes = 0usize;
+        for (index, request) in requests.iter().enumerate() {
+            let (total, count) = self.validate_physical_segments(
+                request.block_id,
+                match request.buffer {
+                    PendingBlkPhysicalBatchBuffer::Read(segments)
+                    | PendingBlkPhysicalBatchBuffer::Write(segments) => segments,
+                },
+                &mut coalesced[index],
+            )?;
+            counts[index] = count;
+            bytes[index] = total;
+            total_bytes = total_bytes.checked_add(total).ok_or(Error::InvalidParam)?;
+            descriptors = descriptors
+                .checked_add(
+                    if self
+                        .negotiated_features
+                        .contains(BlkFeature::RING_INDIRECT_DESC)
+                    {
+                        1
+                    } else {
+                        count + 2
+                    },
+                )
+                .ok_or(Error::QueueFull)?;
+        }
+        if descriptors > self.queue.available_desc()
+            || requests.len() > self.pending.iter().filter(|entry| entry.is_none()).count()
+        {
+            return Err(Error::QueueFull);
+        }
+
+        let mut prepared = PreparedBlockBatch {
+            device: self,
+            requests: requests.as_mut_ptr(),
+            request_count: requests.len(),
+            prepared_count: 0,
+            total_bytes,
+            heads: [0; MAX_PHYSICAL_BATCH_REQUESTS],
+            slots: [0; MAX_PHYSICAL_BATCH_REQUESTS],
+            tokens: [0; MAX_PHYSICAL_BATCH_REQUESTS],
+            published: false,
+            _request_lifetime: core::marker::PhantomData,
+        };
+
+        for index in 0..prepared.request_count {
+            let request = unsafe { &*prepared.requests.add(index) };
+            let direction = match request.buffer {
+                PendingBlkPhysicalBatchBuffer::Read(_) => BufferDirection::DeviceToDriver,
+                PendingBlkPhysicalBatchBuffer::Write(_) => BufferDirection::DriverToDevice,
+            };
+            let (mappings, buffers) = match prepared
+                .device
+                .map_physical_segments(&coalesced[index][..counts[index]], direction)
+            {
+                Ok(value) => value,
+                Err(error) => return Err(error),
+            };
+            let slot = match prepared.device.alloc_pending_slot() {
+                Ok(slot) => slot,
+                Err(error) => {
+                    Self::unmap_physical_mappings(&mappings, counts[index], direction);
+                    return Err(error);
+                }
+            };
+            let token = match prepared.device.install_prepared_physical_request(
+                slot,
+                request,
+                &coalesced[index][..counts[index]],
+                mappings,
+                buffers,
+                bytes[index],
+            ) {
+                Ok(token) => token,
+                Err(error) => return Err(error),
+            };
+            prepared.slots[index] = slot as u16;
+            prepared.tokens[index] = token;
+            prepared.heads[index] = token;
+            prepared.prepared_count = prepared
+                .prepared_count
+                .checked_add(1)
+                .expect("prepared batch count overflow");
+        }
+
+        Ok(prepared)
+    }
+}
+
+impl<'dev, 'req, H: Hal, T: Transport> PreparedBlockBatch<'dev, 'req, H, T> {
+    /// Publishes every prepared descriptor.  Preparation has already checked
+    /// all fallible conditions, so publication consumes the token and cannot
+    /// return an admission error.
+    pub fn publish(self) -> PendingBlkBatchReport {
+        self.publish_with_handles().0
+    }
+
+    /// Publishes and returns the concrete handles without borrowing the
+    /// caller's prepared request vector after publication.  This is useful to
+    /// adapters that must copy handles across a shared-block trait boundary.
+    pub fn publish_with_handles(
+        mut self,
+    ) -> (
+        PendingBlkBatchReport,
+        [PendingBlkHandle; MAX_PHYSICAL_BATCH_REQUESTS],
+        usize,
+    ) {
+        let mut report = PendingBlkBatchReport::default();
+        let mut handles = [PendingBlkHandle {
+            generation: 0,
+            cookie: 0,
+            slot: 0,
+            token: 0,
+            notified: false,
+        }; MAX_PHYSICAL_BATCH_REQUESTS];
+        report.submitted = self.request_count;
+        report.bytes = self.total_bytes;
+        for index in 0..self.request_count {
+            let notified_handle = self
+                .device
+                .pending_handle(usize::from(self.slots[index]), false)
+                .expect("prepared request lost pending handle");
+            handles[index] = notified_handle;
+            // SAFETY: the request slice remains exclusively borrowed for the
+            // lifetime of this prepared batch.
+            unsafe {
+                (*self.requests.add(index)).handle = Some(notified_handle);
+            }
+        }
+        self.published = true;
+        for index in 0..self.request_count {
+            self.device.queue.publish_unpublished(self.heads[index]);
+        }
+        report.notified = self.device.queue.should_notify();
+        for index in 0..self.request_count {
+            self.device.notified_slots[usize::from(self.slots[index])] = report.notified;
+        }
+        if report.notified {
+            self.device.transport.notify(QUEUE);
+            for index in 0..self.request_count {
+                handles[index].notified = true;
+                // SAFETY: see the handle write above.
+                unsafe {
+                    (*self.requests.add(index))
+                        .handle
+                        .as_mut()
+                        .expect("prepared publish lost request handle")
+                        .notified = true;
+                }
+            }
+        }
+        (report, handles, self.request_count)
+    }
+}
+
+impl<'dev, 'req, H: Hal, T: Transport> Drop for PreparedBlockBatch<'dev, 'req, H, T> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        for index in (0..self.prepared_count).rev() {
+            let slot = usize::from(self.slots[index]);
+            let token = self.tokens[index];
+            if let Some(request) = self.device.pending[slot].take() {
+                // SAFETY: no descriptor in this prepared batch was published;
+                // the queue owns exactly the chain represented by `token`.
+                unsafe {
+                    request.discard_unpublished_physical(&mut self.device.queue, token);
+                }
+                self.device.pending_count = self
+                    .device
+                    .pending_count
+                    .checked_sub(1)
+                    .expect("prepared batch pending-count underflow");
+                self.device.async_pending_count = self
+                    .device
+                    .async_pending_count
+                    .checked_sub(1)
+                    .expect("prepared batch async-count underflow");
+                self.device.physical_pending_count = self
+                    .device
+                    .physical_pending_count
+                    .checked_sub(1)
+                    .expect("prepared batch physical-count underflow");
+            }
+            self.device.token_slots[usize::from(token)] = None;
+            // SAFETY: see the handle write in `publish`; preparation itself
+            // leaves request handles empty, but clear a caller-visible stale
+            // value defensively if one was supplied.
+            unsafe {
+                (*self.requests.add(index)).handle = None;
+            }
+        }
+    }
+}
+
+impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     fn tracked_pending_descriptor_count(&self) -> usize {
         self.pending
             .iter()
@@ -1196,17 +2341,22 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         block_id: u64,
         segments: &[PhysicalSegment],
     ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         self.reject_untracked_queue_users()?;
         self.drain_pending_completions()?;
-        let bytes = self.validate_physical_segments(block_id, segments)?;
-        let (mappings, buffers) =
-            self.map_physical_segments(segments, BufferDirection::DeviceToDriver)?;
+        let mut coalesced = [PhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        let (bytes, coalesced_count) =
+            self.validate_physical_segments(block_id, segments, &mut coalesced)?;
+        let (mappings, buffers) = self.map_physical_segments(
+            &coalesced[..coalesced_count],
+            BufferDirection::DeviceToDriver,
+        )?;
         let slot = match self.alloc_pending_slot() {
             Ok(slot) => slot,
             Err(error) => {
                 Self::unmap_physical_mappings(
                     &mappings,
-                    segments.len(),
+                    coalesced_count,
                     BufferDirection::DeviceToDriver,
                 );
                 return Err(error);
@@ -1216,9 +2366,17 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             block_id,
             mappings,
             buffers,
-            segments.len(),
+            coalesced_count,
             bytes,
         ));
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_physical_owner();
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_async_accounted();
         let token = match self.add_pending_slot_unpublished(slot) {
             Ok(token) => token,
             Err(error) => {
@@ -1227,23 +2385,43 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 return Err(error);
             }
         };
-        let token_idx = usize::from(token);
-        debug_assert!(self.token_slots[token_idx].is_none());
-        self.token_slots[token_idx] = Some(slot);
-        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
-        self.pending_count += 1;
+        if let Err(error) = self.assign_pending_token(slot, token) {
+            let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+            // SAFETY: publication has not happened, so the queue chain can
+            // be discarded before releasing its physical mappings.
+            unsafe { request.discard_unpublished_physical(&mut self.queue, token) };
+            return Err(error);
+        }
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
+        self.physical_pending_count = self
+            .physical_pending_count
+            .checked_add(1)
+            .expect("physical pending-count overflow");
+        self.async_pending_count = self
+            .async_pending_count
+            .checked_add(1)
+            .expect("async pending-count overflow");
         record_blk_pending_depth(self.pending_count);
         self.queue.publish_unpublished(token);
-        record_blk_read(bytes, segments.len());
+        record_blk_read(bytes, coalesced_count);
         let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
         if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(PendingBlkHandle {
-            slot: slot as u16,
-            token,
-            notified,
-        })
+        handle.notified = notified;
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Submits a write from pinned physical SG payload buffers.
@@ -1262,17 +2440,22 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         block_id: u64,
         segments: &[PhysicalSegment],
     ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         self.reject_untracked_queue_users()?;
         self.drain_pending_completions()?;
-        let bytes = self.validate_physical_segments(block_id, segments)?;
-        let (mappings, buffers) =
-            self.map_physical_segments(segments, BufferDirection::DriverToDevice)?;
+        let mut coalesced = [PhysicalSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_SG];
+        let (bytes, coalesced_count) =
+            self.validate_physical_segments(block_id, segments, &mut coalesced)?;
+        let (mappings, buffers) = self.map_physical_segments(
+            &coalesced[..coalesced_count],
+            BufferDirection::DriverToDevice,
+        )?;
         let slot = match self.alloc_pending_slot() {
             Ok(slot) => slot,
             Err(error) => {
                 Self::unmap_physical_mappings(
                     &mappings,
-                    segments.len(),
+                    coalesced_count,
                     BufferDirection::DriverToDevice,
                 );
                 return Err(error);
@@ -1282,9 +2465,17 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             block_id,
             mappings,
             buffers,
-            segments.len(),
+            coalesced_count,
             bytes,
         ));
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_physical_owner();
+        self.pending[slot]
+            .as_mut()
+            .ok_or(Error::WrongToken)?
+            .mark_async_accounted();
         let token = match self.add_pending_slot_unpublished(slot) {
             Ok(token) => token,
             Err(error) => {
@@ -1293,23 +2484,43 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 return Err(error);
             }
         };
-        let token_idx = usize::from(token);
-        debug_assert!(self.token_slots[token_idx].is_none());
-        self.token_slots[token_idx] = Some(slot);
-        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
-        self.pending_count += 1;
+        if let Err(error) = self.assign_pending_token(slot, token) {
+            let request = self.pending[slot].take().ok_or(Error::WrongToken)?;
+            // SAFETY: publication has not happened, so the queue chain can
+            // be discarded before releasing its physical mappings.
+            unsafe { request.discard_unpublished_physical(&mut self.queue, token) };
+            return Err(error);
+        }
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
+        self.physical_pending_count = self
+            .physical_pending_count
+            .checked_add(1)
+            .expect("physical pending-count overflow");
+        self.async_pending_count = self
+            .async_pending_count
+            .checked_add(1)
+            .expect("async pending-count overflow");
         record_blk_pending_depth(self.pending_count);
         self.queue.publish_unpublished(token);
-        record_blk_write(bytes, segments.len());
+        record_blk_write(bytes, coalesced_count);
         let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
         if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(PendingBlkHandle {
-            slot: slot as u16,
-            token,
-            notified,
-        })
+        handle.notified = notified;
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Submits a request to read one or more blocks, but returns immediately without waiting for
@@ -1329,13 +2540,14 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     ///
     /// # Usage
     ///
-    /// It will submit request to the VirtIO block device and return a token identifying
-    /// the position of the first Descriptor in the chain. If there are not enough
-    /// Descriptors to allocate, then it returns [`Error::QueueFull`].
+    /// It will submit the request to the VirtIO block device and return a
+    /// generation-safe handle identifying its completion. If there are not
+    /// enough descriptors to allocate, then it returns [`Error::QueueFull`].
     ///
-    /// The caller can then call `peek_used` with the returned token to check whether the device has
-    /// finished handling the request. Once it has, the caller must call `complete_read_blocks` with
-    /// the same buffers before reading the response.
+    /// The caller can then call [`Self::pending_request_done`] with the returned
+    /// handle to check whether the device has finished handling the request.
+    /// Once it has, the caller must call `complete_read_blocks` with the same
+    /// buffers before reading the response.
     ///
     /// ```
     /// # use virtio_drivers::{Error, Hal};
@@ -1347,13 +2559,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// let mut request = BlkReq::default();
     /// let mut buffer = [0; 512];
     /// let mut response = BlkResp::default();
-    /// let token = unsafe { blk.read_blocks_nb(42, &mut request, &mut buffer, &mut response) }?;
+    /// let handle = unsafe { blk.read_blocks_nb(42, &mut request, &mut buffer, &mut response) }?;
     ///
     /// // Wait for an interrupt to tell us that the request completed...
-    /// assert_eq!(blk.peek_used(), Some(token));
+    /// assert!(!blk.pending_request_done(handle));
     ///
     /// unsafe {
-    ///     blk.complete_read_blocks(token, &request, &mut buffer, &mut response)?;
+    ///     blk.complete_read_blocks(handle, &request, &mut buffer, &mut response)?;
     /// }
     /// if response.status() == RespStatus::OK {
     ///     println!("Successfully read block.");
@@ -1375,22 +2587,64 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         req: &mut BlkReq,
         buf: &mut [u8],
         resp: &mut BlkResp,
-    ) -> Result<u16> {
+    ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
+        self.drain_pending_completions()?;
+        let slot = self.alloc_pending_slot()?;
         record_blk_read(buf.len(), 0);
         *req = BlkReq {
             type_: ReqType::In,
             reserved: 0,
             sector: block_id as u64,
         };
-        let token = self
-            .queue
-            .add(&[req.as_bytes()], &mut [buf, resp.as_bytes_mut()])?;
-        if self.queue.should_notify() {
+        self.pending[slot] = Some(PendingBlkRequest::legacy_read(
+            block_id,
+            req as *const BlkReq,
+            buf,
+            resp as *mut BlkResp,
+        ));
+        let token = match self.add_pending_slot_unpublished(slot) {
+            Ok(token) => token,
+            Err(error) => {
+                self.pending[slot] = None;
+                return Err(error);
+            }
+        };
+        let cookie = match self.assign_pending_token(slot, token) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                self.rollback_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        // Keep the full-width identity in the caller-owned request object as
+        // a second binding check.  It is not the request header published to
+        // the device; the returned handle is the authoritative completion
+        // identity and rejects a stale token after variables are reused.
+        req.sector = cookie;
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
+        self.queue.publish_unpublished(token);
+        let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
+        if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(token)
+        record_blk_pending_depth(self.pending_count);
+        handle.notified = notified;
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Completes a read operation which was started by `read_blocks_nb`.
@@ -1401,14 +2655,71 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// the token.
     pub unsafe fn complete_read_blocks(
         &mut self,
-        token: u16,
+        handle: PendingBlkHandle,
         req: &BlkReq,
         buf: &mut [u8],
         resp: &mut BlkResp,
     ) -> Result<()> {
-        self.queue
-            .pop_used(token, &[req.as_bytes()], &mut [buf, resp.as_bytes_mut()])?;
-        resp.status.into()
+        self.ensure_live()?;
+        if handle.generation != 0 && handle.generation != self.generation {
+            return Err(Error::WrongToken);
+        }
+        let slot = self
+            .find_pending_cookie(handle.completion_cookie())
+            .ok_or(Error::WrongToken)?;
+        if handle.generation != 0
+            && (handle.slot != slot as u16
+                || self.pending[slot].as_ref().and_then(|entry| entry.token) != Some(handle.token))
+        {
+            return Err(Error::WrongToken);
+        }
+        let done = self.pending[slot].as_ref().is_some_and(|entry| {
+            entry.completion_owner == BlockCompletionOwner::Legacy
+                && entry.legacy_matches(
+                    req as *const BlkReq,
+                    buf.as_ptr(),
+                    buf.len(),
+                    resp as *mut BlkResp,
+                    true,
+                )
+                && entry.done
+        });
+        let matches = self.pending[slot].as_ref().is_some_and(|entry| {
+            entry.completion_owner == BlockCompletionOwner::Legacy
+                && entry.legacy_matches(
+                    req as *const BlkReq,
+                    buf.as_ptr(),
+                    buf.len(),
+                    resp as *mut BlkResp,
+                    true,
+                )
+        });
+        if !matches {
+            return Err(Error::WrongToken);
+        }
+        if !done {
+            let entry = self.pending[slot].as_mut().ok_or(Error::WrongToken)?;
+            // SAFETY: the caller supplied the exact legacy buffers and the
+            // used entry must still be the FIFO head for this token.
+            let token = entry.token.ok_or(Error::WrongToken)?;
+            let complete = unsafe { entry.complete(&mut self.queue, token) };
+            if matches!(complete, Err(Error::WrongToken | Error::Quarantined)) {
+                self.quarantined = true;
+                return Err(Error::Quarantined);
+            }
+            complete?;
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("completion pending-count underflow");
+        }
+        let status = self.pending[slot]
+            .as_ref()
+            .ok_or(Error::WrongToken)?
+            .resp
+            .status();
+        let _ = self.retire_pending_slot(slot)?;
+        status.into()
     }
 
     /// Writes the contents of the given buffer to a block or blocks.
@@ -1444,6 +2755,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         block_id: usize,
         buf: &[u8],
     ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.drain_pending_completions()?;
@@ -1470,24 +2782,33 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 return Err(err);
             }
         };
-        let token_idx = usize::from(token);
-        debug_assert!(self.token_slots[token_idx].is_none());
-        self.token_slots[token_idx] = Some(slot);
-        self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
-        self.pending_count += 1;
+        if let Err(error) = self.assign_pending_token(slot, token) {
+            self.rollback_unpublished_slot(slot, token)?;
+            return Err(error);
+        }
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
         record_blk_pending_depth(self.pending_count);
         self.queue.publish_unpublished(token);
         record_blk_write(buf.len(), 0);
 
         let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
         if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(PendingBlkHandle {
-            slot: slot as u16,
-            token,
-            notified,
-        })
+        handle.notified = notified;
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Submits as many pending read/write requests as descriptor and slot
@@ -1507,11 +2828,47 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         &mut self,
         requests: &mut [PendingBlkBatchRequest<'_>],
     ) -> Result<PendingBlkBatchReport> {
+        // SAFETY: this is the historical standalone entry point. Its caller
+        // owns the lower used-ring consumer and may reap ordinary entries
+        // before admitting another batch.
+        unsafe { self.submit_pending_batch_inner(requests, true) }
+    }
+
+    /// Submits an ordinary batch without touching the used ring.
+    ///
+    /// A shared block wrapper uses this entry point after installing its
+    /// device-global completion broker. The broker is then the sole task
+    /// context allowed to consume used entries; ordinary submission may
+    /// reserve/publish descriptors but must not perform a hidden drain that
+    /// bypasses the shared completion mailbox.
+    ///
+    /// # Safety
+    ///
+    /// The caller must serialize this operation with the same completion
+    /// owner that drains the used ring and must keep every accepted request
+    /// buffer valid until its concrete completion is retired.
+    pub unsafe fn submit_pending_batch_no_drain(
+        &mut self,
+        requests: &mut [PendingBlkBatchRequest<'_>],
+    ) -> Result<PendingBlkBatchReport> {
+        // SAFETY: the caller supplies the single completion-owner guarantee
+        // documented above; admission/publication is otherwise identical to
+        // the historical batch path.
+        unsafe { self.submit_pending_batch_inner(requests, false) }
+    }
+
+    unsafe fn submit_pending_batch_inner(
+        &mut self,
+        requests: &mut [PendingBlkBatchRequest<'_>],
+        drain_used_ring: bool,
+    ) -> Result<PendingBlkBatchReport> {
+        self.ensure_live()?;
         let mut report = PendingBlkBatchReport::default();
         if requests.is_empty() {
             return Ok(report);
         }
-        for request in requests.iter() {
+        for request in requests.iter_mut() {
+            request.handle = None;
             let len = request.buffer.len();
             let segments = request.buffer.segment_count();
             if matches!(&request.buffer, PendingBlkBatchBuffer::Flush) {
@@ -1527,9 +2884,23 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             if len == 0 || segments == 0 || len % SECTOR_SIZE != 0 {
                 return Err(Error::InvalidParam);
             }
+            #[cfg(feature = "alloc")]
+            if matches!(
+                &request.buffer,
+                PendingBlkBatchBuffer::ReadVectored(bufs)
+                    if bufs.iter().any(|buf| buf.is_empty())
+            ) || matches!(
+                &request.buffer,
+                PendingBlkBatchBuffer::WriteVectored(bufs)
+                    if bufs.iter().any(|buf| buf.is_empty())
+            ) {
+                return Err(Error::InvalidParam);
+            }
         }
 
-        self.drain_pending_completions()?;
+        if drain_used_ring {
+            self.drain_pending_completions()?;
+        }
 
         let depth_cap = self.async_default_depth();
         let depth_available = depth_cap.saturating_sub(self.async_pending_count);
@@ -1542,6 +2913,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
         let desc_budget = self.queue.available_desc();
         let mut accepted_heads = [0u16; QUEUE_SIZE as usize];
+        let mut accepted_slots = [0u16; QUEUE_SIZE as usize];
 
         for request in requests.iter_mut() {
             if report.submitted >= depth_available {
@@ -1587,6 +2959,12 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                     bytes,
                     done: false,
                     async_accounted: false,
+                    completion_cookie: 0,
+                    completion_owner: BlockCompletionOwner::Ordinary,
+                    legacy_resp: None,
+                    legacy_req: None,
+                    completion_bytes: 0,
+                    completion_claimed: false,
                 },
                 PendingBlkBatchBuffer::Write(buf) => PendingBlkRequest {
                     req: BlkReq {
@@ -1603,6 +2981,12 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                     bytes,
                     done: false,
                     async_accounted: false,
+                    completion_cookie: 0,
+                    completion_owner: BlockCompletionOwner::Ordinary,
+                    legacy_resp: None,
+                    legacy_req: None,
+                    completion_bytes: 0,
+                    completion_claimed: false,
                 },
                 #[cfg(feature = "alloc")]
                 PendingBlkBatchBuffer::ReadVectored(bufs) => {
@@ -1615,10 +2999,16 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 PendingBlkBatchBuffer::Flush => PendingBlkRequest::flush(),
             };
             self.pending[slot] = Some(pending);
-            self.pending[slot]
-                .as_mut()
-                .ok_or(Error::WrongToken)?
-                .mark_async_accounted();
+            let Some(entry) = self.pending[slot].as_mut() else {
+                self.rollback_unpublished_batch(
+                    requests,
+                    &accepted_slots,
+                    &accepted_heads,
+                    report.submitted,
+                )?;
+                return Err(Error::WrongToken);
+            };
+            entry.mark_async_accounted();
 
             let token = match self.add_pending_slot_unpublished(slot) {
                 Ok(token) => token,
@@ -1631,18 +3021,50 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 }
                 Err(err) => {
                     self.pending[slot] = None;
+                    self.rollback_unpublished_batch(
+                        requests,
+                        &accepted_slots,
+                        &accepted_heads,
+                        report.submitted,
+                    )?;
                     return Err(err);
                 }
             };
 
-            let token_idx = usize::from(token);
-            debug_assert!(self.token_slots[token_idx].is_none());
-            self.token_slots[token_idx] = Some(slot);
-            self.pending[slot].as_mut().ok_or(Error::WrongToken)?.token = Some(token);
-            self.pending_count += 1;
-            self.async_pending_count += 1;
+            if let Err(error) = self.assign_pending_token(slot, token) {
+                self.rollback_unpublished_slot(slot, token)?;
+                self.rollback_unpublished_batch(
+                    requests,
+                    &accepted_slots,
+                    &accepted_heads,
+                    report.submitted,
+                )?;
+                return Err(error);
+            }
+            let handle = match self.pending_handle(slot, false) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.rollback_assigned_unpublished_slot(slot, token)?;
+                    self.rollback_unpublished_batch(
+                        requests,
+                        &accepted_slots,
+                        &accepted_heads,
+                        report.submitted,
+                    )?;
+                    return Err(error);
+                }
+            };
+            self.pending_count = self
+                .pending_count
+                .checked_add(1)
+                .expect("pending-count overflow");
+            self.async_pending_count = self
+                .async_pending_count
+                .checked_add(1)
+                .expect("async pending-count overflow");
             record_blk_pending_depth(self.pending_count);
             accepted_heads[report.submitted] = token;
+            accepted_slots[report.submitted] = slot as u16;
 
             match &request.buffer {
                 PendingBlkBatchBuffer::Read(_) => record_blk_read(bytes, 0),
@@ -1656,13 +3078,15 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                     record_blk_async_flush_request();
                 }
             }
-            request.handle = Some(PendingBlkHandle {
-                slot: slot as u16,
-                token,
-                notified: false,
-            });
-            report.submitted += 1;
-            report.bytes += bytes;
+            request.handle = Some(handle);
+            report.submitted = report
+                .submitted
+                .checked_add(1)
+                .expect("batch submitted-count overflow");
+            report.bytes = report
+                .bytes
+                .checked_add(bytes)
+                .expect("batch byte-count overflow");
         }
 
         for head in accepted_heads.iter().copied().take(report.submitted) {
@@ -1673,6 +3097,9 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             report.notified = self.queue.should_notify();
             if report.notified {
                 self.transport.notify(QUEUE);
+            }
+            for slot in accepted_slots.iter().copied().take(report.submitted) {
+                self.notified_slots[usize::from(slot)] = report.notified;
             }
             if report.notified {
                 for request in requests.iter_mut().take(report.submitted) {
@@ -1752,22 +3179,60 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         req: &mut BlkReq,
         buf: &[u8],
         resp: &mut BlkResp,
-    ) -> Result<u16> {
+    ) -> Result<PendingBlkHandle> {
+        self.ensure_live()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
+        self.drain_pending_completions()?;
+        let slot = self.alloc_pending_slot()?;
         record_blk_write(buf.len(), 0);
         *req = BlkReq {
             type_: ReqType::Out,
             reserved: 0,
             sector: block_id as u64,
         };
-        let token = self
-            .queue
-            .add(&[req.as_bytes(), buf], &mut [resp.as_bytes_mut()])?;
-        if self.queue.should_notify() {
+        self.pending[slot] = Some(PendingBlkRequest::legacy_write(
+            block_id,
+            req as *const BlkReq,
+            buf,
+            resp as *mut BlkResp,
+        ));
+        let token = match self.add_pending_slot_unpublished(slot) {
+            Ok(token) => token,
+            Err(error) => {
+                self.pending[slot] = None;
+                return Err(error);
+            }
+        };
+        let cookie = match self.assign_pending_token(slot, token) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                self.rollback_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        req.sector = cookie;
+        let mut handle = match self.pending_handle(slot, false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.rollback_assigned_unpublished_slot(slot, token)?;
+                return Err(error);
+            }
+        };
+        self.pending_count = self
+            .pending_count
+            .checked_add(1)
+            .expect("pending-count overflow");
+        self.queue.publish_unpublished(token);
+        let notified = self.queue.should_notify();
+        self.notified_slots[slot] = notified;
+        if notified {
             self.transport.notify(QUEUE);
         }
-        Ok(token)
+        record_blk_pending_depth(self.pending_count);
+        handle.notified = notified;
+        handle.token = token;
+        Ok(handle)
     }
 
     /// Completes a write operation which was started by `write_blocks_nb`.
@@ -1778,74 +3243,152 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// returned the token.
     pub unsafe fn complete_write_blocks(
         &mut self,
-        token: u16,
+        handle: PendingBlkHandle,
         req: &BlkReq,
         buf: &[u8],
         resp: &mut BlkResp,
     ) -> Result<()> {
-        self.queue
-            .pop_used(token, &[req.as_bytes(), buf], &mut [resp.as_bytes_mut()])?;
-        resp.status.into()
+        self.ensure_live()?;
+        if handle.generation != 0 && handle.generation != self.generation {
+            return Err(Error::WrongToken);
+        }
+        let slot = self
+            .find_pending_cookie(handle.completion_cookie())
+            .ok_or(Error::WrongToken)?;
+        if handle.generation != 0
+            && (handle.slot != slot as u16
+                || self.pending[slot].as_ref().and_then(|entry| entry.token) != Some(handle.token))
+        {
+            return Err(Error::WrongToken);
+        }
+        let matches = self.pending[slot].as_ref().is_some_and(|entry| {
+            entry.completion_owner == BlockCompletionOwner::Ordinary
+                && entry.legacy_matches(
+                    req as *const BlkReq,
+                    buf.as_ptr(),
+                    buf.len(),
+                    resp as *mut BlkResp,
+                    false,
+                )
+        });
+        if !matches {
+            return Err(Error::WrongToken);
+        }
+        if !self.pending[slot].as_ref().is_some_and(|entry| entry.done) {
+            let entry = self.pending[slot].as_mut().ok_or(Error::WrongToken)?;
+            // SAFETY: see complete_read_blocks.
+            let token = entry.token.ok_or(Error::WrongToken)?;
+            let complete = unsafe { entry.complete(&mut self.queue, token) };
+            if matches!(complete, Err(Error::WrongToken | Error::Quarantined)) {
+                self.quarantined = true;
+                return Err(Error::Quarantined);
+            }
+            complete?;
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("completion pending-count underflow");
+        }
+        let status = self.pending[slot]
+            .as_ref()
+            .ok_or(Error::WrongToken)?
+            .resp
+            .status();
+        let _ = self.retire_pending_slot(slot)?;
+        status.into()
     }
 
     /// Fetches the token of the next completed request from the used ring and returns it, without
     /// removing it from the used ring. If there are no pending completed requests returns `None`.
     pub fn peek_used(&mut self) -> Option<u16> {
+        if self.quarantined || self.retired {
+            return None;
+        }
         self.queue.peek_used()
     }
 
-    /// Drains at most `budget` completed pending block requests.
-    ///
-    /// The budget is capped at [`PENDING_COMPLETION_DRAIN_BUDGET`] so every
-    /// caller gets the same bounded task-context work unit.  A continuation is
-    /// reported when another used-ring entry is still available; callers must
-    /// invoke this method again without waiting for another interrupt.
-    /// A zero budget performs no work and reports whether a continuation is
-    /// already available.
-    pub fn drain_pending_completions_bounded(
+    fn reap_used_completions(
         &mut self,
         budget: usize,
+        allow_physical: bool,
     ) -> Result<PendingBlkDrainStatus> {
-        if budget == 0 {
-            return Ok(if self.queue.peek_used().is_some() {
-                PendingBlkDrainStatus::Continuation { drained: 0 }
-            } else {
-                PendingBlkDrainStatus::Complete { drained: 0 }
-            });
-        }
+        self.ensure_live()?;
         let budget = budget.min(PENDING_COMPLETION_DRAIN_BUDGET);
-        let mut drained = 0;
-        let mut async_drained = 0;
-        let mut async_drained_bytes = 0;
+        let mut drained = 0usize;
+        let mut async_drained = 0usize;
+        let mut async_drained_bytes = 0usize;
         while drained < budget {
             let Some(token) = self.queue.peek_used() else {
                 break;
             };
-            let idx = usize::from(token);
-            let Some(slot) = self.token_slots[idx] else {
-                return Err(Error::WrongToken);
+            let slot = match self.pending_slot_for_token(token) {
+                Ok(slot) => slot,
+                Err(Error::WrongToken) => {
+                    // A used-ring token with no live owner is a malformed or
+                    // duplicate completion.  Retain every pending owner and
+                    // force the typed reset/quarantine path; never convert
+                    // this protocol violation into an ordinary I/O error.
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                Err(error) => return Err(error),
             };
-            let Some(entry) = self.pending[slot].as_mut() else {
-                return Err(Error::WrongToken);
+            let (bytes, async_accounted, owner, is_flush) = {
+                let entry = match self.pending[slot].as_mut() {
+                    Some(entry) => entry,
+                    None => {
+                        self.quarantined = true;
+                        return Err(Error::Quarantined);
+                    }
+                };
+                let owner = entry.completion_owner;
+                if owner == BlockCompletionOwner::Physical && !allow_physical {
+                    // A count-only consumer may retire ordinary entries ahead
+                    // of a physical effect, but it must stop at the physical
+                    // owner rather than stealing its used element.
+                    break;
+                }
+                // SAFETY: the used entry proves that device access has
+                // stopped for this fully-installed pending request.
+                let complete = unsafe { entry.complete(&mut self.queue, token) };
+                if matches!(complete, Err(Error::WrongToken | Error::Quarantined)) {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                let _ = complete?;
+                (
+                    entry.completion_bytes,
+                    entry.async_accounted,
+                    owner,
+                    entry.is_flush(),
+                )
             };
-            let async_flush = entry.async_accounted && entry.is_flush();
-            // SAFETY: The pending entry was installed before its descriptor was
-            // published, and stores the original buffers for this token.
-            if let Err(err) = unsafe { entry.complete(&mut self.queue, token) } {
-                record_blk_async_completion_error();
-                return Err(err);
-            }
-            if entry.async_accounted {
-                async_drained += 1;
-                async_drained_bytes += entry.bytes();
-                self.async_pending_count = self.async_pending_count.saturating_sub(1);
-                if async_flush {
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("completion pending-count underflow");
+            if async_accounted {
+                async_drained = async_drained
+                    .checked_add(1)
+                    .expect("async drain count overflow");
+                async_drained_bytes = async_drained_bytes
+                    .checked_add(usize::try_from(bytes).unwrap_or(usize::MAX))
+                    .expect("async drain byte-count overflow");
+                if is_flush {
                     record_blk_async_flush_completion();
                 }
             }
-            self.token_slots[idx] = None;
-            self.pending_count -= 1;
-            drained += 1;
+            // Physical requests remain in their slot until the physical
+            // effect consumer takes the concrete completion. Ordinary
+            // requests likewise retain their done state for an exact waiter;
+            // neither path needs an unbounded/intermediate completion FIFO.
+            debug_assert!(matches!(
+                owner,
+                BlockCompletionOwner::Ordinary
+                    | BlockCompletionOwner::Legacy
+                    | BlockCompletionOwner::Physical
+            ));
+            drained = drained.checked_add(1).expect("drain count overflow");
         }
         record_blk_pending_drain(drained);
         record_blk_async_completion(async_drained, async_drained_bytes, self.async_pending_count);
@@ -1857,6 +3400,24 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         })
     }
 
+    /// Drains at most `budget` completed pending block requests.
+    ///
+    /// The budget is capped at [`PENDING_COMPLETION_DRAIN_BUDGET`] so every
+    /// caller gets the same bounded task-context work unit.  A continuation is
+    /// reported when another used-ring entry is still available; callers must
+    /// invoke this method again without waiting for another interrupt.
+    /// A zero budget performs no work and reports whether a continuation is
+    /// already available. Ordinary records remain in their pending slots after
+    /// this count-only reap; callers that do not have an exact handle owner
+    /// must call [`Self::retire_completion_records`] to release those slots.
+    /// This keeps the count-only path bounded without an intermediate FIFO.
+    pub fn drain_pending_completions_bounded(
+        &mut self,
+        budget: usize,
+    ) -> Result<PendingBlkDrainStatus> {
+        self.reap_used_completions(budget, false)
+    }
+
     /// Drains one fixed task-context completion credit.
     pub fn drain_pending_completions(&mut self) -> Result<usize> {
         Ok(self
@@ -1864,28 +3425,323 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             .drained())
     }
 
+    /// Drains used-ring entries for a handle-specific waiter. Unlike the
+    /// count-only API this is allowed to claim physical completions, because
+    /// the waiter will consume the matching owned record immediately.
+    pub fn drain_pending_completions_for_handle(
+        &mut self,
+        handle: PendingBlkHandle,
+        budget: usize,
+    ) -> Result<PendingBlkDrainStatus> {
+        if handle.generation != 0 && handle.generation != self.generation {
+            return Err(Error::WrongToken);
+        }
+        self.ensure_live()?;
+        let target_slot = self
+            .find_pending_cookie(handle.completion_cookie())
+            .ok_or(Error::WrongToken)?;
+        let target_owner = self.pending[target_slot]
+            .as_ref()
+            .ok_or(Error::WrongToken)?
+            .completion_owner;
+        if self.pending[target_slot]
+            .as_ref()
+            .is_some_and(|entry| entry.done)
+        {
+            return Ok(if self.queue.peek_used().is_some() {
+                PendingBlkDrainStatus::Continuation { drained: 0 }
+            } else {
+                PendingBlkDrainStatus::Complete { drained: 0 }
+            });
+        }
+
+        let budget = budget.min(PENDING_COMPLETION_DRAIN_BUDGET);
+        let mut drained = 0usize;
+        let mut async_drained = 0usize;
+        let mut async_drained_bytes = 0usize;
+        while drained < budget {
+            let Some(token) = self.queue.peek_used() else {
+                break;
+            };
+            let slot = match self.pending_slot_for_token(token) {
+                Ok(slot) => slot,
+                Err(Error::WrongToken) => {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                Err(error) => return Err(error),
+            };
+            let owner = match self.pending[slot].as_ref() {
+                Some(entry) => entry.completion_owner,
+                None => {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+            };
+            if target_owner == BlockCompletionOwner::Physical && slot != target_slot {
+                // A physical exact waiter has no authority over either an
+                // ordinary request or another physical effect.  Leave the
+                // used-ring head to its owner; the any-physical completion
+                // worker will demultiplex all physical entries in order.
+                break;
+            }
+            if slot != target_slot && owner == BlockCompletionOwner::Physical {
+                // A different physical effect owns the FIFO head.  An exact
+                // waiter must leave it for the physical drain instead of
+                // claiming a completion merely because it is in front of its
+                // own handle.
+                break;
+            }
+            let (bytes, async_accounted, is_flush) = {
+                let entry = match self.pending[slot].as_mut() {
+                    Some(entry) => entry,
+                    None => {
+                        self.quarantined = true;
+                        return Err(Error::Quarantined);
+                    }
+                };
+                // SAFETY: the used entry at the FIFO head identifies this
+                // fully-installed request and proves device access stopped.
+                let complete = unsafe { entry.complete(&mut self.queue, token) };
+                if matches!(complete, Err(Error::WrongToken | Error::Quarantined)) {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                let _ = complete?;
+                if slot == target_slot && owner == BlockCompletionOwner::Physical {
+                    entry.completion_claimed = true;
+                }
+                (
+                    entry.completion_bytes,
+                    entry.async_accounted,
+                    entry.is_flush(),
+                )
+            };
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("completion pending-count underflow");
+            if async_accounted {
+                async_drained = async_drained
+                    .checked_add(1)
+                    .expect("async drain count overflow");
+                async_drained_bytes = async_drained_bytes
+                    .checked_add(usize::try_from(bytes).unwrap_or(usize::MAX))
+                    .expect("async drain byte-count overflow");
+                if is_flush {
+                    record_blk_async_flush_completion();
+                }
+            }
+            drained = drained.checked_add(1).expect("drain count overflow");
+            if slot == target_slot {
+                break;
+            }
+        }
+        record_blk_pending_drain(drained);
+        record_blk_async_completion(async_drained, async_drained_bytes, self.async_pending_count);
+        record_blk_async_adaptive_completion(async_drained, self.configured_async_depth_cap());
+        Ok(if self.queue.peek_used().is_some() {
+            PendingBlkDrainStatus::Continuation { drained }
+        } else {
+            PendingBlkDrainStatus::Complete { drained }
+        })
+    }
+
+    /// Drains concrete physical completions into a caller-owned bounded output
+    /// slice. Ordinary entries at the used-ring head remain untouched for the
+    /// device-global ordinary owner.
+    pub fn drain_pending_completions_into(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> Result<BlockCompletionDrain> {
+        self.drain_pending_completions_into_mode(output, true)
+    }
+
+    /// Drains concrete completions for the single device-global completion
+    /// owner. Unlike the physical-only drain, this path may consume either
+    /// owner class at the FIFO head and preserves the owner in each record.
+    /// Every consumed record is retired exactly once by this owner.
+    pub fn drain_pending_completions_all_into(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> Result<BlockCompletionDrain> {
+        self.drain_pending_completions_into_mode(output, false)
+    }
+
+    fn drain_pending_completions_into_mode(
+        &mut self,
+        output: &mut [BlockCompletion],
+        physical_only: bool,
+    ) -> Result<BlockCompletionDrain> {
+        self.ensure_live()?;
+        let budget = output.len().min(MAX_PHYSICAL_BATCH_REQUESTS);
+        let mut completed = 0usize;
+        let mut drained = 0usize;
+        while completed < budget && drained < PENDING_COMPLETION_DRAIN_BUDGET {
+            let Some(token) = self.queue.peek_used() else {
+                break;
+            };
+            let slot = match self.pending_slot_for_token(token) {
+                Ok(slot) => slot,
+                Err(Error::WrongToken) => {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                Err(error) => return Err(error),
+            };
+            let owner = match self.pending[slot].as_ref() {
+                Some(entry) => entry.completion_owner,
+                None => {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+            };
+            if physical_only && owner != BlockCompletionOwner::Physical {
+                // The physical completion consumer has no authority over an
+                // ordinary request.  Leave the FIFO head untouched so the
+                // ordinary exact/count owner can reap it first.
+                break;
+            }
+            let handle = match self.pending_handle(slot, false) {
+                Ok(handle) => handle,
+                Err(Error::WrongToken) => {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                Err(error) => return Err(error),
+            };
+            let (cookie, status, bytes, is_flush, async_accounted) = {
+                let entry = match self.pending[slot].as_mut() {
+                    Some(entry) => entry,
+                    None => {
+                        self.quarantined = true;
+                        return Err(Error::Quarantined);
+                    }
+                };
+                let complete = unsafe { entry.complete(&mut self.queue, token) };
+                if matches!(complete, Err(Error::WrongToken | Error::Quarantined)) {
+                    self.quarantined = true;
+                    return Err(Error::Quarantined);
+                }
+                let _ = complete?;
+                (
+                    entry.completion_cookie,
+                    entry.resp.status(),
+                    entry.completion_bytes,
+                    entry.is_flush(),
+                    entry.async_accounted,
+                )
+            };
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("completion pending-count underflow");
+            if async_accounted {
+                record_blk_async_completion(
+                    1,
+                    usize::try_from(bytes).unwrap_or(usize::MAX),
+                    self.async_pending_count,
+                );
+                if is_flush {
+                    record_blk_async_flush_completion();
+                }
+            }
+            output[completed] = BlockCompletion {
+                handle,
+                cookie,
+                owner,
+                status,
+                bytes,
+            };
+            completed = completed.checked_add(1).expect("completion count overflow");
+            let _ = self.retire_pending_slot(slot)?;
+            drained = drained.checked_add(1).expect("drain count overflow");
+        }
+        Ok(BlockCompletionDrain {
+            completed,
+            // Report any used-ring work so the task scheduler can keep the
+            // device's bounded continuation alive.  The physical owner still
+            // consumes only a physical FIFO head; an ordinary head remains
+            // untouched for its owner and the wait path uses
+            // `physical_completion_ready` to avoid retrying it in a loop.
+            continuation: self.queue.peek_used().is_some(),
+        })
+    }
+
+    /// Returns whether the next used-ring entry belongs to the physical
+    /// completion owner.  This deliberately examines only the FIFO head: a
+    /// physical consumer cannot skip an ordinary entry without claiming work
+    /// owned by another completion path.
+    pub fn physical_completion_ready(&mut self) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
+        let Some(token) = self.queue.peek_used() else {
+            return false;
+        };
+        self.pending_slot_for_token(token)
+            .ok()
+            .and_then(|slot| self.pending[slot].as_ref())
+            .is_some_and(|entry| entry.completion_owner == BlockCompletionOwner::Physical)
+    }
+
+    /// Returns the completion owner for a live handle without claiming its
+    /// used-ring entry.
+    pub fn pending_request_owner(&self, handle: PendingBlkHandle) -> Option<BlockCompletionOwner> {
+        if handle.generation != 0 && handle.generation != self.generation {
+            return None;
+        }
+        self.find_pending_cookie(handle.completion_cookie())
+            .and_then(|slot| self.pending[slot].as_ref())
+            .map(|entry| entry.completion_owner)
+    }
+
+    /// Returns whether the used-ring head is the exact physical handle.  A
+    /// handle-specific physical waiter must not advance past another effect,
+    /// even when that other effect is also physical-owned.
+    pub fn physical_completion_ready_for_handle(&mut self, handle: PendingBlkHandle) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
+        let Some(token) = self.queue.peek_used() else {
+            return false;
+        };
+        let Some(slot) = self.pending_slot_for_token(token).ok() else {
+            return false;
+        };
+        self.pending[slot].as_ref().is_some_and(|entry| {
+            entry.completion_owner == BlockCompletionOwner::Physical
+                && entry.completion_cookie == handle.completion_cookie()
+        })
+    }
+
     /// Returns whether a pending block request has completed.
     pub fn pending_request_done(&self, handle: PendingBlkHandle) -> bool {
-        self.pending
-            .get(usize::from(handle.slot))
-            .and_then(Option::as_ref)
-            .is_some_and(|entry| entry.token == Some(handle.token) && entry.done)
+        (handle.generation == 0 || handle.generation == self.generation)
+            && self
+                .find_pending_cookie(handle.completion_cookie())
+                .and_then(|slot| self.pending[slot].as_ref())
+                .is_some_and(|entry| entry.done)
     }
 
     /// Reaps a completed pending request and returns its device status.
     pub fn complete_pending_request(&mut self, handle: PendingBlkHandle) -> Result {
-        let slot = usize::from(handle.slot);
-        let Some(entry) = self.pending.get(slot).and_then(Option::as_ref) else {
-            return Err(Error::WrongToken);
-        };
-        if entry.token != Some(handle.token) {
+        if handle.generation != 0 && handle.generation != self.generation {
             return Err(Error::WrongToken);
         }
-        if !entry.done {
+        self.ensure_live()?;
+        let slot = self
+            .find_pending_cookie(handle.completion_cookie())
+            .ok_or(Error::WrongToken)?;
+        if !self.pending[slot].as_ref().is_some_and(|entry| entry.done) {
             return Err(Error::NotReady);
         }
-        let status = entry.resp.status();
-        self.pending[slot] = None;
+        if self.pending[slot].as_ref().is_some_and(|entry| {
+            entry.completion_owner == BlockCompletionOwner::Physical && !entry.completion_claimed
+        }) {
+            return Err(Error::WrongToken);
+        }
+        let status = self.retire_pending_slot(slot)?;
         status.into()
     }
 
@@ -1893,6 +3749,12 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// drained from the used ring.
     pub fn pending_request_count(&self) -> usize {
         self.pending_count
+    }
+
+    /// Returns whether a physical request still owns completion authority.
+    /// Count-only drains must not claim its used entry.
+    pub fn physical_pending(&self) -> bool {
+        self.physical_pending_count != 0
     }
 
     /// Records a synchronous wait performed outside this object while an
@@ -1907,10 +3769,113 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     pub fn virt_queue_size(&self) -> u16 {
         QUEUE_SIZE
     }
+
+    /// Returns the current generation-safe queue identity while the queue is
+    /// live. A retired reset queue is never returned as a reusable handle
+    /// without a complete transport reinitialization.
+    pub fn queue_handle(&self) -> Option<BlockQueueHandle> {
+        if self.quarantined || self.retired {
+            return None;
+        }
+        Some(BlockQueueHandle {
+            generation: self.generation,
+            queue: QUEUE,
+        })
+    }
+
+    /// Attempts a bounded transport reset and releases pending DMA mappings
+    /// only after quiescence has been observed.  A failed proof leaves the
+    /// request slots and mappings owned by this object and returns the typed
+    /// `Quarantined` outcome.
+    pub fn reset_device(&mut self) -> ResetOutcome {
+        // Stop producing device-side notifications before any early
+        // quarantine return.  This is independent of the quiescence proof:
+        // a late IRQ must not keep a poisoned queue alive.
+        self.queue.set_dev_notify(false);
+        if self.quarantined {
+            return ResetOutcome::Quarantined;
+        }
+        if self.retired {
+            return ResetOutcome::Retired;
+        }
+        if self.queue.outstanding_descriptor_count() != self.tracked_pending_descriptor_count() {
+            // A legacy/untracked descriptor or a queue-accounting mismatch
+            // means the driver cannot enumerate every descriptor and DMA
+            // owner. Resetting and dropping the queue would be a use-after-
+            // free risk, so retain the complete owner instead.
+            self.quarantined = true;
+            return ResetOutcome::Quarantined;
+        }
+        self.transport.set_status(DeviceStatus::empty());
+        let mut polls = 0usize;
+        while !self.transport.get_status().is_empty() && polls < RESET_POLL_BUDGET {
+            polls = polls.checked_add(1).expect("reset poll-count overflow");
+            spin_loop();
+        }
+        if !self.transport.get_status().is_empty() {
+            self.quarantined = true;
+            return ResetOutcome::Quarantined;
+        }
+        self.transport.mark_reset_complete();
+        for entry in (&mut *self.pending).iter_mut() {
+            let Some(request) = entry.take() else {
+                continue;
+            };
+            if !request.done {
+                let token = request.token.expect("live pending request lost token");
+                // SAFETY: reset status was observed empty, proving that the
+                // device no longer accesses this descriptor chain.
+                unsafe { request.recycle_after_quiescence(&mut self.queue, token) };
+            }
+        }
+        if !self.queue.is_empty() || self.queue.has_live_indirect_lists() {
+            self.quarantined = true;
+            return ResetOutcome::Quarantined;
+        }
+        self.token_slots.fill(None);
+        self.notified_slots.fill(false);
+        self.pending_count = 0;
+        self.async_pending_count = 0;
+        self.physical_pending_count = 0;
+        self.transport.queue_unset(QUEUE);
+        if self.generation == u64::MAX {
+            // A generation must never wrap and make an old handle valid
+            // again.  Keep the retired owner fail-closed instead.
+            self.quarantined = true;
+            return ResetOutcome::Quarantined;
+        }
+        let Some(next_generation) = self.generation.checked_add(1) else {
+            self.quarantined = true;
+            return ResetOutcome::Quarantined;
+        };
+        self.generation = next_generation;
+        self.retired = true;
+        ResetOutcome::Retired
+    }
 }
 
 impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
     fn drop(&mut self) {
+        if self.quarantined {
+            // The transport did not prove quiescence.  The resource fields
+            // are ManuallyDrop, so returning here deliberately leaks the
+            // queue, transport, pending slots, and DMA mappings instead of
+            // allowing Rust's drop glue to free memory the device may still
+            // access.  This is the quarantine owner, not a synthetic error.
+            self.queue.set_dev_notify(false);
+            return;
+        }
+        if self.retired {
+            // `reset_device` already proved quiescence and cleared the
+            // queue. Do not ask the transport to reset a third time while
+            // dropping the retired owner.
+            unsafe {
+                ManuallyDrop::drop(&mut self.pending);
+                ManuallyDrop::drop(&mut self.queue);
+                ManuallyDrop::drop(&mut self.transport);
+            }
+            return;
+        }
         let live_pending = self.pending.iter().filter(|entry| entry.is_some()).count();
         record_blk_async_resource_leaks(live_pending);
         // A pending request still contains caller-owned DMA pointers.  Reset
@@ -1919,23 +3884,55 @@ impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
         // deliberately not reported as completed; teardown is fail-closed.
         self.queue.set_dev_notify(false);
         self.transport.set_status(DeviceStatus::empty());
-        while !self.transport.get_status().is_empty() {
+        let mut polls = 0usize;
+        while !self.transport.get_status().is_empty() && polls < RESET_POLL_BUDGET {
+            polls = polls.checked_add(1).expect("reset poll-count overflow");
             spin_loop();
+        }
+        if !self.transport.get_status().is_empty() {
+            self.quarantined = true;
+            // Keep every possible DMA owner in its ManuallyDrop fields.  The
+            // quarantine branch above will retain them when this destructor
+            // returns.
+            return;
+        }
+        self.transport.mark_reset_complete();
+        if self.queue.outstanding_descriptor_count() != self.tracked_pending_descriptor_count() {
+            // Do not destroy a queue containing a descriptor that is not
+            // represented by a pending owner. The ManuallyDrop fields retain
+            // both the queue and all caller/DMA state in this branch.
+            self.quarantined = true;
+            return;
         }
         // Physical mappings are owned by their pending entries until the
         // used-ring reap. After reset the device is quiescent, so release any
         // still-live mappings exactly once; completed entries already unmapped
         // themselves in `PendingBlkRequest::complete`.
-        for entry in &mut self.pending {
+        for entry in (&mut *self.pending).iter_mut() {
             let Some(request) = entry.take() else {
                 continue;
             };
             if !request.done {
-                request.unmap_physical::<H>();
+                let token = request.token.expect("live pending request lost token");
+                // SAFETY: the bounded reset proof above established
+                // quiescence before descriptor recycling.
+                unsafe { request.recycle_after_quiescence(&mut self.queue, token) };
             }
+        }
+        if !self.queue.is_empty() || self.queue.has_live_indirect_lists() {
+            self.quarantined = true;
+            return;
         }
         // Clear any queue pointers after the device has acknowledged reset.
         self.transport.queue_unset(QUEUE);
+        // The owner fields are ManuallyDrop specifically so this is the only
+        // normal path that releases them.  Quarantine returns above retain the
+        // complete owner instead.
+        unsafe {
+            ManuallyDrop::drop(&mut self.pending);
+            ManuallyDrop::drop(&mut self.queue);
+            ManuallyDrop::drop(&mut self.transport);
+        }
     }
 }
 
@@ -2017,6 +4014,11 @@ impl RespStatus {
     pub const UNSUPPORTED: RespStatus = RespStatus(2);
     /// Not ready.
     pub const NOT_READY: RespStatus = RespStatus(3);
+
+    /// Returns the raw device status byte for completion plumbing.
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
 }
 
 impl From<RespStatus> for Result {
@@ -2113,6 +4115,621 @@ mod tests {
             fake::{FakeTransport, QueueStatus, State},
         },
     };
+
+    #[repr(align(512))]
+    struct AlignedBlock([u8; SECTOR_SIZE]);
+
+    #[test]
+    fn pending_handle_round_trips_generation_and_cookie() {
+        let handle = PendingBlkHandle {
+            generation: 0x1234_5678,
+            cookie: 99,
+            slot: 17,
+            token: 99,
+            notified: true,
+        };
+        let encoded = handle.into_raw();
+        let decoded = PendingBlkHandle::from_raw(encoded);
+        assert_eq!(decoded.completion_cookie(), handle.completion_cookie());
+        assert_eq!(decoded.notified(), handle.notified());
+        // Raw handles deliberately carry only the opaque cookie and notify
+        // hint; queue generation/slot/token remain private to the owner.
+        assert_eq!(decoded.generation(), 0);
+        assert_ne!(decoded, handle);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn pending_slab_is_heap_backed_with_fixed_capacity() {
+        type TestBlk = VirtIOBlk<FakeHal, FakeTransport<BlkConfig>>;
+
+        // The queue and bookkeeping arrays are intentionally bounded, but a
+        // 128-entry request owner slab must not inflate every device value or
+        // any caller stack frame.
+        assert!(size_of::<TestBlk>() < 16 * 1024);
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, _| {
+            assert_eq!(blk.pending.len(), QUEUE_SIZE as usize);
+            assert_eq!(
+                blk.pending.iter().filter(|entry| entry.is_some()).count(),
+                0
+            );
+        });
+    }
+
+    fn with_test_blk<R>(
+        device_features: u64,
+        f: impl FnOnce(&mut VirtIOBlk<FakeHal, FakeTransport<BlkConfig>>, Arc<Mutex<State>>) -> R,
+    ) -> R {
+        let mut config_space = BlkConfig {
+            capacity_low: Volatile::new(66),
+            capacity_high: Volatile::new(0),
+            size_max: Volatile::new(0),
+            seg_max: Volatile::new(0),
+            cylinders: Volatile::new(0),
+            heads: Volatile::new(0),
+            sectors: Volatile::new(0),
+            blk_size: Volatile::new(0),
+            physical_block_exp: Volatile::new(0),
+            alignment_offset: Volatile::new(0),
+            min_io_size: Volatile::new(0),
+            opt_io_size: Volatile::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: QUEUE_SIZE.into(),
+            device_features,
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
+        f(&mut blk, state)
+    }
+
+    #[test]
+    fn prepared_physical_drop_rolls_back_without_publication() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let physical = [PhysicalSegment {
+                paddr: SECTOR_SIZE,
+                len: SECTOR_SIZE,
+            }];
+            let mut request = PendingBlkPhysicalBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkPhysicalBatchBuffer::Read(&physical),
+                handle: None,
+            };
+            let descriptor_budget = blk.async_descriptor_budget();
+            {
+                let prepared =
+                    unsafe { blk.prepare_physical_batch(core::slice::from_mut(&mut request)) }
+                        .unwrap();
+                drop(prepared);
+            }
+
+            assert_eq!(blk.pending_request_count(), 0);
+            assert_eq!(blk.async_descriptor_budget(), descriptor_budget);
+            assert!(!State::poll_queue_notified(&state, QUEUE));
+        });
+    }
+
+    #[test]
+    fn legacy_nb_is_tracked_and_stale_handle_cannot_claim_reused_token() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let mut request = BlkReq::default();
+            let mut buffer = [0u8; SECTOR_SIZE];
+            let mut response = BlkResp::default();
+            let old =
+                unsafe { blk.read_blocks_nb(0, &mut request, &mut buffer, &mut response) }.unwrap();
+            let mut used = vec![0x5a; SECTOR_SIZE];
+            used.extend_from_slice(
+                BlkResp {
+                    status: RespStatus::OK,
+                }
+                .as_bytes(),
+            );
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| used)
+            );
+            assert_eq!(
+                blk.drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                    .unwrap()
+                    .drained(),
+                1
+            );
+            assert!(blk.pending_request_done(old));
+            assert_eq!(blk.retire_completion_records(), None);
+            assert_eq!(
+                unsafe { blk.complete_read_blocks(old, &request, &mut buffer, &mut response) },
+                Ok(())
+            );
+
+            let new =
+                unsafe { blk.read_blocks_nb(1, &mut request, &mut buffer, &mut response) }.unwrap();
+            assert_ne!(old.completion_cookie(), new.completion_cookie());
+            assert_eq!(
+                unsafe { blk.complete_read_blocks(old, &request, &mut buffer, &mut response) },
+                Err(Error::WrongToken)
+            );
+            let mut used = vec![0x6b; SECTOR_SIZE];
+            used.extend_from_slice(
+                BlkResp {
+                    status: RespStatus::OK,
+                }
+                .as_bytes(),
+            );
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| used)
+            );
+            assert_eq!(
+                unsafe { blk.complete_read_blocks(new, &request, &mut buffer, &mut response) },
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn physical_prepare_validation_failure_publishes_nothing() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, _state| {
+            let physical = [PhysicalSegment {
+                paddr: 0,
+                len: SECTOR_SIZE,
+            }];
+            let mut request = PendingBlkPhysicalBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkPhysicalBatchBuffer::Read(&physical),
+                handle: None,
+            };
+            let descriptor_budget = blk.async_descriptor_budget();
+            assert!(matches!(
+                unsafe { blk.prepare_physical_batch(core::slice::from_mut(&mut request)) },
+                Err(Error::InvalidParam)
+            ));
+            assert_eq!(blk.pending_request_count(), 0);
+            assert_eq!(blk.async_descriptor_budget(), descriptor_budget);
+        });
+    }
+
+    #[test]
+    fn no_drain_prepare_leaves_ordinary_used_entry_for_global_owner() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let ordinary_buf = [0u8; SECTOR_SIZE];
+            let mut ordinary = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&ordinary_buf),
+                handle: None,
+            };
+            let ordinary_report =
+                unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut ordinary)) }.unwrap();
+            assert_eq!(ordinary_report.submitted, 1);
+            let ordinary_handle = ordinary.handle.expect("ordinary handle");
+            assert!(state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                    BlkResp {
+                        status: RespStatus::OK,
+                    }
+                    .as_bytes()
+                    .to_vec()
+                }));
+
+            let ordinary_buf_2 = [0u8; SECTOR_SIZE];
+            let mut ordinary_2 = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&ordinary_buf_2),
+                handle: None,
+            };
+            let ordinary_report_2 = unsafe {
+                blk.submit_pending_batch_no_drain(core::slice::from_mut(&mut ordinary_2))
+            }
+            .unwrap();
+            assert_eq!(ordinary_report_2.submitted, 1);
+            let ordinary_handle_2 = ordinary_2.handle.expect("ordinary handle 2");
+            // The ordinary no-drain submit must leave the first used entry
+            // at the lower FIFO head for the global owner as well.
+            assert!(!blk.pending_request_done(ordinary_handle));
+            assert!(state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                    BlkResp {
+                        status: RespStatus::OK,
+                    }
+                    .as_bytes()
+                    .to_vec()
+                }));
+
+            let mut backing = AlignedBlock([0; SECTOR_SIZE]);
+            let physical = [PhysicalSegment {
+                paddr: backing.0.as_mut_ptr() as usize,
+                len: SECTOR_SIZE,
+            }];
+            let mut request = PendingBlkPhysicalBatchRequest {
+                block_id: 1,
+                buffer: PendingBlkPhysicalBatchBuffer::Read(&physical),
+                handle: None,
+            };
+            let prepared = unsafe {
+                blk.prepare_physical_batch_no_drain(core::slice::from_mut(&mut request))
+            }
+            .unwrap();
+            let (report, handles, count) = prepared.publish_with_handles();
+            assert_eq!(report.submitted, 1);
+            assert_eq!(count, 1);
+            let physical_handle = handles[0];
+            // Preparation must not let a synchronous submitter consume the
+            // ordinary used-ring head behind the broker's back.
+            assert!(!blk.pending_request_done(ordinary_handle));
+            assert!(state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                    let mut used = vec![0x5a; SECTOR_SIZE];
+                    used.extend_from_slice(
+                        BlkResp {
+                            status: RespStatus::OK,
+                        }
+                        .as_bytes(),
+                    );
+                    used
+                }));
+
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Physical,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }; 3];
+            let drained = blk.drain_pending_completions_all_into(&mut output).unwrap();
+            assert_eq!(drained.completed, 3);
+            assert_eq!(output[0].owner, BlockCompletionOwner::Ordinary);
+            assert_eq!(output[0].handle.into_raw(), ordinary_handle.into_raw());
+            assert_eq!(output[1].owner, BlockCompletionOwner::Ordinary);
+            assert_eq!(output[1].handle.into_raw(), ordinary_handle_2.into_raw());
+            assert_eq!(output[2].owner, BlockCompletionOwner::Physical);
+            assert_eq!(output[2].handle.into_raw(), physical_handle.into_raw());
+        });
+    }
+
+    #[test]
+    fn physical_drain_does_not_consume_ordinary_completions() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let buffers = vec![[0u8; SECTOR_SIZE], [0u8; SECTOR_SIZE]];
+            let mut requests = buffers
+                .iter()
+                .enumerate()
+                .map(|(index, buffer)| PendingBlkBatchRequest {
+                    block_id: index,
+                    buffer: PendingBlkBatchBuffer::Write(buffer),
+                    handle: None,
+                })
+                .collect::<Vec<_>>();
+            let report = unsafe { blk.submit_pending_batch(&mut requests) }.unwrap();
+            assert_eq!(report.submitted, 2);
+            let handles = requests
+                .iter()
+                .map(|request| request.handle.unwrap())
+                .collect::<Vec<_>>();
+
+            for status in [RespStatus::IO_ERR, RespStatus::OK] {
+                assert!(
+                    state
+                        .lock()
+                        .unwrap()
+                        .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| BlkResp { status }
+                            .as_bytes()
+                            .to_vec(),)
+                );
+            }
+
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Physical,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }; 2];
+            let drained = blk.drain_pending_completions_into(&mut output).unwrap();
+            assert_eq!(drained.completed, 0);
+            assert!(drained.continuation);
+            assert_eq!(blk.pending_request_count(), 2);
+
+            assert_eq!(
+                blk.drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                    .unwrap()
+                    .drained(),
+                2
+            );
+            assert!(blk.pending_request_done(handles[0]));
+            assert!(blk.pending_request_done(handles[1]));
+            assert_eq!(
+                blk.complete_pending_request(handles[0]),
+                Err(Error::IoError)
+            );
+            assert_eq!(blk.complete_pending_request(handles[1]), Ok(()));
+            assert_eq!(blk.pending_request_count(), 0);
+        });
+    }
+
+    #[test]
+    fn count_poll_before_exact_physical_drain_preserves_cookie_and_status() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let mut backing = AlignedBlock([0; SECTOR_SIZE]);
+            let physical = [PhysicalSegment {
+                paddr: backing.0.as_mut_ptr() as usize,
+                len: SECTOR_SIZE,
+            }];
+            let handle = unsafe { blk.submit_read_blocks_physical_pending(0, &physical) }.unwrap();
+
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                        let mut response = vec![0x5a; SECTOR_SIZE];
+                        response.extend_from_slice(
+                            BlkResp {
+                                status: RespStatus::IO_ERR,
+                            }
+                            .as_bytes(),
+                        );
+                        response
+                    },)
+            );
+
+            // A count-only poll must not claim a physical used entry. The
+            // exact drain below remains the sole owner of its cookie/status.
+            assert_eq!(
+                blk.drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                    .unwrap(),
+                PendingBlkDrainStatus::Continuation { drained: 0 }
+            );
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Physical,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }];
+            let drained = blk.drain_pending_completions_into(&mut output).unwrap();
+            assert_eq!(drained.completed, 1);
+            assert_eq!(output[0].handle.into_raw(), handle.into_raw());
+            assert_eq!(output[0].cookie, handle.completion_cookie());
+            assert_eq!(output[0].status, RespStatus::IO_ERR);
+            assert_eq!(output[0].bytes, SECTOR_SIZE as u32);
+            assert_eq!(blk.pending_request_count(), 0);
+        });
+    }
+
+    #[test]
+    fn count_only_retirement_caps_a_large_budget_to_one_fixed_pass() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let buffers = [[0u8; SECTOR_SIZE]; 6];
+            let mut requests = buffers
+                .iter()
+                .enumerate()
+                .map(|(index, buffer)| PendingBlkBatchRequest {
+                    block_id: index,
+                    buffer: PendingBlkBatchBuffer::Write(buffer),
+                    handle: None,
+                })
+                .collect::<Vec<_>>();
+            let report =
+                unsafe { blk.submit_pending_batch(&mut requests) }.expect("submit batch");
+            assert_eq!(report.submitted, buffers.len());
+
+            for _ in 0..buffers.len() {
+                assert!(state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                        BlkResp {
+                            status: RespStatus::OK,
+                        }
+                        .as_bytes()
+                        .to_vec()
+                    }));
+            }
+
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Ordinary,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }; PENDING_COMPLETION_DRAIN_BUDGET];
+            let first = blk
+                .drain_pending_completions_all_into(&mut output)
+                .expect("first bounded drain");
+            assert_eq!(first.completed, PENDING_COMPLETION_DRAIN_BUDGET);
+            assert!(first.continuation);
+            let second = blk
+                .drain_pending_completions_all_into(&mut output)
+                .expect("second bounded drain");
+            assert_eq!(second.completed, buffers.len() - PENDING_COMPLETION_DRAIN_BUDGET);
+            assert!(!second.continuation);
+
+            // All six records are done, but the poll surface passes only one
+            // fixed count-only budget. The remaining two owners must stay
+            // visible for the next poll.
+            assert_eq!(blk.pending_request_count(), buffers.len());
+            assert_eq!(
+                blk.retire_completion_records_bounded(PENDING_COMPLETION_DRAIN_BUDGET),
+                None
+            );
+            assert_eq!(
+                blk.pending_request_count(),
+                buffers.len() - PENDING_COMPLETION_DRAIN_BUDGET
+            );
+        });
+    }
+
+    #[test]
+    fn ordinary_batch_drain_preserves_notified_raw_handle() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let buffer = [0u8; SECTOR_SIZE];
+            let mut request = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&buffer),
+                handle: None,
+            };
+            let report =
+                unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut request)) }.unwrap();
+            assert_eq!(report.submitted, 1);
+            assert!(report.notified);
+            let submitted = request.handle.expect("ordinary request lost handle");
+
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                        BlkResp {
+                            status: RespStatus::OK,
+                        }
+                        .as_bytes()
+                        .to_vec()
+                    })
+            );
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Physical,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }];
+            let drained = blk.drain_pending_completions_all_into(&mut output).unwrap();
+            assert_eq!(drained.completed, 1);
+            assert_eq!(output[0].owner, BlockCompletionOwner::Ordinary);
+            assert_eq!(output[0].handle.into_raw(), submitted.into_raw());
+            assert_eq!(output[0].cookie, submitted.completion_cookie());
+        });
+    }
+
+    #[test]
+    fn malformed_used_length_quarantines_without_releasing_owner() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let mut buffer = [0u8; SECTOR_SIZE];
+            let mut request = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Read(&mut buffer),
+                handle: None,
+            };
+            let report =
+                unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut request)) }.unwrap();
+            assert_eq!(report.submitted, 1);
+
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                        BlkResp {
+                            status: RespStatus::OK,
+                        }
+                        .as_bytes()
+                        .to_vec()
+                    })
+            );
+            let mut output = [BlockCompletion {
+                handle: PendingBlkHandle::from_raw(0),
+                cookie: 0,
+                owner: BlockCompletionOwner::Ordinary,
+                status: RespStatus::NOT_READY,
+                bytes: 0,
+            }];
+            assert_eq!(
+                blk.drain_pending_completions_all_into(&mut output),
+                Err(Error::Quarantined)
+            );
+            assert_eq!(blk.pending_request_count(), 1);
+            // A malformed used entry is not a successful completion: keep the
+            // request owner in the reset/quarantine custody path.
+            assert!(!blk.pending_request_done(request.handle.unwrap()));
+            assert!(blk.queue_handle().is_none());
+        });
+    }
+
+    #[test]
+    fn reset_rejects_stale_generation_and_quarantine_retains_owner() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, _state| {
+            let buffer = [0u8; SECTOR_SIZE];
+            let mut request = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&buffer),
+                handle: None,
+            };
+            unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut request)) }.unwrap();
+            let old_handle = request.handle.unwrap();
+            assert_eq!(blk.reset_device(), ResetOutcome::Retired);
+            // A second reset observes the permanently retired queue; it does
+            // not reopen notifications or pretend that submission is live.
+            assert_eq!(blk.reset_device(), ResetOutcome::Retired);
+            assert!(blk.queue_handle().is_none());
+            assert!(!blk.pending_request_done(old_handle));
+            assert_eq!(
+                blk.complete_pending_request(old_handle),
+                Err(Error::WrongToken)
+            );
+            let buffer = [0u8; SECTOR_SIZE];
+            let mut retired_request = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&buffer),
+                handle: None,
+            };
+            assert_eq!(
+                unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut retired_request)) },
+                Err(Error::Quarantined)
+            );
+        });
+
+        let mut config_space = BlkConfig {
+            capacity_low: Volatile::new(66),
+            capacity_high: Volatile::new(0),
+            size_max: Volatile::new(0),
+            seg_max: Volatile::new(0),
+            cylinders: Volatile::new(0),
+            heads: Volatile::new(0),
+            sectors: Volatile::new(0),
+            blk_size: Volatile::new(0),
+            physical_block_exp: Volatile::new(0),
+            alignment_offset: Volatile::new(0),
+            min_io_size: Volatile::new(0),
+            opt_io_size: Volatile::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: QUEUE_SIZE.into(),
+            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
+            config_space: NonNull::from(&mut config_space),
+            state,
+        };
+        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
+        let physical = [PhysicalSegment {
+            paddr: SECTOR_SIZE,
+            len: SECTOR_SIZE,
+        }];
+        unsafe { blk.submit_read_blocks_physical_pending(0, &physical) }.unwrap();
+        blk.quarantined = true;
+        assert_eq!(blk.reset_device(), ResetOutcome::Quarantined);
+        assert_eq!(blk.pending_request_count(), 1);
+        assert!(blk.queue_handle().is_none());
+        core::mem::forget(blk);
+    }
 
     #[test]
     fn config() {
@@ -2243,6 +4860,59 @@ mod tests {
                 blk.complete_pending_request(handle).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn count_drain_retires_owned_records_and_reuses_slot() {
+        with_test_blk(BlkFeature::RING_INDIRECT_DESC.bits(), |blk, state| {
+            let buffer = [0u8; SECTOR_SIZE];
+            let mut request = PendingBlkBatchRequest {
+                block_id: 0,
+                buffer: PendingBlkBatchBuffer::Write(&buffer),
+                handle: None,
+            };
+            assert_eq!(
+                unsafe { blk.submit_pending_batch(core::slice::from_mut(&mut request)) }
+                    .unwrap()
+                    .submitted,
+                1
+            );
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| BlkResp {
+                        status: RespStatus::IO_ERR
+                    }
+                    .as_bytes()
+                    .to_vec(),)
+            );
+            assert_eq!(
+                blk.drain_pending_completions_bounded(PENDING_COMPLETION_DRAIN_BUDGET)
+                    .unwrap(),
+                PendingBlkDrainStatus::Complete { drained: 1 }
+            );
+            assert_eq!(blk.pending_request_count(), 0);
+            assert_eq!(blk.retire_completion_records(), Some(RespStatus::IO_ERR));
+
+            // No handle-specific waiter consumed the completion. The slot was
+            // nevertheless retired by the single completion owner and is
+            // immediately reusable.
+            let replacement = [0u8; SECTOR_SIZE];
+            let mut replacement_request = PendingBlkBatchRequest {
+                block_id: 1,
+                buffer: PendingBlkBatchBuffer::Write(&replacement),
+                handle: None,
+            };
+            assert_eq!(
+                unsafe {
+                    blk.submit_pending_batch(core::slice::from_mut(&mut replacement_request))
+                }
+                .unwrap()
+                .submitted,
+                1
+            );
+        });
     }
 
     #[test]

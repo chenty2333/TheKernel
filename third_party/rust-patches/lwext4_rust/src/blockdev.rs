@@ -21,6 +21,119 @@ pub struct PhysicalIoSegment {
     pub len: usize,
 }
 
+/// Terminal result of a direct physical-SG request.  `Quarantined` means the
+/// lower driver published the descriptor but could not prove DMA retirement;
+/// the caller must retain/transfer its pin owner to quarantine and must not
+/// fall back through a virtual buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoSgOutcome {
+    Completed(usize),
+    NotSubmitted,
+    Quarantined,
+}
+
+/// Why a physical batch was not published.  Every variant is a proof that no
+/// descriptor became visible to the device, so the caller may still choose a
+/// pre-publication fallback.  `Backpressure` is transient queue admission;
+/// the other variants describe permanent capability, allocation, or request
+/// validation failures and must not be conflated with queue pressure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoNotSubmittedReason {
+    Backpressure,
+    Unsupported,
+    NoMemory,
+    Invalid,
+}
+
+/// One owned request description produced from a [`PhysicalIoPlan`].  The
+/// fixed SG array is copied before publication, so a worker never borrows a
+/// caller's registered-buffer descriptor while waiting for the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoBatchRequest {
+    pub block_id: u64,
+    pub operation: crate::fs::PhysicalIoOperation,
+    pub segments: [PhysicalIoSegment; crate::fs::MAX_PHYSICAL_IO_SEGMENTS],
+    pub segment_count: usize,
+    pub bytes: usize,
+}
+
+impl PhysicalIoBatchRequest {
+    pub const fn empty() -> Self {
+        Self {
+            block_id: 0,
+            operation: crate::fs::PhysicalIoOperation::Read,
+            segments: [PhysicalIoSegment { paddr: 0, len: 0 }; crate::fs::MAX_PHYSICAL_IO_SEGMENTS],
+            segment_count: 0,
+            bytes: 0,
+        }
+    }
+
+    pub fn from_plan(plan: crate::fs::PhysicalIoPlan, extent_index: usize) -> Option<Self> {
+        let extent = plan.extent(extent_index)?;
+        let start = extent.segment_start();
+        let count = extent.segment_count();
+        let end = start.checked_add(count)?;
+        if end > plan.segment_count() || count == 0 || count > crate::fs::MAX_PHYSICAL_IO_SEGMENTS {
+            return None;
+        }
+        let mut segments =
+            [PhysicalIoSegment { paddr: 0, len: 0 }; crate::fs::MAX_PHYSICAL_IO_SEGMENTS];
+        for (index, segment) in plan.segments()[start..end].iter().copied().enumerate() {
+            segments[index] = segment;
+        }
+        Some(Self {
+            block_id: extent.physical_block_id(),
+            operation: plan.operation(),
+            segments,
+            segment_count: count,
+            bytes: extent.bytes(),
+        })
+    }
+
+    pub fn physical_segments(&self) -> &[PhysicalIoSegment] {
+        &self.segments[..self.segment_count]
+    }
+}
+
+/// Handles returned by one physical batch publication.  The raw value is an
+/// opaque generation-safe driver handle; completion cookies are reported by
+/// the driver's exact completion drain and must be paired with these handles
+/// by the effect owner.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct PhysicalIoBatchSubmission {
+    pub handles: Vec<u64>,
+    /// Non-zero cookies assigned by the driver before publication, one per
+    /// accepted handle.  A non-empty accepted submission with missing or
+    /// zero cookies is malformed and must remain terminal rather than
+    /// guessing an identity from a later completion.
+    pub cookies: Vec<u64>,
+    pub bytes: usize,
+    pub submitted: usize,
+    /// A partial report is terminal: accepted handles remain owned by the
+    /// caller for quiescence and the operation must not fall back.
+    pub terminal: bool,
+}
+
+/// Result of one all-or-none physical batch admission attempt.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PhysicalIoBatchSubmitOutcome {
+    /// No descriptor was published and the reason is explicit.
+    NotSubmitted(PhysicalIoNotSubmittedReason),
+    /// The returned submission owns every descriptor accepted by the lower
+    /// route.  A partial or malformed submission remains terminal inside the
+    /// effect state machine and cannot become a fallback.
+    Submitted(PhysicalIoBatchSubmission),
+}
+
+/// Result metadata for a bounded device-level physical completion wait.  The
+/// completion records themselves remain in the caller-owned output slice so a
+/// worker can demultiplex them among multiple published effects.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalIoCompletionDrain {
+    pub completed: usize,
+    pub continuation: bool,
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct AsyncReadSubmission {
     pub handles: Vec<u64>,
@@ -69,7 +182,8 @@ pub trait BlockDevice {
     }
 
     /// Attempts a direct read into caller-pinned physical SG memory.
-    /// `Ok(None)` means that the underlying device has no physical-SG path.
+    /// `NotSubmitted` means that the underlying device has no physical-SG
+    /// path. `Quarantined` is reset-required custody, never fallback.
     ///
     /// # Safety
     ///
@@ -80,9 +194,9 @@ pub trait BlockDevice {
         &mut self,
         block_id: u64,
         segments: &[PhysicalIoSegment],
-    ) -> Ext4Result<Option<usize>> {
+    ) -> Ext4Result<PhysicalIoSgOutcome> {
         let _ = (block_id, segments);
-        Ok(None)
+        Ok(PhysicalIoSgOutcome::NotSubmitted)
     }
 
     /// Attempts to submit a scatter-list read through an async block queue.
@@ -156,7 +270,8 @@ pub trait BlockDevice {
     }
 
     /// Attempts a direct overwrite from caller-pinned physical SG memory.
-    /// `Ok(None)` means that the underlying device has no physical-SG path.
+    /// `NotSubmitted` means that the underlying device has no physical-SG
+    /// path. `Quarantined` is reset-required custody, never fallback.
     ///
     /// # Safety
     ///
@@ -167,9 +282,59 @@ pub trait BlockDevice {
         &mut self,
         block_id: u64,
         segments: &[PhysicalIoSegment],
-    ) -> Ext4Result<Option<usize>> {
+    ) -> Ext4Result<PhysicalIoSgOutcome> {
         let _ = (block_id, segments);
-        Ok(None)
+        Ok(PhysicalIoSgOutcome::NotSubmitted)
+    }
+
+    /// Atomically publishes all requests from one owned physical plan.  A
+    /// `NotSubmitted` result means no descriptor was published and the caller
+    /// may use its synchronous fallback.  A returned submission is never a
+    /// fallback:
+    /// when `terminal` is true it contains the accepted prefix whose handles
+    /// must be retained until exact completion/quiescence.
+    unsafe fn submit_physical_batch(
+        &mut self,
+        requests: &[PhysicalIoBatchRequest],
+    ) -> Ext4Result<PhysicalIoBatchSubmitOutcome> {
+        let _ = requests;
+        Ok(PhysicalIoBatchSubmitOutcome::NotSubmitted(
+            PhysicalIoNotSubmittedReason::Unsupported,
+        ))
+    }
+
+    /// Publishes an owned physical batch for the device-global kernel worker.
+    /// Implementations with a shared lower broker may select its kernel route;
+    /// the default preserves the exact-route behavior of simple devices.
+    unsafe fn submit_physical_batch_with_route(
+        &mut self,
+        requests: &[PhysicalIoBatchRequest],
+        _kernel_worker: bool,
+    ) -> Ext4Result<PhysicalIoBatchSubmitOutcome> {
+        unsafe { self.submit_physical_batch(requests) }
+    }
+
+    unsafe fn submit_physical_batch_kernel(
+        &mut self,
+        requests: &[PhysicalIoBatchRequest],
+    ) -> Ext4Result<PhysicalIoBatchSubmitOutcome> {
+        unsafe { self.submit_physical_batch_with_route(requests, true) }
+    }
+
+    /// Waits for at least one concrete physical completion from the shared
+    /// device owner and returns a bounded, device-level batch.  This method is
+    /// intentionally effect-agnostic: callers must match the returned handle
+    /// and cookie to their own published effect.  The default is an explicit
+    /// unsupported error and must not look like a successful empty drain.
+    fn wait_any_physical_completion(
+        &mut self,
+        output: &mut [crate::fs::PhysicalIoCompletion],
+    ) -> Ext4Result<PhysicalIoCompletionDrain> {
+        let _ = output;
+        Err(Ext4Error::new(
+            EIO as _,
+            "physical completion wait unsupported",
+        ))
     }
 }
 

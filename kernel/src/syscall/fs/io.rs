@@ -2,8 +2,8 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileFlags, OpenOptions, PinnedPhysicalSegment};
-use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, PhysicalIoSegment};
+use axfs::{FS_CONTEXT, FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
+use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, NodeType, PhysicalIoSegment};
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
 use axpoll::{IoEvents, Pollable};
@@ -17,13 +17,19 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst, IoSrc,
-        OfdIoStatus, PacketSocket, PidFd, PinnedSocketDescription, Pipe, PreparedSocketMessage,
-        Socket, allowed_write_len, check_resize_limit, executable, flock, get_file_like,
-        get_typed_file, inode_flags,
+        Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst,
+        IoOperationContext, IoSrc, OfdIoStatus, PacketSocket, PidFd, PinnedSocketDescription, Pipe,
+        PreparedSocketMessage, Socket, allowed_write_len, check_resize_limit, executable,
+        fanotify::{FanotifyEventActor, permission_check_file_like_with_actor_and_status},
+        flock, get_file_like, get_typed_file, inode_flags,
         inotify::{
-            notify_exact, notify_parent, notify_read, notify_read_file, notify_write,
-            notify_write_file,
+            notify_exact, notify_parent, notify_read, notify_read_file,
+            notify_read_file_with_actor, notify_write, notify_write_file,
+            notify_write_file_with_actor,
+        },
+        io_uring::{
+            IoUringBufferLease, IoUringFileLease, PreparedPhysicalIoAdmission,
+            PreparedPhysicalIoOperation, PreparedPhysicalIoPlan,
         },
         lease, memfd,
         permission::{
@@ -81,7 +87,8 @@ const USER_SLICE_FAST_MIN: usize = 4096;
 const USER_IOV_FAST_MAX_SEGMENTS: usize = 64;
 const USER_COPY_PREFAULT_MIN: usize = 16 * 1024;
 const TRANSFER_ATTEMPT_LOCK_COUNT: usize = 64;
-const IO_URING_DMA_MAX_SEGMENTS: usize = 4;
+const IO_URING_DMA_MAX_SEGMENTS: usize = crate::file::io_uring::IO_URING_PHYSICAL_MAX_SEGMENTS;
+const IO_URING_DMA_MAX_BYTES: usize = crate::file::io_uring::IO_URING_PHYSICAL_MAX_BYTES;
 
 type IoUringFixedSegments<'a> = (
     &'a [UserIoPinSegment],
@@ -95,6 +102,15 @@ type IoUringFixedSegments<'a> = (
 enum FixedDmaOutcome {
     Completed(usize),
     Fallback,
+}
+
+/// Result of the deliberately narrow io_uring worker entry point. The worker
+/// receives an owned, submitter-prepared token, so it cannot fall back to a
+/// generic path after irreversible write policy cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoUringWorkerResult {
+    Completed(isize),
+    Failed(AxError),
 }
 
 fn fixed_dma_geometry_eligible(
@@ -112,6 +128,34 @@ fn fixed_dma_geometry_eligible(
         && file_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
 }
 
+fn fixed_dma_fallback_reason(
+    addr: usize,
+    len: usize,
+    file_offset: u64,
+    segments: &[UserIoPinSegment],
+    offset_in_segments: usize,
+    segments_disjoint: bool,
+    provenance: UserIoPinProvenance,
+) -> crate::file::io_uring::IoUringDmaFallbackReason {
+    use crate::file::io_uring::IoUringDmaFallbackReason;
+
+    if provenance != UserIoPinProvenance::PrivateAnonymous {
+        return IoUringDmaFallbackReason::Provenance;
+    }
+    if !segments_disjoint
+        || len == 0
+        || !addr.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !len.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !file_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+    {
+        return IoUringDmaFallbackReason::Geometry;
+    }
+    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+    clip_io_uring_dma_segments_with_reason(segments, offset_in_segments, len, &mut physical)
+        .err()
+        .unwrap_or(IoUringDmaFallbackReason::DeviceAdmission)
+}
+
 fn classify_fixed_dma_result(result: Option<usize>, len: usize) -> AxResult<FixedDmaOutcome> {
     match result {
         Some(bytes) if bytes == len => Ok(FixedDmaOutcome::Completed(bytes)),
@@ -121,38 +165,71 @@ fn classify_fixed_dma_result(result: Option<usize>, len: usize) -> AxResult<Fixe
 }
 
 /// Clips a borrowed registered-buffer physical range into the fixed-size SG
-/// descriptor array consumed by the filesystem DMA hook.  This never allocates
-/// and deliberately rejects ranges requiring more than four descriptors so the
-/// caller can use its existing pinned bounce path.
-fn clip_io_uring_dma_segments(
+/// descriptor array consumed by the filesystem DMA hook.  Adjacent physical
+/// ranges are merged after clipping, so page-fragmented user mappings do not
+/// consume descriptors when the device can consume one contiguous span. This
+/// never allocates and deliberately rejects ranges requiring more than four
+/// descriptors so the caller can use its existing pinned bounce path.
+fn clip_io_uring_dma_segments_with_reason(
     segments: &[UserIoPinSegment],
     offset: usize,
     len: usize,
     output: &mut [PhysicalIoSegment; IO_URING_DMA_MAX_SEGMENTS],
-) -> Option<usize> {
-    let end = offset.checked_add(len)?;
+) -> Result<usize, crate::file::io_uring::IoUringDmaFallbackReason> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(crate::file::io_uring::IoUringDmaFallbackReason::Geometry)?;
     let mut logical = 0usize;
     let mut count = 0usize;
     for segment in segments.iter().copied() {
-        let segment_end = logical.checked_add(segment.len)?;
+        let segment_end = logical
+            .checked_add(segment.len)
+            .ok_or(crate::file::io_uring::IoUringDmaFallbackReason::Geometry)?;
         let clip_start = offset.max(logical);
         let clip_end = end.min(segment_end);
         if clip_start < clip_end {
             let paddr = segment
                 .paddr
-                .checked_add(clip_start.checked_sub(logical)?)?;
-            if count == output.len() {
-                return None;
+                .checked_add(
+                    clip_start
+                        .checked_sub(logical)
+                        .ok_or(crate::file::io_uring::IoUringDmaFallbackReason::Geometry)?,
+                )
+                .ok_or(crate::file::io_uring::IoUringDmaFallbackReason::Geometry)?;
+            let clipped_len = clip_end - clip_start;
+            if let Some(previous) = count.checked_sub(1).and_then(|index| output.get_mut(index))
+                && previous.paddr.checked_add(previous.len) == Some(paddr)
+            {
+                previous.len = previous
+                    .len
+                    .checked_add(clipped_len)
+                    .ok_or(crate::file::io_uring::IoUringDmaFallbackReason::Geometry)?;
+            } else {
+                if count == output.len() {
+                    return Err(crate::file::io_uring::IoUringDmaFallbackReason::SgCap);
+                }
+                output[count] = PhysicalIoSegment::new(paddr, clipped_len);
+                count += 1;
             }
-            output[count] = PhysicalIoSegment::new(paddr, clip_end - clip_start);
-            count += 1;
         }
         logical = segment_end;
         if logical >= end {
             break;
         }
     }
-    (logical >= end && count != 0).then_some(count)
+    if logical < end || count == 0 {
+        return Err(crate::file::io_uring::IoUringDmaFallbackReason::Geometry);
+    }
+    Ok(count)
+}
+
+fn clip_io_uring_dma_segments(
+    segments: &[UserIoPinSegment],
+    offset: usize,
+    len: usize,
+    output: &mut [PhysicalIoSegment; IO_URING_DMA_MAX_SEGMENTS],
+) -> Option<usize> {
+    clip_io_uring_dma_segments_with_reason(segments, offset, len, output).ok()
 }
 
 static TRANSFER_ATTEMPT_LOCKS: Lazy<[Mutex<()>; TRANSFER_ATTEMPT_LOCK_COUNT]> =
@@ -161,6 +238,20 @@ static TRANSFER_ATTEMPT_LOCKS: Lazy<[Mutex<()>; TRANSFER_ATTEMPT_LOCK_COUNT]> =
 fn current_vfs_security() -> VfsSecurityContext {
     let current = axtask::current();
     VfsSecurityContext::new(current.as_thread().current_cred())
+}
+
+fn current_io_operation_context<T: ?Sized>(f: &FileHandle<T>) -> IoOperationContext {
+    f.capture_io_operation_context(current_vfs_security(), FanotifyEventActor::current())
+}
+
+/// Captures the immutable operation identity at SQE admission.  Callers must
+/// retain the returned context together with the exact `FileDescription`; no
+/// worker path is allowed to derive a replacement context from `current()`.
+pub(crate) fn capture_io_operation_context(
+    description: &Arc<FileDescription>,
+) -> IoOperationContext {
+    let file_handle = description.file_handle();
+    current_io_operation_context(&file_handle)
 }
 
 const fn generic_socket_message_flags(status: OfdIoStatus) -> u32 {
@@ -177,7 +268,22 @@ fn dispatch_generic_socket_receive(
     iov_count: usize,
     len: usize,
 ) -> AxResult<()> {
-    let security = current_vfs_security();
+    dispatch_generic_socket_receive_with_security(
+        &current_vfs_security(),
+        socket,
+        status,
+        iov_count,
+        len,
+    )
+}
+
+fn dispatch_generic_socket_receive_with_security(
+    security: &VfsSecurityContext,
+    socket: &PinnedSocketDescription,
+    status: OfdIoStatus,
+    iov_count: usize,
+    len: usize,
+) -> AxResult<()> {
     let flags = generic_socket_message_flags(status);
     let message = PreparedSocketMessage::new(flags, iov_count, 0, 0, 0);
     let socket_ref = socket.security_ref()?;
@@ -275,95 +381,135 @@ fn zero_offset_stream_file_like(
     }
 }
 
-fn io_uring_stream_read(
+fn io_uring_stream_read_with_context(
     capability: &UserMemoryCapability,
     file_handle: &FileHandle<dyn FileLike>,
+    context: &IoOperationContext,
     buf: *mut u8,
     len: usize,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+    force_nonblocking: bool,
 ) -> AxResult<isize> {
-    let status = file_handle.io_status_snapshot();
+    let status = context.status();
     file_handle.check_io_status(status)?;
     let socket = PinnedSocketDescription::from_file_handle(file_handle, status)?;
     if socket.is_some() && len == 0 {
         return Ok(0);
     }
-    if len != 0 {
-        crate::file::fanotify::permission_check_file_like(
-            file_handle,
-            crate::file::fanotify::FAN_ACCESS_PERM,
-        )?;
-    }
     generic_read_after_socket_policy(
         socket.as_ref(),
         len,
-        |socket| dispatch_generic_socket_receive(socket, status, 1, len),
+        |socket| {
+            dispatch_generic_socket_receive_with_security(
+                context.security(),
+                socket,
+                status,
+                1,
+                len,
+            )
+        },
         || {
-            file_handle.with_read_credentials(|| {
-                let read = if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
-                    let mut destination =
-                        PinnedPhysicalWriter::from_validated_range(segments, offset, fixed_len);
-                    read_file_like_with_status(file_handle, status, &mut destination)?
-                } else {
-                    read_file_like_with_status(
-                        file_handle,
-                        status,
-                        &mut VmBytesMut::new(capability.clone(), buf, len),
-                    )?
-                };
-                if read > 0
-                    && let Some(file) = file_handle.downcast_ref::<File>()
-                {
-                    notify_read_file(file);
-                }
-                Ok(read)
-            })
+            let read = if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
+                let mut destination =
+                    PinnedPhysicalWriter::from_validated_range(segments, offset, fixed_len);
+                read_file_like_with_status_and_nonblocking(
+                    file_handle,
+                    status,
+                    &mut destination,
+                    force_nonblocking,
+                )?
+            } else {
+                read_file_like_with_status_and_nonblocking(
+                    file_handle,
+                    status,
+                    &mut VmBytesMut::new(capability.clone(), buf, len),
+                    force_nonblocking,
+                )?
+            };
+            if read > 0
+                && let Some(file) = file_handle.downcast_ref::<File>()
+            {
+                notify_read_file_with_actor(file, context.fanotify_actor());
+            }
+            Ok(read)
         },
     )
     .map(|read| read.unwrap_or(0) as isize)
 }
 
-fn io_uring_stream_write(
+fn io_uring_stream_write_with_context(
     capability: &UserMemoryCapability,
     file_handle: &FileHandle<dyn FileLike>,
+    context: &IoOperationContext,
     buf: *const u8,
     len: usize,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
-    let security = current_vfs_security();
-    let status = file_handle.io_status_snapshot();
+    let security = context.security();
+    let status = context.status();
     file_handle.check_io_status(status)?;
     let socket = PinnedSocketDescription::from_file_handle(file_handle, status)?;
     let written = generic_write_after_socket_policy(
         socket.as_ref(),
         |socket| dispatch_generic_socket_send(&security, socket, status, 1, len),
         || {
-            file_handle.with_write_credentials_for_status(status, || {
-                if let Some(file) = file_handle.downcast_ref::<File>() {
-                    check_file_write_admission(file, len)?;
-                }
-                if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
-                    let mut source =
-                        PinnedPhysicalReader::from_validated_range(segments, offset, fixed_len);
-                    write_file_like_with_status(file_handle, status, &mut source, &security)
-                } else {
-                    write_file_like_with_status(
-                        file_handle,
-                        status,
-                        &mut VmBytes::new(capability.clone(), buf, len),
-                        &security,
-                    )
-                }
-            })
+            if let Some(file) = file_handle.downcast_ref::<File>() {
+                check_file_write_admission(file, len)?;
+            }
+            if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
+                let mut source =
+                    PinnedPhysicalReader::from_validated_range(segments, offset, fixed_len);
+                write_file_like_with_status(file_handle, status, &mut source, security)
+            } else {
+                write_file_like_with_status(
+                    file_handle,
+                    status,
+                    &mut VmBytes::new(capability.clone(), buf, len),
+                    security,
+                )
+            }
         },
     )?;
     if written > 0 {
         sync_file_like_after_status_write(status, file_handle)?;
         if let Some(file) = file_handle.downcast_ref::<File>() {
-            notify_write_file(file);
+            notify_write_file_with_actor(file, context.fanotify_actor());
         }
     }
     Ok(written as isize)
+}
+
+/// Performs one retry for the narrow io_uring pending-stream owner.
+///
+/// The owner already captured the exact OFD context and registered-buffer
+/// lease at SQE admission. This task-context entry point therefore does not
+/// consult `current()` or install a temporary `O_NONBLOCK` flag; it uses the
+/// pinned physical writer and an explicit nonblocking read override so a
+/// stale/spurious wake simply re-arms readiness.
+pub(crate) fn io_uring_pending_read_fixed(
+    _capability: &UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    buffer_lease: &IoUringBufferLease,
+    context: &IoOperationContext,
+) -> AxResult<isize> {
+    context.validate_for(description)?;
+    let file_handle = description.file_handle();
+    if !matches!(
+        FileLikeKind::from_file_like(file_handle.as_ref()),
+        FileLikeKind::Fifo
+    ) {
+        return Err(AxError::BadState);
+    }
+    file_handle.check_io_status(context.status())?;
+    let (segments, offset, length, _) = buffer_lease.physical_range()?;
+    let mut destination = PinnedPhysicalWriter::from_validated_range(segments, offset, length);
+    let read = read_file_like_with_status_and_nonblocking(
+        &file_handle,
+        context.status(),
+        &mut destination,
+        true,
+    )?;
+    Ok(read as isize)
 }
 
 fn begin_inode_content_write(
@@ -593,16 +739,32 @@ fn read_file_like_with_status(
     status: OfdIoStatus,
     dst: &mut IoDst,
 ) -> AxResult<usize> {
+    read_file_like_with_status_and_nonblocking(file_like, status, dst, false)
+}
+
+/// Executes one file-like read with an explicit nonblocking override.
+///
+/// io_uring pending-stream admission uses this only for its narrow
+/// zero-offset FIFO slice.  It does not mutate the OFD's `O_NONBLOCK` bit;
+/// the override is carried by this one attempt and lets the task-context
+/// owner return `WouldBlock` without entering a synchronous readiness wait.
+fn read_file_like_with_status_and_nonblocking(
+    file_like: &FileHandle<dyn FileLike>,
+    status: OfdIoStatus,
+    dst: &mut IoDst,
+    force_nonblocking: bool,
+) -> AxResult<usize> {
+    let nonblocking = status.nonblocking() || force_nonblocking;
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.read_with_status(status, dst)
     } else if let Some(pipe) = file_like.downcast_ref::<Pipe>() {
-        pipe.read_with_nonblocking(dst, status.nonblocking())
+        pipe.read_with_nonblocking(dst, nonblocking)
     } else if let Some(pipe) = file_like.downcast_ref::<NamedPipe>() {
-        pipe.read_with_nonblocking(dst, status.nonblocking())
+        pipe.read_with_nonblocking(dst, nonblocking)
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
-        socket.read_with_nonblocking(dst, status.nonblocking())
+        socket.read_with_nonblocking(dst, nonblocking)
     } else if let Some(socket) = file_like.downcast_ref::<PacketSocket>() {
-        socket.read_with_nonblocking(dst, status.nonblocking())
+        socket.read_with_nonblocking(dst, nonblocking)
     } else {
         file_like.read(dst)
     }
@@ -630,6 +792,234 @@ fn regular_file_supports_user_slice_fast_path(file: &File) -> bool {
         .location()
         .flags()
         .contains(NodeFlags::BLOCKING)
+}
+
+fn regular_ext4_physical_worker_plan(
+    file: &File,
+    status: OfdIoStatus,
+    operation: PreparedPhysicalIoOperation,
+    addr: usize,
+    len: usize,
+    offset: u64,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
+) -> bool {
+    let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) = fixed_segments
+    else {
+        return false;
+    };
+    let Some(device) =
+        axfs::block_device_for_filesystem(file.inner().location().mountpoint().device())
+    else {
+        return false;
+    };
+    if !crate::file::io_uring::physical_completion_device_ready_for(device.identity_token()) {
+        return false;
+    }
+    if status.path_only()
+        || !file_uses_direct_io(file)
+        || file.inner().location().node_type() != NodeType::RegularFile
+        || file.inner().location().filesystem().name() != "ext4"
+        || len > IO_URING_DMA_MAX_BYTES
+        || fixed_len != len
+        || !fixed_dma_geometry_eligible(addr, len, offset, disjoint, provenance)
+    {
+        return false;
+    }
+    // The lower ext4 plan is overwrite-only for writes.  Keep the operation
+    // in the admission shape so a read lease can never be paired with a
+    // write effect (or vice versa).
+    if !matches!(
+        operation,
+        PreparedPhysicalIoOperation::Read | PreparedPhysicalIoOperation::Write
+    ) {
+        return false;
+    }
+    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+    clip_io_uring_dma_segments_with_reason(segments, offset_in_segments, len, &mut physical).is_ok()
+}
+
+/// This is only a cheap submission precheck. The file-specific plan resolves
+/// its filesystem identity to an exact SharedBlockDevice and repeats the
+/// readiness check before publication.
+#[inline]
+pub(crate) fn physical_effect_admission_enabled() -> bool {
+    // This is only the feature gate for attempting the physical preparation
+    // path.  Readiness is resolved again from the exact filesystem-bound
+    // SharedBlockDevice in `regular_ext4_physical_worker_plan`; a ready vda
+    // must never authorize a request whose file is on vdb (or vice versa).
+    true
+}
+
+/// Performs submitter-side admission for the only operation shape permitted
+/// to cross a future worker boundary. All checks here are made while the
+/// exact file and registered-buffer leases are held. A `None` result means the
+/// request must use the ordinary submission-task path; an `Err` result is an
+/// already-admitted operation error and must not be retried through that path.
+pub(crate) fn prepare_physical_io_plan(
+    file_lease: &IoUringFileLease,
+    buffer_lease: &IoUringBufferLease,
+    context: &IoOperationContext,
+    operation: PreparedPhysicalIoOperation,
+    offset: u64,
+) -> AxResult<Option<PreparedPhysicalIoPlan>> {
+    let description = file_lease.description()?;
+    context.validate_for(description)?;
+    let file_handle = description.file_handle();
+    let file = match file_handle.downcast::<File>() {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let (address, length) = buffer_lease.range()?;
+    let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
+    let requested_len = usize::try_from(length).map_err(|_| AxError::BadAddress)?;
+    if requested_len == 0 {
+        return Ok(None);
+    }
+    let (segments, offset_in_segments, fixed_len, disjoint) = buffer_lease.physical_range()?;
+    let provenance = buffer_lease.physical_provenance()?;
+    // This cheap shape check keeps generic files, streams, pseudo-files, and
+    // unsupported extents on the submission task without running their
+    // policy hooks twice.
+    if !regular_ext4_physical_worker_plan(
+        file.as_ref(),
+        context.status(),
+        operation,
+        address,
+        requested_len,
+        offset,
+        Some((
+            segments,
+            offset_in_segments,
+            fixed_len,
+            disjoint,
+            provenance,
+        )),
+    ) {
+        return Ok(None);
+    }
+
+    // These calls own the fallible read-side policy proof which used to exist
+    // only in worker comments: exact OFD access, executable exclusion, and
+    // positioned-operation capability all run before a token is published.
+    // A write is deliberately narrower than the generic pwrite path: it may
+    // not append, allocate, or extend the file.  The lower ext4 plan repeats
+    // the written-extent proof, while this admission keeps Linux policy and
+    // error ordering ahead of effect publication.
+    match operation {
+        PreparedPhysicalIoOperation::Read => {
+            let _ = positioned_read_file_handle(file_handle.clone())?;
+        }
+        PreparedPhysicalIoOperation::Write => {
+            if context.status().raw() & O_APPEND != 0 {
+                return Ok(None);
+            }
+            let _ = positioned_write_file_handle(file_handle.clone())?;
+            check_file_write_admission(file.as_ref(), requested_len)?;
+            executable::check_not_active(file.inner().location())?;
+            let file_len = file.inner().location().len()?;
+            let end = offset
+                .checked_add(requested_len as u64)
+                .ok_or(AxError::InvalidInput)?;
+            if end > file_len {
+                return Ok(None);
+            }
+            // A physical write is admitted only when Linux's file-size
+            // policy accepts the complete request.  A limited prefix stays
+            // on the ordinary submission path, which preserves its normal
+            // partial-write result and SIGXFSZ ordering.
+            if allowed_write_len(offset, requested_len)? != requested_len {
+                return Ok(None);
+            }
+        }
+    }
+    let allowed_len = requested_len;
+    validate_direct_io(file.as_ref(), address, allowed_len, offset)?;
+    permission_check_file_like_with_actor_and_status(
+        &file_handle,
+        crate::file::fanotify::FAN_ACCESS_PERM,
+        context.fanotify_actor(),
+        context.status(),
+    )?;
+
+    let mut plan = buffer_lease.prepared_physical_plan(
+        operation,
+        offset,
+        address,
+        requested_len,
+        allowed_len,
+    )?;
+    let device = axfs::block_device_for_filesystem(file.inner().location().mountpoint().device())
+        .ok_or(AxError::OperationNotSupported)?;
+    plan.bind_device(device.identity_token(), device.completion_generation())?;
+    Ok(Some(plan))
+}
+
+/// Acquires the memfd reservation which must span physical effect preparation
+/// and completion. A concurrent seal therefore cannot invalidate the exact
+/// overwrite range while the lower layer maps it.
+pub(crate) fn prepare_physical_io_write_memfd_guard(
+    file_lease: &IoUringFileLease,
+    context: &IoOperationContext,
+    plan: &PreparedPhysicalIoPlan,
+) -> AxResult<Option<memfd::MemfdMutationGuard>> {
+    if plan.operation() != PreparedPhysicalIoOperation::Write {
+        return Ok(None);
+    }
+    let description = file_lease.description()?;
+    context.validate_for(&description)?;
+    let file = description
+        .file_handle()
+        .downcast::<File>()
+        .map_err(|_| AxError::BadFileDescriptor)?;
+    let memfd = reserve_memfd_positioned_write(file.as_ref(), plan.offset(), plan.allowed_len())?;
+    Ok(Some(memfd))
+}
+
+/// Performs the set-id/capability cleanup after the lower effect has been
+/// prepared, then retains the exclusion through physical retirement.  If the
+/// lower layer reports `None`, no metadata side effect is performed and the
+/// request remains eligible for the ordinary fallback.
+pub(crate) fn prepare_physical_io_write_privilege_guard(
+    file_lease: &IoUringFileLease,
+    context: &IoOperationContext,
+    plan: &PreparedPhysicalIoPlan,
+) -> AxResult<Option<ContentWritePrivilegeGuard>> {
+    if plan.operation() != PreparedPhysicalIoOperation::Write {
+        return Ok(None);
+    }
+    let description = file_lease.description()?;
+    context.validate_for(&description)?;
+    let file = description
+        .file_handle()
+        .downcast::<File>()
+        .map_err(|_| AxError::BadFileDescriptor)?;
+    Ok(Some(begin_inode_content_write(
+        file.inner().location(),
+        context.security(),
+    )?))
+}
+
+/// Converts the exact, lease-derived SG plan into the vendor-owned effect.
+/// This is intentionally separate from policy admission so callers can keep
+/// all leases in hand until both effect construction and the request
+/// publication reservation have succeeded.
+pub(crate) fn prepare_physical_io_effect(
+    file_lease: &IoUringFileLease,
+    plan: &PreparedPhysicalIoPlan,
+) -> AxResult<Option<axfs::PreparedPhysicalIoEffect>> {
+    let description = file_lease.description()?;
+    let file = description
+        .file_handle()
+        .downcast::<File>()
+        .map_err(|_| AxError::BadFileDescriptor)?;
+    let operation = match plan.operation() {
+        PreparedPhysicalIoOperation::Read => PhysicalIoOperation::Read,
+        PreparedPhysicalIoOperation::Write => PhysicalIoOperation::Write,
+    };
+    let physical = plan.physical_segments()?;
+    file.inner()
+        .backend()?
+        .prepare_physical_io_effect(operation, physical, plan.offset())
 }
 
 fn regular_file_read_prefault_len(file: &File, len: usize, offset: u64) -> AxResult<usize> {
@@ -816,84 +1206,6 @@ fn write_at_fixed_user_segments(
         };
     record_user_io_direct_write(written, segments.len());
     Ok(written)
-}
-
-fn try_fixed_dma_read(
-    file: &File,
-    addr: usize,
-    segments: &[UserIoPinSegment],
-    offset_in_segments: usize,
-    len: usize,
-    file_offset: u64,
-    segments_disjoint: bool,
-    provenance: UserIoPinProvenance,
-) -> AxResult<FixedDmaOutcome> {
-    let fallback = || {
-        crate::file::io_uring::record_io_uring_dma_direct_read_fallback();
-        FixedDmaOutcome::Fallback
-    };
-    if !fixed_dma_geometry_eligible(addr, len, file_offset, segments_disjoint, provenance)
-        || !file_uses_direct_io(file)
-    {
-        return Ok(fallback());
-    }
-
-    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
-    let Some(count) = clip_io_uring_dma_segments(segments, offset_in_segments, len, &mut physical)
-    else {
-        return Ok(fallback());
-    };
-    let result = unsafe {
-        file.inner()
-            .try_read_at_dma_segments(&physical[..count], file_offset)
-    }?;
-    match classify_fixed_dma_result(result, len)? {
-        FixedDmaOutcome::Completed(read) => {
-            crate::file::io_uring::record_io_uring_dma_direct_read_hit(read);
-            Ok(FixedDmaOutcome::Completed(read))
-        }
-        FixedDmaOutcome::Fallback => Ok(fallback()),
-    }
-}
-
-fn try_fixed_dma_write(
-    file: &File,
-    addr: usize,
-    segments: &[UserIoPinSegment],
-    offset_in_segments: usize,
-    len: usize,
-    file_offset: u64,
-    segments_disjoint: bool,
-    provenance: UserIoPinProvenance,
-) -> AxResult<FixedDmaOutcome> {
-    let fallback = || {
-        crate::file::io_uring::record_io_uring_dma_direct_write_fallback();
-        FixedDmaOutcome::Fallback
-    };
-    let geometry =
-        fixed_dma_geometry_eligible(addr, len, file_offset, segments_disjoint, provenance);
-    let direct = file_uses_direct_io(file);
-    let append = file.inner().flags().contains(FileFlags::APPEND);
-    if !geometry || !direct || append {
-        return Ok(fallback());
-    }
-
-    let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
-    let Some(count) = clip_io_uring_dma_segments(segments, offset_in_segments, len, &mut physical)
-    else {
-        return Ok(fallback());
-    };
-    let result = unsafe {
-        file.inner()
-            .try_write_at_dma_segments(&physical[..count], file_offset)
-    }?;
-    match classify_fixed_dma_result(result, len)? {
-        FixedDmaOutcome::Completed(written) => {
-            crate::file::io_uring::record_io_uring_dma_direct_write_hit(written);
-            Ok(FixedDmaOutcome::Completed(written))
-        }
-        FixedDmaOutcome::Fallback => Ok(fallback()),
-    }
 }
 
 fn reserve_memfd_positioned_write(
@@ -2709,87 +3021,317 @@ pub fn sys_pread64(
         return Err(AxError::InvalidInput);
     }
     let f = positioned_read_file(fd)?;
-    pread64_file(&capability, &f, buf, len, offset as u64, None)
+    let context = current_io_operation_context(&f);
+    validate_direct_io(&f, buf as usize, len, offset as u64)?;
+    if len != 0 {
+        permission_check_file_like_with_actor_and_status(
+            &f.clone().into_file_like(),
+            crate::file::fanotify::FAN_ACCESS_PERM,
+            context.fanotify_actor(),
+            context.status(),
+        )?;
+    }
+    f.with_read_credentials(|| {
+        pread64_file_with_context(&capability, &f, &context, buf, len, offset as u64, None)
+    })
 }
 
-fn pread64_file(
+/// Consumes an owned physical admission. No policy, RLIMIT, or task state is
+/// sampled here. A lower-layer `NotSubmitted` is terminal for this token;
+/// the submitter must only publish a token after the lower owned plan proves
+/// that the generic fallback is no longer part of the operation.
+pub(crate) fn io_uring_pread64_worker(
+    admission: PreparedPhysicalIoAdmission,
+) -> AxResult<IoUringWorkerResult> {
+    let result = (|| {
+        let (file_lease, buffer_lease, context, plan, _memfd, _privilege, effect) =
+            admission.into_parts();
+        // NotSubmitted proves that no device descriptor became visible. Drop
+        // the unpublished effect before touching the synchronous path so its
+        // range lease and staged cache invalidation are rolled back first.
+        // Otherwise the fallback could conflict with its own range lease or
+        // restore stale cache pages after a write.
+        drop(effect);
+        if plan.operation() != PreparedPhysicalIoOperation::Read {
+            return Err(AxError::BadState);
+        }
+        let description = file_lease.description()?;
+        context.validate_for(description)?;
+        let file = description
+            .file_handle()
+            .downcast::<File>()
+            .map_err(|_| AxError::BadFileDescriptor)?;
+        let (address, length) = buffer_lease.range()?;
+        if usize::try_from(address).map_err(|_| AxError::BadAddress)? != plan.address()
+            || usize::try_from(length).map_err(|_| AxError::BadAddress)? != plan.requested_len()
+        {
+            return Err(AxError::BadAddress);
+        }
+        let (segments, offset_in_segments, fixed_len, disjoint) = buffer_lease.physical_range()?;
+        if fixed_len < plan.allowed_len() {
+            return Err(AxError::BadAddress);
+        }
+        // The worker's fallback is deliberately the pinned bounce path. The
+        // legacy PhysicalIoAttempt hook may publish an exact descriptor whose
+        // owner cannot retain this io_uring buffer lease after a VFS error;
+        // only the broker-owned admission above may publish asynchronously.
+        crate::file::io_uring::record_io_uring_dma_direct_read_fallback(
+            crate::file::io_uring::IoUringDmaFallbackReason::DeviceAdmission,
+        );
+        let read = read_at_fixed_user_segments(
+            file.as_ref(),
+            segments,
+            offset_in_segments,
+            plan.allowed_len(),
+            plan.offset(),
+            disjoint,
+        )?;
+        if read != plan.allowed_len() {
+            return Err(AxError::Io);
+        }
+        if read > 0 {
+            notify_read_file_with_actor(file.as_ref(), context.fanotify_actor());
+        }
+        Ok(read as isize)
+    })();
+    Ok(match result {
+        Ok(result) => IoUringWorkerResult::Completed(result),
+        Err(error) => IoUringWorkerResult::Failed(error),
+    })
+}
+
+/// Executes the synchronous fallback for an admitted physical write when the
+/// submitter reserved no device route (`NotSubmitted`, including queue-full
+/// backpressure).  The prepared effect is still unpublished and is dropped
+/// with the exact file/buffer/policy leases; the actual write uses the
+/// ordinary cache-aware pinned source path, so no policy is sampled again.
+pub(crate) fn io_uring_pwrite64_worker(
+    admission: PreparedPhysicalIoAdmission,
+) -> AxResult<IoUringWorkerResult> {
+    let result = (|| {
+        let (file_lease, buffer_lease, context, plan, memfd, privilege, effect) =
+            admission.into_parts();
+        // See the read fallback: an unpublished effect is ordinary rollback
+        // state, not a live DMA owner. Release its range/cache transaction
+        // before the cache-aware synchronous write begins.
+        drop(effect);
+        if plan.operation() != PreparedPhysicalIoOperation::Write {
+            return Err(AxError::BadState);
+        }
+        let _memfd = memfd.ok_or(AxError::BadState)?;
+        let _privilege = privilege.ok_or(AxError::BadState)?;
+        let description = file_lease.description()?;
+        context.validate_for(description)?;
+        let file = description
+            .file_handle()
+            .downcast::<File>()
+            .map_err(|_| AxError::BadFileDescriptor)?;
+        let (address, length) = buffer_lease.range()?;
+        if usize::try_from(address).map_err(|_| AxError::BadAddress)? != plan.address()
+            || usize::try_from(length).map_err(|_| AxError::BadAddress)? != plan.requested_len()
+        {
+            return Err(AxError::BadAddress);
+        }
+        let (segments, offset_in_segments, fixed_len, _) = buffer_lease.physical_range()?;
+        if fixed_len < plan.allowed_len() {
+            return Err(AxError::BadAddress);
+        }
+        crate::file::io_uring::record_io_uring_dma_direct_write_fallback(
+            crate::file::io_uring::IoUringDmaFallbackReason::DeviceAdmission,
+        );
+        let mut source = PinnedPhysicalReader::from_validated_range(
+            segments,
+            offset_in_segments,
+            plan.allowed_len(),
+        );
+        let written = file.write_at_with_status_and_direct_validation(
+            context.status(),
+            &mut source,
+            plan.offset(),
+            context.security(),
+            |write_offset, write_len| {
+                validate_direct_io(file.as_ref(), plan.address(), write_len, write_offset)
+            },
+        )?;
+        if written > 0 {
+            sync_file_after_status_write(context.status(), &file)?;
+            notify_write_file_with_actor(file.as_ref(), context.fanotify_actor());
+        }
+        Ok(written as isize)
+    })();
+    Ok(match result {
+        Ok(result) => IoUringWorkerResult::Completed(result),
+        Err(error) => IoUringWorkerResult::Failed(error),
+    })
+}
+
+fn pread64_file_with_context(
     capability: &UserMemoryCapability,
     f: &FileHandle<File>,
+    context: &IoOperationContext,
     buf: *mut u8,
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> AxResult<isize> {
+    let status = context.status();
     validate_direct_io(f.as_ref(), buf as usize, len, offset)?;
-    if len != 0 {
-        crate::file::fanotify::permission_check_file_like(
-            &f.clone().into_file_like(),
-            crate::file::fanotify::FAN_ACCESS_PERM,
-        )?;
-    }
-    f.with_read_credentials(|| {
-        let fast_read =
-            if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
-                fixed_segments
-            {
-                match try_fixed_dma_read(
-                    f.as_ref(),
-                    buf as usize,
-                    segments,
-                    offset_in_segments,
-                    fixed_len,
-                    offset,
-                    disjoint,
-                    provenance,
-                )? {
-                    FixedDmaOutcome::Completed(read) => Some(read),
-                    FixedDmaOutcome::Fallback => Some(read_at_fixed_user_segments(
-                        f.as_ref(),
-                        segments,
-                        offset_in_segments,
-                        fixed_len,
-                        offset,
-                        disjoint,
-                    )?),
-                }
-            } else {
-                match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
-                    Some(read) => Some(read),
-                    None => try_regular_file_pread_user_segments(
-                        capability,
-                        f.as_ref(),
-                        buf,
-                        len,
-                        offset,
-                    )?,
-                }
-            };
-        if let Some(read) = fast_read {
-            if read > 0 {
-                notify_read_file(f.as_ref());
-            }
-            return Ok(read as _);
+    f.check_io_status(status)?;
+    let fast_read = if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+        fixed_segments
+    {
+        // Fixed-buffer physical publication is owned exclusively by the
+        // broker admission in `io_uring.rs`. If admission did not produce a
+        // worker token, keep this path as the bounded pinned bounce fallback;
+        // the legacy PhysicalIoAttempt hook cannot retain the registered
+        // buffer lease across a post-publication VFS error.
+        crate::file::io_uring::record_io_uring_dma_direct_read_fallback(fixed_dma_fallback_reason(
+            buf as usize,
+            fixed_len,
+            offset,
+            segments,
+            offset_in_segments,
+            disjoint,
+            provenance,
+        ));
+        Some(read_at_fixed_user_segments(
+            f.as_ref(),
+            segments,
+            offset_in_segments,
+            fixed_len,
+            offset,
+            disjoint,
+        )?)
+    } else {
+        match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
+            Some(read) => Some(read),
+            None => try_regular_file_pread_user_segments(capability, f.as_ref(), buf, len, offset)?,
         }
-        if len >= USER_COPY_PREFAULT_MIN {
-            prefault_regular_file_read_fallback(capability, f.as_ref(), buf, len, offset)?;
-        }
-        let read = f
-            .inner()
-            .read_at(VmBytesMut::new(capability.clone(), buf, len), offset as _)?;
+    };
+    if let Some(read) = fast_read {
         if read > 0 {
-            notify_read_file(f.as_ref());
+            notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
         }
-        Ok(read as _)
-    })
+        return Ok(read as _);
+    }
+    if len >= USER_COPY_PREFAULT_MIN {
+        prefault_regular_file_read_fallback(capability, f.as_ref(), buf, len, offset)?;
+    }
+    let read = f
+        .inner()
+        .read_at(VmBytesMut::new(capability.clone(), buf, len), offset as _)?;
+    if read > 0 {
+        notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+    }
+    Ok(read as _)
 }
 
-pub(crate) fn io_uring_pread64(
+/// Executes an io_uring read on the submitting task using a context captured
+/// at SQE admission.  The credential wrapper is intentional: generic VFS,
+/// procfs, and cgroup files still require the original task-local Linux
+/// `with_read_credentials` semantics and are not worker operations.
+pub(crate) fn io_uring_pread64_submission(
     capability: &UserMemoryCapability,
     description: &Arc<FileDescription>,
+    context: &IoOperationContext,
     buf: *mut u8,
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+) -> AxResult<isize> {
+    io_uring_pread64_submission_with_mode(
+        capability,
+        description,
+        context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+        false,
+    )
+}
+
+/// Executes one io_uring read with a task-local nonblocking attempt for the
+/// narrow pending-stream admission. The mode is an operation override only;
+/// it never changes the file's OFD status flags.
+pub(crate) fn io_uring_pread64_submission_nonblocking_stream(
+    capability: &UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    context: &IoOperationContext,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
+) -> AxResult<isize> {
+    io_uring_pread64_submission_with_mode(
+        capability,
+        description,
+        context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+        true,
+    )
+}
+
+fn io_uring_pread64_submission_with_mode(
+    capability: &UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    context: &IoOperationContext,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
+    force_nonblocking_stream: bool,
+) -> AxResult<isize> {
+    context.validate_for(description)?;
+    let file_handle = description.file_handle();
+    if !(offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_READ)) {
+        let file = positioned_read_file_handle(file_handle.clone())?;
+        validate_direct_io(&file, buf as usize, len, offset)?;
+    } else {
+        file_handle.check_io_status(context.status())?;
+        let _ = PinnedSocketDescription::from_file_handle(&file_handle, context.status())?;
+    }
+    if len != 0 {
+        permission_check_file_like_with_actor_and_status(
+            &file_handle,
+            crate::file::fanotify::FAN_ACCESS_PERM,
+            context.fanotify_actor(),
+            context.status(),
+        )?;
+    }
+    file_handle.with_read_credentials(|| {
+        execute_io_uring_pread(
+            capability,
+            description,
+            context,
+            buf,
+            len,
+            offset,
+            fixed_segments,
+            force_nonblocking_stream,
+        )
+    })
+}
+
+/// Executes the submission-task implementation after its caller has installed
+/// the original credential view and validated the exact OFD context.
+///
+/// The context must have been captured from this exact description before
+/// submission.  This implementation is intentionally restricted to the
+/// submitting task; the worker-safe physical path is a separate, narrower
+/// entry point and never reaches this generic implementation.
+fn execute_io_uring_pread(
+    capability: &UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    context: &IoOperationContext,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
+    force_nonblocking_stream: bool,
 ) -> AxResult<isize> {
     let file_handle = description.file_handle();
     // Linux's io_uring rw path treats a zero offset on a non-seekable file
@@ -2797,10 +3339,26 @@ pub(crate) fn io_uring_pread64(
     // of failing with ESPIPE (verified on the host kernel: READ_FIXED on an
     // empty nonblocking pipe with off=0 completes rather than failing).
     if offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_READ) {
-        return io_uring_stream_read(capability, &file_handle, buf, len, fixed_segments);
+        return io_uring_stream_read_with_context(
+            capability,
+            &file_handle,
+            context,
+            buf,
+            len,
+            fixed_segments,
+            force_nonblocking_stream,
+        );
     }
     let file = positioned_read_file_handle(file_handle)?;
-    pread64_file(capability, &file, buf, len, offset, fixed_segments)
+    pread64_file_with_context(
+        capability,
+        &file,
+        &context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+    )
 }
 
 pub fn sys_pwrite64(
@@ -2817,12 +3375,19 @@ pub fn sys_pwrite64(
     // for a zero-length request. Proc id-map controls return ESPIPE here
     // rather than a silent zero-byte success.
     let f = positioned_write_file(fd)?;
-    pwrite64_file(&capability, &f, buf, len, offset as u64, None)
+    if len == 0 {
+        return Ok(0);
+    }
+    let context = current_io_operation_context(&f);
+    f.with_write_credentials_for_status(context.status(), || {
+        pwrite64_file_with_context(&capability, &f, &context, buf, len, offset as u64, None)
+    })
 }
 
-fn pwrite64_file(
+fn pwrite64_file_with_context(
     capability: &UserMemoryCapability,
     f: &FileHandle<File>,
+    context: &IoOperationContext,
     buf: *const u8,
     len: usize,
     offset: u64,
@@ -2831,102 +3396,96 @@ fn pwrite64_file(
     if len == 0 {
         return Ok(0);
     }
-    let security = current_vfs_security();
-    let (write, status) = f.with_write_credentials(|status| {
-        let written = if write_uses_inode_append(f.inner(), status) {
-            if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
-                let mut source = PinnedPhysicalReader::from_validated_range(
-                    segments,
-                    offset_in_segments,
-                    fixed_len,
-                );
-                f.write_at_end_with_status_and_direct_validation(
-                    status,
-                    &mut source,
-                    &security,
-                    |append_offset, allowed| {
-                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
-                    },
-                )
-            } else {
-                f.write_at_end_with_status_and_direct_validation(
-                    status,
-                    &mut VmBytes::new(capability.clone(), buf, len),
-                    &security,
-                    |append_offset, allowed| {
-                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
-                    },
-                )
-            }
+    let security = context.security();
+    let status = context.status();
+    f.check_io_status(status)?;
+    let written = if write_uses_inode_append(f.inner(), status) {
+        if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
+            let mut source =
+                PinnedPhysicalReader::from_validated_range(segments, offset_in_segments, fixed_len);
+            f.write_at_end_with_status_and_direct_validation(
+                status,
+                &mut source,
+                security,
+                |append_offset, allowed| {
+                    validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                },
+            )?
         } else {
-            let allowed = allowed_write_len(offset, len)?;
-            let fast_written =
-                if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
-                    fixed_segments
-                {
-                    if regular_file_supports_user_slice_fast_path(f.as_ref()) {
-                        executable::check_not_active(f.inner().location())?;
-                        if allowed == 0 {
-                            Some(0)
-                        } else {
-                            validate_direct_io(f.as_ref(), buf as usize, allowed, offset)?;
-                            let _memfd_mutation =
-                                reserve_memfd_positioned_write(f.as_ref(), offset, allowed)?;
-                            let _privilege_guard = f
-                                .as_ref()
-                                .begin_content_write_privilege_cleanup(&security)?;
-                            match try_fixed_dma_write(
-                                f.as_ref(),
-                                buf as usize,
-                                segments,
-                                offset_in_segments,
-                                allowed.min(fixed_len),
-                                offset,
-                                disjoint,
-                                provenance,
-                            )? {
-                                FixedDmaOutcome::Completed(written) => Some(written),
-                                FixedDmaOutcome::Fallback => Some(write_at_fixed_user_segments(
-                                    f.as_ref(),
-                                    segments,
-                                    offset_in_segments,
-                                    allowed.min(fixed_len),
-                                    offset,
-                                )?),
-                            }
-                        }
+            f.write_at_end_with_status_and_direct_validation(
+                status,
+                &mut VmBytes::new(capability.clone(), buf, len),
+                security,
+                |append_offset, allowed| {
+                    validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                },
+            )?
+        }
+    } else {
+        let allowed = allowed_write_len(offset, len)?;
+        let fast_written =
+            if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+                fixed_segments
+            {
+                crate::file::io_uring::record_io_uring_dma_direct_write_fallback(
+                    fixed_dma_fallback_reason(
+                        buf as usize,
+                        allowed.min(fixed_len),
+                        offset,
+                        segments,
+                        offset_in_segments,
+                        disjoint,
+                        provenance,
+                    ),
+                );
+                if regular_file_supports_user_slice_fast_path(f.as_ref()) {
+                    executable::check_not_active(f.inner().location())?;
+                    if allowed == 0 {
+                        Some(0)
                     } else {
-                        None
+                        validate_direct_io(f.as_ref(), buf as usize, allowed, offset)?;
+                        let _memfd_mutation =
+                            reserve_memfd_positioned_write(f.as_ref(), offset, allowed)?;
+                        let _privilege_guard =
+                            f.as_ref().begin_content_write_privilege_cleanup(security)?;
+                        Some(write_at_fixed_user_segments(
+                            f.as_ref(),
+                            segments,
+                            offset_in_segments,
+                            allowed.min(fixed_len),
+                            offset,
+                        )?)
                     }
                 } else {
-                    match try_regular_file_pwrite_user_slice(
+                    None
+                }
+            } else {
+                match try_regular_file_pwrite_user_slice(
+                    capability,
+                    f.as_ref(),
+                    status,
+                    security,
+                    buf,
+                    len,
+                    offset,
+                )? {
+                    Some(written) => Some(written),
+                    None => try_regular_file_pwrite_user_segments(
                         capability,
                         f.as_ref(),
                         status,
-                        &security,
+                        security,
                         buf,
                         len,
                         offset,
-                    )? {
-                        Some(written) => Some(written),
-                        None => try_regular_file_pwrite_user_segments(
-                            capability,
-                            f.as_ref(),
-                            status,
-                            &security,
-                            buf,
-                            len,
-                            offset,
-                        )?,
-                    }
-                };
-            if let Some(written) = fast_written {
-                return Ok((written, status));
-            }
-            if allowed >= USER_COPY_PREFAULT_MIN {
-                if fixed_segments.is_none() {
-                    prefault_regular_file_write_fallback(capability, f.as_ref(), buf, allowed)?;
+                    )?,
                 }
+            };
+        if let Some(written) = fast_written {
+            written
+        } else {
+            if allowed >= USER_COPY_PREFAULT_MIN && fixed_segments.is_none() {
+                prefault_regular_file_write_fallback(capability, f.as_ref(), buf, allowed)?;
             }
             if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
                 let mut source = PinnedPhysicalReader::from_validated_range(
@@ -2938,35 +3497,72 @@ fn pwrite64_file(
                     status,
                     &mut source,
                     offset,
-                    &security,
+                    security,
                     |write_offset, write_len| {
                         validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
                     },
-                )
+                )?
             } else {
                 f.write_at_with_status_and_direct_validation(
                     status,
                     &mut VmBytes::new(capability.clone(), buf, len),
                     offset,
-                    &security,
+                    security,
                     |write_offset, write_len| {
                         validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
                     },
-                )
+                )?
             }
-        }?;
-        Ok((written, status))
-    })?;
-    if write > 0 {
+        }
+    };
+    if written > 0 {
         sync_file_after_status_write(status, f)?;
-        notify_write_file(f.as_ref());
+        notify_write_file_with_actor(f.as_ref(), context.fanotify_actor());
     }
-    Ok(write as _)
+    Ok(written as _)
 }
 
-pub(crate) fn io_uring_pwrite64(
+/// Executes an io_uring write on the submitting task using a context captured
+/// at SQE admission.  Generic stream/procfs/cgroup operations stay on this
+/// path so their `with_write_credentials` task-local view remains intact.
+pub(crate) fn io_uring_pwrite64_submission(
     capability: &UserMemoryCapability,
     description: &Arc<FileDescription>,
+    context: &IoOperationContext,
+    buf: *const u8,
+    len: usize,
+    offset: u64,
+    fixed_segments: Option<IoUringFixedSegments<'_>>,
+) -> AxResult<isize> {
+    context.validate_for(description)?;
+    let file_handle = description.file_handle();
+    if offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_WRITE) {
+        file_handle.check_io_status(context.status())?;
+        let _ = PinnedSocketDescription::from_file_handle(&file_handle, context.status())?;
+    } else {
+        let _ = positioned_write_file_handle(file_handle.clone())?;
+    }
+    file_handle.with_write_credentials_for_status(context.status(), || {
+        execute_io_uring_pwrite(
+            capability,
+            description,
+            context,
+            buf,
+            len,
+            offset,
+            fixed_segments,
+        )
+    })
+}
+
+/// Executes the submission-task implementation after its caller has installed
+/// the original credential view and validated the exact OFD context.  This is
+/// deliberately not a worker entry point: generic streams and pseudo-files
+/// may consult task-local policy while running below this function.
+fn execute_io_uring_pwrite(
+    capability: &UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    context: &IoOperationContext,
     buf: *const u8,
     len: usize,
     offset: u64,
@@ -2976,10 +3572,25 @@ pub(crate) fn io_uring_pwrite64(
     // Mirror the pread64 treatment: a zero offset on a non-seekable file
     // performs a plain write, matching Linux's io_uring rw behavior.
     if offset == 0 && zero_offset_stream_file_like(&file_handle, NodeFlags::NO_POSITIONED_WRITE) {
-        return io_uring_stream_write(capability, &file_handle, buf, len, fixed_segments);
+        return io_uring_stream_write_with_context(
+            capability,
+            &file_handle,
+            context,
+            buf,
+            len,
+            fixed_segments,
+        );
     }
     let file = positioned_write_file_handle(file_handle)?;
-    pwrite64_file(capability, &file, buf, len, offset, fixed_segments)
+    pwrite64_file_with_context(
+        capability,
+        &file,
+        &context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+    )
 }
 
 pub fn sys_preadv(
@@ -5361,13 +5972,63 @@ mod tests {
     fn io_uring_dma_clip_rejects_more_than_four_physical_ranges() {
         let segments: [UserIoPinSegment; IO_URING_DMA_MAX_SEGMENTS + 1] =
             core::array::from_fn(|index| UserIoPinSegment {
-                paddr: 0x10_000 + index * 0x1_000,
+                paddr: 0x10_000 + index * 0x2_000,
                 len: 0x1_000,
             });
         let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
         assert_eq!(
             clip_io_uring_dma_segments(&segments, 0, segments.len() * 0x1_000, &mut physical),
             None
+        );
+    }
+
+    #[test]
+    fn io_uring_dma_clip_accepts_one_through_four_sg_ranges() {
+        let segments: [UserIoPinSegment; IO_URING_DMA_MAX_SEGMENTS] =
+            core::array::from_fn(|index| UserIoPinSegment {
+                paddr: 0x60_000 + index * 0x2_000,
+                len: 0x1_000,
+            });
+        for count in 1..=IO_URING_DMA_MAX_SEGMENTS {
+            let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+            assert_eq!(
+                clip_io_uring_dma_segments(&segments[..count], 0, count * 0x1_000, &mut physical),
+                Some(count)
+            );
+        }
+    }
+
+    #[test]
+    fn io_uring_dma_clip_merges_adjacent_physical_pages_for_256k_request() {
+        let segments: [UserIoPinSegment; 64] = core::array::from_fn(|index| UserIoPinSegment {
+            paddr: 0x40_000 + index * 0x1_000,
+            len: 0x1_000,
+        });
+        let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+        let count = clip_io_uring_dma_segments(&segments, 0, IO_URING_DMA_MAX_BYTES, &mut physical);
+        assert_eq!(count, Some(1));
+        assert_eq!(
+            physical[0],
+            PhysicalIoSegment::new(0x40_000, IO_URING_DMA_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn io_uring_dma_clip_reports_sg_cap_only_for_nonadjacent_ranges() {
+        let segments: [UserIoPinSegment; IO_URING_DMA_MAX_SEGMENTS + 1] =
+            core::array::from_fn(|index| UserIoPinSegment {
+                paddr: 0x80_000 + index * 0x2_000,
+                len: 0x1_000,
+            });
+        let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
+        assert_eq!(
+            clip_io_uring_dma_segments_with_reason(
+                &segments,
+                0,
+                segments.len() * 0x1_000,
+                &mut physical,
+            ),
+            Err(crate::file::io_uring::IoUringDmaFallbackReason::SgCap)
         );
     }
 
@@ -5478,6 +6139,42 @@ mod tests {
         let positioned = open(NodeFlags::NON_CACHEABLE | NodeFlags::POSITIONED_APPEND);
         assert!(!write_uses_inode_append(positioned.inner(), append));
         assert!(write_uses_current_position(positioned.inner(), append));
+    }
+
+    #[test]
+    fn generic_regular_file_is_not_worker_safe_even_with_fixed_direct_plan() {
+        let fs = IoContractFs::new(NodeFlags::NON_CACHEABLE, 4096);
+        let mut options = OpenOptions::new();
+        options.read(true).direct(true);
+        let file = Arc::new(File::new(
+            options
+                .open_loc(fs.location())
+                .unwrap()
+                .into_file()
+                .unwrap(),
+        ));
+        let segments = [UserIoPinSegment {
+            paddr: 0x2000,
+            len: 0x1000,
+        }];
+        let fixed = Some((
+            segments.as_slice(),
+            0,
+            0x1000,
+            true,
+            UserIoPinProvenance::PrivateAnonymous,
+        ));
+
+        assert!(file_uses_direct_io(file.as_ref()));
+        assert!(!regular_ext4_physical_worker_plan(
+            file.as_ref(),
+            OfdIoStatus::new(0),
+            PreparedPhysicalIoOperation::Read,
+            0x2000,
+            0x1000,
+            0,
+            fixed,
+        ));
     }
 
     #[test]

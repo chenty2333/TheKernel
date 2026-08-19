@@ -92,7 +92,7 @@ pub use axdriver_virtio::{AsyncBlockWaitPolicy, VirtioIoCounters};
 #[allow(unused_imports)]
 use self::prelude::*;
 #[cfg(feature = "shared-block")]
-pub use self::shared_block::SharedBlockDevice;
+pub use self::shared_block::{BlockPhysicalRouteReservation, SharedBlockDevice};
 #[cfg(feature = "block")]
 pub use self::structs::AxBlockDevice;
 #[cfg(feature = "display")]

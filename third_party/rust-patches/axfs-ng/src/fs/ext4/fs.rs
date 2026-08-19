@@ -13,8 +13,9 @@ use axfs_ng_vfs::{
     DirEntry, Filesystem, FilesystemOps, NodeUserData, Reference, StatFs, VfsError, VfsResult,
     path::MAX_NAME_LEN,
 };
+use axsync::{Mutex as SleepingMutex, MutexGuard as SleepingMutexGuard};
 use hashbrown::HashMap;
-use kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
+use kspin::SpinNoPreempt as SpinMutex;
 use lwext4_rust::{FsConfig, InodeToken, InodeType, ffi::EXT4_ROOT_INO};
 use spin::Once;
 
@@ -126,6 +127,20 @@ impl RuntimeRegistry {
 #[cfg(test)]
 mod runtime_registry_tests {
     use super::*;
+
+    #[test]
+    fn ext4_io_and_wrapper_state_use_their_intended_lock_domains() {
+        fn assert_lock_types(fs: &Ext4Filesystem) {
+            let _: &SleepingMutex<ManuallyDrop<Box<DeferredExt4Finalizer>>> = &fs.inner;
+            let _: &SpinMutex<Option<DirEntry>> = &fs.root_dir;
+            let _: &SpinMutex<RuntimeRegistry> = &fs.runtime_data;
+        }
+
+        // This compile-time shape check prevents the I/O-bearing lwext4 lock
+        // from silently being changed back to a non-preemptible spin lock,
+        // while preserving spin locks for the two short wrapper-only fields.
+        let _ = assert_lock_types as fn(&Ext4Filesystem);
+    }
 
     #[test]
     fn runtime_registry_allocates_capacity_on_demand() {
@@ -307,7 +322,7 @@ pub fn drain_deferred_finalizers(mut between: impl FnMut()) -> usize {
     drained
 }
 
-pub(crate) struct Ext4Guard<'a>(MutexGuard<'a, ManuallyDrop<Box<DeferredExt4Finalizer>>>);
+pub(crate) struct Ext4Guard<'a>(SleepingMutexGuard<'a, ManuallyDrop<Box<DeferredExt4Finalizer>>>);
 
 impl Deref for Ext4Guard<'_> {
     type Target = LwExt4Filesystem;
@@ -324,10 +339,16 @@ impl DerefMut for Ext4Guard<'_> {
 }
 
 pub struct Ext4Filesystem {
-    inner: Mutex<ManuallyDrop<Box<DeferredExt4Finalizer>>>,
+    // lwext4 may perform synchronous block I/O while this serialization lock
+    // is held.  The shared block-device path uses sleeping mutexes once its
+    // completion broker is active, so this outer lock must leave the current
+    // task blockable when another task owns the device queue.
+    inner: SleepingMutex<ManuallyDrop<Box<DeferredExt4Finalizer>>>,
     disk: Ext4Disk,
-    root_dir: Mutex<Option<DirEntry>>,
-    runtime_data: Mutex<RuntimeRegistry>,
+    // These protect only short, non-I/O wrapper state and deliberately keep
+    // their original non-preemptible spin semantics.
+    root_dir: SpinMutex<Option<DirEntry>>,
+    runtime_data: SpinMutex<RuntimeRegistry>,
 }
 
 impl Ext4Filesystem {
@@ -346,10 +367,10 @@ impl Ext4Filesystem {
         .map_err(|_| VfsError::NoMemory)?;
         let runtime_data = RuntimeRegistry::try_new()?;
         let fs = Arc::try_new(Self {
-            inner: Mutex::new(ManuallyDrop::new(finalizer)),
+            inner: SleepingMutex::new(ManuallyDrop::new(finalizer)),
             disk,
-            root_dir: Mutex::new(None),
-            runtime_data: Mutex::new(runtime_data),
+            root_dir: SpinMutex::new(None),
+            runtime_data: SpinMutex::new(runtime_data),
         })
         .map_err(|_| VfsError::NoMemory)?;
         // Allocate the wrapper before installing the backend root self-cycle;
@@ -404,6 +425,19 @@ impl Ext4Filesystem {
             .map_err(into_vfs_err)
     }
 
+    pub(crate) fn prepare_physical_io_plan(
+        &self,
+        ino: u32,
+        operation: lwext4_rust::PhysicalIoOperation,
+        offset: u64,
+        len: usize,
+        segments: &[lwext4_rust::PhysicalIoSegment],
+    ) -> VfsResult<Option<lwext4_rust::PhysicalIoPlan>> {
+        self.lock()
+            .prepare_physical_io_plan(ino, operation, offset, len, segments)
+            .map_err(into_vfs_err)
+    }
+
     pub(crate) fn validate_physical_io_plan(
         &self,
         plan: lwext4_rust::PhysicalIoPlan,
@@ -419,6 +453,16 @@ impl Ext4Filesystem {
     ) -> VfsResult<()> {
         self.lock()
             .commit_physical_io_write(plan)
+            .map_err(into_vfs_err)
+    }
+
+    pub(crate) fn finalize_physical_io_plan(
+        &self,
+        plan: lwext4_rust::PhysicalIoPlan,
+        all_completions_success: bool,
+    ) -> VfsResult<()> {
+        self.lock()
+            .finalize_physical_io_plan(plan, all_completions_success)
             .map_err(into_vfs_err)
     }
 

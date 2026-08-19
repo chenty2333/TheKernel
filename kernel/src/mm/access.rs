@@ -609,15 +609,24 @@ impl UserIoPinSegments {
             .map(|idx| &mut self.segments[idx])
             && prev.paddr.checked_add(prev.len) == Some(paddr)
         {
-            prev.len += len;
-            self.bytes += len;
+            let Some(merged_len) = prev.len.checked_add(len) else {
+                return false;
+            };
+            let Some(bytes) = self.bytes.checked_add(len) else {
+                return false;
+            };
+            prev.len = merged_len;
+            self.bytes = bytes;
             return true;
         }
         if self.segments.len() == self.max_segments {
             return false;
         }
+        let Some(bytes) = self.bytes.checked_add(len) else {
+            return false;
+        };
         self.segments.push(UserIoPinSegment { paddr, len });
-        self.bytes += len;
+        self.bytes = bytes;
         true
     }
 
@@ -1767,6 +1776,18 @@ mod tests {
         assert_eq!(segments.bytes(), 33 * PAGE_SIZE_4K);
         assert!(segments.physical_ranges_are_disjoint());
         assert!(!segments.push_or_merge(0x1000 + 33 * 0x2000, PAGE_SIZE_4K));
+    }
+
+    #[test]
+    fn physical_adjacent_pages_merge_with_checked_accounting() {
+        let mut segments = UserIoPinSegments::try_new(64).unwrap();
+        for index in 0..64 {
+            assert!(segments.push_or_merge(0x20_000 + index * PAGE_SIZE_4K, PAGE_SIZE_4K));
+        }
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments.as_slice()[0].paddr, 0x20_000);
+        assert_eq!(segments.as_slice()[0].len, 256 * 1024);
+        assert_eq!(segments.bytes(), 256 * 1024);
     }
 
     #[test]

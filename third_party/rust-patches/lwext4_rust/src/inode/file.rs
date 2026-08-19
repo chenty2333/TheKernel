@@ -14,7 +14,10 @@ use crate::{
         record_legacy_dblk_lookup, record_mapped_overwrite_hit, record_mapped_overwrite_miss,
         record_mapped_read,
     },
-    iomap::{MappedRun, MappedRunKind},
+    iomap::{
+        FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNWRITTEN, FIEMAP_MAX_BYTES, FiemapExtent,
+        FiemapResult, MappedRun, MappedRunKind,
+    },
     util::get_block_size,
 };
 
@@ -24,7 +27,34 @@ struct ExtentRun {
     blocks: u32,
 }
 
+#[derive(Clone, Copy)]
+struct FiemapRun {
+    fblock: u64,
+    blocks: u32,
+    unwritten: bool,
+}
+
 const MAX_IOMAP_RUNS: usize = 256;
+
+fn retain_fiemap_extent(
+    extent: FiemapExtent,
+    total_extents: &mut usize,
+    retained: &mut Option<Vec<FiemapExtent>>,
+    max_extents: usize,
+) -> Ext4Result<()> {
+    *total_extents = total_extents
+        .checked_add(1)
+        .ok_or_else(|| Ext4Error::new(EFBIG as _, "fiemap extent count overflow"))?;
+    if let Some(extents) = retained.as_mut()
+        && extents.len() < max_extents
+    {
+        extents
+            .try_reserve(1)
+            .map_err(|_| Ext4Error::new(ENOMEM as _, "fiemap extent allocation failed"))?;
+        extents.push(extent);
+    }
+    Ok(())
+}
 
 impl From<ExtentStatusRun> for ExtentRun {
     fn from(run: ExtentStatusRun) -> Self {
@@ -103,11 +133,69 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         max_blocks: u32,
         create: bool,
     ) -> Ext4Result<Option<ExtentRun>> {
+        self.map_extent_run_impl(block, max_blocks, create, true)
+    }
+
+    fn map_extent_run_without_cache(
+        &mut self,
+        block: u32,
+        max_blocks: u32,
+        create: bool,
+    ) -> Ext4Result<Option<ExtentRun>> {
+        self.map_extent_run_impl(block, max_blocks, create, false)
+    }
+
+    /// Looks up one extent-tree run for FIEMAP without touching the hot
+    /// extent-status cache. In particular, an unwritten extent retains its
+    /// physical block number and is returned with an explicit state bit rather
+    /// than being converted into a cached hole.
+    fn map_fiemap_extent_run(
+        &mut self,
+        block: u32,
+        max_blocks: u32,
+    ) -> Ext4Result<Option<FiemapRun>> {
         if max_blocks == 0 || !self.uses_extents() {
             return Ok(None);
         }
 
-        let cache_enabled = ENABLE_EXTENT_STATUS_CACHE.load(core::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            let mut fblock = 0u64;
+            let mut blocks = 0u32;
+            let mut unwritten = false;
+            ext4_extent_get_blocks_fiemap(
+                self.inner.as_mut(),
+                block,
+                max_blocks,
+                &mut fblock,
+                &mut blocks,
+                &mut unwritten,
+            )
+            .context("ext4_extent_get_blocks_fiemap")?;
+            let blocks = blocks.min(max_blocks);
+            if blocks == 0 {
+                return Ok(None);
+            }
+            Ok(Some(FiemapRun {
+                fblock,
+                blocks,
+                unwritten: fblock != 0 && unwritten,
+            }))
+        }
+    }
+
+    fn map_extent_run_impl(
+        &mut self,
+        block: u32,
+        max_blocks: u32,
+        create: bool,
+        populate_extent_status: bool,
+    ) -> Ext4Result<Option<ExtentRun>> {
+        if max_blocks == 0 || !self.uses_extents() {
+            return Ok(None);
+        }
+
+        let cache_enabled = populate_extent_status
+            && ENABLE_EXTENT_STATUS_CACHE.load(core::sync::atomic::Ordering::Relaxed);
         if cache_enabled && !create {
             if let Some(run) = self.extent_status.lookup(block, max_blocks) {
                 return Ok(Some(run.into()));
@@ -172,11 +260,227 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         Ok(fblock)
     }
 
+    /// Scans the existing ext4 block map for a typed FIEMAP result.
+    ///
+    /// The scan is deliberately performed while the owning filesystem lock is
+    /// held by the caller.  It rounds the requested byte range out to block
+    /// boundaries, omits holes, and retains only the requested prefix.  The
+    /// complete walk is still performed after the prefix is full so a caller
+    /// can distinguish a complete result and so `FIEMAP_EXTENT_LAST` is only
+    /// emitted when it is justified.
+    pub fn map_extents(
+        &mut self,
+        start: u64,
+        length: u64,
+        max_extents: usize,
+    ) -> Ext4Result<FiemapResult> {
+        if start >= FIEMAP_MAX_BYTES {
+            return Err(Ext4Error::new(EFBIG as _, "fiemap start exceeds maxbytes"));
+        }
+        if length > FIEMAP_MAX_BYTES - start {
+            return Err(Ext4Error::new(EFBIG as _, "fiemap range exceeds maxbytes"));
+        }
+        if max_extents > crate::iomap::MAX_FIEMAP_EXTENTS {
+            return Err(Ext4Error::new(
+                EINVAL as _,
+                "fiemap extent capacity exceeds bounded interface",
+            ));
+        }
+
+        let file_size = self.size();
+        let requested_end = start.checked_add(length).unwrap_or(u64::MAX);
+        let end = requested_end.min(file_size);
+        if length == 0 || start >= file_size || end <= start {
+            return Ok(FiemapResult::new(Vec::new(), 0, true));
+        }
+
+        let block_size = u64::from(get_block_size(self.superblock()));
+        if block_size == 0 {
+            return Err(Ext4Error::new(EINVAL as _, "invalid ext4 block size"));
+        }
+
+        // `ext4_extent_get_blocks_status` takes a u32 logical block number;
+        // reject an unrepresentable range rather than truncating it.
+        let first_block = start / block_size;
+        let last_block = (end - 1) / block_size;
+        let first_block = u32::try_from(first_block)
+            .map_err(|_| Ext4Error::new(EINVAL as _, "fiemap logical block overflow"))?;
+        let last_block = u32::try_from(last_block)
+            .map_err(|_| Ext4Error::new(EINVAL as _, "fiemap logical block overflow"))?;
+
+        let mut retained = (max_extents != 0).then(Vec::new);
+        let mut total_extents = 0usize;
+        let mut first_extent = None;
+        let mut last_extent = None;
+        let mut pending = None;
+        let mut block = first_block;
+        loop {
+            let remaining = last_block
+                .checked_sub(block)
+                .and_then(|remaining| remaining.checked_add(1))
+                .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap block range overflow"))?;
+
+            let (pblock, blocks, unwritten) = if self.uses_extents() {
+                match self.map_fiemap_extent_run(block, remaining)? {
+                    Some(run) if run.blocks != 0 => {
+                        (run.fblock, run.blocks.min(remaining), run.unwritten)
+                    }
+                    _ => (0, 1, false),
+                }
+            } else {
+                // Ext4 normally creates extent-mapped regular files, but
+                // legacy indirect inodes remain readable and should not turn
+                // into fabricated holes for FIEMAP.
+                (self.get_inode_fblock(block)?, 1, false)
+            };
+            let blocks = blocks.max(1).min(remaining);
+
+            if pblock != 0 {
+                let run_logical = u64::from(block)
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap logical byte overflow"))?;
+                let run_end = run_logical
+                    .checked_add(u64::from(blocks).checked_mul(block_size).ok_or_else(|| {
+                        Ext4Error::new(EINVAL as _, "fiemap run length overflow")
+                    })?)
+                    .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap logical end overflow"))?;
+                let logical = start.max(run_logical);
+                let logical_end = end.min(run_end);
+                if logical >= logical_end {
+                    if block == last_block {
+                        break;
+                    }
+                    block = block
+                        .checked_add(blocks)
+                        .ok_or_else(|| {
+                            Ext4Error::new(EINVAL as _, "fiemap block advance overflow")
+                        })?;
+                    continue;
+                }
+                let physical = pblock
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap physical byte overflow"))?;
+                let physical = physical
+                    .checked_add(logical - run_logical)
+                    .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap physical offset overflow"))?;
+                let bytes = logical_end - logical;
+
+                let flags = if unwritten {
+                    FIEMAP_EXTENT_UNWRITTEN
+                } else {
+                    0
+                };
+                let current = FiemapExtent::new(logical, physical, bytes, flags);
+                let can_extend = pending.as_ref().is_some_and(|previous: &FiemapExtent| {
+                    previous.logical.checked_add(previous.length) == Some(current.logical)
+                        && previous.physical.checked_add(previous.length)
+                            == Some(current.physical)
+                        && previous.flags == current.flags
+                });
+                if can_extend {
+                    if let Some(previous) = pending.as_mut() {
+                        previous.length = previous
+                            .length
+                            .checked_add(current.length)
+                            .ok_or_else(|| {
+                                Ext4Error::new(EFBIG as _, "fiemap extent length overflow")
+                            })?;
+                    }
+                } else {
+                    if let Some(previous) = pending.take() {
+                        if first_extent.is_none() {
+                            first_extent = Some(previous);
+                        }
+                        last_extent = Some(previous);
+                        retain_fiemap_extent(
+                            previous,
+                            &mut total_extents,
+                            &mut retained,
+                            max_extents,
+                        )?;
+                    }
+                    pending = Some(current);
+                }
+            } else if let Some(previous) = pending.take() {
+                if first_extent.is_none() {
+                    first_extent = Some(previous);
+                }
+                last_extent = Some(previous);
+                retain_fiemap_extent(previous, &mut total_extents, &mut retained, max_extents)?;
+            }
+
+            if block == last_block {
+                break;
+            }
+            block = block
+                .checked_add(blocks)
+                .ok_or_else(|| Ext4Error::new(EINVAL as _, "fiemap block advance overflow"))?;
+            if block > last_block {
+                break;
+            }
+        }
+
+        if let Some(previous) = pending.take() {
+            if first_extent.is_none() {
+                first_extent = Some(previous);
+            }
+            last_extent = Some(previous);
+            retain_fiemap_extent(previous, &mut total_extents, &mut retained, max_extents)?;
+        }
+
+        let mapped_extents = if max_extents == 0 {
+            u32::try_from(total_extents)
+                .map_err(|_| Ext4Error::new(EFBIG as _, "fiemap extent count overflow"))?
+        } else {
+            u32::try_from(retained.as_ref().map_or(0, Vec::len))
+                .map_err(|_| Ext4Error::new(EFBIG as _, "fiemap extent count overflow"))?
+        };
+        let complete = max_extents == 0 || total_extents <= max_extents;
+        if complete && end == file_size && max_extents != 0 {
+            if let Some(last) = retained.as_mut().and_then(|extents| extents.last_mut()) {
+                last.flags |= FIEMAP_EXTENT_LAST;
+            }
+        }
+
+        let extents = retained.unwrap_or_else(Vec::new);
+        last_extent = extents.last().copied().or(last_extent);
+        Ok(FiemapResult::with_bounds(
+            extents,
+            mapped_extents,
+            complete,
+            first_extent,
+            last_extent,
+        ))
+    }
+
     pub(crate) fn map_iomap_runs(
         &mut self,
         pos: u64,
         len: usize,
         overwrite_only: bool,
+    ) -> Ext4Result<Option<Vec<MappedRun>>> {
+        self.map_iomap_runs_impl(pos, len, overwrite_only, true)
+    }
+
+    /// Maps an eligibility range without populating the hot inode or extent
+    /// status caches.  Physical-I/O prepare must be observational for a
+    /// rejected hole/unwritten/EOF request so the caller can synchronously
+    /// choose its fallback with zero cache side effects.
+    pub(crate) fn map_iomap_runs_without_cache(
+        &mut self,
+        pos: u64,
+        len: usize,
+        overwrite_only: bool,
+    ) -> Ext4Result<Option<Vec<MappedRun>>> {
+        self.map_iomap_runs_impl(pos, len, overwrite_only, false)
+    }
+
+    fn map_iomap_runs_impl(
+        &mut self,
+        pos: u64,
+        len: usize,
+        overwrite_only: bool,
+        populate_extent_status: bool,
     ) -> Ext4Result<Option<Vec<MappedRun>>> {
         let block_size = get_block_size(self.superblock());
         if len == 0
@@ -192,18 +496,29 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
         let mut runs = Vec::new();
         let mut block = (pos / block_size as u64) as u32;
-        let block_end = block + (len / block_size as usize) as u32;
+        let Some(block_count) = u32::try_from(len / block_size as usize).ok() else {
+            return Ok(None);
+        };
+        let Some(block_end) = block.checked_add(block_count) else {
+            return Ok(None);
+        };
         let mut file_offset = pos;
         while block < block_end {
             let remaining = block_end - block;
-            let run = self.map_extent_run(block, remaining, false)?;
+            let run = if populate_extent_status {
+                self.map_extent_run(block, remaining, false)?
+            } else {
+                self.map_extent_run_without_cache(block, remaining, false)?
+            };
             let (fblock, blocks) = if let Some(run) = run {
                 (run.fblock, run.blocks)
             } else if overwrite_only || !self.uses_extents() {
                 return Ok(None);
             } else {
                 let fblock = self.get_inode_fblock(block)?;
-                self.insert_observed_extent_run(block, fblock, 1);
+                if populate_extent_status {
+                    self.insert_observed_extent_run(block, fblock, 1);
+                }
                 (fblock, 1)
             };
             let blocks = blocks.min(remaining);
@@ -229,7 +544,11 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 seq: self.mapping_seq,
             });
             block += blocks;
-            file_offset += blocks as u64 * block_size as u64;
+            let Some(next_offset) = file_offset.checked_add(blocks as u64 * block_size as u64)
+            else {
+                return Ok(None);
+            };
+            file_offset = next_offset;
         }
         Ok(Some(runs))
     }

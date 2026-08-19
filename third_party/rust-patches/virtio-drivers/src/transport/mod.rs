@@ -33,6 +33,14 @@ pub trait Transport {
     /// Sets the device status.
     fn set_status(&mut self, status: DeviceStatus);
 
+    /// Records that the caller observed a completed device reset.
+    ///
+    /// Transports whose destructor performs a best-effort reset use this mark
+    /// to avoid issuing a second reset after a device wrapper has already
+    /// proved quiescence and reclaimed its queue owners.  The default is a
+    /// no-op for transports without reset work in their destructor.
+    fn mark_reset_complete(&mut self) {}
+
     /// Sets the guest page size.
     fn set_guest_page_size(&mut self, guest_page_size: u32);
 

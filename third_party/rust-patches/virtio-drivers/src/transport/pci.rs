@@ -2,20 +2,22 @@
 
 pub mod bus;
 
-use self::bus::{DeviceFunction, DeviceFunctionInfo, PciError, PciRoot, PCI_CAP_ID_VNDR};
+use core::{
+    fmt::{self, Display, Formatter},
+    hint::spin_loop,
+    mem::{align_of, size_of},
+    ptr::{NonNull, addr_of_mut},
+};
+
+use self::bus::{DeviceFunction, DeviceFunctionInfo, PCI_CAP_ID_VNDR, PciError, PciRoot};
 use super::{DeviceStatus, DeviceType, Transport};
 use crate::{
+    Error,
     hal::{Hal, PhysAddr},
     nonnull_slice_from_raw_parts,
     volatile::{
-        volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
+        ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly, volread, volwrite,
     },
-    Error,
-};
-use core::{
-    fmt::{self, Display, Formatter},
-    mem::{align_of, size_of},
-    ptr::{addr_of_mut, NonNull},
 };
 
 #[inline]
@@ -34,6 +36,11 @@ const TRANSITIONAL_CONSOLE: u16 = 0x1003;
 const TRANSITIONAL_SCSI_HOST: u16 = 0x1004;
 const TRANSITIONAL_ENTROPY_SOURCE: u16 = 0x1005;
 const TRANSITIONAL_9P_TRANSPORT: u16 = 0x1009;
+
+// A transport destructor cannot report reset failure. Keep its best-effort
+// quiescence probe bounded; device wrappers own DMA queues and must retain
+// those owners when their stronger reset proof fails.
+const RESET_POLL_BUDGET: usize = 1 << 20;
 
 /// The offset of the bar field within `virtio_pci_cap`.
 const CAP_BAR_OFFSET: u8 = 4;
@@ -96,6 +103,8 @@ pub struct PciTransport {
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
     config_space: Option<NonNull<[u32]>>,
+    /// Set after a device wrapper observed status zero and completed reset.
+    reset_complete: bool,
 }
 
 impl PciTransport {
@@ -198,6 +207,7 @@ impl PciTransport {
             notify_off_multiplier,
             isr_status,
             config_space,
+            reset_complete: false,
         })
     }
 }
@@ -271,6 +281,13 @@ impl Transport for PciTransport {
         unsafe {
             volwrite!(self.common_cfg, device_status, status.bits() as u8);
         }
+        if !status.is_empty() {
+            self.reset_complete = false;
+        }
+    }
+
+    fn mark_reset_complete(&mut self) {
+        self.reset_complete = true;
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
@@ -331,7 +348,8 @@ impl Transport for PciTransport {
             } else if align_of::<T>() > 4 {
                 // Panic as this should only happen if the driver is written incorrectly.
                 panic!(
-                    "Driver expected config space alignment of {} bytes, but VirtIO only guarantees 4 byte alignment.",
+                    "Driver expected config space alignment of {} bytes, but VirtIO only \
+                     guarantees 4 byte alignment.",
                     align_of::<T>()
                 );
             } else {
@@ -354,9 +372,18 @@ unsafe impl Sync for PciTransport {}
 
 impl Drop for PciTransport {
     fn drop(&mut self) {
+        if self.reset_complete {
+            return;
+        }
         // Reset the device when the transport is dropped.
         self.set_status(DeviceStatus::empty());
-        while self.get_status() != DeviceStatus::empty() {}
+        for _ in 0..RESET_POLL_BUDGET {
+            if self.get_status() == DeviceStatus::empty() {
+                self.reset_complete = true;
+                return;
+            }
+            spin_loop();
+        }
     }
 }
 
@@ -484,7 +511,8 @@ impl Display for VirtioPciError {
             Self::InvalidNotifyOffMultiplier(notify_off_multiplier) => {
                 write!(
                     f,
-                    "`VIRTIO_PCI_CAP_NOTIFY_CFG` capability has a `notify_off_multiplier` that is not a multiple of 2: {}",
+                    "`VIRTIO_PCI_CAP_NOTIFY_CFG` capability has a `notify_off_multiplier` that is \
+                     not a multiple of 2: {}",
                     notify_off_multiplier
                 )
             }

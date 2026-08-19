@@ -21,6 +21,7 @@ use core::{
 };
 
 use axdriver::{AxBlockDevice, AxDeviceContainer, SharedBlockDevice, prelude::*};
+use axfs_ng_vfs::{Filesystem, WeakFilesystemIdentity};
 use axsync::Mutex;
 use spin::Once;
 
@@ -482,6 +483,64 @@ impl BlockDeviceInfo {
 static EXTRA_BLOCK_DEVICES: Once<Mutex<Vec<RegisteredBlockDevice>>> = Once::new();
 static ROOT_BLOCK_DEVICE: Once<RegisteredBlockDevice> = Once::new();
 
+/// Exact filesystem-to-queue bindings used by physical I/O admission. The
+/// table is intentionally tiny and fixed-capacity: lookup is only on the
+/// submitter admission path, while completion routing uses the lower shared
+/// device's opaque identity directly. A weak filesystem identity lets normal
+/// unmount teardown reclaim a slot without coupling queue lifetime to a VFS
+/// path or device-name string.
+const MAX_FILESYSTEM_BLOCK_BINDINGS: usize = 32;
+
+struct FilesystemBlockBinding {
+    filesystem: WeakFilesystemIdentity,
+    device: SharedBlockDevice,
+}
+
+static FILESYSTEM_BLOCK_BINDINGS: Once<Mutex<Vec<FilesystemBlockBinding>>> = Once::new();
+
+fn register_filesystem_block_binding(
+    filesystem: &Filesystem,
+    device: &SharedBlockDevice,
+) -> axfs_ng_vfs::VfsResult<()> {
+    let bindings = FILESYSTEM_BLOCK_BINDINGS.call_once(|| Mutex::new(Vec::new()));
+    let mut bindings = bindings.lock();
+    bindings.retain(|binding| binding.filesystem.upgrade().is_some());
+    if bindings.iter().any(|binding| {
+        binding
+            .filesystem
+            .upgrade()
+            .is_some_and(|identity| identity.device() == filesystem.device())
+    }) {
+        return Ok(());
+    }
+    if bindings.len() >= MAX_FILESYSTEM_BLOCK_BINDINGS {
+        return Err(axfs_ng_vfs::VfsError::NoMemory);
+    }
+    bindings
+        .try_reserve(1)
+        .map_err(|_| axfs_ng_vfs::VfsError::NoMemory)?;
+    bindings.push(FilesystemBlockBinding {
+        filesystem: filesystem.identity_weak(),
+        device: device.clone(),
+    });
+    Ok(())
+}
+
+/// Resolves the exact block queue backing one mounted filesystem identity.
+/// This is intentionally not a pathname or `/dev/vd*` authorization check.
+pub fn block_device_for_filesystem(vfs_device: u64) -> Option<SharedBlockDevice> {
+    let bindings = FILESYSTEM_BLOCK_BINDINGS.get()?;
+    let mut bindings = bindings.lock();
+    bindings.retain(|binding| binding.filesystem.upgrade().is_some());
+    bindings.iter().find_map(|binding| {
+        binding
+            .filesystem
+            .upgrade()
+            .filter(|identity| identity.device() == vfs_device)
+            .map(|_| binding.device.clone())
+    })
+}
+
 pub const ROOT_BLOCK_DEVICE_NAME: &str = "vda";
 
 fn extra_device_name(index: usize) -> String {
@@ -614,7 +673,7 @@ pub fn raw_block_device(name: &str) -> Result<SharedBlockDevice, OpenBlockDevice
 
 pub fn with_block_device_mut<R>(
     name: &str,
-    f: impl FnOnce(&mut AxBlockDevice) -> R,
+    f: impl FnOnce(&mut SharedBlockDevice) -> R,
 ) -> Result<R, OpenBlockDeviceError> {
     if name == ROOT_BLOCK_DEVICE_NAME {
         let entry = ROOT_BLOCK_DEVICE
@@ -623,7 +682,7 @@ pub fn with_block_device_mut<R>(
         if entry.mounted.load(Ordering::Acquire) {
             return Err(OpenBlockDeviceError::Busy);
         }
-        let mut device = entry.device.lock();
+        let mut device = entry.device.clone();
         return Ok(f(&mut device));
     }
     let devices = EXTRA_BLOCK_DEVICES
@@ -637,7 +696,7 @@ pub fn with_block_device_mut<R>(
     if entry.mounted.load(Ordering::Acquire) {
         return Err(OpenBlockDeviceError::Busy);
     }
-    let mut device = entry.device.lock();
+    let mut device = entry.device.clone();
     Ok(f(&mut device))
 }
 
@@ -654,7 +713,7 @@ pub enum AsyncBlockQueueSelftestError {
 #[cfg(feature = "test-io-control")]
 fn with_explicit_scratch_block_device(
     scratch_device: &str,
-    test: impl FnOnce(&mut AxBlockDevice) -> Result<(), AsyncBlockQueueSelftestError>,
+    test: impl FnOnce(&mut SharedBlockDevice) -> Result<(), AsyncBlockQueueSelftestError>,
 ) -> Result<(), AsyncBlockQueueSelftestError> {
     if scratch_device.is_empty() || scratch_device == ROOT_BLOCK_DEVICE_NAME {
         return Err(AsyncBlockQueueSelftestError::UnsafeScratchDevice);
@@ -955,7 +1014,10 @@ pub fn new_block_filesystem(
     fs_type: &str,
     dev: MountedBlockDevice,
 ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Filesystem> {
-    fs::new_named(fs_type, dev, None)
+    let device = dev.device.clone();
+    let filesystem = fs::new_named(fs_type, dev, None)?;
+    register_filesystem_block_binding(&filesystem, &device)?;
+    Ok(filesystem)
 }
 
 pub fn new_block_filesystem_with_fat_options(
@@ -963,7 +1025,10 @@ pub fn new_block_filesystem_with_fat_options(
     dev: MountedBlockDevice,
     options: FatMountOptions,
 ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Filesystem> {
-    fs::new_named(fs_type, dev, Some(options))
+    let device = dev.device.clone();
+    let filesystem = fs::new_named(fs_type, dev, Some(options))?;
+    register_filesystem_block_binding(&filesystem, &device)?;
+    Ok(filesystem)
 }
 
 /// Initializes the filesystem subsystem using the first available block device.
@@ -982,12 +1047,11 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     }
 
     assert!(!block_devs.is_empty(), "No block device found!");
-    let root_index = block_devs
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, dev)| dev.num_blocks())
-        .map(|(index, _)| index)
-        .expect("No block device found!");
+    // Device discovery order is the boot contract: the runner presents the
+    // rootfs image first (vda) and any data image afterwards (vdb). Do not
+    // infer root identity from capacity; a perfectly valid data disk may be
+    // larger than the rootfs image.
+    let root_index = 0;
     let dev = block_devs.remove(root_index);
     info!(
         "  use block device {root_index}: {:?} (blocks={})",
@@ -1034,6 +1098,10 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("failed to claim root block device for filesystem mount");
     let fs = fs::new_default(root_device).expect("Failed to initialize filesystem");
+    let root_device = raw_block_device(ROOT_BLOCK_DEVICE_NAME)
+        .expect("root block device disappeared during filesystem initialization");
+    register_filesystem_block_binding(&fs, &root_device)
+        .expect("failed to bind root filesystem to its block device");
     info!("  filesystem type: {:?}", fs.name());
 
     let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);

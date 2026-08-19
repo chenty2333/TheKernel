@@ -17,6 +17,10 @@ pub struct Ext4Error {
     /// observed; blindly retrying or rolling back may otherwise double-free
     /// blocks after a partially completed C operation.
     pub(crate) metadata_may_have_changed: bool,
+    /// The lower block owner could not prove physical DMA retirement.  This
+    /// is distinct from an ordinary logical I/O error so callers retain the
+    /// physical effect/pin owner instead of releasing it on EIO.
+    physical_quarantined: bool,
 }
 impl Ext4Error {
     pub fn new(code: i32, context: impl Into<Option<&'static str>>) -> Self {
@@ -24,6 +28,7 @@ impl Ext4Error {
             code,
             context: context.into(),
             metadata_may_have_changed: false,
+            physical_quarantined: false,
         }
     }
 
@@ -35,6 +40,19 @@ impl Ext4Error {
     /// Returns whether the failed operation may already have mutated metadata.
     pub const fn metadata_may_have_changed(&self) -> bool {
         self.metadata_may_have_changed
+    }
+
+    /// Returns whether the error carries reset-required physical ownership.
+    pub const fn physical_quarantined(&self) -> bool {
+        self.physical_quarantined
+    }
+
+    /// Marks an error as retaining a physical DMA owner.  This marker is
+    /// sticky across added filesystem context and must not be converted into
+    /// a normal fallback/EIO path.
+    pub fn with_physical_quarantined(mut self, quarantined: bool) -> Self {
+        self.physical_quarantined |= quarantined;
+        self
     }
 }
 

@@ -56,7 +56,7 @@ input = [
     "alloc",
     "axdriver_input",
 ]
-irq = ["dep:axhal"]
+irq = ["dep:axhal", "axhal/irq"]
 net = [
     "alloc",
     "axdriver_net",
@@ -100,6 +100,7 @@ optional = true
 [dependencies.axtask]
 package = "thekernel-axtask"
 version = "=0.1.0"
+features = ["multitask"]
 optional = true
 
 [dependencies.log]

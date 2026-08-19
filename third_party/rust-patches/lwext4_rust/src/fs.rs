@@ -1,5 +1,10 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::{marker::PhantomData, mem, sync::atomic::AtomicU64, time::Duration};
+use core::{
+    marker::PhantomData,
+    mem,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use hashbrown::HashMap;
 
@@ -7,6 +12,8 @@ use crate::{
     DirLookupResult, DirReader, Ext4Error, Ext4Result, FileAttr, InodeRef, InodeToken, InodeType,
     blockdev::{
         AsyncReadSubmission, AsyncWriteSubmission, BlockDevice, EXT4_DEV_BSIZE, Ext4BlockDevice,
+        PhysicalIoBatchRequest, PhysicalIoBatchSubmitOutcome,
+        PhysicalIoNotSubmittedReason, PhysicalIoSegment,
     },
     error::Context,
     ffi::*,
@@ -19,6 +26,9 @@ use crate::{
     iomap::{MappedRun, MappedRunKind},
     util::get_block_size,
 };
+
+#[cfg(test)]
+use crate::blockdev::PhysicalIoBatchSubmission;
 
 pub trait SystemHal {
     fn now() -> Option<Duration>;
@@ -182,6 +192,7 @@ fn complete_namespace_operation(
 }
 
 pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
+    filesystem_id: u64,
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
     hot_inodes: HotInodeCache<Hal>,
@@ -191,11 +202,14 @@ pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     _phantom: PhantomData<Hal>,
 }
 
+static NEXT_FILESYSTEM_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy)]
 struct ShutdownFailure {
     code: i32,
     context: Option<&'static str>,
     metadata_may_have_changed: bool,
+    physical_quarantined: bool,
 }
 
 impl ShutdownFailure {
@@ -204,12 +218,14 @@ impl ShutdownFailure {
             code: error.code,
             context: error.context,
             metadata_may_have_changed: error.metadata_may_have_changed(),
+            physical_quarantined: error.physical_quarantined(),
         }
     }
 
     fn into_error(self) -> Ext4Error {
         Ext4Error::new(self.code, self.context)
             .with_metadata_may_have_changed(self.metadata_may_have_changed)
+            .with_physical_quarantined(self.physical_quarantined)
     }
 }
 
@@ -284,22 +300,80 @@ const NAMESPACE_REAP_BUDGET: usize = 32;
 /// Hard bound for long-lived VFS inode identities and deferred deletions.
 /// This also bounds final filesystem teardown work.
 const MAX_TRACKED_INODE_IDENTITIES: usize = 16_384;
-/// A validated single-extent physical I/O plan.  The plan is copyable so the
-/// caller can release the ext4 filesystem lock before entering a synchronous
-/// device wait, then revalidate the mapping before publishing write-cache
-/// invalidation.
+/// Maximum number of mapped extents in one physical direct-I/O effect.
+///
+/// This is deliberately the same bound as the lower physical route's child
+/// capacity. Keeping it here makes filesystem admission finite before any
+/// queue state or DMA mapping is touched.
+pub const MAX_PHYSICAL_IO_EXTENTS: usize = 16;
+const MAX_PHYSICAL_IO_INPUT_SEGMENTS: usize = 16;
+/// Maximum number of owned physical SG slices in one effect.  A source SG
+/// segment may be split at an extent boundary, so this is a bound on the
+/// normalized slices retained by the plan rather than on the caller's input
+/// count alone.  Intersecting at most E extents with at most S disjoint source
+/// segments creates at most E + S - 1 non-empty slices.
+pub const MAX_PHYSICAL_IO_SEGMENTS: usize =
+    MAX_PHYSICAL_IO_EXTENTS + MAX_PHYSICAL_IO_INPUT_SEGMENTS - 1;
+/// Maximum direct-I/O payload admitted by the ext4 physical fast path.
+pub const MAX_PHYSICAL_IO_BYTES: usize = 256 * 1024;
+
+/// The direction of one prepared physical filesystem operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalIoPlan {
-    ino: u32,
+pub enum PhysicalIoOperation {
+    Read,
+    Write,
+}
+
+impl PhysicalIoOperation {
+    pub const fn is_write(self) -> bool {
+        matches!(self, Self::Write)
+    }
+}
+
+fn physical_io_read_lengths(
+    file_size: u64,
+    offset: u64,
+    len: usize,
+    block_size: usize,
+    overwrite_only: bool,
+) -> Option<(usize, usize)> {
+    if len == 0 || block_size == 0 || offset % block_size as u64 != 0 || len % block_size != 0 {
+        return None;
+    }
+    let request_end = offset.checked_add(len as u64)?;
+    if offset >= file_size || overwrite_only && request_end > file_size {
+        return None;
+    }
+    let logical_bytes = len.min(usize::try_from(file_size - offset).unwrap_or(usize::MAX));
+    if logical_bytes == 0 {
+        return None;
+    }
+    let io_bytes = logical_bytes.checked_add(block_size - 1)? / block_size * block_size;
+    // A physical direct read must never write past the caller-visible short
+    // count. A future mixed tail plan may relax this with a private bounce
+    // block, but the current zero-copy path deliberately falls back.
+    (io_bytes <= len && logical_bytes == io_bytes).then_some((logical_bytes, io_bytes))
+}
+
+/// One written ext4 extent included in a bounded physical I/O plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoExtent {
     file_offset: u64,
     pblock: u64,
     physical_block_id: u64,
     bytes: usize,
     blocks: u32,
-    mapping_seq: u64,
+    /// Index of the first owned SG slice for this extent.
+    segment_start: u8,
+    /// Number of owned SG slices for this extent.
+    segment_count: u8,
 }
 
-impl PhysicalIoPlan {
+impl PhysicalIoExtent {
+    pub fn file_offset(self) -> u64 {
+        self.file_offset
+    }
+
     pub fn physical_block_id(self) -> u64 {
         self.physical_block_id
     }
@@ -307,6 +381,592 @@ impl PhysicalIoPlan {
     pub fn bytes(self) -> usize {
         self.bytes
     }
+
+    pub fn blocks(self) -> u32 {
+        self.blocks
+    }
+
+    pub fn segment_start(self) -> usize {
+        usize::from(self.segment_start)
+    }
+
+    pub fn segment_count(self) -> usize {
+        usize::from(self.segment_count)
+    }
+}
+
+/// A validated, bounded physical I/O plan. The plan is copyable so the
+/// caller can release the ext4 filesystem lock before entering synchronous
+/// device waits, then revalidate the complete mapping before publishing a
+/// write-cache invalidation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoPlan {
+    ino: u32,
+    /// Stable identity of the ext4 filesystem instance which produced this
+    /// plan.  The owner keeps the filesystem alive; the identity additionally
+    /// prevents accidentally finalizing a plan against a replacement mount.
+    filesystem_id: u64,
+    file_offset: u64,
+    /// Bytes visible to the caller. The current physical path requires this
+    /// to equal `io_bytes`; partial-block EOF reads use the bounce path.
+    logical_bytes: usize,
+    io_bytes: usize,
+    operation: PhysicalIoOperation,
+    extent_count: usize,
+    extents: [PhysicalIoExtent; MAX_PHYSICAL_IO_EXTENTS],
+    segment_count: usize,
+    segments: [PhysicalIoSegment; MAX_PHYSICAL_IO_SEGMENTS],
+    mapping_seq: u64,
+}
+
+impl PhysicalIoPlan {
+    pub fn extent_count(self) -> usize {
+        self.extent_count
+    }
+
+    pub fn bytes(self) -> usize {
+        self.logical_bytes
+    }
+
+    pub fn io_bytes(self) -> usize {
+        self.io_bytes
+    }
+
+    pub fn operation(self) -> PhysicalIoOperation {
+        self.operation
+    }
+
+    pub fn inode(self) -> u32 {
+        self.ino
+    }
+
+    pub fn filesystem_id(self) -> u64 {
+        self.filesystem_id
+    }
+
+    pub fn mapping_seq(self) -> u64 {
+        self.mapping_seq
+    }
+
+    pub fn extent(self, index: usize) -> Option<PhysicalIoExtent> {
+        (index < self.extent_count).then_some(self.extents[index])
+    }
+
+    pub fn segment_count(self) -> usize {
+        self.segment_count
+    }
+
+    pub fn segment(self, index: usize) -> Option<PhysicalIoSegment> {
+        (index < self.segment_count).then_some(self.segments[index])
+    }
+
+    pub fn segments(&self) -> &[PhysicalIoSegment] {
+        &self.segments[..self.segment_count]
+    }
+}
+
+/// Exact completion information supplied by the physical effect owner.  A
+/// driver completion cookie is intentionally independent from the raw handle;
+/// both must be checked before a plan can be finalized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoCompletion {
+    pub handle: u64,
+    pub cookie: u64,
+    pub bytes: usize,
+    pub success: bool,
+}
+
+/// Why an effect must remain owned instead of being settled.  These are
+/// protocol/retirement conditions, not ordinary I/O errors: the caller must
+/// retain the pin, range lease, and cache owner and may submit later exact
+/// completions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoPendingReason {
+    NotPublished,
+    /// The device reported an accepted request for which the effect owner
+    /// cannot retain an exact handle (or reported an impossible count).  The
+    /// known prefix may still be drained, but the effect is never drop-safe.
+    MalformedPublication,
+    MissingCompletion {
+        observed: usize,
+        expected: usize,
+    },
+    UnknownHandle,
+    DuplicateCompletion,
+    CookieMismatch,
+    BytesMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoCompletionOutcome {
+    Accepted,
+    Retain(PhysicalIoPendingReason),
+}
+
+/// A physical effect is settled only once every handle that was actually
+/// published has an exact retirement observation.  `success` is the logical
+/// result after all statuses are known; false covers device errors and a
+/// terminal partial publication, but is still safe to release physically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoSettlement {
+    Settled { plan: PhysicalIoPlan, success: bool },
+    Retain(PhysicalIoPendingReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalIoPublication {
+    handles: [u64; MAX_PHYSICAL_IO_EXTENTS],
+    cookies: [u64; MAX_PHYSICAL_IO_EXTENTS],
+    cookie_known: [bool; MAX_PHYSICAL_IO_EXTENTS],
+    count: usize,
+    bytes: usize,
+    terminal: bool,
+}
+
+impl PhysicalIoPublication {
+    pub fn count(self) -> usize {
+        self.count
+    }
+
+    pub fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    pub fn handle(self, index: usize) -> Option<u64> {
+        (index < self.count).then_some(self.handles[index])
+    }
+
+    pub fn cookie(self, index: usize) -> Option<u64> {
+        (index < self.count && self.cookie_known[index]).then_some(self.cookies[index])
+    }
+
+    pub fn terminal(self) -> bool {
+        self.terminal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoPublishOutcome {
+    /// The driver performed no publication; synchronous fallback remains
+    /// valid for this prepared effect.
+    NotSubmitted(PhysicalIoNotSubmittedReason),
+    /// Every extent was accepted and the owner may await exact completions.
+    Published(PhysicalIoPublication),
+    /// A prefix or malformed byte report was accepted.  This is terminal and
+    /// can never be converted into a fallback operation.
+    Terminal(PhysicalIoPublication),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalIoEffectState {
+    Prepared,
+    Published,
+    Terminal,
+    Quarantined,
+    Completed,
+    SettledFailure,
+    Finalized,
+}
+
+/// Owned, bounded state for one physical ext4 effect.  It contains no caller
+/// borrow and no virtual address; the upper layer retains the pin owner and
+/// range lease alongside this value until all exact completions have settled.
+#[derive(Debug)]
+pub struct PhysicalIoEffect {
+    plan: PhysicalIoPlan,
+    state: PhysicalIoEffectState,
+    publication: PhysicalIoPublication,
+    /// A malformed report may have accepted requests for which no exact
+    /// handle was returned.  Keep this bit independent of the retained
+    /// prefix so a complete prefix can never incorrectly become drop-safe.
+    publication_quarantined: bool,
+    /// A malformed/duplicate completion is reset-required, not an ordinary
+    /// logical I/O failure. Keep the reason so settlement can never release
+    /// the upper physical owner after returning EIO.
+    quarantine_reason: Option<PhysicalIoPendingReason>,
+    completed: [bool; MAX_PHYSICAL_IO_EXTENTS],
+    completion_count: usize,
+    logical_success: bool,
+}
+
+impl PhysicalIoEffect {
+    pub fn new(plan: PhysicalIoPlan) -> Self {
+        Self {
+            plan,
+            state: PhysicalIoEffectState::Prepared,
+            publication: PhysicalIoPublication {
+                handles: [0; MAX_PHYSICAL_IO_EXTENTS],
+                cookies: [0; MAX_PHYSICAL_IO_EXTENTS],
+                cookie_known: [false; MAX_PHYSICAL_IO_EXTENTS],
+                count: 0,
+                bytes: 0,
+                terminal: false,
+            },
+            publication_quarantined: false,
+            quarantine_reason: None,
+            completed: [false; MAX_PHYSICAL_IO_EXTENTS],
+            completion_count: 0,
+            logical_success: true,
+        }
+    }
+
+    pub fn plan(&self) -> PhysicalIoPlan {
+        self.plan
+    }
+
+    pub fn state(&self) -> PhysicalIoEffectState {
+        self.state
+    }
+
+    pub fn publication(&self) -> Option<PhysicalIoPublication> {
+        (self.publication.count != 0).then_some(self.publication)
+    }
+
+    /// Publishes every extent through one caller-supplied atomic driver hook.
+    /// The hook receives only owned fixed request copies and must return
+    /// `None` when it can prove that no descriptor was visible.
+    pub unsafe fn publish_with(
+        &mut self,
+        submit: impl FnOnce(
+            &[PhysicalIoBatchRequest],
+        ) -> Ext4Result<PhysicalIoBatchSubmitOutcome>,
+    ) -> Ext4Result<PhysicalIoPublishOutcome> {
+        if self.state != PhysicalIoEffectState::Prepared {
+            return Err(Ext4Error::new(
+                EINVAL as _,
+                "physical effect already published",
+            ));
+        }
+        let mut requests = [PhysicalIoBatchRequest::empty(); MAX_PHYSICAL_IO_EXTENTS];
+        for index in 0..self.plan.extent_count {
+            requests[index] = PhysicalIoBatchRequest::from_plan(self.plan, index)
+                .ok_or_else(|| Ext4Error::new(EINVAL as _, "invalid physical effect extent"))?;
+        }
+        let submission = match submit(&requests[..self.plan.extent_count])? {
+            PhysicalIoBatchSubmitOutcome::NotSubmitted(reason) => {
+                // The effect remains Prepared.  Since the lower contract
+                // proves that no descriptor was visible, the same prepared
+                // effect can safely be retried after transient backpressure.
+                return Ok(PhysicalIoPublishOutcome::NotSubmitted(reason));
+            }
+            PhysicalIoBatchSubmitOutcome::Submitted(submission) => submission,
+        };
+        let malformed_count = submission.submitted > MAX_PHYSICAL_IO_EXTENTS;
+        let malformed_handles = submission.handles.len() != submission.submitted;
+        let malformed_cookies = submission.submitted != 0
+            && (submission.cookies.len() != submission.submitted
+                || submission.cookies.iter().any(|cookie| *cookie == 0));
+        let retained_count = submission
+            .submitted
+            .min(submission.handles.len())
+            .min(MAX_PHYSICAL_IO_EXTENTS);
+        let retained_handles = submission.handles.iter().copied().take(retained_count);
+        self.publication = PhysicalIoPublication {
+            handles: {
+                let mut handles = [0; MAX_PHYSICAL_IO_EXTENTS];
+                for (index, handle) in retained_handles.enumerate() {
+                    handles[index] = handle;
+                }
+                handles
+            },
+            cookies: {
+                let mut cookies = [0; MAX_PHYSICAL_IO_EXTENTS];
+                for (index, cookie) in submission.cookies.iter().copied().enumerate() {
+                    if index == retained_count {
+                        break;
+                    }
+                    cookies[index] = cookie;
+                }
+                cookies
+            },
+            cookie_known: {
+                let mut known = [false; MAX_PHYSICAL_IO_EXTENTS];
+                if !submission.cookies.is_empty() && !malformed_cookies {
+                    for known in known.iter_mut().take(retained_count) {
+                        *known = true;
+                    }
+                }
+                known
+            },
+            count: retained_count,
+            bytes: submission.bytes,
+            terminal: malformed_count
+                || malformed_handles
+                || malformed_cookies
+                || submission.terminal
+                || submission.submitted != self.plan.extent_count
+                || submission.bytes != self.plan.io_bytes,
+        };
+        self.publication_quarantined = malformed_count
+            || malformed_handles
+            || malformed_cookies
+            || (submission.submitted == 0 && (submission.terminal || submission.bytes != 0));
+        self.state = if self.publication.terminal {
+            PhysicalIoEffectState::Terminal
+        } else {
+            PhysicalIoEffectState::Published
+        };
+        let publication = self.publication;
+        Ok(if publication.terminal {
+            PhysicalIoPublishOutcome::Terminal(publication)
+        } else {
+            PhysicalIoPublishOutcome::Published(publication)
+        })
+    }
+
+    fn quarantine(&mut self, reason: PhysicalIoPendingReason) {
+        self.state = PhysicalIoEffectState::Quarantined;
+        self.quarantine_reason.get_or_insert(reason);
+    }
+
+    /// Records one completion observation.  Device failure is an accepted
+    /// retirement and only changes the eventual logical result.  Unknown,
+    /// duplicate, cookie-mismatched, and short observations are retained as
+    /// quarantine reasons; they never make the effect drop-safe.
+    pub fn record_completion(
+        &mut self,
+        completion: PhysicalIoCompletion,
+    ) -> PhysicalIoCompletionOutcome {
+        if !matches!(
+            self.state,
+            PhysicalIoEffectState::Published
+                | PhysicalIoEffectState::Terminal
+                | PhysicalIoEffectState::Quarantined
+        ) {
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::NotPublished);
+        }
+        if completion.handle == 0 {
+            self.quarantine(PhysicalIoPendingReason::UnknownHandle);
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::UnknownHandle);
+        }
+        if completion.cookie == 0 {
+            self.quarantine(PhysicalIoPendingReason::CookieMismatch);
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::CookieMismatch);
+        }
+        let Some(index) = (0..self.publication.count)
+            .find(|index| self.publication.handles[*index] == completion.handle)
+        else {
+            self.quarantine(PhysicalIoPendingReason::UnknownHandle);
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::UnknownHandle);
+        };
+        if self.completed[index] {
+            let reason = if self.publication.cookie_known[index]
+                && self.publication.cookies[index] != completion.cookie
+            {
+                PhysicalIoPendingReason::CookieMismatch
+            } else {
+                PhysicalIoPendingReason::DuplicateCompletion
+            };
+            self.quarantine(reason);
+            return PhysicalIoCompletionOutcome::Retain(reason);
+        }
+        if self.publication.cookie_known[index]
+            && self.publication.cookies[index] != completion.cookie
+        {
+            self.quarantine(PhysicalIoPendingReason::CookieMismatch);
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::CookieMismatch);
+        }
+        if !self.publication.cookie_known[index] {
+            self.publication.cookies[index] = completion.cookie;
+            self.publication.cookie_known[index] = true;
+        }
+        let expected = self.plan.extent(index).map(|extent| extent.bytes());
+        let bytes_match = if !completion.success {
+            // A device-error status is already a terminal logical failure;
+            // used length is commonly zero and does not describe a partial
+            // caller-visible read.  Handle/cookie identity still proves that
+            // this exact request retired.
+            true
+        } else {
+            match expected {
+                Some(expected) => match self.plan.operation {
+                    // Several virtio backends report a successful write with
+                    // a used length of zero.  A non-zero write length is still
+                    // checked when the backend provides one; reads require
+                    // the exact extent length because those bytes fill the
+                    // caller SG.
+                    PhysicalIoOperation::Write => {
+                        completion.bytes == 0 || completion.bytes == expected
+                    }
+                    PhysicalIoOperation::Read => completion.bytes == expected,
+                },
+                None => false,
+            }
+        };
+        if !bytes_match {
+            self.quarantine(PhysicalIoPendingReason::BytesMismatch);
+            return PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::BytesMismatch);
+        }
+        self.completed[index] = true;
+        self.completion_count = self.completion_count.saturating_add(1);
+        if !completion.success {
+            self.logical_success = false;
+        }
+        PhysicalIoCompletionOutcome::Accepted
+    }
+
+    /// Settles the physical owner only after every actually published handle
+    /// has an exact completion observation.  A terminal partial publication
+    /// can therefore settle to a logical EIO once its accepted prefix retires.
+    pub fn settle(&mut self) -> PhysicalIoSettlement {
+        if self.state == PhysicalIoEffectState::Prepared {
+            return PhysicalIoSettlement::Retain(PhysicalIoPendingReason::NotPublished);
+        }
+        if self.state == PhysicalIoEffectState::Finalized {
+            return PhysicalIoSettlement::Retain(PhysicalIoPendingReason::NotPublished);
+        }
+        if self.publication_quarantined {
+            return PhysicalIoSettlement::Retain(PhysicalIoPendingReason::MalformedPublication);
+        }
+        if let Some(reason) = self.quarantine_reason {
+            return PhysicalIoSettlement::Retain(reason);
+        }
+        if self.completion_count != self.publication.count {
+            return PhysicalIoSettlement::Retain(PhysicalIoPendingReason::MissingCompletion {
+                observed: self.completion_count,
+                expected: self.publication.count,
+            });
+        }
+        let success = self.logical_success
+            && !self.publication.terminal
+            && self.state != PhysicalIoEffectState::Quarantined;
+        self.state = if success {
+            PhysicalIoEffectState::Completed
+        } else {
+            PhysicalIoEffectState::SettledFailure
+        };
+        PhysicalIoSettlement::Settled {
+            plan: self.plan,
+            success,
+        }
+    }
+
+    pub fn mark_finalized(&mut self) -> Ext4Result<PhysicalIoPlan> {
+        if !matches!(
+            self.state,
+            PhysicalIoEffectState::Completed | PhysicalIoEffectState::SettledFailure
+        ) {
+            return Err(Ext4Error::new(EIO as _, "physical effect is not complete"));
+        }
+        self.state = PhysicalIoEffectState::Finalized;
+        Ok(self.plan)
+    }
+}
+
+/// Copies a caller SG list into a fixed, extent-sliced representation owned by
+/// the plan.  The input is only borrowed during preparation; no pointer or
+/// borrow is retained after this function returns.
+fn copy_physical_segments_into_plan(
+    plan: &mut PhysicalIoPlan,
+    input: &[PhysicalIoSegment],
+) -> bool {
+    if input.is_empty()
+        || input.len() > MAX_PHYSICAL_IO_INPUT_SEGMENTS
+        || plan.io_bytes == 0
+        || plan.io_bytes > MAX_PHYSICAL_IO_BYTES
+    {
+        return false;
+    }
+
+    let mut ranges = [(0usize, 0usize); MAX_PHYSICAL_IO_INPUT_SEGMENTS];
+    let mut input_total = 0usize;
+    for (index, segment) in input.iter().copied().enumerate() {
+        if segment.len == 0
+            || segment.paddr % EXT4_DEV_BSIZE != 0
+            || segment.len % EXT4_DEV_BSIZE != 0
+        {
+            return false;
+        }
+        let Some(end) = segment.paddr.checked_add(segment.len) else {
+            return false;
+        };
+        input_total = match input_total.checked_add(segment.len) {
+            Some(total) => total,
+            None => return false,
+        };
+        ranges[index] = (segment.paddr, end);
+    }
+    if input_total != plan.io_bytes {
+        return false;
+    }
+    ranges[..input.len()].sort_unstable_by_key(|range| range.0);
+    if ranges[..input.len()]
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0)
+    {
+        return false;
+    }
+
+    let mut input_index = 0usize;
+    let mut input_offset = 0usize;
+    let mut output_count = 0usize;
+    for extent_index in 0..plan.extent_count {
+        let extent = plan.extents[extent_index];
+        let start = output_count;
+        let mut remaining = extent.bytes;
+        while remaining != 0 {
+            let Some(segment) = input.get(input_index).copied() else {
+                return false;
+            };
+            if input_offset == segment.len {
+                input_index = match input_index.checked_add(1) {
+                    Some(index) => index,
+                    None => return false,
+                };
+                input_offset = 0;
+                continue;
+            }
+            let Some(paddr) = segment.paddr.checked_add(input_offset) else {
+                return false;
+            };
+            let take = remaining.min(segment.len - input_offset);
+            if take == 0 || take % EXT4_DEV_BSIZE != 0 || paddr % EXT4_DEV_BSIZE != 0 {
+                return false;
+            }
+            if output_count != start {
+                let previous = plan.segments[output_count - 1];
+                if previous.paddr.checked_add(previous.len) == Some(paddr) {
+                    plan.segments[output_count - 1].len = match previous.len.checked_add(take) {
+                        Some(len) => len,
+                        None => return false,
+                    };
+                } else {
+                    if output_count >= MAX_PHYSICAL_IO_SEGMENTS {
+                        return false;
+                    }
+                    plan.segments[output_count] = PhysicalIoSegment { paddr, len: take };
+                    output_count += 1;
+                }
+            } else {
+                if output_count >= MAX_PHYSICAL_IO_SEGMENTS {
+                    return false;
+                }
+                plan.segments[output_count] = PhysicalIoSegment { paddr, len: take };
+                output_count += 1;
+            }
+            input_offset = match input_offset.checked_add(take) {
+                Some(offset) => offset,
+                None => return false,
+            };
+            remaining -= take;
+        }
+        let count = output_count - start;
+        if count == 0 || start > usize::from(u8::MAX) || count > usize::from(u8::MAX) {
+            return false;
+        }
+        plan.extents[extent_index].segment_start = start as u8;
+        plan.extents[extent_index].segment_count = count as u8;
+    }
+    if input_index < input.len()
+        && (input_offset != input[input_index].len || input_index + 1 != input.len())
+    {
+        return false;
+    }
+    if output_count == 0 || output_count > MAX_PHYSICAL_IO_SEGMENTS {
+        return false;
+    }
+    plan.segment_count = output_count;
+    true
 }
 
 fn try_namespace_epoch() -> Ext4Result<Arc<AtomicU64>> {
@@ -373,6 +1033,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             bd.fs = &mut *fs;
 
             let mut result = Self {
+                filesystem_id: NEXT_FILESYSTEM_ID.fetch_add(1, Ordering::Relaxed),
                 inner: fs,
                 bdev,
                 hot_inodes,
@@ -385,6 +1046,13 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             ext4_block_bind_bcache(bd, bd.bc).context("ext4_block_bind_bcache")?;
             Ok(result)
         }
+    }
+
+    /// Stable identity for this mounted filesystem instance.  It is captured
+    /// in every physical plan so a plan cannot be finalized against a
+    /// replacement mount which happens to reuse the same inode number.
+    pub fn filesystem_id(&self) -> u64 {
+        self.filesystem_id
     }
 
     fn ensure_active(&self) -> Ext4Result<()> {
@@ -740,7 +1408,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         offset: u64,
         len: usize,
     ) -> Ext4Result<Option<(usize, u32, Vec<MappedRun>)>> {
-        self.with_cached_inode_ref(ino, |inode| {
+        self.with_inode_ref_mut(ino, |inode| {
             let file_size = inode.size();
             let block_size = get_block_size(inode.superblock());
             if offset >= file_size {
@@ -771,7 +1439,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     }
 
     fn mapped_runs_current(&mut self, ino: u32, runs: &[MappedRun]) -> Ext4Result<bool> {
-        self.with_cached_inode_ref(ino, |inode| {
+        self.with_inode_ref(ino, |inode| {
             let mut expected_offset = runs.first().map(|run| run.file_offset).unwrap_or(0);
             for run in runs {
                 if run.seq != inode.mapping_seq || run.file_offset != expected_offset {
@@ -884,59 +1552,181 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         len: usize,
         overwrite_only: bool,
     ) -> Ext4Result<Option<PhysicalIoPlan>> {
-        if len == 0 || offset % EXT4_DEV_BSIZE as u64 != 0 || len % EXT4_DEV_BSIZE != 0 {
+        if len == 0
+            || len > MAX_PHYSICAL_IO_BYTES
+            || offset % EXT4_DEV_BSIZE as u64 != 0
+            || len % EXT4_DEV_BSIZE != 0
+        {
             return Ok(None);
         }
-        self.with_cached_inode_ref(ino, |inode| {
+        self.with_inode_ref_mut(ino, |inode| {
             let block_size = get_block_size(inode.superblock());
-            let Some(end) = offset.checked_add(len as u64) else {
-                return Ok(None);
-            };
             if block_size != 4096
                 || offset % block_size as u64 != 0
                 || len % block_size as usize != 0
                 || inode.inode_type() != InodeType::RegularFile
-                || end > inode.size()
             {
                 return Ok(None);
             }
-            let Some(run) = inode.map_iomap_run(offset, len, overwrite_only)? else {
+            let file_size = inode.size();
+            let Some((logical_bytes, io_bytes)) = physical_io_read_lengths(
+                file_size,
+                offset,
+                len,
+                block_size as usize,
+                overwrite_only,
+            ) else {
                 return Ok(None);
             };
-            if run.kind != MappedRunKind::Written || run.pblock == 0 || run.bytes != len {
+            let Some(runs) =
+                inode.map_iomap_runs_without_cache(offset, io_bytes, overwrite_only)?
+            else {
+                return Ok(None);
+            };
+            if runs.is_empty()
+                || runs.len() > MAX_PHYSICAL_IO_EXTENTS
+                || runs.iter().any(|run| {
+                    run.kind != MappedRunKind::Written || run.pblock == 0 || run.bytes == 0
+                })
+            {
                 return Ok(None);
             }
-            let blocks = u32::try_from(len / block_size as usize)
-                .map_err(|_| Ext4Error::new(EINVAL as _, "physical I/O block count overflow"))?;
-            Ok(Some((run.pblock, run.seq, blocks)))
+            let mut extents = [PhysicalIoExtent {
+                file_offset: 0,
+                pblock: 0,
+                physical_block_id: 0,
+                bytes: 0,
+                blocks: 0,
+                segment_start: 0,
+                segment_count: 0,
+            }; MAX_PHYSICAL_IO_EXTENTS];
+            for (index, run) in runs.iter().enumerate() {
+                let blocks = u32::try_from(run.bytes / block_size as usize).map_err(|_| {
+                    Ext4Error::new(EINVAL as _, "physical I/O block count overflow")
+                })?;
+                extents[index] = PhysicalIoExtent {
+                    file_offset: run.file_offset,
+                    pblock: run.pblock,
+                    physical_block_id: 0,
+                    bytes: run.bytes,
+                    blocks,
+                    segment_start: 0,
+                    segment_count: 0,
+                };
+            }
+            Ok(Some((
+                logical_bytes,
+                io_bytes,
+                runs.len(),
+                extents,
+                inode.mapping_seq,
+            )))
         })?
-        .map(|(pblock, mapping_seq, blocks)| PhysicalIoPlan {
-            ino,
-            file_offset: offset,
-            pblock,
-            physical_block_id: self.bdev.direct_physical_block_id(pblock),
-            bytes: len,
-            blocks,
-            mapping_seq,
-        })
+        .map(
+            |(logical_bytes, io_bytes, extent_count, mut extents, mapping_seq)| {
+                for extent in extents.iter_mut().take(extent_count) {
+                    extent.physical_block_id = self.bdev.direct_physical_block_id(extent.pblock);
+                }
+                PhysicalIoPlan {
+                    ino,
+                    filesystem_id: self.filesystem_id,
+                    file_offset: offset,
+                    logical_bytes,
+                    io_bytes,
+                    operation: PhysicalIoOperation::Read,
+                    extent_count,
+                    extents,
+                    segment_count: 0,
+                    segments: [PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_IO_SEGMENTS],
+                    mapping_seq,
+                }
+            },
+        )
         .map_or(Ok(None), |plan| Ok(Some(plan)))
+    }
+
+    /// Performs one complete typed FIEMAP scan while the filesystem lock is
+    /// held by the caller.  The inode cache is allowed to service the mapping
+    /// walk, but no Linux userspace representation or pointer enters this
+    /// layer.
+    pub fn map_extents(
+        &mut self,
+        ino: u32,
+        start: u64,
+        length: u64,
+        max_extents: usize,
+    ) -> Ext4Result<crate::FiemapResult> {
+        self.with_cached_inode_ref(ino, |inode| {
+            inode.map_extents(start, length, max_extents)
+        })
+    }
+
+    /// Prepares an owned physical direct-I/O plan.  All filesystem eligibility
+    /// and SG normalization happens before this returns; no queue slot,
+    /// descriptor, cache invalidation, or metadata mutation is performed.
+    ///
+    /// The returned plan owns only physical numbers and fixed-size metadata,
+    /// so it is safe to move to a worker while the filesystem lock is
+    /// released.  The caller's pin owner remains outside this crate and must
+    /// outlive publication and exact completion retirement.
+    pub fn prepare_physical_io_plan(
+        &mut self,
+        ino: u32,
+        operation: PhysicalIoOperation,
+        offset: u64,
+        len: usize,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<PhysicalIoPlan>> {
+        let Some(mut plan) = self.plan_physical_io(ino, offset, len, operation.is_write())? else {
+            return Ok(None);
+        };
+        plan.operation = operation;
+        if !copy_physical_segments_into_plan(&mut plan, segments) {
+            return Ok(None);
+        }
+        Ok(Some(plan))
+    }
+
+    /// Short alias for callers which already use the prepare/publish/finalize
+    /// vocabulary.
+    pub fn prepare_physical_io(
+        &mut self,
+        ino: u32,
+        operation: PhysicalIoOperation,
+        offset: u64,
+        len: usize,
+        segments: &[PhysicalIoSegment],
+    ) -> Ext4Result<Option<PhysicalIoPlan>> {
+        self.prepare_physical_io_plan(ino, operation, offset, len, segments)
     }
 
     /// Revalidates a plan after a completed synchronous device operation.
     /// Mapping changes are terminal: callers must not bounce or retry after
     /// an accepted physical operation.
     pub fn validate_physical_io_plan(&mut self, plan: PhysicalIoPlan) -> Ext4Result<()> {
-        let valid = self.with_cached_inode_ref(plan.ino, |inode| {
-            if inode.mapping_seq != plan.mapping_seq {
+        let filesystem_id = self.filesystem_id;
+        let valid = self.with_inode_ref_mut(plan.ino, |inode| {
+            if filesystem_id != plan.filesystem_id || inode.mapping_seq != plan.mapping_seq {
                 return Ok(false);
             }
-            let Some(run) = inode.map_iomap_run(plan.file_offset, plan.bytes, true)? else {
+            let Some(runs) =
+                inode.map_iomap_runs_without_cache(plan.file_offset, plan.io_bytes, false)?
+            else {
                 return Ok(false);
             };
-            Ok(run.seq == plan.mapping_seq
-                && run.kind == MappedRunKind::Written
-                && run.pblock == plan.pblock
-                && run.bytes == plan.bytes)
+            if runs.len() != plan.extent_count {
+                return Ok(false);
+            }
+            Ok(runs.iter().enumerate().all(|(index, run)| {
+                let Some(extent) = plan.extent(index) else {
+                    return false;
+                };
+                run.seq == plan.mapping_seq
+                    && run.kind == MappedRunKind::Written
+                    && run.pblock == extent.pblock
+                    && run.file_offset == extent.file_offset
+                    && run.bytes == extent.bytes
+            }))
         })?;
         if valid {
             Ok(())
@@ -945,13 +1735,41 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
     }
 
+    /// Finalizes a prepared plan after the upper effect owner has established
+    /// that every exact device completion was successful.  A false completion
+    /// proof is terminal and never selects a synchronous fallback.
+    pub fn finalize_physical_io_plan(
+        &mut self,
+        plan: PhysicalIoPlan,
+        all_completions_success: bool,
+    ) -> Ext4Result<()> {
+        if !all_completions_success {
+            return Err(Ext4Error::new(EIO as _, "physical I/O completion failed"));
+        }
+        match plan.operation {
+            PhysicalIoOperation::Read => self.validate_physical_io_plan(plan),
+            PhysicalIoOperation::Write => self.commit_physical_io_write(plan),
+        }
+    }
+
     /// Commits cache invalidation for a completed physical overwrite after
     /// revalidating that the mapped extent did not change while the device
     /// was running.
     pub fn commit_physical_io_write(&mut self, plan: PhysicalIoPlan) -> Ext4Result<()> {
+        if plan.logical_bytes != plan.io_bytes {
+            return Err(Ext4Error::new(
+                EINVAL as _,
+                "physical overwrite plan crosses EOF",
+            ));
+        }
         self.validate_physical_io_plan(plan)?;
-        self.bdev
-            .invalidate_logical_block_range(plan.pblock, plan.blocks);
+        for index in 0..plan.extent_count {
+            let extent = plan
+                .extent(index)
+                .expect("physical plan extent count exceeds fixed capacity");
+            self.bdev
+                .invalidate_logical_block_range(extent.pblock, extent.blocks);
+        }
         Ok(())
     }
 
@@ -2103,6 +2921,8 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     fn timestamp_test_inode(fs: &mut ext4_fs, inode: &mut ext4_inode) -> InodeRef<DummyHal> {
@@ -2110,6 +2930,797 @@ mod tests {
         reference.inner.fs = fs;
         reference.inner.inode = inode;
         reference
+    }
+
+    #[test]
+    fn physical_plan_rejects_partial_block_eof_without_tail_bounce() {
+        // The request covers the final 2 KiB of a 10 KiB file and has a full
+        // 4 KiB caller buffer. Reading the complete final block would clobber
+        // bytes after the returned short count, so physical preflight must
+        // fall back instead of publishing a zero-copy request.
+        assert_eq!(
+            physical_io_read_lengths(10 * 1024, 8 * 1024, 4 * 1024, 4096, false),
+            None
+        );
+        assert_eq!(
+            physical_io_read_lengths(12 * 1024, 8 * 1024, 8 * 1024, 4096, false),
+            Some((4 * 1024, 4 * 1024))
+        );
+        assert_eq!(
+            physical_io_read_lengths(10 * 1024, 8 * 1024, 4 * 1024, 4096, true),
+            None
+        );
+    }
+
+    fn physical_effect_test_plan(operation: PhysicalIoOperation) -> PhysicalIoPlan {
+        let mut extents = [PhysicalIoExtent {
+            file_offset: 0,
+            pblock: 0,
+            physical_block_id: 0,
+            bytes: 0,
+            blocks: 0,
+            segment_start: 0,
+            segment_count: 0,
+        }; MAX_PHYSICAL_IO_EXTENTS];
+        extents[0] = PhysicalIoExtent {
+            file_offset: 0,
+            pblock: 10,
+            physical_block_id: 100,
+            bytes: 8 * 1024,
+            blocks: 2,
+            segment_start: 0,
+            segment_count: 0,
+        };
+        extents[1] = PhysicalIoExtent {
+            file_offset: 8 * 1024,
+            pblock: 20,
+            physical_block_id: 200,
+            bytes: 4 * 1024,
+            blocks: 1,
+            segment_start: 0,
+            segment_count: 0,
+        };
+        let mut plan = PhysicalIoPlan {
+            ino: 17,
+            filesystem_id: 9,
+            file_offset: 0,
+            logical_bytes: 12 * 1024,
+            io_bytes: 12 * 1024,
+            operation,
+            extent_count: 2,
+            extents,
+            segment_count: 0,
+            segments: [PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_IO_SEGMENTS],
+            mapping_seq: 31,
+        };
+        assert!(copy_physical_segments_into_plan(
+            &mut plan,
+            &[
+                PhysicalIoSegment {
+                    paddr: 0x1000,
+                    len: 4 * 1024,
+                },
+                PhysicalIoSegment {
+                    paddr: 0x3000,
+                    len: 8 * 1024,
+                },
+            ],
+        ));
+        assert_eq!(plan.segment_count(), 3);
+        assert_eq!(plan.extent(0).unwrap().segment_start(), 0);
+        assert_eq!(plan.extent(0).unwrap().segment_count(), 2);
+        assert_eq!(plan.extent(1).unwrap().segment_start(), 2);
+        assert_eq!(plan.extent(1).unwrap().segment_count(), 1);
+        plan
+    }
+
+    fn physical_effect_max_extent_test_plan(operation: PhysicalIoOperation) -> PhysicalIoPlan {
+        let mut extents = [PhysicalIoExtent {
+            file_offset: 0,
+            pblock: 0,
+            physical_block_id: 0,
+            bytes: 0,
+            blocks: 0,
+            segment_start: 0,
+            segment_count: 0,
+        }; MAX_PHYSICAL_IO_EXTENTS];
+        let mut segments = [PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_IO_SEGMENTS];
+        for index in 0..MAX_PHYSICAL_IO_EXTENTS {
+            let file_offset = (index * 4 * 1024) as u64;
+            extents[index] = PhysicalIoExtent {
+                file_offset,
+                pblock: 0x200 + index as u64,
+                physical_block_id: 0x1000 + index as u64,
+                bytes: 4 * 1024,
+                blocks: 1,
+                segment_start: 0,
+                segment_count: 0,
+            };
+            segments[index] = PhysicalIoSegment {
+                paddr: 0x10_0000 + index * 4 * 1024,
+                len: 4 * 1024,
+            };
+        }
+        let mut plan = PhysicalIoPlan {
+            ino: 17,
+            filesystem_id: 9,
+            file_offset: 0,
+            logical_bytes: MAX_PHYSICAL_IO_EXTENTS * 4 * 1024,
+            io_bytes: MAX_PHYSICAL_IO_EXTENTS * 4 * 1024,
+            operation,
+            extent_count: MAX_PHYSICAL_IO_EXTENTS,
+            extents,
+            segment_count: 0,
+            segments,
+            mapping_seq: 31,
+        };
+        assert!(copy_physical_segments_into_plan(
+            &mut plan,
+            &segments[..MAX_PHYSICAL_IO_EXTENTS],
+        ));
+        assert_eq!(plan.segment_count(), MAX_PHYSICAL_IO_EXTENTS);
+        plan
+    }
+
+    #[test]
+    fn physical_plan_bounds_the_union_of_extent_and_source_sg_boundaries() {
+        let mut extents = [PhysicalIoExtent {
+            file_offset: 0,
+            pblock: 0,
+            physical_block_id: 0,
+            bytes: 0,
+            blocks: 0,
+            segment_start: 0,
+            segment_count: 0,
+        }; MAX_PHYSICAL_IO_EXTENTS];
+        for (index, extent) in extents.iter_mut().enumerate() {
+            *extent = PhysicalIoExtent {
+                file_offset: (index * 8 * 1024) as u64,
+                pblock: 0x200 + (index * 2) as u64,
+                physical_block_id: 0x1000 + (index * 16) as u64,
+                bytes: 8 * 1024,
+                blocks: 2,
+                segment_start: 0,
+                segment_count: 0,
+            };
+        }
+        let mut plan = PhysicalIoPlan {
+            ino: 23,
+            filesystem_id: 11,
+            file_offset: 0,
+            logical_bytes: 128 * 1024,
+            io_bytes: 128 * 1024,
+            operation: PhysicalIoOperation::Read,
+            extent_count: MAX_PHYSICAL_IO_EXTENTS,
+            extents,
+            segment_count: 0,
+            segments: [PhysicalIoSegment { paddr: 0, len: 0 }; MAX_PHYSICAL_IO_SEGMENTS],
+            mapping_seq: 37,
+        };
+        let mut input = [PhysicalIoSegment {
+            paddr: 0,
+            len: 8 * 1024,
+        }; MAX_PHYSICAL_IO_INPUT_SEGMENTS];
+        input[0].len = 4 * 1024;
+        input[MAX_PHYSICAL_IO_INPUT_SEGMENTS - 1].len = 12 * 1024;
+        for (index, segment) in input.iter_mut().enumerate() {
+            segment.paddr = 0x20_0000 + index * 0x20_000;
+        }
+
+        assert!(copy_physical_segments_into_plan(&mut plan, &input));
+        assert_eq!(plan.segment_count(), MAX_PHYSICAL_IO_SEGMENTS);
+        let extent_segment_counts = plan.extents[..plan.extent_count]
+            .iter()
+            .copied()
+            .map(PhysicalIoExtent::segment_count)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extent_segment_counts.iter().copied().sum::<usize>(),
+            MAX_PHYSICAL_IO_SEGMENTS
+        );
+        assert_eq!(
+            extent_segment_counts
+                .iter()
+                .filter(|&&count| count == 2)
+                .count(),
+            MAX_PHYSICAL_IO_EXTENTS - 1
+        );
+        assert_eq!(
+            extent_segment_counts
+                .iter()
+                .filter(|&&count| count == 1)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn physical_effect_owns_extent_sliced_sg_and_publishes_one_exact_batch() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Write);
+        let mut effect = PhysicalIoEffect::new(plan);
+        let mut submitted = Vec::new();
+        let outcome = unsafe {
+            effect.publish_with(|requests| {
+                submitted.extend_from_slice(requests);
+                Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                    handles: vec![41, 42],
+                    cookies: vec![401, 402],
+                    bytes: 12 * 1024,
+                    submitted: 2,
+                    terminal: false,
+                }))
+            })
+        }
+        .unwrap();
+
+        assert_eq!(submitted.len(), 2);
+        assert_eq!(submitted[0].block_id, 100);
+        assert_eq!(submitted[0].operation, PhysicalIoOperation::Write);
+        assert_eq!(
+            submitted[0].physical_segments(),
+            plan.segments().get(..2).unwrap()
+        );
+        assert_eq!(submitted[1].block_id, 200);
+        assert_eq!(
+            submitted[1].physical_segments(),
+            plan.segments().get(2..3).unwrap()
+        );
+        assert_eq!(
+            outcome,
+            PhysicalIoPublishOutcome::Published(effect.publication().unwrap())
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Published);
+    }
+
+    #[test]
+    fn physical_effect_publishes_max_extent_batch_and_settles_once_out_of_order() {
+        let plan = physical_effect_max_extent_test_plan(PhysicalIoOperation::Read);
+        assert_eq!(plan.extent_count(), MAX_PHYSICAL_IO_EXTENTS);
+        let mut effect = PhysicalIoEffect::new(plan);
+        let mut submitted = [PhysicalIoBatchRequest::empty(); MAX_PHYSICAL_IO_EXTENTS];
+        let mut handles = Vec::with_capacity(MAX_PHYSICAL_IO_EXTENTS);
+        let mut cookies = Vec::with_capacity(MAX_PHYSICAL_IO_EXTENTS);
+        for index in 0..MAX_PHYSICAL_IO_EXTENTS {
+            handles.push(0x1000_0000 + index as u64);
+            cookies.push(0x2000_0000 + index as u64);
+        }
+
+        let outcome = unsafe {
+            effect.publish_with(|requests| {
+                assert_eq!(requests.len(), MAX_PHYSICAL_IO_EXTENTS);
+                submitted[..requests.len()].copy_from_slice(requests);
+                for index in 0..MAX_PHYSICAL_IO_EXTENTS {
+                    let extent = plan.extent(index).unwrap();
+                    assert_eq!(requests[index].block_id, extent.physical_block_id());
+                    assert_eq!(requests[index].bytes, extent.bytes());
+                    assert_eq!(
+                        requests[index].physical_segments(),
+                        plan.segments().get(index..index + 1).unwrap()
+                    );
+                }
+                Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                    handles,
+                    cookies,
+                    bytes: plan.io_bytes(),
+                    submitted: MAX_PHYSICAL_IO_EXTENTS,
+                    terminal: false,
+                }))
+            })
+        }
+        .unwrap();
+        let publication = match outcome {
+            PhysicalIoPublishOutcome::Published(publication) => publication,
+            other => panic!("16-extent batch must publish fully: {other:?}"),
+        };
+        assert_eq!(publication.count(), MAX_PHYSICAL_IO_EXTENTS);
+        assert_eq!(publication.bytes(), plan.io_bytes());
+        for index in 0..MAX_PHYSICAL_IO_EXTENTS {
+            assert_eq!(publication.handle(index), Some(0x1000_0000 + index as u64));
+            assert_eq!(publication.cookie(index), Some(0x2000_0000 + index as u64));
+            assert_eq!(submitted[index].segment_count, 1);
+        }
+
+        const COMPLETION_ORDER: [usize; MAX_PHYSICAL_IO_EXTENTS] =
+            [15, 3, 12, 0, 9, 6, 14, 1, 10, 5, 8, 2, 13, 4, 11, 7];
+        for index in COMPLETION_ORDER {
+            assert_eq!(
+                effect.record_completion(PhysicalIoCompletion {
+                    handle: publication.handle(index).unwrap(),
+                    cookie: publication.cookie(index).unwrap(),
+                    bytes: plan.extent(index).unwrap().bytes(),
+                    success: true,
+                }),
+                PhysicalIoCompletionOutcome::Accepted
+            );
+        }
+        assert_eq!(effect.state(), PhysicalIoEffectState::Published);
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Settled {
+                plan,
+                success: true,
+            }
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Completed);
+    }
+
+    #[test]
+    fn physical_effect_queue_full_is_zero_publication_and_keeps_fallback_state() {
+        let mut effect =
+            PhysicalIoEffect::new(physical_effect_test_plan(PhysicalIoOperation::Read));
+        let outcome = unsafe {
+            effect.publish_with(|requests| {
+                assert_eq!(requests.len(), 2);
+                Ok(PhysicalIoBatchSubmitOutcome::NotSubmitted(
+                    PhysicalIoNotSubmittedReason::Backpressure,
+                ))
+            })
+        }
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PhysicalIoPublishOutcome::NotSubmitted(PhysicalIoNotSubmittedReason::Backpressure)
+        );
+        assert_eq!(effect.publication(), None);
+        assert_eq!(effect.state(), PhysicalIoEffectState::Prepared);
+    }
+
+    #[test]
+    fn physical_effect_backpressure_retry_reuses_prepared_all_or_none_plan() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        let mut attempts = 0;
+        let first = unsafe {
+            effect
+                .publish_with(|requests| {
+                    attempts += 1;
+                    assert_eq!(requests.len(), MAX_PHYSICAL_IO_EXTENTS.min(2));
+                    Ok(PhysicalIoBatchSubmitOutcome::NotSubmitted(
+                        PhysicalIoNotSubmittedReason::Backpressure,
+                    ))
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            first,
+            PhysicalIoPublishOutcome::NotSubmitted(PhysicalIoNotSubmittedReason::Backpressure)
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Prepared);
+        assert_eq!(effect.publication(), None);
+
+        let second = unsafe {
+            effect
+                .publish_with(|requests| {
+                    attempts += 1;
+                    assert_eq!(requests.len(), 2);
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(
+                        PhysicalIoBatchSubmission {
+                            handles: vec![11, 22],
+                            cookies: vec![1001, 2002],
+                            bytes: plan.io_bytes(),
+                            submitted: 2,
+                            terminal: false,
+                        },
+                    ))
+                })
+                .unwrap()
+        };
+        assert!(matches!(second, PhysicalIoPublishOutcome::Published(_)));
+        assert_eq!(attempts, 2);
+        assert_eq!(effect.state(), PhysicalIoEffectState::Published);
+    }
+
+    #[test]
+    fn physical_effect_permanent_not_submitted_reasons_remain_distinct() {
+        for reason in [
+            PhysicalIoNotSubmittedReason::Unsupported,
+            PhysicalIoNotSubmittedReason::NoMemory,
+            PhysicalIoNotSubmittedReason::Invalid,
+        ] {
+            let mut effect =
+                PhysicalIoEffect::new(physical_effect_test_plan(PhysicalIoOperation::Read));
+            let outcome = unsafe {
+                effect
+                    .publish_with(|_| Ok(PhysicalIoBatchSubmitOutcome::NotSubmitted(reason)))
+                    .unwrap()
+            };
+            assert_eq!(outcome, PhysicalIoPublishOutcome::NotSubmitted(reason));
+            assert_eq!(effect.state(), PhysicalIoEffectState::Prepared);
+            assert_eq!(effect.publication(), None);
+        }
+    }
+
+    #[test]
+    fn physical_effect_partial_publication_is_terminal_and_retains_prefix_handles() {
+        let mut effect =
+            PhysicalIoEffect::new(physical_effect_test_plan(PhysicalIoOperation::Read));
+        let outcome = unsafe {
+            effect.publish_with(|_| {
+                Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                    handles: vec![77],
+                    cookies: vec![707],
+                    bytes: 8 * 1024,
+                    submitted: 1,
+                    terminal: true,
+                }))
+            })
+        }
+        .unwrap();
+
+        let PhysicalIoPublishOutcome::Terminal(publication) = outcome else {
+            panic!("partial publication must close the fallback path");
+        };
+        assert_eq!(publication.count(), 1);
+        assert_eq!(publication.handle(0), Some(77));
+        assert_eq!(publication.bytes(), 8 * 1024);
+        assert!(publication.terminal());
+        assert_eq!(effect.state(), PhysicalIoEffectState::Terminal);
+    }
+
+    #[test]
+    fn physical_effect_malformed_handle_report_is_terminal_not_fallback() {
+        let mut effect =
+            PhysicalIoEffect::new(physical_effect_test_plan(PhysicalIoOperation::Read));
+        let outcome = unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![88],
+                        cookies: vec![808],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap()
+        };
+
+        let PhysicalIoPublishOutcome::Terminal(publication) = outcome else {
+            panic!("malformed accepted prefix must be terminal");
+        };
+        assert_eq!(publication.count(), 1);
+        assert_eq!(publication.handle(0), Some(88));
+        assert!(publication.terminal());
+        assert_eq!(effect.state(), PhysicalIoEffectState::Terminal);
+    }
+
+    #[test]
+    fn physical_effect_malformed_report_never_becomes_drop_safe_after_prefix_retirement() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![88],
+                        cookies: vec![808],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 88,
+                cookie: 808,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Retain(PhysicalIoPendingReason::MalformedPublication)
+        );
+        assert_ne!(effect.state(), PhysicalIoEffectState::Finalized);
+    }
+
+    #[test]
+    fn physical_effect_requires_all_exact_successful_completions_before_finalize() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 22,
+                cookie: 2002,
+                bytes: 4 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Published);
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 1001,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Published);
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Settled {
+                plan,
+                success: true,
+            }
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::Completed);
+        assert_eq!(effect.mark_finalized().unwrap(), plan);
+        assert_eq!(effect.state(), PhysicalIoEffectState::Finalized);
+    }
+
+    #[test]
+    fn physical_effect_terminal_prefix_settles_failure_after_exact_retirement() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![77],
+                        cookies: vec![707],
+                        bytes: 8 * 1024,
+                        submitted: 1,
+                        terminal: true,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 77,
+                cookie: 707,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Settled {
+                plan,
+                success: false,
+            }
+        );
+        assert_eq!(effect.state(), PhysicalIoEffectState::SettledFailure);
+        assert_eq!(effect.mark_finalized().unwrap(), plan);
+    }
+
+    #[test]
+    fn physical_effect_wrong_cookie_retains_until_exact_completion_then_fails_closed() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 9999,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::CookieMismatch)
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Retain(PhysicalIoPendingReason::CookieMismatch)
+        );
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 1001,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 22,
+                cookie: 2002,
+                bytes: 4 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Retain(PhysicalIoPendingReason::CookieMismatch)
+        );
+    }
+
+    #[test]
+    fn physical_effect_zero_identity_is_quarantined_before_owner_release() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 0,
+                bytes: 8 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::CookieMismatch)
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Retain(PhysicalIoPendingReason::CookieMismatch)
+        );
+    }
+
+    #[test]
+    fn physical_effect_duplicate_completion_is_quarantined() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        let first = PhysicalIoCompletion {
+            handle: 11,
+            cookie: 1001,
+            bytes: 8 * 1024,
+            success: true,
+        };
+        assert_eq!(
+            effect.record_completion(first),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.record_completion(first),
+            PhysicalIoCompletionOutcome::Retain(PhysicalIoPendingReason::DuplicateCompletion)
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Retain(PhysicalIoPendingReason::DuplicateCompletion)
+        );
+    }
+
+    #[test]
+    fn physical_effect_device_error_is_retired_but_settles_failure() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Read);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 1001,
+                bytes: 0,
+                success: false,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 22,
+                cookie: 2002,
+                bytes: 4 * 1024,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        );
+        assert_eq!(
+            effect.settle(),
+            PhysicalIoSettlement::Settled {
+                plan,
+                success: false,
+            }
+        );
+    }
+
+    #[test]
+    fn physical_effect_successful_write_accepts_zero_used_bytes() {
+        let plan = physical_effect_test_plan(PhysicalIoOperation::Write);
+        let mut effect = PhysicalIoEffect::new(plan);
+        unsafe {
+            effect
+                .publish_with(|_| {
+                    Ok(PhysicalIoBatchSubmitOutcome::Submitted(PhysicalIoBatchSubmission {
+                        handles: vec![11, 22],
+                        cookies: vec![1001, 2002],
+                        bytes: 12 * 1024,
+                        submitted: 2,
+                        terminal: false,
+                    }))
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 11,
+                cookie: 1001,
+                bytes: 0,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        ));
+        assert!(matches!(
+            effect.record_completion(PhysicalIoCompletion {
+                handle: 22,
+                cookie: 2002,
+                bytes: 0,
+                success: true,
+            }),
+            PhysicalIoCompletionOutcome::Accepted
+        ));
+        assert!(matches!(
+            effect.settle(),
+            PhysicalIoSettlement::Settled { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn physical_effect_drop_before_publish_has_no_device_callback() {
+        let callback_count = core::cell::Cell::new(0usize);
+        {
+            let _effect =
+                PhysicalIoEffect::new(physical_effect_test_plan(PhysicalIoOperation::Read));
+        }
+        assert_eq!(callback_count.get(), 0);
     }
 
     #[test]

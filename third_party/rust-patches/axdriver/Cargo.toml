@@ -73,6 +73,7 @@ ramdisk = [
 shared-block = [
     "block",
     "dep:axsync",
+    "dep:axtask",
 ]
 virtio = [
     "dep:axdriver_virtio",
@@ -115,6 +116,12 @@ path = "src/lib.rs"
 
 [dependencies.axalloc]
 version = "=0.3.0-preview.2"
+optional = true
+
+[dependencies.axtask]
+package = "thekernel-axtask"
+version = "=0.1.0"
+features = ["multitask"]
 optional = true
 
 [dependencies.axconfig]

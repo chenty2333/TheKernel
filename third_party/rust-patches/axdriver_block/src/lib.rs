@@ -71,6 +71,149 @@ pub enum BlockPhysicalSgOutcome {
     Completed,
     /// The driver did not publish a request, so the caller may use a fallback.
     NotSubmitted,
+    /// The descriptor was published, but the device could not prove that its
+    /// DMA owner has retired.  The caller must transfer/retain the pin owner
+    /// in quarantine; this is never a fallback or an ordinary I/O error.
+    Quarantined,
+}
+
+/// Maximum number of physical requests that can be prepared as one atomic
+/// publication.  A prepared batch owns all queue state until it is either
+/// published or dropped; this bound keeps the rollback path finite.
+pub const MAX_PHYSICAL_BATCH_REQUESTS: usize = 32;
+
+/// Maximum number of coalesced physical segments in one request.
+pub const MAX_PHYSICAL_COALESCED_SG: usize = 16;
+
+/// A completion status copied from the device response before the request
+/// slot is retired.  The raw status is retained because block devices have
+/// device-specific status values beyond the common success code.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockCompletionStatus {
+    /// The device completed the request successfully.
+    Success,
+    /// The device completed the request with a protocol status.
+    DeviceError(u8),
+    /// The queue could not prove that device access had stopped after reset.
+    /// The request owner must remain retained and no synthetic I/O error is
+    /// reported for this state.
+    Quarantined,
+}
+
+/// Completion owner selected when a request is published.  A device-global
+/// completion owner may drain all used-ring entries, but it must preserve this
+/// classification when handing records to ordinary waiters or physical
+/// effect routers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockCompletionOwner {
+    /// A normal async request whose handle waiter owns retirement.
+    Ordinary,
+    /// A legacy request completed through the legacy request/response bridge.
+    Legacy,
+    /// A pinned physical effect owned by the physical completion router.
+    Physical,
+}
+
+/// Destination selected before a physical descriptor is published.
+///
+/// The lower queue has one used-ring consumer.  A route reservation records
+/// which higher-level owner is allowed to consume the resulting completion;
+/// it is not inferred from whichever waiter happens to wake first.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockPhysicalCompletionRoute {
+    /// The device-global asynchronous completion worker owns the record and
+    /// will route it to a registered kernel effect.
+    Kernel,
+    /// One synchronous physical effect owns the exact handle/cookie pair.
+    Exact,
+}
+
+/// Live/terminal state of a block completion queue.
+///
+/// The transport generation changes whenever IRQ delivery is cancelled or
+/// queue ownership is reset; ordinary IRQ progress has a separate wake
+/// generation. Callers must bind a route/admission to the observed transport
+/// generation and reject stale callbacks or submissions from an older one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockCompletionAvailability {
+    /// Queue is live and accepts the capabilities exposed by the driver.
+    Live { generation: u64 },
+    /// Queue access stopped, but the device could not prove owner retirement.
+    Quarantined { generation: u64 },
+    /// Queue was dismantled and requires transport reinitialization.
+    Retired { generation: u64 },
+}
+
+/// IRQ/task completion notification callback.  The callback must be bounded,
+/// allocation-free, and safe to invoke from the device interrupt path.  The
+/// context is an opaque owner supplied when the callback is installed.
+pub type BlockCompletionNotifier = fn(usize);
+
+/// Reset/generation transition callback for a shared completion broker.
+///
+/// The callback runs in task context after the lower reset has selected its
+/// typed availability state.  It must be bounded and must only cancel or
+/// wake higher-level routes; it must not attempt a second lower queue drain.
+pub type BlockCompletionTerminalNotifier = fn(usize, BlockCompletionAvailability);
+
+/// One concrete task-side completion.  Unlike the legacy drain count, this
+/// value identifies the request, its completion cookie, and the exact device
+/// status observed before any slot/mapping retirement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BlockCompletion {
+    /// Opaque generation-safe request handle.
+    pub handle: BlockRequestHandle,
+    /// Completion owner selected at publication time.
+    pub owner: BlockCompletionOwner,
+    /// Per-request completion cookie assigned before publication.
+    pub cookie: u64,
+    /// Device-reported status.
+    pub status: BlockCompletionStatus,
+    /// Bytes reported by the used descriptor.
+    pub bytes: u32,
+}
+
+/// Result metadata for a bounded completion drain.  Completed entries are
+/// written to the caller-provided output slice in used-ring order.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct BlockCompletionDrain {
+    /// Number of valid entries at the start of the output slice.
+    pub completed: usize,
+    /// Another used-ring entry is ready and task context must schedule a
+    /// continuation without waiting for another interrupt.
+    pub continuation: bool,
+}
+
+/// Result of a bounded device-reset/quiescence proof.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlockResetOutcome {
+    /// All device access stopped and DMA owners were released safely.
+    Quiesced,
+    /// All current device access stopped, but the queue was permanently
+    /// retired.  A transport reinitialization is required before any new
+    /// submission; this outcome must not be treated as a live queue.
+    Retired,
+    /// Quiescence could not be proven; request owners remain retained.
+    Quarantined,
+}
+
+/// A physical request offered to an atomic block batch.
+#[derive(Debug)]
+pub struct BlockPhysicalRequest<'a> {
+    /// First block/sector for this request.
+    pub block_id: u64,
+    /// Device operation.
+    pub op: BlockAsyncOp,
+    /// Pinned, coalesced physical segments.  The device never constructs a
+    /// Rust slice from these addresses.
+    pub segments: &'a [BlockPhysicalSegment],
+    /// Driver-filled generation-safe handle after preparation succeeds.
+    pub handle: Option<BlockRequestHandle>,
+    /// Driver-filled, non-zero completion cookie assigned before publication.
+    /// The cookie is carried separately from the opaque raw handle so an
+    /// effect owner can bind the expected identity before waiting for
+    /// completion.
+    pub cookie: Option<u64>,
 }
 
 impl BlockPhysicalSgOutcome {
@@ -82,6 +225,12 @@ impl BlockPhysicalSgOutcome {
     /// Returns whether the driver left the request unpublished.
     pub const fn is_not_submitted(self) -> bool {
         matches!(self, Self::NotSubmitted)
+    }
+
+    /// Returns whether publication happened but DMA ownership remains
+    /// reset-required/quarantined.
+    pub const fn is_quarantined(self) -> bool {
+        matches!(self, Self::Quarantined)
     }
 }
 
@@ -287,8 +436,103 @@ pub trait BlockDriverOps: BaseDriverOps {
         Err(DevError::Unsupported)
     }
 
-    /// Drains at most `budget` completed async block requests without
-    /// blocking. A zero budget is a no-op and returns `Ok(0)`.
+    /// Submits a bounded ordinary batch without waiting for completion.
+    /// Shared synchronous adapters use this split-phase hook to release an
+    /// outer device mutex before the exact handle wait. Drivers may keep their
+    /// optional asynchronous-I/O policy gate on [`Self::submit_async_batch`];
+    /// this hook only admits the finite publication phase and never performs a
+    /// blocking wait.
+    fn submit_sync_batch(
+        &mut self,
+        requests: &mut [BlockQueueRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
+        self.submit_async_batch(requests)
+    }
+
+    /// Prepares and publishes a bounded batch of pinned physical requests.
+    ///
+    /// Implementations must finish slot allocation, descriptor construction,
+    /// request header/status initialization, and all DMA mappings before the
+    /// first descriptor becomes visible to the device.  A failure before
+    /// publication leaves every request unpublished and eligible for caller
+    /// fallback.  Once this method reports an accepted request, completion or
+    /// a typed quarantine is the only valid terminal path; the driver must not
+    /// silently retry it through a virtual-buffer fallback.
+    ///
+    /// # Safety
+    ///
+    /// Every physical range must remain pinned and valid, and must not be
+    /// accessed by the caller until its concrete [`BlockCompletion`] has been
+    /// returned by [`Self::wait_any_physical_completion`] or
+    /// [`Self::drain_async_completions`].
+    unsafe fn submit_physical_batch(
+        &mut self,
+        requests: &mut [BlockPhysicalRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
+        let _ = requests;
+        Err(DevError::Unsupported)
+    }
+
+    /// Drains at most `output.len()` task-side completions.  The output slice
+    /// is populated in used-ring order; no count-only completion API is needed
+    /// by new callers.  A continuation indicates that another bounded drain
+    /// must be scheduled immediately.
+    fn drain_async_completions(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain> {
+        let _ = output;
+        Err(DevError::Unsupported)
+    }
+
+    /// Waits in task context until at least one concrete physical completion
+    /// is available, then drains a bounded prefix into `output`.
+    ///
+    /// The caller-provided slice is the completion credit for this pass.  A
+    /// non-empty slice must produce at least one physical completion before
+    /// returning successfully; `continuation` asks the caller to schedule a
+    /// further bounded pass without waiting for another interrupt.  Ordinary
+    /// async completions are owned by their own drain path and must not be
+    /// consumed here.  An empty slice is a no-op on a driver which implements
+    /// this capability.
+    ///
+    /// The method is intended for a task-context completion owner.  Interrupt
+    /// handlers only acknowledge the device and publish a wake/generation
+    /// token; they never call this method or allocate its output state.
+    fn wait_any_physical_completion(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain> {
+        let _ = output;
+        Err(DevError::Unsupported)
+    }
+
+    /// Installs a bounded completion notification callback.  Drivers that do
+    /// not have an IRQ/task wake source may leave this unsupported; shared
+    /// wrappers retain a timed check fallback, while VirtIO installs the
+    /// callback before enabling queue notifications.
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<BlockCompletionNotifier>,
+        context: usize,
+    ) -> DevResult {
+        let _ = (notifier, context);
+        Err(DevError::Unsupported)
+    }
+
+    /// Resets the device and releases DMA owners only after quiescence is
+    /// proven.  A quarantined result is typed and must not be converted into a
+    /// fabricated I/O completion.
+    fn reset_device(&mut self) -> DevResult<BlockResetOutcome> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Drains and retires at most `budget` completed ordinary async block
+    /// requests without blocking. A zero budget is a no-op and returns
+    /// `Ok(0)`. This is the terminal owner for the count-only API: handles
+    /// belonging to records consumed here must not be used afterwards. Use
+    /// [`Self::drain_async_completions`] when the caller needs a concrete
+    /// completion/status owner instead.
     fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
         let _ = budget;
         Err(DevError::Unsupported)
@@ -386,6 +630,47 @@ mod tests {
         assert!(matches!(
             unsafe { stub.write_block_physical_sg(0, &[segment]) },
             Ok(BlockPhysicalSgOutcome::NotSubmitted)
+        ));
+    }
+
+    #[test]
+    fn completion_status_keeps_device_error_distinct_from_quarantine() {
+        assert_ne!(
+            BlockCompletionStatus::DeviceError(1),
+            BlockCompletionStatus::Quarantined
+        );
+        assert_eq!(
+            BlockCompletionStatus::Success,
+            BlockCompletionStatus::Success
+        );
+        assert!(BlockPhysicalSgOutcome::Quarantined.is_quarantined());
+        assert!(!BlockPhysicalSgOutcome::Quarantined.is_not_submitted());
+        assert_ne!(BlockResetOutcome::Retired, BlockResetOutcome::Quiesced);
+    }
+
+    #[test]
+    fn physical_completion_wait_defaults_to_unsupported() {
+        let mut stub = Stub;
+        let mut output = [BlockCompletion {
+            handle: BlockRequestHandle { raw: 0 },
+            owner: BlockCompletionOwner::Physical,
+            cookie: 0,
+            status: BlockCompletionStatus::Success,
+            bytes: 0,
+        }];
+        assert!(matches!(
+            stub.wait_any_physical_completion(&mut output),
+            Err(DevError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn physical_completion_wait_zero_output_does_not_hide_unsupported() {
+        let mut stub = Stub;
+        let mut output = [];
+        assert!(matches!(
+            stub.wait_any_physical_completion(&mut output),
+            Err(DevError::Unsupported)
         ));
     }
 }

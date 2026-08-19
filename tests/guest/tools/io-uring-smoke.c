@@ -797,7 +797,7 @@ out:
 
 static int test_dma_direct_fixed_buffers(struct ring *ring,
                                          int *diagnostics_available) {
-    enum { DMA_BYTES = 4096 };
+    enum { DMA_BYTES = 256 * 1024 };
     static const char path[] = "/thekernel-io-uring-dma-direct";
     unsigned char *private_buffer = MAP_FAILED;
     unsigned char *shared_buffer = MAP_FAILED;
@@ -810,14 +810,14 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
     *diagnostics_available = 0;
 
     long page_value = sysconf(_SC_PAGESIZE);
-    if (page_value <= 0 || (size_t)page_value < DMA_BYTES) {
+    if (page_value <= 0 || (size_t)page_value < 4096) {
         errno = EINVAL;
         return fail("dma-page-size");
     }
     private_buffer = mmap(NULL, DMA_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (private_buffer == MAP_FAILED ||
-        ((uintptr_t)private_buffer % DMA_BYTES) != 0) {
+        ((uintptr_t)private_buffer % (size_t)page_value) != 0) {
         if (private_buffer != MAP_FAILED) {
             munmap(private_buffer, DMA_BYTES);
         }
@@ -889,74 +889,83 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
     }
     file = -1;
 
-    memset(private_buffer, 0x5a, DMA_BYTES);
-    long long write_hits_before = 0;
-    long long write_bytes_before = 0;
-    if (*diagnostics_available) {
-        write_hits_before = read_io_counter("io_uring.dma_direct_write_hits");
-        write_bytes_before = read_io_counter("io_uring.dma_direct_write_bytes");
-        if (write_hits_before < 0 || write_bytes_before < 0) {
-            fail("dma-write-counter-read");
+    static const size_t dma_lengths[] = {4096, 16 * 1024, 64 * 1024, DMA_BYTES};
+    static const size_t dma_offsets[] = {4096, 32 * 1024, 96 * 1024, 0};
+    for (size_t test = 0; test < sizeof(dma_lengths) / sizeof(dma_lengths[0]); ++test) {
+        const size_t length = dma_lengths[test];
+        const size_t offset = dma_offsets[test];
+        const unsigned char marker = (unsigned char)(0x50 + test);
+        memset(private_buffer, marker, length);
+        long long write_hits_before = 0;
+        long long write_bytes_before = 0;
+        if (*diagnostics_available) {
+            write_hits_before = read_io_counter("io_uring.dma_direct_write_hits");
+            write_bytes_before = read_io_counter("io_uring.dma_direct_write_bytes");
+            if (write_hits_before < 0 || write_bytes_before < 0) {
+                fail("dma-write-counter-read");
+                goto out;
+            }
+        }
+        uint64_t write_tag = 0x444d415700000000ULL | (uint64_t)test;
+        struct raw_sqe write_sqe = make_sqe(IORING_OP_WRITE_FIXED, write_tag);
+        write_sqe.bytes[1] = IOSQE_FIXED_FILE;
+        write_i32(write_sqe.bytes, 4, 0);
+        write_u64(write_sqe.bytes, 8, offset);
+        write_u64(write_sqe.bytes, 16, (uintptr_t)private_buffer);
+        write_u32(write_sqe.bytes, 24, length);
+        write_u16(write_sqe.bytes, 40, 0);
+        if (submit_one(ring, &write_sqe, write_tag, length) != 0) {
             goto out;
         }
-    }
-    struct raw_sqe write_sqe = make_sqe(IORING_OP_WRITE_FIXED, 0x444d41574f495445ULL);
-    write_sqe.bytes[1] = IOSQE_FIXED_FILE;
-    write_i32(write_sqe.bytes, 4, 0);
-    write_u64(write_sqe.bytes, 8, 0);
-    write_u64(write_sqe.bytes, 16, (uintptr_t)private_buffer);
-    write_u32(write_sqe.bytes, 24, DMA_BYTES);
-    write_u16(write_sqe.bytes, 40, 0);
-    if (submit_one(ring, &write_sqe, 0x444d41574f495445ULL, DMA_BYTES) != 0) {
-        goto out;
-    }
-    if (*diagnostics_available) {
-        long long write_hits_after =
-            read_io_counter("io_uring.dma_direct_write_hits");
-        long long write_bytes_after =
-            read_io_counter("io_uring.dma_direct_write_bytes");
-        if (write_hits_after <= write_hits_before ||
-            write_bytes_after < write_bytes_before + DMA_BYTES) {
-            fail_value("dma-write-counter", write_hits_after, write_hits_before + 1);
-            goto out;
+        if (*diagnostics_available) {
+            long long write_hits_after =
+                read_io_counter("io_uring.dma_direct_write_hits");
+            long long write_bytes_after =
+                read_io_counter("io_uring.dma_direct_write_bytes");
+            if (write_hits_after <= write_hits_before ||
+                write_bytes_after < write_bytes_before + (long long)length) {
+                fail_value("dma-write-counter", write_hits_after, write_hits_before + 1);
+                goto out;
+            }
         }
-    }
 
-    memset(private_buffer, 0, DMA_BYTES);
-    long long read_hits_before = 0;
-    long long read_bytes_before = 0;
-    if (*diagnostics_available) {
-        read_hits_before = read_io_counter("io_uring.dma_direct_read_hits");
-        read_bytes_before = read_io_counter("io_uring.dma_direct_read_bytes");
-        if (read_hits_before < 0 || read_bytes_before < 0) {
-            fail("dma-read-counter-read");
+        memset(private_buffer, 0, length);
+        long long read_hits_before = 0;
+        long long read_bytes_before = 0;
+        if (*diagnostics_available) {
+            read_hits_before = read_io_counter("io_uring.dma_direct_read_hits");
+            read_bytes_before = read_io_counter("io_uring.dma_direct_read_bytes");
+            if (read_hits_before < 0 || read_bytes_before < 0) {
+                fail("dma-read-counter-read");
+                goto out;
+            }
+        }
+        uint64_t read_tag = 0x444d415200000000ULL | (uint64_t)test;
+        struct raw_sqe read_sqe = make_sqe(IORING_OP_READ_FIXED, read_tag);
+        read_sqe.bytes[1] = IOSQE_FIXED_FILE;
+        write_i32(read_sqe.bytes, 4, 0);
+        write_u64(read_sqe.bytes, 8, offset);
+        write_u64(read_sqe.bytes, 16, (uintptr_t)private_buffer);
+        write_u32(read_sqe.bytes, 24, length);
+        write_u16(read_sqe.bytes, 40, 0);
+        if (submit_one(ring, &read_sqe, read_tag, length) != 0) {
             goto out;
         }
-    }
-    struct raw_sqe read_sqe = make_sqe(IORING_OP_READ_FIXED, 0x444d4152494f5554ULL);
-    read_sqe.bytes[1] = IOSQE_FIXED_FILE;
-    write_i32(read_sqe.bytes, 4, 0);
-    write_u64(read_sqe.bytes, 8, 0);
-    write_u64(read_sqe.bytes, 16, (uintptr_t)private_buffer);
-    write_u32(read_sqe.bytes, 24, DMA_BYTES);
-    write_u16(read_sqe.bytes, 40, 0);
-    if (submit_one(ring, &read_sqe, 0x444d4152494f5554ULL, DMA_BYTES) != 0) {
-        goto out;
-    }
-    for (size_t index = 0; index < DMA_BYTES; ++index) {
-        if (private_buffer[index] != 0x5a) {
-            errno = EIO;
-            fail("dma-read-contents");
-            goto out;
+        for (size_t index = 0; index < length; ++index) {
+            if (private_buffer[index] != marker) {
+                errno = EIO;
+                fail("dma-read-contents");
+                goto out;
+            }
         }
-    }
-    if (*diagnostics_available) {
-        long long read_hits_after = read_io_counter("io_uring.dma_direct_read_hits");
-        long long read_bytes_after = read_io_counter("io_uring.dma_direct_read_bytes");
-        if (read_hits_after <= read_hits_before ||
-            read_bytes_after < read_bytes_before + DMA_BYTES) {
-            fail_value("dma-read-counter", read_hits_after, read_hits_before + 1);
-            goto out;
+        if (*diagnostics_available) {
+            long long read_hits_after = read_io_counter("io_uring.dma_direct_read_hits");
+            long long read_bytes_after = read_io_counter("io_uring.dma_direct_read_bytes");
+            if (read_hits_after <= read_hits_before ||
+                read_bytes_after < read_bytes_before + (long long)length) {
+                fail_value("dma-read-counter", read_hits_after, read_hits_before + 1);
+                goto out;
+            }
         }
     }
 
@@ -969,7 +978,7 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
     shared_buffer = mmap(NULL, DMA_BYTES, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (shared_buffer == MAP_FAILED ||
-        ((uintptr_t)shared_buffer % DMA_BYTES) != 0) {
+        ((uintptr_t)shared_buffer % (size_t)page_value) != 0) {
         if (shared_buffer != MAP_FAILED) {
             munmap(shared_buffer, DMA_BYTES);
         }
@@ -987,11 +996,15 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
     buffers_registered = 1;
     long long write_hits_ineligible = 0;
     long long write_fallbacks_ineligible = 0;
+    long long write_provenance_fallbacks_ineligible = 0;
     if (*diagnostics_available) {
         write_hits_ineligible = read_io_counter("io_uring.dma_direct_write_hits");
         write_fallbacks_ineligible =
             read_io_counter("io_uring.dma_direct_write_fallbacks");
-        if (write_hits_ineligible < 0 || write_fallbacks_ineligible < 0) {
+        write_provenance_fallbacks_ineligible =
+            read_io_counter("io_uring.dma_direct_write_fallback_provenance");
+        if (write_hits_ineligible < 0 || write_fallbacks_ineligible < 0 ||
+            write_provenance_fallbacks_ineligible < 0) {
             fail("dma-ineligible-write-counter-read");
             goto out;
         }
@@ -1011,8 +1024,12 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
             read_io_counter("io_uring.dma_direct_write_hits");
         long long write_fallbacks_after =
             read_io_counter("io_uring.dma_direct_write_fallbacks");
+        long long write_provenance_fallbacks_after =
+            read_io_counter("io_uring.dma_direct_write_fallback_provenance");
         if (write_hits_after != write_hits_ineligible ||
-            write_fallbacks_after != write_fallbacks_ineligible + 1) {
+            write_fallbacks_after != write_fallbacks_ineligible + 1 ||
+            write_provenance_fallbacks_after !=
+                write_provenance_fallbacks_ineligible + 1) {
             errno = EIO;
             fail("dma-ineligible-write-counters");
             goto out;
@@ -1021,11 +1038,15 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
     memset(shared_buffer, 0, DMA_BYTES);
     long long read_hits_ineligible = 0;
     long long read_fallbacks_ineligible = 0;
+    long long read_provenance_fallbacks_ineligible = 0;
     if (*diagnostics_available) {
         read_hits_ineligible = read_io_counter("io_uring.dma_direct_read_hits");
         read_fallbacks_ineligible =
             read_io_counter("io_uring.dma_direct_read_fallbacks");
-        if (read_hits_ineligible < 0 || read_fallbacks_ineligible < 0) {
+        read_provenance_fallbacks_ineligible =
+            read_io_counter("io_uring.dma_direct_read_fallback_provenance");
+        if (read_hits_ineligible < 0 || read_fallbacks_ineligible < 0 ||
+            read_provenance_fallbacks_ineligible < 0) {
             fail("dma-ineligible-read-counter-read");
             goto out;
         }
@@ -1052,8 +1073,12 @@ static int test_dma_direct_fixed_buffers(struct ring *ring,
             read_io_counter("io_uring.dma_direct_read_hits");
         long long read_fallbacks_after =
             read_io_counter("io_uring.dma_direct_read_fallbacks");
+        long long read_provenance_fallbacks_after =
+            read_io_counter("io_uring.dma_direct_read_fallback_provenance");
         if (read_hits_after != read_hits_ineligible ||
-            read_fallbacks_after != read_fallbacks_ineligible + 1) {
+            read_fallbacks_after != read_fallbacks_ineligible + 1 ||
+            read_provenance_fallbacks_after !=
+                read_provenance_fallbacks_ineligible + 1) {
             errno = EIO;
             fail("dma-ineligible-read-counters");
             goto out;

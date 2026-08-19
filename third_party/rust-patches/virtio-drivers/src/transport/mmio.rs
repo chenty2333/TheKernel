@@ -277,6 +277,8 @@ impl VirtIOHeader {
 pub struct MmioTransport {
     header: NonNull<VirtIOHeader>,
     version: MmioVersion,
+    /// Set after a device wrapper observed status zero and completed reset.
+    reset_complete: bool,
 }
 
 impl MmioTransport {
@@ -295,7 +297,11 @@ impl MmioTransport {
             return Err(MmioError::ZeroDeviceId);
         }
         let version = volread!(header, version).try_into()?;
-        Ok(Self { header, version })
+        Ok(Self {
+            header,
+            version,
+            reset_complete: false,
+        })
     }
 
     /// Gets the version of the VirtIO MMIO transport.
@@ -370,6 +376,10 @@ impl Transport for MmioTransport {
         unsafe {
             volwrite!(self.header, status, status);
         }
+    }
+
+    fn mark_reset_complete(&mut self) {
+        self.reset_complete = true;
     }
 
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
@@ -512,6 +522,9 @@ impl Transport for MmioTransport {
 
 impl Drop for MmioTransport {
     fn drop(&mut self) {
+        if self.reset_complete {
+            return;
+        }
         // Reset the device when the transport is dropped.
         self.set_status(DeviceStatus::empty())
     }
