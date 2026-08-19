@@ -13,16 +13,19 @@ use linux_raw_sys::{
 };
 
 use super::{File, FileHandle, FileLike, IoctlContext, Kstat, PseudoInode, try_pseudo_inode_path};
+#[cfg(feature = "bpf")]
+use crate::bpf::{prog::BpfProgram, vm::BpfVm};
 use crate::{
-    bpf::{prog::BpfProgram, vm::BpfVm},
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
     task::NetworkNamespace,
 };
 
+#[cfg(feature = "bpf")]
 struct AttachedSocketFilter {
     prog: Arc<BpfProgram>,
 }
 
+#[cfg(feature = "bpf")]
 impl axnet::SocketFilter for AttachedSocketFilter {
     fn filter(&self, data: &mut [u8]) -> AxResult<usize> {
         let mut vm = BpfVm::with_aux_budget(
@@ -101,6 +104,7 @@ impl Socket {
             .retry_transfer(direction, effective_nonblocking, attempt)
     }
 
+    #[cfg(feature = "bpf")]
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
         let filter = prog
             .map(|prog| {

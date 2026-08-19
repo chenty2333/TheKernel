@@ -16,8 +16,9 @@ use crate::{
         classify_ethernet_ingress_protocol,
     },
     packet::{
-        LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
-        PacketEndpointId, PacketMetadata, PacketSendRequest,
+        LinkHardwareType, LinkPacketType, PacketAncillaryCapabilities, PacketAncillaryMetadata,
+        PacketDeviceCapabilities, PacketDeviceContext, PacketEndpointId, PacketMetadata,
+        PacketSendRequest,
     },
 };
 
@@ -72,6 +73,7 @@ impl LoopbackDevice {
             cooked_send: true,
             link_header_len: LOOPBACK_HEADER_LEN as u16,
             address_len: 6,
+            ancillary: PacketAncillaryCapabilities::CANONICAL,
         }
     }
 
@@ -128,7 +130,12 @@ impl LoopbackDevice {
 
         // Packet observation is best effort and can neither block nor reject
         // the ordinary loopback path.
-        let _ = context.stage(metadata, header, payload);
+        let _ = context.stage_with_ancillary(
+            metadata,
+            PacketAncillaryMetadata::canonical(),
+            header,
+            payload,
+        );
     }
 
     fn enqueue_packet(
@@ -295,6 +302,10 @@ impl Device for LoopbackDevice {
 
     fn register_waker(&self, waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
         self.poll_bridge.refresh(&self.poll, waker)
+    }
+
+    fn stop_rx_waker(&self) {
+        self.poll_bridge.cancel(&self.poll);
     }
 }
 

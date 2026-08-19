@@ -40,6 +40,21 @@ pub enum PacketSendProgress {
     ImmediateIngressQueued,
 }
 
+/// Result of admitting one device receive wake owner.
+///
+/// A device may be healthy while not providing a source suitable for the
+/// permanent receive worker (for example, an Ethernet device without an IRQ
+/// binding).  Keeping that state distinct from a registration error lets the
+/// router quarantine only the source that actually failed and retain healthy
+/// software/IRQ owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxWakeSource {
+    /// The device retained a live wake owner for this worker.
+    Armed,
+    /// The device accepted the request but has no source this worker can own.
+    Unavailable,
+}
+
 /// Result of one bounded link-layer receive attempt.
 ///
 /// A receive step owns at most one link frame.  A frame that is malformed,
@@ -210,9 +225,28 @@ pub trait Device: Send + Sync {
         false
     }
 
+    /// Reports a terminal device quarantine caused by a completion or
+    /// ownership protocol violation. A quarantined device must not be
+    /// polled or re-armed; the permanent worker continues with other sources.
+    fn is_quarantined(&self) -> bool {
+        false
+    }
+
     /// Returns whether this device owns a hardware IRQ suitable for the
     /// network receive worker.
     fn rx_wake_capable(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the device's receive queue requires a wake source
+    /// owned by the network receive worker.
+    ///
+    /// Software queues (loopback and veth) can use their poll bridge as a
+    /// bounded task-context wake source and therefore leave this as `false`.
+    /// A device backed by a real RX ring must override it when no bounded
+    /// polling fallback exists; admission then rejects a device that cannot
+    /// provide an IRQ-backed wake owner before it is published.
+    fn rx_wake_required(&self) -> bool {
         false
     }
 
@@ -267,16 +301,16 @@ pub trait Device: Send + Sync {
     /// stack readiness source.
     fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError>;
 
-    /// Registers the dedicated task-context receive worker waker.  This is
-    /// separate from [`register_waker`](Self::register_waker), whose source
-    /// feeds user readiness registrations.
-    fn register_rx_waker(&self, _waker: &Waker) -> Result<(), PollRegistrationError> {
-        Ok(())
+    /// Registers the permanent task-context receive-worker waker. Software
+    /// devices use the same bridge as ordinary readiness; a hardware device
+    /// may override this with its IRQ-specific source.
+    fn register_rx_waker(&self, waker: &Waker) -> Result<RxWakeSource, PollRegistrationError> {
+        self.register_waker(waker).map(|()| RxWakeSource::Armed)
     }
 
-    /// Tears down the dedicated receive-worker registration while the device
-    /// is still alive.  Final IRQ masking remains owned by the concrete
-    /// device's destructor.
+    /// Tears down the permanent receive-worker registration while the device
+    /// is still alive. Concrete devices also use this path when a source
+    /// admission failure permanently quarantines that wake source.
     fn stop_rx_waker(&self) {}
 }
 

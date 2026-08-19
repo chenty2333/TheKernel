@@ -9,7 +9,7 @@ mod net_buf;
 use bitflags::bitflags;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-pub use self::dev_raw::VirtIONetRaw;
+pub use self::dev_raw::{ResetOutcome, VirtIONetRaw};
 #[cfg(feature = "alloc")]
 pub use self::{dev::VirtIONet, net_buf::RxBuffer, net_buf::TxBuffer};
 use crate::volatile::ReadOnly;

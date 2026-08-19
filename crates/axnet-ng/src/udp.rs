@@ -167,7 +167,7 @@ impl UdpSocket {
     /// Creates a UDP socket with an immutable Internet address family.
     pub fn new_with_family(stack: Arc<NetStack>, family: UdpSocketFamily) -> AxResult<Self> {
         let socket = new_udp_socket()?;
-        let handle = stack.socket_set.add(socket);
+        let handle = stack.socket_set.add(socket)?;
 
         Ok(Self {
             stack,
@@ -709,7 +709,8 @@ impl Pollable for UdpSocket {
             );
             events.set(IoEvents::READ_HANGUP, rx_shutdown);
         });
-        self.general.add_pending_error_event(events)
+        let events = self.general.add_pending_error_event(events);
+        self.stack.add_terminal_events(events)
     }
 
     fn register<'a>(
@@ -717,13 +718,29 @@ impl Pollable for UdpSocket {
         context: &mut Context<'_>,
         events: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        let network = events.intersects(IoEvents::READABLE | IoEvents::WRITABLE);
-        let mut prepared = PreparedPollRegistration::try_new(usize::from(network) + 1)?;
-        prepared.arm(&self.poll_state, context.waker())?;
+        let network = events.intersects(
+            IoEvents::READABLE
+                | IoEvents::WRITABLE
+                | IoEvents::READ_HANGUP
+                | IoEvents::ERROR
+                | IoEvents::HANGUP,
+        );
+        let terminal = events.contains(IoEvents::REMOVED);
+        let socket_state = network;
+        let mut prepared = PreparedPollRegistration::try_new(
+            usize::from(socket_state) + usize::from(network) + usize::from(terminal),
+        )?;
+        if socket_state {
+            prepared.arm(&self.poll_state, context.waker())?;
+        }
         if network {
             let device_mask = self.route_state.read().device_mask;
             self.stack
                 .arm_readiness(&mut prepared, device_mask, context.waker())?;
+        }
+        if terminal {
+            self.stack
+                .arm_terminal_readiness(&mut prepared, context.waker())?;
         }
         prepared.commit()
     }
@@ -738,12 +755,29 @@ impl Drop for UdpSocket {
 
 #[cfg(test)]
 mod tests {
-    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use alloc::{sync::Arc, task::Wake};
+    use core::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Waker,
+    };
 
     use super::*;
     use crate::consts::{SOCKET_BUFFER_MAX, SOCKET_BUFFER_MIN};
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn endpoint(port: u16) -> SocketAddrEx {
         SocketAddrEx::Ip(SocketAddr::new(LOOPBACK, port))
@@ -783,6 +817,33 @@ mod tests {
 
         replace_udp_recv_buffer(&mut socket, usize::MAX).unwrap();
         assert_eq!(socket.payload_recv_capacity(), SOCKET_BUFFER_MAX);
+    }
+
+    #[test]
+    fn removed_only_registration_arms_udp_terminal_source() {
+        let stack = NetStack::new_loopback_only();
+        let socket = UdpSocket::new(stack).unwrap();
+        let mut context = Context::from_waker(core::task::Waker::noop());
+        let registration = socket.register(&mut context, IoEvents::REMOVED).unwrap();
+        // REMOVED-only waits retain only the dedicated terminal source; the
+        // ordinary UDP state source would wake on unrelated traffic.
+        assert_eq!(registration.source_count(), 1);
+    }
+
+    #[test]
+    fn removed_only_udp_wait_ignores_ordinary_socket_traffic() {
+        let stack = NetStack::new_loopback_only();
+        let receiver = UdpSocket::new(stack.clone()).unwrap();
+        receiver.bind(endpoint(31_206)).unwrap();
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        let registration = receiver.register(&mut context, IoEvents::REMOVED).unwrap();
+
+        let sender = UdpSocket::new(stack).unwrap();
+        send_datagram(&sender, 31_206, b"ordinary");
+        assert_eq!(wake.0.load(Ordering::Acquire), 0);
+        drop(registration);
     }
 
     #[test]

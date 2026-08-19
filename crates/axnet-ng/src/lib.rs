@@ -64,8 +64,8 @@ use self::{
 };
 pub use self::{
     device::{DeviceStats, InterfaceInfo, InterfaceKind, RxStep, VethEnd},
-    net_stack::{NetPollStatus, NetStack},
-    router::{EgressPass, RouteInfo, Rule, RxPass},
+    net_stack::{NetPollStatus, NetRxTerminalReason, NetStack},
+    router::{EgressPass, MAX_DEVICES, RouteInfo, Rule, RxPass},
     socket::*,
 };
 
@@ -95,7 +95,7 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
 
     let mut router = Router::try_new_loopback_only(listen_table.clone())?;
     let loopback = Box::try_new(LoopbackDevice::try_new()?).map_err(|_| AxError::NoMemory)?;
-    let lo_dev = router.add_device(loopback);
+    let lo_dev = router.try_add_device(loopback)?;
 
     let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
     let lo_ip6 = Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128);
@@ -118,11 +118,11 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
         let eth0_address = EthernetAddress(dev.mac_address().0);
         let eth0_ip = Ipv4Cidr::new(IP.parse().expect("Invalid IPv4 address"), IP_PREFIX);
 
-        let eth0_dev = router.add_device(Box::new(EthernetDevice::new(
+        let eth0_dev = router.try_add_device(Box::new(EthernetDevice::new(
             "eth0".to_owned(),
             dev,
             eth0_ip,
-        )));
+        )))?;
 
         router.add_rule(Rule::new(
             Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),

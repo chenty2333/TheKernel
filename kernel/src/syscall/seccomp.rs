@@ -16,7 +16,7 @@ use thekernel_linux_seccomp::{
     ProgramError, SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES, SECCOMP_RET_ALLOW,
     SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG,
     SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT, SeccompData, SeccompMode,
-    StateTransitionError, VerifiedProgram,
+    VerifiedProgram,
 };
 use thekernel_linux_signal::{SignalInfo, Signo};
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
@@ -24,8 +24,8 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 use crate::{
     mm::map_usercopy_error,
     task::{
-        AsThread, do_exit, fail_closed_exit, force_signal_current_thread, ns_capable,
-        seccomp_filter_budget,
+        AsThread, SeccompPublicationError, do_exit, fail_closed_exit, force_signal_current_thread,
+        ns_capable, seccomp_filter_budget,
     },
 };
 
@@ -96,12 +96,8 @@ fn map_install_error(error: FilterInstallError) -> AxError {
     }
 }
 
-fn map_transition_error(error: StateTransitionError) -> AxError {
-    match error {
-        StateTransitionError::ModeConflict => AxError::InvalidInput,
-        StateTransitionError::Stale => LinuxError::EAGAIN.into(),
-        StateTransitionError::InvalidPreparedState => AxError::BadState,
-    }
+fn map_seccomp_publication_error(error: SeccompPublicationError) -> AxError {
+    error.into_ax_error()
 }
 
 fn copy_filter_program<M: UserMemory + ?Sized>(
@@ -175,17 +171,33 @@ fn install_filter<M: UserMemory + ?Sized>(
 
     let instructions = copy_filter_program(memory, header)?;
     let program = VerifiedProgram::try_from_vec(instructions).map_err(map_program_error)?;
+    // Verification is authoritative. Native translation is selected once at
+    // admission and retained by the immutable filter node. Auto may use the
+    // interpreter after a bounded native failure; force-jit returns an
+    // explicit error and is never silently downgraded.
+    let executor = crate::seccomp_jit::try_compile(&program)
+        .map_err(crate::seccomp_jit::JitError::into_ax_error)?;
 
     let curr = current();
     let thread = curr.as_thread();
     let snapshot = thread.seccomp_snapshot();
     let expected = snapshot.filters();
     let prepared = expected
-        .try_append(program, FilterMetadata::default(), seccomp_filter_budget())
+        .try_append_with_executor(
+            program,
+            FilterMetadata::default(),
+            seccomp_filter_budget(),
+            executor,
+        )
         .map_err(map_install_error)?;
+    // Reserve the publication accounting before the immutable task pointer
+    // can become visible. Any stale/retire failure drops this guard and
+    // removes the reservation without exposing a failed program.
+    let publication = crate::seccomp_jit::try_reserve_published().ok_or(AxError::NoMemory)?;
     thread
-        .try_publish_seccomp_filter(&expected, &prepared)
-        .map_err(map_transition_error)?;
+        .try_publish_seccomp_filter(&snapshot, &prepared)
+        .map_err(map_seccomp_publication_error)?;
+    publication.commit();
     Ok(0)
 }
 
@@ -196,7 +208,7 @@ fn enter_strict(flags: u32, args: *const ()) -> AxResult<isize> {
     let curr = current();
     curr.as_thread()
         .try_enter_seccomp_strict()
-        .map_err(map_transition_error)?;
+        .map_err(map_seccomp_publication_error)?;
     Ok(0)
 }
 
@@ -335,11 +347,29 @@ fn rollback_seccomp_syscall_frame(uctx: &mut UserContext, data: &SeccompData, _r
 /// dispatch may continue.
 pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
     let curr = current();
-    let state = curr.as_thread().seccomp_snapshot();
-    match state.mode() {
+    let thread = curr.as_thread();
+    // Permanently disabled tasks do not enter the RCU domain at all. The
+    // pointer load is only a fast-bit hint; the optional RCU read below is
+    // authoritative and closes publication-versus-evaluation races.
+    if !thread.seccomp_active() {
+        return true;
+    }
+
+    let raw_syscall = uctx.sysno();
+    let data = seccomp_data(uctx);
+    // The active path pins the immutable state only for this evaluation. It
+    // neither clones the `SeccompState`/`FilterChain` Arc nor takes a spinlock.
+    let Some((mode, decision)) = thread.with_seccomp_current(|state| {
+        let mode = state.mode();
+        let decision = (mode == SeccompMode::Filter).then(|| state.evaluate(&data));
+        (mode, decision)
+    }) else {
+        return true;
+    };
+    match mode {
         SeccompMode::Disabled => return true,
         SeccompMode::Strict => {
-            if strict_allows(uctx.sysno()) {
+            if strict_allows(raw_syscall) {
                 return true;
             }
             terminate_for_seccomp(Signo::SIGKILL, false);
@@ -347,12 +377,8 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
         }
         SeccompMode::Filter => {}
     }
-
-    // The only task publication lock was released by `seccomp_snapshot`.
-    // Evaluation is allocation-free and touches only immutable chain nodes.
-    let raw_syscall = uctx.sysno();
-    let data = seccomp_data(uctx);
-    let decision = state.evaluate(&data);
+    let decision = decision.expect("active seccomp filter state has no evaluation");
+    crate::seccomp_jit::record_interpreter_executed_many(decision.interpreter_executions);
     let class = decision.action.classify();
     if decision.matched_filter.is_some_and(|metadata| metadata.log)
         && !matches!(class, ActionClass::Allow | ActionClass::Log)
@@ -437,7 +463,7 @@ mod tests {
             AxError::NoMemory
         );
         assert_eq!(
-            map_transition_error(StateTransitionError::Stale),
+            map_seccomp_publication_error(SeccompPublicationError::Stale),
             LinuxError::EAGAIN.into()
         );
     }

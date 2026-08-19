@@ -19,9 +19,10 @@ use axio::prelude::*;
 use axnet::{
     InterfaceKind,
     packet::{
-        LinkHardwareType, LinkPacketType, MAX_PACKET_FRAME_BYTES, PacketDeviceCapabilities,
-        PacketEndpoint, PacketError as PacketMechanismError, PacketMetadata, PacketProtocol,
-        PacketSelector, PacketSendRequest, PacketView as EndpointPacketView,
+        LinkHardwareType, LinkPacketType, MAX_PACKET_FRAME_BYTES, PacketAncillaryCapabilities,
+        PacketDeviceCapabilities, PacketEndpoint, PacketError as PacketMechanismError,
+        PacketMetadata, PacketProtocol, PacketSelector, PacketSendRequest,
+        PacketView as EndpointPacketView,
     },
 };
 use axpoll::{IoEvents, Pollable};
@@ -99,8 +100,32 @@ pub(crate) struct PacketSocket {
     net_ns: Arc<NetworkNamespace>,
     endpoint: Arc<PacketEndpoint>,
     state: Mutex<PacketSocketState>,
+    filter_control: Mutex<PacketFilterControl>,
     nonblocking: AtomicBool,
     inode: PseudoInode,
+}
+
+#[derive(Default)]
+struct PacketFilterControl {
+    locked: bool,
+    required_ancillary: PacketAncillaryCapabilities,
+}
+
+impl PacketFilterControl {
+    /// Applies Linux's one-way `SO_LOCK_FILTER` transition.
+    ///
+    /// Zero is a no-op only while the filter is still unlocked. Once locked,
+    /// a zero value is an attempted unlock and Linux rejects it with `EPERM`;
+    /// repeated nonzero values remain idempotent.
+    fn apply_lock(&mut self, value: i32) -> AxResult<()> {
+        if self.locked && value == 0 {
+            return Err(LinuxError::EPERM.into());
+        }
+        if value != 0 {
+            self.locked = true;
+        }
+        Ok(())
+    }
 }
 
 impl PacketSocket {
@@ -120,6 +145,7 @@ impl PacketSocket {
             net_ns,
             endpoint,
             state: Mutex::new(state),
+            filter_control: Mutex::new(PacketFilterControl::default()),
             nonblocking: AtomicBool::new(false),
             inode: PseudoInode::socket(),
         })
@@ -141,6 +167,71 @@ impl PacketSocket {
         self.state.lock().socket_type()
     }
 
+    /// Returns the one-way SO_LOCK_FILTER state shared by all descriptors
+    /// referring to this open file description.
+    pub(crate) fn filter_locked(&self) -> bool {
+        self.filter_control.lock().locked
+    }
+
+    /// Installs an already verified classic-BPF filter.  The control mutex
+    /// serializes attach, detach, and the one-way lock with the endpoint
+    /// transition, while the endpoint itself keeps retired filter owners out
+    /// of its state lock.
+    pub(crate) fn attach_filter(
+        &self,
+        filter: Arc<crate::packet_cbpf::PacketCbpfFilter>,
+    ) -> AxResult<()> {
+        let state = self.state.lock();
+        let socket_type = state.socket_type();
+        let binding = state.binding();
+        let required_ancillary = filter.required_ancillary_capabilities();
+        let mut control = self.filter_control.lock();
+        if control.locked {
+            return Err(LinuxError::EPERM.into());
+        }
+        validate_filter_capabilities(
+            &self.net_ns,
+            socket_type,
+            binding.interface(),
+            required_ancillary,
+        )?;
+        let publication = crate::packet_cbpf::try_reserve_published().ok_or(AxError::NoMemory)?;
+        self.endpoint
+            .set_filter(Some(filter))
+            .map_err(packet_mechanism_error)?;
+        // The endpoint publication above is the only fallible transition;
+        // retain the same requirement snapshot for later bind validation.
+        control.required_ancillary = required_ancillary;
+        publication.commit();
+        Ok(())
+    }
+
+    /// Detaches the current classic-BPF filter, preserving Linux's ENOENT
+    /// result when no filter is attached.
+    pub(crate) fn detach_filter(&self) -> AxResult<()> {
+        let mut control = self.filter_control.lock();
+        if control.locked {
+            return Err(LinuxError::EPERM.into());
+        }
+        if !self.endpoint.filter_attached() {
+            return Err(LinuxError::ENOENT.into());
+        }
+        let result = self
+            .endpoint
+            .set_filter(None)
+            .map_err(packet_mechanism_error);
+        if result.is_ok() {
+            control.required_ancillary = PacketAncillaryCapabilities::NONE;
+        }
+        result
+    }
+
+    /// Applies the Linux `SO_LOCK_FILTER` value and its irreversible-unlock
+    /// error semantics.
+    pub(crate) fn lock_filter(&self, value: i32) -> AxResult<()> {
+        self.filter_control.lock().apply_lock(value)
+    }
+
     /// Publishes a bind as `validate device -> lower selector -> ABI state`.
     ///
     /// The state mutex excludes another adapter transition between prepare and
@@ -151,6 +242,13 @@ impl PacketSocket {
         let plan = state.prepare_bind(request).map_err(packet_error)?;
         let replacement = plan.replacement();
         validate_receive_device(&self.net_ns, state.socket_type(), replacement.interface())?;
+        let control = self.filter_control.lock();
+        validate_filter_capabilities(
+            &self.net_ns,
+            state.socket_type(),
+            replacement.interface(),
+            control.required_ancillary,
+        )?;
 
         if !plan.is_noop() {
             let selector =
@@ -164,6 +262,7 @@ impl PacketSocket {
             debug_assert_eq!(error, PacketError::StaleBindPlan);
             AxError::BadState
         })?;
+        drop(control);
         Ok(())
     }
 
@@ -512,6 +611,54 @@ fn selector_for_binding(
     )
 }
 
+/// Verifies that every currently eligible receive device for a binding can
+/// define the ancillary fields used by an already verified filter. A wildcard
+/// socket is checked against all current devices because the namespace has no
+/// hotplug path; an exact socket is checked against its one interface.
+fn validate_filter_capabilities(
+    net_ns: &NetworkNamespace,
+    socket_type: PacketSocketType,
+    interface: InterfaceIndex,
+    required: PacketAncillaryCapabilities,
+) -> AxResult<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let stack = net_ns.stack();
+    let check = |interface_index: u32| -> AxResult<()> {
+        let capabilities = stack
+            .packet_device_capabilities(interface_index)
+            .ok_or(LinuxError::ENODEV)?;
+        validate_one_filter_capability(socket_type, capabilities, required)
+    };
+
+    match interface {
+        InterfaceIndex::Any => {
+            for info in stack.interfaces() {
+                check(info.index)?;
+            }
+            Ok(())
+        }
+        exact => check(exact_interface(exact)?),
+    }
+}
+
+fn validate_one_filter_capability(
+    socket_type: PacketSocketType,
+    capabilities: PacketDeviceCapabilities,
+    required: PacketAncillaryCapabilities,
+) -> AxResult<()> {
+    let receives = match socket_type {
+        PacketSocketType::Raw => capabilities.raw_receive,
+        PacketSocketType::Datagram => capabilities.cooked_receive,
+    };
+    if receives && !capabilities.ancillary.supports(required) {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    Ok(())
+}
+
 fn validate_receive_device(
     net_ns: &NetworkNamespace,
     socket_type: PacketSocketType,
@@ -657,6 +804,19 @@ mod tests {
         advertised: usize,
     }
 
+    #[test]
+    fn filter_lock_is_one_way_with_linux_unlock_error() {
+        let mut control = PacketFilterControl::default();
+        assert_eq!(control.apply_lock(0), Ok(()));
+        assert!(!control.locked);
+        assert_eq!(control.apply_lock(1), Ok(()));
+        assert!(control.locked);
+        assert_eq!(control.apply_lock(-1), Ok(()));
+        assert!(control.locked);
+        assert_eq!(control.apply_lock(0), Err(LinuxError::EPERM.into()));
+        assert!(control.locked);
+    }
+
     impl Write for FaultDst {
         fn write(&mut self, _buf: &[u8]) -> AxResult<usize> {
             Err(AxError::BadAddress)
@@ -730,7 +890,31 @@ mod tests {
             cooked_send: true,
             link_header_len: 14,
             address_len: 6,
+            ancillary: PacketAncillaryCapabilities::CANONICAL,
         }
+    }
+
+    #[test]
+    fn ancillary_filter_capability_is_checked_before_publication() {
+        let mut capabilities = packet_capabilities(LinkHardwareType::Ethernet);
+        capabilities.ancillary = PacketAncillaryCapabilities::NONE;
+        assert_eq!(
+            validate_one_filter_capability(
+                PacketSocketType::Raw,
+                capabilities,
+                PacketAncillaryCapabilities::MARK,
+            )
+            .unwrap_err(),
+            LinuxError::EOPNOTSUPP.into()
+        );
+        assert_eq!(
+            validate_one_filter_capability(
+                PacketSocketType::Raw,
+                capabilities,
+                PacketAncillaryCapabilities::NONE,
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -864,6 +1048,138 @@ mod tests {
             panic!("statistics query returned a different option value")
         };
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn attached_cbpf_filter_observes_real_loopback_protocol_context() {
+        let _context = packet_test_context();
+        let net_ns = namespace();
+        let receiver =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
+                .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns).unwrap();
+
+        // Accept only the protocol supplied by the loopback device's real
+        // PacketDeviceContext. The ancillary snapshot is complete as well,
+        // but this filter deliberately checks the hot skb->protocol value.
+        let filter = crate::packet_cbpf::PacketCbpfFilter::try_new(alloc::vec![
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::Protocol.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0x0800, 0, 1),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, u32::MAX),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+        ])
+        .unwrap();
+        receiver.attach_filter(filter).unwrap();
+
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
+        assert_eq!(receiver.endpoint.queue_usage().0, 2);
+        assert_eq!(
+            receiver
+                .endpoint
+                .try_receive(false)
+                .unwrap()
+                .metadata()
+                .protocol,
+            0x0800
+        );
+        assert_eq!(
+            receiver
+                .endpoint
+                .try_receive(false)
+                .unwrap()
+                .metadata()
+                .protocol,
+            0x0800
+        );
+
+        // The same real socket chain must reject a different protocol without
+        // confusing the packet bytes' EtherType with skb->protocol.
+        submit(
+            &sender,
+            &raw_ipv4_frame(),
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0806,
+            ))),
+        )
+        .unwrap();
+        assert_eq!(receiver.endpoint.queue_usage().0, 0);
+    }
+
+    #[test]
+    fn attached_cbpf_filter_observes_canonical_ancillary_state() {
+        let _context = packet_test_context();
+        let net_ns = namespace();
+        let receiver =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns.clone())
+                .unwrap();
+        let sender =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, net_ns).unwrap();
+
+        // Current devices own the canonical values: mark=0, one queue=0,
+        // and no hardware VLAN extraction. Attach must validate that
+        // capability once, and delivery must observe the same values rather
+        // than returning EOPNOTSUPP per packet. The inline VLAN bytes below
+        // deliberately do not populate the skb VLAN sidecar.
+        let filter = crate::packet_cbpf::PacketCbpfFilter::try_new(alloc::vec![
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::Mark.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::Queue.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::VlanTag.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::VlanTagPresent.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+            axcbpf::Instruction::statement(
+                axcbpf::opcode::LD_W_ABS,
+                axcbpf::Ancillary::VlanTpid.encoded_offset(),
+            ),
+            axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
+            axcbpf::Instruction::statement(axcbpf::opcode::RET_K, u32::MAX),
+        ])
+        .unwrap();
+        receiver.attach_filter(filter).unwrap();
+
+        let mut inline_vlan = raw_ipv4_frame();
+        inline_vlan[12..14].copy_from_slice(&0x8100_u16.to_be_bytes());
+        inline_vlan[14..16].copy_from_slice(&0x0064_u16.to_be_bytes());
+        inline_vlan[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
+        submit(
+            &sender,
+            &inline_vlan,
+            Some(loopback_send_address(ProtocolSelector::from_host_order(
+                0x0800,
+            ))),
+        )
+        .unwrap();
+        assert_eq!(receiver.endpoint.queue_usage().0, 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use alloc::vec;
+use alloc::vec::Vec;
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
@@ -15,6 +15,13 @@ pub(crate) enum Transport {
     Udp,
 }
 
+/// Fixed active-socket bound for one network namespace.  The owned storage is
+/// preallocated to this size, and [`SocketSetWrapper::add`] rejects a full
+/// set before smoltcp can grow it.  Keeping the storage owned avoids leaking a
+/// per-namespace `SocketStorage` array merely to manufacture a `'static`
+/// borrow.
+pub(crate) const MAX_SOCKETS: usize = 128;
+
 fn addrs_conflict(requested: Option<IpAddress>, existing: Option<IpAddress>) -> bool {
     match (requested, existing) {
         (None, _) | (_, None) => true,
@@ -30,16 +37,20 @@ pub(crate) struct SocketSetWrapper<'a> {
 impl<'a> SocketSetWrapper<'a> {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(SocketSet::new(vec![])),
+            inner: Mutex::new(SocketSet::new(Vec::with_capacity(MAX_SOCKETS))),
             new_socket: Event::new(),
         }
     }
 
-    pub fn add<T: AnySocket<'a>>(&self, socket: T) -> SocketHandle {
-        let handle = self.inner.lock().add(socket);
+    pub fn add<T: AnySocket<'a>>(&self, socket: T) -> AxResult<SocketHandle> {
+        let mut sockets = self.inner.lock();
+        if sockets.iter().count() >= MAX_SOCKETS {
+            return Err(AxError::ResourceBusy);
+        }
+        let handle = sockets.add(socket);
         debug!("socket {handle}: created");
         self.new_socket.notify(1);
-        handle
+        Ok(handle)
     }
 
     pub fn with_socket<T: AnySocket<'a>, R, F>(&self, handle: SocketHandle, f: F) -> R

@@ -141,7 +141,7 @@ impl TcpSocket {
 
     /// Creates a new TCP socket bound to the given network stack.
     pub fn new(stack: Arc<NetStack>) -> AxResult<Self> {
-        let handle = stack.socket_set.add(new_tcp_socket()?);
+        let handle = stack.socket_set.add(new_tcp_socket()?)?;
         Ok(Self {
             stack,
             state: StateLock::new(State::Idle),
@@ -754,7 +754,8 @@ impl Pollable for TcpSocket {
         let peer_write_closed = matches!(state, State::Connected | State::Closed)
             && self.with_smol_socket(|socket| !socket.may_recv());
         events.set(IoEvents::READ_HANGUP, peer_write_closed);
-        self.general.add_pending_error_event(events)
+        let events = self.general.add_pending_error_event(events);
+        self.stack.add_terminal_events(events)
     }
 
     fn register<'a>(
@@ -762,14 +763,27 @@ impl Pollable for TcpSocket {
         context: &mut Context<'_>,
         events: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        let network =
-            events.intersects(IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::READ_HANGUP);
-        let local_close = events.intersects(IoEvents::READABLE | IoEvents::READ_HANGUP);
-        let mut prepared =
-            PreparedPollRegistration::try_new(usize::from(network) + usize::from(local_close))?;
+        let network = events.intersects(
+            IoEvents::READABLE
+                | IoEvents::WRITABLE
+                | IoEvents::READ_HANGUP
+                | IoEvents::ERROR
+                | IoEvents::HANGUP,
+        );
+        let terminal = events.contains(IoEvents::REMOVED);
+        let local_close = events.intersects(
+            IoEvents::READABLE | IoEvents::READ_HANGUP | IoEvents::ERROR | IoEvents::HANGUP,
+        );
+        let mut prepared = PreparedPollRegistration::try_new(
+            usize::from(network) + usize::from(terminal) + usize::from(local_close),
+        )?;
         if network {
             self.general
                 .arm_waker(&self.stack, &mut prepared, context.waker())?;
+        }
+        if terminal {
+            self.stack
+                .arm_terminal_readiness(&mut prepared, context.waker())?;
         }
         if local_close {
             prepared.arm(&self.poll_rx_closed, context.waker())?;
@@ -797,8 +811,31 @@ impl Drop for TcpSocket {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, task::Wake};
+    use core::{
+        net::IpAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Waker,
+    };
+
     use super::*;
-    use crate::consts::{SOCKET_BUFFER_MAX, SOCKET_BUFFER_MIN};
+    use crate::{
+        SendOptions,
+        consts::{SOCKET_BUFFER_MAX, SOCKET_BUFFER_MIN},
+        udp::UdpSocket,
+    };
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn replacement_changes_tcp_storage_capacity() {
@@ -811,5 +848,43 @@ mod tests {
 
         replace_tcp_recv_buffer(&mut socket, usize::MAX).unwrap();
         assert_eq!(socket.recv_capacity(), SOCKET_BUFFER_MAX);
+    }
+
+    #[test]
+    fn removed_only_registration_arms_tcp_terminal_source() {
+        let stack = NetStack::new_loopback_only();
+        let socket = TcpSocket::new(stack).unwrap();
+        let mut context = Context::from_waker(core::task::Waker::noop());
+        let registration = socket.register(&mut context, IoEvents::REMOVED).unwrap();
+        // REMOVED is terminal stack readiness, not a local-close-only bit.
+        // It retains only the dedicated terminal source when no ordinary TCP
+        // event was requested.
+        assert_eq!(registration.source_count(), 1);
+    }
+
+    #[test]
+    fn removed_only_tcp_wait_ignores_ordinary_loopback_traffic() {
+        let stack = NetStack::new_loopback_only();
+        let socket = TcpSocket::new(stack.clone()).unwrap();
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        let registration = socket.register(&mut context, IoEvents::REMOVED).unwrap();
+
+        let sender = UdpSocket::new(stack).unwrap();
+        sender
+            .send(
+                &b"ordinary"[..],
+                SendOptions {
+                    to: Some(SocketAddrEx::Ip(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        31_205,
+                    ))),
+                    ..SendOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(wake.0.load(Ordering::Acquire), 0);
+        drop(registration);
     }
 }

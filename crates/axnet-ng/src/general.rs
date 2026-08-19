@@ -368,6 +368,18 @@ impl GeneralOptions {
                 .0;
             }
             let events = pollable.poll();
+            // A fenced network source is level-triggered through REMOVED in
+            // addition to the Linux-visible ERROR/HANGUP bits. Do not treat
+            // that persistent edge as ordinary readiness: after one final
+            // operation recheck, return a typed terminal error instead of
+            // repeatedly retrying/yielding a permanently unwakeable object.
+            if events.contains(IoEvents::REMOVED) {
+                return resolve_wait_failure(
+                    self.completed_operation(behavior, false, &mut f),
+                    PollWaitFailure::Error(AxError::ConnectionReset),
+                )
+                .0;
+            }
             if events.intersects(interest | IoEvents::ALWAYS) {
                 ready_retries += 1;
                 if ready_retries >= READY_RETRY_BUDGET {
@@ -636,6 +648,22 @@ mod tests {
         }
     }
 
+    struct Removed;
+
+    impl Pollable for Removed {
+        fn poll(&self) -> IoEvents {
+            IoEvents::ERROR | IoEvents::HANGUP | IoEvents::REMOVED
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
+    }
+
     #[test]
     fn socket_error_is_reported_once() {
         let options = GeneralOptions::new();
@@ -849,6 +877,19 @@ mod tests {
         assert_eq!(result, Ok(31));
         assert_eq!(attempts, 2);
         assert_eq!(pollable.polls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn removed_readiness_returns_terminal_error_without_busy_retry() {
+        let options = GeneralOptions::new();
+        let mut attempts = 0;
+        let result = options.recv_poller(&Removed, || {
+            attempts += 1;
+            Err::<usize, _>(AxError::WouldBlock)
+        });
+
+        assert_eq!(result, Err(AxError::ConnectionReset));
+        assert_eq!(attempts, 2);
     }
 
     #[test]

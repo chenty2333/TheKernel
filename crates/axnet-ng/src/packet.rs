@@ -223,6 +223,14 @@ pub struct PacketDeviceCapabilities {
     pub link_header_len: u16,
     /// Link-address length accepted and reported by this device.
     pub address_len: u8,
+    /// Ancillary metadata fields that are defined for every staged frame.
+    ///
+    /// A capability is about semantic ownership, not whether a field is
+    /// nonzero.  For example, the current single-queue devices report queue
+    /// metadata as supported even though its canonical value is zero, and a
+    /// device without hardware VLAN extraction reports VLAN metadata as
+    /// supported with `vlan_tag_present == false`.
+    pub ancillary: PacketAncillaryCapabilities,
 }
 
 impl PacketDeviceCapabilities {
@@ -236,7 +244,51 @@ impl PacketDeviceCapabilities {
             cooked_send: false,
             link_header_len: 0,
             address_len: 0,
+            ancillary: PacketAncillaryCapabilities::NONE,
         }
+    }
+}
+
+/// Ancillary metadata fields whose values are defined by a link device.
+///
+/// The bits describe which values a device can provide for every captured
+/// frame.  They are intentionally separate from the values themselves, so a
+/// canonical zero remains distinguishable from an unavailable field at
+/// filter-attachment time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketAncillaryCapabilities(u8);
+
+impl Default for PacketAncillaryCapabilities {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl PacketAncillaryCapabilities {
+    /// No ancillary field is defined.
+    pub const NONE: Self = Self(0);
+    /// Packet mark is defined (zero is a valid canonical value).
+    pub const MARK: Self = Self(1 << 0);
+    /// Receive queue mapping is defined (zero is a valid canonical value).
+    pub const QUEUE: Self = Self(1 << 1);
+    /// VLAN tag, presence, and protocol are defined.
+    pub const VLAN: Self = Self(1 << 2);
+    /// All ancillary fields currently supported by the cBPF provider.
+    pub const CANONICAL: Self = Self(Self::MARK.0 | Self::QUEUE.0 | Self::VLAN.0);
+
+    /// Returns whether all fields in `required` are defined by this device.
+    pub const fn supports(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    /// Combines two ancillary capability sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns whether no ancillary field is required.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -281,6 +333,118 @@ pub struct PacketMetadata {
     pub address: [u8; 8],
     /// Number of valid bytes in `address`.
     pub address_len: u8,
+}
+
+/// Packet ancillary metadata populated for every staged frame.
+///
+/// The ordinary link metadata above remains the hot capture key and is
+/// present for every frame. Mark, queue, and VLAN state are kept in this
+/// separate cold value so filters that do not use ancillary fields do not pay
+/// for an expanded hot metadata copy. The current devices own canonical
+/// values for all three fields: mark and queue are zero, and VLAN is absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketAncillaryMetadata {
+    mark: u32,
+    queue: u16,
+    vlan_tag: u16,
+    vlan_tpid: u16,
+    vlan_tag_present: bool,
+}
+
+impl PacketAncillaryMetadata {
+    /// Creates the canonical snapshot used by current Ethernet and loopback
+    /// devices: no packet mark, one receive queue, and no hardware VLAN tag.
+    pub const fn canonical() -> Self {
+        Self {
+            mark: 0,
+            queue: 0,
+            vlan_tag: 0,
+            vlan_tpid: 0,
+            vlan_tag_present: false,
+        }
+    }
+
+    /// Returns a snapshot containing a device-owned packet mark.
+    pub const fn with_mark(mut self, mark: u32) -> Self {
+        self.mark = mark;
+        self
+    }
+
+    /// Returns a snapshot containing a real receive queue mapping.
+    pub const fn with_queue(mut self, queue: u16) -> Self {
+        self.queue = queue;
+        self
+    }
+
+    /// Returns a snapshot containing a real VLAN tag state.
+    ///
+    /// `vlan_tag_present` is preserved even when false: a device that owns
+    /// the VLAN metadata can distinguish “no tag” from a future unavailable
+    /// capability at filter attachment time.
+    pub const fn with_vlan(
+        mut self,
+        vlan_tag: u16,
+        vlan_tag_present: bool,
+        vlan_tpid: u16,
+    ) -> Self {
+        self.vlan_tag = vlan_tag;
+        self.vlan_tag_present = vlan_tag_present;
+        self.vlan_tpid = vlan_tpid;
+        self
+    }
+
+    /// Returns the packet mark, including the canonical zero value.
+    pub const fn mark(self) -> u32 {
+        self.mark
+    }
+
+    /// Returns the receive queue mapping, including the canonical zero value.
+    pub const fn queue(self) -> u16 {
+        self.queue
+    }
+
+    /// Returns VLAN tag, presence, and protocol, including the canonical
+    /// absent-tag state.
+    pub const fn vlan(self) -> (u16, bool, u16) {
+        (self.vlan_tag, self.vlan_tag_present, self.vlan_tpid)
+    }
+
+    /// Returns the ancillary capabilities represented by this complete
+    /// snapshot.
+    pub const fn capabilities(self) -> PacketAncillaryCapabilities {
+        PacketAncillaryCapabilities::CANONICAL
+    }
+}
+
+/// Immutable context supplied to an endpoint filter for one captured frame.
+///
+/// The hot link metadata and complete ancillary state are borrowed directly;
+/// invoking an ordinary byte-only filter performs no allocation or metadata
+/// conversion.
+#[derive(Clone, Copy)]
+pub struct PacketFilterContext<'a> {
+    metadata: &'a PacketMetadata,
+    ancillary: &'a PacketAncillaryMetadata,
+}
+
+impl<'a> PacketFilterContext<'a> {
+    /// Creates a filter context from the immutable packet snapshots.
+    pub const fn new(metadata: &'a PacketMetadata, ancillary: &'a PacketAncillaryMetadata) -> Self {
+        Self {
+            metadata,
+            ancillary,
+        }
+    }
+
+    /// Returns the hot link metadata snapshot.
+    pub const fn metadata(self) -> &'a PacketMetadata {
+        self.metadata
+    }
+
+    /// Returns the complete device-owned ancillary snapshot.
+    pub const fn ancillary(self) -> &'a PacketAncillaryMetadata {
+        self.ancillary
+    }
 }
 
 /// Device-facing publication context supplied by the owning router.
@@ -333,15 +497,37 @@ impl<'a> PacketDeviceContext<'a> {
         payload: &[u8],
     ) -> PacketResult<()> {
         metadata.interface_index = self.interface_index;
+        self.broker.stage_parts_from(
+            metadata,
+            PacketAncillaryMetadata::canonical(),
+            header,
+            payload,
+            self.origin,
+        )
+    }
+
+    /// Stages a frame together with ancillary fields owned by the device.
+    ///
+    /// This is intentionally separate from [`Self::stage`].  Callers must
+    /// have a real receive/transmit source for every noncanonical field;
+    /// inline packet bytes alone do not imply Linux skb VLAN metadata.
+    pub fn stage_with_ancillary(
+        self,
+        mut metadata: PacketMetadata,
+        ancillary: PacketAncillaryMetadata,
+        header: &[u8],
+        payload: &[u8],
+    ) -> PacketResult<()> {
+        metadata.interface_index = self.interface_index;
         self.broker
-            .stage_parts_from(metadata, header, payload, self.origin)
+            .stage_parts_from(metadata, ancillary, header, payload, self.origin)
     }
 }
 
 /// Optional endpoint-local filter applied before queue admission.
 pub trait PacketFilter: Send + Sync {
     /// Returns the maximum visible bytes to retain, or zero to reject.
-    fn filter(&self, packet: &[u8]) -> AxResult<usize>;
+    fn filter(&self, packet: &[u8], context: PacketFilterContext<'_>) -> AxResult<usize>;
 }
 
 struct PacketPoolBudget {
@@ -382,6 +568,7 @@ struct SharedPacketFrame {
     bytes: Vec<u8>,
     pool: Arc<PacketPoolBudget>,
     charge: usize,
+    ancillary: PacketAncillaryMetadata,
 }
 
 impl Drop for SharedPacketFrame {
@@ -610,7 +797,10 @@ impl PacketEndpoint {
                 .and_then(|epoch| epoch.filter.as_ref().cloned())
         };
         let captured_len = if let Some(filter) = filter {
-            match filter.filter(visible) {
+            match filter.filter(
+                visible,
+                PacketFilterContext::new(&metadata, &frame.ancillary),
+            ) {
                 Ok(0) => {
                     let mut state = self.state.lock();
                     state.stats.filter_rejected = state.stats.filter_rejected.saturating_add(1);
@@ -721,6 +911,15 @@ impl PacketEndpoint {
             .back()
             .expect("packet endpoint always retains one selector")
             .selector
+    }
+
+    /// Returns whether a filter is attached for future captures.
+    pub fn filter_attached(&self) -> bool {
+        self.state
+            .lock()
+            .filters
+            .back()
+            .is_some_and(|epoch| epoch.filter.is_some())
     }
 
     /// Publishes an endpoint-local filter transition for future captures.
@@ -1350,6 +1549,7 @@ impl PacketBroker {
     pub(crate) fn stage_parts_from(
         &self,
         metadata: PacketMetadata,
+        ancillary: PacketAncillaryMetadata,
         header: &[u8],
         payload: &[u8],
         origin: Option<PacketEndpointId>,
@@ -1441,6 +1641,7 @@ impl PacketBroker {
             bytes,
             pool: Arc::clone(&self.pool),
             charge,
+            ancillary,
         }) {
             Ok(frame) => frame,
             Err(_) => {
@@ -1475,7 +1676,13 @@ impl PacketBroker {
         header: &[u8],
         payload: &[u8],
     ) -> PacketResult<()> {
-        self.stage_parts_from(metadata, header, payload, None)
+        self.stage_parts_from(
+            metadata,
+            PacketAncillaryMetadata::canonical(),
+            header,
+            payload,
+            None,
+        )
     }
 
     fn deliver(&self, pending: PendingPacket) {
@@ -1819,9 +2026,61 @@ mod tests {
     struct Snaplen(usize);
 
     impl PacketFilter for Snaplen {
-        fn filter(&self, _packet: &[u8]) -> AxResult<usize> {
+        fn filter(&self, _packet: &[u8], _context: PacketFilterContext<'_>) -> AxResult<usize> {
             Ok(self.0)
         }
+    }
+
+    struct MetadataProbe(Arc<AtomicBool>);
+
+    impl PacketFilter for MetadataProbe {
+        fn filter(&self, packet: &[u8], context: PacketFilterContext<'_>) -> AxResult<usize> {
+            let hot = context.metadata();
+            let vlan = context.ancillary().vlan();
+            if hot.interface_index == 1
+                && hot.protocol == 0x8100
+                && hot.packet_type == LinkPacketType::Host
+                && context.ancillary().mark() == 0x1234_5678
+                && context.ancillary().queue() == 3
+                && vlan == (0x0064, true, 0x8100)
+            {
+                self.0.store(true, Ordering::Release);
+            }
+            Ok(packet.len())
+        }
+    }
+
+    #[test]
+    fn filter_receives_real_hot_and_complete_ancillary_snapshot() {
+        let broker = PacketBroker::try_new().unwrap();
+        let endpoint = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::All,
+                None,
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        let seen = Arc::new(AtomicBool::new(false));
+        endpoint
+            .set_filter(Some(Arc::new(MetadataProbe(Arc::clone(&seen)))))
+            .unwrap();
+        let context = PacketDeviceContext::new(1, &broker, None);
+        context
+            .stage_with_ancillary(
+                metadata(0x8100, LinkPacketType::Host),
+                PacketAncillaryMetadata::canonical()
+                    .with_mark(0x1234_5678)
+                    .with_queue(3)
+                    .with_vlan(0x0064, true, 0x8100),
+                &[0; 14],
+                &[1, 2, 3],
+            )
+            .unwrap();
+        broker.drain_staged();
+        let record = endpoint.try_receive(false).unwrap();
+        assert_eq!(record.data().len(), 17);
+        assert!(seen.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2203,6 +2462,7 @@ mod tests {
         broker
             .stage_parts_from(
                 metadata(0x0800, LinkPacketType::Outgoing),
+                PacketAncillaryMetadata::canonical(),
                 &[0; 14],
                 &[1, 2, 3],
                 Some(source.id),
@@ -2682,7 +2942,7 @@ mod tests {
     struct RejectAll;
 
     impl PacketFilter for RejectAll {
-        fn filter(&self, _packet: &[u8]) -> AxResult<usize> {
+        fn filter(&self, _packet: &[u8], _context: PacketFilterContext<'_>) -> AxResult<usize> {
             Ok(0)
         }
     }
@@ -2759,7 +3019,7 @@ mod tests {
     }
 
     impl PacketFilter for ReentrantDropFilter {
-        fn filter(&self, packet: &[u8]) -> AxResult<usize> {
+        fn filter(&self, packet: &[u8], _context: PacketFilterContext<'_>) -> AxResult<usize> {
             Ok(packet.len())
         }
     }

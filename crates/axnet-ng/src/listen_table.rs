@@ -12,7 +12,11 @@ use smoltcp::{
     wire::{IpEndpoint, IpListenEndpoint},
 };
 
-use crate::{consts::LISTEN_QUEUE_SIZE, tcp::new_tcp_socket, wrapper::SocketSetWrapper};
+use crate::{
+    consts::LISTEN_QUEUE_SIZE,
+    tcp::new_tcp_socket,
+    wrapper::{MAX_SOCKETS, SocketSetWrapper},
+};
 
 const PORT_NUM: usize = 65536;
 
@@ -224,6 +228,10 @@ impl ListenTable {
                 warn!("Failed to listen on {}: {:?}", entry.listen_endpoint, err);
                 return;
             }
+            if sockets.iter().count() >= MAX_SOCKETS {
+                warn!("network socket storage is full; dropping incoming connection");
+                return;
+            }
             let handle = sockets.add(socket);
             debug!(
                 "TCP socket {}: prepare for connection {} -> {}",
@@ -280,7 +288,7 @@ mod tests {
             port: 2345,
         };
         table.listen(endpoint, 2, &socket_set).unwrap();
-        let handle = socket_set.add(new_tcp_socket().unwrap());
+        let handle = socket_set.add(new_tcp_socket().unwrap()).unwrap();
         let generation = {
             let mut table_entry = table.listen_entry(endpoint.port).lock();
             let entry = table_entry.as_deref_mut().unwrap();

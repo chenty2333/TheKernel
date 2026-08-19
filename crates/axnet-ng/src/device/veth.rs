@@ -141,6 +141,10 @@ impl Device for VethEnd {
     fn register_waker(&self, waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
         self.waker_bridge.refresh(&self.waker, waker)
     }
+
+    fn stop_rx_waker(&self) {
+        self.waker_bridge.cancel(&self.waker);
+    }
 }
 
 impl Drop for VethEnd {

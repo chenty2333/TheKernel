@@ -10,7 +10,7 @@ use axhal::time::{NANOS_PER_MICROS, TimeValue, wall_time_nanos};
 use axpoll::PollRegistrationError;
 use axtask::future::{TimerRegistrationError, sleep_until};
 use smoltcp::{
-    iface::{Interface, PollIngressSingleResult, SocketSet},
+    iface::{Interface, PollIngressSingleResult, PollResult, SocketSet},
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpListenEndpoint},
 };
@@ -18,7 +18,7 @@ use smoltcp::{
 use crate::{
     device::PacketSendProgress,
     packet::{PacketEndpoint, PacketSendRequest},
-    router::{RX_PASS_BUDGET, Router, Rule},
+    router::{RX_PASS_BUDGET, Router, Rule, RxWakeRegistration},
     wrapper::SocketSetWrapper,
 };
 
@@ -46,6 +46,13 @@ pub enum ServicePoll {
     Quiescent,
     /// At least one bounded source retained work for a subsequent pass.
     Continuation,
+    /// A link device fenced itself after a completion/ownership protocol
+    /// error. The receive worker remains the software owner for all other
+    /// devices while the fenced source retains its DMA owners for teardown.
+    /// `continuation` is true when a healthy software source retained work
+    /// after this bounded pass; callers must yield and poll it again while
+    /// keeping the quarantine visible.
+    Quarantined { continuation: bool },
 }
 
 struct ServiceTimeout {
@@ -93,17 +100,27 @@ impl Service {
             }
         }
 
-        self.iface.poll_egress(timestamp, &mut self.router, sockets);
+        // `poll_egress` is bounded by the fixed socket-set capacity and
+        // emits at most one packet per socket.  Preserve its continuation
+        // signal so a socket with more queued data is revisited on the next
+        // task-context pass instead of relying on a fresh IRQ.
+        let egress_blocked = self.router.tx_queue_full();
+        let egress = self.iface.poll_egress(timestamp, &mut self.router, sockets);
         let tx = self.router.dispatch(timestamp);
 
-        if rx.is_continuation()
+        let continuation = rx.is_continuation()
             || tx.is_continuation()
+            || matches!(egress, PollResult::SocketStateChanged)
+            || egress_blocked
             || ingress == RX_PASS_BUDGET
             // Ingress can stop while the router's TX queue is full.  The
             // dispatch pass frees that queue, but must not make this pass
             // quiescent while a packet remains in the software RX queue.
-            || self.router.has_rx_backlog()
-        {
+            || self.router.has_rx_backlog();
+        if self.router.has_quarantined_device() {
+            return ServicePoll::Quarantined { continuation };
+        }
+        if continuation {
             ServicePoll::Continuation
         } else {
             ServicePoll::Quiescent
@@ -128,7 +145,8 @@ impl Service {
         self.router.has_rx_wake_capable_device()
     }
 
-    pub(crate) fn register_rx_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+    /// Arm the permanent receive-worker wake sources for every live device.
+    pub(crate) fn register_rx_waker(&mut self, waker: &Waker) -> RxWakeRegistration {
         self.router.register_rx_waker(waker)
     }
 
@@ -209,7 +227,6 @@ impl Service {
         &mut self,
         mask: u64,
         waker: &Waker,
-        rx_worker_active: bool,
     ) -> Result<(), PollRegistrationError> {
         let next = self.iface.poll_at(now(), &self.socket_set.inner.lock());
 
@@ -250,9 +267,7 @@ impl Service {
         }
 
         for (i, device) in self.router.devices.iter().enumerate() {
-            if (i >= 64 || mask & (1u64 << i) != 0)
-                && !(rx_worker_active && device.rx_wake_capable())
-            {
+            if i >= 64 || mask & (1u64 << i) != 0 {
                 device.register_waker(waker)?;
             }
         }
@@ -271,6 +286,7 @@ fn map_timer_registration_error(error: TimerRegistrationError) -> PollRegistrati
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use core::task::Waker;
 
     use smoltcp::{

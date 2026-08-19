@@ -21,10 +21,10 @@ use thekernel_linux_packet::{
 };
 
 use super::{SocketSyscallSnapshot, import_socket_output_after_policy};
+#[cfg(feature = "bpf")]
+use crate::file::FileLike;
 use crate::{
-    file::{
-        FileLike, PinnedSocketDescription, SocketBackendKind, af_alg, packet_socket::packet_error,
-    },
+    file::{PinnedSocketDescription, SocketBackendKind, af_alg, packet_socket::packet_error},
     mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
         ns_capable,
@@ -416,6 +416,19 @@ fn read_option<T: Copy>(
         .map(|value| unsafe { value.assume_init() })
 }
 
+fn read_option_prefix_i32(
+    capability: &UserMemoryCapability,
+    val: UserConstPtr<u8>,
+    len: socklen_t,
+) -> AxResult<i32> {
+    if (len as usize) < size_of::<i32>() {
+        return Err(AxError::InvalidInput);
+    }
+    capability
+        .read_value::<i32>(val.address().as_usize() as *const i32)
+        .map_err(map_usercopy_error)
+}
+
 fn write_option<T: Copy>(
     capability: &UserMemoryCapability,
     val: UserPtr<u8>,
@@ -522,7 +535,11 @@ pub fn sys_getsockopt(
 
     if pinned.backend()? == SocketBackendKind::Packet {
         if level == SOL_SOCKET {
-            let value = packet_sol_socket_value(pinned.packet()?.socket_type(), optname)?;
+            let value = if optname == SO_LOCK_FILTER {
+                i32::from(pinned.packet()?.filter_locked())
+            } else {
+                packet_sol_socket_value(pinned.packet()?.socket_type(), optname)?
+            };
             write_packet_option_bytes(&capability, optval, &mut optlen, &value.to_ne_bytes())?;
             capability
                 .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
@@ -652,7 +669,37 @@ pub fn sys_setsockopt(
 
     if pinned.backend()? == SocketBackendKind::Packet {
         if level == SOL_SOCKET {
-            return Err(packet_sol_socket_set_error(optname));
+            match optname {
+                SO_ATTACH_FILTER => {
+                    // Linux first copies the complete sock_fprog envelope.
+                    // This preserves EFAULT for an unreadable header even on
+                    // a locked socket, and lets a readable but invalid header
+                    // report EPERM before field validation/verifier errors.
+                    let envelope = crate::packet_cbpf::copy_envelope(&capability, optval, optlen)?;
+                    if pinned.packet()?.filter_locked() {
+                        return Err(LinuxError::EPERM.into());
+                    }
+                    let instructions =
+                        crate::packet_cbpf::copy_instructions(&capability, envelope)?;
+                    let filter = crate::packet_cbpf::PacketCbpfFilter::try_new(instructions)?;
+                    pinned.packet()?.attach_filter(filter)?;
+                    return Ok(0);
+                }
+                SO_DETACH_BPF => {
+                    // SO_DETACH_FILTER consumes an int-sized optval even
+                    // though its value is ignored.  The copy precedes the
+                    // locked-state check, matching Linux's EFAULT ordering.
+                    read_option_prefix_i32(&capability, optval, optlen)?;
+                    pinned.packet()?.detach_filter()?;
+                    return Ok(0);
+                }
+                SO_LOCK_FILTER => {
+                    let value = read_option_prefix_i32(&capability, optval, optlen)?;
+                    pinned.packet()?.lock_filter(value)?;
+                    return Ok(0);
+                }
+                _ => return Err(packet_sol_socket_set_error(optname)),
+            }
         }
         if level != SOL_PACKET {
             return Err(LinuxError::ENOPROTOOPT.into());
@@ -710,17 +757,27 @@ pub fn sys_setsockopt(
                 return Ok(0);
             }
             SO_ATTACH_BPF => {
-                let prog_fd = read_option::<i32>(&capability, optval, optlen)?;
-                let prog_fd = crate::file::bpf::BpfProgFd::from_fd(prog_fd)?;
-                if prog_fd.prog.prog_type != crate::bpf::defs::BPF_PROG_TYPE_SOCKET_FILTER {
-                    return Err(AxError::InvalidInput);
+                #[cfg(feature = "bpf")]
+                {
+                    let prog_fd = read_option::<i32>(&capability, optval, optlen)?;
+                    let prog_fd = crate::file::bpf::BpfProgFd::from_fd(prog_fd)?;
+                    if prog_fd.prog.prog_type != crate::bpf::defs::BPF_PROG_TYPE_SOCKET_FILTER {
+                        return Err(AxError::InvalidInput);
+                    }
+                    socket.set_bpf_filter(Some(prog_fd.prog.clone()))?;
+                    return Ok(0);
                 }
-                socket.set_bpf_filter(Some(prog_fd.prog.clone()))?;
-                return Ok(0);
+                #[cfg(not(feature = "bpf"))]
+                return Err(LinuxError::EOPNOTSUPP.into());
             }
             SO_DETACH_BPF => {
-                socket.set_bpf_filter(None)?;
-                return Ok(0);
+                #[cfg(feature = "bpf")]
+                {
+                    socket.set_bpf_filter(None)?;
+                    return Ok(0);
+                }
+                #[cfg(not(feature = "bpf"))]
+                return Err(LinuxError::EOPNOTSUPP.into());
             }
             _ => {}
         }

@@ -22,16 +22,99 @@ use smoltcp::{
 use crate::{
     consts::{ETHERNET_MAX_PENDING_PACKETS, STANDARD_MTU},
     device::{
-        Device, DeviceStats, InterfaceKind, PacketSendProgress, RxStep,
+        Device, DeviceStats, InterfaceKind, PacketSendProgress, RxStep, RxWakeSource,
         classify_ethernet_ingress_protocol,
     },
     packet::{
-        LinkHardwareType, LinkPacketType, PacketDeviceCapabilities, PacketDeviceContext,
-        PacketMetadata, PacketSendRequest,
+        LinkHardwareType, LinkPacketType, PacketAncillaryCapabilities, PacketAncillaryMetadata,
+        PacketDeviceCapabilities, PacketDeviceContext, PacketMetadata, PacketSendRequest,
     },
 };
 
 const EMPTY_MAC: EthernetAddress = EthernetAddress([0; 6]);
+const ETHERNET_HEADER_LEN: usize = 14;
+const VLAN_HEADER_LEN: usize = 4;
+const ETHERTYPE_8021Q: u16 = 0x8100;
+const ETHERTYPE_8021AD: u16 = 0x88a8;
+
+/// The bounded ingress view used by the packet tap and the ordinary Ethernet
+/// protocol path.  Linux removes one inline VLAN header before running packet
+/// taps, retaining its TCI/TPID in skb metadata.  A second inline tag remains
+/// in `payload` and is therefore the (bounded) inner protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedIngressFrame<'a> {
+    dst_addr: EthernetAddress,
+    src_addr: EthernetAddress,
+    /// The protocol field that remains in the canonical, untagged header.
+    wire_protocol: u16,
+    /// Linux's normalized host-order protocol selector.
+    protocol: u16,
+    payload: &'a [u8],
+    vlan: Option<(u16, u16)>, // (TCI, TPID), outermost inline tag
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngressFrameError {
+    TruncatedEthernet,
+    TruncatedVlan,
+}
+
+#[inline]
+fn read_be16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline]
+const fn is_inline_vlan(protocol: u16) -> bool {
+    matches!(protocol, ETHERTYPE_8021Q | ETHERTYPE_8021AD)
+}
+
+/// Parses one Ethernet ingress frame without allocating or rewriting the
+/// driver's receive buffer.
+///
+/// This intentionally mirrors Linux's single `skb_vlan_untag()` pass: a
+/// complete outer 802.1Q/802.1AD header is removed from the packet-tap view,
+/// while an inner VLAN header is left in the canonical payload.  A VLAN
+/// marker without its complete four-byte tag is malformed and is dropped by
+/// the caller, as Linux drops a failed `skb_vlan_untag()` pull.
+fn parse_ingress_frame(frame: &[u8]) -> Result<ParsedIngressFrame<'_>, IngressFrameError> {
+    if frame.len() < ETHERNET_HEADER_LEN {
+        return Err(IngressFrameError::TruncatedEthernet);
+    }
+
+    let dst_addr = EthernetAddress::from_bytes(&frame[..6]);
+    let src_addr = EthernetAddress::from_bytes(&frame[6..12]);
+    let outer_protocol = read_be16(frame, 12);
+    if !is_inline_vlan(outer_protocol) {
+        let payload = &frame[ETHERNET_HEADER_LEN..];
+        return Ok(ParsedIngressFrame {
+            dst_addr,
+            src_addr,
+            wire_protocol: outer_protocol,
+            protocol: classify_ethernet_ingress_protocol(outer_protocol, payload),
+            payload,
+            vlan: None,
+        });
+    }
+
+    let vlan_end = ETHERNET_HEADER_LEN
+        .checked_add(VLAN_HEADER_LEN)
+        .expect("Ethernet VLAN header length is bounded");
+    if frame.len() < vlan_end {
+        return Err(IngressFrameError::TruncatedVlan);
+    }
+    let tci = read_be16(frame, ETHERNET_HEADER_LEN);
+    let inner_protocol = read_be16(frame, ETHERNET_HEADER_LEN + 2);
+    let payload = &frame[vlan_end..];
+    Ok(ParsedIngressFrame {
+        dst_addr,
+        src_addr,
+        wire_protocol: inner_protocol,
+        protocol: classify_ethernet_ingress_protocol(inner_protocol, payload),
+        payload,
+        vlan: Some((tci, outer_protocol)),
+    })
+}
 
 struct Neighbor {
     hardware_address: EthernetAddress,
@@ -47,6 +130,11 @@ pub struct EthernetDevice {
     stats: DeviceStats,
     irq_registration: SpinNoIrq<Option<IrqWakerToken>>,
     rx_irq_registration: SpinNoIrq<Option<IrqWakerToken>>,
+    /// A terminal completion/ownership failure fences this interface.  The
+    /// raw driver retains every DMA owner in this state; keeping the marker at
+    /// the link-device boundary prevents router and worker polling from
+    /// repeatedly probing a fenced used ring.
+    quarantined: bool,
 
     pending_packets: PacketBuffer<'static, IpAddress>,
 }
@@ -78,6 +166,7 @@ impl EthernetDevice {
             stats: DeviceStats::default(),
             irq_registration: SpinNoIrq::new(None),
             rx_irq_registration: SpinNoIrq::new(None),
+            quarantined: false,
 
             pending_packets,
         }
@@ -97,6 +186,7 @@ impl EthernetDevice {
             cooked_send: true,
             link_header_len: EthernetFrame::<&[u8]>::header_len() as u16,
             address_len: 6,
+            ancillary: PacketAncillaryCapabilities::CANONICAL,
         }
     }
 
@@ -124,6 +214,11 @@ impl EthernetDevice {
         packet_type: LinkPacketType,
         address: EthernetAddress,
     ) {
+        // This helper is used for locally generated traffic. Linux's
+        // dev_queue_xmit_nit() tap observes an outgoing raw frame before the
+        // receive-side VLAN untag pass, so preserve those bytes and the
+        // caller-supplied protocol. Incoming frames use
+        // `stage_ingress_frame` below instead.
         let header_len = repr.buffer_len().min(frame.as_ref().len());
         let (header, payload) = frame.as_ref().split_at(header_len);
         let mut link_address = [0u8; 8];
@@ -141,7 +236,63 @@ impl EthernetDevice {
         // Packet observation is deliberately best effort. Capture pressure is
         // accounted by the broker and must never block or fail the ordinary
         // network datapath.
-        let _ = context.stage(metadata, header, payload);
+        let _ = context.stage_with_ancillary(
+            metadata,
+            PacketAncillaryMetadata::canonical(),
+            header,
+            payload,
+        );
+    }
+
+    /// Stages the Linux packet-tap view of one parsed ingress frame.
+    ///
+    /// The ordinary frame path remains allocation-free for an untagged
+    /// packet: the existing driver's header and payload slices are passed
+    /// directly to the bounded broker.  VLAN normalization only needs a
+    /// fourteen-byte stack header because the inline four-byte tag is not
+    /// contiguous with the canonical EtherType field.
+    fn stage_ingress_frame(
+        context: &PacketDeviceContext<'_>,
+        frame: &[u8],
+        parsed: ParsedIngressFrame<'_>,
+        packet_type: LinkPacketType,
+    ) {
+        let mut link_address = [0u8; 8];
+        link_address[..parsed.src_addr.0.len()].copy_from_slice(&parsed.src_addr.0);
+        let metadata = PacketMetadata {
+            interface_index: context.interface_index(),
+            protocol: parsed.protocol,
+            hardware_type: LinkHardwareType::Ethernet,
+            packet_type,
+            link_header_len: ETHERNET_HEADER_LEN as u16,
+            address: link_address,
+            address_len: parsed.src_addr.0.len() as u8,
+        };
+
+        let Some((tci, tpid)) = parsed.vlan else {
+            let (header, payload) = frame.split_at(ETHERNET_HEADER_LEN);
+            let _ = context.stage_with_ancillary(
+                metadata,
+                PacketAncillaryMetadata::canonical(),
+                header,
+                payload,
+            );
+            return;
+        };
+
+        // The first twelve bytes are unchanged; the canonical header exposes
+        // the inner EtherType at the normal Ethernet offset.  The original
+        // receive buffer is never mutated, and the broker copies this bounded
+        // stack header before this function returns.
+        let mut header = [0u8; ETHERNET_HEADER_LEN];
+        header[..12].copy_from_slice(&frame[..12]);
+        header[12..14].copy_from_slice(&parsed.wire_protocol.to_be_bytes());
+        let _ = context.stage_with_ancillary(
+            metadata,
+            PacketAncillaryMetadata::canonical().with_vlan(tci, true, tpid),
+            &header,
+            parsed.payload,
+        );
     }
 
     fn map_dev_error(error: DevError) -> AxError {
@@ -154,6 +305,32 @@ impl EthernetDevice {
             DevError::NoMemory => AxError::NoMemory,
             DevError::ResourceBusy => AxError::ResourceBusy,
             DevError::Unsupported => AxError::Unsupported,
+        }
+    }
+
+    fn quarantine(&mut self) {
+        if self.quarantined {
+            return;
+        }
+        self.quarantined = true;
+        // A terminal queue protocol error is not recoverable by another
+        // readiness arm.  Mask the device IRQ before removing both one-shot
+        // registrations; the raw driver retains the descriptor owners.
+        if let Some(irq) = self.irq {
+            axhal::irq::set_enable(irq, false);
+        }
+        if let Some(token) = self.rx_irq_registration.lock().take() {
+            cancel_irq_waker(token);
+        }
+        if let Some(token) = self.irq_registration.lock().take() {
+            cancel_irq_waker(token);
+        }
+    }
+
+    #[inline]
+    fn note_terminal_error(&mut self, error: AxError) {
+        if matches!(error, AxError::BadState | AxError::Io) {
+            self.quarantine();
         }
     }
 
@@ -251,42 +428,39 @@ impl EthernetDevice {
         buffer: &mut PacketBuffer<()>,
         timestamp: Instant,
     ) -> RxStep {
-        let frame = EthernetFrame::new_unchecked(frame);
-        let Ok(repr) = EthernetRepr::parse(&frame) else {
+        let Ok(parsed) = parse_ingress_frame(frame) else {
             self.stats.record_rx_error();
             self.stats.record_rx_drop();
             warn!("Dropping malformed Ethernet frame");
             return RxStep::Consumed;
         };
 
-        Self::stage_frame(
+        Self::stage_ingress_frame(
             context,
-            &frame,
-            &repr,
-            classify_ethernet_ingress_protocol(u16::from(repr.ethertype), frame.payload()),
-            Self::packet_type(repr.dst_addr, self.hardware_address()),
-            repr.src_addr,
+            frame,
+            parsed,
+            Self::packet_type(parsed.dst_addr, self.hardware_address()),
         );
 
-        if !repr.dst_addr.is_broadcast()
-            && repr.dst_addr != EMPTY_MAC
-            && repr.dst_addr != self.hardware_address()
+        if !parsed.dst_addr.is_broadcast()
+            && parsed.dst_addr != EMPTY_MAC
+            && parsed.dst_addr != self.hardware_address()
         {
             self.stats.record_rx_drop();
             return RxStep::Consumed;
         }
 
-        match repr.ethertype {
+        match EthernetProtocol::from(parsed.wire_protocol) {
             EthernetProtocol::Ipv4 => {
-                let Ok(dst) = buffer.enqueue(frame.payload().len(), ()) else {
+                let Ok(dst) = buffer.enqueue(parsed.payload.len(), ()) else {
                     self.stats.record_rx_drop();
                     return RxStep::Consumed;
                 };
-                dst.copy_from_slice(frame.payload());
+                dst.copy_from_slice(parsed.payload);
                 RxStep::Delivered
             }
             EthernetProtocol::Arp => {
-                self.process_arp(context, frame.payload(), timestamp);
+                self.process_arp(context, parsed.payload, timestamp);
                 RxStep::Consumed
             }
             _ => {
@@ -311,7 +485,7 @@ impl EthernetDevice {
             target_protocol_addr: target_ipv4,
         };
 
-        let _ = Self::send_to(
+        let result = Self::send_to(
             &mut self.inner,
             &mut self.stats,
             context,
@@ -320,6 +494,12 @@ impl EthernetDevice {
             |buf| arp_repr.emit(&mut ArpPacket::new_unchecked(buf)),
             EthernetProtocol::Arp,
         );
+        if let Err(error) = result {
+            self.note_terminal_error(error);
+        }
+        if self.quarantined {
+            return;
+        }
 
         self.neighbors.insert(target_ip, None);
     }
@@ -379,7 +559,7 @@ impl EthernetDevice {
                     target_protocol_addr: source_protocol_addr,
                 };
 
-                let _ = Self::send_to(
+                let result = Self::send_to(
                     &mut self.inner,
                     &mut self.stats,
                     context,
@@ -388,6 +568,12 @@ impl EthernetDevice {
                     |buf| response.emit(&mut ArpPacket::new_unchecked(buf)),
                     EthernetProtocol::Arp,
                 );
+                if let Err(error) = result {
+                    self.note_terminal_error(error);
+                    if self.quarantined {
+                        return;
+                    }
+                }
             }
 
             if self
@@ -408,7 +594,7 @@ impl EthernetDevice {
                         break;
                     }
 
-                    let _ = Self::send_to(
+                    let result = Self::send_to(
                         &mut self.inner,
                         &mut self.stats,
                         context,
@@ -417,6 +603,10 @@ impl EthernetDevice {
                         |b| b.copy_from_slice(buf),
                         EthernetProtocol::Ipv4,
                     );
+                    if let Err(error) = result {
+                        self.note_terminal_error(error);
+                        break;
+                    }
                     let _ = self.pending_packets.dequeue();
                 }
             }
@@ -442,11 +632,19 @@ impl Device for EthernetDevice {
     }
 
     fn has_rx_backlog(&self) -> bool {
-        self.inner.can_receive()
+        !self.quarantined && self.inner.can_receive()
+    }
+
+    fn is_quarantined(&self) -> bool {
+        self.quarantined
     }
 
     fn rx_wake_capable(&self) -> bool {
-        self.irq.is_some()
+        !self.quarantined && self.irq.is_some()
+    }
+
+    fn rx_wake_required(&self) -> bool {
+        true
     }
 
     fn hardware_address(&self) -> Option<[u8; 6]> {
@@ -467,12 +665,16 @@ impl Device for EthernetDevice {
         buffer: &mut PacketBuffer<()>,
         timestamp: Instant,
     ) -> RxStep {
+        if self.quarantined {
+            return RxStep::Idle;
+        }
         let rx_buf = match self.inner.receive() {
             Ok(buf) => buf,
             Err(err) => {
                 if !matches!(err, DevError::Again) {
                     self.stats.record_rx_error();
                     warn!("receive failed: {err:?}");
+                    self.quarantine();
                 }
                 return RxStep::Idle;
             }
@@ -488,6 +690,7 @@ impl Device for EthernetDevice {
         if let Err(err) = self.inner.recycle_rx_buffer(rx_buf) {
             self.stats.record_rx_error();
             warn!("recycle_rx_buffer failed: {err:?}");
+            self.quarantine();
         }
         result
     }
@@ -499,8 +702,11 @@ impl Device for EthernetDevice {
         packet: &[u8],
         timestamp: Instant,
     ) -> bool {
+        if self.quarantined {
+            return false;
+        }
         if next_hop.is_broadcast() || self.ip.broadcast().map(IpAddress::Ipv4) == Some(next_hop) {
-            let _ = Self::send_to(
+            let result = Self::send_to(
                 &mut self.inner,
                 &mut self.stats,
                 &context,
@@ -509,13 +715,16 @@ impl Device for EthernetDevice {
                 |buf| buf.copy_from_slice(packet),
                 EthernetProtocol::Ipv4,
             );
+            if let Err(error) = result {
+                self.note_terminal_error(error);
+            }
             return false;
         }
 
         let need_request = match self.neighbors.get(&next_hop) {
             Some(Some(neighbor)) => {
                 if neighbor.expires_at > timestamp {
-                    let _ = Self::send_to(
+                    let result = Self::send_to(
                         &mut self.inner,
                         &mut self.stats,
                         &context,
@@ -524,6 +733,9 @@ impl Device for EthernetDevice {
                         |buf| buf.copy_from_slice(packet),
                         EthernetProtocol::Ipv4,
                     );
+                    if let Err(error) = result {
+                        self.note_terminal_error(error);
+                    }
                     return false;
                 } else {
                     true
@@ -557,7 +769,10 @@ impl Device for EthernetDevice {
         request: PacketSendRequest<'_>,
         _timestamp: Instant,
     ) -> AxResult<PacketSendProgress> {
-        match request {
+        if self.quarantined {
+            return Err(AxError::BadState);
+        }
+        let result = match request {
             PacketSendRequest::Raw { protocol, frame } => {
                 let header_len = EthernetFrame::<&[u8]>::header_len();
                 if frame.len() < header_len || frame.len() > STANDARD_MTU + header_len {
@@ -598,11 +813,17 @@ impl Device for EthernetDevice {
                     EthernetProtocol::from(protocol),
                 )
             }
+        };
+        if let Err(error) = result {
+            self.note_terminal_error(error);
         }
-        .map(|()| PacketSendProgress::NoImmediateIngress)
+        result.map(|()| PacketSendProgress::NoImmediateIngress)
     }
 
     fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+        if self.quarantined {
+            return Ok(());
+        }
         let Some(irq) = self.irq else {
             return Ok(());
         };
@@ -630,15 +851,18 @@ impl Device for EthernetDevice {
         Ok(())
     }
 
-    fn register_rx_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+    fn register_rx_waker(&self, waker: &Waker) -> Result<RxWakeSource, PollRegistrationError> {
+        if self.quarantined {
+            return Ok(RxWakeSource::Unavailable);
+        }
         let Some(irq) = self.irq else {
-            return Ok(());
+            return Ok(RxWakeSource::Unavailable);
         };
 
         let mut registration = self.rx_irq_registration.lock();
         if let Some(token) = *registration {
             match update_irq_waker(token, waker) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(RxWakeSource::Armed),
                 Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
                     *registration = None;
                 }
@@ -655,16 +879,19 @@ impl Device for EthernetDevice {
         }
 
         *registration = Some(register_irq_waker(irq, waker).map_err(map_irq_register_error)?);
-        Ok(())
+        Ok(RxWakeSource::Armed)
     }
 
     fn stop_rx_waker(&self) {
         if let Some(irq) = self.irq {
-            // Teardown masks the source before cancelling its one-shot
-            // registration, so no final interrupt can race token removal.
+            // Teardown or source quarantine masks before cancelling every
+            // one-shot registration, so no final interrupt can race removal.
             axhal::irq::set_enable(irq, false);
         }
         if let Some(token) = self.rx_irq_registration.lock().take() {
+            cancel_irq_waker(token);
+        }
+        if let Some(token) = self.irq_registration.lock().take() {
             cancel_irq_waker(token);
         }
     }
@@ -697,8 +924,124 @@ impl Drop for EthernetDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        vec::Vec,
+    };
+
     use super::*;
-    use crate::packet::{PacketBroker, PacketProtocol, PacketSelector, PacketView};
+    use crate::packet::{
+        PacketBroker, PacketFilter, PacketFilterContext, PacketProtocol, PacketSelector, PacketView,
+    };
+
+    fn vlan_frame(tpid: u16, tci: u16, inner_protocol: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + VLAN_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&[2, 1, 2, 3, 4, 5]);
+        frame.extend_from_slice(&[0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6]);
+        frame.extend_from_slice(&tpid.to_be_bytes());
+        frame.extend_from_slice(&tci.to_be_bytes());
+        frame.extend_from_slice(&inner_protocol.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn ingress_vlan_view_strips_one_tag_and_preserves_inner_protocol() {
+        let frame = vlan_frame(ETHERTYPE_8021Q, 0x0064, 0x0800, &[0x45, 0, 1, 2]);
+        let parsed = parse_ingress_frame(&frame).unwrap();
+        assert_eq!(parsed.wire_protocol, 0x0800);
+        assert_eq!(parsed.protocol, 0x0800);
+        assert_eq!(parsed.payload, &[0x45, 0, 1, 2]);
+        assert_eq!(parsed.vlan, Some((0x0064, ETHERTYPE_8021Q)));
+
+        let broker = PacketBroker::try_new().unwrap();
+        let raw = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::Exact(0x0800),
+                Some(1),
+                PacketView::Raw,
+                true,
+            ))
+            .unwrap();
+        let filter_seen = Arc::new(AtomicBool::new(false));
+        raw.set_filter(Some(Arc::new(VlanFilter(Arc::clone(&filter_seen)))))
+            .unwrap();
+        let cooked = broker
+            .subscribe(PacketSelector::new(
+                PacketProtocol::Exact(0x0800),
+                Some(1),
+                PacketView::Cooked,
+                true,
+            ))
+            .unwrap();
+        let context = PacketDeviceContext::new(1, &broker, None);
+        stage_ingress_for_test(&context, &frame, parsed);
+        broker.drain_staged();
+
+        let raw_record = raw.try_receive(false).unwrap();
+        assert_eq!(
+            raw_record.data(),
+            &[
+                2, 1, 2, 3, 4, 5, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0x08, 0x00, 0x45, 0, 1, 2
+            ]
+        );
+        assert_eq!(raw_record.wire_len(), 18);
+        assert_eq!(raw_record.metadata().protocol, 0x0800);
+        assert_eq!(raw_record.metadata().link_header_len, 14);
+        assert_eq!(cooked.try_receive(false).unwrap().data(), &[0x45, 0, 1, 2]);
+        assert!(filter_seen.load(Ordering::Acquire));
+    }
+
+    struct VlanFilter(Arc<AtomicBool>);
+
+    impl PacketFilter for VlanFilter {
+        fn filter(&self, packet: &[u8], context: PacketFilterContext<'_>) -> AxResult<usize> {
+            if packet.get(12..14) == Some(&[0x08, 0x00])
+                && context.metadata().protocol == 0x0800
+                && context.metadata().link_header_len == ETHERNET_HEADER_LEN as u16
+                && context.ancillary().vlan() == (0x0064, true, ETHERTYPE_8021Q)
+            {
+                self.0.store(true, Ordering::Release);
+            }
+            Ok(packet.len())
+        }
+    }
+
+    // Keep the test on the same staging helper used by `handle_frame` while
+    // avoiding an Ethernet driver allocation in this parser-focused unit
+    // test.
+    fn stage_ingress_for_test(
+        context: &PacketDeviceContext<'_>,
+        frame: &[u8],
+        parsed: ParsedIngressFrame<'_>,
+    ) {
+        EthernetDevice::stage_ingress_frame(context, frame, parsed, LinkPacketType::Host);
+    }
+
+    #[test]
+    fn ingress_vlan_parser_bounds_truncation_and_double_tags() {
+        let mut truncated = vec![0u8; ETHERNET_HEADER_LEN + 1];
+        truncated[12..14].copy_from_slice(&ETHERTYPE_8021Q.to_be_bytes());
+        assert_eq!(
+            parse_ingress_frame(&truncated),
+            Err(IngressFrameError::TruncatedVlan)
+        );
+
+        let double = vlan_frame(
+            ETHERTYPE_8021AD,
+            0x0123,
+            ETHERTYPE_8021Q,
+            &[0x00, 0x2a, 0x08, 0x00],
+        );
+        let parsed = parse_ingress_frame(&double).unwrap();
+        assert_eq!(parsed.wire_protocol, ETHERTYPE_8021Q);
+        assert_eq!(parsed.protocol, ETHERTYPE_8021Q);
+        assert_eq!(parsed.payload, &[0x00, 0x2a, 0x08, 0x00]);
+        assert_eq!(parsed.vlan, Some((0x0123, ETHERTYPE_8021AD)));
+    }
 
     #[test]
     fn zero_destination_is_not_classified_as_local_host_metadata() {
