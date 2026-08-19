@@ -462,6 +462,42 @@ static int check_zero(const unsigned char *buffer, size_t length,
     return check_fill(buffer, length, 0, stage);
 }
 
+/* iomap direct-I/O short reads may preserve destination bytes after the CQE
+ * length or clear the aligned tail.  Accept only those two uniform Linux-
+ * visible states; mixed data is not a valid short-read oracle. */
+static int check_short_read_tail(const unsigned char *buffer, size_t length,
+                                 const char **behavior, const char *stage) {
+    int preserved = 1;
+    int zeroed = 1;
+    size_t first_mismatch = 0;
+    unsigned char mismatch_value = 0;
+    for (size_t index = 0; index < length; ++index) {
+        unsigned char value = buffer[index];
+        if (value != 0xcc && preserved) {
+            first_mismatch = index;
+            mismatch_value = value;
+            preserved = 0;
+        }
+        if (value != 0) {
+            zeroed = 0;
+        }
+    }
+    if (preserved) {
+        *behavior = "preserved";
+        return 0;
+    }
+    if (zeroed) {
+        *behavior = "zeroed";
+        return 0;
+    }
+    errno = EIO;
+    fprintf(stderr,
+            "THEKERNEL_IO_URING_DIRECTIO_FAIL stage=%s first_mismatch=%zu "
+            "actual=0x%02x expected=uniform-0xcc-or-uniform-0 errno=%d (%s)\n",
+            stage, first_mismatch, mismatch_value, errno, strerror(errno));
+    return 1;
+}
+
 static void print_boundary(const char *name, int32_t result, int expected) {
     fprintf(stderr,
             "io_uring_directio: linux_host=%d %s result=%d expected=%d\n",
@@ -544,13 +580,23 @@ static int test_eof_and_short(struct ring *ring, int file,
                     "short-read") != 0) {
         return 1;
     }
-    if (short_result != (int32_t)DIRECT_BLOCK ||
-        check_fill(buffer, DIRECT_BLOCK, 'C', "short-read-content") != 0 ||
-        check_fill(buffer + DIRECT_BLOCK, page_bytes - DIRECT_BLOCK, 0xcc,
-                   "short-read-tail") != 0) {
+    if (short_result != (int32_t)DIRECT_BLOCK) {
         return fail_result("short-read", short_result, DIRECT_BLOCK);
     }
+    if (check_fill(buffer, DIRECT_BLOCK, 'C', "short-read-content") != 0) {
+        return 1;
+    }
+    const char *tail_behavior = NULL;
+    if (check_short_read_tail(buffer + DIRECT_BLOCK,
+                              page_bytes - DIRECT_BLOCK, &tail_behavior,
+                              "short-read-tail") != 0) {
+        return 1;
+    }
     print_boundary("short_read", short_result, DIRECT_BLOCK);
+    fprintf(stderr,
+            "io_uring_directio: linux_host=%d short_read_tail=%s bytes=%zu\n",
+            linux_host, tail_behavior, page_bytes - DIRECT_BLOCK);
+    puts("THEKERNEL_IO_URING_DIRECTIO_SHORT_READ_TAIL_CHECKED");
     puts("THEKERNEL_IO_URING_DIRECTIO_SHORT_READ_OK");
     return 0;
 }

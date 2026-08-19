@@ -118,6 +118,14 @@ for boundary in alignment_address alignment_length alignment_offset eof_exact eo
         fail_run "boundary_count_mismatch=${boundary}"
     fi
 done
+short_tail_total=$(grep -c \
+    '^io_uring_directio: linux_host=1 short_read_tail=' "$LOG" || true)
+short_tail_valid=$(grep -Ec \
+    '^io_uring_directio: linux_host=1 short_read_tail=(preserved|zeroed) bytes=[0-9]+$' \
+    "$LOG" || true)
+if [ "$short_tail_total" -ne 1 ] || [ "$short_tail_valid" -ne 1 ]; then
+    fail_run 'short-read-tail-oracle-missing-or-invalid=1'
+fi
 fragmented_physical=$(grep -c \
     '^THEKERNEL_IO_URING_DIRECTIO_FRAGMENTED_EXTENT_PHYSICAL_SG_OK$' "$LOG" || true)
 fragmented_unsupported=$(grep -c \
