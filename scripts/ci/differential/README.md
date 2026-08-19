@@ -2,10 +2,10 @@
 
 This directory hosts the shared machinery for TheKernel's Linux-ABI
 differential cases. A case is a portable C smoke program whose observable
-behavior is first pinned against a host Linux kernel (the reference oracle)
-and later replayed inside the TheKernel guest. The host runners here produce
-auditable evidence: a bounded log, a `result.txt` verdict, and a
-`receipt.json` conforming to `thekernel-differential-receipt-v0`.
+behavior is checked against a host Linux kernel (the reference oracle) and can
+then be replayed inside the TheKernel guest. The host runners here produce a
+bounded log, a `result.txt` verdict, and, where useful, a `receipt.json`
+conforming to `thekernel-differential-receipt-v0`.
 
 Contents:
 
@@ -97,11 +97,13 @@ Every executed run writes `<workdir>/receipt.json`:
 }
 ```
 
-Portable runners refuse a dirty checkout, freeze their C source and marker
-manifest directly from `git_rev`, execute that frozen source, and revalidate
-the repository revision and cleanliness immediately before publishing the
-receipt. Thus `git_rev` identifies the exact input bytes rather than merely
-describing whichever commit happened to be checked out near the run.
+The working-tree portable host runners (for example `vfork`,
+`signal-mask-alias`, `io-uring-directio`, and `proc-zombie`) compile their C
+source and marker manifest directly. Their receipts include SHA-256 records
+under `source_inputs`, so the input bytes actually used by a run remain
+identifiable even when the personal project checkout is dirty. `git_rev` is
+retained as repository context, not as a claim that it identifies uncommitted
+input bytes.
 
 `epoll` has an explicit guest capability boundary. Host Linux is checked
 against `epoll.markers`, including real `EPOLLEXCLUSIVE` wake selection. The

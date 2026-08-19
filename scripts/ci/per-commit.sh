@@ -592,6 +592,10 @@ ci_run_step axcbpf-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axcbpf --all-targets
+ci_run_step axrcu-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo +1.85.0 test --locked --manifest-path "$AX_REPO/Cargo.toml" \
+    -p thekernel-axrcu --all-targets
 ci_run_step axfault-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \

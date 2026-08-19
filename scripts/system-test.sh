@@ -118,6 +118,13 @@ fi
 WORKDIR=$(ci_prepare_owned_run_dir \
     "system-test-$ARCH" "$WORKDIR" "$REPO_ROOT" "$THEKERNEL_STATE_DIR")
 set +e
+# QEMU 10 can probe io_uring for its fd monitor even though every disk uses
+# the deterministic aio=threads backend.  Under a small non-zero memlock
+# limit that probe may abort QEMU instead of falling back.  A zero child limit
+# makes the unsupported probe fail deterministically and selects epoll; keep
+# the parent shell and the benchmark pinner's independently recorded policy
+# unchanged.
+ulimit -l 0
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m tools.qemu_runner run \
         --arch x86_64 \
@@ -162,10 +169,9 @@ for marker in \
     THEKERNEL_SYSTEM_TEST_PROCESS_OK \
     THEKERNEL_EXEC_SMOKE_OK \
     THEKERNEL_SYSTEM_TEST_EXEC_OK \
-    THEKERNEL_VFORK_EXIT_OK \
-    THEKERNEL_VFORK_EXEC_OK \
-    THEKERNEL_VFORK_OK \
     THEKERNEL_SYSTEM_TEST_VFORK_OK \
+    CI_SIGNAL_MASK_ALIAS_PASS \
+    THEKERNEL_SYSTEM_TEST_SIGNAL_MASK_ALIAS_OK \
     "THEKERNEL_RSEQ_AUXV_OK feature_size=24 align=32" \
     THEKERNEL_RSEQ_REGISTRATION_OK \
     THEKERNEL_RSEQ_FIRST_TOUCH_OK \
@@ -207,8 +213,11 @@ for marker in \
     CI_WAIT_BOUNDARY_PASS \
     THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK \
     THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_FUTEX2_WAITV_SIGNAL_DIFFERENTIAL_OK \
     THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK \
     THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_IO_URING_DIRECTIO_DIFFERENTIAL_OK \
+    THEKERNEL_SYSTEM_TEST_PROC_ZOMBIE_DIFFERENTIAL_OK \
     THEKERNEL_SIGNAL_FP_OK \
     THEKERNEL_SYSTEM_TEST_SIGNAL_FP_OK \
     THEKERNEL_IO_URING_OK \
@@ -244,6 +253,8 @@ for marker in \
     THEKERNEL_PACKET_SEND_FLAGS_OK \
     THEKERNEL_PACKET_SEND_OK \
     THEKERNEL_PACKET_OPTIONS_OK \
+    THEKERNEL_PACKET_CBPF_METADATA_OK \
+    THEKERNEL_PACKET_CBPF_OK \
     THEKERNEL_PACKET_OK \
     THEKERNEL_SYSTEM_TEST_PACKET_OK \
     THEKERNEL_SECCOMP_API_OK \
@@ -285,8 +296,13 @@ done
 
 for manifest in \
     "$REPO_ROOT/scripts/ci/differential/manifests/futex.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/futex2-waitv-signal.markers" \
     "$REPO_ROOT/scripts/ci/differential/manifests/epoll-guest.markers" \
-    "$REPO_ROOT/scripts/ci/differential/manifests/signal-order.markers"
+    "$REPO_ROOT/scripts/ci/differential/manifests/signal-order.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/vfork.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/signal-mask-alias.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/io-uring-directio.markers" \
+    "$REPO_ROOT/scripts/ci/differential/manifests/proc-zombie.markers"
 do
     while IFS= read -r marker; do
         case "$marker" in
@@ -300,7 +316,7 @@ do
     done <"$manifest"
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_FUTEX_FAIL|THEKERNEL_EPOLL_FAIL|THEKERNEL_SIGORDER_FAIL|THEKERNEL_SIGNAL_FP_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_IO_URING_BUFFERS_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|THEKERNEL_IOPRIO_FAIL|THEKERNEL_MEMBARRIER_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|CI_SIGNAL_WAIT_BOUNDARY_FAIL|CI_SIGNAL_MASK_ALIAS_FAIL|CI_WAIT_BOUNDARY_FAIL|THEKERNEL_FUTEX_FAIL|THEKERNEL_FUTEX2_WAITV_SIGNAL_FAIL|THEKERNEL_EPOLL_FAIL|THEKERNEL_SIGORDER_FAIL|THEKERNEL_SIGNAL_FP_FAIL|THEKERNEL_IO_URING_FAIL|THEKERNEL_IO_URING_BUFFERS_FAIL|THEKERNEL_IO_URING_DIRECTIO_FAIL|THEKERNEL_PROC_ZOMBIE_FAIL|THEKERNEL_USERFAULTFD_FAIL|THEKERNEL_PACKET_FAIL|THEKERNEL_SECCOMP_FAIL|THEKERNEL_IOPRIO_FAIL|THEKERNEL_MEMBARRIER_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

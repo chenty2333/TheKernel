@@ -117,8 +117,9 @@ jobs:
           include-hidden-files: true
 
   # These portable cases need no elevated host capability. Run each against
-  # the bare hosted Linux kernel, publish its source-exact receipt, and replay
-  # the same C source in the x86_64 semantic rootfs below.
+  # the bare hosted Linux kernel and retain the working-tree source hashes in
+  # the receipt so a local dirty checkout cannot accidentally claim a stale
+  # committed input.
   host-portable-differentials:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -127,8 +128,13 @@ jobs:
       matrix:
         case:
           - futex
+          - futex2-waitv-signal
           - epoll
           - signal-order
+          - vfork
+          - signal-mask-alias
+          - io-uring-directio
+          - proc-zombie
     steps:
       - name: Checkout
         uses: actions/checkout@v6

@@ -24,6 +24,15 @@
 #ifndef SYS_clone
 #define SYS_clone 56
 #endif
+#ifndef SYS_exit
+#define SYS_exit 60
+#endif
+#ifndef SYS_sched_setscheduler
+#define SYS_sched_setscheduler 144
+#endif
+#ifndef SYS_sched_getscheduler
+#define SYS_sched_getscheduler 145
+#endif
 
 #ifndef CLONE_IO
 #define CLONE_IO 0x80000000ULL
@@ -71,6 +80,17 @@ static long ioprio_get_call(unsigned int which, int who)
 static long ioprio_set_call(unsigned int which, int who, unsigned int value)
 {
     return syscall(SYS_ioprio_set, which, who, value);
+}
+
+static long sched_setscheduler_call(pid_t pid, int policy,
+                                    const struct sched_param *param)
+{
+    return syscall(SYS_sched_setscheduler, pid, policy, param);
+}
+
+static long sched_getscheduler_call(pid_t pid)
+{
+    return syscall(SYS_sched_getscheduler, pid);
 }
 
 static int expect_get(const char *stage, unsigned int which, int who,
@@ -285,10 +305,19 @@ static int test_zombie_group_scheduler(void)
         return fail("zombie-group-fork");
     }
     if (child == 0) {
-        if (setpgid(0, 0) != 0 ||
-            setpriority(PRIO_PROCESS, 0, 19) != 0 ||
-            sched_setscheduler(0, SCHED_IDLE, &param) != 0) {
-            _exit(1);
+        if (setpgid(0, 0) != 0) {
+            _exit(fail("zombie-group-child-setpgid"));
+        }
+        if (setpriority(PRIO_PROCESS, 0, 19) != 0) {
+            _exit(fail("zombie-group-child-setpriority"));
+        }
+        if (sched_setscheduler_call(0, SCHED_IDLE, &param) != 0) {
+            _exit(fail("zombie-group-child-sched-setscheduler"));
+        }
+        int policy = (int)sched_getscheduler_call(0);
+        if (policy != SCHED_IDLE) {
+            _exit(fail_value("zombie-group-child-sched-getscheduler",
+                             policy, SCHED_IDLE));
         }
         _exit(0);
     }
@@ -297,6 +326,15 @@ static int test_zombie_group_scheduler(void)
     if (waitid(P_PID, child, &info, WEXITED | WNOWAIT) != 0) {
         (void)waitpid(child, NULL, 0);
         return fail("zombie-group-waitid");
+    }
+    if (info.si_code != CLD_EXITED) {
+        (void)waitpid(child, NULL, 0);
+        return fail_value("zombie-group-child-code", info.si_code,
+                          CLD_EXITED);
+    }
+    if (info.si_status != 0) {
+        (void)waitpid(child, NULL, 0);
+        return fail_value("zombie-group-child-status", info.si_status, 0);
     }
     if (expect_get("zombie-group-idle", IOPRIO_WHO_PGRP, (int)child,
                    ioprio_value(IOPRIO_CLASS_IDLE, 7))) {
@@ -312,6 +350,48 @@ static int test_zombie_group_scheduler(void)
 struct exec_oldtid_args {
     const char *self;
 };
+
+/*
+ * The glibc clone() wrapper rejects CLONE_THREAD for this static helper.  A
+ * raw clone syscall returns in the child at the supplied stack pointer, so
+ * place the function and argument there and finish the child with _exit's
+ * syscall ABI rather than depending on a libc/pthread trampoline.
+ */
+static __attribute__((noinline, noclone)) long
+raw_clone_thread(unsigned long flags, void *child_stack)
+{
+    long result;
+
+    __asm__ volatile(
+        "mov %[flags], %%rdi\n\t"
+        "mov %[child_stack], %%rsi\n\t"
+        "xor %%edx, %%edx\n\t"
+        "xor %%r10d, %%r10d\n\t"
+        "xor %%r8d, %%r8d\n\t"
+        "mov %[sys_clone], %%eax\n\t"
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jnz 1f\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdi\n\t"
+        "call *%%rsi\n\t"
+        "mov %%eax, %%edi\n\t"
+        "mov %[sys_exit], %%eax\n\t"
+        "syscall\n\t"
+        "ud2\n\t"
+        "1:\n\t"
+        : "=a"(result)
+        : [flags] "r"(flags), [child_stack] "r"(child_stack),
+          [sys_clone] "i"(SYS_clone), [sys_exit] "i"(SYS_exit)
+        : "cc", "rcx", "rdi", "rsi", "rdx", "r8", "r10", "r11",
+          "memory");
+
+    if (result < 0) {
+        errno = (int)-result;
+        return -1;
+    }
+    return result;
+}
 
 static int exec_oldtid_thread(void *opaque)
 {
@@ -358,18 +438,31 @@ static int test_exec_oldtid(const char *self)
         void *stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         struct exec_oldtid_args args = { .self = self };
-        int thread;
+        uintptr_t *thread_stack;
+        pid_t thread;
 
         if (stack == MAP_FAILED) {
             _exit(1);
         }
-        thread = clone(exec_oldtid_thread, (char *)stack + STACK_SIZE,
-                       CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-                           CLONE_THREAD | CLONE_SYSVSEM,
-                       &args);
+        /*
+         * The raw child begins with rsp at thread_stack.  Keep that entry
+         * point 16-byte aligned; after the two pops below, the call-site rsp
+         * is aligned for the SysV ABI and the callee owns its own red zone.
+         */
+        thread_stack = (uintptr_t *)((uintptr_t)stack + STACK_SIZE);
+        thread_stack = (uintptr_t *)((uintptr_t)thread_stack & ~(uintptr_t)0xf);
+        *--thread_stack = (uintptr_t)&args;
+        *--thread_stack = (uintptr_t)exec_oldtid_thread;
+        thread = (pid_t)raw_clone_thread(
+            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                CLONE_THREAD | CLONE_SYSVSEM,
+            thread_stack);
         if (thread < 0) {
+            int saved_errno = errno;
+
             munmap(stack, STACK_SIZE);
-            _exit(1);
+            errno = saved_errno;
+            _exit(fail("exec-oldtid-clone"));
         }
         /* A non-leader exec terminates the other thread.  If the exec path
          * unexpectedly fails, bound the supervisor rather than hanging the

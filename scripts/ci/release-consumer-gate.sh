@@ -30,6 +30,7 @@ AX_PACKAGES=(
     thekernel-axpmu
     thekernel-axtask
     thekernel-axtlb
+    thekernel-axrcu
 )
 LINUX_ABI_PACKAGES=(
     thekernel-linux-usercopy
@@ -52,6 +53,7 @@ CONSUMED_PACKAGES=(
     thekernel-axpmu
     thekernel-axtask
     thekernel-axtlb
+    thekernel-axrcu
     thekernel-linux-usercopy
     thekernel-linux-rseq
     thekernel-linux-cred
@@ -311,7 +313,8 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
             -p thekernel-axfault \
             -p thekernel-axpmu \
             -p thekernel-axtask \
-            -p thekernel-axtlb
+            -p thekernel-axtlb \
+            -p thekernel-axrcu
 )
 
 # `cargo package --no-verify` still resolves registry dependencies while it
@@ -496,6 +499,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-$VERSION" \
+    --replace "../thekernel-ax/crates/thekernel-axrcu=../artifacts/thekernel-axrcu-$VERSION" \
     --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
     --replace "../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-$VERSION" \
     --replace "../thekernel-linux-abi/crates/packet=../artifacts/thekernel-linux-packet-$VERSION" \
@@ -632,7 +636,7 @@ release_set_tmp="$OUTPUT_RELEASE_SET.tmp.$$"
     printf 'package\tversion\tsha256\trepository_head\n'
     for package in "${all_packages[@]}"; do
         case "$package" in
-            thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb)
+            thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb|thekernel-axrcu)
                 repo_head=$AX_HEAD
                 ;;
             *)

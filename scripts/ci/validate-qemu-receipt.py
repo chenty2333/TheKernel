@@ -241,6 +241,20 @@ def validate(args: argparse.Namespace) -> None:
             require(extra_before == extra_after, "read-only extra block changed during QEMU")
         extra_block = Drive(Path(extra_runtime_path), extra_mode)
 
+    accel = receipt.get("accel")
+    cpu = receipt.get("cpu")
+    iothread_id = receipt.get("iothread_id")
+    extra_args = receipt.get("extra_args", [])
+    require(accel is None or isinstance(accel, str), "invalid receipt accelerator")
+    require(cpu is None or isinstance(cpu, str), "invalid receipt CPU model")
+    require(
+        iothread_id is None or isinstance(iothread_id, str),
+        "invalid receipt iothread id",
+    )
+    require(
+        isinstance(extra_args, list) and all(isinstance(value, str) for value in extra_args),
+        "invalid receipt extra QEMU arguments",
+    )
     expected_command = list(
         build_qemu_command(
             arch=args.arch,
@@ -254,6 +268,10 @@ def validate(args: argparse.Namespace) -> None:
             memory=args.memory,
             cpus=args.cpus,
             qemu_binary=qemu_path,
+            accel=accel,
+            cpu=cpu,
+            iothread_id=iothread_id,
+            extra_args=tuple(extra_args),
         )
     )
     command = receipt.get("command")

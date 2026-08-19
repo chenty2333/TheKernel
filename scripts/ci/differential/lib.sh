@@ -302,9 +302,12 @@ PY
 
 # Writes RECEIPT per the thekernel-differential-receipt-v0 schema:
 #   differential_write_receipt RECEIPT CASE REPO_ROOT EXPECTED MATCHED \
-#       APPLIED_JSONL RESULT
+#       APPLIED_JSONL RESULT [SOURCE_INPUT ...]
 # APPLIED_JSONL may be absent; duplicate applications are collapsed. RESULT
-# must be "pass" or "fail".
+# must be "pass" or "fail".  When SOURCE_INPUT paths are supplied, their
+# bytes are hashed at receipt creation and recorded as source_inputs.  This is
+# the working-tree path used by current host runners; it deliberately does
+# not claim that git_rev alone identifies a dirty checkout's input bytes.
 differential_write_receipt() {
     local receipt=$1
     local case_name=$2
@@ -313,6 +316,8 @@ differential_write_receipt() {
     local matched=$5
     local applied_jsonl=$6
     local result=$7
+    shift 7
+    local source_inputs=("$@")
     local git_rev
     local kernel_release
     local version_line
@@ -323,7 +328,8 @@ differential_write_receipt() {
     cc_line=$(cc --version | sed -n 1p)
     python3 - "$receipt" "$case_name" "$git_rev" "$kernel_release" \
         "$version_line" "$cc_line" "$expected" "$matched" "$applied_jsonl" \
-        "$result" <<'PY'
+        "$result" "$repo_root" "${source_inputs[@]}" <<'PY'
+import hashlib
 import json
 import os
 import sys
@@ -339,7 +345,9 @@ import sys
     matched,
     applied_path,
     result,
-) = sys.argv[1:11]
+    repo_root,
+) = sys.argv[1:12]
+input_paths = sys.argv[12:]
 if result not in ("pass", "fail"):
     raise SystemExit(f"differential: invalid receipt result: {result!r}")
 
@@ -358,6 +366,24 @@ if applied_path and os.path.exists(applied_path):
             seen.add(key)
             applied.append(entry)
 
+source_inputs = []
+repo_root = os.path.realpath(repo_root)
+for input_path in input_paths:
+    resolved = os.path.realpath(input_path)
+    try:
+        relative = os.path.relpath(resolved, repo_root)
+    except ValueError as error:
+        raise SystemExit(f"differential: source input is not in repository: {input_path}") from error
+    if relative == ".." or relative.startswith("../"):
+        raise SystemExit(f"differential: source input is not in repository: {input_path}")
+    if not os.path.isfile(resolved):
+        raise SystemExit(f"differential: source input is not a file: {input_path}")
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    source_inputs.append({"path": relative, "sha256": digest.hexdigest()})
+
 document = {
     "schema": "thekernel-differential-receipt-v0",
     "case": case_name,
@@ -373,6 +399,8 @@ document = {
     "allowlist_applied": applied,
     "result": result,
 }
+if source_inputs:
+    document["source_inputs"] = source_inputs
 with open(receipt, "w", encoding="utf-8") as sink:
     json.dump(document, sink, indent=2)
     sink.write("\n")

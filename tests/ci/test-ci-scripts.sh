@@ -16,6 +16,16 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
 done
 bash -n "$0"
 
+# Rootfs ext4 images must not inherit host mke2fs defaults.  In particular,
+# metadata_csum_seed is outside lwext4's supported incompat feature mask.
+rootfs_builder="$REPO_ROOT/scripts/build-rootfs.sh"
+grep -Fq 'MKE2FS_CONFIG="$WORK_ROOT/mke2fs.conf"' "$rootfs_builder"
+grep -Fq 'export MKE2FS_CONFIG' "$rootfs_builder"
+grep -Fq 'base_features = none' "$rootfs_builder"
+grep -Fq \
+    'features = none,has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum,^metadata_csum_seed,^orphan_file' \
+    "$rootfs_builder"
+
 # The host and pinned Debian developer container must never execute artifacts
 # from the same primary or maintained-sibling Cargo target. This is a static
 # contract test because the remainder of this file deliberately stays
@@ -38,6 +48,8 @@ grep -Fq -- '-p thekernel-axpmu --all-targets' "$CI_DIR/per-commit.sh"
 grep -Fq -- 'bpf,asid-switch-diagnostics,pmu-diagnostics' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step axcbpf-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-axcbpf' "$CI_DIR/per-commit.sh"
+grep -Fq 'ci_run_step axrcu-core-tests' "$CI_DIR/per-commit.sh"
+grep -Fq -- '-p thekernel-axrcu --all-targets' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step seccomp-core-tests' "$CI_DIR/per-commit.sh"
 grep -Fq -- '-p thekernel-linux-seccomp' "$CI_DIR/per-commit.sh"
 grep -Fq 'ci_run_step kernel-seccomp-adapter-tests' "$CI_DIR/per-commit.sh"
@@ -892,8 +904,13 @@ mkdir -p \
 cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
 cp "$CI_DIR/lib.sh" "$system_fixture/scripts/ci/"
 cp "$CI_DIR/differential/manifests/futex.markers" \
+    "$CI_DIR/differential/manifests/futex2-waitv-signal.markers" \
     "$CI_DIR/differential/manifests/epoll-guest.markers" \
     "$CI_DIR/differential/manifests/signal-order.markers" \
+    "$CI_DIR/differential/manifests/vfork.markers" \
+    "$CI_DIR/differential/manifests/signal-mask-alias.markers" \
+    "$CI_DIR/differential/manifests/io-uring-directio.markers" \
+    "$CI_DIR/differential/manifests/proc-zombie.markers" \
     "$system_fixture/scripts/ci/differential/manifests/"
 printf fixture >"$system_fixture/kernel-x86_64"
 printf fixture >"$system_fixture/.state/rootfs/rootfs-x86.img"
@@ -936,10 +953,9 @@ THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK
 THEKERNEL_SYSTEM_TEST_PROCESS_OK
 THEKERNEL_EXEC_SMOKE_OK
 THEKERNEL_SYSTEM_TEST_EXEC_OK
-THEKERNEL_VFORK_EXIT_OK
-THEKERNEL_VFORK_EXEC_OK
-THEKERNEL_VFORK_OK
 THEKERNEL_SYSTEM_TEST_VFORK_OK
+CI_SIGNAL_MASK_ALIAS_PASS
+THEKERNEL_SYSTEM_TEST_SIGNAL_MASK_ALIAS_OK
 THEKERNEL_RSEQ_AUXV_OK feature_size=24 align=32
 THEKERNEL_RSEQ_REGISTRATION_OK
 THEKERNEL_RSEQ_FIRST_TOUCH_OK
@@ -987,13 +1003,21 @@ MARKERS_AFTER_WAIT
 fixture_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cat \
     "$fixture_root/scripts/ci/differential/manifests/futex.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/futex2-waitv-signal.markers" \
     "$fixture_root/scripts/ci/differential/manifests/epoll-guest.markers" \
     "$fixture_root/scripts/ci/differential/manifests/signal-order.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/vfork.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/signal-mask-alias.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/io-uring-directio.markers" \
+    "$fixture_root/scripts/ci/differential/manifests/proc-zombie.markers" \
     >>"$workdir/console.log"
 cat >>"$workdir/console.log" <<'MARKERS_AFTER_DIFFERENTIAL'
 THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_FUTEX2_WAITV_SIGNAL_DIFFERENTIAL_OK
 THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK
 THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_IO_URING_DIRECTIO_DIFFERENTIAL_OK
+THEKERNEL_SYSTEM_TEST_PROC_ZOMBIE_DIFFERENTIAL_OK
 THEKERNEL_SIGNAL_FP_OK
 THEKERNEL_SYSTEM_TEST_SIGNAL_FP_OK
 THEKERNEL_IO_URING_OK

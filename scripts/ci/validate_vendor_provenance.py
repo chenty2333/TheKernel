@@ -34,6 +34,7 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-axpmu": ("../thekernel-ax/crates/thekernel-axpmu", "0.1.0"),
     "thekernel-axtask": ("../thekernel-ax/crates/thekernel-axtask", "0.1.0"),
     "thekernel-axtlb": ("../thekernel-ax/crates/thekernel-axtlb", "0.1.0"),
+    "thekernel-axrcu": ("../thekernel-ax/crates/thekernel-axrcu", "0.1.0"),
     "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
     "thekernel-linux-fd": ("../thekernel-linux-abi/crates/fd", "0.1.0"),
     "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
@@ -54,6 +55,7 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-axpmu": ("ax", Path("crates/thekernel-axpmu")),
     "thekernel-axtask": ("ax", Path("crates/thekernel-axtask")),
     "thekernel-axtlb": ("ax", Path("crates/thekernel-axtlb")),
+    "thekernel-axrcu": ("ax", Path("crates/thekernel-axrcu")),
     "thekernel-linux-vfs": ("linux-abi", Path("crates/vfs")),
     "thekernel-linux-fd": ("linux-abi", Path("crates/fd")),
     "thekernel-linux-process": ("linux-abi", Path("crates/process")),
@@ -72,6 +74,7 @@ MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "axpmu": ("thekernel-axpmu", "=0.1.0"),
     "axtask": ("thekernel-axtask", "=0.1.0"),
     "axtlb": ("thekernel-axtlb", "=0.1.0"),
+    "axrcu": ("thekernel-axrcu", "=0.1.0"),
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
     "thekernel-linux-mm": ("thekernel-linux-mm", "=0.1.0"),
@@ -87,6 +90,7 @@ MAINTAINED_SIBLING_LIB_NAMES = {
     "thekernel-axfault": "axfault",
     "thekernel-axpmu": "axpmu",
     "thekernel-axtlb": "axtlb",
+    "thekernel-axrcu": "axrcu",
 }
 LOCAL_ADAPTER_PATCHES = {
     "thekernel-readiness-adapter": ("crates/readiness-adapter", "0.1.0"),

@@ -35,16 +35,25 @@ if [ "$(grep -c '^    thekernel-linux-signal$' \
     printf 'test-release-consumer: signal is absent from a release consumer set\n' >&2
     exit 1
 fi
+if [ "$(grep -c '^    thekernel-axrcu$' \
+    "$CI_DIR/release-consumer-gate.sh")" -lt 2 ]; then
+    printf 'test-release-consumer: axrcu is absent from a release package set\n' >&2
+    exit 1
+fi
 grep -Fq -- '-p thekernel-axfault \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-axpmu \' "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- '-p thekernel-axrcu \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- \
     '--replace "../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-$VERSION" \' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- \
     '--replace "../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-$VERSION" \' \
     "$CI_DIR/release-consumer-gate.sh"
+grep -Fq -- \
+    '--replace "../thekernel-ax/crates/thekernel-axrcu=../artifacts/thekernel-axrcu-$VERSION" \' \
+    "$CI_DIR/release-consumer-gate.sh"
 grep -Fq \
-    'thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb)' \
+    'thekernel-axsched|thekernel-axpoll|thekernel-axcbpf|thekernel-axfault|thekernel-axpmu|thekernel-axtask|thekernel-axtlb|thekernel-axrcu)' \
     "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-axcbpf \' "$CI_DIR/release-consumer-gate.sh"
 grep -Fq -- '-p thekernel-linux-seccomp \' "$CI_DIR/release-consumer-gate.sh"
@@ -95,6 +104,7 @@ members = []
 one = { path = "../source/one" }
 axfault = { package = "thekernel-axfault", path = "../thekernel-ax/crates/thekernel-axfault" }
 axpmu = { package = "thekernel-axpmu", path = "../thekernel-ax/crates/thekernel-axpmu" }
+axrcu = { package = "thekernel-axrcu", path = "../thekernel-ax/crates/thekernel-axrcu" }
 axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf" }
 axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
@@ -115,6 +125,7 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../source/two=../artifacts/two-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axfault=../artifacts/thekernel-axfault-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axpmu=../artifacts/thekernel-axpmu-0.1.0' \
+    --replace '../thekernel-ax/crates/thekernel-axrcu=../artifacts/thekernel-axrcu-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axcbpf=../artifacts/thekernel-axcbpf-0.1.0' \
     --replace '../thekernel-ax/crates/thekernel-axtlb=../artifacts/thekernel-axtlb-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
@@ -134,6 +145,8 @@ grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axfault-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axpmu-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-axrcu-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-axcbpf-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
@@ -375,6 +388,7 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axpmu-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-axtlb-0.1.0" \
+    "$tmp/artifacts/thekernel-axrcu-0.1.0" \
     "$tmp/artifacts/thekernel-linux-usercopy-0.1.0" \
     "$tmp/artifacts/thekernel-linux-rseq-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
@@ -402,6 +416,7 @@ release_names = [
     "thekernel-axpmu",
     "thekernel-axtask",
     "thekernel-axtlb",
+    "thekernel-axrcu",
     "thekernel-linux-usercopy",
     "thekernel-linux-rseq",
     "thekernel-linux-cred",
@@ -497,7 +512,7 @@ graph_args=(
 )
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axcbpf thekernel-axfault \
-    thekernel-axpmu thekernel-axtask thekernel-axtlb \
+    thekernel-axpmu thekernel-axtask thekernel-axtlb thekernel-axrcu \
     thekernel-linux-usercopy thekernel-linux-rseq \
     thekernel-linux-cred thekernel-linux-mm thekernel-linux-packet \
     thekernel-linux-io-uring \

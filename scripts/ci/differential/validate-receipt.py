@@ -12,6 +12,7 @@ RECEIPT_SCHEMA = "thekernel-differential-receipt-v0"
 CASE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 GIT_REV_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 RANGE_CLAUSE_PATTERN = re.compile(r"^(>=|<=|==|>|<)?\d+(?:\.\d+){0,2}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def require(condition: bool, message: str) -> None:
@@ -121,6 +122,35 @@ def validate(args: argparse.Namespace) -> None:
         )
     if args.require_empty_allowlist:
         require(not applied, "receipt applied an allowlist but none was permitted")
+
+    source_inputs = receipt.get("source_inputs")
+    if source_inputs is not None:
+        require(isinstance(source_inputs, list), "source_inputs must be a JSON array")
+        assert isinstance(source_inputs, list)
+        seen_paths: set[str] = set()
+        for index, entry in enumerate(source_inputs):
+            label = f"source_inputs[{index}]"
+            require(isinstance(entry, dict), f"{label} must be a JSON object")
+            assert isinstance(entry, dict)
+            require(
+                set(entry) == {"path", "sha256"},
+                f"{label} must contain exactly path/sha256",
+            )
+            path = nonempty_string(entry.get("path"), f"{label}.path")
+            digest = nonempty_string(entry.get("sha256"), f"{label}.sha256")
+            require(
+                not Path(path).is_absolute()
+                and path != ".."
+                and not path.startswith("../")
+                and ".." not in Path(path).parts,
+                f"{label}.path must be repository-relative",
+            )
+            require(
+                SHA256_PATTERN.fullmatch(digest) is not None,
+                f"{label}.sha256 is invalid",
+            )
+            require(path not in seen_paths, f"{label} repeats path {path!r}")
+            seen_paths.add(path)
     if args.manifest is not None:
         manifest = Path(args.manifest).expanduser().resolve()
         require(

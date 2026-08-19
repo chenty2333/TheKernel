@@ -280,6 +280,14 @@ static int test_vfork(void) {
         "THEKERNEL_SYSTEM_TEST_VFORK_OK");
 }
 
+static int test_signal_mask_alias(void) {
+    return test_portable_differential(
+        "/opt/thekernel-tests/bin/thekernel-signal-mask-alias",
+        NULL,
+        "signal-mask-alias-child",
+        "THEKERNEL_SYSTEM_TEST_SIGNAL_MASK_ALIAS_OK");
+}
+
 static int test_io_uring(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -571,7 +579,8 @@ int main(int argc, char **argv) {
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
         test_memory_pressure_reclaim() || test_process_pipe_and_exec() ||
-        test_vfork() || test_signal_wait_boundary() || test_pause() || test_alarm() ||
+        test_vfork() || test_signal_mask_alias() || test_signal_wait_boundary() ||
+        test_pause() || test_alarm() ||
         test_wait_boundary() ||
         test_rseq() ||
         test_portable_differential(
@@ -579,6 +588,11 @@ int main(int argc, char **argv) {
             NULL,
             "futex-differential-child",
             "THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK") ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-futex2-waitv-signal",
+            NULL,
+            "futex2-waitv-signal-differential-child",
+            "THEKERNEL_SYSTEM_TEST_FUTEX2_WAITV_SIGNAL_DIFFERENTIAL_OK") ||
         test_portable_differential(
             "/opt/thekernel-tests/bin/thekernel-epoll-smoke",
             "--thekernel",
@@ -589,6 +603,16 @@ int main(int argc, char **argv) {
             NULL,
             "signal-order-differential-child",
             "THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK") ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-io-uring-directio-differential",
+            NULL,
+            "io-uring-directio-differential-child",
+            "THEKERNEL_SYSTEM_TEST_IO_URING_DIRECTIO_DIFFERENTIAL_OK") ||
+        test_portable_differential(
+            "/opt/thekernel-tests/bin/thekernel-proc-zombie-differential",
+            NULL,
+            "proc-zombie-differential-child",
+            "THEKERNEL_SYSTEM_TEST_PROC_ZOMBIE_DIFFERENTIAL_OK") ||
         test_signal_fp() ||
         test_io_uring() || test_io_uring_buffers() || test_ioprio() ||
         test_membarrier() || test_userfaultfd() ||

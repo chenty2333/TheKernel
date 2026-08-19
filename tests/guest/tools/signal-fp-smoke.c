@@ -8,9 +8,9 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
-#include <asm/ucontext.h>
 
 #if !defined(__x86_64__)
 #error "the signal FP smoke is x86_64-only"
@@ -21,8 +21,15 @@
 #define FPSTATE_XMM15_OFFSET 400U
 #define FPSTATE_LEGACY_BYTES 512U
 #define FPSTATE_XMM_BYTES 16U
-#define REQUIRED_UC_FLAGS (UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS)
+/* These are Linux x86_64 ucontext ABI bits, not libc-private declarations.
+ * glibc exposes them through <asm/ucontext.h>, while musl intentionally does
+ * not ship that non-portable wrapper.  Keep the ABI values local so this
+ * helper builds against either libc. */
+#define TK_UC_SIGCONTEXT_SS UINT64_C(0x2)
+#define TK_UC_STRICT_RESTORE_SS UINT64_C(0x4)
+#define REQUIRED_UC_FLAGS (TK_UC_SIGCONTEXT_SS | TK_UC_STRICT_RESTORE_SS)
 #define INITIAL_MXCSR UINT32_C(0x1f80)
+#define ALTSTACK_SIZE (64U * 1024U)
 
 _Static_assert(FPSTATE_XMM15_OFFSET + FPSTATE_XMM_BYTES <=
                    FPSTATE_LEGACY_BYTES,
@@ -73,8 +80,58 @@ enum handler_failure {
 static volatile sig_atomic_t handler_failure;
 static volatile sig_atomic_t handler_depth;
 static volatile sig_atomic_t nested_returned;
+static volatile sig_atomic_t altstack_failure;
+static volatile sig_atomic_t altstack_seen;
 static pid_t self_pid;
 static pid_t self_tid;
+static unsigned char alternate_stack[ALTSTACK_SIZE] __attribute__((aligned(16)));
+
+enum altstack_failure {
+    ALTSTACK_FAILURE_NONE = 0,
+    ALTSTACK_FAILURE_QUERY = 1,
+    ALTSTACK_FAILURE_FLAGS = 2,
+    ALTSTACK_FAILURE_RANGE = 3,
+    ALTSTACK_FAILURE_CONFIGURATION = 4,
+};
+
+static int stack_contains_address(const stack_t *stack, uintptr_t address) {
+    const uintptr_t base = (uintptr_t)stack->ss_sp;
+    if (address < base) {
+        return 0;
+    }
+    return address - base < stack->ss_size;
+}
+
+static void check_altstack_in_handler(void) {
+    volatile unsigned char local = 0;
+    stack_t current;
+    const int saved_errno = errno;
+
+    memset(&current, 0, sizeof(current));
+    if (sigaltstack(NULL, &current) != 0) {
+        altstack_failure = ALTSTACK_FAILURE_QUERY;
+        errno = saved_errno;
+        return;
+    }
+    if (current.ss_flags != SS_ONSTACK) {
+        altstack_failure = ALTSTACK_FAILURE_FLAGS;
+        errno = saved_errno;
+        return;
+    }
+    if ((uintptr_t)current.ss_sp != (uintptr_t)alternate_stack ||
+        current.ss_size != sizeof(alternate_stack)) {
+        altstack_failure = ALTSTACK_FAILURE_CONFIGURATION;
+        errno = saved_errno;
+        return;
+    }
+    if (!stack_contains_address(&current, (uintptr_t)&local)) {
+        altstack_failure = ALTSTACK_FAILURE_RANGE;
+        errno = saved_errno;
+        return;
+    }
+    altstack_seen = 1;
+    errno = saved_errno;
+}
 
 static uint16_t frame_load_cw(const volatile unsigned char *fpstate) {
     return (uint16_t)fpstate[FPSTATE_CW_OFFSET] |
@@ -211,6 +268,7 @@ static void signal_handler(int signo, siginfo_t *info, void *opaque_context) {
     ucontext_t *context = (ucontext_t *)opaque_context;
 
     if (signo == SIGUSR1) {
+        check_altstack_in_handler();
         if (!xmm_equal(entry_xmm, state_entry_xmm) ||
             entry_cw != CW_INITIAL || entry_mxcsr != INITIAL_MXCSR) {
             handler_failure = FAILURE_OUTER_ENTRY;
@@ -280,11 +338,11 @@ static void signal_handler(int signo, siginfo_t *info, void *opaque_context) {
     }
 }
 
-static int install_handler(int signo) {
+static int install_handler(int signo, int extra_flags) {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = signal_handler;
-    action.sa_flags = SA_SIGINFO;
+    action.sa_flags = SA_SIGINFO | extra_flags;
     if (sigemptyset(&action.sa_mask) != 0 ||
         sigaction(signo, &action, NULL) != 0) {
         return -1;
@@ -292,11 +350,51 @@ static int install_handler(int signo) {
     return 0;
 }
 
+static void malformed_pc_handler(int signo, siginfo_t *info,
+                                 void *opaque_context) {
+    (void)signo;
+    (void)info;
+    ucontext_t *context = (ucontext_t *)opaque_context;
+    context->uc_mcontext.gregs[REG_RIP] = 1;
+}
+
+static int run_malformed_pc_child(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return -1;
+    }
+    if (child == 0) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_sigaction = malformed_pc_handler;
+        action.sa_flags = SA_SIGINFO;
+        if (sigemptyset(&action.sa_mask) != 0 ||
+            sigaction(SIGUSR1, &action, NULL) != 0 ||
+            kill(getpid(), SIGUSR1) != 0) {
+            _exit(120);
+        }
+        _exit(121);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        return -1;
+    }
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV ? 0 : -1;
+}
+
 int main(void) {
+    stack_t configured_altstack;
+    stack_t restored_altstack;
+
     self_pid = getpid();
     self_tid = (pid_t)syscall(SYS_gettid);
-    if (self_tid <= 0 || install_handler(SIGUSR1) != 0 ||
-        install_handler(SIGUSR2) != 0) {
+    memset(&configured_altstack, 0, sizeof(configured_altstack));
+    configured_altstack.ss_sp = alternate_stack;
+    configured_altstack.ss_size = sizeof(alternate_stack);
+    if (self_tid <= 0 || sigaltstack(&configured_altstack, NULL) != 0 ||
+        install_handler(SIGUSR1, SA_ONSTACK) != 0 ||
+        install_handler(SIGUSR2, SA_ONSTACK) != 0) {
         fprintf(stderr, "THEKERNEL_SIGNAL_FP_FAIL setup errno=%d (%s)\n", errno,
                 strerror(errno));
         return EXIT_FAILURE;
@@ -320,6 +418,33 @@ int main(void) {
                 handler_failure, nested_returned);
         return EXIT_FAILURE;
     }
+
+    if (altstack_failure != ALTSTACK_FAILURE_NONE || altstack_seen == 0) {
+        fprintf(stderr,
+                "THEKERNEL_SIGNAL_FP_FAIL altstack-handler failure=%d seen=%d\n",
+                altstack_failure, altstack_seen);
+        return EXIT_FAILURE;
+    }
+    puts("THEKERNEL_SIGNAL_ALTSTACK_HANDLER_OK");
+
+    memset(&restored_altstack, 0, sizeof(restored_altstack));
+    if (sigaltstack(NULL, &restored_altstack) != 0 ||
+        restored_altstack.ss_flags != 0 ||
+        restored_altstack.ss_sp != configured_altstack.ss_sp ||
+        restored_altstack.ss_size != configured_altstack.ss_size) {
+        fprintf(stderr,
+                "THEKERNEL_SIGNAL_FP_FAIL altstack-restore flags=%d sp=%p size=%zu\n",
+                restored_altstack.ss_flags, restored_altstack.ss_sp,
+                restored_altstack.ss_size);
+        return EXIT_FAILURE;
+    }
+    puts("THEKERNEL_SIGNAL_ALTSTACK_RESTORE_OK");
+
+    if (run_malformed_pc_child() != 0) {
+        fprintf(stderr, "THEKERNEL_SIGNAL_FP_FAIL malformed-pc-child\n");
+        return EXIT_FAILURE;
+    }
+    puts("THEKERNEL_SIGNAL_SIGRETURN_BAD_PC_OK");
 
     puts("THEKERNEL_SIGNAL_FP_OK");
     return EXIT_SUCCESS;

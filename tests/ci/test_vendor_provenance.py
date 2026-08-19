@@ -791,7 +791,7 @@ class VendorProvenanceTests(unittest.TestCase):
         # the retired LoongArch/RISC-V platforms and migrated starry process,
         # signal, and VM crates are gone, while axplat-x86-pc is now local.
         self.assertEqual(result.package_checks, 24)
-        self.assertEqual(result.maintained_checks, 18)
+        self.assertEqual(result.maintained_checks, 19)
 
 
 if __name__ == "__main__":

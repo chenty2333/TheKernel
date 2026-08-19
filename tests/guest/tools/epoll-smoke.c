@@ -347,6 +347,86 @@ static int test_timeouts(void) {
     return 0;
 }
 
+static int test_ofd_close_and_fd_reuse(void) {
+    int pipe_fds[2];
+    if (pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+        return fail("ofd-pipe");
+    }
+    int original_fd = pipe_fds[0];
+    int duplicate_fd = dup(original_fd);
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (duplicate_fd < 0 || epoll_fd < 0) {
+        return fail("ofd-create");
+    }
+    if (ctl_add(epoll_fd, original_fd, EPOLLIN, 0x0F,
+                "ofd-add-original")) {
+        return 1;
+    }
+
+    /* An epoll interest keeps the open file description observable after the
+     * descriptor used by EPOLL_CTL_ADD is closed. The duplicate is the only
+     * remaining descriptor for this pipe read end. */
+    if (close(original_fd) != 0) {
+        return fail("ofd-close-original");
+    }
+    if (write(pipe_fds[1], "o", 1) != 1) {
+        return fail("ofd-write-after-close");
+    }
+    if (wait_single(epoll_fd, BOUNDED_WAIT_MS, EPOLLIN, 0x0F,
+                    "ofd-event-after-close")) {
+        return 1;
+    }
+    marker("THEKERNEL_EPOLL_OFD_DUP_CLOSE_OK");
+
+    /* Drain the old OFD through its duplicate before testing fd-number
+     * reuse; otherwise a level-triggered pipe event would be a real event,
+     * not stale delivery for the new descriptor. */
+    char byte;
+    if (read(duplicate_fd, &byte, 1) != 1 || byte != 'o') {
+        return fail("ofd-drain-duplicate");
+    }
+    if (wait_count(epoll_fd, 0, 0, "ofd-drain-epoll")) {
+        return 1;
+    }
+
+    /* Reuse the original number while the duplicate still retains the old
+     * OFD. A readiness signal from this different eventfd must not alias the
+     * old epoll key. */
+    int reused_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (reused_fd < 0) {
+        return fail("ofd-reuse-eventfd");
+    }
+    if (dup2(reused_fd, original_fd) < 0) {
+        return fail("ofd-reuse-dup2");
+    }
+    if (reused_fd != original_fd && close(reused_fd) != 0) {
+        return fail("ofd-reuse-close-source");
+    }
+    uint64_t one = 1;
+    if (write(original_fd, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+        return fail("ofd-reuse-signal");
+    }
+    if (wait_count(epoll_fd, 0, 0, "ofd-reuse-no-stale-event")) {
+        return 1;
+    }
+    marker("THEKERNEL_EPOLL_FD_REUSE_NO_STALE_OK");
+
+    /* Closing the duplicate is the terminal OFD close. epoll_wait(0) drains
+     * its close notification and removes the old interest before teardown. */
+    if (close(duplicate_fd) != 0) {
+        return fail("ofd-close-duplicate");
+    }
+    if (wait_count(epoll_fd, 0, 0, "ofd-final-close-drain")) {
+        return 1;
+    }
+    marker("THEKERNEL_EPOLL_OFD_FINAL_CLOSE_OK");
+
+    close(epoll_fd);
+    close(original_fd);
+    close(pipe_fds[1]);
+    return 0;
+}
+
 static int test_nested(void) {
     int pipe_fds[2];
     if (pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC) != 0) {
@@ -620,7 +700,8 @@ int main(int argc, char **argv) {
     self_path = argv[0];
 
     if (test_level_vs_edge() || test_et_partial_read() || test_oneshot() ||
-        test_ctl_errors() || test_hup() || test_timeouts() || test_nested() ||
+        test_ctl_errors() || test_hup() || test_timeouts() ||
+        test_ofd_close_and_fd_reuse() || test_nested() ||
         (thekernel_mode ? test_exclusive_unsupported() : test_exclusive())) {
         return 1;
     }
