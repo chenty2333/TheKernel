@@ -30,10 +30,11 @@ use thekernel_linux_signal::{SignalInfo, SignalPollPayload, Signo};
 
 use super::{
     executable::{self, ExecutableKey},
-    fanotify::FanotifyFile,
+    fanotify::{FanotifyEventActor, FanotifyFile},
     flock,
     fs::File,
     lease,
+    permission::VfsSecurityContext,
     types::{FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap},
 };
 use crate::{
@@ -600,13 +601,97 @@ impl Drop for DescriptorCloseRegistration {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OpenCredentials {
     pub(crate) uid: Kuid,
     pub(crate) euid: Kuid,
     pub(crate) suid: Kuid,
     pub(crate) fsuid: Kuid,
     pub(crate) cgroup_ns_id: u64,
+}
+
+/// Immutable, owned identity and OFD snapshot for one file I/O operation.
+///
+/// This is deliberately independent of a task, fd number, or borrowed VFS
+/// state.  A submission thread can capture it before handing work to a
+/// kernel worker; the worker can then make all status, set-id, and deferred
+/// event decisions from the same values even after the submitting task has
+/// changed credentials or exited.
+#[derive(Clone)]
+pub(crate) struct IoOperationContext {
+    /// The exact open-file description which admitted this operation.  The
+    /// strong reference keeps the OFD alive across submission/worker handoff;
+    /// the monotonic id makes the binding generation-visible even if another
+    /// descriptor is later allocated for the same numeric fd.
+    description: Arc<FileDescription>,
+    description_id: FileDescriptionId,
+    security: VfsSecurityContext,
+    status: OfdIoStatus,
+    open_credentials: OpenCredentials,
+    vfs_open_credential: Option<Arc<Cred>>,
+    open_security_credential: Option<Arc<Cred>>,
+    fanotify_actor: FanotifyEventActor,
+}
+
+impl IoOperationContext {
+    pub(crate) fn new(
+        description: Arc<FileDescription>,
+        security: VfsSecurityContext,
+        status: OfdIoStatus,
+        open_credentials: OpenCredentials,
+        vfs_open_credential: Option<Arc<Cred>>,
+        open_security_credential: Option<Arc<Cred>>,
+        fanotify_actor: FanotifyEventActor,
+    ) -> Self {
+        Self {
+            description_id: description.id(),
+            description,
+            security,
+            status,
+            open_credentials,
+            vfs_open_credential,
+            open_security_credential,
+            fanotify_actor,
+        }
+    }
+
+    pub(crate) const fn status(&self) -> OfdIoStatus {
+        self.status
+    }
+
+    pub(crate) const fn security(&self) -> &VfsSecurityContext {
+        &self.security
+    }
+
+    pub(crate) const fn open_credentials(&self) -> OpenCredentials {
+        self.open_credentials
+    }
+
+    pub(crate) fn vfs_open_credential(&self) -> Option<Arc<Cred>> {
+        self.vfs_open_credential.clone()
+    }
+
+    pub(crate) fn open_security_credential(&self) -> Option<Arc<Cred>> {
+        self.open_security_credential.clone()
+    }
+
+    pub(crate) const fn fanotify_actor(&self) -> FanotifyEventActor {
+        self.fanotify_actor
+    }
+
+    /// Validates that a retained operation is still executing against the
+    /// exact OFD which admitted it.  Numeric fd reuse and a caller-provided
+    /// status snapshot are never sufficient to establish this binding.
+    pub(crate) fn validate_for(&self, description: &Arc<FileDescription>) -> AxResult<()> {
+        if self.description_id != description.id()
+            || !Arc::ptr_eq(&self.description, description)
+            || self.open_credentials != description.open_credentials()
+            || self.status.path_only()
+        {
+            return Err(AxError::BadFileDescriptor);
+        }
+        description.check_io_status(self.status)
+    }
 }
 
 impl OpenCredentials {
@@ -1155,6 +1240,27 @@ impl FileDescription {
         self.vfs_open_credential.clone()
     }
 
+    /// Captures all immutable state needed by a positioned file operation.
+    ///
+    /// The caller supplies the actor and event identity observed at syscall
+    /// submission. No task-local state is retained in the returned value;
+    /// every field is either copy-only or owned by an `Arc`.
+    pub(crate) fn capture_io_operation_context(
+        self: &Arc<Self>,
+        security: VfsSecurityContext,
+        fanotify_actor: FanotifyEventActor,
+    ) -> IoOperationContext {
+        IoOperationContext::new(
+            self.clone(),
+            security,
+            self.io_status_snapshot(),
+            self.open_credentials,
+            self.vfs_open_credential.clone(),
+            self.open_security_credential.clone(),
+            fanotify_actor,
+        )
+    }
+
     /// Pins this exact open file description and erases only its inner type.
     ///
     /// Long-lived kernel operations use this after descriptor lookup or fixed
@@ -1510,6 +1616,15 @@ impl<T: ?Sized> FileHandle<T> {
 
     pub(crate) fn io_status_snapshot(&self) -> OfdIoStatus {
         self.description.io_status_snapshot()
+    }
+
+    pub(crate) fn capture_io_operation_context(
+        &self,
+        security: VfsSecurityContext,
+        fanotify_actor: FanotifyEventActor,
+    ) -> IoOperationContext {
+        self.description
+            .capture_io_operation_context(security, fanotify_actor)
     }
 
     pub(crate) fn transition_status_flags(
@@ -1950,6 +2065,102 @@ mod tests {
         let retained = description.vfs_open_credential().unwrap();
         assert!(Arc::ptr_eq(&retained, &credential));
         assert!(description.open_security_credential().is_none());
+    }
+
+    #[test]
+    fn io_operation_context_owns_open_identity_without_task_state() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<IoOperationContext>();
+
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "context-bound-open",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file: Arc<dyn FileLike> = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(loc),
+            FileFlags::READ,
+        )));
+        let namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root(namespace).unwrap();
+        let description =
+            FileDescription::new_inner(file, 0, None, None, None, Some(credential.clone()))
+                .unwrap();
+        let context = description.capture_io_operation_context(
+            VfsSecurityContext::new(credential.clone()),
+            FanotifyEventActor::default(),
+        );
+        let retained_description = context.description.clone();
+        let replacement_namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let replacement_credential = Cred::try_root(replacement_namespace).unwrap();
+
+        assert_eq!(context.status().raw(), 0);
+        assert!(Arc::ptr_eq(context.security().actor_arc(), &credential));
+        assert!(Arc::ptr_eq(
+            &context.vfs_open_credential().unwrap(),
+            &credential
+        ));
+        assert!(context.open_security_credential().is_none());
+        assert_eq!(context.open_credentials(), description.open_credentials());
+        assert_eq!(context.fanotify_actor(), FanotifyEventActor::default());
+        // Changing the submitter's current credential must not alter the
+        // admitted actor, and dropping the submitter's last local OFD handle
+        // must not end the context's exact identity.
+        assert!(!Arc::ptr_eq(
+            context.security().actor_arc(),
+            &replacement_credential
+        ));
+        drop(description);
+        assert!(context.validate_for(&retained_description).is_ok());
+    }
+
+    #[test]
+    fn io_operation_context_rejects_wrong_generation_and_path_only_ofd() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "context-generation-bound",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file: Arc<dyn FileLike> = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(loc),
+            FileFlags::READ,
+        )));
+        let namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root(namespace).unwrap();
+        let first =
+            FileDescription::new_inner(file.clone(), 0, None, None, None, Some(credential.clone()))
+                .unwrap();
+        let second =
+            FileDescription::new_inner(file.clone(), 0, None, None, None, Some(credential.clone()))
+                .unwrap();
+        let context = first.capture_io_operation_context(
+            VfsSecurityContext::new(credential.clone()),
+            FanotifyEventActor::default(),
+        );
+        assert_eq!(
+            context.validate_for(&second),
+            Err(AxError::BadFileDescriptor)
+        );
+
+        let path_only = FileDescription::new_with_flags(file, O_PATH).unwrap();
+        let path_context = path_only.capture_io_operation_context(
+            VfsSecurityContext::new(credential),
+            FanotifyEventActor::default(),
+        );
+        assert_eq!(
+            path_context.validate_for(&path_only),
+            Err(AxError::BadFileDescriptor)
+        );
     }
 
     #[test]

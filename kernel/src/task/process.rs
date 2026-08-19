@@ -168,8 +168,8 @@ pub(crate) struct GroupLeaderSignalIdentity {
     /// PID namespace in which the retained process identity lives. This is
     /// needed to filter a zombie from callers in unrelated namespaces.
     pid_ns: Option<Arc<PidNamespace>>,
-    /// Shared scheduler snapshot updated by the exiting task and retained by
-    /// the zombie owner after the live scheduler node disappears.
+    /// Shared scheduler snapshot updated by successful scheduler transactions
+    /// and retained by the zombie owner after the live scheduler node disappears.
     scheduler: Option<Arc<SpinNoIrq<ZombieSchedulerSnapshot>>>,
 }
 
@@ -324,9 +324,9 @@ pub(crate) fn zombie_pid_ns(process: &Process) -> Option<Arc<PidNamespace>> {
 }
 
 /// Returns the scheduler state retained by an authoritative unreaped zombie.
-/// The live scheduler object is gone by this point, so the final thread
-/// publishes this compact class/nice snapshot through the durable group-leader
-/// identity before its task is marked terminal.
+/// The live scheduler object is gone by this point, so this returns the last
+/// successful scheduler transaction retained through the durable group-leader
+/// identity.
 pub(crate) fn zombie_scheduler_state(process: &Process) -> AxResult<ZombieSchedulerSnapshot> {
     ensure_authoritative_zombie(process)?;
     let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
@@ -921,6 +921,30 @@ impl UtsState {
 pub(crate) struct UtsNamespace {
     state: SpinNoIrq<UtsState>,
     owner_user_ns: Arc<UserNamespace>,
+    execution_gate: Arc<crate::world::ExecutionGate>,
+}
+
+/// Fallible part of a ProcessData UTS replacement. Acquiring the Semantic
+/// World consumer lease is kept separate from pointer publication so callers
+/// can prepare every namespace change before mutating another process scope.
+pub(crate) struct PreparedUtsNamespaceReplacement {
+    uts_ns: Arc<UtsNamespace>,
+    consumer_lease: Option<crate::world::UtsConsumerLease>,
+}
+
+impl PreparedUtsNamespaceReplacement {
+    pub(crate) fn commit(self, process: &ProcessData) {
+        let Self {
+            uts_ns,
+            consumer_lease,
+        } = self;
+        let mut current = process.uts_ns.write();
+        let old_uts = core::mem::replace(&mut *current, uts_ns);
+        let old_lease = core::mem::replace(&mut *process.uts_consumer_lease.lock(), consumer_lease);
+        drop(current);
+        drop(old_uts);
+        drop(old_lease);
+    }
 }
 
 impl UtsNamespace {
@@ -928,15 +952,22 @@ impl UtsNamespace {
         Arc::try_new(Self {
             state: SpinNoIrq::new(init_uts_state()),
             owner_user_ns,
+            execution_gate: crate::world::ExecutionGate::try_new()?,
         })
         .map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        // Forking publishes a new UTS namespace by copying provider state.
+        // It therefore participates in the same gate as hostname mutation;
+        // acquire before taking the state lock so a source fence cannot
+        // observe a concurrent copy, and never enter while holding it.
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
         Arc::try_new(Self {
             state: SpinNoIrq::new(state),
             owner_user_ns,
+            execution_gate: crate::world::ExecutionGate::try_new()?,
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -945,22 +976,95 @@ impl UtsNamespace {
         &self.owner_user_ns
     }
 
-    pub(crate) fn nodename(&self) -> Vec<u8> {
+    pub(crate) fn nodename(&self) -> AxResult<Vec<u8>> {
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
-        state.nodename[..state.nodename_len].to_vec()
+        Ok(state.nodename[..state.nodename_len].to_vec())
     }
 
-    pub(crate) fn domainname(&self) -> Vec<u8> {
+    pub(crate) fn domainname(&self) -> AxResult<Vec<u8>> {
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
-        state.domainname[..state.domainname_len].to_vec()
+        Ok(state.domainname[..state.domainname_len].to_vec())
     }
 
-    pub(crate) fn set_nodename(&self, value: &[u8]) {
+    pub(crate) fn set_nodename(&self, value: &[u8]) -> AxResult<()> {
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         self.state.lock().set_nodename(value);
+        Ok(())
     }
 
-    pub(crate) fn set_domainname(&self, value: &[u8]) {
+    pub(crate) fn set_domainname(&self, value: &[u8]) -> AxResult<()> {
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         self.state.lock().set_domainname(value);
+        Ok(())
+    }
+
+    /// Enters the embedded UTS gate without consulting Semantic World.
+    pub(crate) fn try_enter_execution(&self) -> Option<crate::world::ExecutionLease> {
+        self.execution_gate.enter()
+    }
+
+    /// Closes new provider-state executions and returns a rollbackable fence.
+    pub(crate) fn freeze_execution(&self) -> AxResult<crate::world::ExecutionFence> {
+        self.execution_gate.begin_fence()
+    }
+
+    pub(crate) fn try_provider_snapshot(&self) -> AxResult<crate::world::UtsProviderSnapshot> {
+        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
+        let state = *self.state.lock();
+        crate::world::UtsProviderSnapshot::from_fields(
+            &state.nodename[..state.nodename_len],
+            &state.domainname[..state.domainname_len],
+        )
+    }
+
+    pub(crate) fn try_provider_snapshot_after_fence(
+        &self,
+        fence: &crate::world::ExecutionFence,
+    ) -> AxResult<crate::world::UtsProviderSnapshot> {
+        if !fence.matches_gate(&self.execution_gate) {
+            return Err(AxError::InvalidInput);
+        }
+        fence.wait_for_drain()?;
+        let state = *self.state.lock();
+        crate::world::UtsProviderSnapshot::from_fields(
+            &state.nodename[..state.nodename_len],
+            &state.domainname[..state.domainname_len],
+        )
+    }
+
+    pub(crate) fn execution_gate(&self) -> Arc<crate::world::ExecutionGate> {
+        self.execution_gate.clone()
+    }
+
+    pub(crate) fn activate_execution(&self) -> AxResult<()> {
+        self.execution_gate.activate()
+    }
+
+    pub(crate) fn try_from_provider_snapshot(
+        owner_user_ns: Arc<UserNamespace>,
+        snapshot: crate::world::UtsProviderSnapshot,
+    ) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            state: SpinNoIrq::new(UtsState {
+                nodename: {
+                    let mut value = [0; UTS_FIELD_LEN];
+                    value[..snapshot.nodename().len()].copy_from_slice(snapshot.nodename());
+                    value
+                },
+                nodename_len: snapshot.nodename().len(),
+                domainname: {
+                    let mut value = [0; UTS_FIELD_LEN];
+                    value[..snapshot.domainname().len()].copy_from_slice(snapshot.domainname());
+                    value
+                },
+                domainname_len: snapshot.domainname().len(),
+            }),
+            owner_user_ns,
+            execution_gate: crate::world::ExecutionGate::try_new()?,
+        })
+        .map_err(|_| AxError::NoMemory)
     }
 }
 
@@ -1336,6 +1440,10 @@ impl GroupLeaderIdentityBinding {
         self.signal.clone()
     }
 
+    fn publish_scheduler_state(&self, state: SchedState) {
+        *self.scheduler.lock() = state.into();
+    }
+
     fn publish_handoff<'a>(
         &self,
         credential: Arc<CredentialSlot>,
@@ -1636,6 +1744,13 @@ fn replace_process_image_with_group_handoff<'a, A>(
     (group_leader, retired_image)
 }
 
+/// Clones the scheduler-facing TLB owner without joining the process-image
+/// lock domain. Exec serializes replacement against scheduling on its sole
+/// surviving thread, while this `Arc` keeps either observed generation alive.
+fn scheduler_tlb_state_snapshot<T>(image_tlb_state: &RwLock<Arc<T>>) -> Arc<T> {
+    image_tlb_state.read().clone()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PtraceReverseLink {
     tracee: Pid,
@@ -1867,10 +1982,10 @@ pub struct ProcessData {
     start_monotonic_ns: u64,
     /// Executable address space and its coherent process-access owner.
     image_binding: RwLock<LiveProcessImageBinding>,
-    /// Scheduler-facing TLB state for the image currently in
-    /// `image_binding`. The image lock is acquired before this lock whenever
-    /// the pair is replaced or sampled, keeping context-switch snapshots
-    /// coherent without taking the address-space mutex.
+    /// Scheduler-facing TLB state for the current image. Exec is the sole
+    /// writer and publishes it while its sole surviving thread cannot be
+    /// preempted; scheduler readers deliberately never take `image_binding`.
+    /// The independent `Arc` pins the observed TLB state across replacement.
     image_tlb_state: RwLock<Arc<TlbState>>,
     /// The resource scope
     pub scope: RwLock<Scope>,
@@ -1937,6 +2052,10 @@ pub struct ProcessData {
     pub(crate) process_rlimit_cpu_active: AtomicBool,
     /// Standard timer signals awaiting a scheduler-safe task-context drain.
     pub(crate) process_itimer_pending: AtomicU8,
+    /// Encoded owner CPU (+1) for the queued process-timer node. This is the
+    /// exact wake target when a producer observes an already queued token;
+    /// zero means the consumer handoff is currently unowned.
+    pub(crate) process_itimer_work_owner_cpu: AtomicUsize,
     /// Intrusive single-consumer work node used to defer process-timer signal
     /// publication out of IRQ-off context-switch accounting.
     pub(crate) process_itimer_work_queued: AtomicBool,
@@ -1984,6 +2103,10 @@ pub struct ProcessData {
     pid_ns: Arc<PidNamespace>,
     /// The UTS namespace for this process.
     uts_ns: RwLock<Arc<UtsNamespace>>,
+    /// Exact Semantic World consumer lease for the current UTS generation.
+    /// This is absent only for host/unit construction before the local
+    /// authority is initialized.
+    uts_consumer_lease: SpinNoIrq<Option<crate::world::UtsConsumerLease>>,
     /// The time namespace visible to this process.
     time_ns: RwLock<Arc<TimeNamespace>>,
     /// The time namespace inherited by children created after unshare/setns.
@@ -2329,6 +2452,7 @@ impl ProcessData {
         let start_realtime_sec = wall_time().as_secs();
         let start_monotonic_ns = monotonic_time_nanos();
         let mut executable_rollback = ExecutableRollback(executable);
+        let uts_consumer_lease = crate::world::acquire_uts_consumer(&uts_ns)?;
         let child_exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exec_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
@@ -2395,6 +2519,7 @@ impl ProcessData {
             process_itimer_cpu_armed: AtomicU8::new(0),
             process_rlimit_cpu_active: AtomicBool::new(false),
             process_itimer_pending: AtomicU8::new(0),
+            process_itimer_work_owner_cpu: AtomicUsize::new(0),
             process_itimer_work_queued: AtomicBool::new(false),
             process_itimer_work_node: ProcessITimerWorkNode::new(),
             exited_threads_usage: AtomicTaskUsage::new(),
@@ -2416,6 +2541,7 @@ impl ProcessData {
             cgroup_ns,
             pid_ns,
             uts_ns: RwLock::new(uts_ns),
+            uts_consumer_lease: SpinNoIrq::new(uts_consumer_lease),
             time_ns: RwLock::new(time_ns.clone()),
             time_ns_for_children: RwLock::new(time_ns),
         };
@@ -2493,7 +2619,7 @@ impl ProcessData {
     /// already-published zombie payload, so this remains valid even after the
     /// runtime process membership is removed.
     pub(crate) fn publish_scheduler_state(&self, state: SchedState) {
-        *self.group_leader_identity.scheduler.lock() = state.into();
+        self.group_leader_identity.publish_scheduler_state(state);
     }
 
     /// Takes process-directed identity, dumpability, and image through one
@@ -2623,6 +2749,12 @@ impl ProcessData {
             thread.set_pdeath_signal(0);
         }
         let new_tlb_state = new_aspace.lock().tlb_state();
+        // `publish_exec_image` is the only production image writer. Exec has
+        // already drained the thread group to `owner`, so preventing this
+        // thread from being switched out closes the only scheduler race: an
+        // on-enter hook can observe either complete publication, but can
+        // never run while this task is suspended holding either writer lock.
+        let _switch_guard = kernel_guard::NoPreemptIrqSave::new();
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
             &self.group_leader_identity,
@@ -2685,13 +2817,12 @@ impl ProcessData {
         self.image_binding.read().aspace.clone()
     }
 
-    /// Returns the lock-free scheduler TLB state for the current process
-    /// image. Context-switch hooks use this snapshot instead of taking the
-    /// address-space mutex, which may be held by a page-table writer waiting
-    /// for a remote shootdown acknowledgement.
+    /// Returns the scheduler TLB state without taking the process-image or
+    /// address-space locks. The latter may be held by a page-table writer
+    /// waiting for a remote shootdown acknowledgement; the former may be held
+    /// by the exec publication which this hook must allow to run to completion.
     pub(crate) fn aspace_tlb_state(&self) -> Arc<TlbState> {
-        let _image = self.image_binding.read();
-        self.image_tlb_state.read().clone()
+        scheduler_tlb_state_snapshot(&self.image_tlb_state)
     }
 
     pub(crate) fn image_matches(&self, aspace: &Arc<Mutex<AddrSpace>>) -> bool {
@@ -2721,9 +2852,60 @@ impl ProcessData {
         self.pid_ns.clone()
     }
 
-    pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) {
-        let old = core::mem::replace(&mut *self.uts_ns.write(), uts_ns);
-        drop(old);
+    pub(crate) fn prepare_uts_ns_replacement(
+        &self,
+        uts_ns: Arc<UtsNamespace>,
+    ) -> AxResult<PreparedUtsNamespaceReplacement> {
+        let consumer_lease = crate::world::acquire_uts_consumer(&uts_ns)?;
+        Ok(PreparedUtsNamespaceReplacement {
+            uts_ns,
+            consumer_lease,
+        })
+    }
+
+    pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) -> AxResult<()> {
+        let prepared = self.prepare_uts_ns_replacement(uts_ns)?;
+        prepared.commit(self);
+        Ok(())
+    }
+
+    /// Atomically switches a process's canonical UTS consumer only if it
+    /// still points at the fenced source generation. Semantic World uses this
+    /// compare-and-swap-style operation during activation so stale bindings
+    /// cannot silently replace a concurrently selected namespace.
+    pub(crate) fn activate_and_compare_replace_uts_ns<F>(
+        &self,
+        expected: &Arc<UtsNamespace>,
+        replacement: Arc<UtsNamespace>,
+        commit: F,
+    ) -> AxResult<bool>
+    where
+        F: FnOnce(bool),
+    {
+        let mut current = self.uts_ns.write();
+        if !Arc::ptr_eq(&*current, expected) {
+            return Ok(false);
+        }
+        let had_consumer_lease = self.uts_consumer_lease.lock().is_some();
+        // Keep the UTS write lock across gate activation and pointer
+        // publication. No caller can observe the destination while it is
+        // still closed, and an activation failure leaves the old pointer
+        // untouched.
+        replacement.activate_execution()?;
+        commit(had_consumer_lease);
+        *current = replacement;
+        Ok(true)
+    }
+
+    pub(crate) fn install_uts_consumer_lease(
+        &self,
+        lease: Option<crate::world::UtsConsumerLease>,
+    ) -> Option<crate::world::UtsConsumerLease> {
+        core::mem::replace(&mut *self.uts_consumer_lease.lock(), lease)
+    }
+
+    pub(crate) fn has_uts_consumer_lease(&self) -> bool {
+        self.uts_consumer_lease.lock().is_some()
     }
 
     pub(crate) fn time_ns(&self) -> Arc<TimeNamespace> {
@@ -3920,6 +4102,8 @@ impl Drop for ProcessData {
     fn drop(&mut self) {
         let executable = *self.executable.lock();
         executable::release(executable);
+        let uts_consumer_lease = self.uts_consumer_lease.lock().take();
+        drop(uts_consumer_lease);
     }
 }
 
@@ -3952,8 +4136,8 @@ mod tests {
         ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
         release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
-        snapshot_credential_image, snapshot_group_credential_image, try_allocate_namespace_id,
-        try_increment_bounded,
+        scheduler_tlb_state_snapshot, snapshot_credential_image, snapshot_group_credential_image,
+        try_allocate_namespace_id, try_increment_bounded,
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
@@ -4040,6 +4224,31 @@ mod tests {
         let state = init_uts_state();
         assert_eq!(&state.nodename[..state.nodename_len], b"thekernel");
         assert_eq!(&state.domainname[..state.domainname_len], b"(none)");
+    }
+
+    #[test]
+    fn uts_execution_gate_drains_and_rolls_back_without_global_authority() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let uts = UtsNamespace::try_new_root(owner).unwrap();
+        let lease = uts.try_enter_execution().unwrap();
+        let fence = uts.freeze_execution().unwrap();
+        assert!(uts.try_enter_execution().is_none());
+        drop(lease);
+        fence.wait_for_drain().unwrap();
+        fence.rollback().unwrap();
+        assert!(uts.try_enter_execution().is_some());
+    }
+
+    #[test]
+    fn uts_provider_snapshot_round_trips_logical_state_only() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let uts = UtsNamespace::try_new_root(owner.clone()).unwrap();
+        uts.set_nodename(b"world-node").unwrap();
+        uts.set_domainname(b"world-domain").unwrap();
+        let snapshot = uts.try_provider_snapshot().unwrap();
+        let copy = UtsNamespace::try_from_provider_snapshot(owner, snapshot).unwrap();
+        assert_eq!(copy.nodename().unwrap(), b"world-node");
+        assert_eq!(copy.domainname().unwrap(), b"world-domain");
     }
 
     #[test]
@@ -4770,6 +4979,28 @@ mod tests {
         reader.join().unwrap();
     }
 
+    #[test]
+    fn scheduler_tlb_snapshot_does_not_join_image_writer_domain() {
+        let owner = Arc::new(7usize);
+        let owner_weak = Arc::downgrade(&owner);
+        let image = spin::RwLock::new(1usize);
+        let tlb = spin::RwLock::new(owner);
+
+        // This models an exec publication after taking image_binding.write().
+        // A scheduler snapshot must remain callable without recursively
+        // acquiring that lock, and its Arc must pin the observed TLB owner.
+        let image_writer = image.write();
+        let snapshot = scheduler_tlb_state_snapshot(&tlb);
+        assert_eq!(*snapshot, 7);
+        let retired = core::mem::replace(&mut *tlb.write(), Arc::new(9));
+        drop(retired);
+        drop(image_writer);
+
+        assert!(owner_weak.upgrade().is_some());
+        drop(snapshot);
+        assert!(owner_weak.upgrade().is_none());
+    }
+
     // Host tests cannot construct the scheduler-owned AxTaskRef/ProcessData
     // graph without booting global kernel runtime. This is intentionally a
     // structural test of the production publication, alias-lock, action-drop,
@@ -4984,7 +5215,7 @@ mod tests {
     }
 
     #[test]
-    fn group_leader_scheduler_snapshot_retains_final_live_state() {
+    fn group_leader_scheduler_snapshot_retains_last_successful_policy_through_exit_owner() {
         let group = GroupLeaderIdentityBinding::try_new(credential_slot(0)).unwrap();
         group
             .bind_initial_signal(41, thread_signal_manager())
@@ -4998,16 +5229,20 @@ mod tests {
 
         assert_eq!(*scheduler.lock(), ZombieSchedulerSnapshot::default());
 
-        *group.scheduler.lock() = SchedState {
-            class: SchedClass::Batch,
-            nice: -17,
+        group.publish_scheduler_state(SchedState {
+            class: SchedClass::Normal,
+            nice: 19,
             rt_priority: 0,
-        }
-        .into();
+        });
+        group.publish_scheduler_state(SchedState {
+            class: SchedClass::Idle,
+            nice: 19,
+            rt_priority: 0,
+        });
 
         let expected = ZombieSchedulerSnapshot {
-            class: SchedClass::Batch,
-            nice: -17,
+            class: SchedClass::Idle,
+            nice: 19,
         };
         assert_eq!(*scheduler.lock(), expected);
         assert_eq!(
@@ -5540,10 +5775,10 @@ mod tests {
         assert!(Arc::ptr_eq(pid_child.owner_user_ns(), &child));
 
         let uts_root = UtsNamespace::try_new_root(root.clone()).unwrap();
-        uts_root.set_nodename(b"owner-snapshot");
+        uts_root.set_nodename(b"owner-snapshot").unwrap();
         let uts_child = uts_root.try_fork(child.clone()).unwrap();
         assert!(Arc::ptr_eq(uts_child.owner_user_ns(), &child));
-        assert_eq!(uts_child.nodename(), b"owner-snapshot");
+        assert_eq!(uts_child.nodename().unwrap(), b"owner-snapshot");
 
         let time_root = TimeNamespace::try_new_root(root.clone()).unwrap();
         time_root.set_monotonic_offset(7, 11);

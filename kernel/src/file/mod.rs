@@ -6,6 +6,7 @@ pub mod epoll;
 pub mod event;
 pub(crate) mod executable;
 pub mod fanotify;
+mod fiemap;
 pub mod flock;
 mod fs;
 pub(crate) mod inode_flags;

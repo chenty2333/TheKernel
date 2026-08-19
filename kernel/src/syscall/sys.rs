@@ -265,7 +265,7 @@ fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
     }
 }
 
-pub(crate) fn current_utsname() -> new_utsname {
+pub(crate) fn current_utsname() -> AxResult<new_utsname> {
     let mut utsname = new_utsname {
         sysname: pad_str("Linux"),
         nodename: [0; 65],
@@ -277,76 +277,74 @@ pub(crate) fn current_utsname() -> new_utsname {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let uts_ns = proc_data.uts_ns();
-    fill_uts_field(&mut utsname.nodename, &uts_ns.nodename());
-    fill_uts_field(&mut utsname.domainname, &uts_ns.domainname());
-    utsname
+    fill_uts_field(&mut utsname.nodename, &uts_ns.nodename()?);
+    fill_uts_field(&mut utsname.domainname, &uts_ns.domainname()?);
+    Ok(utsname)
 }
 
-pub(crate) fn proc_version_string() -> String {
-    let utsname = current_utsname();
+pub(crate) fn proc_version_string() -> AxResult<String> {
+    let utsname = current_utsname()?;
     let sysname = cstr_field_to_string(&utsname.sysname);
     let release = cstr_field_to_string(&utsname.release);
     let version = cstr_field_to_string(&utsname.version);
     let machine = cstr_field_to_string(&utsname.machine);
-    format!("{sysname} version {release} ({machine}) {version}\n")
+    Ok(format!(
+        "{sysname} version {release} ({machine}) {version}\n"
+    ))
 }
 
-pub(crate) fn current_sysname_string() -> String {
-    let utsname = current_utsname();
-    cstr_field_to_string(&utsname.sysname)
+pub(crate) fn current_sysname_string() -> AxResult<String> {
+    let utsname = current_utsname()?;
+    Ok(cstr_field_to_string(&utsname.sysname))
 }
 
-pub(crate) fn current_release_string() -> String {
-    let utsname = current_utsname();
-    cstr_field_to_string(&utsname.release)
+pub(crate) fn current_release_string() -> AxResult<String> {
+    let utsname = current_utsname()?;
+    Ok(cstr_field_to_string(&utsname.release))
 }
 
-pub(crate) fn current_version_string() -> String {
-    let utsname = current_utsname();
-    cstr_field_to_string(&utsname.version)
+pub(crate) fn current_version_string() -> AxResult<String> {
+    let utsname = current_utsname()?;
+    Ok(cstr_field_to_string(&utsname.version))
 }
 
-pub(crate) fn current_machine_string() -> String {
-    let utsname = current_utsname();
-    cstr_field_to_string(&utsname.machine)
+pub(crate) fn current_machine_string() -> AxResult<String> {
+    let utsname = current_utsname()?;
+    Ok(cstr_field_to_string(&utsname.machine))
 }
 
-pub(crate) fn current_hostname_string() -> String {
+pub(crate) fn current_hostname_string() -> AxResult<String> {
     current()
         .as_thread()
         .proc_data
         .uts_ns()
         .nodename()
-        .into_iter()
-        .map(char::from)
-        .collect()
+        .map(|value| value.into_iter().map(char::from).collect())
 }
 
-pub(crate) fn current_domainname_string() -> String {
+pub(crate) fn current_domainname_string() -> AxResult<String> {
     current()
         .as_thread()
         .proc_data
         .uts_ns()
         .domainname()
-        .into_iter()
-        .map(char::from)
-        .collect()
+        .map(|value| value.into_iter().map(char::from).collect())
 }
 
-pub(crate) fn set_hostname_bytes(hostname: &[u8]) {
+pub(crate) fn set_hostname_bytes(hostname: &[u8]) -> AxResult<()> {
     current()
         .as_thread()
         .proc_data
         .uts_ns()
-        .set_nodename(hostname);
+        .set_nodename(hostname)
 }
 
-pub(crate) fn set_domainname_bytes(domainname: &[u8]) {
+pub(crate) fn set_domainname_bytes(domainname: &[u8]) -> AxResult<()> {
     current()
         .as_thread()
         .proc_data
         .uts_ns()
-        .set_domainname(domainname);
+        .set_domainname(domainname)
 }
 
 pub(crate) fn current_can_administer_uts() -> bool {
@@ -376,7 +374,7 @@ pub fn sys_uname<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *mut new_utsname,
 ) -> AxResult<isize> {
-    let mut uts = current_utsname();
+    let mut uts = current_utsname()?;
     if current().as_thread().proc_data.personality() & UNAME26 != 0 {
         uts.release = [0; 65];
         fill_uts_field(&mut uts.release, UNAME26_RELEASE);
@@ -402,7 +400,7 @@ pub fn sys_sethostname<M: UserMemory + ?Sized>(
         return Err(AxError::BadAddress);
     }
     let hostname = vm_load(memory, name, len).map_err(map_usercopy_error)?;
-    set_hostname_bytes(&hostname);
+    set_hostname_bytes(&hostname)?;
     Ok(0)
 }
 
@@ -421,7 +419,7 @@ pub fn sys_setdomainname<M: UserMemory + ?Sized>(
         return Err(AxError::BadAddress);
     }
     let domainname = vm_load(memory, name, len).map_err(map_usercopy_error)?;
-    set_domainname_bytes(&domainname);
+    set_domainname_bytes(&domainname)?;
     Ok(0)
 }
 

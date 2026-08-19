@@ -30,8 +30,21 @@ pub fn init(args: &[String], envs: &[String]) {
 
     crate::mm::init_tlb_shootdown();
     crate::syscall::init_membarrier_ipi();
+    #[cfg(all(feature = "smp-tlb-shootdown", target_os = "none"))]
+    axtask::init_remote_resched_ipi()
+        .expect("failed to register the EEVDF remote-reschedule IPI consumer");
     crate::mm::init_hardware_asids();
+    crate::rcu::init().expect("Failed to initialize kernel RCU domains");
+    crate::world::init().expect("Failed to initialize local Semantic World authority");
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
+    #[cfg(feature = "bpf")]
+    if let Err(error) = crate::jit_memory::init() {
+        // Native cBPF execution is an optional optimization. The verified
+        // interpreter remains the canonical executor when the arena cannot
+        // be established, while ForceJit admissions still receive an
+        // explicit unavailable/publication error from the JIT adapter.
+        error!("optional bounded W^X JIT arena unavailable: {error:?}; using interpreter fallback");
+    }
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
         system_off();
@@ -153,6 +166,10 @@ pub fn init(args: &[String], envs: &[String]) {
     let exit_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
             .expect("Failed to allocate init exit fd table");
+    let init_uts_ns =
+        UtsNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init UTS namespace");
+    crate::world::register_initial_uts(&init_uts_ns)
+        .expect("Failed to register init UTS provider state");
     let proc = ProcessData::try_new(
         proc,
         prepared_zombie_snapshot,
@@ -170,7 +187,7 @@ pub fn init(args: &[String], envs: &[String]) {
         CgroupNamespace::try_new_root(user_ns.clone())
             .expect("Failed to allocate init cgroup namespace"),
         PidNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init pid namespace"),
-        UtsNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init UTS namespace"),
+        init_uts_ns,
         TimeNamespace::try_new_root(user_ns).expect("Failed to allocate init time namespace"),
     )
     .expect("Failed to allocate init process runtime state");
@@ -183,9 +200,13 @@ pub fn init(args: &[String], envs: &[String]) {
     let thread_admission = proc
         .prepare_thread(tid)
         .expect("Failed to admit init thread membership");
-    let (thr, signal_registration) =
-        Thread::try_new(tid, proc.clone(), credential, SeccompState::disabled())
-            .expect("Failed to allocate init thread state");
+    let (thr, signal_registration) = Thread::try_new(
+        tid,
+        proc.clone(),
+        credential,
+        Arc::new(SeccompState::disabled()),
+    )
+    .expect("Failed to allocate init thread state");
     proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
         .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {

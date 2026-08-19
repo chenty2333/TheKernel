@@ -14,10 +14,7 @@ pub mod tty;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 
-use axdriver::{
-    SharedBlockDevice,
-    prelude::{BlockDriverOps, DevError},
-};
+use axdriver::{SharedBlockDevice, prelude::DevError};
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodePermission, NodeType, VfsResult};

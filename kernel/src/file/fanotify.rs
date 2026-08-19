@@ -25,8 +25,8 @@ use spin::Mutex;
 
 use crate::{
     file::{
-        Directory, File, FileDescription, FileHandle, FileLike, IoDst, IoSrc, Kstat, PidFd,
-        ReservedFd, get_file_like, inotify::WatchKey, reserve_fd,
+        Directory, File, FileDescription, FileHandle, FileLike, IoDst, IoSrc, Kstat, OfdIoStatus,
+        PidFd, ReservedFd, get_file_like, inotify::WatchKey, reserve_fd,
     },
     readiness::{block_on_poll_io, block_on_poll_set},
     task::{AsThread, get_process_data},
@@ -1297,7 +1297,24 @@ pub(crate) fn permission_check(
     is_dir: bool,
     parent_event: bool,
 ) -> AxResult<()> {
-    let actor = FanotifyEventActor::current();
+    permission_check_with_actor(
+        event_loc,
+        watch_loc,
+        mask,
+        is_dir,
+        parent_event,
+        FanotifyEventActor::current(),
+    )
+}
+
+pub(crate) fn permission_check_with_actor(
+    event_loc: &Location,
+    watch_loc: &Location,
+    mask: u64,
+    is_dir: bool,
+    parent_event: bool,
+    actor: FanotifyEventActor,
+) -> AxResult<()> {
     let event_key = WatchKey::from_location(event_loc)?;
     let event_mount_id = event_loc.mountpoint().mount_id();
     let watch_key = WatchKey::from_location(watch_loc)?;
@@ -1364,7 +1381,29 @@ pub(crate) fn permission_check_file_like(
     file_like: &FileHandle<dyn FileLike>,
     mask: u64,
 ) -> AxResult<()> {
-    file_like.check_io_access()?;
+    permission_check_file_like_with_actor(file_like, mask, FanotifyEventActor::current())
+}
+
+pub(crate) fn permission_check_file_like_with_actor(
+    file_like: &FileHandle<dyn FileLike>,
+    mask: u64,
+    actor: FanotifyEventActor,
+) -> AxResult<()> {
+    permission_check_file_like_with_actor_and_status(
+        file_like,
+        mask,
+        actor,
+        file_like.io_status_snapshot(),
+    )
+}
+
+pub(crate) fn permission_check_file_like_with_actor_and_status(
+    file_like: &FileHandle<dyn FileLike>,
+    mask: u64,
+    actor: FanotifyEventActor,
+    status: OfdIoStatus,
+) -> AxResult<()> {
+    file_like.check_io_status(status)?;
     let loc = if let Some(file) = file_like.downcast_ref::<File>() {
         file.inner().location().clone()
     } else if let Some(dir) = file_like.downcast_ref::<Directory>() {
@@ -1372,7 +1411,7 @@ pub(crate) fn permission_check_file_like(
     } else {
         return Ok(());
     };
-    permission_check(&loc, &loc, mask, loc.is_dir(), false)?;
+    permission_check_with_actor(&loc, &loc, mask, loc.is_dir(), false, actor)?;
     Ok(())
 }
 

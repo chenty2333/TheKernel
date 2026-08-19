@@ -559,7 +559,7 @@ pub fn sys_waitid(
     }
 
     let curr = current();
-    let viewer_user_ns = curr.as_thread().current_cred().user_ns().clone();
+    let viewer_user_ns = curr.as_thread().current_user_namespace();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);

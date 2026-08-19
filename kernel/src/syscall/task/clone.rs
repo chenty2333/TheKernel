@@ -243,8 +243,8 @@ bitflags! {
 
 fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
     let proc_data = &thread.proc_data;
+    let uid = thread.real_uid();
     let cred = thread.current_cred();
-    let uid = cred.ids().ruid;
     if cred.is_initial_root_ruid()
         || cred.has_effective_capability(CAP_SYS_RESOURCE)
         || cred.has_effective_capability(CAP_SYS_ADMIN)
@@ -261,7 +261,7 @@ fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
         .into_iter()
         .filter(|task| {
             let thread = task.as_thread();
-            !thread.pending_exit() && thread.current_cred().ids().ruid == uid
+            !thread.pending_exit() && thread.real_uid() == uid
         })
         .count() as u64;
 

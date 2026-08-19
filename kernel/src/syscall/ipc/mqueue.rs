@@ -401,8 +401,8 @@ pub(crate) fn set_mq_msgsize_max(value: usize) {
 
 fn current_ids() -> (u32, u32) {
     let curr = current();
-    let ids = curr.as_thread().current_cred().ids();
-    (ids.fsuid.into_raw(), ids.fsgid.into_raw())
+    let thread = curr.as_thread();
+    (thread.fsuid().into_raw(), thread.fsgid().into_raw())
 }
 
 fn current_mq_sender() -> MqSender {
@@ -410,7 +410,7 @@ fn current_mq_sender() -> MqSender {
     let thread = curr.as_thread();
     MqSender {
         pid: thread.proc_data.proc.pid(),
-        real_uid: thread.current_cred().ids().ruid,
+        real_uid: thread.real_uid(),
         pid_ns: thread.proc_data.pid_ns(),
     }
 }
@@ -590,7 +590,7 @@ fn build_notifier<M: UserMemory + ?Sized>(
         // makes RT siginfo delivery allocation-free. The sender fields are
         // filled from the message snapshot at the edge; only the target
         // namespace and sigev_value belong to this registration.
-        let target_user_ns = curr.as_thread().current_cred().user_ns().clone();
+        let target_user_ns = curr.as_thread().current_user_namespace();
         let target_pid_ns = proc_data.pid_ns();
         let info = SignalInfo::new_rt(
             signo,

@@ -85,8 +85,10 @@ fn update_resource_limit(
     }
     drop(limits);
 
-    if resource == RLIMIT_CPU && crate::task::request_process_cpu_evaluation(proc_data) {
-        crate::deferred_work::wake_process_timer_worker();
+    if resource == RLIMIT_CPU
+        && let Some(cpu) = crate::task::request_process_cpu_evaluation(proc_data)
+    {
+        crate::deferred_work::wake_process_timer_worker(cpu);
     }
     Ok(old)
 }

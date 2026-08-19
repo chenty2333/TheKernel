@@ -1,13 +1,11 @@
 use alloc::sync::Arc;
 #[cfg(test)]
 use core::cell::Cell;
-use core::mem;
 
 #[cfg(test)]
 extern crate std;
 
 use axerrno::{AxError, AxResult};
-use axsync::spin::SpinNoIrq;
 #[cfg(test)]
 pub(crate) use thekernel_linux_cred::CAPABILITY_VALID_MASK;
 pub(crate) use thekernel_linux_cred::{
@@ -26,6 +24,10 @@ use super::{
         CredentialMutationKind, CredentialSecurityState, CredentialStateTransition,
         FrozenSecurityRegistry, PendingCredentialPostCommit, capable, capable_for_setid,
     },
+};
+use crate::rcu::{
+    CredentialRcuSlot, CredentialRetireReservation, ensure_current_cpu_registered,
+    wake_credential_retire_worker,
 };
 
 pub(in crate::task) type CoreCred = Credential<UserNamespace>;
@@ -376,13 +378,13 @@ impl CredBuilder {
 /// subsequent commits therefore affect only the owning task.
 pub(crate) struct CredentialSlot {
     update: CredentialUpdateMutex<()>,
-    current: SpinNoIrq<Arc<Cred>>,
+    current: CredentialRcuSlot<Cred>,
 }
 
 /// Pins one credential slot against publication while a security decision is
 /// carried into a later composite operation. The sleepable update guard is
-/// held for the lifetime of this value; the current-pointer spin lock is used
-/// only to clone the immutable credential object.
+/// held for the lifetime of this value; the bounded RCU slot is used only to
+/// clone the immutable credential object.
 pub(crate) struct CredentialSnapshotGuard<'a> {
     slot: &'a CredentialSlot,
     _update: CredentialUpdateGuard<'a, ()>,
@@ -401,20 +403,40 @@ impl CredentialSnapshotGuard<'_> {
 
 impl CredentialSlot {
     pub(crate) fn new(initial: Arc<Cred>) -> Self {
+        ensure_current_cpu_registered()
+            .unwrap_or_else(|error| panic!("credential RCU CPU registration failed: {error}"));
         Self {
             update: CredentialUpdateMutex::new(()),
-            current: SpinNoIrq::new(initial),
+            current: crate::rcu::credential_slot(initial),
         }
     }
 
     pub(crate) fn try_new(initial: Arc<Cred>) -> AxResult<Arc<Self>> {
-        Arc::try_new(Self::new(initial)).map_err(|_| AxError::NoMemory)
+        ensure_current_cpu_registered()?;
+        Arc::try_new(Self {
+            update: CredentialUpdateMutex::new(()),
+            current: crate::rcu::credential_slot(initial),
+        })
+        .map_err(|_| AxError::NoMemory)
     }
 
-    /// Takes a coherent reader reference while holding only the short
-    /// publication spin lock. No allocation or destruction occurs here.
+    /// Takes a coherent immutable reader reference through the bounded RCU
+    /// slot. The allocation-free read side only clones the existing Arc.
     pub(crate) fn current(&self) -> Arc<Cred> {
-        self.current.lock().clone()
+        self.current.load()
+    }
+
+    /// Runs a read-only credential query from an owned immutable snapshot.
+    ///
+    /// The RCU section is intentionally limited to `current()`, which bumps
+    /// one Arc strong count and then releases the preemption pin. Callers may
+    /// therefore perform arbitrarily long pure evaluation (including helper
+    /// calls that can reschedule) without holding a non-preemptible RCU
+    /// section. Publication/clear still linearize at the slot's atomic swap;
+    /// the returned Arc keeps the exact committed composite alive.
+    pub(crate) fn with_current<R>(&self, operation: impl for<'a> FnOnce(&'a Cred) -> R) -> R {
+        let credential = self.current();
+        operation(&credential)
     }
 
     pub(crate) fn lock_snapshot(&self) -> CredentialSnapshotGuard<'_> {
@@ -451,6 +473,19 @@ impl CredentialSlot {
             guard,
             old,
             builder,
+        }
+    }
+
+    fn reserve_retire(&self) -> AxResult<CredentialRetireReservation> {
+        match self.current.reserve_retire() {
+            Ok(reservation) => Ok(reservation),
+            // The caller still holds the credential writer mutex. Draining
+            // here could run a retired `Cred` destructor (and its security
+            // free callback) under that lock, violating the publication
+            // lock order and permitting callback re-entry. The policy worker
+            // owns reclamation; report bounded pressure and leave the exact
+            // transaction uncommitted instead.
+            Err(_) => Err(AxError::ResourceBusy),
         }
     }
 
@@ -528,12 +563,14 @@ impl<'a> CredentialUpdate<'a> {
         } = self;
         let (proposed, effects, transition) = builder.try_build(&old)?;
         let post_commit = PendingCredentialPostCommit::try_new(&old, &proposed, transition)?;
+        let retire = slot.reserve_retire()?;
         Ok(PreparedCred {
             slot,
             guard,
             old,
             proposed,
             post_commit,
+            retire,
             requires_dumpability_drop: effects.requires_dumpability_drop(),
         })
     }
@@ -560,6 +597,7 @@ impl<'a> CredentialUpdate<'a> {
         let proposed = Cred::try_from_prepared_parts(proposed_core, proposed_security)?;
         let post_commit =
             PendingCredentialPostCommit::try_new(&old, &proposed, CredentialStateTransition::Exec)?;
+        let retire = slot.reserve_retire()?;
         drop(builder);
         Ok(PreparedCred {
             slot,
@@ -567,6 +605,7 @@ impl<'a> CredentialUpdate<'a> {
             old,
             proposed,
             post_commit,
+            retire,
             requires_dumpability_drop,
         })
     }
@@ -579,6 +618,7 @@ pub(crate) struct PreparedCred<'a> {
     old: Arc<Cred>,
     proposed: Arc<Cred>,
     post_commit: PendingCredentialPostCommit,
+    retire: CredentialRetireReservation,
     requires_dumpability_drop: bool,
 }
 
@@ -675,23 +715,15 @@ impl<'a> PreparedCred<'a> {
             old,
             proposed,
             post_commit,
+            retire,
             requires_dumpability_drop: _,
         } = self;
         post_commit.activate();
-        let published = {
-            let mut current = slot.current.lock();
-            #[cfg(test)]
-            CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
-            assert!(
-                Arc::ptr_eq(&*current, &old),
-                "credential publication lost its exact old composite"
-            );
-            let published = mem::replace(&mut *current, proposed.clone());
-            #[cfg(test)]
-            CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
-            published
-        };
-        debug_assert!(Arc::ptr_eq(&published, &old));
+        let published = slot
+            .current
+            .publish(proposed.clone(), &old, retire)
+            .unwrap_or_else(|_| panic!("credential publication lost its exact old composite"));
+        wake_credential_retire_worker();
         CredentialPublication {
             guard: Some(guard),
             proposed: Some(proposed),
@@ -941,9 +973,27 @@ mod tests {
             thread::spawn(move || {
                 for value in 1..=UPDATES {
                     round.wait();
-                    let mut update = slot.prepare();
-                    update.builder.ids.ruid = kuid(value);
-                    update.finish().unwrap().commit();
+                    loop {
+                        let mut update = slot.prepare();
+                        update.builder.ids.ruid = kuid(value);
+                        match update.finish() {
+                            Ok(prepared) => {
+                                prepared.commit();
+                                break;
+                            }
+                            Err(AxError::ResourceBusy) => {
+                                // The writer guard has been dropped with the
+                                // consumed update. Reclaim only at this
+                                // outer retry boundary; production uses the
+                                // policy worker for the same lock-safe drain.
+                                crate::rcu::drain_credential_retire(
+                                    crate::rcu::CREDENTIAL_RETIRE_CAPACITY,
+                                );
+                                thread::yield_now();
+                            }
+                            Err(error) => panic!("credential update failed: {error:?}"),
+                        }
+                    }
                     finish.wait();
                 }
             })
@@ -953,9 +1003,23 @@ mod tests {
             thread::spawn(move || {
                 for value in 1..=UPDATES {
                     round.wait();
-                    let mut update = slot.prepare();
-                    update.builder.ids.rgid = kgid(10_000 + value);
-                    update.finish().unwrap().commit();
+                    loop {
+                        let mut update = slot.prepare();
+                        update.builder.ids.rgid = kgid(10_000 + value);
+                        match update.finish() {
+                            Ok(prepared) => {
+                                prepared.commit();
+                                break;
+                            }
+                            Err(AxError::ResourceBusy) => {
+                                crate::rcu::drain_credential_retire(
+                                    crate::rcu::CREDENTIAL_RETIRE_CAPACITY,
+                                );
+                                thread::yield_now();
+                            }
+                            Err(error) => panic!("credential update failed: {error:?}"),
+                        }
+                    }
                     finish.wait();
                 }
             })
@@ -976,7 +1040,7 @@ mod tests {
         let slot = slot();
         let root_ns = slot.current().user_ns().clone();
 
-        let publish = |slot: &CredentialSlot, first: bool| {
+        let publish = |slot: &CredentialSlot, first: bool| loop {
             let mut update = slot.prepare();
             let (id, group, cap, securebits) = if first {
                 (kuid(1000), kgid(100), CAP_CHOWN, 0)
@@ -1002,7 +1066,21 @@ mod tests {
                 [0; CAPABILITY_WORDS],
                 securebits,
             );
-            update.finish().unwrap().commit();
+            match update.finish() {
+                Ok(prepared) => {
+                    prepared.commit();
+                    break;
+                }
+                Err(AxError::ResourceBusy) => {
+                    // `finish` has released the credential writer guard.  The
+                    // test fixture has no policy worker, so make bounded RCU
+                    // progress here without ever running destructors under
+                    // the writer lock.
+                    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
+                    thread::yield_now();
+                }
+                Err(error) => panic!("credential update failed: {error:?}"),
+            }
         };
         publish(&slot, true);
 

@@ -9,7 +9,7 @@ use thekernel_linux_cred::{
 };
 
 use super::{
-    Kgid, Kuid, Thread,
+    Kgid, Kuid, Thread, UserNamespace,
     creds::{
         CapabilityState, Cred, CredentialSlot, CredentialSnapshotGuard, CredentialUpdate,
         DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
@@ -225,7 +225,7 @@ pub(in crate::task) fn prepare_securebits_update(
 
 impl Thread {
     pub fn no_new_privs(&self) -> bool {
-        self.current_cred().no_new_privs()
+        self.credential.with_current(Cred::no_new_privs)
     }
 
     pub fn set_no_new_privs(&self) -> AxResult<()> {
@@ -242,6 +242,38 @@ impl Thread {
 impl Thread {
     pub(crate) fn current_cred(&self) -> Arc<Cred> {
         self.credential.current()
+    }
+
+    /// Scalar identity queries stay on the RCU read side and do not clone the
+    /// outer credential Arc.
+    pub(crate) fn real_uid(&self) -> Kuid {
+        self.credential
+            .with_current(|credential| credential.ids().ruid)
+    }
+
+    pub(crate) fn real_gid(&self) -> Kgid {
+        self.credential
+            .with_current(|credential| credential.ids().rgid)
+    }
+
+    pub(crate) fn effective_uid(&self) -> Kuid {
+        self.credential
+            .with_current(|credential| credential.ids().euid)
+    }
+
+    pub(crate) fn fsuid(&self) -> Kuid {
+        self.credential
+            .with_current(|credential| credential.ids().fsuid)
+    }
+
+    pub(crate) fn fsgid(&self) -> Kgid {
+        self.credential
+            .with_current(|credential| credential.ids().fsgid)
+    }
+
+    pub(crate) fn current_user_namespace(&self) -> Arc<UserNamespace> {
+        self.credential
+            .with_current(|credential| credential.user_ns().clone())
     }
 
     /// Pins this task's exact immutable credential across a composite
@@ -306,18 +338,21 @@ impl Thread {
 impl Thread {
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
-        self.current_cred().fs_dac_credentials()
+        self.credential.with_current(Cred::fs_dac_credentials)
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
-        self.current_cred().has_effective_capability(cap)
+        self.credential
+            .with_current(|credential| credential.has_effective_capability(cap))
     }
 
     pub fn bounding_capability_enabled(&self, cap: u32) -> AxResult<bool> {
         if CapabilityState::cap_mask(cap).is_none() {
             return Err(AxError::InvalidInput);
         }
-        Ok(self.current_cred().capabilities().bounding_contains(cap))
+        Ok(self
+            .credential
+            .with_current(|credential| credential.capabilities().bounding_contains(cap)))
     }
 
     pub fn drop_bounding_capability(&self, cap: u32) -> AxResult<()> {
@@ -341,7 +376,9 @@ impl Thread {
         if CapabilityState::cap_mask(cap).is_none() {
             return Err(AxError::InvalidInput);
         }
-        Ok(self.current_cred().capabilities().ambient_contains(cap))
+        Ok(self
+            .credential
+            .with_current(|credential| credential.capabilities().ambient_contains(cap)))
     }
 
     pub fn raise_ambient_capability(&self, cap: u32) -> AxResult<()> {
@@ -377,7 +414,8 @@ impl Thread {
     }
 
     pub fn securebits(&self) -> u32 {
-        self.current_cred().capabilities().securebits()
+        self.credential
+            .with_current(|credential| credential.capabilities().securebits())
     }
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
@@ -388,7 +426,9 @@ impl Thread {
     }
 
     pub fn keep_caps(&self) -> bool {
-        self.current_cred().capabilities().securebits() & SECBIT_KEEP_CAPS != 0
+        self.credential.with_current(|credential| {
+            credential.capabilities().securebits() & SECBIT_KEEP_CAPS != 0
+        })
     }
 
     pub fn set_keep_caps(&self, enabled: bool) -> AxResult<()> {

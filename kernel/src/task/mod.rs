@@ -63,7 +63,7 @@ pub(crate) use self::{
     },
     restart::*,
     rseq::{AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE},
-    seccomp::{init_seccomp_filter_budget, seccomp_filter_budget},
+    seccomp::{SeccompPublicationError, init_seccomp_filter_budget, seccomp_filter_budget},
     security::{PendingCredentialPublication, SignalTargetKind},
     thread::{
         ProcStateHint, TaskParentChoice, TaskParentCredentialPin, TaskParentNode,

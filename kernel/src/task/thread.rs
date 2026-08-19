@@ -26,6 +26,7 @@ use super::{
     accounting::{AtomicTaskUsage, TaskUsage},
     creds::{Cred, CredentialSlot, CredentialSnapshotGuard},
     restart::RestartTracker,
+    seccomp::ThreadSeccompSlot,
     timer::{TimeManager, request_process_cpu_evaluation},
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
@@ -717,12 +718,19 @@ pub struct Thread {
     /// publication point.
     pub(in crate::task) credential: Arc<CredentialSlot>,
 
-    /// One atomically consistent, task-local seccomp mode and filter ancestry.
+    /// One atomically consistent, task-local seccomp mode and filter ancestry
+    /// published through the independent bounded seccomp RCU domain.
     ///
     /// Fork and clone initialize an independent publication slot from one
     /// caller snapshot. Immutable filter nodes remain shared and accounted
     /// until their final owner exits.
-    pub(in crate::task) seccomp: SpinNoIrq<SeccompState>,
+    pub(in crate::task) seccomp: ThreadSeccompSlot,
+
+    /// Preallocated disabled state retained for cold snapshots and terminal
+    /// teardown. An active slot is synchronously cleared at exit, so the
+    /// terminal path needs neither a replacement allocation nor retire-queue
+    /// capacity.
+    pub(in crate::task) seccomp_terminal_disabled: Arc<SeccompState>,
 
     /// Thread-local Linux restartable-sequence registration and event state.
     ///
@@ -731,16 +739,6 @@ pub struct Thread {
     /// an address space. Scheduler, signal, and final-return callers publish
     /// observations through this state without resolving an implicit task.
     pub(in crate::task) rseq: SpinNoIrq<ThreadRseq>,
-
-    /// Negative fast-path for syscall entry.
-    ///
-    /// This bit is not a second writable seccomp state: the guarded
-    /// `SeccompState` remains authoritative. It changes only after a complete
-    /// state publication and lets permanently-disabled tasks avoid taking the
-    /// publication lock or cloning an empty filter chain on every syscall.
-    /// It returns to `false` only after this task's irreversible exit commit,
-    /// when no later syscall or seccomp publication is permitted.
-    pub(in crate::task) seccomp_active: AtomicBool,
 
     /// Per-task operation credential used while an OFD read/write is active.
     /// This is not process Scope state: sibling threads may block or perform
@@ -833,7 +831,7 @@ impl Thread {
         tid: u32,
         proc_data: Arc<ProcessData>,
         credential: Arc<CredentialSlot>,
-        seccomp: SeccompState,
+        seccomp: Arc<SeccompState>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         Self::try_new_with_io_context(tid, proc_data, credential, seccomp, None)
     }
@@ -845,13 +843,13 @@ impl Thread {
         tid: u32,
         proc_data: Arc<ProcessData>,
         credential: Arc<CredentialSlot>,
-        seccomp: SeccompState,
+        seccomp: Arc<SeccompState>,
         io_context: Option<Arc<AtomicU16>>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         // ProcessData is created before the child scheduler object. Seed its
         // durable scheduler identity from the caller now, including Linux's
-        // reset-on-fork transformation; later scheduler syscalls keep this
-        // cell current and set_exit publishes one final authoritative sample.
+        // reset-on-fork transformation; later successful scheduler syscalls
+        // keep this cell current through final exit and zombie retention.
         if let Some(current_task) = current_may_uninit()
             && let Some(parent) = current_task.try_as_thread()
             && proc_data.proc.pid() == tid
@@ -884,14 +882,14 @@ impl Thread {
         let task_parent =
             TaskParentNode::try_new(tid, Arc::downgrade(&proc_data), Arc::downgrade(&credential))?;
         let time = TimeManager::new(&proc_data);
-        let seccomp_active = seccomp.mode() != thekernel_linux_seccomp::SeccompMode::Disabled;
+        let (seccomp, seccomp_terminal_disabled) = super::seccomp::new_thread_seccomp(seccomp)?;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
             credential,
-            seccomp: SpinNoIrq::new(seccomp),
+            seccomp,
+            seccomp_terminal_disabled,
             rseq: SpinNoIrq::new(ThreadRseq::new()),
-            seccomp_active: AtomicBool::new(seccomp_active),
             file_operation_credential: SpinNoIrq::new(None),
             file_write_credentials: SpinNoIrq::new(None),
             set_child_tid: AtomicUsize::new(0),
@@ -1237,8 +1235,8 @@ impl Thread {
             TaskUsage::from_time_values(utime, stime)
         };
         self.store_usage_snapshot(usage);
-        if request_process_cpu_evaluation(&self.proc_data) {
-            crate::deferred_work::wake_process_timer_worker();
+        if let Some(cpu) = request_process_cpu_evaluation(&self.proc_data) {
+            crate::deferred_work::wake_process_timer_worker(cpu);
         }
     }
 
@@ -1254,10 +1252,10 @@ impl Thread {
         };
         self.store_usage_snapshot(usage);
         let work_pending = request_process_cpu_evaluation(&self.proc_data);
-        if work_pending {
-            crate::deferred_work::wake_process_timer_worker();
+        if let Some(cpu) = work_pending {
+            crate::deferred_work::wake_process_timer_worker(cpu);
         }
-        work_pending
+        work_pending.is_some()
     }
 
     fn resume_cpu_accounting_after_switch(&self) {

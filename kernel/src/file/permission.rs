@@ -26,6 +26,7 @@ use thekernel_linux_cred::{
 
 use crate::{
     file::privilege_metadata::InodePrivilegeCleanup,
+    pseudofs::check_proc_pid_dir_search,
     task::{
         Cred, DacCredentialView, Kgid, Kuid, UserNamespace,
         security::{
@@ -1227,6 +1228,7 @@ pub(crate) fn check_pathwalk_search_permission_with_security(
     credentials: &DacCredentialView,
     filesystem_owner_user_ns: &Arc<UserNamespace>,
 ) -> AxResult {
+    check_proc_pid_dir_search(dir)?;
     check_inode_permissions(dir, X_OK, actor, credentials, filesystem_owner_user_ns)
 }
 
@@ -1306,6 +1308,7 @@ pub(crate) fn check_pathwalk_search_permission(
     dir: &Location,
     credentials: &DacCredentialView,
 ) -> AxResult {
+    check_proc_pid_dir_search(dir)?;
     let stat = dir.metadata()?;
     check_dac_permissions(
         stat.mode.bits() as u32,

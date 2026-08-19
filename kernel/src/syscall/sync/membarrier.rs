@@ -125,22 +125,12 @@ fn full_memory_barrier() {
     fence(Ordering::SeqCst);
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn synchronize_core() {
     full_memory_barrier();
     // CPUID is serializing on x86 and is the architecture primitive used by
     // Linux's sync-core membarrier path.
     let _ = core::arch::x86_64::__cpuid(0);
-    full_memory_barrier();
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn synchronize_core() {
-    // The project is x86_64-only. Keeping this fallback makes host parsing
-    // tests well-formed if Cargo performs a metadata-only non-x86 build,
-    // without advertising a non-x86 runtime implementation.
     full_memory_barrier();
 }
 

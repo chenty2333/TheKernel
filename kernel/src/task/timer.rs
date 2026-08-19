@@ -7,10 +7,12 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
+    cell::UnsafeCell,
     future::{Future, poll_fn},
+    mem::MaybeUninit,
     pin::Pin,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -28,6 +30,7 @@ use kernel_guard::NoPreempt;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
+use spin::Once;
 use strum::FromRepr;
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{SignalInfo, SignalTimerPayload, Signo};
@@ -1392,10 +1395,10 @@ const PROCESS_CPU_POLICY_PENDING_MASK: u8 = PROCESS_ITIMER_CPU_ARMED_MASK
     | PROCESS_RLIMIT_CPU_HARD_PENDING
     | PROCESS_CPU_EVALUATE_PENDING;
 const PROCESS_ITIMER_WORK_BATCH: usize = 16;
-/// Intrusive node for the bounded process-timer MPSC ingress. A queued process
-/// retains one strong `Arc` in `owner`; the single consumer converts that raw
-/// strong reference back into an `Arc` after fully unlinking the node. The
-/// permanent stub has a null owner.
+/// Intrusive node for one bounded process-timer MPSC ingress. A queued
+/// process retains one strong `Arc` in `owner`; the queue's single consumer
+/// converts that raw strong reference back into an `Arc` after fully unlinking
+/// the node. Permanent per-CPU stubs have a null owner.
 pub(crate) struct ProcessITimerWorkNode {
     next: AtomicPtr<ProcessITimerWorkNode>,
     owner: AtomicPtr<ProcessData>,
@@ -1410,10 +1413,175 @@ impl ProcessITimerWorkNode {
     }
 }
 
-static PROCESS_ITIMER_WORK_STUB: ProcessITimerWorkNode = ProcessITimerWorkNode::new();
-static PROCESS_ITIMER_WORK_TAIL: AtomicPtr<ProcessITimerWorkNode> = AtomicPtr::new(
-    &PROCESS_ITIMER_WORK_STUB as *const ProcessITimerWorkNode as *mut ProcessITimerWorkNode,
-);
+const PROCESS_ITIMER_CPU_COUNT: usize = axconfig::plat::MAX_CPU_NUM;
+
+// Queue ownership is permanent for the x86_64-only kernel. The current
+// project has no CPU hotplug path, so a node published to CPU N's queue is
+// normally consumed by CPU N's pinned worker; if that worker fails, the same
+// fixed cursor may be handed to one bounded fallback task context. Keeping
+// stubs and tails in fixed storage makes IRQ/task-context publication
+// allocation free and gives every producer its own tail cache line domain.
+static PROCESS_ITIMER_WORK_STUBS: [ProcessITimerWorkNode; PROCESS_ITIMER_CPU_COUNT] =
+    [const { ProcessITimerWorkNode::new() }; PROCESS_ITIMER_CPU_COUNT];
+static PROCESS_ITIMER_WORK_TAILS: [AtomicPtr<ProcessITimerWorkNode>; PROCESS_ITIMER_CPU_COUNT] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; PROCESS_ITIMER_CPU_COUNT];
+static PROCESS_ITIMER_WORK_QUEUES_INIT: Once = Once::new();
+static PROCESS_ITIMER_WORK_PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_ITIMER_WORK_DRAINED: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_ITIMER_WORK_LAST_NODE_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_ITIMER_WORK_PRODUCER_LINK_GAPS: AtomicUsize = AtomicUsize::new(0);
+
+const PROCESS_ITIMER_CONSUMER_FREE: u8 = 0;
+const PROCESS_ITIMER_CONSUMER_WORKER: u8 = 1;
+const PROCESS_ITIMER_CONSUMER_FALLBACK: u8 = 2;
+
+struct ProcessITimerConsumerSlot {
+    owner: AtomicU8,
+    cursor: UnsafeCell<MaybeUninit<ProcessITimerWorkConsumer>>,
+}
+
+// The owner token is the synchronization boundary. Exactly one task context
+// may dereference a slot cursor at a time; the fixed storage itself never
+// moves, so a worker can release it after an error and a fallback (possibly
+// running on another CPU) can acquire the same cursor without rebuilding the
+// queue position from the stub.
+unsafe impl Sync for ProcessITimerConsumerSlot {}
+
+impl ProcessITimerConsumerSlot {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicU8::new(PROCESS_ITIMER_CONSUMER_FREE),
+            cursor: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+static PROCESS_ITIMER_CONSUMER_SLOTS: [ProcessITimerConsumerSlot; PROCESS_ITIMER_CPU_COUNT] =
+    [const { ProcessITimerConsumerSlot::new() }; PROCESS_ITIMER_CPU_COUNT];
+static PROCESS_ITIMER_CONSUMERS_INIT: Once = Once::new();
+
+fn ensure_process_itimer_work_queues() {
+    PROCESS_ITIMER_WORK_QUEUES_INIT.call_once(|| {
+        for cpu in 0..PROCESS_ITIMER_CPU_COUNT {
+            let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[cpu]).cast_mut();
+            PROCESS_ITIMER_WORK_STUBS[cpu]
+                .next
+                .store(ptr::null_mut(), Ordering::Relaxed);
+            PROCESS_ITIMER_WORK_STUBS[cpu]
+                .owner
+                .store(ptr::null_mut(), Ordering::Relaxed);
+            PROCESS_ITIMER_WORK_TAILS[cpu].store(stub, Ordering::Relaxed);
+        }
+    });
+}
+
+fn process_itimer_consumer_from_cpu(cpu: usize) -> ProcessITimerWorkConsumer {
+    debug_assert!(cpu < PROCESS_ITIMER_CPU_COUNT);
+    ProcessITimerWorkConsumer {
+        cpu,
+        head: ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[cpu]).cast_mut(),
+    }
+}
+
+fn ensure_process_itimer_consumers() {
+    ensure_process_itimer_work_queues();
+    PROCESS_ITIMER_CONSUMERS_INIT.call_once(|| {
+        for cpu in 0..PROCESS_ITIMER_CPU_COUNT {
+            // SAFETY: `call_once` exclusively initializes each never-read
+            // slot. The owner token remains FREE until this write completes.
+            unsafe {
+                (*PROCESS_ITIMER_CONSUMER_SLOTS[cpu].cursor.get()) =
+                    MaybeUninit::new(process_itimer_consumer_from_cpu(cpu));
+            }
+        }
+    });
+}
+
+fn acquire_process_itimer_consumer(cpu: usize, owner: u8) -> bool {
+    ensure_process_itimer_consumers();
+    debug_assert!(cpu < PROCESS_ITIMER_CPU_COUNT);
+    PROCESS_ITIMER_CONSUMER_SLOTS[cpu]
+        .owner
+        .compare_exchange(
+            PROCESS_ITIMER_CONSUMER_FREE,
+            owner,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+fn release_process_itimer_consumer(cpu: usize, owner: u8) {
+    debug_assert!(cpu < PROCESS_ITIMER_CPU_COUNT);
+    let result = PROCESS_ITIMER_CONSUMER_SLOTS[cpu].owner.compare_exchange(
+        owner,
+        PROCESS_ITIMER_CONSUMER_FREE,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
+    debug_assert!(result.is_ok());
+}
+
+unsafe fn process_itimer_consumer_mut(cpu: usize) -> &'static mut ProcessITimerWorkConsumer {
+    // SAFETY: callers hold the slot's owner token, which serializes this
+    // mutable access between the bound worker and the fallback consumer.
+    unsafe { (*PROCESS_ITIMER_CONSUMER_SLOTS[cpu].cursor.get()).assume_init_mut() }
+}
+
+pub(crate) fn acquire_process_itimer_worker_consumer(cpu: usize) -> bool {
+    acquire_process_itimer_consumer(cpu, PROCESS_ITIMER_CONSUMER_WORKER)
+}
+
+pub(crate) fn acquire_process_itimer_fallback_consumer(cpu: usize) -> bool {
+    acquire_process_itimer_consumer(cpu, PROCESS_ITIMER_CONSUMER_FALLBACK)
+}
+
+pub(crate) fn release_process_itimer_worker_consumer(cpu: usize) {
+    release_process_itimer_consumer(cpu, PROCESS_ITIMER_CONSUMER_WORKER);
+}
+
+pub(crate) fn release_process_itimer_fallback_consumer(cpu: usize) {
+    release_process_itimer_consumer(cpu, PROCESS_ITIMER_CONSUMER_FALLBACK);
+}
+
+pub(crate) fn process_itimer_consumer_has_pending(cpu: usize) -> bool {
+    // SAFETY: the worker/fallback owner token is held by the caller.
+    unsafe { process_itimer_consumer_mut(cpu).has_pending() }
+}
+
+pub(crate) fn process_itimer_consumer_is_quiescent(cpu: usize) -> bool {
+    // SAFETY: the worker/fallback owner token is held by the caller.
+    unsafe { process_itimer_consumer_mut(cpu).is_quiescent() }
+}
+
+pub(crate) fn drain_process_itimer_batch(cpu: usize) -> usize {
+    // SAFETY: the worker/fallback owner token is held by the caller.
+    unsafe { process_itimer_consumer_mut(cpu).drain_batch() }
+}
+
+/// Initializes the fixed per-CPU ingress before user tasks are published.
+/// `Once` also keeps direct unit-test and early teardown callers safe if they
+/// exercise the producer before the normal deferred-work init sequence.
+pub(crate) fn init_process_itimer_work_queues() {
+    ensure_process_itimer_consumers();
+}
+
+#[inline]
+fn process_itimer_owner_cpu() -> usize {
+    let cpu = axhal::percpu::this_cpu_id();
+    debug_assert!(cpu < PROCESS_ITIMER_CPU_COUNT);
+    cpu
+}
+
+#[inline]
+fn process_itimer_owner_from_token(token: usize) -> Option<usize> {
+    let cpu = token.checked_sub(1)?;
+    // This word is only ever published by `publish_process_itimer_work`, but
+    // treat a stale/corrupt value as an absent wake target in release builds
+    // as well.  Returning an out-of-range CPU here would turn a harmless
+    // coalesced request into an indexing panic in the wake path.
+    (cpu < PROCESS_ITIMER_CPU_COUNT).then_some(cpu)
+}
 
 fn rebase_process_cpu_timer_clock(
     owner: &ProcessData,
@@ -1715,6 +1883,8 @@ impl ProcessITimers {
 
 #[cfg(test)]
 mod process_itimer_tests {
+    use alloc::vec;
+
     use super::*;
 
     fn arm_cpu_timer(timers: &mut ProcessITimers, ty: ITimerType, interval: usize, deadline: u64) {
@@ -2142,6 +2312,312 @@ mod process_itimer_tests {
     }
 
     #[test]
+    fn per_cpu_owner_queues_start_with_isolated_stub_and_tail_pairs() {
+        ensure_process_itimer_work_queues();
+        let cpu_count = PROCESS_ITIMER_CPU_COUNT.min(2);
+        for cpu in 0..cpu_count {
+            let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[cpu]).cast_mut();
+            assert_eq!(PROCESS_ITIMER_WORK_TAILS[cpu].load(Ordering::Acquire), stub);
+            assert!(!has_deferred_process_itimer_work_on_cpu(cpu));
+            assert!(
+                PROCESS_ITIMER_WORK_STUBS[cpu]
+                    .next
+                    .load(Ordering::Acquire)
+                    .is_null()
+            );
+            assert!(
+                PROCESS_ITIMER_WORK_STUBS[cpu]
+                    .owner
+                    .load(Ordering::Acquire)
+                    .is_null()
+            );
+        }
+        if let Some((first, rest)) = PROCESS_ITIMER_WORK_STUBS.split_first()
+            && let Some(second) = rest.first()
+        {
+            assert_ne!(ptr::from_ref(first), ptr::from_ref(second));
+        }
+    }
+
+    #[test]
+    fn process_timer_policy_drain_is_bounded_to_one_fixed_batch() {
+        assert_eq!(PROCESS_ITIMER_WORK_BATCH, 16);
+    }
+
+    #[test]
+    fn consumer_owner_token_handoff_is_exclusive() {
+        ensure_process_itimer_consumers();
+        assert!(acquire_process_itimer_worker_consumer(0));
+        assert!(!acquire_process_itimer_fallback_consumer(0));
+        // The ownership token protects a fixed cursor, not a consumer value
+        // rebuilt from the stub. Preserve the exact cursor address/state
+        // across the worker -> fallback handoff.
+        let worker_head = unsafe { process_itimer_consumer_mut(0).head };
+        release_process_itimer_worker_consumer(0);
+        assert!(acquire_process_itimer_fallback_consumer(0));
+        let fallback_head = unsafe { process_itimer_consumer_mut(0).head };
+        assert_eq!(fallback_head, worker_head);
+        release_process_itimer_fallback_consumer(0);
+    }
+
+    #[test]
+    fn queued_owner_token_keeps_wake_target_across_producer_migration() {
+        // CPU 2 owns the queued node (the public token is CPU + 1). The
+        // producer may migrate before its caller performs the wake, but the
+        // readback remains the queue owner's exact CPU rather than the
+        // producer's current CPU.
+        let owner_token = core::sync::atomic::AtomicUsize::new(2 + 1);
+        let wake_cpu = process_itimer_owner_from_token(owner_token.load(Ordering::Acquire));
+        let producer_cpu_after_migration = 0;
+        assert_eq!(wake_cpu, Some(2));
+        assert_ne!(producer_cpu_after_migration, wake_cpu.unwrap());
+        owner_token.store(0, Ordering::Release);
+        assert_eq!(
+            process_itimer_owner_from_token(owner_token.load(Ordering::Acquire)),
+            None
+        );
+        assert_eq!(
+            process_itimer_owner_from_token(PROCESS_ITIMER_CPU_COUNT + 1),
+            None
+        );
+    }
+
+    #[derive(Debug)]
+    struct QueueCursorModel {
+        next: Vec<Option<usize>>,
+        owner: Vec<bool>,
+        head: usize,
+        tail: usize,
+    }
+
+    impl QueueCursorModel {
+        const STUB: usize = 0;
+
+        fn new(node_count: usize) -> Self {
+            Self {
+                next: vec![None; node_count + 1],
+                owner: vec![false; node_count + 1],
+                head: Self::STUB,
+                tail: Self::STUB,
+            }
+        }
+
+        fn publish(&mut self, node: usize) {
+            assert!(!self.owner[node]);
+            self.owner[node] = true;
+            self.next[node] = None;
+            let previous = self.tail;
+            self.tail = node;
+            self.next[previous] = Some(node);
+        }
+
+        fn pop(&mut self) -> Option<usize> {
+            let mut head = self.head;
+            let mut next = self.next[head];
+            if head == Self::STUB {
+                let node = next?;
+                self.head = node;
+                head = node;
+                next = self.next[head];
+            }
+            if next.is_none() {
+                if head != self.tail {
+                    // Producer tail-link gap: preserve the exact cursor.
+                    return None;
+                }
+                self.next[Self::STUB] = None;
+                let previous = self.tail;
+                self.tail = Self::STUB;
+                self.next[previous] = Some(Self::STUB);
+                next = self.next[head];
+                next?;
+            }
+            self.head = next.expect("linked queue node must have a successor");
+            assert!(self.owner[head]);
+            self.owner[head] = false;
+            Some(head)
+        }
+
+        fn drain_batch(&mut self) -> usize {
+            let mut drained = 0;
+            while drained < PROCESS_ITIMER_WORK_BATCH {
+                if self.pop().is_none() {
+                    break;
+                }
+                drained += 1;
+            }
+            drained
+        }
+
+        fn raw_work_pending(&self) -> bool {
+            self.tail != Self::STUB || self.next[Self::STUB].is_some()
+        }
+
+        fn all_released(&self) -> bool {
+            self.owner.iter().skip(1).all(|owner| !owner)
+                && self.head == Self::STUB
+                && self.tail == Self::STUB
+        }
+    }
+
+    #[test]
+    fn persistent_cursor_drains_more_than_two_batches_after_failure() {
+        let mut queue = QueueCursorModel::new(40);
+        for node in 1..=40 {
+            queue.publish(node);
+        }
+        let mut consumer_owner = PROCESS_ITIMER_CONSUMER_WORKER;
+        assert_eq!(consumer_owner, PROCESS_ITIMER_CONSUMER_WORKER);
+        assert_eq!(queue.drain_batch(), 16);
+        assert_ne!(queue.head, QueueCursorModel::STUB);
+        // A failed worker hands this exact non-stub cursor to fallback;
+        // rebuilding a fresh consumer from STUB here would revisit the first
+        // batch whose owners have already been cleared.
+        consumer_owner = PROCESS_ITIMER_CONSUMER_FALLBACK;
+        assert_eq!(consumer_owner, PROCESS_ITIMER_CONSUMER_FALLBACK);
+        assert_eq!(queue.drain_batch(), 16);
+        assert_eq!(queue.drain_batch(), 8);
+        assert_eq!(queue.drain_batch(), 0);
+        assert!(queue.all_released());
+    }
+
+    #[test]
+    fn failed_consumer_keeps_nonstub_cursor_during_producer_link_gap() {
+        let mut queue = QueueCursorModel::new(2);
+        queue.publish(1);
+        // Consumer detached node 1; producer has swapped node 2 into tail but
+        // has not yet published node 1's successor.
+        queue.head = 1;
+        queue.next[1] = None;
+        queue.owner[2] = true;
+        queue.tail = 2;
+        assert_eq!(queue.pop(), None);
+        assert_eq!(queue.head, 1);
+        // Failure releases only ownership, so fallback resumes this cursor.
+        queue.next[1] = Some(2);
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+        assert!(queue.all_released());
+    }
+
+    #[test]
+    fn failed_worker_scans_cursor_after_stub_tail_masks_late_link() {
+        let mut queue = QueueCursorModel::new(2);
+        queue.publish(1);
+        // The worker advanced to node 1 while a producer swapped node 2 but
+        // had not linked node 1 -> node 2 yet.
+        queue.head = 1;
+        queue.next[1] = None;
+        queue.owner[2] = true;
+        queue.tail = 2;
+        assert!(queue.raw_work_pending());
+
+        // The failed worker's last consumer step inserts the permanent stub
+        // after observing the producer tail. The producer then completes the
+        // old predecessor link. The raw tail/stub predicate is now empty even
+        // though the persistent cursor still has both nodes to consume.
+        queue.next[QueueCursorModel::STUB] = None;
+        queue.tail = QueueCursorModel::STUB;
+        queue.next[2] = Some(QueueCursorModel::STUB);
+        queue.next[1] = Some(2);
+        assert!(!queue.raw_work_pending());
+
+        // A failed-worker fallback must scan the cursor/generation latch,
+        // rather than trust that false predicate.
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+        assert!(queue.all_released());
+    }
+
+    #[derive(Debug, Default)]
+    struct DeliveryOwnershipModel {
+        owner: bool,
+        queued: bool,
+        pending: bool,
+        delivered: Vec<u8>,
+    }
+
+    impl DeliveryOwnershipModel {
+        fn publish_initial(&mut self) {
+            assert!(!self.owner);
+            self.owner = true;
+            self.queued = true;
+            self.pending = true;
+        }
+
+        fn begin_batch(&mut self) -> bool {
+            assert!(self.owner);
+            core::mem::replace(&mut self.pending, false)
+        }
+
+        fn producer_request_during_delivery(&mut self) -> bool {
+            self.pending = true;
+            // The live owner coalesces the request; it must not publish a
+            // second delivery node while the first signal batch is in flight.
+            !self.owner
+        }
+
+        fn try_begin_concurrent_fallback(&mut self) -> bool {
+            if self.owner {
+                return false;
+            }
+            self.owner = true;
+            self.queued = true;
+            true
+        }
+
+        fn send(&mut self, signal: u8) {
+            assert!(self.owner);
+            self.delivered.push(signal);
+        }
+
+        fn finish_batch_and_requeue(&mut self) {
+            self.queued = false;
+            self.owner = false;
+            if self.pending {
+                self.owner = true;
+                self.queued = true;
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_owner_blocks_concurrent_fallback_until_signal_batch_finishes() {
+        let mut model = DeliveryOwnershipModel::default();
+        model.publish_initial();
+        assert!(model.begin_batch());
+
+        // A producer races while the worker/fallback is delivering the
+        // snapshot. It records coalesced work, but cannot acquire delivery
+        // ownership or reorder the signal batch.
+        assert!(!model.producer_request_during_delivery());
+        assert!(!model.try_begin_concurrent_fallback());
+        model.send(1);
+        model.send(2);
+        assert_eq!(model.delivered, vec![1, 2]);
+
+        // Only after delivery completes may the coalesced request be
+        // republished and become eligible for the next consumer pass.
+        model.finish_batch_and_requeue();
+        assert!(model.owner);
+        assert!(model.queued);
+        assert!(model.begin_batch());
+    }
+
+    #[test]
+    fn independent_owner_queues_do_not_cross_consume_or_retain_nodes() {
+        let mut cpu0 = QueueCursorModel::new(2);
+        let mut cpu1 = QueueCursorModel::new(2);
+        cpu0.publish(1);
+        cpu1.publish(1);
+        assert_eq!(cpu0.drain_batch(), 1);
+        assert!(cpu1.owner[1]);
+        assert_eq!(cpu1.drain_batch(), 1);
+        assert!(cpu0.all_released());
+        assert!(cpu1.all_released());
+    }
+
+    #[test]
     fn process_cpu_overflow_marker_closes_the_logical_clock_domain() {
         let counter = core::sync::atomic::AtomicU64::new(u64::MAX - 1);
         let overflowed = core::sync::atomic::AtomicBool::new(false);
@@ -2358,103 +2834,161 @@ fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicy
 /// Publishes a coalescible evaluation request after CPU-clock counters have
 /// advanced. The producer path is allocation-free and contains no Linux
 /// signal or rlimit policy; the dedicated worker is the only evaluator.
-pub(crate) fn request_process_cpu_evaluation(proc_data: &Arc<ProcessData>) -> bool {
+pub(crate) fn request_process_cpu_evaluation(proc_data: &Arc<ProcessData>) -> Option<usize> {
     if proc_data.process_itimer_cpu_armed.load(Ordering::Acquire) != 0
         || proc_data.process_rlimit_cpu_active.load(Ordering::Acquire)
     {
         // Pending publication and queue ownership share the worker's SeqCst
         // handoff order; either side must observe responsibility for the last
-        // request even though the state lives in two atomic words.
+        // request even though the state spans pending, queued, and owner-CPU
+        // atomic words.
         proc_data
             .process_itimer_pending
             .fetch_or(PROCESS_CPU_EVALUATE_PENDING, Ordering::SeqCst);
-        publish_process_itimer_work(proc_data);
-        true
+        publish_process_itimer_work(proc_data)
     } else {
-        proc_data.process_itimer_work_queued.load(Ordering::Acquire)
+        process_itimer_owner_from_token(
+            proc_data
+                .process_itimer_work_owner_cpu
+                .load(Ordering::Acquire),
+        )
     }
 }
 
-fn publish_process_itimer_work(proc_data: &Arc<ProcessData>) {
+fn publish_process_itimer_work(proc_data: &Arc<ProcessData>) -> Option<usize> {
+    // Prevent a task-context producer from being descheduled inside the
+    // two-instruction MPSC link publication. IRQ callers are already in this
+    // state. No lock or allocation is used here; the owner-token CAS is a
+    // bounded handoff between the producer and the current queue consumer.
+    let _guard = NoPreempt::new();
+    let cpu = process_itimer_owner_cpu();
+    let encoded_cpu = cpu
+        .checked_add(1)
+        .expect("process timer owner CPU encoding overflow");
+    loop {
+        let owner = proc_data
+            .process_itimer_work_owner_cpu
+            .load(Ordering::SeqCst);
+        if owner != 0 {
+            // The queued token already has an exact owner. Returning that
+            // token lets the caller wake the right CPU even if it migrates
+            // after this function returns.
+            return process_itimer_owner_from_token(owner);
+        }
+        if proc_data
+            .process_itimer_work_owner_cpu
+            .compare_exchange(0, encoded_cpu, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    // Keep the original SeqCst queued transition as the compact mirror used
+    // by teardown/diagnostics. The owner CPU token is the deduplication and
+    // wake-target state; under the handoff invariant this CAS always wins.
     if proc_data
         .process_itimer_work_queued
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return;
+        // A stale mirror must not strand the owner token. Preserve the
+        // publication and repair the mirror before linking the node.
+        proc_data
+            .process_itimer_work_queued
+            .store(true, Ordering::SeqCst);
     }
-
-    // Prevent a task-context producer from being descheduled inside the
-    // two-instruction MPSC link publication. IRQ callers are already in this
-    // state. No lock, allocation, or retry loop is used here.
-    let _guard = NoPreempt::new();
     // Arc cloning is one bounded refcount operation and allocates nothing.
     // The raw strong reference is transferred to the queue and reconstructed
     // exactly once by the single consumer.
     let owner = Arc::into_raw(proc_data.clone()).cast_mut();
 
+    ensure_process_itimer_work_queues();
     let node = &proc_data.process_itimer_work_node;
     node.owner.store(owner, Ordering::Relaxed);
     node.next.store(ptr::null_mut(), Ordering::Relaxed);
     let node = ptr::from_ref(node).cast_mut();
-    let previous = PROCESS_ITIMER_WORK_TAIL.swap(node, Ordering::AcqRel);
+    let previous = PROCESS_ITIMER_WORK_TAILS[cpu].swap(node, Ordering::AcqRel);
     // Release is the publication point. The caller wakes the worker only after
-    // this store, so the consumer may return NotReady on the transient tail
-    // gap without losing progress.
+    // this store, so CPU `cpu`'s consumer may return NotReady on the transient
+    // tail gap without losing progress.
     unsafe { &*previous }.next.store(node, Ordering::Release);
+    PROCESS_ITIMER_WORK_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+    Some(cpu)
 }
 
-pub(crate) fn has_deferred_process_itimer_work() -> bool {
-    let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
-    let tail = PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire);
+pub(crate) fn has_deferred_process_itimer_work_on_cpu(cpu: usize) -> bool {
+    debug_assert!(cpu < PROCESS_ITIMER_CPU_COUNT);
+    ensure_process_itimer_work_queues();
+    let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[cpu]).cast_mut();
+    let tail = PROCESS_ITIMER_WORK_TAILS[cpu].load(Ordering::Acquire);
     tail != stub
-        || !PROCESS_ITIMER_WORK_STUB
+        || !PROCESS_ITIMER_WORK_STUBS[cpu]
             .next
             .load(Ordering::Acquire)
             .is_null()
 }
 
-/// Single-consumer state for the bounded FIFO process-timer MPSC ingress.
+pub(crate) fn has_deferred_process_itimer_work() -> bool {
+    has_deferred_process_itimer_work_on_cpu(process_itimer_owner_cpu())
+}
+
+/// Single-consumer state for one bounded FIFO process-timer MPSC ingress.
 pub(crate) struct ProcessITimerWorkConsumer {
+    cpu: usize,
     head: *mut ProcessITimerWorkNode,
 }
 
 impl ProcessITimerWorkConsumer {
-    pub(crate) const fn new() -> Self {
-        Self {
-            head: &PROCESS_ITIMER_WORK_STUB as *const ProcessITimerWorkNode
-                as *mut ProcessITimerWorkNode,
-        }
+    fn is_quiescent(&self) -> bool {
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[self.cpu]).cast_mut();
+        self.head == stub
+            && PROCESS_ITIMER_WORK_TAILS[self.cpu].load(Ordering::Acquire) == stub
+            && unsafe { &*self.head }
+                .next
+                .load(Ordering::Acquire)
+                .is_null()
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        let tail = PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire);
+        let tail = PROCESS_ITIMER_WORK_TAILS[self.cpu].load(Ordering::Acquire);
         // SAFETY: `head` is either the permanent stub or a process node whose
         // queue-owned Arc remains retained until pop advances past it.
         let next = unsafe { &*self.head }.next.load(Ordering::Acquire);
         if !next.is_null() {
             return true;
         }
-        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[self.cpu]).cast_mut();
         // `head != tail && next == null` is the bounded producer link gap.
         // Report NotReady and rely on the producer's post-link wake; the
         // register-then-check worker wait closes the wake-before-sleep race.
-        self.head != stub && self.head == tail
+        if self.head != stub && self.head == tail {
+            // The consumer is parked on the final node before it links the
+            // permanent stub back into the FIFO. This is local cleanup, not a
+            // producer tail-link gap. Count the cleanup only when `pop`
+            // actually inserts the stub; `has_pending` can observe a stale
+            // tail snapshot while a producer is already linking a new node.
+            true
+        } else {
+            false
+        }
     }
 
-    fn push_stub(&self) {
-        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
-        PROCESS_ITIMER_WORK_STUB
+    fn push_stub(&self) -> *mut ProcessITimerWorkNode {
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[self.cpu]).cast_mut();
+        PROCESS_ITIMER_WORK_STUBS[self.cpu]
             .next
             .store(ptr::null_mut(), Ordering::Relaxed);
-        let previous = PROCESS_ITIMER_WORK_TAIL.swap(stub, Ordering::AcqRel);
-        // SAFETY: the single consumer injects the stub only while `previous`
-        // is its current head and therefore still retained.
+        let previous = PROCESS_ITIMER_WORK_TAILS[self.cpu].swap(stub, Ordering::AcqRel);
+        // SAFETY: the single consumer owns `self.head`. If a producer wins
+        // the tail swap concurrently, `previous` is that producer's node and
+        // remains queue-owned until the producer links it; linking the stub
+        // here preserves the same intrusive-chain lifetime rule.
         unsafe { &*previous }.next.store(stub, Ordering::Release);
+        previous
     }
 
     fn pop(&mut self) -> Option<Arc<ProcessData>> {
-        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUB).cast_mut();
+        let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[self.cpu]).cast_mut();
         let mut head = self.head;
         // SAFETY: see `has_pending`; the single consumer owns `head` updates.
         let mut next = unsafe { &*head }.next.load(Ordering::Acquire);
@@ -2468,12 +3002,24 @@ impl ProcessITimerWorkConsumer {
         }
 
         if next.is_null() {
-            if head != PROCESS_ITIMER_WORK_TAIL.load(Ordering::Acquire) {
+            if head != PROCESS_ITIMER_WORK_TAILS[self.cpu].load(Ordering::Acquire) {
                 // A producer has swapped the tail but has not yet linked its
                 // predecessor. It will publish next with Release and wake us.
+                PROCESS_ITIMER_WORK_PRODUCER_LINK_GAPS.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            self.push_stub();
+            // The tail check above is only a snapshot. A producer may swap a
+            // new node between that load and the stub insertion. Returning
+            // the predecessor lets us classify that race as a producer link
+            // gap rather than charging it to final-node cleanup. This keeps
+            // the diagnostics meaningful without changing the queue's
+            // lock-free progress rule.
+            let previous = self.push_stub();
+            if previous == head {
+                PROCESS_ITIMER_WORK_LAST_NODE_CLEANUPS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PROCESS_ITIMER_WORK_PRODUCER_LINK_GAPS.fetch_add(1, Ordering::Relaxed);
+            }
             next = unsafe { &*head }.next.load(Ordering::Acquire);
             if next.is_null() {
                 return None;
@@ -2507,17 +3053,6 @@ impl ProcessITimerWorkConsumer {
                 // snapshot.
                 pending &= !PROCESS_RLIMIT_CPU_SOFT_PENDING;
             }
-            proc_data
-                .process_itimer_work_queued
-                .store(false, Ordering::SeqCst);
-            // These two words form one linearized handoff with the producer's
-            // SeqCst pending publication and queued CAS. Either this recheck
-            // republishes the process, or the producer observes queued=false
-            // and owns publication itself; the last request cannot be stranded.
-            if proc_data.process_itimer_pending.load(Ordering::SeqCst) != 0 {
-                publish_process_itimer_work(&proc_data);
-            }
-
             if pending & PROCESS_RLIMIT_CPU_HARD_PENDING != 0 {
                 // Publish the terminal process-directed signal before any
                 // catchable timer signal from the same aggregate snapshot.
@@ -2545,9 +3080,60 @@ impl ProcessITimerWorkConsumer {
                 );
             }
             debug_assert_eq!(pending & !PROCESS_CPU_POLICY_PENDING_MASK, 0);
+
+            // Keep the ProcessData delivery owner until every signal derived
+            // from this snapshot has been sent. A producer may set pending
+            // while delivery is in progress, but it observes the owner token
+            // and coalesces into the post-delivery requeue instead of
+            // allowing another worker/fallback to deliver this process out of
+            // order.
+            proc_data
+                .process_itimer_work_queued
+                .store(false, Ordering::SeqCst);
+            proc_data
+                .process_itimer_work_owner_cpu
+                .store(0, Ordering::SeqCst);
+            // These words form one linearized handoff with the producer's
+            // SeqCst pending publication, queued mirror, and owner-CPU token.
+            // Either this recheck republishes the process, or the producer
+            // observes the cleared owner and owns publication itself; the
+            // last request cannot be stranded.
+            if proc_data.process_itimer_pending.load(Ordering::SeqCst) != 0 {
+                // A fallback may be draining a failed queue from a different
+                // CPU. Re-publication can therefore select a new queue; wake
+                // the exact token returned by that publication instead of
+                // assuming the current consumer remains runnable.
+                if let Some(cpu) = publish_process_itimer_work(&proc_data) {
+                    crate::deferred_work::wake_process_timer_worker(cpu);
+                }
+            }
+            PROCESS_ITIMER_WORK_DRAINED.fetch_add(1, Ordering::Relaxed);
             drained += 1;
         }
         drained
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct ProcessITimerWorkStats {
+    pub published: usize,
+    pub drained: usize,
+    /// Number of times the consumer inserted the permanent stub after
+    /// confirming that its current head was the queue tail. This excludes
+    /// producer tail/link races observed during the same transition.
+    pub last_node_cleanups: usize,
+    /// Number of observations in which a producer had swapped the tail but
+    /// had not yet linked the predecessor's `next` pointer. This includes a
+    /// race discovered while inserting the permanent stub.
+    pub producer_link_gaps: usize,
+}
+
+pub(crate) fn process_itimer_work_stats() -> ProcessITimerWorkStats {
+    ProcessITimerWorkStats {
+        published: PROCESS_ITIMER_WORK_PUBLISHED.load(Ordering::Relaxed),
+        drained: PROCESS_ITIMER_WORK_DRAINED.load(Ordering::Relaxed),
+        last_node_cleanups: PROCESS_ITIMER_WORK_LAST_NODE_CLEANUPS.load(Ordering::Relaxed),
+        producer_link_gaps: PROCESS_ITIMER_WORK_PRODUCER_LINK_GAPS.load(Ordering::Relaxed),
     }
 }
 

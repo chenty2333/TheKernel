@@ -190,11 +190,11 @@ pub fn sys_acct(memory: UserMemoryCapability, name: *const c_char) -> AxResult<i
     }
 
     let curr = current();
-    let ids = curr.as_thread().current_cred().ids();
+    let thread = curr.as_thread();
     let accounting = AccountingFile {
         file,
-        uid: ids.ruid.into_raw(),
-        gid: ids.rgid.into_raw(),
+        uid: thread.real_uid().into_raw(),
+        gid: thread.real_gid().into_raw(),
     };
     let _ = close_file_like(fd);
     *PROCESS_ACCOUNTING.lock() = Some(accounting);

@@ -681,6 +681,9 @@ impl FileLike for File {
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if super::fiemap::is_fiemap_command(cmd) {
+            return super::fiemap::ioctl(self.inner(), context, arg);
+        }
         if let Some(result) = super::inode_flags::ioctl(self.inner().location(), cmd, arg) {
             return result;
         }

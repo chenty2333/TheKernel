@@ -8,7 +8,7 @@ use alloc::{
 use core::{any::Any, ffi::CStr, fmt::Write as _, iter, str, task::Context};
 
 use axdriver::virtio_io_counters_snapshot;
-use axerrno::{AxError, LinuxError};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::render_io_stats_counters;
 use axfs_ng_vfs::{
     DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
@@ -76,8 +76,8 @@ use crate::{
         get_process_data, get_process_including_zombie, get_task, get_visible_task,
         get_visible_task_including_exiting, may_begin_gid_map_write, may_begin_uid_map_write,
         may_update_setgroups_policy, may_write_gid_map, may_write_uid_map, nr_open_limit,
-        ns_capable, render_task_stat, render_zombie_stat, set_nr_open_limit, task_state,
-        try_processes, validate_id_map_input,
+        ns_capable, process_domain, process_error, render_task_stat, render_zombie_stat,
+        set_nr_open_limit, task_state, validate_id_map_input,
     },
 };
 
@@ -114,7 +114,7 @@ fn render_key_users_snapshot(
 }
 
 fn key_users_snapshot() -> VfsResult<String> {
-    let viewer_user_ns = current().as_thread().current_cred().user_ns().clone();
+    let viewer_user_ns = current().as_thread().current_user_namespace();
     let records = key_user_records().map_err(|error| match error {
         AxError::NoMemory => VfsError::NoMemory,
         _ => VfsError::Io,
@@ -151,6 +151,31 @@ fn render_proc_io_stats() -> Vec<u8> {
         );
         let _ = writeln!(
             out,
+            "io_uring.dma_direct_read_fallback_geometry {}",
+            io_uring_dma.read_fallback_geometry
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_fallback_provenance {}",
+            io_uring_dma.read_fallback_provenance
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_fallback_sg_cap {}",
+            io_uring_dma.read_fallback_sg_cap
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_fallback_extent {}",
+            io_uring_dma.read_fallback_extent
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_read_fallback_device_admission {}",
+            io_uring_dma.read_fallback_device_admission
+        );
+        let _ = writeln!(
+            out,
             "io_uring.dma_direct_write_hits {}",
             io_uring_dma.write_hits
         );
@@ -163,6 +188,71 @@ fn render_proc_io_stats() -> Vec<u8> {
             out,
             "io_uring.dma_direct_write_fallbacks {}",
             io_uring_dma.write_fallbacks
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallback_geometry {}",
+            io_uring_dma.write_fallback_geometry
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallback_provenance {}",
+            io_uring_dma.write_fallback_provenance
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallback_sg_cap {}",
+            io_uring_dma.write_fallback_sg_cap
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallback_extent {}",
+            io_uring_dma.write_fallback_extent
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.dma_direct_write_fallback_device_admission {}",
+            io_uring_dma.write_fallback_device_admission
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_submitted {}",
+            io_uring_dma.physical_submitted
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_child_submitted {}",
+            io_uring_dma.physical_child_submitted
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_completed {}",
+            io_uring_dma.physical_completed
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_child_completed {}",
+            io_uring_dma.physical_child_completed
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_direct_bytes {}",
+            io_uring_dma.physical_direct_bytes
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_qd_highwater {}",
+            io_uring_dma.physical_qd_highwater
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_extent_highwater {}",
+            io_uring_dma.physical_extent_highwater
+        );
+        let _ = writeln!(
+            out,
+            "io_uring.physical_quarantine {}",
+            io_uring_dma.physical_quarantine
         );
     }
     let pin = user_io_pin_counters_snapshot();
@@ -646,6 +736,329 @@ fn render_proc_io_stats() -> Vec<u8> {
         out,
         "virtio.blk_async_resource_leaks {}",
         virtio.blk_async_resource_leaks
+    );
+    out.into_bytes()
+}
+
+/// Render the bounded, read-only cBPF execution counters used by the
+/// performance evidence lane. The two adapters intentionally have separate
+/// namespaces: a packet capture must never make a seccomp execution appear in
+/// this file (or vice versa). The policy is diagnostic metadata only; it is
+/// not a Linux ABI control surface.
+fn render_proc_bpf_stats() -> Vec<u8> {
+    let seccomp = crate::seccomp_jit::counters();
+    let packet = crate::packet_cbpf::counters();
+    let (seccomp_policy, packet_policy) = crate::seccomp_jit::executor_policies();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "BPF_STATS schema=thekernel-bpf-stats-v1 seccomp_policy={} packet_policy={}",
+        seccomp_policy.as_str(),
+        packet_policy.as_str(),
+    );
+    let _ = writeln!(out, "seccomp.published {}", seccomp.published);
+    let _ = writeln!(out, "seccomp.native_executed {}", seccomp.native_executed);
+    let _ = writeln!(
+        out,
+        "seccomp.interpreter_executed {}",
+        seccomp.interpreter_executed
+    );
+    let _ = writeln!(
+        out,
+        "seccomp.fallback.policy_interpreter {}",
+        seccomp.fallback_policy_interpreter
+    );
+    let _ = writeln!(
+        out,
+        "seccomp.fallback.translation {}",
+        seccomp.fallback_translation
+    );
+    let _ = writeln!(
+        out,
+        "seccomp.fallback.publication {}",
+        seccomp.fallback_publication
+    );
+    let _ = writeln!(out, "seccomp.fallback.owner {}", seccomp.fallback_owner);
+    let _ = writeln!(
+        out,
+        "seccomp.fallback.unavailable {}",
+        seccomp.fallback_unavailable
+    );
+    let _ = writeln!(out, "seccomp.jit_rejected {}", seccomp.jit_rejected);
+
+    let _ = writeln!(out, "packet.published {}", packet.published);
+    let _ = writeln!(out, "packet.native_executed {}", packet.native_executed);
+    let _ = writeln!(
+        out,
+        "packet.interpreter_executed {}",
+        packet.interpreter_executed
+    );
+    let _ = writeln!(
+        out,
+        "packet.fallback.policy_interpreter {}",
+        packet.fallback_policy_interpreter
+    );
+    let _ = writeln!(
+        out,
+        "packet.fallback.translation {}",
+        packet.fallback_translation
+    );
+    let _ = writeln!(
+        out,
+        "packet.fallback.publication {}",
+        packet.fallback_publication
+    );
+    let _ = writeln!(out, "packet.fallback.owner {}", packet.fallback_owner);
+    let _ = writeln!(
+        out,
+        "packet.fallback.unavailable {}",
+        packet.fallback_unavailable
+    );
+    let _ = writeln!(out, "packet.jit_rejected {}", packet.jit_rejected);
+    out.into_bytes()
+}
+
+/// One open instance of `/proc/bpf_stats`.
+///
+/// The proc directory is deliberately non-cacheable, so every path lookup
+/// creates a fresh node.  The node then freezes both cBPF domains in its open
+/// callback; subsequent `read_at` calls only consume that immutable byte
+/// vector.  This keeps a short-buffer/chunked reader from combining counters
+/// from multiple observations while leaving the ordinary 0444 proc
+/// permission check in the VFS open path.
+struct ProcBpfStatsFile {
+    node: SimpleFsNode,
+    snapshot: Mutex<Option<Vec<u8>>>,
+}
+
+impl ProcBpfStatsFile {
+    fn try_new(fs: Arc<SimpleFs>) -> VfsResult<Arc<Self>> {
+        let node = SimpleFsNode::try_new(
+            fs,
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o444),
+        )?;
+        Arc::try_new(Self {
+            node,
+            snapshot: Mutex::new(None),
+        })
+        .map_err(|_| VfsError::NoMemory)
+    }
+
+    fn snapshot_len(&self) -> u64 {
+        self.snapshot
+            .lock()
+            .as_ref()
+            .map_or(0, |data| data.len() as u64)
+    }
+}
+
+#[inherit_methods(from = "self.node")]
+impl NodeOps for ProcBpfStatsFile {
+    fn inode(&self) -> u64;
+
+    fn metadata(&self) -> VfsResult<Metadata> {
+        let mut metadata = self.node.metadata()?;
+        metadata.size = self.snapshot_len();
+        Ok(metadata)
+    }
+
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
+
+    fn filesystem(&self) -> &dyn FilesystemOps;
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        Ok(self.snapshot_len())
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+    }
+
+    fn open(&self, _read: bool, write: bool) -> VfsResult<()> {
+        if write {
+            return Err(VfsError::PermissionDenied);
+        }
+        let data = render_proc_bpf_stats();
+        let data_len = data.len() as u64;
+        let mut snapshot = self.snapshot.lock();
+        if snapshot.is_some() {
+            return Ok(());
+        }
+        *snapshot = Some(data);
+        drop(snapshot);
+        self.node.metadata.lock().size = data_len;
+        Ok(())
+    }
+}
+
+impl FileNodeOps for ProcBpfStatsFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let snapshot = self.snapshot.lock();
+        let data = snapshot.as_deref().ok_or(VfsError::BadFileDescriptor)?;
+        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
+        if offset >= data.len() {
+            return Ok(0);
+        }
+        let data = &data[offset..];
+        let read = data.len().min(buf.len());
+        buf[..read].copy_from_slice(&data[..read]);
+        Ok(read)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_len(&self, _len: u64) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+}
+
+impl Pollable for ProcBpfStatsFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::READABLE | IoEvents::WRITABLE
+    }
+
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
+}
+
+#[cfg(feature = "test-io-control")]
+fn render_proc_bpf_executor_control() -> Vec<u8> {
+    let (seccomp, packet) = crate::seccomp_jit::executor_policies();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "BPF_EXECUTOR_CONTROL schema=thekernel-bpf-executor-control-v1"
+    );
+    let _ = writeln!(out, "seccomp={}", seccomp.as_str());
+    let _ = writeln!(out, "packet={}", packet.as_str());
+    out.into_bytes()
+}
+
+#[cfg(feature = "test-io-control")]
+fn parse_bpf_executor_policy(value: &str) -> Option<crate::seccomp_jit::ExecutorPolicy> {
+    match value {
+        "auto" => Some(crate::seccomp_jit::ExecutorPolicy::Auto),
+        "interpreter" => Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
+        "jit" => Some(crate::seccomp_jit::ExecutorPolicy::Jit),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "test-io-control")]
+fn parse_bpf_executor_control(
+    data: &[u8],
+) -> VfsResult<(
+    Option<crate::seccomp_jit::ExecutorPolicy>,
+    Option<crate::seccomp_jit::ExecutorPolicy>,
+)> {
+    const MAX_CONTROL_BYTES: usize = 128;
+    if data.is_empty() || data.len() > MAX_CONTROL_BYTES {
+        return Err(VfsError::InvalidInput);
+    }
+    let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+    let mut seccomp = None;
+    let mut packet = None;
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        // A single final newline is the only accepted empty line. Every
+        // nonempty line is parsed before either policy is changed.
+        if line.is_empty() {
+            if lines.peek().is_none() && text.ends_with('\n') {
+                break;
+            }
+            return Err(VfsError::InvalidInput);
+        }
+        if line.ends_with('\r') {
+            return Err(VfsError::InvalidInput);
+        }
+        let (key, value) = line.split_once('=').ok_or(VfsError::InvalidInput)?;
+        if key.is_empty() || value.is_empty() || key.trim() != key || value.trim() != value {
+            return Err(VfsError::InvalidInput);
+        }
+        let policy = parse_bpf_executor_policy(value).ok_or(VfsError::InvalidInput)?;
+        match key {
+            "seccomp" if seccomp.is_none() => seccomp = Some(policy),
+            "packet" if packet.is_none() => packet = Some(policy),
+            _ => return Err(VfsError::InvalidInput),
+        }
+    }
+    if seccomp.is_none() && packet.is_none() {
+        return Err(VfsError::InvalidInput);
+    }
+    Ok((seccomp, packet))
+}
+
+#[cfg(feature = "test-io-control")]
+fn bpf_executor_control_operation(request: SimpleFileOperation<'_>) -> VfsResult<Option<Vec<u8>>> {
+    match request {
+        SimpleFileOperation::Read => Ok(Some(render_proc_bpf_executor_control())),
+        SimpleFileOperation::Write(data) => {
+            // This is deliberately initial-root-only rather than a generic
+            // capability gate: the node is a non-Linux test/perf control and
+            // must not become a namespace-relative production interface.
+            if !current().as_thread().current_cred().is_initial_root_euid() {
+                return Err(VfsError::PermissionDenied);
+            }
+            let (seccomp, packet) = parse_bpf_executor_control(data)?;
+            crate::seccomp_jit::set_executor_policies_for_control(seccomp, packet);
+            Ok(None)
+        }
+    }
+}
+
+/// Render immutable scheduler-build configuration for low-perturbation
+/// diagnosis.  This is a read-only snapshot of compile-time values; it does
+/// not sample or mutate the EEVDF ready path.  Idle stealing is listed in a
+/// separate record because it transfers queue ownership and is not an EEVDF
+/// parameter or a scheduler-performance claim.
+fn render_proc_sched_profile() -> Vec<u8> {
+    let profile = axtask::eevdf_profile();
+    let idle_steal = axtask::idle_steal_config();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "EEVDF_PROFILE schema=thekernel-eevdf-profile-v1 name={} normal_target_ticks={} \
+         batch_target_ticks={} idle_target_ticks={} sleeper_grace_ticks={} sleeper_decay_ticks={}",
+        profile.name,
+        profile.normal_target_ticks,
+        profile.batch_target_ticks,
+        profile.idle_target_ticks,
+        profile.sleeper_grace_ticks,
+        profile.sleeper_decay_ticks,
+    );
+    let _ = writeln!(
+        out,
+        "IDLE_STEAL_CONFIG schema=thekernel-idle-steal-config-v1 enabled={} victim_scan_limit={} \
+         candidate_scan_limit={} hot_residency_ns={} severe_imbalance_ready_tasks={}",
+        u8::from(idle_steal.enabled),
+        idle_steal.victim_scan_limit,
+        idle_steal.candidate_scan_limit,
+        idle_steal.hot_residency_ns,
+        idle_steal.severe_imbalance_ready_tasks,
     );
     out.into_bytes()
 }
@@ -2133,6 +2546,90 @@ struct ZombieProcessDir {
     process: Weak<Process>,
 }
 
+/// Resolves the exact unreaped process identity retained by a procfs handle.
+///
+/// A zombie `Arc` can outlive the process-domain registry entry when a file was
+/// opened before `wait(2)` reaped it.  Never render that retained payload
+/// without first matching the canonical PID entry and its exact process
+/// generation; otherwise a stale handle could continue to expose a reaped
+/// zombie or alias a later process which reuses the PID.
+fn authoritative_zombie(process: &Process) -> VfsResult<Arc<Process>> {
+    let current = process_domain()?
+        .registry()
+        .get(process.pid())
+        .ok_or(VfsError::NotFound)?;
+    if !core::ptr::eq(&*current, process)
+        || !current.is_zombie()
+        || current.zombie_payload().is_none()
+    {
+        return Err(VfsError::NotFound);
+    }
+    Ok(current)
+}
+
+fn zombie_stat_lifecycle_error(error: VfsError) -> VfsError {
+    match error {
+        VfsError::NotFound => VfsError::NoSuchProcess,
+        error => error,
+    }
+}
+
+/// Verifies that a retained live-task proc directory still names the exact
+/// process published in the PID registry.  The registry pointer check is the
+/// generation boundary: a reused numeric PID must not revive an old dentry.
+fn authoritative_proc_pid_process(process: &Process) -> AxResult<()> {
+    let current = process_domain()?
+        .registry()
+        .get(process.pid())
+        .ok_or(AxError::NoSuchProcess)?;
+    if !core::ptr::eq(&*current, process) {
+        return Err(AxError::NoSuchProcess);
+    }
+    Ok(())
+}
+
+/// Admits pathname search through a retained `/proc/[pid]` directory only
+/// while its exact process identity remains the canonical live or zombie PID
+/// entry appropriate to the retained dentry.
+///
+/// The generic path resolver invokes this check before looking up a named
+/// child and while traversing `.`/`..`.  Pointer equality is intentional: a
+/// recycled numeric PID must never make an old directory handle search a new
+/// process.  The descriptor itself remains usable for metadata and
+/// `AT_EMPTY_PATH`; only pathname search through a stale directory is ESRCH.
+pub(crate) fn check_proc_pid_dir_search(loc: &axfs_ng_vfs::Location) -> AxResult<()> {
+    if let Ok(dir) = loc.entry().downcast::<SimpleDir<ZombieProcessDir>>() {
+        let process = dir.ops().process.upgrade().ok_or(AxError::NoSuchProcess)?;
+        return authoritative_zombie(&process)
+            .map(|_| ())
+            .map_err(zombie_stat_lifecycle_error);
+    }
+
+    let Ok(dir) = loc.entry().downcast::<SimpleDir<ThreadDir>>() else {
+        return Ok(());
+    };
+    let task = dir.ops().task.upgrade().ok_or(AxError::NoSuchProcess)?;
+    let process = task.as_thread().proc_data.proc.clone();
+    authoritative_proc_pid_process(&process)
+}
+
+/// Reads zombie stat only while the canonical identity and payload remain
+/// current.  The second lookup closes the ordinary reap-before-return window;
+/// pointer equality keeps a recycled numeric PID from redirecting the handle.
+fn read_authoritative_zombie_stat(process: &Process) -> VfsResult<Vec<u8>> {
+    let current = authoritative_zombie(process).map_err(zombie_stat_lifecycle_error)?;
+    let payload = current.zombie_payload().ok_or(VfsError::NoSuchProcess)?;
+    let stat = render_zombie_stat(&current)?.into_bytes();
+    let current_after = authoritative_zombie(process).map_err(zombie_stat_lifecycle_error)?;
+    let payload_after = current_after
+        .zombie_payload()
+        .ok_or(VfsError::NoSuchProcess)?;
+    if !Arc::ptr_eq(&payload, &payload_after) {
+        return Err(VfsError::NoSuchProcess);
+    }
+    Ok(stat)
+}
+
 pub(crate) enum ProcDirProcess {
     NotProcDir,
     Live(Arc<ProcessData>),
@@ -2390,10 +2887,13 @@ impl Pollable for ProcPagemapFile {
 
 impl SimpleDirOps for ZombieProcessDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        if self.process.upgrade().is_some() {
-            try_boxed_names(iter::once(Cow::Borrowed("stat")))
-        } else {
-            try_boxed_names(iter::empty())
+        match self.process.upgrade() {
+            Some(process) => match authoritative_zombie(&process) {
+                Ok(_) => try_boxed_names(iter::once(Cow::Borrowed("stat"))),
+                Err(VfsError::NotFound) => Err(VfsError::NotFound),
+                Err(error) => Err(error),
+            },
+            None => Err(VfsError::NotFound),
         }
     }
 
@@ -2403,10 +2903,8 @@ impl SimpleDirOps for ZombieProcessDir {
         }
         let fs = self.fs.clone();
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
-        Ok(
-            SimpleFile::new_regular(fs, move || Ok(render_zombie_stat(&process)?.into_bytes()))
-                .into(),
-        )
+        let _ = authoritative_zombie(&process)?;
+        Ok(SimpleFile::new_regular(fs, move || read_authoritative_zombie_stat(&process)).into())
     }
 
     fn is_cacheable(&self) -> bool {
@@ -2416,6 +2914,12 @@ impl SimpleDirOps for ZombieProcessDir {
 
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let process = task.as_thread().proc_data.proc.clone();
+        authoritative_proc_pid_process(&process).map_err(|error| match error {
+            AxError::NoSuchProcess => VfsError::NotFound,
+            error => error,
+        })?;
         try_boxed_names(
             [
                 Some("stat"),
@@ -2692,22 +3196,30 @@ struct ProcFsHandler(Arc<SimpleFs>);
 
 impl SimpleDirOps for ProcFsHandler {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        let processes = try_processes()?;
-        let capacity = processes.len().checked_add(1).ok_or(VfsError::NoMemory)?;
+        let processes = process_domain()?
+            .registry()
+            .try_processes()
+            .map_err(process_error)?;
+        let capacity = processes.len().checked_add(2).ok_or(VfsError::NoMemory)?;
         let mut names = Vec::new();
         names
             .try_reserve_exact(capacity)
             .map_err(|_| VfsError::NoMemory)?;
-        for proc_data in processes {
-            if !proc_data.proc.is_zombie() {
-                names.push(Cow::Owned(try_pid_name(proc_data.proc.pid())?));
+        for process in processes {
+            if process.is_zombie() && process.zombie_payload().is_none() {
+                continue;
             }
+            names.push(Cow::Owned(try_pid_name(process.pid())?));
         }
         names.push(Cow::Borrowed("self"));
+        names.push(Cow::Borrowed("bpf_stats"));
         try_boxed_names(names.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        if name == "bpf_stats" {
+            return ProcBpfStatsFile::try_new(self.0.clone()).map(Into::into);
+        }
         if name == "self" {
             return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, || {
                 Ok(current().as_thread().proc_data.proc.pid().to_string())
@@ -2864,6 +3376,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             || -> VfsResult<Vec<u8>> { Ok(render_proc_io_stats()) },
         ),
     );
+    root.add(
+        "sched",
+        SimpleFile::new_regular_with_permission(
+            fs.clone(),
+            NodePermission::from_bits_truncate(0o444),
+            || -> VfsResult<Vec<u8>> { Ok(render_proc_sched_profile()) },
+        ),
+    );
     #[cfg(feature = "mm-lock-diagnostics")]
     root.add(
         "mm_lock_stats",
@@ -2896,6 +3416,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "io_test_control",
         super::io_test_control::new_file(fs.clone()),
     );
+    #[cfg(feature = "test-io-control")]
+    root.add(
+        "bpf_executor_control",
+        SimpleFile::new_regular_with_permission(
+            fs.clone(),
+            NodePermission::from_bits_truncate(0o600),
+            RwFile::new(bpf_executor_control_operation),
+        ),
+    );
     root.add(
         "cpuinfo",
         SimpleFile::new_regular(fs.clone(), || {
@@ -2916,7 +3445,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
     root.add(
         "version",
-        SimpleFile::new_regular(fs.clone(), || Ok(proc_version_string())),
+        SimpleFile::new_regular(fs.clone(), || Ok(proc_version_string()?.into_bytes())),
     );
     root.add(
         "uptime",
@@ -3191,7 +3720,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o444),
-                    || Ok(format!("{}\n", current_machine_string()).into_bytes()),
+                    || Ok(format!("{}\n", current_machine_string()?).into_bytes()),
                 ),
             );
             kernel.add(
@@ -3199,7 +3728,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o444),
-                    || Ok(format!("{}\n", current_sysname_string()).into_bytes()),
+                    || Ok(format!("{}\n", current_sysname_string()?).into_bytes()),
                 ),
             );
             kernel.add(
@@ -3207,7 +3736,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o444),
-                    || Ok(format!("{}\n", current_release_string()).into_bytes()),
+                    || Ok(format!("{}\n", current_release_string()?).into_bytes()),
                 ),
             );
             kernel.add(
@@ -3215,7 +3744,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o444),
-                    || Ok(format!("{}\n", current_version_string()).into_bytes()),
+                    || Ok(format!("{}\n", current_version_string()?).into_bytes()),
                 ),
             );
             kernel.add(
@@ -3225,14 +3754,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     NodePermission::from_bits_truncate(0o644),
                     RwFile::new(move |req| match req {
                         SimpleFileOperation::Read => Ok(Some(
-                            format!("{}\n", current_domainname_string()).into_bytes(),
+                            format!("{}\n", current_domainname_string()?).into_bytes(),
                         )),
                         SimpleFileOperation::Write(data) => {
                             if !current_can_administer_uts() {
                                 return Err(VfsError::PermissionDenied);
                             }
                             if let Some(value) = proc_uts_write_value(data) {
-                                set_domainname_bytes(value);
+                                set_domainname_bytes(value)?;
                             }
                             Ok(None)
                         }
@@ -3246,14 +3775,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     NodePermission::from_bits_truncate(0o644),
                     RwFile::new(move |req| match req {
                         SimpleFileOperation::Read => Ok(Some(
-                            format!("{}\n", current_hostname_string()).into_bytes(),
+                            format!("{}\n", current_hostname_string()?).into_bytes(),
                         )),
                         SimpleFileOperation::Write(data) => {
                             if !current_can_administer_uts() {
                                 return Err(VfsError::PermissionDenied);
                             }
                             if let Some(value) = proc_uts_write_value(data) {
-                                set_hostname_bytes(value);
+                                set_hostname_bytes(value)?;
                             }
                             Ok(None)
                         }
@@ -3702,5 +4231,124 @@ mod tests {
         let child_object = ProcNamespaceObject::User(child);
         assert!(Arc::ptr_eq(&child_object.owner_user_ns().unwrap(), &root));
         assert!(ProcNamespaceObject::User(root).owner_user_ns().is_none());
+    }
+
+    #[test]
+    fn bpf_stats_are_read_only_and_keep_adapters_separate() {
+        let output = String::from_utf8(render_proc_bpf_stats()).unwrap();
+        assert!(output.starts_with("BPF_STATS schema=thekernel-bpf-stats-v1 "));
+        assert!(output.contains(" seccomp_policy="));
+        assert!(output.contains(" packet_policy="));
+        assert!(output.contains("seccomp.published "));
+        assert!(output.contains("seccomp.native_executed "));
+        assert!(output.contains("seccomp.interpreter_executed "));
+        assert!(output.contains("packet.published "));
+        assert!(output.contains("packet.native_executed "));
+        assert!(output.contains("packet.interpreter_executed "));
+        assert!(output.contains("seccomp.fallback.translation "));
+        assert!(output.contains("packet.fallback.translation "));
+    }
+
+    #[test]
+    fn bpf_stats_open_snapshot_survives_chunked_read_and_concurrent_publication() {
+        fn new_file() -> Arc<ProcBpfStatsFile> {
+            let holder = Arc::new(Mutex::new(None));
+            let holder_for_root = holder.clone();
+            let filesystem = SimpleFs::new_with("proc-test".to_string(), 0, move |fs| {
+                *holder_for_root.lock() = Some(ProcBpfStatsFile::try_new(fs.clone()).unwrap());
+                SimpleDir::new_maker(fs, Arc::new(DirMapping::new()))
+            });
+            drop(filesystem);
+            holder.lock().take().unwrap()
+        }
+
+        let file = new_file();
+        file.open(true, false).unwrap();
+        let length = file.len().unwrap() as usize;
+        let mut expected = vec![0; length];
+        file.read_at(&mut expected, 0).unwrap();
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_start = start.clone();
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for _ in 0..256 {
+                crate::seccomp_jit::try_reserve_published()
+                    .expect("seccomp publication counter has capacity")
+                    .commit();
+                crate::packet_cbpf::try_reserve_published()
+                    .expect("packet publication counter has capacity")
+                    .commit();
+                std::thread::yield_now();
+            }
+        });
+        start.wait();
+
+        let mut actual = Vec::with_capacity(length);
+        let mut offset = 0;
+        while offset < length {
+            let chunk_len = (length - offset).min(7);
+            let mut chunk = vec![0; chunk_len];
+            assert_eq!(file.read_at(&mut chunk, offset as u64).unwrap(), chunk_len);
+            actual.extend_from_slice(&chunk);
+            offset += chunk_len;
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "test-io-control")]
+    #[test]
+    fn bpf_executor_control_parses_all_lines_before_publishing() {
+        let old = crate::seccomp_jit::executor_policies();
+        crate::seccomp_jit::set_executor_policies_for_control(
+            Some(crate::seccomp_jit::ExecutorPolicy::Auto),
+            Some(crate::seccomp_jit::ExecutorPolicy::Auto),
+        );
+
+        assert_eq!(
+            parse_bpf_executor_control(b"seccomp=interpreter\npacket=jit\n"),
+            Ok((
+                Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
+                Some(crate::seccomp_jit::ExecutorPolicy::Jit),
+            ))
+        );
+        assert_eq!(
+            parse_bpf_executor_control(b"seccomp=interpreter\npacket=bad\n"),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            crate::seccomp_jit::executor_policies(),
+            (
+                crate::seccomp_jit::ExecutorPolicy::Auto,
+                crate::seccomp_jit::ExecutorPolicy::Auto,
+            )
+        );
+
+        crate::seccomp_jit::set_executor_policies_for_control(Some(old.0), Some(old.1));
+    }
+
+    #[cfg(feature = "test-io-control")]
+    #[test]
+    fn bpf_executor_control_readback_has_independent_domains() {
+        let old = crate::seccomp_jit::executor_policies();
+        crate::seccomp_jit::set_executor_policies_for_control(
+            Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
+            Some(crate::seccomp_jit::ExecutorPolicy::Jit),
+        );
+        assert_eq!(
+            crate::seccomp_jit::executor_policy(),
+            crate::seccomp_jit::ExecutorPolicy::Interpreter
+        );
+        assert_eq!(
+            crate::seccomp_jit::packet_executor_policy(),
+            crate::seccomp_jit::ExecutorPolicy::Jit
+        );
+        let output = String::from_utf8(render_proc_bpf_executor_control()).unwrap();
+        assert!(output.contains("seccomp=interpreter\n"));
+        assert!(output.contains("packet=jit\n"));
+        crate::seccomp_jit::set_executor_policies_for_control(Some(old.0), Some(old.1));
     }
 }

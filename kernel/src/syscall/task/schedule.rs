@@ -20,6 +20,7 @@ use linux_raw_sys::general::{
     SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
@@ -27,9 +28,9 @@ use thekernel_linux_usercopy::{
 use crate::{
     mm::map_usercopy_error,
     task::{
-        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, get_process_group,
-        get_process_including_zombie, get_task, get_visible_task, prepare_clock_sleep,
-        process_domain,
+        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
+        get_process_group, get_process_including_zombie, get_task, get_visible_task,
+        has_pending_syscall_signal, prepare_clock_sleep, process_domain,
         security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
         try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
@@ -438,6 +439,91 @@ enum ClockSleepOutcome {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ClockSleepInterruptDisposition {
+    Retry,
+    Return,
+}
+
+/// A default SIGCONT resumes a stopped task but has no userspace signal
+/// handler to interrupt a sleep.  Other default actions, and every handler,
+/// retain the ordinary Linux EINTR boundary.
+fn clock_sleep_signal_is_visible(
+    signo: Signo,
+    blocked: bool,
+    disposition: SignalDisposition,
+) -> bool {
+    if blocked {
+        return false;
+    }
+    match disposition {
+        SignalDisposition::Ignore => false,
+        SignalDisposition::Handler(_) => true,
+        SignalDisposition::Default if signo == Signo::SIGCONT => false,
+        SignalDisposition::Default => {
+            !matches!(signo.default_action(), DefaultSignalAction::Ignore)
+        }
+    }
+}
+
+/// Refines the common task signal predicate for clock sleeps.  The shared
+/// predicate intentionally treats default SIGCONT as syscall-visible; for a
+/// sleep it is only a continuation wake, so inspect the exact pending set to
+/// avoid exposing EINTR while still preserving any other pending signal.
+fn has_pending_clock_sleep_signal(thr: &Thread) -> bool {
+    if !has_pending_syscall_signal(thr) {
+        return false;
+    }
+
+    let pending = thr.signal.pending();
+    let blocked = thr.signal.blocked();
+    for raw in 1..=64u8 {
+        let Some(signo) = Signo::from_repr(raw) else {
+            continue;
+        };
+        if pending.has(signo)
+            && clock_sleep_signal_is_visible(
+                signo,
+                blocked.has(signo),
+                thr.proc_data.signal.action(signo).disposition,
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classifies the task-interrupt wake that follows an interruptible clock
+/// sleep.  `TaskInner::interrupt` is deliberately a single wake channel: it
+/// is also used for exec/exit handoff and other internal state changes, not
+/// only for a signal which Linux exposes as EINTR.  Keep the ABI decision
+/// tied to the durable task predicates instead of treating the wake bit as a
+/// signal by itself.
+fn classify_clock_sleep_interrupt(
+    pending_exit: bool,
+    pending_signal: bool,
+    should_exit_for_exec: bool,
+    should_wait_for_stop: bool,
+) -> ClockSleepInterruptDisposition {
+    if pending_exit || pending_signal || should_exit_for_exec || should_wait_for_stop {
+        ClockSleepInterruptDisposition::Return
+    } else {
+        ClockSleepInterruptDisposition::Retry
+    }
+}
+
+fn current_clock_sleep_interrupt_disposition() -> ClockSleepInterruptDisposition {
+    let curr = current();
+    let thr = curr.as_thread();
+    classify_clock_sleep_interrupt(
+        thr.pending_exit(),
+        has_pending_clock_sleep_signal(thr),
+        thr.proc_data.should_exit_for_exec(thr.tid()),
+        thr.proc_data.should_wait_for_stop(),
+    )
+}
+
 fn flatten_clock_sleep_result(
     result: Result<Result<(), Interrupted>, BlockOnError>,
 ) -> AxResult<ClockSleepOutcome> {
@@ -456,13 +542,25 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
     }
     let start = AlarmClock::Monotonic.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
-    let mut sleeper = prepare_clock_sleep(AlarmClock::Monotonic, deadline)?;
+    loop {
+        let mut sleeper = prepare_clock_sleep(AlarmClock::Monotonic, deadline)?;
 
-    // We detect EINTR manually if the slept time is not enough.
-    let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on(interruptible(&mut sleeper))
-    });
-    let _ = flatten_clock_sleep_result(result)?;
+        // We detect EINTR manually if the slept time is not enough.  The
+        // task interrupt is only a wake hint; retry while no visible signal,
+        // exec handoff, or terminal exit predicate owns the interruption.
+        let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
+            block_on(interruptible(&mut sleeper))
+        });
+        match flatten_clock_sleep_result(result)? {
+            ClockSleepOutcome::Completed => break,
+            ClockSleepOutcome::Interrupted
+                if matches!(
+                    current_clock_sleep_interrupt_disposition(),
+                    ClockSleepInterruptDisposition::Retry
+                ) => {}
+            ClockSleepOutcome::Interrupted => break,
+        }
+    }
 
     Ok(AlarmClock::Monotonic.now() - start)
 }
@@ -470,11 +568,21 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
 fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
     debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
 
-    let mut sleeper = prepare_clock_sleep(clock, deadline)?;
-    let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on(interruptible(&mut sleeper))
-    });
-    flatten_clock_sleep_result(result)
+    loop {
+        let mut sleeper = prepare_clock_sleep(clock, deadline)?;
+        let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
+            block_on(interruptible(&mut sleeper))
+        });
+        match flatten_clock_sleep_result(result)? {
+            ClockSleepOutcome::Completed => return Ok(ClockSleepOutcome::Completed),
+            ClockSleepOutcome::Interrupted
+                if matches!(
+                    current_clock_sleep_interrupt_disposition(),
+                    ClockSleepInterruptDisposition::Retry
+                ) => {}
+            ClockSleepOutcome::Interrupted => return Ok(ClockSleepOutcome::Interrupted),
+        }
+    }
 }
 
 fn clock_nanosleep_is_absolute(flags: u32) -> AxResult<bool> {
@@ -929,8 +1037,8 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
             Ok(raw_priority_from_nice(min_nice_for_threads(
                 try_tasks()?.into_iter().filter_map(|task| {
                     let thread = task.try_as_thread()?;
-                    let ids = thread.current_cred().ids();
-                    (ids.ruid == uid || ids.euid == uid).then_some(thread.tid())
+                    (thread.real_uid() == uid || thread.effective_uid() == uid)
+                        .then_some(thread.tid())
                 }),
             )?))
         }
@@ -1310,9 +1418,7 @@ fn ioprio_multi_targets(
             };
             for task in tasks {
                 let thread = task.as_thread();
-                if caller_pid_ns.contains(&thread.proc_data.pid_ns())
-                    && thread.current_cred().ids().ruid == uid
-                {
+                if caller_pid_ns.contains(&thread.proc_data.pid_ns()) && thread.real_uid() == uid {
                     targets.push(IoprioTarget::Live(task));
                 }
             }
@@ -1439,6 +1545,54 @@ mod tests {
             flatten_clock_sleep_result(Ok(Ok(()))),
             Ok(ClockSleepOutcome::Completed)
         );
+    }
+
+    #[test]
+    fn clock_sleep_interrupt_retries_only_pure_internal_wakes() {
+        assert_eq!(
+            classify_clock_sleep_interrupt(false, false, false, false),
+            ClockSleepInterruptDisposition::Retry
+        );
+        assert_eq!(
+            classify_clock_sleep_interrupt(true, false, false, false),
+            ClockSleepInterruptDisposition::Return
+        );
+        assert_eq!(
+            classify_clock_sleep_interrupt(false, true, false, false),
+            ClockSleepInterruptDisposition::Return
+        );
+        assert_eq!(
+            classify_clock_sleep_interrupt(false, false, true, false),
+            ClockSleepInterruptDisposition::Return
+        );
+        assert_eq!(
+            classify_clock_sleep_interrupt(false, false, false, true),
+            ClockSleepInterruptDisposition::Return
+        );
+    }
+
+    #[test]
+    fn default_sigcont_does_not_make_clock_sleep_visible() {
+        assert!(!clock_sleep_signal_is_visible(
+            Signo::SIGCONT,
+            false,
+            SignalDisposition::Default,
+        ));
+        assert!(clock_sleep_signal_is_visible(
+            Signo::SIGCONT,
+            false,
+            SignalDisposition::Handler(0x1000),
+        ));
+        assert!(clock_sleep_signal_is_visible(
+            Signo::SIGTERM,
+            false,
+            SignalDisposition::Default,
+        ));
+        assert!(!clock_sleep_signal_is_visible(
+            Signo::SIGTERM,
+            true,
+            SignalDisposition::Default,
+        ));
     }
 
     #[test]

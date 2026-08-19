@@ -14,7 +14,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::{mem::phys_to_virt, paging::MappingFlags, power::system_off};
 use axsync::Mutex;
-use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current, sched_state};
+use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use hashbrown::{HashMap, HashSet};
 use kernel_guard::NoPreemptIrqSave;
@@ -1006,8 +1006,8 @@ pub fn poll_timer(task: &TaskInner) {
         TaskUsage::from_time_values(utime, stime)
     };
     thr.store_usage_snapshot(usage);
-    if request_process_cpu_evaluation(&thr.proc_data) {
-        crate::deferred_work::wake_process_timer_worker();
+    if let Some(cpu) = request_process_cpu_evaluation(&thr.proc_data) {
+        crate::deferred_work::wake_process_timer_worker(cpu);
     }
 }
 
@@ -1026,10 +1026,10 @@ pub fn set_timer_state(task: &TaskInner, state: TimerState) -> bool {
     };
     thr.store_usage_snapshot(usage);
     let timer_work_published = request_process_cpu_evaluation(&thr.proc_data);
-    if timer_work_published {
-        crate::deferred_work::wake_process_timer_worker();
+    if let Some(cpu) = timer_work_published {
+        crate::deferred_work::wake_process_timer_worker(cpu);
     }
-    timer_work_published
+    timer_work_published.is_some()
 }
 
 #[repr(C)]
@@ -1312,12 +1312,11 @@ fn publish_final_process_exit(
     self_usage: TaskUsage,
     child_usage: TaskUsage,
 ) -> CommittedProcessExit {
-    // The live scheduler object disappears from process targeting as soon as
-    // this core commit publishes the zombie.  Sample it while the exiting
-    // task is still authoritative, so PGRP/USER ioprio readers cannot observe
-    // the retained default snapshot between those two publications.
-    let live_task = current();
-    proc_data.publish_scheduler_state(sched_state(&live_task));
+    // Scheduler syscalls publish the durable process snapshot only after the
+    // scheduler transaction succeeds.  Preserve that exact last publication
+    // through final exit.  Re-sampling ambient `current()` here would create a
+    // second authority after live process membership has already been removed
+    // and after teardown has crossed blocking/context-switch boundaries.
     exit.commit_with_reparent_handoff(
         process.exit_code(),
         self_usage.into(),
@@ -1449,6 +1448,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         ),
     }
     let process = &thr.proc_data.proc;
+    // Reserve the bounded terminal-retirement entry before group exit can
+    // become irreversible.  A full queue must still be reported while the
+    // caller can return without leaving the group-exit gate or peer SIGKILLs
+    // behind.
+    let seccomp_retirement_plan = thr.prepare_seccomp_exit_retirement()?;
     set_timer_state(&curr, TimerState::Kernel);
     // rseq teardown is purely kernel state. Linux does not attempt to repair
     // the registered user area while a task is exiting (the mapping may have
@@ -1471,40 +1475,39 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // Declared before the lifecycle guard so unwind also releases every outer
     // lock before a detached immutable filter chain can run its iterative Drop.
     let mut seccomp_retirement = None;
+    // Completion below only clears and queues the exact old owner; it never
+    // waits for a grace period while lifecycle serialization is held.
     let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
     let final_exit = match remove_current_thread(process, tid, exit_code) {
         Ok(ThreadExitTransition::NotFound) => {
-            error!(
-                "refusing partial exit because current TID {} is absent from process {}",
-                tid,
-                process.pid()
-            );
-            drop(task_parent_publication.take());
-            drop(lifecycle);
-            return Err(AxError::BadState);
+            fail_closed_exit(AxError::BadState);
         }
         Ok(ThreadExitTransition::LiveThreadsRemain) => None,
         Ok(ThreadExitTransition::FinalThread(exit)) => Some(exit),
         Err(error) => {
             error!(
-                "refusing partial exit for TID {} in process {} after lifecycle error: {}",
+                "fatal exit transition failure for TID {} in process {} after irreversible setup: \
+                 {}",
                 tid,
                 process.pid(),
                 error
             );
-            drop(task_parent_publication.take());
-            drop(lifecycle);
-            return Err(error);
+            fail_closed_exit(error);
         }
     };
 
     // A final admission owns the removed membership and restores it on Drop.
-    // Bind the process-owned payload before any per-thread/process teardown so
-    // every operation after this point is an infallible commit sequence.
+    // Bind the process-owned payload before any per-thread/process teardown.
+    // A missing preallocated payload is an internal invariant failure after
+    // thread removal; fail closed rather than returning a syscall error after
+    // the irreversible group-exit setup above.
     let final_exit = final_exit
         .map(|exit| thr.proc_data.prepare_zombie_exit(exit))
-        .transpose()?;
+        .transpose()
+        .unwrap_or_else(|error| {
+            fail_closed_exit(error);
+        });
     let final_thread = final_exit.is_some();
     if final_exit.is_some() {
         // Freeze shared generation before zombie publication. A concurrent
@@ -1690,7 +1693,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         seccomp_retirement.is_none(),
         "seccomp exit ownership retired more than once"
     );
-    seccomp_retirement = Some(thr.retire_seccomp_after_exit());
+    seccomp_retirement = Some(
+        thr.complete_seccomp_exit_retirement(seccomp_retirement_plan)
+            .unwrap_or_else(|error| fail_closed_exit(error)),
+    );
     // Both non-final and final paths have released their graph gate by here.
     // Keep this defensive take adjacent to lifecycle release so future exit
     // edits cannot accidentally move credential free callbacks back under it.
@@ -1710,10 +1716,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
 
 /// Stops the machine after an unrecoverable internal exit-transaction fault.
 ///
-/// User-issued exit syscalls return the typed error to their caller. Fatal
-/// signal/default-action paths cannot safely resume userspace after consuming
-/// the fatal event, so they use this explicit fail-closed policy rather than
-/// silently leaving a partially exited task runnable.
+/// User-issued exit syscalls return typed errors only while exit is still
+/// reversible. Once timer/rseq/group-exit or membership removal has begun,
+/// the caller cannot safely resume userspace after an internal fault, so this
+/// explicit fail-closed policy prevents a partially exited task from running.
 pub(crate) fn fail_closed_exit(error: AxError) -> ! {
     error!("fatal process-exit invariant failure: {error}");
     system_off()

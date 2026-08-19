@@ -272,6 +272,7 @@ impl InterestCallbackState {
 struct InterestControl {
     file: Arc<FileDescription>,
     poll_events: IoEvents,
+    interest: InterestMask,
     one_shot: bool,
     active: AtomicBool,
     callback: Arc<InterestCallbackState>,
@@ -309,6 +310,7 @@ impl InterestControl {
         wake_port: &Arc<EpollWakePort>,
         file: Arc<FileDescription>,
         poll_events: IoEvents,
+        interest: InterestMask,
         one_shot: bool,
     ) -> AxResult<Arc<Self>> {
         let callback = Arc::try_new(InterestCallbackState {
@@ -321,6 +323,7 @@ impl InterestControl {
         let control = Arc::try_new(Self {
             file,
             poll_events,
+            interest,
             one_shot,
             active: AtomicBool::new(true),
             callback: Arc::clone(&callback),
@@ -854,7 +857,7 @@ impl EpollInner {
             .try_reserve_exact(limit)
             .map_err(|_| AxError::NoMemory)?;
         while deliveries.len() < limit {
-            let next = {
+            let mut next = {
                 let mut state = self.state.lock();
                 let Some(ready) = state.core.begin_delivery().map_err(map_epoll_error)? else {
                     break;
@@ -873,15 +876,47 @@ impl EpollInner {
                 };
                 PreparedDelivery { ready, control }
             };
-            if let Err(error) = next.control.ensure_armed() {
-                let mut state = self.state.lock();
-                let _ = state
+            let current = match next.control.check_arm_check() {
+                Ok(ready) => ready.deliverable(next.control.interest),
+                Err(error) => {
+                    let mut state = self.state.lock();
+                    let _ = state
+                        .core
+                        .finish_delivery(next.ready.delivery, DeliveryOutcome::Fault);
+                    drop(state);
+                    self.wake_port.poll_ready.wake();
+                    return Err(error);
+                }
+            };
+            if current.is_empty() {
+                // Linux re-polls each ready-list item immediately before
+                // copyout.  A level-triggered snapshot can stay queued after
+                // another descriptor drains the source, because becoming
+                // not-ready does not itself produce a wake.  Discard only the
+                // stale snapshot; the core preserves any callback which raced
+                // this recheck and does not consume EPOLLONESHOT.
+                let result = self
+                    .state
+                    .lock()
                     .core
-                    .finish_delivery(next.ready.delivery, DeliveryOutcome::Fault);
-                drop(state);
-                self.wake_port.poll_ready.wake();
-                return Err(error);
+                    .finish_delivery(next.ready.delivery, DeliveryOutcome::Suppressed);
+                match result {
+                    Ok(()) | Err(EpollError::StaleToken) => {}
+                    Err(EpollError::ReadyQueueFull) => {
+                        self.wake_port.poll_ready.wake();
+                    }
+                    Err(error) => {
+                        error!("epoll stale-delivery suppression failed: {error:?}");
+                        self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                        return Err(AxError::BadState);
+                    }
+                }
+                continue;
             }
+            // Return the mask observed by the delivery-time poll rather than
+            // the older coalesced wake snapshot. Error/hangup bits remain
+            // unconditional through ReadyMask::deliverable.
+            next.ready.events = current;
             deliveries.push(next);
         }
         if deliveries.is_empty() {
@@ -1061,6 +1096,7 @@ impl Epoll {
             &self.inner.wake_port,
             Arc::clone(&file),
             event.events,
+            interest,
             mode.one_shot,
         )?;
         let initial_ready = match control.check_arm_check() {
@@ -1152,8 +1188,13 @@ impl Epoll {
             one_shot: flags.contains(EpollFlags::ONESHOT),
             exclusive: false,
         };
-        let control =
-            InterestControl::try_new(&self.inner.wake_port, file, event.events, mode.one_shot)?;
+        let control = InterestControl::try_new(
+            &self.inner.wake_port,
+            file,
+            event.events,
+            interest,
+            mode.one_shot,
+        )?;
         let initial_ready = match control.check_arm_check() {
             Ok(ready) => ready,
             Err(error) => {
@@ -1458,6 +1499,7 @@ mod tests {
             &epoll.inner.wake_port,
             file.clone(),
             IoEvents::READABLE,
+            InterestMask::IN,
             false,
         )
         .unwrap();

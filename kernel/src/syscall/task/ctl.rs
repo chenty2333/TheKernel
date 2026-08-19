@@ -435,6 +435,12 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             } else {
                 None
             };
+            // Reserve the canonical Semantic World consumer before changing
+            // any shared scope state. Commit below is pointer-only and cannot
+            // leave a half-unshared process if the authority is at capacity.
+            let prepared_uts = private_uts_ns
+                .map(|uts_ns| thread.proc_data.prepare_uts_ns_replacement(uts_ns))
+                .transpose()?;
             let private_time_ns = if flags & CLONE_NEWTIME != 0 {
                 Some(
                     thread
@@ -457,8 +463,8 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             // cleanup. Keep all such work outside the IRQ/preempt-off scope gate.
             drop(old_fd_table);
             drop(old_fs_context);
-            if let Some(uts_ns) = private_uts_ns {
-                thread.proc_data.replace_uts_ns(uts_ns);
+            if let Some(prepared_uts) = prepared_uts {
+                prepared_uts.commit(&thread.proc_data);
             }
             if let Some(time_ns) = private_time_ns {
                 thread.proc_data.replace_time_ns_for_children(time_ns);
@@ -521,11 +527,15 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
         return Err(AxError::OperationNotSupported);
     }
-    match replacement {
+    let result = match replacement {
         Replacement::Uts(uts_ns) => thread.proc_data.replace_uts_ns(uts_ns),
-        Replacement::Time(time_ns) => thread.proc_data.replace_time_ns(time_ns),
-    }
+        Replacement::Time(time_ns) => {
+            thread.proc_data.replace_time_ns(time_ns);
+            Ok(())
+        }
+    };
     thread.proc_data.end_exec(curr_tid);
+    result?;
     Ok(0)
 }
 

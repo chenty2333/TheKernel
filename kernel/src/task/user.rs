@@ -214,7 +214,24 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     // the kernel so a pure CPU loop cannot defer publication.
                     axtask::resched_if_needed();
                 }
+
+                // `interrupt` is also the wake edge for a sibling exec gate.
+                // Clear it before the final gate read: a gate published
+                // before this store is observed below, while a publication
+                // after the read leaves the interrupt set for the next trap
+                // or blocking point.
                 curr.clear_interrupt();
+
+                if thr.proc_data.should_exit_for_exec(tid) {
+                    if has_pending_fatal_signal(thr) {
+                        while check_signals(thr, &mut uctx, None) {}
+                    } else {
+                        if let Err(error) = do_exit(0, false) {
+                            fail_closed_exit(error);
+                        }
+                        continue;
+                    }
+                }
             }
         },
         name,

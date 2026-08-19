@@ -22,8 +22,8 @@ pub use tmp::MemoryFs;
 
 pub(crate) use self::proc::{
     ProcDirProcess, ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
-    namespace_target_from_proc_file, proc_namespace_location_from_object,
-    process_data_from_proc_dir,
+    check_proc_pid_dir_search, namespace_target_from_proc_file,
+    proc_namespace_location_from_object, process_data_from_proc_dir,
 };
 pub use self::{device::*, dir::*, file::*, fs::*};
 use crate::mounts;
@@ -57,10 +57,23 @@ impl<T: FileNodeOps> From<Arc<T>> for NodeOpsMux {
 const DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o755);
 const VAR_TMP_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
 
-fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
-    if fs.resolve(path).is_err() {
-        fs.create_dir(path, DIR_PERMISSION)?;
+fn is_missing_path_error(error: axfs_ng_vfs::VfsError) -> bool {
+    error.canonicalize() == axfs_ng_vfs::VfsError::NotFound
+}
+
+fn ensure_dir(fs: &FsContext, path: &str) -> LinuxResult<()> {
+    match fs.resolve(path) {
+        Ok(_) => Ok(()),
+        Err(error) if is_missing_path_error(error) => {
+            fs.create_dir(path, DIR_PERMISSION)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
+}
+
+fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
+    ensure_dir(fs, path)?;
     let target = fs.resolve(path)?;
     let mountpoint = mounts::new_detached_with_flags(
         &mount_fs,
@@ -94,9 +107,7 @@ pub fn mount_all(
         "/tmp",
         tmp::MemoryFs::new_with_permission(tmp_permission)?,
     )?;
-    if fs.resolve("/var").is_err() {
-        fs.create_dir("/var", DIR_PERMISSION)?;
-    }
+    ensure_dir(&fs, "/var")?;
     mount_at(
         &fs,
         "/var/tmp",
@@ -114,4 +125,19 @@ pub fn mount_all(
     dev::bind_dev_log(boot_security, unix_namespace).expect("Failed to bind /dev/log");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axerrno::{AxError, LinuxError};
+
+    use super::is_missing_path_error;
+
+    #[test]
+    fn only_not_found_errors_allow_directory_creation() {
+        assert!(is_missing_path_error(AxError::NotFound));
+        assert!(is_missing_path_error(AxError::from(LinuxError::ENOENT)));
+        assert!(!is_missing_path_error(AxError::from(LinuxError::EIO)));
+        assert!(!is_missing_path_error(AxError::from(LinuxError::EEXIST)));
+    }
 }

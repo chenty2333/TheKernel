@@ -1274,15 +1274,23 @@ pub(crate) fn notify_write(fd: i32) {
 }
 
 pub(crate) fn notify_read_file(file: &File) {
+    notify_read_file_with_actor(file, FanotifyEventActor::current());
+}
+
+pub(crate) fn notify_read_file_with_actor(file: &File, actor: FanotifyEventActor) {
     let loc = file.inner().location().clone();
-    let _ = notify_exact(&loc, IN_ACCESS);
-    let _ = notify_parent(&loc, IN_ACCESS);
+    let _ = notify_exact_with_actor(&loc, IN_ACCESS, actor);
+    let _ = notify_parent_with_actor(&loc, IN_ACCESS, actor);
 }
 
 pub(crate) fn notify_write_file(file: &File) {
+    notify_write_file_with_actor(file, FanotifyEventActor::current());
+}
+
+pub(crate) fn notify_write_file_with_actor(file: &File, actor: FanotifyEventActor) {
     let loc = file.inner().location().clone();
-    let _ = notify_exact(&loc, IN_MODIFY);
-    let _ = notify_parent(&loc, IN_MODIFY);
+    let _ = notify_exact_with_actor(&loc, IN_MODIFY, actor);
+    let _ = notify_parent_with_actor(&loc, IN_MODIFY, actor);
 }
 
 pub(crate) fn location_for_fd(fd: i32) -> Option<Location> {
