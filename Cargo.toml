@@ -77,6 +77,7 @@ axsync = { version = "0.3.0-preview.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
 axcbpf = { package = "thekernel-axcbpf", version = "=0.1.0" }
 axfault = { package = "thekernel-axfault", version = "=0.1.0" }
+axrcu = { package = "thekernel-axrcu", version = "=0.1.0" }
 axpmu = { package = "thekernel-axpmu", version = "=0.1.0", default-features = false }
 axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
@@ -92,6 +93,9 @@ thekernel-linux-signal = { version = "=0.1.0", default-features = false }
 thekernel-linux-usercopy = { version = "=0.1.0", default-features = false }
 axtlb = { package = "thekernel-axtlb", version = "=0.1.0", default-features = false }
 thekernel-linux-process-adapter = { version = "=0.1.0", path = "crates/process-adapter" }
+
+visa-core = { path = "../vISA/crates/visa-core", version = "=0.1.0" }
+visa-coordinator = { path = "../vISA/crates/visa-coordinator", version = "=0.1.0" }
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
@@ -137,7 +141,12 @@ smp = [
     "axfeat/smp",
     "thekernel-kernel/smp-tlb-shootdown",
     "thekernel-kernel/irq-continuation-diagnostics",
+    "thekernel-kernel/idle-steal",
 ]
+# EEVDF profile selection is compile time; the default is balanced.
+eevdf-balanced = ["thekernel-kernel/eevdf-balanced"]
+eevdf-latency = ["thekernel-kernel/eevdf-latency"]
+eevdf-throughput = ["thekernel-kernel/eevdf-throughput"]
 
 [[bin]]
 name = "thekernel"
@@ -178,6 +187,7 @@ thekernel-axfault = { path = "../thekernel-ax/crates/thekernel-axfault" }
 thekernel-axpmu = { path = "../thekernel-ax/crates/thekernel-axpmu" }
 thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
 thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
+thekernel-axrcu = { path = "../thekernel-ax/crates/thekernel-axrcu" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet" }

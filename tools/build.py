@@ -36,7 +36,7 @@ IGNORE_FILE_SUFFIXES = (".pyc",)
 KERNEL_ENV: Mapping[str, str] = {
     "DEBUGINFO": "y",
     "DWARF": "n",
-    "LOG": "off",
+    "LOG": "warn",
     "BANNER": "n",
     "BACKTRACE": "n",
     "NO_AXSTD": "y",

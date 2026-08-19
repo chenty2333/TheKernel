@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .command import VALID_DRIVE_MODES, build_qemu_command
+from .command import VALID_DRIVE_MODES, VALID_NETWORK_MODES, build_qemu_command
 from .evidence import file_evidence
 from .images import materialize_writable_image, prepare_image
 from .model import Arch, Drive, DriveMode, Interaction, RunLimits, RunResult
@@ -40,6 +41,18 @@ class RunConfig:
     memory: str = "1G"
     cpus: int = 1
     qemu_binary: str | None = None
+    qemu_launcher: tuple[str, ...] | None = None
+    accel: str | None = None
+    cpu: str | None = None
+    iothread_id: str | None = None
+    # Correctness lanes retain QEMU's user-mode network by default.  The
+    # performance lane opts into ``passt`` (or ``tap-vhost``) explicitly so
+    # a normal qemu-runner invocation never unexpectedly requires host setup.
+    network: str = "user"
+    network_mode: str | None = None
+    network_topology: str | None = None
+    tap_name: str | None = None
+    extra_args: tuple[str, ...] = ()
     ovmf_code: Path | None = None
     ovmf_vars: Path | None = None
     direct_kernel: bool = False
@@ -94,6 +107,26 @@ def _validate_mode(name: str, mode: str) -> DriveMode:
     return mode  # type: ignore[return-value]
 
 
+def _validate_network(config: RunConfig) -> str:
+    network = config.network
+    if config.network_mode is not None:
+        if network != "user" and network != config.network_mode:
+            raise RunnerError("network and network_mode disagree")
+        network = config.network_mode
+    if config.network_topology is not None:
+        if network != "user" and network != config.network_topology:
+            raise RunnerError("network and network_topology disagree")
+        network = config.network_topology
+    if network not in VALID_NETWORK_MODES:
+        raise RunnerError(f"unsupported network topology: {network}")
+    if config.tap_name is not None and (
+        not config.tap_name
+        or any(char in config.tap_name for char in ",=\n\r")
+    ):
+        raise RunnerError("tap name must be a non-empty QEMU-safe value")
+    return network
+
+
 def _prepare_drive(
     source: Path,
     *,
@@ -113,8 +146,7 @@ def _prepare_drive(
     return Drive(path=runtime, mode=mode)
 
 
-def _qemu_evidence(command: tuple[str, ...]) -> dict[str, str | int | None]:
-    requested = command[0]
+def _qemu_evidence(requested: str) -> dict[str, str | int | None]:
     resolved = shutil.which(requested)
     if resolved is None and "/" in requested:
         candidate = Path(requested).expanduser().resolve()
@@ -165,6 +197,16 @@ def run(
 
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
+    network = _validate_network(config)
+    effective_qemu_launcher = config.qemu_launcher
+    if (
+        effective_qemu_launcher is None
+        and config.qemu_binary is not None
+        and config.qemu_binary.endswith(".py")
+    ):
+        # The scheduler pinner is a source-controlled Python entry point and
+        # intentionally need not carry an executable bit in a checkout.
+        effective_qemu_launcher = (sys.executable, config.qemu_binary)
     rootfs = _prepare_drive(
         config.rootfs,
         mode=rootfs_mode,
@@ -234,9 +276,17 @@ def run(
         memory=config.memory,
         cpus=config.cpus,
         qemu_binary=config.qemu_binary,
+        qemu_launcher=effective_qemu_launcher,
+        accel=config.accel,
+        cpu=config.cpu,
+        iothread_id=config.iothread_id,
+        network=network,
+        tap_name=config.tap_name,
+        extra_args=config.extra_args,
     )
-    qemu = _qemu_evidence(command)
-    if qemu["path"] is not None:
+    qemu_requested = config.qemu_binary or "qemu-system-x86_64"
+    qemu = _qemu_evidence(qemu_requested)
+    if qemu["path"] is not None and effective_qemu_launcher is None:
         command = (str(qemu["path"]), *command[1:])
     rootfs_source_path = config.rootfs.expanduser().resolve()
     rootfs_runtime_path = rootfs.path.resolve()
@@ -270,11 +320,18 @@ def run(
         "arch": config.arch,
         "cpus": config.cpus,
         "memory": config.memory,
+        "accel": config.accel,
+        "cpu": config.cpu,
+        "iothread_id": config.iothread_id,
+        "network": network,
+        "tap_name": config.tap_name,
+        "extra_args": list(config.extra_args),
         "kernel": file_evidence(kernel),
         "rootfs_source": rootfs_source,
         "rootfs_runtime_before": rootfs_runtime,
         "qemu": qemu,
         "command": list(command),
+        "qemu_launcher": list(effective_qemu_launcher) if effective_qemu_launcher is not None else None,
         "workdir": str(workdir),
         "log_path": str(log_path),
         "rootfs_mode": rootfs_mode,

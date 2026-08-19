@@ -29,6 +29,12 @@ userspace, TheKernel's system init, boot-shell entrypoint, and semantic helpers.
 
 Environment overrides:
   THEKERNEL_X86_CROSS_COMPILE x86_64 tool prefix (default: x86_64-linux-gnu-)
+  THEKERNEL_USE_LOCAL_MUSL=1  opt into the repository-local .tmp/musl-root
+  THEKERNEL_MUSL_ROOT         local musl root (default: .tmp/musl-root)
+  THEKERNEL_MUSL_LINUX_UAPI_INCLUDE Linux UAPI headers (default: /usr/include)
+  THEKERNEL_MUSL_LINUX_ARCH_INCLUDE architecture UAPI headers (optional)
+  THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
+                                when fakeroot is intentionally unavailable)
   THEKERNEL_SOURCE_CACHE      Download cache
   THEKERNEL_ROOTFS_BUILD_DIR  Per-architecture compiler work directory
 EOF
@@ -47,7 +53,6 @@ done
 case "$ARCH" in
     x86|x86_64)
         ARCH=x86
-        CROSS_COMPILE=${THEKERNEL_X86_CROSS_COMPILE:-x86_64-linux-gnu-}
         BUSYBOX_ARCH=x86_64
         ;;
     *) printf '%s\n' '--arch must be x86 or x86_64' >&2; exit 2 ;;
@@ -57,8 +62,13 @@ case "$SIZE_MB" in
     ''|*[!0-9]*) printf 'invalid --size-mb: %s\n' "$SIZE_MB" >&2; exit 2 ;;
 esac
 [ "$SIZE_MB" -ge 32 ] || { printf '%s\n' '--size-mb must be at least 32' >&2; exit 2; }
+ROOTFS_OWNER_MODE=${THEKERNEL_ROOTFS_OWNER_MODE:-root}
+case "$ROOTFS_OWNER_MODE" in
+    root|preserve) ;;
+    *) printf 'invalid THEKERNEL_ROOTFS_OWNER_MODE: %s\n' "$ROOTFS_OWNER_MODE" >&2; exit 2 ;;
+esac
 
-for command in "${CROSS_COMPILE}gcc" curl debugfs find make mke2fs \
+for command in curl debugfs find make mke2fs \
     realpath sha256sum tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
@@ -88,6 +98,128 @@ OUTPUT=$(realpath -m "$OUTPUT")
 mkdir -p "$(dirname -- "$OUTPUT")"
 WORK_ROOT=$(mktemp -d "$REPO_ROOT/.tmp/rootfs.XXXXXX")
 trap 'rm -rf "$WORK_ROOT"' EXIT
+
+# mke2fs inherits the host's ext4 defaults.  Recent e2fsprogs enables
+# metadata_csum_seed (incompat 0x2000), which lwext4 rejects even though the
+# image otherwise only uses its supported incompat features (0x2c2 <= 0x2d2).
+# lwext4 documents has_journal, ext_attr, dir_index, extents, 64bit, flex_bg,
+# sparse_super, large_file, huge_file, dir_nlink, extra_isize, and metadata_csum
+# as supported, but explicitly documents resize_inode as unsupported. Its
+# compatible-feature check does not reject that bit, so do not enable it here.
+# Keep the complete feature set in a throw-away config so rootfs creation is
+# independent of the host defaults while retaining the supported ext4 layout.
+MKE2FS_CONFIG="$WORK_ROOT/mke2fs.conf"
+cat >"$MKE2FS_CONFIG" <<'EOF'
+[defaults]
+    base_features = none
+    default_mntopts = acl,user_xattr
+    blocksize = 4096
+    inode_size = 256
+    inode_ratio = 16384
+[fs_types]
+    ext4 = {
+        features = none,has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum,^metadata_csum_seed,^orphan_file
+    }
+    small = {
+        blocksize = 1024
+        inode_ratio = 4096
+    }
+EOF
+export MKE2FS_CONFIG
+
+# Keep the explicit toolchain override authoritative.  The local musl path is
+# intentionally opt-in: .tmp is a developer cache, not a checked-in or
+# implicit compatibility toolchain.  The wrapper is materialized below the
+# throw-away rootfs work directory and is removed with it on exit.
+if [ -n "${THEKERNEL_X86_CROSS_COMPILE:-}" ]; then
+    CROSS_COMPILE=$THEKERNEL_X86_CROSS_COMPILE
+elif [ "${THEKERNEL_USE_LOCAL_MUSL:-0}" = 1 ]; then
+    MUSL_ROOT=${THEKERNEL_MUSL_ROOT:-$REPO_ROOT/.tmp/musl-root}
+    MUSL_ROOT=$(realpath -e "$MUSL_ROOT") || {
+        printf 'local musl root does not exist: %s\n' "$MUSL_ROOT" >&2
+        exit 1
+    }
+    MUSL_PREFIX="$MUSL_ROOT/usr/x86_64-linux-musl"
+    MUSL_SPEC_TEMPLATE="$MUSL_PREFIX/lib64/musl-gcc.specs"
+    for path in "$MUSL_PREFIX/include" "$MUSL_PREFIX/lib64" \
+        "$MUSL_SPEC_TEMPLATE"; do
+        [ -e "$path" ] || {
+            printf 'local musl root is incomplete: %s\n' "$path" >&2
+            exit 1
+        }
+    done
+
+    REAL_GCC=$(command -v gcc) || {
+        printf '%s\n' 'local musl toolchain requires a host gcc' >&2
+        exit 1
+    }
+    MUSL_UAPI_INCLUDE=${THEKERNEL_MUSL_LINUX_UAPI_INCLUDE:-/usr/include}
+    [ -d "$MUSL_UAPI_INCLUDE/linux" ] || {
+        printf 'local musl toolchain requires Linux UAPI headers: %s/linux\n' \
+            "$MUSL_UAPI_INCLUDE" >&2
+        exit 1
+    }
+    MUSL_UAPI_ARCH_INCLUDE=${THEKERNEL_MUSL_LINUX_ARCH_INCLUDE:-}
+    if [ -z "$MUSL_UAPI_ARCH_INCLUDE" ] &&
+        [ -d "$MUSL_UAPI_INCLUDE/x86_64-linux-gnu" ]; then
+        MUSL_UAPI_ARCH_INCLUDE="$MUSL_UAPI_INCLUDE/x86_64-linux-gnu"
+    fi
+    if [ -n "$MUSL_UAPI_ARCH_INCLUDE" ] &&
+        [ ! -d "$MUSL_UAPI_ARCH_INCLUDE/asm" ]; then
+        printf 'local musl architecture UAPI headers are incomplete: %s/asm\n' \
+            "$MUSL_UAPI_ARCH_INCLUDE" >&2
+        exit 1
+    fi
+    TOOLCHAIN_DIR="$WORK_ROOT/toolchain"
+    mkdir -p "$TOOLCHAIN_DIR"
+    LOCAL_SPEC="$TOOLCHAIN_DIR/musl-gcc.specs"
+
+    # Fedora's musl-gcc.specs records the install prefix it was generated
+    # from.  Rewrite that prefix so a copied .tmp/musl-root remains usable
+    # from another checkout or an overridden THEKERNEL_MUSL_ROOT.
+    OLD_MUSL_PREFIX=$(sed -n 's/.*-isystem \([^ ]*\)\/include.*/\1/p' \
+        "$MUSL_SPEC_TEMPLATE" | head -n 1)
+    [ -n "$OLD_MUSL_PREFIX" ] || {
+        printf 'cannot determine musl prefix from: %s\n' "$MUSL_SPEC_TEMPLATE" >&2
+        exit 1
+    }
+    OLD_MUSL_PREFIX_ESC=$(printf '%s' "$OLD_MUSL_PREFIX" |
+        sed 's/[.[\*^$\\]/\\&/g')
+    NEW_MUSL_PREFIX_ESC=$(printf '%s' "$MUSL_PREFIX" |
+        sed 's/[&|\\]/\\&/g')
+    sed "s|$OLD_MUSL_PREFIX_ESC|$NEW_MUSL_PREFIX_ESC|g" \
+        "$MUSL_SPEC_TEMPLATE" >"$LOCAL_SPEC"
+
+    CROSS_COMPILE="$TOOLCHAIN_DIR/x86_64-linux-musl-"
+    UAPI_FLAGS="-idirafter \"$MUSL_UAPI_INCLUDE\""
+    if [ -n "$MUSL_UAPI_ARCH_INCLUDE" ]; then
+        UAPI_FLAGS="$UAPI_FLAGS -idirafter \"$MUSL_UAPI_ARCH_INCLUDE\""
+    fi
+    cat >"${CROSS_COMPILE}gcc" <<EOF
+#!/bin/sh
+exec "$REAL_GCC" -specs "$LOCAL_SPEC" $UAPI_FLAGS "\$@"
+EOF
+    chmod 0755 "${CROSS_COMPILE}gcc"
+    # BusyBox's build can invoke these tools through CROSS_COMPILE even though
+    # the local musl sysroot only needs the host binutils.
+    for tool in ar as ld nm objcopy objdump ranlib readelf strip; do
+        tool_path=$(command -v "$tool") || {
+            printf 'required host tool not found for local musl: %s\n' "$tool" >&2
+            exit 1
+        }
+        ln -s "$tool_path" "${CROSS_COMPILE}${tool}"
+    done
+    printf 'build-rootfs: using opt-in local musl root %s\n' "$MUSL_ROOT" >&2
+else
+    CROSS_COMPILE=x86_64-linux-gnu-
+fi
+
+command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 || {
+    printf 'required command not found: %sgcc\n' "$CROSS_COMPILE" >&2
+    printf 'set THEKERNEL_X86_CROSS_COMPILE or opt into the local musl root with THEKERNEL_USE_LOCAL_MUSL=1\n' >&2
+    exit 1
+}
+
 tar -xjf "$ARCHIVE" -C "$WORK_ROOT"
 SOURCE_DIR="$WORK_ROOT/busybox-${BUSYBOX_VERSION}"
 STAGE="$WORK_ROOT/root"
@@ -148,15 +280,21 @@ build_guest_tool hackstress.c thekernel-hackstress -pthread
 build_guest_tool exec-smoke.c thekernel-exec-smoke
 build_guest_tool epoll-smoke.c thekernel-epoll-smoke -pthread
 build_guest_tool futex-smoke.c thekernel-futex-smoke -pthread
+build_guest_tool futex2-waitv-signal-differential.c thekernel-futex2-waitv-signal -pthread
 build_guest_tool io-uring-smoke.c thekernel-io-uring-smoke
 build_guest_tool io-uring-buffers-smoke.c thekernel-io-uring-buffers-smoke -pthread
+build_guest_tool io-uring-directio-differential.c thekernel-io-uring-directio-differential -pthread
+build_guest_tool proc-zombie-differential.c thekernel-proc-zombie-differential
+build_guest_tool io-uring-physical-perf.c thekernel-io-uring-physical-perf
 build_guest_tool io-pin-safety.c thekernel-io-pin-safety -pthread
 build_guest_tool memory-pressure-smoke.c thekernel-memory-pressure-smoke
 build_guest_tool mm-performance.c thekernel-mm-performance -pthread
+build_guest_tool scheduler-baseline.c thekernel-scheduler-baseline -pthread
 build_guest_tool smp-tlb-shootdown.c thekernel-smp-tlb-shootdown -pthread
 build_guest_tool oom-admission.c thekernel-oom-admission
 build_guest_tool alarm-smoke.c thekernel-alarm-smoke
 build_guest_tool packet-socket-smoke.c thekernel-packet-socket-smoke
+build_guest_tool packet-perf.c thekernel-packet-perf
 build_guest_tool ioprio-smoke.c thekernel-ioprio-smoke
 build_guest_tool membarrier-smoke.c thekernel-membarrier-smoke -pthread
 build_guest_tool rseq-smoke.c thekernel-rseq-smoke
@@ -164,6 +302,7 @@ build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias
 build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
 build_guest_tool pause-smoke.c thekernel-pause-smoke
 build_guest_tool seccomp-smoke.c thekernel-seccomp-smoke -pthread
+build_guest_tool seccomp-perf.c thekernel-seccomp-perf
 build_guest_tool signal-order-smoke.c thekernel-signal-order-smoke
 build_guest_tool signal-fp-smoke.c thekernel-signal-fp-smoke
 build_guest_tool sync-fence.c thekernel-sync-fence
@@ -177,6 +316,7 @@ for script in "$REPO_ROOT"/tests/guest/nightly/*; do
 done
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \
-    --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB"
+    --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \
+    --owner-mode "$ROOTFS_OWNER_MODE"
 mv -f "$IMAGE" "$OUTPUT"
 printf '%s\n' "$OUTPUT"
