@@ -1,10 +1,13 @@
 # Build and test policy
 
-TheKernel has three verification tiers. The tiers are intentionally separate so a pull request does not rebuild root filesystems, launch QEMU, upload receipts, or rerun the same Rust tests through several wrappers.
+TheKernel keeps source checks, product builds, semantic boots, and research
+evidence separate. GitHub Actions expresses the ordinary checks directly; no
+shell command recursively invokes another acceptance gate.
 
 ## Checkout layout
 
-The root `Cargo.toml` consumes three maintained sibling repositories through relative paths. Local development and CI therefore use this layout:
+The root `Cargo.toml` consumes three maintained sibling repositories through
+relative paths:
 
 ```text
 parent/
@@ -14,43 +17,46 @@ parent/
   thekernel-linux-abi/
 ```
 
-Run `./scripts/ci.sh layout` to validate it. The GitHub workflow checks out exact sibling commits so a result is tied to one integration set rather than whichever `main` commits happen to exist when a runner starts.
+GitHub Actions checks out exact sibling commits. A local cross-repository change
+may intentionally substitute different sibling revisions, but the resulting
+integration set should be recorded explicitly.
 
-GitHub jobs execute in the maintained development image selected by the repository variable `THEKERNEL_DEV_IMAGE`, or by default `ghcr.io/<owner>/thekernel-dev:nightly`. The existing `Publish Dev Image` workflow must have published that tag before the first test run; changing the image is an environment change, not a test-script change.
+## Pull-request checks
 
-## Tier 1: pull-request quality
+The ordinary workflow has two visible jobs.
 
-```bash
-./scripts/ci.sh quick
-```
+### Host checks and tests
 
-This gate runs whitespace checks, `rustfmt`, vendor provenance checks, Python build-tool and differential-tool tests, the two local adapter crates, one host kernel check, one complete host kernel test run, and host-profile Clippy. It does not rerun the full kernel test binary under dozens of filters or enforce test-count floors.
+The host job runs changed-line whitespace checks, `cargo fmt`, vendored
+provenance validation, `make test-tools`, the two local adapter suites, one
+complete host kernel test run, and direct host-profile Clippy. It does not
+replay the complete kernel binary under a directory of test filters, enforce
+test-count receipts, or test an acceptance script's evidence schema.
 
-The maintained sibling repositories own their unit, MSRV, and packaging tests. TheKernel builds their pinned revisions as dependencies and tests the integration boundary; it does not duplicate their complete suites.
+### x86_64 product configuration
 
-## Tier 2: patched-source contracts and product profiles
+The target job checks the diagnostic and I/O-control feature profiles, builds
+`kernel-x86_64`, and runs Clippy through the same q35/UEFI build configuration.
+The maintained sibling repositories own their complete unit, MSRV, packaging,
+and release checks; TheKernel verifies their pinned integration boundary.
 
-```bash
-./scripts/ci.sh patches
-./scripts/ci.sh kernel
-```
+## Semantic and targeted tests
 
-`patches` retains the real unit/contract tests for patched or local crates that are outside the root Cargo workspace. `kernel` checks the non-default diagnostic and test-control profiles, builds the actual x86_64 q35/UEFI kernel, and runs the architecture Clippy profile. `./scripts/ci.sh all` runs tiers 1 and 2 and is the GitHub pull-request gate.
-
-## Tier 3: semantic and targeted tests
-
-The system test and semantic smokes remain explicit because they build fixtures and launch QEMU:
-
-```bash
-./scripts/ci.sh system
-./scripts/ci.sh smoke lwext4-io-boost --arch x86
-```
-
-Host Linux differential oracles remain available without being multiplied into one artifact-uploading job per case:
+The full QEMU semantic boot remains an explicit heavier operation:
 
 ```bash
-./scripts/ci.sh differential futex
-./scripts/ci.sh differential epoll
+make system-test
 ```
 
-The default CI gate reports command output directly. Checksums, copied source trees, sealed receipts, and tests of the gate's own evidence format are not acceptance criteria. Evidence-producing performance or research runs may keep their own receipts when the receipt is part of the experiment rather than a substitute for a test result.
+Targeted smokes and host Linux differential oracles remain directly runnable:
+
+```bash
+make smoke NAME=lwext4-io-boost ARCH=x86
+scripts/ci/futex-host-differential.sh
+scripts/ci/epoll-host-differential.sh
+```
+
+These commands report their actual test output. Performance and research tools
+may retain checksums, manifests, or receipts when those artifacts are part of
+the experiment; such evidence is not a substitute for an ordinary source or
+product test result.

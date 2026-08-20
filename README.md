@@ -46,15 +46,11 @@ parent/
   thekernel-linux-abi/
 ```
 
-Validate the layout with:
-
-```bash
-./scripts/ci.sh layout
-```
-
-GitHub Actions checks out exact sibling commits for each integration run. A
-local developer may intentionally use different sibling revisions while
-working on a cross-repository change.
+A valid checkout has `../vISA/crates/visa-core/Cargo.toml`,
+`../thekernel-ax/Cargo.toml`, and `../thekernel-linux-abi/Cargo.toml` next to
+this repository. GitHub Actions checks out exact sibling commits for every
+integration result; local cross-repository work may intentionally use different
+revisions.
 
 ## Development environment
 
@@ -74,8 +70,9 @@ make dev-shell DEV_CMD='make all'
 ```
 
 Inside an already-open development shell, run the inner command directly.
-
-GitHub Actions uses the same maintained image through the `THEKERNEL_DEV_IMAGE` repository variable, falling back to the repository `thekernel-dev:nightly` package. Publish the development image once before enabling the new test workflows.
+GitHub Actions uses the same maintained image through the
+`THEKERNEL_DEV_IMAGE` repository variable, falling back to the repository's
+`thekernel-dev:nightly` package.
 
 ## Build
 
@@ -134,78 +131,59 @@ python3 -m tools.qemu_runner run \
 
 ## Verification
 
-The public verification front door is `scripts/ci.sh`.
+GitHub Actions exposes the ordinary pull-request result as two independent
+jobs rather than one shell dispatcher:
 
-Run the pull-request quality gate:
+- **Host checks and tests**: changed-line whitespace, `rustfmt`, vendored
+  provenance, build/runner tool tests, local adapter tests, one complete host
+  kernel test run, and host-profile Clippy.
+- **x86_64 product configuration**: non-default diagnostic and I/O-control
+  configurations, the real product build, and target-profile Clippy.
+
+The corresponding commands remain ordinary project commands. Common local
+checks include:
 
 ```bash
-./scripts/ci.sh quick
+cargo fmt --all -- --check
+python3 scripts/ci/validate_vendor_provenance.py \
+  --archive-policy if-present \
+  --ax-repo ../thekernel-ax \
+  --linux-abi-repo ../thekernel-linux-abi
+make test-tools
+make kernel-x86_64
 ```
 
-It performs whitespace and formatting checks, validates vendored provenance,
-runs build-tool, differential-tool, and local-adapter tests, checks and tests
-the host kernel once, and runs host-profile Clippy.
-
-Run the maintained local/fork contract tests that are outside the root Cargo
-workspace:
+The heavier QEMU semantic test is explicit and manual:
 
 ```bash
-./scripts/ci.sh patches
-```
-
-This covers the patched smoltcp, IPI, synchronization, memory-set, scope-local,
-VFS/ext4, lwext4, and axnet/vsock profiles without rerunning the complete
-kernel binary under dozens of filters.
-
-Build and lint the actual x86_64 product configuration, including the
-non-default diagnostic and test-control profiles:
-
-```bash
-./scripts/ci.sh kernel
-```
-
-Run the complete pull-request gate (`quick`, `patches`, and `kernel`):
-
-```bash
-./scripts/ci.sh all
-```
-
-The QEMU semantic system test remains an explicit heavier tier:
-
-```bash
-./scripts/ci.sh system
+make system-test
 ```
 
 Targeted storage and page-cache smokes remain directly selectable:
 
 ```bash
-./scripts/ci.sh smoke lwext4-io-boost --arch x86
+make smoke NAME=lwext4-io-boost ARCH=x86
 ```
 
-Host Linux differential oracles are also explicit:
+Host Linux differential oracles are standalone scripts rather than acceptance
+wrappers:
 
 ```bash
-./scripts/ci.sh differential futex
-./scripts/ci.sh differential epoll
+scripts/ci/futex-host-differential.sh
+scripts/ci/epoll-host-differential.sh
 ```
 
-See [`docs/testing.md`](docs/testing.md) for the tier policy and the boundary
-between repository tests, sibling-crate tests, product boots, and research or
+See [`docs/testing.md`](docs/testing.md) for the coverage boundary between
+repository tests, sibling-crate tests, product boots, and research or
 performance evidence.
 
 ## Lints
 
-Clippy runs in two configurations because they answer different questions:
-
-```bash
-scripts/ci/clippy-gate.sh --profile host
-scripts/ci/clippy-gate.sh --profile x86_64
-```
-
-The host profile covers tests and generic paths. The x86_64 profile reuses the
-real kernel build machinery so platform configuration, features, and
-`RUSTFLAGS` match the shipped image. The lint policy lives in
-`[workspace.lints]` in the root `Cargo.toml`.
+Clippy runs directly in two configurations because they answer different
+questions. The host command covers tests and generic paths; the x86_64 command
+reuses the actual platform configuration and features. Deliberate allowances
+are documented in `[workspace.lints]` in the root `Cargo.toml`; CI promotes all
+other warnings to errors without an intermediate report format or parser.
 
 ## Repository layout
 
@@ -216,9 +194,7 @@ real kernel build machinery so platform configuration, features, and
 - `tools/build.py`: content-addressed kernel and rootfs builder.
 - `tools/qemu_runner/`: policy-neutral x86_64 QEMU runner.
 - `tests/guest/`: project init, guest helpers, and nightly programs.
-- `scripts/ci.sh`: stable developer and CI front door.
-- `scripts/ci/`: focused reusable helpers, differential oracles, and optional
-  nightly or research checks.
+- `scripts/ci/`: reusable differential, benchmark, and optional research tools.
 - `scripts/smoke/`: named QEMU semantic smokes.
 
 ## Cleaning

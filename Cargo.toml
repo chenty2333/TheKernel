@@ -7,21 +7,19 @@ members = [
 ]
 exclude = ["arceos"]
 
-# Lint policy for TheKernel-owned packages. `scripts/ci/clippy-gate.sh` promotes
-# everything that survives this table to an error, so an entry here is a
-# deliberate, reviewable decision rather than a silent local override. Vendored
-# sources under `third_party/rust-patches/` keep their upstream posture and are
-# reported separately by the gate.
+# Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
+# directly and promotes every warning not explicitly allowed here to an error.
+# Vendored sources under `third_party/rust-patches/` and maintained sibling
+# workspaces keep their own lint policy and CI.
 #
 # Every allowance must state the mechanism that makes the lint wrong for this
 # codebase, not merely that it is inconvenient.
 [workspace.lints.rust]
 # `dead_code` answers a different question in every build configuration: a
 # symbol unreachable in the qemu profile is frequently live under `smp`,
-# `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. The host
-# gate still does not span the full feature power set, so
-# they cannot classify reachability truthfully. Keep this rustc lint outside
-# the zero-owned-Clippy-diagnostic contract; feature-local cleanup must use a
+# `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. Neither
+# ordinary Clippy configuration spans the complete feature power set, so it
+# cannot classify reachability truthfully. Feature-local cleanup must use a
 # narrow `cfg` or a separately reviewed allowance rather than inferred removal.
 dead_code = "allow"
 
@@ -39,7 +37,7 @@ drop_non_drop = "allow"
 # implicit kernel globals such as the current task or the global FD table.
 # Wide signatures are the intended consequence of that rule; collapsing them
 # into context structs purely to satisfy an arity threshold would re-introduce
-# the ambient state the gate exists to remove.
+# the ambient state the checks exist to remove.
 too_many_arguments = "allow"
 
 [workspace.package]

@@ -46,7 +46,7 @@ jobs:
           path: vISA
           persist-credentials: false
 
-      - name: Checkout pinned thekernel-ax
+      - name: Checkout pinned mechanism workspace
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: chenty2333/thekernel-ax
@@ -54,7 +54,7 @@ jobs:
           path: thekernel-ax
           persist-credentials: false
 
-      - name: Checkout pinned thekernel-linux-abi
+      - name: Checkout pinned Linux ABI workspace
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: chenty2333/thekernel-linux-abi
@@ -76,5 +76,5 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
-      - name: Run semantic system test
-        run: ./scripts/ci.sh system
+      - name: Run x86_64 semantic system test
+        run: make system-test
