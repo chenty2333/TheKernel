@@ -12,9 +12,8 @@ boundaries are still being stabilized.
 
 ## Architecture
 
-x86_64 is the only product architecture. The reference virtual machine is
-QEMU `q35` with UEFI/OVMF; builds, boot gates, and system tests all use this
-platform.
+x86_64 is the only product architecture. The reference virtual machine is QEMU
+`q35` with UEFI/OVMF; builds, boot checks, and system tests use this platform.
 
 The code follows five ownership layers:
 
@@ -34,10 +33,33 @@ pitfalls live respectively in [`maproom/terrain.md`](maproom/terrain.md),
 [`maproom/basecamp.md`](maproom/basecamp.md), and
 [`maproom/hazards.md`](maproom/hazards.md).
 
-## Development Environment
+## Checkout layout
+
+The root workspace consumes three maintained sibling repositories through
+relative paths. Local development and CI use this layout:
+
+```text
+parent/
+  TheKernel/
+  vISA/
+  thekernel-ax/
+  thekernel-linux-abi/
+```
+
+Validate the layout with:
+
+```bash
+./scripts/ci.sh layout
+```
+
+GitHub Actions checks out exact sibling commits for each integration run. A
+local developer may intentionally use different sibling revisions while
+working on a cross-repository change.
+
+## Development environment
 
 The supported build environment is the repository development container. Build
-it once, verify the pinned toolchains, and then enter a shell:
+it once, verify the installed tools, and enter a shell:
 
 ```bash
 make dev-image
@@ -45,14 +67,15 @@ make dev-check
 make dev-shell
 ```
 
-From the host, a one-shot command can be run with:
+From the host, run a one-shot command with:
 
 ```bash
 make dev-shell DEV_CMD='make all'
 ```
 
-Inside an already-open development shell, run the inner `make` command
-directly.
+Inside an already-open development shell, run the inner command directly.
+
+GitHub Actions uses the same maintained image through the `THEKERNEL_DEV_IMAGE` repository variable, falling back to the repository `thekernel-dev:nightly` package. Publish the development image once before enabling the new test workflows.
 
 ## Build
 
@@ -62,22 +85,18 @@ Build the release-mode x86_64 kernel image:
 make all
 ```
 
-The materialized artifacts are:
-
-- `kernel-x86_64`
-
-Build the kernel or complete artifact set explicitly:
+The materialized artifact is `kernel-x86_64`. Explicit build targets are also
+available:
 
 ```bash
 make kernel-x86_64
 make artifacts
 ```
 
-`make artifacts` produces the kernel image; it does not build or publish test
-fixtures. Kernel and rootfs outputs use a content-addressed cache under
+Kernel and rootfs outputs use a content-addressed cache under
 `.state/build-cache/`; Cargo target caches remain under `.state/x86_64/target`.
 
-## Root Filesystem
+## Root filesystem
 
 The project test rootfs is built from a checksum-pinned BusyBox release plus
 TheKernel-owned init and guest test programs:
@@ -87,13 +106,10 @@ make test-fixtures
 make rootfs-x86
 ```
 
-The first build downloads BusyBox 1.36.1 into `.state/source-cache/`. The
-resulting ext4 images contain the same semantic helpers used by local smoke and
-nightly system tests. These repository-built images live under `.state/rootfs/`
-and are local/CI fixtures, not published kernel release artifacts. No external
-test image is required. The generated image contains its applicable project
-and BusyBox notices; see
-[PROVENANCE.md](PROVENANCE.md) before redistributing a generated image.
+The first build downloads BusyBox 1.36.1 into `.state/source-cache/`. Generated
+ext4 images live under `.state/rootfs/` and are local or CI fixtures, not
+published kernel release artifacts. See [PROVENANCE.md](PROVENANCE.md) before
+redistributing a generated image.
 
 ## Boot
 
@@ -103,12 +119,10 @@ Boot an interactive x86_64 project rootfs:
 make shell-x86_64
 ```
 
-Exit the guest shell to trigger a clean kernel shutdown. Additional generic
-runner options can be passed through `SHELL_ARGS`.
+Exit the guest shell to trigger a clean kernel shutdown. Additional runner
+options can be passed through `SHELL_ARGS`.
 
-The underlying runner accepts only explicit artifacts and keeps architecture
-topology, image modes, timeouts, serial capture, and interaction separate from
-test policy:
+The policy-neutral runner also accepts explicit artifacts:
 
 ```bash
 python3 -m tools.qemu_runner run \
@@ -120,84 +134,99 @@ python3 -m tools.qemu_runner run \
 
 ## Verification
 
-Run the project semantic init on x86_64:
+The public verification front door is `scripts/ci.sh`.
+
+Run the pull-request quality gate:
 
 ```bash
-make system-test
+./scripts/ci.sh quick
 ```
 
-The system test covers PID 1 and child `execve` transitions, rootfs mutation,
-tmpfs mount lifecycle, procfs reads, process creation, wait, pipes, and clean
-shutdown. Targeted subsystem smokes exercise more specialized storage,
-writeback, interrupt, mapped-I/O, pinning, and page-cache contracts:
+It performs whitespace and formatting checks, validates vendored provenance,
+runs build-tool, differential-tool, and local-adapter tests, checks and tests
+the host kernel once, and runs host-profile Clippy.
+
+Run the maintained local/fork contract tests that are outside the root Cargo
+workspace:
 
 ```bash
-make smoke-list
-make smoke NAME=lwext4-io-boost ARCH=x86
+./scripts/ci.sh patches
 ```
 
-Run host-side tool and contract tests:
+This covers the patched smoltcp, IPI, synchronization, memory-set, scope-local,
+VFS/ext4, lwext4, and axnet/vsock profiles without rerunning the complete
+kernel binary under dozens of filters.
+
+Build and lint the actual x86_64 product configuration, including the
+non-default diagnostic and test-control profiles:
 
 ```bash
-make test-tools
-scripts/ci/per-commit.sh
+./scripts/ci.sh kernel
 ```
 
-The per-commit gate runs focused, single-threaded test sets per subsystem, each
-with a floor on the number of tests executed, and then runs the whole suite once
-with the harness' default parallelism. The focused runs give precise
-attribution; only the full run can observe tests that no filter names, or
-interference between tests that share kernel globals.
+Run the complete pull-request gate (`quick`, `patches`, and `kernel`):
+
+```bash
+./scripts/ci.sh all
+```
+
+The QEMU semantic system test remains an explicit heavier tier:
+
+```bash
+./scripts/ci.sh system
+```
+
+Targeted storage and page-cache smokes remain directly selectable:
+
+```bash
+./scripts/ci.sh smoke lwext4-io-boost --arch x86
+```
+
+Host Linux differential oracles are also explicit:
+
+```bash
+./scripts/ci.sh differential futex
+./scripts/ci.sh differential epoll
+```
+
+See [`docs/testing.md`](docs/testing.md) for the tier policy and the boundary
+between repository tests, sibling-crate tests, product boots, and research or
+performance evidence.
 
 ## Lints
 
-`cargo fmt` and `cargo clippy` both gate. Clippy runs per build profile,
-because several lints answer a different question in each one: a symbol that is
-unreachable in the x86_64 host test build is often the live kernel path,
-`GlobalGrace` only carries drop glue when `smp-tlb-shootdown` is enabled, and
-architecture-specific usercopy casts are load-bearing in the kernel profile.
+Clippy runs in two configurations because they answer different questions:
 
 ```bash
 scripts/ci/clippy-gate.sh --profile host
 scripts/ci/clippy-gate.sh --profile x86_64
 ```
 
-The per-commit gate runs the `host` and `x86_64` profiles. Only TheKernel-owned
-packages are linted. Vendored sources under
-`third_party/rust-patches/` keep their upstream lint posture; their diagnostics
-are counted and printed but never fail the gate, so a clean owned report never
-implies a clean tree.
+The host profile covers tests and generic paths. The x86_64 profile reuses the
+real kernel build machinery so platform configuration, features, and
+`RUSTFLAGS` match the shipped image. The lint policy lives in
+`[workspace.lints]` in the root `Cargo.toml`.
 
-The lint policy lives in `[workspace.lints]` in the root `Cargo.toml`, so
-editors and a bare `cargo clippy` enforce exactly what CI does. Every allowance
-there records the mechanism that makes the lint wrong for this codebase.
-
-The PR gate builds and boots the x86_64 project rootfs. Its release consumer
-subgate also compiles the x86_64 MM-diagnostics profile with
-`asid-switch-diagnostics` and `pmu-diagnostics` from the normalized sibling
-`.crate` artifacts, with Cargo locked and offline. That is target-specific
-archive/API compile coverage; it does not claim PMU samples. Nightly adapters
-add mixed pressure, deterministic allocation failure, ext4 power-cut recovery,
-and non-loopback network coverage.
-
-## Repository Layout
+## Repository layout
 
 - `kernel/`: Linux-compatible kernel and syscall integration.
 - `crates/`: maintained generic and reusable components.
-- `third_party/rust-patches/`: pinned upstream sources with provenance records.
+- `third_party/rust-patches/`: pinned upstream sources and provenance records.
 - `make/`: architecture build machinery.
 - `tools/build.py`: content-addressed kernel and rootfs builder.
 - `tools/qemu_runner/`: policy-neutral x86_64 QEMU runner.
 - `tests/guest/`: project init, guest helpers, and nightly programs.
-- `scripts/ci/` and `scripts/smoke/`: repository verification workflows.
+- `scripts/ci.sh`: stable developer and CI front door.
+- `scripts/ci/`: focused reusable helpers, differential oracles, and optional
+  nightly or research checks.
+- `scripts/smoke/`: named QEMU semantic smokes.
 
 ## Cleaning
 
 `make clean` removes materialized kernels and run/build outputs while retaining
-the content and Cargo caches. `make clean-all` removes all generated `.state`
-data.
+content and Cargo caches. `make clean-all` removes all generated `.state` data.
 
-## License and Provenance
+## License and provenance
 
 TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE),
 [NOTICE](NOTICE), and [PROVENANCE.md](PROVENANCE.md). Third-party and vendored
