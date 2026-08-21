@@ -50,7 +50,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: chenty2333/thekernel-ax
-          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
+          ref: 21582660f97c986d080615d51fca0accfd43fcb2
           path: thekernel-ax
           persist-credentials: false
 
@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: chenty2333/thekernel-linux-abi
-          ref: 92ca5300541740037974a932615d1985aa218f9b
+          ref: f0721ef792ecd0c4826a00b90b88a524f6411d47
           path: thekernel-linux-abi
           persist-credentials: false
 
