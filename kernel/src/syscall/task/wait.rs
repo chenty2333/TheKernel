@@ -361,16 +361,16 @@ fn write_waitpid_event(
             .write_value(exit_code, event.waitpid_status())
             .map_err(map_usercopy_error)?;
     }
-    if let Some(usage) = event.exited_usage() {
-        if !rusage_ptr.is_null() {
-            // TaskUsage's conversion starts from a zeroed rusage and fills
-            // every exposed field, so the complete ABI representation is
-            // initialized for this unchecked copyout.
-            unsafe {
-                memory
-                    .write_value_unchecked(rusage_ptr, usage.into())
-                    .map_err(map_usercopy_error)?;
-            }
+    if let Some(usage) = event.exited_usage()
+        && !rusage_ptr.is_null()
+    {
+        // TaskUsage's conversion starts from a zeroed rusage and fills
+        // every exposed field, so the complete ABI representation is
+        // initialized for this unchecked copyout.
+        unsafe {
+            memory
+                .write_value_unchecked(rusage_ptr, usage.into())
+                .map_err(map_usercopy_error)?;
         }
     }
     Ok(())
@@ -391,13 +391,13 @@ fn write_waitid_event(
                 .map_err(map_usercopy_error)?;
         }
     }
-    if let Some(usage) = event.exited_usage() {
-        if !rusage_ptr.is_null() {
-            unsafe {
-                memory
-                    .write_value_unchecked(rusage_ptr, usage.into())
-                    .map_err(map_usercopy_error)?;
-            }
+    if let Some(usage) = event.exited_usage()
+        && !rusage_ptr.is_null()
+    {
+        unsafe {
+            memory
+                .write_value_unchecked(rusage_ptr, usage.into())
+                .map_err(map_usercopy_error)?;
         }
     }
     Ok(())

@@ -1285,8 +1285,17 @@ mod tests {
 
         let copied = {
             let mut memory = UserMemoryContext::new(&mut provider);
-            let copied = read_timer_spec(&mut memory, input_addr as *const itimerspec).unwrap();
-            write_timer_id(&mut memory, timerid_addr as *mut i32, 17).unwrap();
+            let copied = read_timer_spec(
+                &mut memory,
+                core::ptr::without_provenance::<itimerspec>(input_addr),
+            )
+            .unwrap();
+            write_timer_id(
+                &mut memory,
+                core::ptr::without_provenance_mut::<i32>(timerid_addr),
+                17,
+            )
+            .unwrap();
             write_timer_spec(&mut memory, output_addr as *mut itimerspec, copied).unwrap();
             copied
         };
@@ -1337,7 +1346,11 @@ mod tests {
 
         let copied = {
             let mut memory = UserMemoryContext::new(&mut provider);
-            let copied = read_itimer_value(&mut memory, input_addr as *const itimerval).unwrap();
+            let copied = read_itimer_value(
+                &mut memory,
+                core::ptr::without_provenance::<itimerval>(input_addr),
+            )
+            .unwrap();
             write_itimer_value(&mut memory, output_addr as *mut itimerval, copied).unwrap();
             copied
         };
@@ -1360,7 +1373,7 @@ mod tests {
         };
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            write_timer_id(&mut memory, 3 as *mut i32, 1),
+            write_timer_id(&mut memory, core::ptr::without_provenance_mut::<i32>(3), 1),
             Err(AxError::BadAddress)
         );
         assert_eq!(

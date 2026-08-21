@@ -85,7 +85,7 @@ pub struct MqAttr {
 // relying on a generated `Pod` marker.
 const _: () = {
     assert!(align_of::<MqAttr>() == align_of::<isize>());
-    assert!(size_of::<MqAttr>() == size_of::<isize>() * 8);
+    assert!(size_of::<MqAttr>() == isize::BITS as usize);
     assert!(offset_of!(MqAttr, mq_flags) == 0);
     assert!(offset_of!(MqAttr, mq_maxmsg) == size_of::<isize>());
     assert!(offset_of!(MqAttr, mq_msgsize) == size_of::<isize>() * 2);

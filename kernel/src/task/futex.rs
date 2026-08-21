@@ -1052,8 +1052,7 @@ fn wait_on_any_futex_inner(
     gate_order
         .sort_unstable_by_key(|index| (&waiters[*index].0.inner.wq as *const WaitQueue) as usize);
     gate_order.dedup_by(|left, right| {
-        (&waiters[*left].0.inner.wq as *const WaitQueue) as usize
-            == (&waiters[*right].0.inner.wq as *const WaitQueue) as usize
+        core::ptr::eq(&waiters[*left].0.inner.wq, &waiters[*right].0.inner.wq)
     });
 
     let mut waiters_refs = Vec::new();
@@ -1835,6 +1834,7 @@ mod tests {
 
         let src = Arc::new(FutexEntry::new());
         let dst = Arc::new(FutexEntry::new());
+        #[allow(clippy::arc_with_non_send_sync)]
         src.wq
             .queue
             .lock()
@@ -1858,6 +1858,7 @@ mod tests {
         init_scheduler();
 
         let src = Arc::new(FutexEntry::new());
+        #[allow(clippy::arc_with_non_send_sync)]
         src.wq
             .queue
             .lock()
@@ -1883,6 +1884,7 @@ mod tests {
         let dst = Arc::new(FutexEntry::new());
 
         for _ in 0..1000 {
+            #[allow(clippy::arc_with_non_send_sync)]
             src.wq
                 .queue
                 .lock()

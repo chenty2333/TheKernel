@@ -65,7 +65,7 @@ fn read_xattr_value<M: UserMemory + ?Sized>(
     if size == 0 {
         return Ok(Vec::new());
     }
-    Ok(vm_load(memory, value, size).map_err(map_usercopy_error)?)
+    vm_load(memory, value, size).map_err(map_usercopy_error)
 }
 
 fn current_vfs_security_context() -> VfsSecurityContext {

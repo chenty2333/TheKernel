@@ -2172,7 +2172,7 @@ mod tests {
         let current = SignalStack::new(0x1000, 0, 0x2000);
         let replacement = SignalStack::new(0x8000, 0, MINSIGSTKSZ as usize);
         assert_eq!(
-            prepare_sigaltstack_update(&current, 0x1800, replacement.clone()).err(),
+            prepare_sigaltstack_update(&current, 0x1800, replacement).err(),
             Some(AxError::OperationNotPermitted)
         );
         assert_eq!(

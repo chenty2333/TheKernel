@@ -995,8 +995,10 @@ mod tests {
         };
         assert!(matches!(output, LoopBlockOutput::U32(DEFAULT_BLOCK_SIZE)));
 
-        let mut state = LoopState::default();
-        state.flags = FLAG_READ_ONLY;
+        let state = LoopState {
+            flags: FLAG_READ_ONLY,
+            ..LoopState::default()
+        };
         assert!(matches!(
             snapshot_block_output(&state, BLKROGET),
             Ok(LoopBlockOutput::U32(1))
@@ -1006,8 +1008,10 @@ mod tests {
 
     #[test]
     fn invisible_loop_rejects_every_scalar_output() {
-        let mut state = LoopState::default();
-        state.visible = false;
+        let state = LoopState {
+            visible: false,
+            ..LoopState::default()
+        };
         for cmd in [BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKROGET] {
             assert!(snapshot_block_output(&state, cmd).is_err());
         }

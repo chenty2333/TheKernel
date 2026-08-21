@@ -354,9 +354,9 @@ mod remote {
             }
             let generation = state.membarrier_state().next_generation()?;
             state.membarrier_state().acknowledge(issuer_cpu, generation);
-            for cpu in 0..cpu_count {
+            for (cpu, target) in targets.iter_mut().enumerate().take(cpu_count) {
                 if cpu != issuer_cpu && state.membarrier_resident_on(cpu) {
-                    targets[cpu] = true;
+                    *target = true;
                 }
             }
             if targets.iter().all(|target| !*target) {

@@ -894,7 +894,7 @@ pub fn sys_vfork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxR
     sys_clone(
         caller_memory,
         uctx,
-        (CLONE_VM | CLONE_VFORK | SIGCHLD) as u32,
+        CLONE_VM | CLONE_VFORK | SIGCHLD,
         0,
         0,
         0,

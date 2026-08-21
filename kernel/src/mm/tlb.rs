@@ -149,9 +149,9 @@ mod imp {
             let _cpu_guard = NoPreempt::new();
             let issuer_cpu = axhal::percpu::this_cpu_id();
             let mut attempts = ShootdownAttempts::new();
-            for cpu in 0..cpu_count {
+            for (cpu, runtime) in CPU_RUNTIME.iter().enumerate().take(cpu_count) {
                 attempts.ipi_entries_before[cpu] =
-                    CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+                    runtime.ipi_handler_entries.load(Ordering::Acquire);
                 #[cfg(feature = "irq-continuation-diagnostics")]
                 {
                     attempts.irq_diagnostics_before[cpu] =
@@ -423,12 +423,11 @@ mod imp {
         generation: u64,
         cpu_count: usize,
     ) {
-        for cpu in 0..cpu_count {
+        for (cpu, seen_generation) in seen_generations.iter().enumerate().take(cpu_count) {
             if targets.contains(cpu) {
-                let _ =
-                    seen_generations[cpu].try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
-                        Some(seen.max(generation))
-                    });
+                let _ = seen_generation.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+                    Some(seen.max(generation))
+                });
             }
         }
     }
@@ -505,14 +504,14 @@ mod imp {
             attempts.rounds,
         );
         let mut first_incomplete = None;
-        for cpu in 0..axhal::cpu_num() {
+        for (cpu, runtime) in CPU_RUNTIME.iter().enumerate().take(axhal::cpu_num()) {
             if !request.targets(cpu) {
                 continue;
             }
             match SHOOTDOWN.cpu_snapshot(cpu) {
                 Ok(snapshot) => {
                     let pending = request.target_pending(cpu);
-                    let ipi_entries = CPU_RUNTIME[cpu].ipi_handler_entries.load(Ordering::Acquire);
+                    let ipi_entries = runtime.ipi_handler_entries.load(Ordering::Acquire);
                     let ipi_entries_delta =
                         ipi_entries.saturating_sub(attempts.ipi_entries_before[cpu]);
                     error!(

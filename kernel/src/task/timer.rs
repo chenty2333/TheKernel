@@ -1486,12 +1486,11 @@ fn process_itimer_consumer_from_cpu(cpu: usize) -> ProcessITimerWorkConsumer {
 fn ensure_process_itimer_consumers() {
     ensure_process_itimer_work_queues();
     PROCESS_ITIMER_CONSUMERS_INIT.call_once(|| {
-        for cpu in 0..PROCESS_ITIMER_CPU_COUNT {
+        for (cpu, slot) in PROCESS_ITIMER_CONSUMER_SLOTS.iter().enumerate() {
             // SAFETY: `call_once` exclusively initializes each never-read
             // slot. The owner token remains FREE until this write completes.
             unsafe {
-                (*PROCESS_ITIMER_CONSUMER_SLOTS[cpu].cursor.get()) =
-                    MaybeUninit::new(process_itimer_consumer_from_cpu(cpu));
+                (*slot.cursor.get()) = MaybeUninit::new(process_itimer_consumer_from_cpu(cpu));
             }
         }
     });

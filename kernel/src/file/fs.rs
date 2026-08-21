@@ -692,7 +692,7 @@ impl FileLike for File {
             .entry()
             .downcast::<Device>()
             .map_err(|_| AxError::NotATty)?;
-        device.inner().ioctl(context, cmd, arg).map_err(Into::into)
+        device.inner().ioctl(context, cmd, arg)
     }
 
     fn set_nonblocking(&self, flag: bool) -> AxResult {

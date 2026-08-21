@@ -156,7 +156,7 @@ fn destination_coordinate(source: &ExternalCoordinate) -> ExternalCoordinate {
 }
 
 fn logical_requirement() -> AxResult<ResourceRequirement> {
-    let id = visa_core::RequirementId::from_u128(0x5554_532d_5553_4552_4e53_01);
+    let id = visa_core::RequirementId::from_u128(0x55_54_53_2d_55_53_45_52_4e_53_01);
     let mut kind = Vec::new();
     kind.try_reserve_exact(7).map_err(|_| AxError::NoMemory)?;
     kind.extend_from_slice(b"user-ns");
@@ -443,7 +443,7 @@ impl UtsNativeState {
         true
     }
 
-    fn ensure_capacity<T>(rows: &Vec<T>) -> Result<(), UtsAuthorityRejection> {
+    fn ensure_capacity<T>(rows: &[T]) -> Result<(), UtsAuthorityRejection> {
         (rows.len() < NATIVE_ROW_CAPACITY)
             .then_some(())
             .ok_or(UtsAuthorityRejection::Capacity)
@@ -762,7 +762,7 @@ impl UtsAuthorityAdapter {
             && binding
                 .capture_receipt
                 .as_ref()
-                .map_or(true, |receipt| receipt == capture.receipt.as_ref())
+                .is_none_or(|receipt| receipt == capture.receipt.as_ref())
     }
 
     fn capture_key(
@@ -906,10 +906,13 @@ impl UtsAuthorityAdapter {
         request: &PrepareRequest,
     ) -> Result<BindingPreparationReceipt, UtsAuthorityRejection> {
         let digest = Self::operation_digest(&request.binding);
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return Err(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return Err(UtsAuthorityRejection::Invalid);
         }
         let expected_destination = destination_coordinate(&request.binding.source);
         let capture_key = self.capture_key(&request.binding)?;
@@ -1079,10 +1082,13 @@ impl UtsAuthorityAdapter {
         if request.preparation.verify().is_err() {
             return Err(UtsAuthorityRejection::Invalid);
         }
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return Err(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return Err(UtsAuthorityRejection::Invalid);
         }
         let prepare_key = self.operation_key(
             request.binding.continuation,
@@ -1219,7 +1225,7 @@ impl UtsAuthorityAdapter {
                 .take()
                 .ok_or(UtsAuthorityRejection::Busy)?;
             state.operations.push(NativeOperation {
-                key: commit_key.clone(),
+                key: commit_key,
                 continuation: request.binding.continuation,
                 binding: commit_row_binding,
                 canonical: Some(commit_row_canonical),
@@ -1365,10 +1371,13 @@ impl AuthorityPort for UtsAuthorityAdapter {
         request: QueryPrepareRequest,
     ) -> QueryOutcome<BindingPreparationReceipt, Self::PrepareRejection> {
         let digest = Self::operation_digest(&request.binding);
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
         let key = self.operation_key(
             request.binding.continuation,
@@ -1446,10 +1455,13 @@ impl AuthorityPort for UtsAuthorityAdapter {
         if request.preparation.verify().is_err() {
             return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
         let key = self.operation_key(
             request.binding.continuation,
@@ -1537,10 +1549,13 @@ impl AuthorityPort for UtsAuthorityAdapter {
         if request.preparation.verify().is_err() {
             return CallOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return CallOutcome::Rejected(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return CallOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
         let capture_key = match self.capture_key(&request.binding) {
             Ok(key) => key,
@@ -1716,10 +1731,13 @@ impl AuthorityPort for UtsAuthorityAdapter {
         if request.preparation.verify().is_err() {
             return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
-        if let Some(capture_receipt) = request.binding.capture_receipt.as_ref() {
-            if capture_receipt.verify().is_err() {
-                return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
-            }
+        if request
+            .binding
+            .capture_receipt
+            .as_ref()
+            .is_some_and(|capture_receipt| capture_receipt.verify().is_err())
+        {
+            return QueryOutcome::Rejected(UtsAuthorityRejection::Invalid);
         }
         let key = self.operation_key(
             request.binding.continuation,
@@ -2162,10 +2180,8 @@ fn restore_capture(
                 && row.capture.key.continuation == request.continuation
                 && row.capture.snapshot.as_ref() == &request.snapshot
                 && row.capture.receipt.source == request.source;
-            if matches {
-                if matching_index.replace(index).is_some() {
-                    return CallOutcome::Rejected(UtsRuntimeError::Conflict);
-                }
+            if matches && matching_index.replace(index).is_some() {
+                return CallOutcome::Rejected(UtsRuntimeError::Conflict);
             }
         }
         let Some(index) = matching_index else {
@@ -2837,14 +2853,14 @@ pub(crate) fn continue_uts_provider_state(
             return Err(AxError::BadState);
         }
     };
-    if let Some(record) = existing.as_ref() {
-        if matches!(
+    if existing.as_ref().is_some_and(|record| {
+        matches!(
             record.phase,
             ContinuationPhase::Progress(Progress::Activated)
-        ) {
-            return_workflow_store(store_slot, store);
-            return Ok(());
-        }
+        )
+    }) {
+        return_workflow_store(store_slot, store);
+        return Ok(());
     }
     // Resolve the process-local continuation before requiring the process's
     // current UTS to be the intent source.  A committed source is
@@ -2908,10 +2924,13 @@ pub(crate) fn continue_uts_provider_state(
     );
     let mut coordinator = Coordinator::new(store, authority, runtime);
     if !recovering {
-        if let Err(error) = coordinator.begin(intent) {
-            let error = map_coordinator_error(error);
-            return_workflow_store(store_slot, coordinator.store);
-            return Err(error);
+        match coordinator.begin(intent) {
+            Ok(_) => {}
+            Err(error) => {
+                let error = map_coordinator_error(error);
+                return_workflow_store(store_slot, coordinator.store);
+                return Err(error);
+            }
         }
     }
     let result = run_coordinator(&mut coordinator, &continuation, recovering);
@@ -2946,7 +2965,7 @@ mod tests {
         assert!(
             !bytes
                 .windows(core::mem::size_of::<usize>())
-                .any(|window| { window == &usize::to_ne_bytes(0x1234_5678usize) })
+                .any(|window| { window == usize::to_ne_bytes(0x1234_5678usize) })
         );
     }
 
@@ -3259,7 +3278,7 @@ mod tests {
             CallOutcome::Applied(receipt) => receipt,
             other => panic!("unexpected process-local prepare outcome: {other:?}"),
         };
-        assert!(matches!(
+        assert!(
             UtsRuntimeAdapter::destination_for(
                 &world.authority,
                 &shared,
@@ -3268,9 +3287,9 @@ mod tests {
                 &binding.destination,
                 &binding.requirements,
                 binding.preparation_digest,
-            ),
-            Ok(_)
-        ));
+            )
+            .is_ok()
+        );
         assert!(matches!(
             adapter.commit(CommitRequest {
                 operation: OperationId::from_u128(0x118),

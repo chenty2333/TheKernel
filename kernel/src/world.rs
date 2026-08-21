@@ -780,6 +780,7 @@ enum OperationStatus {
     Conflict,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrepareOutcome {
     Prepared(PreparedBinding),
     AlreadyPending,
@@ -1195,10 +1196,10 @@ impl Authority {
         (state.bindings.len() < state.limits.bindings).then_some(state.bindings.len())
     }
 
-    fn find_operation<'a>(
-        state: &'a AuthorityState,
+    fn find_operation(
+        state: &AuthorityState,
         operation: AuthorityOperationId,
-    ) -> Option<&'a OperationRecord> {
+    ) -> Option<&OperationRecord> {
         Self::operation_index(state, operation).and_then(|index| state.operations[index].as_ref())
     }
 
@@ -1232,13 +1233,14 @@ impl Authority {
         // Once the last live consumer has quiesced, the Applied receipt is no
         // longer an activation capability. Reclaim the operation row with
         // the binding so the bounded table can serve a later request.
-        if let Some(operation_index) = Self::operation_index(state, binding.operation) {
-            if state.operations[operation_index]
-                .as_ref()
-                .is_some_and(|operation| operation.binding == Some(binding.id))
-            {
-                state.operations[operation_index] = None;
-            }
+        if let Some(operation_index) =
+            Self::operation_index(state, binding.operation).filter(|&operation_index| {
+                state.operations[operation_index]
+                    .as_ref()
+                    .is_some_and(|operation| operation.binding == Some(binding.id))
+            })
+        {
+            state.operations[operation_index] = None;
         }
     }
 
@@ -1272,12 +1274,15 @@ impl Authority {
                     .and_then(|index| state.providers[index].as_ref())
                     .is_some_and(Self::provider_has_live_owner);
 
-                if !source_live {
-                    if let Some(index) = Self::provider_index(state, source_coordinate) {
-                        Self::note_reclaimed_provider_locked(state, source_coordinate);
-                        state.providers[index] = None;
-                        changed = true;
-                    }
+                let source_index = if source_live {
+                    None
+                } else {
+                    Self::provider_index(state, source_coordinate)
+                };
+                if let Some(index) = source_index {
+                    Self::note_reclaimed_provider_locked(state, source_coordinate);
+                    state.providers[index] = None;
+                    changed = true;
                 }
                 if !destination_live {
                     if let Some(index) = Self::provider_index(state, destination_coordinate) {
@@ -1731,11 +1736,11 @@ impl Authority {
             state.bindings[binding_index] = Some(record);
             return;
         }
-        if let Some(operation_index) = Self::operation_index(&state, operation) {
-            if let Some(operation) = state.operations[operation_index].as_mut() {
-                operation.status = OperationStatus::Rejected;
-                operation.binding = None;
-            }
+        if let Some(operation) = Self::operation_index(&state, operation)
+            .and_then(|operation_index| state.operations[operation_index].as_mut())
+        {
+            operation.status = OperationStatus::Rejected;
+            operation.binding = None;
         }
         Self::reap_quiescent_locked(&mut state);
     }
@@ -1764,7 +1769,7 @@ impl Authority {
             let binding = state.bindings[binding_index]
                 .as_ref()
                 .ok_or(AxError::BadState)?;
-            let valid = binding.lifecycle == BindingLifecycle::Prepared
+            binding.lifecycle == BindingLifecycle::Prepared
                 && state.operations[operation_index]
                     .as_ref()
                     .is_some_and(|operation| operation.status == OperationStatus::Pending)
@@ -1788,8 +1793,7 @@ impl Authority {
                             .is_some_and(|execution| execution.is_drained())
                             && source.uts.execution_gate().closed_and_drained()
                     })
-                });
-            valid
+                })
         };
         if !valid {
             state.bindings[binding_index] = None;

@@ -423,6 +423,7 @@ enum SubmissionOutcome {
 /// existing synchronous fallback while the issued request remains its sole
 /// terminal owner.  Published/Terminal effects have already transferred all
 /// ownership to the bounded worker queue and cannot fall back.
+#[allow(clippy::large_enum_variant)]
 enum PhysicalPublishDecision {
     NotSubmitted {
         issued: thekernel_linux_io_uring::IssuedRequest,
@@ -1004,72 +1005,71 @@ fn submit_entries(
                         }
                         _ => None,
                     };
-                    if let Some((operation, request)) = operation {
-                        if let (Some(file_lease), Some(buffer_lease), Some(context_ref)) =
+                    if let Some((operation, request)) = operation
+                        && let (Some(file_lease), Some(buffer_lease), Some(context_ref)) =
                             (lease.as_ref(), buffer.as_ref(), context.as_ref())
-                        {
-                            match prepare_physical_io_plan(
-                                file_lease,
-                                buffer_lease,
-                                context_ref,
-                                operation,
-                                request.offset(),
-                            ) {
-                                Ok(Some(plan)) => {
-                                    match prepare_physical_io_write_memfd_guard(
-                                        file_lease,
-                                        context_ref,
-                                        &plan,
-                                    ) {
-                                        Ok(memfd) => {
-                                            match prepare_physical_io_effect(file_lease, &plan) {
-                                                Ok(Some(effect)) => {
-                                                    match prepare_physical_io_write_privilege_guard(
-                                                        file_lease,
-                                                        context_ref,
-                                                        &plan,
-                                                    ) {
-                                                        Ok(privilege) => {
-                                                            let file_lease = lease
-                                                                .take()
-                                                                .ok_or(AxError::BadState)?;
-                                                            let buffer_lease = buffer
-                                                                .take()
-                                                                .ok_or(AxError::BadState)?;
-                                                            let prepared =
-                                                                PreparedPhysicalIoAdmission::new(
-                                                                    file_lease,
-                                                                    buffer_lease,
-                                                                    context
-                                                                        .take()
-                                                                        .ok_or(AxError::BadState)?,
-                                                                    plan,
-                                                                    memfd,
-                                                                    privilege,
-                                                                    effect,
-                                                                );
-                                                            match prepared {
-                                                                Ok(prepared) => {
-                                                                    physical = Some(prepared)
-                                                                }
-                                                                Err(error) => {
-                                                                    admission_error = Some(error)
-                                                                }
+                    {
+                        match prepare_physical_io_plan(
+                            file_lease,
+                            buffer_lease,
+                            context_ref,
+                            operation,
+                            request.offset(),
+                        ) {
+                            Ok(Some(plan)) => {
+                                match prepare_physical_io_write_memfd_guard(
+                                    file_lease,
+                                    context_ref,
+                                    &plan,
+                                ) {
+                                    Ok(memfd) => {
+                                        match prepare_physical_io_effect(file_lease, &plan) {
+                                            Ok(Some(effect)) => {
+                                                match prepare_physical_io_write_privilege_guard(
+                                                    file_lease,
+                                                    context_ref,
+                                                    &plan,
+                                                ) {
+                                                    Ok(privilege) => {
+                                                        let file_lease = lease
+                                                            .take()
+                                                            .ok_or(AxError::BadState)?;
+                                                        let buffer_lease = buffer
+                                                            .take()
+                                                            .ok_or(AxError::BadState)?;
+                                                        let prepared =
+                                                            PreparedPhysicalIoAdmission::new(
+                                                                file_lease,
+                                                                buffer_lease,
+                                                                context
+                                                                    .take()
+                                                                    .ok_or(AxError::BadState)?,
+                                                                plan,
+                                                                memfd,
+                                                                privilege,
+                                                                effect,
+                                                            );
+                                                        match prepared {
+                                                            Ok(prepared) => {
+                                                                physical = Some(prepared)
+                                                            }
+                                                            Err(error) => {
+                                                                admission_error = Some(error)
                                                             }
                                                         }
-                                                        Err(error) => admission_error = Some(error),
                                                     }
+                                                    Err(error) => admission_error = Some(error),
                                                 }
-                                                Ok(None) => {}
-                                                Err(error) => admission_error = Some(error),
                                             }
+                                            Ok(None) => {}
+                                            Err(error) => admission_error = Some(error),
                                         }
-                                        Err(error) => admission_error = Some(error),
                                     }
+                                    Err(error) => admission_error = Some(error),
                                 }
-                                Ok(None) => {}
-                                Err(error) => admission_error = Some(error),
                             }
+                            Ok(None) => {}
+                            Err(error) => admission_error = Some(error),
                         }
                     }
                 }

@@ -2537,18 +2537,17 @@ fn take_replayable_physical_completions_for_device(
             count += 1;
             router.quarantine[index] = None;
             router.quarantine_len = router.quarantine_len.saturating_sub(1);
-        } else if wrong_cookie_owner {
-            if let Some(record) = router.quarantine[index].as_mut() {
-                if record.replayable {
-                    record.replayable = false;
-                    // The apparent early completion has now been proven to
-                    // belong to an older publication of the reused raw
-                    // handle.  Count the transition exactly once when its
-                    // cookie mismatch turns replay custody into fail-stop
-                    // quarantine.
-                    record_io_uring_physical_quarantine();
-                }
-            }
+        } else if wrong_cookie_owner
+            && let Some(record) = router.quarantine[index].as_mut()
+            && record.replayable
+        {
+            record.replayable = false;
+            // The apparent early completion has now been proven to
+            // belong to an older publication of the reused raw
+            // handle.  Count the transition exactly once when its
+            // cookie mismatch turns replay custody into fail-stop
+            // quarantine.
+            record_io_uring_physical_quarantine();
         }
     }
     count
@@ -4310,13 +4309,12 @@ pub(crate) fn drain_physical_completion_work() {
         if physical_completion_terminal_event_for_device(identity).is_some()
             || physical_completion_device_reset_pending(identity)
         {
-            if let Err(error) = service_physical_completion_reset_for_device(identity) {
-                if !matches!(error, AxError::ResourceBusy) {
-                    error!(
-                        "io_uring physical reset/terminal custody for device {identity:#x}: \
-                         {error:?}"
-                    );
-                }
+            if let Err(error) = service_physical_completion_reset_for_device(identity)
+                && !matches!(error, AxError::ResourceBusy)
+            {
+                error!(
+                    "io_uring physical reset/terminal custody for device {identity:#x}: {error:?}"
+                );
             }
             continue;
         }
@@ -5515,16 +5513,16 @@ impl Drop for PhysicalIoWork {
             self.ring.park_physical_worker_custody(work);
             return;
         }
-        if self.pending_publication {
-            if let (Some(request), Some(admission)) = (self.request_id(), self.admission.as_ref()) {
-                clear_physical_completion_pending_owner(
-                    &self.ring,
-                    request,
-                    self.slot,
-                    admission.plan().device_identity(),
-                    admission.plan().device_generation(),
-                );
-            }
+        if self.pending_publication
+            && let (Some(request), Some(admission)) = (self.request_id(), self.admission.as_ref())
+        {
+            clear_physical_completion_pending_owner(
+                &self.ring,
+                request,
+                self.slot,
+                admission.plan().device_identity(),
+                admission.plan().device_generation(),
+            );
         }
         // A work item is only dropped after the completion owner has consumed
         // the exact device settlement (or moved the item into quarantine).
@@ -5591,6 +5589,7 @@ impl PhysicalIoWorkerReservation<'_> {
     /// by published work.  A route reservation, if any, is deliberately
     /// dropped first: PendingPublication owns no lower child route and must
     /// not consume a handle/cookie route while waiting for device credit.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn commit_pending(
         mut self,
         issued: IssuedRequest,
@@ -5616,18 +5615,19 @@ impl PhysicalIoWorkerReservation<'_> {
             .physical_work
             .get(self.slot)
             .is_some_and(Option::is_none);
+        if (!slot_reserved || !slot_available)
+            && let Some((claimed_request, claimed_generation)) = pending_claim
+            && let Some(owner) = router.pending.iter_mut().flatten().find(|owner| {
+                owner.device_identity == device_identity
+                    && owner.generation == claimed_generation
+                    && owner.request == claimed_request
+                    && owner.slot == self.slot
+                    && Arc::ptr_eq(&owner.ring, &self.owner)
+            })
+        {
+            owner.claimed = false;
+        }
         if !slot_reserved || !slot_available {
-            if let Some((claimed_request, claimed_generation)) = pending_claim {
-                if let Some(owner) = router.pending.iter_mut().flatten().find(|owner| {
-                    owner.device_identity == device_identity
-                        && owner.generation == claimed_generation
-                        && owner.request == claimed_request
-                        && owner.slot == self.slot
-                        && Arc::ptr_eq(&owner.ring, &self.owner)
-                }) {
-                    owner.claimed = false;
-                }
-            }
             drop(router);
             drop(state);
             return Err((AxError::BadState, issued, admission));
@@ -6375,6 +6375,17 @@ struct RingState {
     final_close: FinalCloseProgress,
 }
 
+type SubmissionWorkParts = (
+    PreparedRequest,
+    Result<ParsedSubmission, IoUringError>,
+    Option<IoUringFileLease>,
+    Option<IoUringBufferLease>,
+    Option<IoOperationContext>,
+    Option<PreparedPhysicalIoAdmission>,
+    Option<AxError>,
+    UserMemoryCapability,
+);
+
 /// One accepted SQ entry after terminal credit and SQ-head publication.
 pub(crate) struct SubmissionWork {
     prepared: PreparedRequest,
@@ -6394,18 +6405,7 @@ pub(crate) struct SubmissionWork {
 }
 
 impl SubmissionWork {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        PreparedRequest,
-        Result<ParsedSubmission, IoUringError>,
-        Option<IoUringFileLease>,
-        Option<IoUringBufferLease>,
-        Option<IoOperationContext>,
-        Option<PreparedPhysicalIoAdmission>,
-        Option<AxError>,
-        UserMemoryCapability,
-    ) {
+    pub(crate) fn into_parts(self) -> SubmissionWorkParts {
         (
             self.prepared,
             self.parsed,
@@ -6965,10 +6965,8 @@ impl IoUring {
                     .store(false, Ordering::Release);
             }
             drop(state);
-            if wake_close {
-                if let Some(ring) = self.self_weak.get().and_then(Weak::upgrade) {
-                    ring.enqueue_deferred();
-                }
+            if wake_close && let Some(ring) = self.self_weak.get().and_then(Weak::upgrade) {
+                ring.enqueue_deferred();
             }
         }
     }
@@ -7361,14 +7359,7 @@ impl IoUring {
                 record_io_uring_dma_direct_write_hit(completed_bytes)
             }
         }
-        if let Err(error) =
-            completion_ring.complete_issued(issued, TerminalCause::Completed, result, 0)
-        {
-            // The exact physical completion has already been accounted and
-            // all reusable resources are retired. A close/cancel terminal
-            // claimant may still win the logical CQE race.
-            return Err(error);
-        }
+        completion_ring.complete_issued(issued, TerminalCause::Completed, result, 0)?;
         Ok(PhysicalIoCompletionDisposition::Settled)
     }
 
@@ -8337,6 +8328,7 @@ impl IoUring {
     /// Installs one already-admitted pending stream owner into the fixed
     /// ring-local table. Returning the owner on failure keeps the issued
     /// proof and both leases available for an explanatory terminal CQE.
+    #[allow(clippy::result_large_err)]
     fn install_pending_stream(
         &self,
         mut work: PendingStreamWork,
@@ -8358,6 +8350,7 @@ impl IoUring {
     /// owner. Readiness registration is prepared before publication; any
     /// allocation/capacity/registration failure returns every exact lease so
     /// the submitter can complete the issued request with a visible errno.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn admit_pending_stream(
         &self,
         issued: IssuedRequest,
@@ -8445,10 +8438,10 @@ impl IoUring {
                 capability,
             });
         }
-        if !ready.is_empty() || control.has_source_wake() {
-            if let Some(ring) = self.self_weak.get().and_then(Weak::upgrade) {
-                ring.publish_poll_hint(request_id);
-            }
+        if (!ready.is_empty() || control.has_source_wake())
+            && let Some(ring) = self.self_weak.get().and_then(Weak::upgrade)
+        {
+            ring.publish_poll_hint(request_id);
         }
         Ok(())
     }
@@ -8467,6 +8460,7 @@ impl IoUring {
         work
     }
 
+    #[allow(clippy::result_large_err)]
     fn reinsert_pending_stream(&self, work: PendingStreamWork) -> Result<(), PendingStreamWork> {
         let slot = work.slot;
         let mut state = self.state.lock();
@@ -9096,8 +9090,8 @@ mod adapter_state_tests {
         // Model a lower completion that was consumed by an early worker pass
         // before the upper route/work publication became visible.
         advance_physical_completion_progress(&mut progress).unwrap();
-        let early = Some(progress.generation);
-        clear_physical_completion_progress_if_unchanged(&mut progress, early);
+        let early_generation = progress.generation;
+        clear_physical_completion_progress_if_unchanged(&mut progress, Some(early_generation));
         assert!(!progress.pending);
 
         // PhysicalIoWorkerReservation::commit uses the same state transition
@@ -9105,7 +9099,7 @@ mod adapter_state_tests {
         // though the transport generation never changed.
         advance_physical_completion_progress(&mut progress).unwrap();
         assert!(progress.pending);
-        assert_eq!(progress.generation, early.unwrap() + 1);
+        assert_eq!(progress.generation, early_generation + 1);
     }
 
     #[test]

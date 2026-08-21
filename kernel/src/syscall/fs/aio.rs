@@ -558,7 +558,7 @@ pub fn sys_io_submit<M: UserMemory + ?Sized>(
         let iocb = match VmPtr::vm_read(ptr, memory).map_err(map_usercopy_error) {
             Ok(iocb) => iocb,
             Err(err) => {
-                return fail_io_submit(&context, reserved, completions, submitted, err.into());
+                return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
 

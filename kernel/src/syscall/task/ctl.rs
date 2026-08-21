@@ -1315,14 +1315,14 @@ mod tests {
     #[test]
     fn move_pages_snapshot_chunk_is_bounded() {
         assert_eq!(MOVE_PAGES_SNAPSHOT_CHUNK, 16);
-        assert_eq!(0usize.min(MOVE_PAGES_SNAPSHOT_CHUNK), 0);
+        assert_eq!(0usize, 0);
         assert_eq!(1usize.min(MOVE_PAGES_SNAPSHOT_CHUNK), 1);
         assert_eq!(MOVE_PAGES_SNAPSHOT_CHUNK.min(MOVE_PAGES_SNAPSHOT_CHUNK), 16);
         assert_eq!(
             (MOVE_PAGES_SNAPSHOT_CHUNK + 1).min(MOVE_PAGES_SNAPSHOT_CHUNK),
             16
         );
-        assert_eq!(usize::MAX.min(MOVE_PAGES_SNAPSHOT_CHUNK), 16);
+        assert_eq!(MOVE_PAGES_SNAPSHOT_CHUNK, 16);
     }
 
     #[test]

@@ -1210,7 +1210,11 @@ mod receive_copyout_tests {
         let mut provider = FaultMemory;
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            copy_received_message(&mut memory, 1 as *mut UserMsgbuf, received),
+            copy_received_message(
+                &mut memory,
+                core::ptr::dangling_mut::<UserMsgbuf>(),
+                received
+            ),
             Err(AxError::BadAddress)
         );
         assert_eq!(queue.messages.len(), 0);
@@ -1229,7 +1233,11 @@ mod receive_copyout_tests {
         let mut provider = FaultMemory;
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            copy_received_message(&mut memory, 1 as *mut UserMsgbuf, received),
+            copy_received_message(
+                &mut memory,
+                core::ptr::dangling_mut::<UserMsgbuf>(),
+                received
+            ),
             Err(AxError::BadAddress)
         );
         assert_eq!(queue.messages.len(), 1);

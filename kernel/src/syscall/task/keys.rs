@@ -149,7 +149,7 @@ fn load_payload<M: UserMemory + ?Sized>(
     if payload.is_null() {
         return Err(AxError::BadAddress);
     }
-    Ok(vm_load(memory, payload, plen).map_err(map_usercopy_error)?)
+    vm_load(memory, payload, plen).map_err(map_usercopy_error)
 }
 
 fn write_keyring_ids<M: UserMemory + ?Sized>(

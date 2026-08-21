@@ -156,18 +156,16 @@ impl ExecutableArena {
         // hierarchy anchor.
         unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, PAGE_SIZE_4K) };
         let sentinel = base + SENTINEL_PAGE * PAGE_SIZE_4K;
-        if let Err(error) = kernel.lock().map_linear(
+        // Keep the anchor page if the mapping backend reports failure:
+        // a backend may have installed a page-table prefix before the
+        // error. The optional arena is unavailable, so retaining one
+        // page is safer than returning it behind a stale mapping.
+        kernel.lock().map_linear(
             sentinel,
             virt_to_phys(direct),
             PAGE_SIZE_4K,
             MappingFlags::READ,
-        ) {
-            // Keep the anchor page if the mapping backend reports failure:
-            // a backend may have installed a page-table prefix before the
-            // error. The optional arena is unavailable, so retaining one
-            // page is safer than returning it behind a stale mapping.
-            return Err(error);
-        }
+        )?;
 
         Ok(Self {
             base,
@@ -544,7 +542,7 @@ mod tests {
     fn arena_constants_are_page_and_bitmap_aligned() {
         assert_eq!(ARENA_BYTES % PAGE_SIZE_4K, 0);
         assert_eq!(ARENA_PAGES % u64::BITS as usize, 0);
-        assert!(ARENA_END_GUARD_BYTES >= ARENA_BYTES);
+        const _: () = assert!(ARENA_END_GUARD_BYTES >= ARENA_BYTES);
     }
 
     #[test]

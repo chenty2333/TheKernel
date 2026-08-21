@@ -109,7 +109,7 @@ fn validate_futex_user_range(address: *const u32, _caller: &UserMemoryCapability
 
 fn validate_futex_word_read(address: *const u32, caller: &UserMemoryCapability) -> AxResult<()> {
     validate_futex_address(address)?;
-    check_user_readable_with(caller, address.addr(), size_of::<u32>()).map_err(AxError::from)?;
+    check_user_readable_with(caller, address.addr(), size_of::<u32>())?;
     Ok(())
 }
 
@@ -290,7 +290,7 @@ fn wake_futex(
 }
 
 fn fault_read_u32(caller: &UserMemoryCapability, address: usize) -> AxResult<u32> {
-    check_user_readable_with(caller, address, size_of::<u32>()).map_err(AxError::from)?;
+    check_user_readable_with(caller, address, size_of::<u32>())?;
     caller
         .read_value(address as *const u32)
         .map_err(map_usercopy_error)
@@ -308,7 +308,7 @@ fn checked_user_array_address<T>(
     let bytes = count
         .checked_mul(size_of::<T>())
         .ok_or(AxError::BadAddress)?;
-    check_user_readable_with(caller, base_addr, bytes).map_err(AxError::from)?;
+    check_user_readable_with(caller, base_addr, bytes)?;
     Ok(base_addr)
 }
 
@@ -421,7 +421,6 @@ fn validate_waitv_timeout(
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = timeout;
     let clock = match clockid as u32 {
         CLOCK_REALTIME => AlarmClock::Realtime,
         CLOCK_MONOTONIC => AlarmClock::Monotonic,

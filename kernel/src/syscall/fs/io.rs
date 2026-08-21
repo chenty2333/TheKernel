@@ -451,7 +451,7 @@ fn io_uring_stream_write_with_context(
     let socket = PinnedSocketDescription::from_file_handle(file_handle, status)?;
     let written = generic_write_after_socket_policy(
         socket.as_ref(),
-        |socket| dispatch_generic_socket_send(&security, socket, status, 1, len),
+        |socket| dispatch_generic_socket_send(security, socket, status, 1, len),
         || {
             if let Some(file) = file_handle.downcast_ref::<File>() {
                 check_file_write_admission(file, len)?;
@@ -966,7 +966,7 @@ pub(crate) fn prepare_physical_io_write_memfd_guard(
         return Ok(None);
     }
     let description = file_lease.description()?;
-    context.validate_for(&description)?;
+    context.validate_for(description)?;
     let file = description
         .file_handle()
         .downcast::<File>()
@@ -988,7 +988,7 @@ pub(crate) fn prepare_physical_io_write_privilege_guard(
         return Ok(None);
     }
     let description = file_lease.description()?;
-    context.validate_for(&description)?;
+    context.validate_for(description)?;
     let file = description
         .file_handle()
         .downcast::<File>()
@@ -3350,15 +3350,7 @@ fn execute_io_uring_pread(
         );
     }
     let file = positioned_read_file_handle(file_handle)?;
-    pread64_file_with_context(
-        capability,
-        &file,
-        &context,
-        buf,
-        len,
-        offset,
-        fixed_segments,
-    )
+    pread64_file_with_context(capability, &file, context, buf, len, offset, fixed_segments)
 }
 
 pub fn sys_pwrite64(
@@ -3582,15 +3574,7 @@ fn execute_io_uring_pwrite(
         );
     }
     let file = positioned_write_file_handle(file_handle)?;
-    pwrite64_file_with_context(
-        capability,
-        &file,
-        &context,
-        buf,
-        len,
-        offset,
-        fixed_segments,
-    )
+    pwrite64_file_with_context(capability, &file, context, buf, len, offset, fixed_segments)
 }
 
 pub fn sys_preadv(

@@ -249,7 +249,8 @@ impl DeviceOps for EventDev {
         }
         let mut read = 0;
         let mut inner = self.inner.lock();
-        for out in buf.chunks_exact_mut(size_of::<InputEvent>()) {
+        let (chunks, _) = buf.as_chunks_mut::<{ size_of::<InputEvent>() }>();
+        for out in chunks {
             if !inner.has_event() {
                 break;
             }

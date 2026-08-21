@@ -61,7 +61,7 @@ fn insecure_seed() -> [u8; 32] {
         (&stack_marker as *const u8 as usize as u64).rotate_left(17),
     ];
     let mut seed = [0u8; 32];
-    for (dst, word) in seed.chunks_exact_mut(8).zip(words) {
+    for (dst, word) in seed.as_chunks_mut::<8>().0.iter_mut().zip(words) {
         dst.copy_from_slice(&word.to_ne_bytes());
     }
     seed
