@@ -21,16 +21,17 @@ not inferred from the guest's summary line.
 
 ## TheKernel lane
 
-Build the normal x86_64 shell artifacts (the rootfs build installs
+Build the x86_64 shell image and rootfs (the rootfs installs
 `/opt/thekernel-tests/bin/thekernel-scheduler-baseline`) and run:
 
 ```bash
-make kernel-x86_64-shell rootfs-x86
+./tools/thekernel.py build --profile shell
+./tools/thekernel.py rootfs
 PYTHONPATH=. python3 -m tools.kvm_scheduler_baseline run \
   --target thekernel \
-  --kernel .state/shell/kernel-x86_64 \
-  --rootfs .state/rootfs/rootfs-x86.img \
-  --esp .state/uefi/shell-x86_64.esp \
+  --kernel .state/out/x86_64/q35-uefi/shell/smp4-mem1g/kernel-x86_64 \
+  --rootfs .state/out/rootfs/x86/rootfs-x86.img \
+  --esp .state/out/x86_64/q35-uefi/shell/smp4-mem1g/kernel-x86_64.esp \
   --output .state/kvm-scheduler/thekernel \
   --cpus 4 --warmup 200 --iterations 2000 --repeat 5 \
   --vcpu-cpus 4,5 --io-cpus 6

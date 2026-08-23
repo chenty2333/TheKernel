@@ -1,208 +1,133 @@
 # TheKernel
 
-TheKernel is a personal Rust operating-system project that provides a
-Linux-compatible userspace ABI on top of ArceOS components. Its target is a
-high-performance, production-usable x86_64 kernel. It is being evolved toward
-reusable, explicitly layered kernel components rather than syscall-local
-implementations.
+TheKernel is a personal Rust operating-system project providing a
+Linux-compatible userspace ABI on ArceOS components. x86_64 is the only
+supported product architecture; the reference machine is QEMU `q35` with
+UEFI/OVMF.
 
-The repository is currently a preview. It has broad syscall and subsystem
-coverage, but it is not yet a drop-in Linux replacement and its public crate
-boundaries are still being stabilized.
-
-## Architecture
-
-x86_64 is the only product architecture. The reference virtual machine is QEMU
-`q35` with UEFI/OVMF; builds, boot checks, and system tests use this platform.
-
-The code follows five ownership layers:
-
-1. architecture and HAL primitives;
-2. generic task, driver, filesystem, and network mechanisms;
-3. reusable Linux ABI support for process, VFS, fd, readiness, credentials,
-   memory, and related semantics;
-4. thin syscall argument handling and subsystem composition;
-5. project build, boot, test, and diagnostic tooling.
-
-Linux-visible policy should not leak into generic `ax-*` mechanisms, and
-syscall bodies should not duplicate rules owned by the ABI-support layer.
-
-The project's durable design, selected direction, current position, and known
-pitfalls live respectively in [`maproom/terrain.md`](maproom/terrain.md),
+The durable design, selected direction, current position, and known pitfalls
+are in [`maproom/terrain.md`](maproom/terrain.md),
 [`maproom/route.md`](maproom/route.md),
 [`maproom/basecamp.md`](maproom/basecamp.md), and
 [`maproom/hazards.md`](maproom/hazards.md).
+Unsafe review islands and their invariants are indexed in
+[`docs/unsafe-boundaries.md`](docs/unsafe-boundaries.md).
 
-## Checkout layout
+## Checkout and development environment
 
-The root workspace consumes three maintained sibling repositories through
-relative paths. Local development and CI use this layout:
+The workspace expects maintained sibling repositories:
 
 ```text
 parent/
   TheKernel/
-  vISA/
   thekernel-ax/
   thekernel-linux-abi/
 ```
 
-A valid checkout has `../vISA/crates/visa-core/Cargo.toml`,
-`../thekernel-ax/Cargo.toml`, and `../thekernel-linux-abi/Cargo.toml` next to
-this repository. GitHub Actions checks out exact sibling commits for every
-integration result; local cross-repository work may intentionally use different
-revisions.
+CI reads its exact sibling checkout combination from
+[`config/source-combination.toml`](config/source-combination.toml) and prints
+a stable ID that also includes the checked-out TheKernel commit.
 
-## Development environment
-
-The supported build environment is the repository development container. Build
-it once, verify the installed tools, and enter a shell:
+Enter the system-dependency development container with:
 
 ```bash
-make dev-image
-make dev-check
-make dev-shell
+./scripts/dev-shell.sh
 ```
 
-From the host, run a one-shot command with:
+The image deliberately contains no Rust runtime. Install rustup there, then
+run `rustup show` from this checkout to install the toolchain declared by the
+root [`rust-toolchain.toml`](rust-toolchain.toml): `nightly-2026-08-23`
+(`rustc 1.100.0-nightly`, `c54751567`, commit date 2026-08-22). Product builds
+also require the configuration generator; LLVM object tools come from the
+toolchain's declared `llvm-tools` component:
 
 ```bash
-make dev-shell DEV_CMD='make all'
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup show
+cargo install --locked --version 0.2.1 axconfig-gen
 ```
 
-Inside an already-open development shell, run the inner command directly.
-GitHub Actions uses the same maintained image through the
-`THEKERNEL_DEV_IMAGE` repository variable, falling back to the repository's
-`thekernel-dev:nightly` package.
+## Product entry point
 
-## Build
-
-Build the release-mode x86_64 kernel image:
+`./tools/thekernel.py` is the only product build and boot entry point:
 
 ```bash
-make all
+./tools/thekernel.py build
+./tools/thekernel.py rootfs
+./tools/thekernel.py run --profile shell --interactive
+./tools/thekernel.py system-test --smp 4 --accel tcg
+./tools/thekernel.py lint --smp 4
 ```
 
-The materialized artifact is `kernel-x86_64`. Explicit build targets are also
-available:
-
-```bash
-make kernel-x86_64
-make artifacts
-```
-
-Kernel and rootfs outputs use a content-addressed cache under
-`.state/build-cache/`; Cargo target caches remain under `.state/x86_64/target`.
-
-## Root filesystem
-
-The project test rootfs is built from a checksum-pinned BusyBox release plus
-TheKernel-owned init and guest test programs:
-
-```bash
-make test-fixtures
-make rootfs-x86
-```
-
-The first build downloads BusyBox 1.36.1 into `.state/source-cache/`. Generated
-ext4 images live under `.state/rootfs/` and are local or CI fixtures, not
-published kernel release artifacts. See [PROVENANCE.md](PROVENANCE.md) before
-redistributing a generated image.
-
-## Boot
-
-Boot an interactive x86_64 project rootfs:
-
-```bash
-make shell-x86_64
-```
-
-Exit the guest shell to trigger a clean kernel shutdown. Additional runner
-options can be passed through `SHELL_ARGS`.
-
-The policy-neutral runner also accepts explicit artifacts:
-
-```bash
-python3 -m tools.qemu_runner run \
-  --arch x86_64 \
-  --kernel kernel-x86_64 \
-  --rootfs .state/rootfs/rootfs-x86.img \
-  --timeout 300
-```
+Its commands write below `${THEKERNEL_STATE_DIR:-.state}`. With defaults, the
+system kernel and ESP are under
+`.state/out/x86_64/q35-uefi/system/smp4-mem1g/`, and the root filesystem is
+`.state/out/rootfs/x86/rootfs-x86.img`.
 
 ## Verification
 
-GitHub Actions exposes the ordinary pull-request result as two independent
-jobs rather than one shell dispatcher:
-
-- **Host checks and tests**: changed-line whitespace, `rustfmt`, vendored
-  provenance, build/runner tool tests, local adapter tests, one complete host
-  kernel test run, and host-profile Clippy.
-- **x86_64 product configuration**: non-default diagnostic and I/O-control
-  configurations, the real product build, and target-profile Clippy.
-
-The corresponding commands remain ordinary project commands. Common local
-checks include:
+Formatting and host tests are direct Cargo commands. The full host kernel test
+uses the same linker settings as CI:
 
 ```bash
-cargo fmt --all -- --check
-python3 scripts/ci/validate_vendor_provenance.py \
-  --archive-policy if-present \
-  --ax-repo ../thekernel-ax \
-  --linux-abi-repo ../thekernel-linux-abi
-make test-tools
-make kernel-x86_64
+cargo fmt \
+  -p thekernel \
+  -p thekernel-kernel \
+  -p axnet-ng \
+  -p thekernel-linux-process-adapter \
+  -p thekernel-readiness-adapter \
+  -- --check
+cargo test --locked -p thekernel-readiness-adapter
+cargo test --locked -p thekernel-linux-process-adapter
+env \
+  CC=gcc CXX=g++ AR=ar AS=as OBJCOPY=objcopy OBJDUMP=objdump SIZE=size \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
+  cargo test --locked --manifest-path kernel/Cargo.toml --tests \
+    --features bpf,axtask/test,test-io-control \
+    --target x86_64-unknown-linux-gnu -- --test-threads=1
 ```
 
-The heavier QEMU semantic test is explicit and manual:
+Run the QEMU system suite with `./tools/thekernel.py system-test`; it reports
+the guest KTAP suite. The same portable C assertions can be run against Linux
+without a per-case wrapper:
 
 ```bash
-make system-test
+./scripts/host-differential.sh
 ```
 
-Targeted storage and page-cache smokes remain directly selectable:
+Run a named semantic smoke with:
 
 ```bash
-make smoke NAME=lwext4-io-boost ARCH=x86
+./scripts/smoke.sh list
+./scripts/smoke.sh lwext4-io-boost
 ```
 
-Host Linux differential oracles are standalone scripts rather than acceptance
-wrappers:
+See [`docs/testing.md`](docs/testing.md) for the testing boundary, and
+[`PROVENANCE.md`](PROVENANCE.md) for source and generated-rootfs provenance.
 
-```bash
-scripts/ci/futex-host-differential.sh
-scripts/ci/epoll-host-differential.sh
-```
+The current bounded product claim is `q35-preview-v0`; it is not a claim of
+complete Linux ABI coverage, distribution/container compatibility, bare-metal
+support, or general performance superiority. Its exact gate and fixed Linux
+comparison baseline are defined in [`docs/testing.md`](docs/testing.md).
 
-See [`docs/testing.md`](docs/testing.md) for the coverage boundary between
-repository tests, sibling-crate tests, product boots, and research or
-performance evidence.
-
-## Lints
-
-Clippy runs directly in two configurations because they answer different
-questions. The host command covers tests and generic paths; the x86_64 command
-reuses the actual platform configuration and features. Deliberate allowances
-are documented in `[workspace.lints]` in the root `Cargo.toml`; CI promotes all
-other warnings to errors without an intermediate report format or parser.
+CI may override its checked-in development-image digest with the
+`THEKERNEL_DEV_IMAGE` repository variable. When set, it must be an immutable
+`ghcr.io/...@sha256:...` system-image reference; Rust remains controlled solely
+by the root `rust-toolchain.toml` for product builds and CI.
 
 ## Repository layout
 
 - `kernel/`: Linux-compatible kernel and syscall integration.
 - `crates/`: maintained generic and reusable components.
-- `third_party/rust-patches/`: pinned upstream sources and provenance records.
-- `make/`: architecture build machinery.
-- `tools/build.py`: content-addressed kernel and rootfs builder.
-- `tools/qemu_runner/`: policy-neutral x86_64 QEMU runner.
-- `tests/guest/`: project init, guest helpers, and nightly programs.
-- `scripts/ci/`: reusable differential, benchmark, and optional research tools.
-- `scripts/smoke/`: named QEMU semantic smokes.
+- `config/`: x86_64 product configuration and GRUB configuration.
+- `tools/thekernel.py`: product build, boot, system-test, and lint entry point.
+- `tools/qemu_runner/`: x86_64 QEMU runner implementation.
+- `tests/guest/`: system suite and semantic smoke command streams.
 
-## Cleaning
-
-`make clean` removes materialized kernels and run/build outputs while retaining
-content and Cargo caches. `make clean-all` removes all generated `.state` data.
-
-## License and provenance
+## License
 
 TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE),
 [NOTICE](NOTICE), and [PROVENANCE.md](PROVENANCE.md). Third-party and vendored

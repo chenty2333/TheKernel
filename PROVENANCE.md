@@ -18,15 +18,23 @@ license status, and maintained differences.
 
 ## Development toolchains
 
-`dev-env/versions.env` and `dev-env/Dockerfile` pin the development image,
-QEMU source release, and Rust toolchain by version and checksum. These are
-external build tools, not source incorporated into TheKernel.
+The root [`rust-toolchain.toml`](rust-toolchain.toml) is the sole Rust
+toolchain authority for TheKernel product builds and CI: the rustup snapshot is
+`nightly-2026-08-23`, corresponding to
+`rustc 1.100.0-nightly` (`c54751567`, commit date 2026-08-22), with the
+declared components and `x86_64-unknown-none` target. Rust is installed by
+rustup from that repository pin.
+
+`dev-env/Dockerfile` defines only the system build dependencies and pinned QEMU
+source used by the development image. Those external build tools are not source
+incorporated into TheKernel. CI consumes that image through the repository
+variable `THEKERNEL_DEV_IMAGE`, which must contain an immutable digest reference;
+the moving publish tags are discovery names, not CI inputs.
 
 ## Generated test root filesystem
 
-The images produced by `make test-fixtures` (or its `make rootfs` alias) are
-local and CI test fixtures. They are not part of the published kernel release
-artifact set.
+The image produced by `./tools/thekernel.py rootfs` is a local and CI test
+fixture.
 
 The builder downloads BusyBox 1.36.1 from
 <https://busybox.net/downloads/busybox-1.36.1.tar.bz2> and requires SHA-256
@@ -37,5 +45,4 @@ selected cross toolchain.
 
 Anyone redistributing a generated image must preserve its notices and satisfy
 the corresponding-source requirements for BusyBox and the license obligations
-of the selected C runtime. The repository's release artifact policy excludes
-these generated rootfs images.
+of the selected C runtime.

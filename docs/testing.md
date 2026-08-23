@@ -1,62 +1,108 @@
-# Build and test policy
+# Testing
 
-TheKernel keeps source checks, product builds, semantic boots, and research
-evidence separate. GitHub Actions expresses the ordinary checks directly; no
-shell command recursively invokes another acceptance gate.
+TheKernel separates Rust host tests, portable Linux differentials, the guest
+KTAP suite, semantic smokes, and performance measurements.
 
-## Checkout layout
+## `q35-preview-v0` gate
 
-The root `Cargo.toml` consumes three maintained sibling repositories through
-relative paths:
+The current product candidate is limited to x86_64 QEMU `q35`, UEFI/OVMF,
+4 vCPUs, 1 GiB RAM, and the configured virtio devices. A candidate must be
+built from a clean worktree whose repositories match one
+`config/source-combination.toml` identity, and must pass formatting/lint, the
+host suites, portable Linux differential, and guest KTAP with zero FAIL and
+zero SKIP. The guest must then shut down normally: a suite marker, timeout, or
+runner-terminated QEMU is not a pass.
 
-```text
-parent/
-  TheKernel/
-  vISA/
-  thekernel-ax/
-  thekernel-linux-abi/
-```
+This preview covers untrusted local guest processes only for implemented ABI
+surfaces. It does not claim unmodified distribution/systemd/container support,
+strong multi-tenancy, long-running memory-pressure service, production
+storage, bare metal, or complete Linux ABI coverage.
 
-GitHub Actions checks out exact sibling commits. A local cross-repository change
-may intentionally substitute different sibling revisions, but the resulting
-integration set should be recorded explicitly.
+Linux semantic and performance comparisons use Linux stable `v6.12.103`
+(commit `25c09b42358e73e1476e517b296edb6344f2e4bd`) with the compared kernel
+configuration, OVMF, rootfs, helpers, virtual topology, and CPU placement
+identified in the result. Syscall dispatcher branch count is not coverage
+evidence.
 
-## Pull-request checks
+## Host suite
 
-The ordinary workflow has two visible jobs.
-
-### Host checks and tests
-
-The host job runs changed-line whitespace checks, `cargo fmt`, vendored
-provenance validation, `make test-tools`, the two local adapter suites, one
-complete host kernel test run, and direct host-profile Clippy. It does not
-replay the complete kernel binary under a directory of test filters, enforce
-test-count receipts, or test an acceptance script's evidence schema.
-
-### x86_64 product configuration
-
-The target job checks the diagnostic and I/O-control feature profiles, builds
-`kernel-x86_64`, and runs Clippy through the same q35/UEFI build configuration.
-The maintained sibling repositories own their complete unit, MSRV, packaging,
-and release checks; TheKernel verifies their pinned integration boundary.
-
-## Semantic and targeted tests
-
-The full QEMU semantic boot remains an explicit heavier operation:
+Run formatting and the maintained adapter tests directly with Cargo:
 
 ```bash
-make system-test
+cargo fmt \
+  -p thekernel \
+  -p thekernel-kernel \
+  -p axnet-ng \
+  -p thekernel-linux-process-adapter \
+  -p thekernel-readiness-adapter \
+  -- --check
+cargo test --locked -p thekernel-readiness-adapter
+cargo test --locked -p thekernel-linux-process-adapter
 ```
 
-Targeted smokes and host Linux differential oracles remain directly runnable:
+The host kernel suite needs the project linker settings:
 
 ```bash
-make smoke NAME=lwext4-io-boost ARCH=x86
-scripts/ci/futex-host-differential.sh
-scripts/ci/epoll-host-differential.sh
+env \
+  CC=gcc CXX=g++ AR=ar AS=as OBJCOPY=objcopy OBJDUMP=objdump SIZE=size \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
+  cargo test --locked --manifest-path kernel/Cargo.toml --tests \
+    --features bpf,axtask/test,test-io-control \
+    --target x86_64-unknown-linux-gnu -- --test-threads=1
 ```
 
-These commands report their actual test output. Performance and research tools
-may retain checksums, manifests, or receipts when those artifacts are part of
-the experiment; such evidence is not a substitute for an ordinary source or
-product test result.
+## Portable Linux differential
+
+One runner discovers every source under `tests/guest/portable/`, compiles it
+for Linux, and reports its direct `0` PASS, `1` FAIL, or `4` SKIP result as
+KTAP:
+
+```bash
+./scripts/host-differential.sh
+```
+
+The rootfs builder discovers the same source directory for guest execution;
+there is no second test manifest.
+
+## Guest KTAP suite
+
+The product system suite builds and boots the x86_64 Q35/UEFI image, then
+reports the guest KTAP result:
+
+```bash
+./tools/thekernel.py system-test --smp 4 --accel tcg
+```
+
+## Semantic smokes
+
+Smokes are named guest command streams run through the product CLI:
+
+```bash
+./scripts/smoke.sh list
+./scripts/smoke.sh lwext4-io-boost
+```
+
+## Performance measurements
+
+Performance runs are explicit. Pass `--receipt PATH` only when recording a
+performance measurement that needs its run receipt; ordinary host, KTAP, and
+smoke tests do not create one.
+
+```bash
+mkdir -p .state/performance
+printf '%s\n' \
+  '/opt/thekernel-tests/bin/thekernel-mm-performance --iterations 256 --vmas 512 --pin-iterations 64 --pin-workers 4 || exit 1' \
+  'exit' > .state/performance/run.commands
+./tools/thekernel.py run --profile mm-performance --smp 4 --accel kvm \
+  --commands .state/performance/run.commands \
+  --receipt .state/performance/run.json
+```
+
+A performance claim needs at least five fresh raw repeats on the same topology
+and reports throughput, CPU cost, P50, P99, and P99.9. Zero raw samples,
+unavailable PMU data, or missing `perf` produces only `not-measured` or degraded
+evidence, never `formal`, `complete`, or an “exceeds Linux” claim. Keep an
+optimization only when its predeclared primary metric improves by at least 5%
+without correctness/resource regressions or more than 5% P99.9 regression;
+otherwise revert it.
