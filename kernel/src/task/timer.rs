@@ -829,6 +829,13 @@ mod alarm_registry_tests {
         );
 
         drop(retired);
+        // The rearm kept the owner leased with the 2s alarm active, so the
+        // lease release retires exactly that alarm; a second release finds
+        // nothing left.
+        let released = registry.release(owner);
+        assert!(released.is_some());
+        drop(released);
+        assert_eq!(registry.realtime.len + registry.monotonic.len, 0);
         assert!(registry.release(owner).is_none());
         assert_eq!(Arc::strong_count(&source), 1);
     }
@@ -1573,13 +1580,18 @@ fn process_itimer_owner_cpu() -> usize {
 }
 
 #[inline]
-fn process_itimer_owner_from_token(token: usize) -> Option<usize> {
+fn process_itimer_owner_from_token_for_cpu_count(token: usize, cpu_count: usize) -> Option<usize> {
     let cpu = token.checked_sub(1)?;
+    (cpu < cpu_count).then_some(cpu)
+}
+
+#[inline]
+fn process_itimer_owner_from_token(token: usize) -> Option<usize> {
     // This word is only ever published by `publish_process_itimer_work`, but
     // treat a stale/corrupt value as an absent wake target in release builds
     // as well.  Returning an out-of-range CPU here would turn a harmless
     // coalesced request into an indexing panic in the wake path.
-    (cpu < PROCESS_ITIMER_CPU_COUNT).then_some(cpu)
+    process_itimer_owner_from_token_for_cpu_count(token, PROCESS_ITIMER_CPU_COUNT)
 }
 
 fn rebase_process_cpu_timer_clock(
@@ -2364,9 +2376,14 @@ mod process_itimer_tests {
         // CPU 2 owns the queued node (the public token is CPU + 1). The
         // producer may migrate before its caller performs the wake, but the
         // readback remains the queue owner's exact CPU rather than the
-        // producer's current CPU.
+        // producer's current CPU. Use a synthetic topology because host
+        // tests configure only one production CPU.
+        const SYNTHETIC_CPU_COUNT: usize = 4;
         let owner_token = core::sync::atomic::AtomicUsize::new(2 + 1);
-        let wake_cpu = process_itimer_owner_from_token(owner_token.load(Ordering::Acquire));
+        let wake_cpu = process_itimer_owner_from_token_for_cpu_count(
+            owner_token.load(Ordering::Acquire),
+            SYNTHETIC_CPU_COUNT,
+        );
         let producer_cpu_after_migration = 0;
         assert_eq!(wake_cpu, Some(2));
         assert_ne!(producer_cpu_after_migration, wake_cpu.unwrap());

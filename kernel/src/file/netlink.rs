@@ -23,6 +23,13 @@ use crate::{
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
 const NETLINK_QUEUE_LIMIT: usize = 128;
+// Linux limits one netlink datagram to sk_sndbuf minus 32 bytes. TheKernel
+// does not yet expose a configurable netlink SO_SNDBUF, so use Linux's
+// 208-KiB default send buffer as the explicit per-message admission budget.
+const NETLINK_DEFAULT_SEND_BUFFER_BYTES: usize = 208 * 1024;
+const NETLINK_SEND_BUFFER_OVERHEAD: usize = 32;
+const NETLINK_MAX_MESSAGE_BYTES: usize =
+    NETLINK_DEFAULT_SEND_BUFFER_BYTES - NETLINK_SEND_BUFFER_OVERHEAD;
 const NETLINK_ROUTE: u32 = 0;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
@@ -453,8 +460,15 @@ impl FileLike for NetlinkSocket {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let len = src.remaining();
-        let mut data = vec![0; len];
-        src.read(&mut data)?;
+        if len > NETLINK_MAX_MESSAGE_BYTES {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+        data.resize(len, 0);
+        src.read_exact(&mut data)?;
         self.handle_write(&data)?;
         Ok(len)
     }
@@ -757,15 +771,63 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::{MaybeUninit, size_of};
 
+    use axerrno::LinuxError;
     use axhal::paging::{MappingFlags, PageSize};
+    use axio::{IoBuf, Read};
     use axsync::Mutex;
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
-    use super::{NetlinkSocket, SockaddrNl};
+    use super::{
+        NETLINK_MAX_MESSAGE_BYTES, NetlinkSocket, NlMsgHdr, RTM_GETLINK, SockaddrNl, write_struct,
+    };
     use crate::{
+        file::FileLike,
         mm::{AddrSpace, Backend, UserMemoryCapability, UserPtr},
         task::{NetworkNamespace, UserNamespace},
     };
+
+    struct UnreadableLengthSource {
+        remaining: usize,
+    }
+
+    impl Read for UnreadableLengthSource {
+        fn read(&mut self, _buf: &mut [u8]) -> axio::Result<usize> {
+            panic!("an over-limit netlink source must not be read")
+        }
+    }
+
+    impl IoBuf for UnreadableLengthSource {
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    struct ZeroedSource {
+        remaining: usize,
+        reads: usize,
+    }
+
+    impl Read for ZeroedSource {
+        fn read(&mut self, output: &mut [u8]) -> axio::Result<usize> {
+            assert!(output.len() <= self.remaining);
+            output.fill(0);
+            self.remaining -= output.len();
+            self.reads += 1;
+            Ok(output.len())
+        }
+    }
+
+    impl IoBuf for ZeroedSource {
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    fn route_socket() -> Arc<NetlinkSocket> {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        NetlinkSocket::try_new(0, net_ns).unwrap()
+    }
 
     fn mapped_capability() -> UserMemoryCapability {
         let mut address_space = AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
@@ -824,5 +886,64 @@ mod tests {
         };
         let copied = unsafe { bytes.map(|byte| byte.assume_init()) };
         assert_eq!(&copied, &expected_bytes[..4]);
+    }
+
+    #[test]
+    fn write_rejects_usize_max_message_without_reading_source() {
+        let socket = route_socket();
+        let mut source = UnreadableLengthSource {
+            remaining: usize::MAX,
+        };
+
+        let error = socket.write(&mut source).unwrap_err();
+
+        assert_eq!(LinuxError::from(error), LinuxError::EMSGSIZE);
+    }
+
+    #[test]
+    fn write_rejects_message_above_explicit_limit_without_reading_source() {
+        let socket = route_socket();
+        let mut source = UnreadableLengthSource {
+            remaining: NETLINK_MAX_MESSAGE_BYTES + 1,
+        };
+
+        let error = socket.write(&mut source).unwrap_err();
+
+        assert_eq!(LinuxError::from(error), LinuxError::EMSGSIZE);
+    }
+
+    #[test]
+    fn write_admits_message_at_explicit_limit() {
+        let socket = route_socket();
+        let mut source = ZeroedSource {
+            remaining: NETLINK_MAX_MESSAGE_BYTES,
+            reads: 0,
+        };
+
+        // A zeroed datagram is structurally invalid, but it must clear the
+        // length admission and reach netlink parsing at the exact limit.
+        let error = socket.write(&mut source).unwrap_err();
+
+        assert_eq!(LinuxError::from(error), LinuxError::EINVAL);
+        assert_eq!(source.remaining, 0);
+        assert_eq!(source.reads, 1);
+    }
+
+    #[test]
+    fn write_accepts_normal_route_message() {
+        let _context = crate::test_support::scheduler_test_context();
+        let socket = route_socket();
+        let header = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: RTM_GETLINK,
+            nlmsg_flags: 0,
+            nlmsg_seq: 7,
+            nlmsg_pid: 0,
+        };
+        let mut message = [0_u8; size_of::<NlMsgHdr>()];
+        write_struct(&mut message, &header);
+        let mut source = &message[..];
+
+        assert_eq!(socket.write(&mut source).unwrap(), message.len());
     }
 }

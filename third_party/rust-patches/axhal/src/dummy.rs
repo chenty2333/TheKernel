@@ -1,5 +1,7 @@
 //! Dummy implementation of platform-related interfaces defined in [`axplat`].
 
+use core::cell::UnsafeCell;
+
 #[cfg(feature = "irq")]
 use axplat::irq::{IpiTarget, IrqHandler, IrqIf};
 use axplat::{
@@ -10,6 +12,7 @@ use axplat::{
     power::PowerIf,
     time::TimeIf,
 };
+use spin::Lazy;
 
 struct DummyInit;
 struct DummyConsole;
@@ -18,6 +21,42 @@ struct DummyTime;
 struct DummyPower;
 #[cfg(feature = "irq")]
 struct DummyIrq;
+
+const HOST_PAGE_ARENA_SIZE: usize = 32 * 1024 * 1024;
+
+/// Host-test backing memory for the dummy platform's page allocator.
+///
+/// The dummy platform never represents real physical memory.  Its page-table
+/// implementation nevertheless needs a bounded region whose physical and
+/// virtual names round-trip while host tests manipulate mappings.
+#[repr(align(4096))]
+struct HostPageArena(UnsafeCell<[u8; HOST_PAGE_ARENA_SIZE]>);
+
+// The host page allocator has exclusive ownership of this region after the
+// kernel test bootstrap initializes it.  `UnsafeCell` keeps the storage in
+// writable BSS without creating aliases through Rust references.
+unsafe impl Sync for HostPageArena {}
+
+static HOST_PAGE_ARENA: HostPageArena = HostPageArena(UnsafeCell::new([0; HOST_PAGE_ARENA_SIZE]));
+static HOST_PAGE_ARENA_RANGE: Lazy<[RawRange; 1]> = Lazy::new(|| {
+    [(
+        HOST_PAGE_ARENA.0.get() as *mut u8 as usize,
+        HOST_PAGE_ARENA_SIZE,
+    )]
+});
+
+fn host_page_arena_range() -> RawRange {
+    HOST_PAGE_ARENA_RANGE[0]
+}
+
+fn host_page_arena_address(address: usize) -> usize {
+    let (start, size) = host_page_arena_range();
+    assert!(
+        (start..start + size).contains(&address),
+        "dummy host physical address outside page arena: {address:#x}"
+    );
+    address
+}
 
 #[impl_plat_interface]
 impl InitIf for DummyInit {
@@ -51,7 +90,7 @@ impl ConsoleIf for DummyConsole {
 #[impl_plat_interface]
 impl MemIf for DummyMem {
     fn phys_ram_ranges() -> &'static [RawRange] {
-        &[]
+        &HOST_PAGE_ARENA_RANGE[..]
     }
 
     fn reserved_phys_ram_ranges() -> &'static [RawRange] {
@@ -62,12 +101,12 @@ impl MemIf for DummyMem {
         &[]
     }
 
-    fn phys_to_virt(_paddr: memory_addr::PhysAddr) -> memory_addr::VirtAddr {
-        va!(0)
+    fn phys_to_virt(paddr: memory_addr::PhysAddr) -> memory_addr::VirtAddr {
+        va!(host_page_arena_address(paddr.as_usize()))
     }
 
-    fn virt_to_phys(_vaddr: memory_addr::VirtAddr) -> memory_addr::PhysAddr {
-        pa!(0)
+    fn virt_to_phys(vaddr: memory_addr::VirtAddr) -> memory_addr::PhysAddr {
+        pa!(host_page_arena_address(vaddr.as_usize()))
     }
 
     fn kernel_aspace() -> (memory_addr::VirtAddr, usize) {

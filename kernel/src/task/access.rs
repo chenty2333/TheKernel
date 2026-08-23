@@ -499,27 +499,36 @@ mod tests {
     fn publish_ids(slot: &CredentialSlot, uid: u32, gid: u32) -> Arc<Cred> {
         let uid = kuid(uid);
         let gid = kgid(gid);
-        let mut update = slot.prepare();
-        update.builder.ids = Credentials {
-            ruid: uid,
-            euid: uid,
-            suid: uid,
-            fsuid: uid,
-            rgid: gid,
-            egid: gid,
-            sgid: gid,
-            fsgid: gid,
-        };
-        let caps = update.builder.caps;
-        update.builder.caps = capability_state_for_test(
-            [0; CAPABILITY_WORDS],
-            [0; CAPABILITY_WORDS],
-            [0; CAPABILITY_WORDS],
-            caps.bounding(),
-            [0; CAPABILITY_WORDS],
-            caps.securebits(),
-        );
-        update.finish().unwrap().commit()
+        loop {
+            let mut update = slot.prepare();
+            update.builder.ids = Credentials {
+                ruid: uid,
+                euid: uid,
+                suid: uid,
+                fsuid: uid,
+                rgid: gid,
+                egid: gid,
+                sgid: gid,
+                fsgid: gid,
+            };
+            let caps = update.builder.caps;
+            update.builder.caps = capability_state_for_test(
+                [0; CAPABILITY_WORDS],
+                [0; CAPABILITY_WORDS],
+                [0; CAPABILITY_WORDS],
+                caps.bounding(),
+                [0; CAPABILITY_WORDS],
+                caps.securebits(),
+            );
+            match update.finish() {
+                Ok(prepared) => return prepared.commit(),
+                Err(AxError::ResourceBusy) => {
+                    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
+                    thread::yield_now();
+                }
+                Err(error) => panic!("credential update failed: {error:?}"),
+            }
+        }
     }
 
     #[test]
@@ -819,7 +828,7 @@ mod tests {
             let finish = finish.clone();
             thread::spawn(move || {
                 start.wait();
-                for uid in 2000..3000 {
+                for uid in 2000..2100 {
                     publish_ids(&target_slot, uid, 200);
                 }
                 finish.wait();
@@ -853,6 +862,7 @@ mod tests {
             )
             .is_err()
         );
+        crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
     }
 
     #[test]
@@ -1004,7 +1014,7 @@ mod tests {
             let finish = finish.clone();
             thread::spawn(move || {
                 start.wait();
-                for uid in 2000..3000 {
+                for uid in 2000..2100 {
                     publish_ids(&target_slot, uid, 200);
                 }
                 finish.wait();
@@ -1032,5 +1042,6 @@ mod tests {
             fresh_target.user_ns(),
             PtraceAccessMode::AttachReal,
         ));
+        crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
     }
 }

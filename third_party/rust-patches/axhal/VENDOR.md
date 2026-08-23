@@ -49,6 +49,10 @@ linkable on a host without changing the bare-metal feature graph.
   the broker-owned vector.
 - This patch does not change platform IRQ acknowledgement or the existing
   device hook; Linux ABI and scheduler policy remain above this crate.
+- Supplies the host-only dummy platform with one bounded, page-aligned 32 MiB
+  RAM arena.  The arena's physical and virtual addresses are identical only
+  within that range, allowing host unit tests to allocate and dereference page
+  tables without changing the real x86_64 platform path.
 
 ## Rebase rule
 

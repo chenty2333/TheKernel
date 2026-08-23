@@ -132,8 +132,6 @@ scope-local = "0.1"
 slab = { version = "0.4.9", default-features = false }
 spin = "0.10"
 thekernel-linux-process-adapter.workspace = true
-visa-core.workspace = true
-visa-coordinator.workspace = true
 strum = { version = "0.28", default-features = false, features = ["derive"] }
 syscalls = { version = "0.8", default-features = false }
 

@@ -1443,6 +1443,9 @@ impl AddrSpace {
 
     /// Creates a new empty address space.
     pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
+        #[cfg(test)]
+        crate::test_support::ensure_host_memory();
+
         let va_range = VirtAddrRange::try_from_start_size(base, size).ok_or(AxError::NoMemory)?;
         let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
             new_user_io_policy()?;

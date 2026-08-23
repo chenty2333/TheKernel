@@ -435,6 +435,7 @@ mod tests {
 
     use alloc::{sync::Arc, vec};
     use core::cell::Cell;
+    use std::thread;
 
     use axerrno::AxError;
     use thekernel_linux_cred::{CAPABILITY_WORDS, GroupInfo};
@@ -452,27 +453,39 @@ mod tests {
         let slot = CredentialSlot::try_new(root).unwrap();
         let uid = Kuid::from_raw(1000).unwrap();
         let gid = Kgid::from_raw(1000).unwrap();
-        let mut update = slot.prepare();
-        update.builder.ids = Credentials {
-            ruid: uid,
-            euid: uid,
-            suid: uid,
-            fsuid: uid,
-            rgid: gid,
-            egid: gid,
-            sgid: gid,
-            fsgid: gid,
-        };
-        update.builder.groups = GroupInfo::try_new(vec![gid]).unwrap();
-        update.builder.caps = capability_state_for_test(
-            [0; CAPABILITY_WORDS],
-            [0; CAPABILITY_WORDS],
-            [0; CAPABILITY_WORDS],
-            thekernel_linux_cred::CAPABILITY_VALID_MASK,
-            [0; CAPABILITY_WORDS],
-            0,
-        );
-        update.finish().unwrap().commit();
+        loop {
+            let mut update = slot.prepare();
+            update.builder.ids = Credentials {
+                ruid: uid,
+                euid: uid,
+                suid: uid,
+                fsuid: uid,
+                rgid: gid,
+                egid: gid,
+                sgid: gid,
+                fsgid: gid,
+            };
+            update.builder.groups = GroupInfo::try_new(vec![gid]).unwrap();
+            update.builder.caps = capability_state_for_test(
+                [0; CAPABILITY_WORDS],
+                [0; CAPABILITY_WORDS],
+                [0; CAPABILITY_WORDS],
+                thekernel_linux_cred::CAPABILITY_VALID_MASK,
+                [0; CAPABILITY_WORDS],
+                0,
+            );
+            match update.finish() {
+                Ok(prepared) => {
+                    prepared.commit();
+                    break;
+                }
+                Err(AxError::ResourceBusy) => {
+                    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
+                    thread::yield_now();
+                }
+                Err(error) => panic!("credential update failed: {error:?}"),
+            }
+        }
         slot
     }
 

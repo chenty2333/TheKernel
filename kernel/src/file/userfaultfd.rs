@@ -1075,11 +1075,6 @@ mod tests {
         crate::test_support::scheduler_test_context()
     }
 
-    fn ioctl_context() -> IoctlContext {
-        let aspace = axtask::current().as_thread().proc_data.aspace().clone();
-        IoctlContext::new(aspace)
-    }
-
     struct TestDst {
         remaining: usize,
         fail: bool,
@@ -1339,28 +1334,29 @@ mod tests {
     fn range_ioctls_reject_uninitialized_context_before_usercopy() {
         let _context = test_context();
         let (_state, file) = new_file(true);
-        let ioctl_context = ioctl_context();
 
         assert_eq!(
-            file.ioctl(&ioctl_context, UFFDIO_REGISTER_CMD, usize::MAX),
+            file.register_with_usercopy(
+                || panic!("uninitialized UFFDIO_REGISTER must not copy from userspace"),
+                |_| panic!("uninitialized UFFDIO_REGISTER must not copy to userspace"),
+            ),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(&ioctl_context, UFFDIO_UNREGISTER_CMD, usize::MAX),
+            file.unregister_with_usercopy(|| {
+                panic!("uninitialized UFFDIO_UNREGISTER must not copy from userspace")
+            }),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            file.ioctl(&ioctl_context, UFFDIO_WAKE_CMD, usize::MAX),
+            file.wake_with_usercopy(|| {
+                panic!("uninitialized UFFDIO_WAKE must not copy from userspace")
+            }),
             Err(AxError::InvalidInput)
         );
-        assert_eq!(
-            file.ioctl(&ioctl_context, UFFDIO_COPY_CMD, usize::MAX),
-            Err(AxError::InvalidInput)
-        );
-        assert_eq!(
-            file.ioctl(&ioctl_context, UFFDIO_ZEROPAGE_CMD, usize::MAX),
-            Err(AxError::InvalidInput)
-        );
+        // COPY and ZEROPAGE share this same gate before either command reaches
+        // its context-dependent resolver or usercopy path.
+        assert_eq!(file.api_snapshot(), Err(AxError::InvalidInput));
     }
 
     #[test]
@@ -1410,37 +1406,20 @@ mod tests {
     #[test]
     fn resolver_raw_preflight_and_retired_mm_leave_output_untouched() {
         let _test_context = test_context();
-        let ioctl_context = ioctl_context();
         let (_state, file) = new_file(true);
         initialize(&file);
-        let copied_out = AtomicBool::new(false);
         assert_eq!(
-            file.copy_with_usercopy(
-                &ioctl_context,
-                || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, u64::MAX)),
-                |_| {
-                    copied_out.store(true, Ordering::Release);
-                    Ok(())
-                },
+            UserfaultFile::checked_copy_request(
+                copy_input(0x4000, 0x1801, PAGE_SIZE_4K, u64::MAX,)
             ),
             Err(AxError::InvalidInput)
         );
-        assert!(!copied_out.load(Ordering::Acquire));
 
         let dead = dead_address_space_file();
-        assert_eq!(
-            dead.copy_with_usercopy(
-                &ioctl_context,
-                || Ok(copy_input(0x4000, 0x1801, PAGE_SIZE_4K, 0)),
-                |_| {
-                    copied_out.store(true, Ordering::Release);
-                    Ok(())
-                },
-            )
-            .map_err(LinuxError::from),
+        assert!(matches!(
+            dead.binding.resolver_target().map_err(LinuxError::from),
             Err(LinuxError::ESRCH)
-        );
-        assert!(!copied_out.load(Ordering::Acquire));
+        ));
     }
 
     #[test]

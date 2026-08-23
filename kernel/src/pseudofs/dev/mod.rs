@@ -32,7 +32,32 @@ use crate::{
     mm::map_usercopy_error,
     mounts,
     pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs},
+    task::Cred,
 };
+
+const LOOP_NODE_MODE: u16 = 0o600;
+
+fn require_blkroset_admin(credential: &Cred) -> VfsResult<()> {
+    if credential.has_effective_capability(CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(AxError::PermissionDenied)
+    }
+}
+
+/// Authorizes a mutation of global loop-device state.
+///
+/// Loop bindings are not scoped to the descriptor that issued the ioctl: they
+/// publish a backing file and change the device subsequently seen by every
+/// opener.  Consequently node DAC alone is insufficient (an already-open
+/// descriptor can be inherited or passed across a credential transition).
+pub(super) fn require_loop_admin(credential: &Cred) -> VfsResult<()> {
+    if credential.has_effective_capability(CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
 
 pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
@@ -216,12 +241,7 @@ impl DeviceOps for BlockDevice {
                     .map_err(map_usercopy_error)?;
             }
             BLKROSET => {
-                if !context
-                    .caller_cred()
-                    .has_effective_capability(CAP_SYS_ADMIN)
-                {
-                    return Err(AxError::PermissionDenied);
-                }
+                require_blkroset_admin(context.caller_cred())?;
                 let ro = context
                     .user_memory()
                     .read_value(arg as *const u32)
@@ -386,10 +406,11 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     // Loop devices
     root.add(
         "loop-control",
-        Device::new(
+        Device::new_with_permissions(
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(10, 237),
+            NodePermission::from_bits_truncate(LOOP_NODE_MODE),
             Arc::new(r#loop::LoopControl),
         ),
     );
@@ -397,10 +418,11 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         let dev_id = DeviceId::new(7, i);
         root.add(
             format!("loop{i}"),
-            Device::new(
+            Device::new_with_permissions(
                 fs.clone(),
                 NodeType::BlockDevice,
                 dev_id,
+                NodePermission::from_bits_truncate(LOOP_NODE_MODE),
                 Arc::new(r#loop::LoopDevice::new(i, dev_id)),
             ),
         );
@@ -456,4 +478,50 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
 
     SimpleDir::new_maker(fs, Arc::new(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn loop_nodes_are_owner_only_by_default() {
+        assert_eq!(
+            NodePermission::from_bits_truncate(LOOP_NODE_MODE).bits(),
+            0o600
+        );
+    }
+
+    #[test]
+    fn blkroset_admin_is_confined_to_initial_user_namespace() {
+        let initial = UserNamespace::try_new_root().unwrap();
+        let initial_root = Cred::try_root(initial.clone()).unwrap();
+        assert!(require_blkroset_admin(&initial_root).is_ok());
+
+        let child = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, true)
+            .unwrap();
+        let child_root = Cred::try_with_user_namespace(&initial_root, child).unwrap();
+        assert!(matches!(
+            require_blkroset_admin(&child_root),
+            Err(AxError::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn loop_mutation_admin_is_confined_to_initial_user_namespace() {
+        let initial = UserNamespace::try_new_root().unwrap();
+        let initial_root = Cred::try_root(initial.clone()).unwrap();
+        assert!(require_loop_admin(&initial_root).is_ok());
+
+        let child = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, true)
+            .unwrap();
+        let child_root = Cred::try_with_user_namespace(&initial_root, child).unwrap();
+        assert!(matches!(
+            require_loop_admin(&child_root),
+            Err(AxError::OperationNotPermitted)
+        ));
+    }
 }

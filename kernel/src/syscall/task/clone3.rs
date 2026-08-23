@@ -5,7 +5,10 @@ use axhal::uspace::UserContext;
 use bytemuck::AnyBitPattern;
 
 use super::clone::{CloneApi, CloneArgs, CloneFlags};
-use crate::mm::{UserMemoryCapability, map_usercopy_error};
+use crate::{
+    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
+    mm::{UserMemoryCapability, map_usercopy_error},
+};
 
 /// Structure passed to clone3() system call.
 #[repr(C)]
@@ -27,6 +30,26 @@ pub struct Clone3Args {
 const MIN_CLONE_ARGS_SIZE: usize = core::mem::size_of::<u64>() * 8;
 const CLONE3_ARGS_SIZE: usize = core::mem::size_of::<Clone3Args>();
 const CLONE3_ARGS_SIZE_VER2: usize = core::mem::size_of::<Clone3Args>();
+
+/// Validates clone3's explicit stack range and returns the initial x86_64 SP.
+///
+/// Linux validates the complete `[stack, stack + stack_size)` user range before
+/// converting the downward-growing stack base to its initial top. Keep the
+/// addition checked so an extreme userspace pair cannot wrap into a valid SP.
+fn clone3_stack_top(stack: u64, stack_size: u64) -> AxResult<usize> {
+    let stack = usize::try_from(stack).map_err(|_| AxError::InvalidInput)?;
+    let stack_size = usize::try_from(stack_size).map_err(|_| AxError::InvalidInput)?;
+    let stack_top = stack.checked_add(stack_size).ok_or(AxError::InvalidInput)?;
+    let user_space_end = USER_SPACE_BASE
+        .checked_add(USER_SPACE_SIZE)
+        .ok_or(AxError::BadState)?;
+
+    if stack < USER_SPACE_BASE || stack_top > user_space_end {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(stack_top)
+}
 
 fn validate_extra_bytes(bytes: &[u8]) -> AxResult<()> {
     if bytes.iter().any(|byte| *byte != 0) {
@@ -60,8 +83,8 @@ impl TryFrom<Clone3Args> for CloneArgs {
             return Err(AxError::InvalidInput);
         }
 
-        let stack = if args.stack > 0 {
-            (args.stack + args.stack_size) as usize
+        let stack = if args.stack != 0 {
+            clone3_stack_top(args.stack, args.stack_size)?
         } else {
             0
         };
@@ -146,7 +169,10 @@ mod tests {
         CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD,
     };
 
-    use super::{Clone3Args, CloneApi, CloneArgs, CloneFlags, validate_extra_bytes};
+    use super::{
+        Clone3Args, CloneApi, CloneArgs, CloneFlags, clone3_stack_top, validate_extra_bytes,
+    };
+    use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
 
     #[test]
     fn clone3_requires_matching_stack_and_stack_size() {
@@ -163,6 +189,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(CloneArgs::try_from(args), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn clone3_accepts_zero_stack_pair() {
+        let args = Clone3Args::default();
+        assert_eq!(CloneArgs::try_from(args).unwrap().stack, 0);
+    }
+
+    #[test]
+    fn clone3_accepts_stack_ending_at_user_address_boundary() {
+        let user_space_end = USER_SPACE_BASE + USER_SPACE_SIZE;
+        let args = Clone3Args {
+            stack: (user_space_end - 1) as u64,
+            stack_size: 1,
+            ..Default::default()
+        };
+        assert_eq!(CloneArgs::try_from(args).unwrap().stack, user_space_end);
+    }
+
+    #[test]
+    fn clone3_rejects_stack_range_outside_user_address_space() {
+        let args = Clone3Args {
+            stack: (USER_SPACE_BASE - 1) as u64,
+            stack_size: 1,
+            ..Default::default()
+        };
+        assert_eq!(CloneArgs::try_from(args), Err(AxError::InvalidInput));
+
+        let args = Clone3Args {
+            stack: (USER_SPACE_BASE + USER_SPACE_SIZE) as u64,
+            stack_size: 1,
+            ..Default::default()
+        };
+        assert_eq!(CloneArgs::try_from(args), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn clone3_rejects_stack_top_overflow_without_wrapping() {
+        assert_eq!(clone3_stack_top(u64::MAX, 1), Err(AxError::InvalidInput));
     }
 
     #[test]

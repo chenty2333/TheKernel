@@ -561,7 +561,7 @@ mod tests {
         let mut alg_type = [0_u8; 14];
         alg_type[..4].copy_from_slice(b"hash");
         let mut alg_name = [0_u8; 64];
-        alg_name[..5].copy_from_slice(b"sha1");
+        alg_name[..4].copy_from_slice(b"sha1");
         SockAddrAlgRaw {
             salg_family: family,
             salg_type: alg_type,

@@ -25,7 +25,7 @@ use memory_addr::PAGE_SIZE_4K;
 
 use crate::{
     file::{File, FileLike, IoctlContext, try_path_into_owned},
-    mm::map_usercopy_error,
+    mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::DeviceOps,
 };
 
@@ -94,6 +94,21 @@ fn snapshot_block_output(state: &LoopState, cmd: u32) -> VfsResult<LoopBlockOutp
         BLKSSZGET => Ok(LoopBlockOutput::U32(state.block_size)),
         BLKROGET => Ok(LoopBlockOutput::U32(state.read_only() as u32)),
         _ => unreachable!(),
+    }
+}
+
+fn copy_block_output(
+    user_memory: &UserMemoryCapability,
+    address: usize,
+    output: LoopBlockOutput,
+) -> AxResult {
+    match output {
+        LoopBlockOutput::U32(value) => user_memory
+            .write_bytes(address, &value.to_ne_bytes())
+            .map_err(map_usercopy_error),
+        LoopBlockOutput::U64(value) => user_memory
+            .write_bytes(address, &value.to_ne_bytes())
+            .map_err(map_usercopy_error),
     }
 }
 
@@ -659,6 +674,25 @@ fn loop_control_remove(number: usize) -> VfsResult<()> {
     Err(AxError::OperationNotSupported)
 }
 
+/// Identifies operations that can change a loop device globally rather than
+/// merely report its current state.  Keep this classification adjacent to the
+/// dispatch so new ioctls cannot accidentally inherit node-mode-only access.
+const fn loop_ioctl_requires_admin(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        LOOP_SET_FD
+            | LOOP_CONFIGURE
+            | LOOP_CHANGE_FD
+            | LOOP_CLR_FD
+            | LOOP_SET_STATUS
+            | LOOP_SET_STATUS64
+            | LOOP_SET_BLOCK_SIZE
+            | LOOP_SET_CAPACITY
+            | LOOP_SET_DIRECT_IO
+            | BLKROSET
+    )
+}
+
 /// /dev/loop-control controller.
 pub struct LoopControl;
 
@@ -671,11 +705,15 @@ impl DeviceOps for LoopControl {
         Err(AxError::InvalidInput)
     }
 
-    fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             LOOP_CTL_GET_FREE => loop_control_get_free(),
-            LOOP_CTL_ADD => loop_control_add(arg),
+            LOOP_CTL_ADD => {
+                super::require_loop_admin(context.caller_cred())?;
+                loop_control_add(arg)
+            }
             LOOP_CTL_REMOVE => {
+                super::require_loop_admin(context.caller_cred())?;
                 if arg > i32::MAX as usize {
                     return Err(AxError::InvalidInput);
                 }
@@ -784,6 +822,14 @@ impl DeviceOps for LoopDevice {
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
+        // DeviceOps is shared by every descriptor for this device and does
+        // not receive the descriptor's open mode.  Never treat a successful
+        // open as authority to alter its globally visible backing or state.
+        // The context is captured at syscall dispatch, so this also avoids
+        // resolving a potentially different credential or fd table later.
+        if loop_ioctl_requires_admin(cmd) {
+            super::require_loop_admin(context.caller_cred())?;
+        }
         match cmd {
             LOOP_SET_FD => {
                 let (backing, read_only) = Self::read_backing_fd(context, arg as i32)?;
@@ -865,16 +911,7 @@ impl DeviceOps for LoopDevice {
                     let state = self.state().lock();
                     snapshot_block_output(&state, cmd)?
                 };
-                match output {
-                    LoopBlockOutput::U32(value) => context
-                        .user_memory()
-                        .write_bytes(arg, &value.to_ne_bytes())
-                        .map_err(map_usercopy_error)?,
-                    LoopBlockOutput::U64(value) => context
-                        .user_memory()
-                        .write_bytes(arg, &value.to_ne_bytes())
-                        .map_err(map_usercopy_error)?,
-                }
+                copy_block_output(context.user_memory(), arg, output)?;
             }
             BLKROSET => {
                 let ro = context
@@ -983,8 +1020,9 @@ fn copy_cstr_to_c_char<T: LoopChar>(src: &str, dst: &mut [T]) {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use super::*;
-    use crate::task::AsThread;
 
     #[test]
     fn scalar_outputs_are_snapshotted_before_usercopy() {
@@ -1033,12 +1071,45 @@ mod tests {
     #[test]
     fn scalar_copyout_fault_leaves_state_unchanged() {
         let _test_context = crate::test_support::scheduler_test_context();
-        let aspace = axtask::current().as_thread().proc_data.aspace().clone();
-        let ioctl_context = IoctlContext::new(aspace);
         let device = LoopDevice::new(0, DeviceId::new(7, 0));
         let block_size = device.state().lock().block_size;
+        let output = {
+            let state = device.state().lock();
+            snapshot_block_output(&state, BLKSSZGET).unwrap()
+        };
+        let user_memory = UserMemoryCapability::new(Arc::new(Mutex::new(
+            crate::mm::new_user_aspace_empty().unwrap(),
+        )));
 
-        assert!(device.ioctl(&ioctl_context, BLKSSZGET, usize::MAX).is_err());
+        assert!(copy_block_output(&user_memory, usize::MAX, output).is_err());
         assert_eq!(device.state().lock().block_size, block_size);
+    }
+
+    #[test]
+    fn global_loop_mutations_are_explicitly_classified() {
+        for command in [
+            LOOP_SET_FD,
+            LOOP_CONFIGURE,
+            LOOP_CHANGE_FD,
+            LOOP_CLR_FD,
+            LOOP_SET_STATUS,
+            LOOP_SET_STATUS64,
+            LOOP_SET_BLOCK_SIZE,
+            LOOP_SET_CAPACITY,
+            LOOP_SET_DIRECT_IO,
+            BLKROSET,
+        ] {
+            assert!(loop_ioctl_requires_admin(command));
+        }
+        for command in [
+            LOOP_GET_STATUS,
+            LOOP_GET_STATUS64,
+            BLKGETSIZE,
+            BLKGETSIZE64,
+            BLKSSZGET,
+            BLKROGET,
+        ] {
+            assert!(!loop_ioctl_requires_admin(command));
+        }
     }
 }

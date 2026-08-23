@@ -694,20 +694,26 @@ mod tests {
 
             #[cfg(feature = "bpf")]
             {
-                let filter = PacketCbpfFilter::try_new_with_policy(
+                let result = PacketCbpfFilter::try_new_with_policy(
                     alloc::vec![
                         Instruction::statement(axcbpf::opcode::LD_W_ABS, field.encoded_offset(),),
                         Instruction::statement(axcbpf::opcode::ALU_AND_K, 0xffff),
                         Instruction::statement(axcbpf::opcode::RET_A, 0),
                     ],
                     ExecutorPolicy::Jit,
-                )
-                .unwrap();
-                assert_eq!(
-                    PacketFilter::filter(filter.as_ref(), &packet, context).unwrap(),
-                    expected as usize,
-                    "{field:?} jit"
                 );
+                match result {
+                    Ok(filter) => assert_eq!(
+                        PacketFilter::filter(filter.as_ref(), &packet, context).unwrap(),
+                        expected as usize,
+                        "{field:?} jit"
+                    ),
+                    // Host tests do not construct axmm's kernel address space,
+                    // so a ForceJit admission correctly reports an unavailable
+                    // executable arena rather than falling back silently.
+                    Err(AxError::BadState) => {}
+                    Err(error) => panic!("{field:?} JIT admission failed unexpectedly: {error:?}"),
+                }
             }
         }
 

@@ -35,7 +35,6 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("failed to register the EEVDF remote-reschedule IPI consumer");
     crate::mm::init_hardware_asids();
     crate::rcu::init().expect("Failed to initialize kernel RCU domains");
-    crate::world::init().expect("Failed to initialize local Semantic World authority");
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
     #[cfg(feature = "bpf")]
     if let Err(error) = crate::jit_memory::init() {
@@ -168,8 +167,6 @@ pub fn init(args: &[String], envs: &[String]) {
             .expect("Failed to allocate init exit fd table");
     let init_uts_ns =
         UtsNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init UTS namespace");
-    crate::world::register_initial_uts(&init_uts_ns)
-        .expect("Failed to register init UTS provider state");
     let proc = ProcessData::try_new(
         proc,
         prepared_zombie_snapshot,

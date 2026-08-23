@@ -150,6 +150,9 @@ fn reset_credential_state_probes() -> MutexGuard<'static, ()> {
     let guard = CRED_STATE_TEST_SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Host tests do not run the production policy worker. Reclaim anything
+    // left by the preceding serialized probe before resetting its traces.
+    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
     for trace in [
         &CRED_STATE_INIT_TRACE,
         &CRED_STATE_PREPARE_TRACE,
@@ -218,6 +221,15 @@ fn reset_credential_state_probes() -> MutexGuard<'static, ()> {
     CRED_STATE_PUBLICATION_TARGET.store(0, Ordering::SeqCst);
     CRED_STATE_MMAP_IMAGE_IDENTITY.store(0, Ordering::SeqCst);
     guard
+}
+
+fn reclaim_deferred_credential_owners() {
+    assert!(!credential_publication_lock_held());
+    assert_ne!(
+        crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY),
+        0,
+        "security test fixture expected a reclaimable retired credential"
+    );
 }
 
 fn reset_hardlink_vertical_probe() -> MutexGuard<'static, ()> {
@@ -6768,6 +6780,8 @@ fn ordinary_post_commit_notifies_once_in_order_before_retirement() {
     drop(old);
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
     drop(retirement);
+    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+    reclaim_deferred_credential_owners();
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
     drop(new);
     drop(slot);
@@ -6849,6 +6863,8 @@ fn exec_post_commit_notifies_once_with_exec_transition() {
 
     drop(old);
     drop(retirement);
+    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+    reclaim_deferred_credential_owners();
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
     drop(new);
     drop(slot);
@@ -6893,6 +6909,8 @@ fn exec_lifecycle_notifies_committing_then_generic_then_full_committed() {
     drop(old);
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
     drop(retirement);
+    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+    reclaim_deferred_credential_owners();
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
     drop(completed);
     assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
@@ -7026,8 +7044,10 @@ fn retired_module_state_is_freed_outside_publication_spin_lock() {
 
     let proposed = slot.prepare().finish().unwrap().commit();
     assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1 << 1);
-    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
     assert!(!credential_publication_lock_held());
+    reclaim_deferred_credential_owners();
+    assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
     drop(proposed);
     drop(slot);
 }

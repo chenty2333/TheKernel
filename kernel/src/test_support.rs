@@ -24,14 +24,32 @@ use std::sync::{Mutex, MutexGuard, Once};
 /// Serializes tests that share the emulated primary-CPU current-task slot.
 static SERIAL: Mutex<()> = Mutex::new(());
 static INIT: Once = Once::new();
+static PAGE_ALLOC_INIT: Once = Once::new();
 
-/// Brings the host scheduler up at most once per test binary.
+/// Brings up the host memory and scheduler fixtures once for this test process.
 ///
-/// Finding the scheduler already initialized is a normal outcome, not a
-/// failure: it means another test module got there first. The current-task
-/// slot being live is the property callers actually depend on, so that is what
-/// is asserted.
-pub(crate) fn ensure_scheduler() {
+/// The allocator's page-table frames use the dummy platform's identity
+/// phys-to-virt mapping, so its backing range must stay live for the complete
+/// process. Address-space teardown also completes a TLB grace through the
+/// current task, so a page-table test needs the scheduler even when it does not
+/// otherwise use a scheduler-facing API.
+pub(crate) fn ensure_host_memory() {
+    PAGE_ALLOC_INIT.call_once(|| {
+        let ranges = axhal::mem::phys_ram_ranges();
+        assert_eq!(
+            ranges.len(),
+            1,
+            "host tests require exactly one dummy page arena"
+        );
+        let (start, size) = ranges[0];
+        assert!(size >= 0x9000, "host dummy page arena is too small");
+        assert_eq!(
+            axalloc::global_allocator().available_pages(),
+            0,
+            "host page allocator was initialized before the test bootstrap"
+        );
+        axalloc::global_init(start, size);
+    });
     INIT.call_once(|| {
         if let Err(error) = axtask::init_scheduler() {
             assert!(
@@ -40,6 +58,16 @@ pub(crate) fn ensure_scheduler() {
             );
         }
     });
+}
+
+/// Brings the host scheduler up at most once per test binary.
+///
+/// Finding the scheduler already initialized is a normal outcome, not a
+/// failure: it means another test module got there first. The current-task
+/// slot being live is the property callers actually depend on, so that is what
+/// is asserted.
+pub(crate) fn ensure_scheduler() {
+    ensure_host_memory();
 }
 
 /// Brings the scheduler up and serializes the caller against every other test

@@ -92,9 +92,6 @@ thekernel-linux-usercopy = { version = "=0.1.0", default-features = false }
 axtlb = { package = "thekernel-axtlb", version = "=0.1.0", default-features = false }
 thekernel-linux-process-adapter = { version = "=0.1.0", path = "crates/process-adapter" }
 
-visa-core = { path = "../vISA/crates/visa-core", version = "=0.1.0" }
-visa-coordinator = { path = "../vISA/crates/visa-coordinator", version = "=0.1.0" }
-
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
 log = "0.4"

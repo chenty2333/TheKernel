@@ -301,6 +301,8 @@ fn control_operation(request: SimpleFileOperation<'_>) -> VfsResult<Option<Vec<u
     match request {
         SimpleFileOperation::Read => {
             let help = CONTROL_HELP.as_bytes().to_vec();
+            #[cfg(any(feature = "mm-lock-diagnostics", feature = "asid-switch-diagnostics"))]
+            let mut help = help;
             #[cfg(feature = "mm-lock-diagnostics")]
             help.extend_from_slice(MM_LOCK_CONTROL_HELP.as_bytes());
             #[cfg(feature = "asid-switch-diagnostics")]

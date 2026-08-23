@@ -921,29 +921,20 @@ impl UtsState {
 pub(crate) struct UtsNamespace {
     state: SpinNoIrq<UtsState>,
     owner_user_ns: Arc<UserNamespace>,
-    execution_gate: Arc<crate::world::ExecutionGate>,
 }
 
-/// Fallible part of a ProcessData UTS replacement. Acquiring the Semantic
-/// World consumer lease is kept separate from pointer publication so callers
-/// can prepare every namespace change before mutating another process scope.
+/// Prepared UTS namespace pointer replacement.
 pub(crate) struct PreparedUtsNamespaceReplacement {
     uts_ns: Arc<UtsNamespace>,
-    consumer_lease: Option<crate::world::UtsConsumerLease>,
 }
 
 impl PreparedUtsNamespaceReplacement {
     pub(crate) fn commit(self, process: &ProcessData) {
-        let Self {
-            uts_ns,
-            consumer_lease,
-        } = self;
+        let Self { uts_ns } = self;
         let mut current = process.uts_ns.write();
         let old_uts = core::mem::replace(&mut *current, uts_ns);
-        let old_lease = core::mem::replace(&mut *process.uts_consumer_lease.lock(), consumer_lease);
         drop(current);
         drop(old_uts);
-        drop(old_lease);
     }
 }
 
@@ -952,22 +943,15 @@ impl UtsNamespace {
         Arc::try_new(Self {
             state: SpinNoIrq::new(init_uts_state()),
             owner_user_ns,
-            execution_gate: crate::world::ExecutionGate::try_new()?,
         })
         .map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
-        // Forking publishes a new UTS namespace by copying provider state.
-        // It therefore participates in the same gate as hostname mutation;
-        // acquire before taking the state lock so a source fence cannot
-        // observe a concurrent copy, and never enter while holding it.
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
         Arc::try_new(Self {
             state: SpinNoIrq::new(state),
             owner_user_ns,
-            execution_gate: crate::world::ExecutionGate::try_new()?,
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -977,94 +961,23 @@ impl UtsNamespace {
     }
 
     pub(crate) fn nodename(&self) -> AxResult<Vec<u8>> {
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
         Ok(state.nodename[..state.nodename_len].to_vec())
     }
 
     pub(crate) fn domainname(&self) -> AxResult<Vec<u8>> {
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         let state = *self.state.lock();
         Ok(state.domainname[..state.domainname_len].to_vec())
     }
 
     pub(crate) fn set_nodename(&self, value: &[u8]) -> AxResult<()> {
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         self.state.lock().set_nodename(value);
         Ok(())
     }
 
     pub(crate) fn set_domainname(&self, value: &[u8]) -> AxResult<()> {
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
         self.state.lock().set_domainname(value);
         Ok(())
-    }
-
-    /// Enters the embedded UTS gate without consulting Semantic World.
-    pub(crate) fn try_enter_execution(&self) -> Option<crate::world::ExecutionLease> {
-        self.execution_gate.enter()
-    }
-
-    /// Closes new provider-state executions and returns a rollbackable fence.
-    pub(crate) fn freeze_execution(&self) -> AxResult<crate::world::ExecutionFence> {
-        self.execution_gate.begin_fence()
-    }
-
-    pub(crate) fn try_provider_snapshot(&self) -> AxResult<crate::world::UtsProviderSnapshot> {
-        let _lease = self.try_enter_execution().ok_or(AxError::ResourceBusy)?;
-        let state = *self.state.lock();
-        crate::world::UtsProviderSnapshot::from_fields(
-            &state.nodename[..state.nodename_len],
-            &state.domainname[..state.domainname_len],
-        )
-    }
-
-    pub(crate) fn try_provider_snapshot_after_fence(
-        &self,
-        fence: &crate::world::ExecutionFence,
-    ) -> AxResult<crate::world::UtsProviderSnapshot> {
-        if !fence.matches_gate(&self.execution_gate) {
-            return Err(AxError::InvalidInput);
-        }
-        fence.wait_for_drain()?;
-        let state = *self.state.lock();
-        crate::world::UtsProviderSnapshot::from_fields(
-            &state.nodename[..state.nodename_len],
-            &state.domainname[..state.domainname_len],
-        )
-    }
-
-    pub(crate) fn execution_gate(&self) -> Arc<crate::world::ExecutionGate> {
-        self.execution_gate.clone()
-    }
-
-    pub(crate) fn activate_execution(&self) -> AxResult<()> {
-        self.execution_gate.activate()
-    }
-
-    pub(crate) fn try_from_provider_snapshot(
-        owner_user_ns: Arc<UserNamespace>,
-        snapshot: crate::world::UtsProviderSnapshot,
-    ) -> AxResult<Arc<Self>> {
-        Arc::try_new(Self {
-            state: SpinNoIrq::new(UtsState {
-                nodename: {
-                    let mut value = [0; UTS_FIELD_LEN];
-                    value[..snapshot.nodename().len()].copy_from_slice(snapshot.nodename());
-                    value
-                },
-                nodename_len: snapshot.nodename().len(),
-                domainname: {
-                    let mut value = [0; UTS_FIELD_LEN];
-                    value[..snapshot.domainname().len()].copy_from_slice(snapshot.domainname());
-                    value
-                },
-                domainname_len: snapshot.domainname().len(),
-            }),
-            owner_user_ns,
-            execution_gate: crate::world::ExecutionGate::try_new()?,
-        })
-        .map_err(|_| AxError::NoMemory)
     }
 }
 
@@ -2103,10 +2016,6 @@ pub struct ProcessData {
     pid_ns: Arc<PidNamespace>,
     /// The UTS namespace for this process.
     uts_ns: RwLock<Arc<UtsNamespace>>,
-    /// Exact Semantic World consumer lease for the current UTS generation.
-    /// This is absent only for host/unit construction before the local
-    /// authority is initialized.
-    uts_consumer_lease: SpinNoIrq<Option<crate::world::UtsConsumerLease>>,
     /// The time namespace visible to this process.
     time_ns: RwLock<Arc<TimeNamespace>>,
     /// The time namespace inherited by children created after unshare/setns.
@@ -2452,7 +2361,6 @@ impl ProcessData {
         let start_realtime_sec = wall_time().as_secs();
         let start_monotonic_ns = monotonic_time_nanos();
         let mut executable_rollback = ExecutableRollback(executable);
-        let uts_consumer_lease = crate::world::acquire_uts_consumer(&uts_ns)?;
         let child_exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exec_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
@@ -2541,7 +2449,6 @@ impl ProcessData {
             cgroup_ns,
             pid_ns,
             uts_ns: RwLock::new(uts_ns),
-            uts_consumer_lease: SpinNoIrq::new(uts_consumer_lease),
             time_ns: RwLock::new(time_ns.clone()),
             time_ns_for_children: RwLock::new(time_ns),
         };
@@ -2856,56 +2763,12 @@ impl ProcessData {
         &self,
         uts_ns: Arc<UtsNamespace>,
     ) -> AxResult<PreparedUtsNamespaceReplacement> {
-        let consumer_lease = crate::world::acquire_uts_consumer(&uts_ns)?;
-        Ok(PreparedUtsNamespaceReplacement {
-            uts_ns,
-            consumer_lease,
-        })
+        Ok(PreparedUtsNamespaceReplacement { uts_ns })
     }
 
     pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) -> AxResult<()> {
-        let prepared = self.prepare_uts_ns_replacement(uts_ns)?;
-        prepared.commit(self);
+        self.prepare_uts_ns_replacement(uts_ns)?.commit(self);
         Ok(())
-    }
-
-    /// Atomically switches a process's canonical UTS consumer only if it
-    /// still points at the fenced source generation. Semantic World uses this
-    /// compare-and-swap-style operation during activation so stale bindings
-    /// cannot silently replace a concurrently selected namespace.
-    pub(crate) fn activate_and_compare_replace_uts_ns<F>(
-        &self,
-        expected: &Arc<UtsNamespace>,
-        replacement: Arc<UtsNamespace>,
-        commit: F,
-    ) -> AxResult<bool>
-    where
-        F: FnOnce(bool),
-    {
-        let mut current = self.uts_ns.write();
-        if !Arc::ptr_eq(&*current, expected) {
-            return Ok(false);
-        }
-        let had_consumer_lease = self.uts_consumer_lease.lock().is_some();
-        // Keep the UTS write lock across gate activation and pointer
-        // publication. No caller can observe the destination while it is
-        // still closed, and an activation failure leaves the old pointer
-        // untouched.
-        replacement.activate_execution()?;
-        commit(had_consumer_lease);
-        *current = replacement;
-        Ok(true)
-    }
-
-    pub(crate) fn install_uts_consumer_lease(
-        &self,
-        lease: Option<crate::world::UtsConsumerLease>,
-    ) -> Option<crate::world::UtsConsumerLease> {
-        core::mem::replace(&mut *self.uts_consumer_lease.lock(), lease)
-    }
-
-    pub(crate) fn has_uts_consumer_lease(&self) -> bool {
-        self.uts_consumer_lease.lock().is_some()
     }
 
     pub(crate) fn time_ns(&self) -> Arc<TimeNamespace> {
@@ -4102,8 +3965,6 @@ impl Drop for ProcessData {
     fn drop(&mut self) {
         let executable = *self.executable.lock();
         executable::release(executable);
-        let uts_consumer_lease = self.uts_consumer_lease.lock().take();
-        drop(uts_consumer_lease);
     }
 }
 
@@ -4166,14 +4027,34 @@ mod tests {
         let slot = CredentialSlot::try_new(Cred::try_root(namespace).unwrap()).unwrap();
         if uid != 0 {
             let uid = kuid(uid);
-            let mut update = slot.prepare();
-            update.builder.ids.ruid = uid;
-            update.builder.ids.euid = uid;
-            update.builder.ids.suid = uid;
-            update.builder.ids.fsuid = uid;
-            update.finish().unwrap().commit();
+            loop {
+                let mut update = slot.prepare();
+                update.builder.ids.ruid = uid;
+                update.builder.ids.euid = uid;
+                update.builder.ids.suid = uid;
+                update.builder.ids.fsuid = uid;
+                match update.finish() {
+                    Ok(prepared) => {
+                        prepared.commit();
+                        break;
+                    }
+                    Err(AxError::ResourceBusy) => {
+                        crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
+                        thread::yield_now();
+                    }
+                    Err(error) => panic!("credential update failed: {error:?}"),
+                }
+            }
         }
         slot
+    }
+
+    fn reclaim_deferred_credential_owners() {
+        assert_ne!(
+            crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY),
+            0,
+            "credential test fixture expected a reclaimable retired owner"
+        );
     }
 
     fn thread_signal_manager() -> Arc<ThreadSignalManager> {
@@ -4227,28 +4108,15 @@ mod tests {
     }
 
     #[test]
-    fn uts_execution_gate_drains_and_rolls_back_without_global_authority() {
+    fn uts_namespace_fork_copies_state_independently() {
         let owner = UserNamespace::try_new_root().unwrap();
-        let uts = UtsNamespace::try_new_root(owner).unwrap();
-        let lease = uts.try_enter_execution().unwrap();
-        let fence = uts.freeze_execution().unwrap();
-        assert!(uts.try_enter_execution().is_none());
-        drop(lease);
-        fence.wait_for_drain().unwrap();
-        fence.rollback().unwrap();
-        assert!(uts.try_enter_execution().is_some());
-    }
-
-    #[test]
-    fn uts_provider_snapshot_round_trips_logical_state_only() {
-        let owner = UserNamespace::try_new_root().unwrap();
-        let uts = UtsNamespace::try_new_root(owner.clone()).unwrap();
-        uts.set_nodename(b"world-node").unwrap();
-        uts.set_domainname(b"world-domain").unwrap();
-        let snapshot = uts.try_provider_snapshot().unwrap();
-        let copy = UtsNamespace::try_from_provider_snapshot(owner, snapshot).unwrap();
-        assert_eq!(copy.nodename().unwrap(), b"world-node");
-        assert_eq!(copy.domainname().unwrap(), b"world-domain");
+        let source = UtsNamespace::try_new_root(owner.clone()).unwrap();
+        source.set_nodename(b"source-node").unwrap();
+        source.set_domainname(b"source-domain").unwrap();
+        let copy = source.try_fork(owner).unwrap();
+        source.set_nodename(b"changed-source").unwrap();
+        assert_eq!(copy.nodename().unwrap(), b"source-node");
+        assert_eq!(copy.domainname().unwrap(), b"source-domain");
     }
 
     #[test]
@@ -4374,6 +4242,7 @@ mod tests {
                         .complete_post_commit();
                     drop(proposed);
                     drop(retirement);
+                    reclaim_deferred_credential_owners();
                     stronger_ready.wait();
                     stronger_sampled.wait();
 
@@ -4387,6 +4256,7 @@ mod tests {
                         .complete_post_commit();
                     drop(proposed);
                     drop(retirement);
+                    reclaim_deferred_credential_owners();
                     state.set_dumpability(Dumpability::UserDumpable);
                 }
             })
@@ -4587,6 +4457,7 @@ mod tests {
         drop(relationship);
         assert!(attached_credential_weak.upgrade().is_some());
         drop(retired);
+        reclaim_deferred_credential_owners();
         assert!(attached_credential_weak.upgrade().is_none());
     }
 
@@ -4849,6 +4720,7 @@ mod tests {
         // guards. The drain, rather than a temporary loop local, is therefore
         // the deterministic final owner.
         drop(drain);
+        reclaim_deferred_credential_owners();
         assert!(attached_credential_weak.upgrade().is_none());
     }
 
@@ -4967,6 +4839,7 @@ mod tests {
         drop(clone_vm_peer_state);
         assert!(old_state_weak.upgrade().is_some());
         drop(retirement);
+        reclaim_deferred_credential_owners();
         assert!(executor_old_weak.upgrade().is_none());
         assert!(old_state_weak.upgrade().is_some());
         drop(retired_image);
@@ -5172,6 +5045,7 @@ mod tests {
             assert!(old_image_weak.upgrade().is_some());
 
             drop(completed);
+            reclaim_deferred_credential_owners();
             trace.lock().push("retirement-dropped");
             assert!(old_leader_credential_weak.upgrade().is_none());
             assert!(old_executor_credential_weak.upgrade().is_none());

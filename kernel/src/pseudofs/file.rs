@@ -1,5 +1,5 @@
 use alloc::{borrow::Cow, sync::Arc, vec::Vec};
-use core::{any::Any, cmp::Ordering, task::Context};
+use core::{any::Any, task::Context};
 
 use axfs_ng_vfs::{
     FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
@@ -7,11 +7,32 @@ use axfs_ng_vfs::{
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
+use memory_addr::PAGE_SIZE_4K;
 
 use super::fs::{SimpleFs, SimpleFsNode};
 
+// Linux's proc sysctl write path accepts at most one page minus the trailing
+// NUL it adds before dispatching the handler.  SimpleFile is the shared value
+// endpoint for those controls, so keep its user-controlled submissions within
+// the same bounded shape before a handler can parse or retain them.
+const SIMPLE_FILE_MAX_VALUE_LEN: usize = PAGE_SIZE_4K - 1;
+
+fn validate_value_write_len(len: usize) -> VfsResult<()> {
+    if len > SIMPLE_FILE_MAX_VALUE_LEN {
+        return Err(VfsError::InvalidInput);
+    }
+    Ok(())
+}
+
 /// Operations for a simple file.
 pub trait SimpleFileOps: Send + Sync + 'static {
+    /// Default inode permissions for a regular file backed by these
+    /// operations. Read-only operation implementations must not advertise a
+    /// writable inode; writable pseudo-files are owner-writable by default.
+    fn default_permission(&self) -> NodePermission {
+        NodePermission::from_bits_truncate(0o444)
+    }
+
     /// Reads all content in the file.
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>>;
     /// Replaces the file's content with `data`.
@@ -28,16 +49,37 @@ pub enum SimpleFileOperation<'a> {
 
 /// A wrapper that implements [`SimpleFileOps`] for `Fn(SimpleFileOperation) ->
 /// VfsResult<Option<impl Into<Vec<u8>>>>`.
-pub struct RwFile<F>(F);
+pub struct RwFile<F> {
+    imp: F,
+    permission: NodePermission,
+}
 
 impl<F, R> RwFile<F>
 where
     F: Fn(SimpleFileOperation) -> VfsResult<Option<R>> + Send + Sync,
     R: Into<Vec<u8>>,
 {
-    /// Creates a new `RwFile`.
+    /// Creates an owner-writable `RwFile` suitable for global controls.
     pub fn new(imp: F) -> Self {
-        Self(imp)
+        Self {
+            imp,
+            permission: NodePermission::from_bits_truncate(0o644),
+        }
+    }
+
+    /// Creates a writable global control file that only root may modify.
+    pub fn new_root_writable(imp: F) -> Self {
+        Self::new(imp)
+    }
+
+    /// Preserves the existing access mode for per-process controls that must
+    /// remain writable by their non-root owner. Call sites remain responsible
+    /// for target-specific authorization until pseudo-inode ownership exists.
+    pub fn new_process_writable(imp: F) -> Self {
+        Self {
+            imp,
+            permission: NodePermission::default(),
+        }
     }
 }
 
@@ -46,8 +88,12 @@ where
     F: Fn(SimpleFileOperation) -> VfsResult<Option<R>> + Send + Sync + 'static,
     R: Into<Vec<u8>>,
 {
+    fn default_permission(&self) -> NodePermission {
+        self.permission
+    }
+
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
-        (self.0)(SimpleFileOperation::Read).and_then(|value| {
+        (self.imp)(SimpleFileOperation::Read).and_then(|value| {
             value
                 .map(|value| Cow::Owned(value.into()))
                 .ok_or(VfsError::InvalidData)
@@ -55,7 +101,7 @@ where
     }
 
     fn write_all(&self, data: &[u8]) -> VfsResult<()> {
-        (self.0)(SimpleFileOperation::Write(data)).map(|_| ())
+        (self.imp)(SimpleFileOperation::Write(data)).map(|_| ())
     }
 }
 
@@ -84,7 +130,11 @@ pub struct SimpleFile {
 impl SimpleFile {
     /// Creates a simple file from given file operations.
     pub fn new(fs: Arc<SimpleFs>, ty: NodeType, ops: impl SimpleFileOps) -> Arc<Self> {
-        Self::new_with_permission(fs, ty, NodePermission::default(), ops)
+        let permission = match ty {
+            NodeType::RegularFile => ops.default_permission(),
+            _ => NodePermission::default(),
+        };
+        Self::new_with_permission(fs, ty, permission, ops)
     }
 
     /// Creates a simple file from given file operations and permissions.
@@ -166,10 +216,11 @@ impl SimpleFile {
         fs: Arc<SimpleFs>,
         ops: impl SimpleFileOps,
     ) -> VfsResult<Arc<Self>> {
+        let permission = ops.default_permission();
         Self::try_new_with_permission_and_flags(
             fs,
             NodeType::RegularFile,
-            NodePermission::default(),
+            permission,
             NodeFlags::NON_CACHEABLE | NodeFlags::OPEN_CREDENTIAL,
             ops,
         )
@@ -235,58 +286,164 @@ impl FileNodeOps for SimpleFile {
         Ok(read)
     }
 
-    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        // Proc-style control files treat each write from offset 0 as a full
-        // value replacement instead of patching the previous text contents.
-        if offset == 0 {
-            self.ops.write_all(buf)?;
-            self.node.metadata.lock().size = buf.len() as u64;
-            return Ok(buf.len());
-        }
-        let data = self.ops.read_all()?;
-        let mut data = data.to_vec();
-        let end_pos = offset + buf.len() as u64;
-        if end_pos > data.len() as u64 {
-            data.resize(end_pos as usize, 0);
-        }
-        data[offset as usize..end_pos as usize].copy_from_slice(buf);
-        self.ops.write_all(&data)?;
-        self.node.metadata.lock().size = data.len() as u64;
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        // Proc-style value endpoints ignore the file position: each write is
+        // a complete value submission. Never turn the user-controlled offset
+        // into a sparse-file allocation. Validate the bounded value shape
+        // before dispatching to the handler.
+        validate_value_write_len(buf.len())?;
+        self.ops.write_all(buf)?;
+        self.node.metadata.lock().size = buf.len() as u64;
         Ok(buf.len())
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
-        let mut data = self.ops.read_all()?.to_vec();
-        data.extend_from_slice(buf);
-        self.ops.write_all(&data)?;
-        self.node.metadata.lock().size = data.len() as u64;
-        Ok((buf.len(), data.len() as u64))
+        // O_APPEND has the same value-submission semantics and does not
+        // concatenate generated contents.
+        validate_value_write_len(buf.len())?;
+        self.ops.write_all(buf)?;
+        self.node.metadata.lock().size = buf.len() as u64;
+        Ok((buf.len(), buf.len() as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
-        let data = self.ops.read_all()?;
-        match len.cmp(&(data.len() as u64)) {
-            Ordering::Less => {
-                self.ops.write_all(&data[..len as usize])?;
-                self.node.metadata.lock().size = len;
-                Ok(())
-            }
-            Ordering::Greater => {
-                let mut data = data.to_vec();
-                data.resize(len as usize, 0);
-                self.ops.write_all(&data)?;
-                self.node.metadata.lock().size = len;
-                Ok(())
-            }
-            _ => {
-                self.node.metadata.lock().size = len;
-                Ok(())
-            }
-        }
+        // Proc-style value endpoints do not have stored contents to resize.
+        // Linux accepts ftruncate/O_TRUNC on these files as a no-op; never
+        // synthesize a user-controlled buffer or dispatch a fake write.
+        let _ = len;
+        Ok(())
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
         self.ops.write_all(target.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::pseudofs::{DirMapping, SimpleDir};
+
+    fn new_test_file(ops: impl SimpleFileOps) -> Arc<SimpleFile> {
+        let _test_context = crate::test_support::scheduler_test_context();
+        let holder = Arc::new(axsync::Mutex::new(None));
+        let holder_for_root = holder.clone();
+        let filesystem = SimpleFs::new_with("simple-file-test".into(), 0, move |fs| {
+            *holder_for_root.lock() = Some(SimpleFile::new_regular(fs.clone(), ops));
+            SimpleDir::new_maker(fs, Arc::new(DirMapping::new()))
+        });
+        drop(filesystem);
+        holder.lock().take().unwrap()
+    }
+
+    #[test]
+    fn default_permissions_match_operation_capability() {
+        let read_only = new_test_file(|| Ok::<_, VfsError>(b"value"));
+        assert_eq!(read_only.metadata().unwrap().mode.bits(), 0o444);
+
+        let writable = new_test_file(RwFile::new_root_writable(|operation| match operation {
+            SimpleFileOperation::Read => Ok(Some(b"value".to_vec())),
+            SimpleFileOperation::Write(_) => Ok(None),
+        }));
+        assert_eq!(writable.metadata().unwrap().mode.bits(), 0o644);
+
+        let process_control =
+            new_test_file(RwFile::new_process_writable(|operation| match operation {
+                SimpleFileOperation::Read => Ok(Some(b"value".to_vec())),
+                SimpleFileOperation::Write(_) => Ok(None),
+            }));
+        assert_eq!(process_control.metadata().unwrap().mode.bits(), 0o666);
+    }
+
+    #[test]
+    fn positioned_write_ignores_offset_without_reading_or_allocating() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_ops = dispatches.clone();
+        let file = new_test_file(RwFile::new(move |operation| {
+            dispatches_for_ops.fetch_add(1, Ordering::Relaxed);
+            match operation {
+                SimpleFileOperation::Read => panic!("positioned write must not read old contents"),
+                SimpleFileOperation::Write(data) => {
+                    assert_eq!(data, b"x");
+                    Ok::<Option<Vec<u8>>, VfsError>(None)
+                }
+            }
+        }));
+
+        assert_eq!(file.write_at(b"x", u64::MAX), Ok(1));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sequential_positioned_writes_each_submit_a_complete_value() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_ops = dispatches.clone();
+        let file = new_test_file(RwFile::new(move |operation| {
+            dispatches_for_ops.fetch_add(1, Ordering::Relaxed);
+            match operation {
+                SimpleFileOperation::Read => panic!("write must not read old contents"),
+                SimpleFileOperation::Write(_) => Ok::<Option<Vec<u8>>, VfsError>(None),
+            }
+        }));
+
+        assert_eq!(file.write_at(b"first", 0), Ok(5));
+        assert_eq!(file.write_at(b"second", 5), Ok(6));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn append_submits_value_without_reading_or_concatenating() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_ops = dispatches.clone();
+        let file = new_test_file(RwFile::new(move |operation| {
+            dispatches_for_ops.fetch_add(1, Ordering::Relaxed);
+            match operation {
+                SimpleFileOperation::Read => panic!("append must not read old contents"),
+                SimpleFileOperation::Write(data) => {
+                    assert_eq!(data, b"new");
+                    Ok::<Option<Vec<u8>>, VfsError>(None)
+                }
+            }
+        }));
+
+        assert_eq!(file.append(b"new"), Ok((3, 3)));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(file.metadata().unwrap().size, 3);
+    }
+
+    #[test]
+    fn truncate_is_a_noop_without_dispatch_or_allocation() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_ops = dispatches.clone();
+        let file = new_test_file(RwFile::new(move |operation| {
+            dispatches_for_ops.fetch_add(1, Ordering::Relaxed);
+            match operation {
+                SimpleFileOperation::Read => Ok(Some(b"value".to_vec())),
+                SimpleFileOperation::Write(_) => Ok(None),
+            }
+        }));
+
+        assert_eq!(file.set_len(u64::MAX), Ok(()));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn oversized_write_is_rejected_before_handler_dispatch() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_ops = dispatches.clone();
+        let file = new_test_file(RwFile::new(move |operation| {
+            dispatches_for_ops.fetch_add(1, Ordering::Relaxed);
+            match operation {
+                SimpleFileOperation::Read => Ok(Some(b"value".to_vec())),
+                SimpleFileOperation::Write(_) => Ok(None),
+            }
+        }));
+
+        let oversized = [0; PAGE_SIZE_4K];
+        assert_eq!(file.write_at(&oversized, 0), Err(VfsError::InvalidInput));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 0);
     }
 }
 

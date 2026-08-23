@@ -1105,9 +1105,11 @@ mod tests {
 
         // The same real socket chain must reject a different protocol without
         // confusing the packet bytes' EtherType with skb->protocol.
+        let mut arp_frame = raw_ipv4_frame();
+        arp_frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
         submit(
             &sender,
-            &raw_ipv4_frame(),
+            &arp_frame,
             Some(loopback_send_address(ProtocolSelector::from_host_order(
                 0x0806,
             ))),

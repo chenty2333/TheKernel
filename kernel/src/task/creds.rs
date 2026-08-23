@@ -824,21 +824,33 @@ mod tests {
         let second = inherited_slot(&first);
         let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
 
-        let mut update = first.prepare();
-        let caps = update.builder.caps;
-        let mut effective = caps.effective();
-        let mut permitted = caps.permitted();
-        effective[word] &= !mask;
-        permitted[word] &= !mask;
-        update.builder.caps = capability_state_for_test(
-            effective,
-            permitted,
-            caps.inheritable(),
-            caps.bounding(),
-            caps.ambient(),
-            caps.securebits(),
-        );
-        update.finish().unwrap().commit();
+        loop {
+            let mut update = first.prepare();
+            let caps = update.builder.caps;
+            let mut effective = caps.effective();
+            let mut permitted = caps.permitted();
+            effective[word] &= !mask;
+            permitted[word] &= !mask;
+            update.builder.caps = capability_state_for_test(
+                effective,
+                permitted,
+                caps.inheritable(),
+                caps.bounding(),
+                caps.ambient(),
+                caps.securebits(),
+            );
+            match update.finish() {
+                Ok(prepared) => {
+                    prepared.commit();
+                    break;
+                }
+                Err(AxError::ResourceBusy) => {
+                    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
+                    thread::yield_now();
+                }
+                Err(error) => panic!("credential update failed: {error:?}"),
+            }
+        }
 
         assert!(!first.current().has_effective_capability(CAP_CHOWN));
         assert!(second.current().has_effective_capability(CAP_CHOWN));

@@ -1305,11 +1305,12 @@ fn prepare_user_io_pin_with_duration(
     #[cfg(feature = "test-io-control")]
     {
         let delay_ms = user_io_pin_test_delay_ms();
-        if delay_ms != 0 && user_io_pin_counters_enabled() {
-            if sleep(Duration::from_millis(delay_ms)).is_err() {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-                return None;
-            }
+        if delay_ms != 0
+            && user_io_pin_counters_enabled()
+            && sleep(Duration::from_millis(delay_ms)).is_err()
+        {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+            return None;
         }
     }
 
@@ -1505,7 +1506,9 @@ impl<'a> PinnedPhysicalCursor<'a> {
                 self.offset = 0;
                 continue;
             }
-            let len = limit.min(segment.len.checked_sub(self.offset)?);
+            let len = limit
+                .min(self.remaining)
+                .min(segment.len.checked_sub(self.offset)?);
             let paddr = segment.paddr.checked_add(self.offset)?;
             paddr.checked_add(len)?;
             self.offset = self.offset.checked_add(len)?;

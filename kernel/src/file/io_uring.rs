@@ -406,6 +406,15 @@ static DEFERRED_IO_URING_WORK: AtomicPtr<IoUring> = AtomicPtr::new(ptr::null_mut
 /// admission path may scan it, while completion routing remains a direct
 /// identity carried by the route group.
 const PHYSICAL_COMPLETION_MAX_DEVICES: usize = 8;
+/// Completion routing is shared only by rings targeting the *same* lower
+/// device. A failed device may retain every one of its QD owners until a
+/// typed reset proof arrives, so one QD-sized slab for all devices would let
+/// that failure deny direct-DMA admission to healthy siblings. Production
+/// therefore has one bounded QD namespace per installed-device slot. Tests
+/// exercise the same capacity contract: a test-only smaller table would hide
+/// the exact sibling-isolation property this router exists to preserve.
+const PHYSICAL_COMPLETION_ROUTER_CAPACITY: usize =
+    PHYSICAL_COMPLETION_MAX_DEVICES * IO_URING_PHYSICAL_MAX_QD;
 
 type PhysicalCompletionDeviceIdentities = [usize; PHYSICAL_COMPLETION_MAX_DEVICES];
 
@@ -1393,9 +1402,10 @@ impl PhysicalCompletionRouteChild {
 }
 
 /// A single physical request group owns one ring/request identity and up to
-/// sixteen lower descriptors.  Keeping the Arc and request metadata here,
-/// instead of in every child, makes the hot completion lookup bounded at 32
-/// groups without multiplying the ownership footprint by extent count.
+/// sixteen lower descriptors. Keeping the Arc and request metadata here,
+/// instead of in every child, makes the hot completion lookup bounded at the
+/// fixed shared QD without multiplying the ownership footprint by extent
+/// count.
 struct PhysicalCompletionRouteGroup {
     ring: Option<Arc<IoUring>>,
     request: Option<RequestId>,
@@ -1480,9 +1490,9 @@ struct PhysicalCompletionPendingOwner {
 }
 
 struct PhysicalCompletionRouter {
-    groups: [Option<PhysicalCompletionRouteGroup>; IO_URING_PHYSICAL_MAX_QD],
-    pending: [Option<PhysicalCompletionPendingOwner>; IO_URING_PHYSICAL_MAX_QD],
-    quarantine: [Option<QuarantinedPhysicalCompletion>; IO_URING_PHYSICAL_MAX_QD],
+    groups: [Option<PhysicalCompletionRouteGroup>; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
+    pending: [Option<PhysicalCompletionPendingOwner>; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
+    quarantine: [Option<QuarantinedPhysicalCompletion>; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
     quarantine_len: usize,
     work_count: usize,
     pending_count: usize,
@@ -1491,14 +1501,56 @@ struct PhysicalCompletionRouter {
 impl PhysicalCompletionRouter {
     const fn new() -> Self {
         Self {
-            groups: [const { None }; IO_URING_PHYSICAL_MAX_QD],
-            pending: [const { None }; IO_URING_PHYSICAL_MAX_QD],
-            quarantine: [const { None }; IO_URING_PHYSICAL_MAX_QD],
+            groups: [const { None }; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
+            pending: [const { None }; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
+            quarantine: [const { None }; PHYSICAL_COMPLETION_ROUTER_CAPACITY],
             quarantine_len: 0,
             work_count: 0,
             pending_count: 0,
         }
     }
+}
+
+fn physical_completion_device_group_capacity_available(
+    router: &PhysicalCompletionRouter,
+    device_identity: usize,
+) -> bool {
+    router
+        .groups
+        .iter()
+        .flatten()
+        .filter(|group| group.device_identity == device_identity)
+        .count()
+        < IO_URING_PHYSICAL_MAX_QD
+        && router.groups.iter().any(Option::is_none)
+}
+
+fn physical_completion_device_pending_capacity_available(
+    router: &PhysicalCompletionRouter,
+    device_identity: usize,
+) -> bool {
+    router
+        .pending
+        .iter()
+        .flatten()
+        .filter(|owner| owner.device_identity == device_identity)
+        .count()
+        < IO_URING_PHYSICAL_MAX_QD
+        && router.pending.iter().any(Option::is_none)
+}
+
+fn physical_completion_device_quarantine_capacity_available(
+    router: &PhysicalCompletionRouter,
+    device_identity: usize,
+) -> bool {
+    router
+        .quarantine
+        .iter()
+        .flatten()
+        .filter(|record| record.device_identity == device_identity)
+        .count()
+        < IO_URING_PHYSICAL_MAX_QD
+        && router.quarantine.iter().any(Option::is_none)
 }
 
 static PHYSICAL_COMPLETION_ROUTER: SpinNoIrq<PhysicalCompletionRouter> =
@@ -1554,6 +1606,9 @@ fn register_physical_completion_pending_owner(
             && Arc::ptr_eq(&owner.ring, ring)
     }) {
         return Err(AxError::BadState);
+    }
+    if !physical_completion_device_pending_capacity_available(&router, device_identity) {
+        return Err(AxError::ResourceBusy);
     }
     let Some(entry) = router.pending.iter_mut().find(|entry| entry.is_none()) else {
         return Err(AxError::ResourceBusy);
@@ -1668,8 +1723,10 @@ fn physical_completion_pending_owner_count_for_device(device_identity: usize) ->
 /// reservation occupies exactly one fixed request group, regardless of its
 /// extent count. It is deliberately separate from the per-ring QD
 /// reservation: completion ownership is device-global, so two rings must
-/// compete for the same fixed group table even when each ring still has local
-/// QD credit.
+/// compete for the same fixed group table for that device even when each ring
+/// still has local QD credit. Different devices receive independent bounded
+/// namespaces so one fail-closed quarantine cannot consume a sibling's
+/// admission capacity.
 struct PhysicalCompletionRouteReservation {
     group: usize,
     len: usize,
@@ -1688,13 +1745,7 @@ impl PhysicalCompletionRouteReservation {
             return Err(AxError::BadState);
         }
         let mut router = PHYSICAL_COMPLETION_ROUTER.lock();
-        let device_work_count = router
-            .groups
-            .iter()
-            .flatten()
-            .filter(|group| group.device_identity == device_identity)
-            .count();
-        if device_work_count >= IO_URING_PHYSICAL_MAX_QD {
+        if !physical_completion_device_group_capacity_available(&router, device_identity) {
             return Err(AxError::ResourceBusy);
         }
         let Some(group) = router.groups.iter().position(Option::is_none) else {
@@ -2456,6 +2507,12 @@ fn quarantine_physical_completion_for_device(
     replayable: bool,
 ) -> AxResult<()> {
     let mut router = PHYSICAL_COMPLETION_ROUTER.lock();
+    if !physical_completion_device_quarantine_capacity_available(&router, device_identity) {
+        // The effect route remains installed and its owner remains pinned;
+        // callers must take a typed reset/quarantine path instead of turning
+        // this bounded-storage failure into an I/O error or fallback.
+        return Err(AxError::ResourceBusy);
+    }
     let Some(index) = router.quarantine.iter().position(Option::is_none) else {
         // The effect route remains installed and its owner remains pinned;
         // callers must take a typed reset/quarantine path instead of turning
@@ -3516,20 +3573,53 @@ fn stabilize_physical_completion_overflow(device_identity: usize) {
     }
 }
 
+/// Ends one explicit reset attempt that failed before the lower layer
+/// produced a typed physical-retirement proof. This is deliberately not a
+/// retirement path: every route, effect, pin, cache lease, and device credit
+/// remains owned by the fenced slot. Clearing only `reset_pending` prevents a
+/// reset-unsupported or silent device from turning the shared worker into an
+/// infinite self-wake loop. A future management request may set the bit
+/// again, and a later lower terminal callback is still processed normally.
+fn stabilize_physical_completion_reset_failure(device_identity: usize) {
+    {
+        let mut registry = PHYSICAL_COMPLETION_DEVICE_REGISTRY.lock();
+        let Some(slot) = registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.identity == device_identity)
+        else {
+            return;
+        };
+        slot.active = false;
+        slot.admission_open = false;
+        slot.reset_pending = false;
+    }
+    if device_identity == physical_completion_default_identity() {
+        PHYSICAL_COMPLETION_DEVICE_ACTIVE.store(false, Ordering::Release);
+        PHYSICAL_COMPLETION_RESET_PENDING.store(false, Ordering::Release);
+    }
+}
+
 /// Services one registry slot without consulting root-device globals.  The
 /// lower SharedBlockDevice callback supplies the exact terminal generation;
 /// only after that proof are this device's routes and ring owners retired.
 fn service_physical_completion_reset_for_device(device_identity: usize) -> AxResult<()> {
     if let Some(event) = physical_completion_terminal_event_for_device(device_identity) {
         if event.state == PHYSICAL_COMPLETION_TERMINAL_QUARANTINED {
+            // Quarantine is an explicit lower terminal state but not a
+            // physical retirement proof. Consume this notification without
+            // releasing any route, pin, file lease, or device credit: the
+            // slot remains admission-closed and its owners remain custody.
+            // Leaving the same non-proof terminal event pending would make
+            // the shared worker self-wake forever, needlessly penalizing
+            // healthy devices. A later lower Quiesced/Retired notification
+            // is a new sequence and is still the only event that can retire
+            // this device's owners.
+            clear_physical_completion_terminal_event_for_device(device_identity);
             if physical_completion_device_progress_overflowed(device_identity)
                 || physical_completion_device_terminal_sequence_overflowed(device_identity)
             {
-                // Quarantine is an explicit lower terminal state but not a
-                // physical retirement proof.  For an already-overflowed
-                // marker, consume only the notification and remain fenced;
-                // repeated worker wakes cannot produce a new proof.
-                clear_physical_completion_terminal_event_for_device(device_identity);
                 stabilize_physical_completion_overflow(device_identity);
             }
             return Err(AxError::BadState);
@@ -3562,6 +3652,11 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
             return Ok(());
         }
         if slot.in_flight != 0 {
+            // An admitted submitter may still be between lower publication
+            // and route commit. Give that bounded hand-off time to install
+            // exact custody before attempting the lower reset again.
+            drop(registry);
+            defer_physical_completion_reset_retry();
             return Err(AxError::ResourceBusy);
         }
         slot.active = false;
@@ -3579,6 +3674,8 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
             || physical_completion_device_terminal_sequence_overflowed(device_identity)
         {
             stabilize_physical_completion_overflow(device_identity);
+        } else {
+            stabilize_physical_completion_reset_failure(device_identity);
         }
         return Err(error);
     }
@@ -3586,20 +3683,26 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
         // Reset without the exact lower terminal callback is not enough to
         // retire an upper route.  An overflowed marker has now spent its one
         // reset attempt and enters stable custody until an external exact
-        // proof or slot removal/reinstall; ordinary markers remain pending
-        // for a later recovery edge.
+        // proof or slot removal/reinstall; ordinary markers likewise become
+        // stable fail-closed custody until a new explicit reset request or
+        // later recovery edge supplies a proof.
         if physical_completion_device_progress_overflowed(device_identity)
             || physical_completion_device_terminal_sequence_overflowed(device_identity)
         {
             stabilize_physical_completion_overflow(device_identity);
+        } else {
+            stabilize_physical_completion_reset_failure(device_identity);
         }
         return Err(AxError::BadState);
     };
     if event.state == PHYSICAL_COMPLETION_TERMINAL_QUARANTINED {
+        // See the early terminal-event path above. The reset call did not
+        // prove physical quiescence, so retain all upper custody but consume
+        // the one notification to avoid an unbounded worker wake/retry loop.
+        clear_physical_completion_terminal_event_for_device(device_identity);
         if physical_completion_device_progress_overflowed(device_identity)
             || physical_completion_device_terminal_sequence_overflowed(device_identity)
         {
-            clear_physical_completion_terminal_event_for_device(device_identity);
             stabilize_physical_completion_overflow(device_identity);
         }
         return Err(AxError::BadState);
@@ -4051,16 +4154,16 @@ fn handoff_pending_physical_publication(
 fn retry_pending_physical_publications_for_device(
     device_identity: usize,
 ) -> AxResult<PhysicalPublicationRetryDisposition> {
-    let start =
-        PHYSICAL_PUBLICATION_RETRY_CURSOR.fetch_add(1, Ordering::AcqRel) % IO_URING_PHYSICAL_MAX_QD;
+    let start = PHYSICAL_PUBLICATION_RETRY_CURSOR.fetch_add(1, Ordering::AcqRel)
+        % PHYSICAL_COMPLETION_ROUTER_CAPACITY;
     let mut attempts = 0usize;
     let mut published = false;
 
-    for offset in 0..IO_URING_PHYSICAL_MAX_QD {
+    for offset in 0..PHYSICAL_COMPLETION_ROUTER_CAPACITY {
         if attempts == PHYSICAL_PUBLICATION_RETRY_BUDGET {
             break;
         }
-        let index = (start + offset) % IO_URING_PHYSICAL_MAX_QD;
+        let index = (start + offset) % PHYSICAL_COMPLETION_ROUTER_CAPACITY;
         let Some((ring, request, slot, identity, generation)) =
             physical_completion_pending_owner_snapshot(index)
         else {
@@ -5676,7 +5779,7 @@ impl PhysicalIoWorkerReservation<'_> {
                 return Err((AxError::BadState, issued, admission));
             }
         } else {
-            if router.pending.iter().flatten().count() >= IO_URING_PHYSICAL_MAX_QD {
+            if !physical_completion_device_pending_capacity_available(&router, device_identity) {
                 drop(router);
                 drop(state);
                 return Err((AxError::ResourceBusy, issued, admission));
@@ -8125,7 +8228,51 @@ impl IoUring {
 
     fn request_final_close(self: &Arc<Self>) {
         self.final_close_requested.store(true, Ordering::Release);
+        self.request_physical_reset_for_final_close();
         self.enqueue_deferred();
+    }
+
+    /// Closing a ring with a published physical effect is an explicit
+    /// management abort request, not evidence that DMA has stopped. Fence
+    /// only the exact devices used by this ring and hand the actual reset to
+    /// the dedicated task-context completion worker. That worker invokes the
+    /// lower bounded reset API and may release these owners only after its
+    /// `Quiesced` or `Retired` terminal proof arrives.
+    ///
+    /// A normally slow request never reaches this path: there is no timer
+    /// that reinterprets elapsed I/O time as quiescence or resets an active
+    /// device. A close provides the explicit cancellation/management edge
+    /// for an otherwise silent device; a lower `Quarantined` result remains
+    /// fail-closed and keeps this ring parked.
+    fn request_physical_reset_for_final_close(&self) {
+        let mut identities = [0usize; PHYSICAL_COMPLETION_MAX_DEVICES];
+        let mut len = 0;
+        {
+            let state = self.state.lock();
+            for work in state
+                .physical_work
+                .iter()
+                .chain(state.physical_custody.iter())
+                .flatten()
+            {
+                let identity = work.device_identity();
+                if identity == 0 || identities[..len].contains(&identity) {
+                    continue;
+                }
+                if len == identities.len() {
+                    // The registry itself bounds the number of physical
+                    // devices. A ring carrying an unrepresentable identity
+                    // set is already corrupted; preserve custody rather than
+                    // guessing which lower queue to reset.
+                    break;
+                }
+                identities[len] = identity;
+                len += 1;
+            }
+        }
+        for identity in identities[..len].iter().copied() {
+            mark_physical_completion_device_reset_pending(identity);
+        }
     }
 
     fn begin_final_close_step(&self) -> AxResult<bool> {
@@ -9495,7 +9642,7 @@ mod adapter_state_tests {
             0x1000,
             0x1000,
             [PhysicalIoSegment::new(0x2000, 0x1000); IO_URING_PHYSICAL_MAX_SEGMENTS],
-            5,
+            IO_URING_PHYSICAL_MAX_SEGMENTS + 1,
         );
         assert!(matches!(plan.physical_segments(), Err(AxError::BadState)));
     }
@@ -10370,7 +10517,7 @@ mod adapter_state_tests {
     }
 
     #[test]
-    fn physical_route_reservation_is_global_qd_limited() {
+    fn physical_route_reservation_is_per_device_qd_limited() {
         let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
         let mut reservations = Vec::new();
         for _ in 0..IO_URING_PHYSICAL_MAX_QD {
@@ -10388,6 +10535,53 @@ mod adapter_state_tests {
         ));
         drop(reservations);
         assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().work_count, 0);
+    }
+
+    #[test]
+    fn physical_router_quarantine_capacity_is_isolated_per_device() {
+        let failed_device = 0xDEAD;
+        let healthy_device = 0xBEEF;
+        let mut router = PhysicalCompletionRouter::new();
+
+        assert_eq!(
+            router.groups.len(),
+            PHYSICAL_COMPLETION_MAX_DEVICES * IO_URING_PHYSICAL_MAX_QD
+        );
+        for index in 0..IO_URING_PHYSICAL_MAX_QD {
+            let group = &mut router.groups[index];
+            *group = Some(PhysicalCompletionRouteGroup::reserved(failed_device, 7, 1));
+            router.quarantine[index] = Some(QuarantinedPhysicalCompletion {
+                completion: PhysicalIoCompletion {
+                    handle: index as u64 + 1,
+                    cookie: index as u64 + 1,
+                    bytes: 4096,
+                    success: false,
+                },
+                device_identity: failed_device,
+                replayable: false,
+            });
+        }
+
+        assert!(!physical_completion_device_group_capacity_available(
+            &router,
+            failed_device
+        ));
+        assert!(!physical_completion_device_quarantine_capacity_available(
+            &router,
+            failed_device
+        ));
+        // The failed device has consumed all of its QD entries, but a healthy
+        // sibling still has its own deterministic QD namespace. This is the
+        // property that prevents permanent custody on one device from
+        // globally closing physical-DMA admission.
+        assert!(physical_completion_device_group_capacity_available(
+            &router,
+            healthy_device
+        ));
+        assert!(physical_completion_device_quarantine_capacity_available(
+            &router,
+            healthy_device
+        ));
     }
 
     #[test]
@@ -10475,6 +10669,11 @@ mod adapter_state_tests {
     fn reset_retirement_releases_quarantine_and_unblocks_final_close() {
         let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
         let _context = crate::test_support::scheduler_test_context();
+        // This test models a lower owner without a full admission object, so
+        // its synthetic work generation is zero. Establish the matching
+        // synthetic route generation explicitly; other tests legitimately
+        // advance the global generation before this fixture runs.
+        let previous_generation = PHYSICAL_COMPLETION_DEVICE_GENERATION.swap(0, Ordering::AcqRel);
         let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
             .resolve(FeatureFlags::EMPTY)
             .unwrap();
@@ -10497,7 +10696,12 @@ mod adapter_state_tests {
             });
             state.physical_work_count = 1;
         }
-        ring.final_close_requested.store(true, Ordering::Release);
+        // Exercise the real close lifecycle before parking at the completion
+        // phase. Merely setting the final-close flag is not enough: request
+        // retirement may enqueue an EIO token, and `begin_draining` accepts
+        // it only after `begin_close` has established the Closing state.
+        ring.request_final_close();
+        assert!(!ring.begin_final_close_step().unwrap());
         ring.state.lock().final_close.phase = FinalClosePhase::Completions;
 
         assert!(physical_completion_has_quarantined_route());
@@ -10517,6 +10721,7 @@ mod adapter_state_tests {
         // CQE publication while final close is already in progress.  The
         // normal close-completions step can now discard it and finish.
         assert!(ring.close_completions_step().unwrap());
+        PHYSICAL_COMPLETION_DEVICE_GENERATION.store(previous_generation, Ordering::Release);
     }
 
     #[test]

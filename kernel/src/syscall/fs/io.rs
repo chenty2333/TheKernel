@@ -5942,12 +5942,13 @@ mod tests {
         ];
         let mut physical = [PhysicalIoSegment::new(0, 0); IO_URING_DMA_MAX_SEGMENTS];
         let count = clip_io_uring_dma_segments(&segments, 0x200, 0x1_000, &mut physical);
-        assert_eq!(count, Some(2));
+        assert_eq!(count, Some(3));
         assert_eq!(
-            &physical[..2],
+            &physical[..3],
             &[
                 PhysicalIoSegment::new(0x10_200, 0x600),
-                PhysicalIoSegment::new(0x20_000, 0x400),
+                PhysicalIoSegment::new(0x20_000, 0x800),
+                PhysicalIoSegment::new(0x30_000, 0x200),
             ]
         );
     }
@@ -6033,7 +6034,7 @@ mod tests {
             UserIoPinProvenance::Ineligible,
         ));
         assert!(!fixed_dma_geometry_eligible(
-            0x2200,
+            0x2201,
             0x1000,
             0x4000,
             true,

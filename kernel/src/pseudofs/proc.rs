@@ -20,7 +20,9 @@ use axsync::Mutex;
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
-    general::{CAP_SYS_ADMIN, CLOCK_BOOTTIME, CLOCK_MONOTONIC, RLIM_INFINITY, RLIM_NLIMITS},
+    general::{
+        CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC, RLIM_INFINITY, RLIM_NLIMITS,
+    },
     mempolicy::{
         MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
     },
@@ -83,6 +85,39 @@ use crate::{
 
 const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+fn validate_oom_score_adj_value(next_value: i32) -> VfsResult<()> {
+    if !(-1000..=1000).contains(&next_value) {
+        return Err(VfsError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn parse_oom_score_adj_value(data: &[u8]) -> VfsResult<i32> {
+    let value = str::from_utf8(data)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .ok_or(VfsError::InvalidInput)?;
+    validate_oom_score_adj_value(value)?;
+    Ok(value)
+}
+
+fn timerslack_access_decision(same_task: bool, capable: bool) -> VfsResult<()> {
+    if same_task || capable {
+        Ok(())
+    } else {
+        Err(VfsError::PermissionDenied)
+    }
+}
+
+fn check_timerslack_access(task: &AxTaskRef, actor: &Cred) -> VfsResult<()> {
+    let same_task = Arc::ptr_eq(&current(), task);
+    let target_cred = task.as_thread().current_cred();
+    timerslack_access_decision(
+        same_task,
+        ns_capable(actor, target_cred.user_ns(), CAP_SYS_NICE),
+    )
+}
 
 fn render_key_users_snapshot(
     records: Vec<KeyUserRecord>,
@@ -1754,7 +1789,7 @@ fn set_current_net_ipv4_conf_tag(iface: &str, value: i32) -> VfsResult<()> {
 }
 
 fn proc_ipv4_conf_tag_file(iface: &'static str) -> impl crate::pseudofs::SimpleFileOps {
-    RwFile::new(move |req| match req {
+    RwFile::new_root_writable(move |req| match req {
         SimpleFileOperation::Read => Ok(Some(
             format!("{}\n", current_net_ipv4_conf_tag(iface)?).into_bytes(),
         )),
@@ -3006,16 +3041,14 @@ impl SimpleDirOps for ThreadDir {
             "limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
             "oom_score_adj" => SimpleFile::new_regular(
                 fs,
-                RwFile::new(move |req| match req {
+                RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(
                         task.as_thread().oom_score_adj().to_string().into_bytes(),
                     )),
                     SimpleFileOperation::Write(data) => {
                         if !data.is_empty() {
-                            let value = str::from_utf8(data)
-                                .ok()
-                                .and_then(|it| it.parse::<i32>().ok())
-                                .ok_or(VfsError::InvalidInput)?;
+                            drop(proc_image_access(&task, process_view)?);
+                            let value = parse_oom_score_adj_value(data)?;
                             task.as_thread().set_oom_score_adj(value);
                         }
                         Ok(None)
@@ -3078,13 +3111,22 @@ impl SimpleDirOps for ThreadDir {
                 Ok(buf)
             })
             .into(),
-            "timerslack_ns" => SimpleFile::new_regular(
+            "timerslack_ns" => SimpleFile::try_new_regular_with_open_credential(
                 fs,
-                RwFile::new(move |req| match req {
-                    SimpleFileOperation::Read => Ok(Some(
-                        format!("{}\n", task.as_thread().proc_data.timerslack_ns()).into_bytes(),
-                    )),
+                RwFile::new_process_writable(move |req| match req {
+                    SimpleFileOperation::Read => {
+                        let actor =
+                            current_file_operation_security_credential().ok_or(VfsError::Io)?;
+                        check_timerslack_access(&task, actor.as_ref())?;
+                        Ok(Some(
+                            format!("{}\n", task.as_thread().proc_data.timerslack_ns())
+                                .into_bytes(),
+                        ))
+                    }
                     SimpleFileOperation::Write(data) => {
+                        let actor =
+                            current_file_operation_security_credential().ok_or(VfsError::Io)?;
+                        check_timerslack_access(&task, actor.as_ref())?;
                         if !data.is_empty() {
                             let value = str::from_utf8(data)
                                 .ok()
@@ -3096,11 +3138,11 @@ impl SimpleDirOps for ThreadDir {
                         Ok(None)
                     }
                 }),
-            )
+            )?
             .into(),
             "timens_offsets" => SimpleFile::try_new_regular_with_open_credential(
                 fs,
-                RwFile::new(move |req| match req {
+                RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(render_timens_offsets(&task))),
                     SimpleFileOperation::Write(data) => {
                         write_timens_offsets(&task, data)?;
@@ -3111,7 +3153,7 @@ impl SimpleDirOps for ThreadDir {
             .into(),
             "comm" => SimpleFile::new_regular(
                 fs,
-                RwFile::new(move |req| match req {
+                RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => {
                         let name = task.try_name().map_err(|_| VfsError::NoMemory)?;
                         let copy_len = name.len().min(15);
@@ -3122,6 +3164,12 @@ impl SimpleDirOps for ThreadDir {
                     }
                     SimpleFileOperation::Write(data) => {
                         if !data.is_empty() {
+                            if !Arc::ptr_eq(
+                                &current().as_thread().proc_data.proc,
+                                &task.as_thread().proc_data.proc,
+                            ) {
+                                return Err(VfsError::InvalidInput);
+                            }
                             let mut input = [0; 16];
                             let data = data.strip_suffix(b"\n").unwrap_or(data);
                             let copy_len = data.len().min(15);
@@ -4097,6 +4145,41 @@ mod tests {
 
     fn kgid(raw: u32) -> Kgid {
         Kgid::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn oom_score_adj_accepts_in_range_raise_and_lower_values() {
+        assert_eq!(validate_oom_score_adj_value(500), Ok(()));
+        assert_eq!(validate_oom_score_adj_value(0), Ok(()));
+        assert_eq!(parse_oom_score_adj_value(b"500\n"), Ok(500));
+    }
+
+    #[test]
+    fn oom_score_adj_rejects_values_outside_linux_range() {
+        assert_eq!(validate_oom_score_adj_value(-1000), Ok(()));
+        assert_eq!(validate_oom_score_adj_value(1000), Ok(()));
+        assert_eq!(
+            validate_oom_score_adj_value(-1001),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            validate_oom_score_adj_value(1001),
+            Err(VfsError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn timerslack_access_allows_self_without_capability() {
+        assert_eq!(timerslack_access_decision(true, false), Ok(()));
+    }
+
+    #[test]
+    fn timerslack_access_requires_capability_for_remote_task() {
+        assert_eq!(timerslack_access_decision(false, true), Ok(()));
+        assert_eq!(
+            timerslack_access_decision(false, false),
+            Err(VfsError::PermissionDenied)
+        );
     }
 
     #[test]

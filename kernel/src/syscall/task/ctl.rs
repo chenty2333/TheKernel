@@ -435,9 +435,6 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             } else {
                 None
             };
-            // Reserve the canonical Semantic World consumer before changing
-            // any shared scope state. Commit below is pointer-only and cannot
-            // leave a half-unshared process if the authority is at capacity.
             let prepared_uts = private_uts_ns
                 .map(|uts_ns| thread.proc_data.prepare_uts_ns_replacement(uts_ns))
                 .transpose()?;

@@ -1051,7 +1051,7 @@ mod tests {
         let base = 0x100usize;
         let array_bytes = (count + 1) * size_of::<usize>();
         let string = base + array_bytes;
-        let mut bytes = vec![0; string + 1];
+        let mut bytes = vec![0; string + super::EXEC_POINTER_ARRAY_CHUNK * size_of::<usize>()];
         for index in 0..count {
             put_usize(&mut bytes, base + index * size_of::<usize>(), string);
         }
@@ -1072,7 +1072,7 @@ mod tests {
         let base = PAGE_SIZE_4K + size_of::<usize>();
         let count = PAGE_SIZE_4K / size_of::<usize>() - 2;
         let string = 3 * PAGE_SIZE_4K;
-        let mut bytes = vec![0; string + 1];
+        let mut bytes = vec![0; string + PAGE_SIZE_4K];
         for index in 0..count {
             put_usize(&mut bytes, base + index * size_of::<usize>(), string);
         }
@@ -1139,7 +1139,7 @@ mod tests {
     fn exec_pointer_and_string_budget_is_e2big() {
         let base = 0x100usize;
         let string = base + 2 * size_of::<usize>();
-        let mut bytes = vec![0; string + 2];
+        let mut bytes = vec![0; string + 32];
         put_usize(&mut bytes, base, string);
         put_usize(&mut bytes, base + size_of::<usize>(), 0);
         bytes[string] = b'x';
