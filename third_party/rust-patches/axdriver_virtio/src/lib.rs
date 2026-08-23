@@ -120,13 +120,14 @@ pub fn probe_pci_device<H: VirtIoHal>(
     root: &mut PciRoot,
     bdf: DeviceFunction,
     dev_info: &DeviceFunctionInfo,
-) -> Option<(DeviceType, PciTransport, usize)> {
+) -> Option<(DeviceType, PciTransport, Option<usize>)> {
     use virtio_drivers::transport::pci::virtio_device_type;
 
     let dev_type = virtio_device_type(dev_info).and_then(as_dev_type)?;
-    let (line, _pin) = root.interrupt_line_and_pin(bdf)?;
     #[cfg(target_arch = "x86_64")]
-    let irq = pci_irq_vector_from_line(line)?;
+    let irq = root
+        .interrupt_line_and_pin(bdf)
+        .and_then(|(line, _pin)| pci_irq_vector_from_line(line));
     let transport = PciTransport::new::<H>(root, bdf).ok()?;
     Some((dev_type, transport, irq))
 }

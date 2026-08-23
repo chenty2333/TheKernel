@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,28 @@ def load_product():
 
 
 class SystemTestGateTests(unittest.TestCase):
+    def test_product_defaults_and_compile_time_network_match_q35_gate(self) -> None:
+        product = load_product()
+        args = product.build_parser().parse_args(["system-test"])
+        self.assertEqual((args.machine, args.firmware, args.smp, args.memory), (
+            "q35", "uefi", 4, "1G"
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = product.Artifacts(
+                Path(directory), product.parse_variant(args), "system"
+            )
+            environment = product.command_env(artifacts)
+        self.assertEqual(environment["AX_IP"], "10.0.2.15")
+        self.assertEqual(environment["AX_GW"], "10.0.2.2")
+        self.assertEqual(environment["SMOLTCP_IFACE_MAX_ADDR_COUNT"], "4")
+        platform = tomllib.loads(
+            (REPO_ROOT / "config/x86_64/q35-uefi.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(platform["devices"]["pci-ecam-base"], 0xB000_0000)
+        self.assertIn(
+            [0xB000_0000, 0x1000_0000], platform["devices"]["mmio-ranges"]
+        )
+
     def test_ktap_skip_is_rejected_by_default_gate(self) -> None:
         product = load_product()
         with tempfile.TemporaryDirectory() as directory:

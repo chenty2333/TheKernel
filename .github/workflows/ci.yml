@@ -29,6 +29,9 @@ jobs:
       # digest, but the override must also use ghcr.io/...@sha256:....  The
       # compiler itself remains controlled only by rust-toolchain.toml.
       image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:ad06d4055a3987aa3dc6758267d8dae9b2187271680e837c0c87cdb59d2a38ef' }}
+      # Portable Linux oracles exercise io_uring, seccomp, and isolated user/
+      # network namespaces. The job container must not mask those host ABIs.
+      options: --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

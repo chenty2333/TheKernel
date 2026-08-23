@@ -146,6 +146,11 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         "AX_PLATFORM": PLATFORM,
         "AX_MODE": "release",
         "AX_LOG": "off",
+        # QEMU user networking's fixed product subnet.  axnet-ng consumes
+        # these at compile time and rejects an absent address at boot.
+        "AX_IP": "10.0.2.15",
+        "AX_GW": "10.0.2.2",
+        "SMOLTCP_IFACE_MAX_ADDR_COUNT": "4",
         "AX_TARGET": TARGET,
         "AX_START_BANNER": "n",
         "AX_BACKTRACE": "n",
@@ -563,7 +568,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow KTAP SKIP results for a non-gating preview run",
     )
-    system_test.set_defaults(memory="128M")
     system_test.set_defaults(func=system_test_cmd)
     return parser
 

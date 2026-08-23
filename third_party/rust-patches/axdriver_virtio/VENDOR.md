@@ -32,7 +32,8 @@ The published archive contains no `tests/` files, so there are no upstream test 
   fails stop on missing handles or lost completion state, reaps already accepted
   requests before returning a later submission error, and continues reaping all
   handles after the first completion-status error.
-- Maintained delta: generic VirtIO block/net/input/gpu/vsock adapters, explicit IRQ propagation, and bounded queue lifecycle.
+- Maintained delta: generic VirtIO block/net/input/gpu/vsock adapters, optional
+  explicit IRQ propagation with polling fallback, and bounded queue lifecycle.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff
