@@ -29,6 +29,7 @@ from tools.kvm_scheduler_baseline import (
     stats,
     validate_pin_report,
 )
+from tools.kvm_subsystem_baseline import HostCpu, HostTopology
 from tools.qemu_runner.command import build_qemu_command
 from tools.qemu_runner.model import Drive
 
@@ -74,6 +75,23 @@ class SchedulerBaselineTests(unittest.TestCase):
             text=True,
             timeout=30,
         )
+
+    @staticmethod
+    def synthetic_single_thread_topology(cpus: list[int]) -> HostTopology:
+        """Return a homogeneous topology independent of the CI host's SMT layout."""
+        return HostTopology(tuple(
+            HostCpu(
+                cpu,
+                frozenset({cpu}),
+                "0",
+                str(index),
+                "1024",
+                "test-core",
+                "test-cache",
+                1_000_000,
+            )
+            for index, cpu in enumerate(cpus)
+        ))
 
     @staticmethod
     def write_pin_report(
@@ -640,8 +658,9 @@ class SchedulerBaselineTests(unittest.TestCase):
             rootfs.write_bytes(b"ext4")
             output = root / "output"
             allowed = sorted(os.sched_getaffinity(0))
-            if len(allowed) < 2:
-                self.skipTest("host exposes fewer than two CPUs")
+            if len(allowed) < 3:
+                self.skipTest("host exposes fewer than three CPUs")
+            topology = self.synthetic_single_thread_topology(allowed)
             args = build_parser().parse_args([
                 "run", "--target", "linux", "--linux-kernel", str(kernel),
                 "--linux-rootfs", str(rootfs), "--output", str(output),
@@ -674,6 +693,10 @@ class SchedulerBaselineTests(unittest.TestCase):
                 self.write_pin_report(
                     config.workdir / "thread-pinning.json", vcpu_cpus=vcpu, io_cpus=io,
                     count=int(os.environ["THEKERNEL_KVM_VCPU_COUNT"]),
+                    housekeeping_cpus=tuple(
+                        int(value)
+                        for value in os.environ["THEKERNEL_KVM_HOUSEKEEPING_CPUS"].split(",")
+                    ),
                 )
                 if not complete_pin:
                     pin_path = config.workdir / "thread-pinning.json"
@@ -685,6 +708,7 @@ class SchedulerBaselineTests(unittest.TestCase):
             with (
                 patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
                 patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
+                patch("tools.kvm_scheduler_baseline.read_host_topology", return_value=topology),
             ):
                 from tools.kvm_scheduler_baseline import run_command
 
@@ -911,8 +935,9 @@ class SchedulerBaselineTests(unittest.TestCase):
             initrd.write_bytes(b"initrd")
             output = root / "output"
             allowed = sorted(os.sched_getaffinity(0))
-            if len(allowed) < 2:
-                self.skipTest("host exposes fewer than two CPUs")
+            if len(allowed) < 3:
+                self.skipTest("host exposes fewer than three CPUs")
+            topology = self.synthetic_single_thread_topology(allowed)
             args = build_parser().parse_args([
                 "run", "--target", "linux",
                 "--linux-kernel", str(kernel),
@@ -949,12 +974,17 @@ class SchedulerBaselineTests(unittest.TestCase):
                     config.workdir / "thread-pinning.json",
                     vcpu_cpus=vcpu, io_cpus=io,
                     count=int(os.environ["THEKERNEL_KVM_VCPU_COUNT"]),
+                    housekeeping_cpus=tuple(
+                        int(value)
+                        for value in os.environ["THEKERNEL_KVM_HOUSEKEEPING_CPUS"].split(",")
+                    ),
                 )
                 return type("Result", (), {"returncode": 0})()
 
             with (
                 patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
                 patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
+                patch("tools.kvm_scheduler_baseline.read_host_topology", return_value=topology),
             ):
                 from tools.kvm_scheduler_baseline import run_command
 

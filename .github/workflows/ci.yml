@@ -28,7 +28,7 @@ jobs:
       # An optional repository variable may override this known-good immutable
       # digest, but the override must also use ghcr.io/...@sha256:....  The
       # compiler itself remains controlled only by rust-toolchain.toml.
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:a858cfc9bd234b4854476ed20a4a6d5f70c890960e42c83a7f3f3a3925e2bbf7' }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:ad06d4055a3987aa3dc6758267d8dae9b2187271680e837c0c87cdb59d2a38ef' }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -169,7 +169,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:a858cfc9bd234b4854476ed20a4a6d5f70c890960e42c83a7f3f3a3925e2bbf7' }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:ad06d4055a3987aa3dc6758267d8dae9b2187271680e837c0c87cdb59d2a38ef' }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
