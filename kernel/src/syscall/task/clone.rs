@@ -34,14 +34,16 @@ use crate::{
 };
 
 fn should_yield_after_clone(flags: CloneFlags) -> bool {
-    flags.intersects(
-        CloneFlags::THREAD
-            | CloneFlags::VM
-            | CloneFlags::VFORK
-            | CloneFlags::PARENT_SETTID
-            | CloneFlags::CHILD_SETTID
-            | CloneFlags::CHILD_CLEARTID,
-    )
+    // VFORK enters the readiness-armed parent wait immediately after publication;
+    // yielding first adds a scheduler window without advancing its handshake.
+    !flags.contains(CloneFlags::VFORK)
+        && flags.intersects(
+            CloneFlags::THREAD
+                | CloneFlags::VM
+                | CloneFlags::PARENT_SETTID
+                | CloneFlags::CHILD_SETTID
+                | CloneFlags::CHILD_CLEARTID,
+        )
 }
 
 fn clone_namespace_owner(
@@ -917,6 +919,7 @@ mod tests {
         CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
         clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
         clone_process_access_state, inherited_ioprio, release_clone_lifecycle_then,
+        should_yield_after_clone,
     };
     use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
 
@@ -959,6 +962,15 @@ mod tests {
         );
         // The caller performs runqueue publication only after this boundary.
         assert_eq!(state.get(), 1 << 1);
+    }
+
+    #[test]
+    fn vfork_wait_owns_the_parent_child_handoff() {
+        assert!(!should_yield_after_clone(CloneFlags::VFORK));
+        assert!(!should_yield_after_clone(
+            CloneFlags::VFORK | CloneFlags::VM
+        ));
+        assert!(should_yield_after_clone(CloneFlags::VM));
     }
 
     #[test]
