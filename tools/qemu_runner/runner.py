@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import lzma
 import os
 import shutil
 import sys
@@ -9,15 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .command import VALID_DRIVE_MODES, VALID_NETWORK_MODES, build_qemu_command
-from .evidence import file_evidence
-from .images import materialize_writable_image, prepare_image
 from .model import Arch, Drive, DriveMode, Interaction, RunLimits, RunResult
 from .process import run_process
-from .receipt import (
-    RECEIPT_SCHEMA_VERSION,
-    atomic_write_receipt,
-    input_forwarding_payload,
-)
 
 
 class RunnerError(ValueError):
@@ -31,7 +26,6 @@ class RunConfig:
     rootfs: Path
     workdir: Path
     log_path: Path
-    cache_dir: Path
     esp: Path | None = None
     rootfs_mode: DriveMode = "snapshot"
     extra_block: Path | None = None
@@ -57,7 +51,16 @@ class RunConfig:
     ovmf_vars: Path | None = None
     direct_kernel: bool = False
     receipt_path: Path | None = None
-    external_input_producer: bool = False
+    input_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _DrivePlan:
+    source: Path
+    runtime: Path
+    mode: DriveMode
+    label: str
+    compression_suffix: str | None
 
 
 def normalize_arch(value: str) -> Arch:
@@ -87,8 +90,7 @@ def _resolve_ovmf_image(
     return path
 
 
-def _copy_ovmf_vars(source: Path, workdir: Path) -> Path:
-    destination = workdir / "firmware" / "OVMF_VARS.fd"
+def _copy_ovmf_vars(source: Path, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.unlink(missing_ok=True)
@@ -127,34 +129,77 @@ def _validate_network(config: RunConfig) -> str:
     return network
 
 
-def _prepare_drive(
+def _plan_drive(
     source: Path,
     *,
     mode: DriveMode,
     label: str,
-    cache_dir: Path,
     workdir: Path,
-) -> Drive:
-    prepared = prepare_image(source, cache_dir=cache_dir)
-    runtime = prepared.runtime
-    if mode == "rw":
-        runtime = materialize_writable_image(
-            prepared,
-            destination_dir=workdir / "writable-images",
-            label=label,
-        )
-    return Drive(path=runtime, mode=mode)
+) -> _DrivePlan:
+    source = source.expanduser().resolve()
+    if not source.is_file():
+        raise RunnerError(f"{label} image does not exist: {source}")
+    if source.stat().st_size == 0:
+        raise RunnerError(f"{label} image is empty: {source}")
+    runtime = source
+    compression_suffix = None
+    if source.name.endswith((".xz", ".gz")):
+        compression_suffix = ".xz" if source.name.endswith(".xz") else ".gz"
+        runtime = (
+            workdir
+            / "images"
+            / f"{label}-{source.name.removesuffix(compression_suffix)}"
+        ).resolve()
+    return _DrivePlan(
+        source=source,
+        runtime=runtime,
+        mode=mode,
+        label=label,
+        compression_suffix=compression_suffix,
+    )
 
 
-def _qemu_evidence(requested: str) -> dict[str, str | int | None]:
+def _prepare_drive(plan: _DrivePlan) -> Drive:
+    source = plan.source
+    runtime = plan.runtime
+    if plan.compression_suffix is not None:
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        temporary = runtime.with_name(f".{runtime.name}.tmp")
+        temporary.unlink(missing_ok=True)
+        opener = lzma.open if plan.compression_suffix == ".xz" else gzip.open
+        try:
+            with opener(source, "rb") as input_file, temporary.open("wb") as output_file:
+                shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
+            if temporary.stat().st_size == 0:
+                raise RunnerError(f"decompressed {plan.label} image is empty: {source}")
+            temporary.replace(runtime)
+        except RunnerError:
+            temporary.unlink(missing_ok=True)
+            raise
+        except (OSError, EOFError, lzma.LZMAError) as error:
+            temporary.unlink(missing_ok=True)
+            raise RunnerError(
+                f"could not decompress {plan.label} image {source}: {error}"
+            ) from error
+    return Drive(path=runtime, mode=plan.mode)
+
+
+def _resolve_executable(requested: str) -> Path | None:
     resolved = shutil.which(requested)
     if resolved is None and "/" in requested:
         candidate = Path(requested).expanduser().resolve()
         if candidate.is_file():
             resolved = str(candidate)
+    return Path(resolved).resolve() if resolved is not None else None
+
+
+def _qemu_evidence(requested: str) -> dict[str, str | int | None]:
+    from .evidence import file_evidence
+
+    resolved = _resolve_executable(requested)
     if resolved is None:
         return {"requested": requested, "path": None, "size_bytes": None, "sha256": None}
-    evidence = file_evidence(Path(resolved).resolve())
+    evidence = file_evidence(resolved)
     return {"requested": requested, **evidence}
 
 
@@ -175,29 +220,51 @@ def _validate_output_destination(
     return destination
 
 
+def _temporary_destination(destination: Path) -> Path:
+    return destination.with_name(f".{destination.name}.tmp")
+
+
+def _validate_output_destinations(
+    outputs: tuple[tuple[str, Path], ...],
+    *,
+    protected_paths: tuple[Path, ...],
+) -> dict[str, Path]:
+    resolved: dict[str, Path] = {}
+    earlier_outputs: list[Path] = []
+    for label, destination in outputs:
+        checked = _validate_output_destination(
+            destination,
+            label=label,
+            protected_paths=tuple([*protected_paths, *earlier_outputs]),
+        )
+        resolved[label] = checked
+        earlier_outputs.append(checked)
+    return resolved
+
+
 def run(
     config: RunConfig,
     *,
-    input_stream=None,
     console_stream=None,
 ) -> RunResult:
     """Prepare explicit artifacts and run one architecture without discovery."""
-
-    if config.external_input_producer and not config.interaction.interactive:
-        raise RunnerError("external input producer requires interactive mode")
-    if config.external_input_producer and config.receipt_path is None:
-        raise RunnerError("external input producer requires a receipt")
 
     kernel = config.kernel.expanduser().resolve()
     if not kernel.is_file():
         raise RunnerError(f"kernel does not exist: {kernel}")
     workdir = config.workdir.expanduser().resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
-    cache_dir = config.cache_dir.expanduser().resolve()
-
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
     network = _validate_network(config)
+    input_path = None
+    if config.input_path is not None:
+        input_path = config.input_path.expanduser().resolve()
+        if not input_path.is_file():
+            raise RunnerError(f"input file does not exist: {input_path}")
+        if not config.interaction.interactive:
+            raise RunnerError("input file requires interactive mode")
+    if config.receipt_path is not None and input_path is None:
+        raise RunnerError("receipt requires an input file")
     effective_qemu_launcher = config.qemu_launcher
     if (
         effective_qemu_launcher is None
@@ -207,26 +274,33 @@ def run(
         # The scheduler pinner is a source-controlled Python entry point and
         # intentionally need not carry an executable bit in a checkout.
         effective_qemu_launcher = (sys.executable, config.qemu_binary)
-    rootfs = _prepare_drive(
+
+    qemu_requested = config.qemu_binary or "qemu-system-x86_64"
+    qemu_executable = _resolve_executable(qemu_requested)
+    launcher_executable = (
+        _resolve_executable(effective_qemu_launcher[0])
+        if effective_qemu_launcher is not None
+        else None
+    )
+
+    rootfs_plan = _plan_drive(
         config.rootfs,
         mode=rootfs_mode,
         label="rootfs",
-        cache_dir=cache_dir,
         workdir=workdir,
     )
-    extra_block = (
-        _prepare_drive(
+    extra_plan = (
+        _plan_drive(
             config.extra_block,
             mode=extra_mode,
             label="extra",
-            cache_dir=cache_dir,
             workdir=workdir,
         )
         if config.extra_block is not None
         else None
     )
 
-    esp = None
+    esp_plan = None
     ovmf_code = None
     ovmf_vars_source = None
     ovmf_vars_runtime = None
@@ -235,11 +309,10 @@ def run(
             raise RunnerError(
                 "x86_64 UEFI boot requires a GPT ESP; pass --esp or use --direct-kernel"
             )
-        esp = _prepare_drive(
+        esp_plan = _plan_drive(
             config.esp,
             mode="snapshot",
             label="esp",
-            cache_dir=cache_dir,
             workdir=workdir,
         )
         ovmf_code = _resolve_ovmf_image(
@@ -262,7 +335,60 @@ def run(
             ),
             "OVMF vars",
         )
-        ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, workdir)
+        ovmf_vars_runtime = (workdir / "firmware" / "OVMF_VARS.fd").resolve()
+
+    run_input_paths = [kernel, rootfs_plan.source]
+    if input_path is not None:
+        run_input_paths.append(input_path)
+    if esp_plan is not None:
+        run_input_paths.append(esp_plan.source)
+    if ovmf_code is not None:
+        run_input_paths.append(ovmf_code)
+    if ovmf_vars_source is not None:
+        run_input_paths.append(ovmf_vars_source)
+    if extra_plan is not None:
+        run_input_paths.append(extra_plan.source)
+    if qemu_executable is not None:
+        run_input_paths.append(qemu_executable)
+    if launcher_executable is not None:
+        run_input_paths.append(launcher_executable)
+
+    planned_outputs: list[tuple[str, Path]] = []
+    for plan in (rootfs_plan, extra_plan, esp_plan):
+        if plan is not None and plan.compression_suffix is not None:
+            planned_outputs.extend(
+                [
+                    (f"{plan.label} runtime", plan.runtime),
+                    (f"{plan.label} runtime temporary", _temporary_destination(plan.runtime)),
+                ]
+            )
+    if ovmf_vars_runtime is not None:
+        planned_outputs.extend(
+            [
+                ("OVMF vars runtime", ovmf_vars_runtime),
+                (
+                    "OVMF vars runtime temporary",
+                    _temporary_destination(ovmf_vars_runtime),
+                ),
+            ]
+        )
+    planned_outputs.append(("log", config.log_path))
+    if config.receipt_path is not None:
+        planned_outputs.append(("receipt", config.receipt_path))
+    resolved_outputs = _validate_output_destinations(
+        tuple(planned_outputs), protected_paths=tuple(run_input_paths)
+    )
+    log_path = resolved_outputs["log"]
+    receipt_path = (
+        resolved_outputs["receipt"] if config.receipt_path is not None else None
+    )
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    rootfs = _prepare_drive(rootfs_plan)
+    extra_block = _prepare_drive(extra_plan) if extra_plan is not None else None
+    esp = _prepare_drive(esp_plan) if esp_plan is not None else None
+    if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
+        ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, ovmf_vars_runtime)
 
     command = build_qemu_command(
         arch=config.arch,
@@ -284,122 +410,126 @@ def run(
         tap_name=config.tap_name,
         extra_args=config.extra_args,
     )
-    qemu_requested = config.qemu_binary or "qemu-system-x86_64"
-    qemu = _qemu_evidence(qemu_requested)
-    if qemu["path"] is not None and effective_qemu_launcher is None:
-        command = (str(qemu["path"]), *command[1:])
-    rootfs_source_path = config.rootfs.expanduser().resolve()
-    rootfs_runtime_path = rootfs.path.resolve()
-    run_input_paths = [kernel, rootfs_source_path, rootfs_runtime_path]
-    if config.esp is not None and esp is not None:
-        run_input_paths.extend([config.esp.expanduser().resolve(), esp.path.resolve()])
-    if ovmf_code is not None:
-        run_input_paths.append(ovmf_code)
-    if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
-        run_input_paths.extend([ovmf_vars_source, ovmf_vars_runtime])
-    if qemu["path"] is not None:
-        run_input_paths.append(Path(str(qemu["path"])))
-    if config.extra_block is not None and extra_block is not None:
-        run_input_paths.extend(
-            [config.extra_block.expanduser().resolve(), extra_block.path.resolve()]
-        )
-    log_path = _validate_output_destination(
-        config.log_path,
-        label="log",
-        protected_paths=tuple(run_input_paths),
-    )
-    rootfs_source = file_evidence(rootfs_source_path)
-    rootfs_runtime = (
-        rootfs_source.copy()
-        if rootfs_runtime_path == rootfs_source_path
-        else file_evidence(rootfs_runtime_path)
-    )
-    receipt = {
-        "schema_version": RECEIPT_SCHEMA_VERSION,
-        "state": "prepared",
-        "arch": config.arch,
-        "cpus": config.cpus,
-        "memory": config.memory,
-        "accel": config.accel,
-        "cpu": config.cpu,
-        "iothread_id": config.iothread_id,
-        "network": network,
-        "tap_name": config.tap_name,
-        "extra_args": list(config.extra_args),
-        "kernel": file_evidence(kernel),
-        "rootfs_source": rootfs_source,
-        "rootfs_runtime_before": rootfs_runtime,
-        "qemu": qemu,
-        "command": list(command),
-        "qemu_launcher": list(effective_qemu_launcher) if effective_qemu_launcher is not None else None,
-        "workdir": str(workdir),
-        "log_path": str(log_path),
-        "rootfs_mode": rootfs_mode,
-        "direct_kernel": config.direct_kernel,
-        "extra_block_mode": extra_mode,
-        "interaction": {
-            "interactive": config.interaction.interactive,
-            "input_after_marker": config.interaction.input_after_marker,
-            "stop_after_marker": config.interaction.stop_after_marker,
-            "external_input_producer": config.external_input_producer,
-        },
-    }
-    if config.esp is not None and esp is not None:
-        receipt["esp_source"] = file_evidence(config.esp.expanduser().resolve())
-        receipt["esp_runtime"] = file_evidence(esp.path.resolve())
-    if ovmf_code is not None:
-        receipt["ovmf_code"] = file_evidence(ovmf_code)
-    if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
-        receipt["ovmf_vars_source"] = file_evidence(ovmf_vars_source)
-        receipt["ovmf_vars_runtime"] = file_evidence(ovmf_vars_runtime)
-    if config.extra_block is not None and extra_block is not None:
-        receipt["extra_block_source"] = file_evidence(config.extra_block.expanduser().resolve())
-        receipt["extra_block_runtime_before"] = file_evidence(extra_block.path.resolve())
-    receipt_path = None
-    if config.receipt_path is not None:
-        receipt_path = _validate_output_destination(
-            config.receipt_path,
-            label="receipt",
-            protected_paths=tuple([*run_input_paths, log_path]),
-        )
-        atomic_write_receipt(receipt_path, receipt)
+    if qemu_executable is not None and effective_qemu_launcher is None:
+        command = (str(qemu_executable), *command[1:])
 
-    result = run_process(
-        arch=config.arch,
-        command=command,
-        workdir=workdir,
-        log_path=log_path,
-        limits=config.limits,
-        interaction=config.interaction,
-        input_stream=input_stream,
-        console_stream=console_stream,
-        proxy_interactive_input=config.external_input_producer,
-    )
+    rootfs_source_path = rootfs_plan.source
+    rootfs_runtime_path = rootfs.path.resolve()
+    if config.receipt_path is not None:
+        # Receipts are a performance-comparator input.  Keep their evidence
+        # capture out of the ordinary correctness path entirely.
+        from .evidence import file_evidence
+        from .receipt import (
+            RECEIPT_SCHEMA_VERSION,
+            atomic_write_receipt,
+            command_stream_evidence,
+            source_identity,
+        )
+
+        qemu = _qemu_evidence(qemu_requested)
+        rootfs_source = file_evidence(rootfs_source_path)
+        rootfs_runtime = (
+            rootfs_source.copy()
+            if rootfs_runtime_path == rootfs_source_path
+            else file_evidence(rootfs_runtime_path)
+        )
+        receipt = {
+            "schema_version": RECEIPT_SCHEMA_VERSION,
+            "source_identity": source_identity(),
+            "arch": config.arch,
+            "cpus": config.cpus,
+            "memory": config.memory,
+            "accel": config.accel,
+            "cpu": config.cpu,
+            "iothread_id": config.iothread_id,
+            "network": network,
+            "tap_name": config.tap_name,
+            "extra_args": list(config.extra_args),
+            "kernel": file_evidence(kernel),
+            "rootfs_source": rootfs_source,
+            "rootfs_runtime_before": rootfs_runtime,
+            "qemu": qemu,
+            "command": list(command),
+            "qemu_launcher": list(effective_qemu_launcher) if effective_qemu_launcher is not None else None,
+            "workdir": str(workdir),
+            "log_path": str(log_path),
+            "rootfs_mode": rootfs_mode,
+            "direct_kernel": config.direct_kernel,
+            "extra_block_mode": extra_mode,
+            "interaction": {
+                "interactive": config.interaction.interactive,
+                "input_after_marker": config.interaction.input_after_marker,
+                "stop_after_marker": config.interaction.stop_after_marker,
+            },
+        }
+        assert input_path is not None
+        input_evidence = command_stream_evidence(input_path)
+        if config.esp is not None and esp is not None:
+            receipt["esp_source"] = file_evidence(config.esp.expanduser().resolve())
+            receipt["esp_runtime"] = file_evidence(esp.path.resolve())
+        if ovmf_code is not None:
+            receipt["ovmf_code"] = file_evidence(ovmf_code)
+        if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
+            receipt["ovmf_vars_source"] = file_evidence(ovmf_vars_source)
+            receipt["ovmf_vars_runtime"] = file_evidence(ovmf_vars_runtime)
+        if config.extra_block is not None and extra_block is not None:
+            receipt["extra_block_source"] = file_evidence(config.extra_block.expanduser().resolve())
+            receipt["extra_block_runtime_before"] = file_evidence(extra_block.path.resolve())
+        assert receipt_path is not None
+
+    if input_path is None:
+        result = run_process(
+            arch=config.arch,
+            command=command,
+            workdir=workdir,
+            log_path=log_path,
+            limits=config.limits,
+            interaction=config.interaction,
+            console_stream=console_stream,
+        )
+    else:
+        with input_path.open("rb") as input_stream:
+            result = run_process(
+                arch=config.arch,
+                command=command,
+                workdir=workdir,
+                log_path=log_path,
+                limits=config.limits,
+                interaction=config.interaction,
+                input_stream=input_stream,
+                console_stream=console_stream,
+                capture_input_evidence=receipt_path is not None,
+            )
     if receipt_path is not None:
         receipt["rootfs_runtime_after"] = file_evidence(rootfs_runtime_path)
         receipt["log"] = file_evidence(result.log_path)
         if config.extra_block is not None and extra_block is not None:
             receipt["extra_block_runtime_after"] = file_evidence(extra_block.path.resolve())
-        final_state = "awaiting_producer" if config.external_input_producer else "complete"
-        if result.input_forwarding is not None:
-            stdin = input_forwarding_payload(result.input_forwarding)
-            if not config.external_input_producer:
-                stdin.update(
-                    {
-                        "state": "runner_complete",
-                        "source_fully_relayed": result.input_forwarding.relay_complete,
-                    }
-                )
-            receipt["stdin"] = stdin
+        from .receipt import command_stream_evidence, input_forwarding_payload
+
+        assert input_path is not None
+        assert result.input_forwarding is not None
+        receipt["stdin"] = input_forwarding_payload(
+            result.input_forwarding,
+            source=input_evidence,
+            source_unchanged=command_stream_evidence(input_path) == input_evidence,
+        )
         receipt.update(
             {
-                "state": final_state,
+                "state": "recorded",
                 "returncode": result.returncode,
                 "duration_ms": result.duration_ms,
                 "error_message": result.error_message,
                 "timed_out": result.timed_out,
                 "interrupted": result.interrupted,
                 "intentionally_stopped": result.intentionally_stopped,
+                "marker_success": result.marker_success,
+                "guest_clean_shutdown": result.guest_clean_shutdown,
+                "runner_terminated": result.runner_terminated,
+                "runner_termination_reason": result.runner_termination_reason,
+                # QEMU process exit observes neither device quiescence nor
+                # kernel-internal physical retirement.
+                "physical_retirement_proven": False,
             }
         )
         atomic_write_receipt(receipt_path, receipt)

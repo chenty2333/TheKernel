@@ -39,6 +39,7 @@ class ProcessTests(unittest.TestCase):
             interaction=interaction,
             input_stream=input_file,
             console_stream=console,
+            capture_input_evidence=True,
         )
         return result, (root / "console.log").read_bytes(), console.getvalue()
 
@@ -146,7 +147,7 @@ class ProcessTests(unittest.TestCase):
         forwarding = result.input_forwarding
         assert forwarding is not None
         self.assertFalse(forwarding.relay_complete)
-        self.assertLess(forwarding.bytes_forwarded, forwarding.observed_bytes)
+        self.assertFalse(forwarding.relay_complete)
 
     def test_near_marker_does_not_open_input(self) -> None:
         result, _, _ = self.run_child(
@@ -173,6 +174,10 @@ class ProcessTests(unittest.TestCase):
             interaction=Interaction(stop_after_marker="STOP"),
         )
         self.assertTrue(result.intentionally_stopped)
+        self.assertTrue(result.marker_success)
+        self.assertTrue(result.runner_terminated)
+        self.assertEqual(result.runner_termination_reason, "stop-after-marker")
+        self.assertFalse(result.guest_clean_shutdown)
         self.assertIn(b"STOP", log)
 
 

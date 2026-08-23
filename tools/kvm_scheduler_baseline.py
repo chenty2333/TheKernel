@@ -221,6 +221,21 @@ class Sample:
     attributes: tuple[tuple[str, str], ...] = ()
 
 
+def scheduler_evidence_class(samples: Iterable[Sample]) -> str:
+    """Require a per-sample CPU/PMU witness before calling a lane formal."""
+
+    captured = tuple(samples)
+    if not captured:
+        return "not-measured"
+    attributes = tuple(dict(sample.attributes) for sample in captured)
+    if all("cpu_cost_ns" in witness for witness in attributes):
+        return "cpu-cost-evidenced"
+    hardware_pmu = ("cycles", "instructions", "cache_misses", "branch_misses", "llc_hitm")
+    if all(any(metric in witness for metric in hardware_pmu) for witness in attributes):
+        return "pmu-evidenced"
+    return "measured-latency-only"
+
+
 @dataclass(frozen=True)
 class GuestRun:
     target: str
@@ -1430,6 +1445,8 @@ def stats_command(input_path: Path, output_path: Path, summary_tsv: Path | None)
         "schema": SCHEMA,
         "quantile": "nearest-rank",
         "raw_sample_count": len(samples),
+        "measurement_status": "measured" if samples else "not-measured",
+        "evidence_class": scheduler_evidence_class(samples),
         "optional_cost_metrics": list(PMU_EVIDENCE_COLUMNS),
         "optional_cost_policy": "record-when-available; missing-is-empty-not-zero",
         "cost_capabilities": host_cost_capabilities(),
@@ -1441,7 +1458,7 @@ def stats_command(input_path: Path, output_path: Path, summary_tsv: Path | None)
     temporary.replace(output_path)
     if summary_tsv is not None:
         _write_tsv(summary_tsv, SUMMARY_COLUMNS, rows)
-    return 0
+    return 0 if samples else 1
 
 
 def _require_file(path: Path, label: str) -> Path:
@@ -1641,40 +1658,39 @@ def run_command(args: argparse.Namespace) -> int:
                     previous = {key: os.environ.get(key) for key in env if key.startswith("THEKERNEL_KVM_")}
                     os.environ.update({key: value for key, value in env.items() if key.startswith("THEKERNEL_KVM_")})
                     try:
-                        with commands_path.open("rb") as commands:
-                            extra_args = [
-                                "-name",
-                                "guest=scheduler-baseline,debug-threads=on",
+                        extra_args = [
+                            "-name",
+                            "guest=scheduler-baseline,debug-threads=on",
+                        ]
+                        if images.direct_kernel:
+                            # ``-kernel`` accepts Linux's bzImage directly;
+                            # the rootfs remains the runner's explicit
+                            # virtio-blk vda image.
+                            extra_args[0:0] = [
+                                "-append",
+                                images.cmdline or DEFAULT_LINUX_CMDLINE,
                             ]
-                            if images.direct_kernel:
-                                # ``-kernel`` accepts Linux's bzImage directly;
-                                # the rootfs remains the runner's explicit
-                                # virtio-blk vda image.
-                                extra_args[0:0] = [
-                                    "-append",
-                                    images.cmdline or DEFAULT_LINUX_CMDLINE,
-                                ]
-                                if images.initrd is not None:
-                                    extra_args[0:0] = ["-initrd", str(images.initrd)]
-                            result = run(
-                                RunConfig(
-                                    arch="x86_64", kernel=images.kernel, rootfs=images.rootfs,
-                                    esp=images.esp, direct_kernel=images.direct_kernel,
-                                    workdir=run_dir, log_path=run_dir / "console.log",
-                                    cache_dir=output / "image-cache", memory=args.memory,
-                                    cpus=args.cpus, qemu_binary=str(pinner), accel="kvm",
-                                    cpu="host", iothread_id="baseline-io",
-                                    extra_args=tuple(extra_args),
-                                    receipt_path=run_dir / "qemu-receipt.json",
-                                    limits=RunLimits(total_timeout_secs=args.timeout,
-                                                      ready_timeout_secs=args.ready_timeout),
-                                    interaction=Interaction(interactive=True,
-                                                            input_after_marker=args.ready_marker),
-                                    ovmf_code=Path(args.ovmf_code).resolve() if args.ovmf_code else None,
-                                    ovmf_vars=Path(args.ovmf_vars).resolve() if args.ovmf_vars else None,
-                                ),
-                                input_stream=commands,
-                            )
+                            if images.initrd is not None:
+                                extra_args[0:0] = ["-initrd", str(images.initrd)]
+                        result = run(
+                            RunConfig(
+                                arch="x86_64", kernel=images.kernel, rootfs=images.rootfs,
+                                esp=images.esp, direct_kernel=images.direct_kernel,
+                                workdir=run_dir, log_path=run_dir / "console.log",
+                                memory=args.memory,
+                                cpus=args.cpus, qemu_binary=str(pinner), accel="kvm",
+                                cpu="host", iothread_id="baseline-io",
+                                extra_args=tuple(extra_args),
+                                receipt_path=run_dir / "qemu-receipt.json",
+                                input_path=commands_path,
+                                limits=RunLimits(total_timeout_secs=args.timeout,
+                                                  ready_timeout_secs=args.ready_timeout),
+                                interaction=Interaction(interactive=True,
+                                                        input_after_marker=args.ready_marker),
+                                ovmf_code=Path(args.ovmf_code).resolve() if args.ovmf_code else None,
+                                ovmf_vars=Path(args.ovmf_vars).resolve() if args.ovmf_vars else None,
+                            ),
+                        )
                     finally:
                         for key in ("THEKERNEL_KVM_QEMU", "THEKERNEL_KVM_VCPU_CPUS",
                                     "THEKERNEL_KVM_IO_CPUS", "THEKERNEL_KVM_BACKEND_CPUS",
@@ -1699,11 +1715,18 @@ def run_command(args: argparse.Namespace) -> int:
                             expected_external_backends=expected_external_backends,
                         )
                     guest = parse_guest_log(run_dir / "console.log", target=target, repeat=repeat)
-                    if (
+                    measured = (
                         pinning_reason is None
                         and result.returncode == 0
                         and guest.status == "ok"
-                    ):
+                    )
+                    evidence_class = scheduler_evidence_class(
+                        guest.samples if measured else ()
+                    )
+                    formal = measured and evidence_class in {
+                        "cpu-cost-evidenced", "pmu-evidenced"
+                    }
+                    if measured:
                         raw_samples.extend(guest.samples)
                     pin_status = pin_report_failure_status(pin_report, pinning_reason)
                     if result.returncode == 78 and pin_status == "pinning-error":
@@ -1722,8 +1745,12 @@ def run_command(args: argparse.Namespace) -> int:
                     else:
                         status = guest.status if result.returncode == 0 else "runner-error"
                         reason = guest.reason if status != "ok" else None
+                    if measured and not formal:
+                        status = "measured-latency-only"
+                        reason = "missing-per-sample-cpu-or-pmu-cost-witness"
                     runs.append({"target": target, "repeat": repeat, "workload": workload,
                                  "placement": placement, "status": status,
+                                 "evidence_class": evidence_class,
                                  "reason": reason,
                                  "returncode": result.returncode,
                                  "pin_report": str(pin_report.relative_to(output)),
@@ -1737,7 +1764,10 @@ def run_command(args: argparse.Namespace) -> int:
         "latency_ns": sample.latency_ns,
         **_optional_row_fields((sample,)),
     } for sample in raw_samples))
-    stats_command(output / "raw-samples.tsv", output / "summary.json", output / "summary.tsv")
+    if stats_command(
+        output / "raw-samples.tsv", output / "summary.json", output / "summary.tsv"
+    ) != 0:
+        overall_status = 1
     cost_capabilities = host_cost_capabilities()
     manifest = {"schema": SCHEMA, "qemu": qemu, "accel": "kvm", "cpu": "host",
                 "machine": "q35", "cpus": args.cpus,
@@ -1760,6 +1790,8 @@ def run_command(args: argparse.Namespace) -> int:
                     ),
                 },
                 "host_cpu_topology": host_topology_manifest(topology),
+                "measurement_status": "measured" if raw_samples else "not-measured",
+                "evidence_class": scheduler_evidence_class(raw_samples),
                 "cost_capabilities": cost_capabilities,
                 "boot_comparison": (
                     "TheKernel uses UEFI/OVMF; Linux uses direct bzImage when selected; "

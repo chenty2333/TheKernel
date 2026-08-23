@@ -13,9 +13,7 @@ Usage:
   scripts/dev-shell.sh --service builder -- COMMAND [ARGS...]
 
 Environment:
-  THEKERNEL_DEV_IMAGE        Docker image tag (default: thekernel-dev:local)
-  THEKERNEL_ROOTFS_HOST_DIR  Optional host rootfs directory mounted read-only
-                             at /opt/thekernel/rootfs
+  THEKERNEL_DEV_IMAGE        Docker image tag or digest (default: thekernel-dev:local)
   THEKERNEL_AX_REPO          Maintained thekernel-ax checkout (default: ../thekernel-ax)
   THEKERNEL_LINUX_ABI_REPO   Maintained Linux ABI checkout (default: ../thekernel-linux-abi)
 EOF
@@ -40,13 +38,6 @@ if [[ $# -eq 0 ]]; then
     set -- bash
 fi
 
-rootfs_host_dir="${THEKERNEL_ROOTFS_HOST_DIR:-}"
-if [[ -z "$rootfs_host_dir" ]]; then
-    rootfs_host_dir="$REPO_ROOT/.state/empty-rootfs"
-    mkdir -p "$rootfs_host_dir"
-fi
-
-export THEKERNEL_ROOTFS_HOST_DIR="$rootfs_host_dir"
 export THEKERNEL_DEV_IMAGE="${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}"
 export LOCAL_UID="$(id -u)"
 export LOCAL_GID="$(id -g)"
@@ -109,6 +100,5 @@ mount_linked_git_common_dir "$linux_abi_repo"
 
 cd "$REPO_ROOT"
 exec docker compose \
-    --env-file "$DEV_ENV_DIR/versions.env" \
     -f "$DEV_ENV_DIR/compose.yaml" \
     "${run_args[@]}" "$service" "$@"

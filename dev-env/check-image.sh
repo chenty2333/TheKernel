@@ -8,19 +8,11 @@ expect_cmd() {
     }
 }
 
-expect_target() {
-    rustup target list --installed | grep -qx "$1" || {
-        printf 'missing rust target: %s\n' "$1" >&2
-        exit 1
-    }
-}
-
 QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-9.2.1}"
-RUST_TOOLCHAIN_EXPECTED="${RUSTUP_TOOLCHAIN:-nightly}"
 
 for cmd in \
-    cargo rustc rustup python3 \
-    cargo-axplat axconfig-gen rust-objcopy rust-objdump \
+    python3 \
+    ip unshare \
     qemu-system-x86_64 \
     mke2fs debugfs fakeroot truncate mkfs.vfat mkimage \
     parted mcopy mmd \
@@ -36,14 +28,18 @@ command -v grub-mkstandalone >/dev/null 2>&1 \
     || command -v grub2-mkstandalone >/dev/null 2>&1 \
     || { printf 'missing grub-mkstandalone/grub2-mkstandalone\n' >&2; exit 1; }
 
-cargo axplat --version >/dev/null
-axconfig-gen --version >/dev/null
-
 qemu-system-x86_64 --version | grep -q "version ${QEMU_EXPECTED_VERSION}"
 
-rustup show active-toolchain | grep -q "^${RUST_TOOLCHAIN_EXPECTED}"
-
-expect_target x86_64-unknown-none
+for ovmf in \
+    /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    /usr/share/edk2/ovmf/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd
+do
+    if [[ -r "$ovmf" ]]; then
+        break
+    fi
+done
+[[ -r "$ovmf" ]] || { printf 'missing OVMF code image\n' >&2; exit 1; }
 
 x86_64-linux-gnu-gcc -print-sysroot >/dev/null
 

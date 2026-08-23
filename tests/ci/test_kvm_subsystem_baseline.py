@@ -716,7 +716,20 @@ class SubsystemBaselineTests(unittest.TestCase):
             self.assertIn(name, metrics)
             self.assertIn("status", metrics[name])
             self.assertFalse(metrics[name]["measured"])
+            self.assertEqual(metrics[name]["measurement_status"], "not-measured")
+        self.assertEqual(capabilities["measurement_status"], "not-measured")
         self.assertEqual(capabilities["throughput"]["concurrent"], False)
+
+    def test_subsystem_evidence_class_requires_a_sample_not_capability_probe(self) -> None:
+        self.assertEqual(subsystem_baseline.subsystem_evidence_class(()), "not-measured")
+        sample = subsystem_baseline.Sample(
+            "thekernel", 1, "seccomp", RUN_ID, "no_filter", None, None, None,
+            1, 1, 1, 10, 20, 3, 4,
+        )
+        self.assertEqual(
+            subsystem_baseline.subsystem_evidence_class((sample,)),
+            "cpu-cost-evidenced",
+        )
 
     def test_pin_validator_rejects_null_external_container_before_iteration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

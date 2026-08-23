@@ -12,7 +12,6 @@ ARCH=""
 OUTPUT=""
 SIZE_MB=96
 SOURCE_CACHE=${THEKERNEL_SOURCE_CACHE:-$REPO_ROOT/.state/source-cache}
-BUILD_ROOT=${THEKERNEL_ROOTFS_BUILD_DIR:-$REPO_ROOT/.state/rootfs-build}
 
 export LC_ALL=C
 export TZ=UTC
@@ -36,7 +35,6 @@ Environment overrides:
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
   THEKERNEL_SOURCE_CACHE      Download cache
-  THEKERNEL_ROOTFS_BUILD_DIR  Per-architecture compiler work directory
 EOF
 }
 
@@ -76,7 +74,7 @@ for command in curl debugfs find make mke2fs \
     }
 done
 
-mkdir -p "$SOURCE_CACHE" "$BUILD_ROOT/$ARCH" "$REPO_ROOT/.tmp"
+mkdir -p "$SOURCE_CACHE" "$REPO_ROOT/.tmp"
 ARCHIVE="$SOURCE_CACHE/busybox-${BUSYBOX_VERSION}.tar.bz2"
 
 if [ ! -f "$ARCHIVE" ]; then
@@ -224,12 +222,8 @@ tar -xjf "$ARCHIVE" -C "$WORK_ROOT"
 SOURCE_DIR="$WORK_ROOT/busybox-${BUSYBOX_VERSION}"
 STAGE="$WORK_ROOT/root"
 IMAGE="$WORK_ROOT/rootfs.img"
-BUSYBOX_BUILD="$BUILD_ROOT/$ARCH/busybox-${BUSYBOX_VERSION}"
+BUSYBOX_BUILD="$WORK_ROOT/busybox-build"
 
-# The outer rootfs cache already avoids work on an identity hit. A cache miss
-# must rebuild BusyBox from the selected compiler and configuration; reusing a
-# second, unkeyed build directory would make the artifact identity inaccurate.
-rm -rf "$BUSYBOX_BUILD"
 mkdir -p "$BUSYBOX_BUILD"
 install -m 0644 "$REPO_ROOT/tests/rootfs/busybox-${BUSYBOX_VERSION}.config" \
     "$BUSYBOX_BUILD/.config"
@@ -244,6 +238,7 @@ make -C "$BUSYBOX_BUILD" ARCH="$BUSYBOX_ARCH" \
 
 mkdir -p "$STAGE/etc/thekernel" \
     "$STAGE/opt/thekernel-tests/bin" \
+    "$STAGE/opt/thekernel-tests/portable" \
     "$STAGE/usr/share/licenses/busybox" \
     "$STAGE/usr/share/licenses/thekernel" \
     "$STAGE/usr/share/doc/thekernel" \
@@ -267,50 +262,26 @@ rm -f "$STAGE/sbin/init"
     "$REPO_ROOT/tests/guest/system-init.c" \
     -o "$STAGE/sbin/init"
 
-build_guest_tool() {
-    local source=$1
-    local output=$2
-    shift 2
+for source in "$REPO_ROOT"/tests/guest/tools/*.c; do
+    [ -f "$source" ] || continue
+    name=${source##*/}
+    name=${name%.c}
     "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
-        "$@" "$REPO_ROOT/tests/guest/tools/$source" \
-        -o "$STAGE/opt/thekernel-tests/bin/$output"
-}
+        -pthread "$source" \
+        -o "$STAGE/opt/thekernel-tests/bin/thekernel-$name"
+done
 
-build_guest_tool hackstress.c thekernel-hackstress -pthread
-build_guest_tool exec-smoke.c thekernel-exec-smoke
-build_guest_tool epoll-smoke.c thekernel-epoll-smoke -pthread
-build_guest_tool futex-smoke.c thekernel-futex-smoke -pthread
-build_guest_tool futex2-waitv-signal-differential.c thekernel-futex2-waitv-signal -pthread
-build_guest_tool io-uring-smoke.c thekernel-io-uring-smoke
-build_guest_tool io-uring-buffers-smoke.c thekernel-io-uring-buffers-smoke -pthread
-build_guest_tool io-uring-directio-differential.c thekernel-io-uring-directio-differential -pthread
-build_guest_tool proc-zombie-differential.c thekernel-proc-zombie-differential
-build_guest_tool io-uring-physical-perf.c thekernel-io-uring-physical-perf
-build_guest_tool io-pin-safety.c thekernel-io-pin-safety -pthread
-build_guest_tool memory-pressure-smoke.c thekernel-memory-pressure-smoke
-build_guest_tool mm-performance.c thekernel-mm-performance -pthread
-build_guest_tool scheduler-baseline.c thekernel-scheduler-baseline -pthread
-build_guest_tool smp-tlb-shootdown.c thekernel-smp-tlb-shootdown -pthread
-build_guest_tool oom-admission.c thekernel-oom-admission
-build_guest_tool alarm-smoke.c thekernel-alarm-smoke
-build_guest_tool packet-socket-smoke.c thekernel-packet-socket-smoke
-build_guest_tool packet-perf.c thekernel-packet-perf
-build_guest_tool ioprio-smoke.c thekernel-ioprio-smoke
-build_guest_tool membarrier-smoke.c thekernel-membarrier-smoke -pthread
-build_guest_tool rseq-smoke.c thekernel-rseq-smoke
-build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias
-build_guest_tool signal-wait-boundary.c thekernel-signal-wait-boundary
-build_guest_tool pause-smoke.c thekernel-pause-smoke
-build_guest_tool seccomp-smoke.c thekernel-seccomp-smoke -pthread
-build_guest_tool seccomp-perf.c thekernel-seccomp-perf
-build_guest_tool signal-order-smoke.c thekernel-signal-order-smoke
-build_guest_tool signal-fp-smoke.c thekernel-signal-fp-smoke
-build_guest_tool sync-fence.c thekernel-sync-fence
-build_guest_tool userfaultfd-smoke.c thekernel-userfaultfd-smoke -pthread
-build_guest_tool wait-boundary.c thekernel-wait-boundary -pthread
-build_guest_tool vfork-smoke.c thekernel-vfork-smoke
+for source in "$REPO_ROOT"/tests/guest/portable/*.c; do
+    [ -f "$source" ] || continue
+    name=${source##*/}
+    name=${name%.c}
+    "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
+        -pthread "$source" \
+        -o "$STAGE/opt/thekernel-tests/portable/$name"
+done
 
 for script in "$REPO_ROOT"/tests/guest/nightly/*; do
+    [ -f "$script" ] || continue
     install -m 0755 "$script" \
         "$STAGE/opt/thekernel-tests/bin/thekernel-nightly-${script##*/}"
 done

@@ -2,13 +2,7 @@ name: thekernel-dev
 
 x-common-env: &common-env
   HOME: /home/thekernel
-  CARGO_HOME: /usr/local/cargo
-  RUSTUP_HOME: /usr/local/rustup
-  THEKERNEL_ROOTFS_DIR: /opt/thekernel/rootfs
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   PYTHONDONTWRITEBYTECODE: "1"
-  THEKERNEL_CI_TARGET_DIR: /workspace/target/ci-per-commit-container
-  THEKERNEL_CI_SIBLING_TARGET_DIR: /workspace/target/ci-maintained-siblings-container
   LOCAL_UID: "${LOCAL_UID:-1000}"
   LOCAL_GID: "${LOCAL_GID:-1000}"
 
@@ -21,24 +15,13 @@ x-common-volumes: &common-volumes
   - type: volume
     source: thekernel-home
     target: /home/thekernel
-  - type: bind
-    source: ${THEKERNEL_ROOTFS_HOST_DIR}
-    target: /opt/thekernel/rootfs
-    read_only: true
-    bind:
-      selinux: z
 
 services:
   dev:
-    image: ${THEKERNEL_DEV_IMAGE}
+    image: ${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
-        RUST_TOOLCHAIN: ${RUST_TOOLCHAIN}
-        QEMU_VERSION: ${QEMU_VERSION}
-        QEMU_SHA256: ${QEMU_SHA256}
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -47,15 +30,10 @@ services:
     volumes: *common-volumes
 
   builder:
-    image: ${THEKERNEL_DEV_IMAGE}
+    image: ${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
-        RUST_TOOLCHAIN: ${RUST_TOOLCHAIN}
-        QEMU_VERSION: ${QEMU_VERSION}
-        QEMU_SHA256: ${QEMU_SHA256}
     working_dir: /workspace
     privileged: true
     stdin_open: true

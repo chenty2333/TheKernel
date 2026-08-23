@@ -968,6 +968,29 @@ def write_json(evidence: Evidence, output: TextIO) -> None:
     output.write("\n")
 
 
+def infer_workload_arguments(log: Path, arch: str) -> tuple[int, int, int, int]:
+    """Read the workload declaration from the self-describing guest stream."""
+
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        raise EvidenceError(f"cannot read log {log}: {error}") from error
+    records = [line for line in lines if line.startswith("MM_PERF_RUN ")]
+    if len(records) != 1:
+        raise EvidenceError(
+            f"expected one MM_PERF_RUN record while inferring workload, found {len(records)}"
+        )
+    fields = parse_fields(records[0], "MM_PERF_RUN ")
+    required = {"schema", "arch", "iterations", "vmas", "pin_iterations", "pin_workers", "page_size"}
+    require_keys(fields, required, required, "MM_PERF_RUN")
+    if fields["schema"] != RUN_SCHEMA or fields["arch"] != arch:
+        raise EvidenceError("MM_PERF_RUN does not identify the requested architecture")
+    return tuple(
+        parse_positive_int(fields[name], name, "MM_PERF_RUN")
+        for name in ("iterations", "vmas", "pin_iterations", "pin_workers")
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="validate and normalize TheKernel MM performance evidence"
@@ -975,10 +998,10 @@ def main() -> int:
     parser.add_argument("log", type=Path)
     parser.add_argument("--arch", required=True, choices=("x86_64", "host"))
     parser.add_argument("--cpus", required=True, type=int)
-    parser.add_argument("--iterations", required=True, type=int)
-    parser.add_argument("--vmas", required=True, type=int)
-    parser.add_argument("--pin-iterations", required=True, type=int)
-    parser.add_argument("--pin-workers", required=True, type=int)
+    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--vmas", type=int)
+    parser.add_argument("--pin-iterations", type=int)
+    parser.add_argument("--pin-workers", type=int)
     parser.add_argument("--format", choices=("tsv", "json"), default="tsv")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -990,6 +1013,15 @@ def main() -> int:
         args.pin_iterations,
         args.pin_workers,
     )
+    if any(value is None for value in workload_arguments):
+        if any(value is not None for value in workload_arguments):
+            parser.error(
+                "--iterations, --vmas, --pin-iterations, and --pin-workers must be supplied together"
+            )
+        try:
+            workload_arguments = infer_workload_arguments(args.log, args.arch)
+        except EvidenceError as error:
+            parser.error(str(error))
     if not all(value > 0 for value in workload_arguments):
         parser.error(
             "--iterations, --vmas, --pin-iterations, and --pin-workers must be positive"
@@ -1000,10 +1032,10 @@ def main() -> int:
             args.log,
             args.arch,
             args.cpus,
-            iterations=args.iterations,
-            vmas=args.vmas,
-            pin_iterations=args.pin_iterations,
-            pin_workers=args.pin_workers,
+            iterations=workload_arguments[0],
+            vmas=workload_arguments[1],
+            pin_iterations=workload_arguments[2],
+            pin_workers=workload_arguments[3],
         )
         if args.output is None:
             output = sys.stdout

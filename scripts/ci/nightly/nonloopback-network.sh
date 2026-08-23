@@ -61,7 +61,7 @@ while IFS= read -r arch; do
         nightly_fail "host network peer failed with exit $status: $peer_log"
     fi
     nightly_validate_guest_log \
-        "$run_dir/qemu.log" clean \
+        "$run_dir/console.log" clean \
         CI_NIGHTLY_NONLOOPBACK_NETWORK_START \
         CI_NIGHTLY_NONLOOPBACK_NETWORK_PASS
     grep -Fq 'network-peer: validated guest request' "$peer_log" \

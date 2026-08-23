@@ -82,10 +82,10 @@ class X86UefiEspTests(unittest.TestCase):
             "part_gpt fat search search_fs_file multiboot multiboot2 serial terminal",
             source,
         )
-        self.assertIn("make/x86_64/grub.cfg", source)
+        self.assertIn("config/x86_64/grub.cfg", source)
 
     def test_default_grub_entry_is_multiboot2_with_multiboot1_fallback(self) -> None:
-        config = (ROOT / "make" / "x86_64" / "grub.cfg").read_text(encoding="utf-8")
+        config = (ROOT / "config" / "x86_64" / "grub.cfg").read_text(encoding="utf-8")
         self.assertIn('menuentry "TheKernel (Multiboot2)"', config)
         self.assertIn("multiboot2 /TheKernel.elf", config)
         self.assertIn('menuentry "TheKernel (Multiboot1 fallback)"', config)

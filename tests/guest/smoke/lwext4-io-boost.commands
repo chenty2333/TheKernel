@@ -1,0 +1,123 @@
+set -e
+echo 'KTAP version 1'
+echo '1..1'
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
+rm -f /io_src_auto /io_copy_auto /io_dirty_auto /io_readback_auto /io_trunc_auto /io_first_auto
+rm -f /io_unaligned_auto /io_unaligned_copy_auto /io_sparse_auto /io_sparse_first_auto /io_zero_auto
+rm -f /io_multi_auto /io_fdread_auto /io_extend_auto /io_extend_tail_auto
+rm -f /io_meta_auto /io_meta_read_auto /io_retained_auto /io_retained_read_auto
+i=0
+while [ "$i" -lt 18 ]; do
+    rm -f "/io_trim_$i"
+    i=$((i + 1))
+done
+dd if=/bin/busybox of=/io_src_auto bs=4096 count=2
+dd if=/io_src_auto of=/io_copy_auto bs=4096 count=2
+cmp /io_src_auto /io_copy_auto
+dd if=/io_src_auto of=/io_dirty_auto bs=4096 count=2
+exec 4<>/io_dirty_auto
+printf Z >&4
+dd if=/io_src_auto of=/io_dirty_auto bs=4096 count=2 conv=notrunc
+dd if=/io_dirty_auto of=/io_readback_auto bs=4096 count=2
+cmp /io_src_auto /io_readback_auto
+exec 4<&-
+dd if=/io_src_auto of=/io_trunc_auto bs=4096 count=2
+truncate -s 4096 /io_trunc_auto
+[ "$(wc -c < /io_trunc_auto)" = 4096 ]
+dd if=/io_src_auto of=/io_first_auto bs=4096 count=1
+dd if=/io_src_auto of=/io_trunc_auto bs=4096 count=1 conv=notrunc
+cmp /io_first_auto /io_trunc_auto
+dd if=/io_src_auto of=/io_unaligned_auto bs=1000 count=5
+dd if=/io_unaligned_auto of=/io_unaligned_copy_auto bs=1000 count=5
+cmp /io_unaligned_auto /io_unaligned_copy_auto
+dd if=/dev/zero of=/io_zero_auto bs=4096 count=1
+dd if=/io_src_auto of=/io_sparse_auto bs=4096 count=1 seek=1
+dd if=/io_sparse_auto of=/io_sparse_first_auto bs=4096 count=1
+cmp /io_zero_auto /io_sparse_first_auto
+dd if=/io_src_auto of=/io_extend_auto bs=4096 count=1
+truncate -s 12288 /io_extend_auto
+dd if=/io_extend_auto of=/io_extend_tail_auto bs=4096 skip=2 count=1
+cmp /io_zero_auto /io_extend_tail_auto
+dd if=/io_src_auto of=/io_meta_auto bs=4096 count=2
+chmod 600 /io_meta_auto
+dd if=/io_src_auto of=/io_meta_auto bs=4096 count=1 conv=notrunc
+dd if=/io_meta_auto of=/io_meta_read_auto bs=4096 count=1
+cmp /io_first_auto /io_meta_read_auto
+dd if=/io_src_auto of=/io_retained_auto bs=4096 count=2
+dd if=/io_retained_auto of=/io_retained_read_auto bs=4096 count=2
+cmp /io_src_auto /io_retained_read_auto
+i=0
+while [ "$i" -lt 18 ]; do
+    /bin/busybox yes T | dd of="/io_trim_$i" bs=1000 count=264
+    i=$((i + 1))
+done
+sleep 8
+[ "$(dd if=/io_trim_0 bs=1 count=1 2>/dev/null)" = T ]
+echo pin_delay_ms=100 > /proc/io_test_control
+/opt/thekernel-tests/bin/thekernel-io-pin-safety
+echo pin_delay_ms=0 > /proc/io_test_control
+stats=/proc/io_stats
+value() { awk -v key="$1" '$1 == key { value = $2 } END { gsub(/\r/, "", value); if (value == "") exit 1; print value }' "$stats"; }
+positive() { [ "$(value "$1")" -gt 0 ]; }
+zero() { [ "$(value "$1")" -eq 0 ]; }
+positive cached.read_bypass_hits
+positive cached.read_bypass_slice_hits
+positive cached.write_bypass_hits
+positive cached.write_bypass_slice_hits
+positive cached.range_flush_dirty_pages
+positive cached.range_invalidate_pages
+positive cached.closed_cache_retain_hits
+positive cached.closed_cache_retain_pages
+positive cached.closed_cache_reopen_hits
+positive cached.closed_cache_trim_releases
+positive cached.closed_cache_trim_pages
+at_most() { [ "$(value "$1")" -le "$2" ]; }
+at_most cached.closed_cache_retained_pages_current 1024
+zero cached.readahead_enabled
+zero cached.readahead_misses
+zero cached.readahead_windows
+zero cached.readahead_pages
+zero cached.readahead_hits
+zero cached.readahead_retired_unused_pages
+positive ext4.mapped_read_runs
+positive ext4.mapped_overwrite_hits
+positive user_pin.to_user_hits
+positive user_pin.from_user_hits
+positive user_pin.sg_batches
+positive user_pin.sg_multi_segment_batches
+positive user_pin.sg_segments
+positive user_pin.sg_bytes
+positive user_pin.direct_read_hits
+positive user_pin.direct_read_bytes
+positive user_pin.direct_read_segments
+positive user_pin.direct_write_hits
+positive user_pin.direct_write_bytes
+positive user_pin.direct_write_segments
+positive user_prefault.to_user_hits
+positive user_prefault.to_user_bytes
+positive user_prefault.from_user_hits
+positive user_prefault.from_user_bytes
+positive user_pin.cow_pin_pages
+positive user_pin.file_pin_pages
+positive user_pin.frame_pin_hits
+positive user_pin.frame_pin_pages
+positive user_pin.frame_pin_bytes
+positive user_pin.frame_pin_unpins
+positive user_pin.page_cache_pin_attempts
+positive user_pin.page_cache_pin_hits
+positive user_pin.page_cache_pin_pages
+positive user_pin.page_cache_pin_bytes
+positive user_pin.page_cache_pin_unpins
+positive user_pin.vm_range_pin_hits
+positive user_pin.vm_range_pin_bytes
+positive user_pin.vm_range_pin_unpins
+positive user_pin.unpins
+zero cached.closed_cache_trim_flush_errors
+zero ext4.async_mapped_read_enabled
+echo test_policy=reset > /proc/io_test_control
+echo 'ok 1 - lwext4-io-boost'
+echo '# THEKERNEL_SMOKE_COMPLETE'
+exit

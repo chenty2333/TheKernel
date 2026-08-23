@@ -2,29 +2,17 @@
 set -euo pipefail
 
 export HOME="${HOME:-/home/thekernel}"
-export CARGO_HOME="${CARGO_HOME:-/usr/local/cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}"
 export LOCAL_UID="${LOCAL_UID:-1000}"
 export LOCAL_GID="${LOCAL_GID:-1000}"
 
-mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
+mkdir -p "$HOME"
 
 if [[ -d /workspace ]]; then
     mkdir -p /workspace/.state
 fi
 
 if [[ "$(id -u)" == "0" ]]; then
-    if ! getent group thekernel >/dev/null 2>&1 || [[ "$(getent group thekernel | cut -d: -f3)" != "$LOCAL_GID" ]]; then
-        groupdel thekernel >/dev/null 2>&1 || true
-        groupadd -g "$LOCAL_GID" thekernel
-    fi
-
-    if ! id -u thekernel >/dev/null 2>&1 || [[ "$(id -u thekernel)" != "$LOCAL_UID" ]]; then
-        userdel -r thekernel >/dev/null 2>&1 || true
-        useradd -m -u "$LOCAL_UID" -g "$LOCAL_GID" -s /bin/bash thekernel
-    fi
-
-    chown -R "$LOCAL_UID:$LOCAL_GID" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" >/dev/null 2>&1 || true
+    chown -R "$LOCAL_UID:$LOCAL_GID" "$HOME" >/dev/null 2>&1 || true
     if [[ -d /workspace/.state ]]; then
         chown "$LOCAL_UID:$LOCAL_GID" /workspace/.state >/dev/null 2>&1 || true
         if [[ "${THEKERNEL_DEV_RECURSIVE_CHOWN_STATE:-n}" == "y" ]]; then

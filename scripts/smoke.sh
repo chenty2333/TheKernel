@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-SMOKE_DIR="$SCRIPT_DIR/smoke"
-export PYTHONDONTWRITEBYTECODE=1
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SMOKE_DIR="$REPO_ROOT/tests/guest/smoke"
 
 usage() {
     cat <<'EOF'
@@ -11,30 +11,21 @@ Usage:
   scripts/smoke.sh list
   scripts/smoke.sh NAME [ARGS...]
 
-Semantic smokes build or reuse the x86_64 I/O-test shell kernel and its UEFI
-ESP plus the repository-built x86_64 rootfs, then drive commands through the
-q35 QEMU runner.
+Semantic smokes run their guest command stream through the product CLI.
+Arguments after NAME are passed to `thekernel.py run`.
 
 Smoke names:
-  async-block-queue
-  async-flush-fence
-  async-irq-first
-  lwext4-async-read
-  lwext4-io-boost
-  page-cache-readahead
 EOF
+    list_smokes
 }
 
-script_for() {
-    case "$1" in
-        async-block-queue) printf '%s\n' "$SMOKE_DIR/async-block-queue-smoke.sh" ;;
-        async-flush-fence) printf '%s\n' "$SMOKE_DIR/async-flush-fence-smoke.sh" ;;
-        async-irq-first) printf '%s\n' "$SMOKE_DIR/async-irq-first-smoke.sh" ;;
-        lwext4-async-read) printf '%s\n' "$SMOKE_DIR/lwext4-async-read-smoke.sh" ;;
-        lwext4-io-boost) printf '%s\n' "$SMOKE_DIR/lwext4-io-boost-smoke.sh" ;;
-        page-cache-readahead) printf '%s\n' "$SMOKE_DIR/page-cache-readahead-smoke.sh" ;;
-        *) return 1 ;;
-    esac
+list_smokes() {
+    local path name
+    for path in "$SMOKE_DIR"/*.commands; do
+        [ -f "$path" ] || continue
+        name=${path##*/}
+        printf '  %s\n' "${name%.commands}"
+    done
 }
 
 if [ $# -eq 0 ]; then
@@ -48,17 +39,38 @@ case "$1" in
         exit 0
         ;;
     list)
-        usage | sed -n '/^Smoke names:/,$p'
+        printf 'Smoke names:\n'
+        list_smokes
         exit 0
         ;;
 esac
 
 name=$1
 shift
-target=$(script_for "$name") || {
+case "$name" in
+    ''|*[!a-z0-9-]*) commands= ;;
+    *) commands="$SMOKE_DIR/$name.commands" ;;
+esac
+if [ ! -f "$commands" ]; then
     printf 'scripts/smoke.sh: unknown smoke: %s\n' "$name" >&2
     usage >&2
     exit 2
-}
+fi
 
-exec "$target" "$@"
+extra_args=()
+case "$name" in
+    async-block-queue|async-irq-first)
+        state_dir=${THEKERNEL_STATE_DIR:-"$REPO_ROOT/.state"}
+        case "$state_dir" in /*) ;; *) state_dir="$REPO_ROOT/$state_dir" ;; esac
+        extra_block="$state_dir/out/smoke/$name-extra.img"
+        mkdir -p "$(dirname -- "$extra_block")"
+        truncate -s 8M "$extra_block"
+        extra_args=(--extra-block "$extra_block")
+        ;;
+esac
+
+cd "$REPO_ROOT"
+exec python3 tools/thekernel.py run --profile io-test --commands "$commands" \
+    --input-after-marker THEKERNEL_SHELL_READY \
+    --stop-after-marker '# THEKERNEL_SMOKE_COMPLETE' \
+    "${extra_args[@]}" "$@"

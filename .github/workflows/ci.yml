@@ -20,12 +20,15 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  host:
-    name: Host checks and tests
+  fast:
+    name: Fast checks
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly', github.repository_owner) }}
+      # An optional repository variable may override this known-good immutable
+      # digest, but the override must also use ghcr.io/...@sha256:....  The
+      # compiler itself remains controlled only by rust-toolchain.toml.
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:a858cfc9bd234b4854476ed20a4a6d5f70c890960e42c83a7f3f3a3925e2bbf7' }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -44,39 +47,39 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Checkout pinned vISA
+      - name: Load source combination
+        id: source_combination
+        run: python3 scripts/ci/source_combination.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout mechanism workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: chenty2333/vISA
-          ref: 198b1bdf7641717f52cd386752f0f25974db6d11
-          path: vISA
+          repository: ${{ steps.source_combination.outputs.ax_repository }}
+          ref: ${{ steps.source_combination.outputs.ax_ref }}
+          path: ${{ steps.source_combination.outputs.ax_path }}
           persist-credentials: false
 
-      - name: Checkout pinned mechanism workspace
+      - name: Checkout Linux ABI workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: chenty2333/thekernel-ax
-          ref: 21582660f97c986d080615d51fca0accfd43fcb2
-          path: thekernel-ax
+          repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
+          ref: ${{ steps.source_combination.outputs.linux_abi_ref }}
+          path: ${{ steps.source_combination.outputs.linux_abi_path }}
           persist-credentials: false
 
-      - name: Checkout pinned Linux ABI workspace
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: chenty2333/thekernel-linux-abi
-          ref: f0721ef792ecd0c4826a00b90b88a524f6411d47
-          path: thekernel-linux-abi
-          persist-credentials: false
-
-      - name: Cache Cargo outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: TheKernel -> .state/ci/cargo-target
+      - name: Install Rust from the repository pin
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup show active-toolchain
+          cargo install --locked --version 0.2.1 axconfig-gen
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Trust mounted checkouts
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE/TheKernel"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/vISA"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
@@ -93,7 +96,14 @@ jobs:
           git diff --cached --check
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt \
+            -p thekernel \
+            -p thekernel-kernel \
+            -p axnet-ng \
+            -p thekernel-linux-process-adapter \
+            -p thekernel-readiness-adapter \
+            -- --check
 
       - name: Validate vendored provenance
         run: |
@@ -102,13 +112,24 @@ jobs:
             --ax-repo ../thekernel-ax \
             --linux-abi-repo ../thekernel-linux-abi
 
-      - name: Test build and runner tools
-        run: make test-tools
+      - name: Test product tools
+        run: |
+          python3 -m unittest tests.ci.test_source_combination -v
+          python3 -m unittest discover -s tests/qemu_runner -v
+          python3 -m unittest \
+            tests.test_thekernel_system_test \
+            tests.test_x86_uefi_esp \
+            tests.ci.test_scheduler_baseline \
+            tests.ci.test_kvm_subsystem_baseline \
+            -v
 
       - name: Test local adapters
         run: |
           cargo test --locked -p thekernel-readiness-adapter
           cargo test --locked -p thekernel-linux-process-adapter
+
+      - name: Run portable Linux differentials
+        run: ./scripts/host-differential.sh
 
       - name: Check host kernel profile
         run: |
@@ -127,8 +148,8 @@ jobs:
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
             cargo test --locked --manifest-path kernel/Cargo.toml \
-              --tests --features bpf,axtask/test \
-              --target x86_64-unknown-linux-gnu
+              --tests --features bpf,axtask/test,test-io-control \
+              --target x86_64-unknown-linux-gnu -- --test-threads=1
 
       - name: Lint host kernel profile
         run: |
@@ -143,12 +164,12 @@ jobs:
               -A clippy::drop-non-drop \
               -A clippy::too-many-arguments
 
-  x86_64:
-    name: x86_64 product configuration
+  product:
+    name: x86_64 product
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 90
     container:
-      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:nightly', github.repository_owner) }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:a858cfc9bd234b4854476ed20a4a6d5f70c890960e42c83a7f3f3a3925e2bbf7' }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -166,99 +187,47 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Checkout pinned vISA
+      - name: Load source combination
+        id: source_combination
+        run: python3 scripts/ci/source_combination.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout mechanism workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: chenty2333/vISA
-          ref: 198b1bdf7641717f52cd386752f0f25974db6d11
-          path: vISA
+          repository: ${{ steps.source_combination.outputs.ax_repository }}
+          ref: ${{ steps.source_combination.outputs.ax_ref }}
+          path: ${{ steps.source_combination.outputs.ax_path }}
           persist-credentials: false
 
-      - name: Checkout pinned mechanism workspace
+      - name: Checkout Linux ABI workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: chenty2333/thekernel-ax
-          ref: 21582660f97c986d080615d51fca0accfd43fcb2
-          path: thekernel-ax
+          repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
+          ref: ${{ steps.source_combination.outputs.linux_abi_ref }}
+          path: ${{ steps.source_combination.outputs.linux_abi_path }}
           persist-credentials: false
 
-      - name: Checkout pinned Linux ABI workspace
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: chenty2333/thekernel-linux-abi
-          ref: f0721ef792ecd0c4826a00b90b88a524f6411d47
-          path: thekernel-linux-abi
-          persist-credentials: false
-
-      - name: Cache Cargo outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: |
-            TheKernel -> .state/ci/cargo-target
-            TheKernel -> .state/x86_64/target
-            TheKernel -> .state/x86_64/clippy-target
+      - name: Install Rust from the repository pin
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup show active-toolchain
+          cargo install --locked --version 0.2.1 axconfig-gen
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Trust mounted checkouts
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE/TheKernel"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/vISA"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
-      - name: Check diagnostic feature profile
-        run: |
-          env \
-            CC=gcc CXX=g++ AR=ar AS=as OBJCOPY=objcopy OBJDUMP=objdump SIZE=size \
-            CARGO_TARGET_DIR="$THEKERNEL_CI_TARGET_DIR" \
-            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
-            cargo check --locked --manifest-path kernel/Cargo.toml \
-              --tests --features bpf,asid-switch-diagnostics,pmu-diagnostics \
-              --target x86_64-unknown-linux-gnu
-
-      - name: Test I/O control feature profile
-        run: |
-          env \
-            CC=gcc CXX=g++ AR=ar AS=as OBJCOPY=objcopy OBJDUMP=objdump SIZE=size \
-            CARGO_TARGET_DIR="$THEKERNEL_CI_TARGET_DIR" \
-            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
-            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
-            cargo test --locked --manifest-path kernel/Cargo.toml \
-              --tests --features bpf,test-io-control \
-              --target x86_64-unknown-linux-gnu \
-              pseudofs::io_test_control::tests -- --test-threads=1
-
-      - name: Build x86_64 kernel
-        run: make kernel-x86_64
-
       - name: Lint x86_64 product profile
         run: |
-          set -euo pipefail
-          package_args='-p thekernel -p thekernel-kernel -p axnet-ng -p thekernel-linux-process-adapter -p thekernel-readiness-adapter'
-          common=(
-            -C "$PWD/make"
-            "A=$PWD"
-            ARCH=x86_64
-            PLAT_CONFIG=platforms/axplat-x86-q35-uefi.toml
-            SMP=4
-            DEBUGINFO=y
-            DWARF=n
-            LOG=off
-            BANNER=n
-            BACKTRACE=n
-            NO_AXSTD=y
-            AX_LIB=axfeat
-            BLK=y
-            NET=y
-            VSOCK=n
-            MEM=1G
-            LTO=
-            MODE=release
-            "STATE_DIR=$PWD/.state"
-            'APP_FEATURES=qemu smp'
-            "TARGET_DIR=$PWD/.state/x86_64/clippy-target"
-          )
-          make "${common[@]}" defconfig
-          make "${common[@]}" \
-            "CLIPPY_PACKAGES=$package_args" \
-            'CLIPPY_ARGS=-- -D warnings -A dead-code -A clippy::drop-non-drop -A clippy::too-many-arguments' \
-            clippy-elf
+          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4
+          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4 \
+            --profile mm-performance
+
+      - name: Run q35 UEFI SMP4 TCG system test
+        run: ./tools/thekernel.py system-test --machine q35 --firmware uefi --smp 4 --accel tcg

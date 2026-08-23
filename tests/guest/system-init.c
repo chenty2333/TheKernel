@@ -50,7 +50,6 @@ static int verify_core_filesystems(void) {
     if (close(fd) != 0) {
         return fail("sysfs-node-online-close");
     }
-    puts("THEKERNEL_SYSTEM_TEST_MOUNTS_OK");
     return 0;
 }
 
@@ -93,7 +92,6 @@ static int test_rootfs(void) {
     if (unlink("/var/tmp/thekernel-rootfs-renamed") != 0) {
         return fail("unlink");
     }
-    puts("THEKERNEL_SYSTEM_TEST_ROOTFS_OK");
     return 0;
 }
 
@@ -116,7 +114,6 @@ static int test_tmpfs(void) {
     if (rmdir("/tmp/thekernel-system-test") != 0) {
         return fail("tmpfs-rmdir");
     }
-    puts("THEKERNEL_SYSTEM_TEST_TMPFS_OK");
     return 0;
 }
 
@@ -130,8 +127,6 @@ static int test_procfs(void) {
     if (close(fd) != 0 || count <= 0) {
         return fail("proc-meminfo-read");
     }
-    puts("THEKERNEL_SYSTEM_TEST_PROCFS_OK");
-
     memset(buffer, 0, sizeof(buffer));
     fd = open("/proc/memory_pressure", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -149,7 +144,6 @@ static int test_procfs(void) {
         errno = EPROTO;
         return fail("proc-memory-pressure-schema");
     }
-    puts("THEKERNEL_SYSTEM_TEST_MM_PRESSURE_OK");
     return 0;
 }
 
@@ -171,6 +165,9 @@ static int wait_for_success(pid_t child, const char *stage) {
                 stage, status);
         return 1;
     }
+    if (WEXITSTATUS(status) == 4) {
+        return 4;
+    }
     if (WEXITSTATUS(status) != 0) {
         fprintf(stderr,
                 "THEKERNEL_SYSTEM_TEST_FAIL %s exit-status=%d\n",
@@ -180,9 +177,8 @@ static int wait_for_success(pid_t child, const char *stage) {
     return 0;
 }
 
-static int test_portable_differential(const char *path, const char *argument,
-                                      const char *stage,
-                                      const char *success_marker) {
+static int run_guest_program(const char *path, const char *argument,
+                             const char *stage) {
     pid_t child = fork();
     if (child < 0) {
         return fail(stage);
@@ -198,10 +194,10 @@ static int test_portable_differential(const char *path, const char *argument,
                 stage, errno, strerror(errno));
         _exit(127);
     }
-    if (wait_for_success(child, stage) != 0) {
-        return 1;
+    int result = wait_for_success(child, stage);
+    if (result != 0) {
+        return result;
     }
-    puts(success_marker);
     return 0;
 }
 
@@ -221,7 +217,6 @@ static int test_memory_pressure_reclaim(void) {
     if (wait_for_success(child, "memory-pressure-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_MM_PRESSURE_RECLAIM_OK");
     return 0;
 }
 
@@ -252,8 +247,6 @@ static int test_process_pipe_and_exec(void) {
     if (wait_for_success(child, "pipe-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_PROCESS_OK");
-
     child = fork();
     if (child < 0) {
         return fail("exec-fork");
@@ -268,24 +261,21 @@ static int test_process_pipe_and_exec(void) {
     if (wait_for_success(child, "exec-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_EXEC_OK");
     return 0;
 }
 
 static int test_vfork(void) {
-    return test_portable_differential(
-        "/opt/thekernel-tests/bin/thekernel-vfork-smoke",
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/vfork-smoke",
         NULL,
-        "vfork-child",
-        "THEKERNEL_SYSTEM_TEST_VFORK_OK");
+        "vfork-child");
 }
 
 static int test_signal_mask_alias(void) {
-    return test_portable_differential(
-        "/opt/thekernel-tests/bin/thekernel-signal-mask-alias",
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/signal-mask-alias",
         NULL,
-        "signal-mask-alias-child",
-        "THEKERNEL_SYSTEM_TEST_SIGNAL_MASK_ALIAS_OK");
+        "signal-mask-alias-child");
 }
 
 static int test_io_uring(void) {
@@ -303,7 +293,6 @@ static int test_io_uring(void) {
     if (wait_for_success(child, "io-uring-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_IO_URING_OK");
     return 0;
 }
 
@@ -323,16 +312,14 @@ static int test_io_uring_buffers(void) {
     if (wait_for_success(child, "io-uring-buffers-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_IO_URING_BUFFERS_OK");
     return 0;
 }
 
 static int test_signal_fp(void) {
-    return test_portable_differential(
+    return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-signal-fp-smoke",
         NULL,
-        "signal-fp-child",
-        "THEKERNEL_SYSTEM_TEST_SIGNAL_FP_OK");
+        "signal-fp-child");
 }
 
 static int test_ioprio(void) {
@@ -351,7 +338,6 @@ static int test_ioprio(void) {
     if (wait_for_success(child, "ioprio-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_IOPRIO_OK");
     return 0;
 }
 
@@ -371,7 +357,6 @@ static int test_membarrier(void) {
     if (wait_for_success(child, "membarrier-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_MEMBARRIER_OK");
     return 0;
 }
 
@@ -391,13 +376,12 @@ static int test_userfaultfd(void) {
     if (wait_for_success(child, "userfaultfd-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_USERFAULTFD_OK");
     return 0;
 }
 
 static int test_packet_socket(void) {
     static const char path[] =
-        "/opt/thekernel-tests/bin/thekernel-packet-socket-smoke";
+        "/opt/thekernel-tests/portable/packet-socket-smoke";
     pid_t child = fork();
     if (child < 0) {
         return fail("packet-socket-fork");
@@ -414,13 +398,12 @@ static int test_packet_socket(void) {
     if (wait_for_success(child, "packet-socket-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_PACKET_OK");
     return 0;
 }
 
 static int test_seccomp(void) {
     static const char path[] =
-        "/opt/thekernel-tests/bin/thekernel-seccomp-smoke";
+        "/opt/thekernel-tests/portable/seccomp-smoke";
     pid_t child = fork();
     if (child < 0) {
         return fail("seccomp-fork");
@@ -435,7 +418,6 @@ static int test_seccomp(void) {
     if (wait_for_success(child, "seccomp-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_SECCOMP_OK");
     return 0;
 }
 
@@ -455,16 +437,14 @@ static int test_signal_wait_boundary(void) {
     if (wait_for_success(child, "signal-wait-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_SIGNAL_WAIT_OK");
     return 0;
 }
 
 static int test_pause(void) {
-    return test_portable_differential(
+    return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-pause-smoke",
         NULL,
-        "pause-child",
-        "THEKERNEL_SYSTEM_TEST_PAUSE_OK");
+        "pause-child");
 }
 
 static int test_alarm(void) {
@@ -483,7 +463,6 @@ static int test_alarm(void) {
     if (wait_for_success(child, "alarm-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_ALARM_OK");
     return 0;
 }
 
@@ -503,7 +482,6 @@ static int test_wait_boundary(void) {
     if (wait_for_success(child, "wait-boundary-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_WAIT_BOUNDARY_OK");
     return 0;
 }
 
@@ -529,7 +507,6 @@ static int test_rseq(void) {
     if (wait_for_success(child, "rseq-child") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_RSEQ_OK");
     return 0;
 }
 
@@ -550,6 +527,100 @@ static int self_exec_init(const char *next_stage) {
     return fail(next_stage);
 }
 
+struct suite_case {
+    const char *name;
+    int (*run)(void);
+};
+
+static int test_futex_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/futex-smoke", NULL,
+        "futex-differential-child");
+}
+
+static int test_futex2_waitv_signal_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/futex2-waitv-signal-differential", NULL,
+        "futex2-waitv-signal-differential-child");
+}
+
+static int test_epoll_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/epoll-smoke", "--thekernel",
+        "epoll-differential-child");
+}
+
+static int test_signal_order_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/signal-order-smoke", NULL,
+        "signal-order-differential-child");
+}
+
+static int test_io_uring_directio_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/io-uring-directio-differential",
+        NULL, "io-uring-directio-differential-child");
+}
+
+static int test_proc_zombie_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/proc-zombie-differential", NULL,
+        "proc-zombie-differential-child");
+}
+
+/* The only suite status protocol is the direct child status: 0 is pass, 1
+ * is fail, and 4 is an explicit environmental skip.  Everything the child
+ * writes is forwarded as KTAP diagnostics, never interpreted as a verdict. */
+static int run_suite_case(const struct suite_case *test) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) {
+        return 1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return 1;
+    }
+    if (child == 0) {
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0 ||
+            dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+            _exit(1);
+        }
+        if (pipe_fds[1] > STDERR_FILENO) {
+            close(pipe_fds[1]);
+        }
+        int result = test->run();
+        _exit(result == 0 ? 0 : result == 4 ? 4 : 1);
+    }
+
+    close(pipe_fds[1]);
+    FILE *diagnostics = fdopen(pipe_fds[0], "r");
+    if (diagnostics == NULL) {
+        close(pipe_fds[0]);
+        (void)waitpid(child, NULL, 0);
+        return 1;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), diagnostics) != NULL) {
+        printf("# %s: %s", test->name, line);
+        size_t length = strlen(line);
+        if (length == 0 || line[length - 1] != '\n') {
+            putchar('\n');
+        }
+    }
+    int read_failed = ferror(diagnostics);
+    fclose(diagnostics);
+
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || read_failed || !WIFEXITED(status)) {
+        return 1;
+    }
+    int exit_status = WEXITSTATUS(status);
+    return exit_status == 0 || exit_status == 4 ? exit_status : 1;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
@@ -564,7 +635,6 @@ int main(int argc, char **argv) {
         if (require_init_identity("init-exec-stage-1") != 0) {
             return 1;
         }
-        puts("THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK");
         return self_exec_init("--thekernel-init-exec-stage-2");
     }
     if (argc != 2 || strcmp(argv[1], "--thekernel-init-exec-stage-2") != 0) {
@@ -574,54 +644,60 @@ int main(int argc, char **argv) {
     if (require_init_identity("init-exec-stage-2") != 0) {
         return 1;
     }
-    puts("THEKERNEL_SYSTEM_TEST_INIT_EXEC_2_OK");
-    puts("THEKERNEL_SYSTEM_TEST_START");
 
-    if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
-        test_memory_pressure_reclaim() || test_process_pipe_and_exec() ||
-        test_vfork() || test_signal_mask_alias() || test_signal_wait_boundary() ||
-        test_pause() || test_alarm() ||
-        test_wait_boundary() ||
-        test_rseq() ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-futex-smoke",
-            NULL,
-            "futex-differential-child",
-            "THEKERNEL_SYSTEM_TEST_FUTEX_DIFFERENTIAL_OK") ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-futex2-waitv-signal",
-            NULL,
-            "futex2-waitv-signal-differential-child",
-            "THEKERNEL_SYSTEM_TEST_FUTEX2_WAITV_SIGNAL_DIFFERENTIAL_OK") ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-epoll-smoke",
-            "--thekernel",
-            "epoll-differential-child",
-            "THEKERNEL_SYSTEM_TEST_EPOLL_DIFFERENTIAL_OK") ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-signal-order-smoke",
-            NULL,
-            "signal-order-differential-child",
-            "THEKERNEL_SYSTEM_TEST_SIGNAL_ORDER_DIFFERENTIAL_OK") ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-io-uring-directio-differential",
-            NULL,
-            "io-uring-directio-differential-child",
-            "THEKERNEL_SYSTEM_TEST_IO_URING_DIRECTIO_DIFFERENTIAL_OK") ||
-        test_portable_differential(
-            "/opt/thekernel-tests/bin/thekernel-proc-zombie-differential",
-            NULL,
-            "proc-zombie-differential-child",
-            "THEKERNEL_SYSTEM_TEST_PROC_ZOMBIE_DIFFERENTIAL_OK") ||
-        test_signal_fp() ||
-        test_io_uring() || test_io_uring_buffers() || test_ioprio() ||
-        test_membarrier() || test_userfaultfd() ||
-        test_packet_socket() ||
-        test_seccomp()) {
-        return 1;
+    static const struct suite_case suite[] = {
+        { "mounts", verify_core_filesystems },
+        { "rootfs", test_rootfs },
+        { "tmpfs", test_tmpfs },
+        { "procfs", test_procfs },
+        { "memory-pressure", test_memory_pressure_reclaim },
+        { "process-exec", test_process_pipe_and_exec },
+        { "vfork", test_vfork },
+        { "signal-mask-alias", test_signal_mask_alias },
+        { "signal-wait", test_signal_wait_boundary },
+        { "pause", test_pause },
+        { "alarm", test_alarm },
+        { "wait-boundary", test_wait_boundary },
+        { "rseq", test_rseq },
+        { "futex", test_futex_differential },
+        { "futex2-waitv-signal", test_futex2_waitv_signal_differential },
+        { "epoll", test_epoll_differential },
+        { "signal-order", test_signal_order_differential },
+        { "io-uring-directio", test_io_uring_directio_differential },
+        { "proc-zombie", test_proc_zombie_differential },
+        { "signal-fp", test_signal_fp },
+        { "io-uring", test_io_uring },
+        { "io-uring-buffers", test_io_uring_buffers },
+        { "ioprio", test_ioprio },
+        { "membarrier", test_membarrier },
+        { "userfaultfd", test_userfaultfd },
+        { "packet", test_packet_socket },
+        { "seccomp", test_seccomp },
+    };
+
+    puts("KTAP version 1");
+    printf("1..%zu\n", sizeof(suite) / sizeof(suite[0]));
+    unsigned int failures = 0;
+    unsigned int skips = 0;
+    for (size_t index = 0; index < sizeof(suite) / sizeof(suite[0]); ++index) {
+        int result = run_suite_case(&suite[index]);
+        if (result == 0) {
+            printf("ok %zu - %s\n", index + 1, suite[index].name);
+        } else if (result == 4) {
+            ++skips;
+            printf("ok %zu - %s # SKIP unsupported by guest ABI\n",
+                   index + 1, suite[index].name);
+        } else {
+            ++failures;
+            printf("not ok %zu - %s\n", index + 1, suite[index].name);
+        }
     }
 
+    if (failures != 0) {
+        printf("# KTAP suite failed failures=%u skips=%u\n", failures, skips);
+        return 1;
+    }
     sync();
-    puts("THEKERNEL_SYSTEM_TEST_PASS");
+    puts("# THEKERNEL_SYSTEM_TEST_COMPLETE");
     return 0;
 }

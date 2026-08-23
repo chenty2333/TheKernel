@@ -14,15 +14,6 @@ INTENTIONAL_STOP_RETURN_CODE = 75
 
 
 @dataclass(frozen=True)
-class PreparedImage:
-    """An image source and the uncompressed path passed to QEMU."""
-
-    source: Path
-    runtime: Path
-    cached: bool = False
-
-
-@dataclass(frozen=True)
 class Drive:
     """One block image and the write policy exposed to QEMU."""
 
@@ -52,16 +43,12 @@ class Interaction:
 class InputForwarding:
     """Evidence for bytes successfully forwarded to the QEMU stdin pipe.
 
-    ``observed`` counts bytes read from the external producer, while the
-    digest and counters below cover only bytes accepted by the QEMU stdin
-    pipe.  Keeping those two notions separate prevents a source-file hash
-    from being mistaken for proof that QEMU's stdin pipe accepted the stream.
+    The digest and counters cover only bytes accepted by the QEMU stdin pipe.
     """
 
     sha256: str
     bytes_forwarded: int
     line_count: int
-    observed_bytes: int
     source_eof: bool
     broken_pipe: bool
     relay_complete: bool
@@ -79,6 +66,9 @@ class RunResult:
     workdir: Path
     error_message: str | None = None
     input_forwarding: InputForwarding | None = None
+    marker_success: bool = False
+    runner_terminated: bool = False
+    runner_termination_reason: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -96,9 +86,18 @@ class RunResult:
     def intentionally_stopped(self) -> bool:
         return (
             self.returncode == INTENTIONAL_STOP_RETURN_CODE
+            and self.marker_success
+            and self.runner_terminated
+            and self.runner_termination_reason == "stop-after-marker"
             and self.error_message is not None
             and self.error_message.startswith("QEMU stopped after marker: ")
         )
+
+    @property
+    def guest_clean_shutdown(self) -> bool:
+        """Whether QEMU exited cleanly without a runner-initiated stop."""
+
+        return self.returncode == 0 and not self.runner_terminated
 
     @property
     def launch_failed(self) -> bool:

@@ -34,18 +34,11 @@ while IFS= read -r arch; do
         '/opt/thekernel-tests/bin/thekernel-nightly-fs-powercut-phase1' \
         >"$phase1_commands"
 
-    if nightly_run_guest \
+    nightly_run_guest \
         "$arch" "$phase1_commands" "$phase1_dir" "$disk" \
-        CI_NIGHTLY_FS_POWERCUT_ARMED; then
-        phase1_status=0
-    else
-        phase1_status=$?
-    fi
-    [ "$phase1_status" -eq 75 ] \
-        || nightly_fail \
-            "power-cut phase returned $phase1_status instead of intentional-stop 75"
+        CI_NIGHTLY_FS_POWERCUT_ARMED
     nightly_validate_guest_log \
-        "$phase1_dir/qemu.log" abrupt \
+        "$phase1_dir/console.log" abrupt \
         CI_NIGHTLY_FS_POWERCUT_PHASE1_START \
         CI_NIGHTLY_FS_POWERCUT_ARMED
 
@@ -56,7 +49,7 @@ while IFS= read -r arch; do
     nightly_run_guest \
         "$arch" "$phase2_commands" "$phase2_dir" "$disk"
     nightly_validate_guest_log \
-        "$phase2_dir/qemu.log" clean \
+        "$phase2_dir/console.log" clean \
         CI_NIGHTLY_FS_POWERCUT_PHASE2_START \
         CI_NIGHTLY_FS_POWERCUT_PASS
     e2fsck -f -n "$disk" >"$fsck_log" 2>&1 \

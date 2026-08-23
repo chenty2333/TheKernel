@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import select
@@ -34,6 +33,8 @@ class _InputForwardingRecorder:
     """Track only bytes accepted by the QEMU stdin pipe."""
 
     def __init__(self) -> None:
+        import hashlib
+
         self._digest = hashlib.sha256()
         self._bytes_forwarded = 0
         self._newlines = 0
@@ -72,7 +73,6 @@ class _InputForwardingRecorder:
             sha256=self._digest.hexdigest(),
             bytes_forwarded=self._bytes_forwarded,
             line_count=line_count,
-            observed_bytes=self.observed_bytes,
             source_eof=self.source_eof,
             broken_pipe=self.broken_pipe,
             relay_complete=relay_complete,
@@ -139,11 +139,12 @@ def _wait_for_process(
     input_stream: BinaryIO,
     console_stream: BinaryIO | None,
     input_recorder: _InputForwardingRecorder | None,
-) -> tuple[int, str | None]:
+    forward_input: bool,
+) -> tuple[int, str | None, bool, str | None]:
     started_at = time.monotonic()
     last_output_at = started_at
     input_ready = interaction.input_after_marker is None
-    input_open = input_recorder is not None
+    input_open = forward_input
     stdout_open = True
     pending_output = bytearray()
     pending_input = bytearray()
@@ -151,7 +152,9 @@ def _wait_for_process(
     if input_recorder is not None:
         assert process.stdin is not None
 
-    def consume_lines(data: bytes, *, final: bool = False) -> tuple[int, str] | None:
+    def consume_lines(
+        data: bytes, *, final: bool = False
+    ) -> tuple[int, str, bool, str] | None:
         nonlocal input_ready
         pending_output.extend(data)
         while True:
@@ -167,7 +170,12 @@ def _wait_for_process(
                 message = f"QEMU stopped after marker: {interaction.stop_after_marker}"
                 terminate_process_group(process, signal.SIGKILL)
                 process.wait()
-                return INTENTIONAL_STOP_RETURN_CODE, message
+                return (
+                    INTENTIONAL_STOP_RETURN_CODE,
+                    message,
+                    True,
+                    "stop-after-marker",
+                )
         if final and pending_output:
             pending_output.clear()
         return None
@@ -209,16 +217,15 @@ def _wait_for_process(
                 MAX_PENDING_INPUT_BYTES - len(pending_input),
             )
             if data:
-                assert input_recorder is not None
-                input_recorder.observe(data)
+                if input_recorder is not None:
+                    input_recorder.observe(data)
                 pending_input.extend(data)
             else:
                 input_open = False
-                assert input_recorder is not None
-                input_recorder.mark_eof()
+                if input_recorder is not None:
+                    input_recorder.mark_eof()
 
         if process.stdin is not None and process.stdin in writable:
-            assert input_recorder is not None
             try:
                 written = os.write(process.stdin.fileno(), pending_input)
                 if written <= 0:
@@ -226,17 +233,18 @@ def _wait_for_process(
             except (BlockingIOError, InterruptedError):
                 pass
             except (BrokenPipeError, OSError, ValueError):
-                input_recorder.mark_broken_pipe()
+                if input_recorder is not None:
+                    input_recorder.mark_broken_pipe()
                 input_open = False
                 pending_input.clear()
                 process.stdin.close()
             else:
-                input_recorder.forwarded(bytes(pending_input[:written]))
+                if input_recorder is not None:
+                    input_recorder.forwarded(bytes(pending_input[:written]))
                 del pending_input[:written]
 
         if (
-            input_recorder is not None
-            and input_recorder.source_eof
+            not input_open
             and not pending_input
             and process.stdin is not None
             and not process.stdin.closed
@@ -260,8 +268,10 @@ def _wait_for_process(
                 return (
                     returncode if returncode != 0 else 4,
                     f"QEMU exited before input-ready marker: {interaction.input_after_marker}",
+                    False,
+                    None,
                 )
-            return returncode, None
+            return returncode, None, False, None
 
         now = time.monotonic()
         if (
@@ -274,11 +284,11 @@ def _wait_for_process(
                 f"waiting for marker: {interaction.input_after_marker}"
             )
             _terminate_with_grace(process)
-            return 124, message
+            return 124, message, False, "ready-timeout"
         if limits.total_timeout_secs is not None and now - started_at >= limits.total_timeout_secs:
             message = f"QEMU timed out after {limits.total_timeout_secs:g}s"
             _terminate_with_grace(process)
-            return 124, message
+            return 124, message, False, "total-timeout"
         if (
             limits.idle_timeout_secs is not None
             and now - last_output_at >= limits.idle_timeout_secs
@@ -288,7 +298,7 @@ def _wait_for_process(
                 "without console output"
             )
             _terminate_with_grace(process)
-            return 124, message
+            return 124, message, False, "idle-timeout"
 
 
 def run_process(
@@ -301,7 +311,7 @@ def run_process(
     interaction: Interaction,
     input_stream: BinaryIO | None = None,
     console_stream: BinaryIO | None = None,
-    proxy_interactive_input: bool = False,
+    capture_input_evidence: bool = False,
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
 
@@ -320,11 +330,17 @@ def run_process(
     started_at = time.monotonic()
     process: subprocess.Popen[bytes] | None = None
     proxy_input = (
-        interaction.input_after_marker is not None or proxy_interactive_input
+        interaction.input_after_marker is not None
+        or capture_input_evidence
     )
-    input_recorder = _InputForwardingRecorder() if proxy_input else None
+    input_recorder = (
+        _InputForwardingRecorder() if proxy_input and capture_input_evidence else None
+    )
     launched = False
     error_message: str | None = None
+    marker_success = False
+    runner_terminated = False
+    runner_termination_reason: str | None = None
     try:
         if proxy_input:
             process_stdin: int | BinaryIO | None = subprocess.PIPE
@@ -344,10 +360,15 @@ def run_process(
                 start_new_session=True,
             )
             launched = True
-            if input_recorder is not None:
+            if proxy_input:
                 assert process.stdin is not None
                 os.set_blocking(process.stdin.fileno(), False)
-            returncode, error_message = _wait_for_process(
+            (
+                returncode,
+                error_message,
+                marker_success,
+                runner_termination_reason,
+            ) = _wait_for_process(
                 process,
                 log_file=log_file,
                 limits=limits,
@@ -355,15 +376,20 @@ def run_process(
                 input_stream=input_stream,
                 console_stream=console_stream,
                 input_recorder=input_recorder,
+                forward_input=proxy_input,
             )
     except KeyboardInterrupt:
         if process is not None:
             _terminate_with_grace(process)
+            runner_terminated = True
+            runner_termination_reason = "interrupted"
         returncode = 130
         error_message = "interrupted"
     except OSError as error:
         if process is not None and process.poll() is None:
             _terminate_with_grace(process)
+            runner_terminated = True
+            runner_termination_reason = "process-io-error"
         if launched:
             returncode = 4
             error_message = f"QEMU process I/O failed: {error}"
@@ -389,4 +415,9 @@ def run_process(
         input_forwarding=(
             input_recorder.snapshot() if input_recorder is not None else None
         ),
+        marker_success=marker_success,
+        runner_terminated=(
+            runner_terminated or runner_termination_reason is not None
+        ),
+        runner_termination_reason=runner_termination_reason,
     )

@@ -183,6 +183,12 @@ class MmPerformanceParserTests(unittest.TestCase):
             lines[11],
         )
 
+    def test_infers_workload_from_the_self_describing_run_record(self) -> None:
+        result = self.run_parser(complete_log(), workload_args=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 12)
+
     def test_structured_missing_pin_metrics_are_evidence(self) -> None:
         result = self.run_parser(complete_log(missing_pin=True), "--format", "json")
 

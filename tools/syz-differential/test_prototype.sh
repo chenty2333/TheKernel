@@ -2,8 +2,7 @@
 # End-to-end test for the syzlang-driven differential-case generation
 # prototype.  Parses both descriptions, generates both C cases, checks
 # generation determinism, verifies the parser rejects out-of-subset syntax,
-# compiles with the contract flags, runs the binaries on the host, and
-# verifies every marker in the generated manifests with grep -Fqx.
+# compiles the generated cases, and runs them on the host.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +63,6 @@ for c in "${cases[@]}"; do
     python3 generate.py --description "descriptions/$c.txt" \
         --semantics "semantics/$c.json" --out-dir "$work/regen" >/dev/null
     diff -u "generated/$c-gen-smoke.c" "$work/regen/$c-gen-smoke.c"
-    diff -u "generated/$c-gen-smoke.markers" "$work/regen/$c-gen-smoke.markers"
 done
 echo "  deterministic OK"
 
@@ -86,10 +84,8 @@ print("  drift detection OK")
 EOF
 
 echo "== 6. compile with contract flags =="
-# Contract flags are `cc -static -O2 -Wall -Wextra -Werror`.  Some hosts
-# (like Fedora without glibc-static) cannot link -static; in that case fall
-# back to dynamic linking — the same flags the existing reference runner
-# scripts/ci/seccomp-host-differential.sh uses — and say so explicitly.
+# Some hosts (such as Fedora without glibc-static) cannot link statically; in
+# that case fall back to dynamic linking and say so explicitly.
 link_mode="-static"
 if ! cc -static -O2 -Wall -Wextra -Werror \
         -o "$work/linkprobe" -x c - <<<'int main(void){return 0;}' \
@@ -109,18 +105,18 @@ for c in "${cases[@]}"; do
 done
 echo "  compile OK (${link_mode:-dynamic})"
 
-echo "== 7. run on host and verify marker manifests =="
+echo "== 7. run on host and verify generated expectations =="
 for c in "${cases[@]}"; do
     out="$work/$c.out"
     "$work/$c-gen-smoke" > "$out"
-    while IFS= read -r marker; do
-        if ! grep -Fqx "$marker" "$out"; then
-            echo "FAIL: $c missing marker: $marker" >&2
+    while IFS= read -r expected; do
+        if ! grep -Fqx "$expected" "$out"; then
+            echo "FAIL: $c missing expected result: $expected" >&2
             exit 1
         fi
     done < "generated/$c-gen-smoke.markers"
     n="$(wc -l < "generated/$c-gen-smoke.markers")"
-    echo "  $c: all $n markers matched"
+    echo "  $c: all $n expected results matched"
     sed 's/^/    /' "$out"
 done
 

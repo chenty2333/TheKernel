@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -145,38 +146,79 @@ class RunnerContractTests(unittest.TestCase):
         source = (CI_DIR / "nightly" / "mm-performance.sh").read_text(
             encoding="utf-8"
         )
-        block = source.split("manifest_columns=(", 1)[1].split("\n)", 1)[0]
-        columns = tuple(line.strip() for line in block.splitlines() if line.strip())
-        self.assertEqual(columns, schema.MANIFEST_COLUMNS)
-        self.assertIn("thekernel-mm-performance-bundle-v10", source)
         self.assertIn(
-            f"$((run_count * {len(schema.EXPECTED_METRICS)}))",
+            "mode\\tarch\\tcpus\\tonline_cpus\\tmetrics\\treceipt\\thost_pre\\thost_post",
             source,
         )
+        self.assertEqual(
+            schema.MANIFEST_COLUMNS,
+            ("mode", "arch", "cpus", "online_cpus", "metrics", "receipt", "host_pre", "host_post"),
+        )
 
-    def test_runner_hash_covers_affinity_diagnostics_and_pairing_contract(self) -> None:
+    def test_runner_materializes_one_explicit_receipt_per_run(self) -> None:
         source = (CI_DIR / "nightly" / "mm-performance.sh").read_text(
             encoding="utf-8"
         )
-        for relative in (
-            "scripts/ci/mm_performance_host.py",
-            "scripts/ci/capture-mm-performance-host.py",
-            "scripts/ci/select-mm-performance-cpus.py",
-            "scripts/ci/compare-mm-performance.py",
-            "scripts/ci/nightly/mm-performance-boundary.sh",
-            "scripts/ci/parse-mm-lock-diagnostics.py",
-            "scripts/ci/parse-asid-switch-diagnostics.py",
-            "scripts/ci/parse-pmu-capabilities.py",
-            "scripts/ci/nightly/mm-performance-regression-policy.json",
-            "scripts/ci/nightly/mm-performance-stability-policy.json",
-            "scripts/create-rootfs-image.sh",
+        self.assertIn("mm_perf_capture_prepared_run", source)
+        self.assertIn('"$run_name/performance-receipt.json"', source)
+        self.assertIn('"$run_name/host-pre.tsv"', source)
+        self.assertIn('"$run_name/host-post.tsv"', source)
+
+    def test_mm_boundary_prepares_before_host_pre_and_only_runs_between_snapshots(self) -> None:
+        source = (CI_DIR / "nightly" / "mm-performance-boundary.sh").read_text(
+            encoding="utf-8"
+        )
+        prepare = source.index("nightly_prepare_guest_run")
+        host_pre = source.index("--phase pre")
+        execute = source.index("nightly_run_prepared_guest")
+        host_post = source.index("--phase post")
+        self.assertLess(prepare, host_pre)
+        self.assertLess(host_pre, execute)
+        self.assertLess(execute, host_post)
+
+        nightly_lib = (CI_DIR / "nightly" / "lib.sh").read_text(encoding="utf-8")
+        prepare_body = nightly_lib.split("nightly_prepare_guest_run() {", 1)[1].split(
+            "nightly_run_prepared_guest() {", 1
+        )[0]
+        execute_body = nightly_lib.split("nightly_run_prepared_guest() {", 1)[1].split(
+            "nightly_run_guest() {", 1
+        )[0]
+        self.assertIn("ci_prepare_run_dir", prepare_body)
+        self.assertIn("thekernel.py build", prepare_body)
+        self.assertIn("thekernel.py rootfs", prepare_body)
+        self.assertIn("run --no-build", execute_body)
+        self.assertNotIn("ci_prepare_run_dir", execute_body)
+        self.assertNotIn("thekernel.py build", execute_body)
+        self.assertNotIn("thekernel.py rootfs", execute_body)
+
+    def test_product_run_no_build_skips_artifact_builders(self) -> None:
+        product = load_module(
+            "thekernel_product_cli", REPO_ROOT / "tools" / "thekernel.py"
+        )
+        args = product.build_parser().parse_args(
+            ["run", "--no-build", "--profile", "mm-performance", "--smp", "4"]
+        )
+        with (
+            mock.patch.object(product, "build_kernel") as build_kernel,
+            mock.patch.object(product, "build_rootfs") as build_rootfs,
+            mock.patch.object(product, "run_product", return_value=0) as run_product,
         ):
-            self.assertIn(relative, source)
-        self.assertIn("mm_perf_settle_seconds=%s", source)
-        self.assertIn('"$MM_PERF_SETTLE_SECS"', source)
-        self.assertIn("mm_perf_measurement_mode=%s", source)
-        self.assertIn("mm_perf_kernel_profile=%s", source)
-        self.assertIn("mm_perf_diagnostic_off_retries=%s", source)
+            self.assertEqual(product.run_cmd(args), 0)
+        build_kernel.assert_not_called()
+        build_rootfs.assert_not_called()
+        run_product.assert_called_once()
+
+    def test_product_run_no_build_fails_closed_when_artifacts_are_missing(self) -> None:
+        product = load_module(
+            "thekernel_product_cli_missing", REPO_ROOT / "tools" / "thekernel.py"
+        )
+        args = product.build_parser().parse_args(["run", "--no-build"])
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ, {"THEKERNEL_STATE_DIR": temporary}, clear=False
+            ):
+                with self.assertRaisesRegex(product.ProductError, "kernel and ESP"):
+                    product.run_cmd(args)
 
 
 if __name__ == "__main__":

@@ -280,6 +280,7 @@ def host_cost_capabilities() -> dict[str, object]:
             "status": host_status,
             "reason": host_reason,
             "measured": False,
+            "measurement_status": "not-measured",
         }
     if host_status == "unavailable":
         llc_status = "unavailable"
@@ -295,15 +296,20 @@ def host_cost_capabilities() -> dict[str, object]:
         "reason": llc_reason,
         "event_aliases": exposed_llc_aliases,
         "measured": False,
+        "measurement_status": "not-measured",
     }
     metrics["cpu_cost_ns"] = {
         "status": "helper-supported",
         "reason": "process-cpu-clock-in-TKPERF_LATENCY",
         "measured": False,
+        "measurement_status": "not-measured",
     }
     return {
         "schema": "thekernel-perf-cost-capabilities-v1",
-        "perf": {"path": perf_path, "status": "available" if perf_path else "unavailable"},
+        "perf": {
+            "path": perf_path,
+            "status": "binary-present" if perf_path else "not-installed",
+        },
         "cpu_pmu_sysfs": {"path": str(pmu_root), "present": pmu_present},
         "perf_event_paranoid": paranoid,
         "permission": {"status": host_status, "reason": host_reason},
@@ -314,7 +320,8 @@ def host_cost_capabilities() -> dict[str, object]:
             "definition": "floor(1e9 / wall_p50_ns) for serial syscall cells",
             "concurrent": False,
         },
-        "measurement_policy": "PMU values are recorded only when helper evidence is present; unavailable stays empty",
+        "measurement_status": "not-measured",
+        "measurement_policy": "This capability record contains no PMU measurements; only helper-emitted values are recorded, and unavailable counters stay empty.",
     }
 
 
@@ -353,6 +360,25 @@ class Sample:
             if value:
                 return value.lower()
         return None
+
+
+def subsystem_evidence_class(samples: Iterable[Sample]) -> str:
+    """Classify direct cost evidence, never host capability alone.
+
+    Successful TKPERF latency records carry process-CPU p50/p99 fields as
+    mandatory sample witnesses.  A host ``perf`` probe is only a capability
+    record and cannot upgrade a latency-only run to formal evidence.
+    """
+
+    captured = tuple(samples)
+    if not captured:
+        return "not-measured"
+    if all(
+        isinstance(sample.cpu_p50_ns, int) and isinstance(sample.cpu_p99_ns, int)
+        for sample in captured
+    ):
+        return "cpu-cost-evidenced"
+    return "measured-latency-only"
 
 
 @dataclass(frozen=True)
@@ -1623,14 +1649,20 @@ def stats_command(input_path: Path, output_path: Path, summary_tsv: Path | None 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.tmp")
     temporary.write_text(
-        json.dumps({"schema": SCHEMA, "raw_sample_count": len(samples), "runs": runs},
+        json.dumps({
+            "schema": SCHEMA,
+            "raw_sample_count": len(samples),
+            "measurement_status": "measured" if samples else "not-measured",
+            "evidence_class": subsystem_evidence_class(samples),
+            "runs": runs,
+        },
                    indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     temporary.replace(output_path)
     if summary_tsv is not None:
         _write_tsv(summary_tsv, SUMMARY_COLUMNS, runs)
-    return 0
+    return 0 if samples else 1
 
 
 # ---- host CPU topology -------------------------------------------------
@@ -3518,39 +3550,37 @@ def run_command(args: argparse.Namespace) -> int:
                     extra_args[0:0] = ["-append", images.cmdline or ""]
                     if images.initrd is not None:
                         extra_args[0:0] = ["-initrd", str(images.initrd)]
-                with commands.open("rb") as input_stream:
-                    result = run(
-                        RunConfig(
-                            arch="x86_64",
-                            kernel=images.kernel,
-                            rootfs=images.rootfs,
-                            esp=images.esp,
-                            direct_kernel=images.direct_kernel,
-                            workdir=run_dir,
-                            log_path=run_dir / "console.log",
-                            cache_dir=output / "image-cache",
-                            extra_block=images.extra_block,
-                            memory=args.memory,
-                            cpus=args.cpus,
-                            qemu_binary=qemu,
-                            qemu_launcher=(
-                                sys.executable,
-                                str(Path(__file__).with_name("kvm_scheduler_pinner.py")),
-                            ),
-                            accel="kvm",
-                            cpu="host",
-                            iothread_id="subsystem-io",
-                            network=network,
-                            tap_name=packet_tap,
-                            extra_args=tuple(extra_args),
-                            ovmf_code=args.ovmf_code,
-                            ovmf_vars=args.ovmf_vars,
-                            receipt_path=run_dir / "qemu-receipt.json",
-                            limits=RunLimits(total_timeout_secs=args.timeout, ready_timeout_secs=args.ready_timeout),
-                            interaction=Interaction(interactive=True, input_after_marker=args.ready_marker),
+                result = run(
+                    RunConfig(
+                        arch="x86_64",
+                        kernel=images.kernel,
+                        rootfs=images.rootfs,
+                        esp=images.esp,
+                        direct_kernel=images.direct_kernel,
+                        workdir=run_dir,
+                        log_path=run_dir / "console.log",
+                        extra_block=images.extra_block,
+                        memory=args.memory,
+                        cpus=args.cpus,
+                        qemu_binary=qemu,
+                        qemu_launcher=(
+                            sys.executable,
+                            str(Path(__file__).with_name("kvm_scheduler_pinner.py")),
                         ),
-                        input_stream=input_stream,
-                    )
+                        accel="kvm",
+                        cpu="host",
+                        iothread_id="subsystem-io",
+                        network=network,
+                        tap_name=packet_tap,
+                        extra_args=tuple(extra_args),
+                        ovmf_code=args.ovmf_code,
+                        ovmf_vars=args.ovmf_vars,
+                        receipt_path=run_dir / "qemu-receipt.json",
+                        input_path=commands,
+                        limits=RunLimits(total_timeout_secs=args.timeout, ready_timeout_secs=args.ready_timeout),
+                        interaction=Interaction(interactive=True, input_after_marker=args.ready_marker),
+                    ),
+                )
             finally:
                 if peer is not None and result is not None:
                     try:
@@ -3615,11 +3645,16 @@ def run_command(args: argparse.Namespace) -> int:
             eligible = peer_ok and run_identity_ok and data_proof_ok and eligible_for_stats(
                 guest, runner_returncode=runner_returncode, pin_valid=pin_valid
             )
+            sample_witness = guest.samples if eligible else ()
+            evidence_class = subsystem_evidence_class(sample_witness)
+            formal = eligible and not guest.claim_degraded and evidence_class == "cpu-cost-evidenced"
             pin_status = pin_report_failure_status(pin_report, pin_valid)
             if eligible:
                 raw_samples.extend(guest.samples)
             status = (
-                "ok" if eligible
+                "ok" if formal
+                else "degraded" if eligible and guest.claim_degraded
+                else "measured-latency-only" if eligible
                 else "host-peer-error" if not peer_ok
                 else "protocol-error" if not run_identity_ok
                 else "data-disk-error" if not data_proof_ok
@@ -3662,7 +3697,14 @@ def run_command(args: argparse.Namespace) -> int:
                     "done": guest.done,
                     "done_status": guest.done_status,
                     "correctness": guest.correctness,
-                    "claim": "degraded" if guest.claim_degraded else "formal",
+                    "claim": (
+                        "formal" if formal
+                        else "degraded" if eligible and guest.claim_degraded
+                        else evidence_class if eligible
+                        else "degraded" if guest.claim_degraded
+                        else "not-measured"
+                    ),
+                    "evidence_class": evidence_class,
                     "claim_degraded": guest.claim_degraded,
                     "pin_valid": pin_valid,
                     "data_proof": dict(guest.data_proof) if guest.data_proof is not None else None,
@@ -3675,7 +3717,8 @@ def run_command(args: argparse.Namespace) -> int:
                         if pin_status == "unsupported"
                         else guest.error
                     ),
-                    "formal_cells": len(guest.samples),
+                    "formal_cells": len(sample_witness) if formal else 0,
+                    "latency_sample_cells": len(sample_witness),
                 }
             )
 
@@ -3714,6 +3757,8 @@ def run_command(args: argparse.Namespace) -> int:
                 "subsystem": args.subsystem,
                 "targets": list(targets),
                 "raw_sample_count": len(raw_samples),
+                "measurement_status": "measured" if raw_samples else "not-measured",
+                "evidence_class": subsystem_evidence_class(raw_samples),
                 "optional_cost_metrics": list(PMU_EVIDENCE_KEYS),
                 "optional_cost_policy": "record-when-available; missing-is-empty-not-zero",
                 "cost_capabilities": cost_capabilities,
@@ -3795,6 +3840,8 @@ def run_command(args: argparse.Namespace) -> int:
             {
                 "schema": SCHEMA,
                 "subsystem": args.subsystem,
+                "measurement_status": "measured" if raw_samples else "not-measured",
+                "evidence_class": subsystem_evidence_class(raw_samples),
                 "target": target_choice,
                 "targets": target_manifest,
                 "boot_comparison": "TheKernel uses UEFI/OVMF; Linux uses direct bzImage when selected; boot is outside measurement windows",
@@ -3831,7 +3878,7 @@ def run_command(args: argparse.Namespace) -> int:
         + "\n",
         encoding="utf-8",
     )
-    return 0 if runs and all(run_record["status"] == "ok" for run_record in runs) else 1
+    return 0 if raw_samples and runs and all(run_record["status"] == "ok" for run_record in runs) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:

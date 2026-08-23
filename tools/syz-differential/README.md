@@ -1,9 +1,7 @@
 # syz-differential: syzlang-driven differential-case generation (prototype)
 
-Prototype (workstream C of the Linux-ABI differential-testing framework)
-proving that contract-conforming differential C smoke cases can be *generated*
-from syzkaller-style syscall descriptions (syzlang) plus a small hand-written
-semantics annotation, instead of being hand-written C.
+This prototype generates differential C smoke cases from syzkaller-style
+syscall descriptions (syzlang) plus a small hand-written semantics annotation.
 
 ```
 descriptions/<name>.txt   syzlang-subset description (what the ABI looks like)
@@ -12,8 +10,7 @@ descriptions/<name>.txt   syzlang-subset description (what the ABI looks like)
         |
 semantics/<name>.json     hand-written annotation (what behavior to assert)
         |
-    generate.py ---------> generated/<name>-gen-smoke.c   (contract v0 case)
-                           generated/<name>-gen-smoke.markers (manifest)
+    generate.py ---------> generated/<name>-gen-smoke.c
 ```
 
 Run end to end:
@@ -22,20 +19,12 @@ Run end to end:
 bash tools/syz-differential/test_prototype.sh
 ```
 
-This parses both descriptions, verifies the parser rejects out-of-subset
-syntax, generates both C cases, checks generation is byte-identical on
-regeneration, verifies the generator rejects annotation/description drift,
-compiles with `cc -static -O2 -Wall -Wextra -Werror` (falling back to a
-dynamic link with an explicit warning on hosts without a static libc, matching
-`scripts/ci/seccomp-host-differential.sh`), runs the binaries on the host
-kernel, and verifies every manifest marker with `grep -Fqx`.
-
-Generated cases follow the differential-case contract v0: per-check
-`THEKERNEL_<NAME>GEN_<CHECK>_OK` markers on stdout, a final
-`THEKERNEL_<NAME>GEN_OK`, and on failure a single
-`THEKERNEL_<NAME>GEN_FAIL <stage> actual=<n> expected=<n> errno=<n> (<msg>)`
-line on stderr followed by `exit(EXIT_FAILURE)`. Generation is deterministic:
-no timestamps, no randomness, output depends only on the two input files.
+This parses both descriptions, verifies parser rejection paths, regenerates
+both C cases, checks annotation/description drift, compiles with
+`cc -static -O2 -Wall -Wextra -Werror` (falling back to dynamic linking when a
+static libc is unavailable), and runs the cases on the host kernel. Generation
+is deterministic: no timestamps or randomness; output depends only on the two
+input files.
 
 ## Supported syzlang subset (grammar)
 
@@ -71,46 +60,16 @@ JSON.
 
 ## Semantics annotation format (`semantics/<name>.json`)
 
-The description says what the ABI looks like; the annotation says which
-concrete sequences to run and what Linux must observably do. Schema
-`syz-differential-semantics-v0`:
+The description defines the ABI shape; the annotation defines concrete calls
+and expected Linux-visible results. Each check can save syscall results, use
+declared locals, assert return values, errno, and values, or set a local field
+before a call. The existing `eventfd.json` and `timerfd.json` are the concise
+format references.
 
-```jsonc
-{
-  "schema": "syz-differential-semantics-v0",
-  "name": "eventfd",              // output basename; prefix must be NAMEGEN
-  "marker_prefix": "EVENTFDGEN",
-  "c_includes": ["sys/eventfd.h"],  // appended after the base include set
-  "checks": [
-    {
-      "marker": "COUNTER_INITVAL",   // -> THEKERNEL_EVENTFDGEN_COUNTER_INITVAL_OK
-      "locals": {"rval": "u64"},     // u64 | i64 | int | itimerspec | timespec
-      "steps": [
-        // call step: syscall must be declared in the description, arity is
-        // checked, named flags are checked against the arg's flag set.
-        {"call": "eventfd2", "args": ["3", "EFD_NONBLOCK"], "save": "efd",
-         "expect": {"ret": ">=0"}},
-        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
-         "expect": {"ret": "8"}},
-        // value assertion on a local after a call
-        {"expect": {"var": "rval", "cmp": "==", "value": 3}},
-        // errno assertion (requires ret == "-1")
-        {"call": "read$eventfd", "args": ["@efd", "&rval", "8"],
-         "expect": {"ret": "-1", "errno": "EAGAIN"}},
-        // set step: write a field of a declared local before a call
-        // {"set": "its.it_value.tv_nsec", "value": 20000000}
-        {"call": "close$eventfd", "args": ["@efd"], "expect": {"ret": "0"}}
-      ]
-    }
-  ]
-}
-```
-
-Argument forms: integer literal (always allowed — this is how negative tests
-pass bad flags/fds/lengths), `NAME|NAME` flag expressions (validated against
-the parameter's flag set from the description), `@var` (a value saved from an
-earlier call in the same check — resource threading), `&local` (address of a
-declared local, only for `ptr`/`buffer` parameters; `0` means NULL).
+Argument forms are integer literals, `NAME|NAME` flag expressions validated
+against the declared flag set, `@var` values saved by an earlier call in the
+same check, and `&local` addresses for pointer or buffer parameters (`0` is
+NULL).
 
 Calls are emitted as `syscall(SYS_<basename>, ...)` — `read$eventfd` invokes
 `SYS_read` — so the same generated source is meaningful on host Linux and in
@@ -120,7 +79,7 @@ Cross-validation the generator enforces (drift between annotation and
 description is a generation error, exercised by `test_prototype.sh`):
 undeclared syscall names, wrong arity, flag names outside the declared set,
 pointer args for non-pointer params, references to never-saved values,
-undeclared locals, duplicate markers, malformed errno/marker names.
+undeclared locals, duplicate check identifiers, and malformed errno names.
 
 ## Current cases
 
@@ -173,12 +132,9 @@ What full support additionally needs:
 - **Deterministic timing**: blocking reads on armed timers are deterministic
   in count but not duration; a full harness wants per-case timeouts.
 
-Intended import path for upstream `sys/linux/*.txt`: (1) vendor the files
-unmodified, (2) extend the parser milestone-by-milestone (strings/arrays →
-unions/attributes → templates/defines), keeping the hard-error property so
-unsupported constructs are visible rather than mis-parsed, (3) replace
-compiler-side const resolution with a `syz-extract`-style const table,
-(4) grow the annotation schema only where behavior cannot be derived, and
-(5) at integration time, hook `generated/*.c` into the standard
-`scripts/ci/<subsys>-host-differential.sh` runner + receipt flow from the
-shared contract (kept out of this prototype to avoid touching CI wiring).
+Intended import path for upstream `sys/linux/*.txt`: vendor files unmodified,
+extend the parser incrementally while retaining hard errors for unsupported
+constructs, replace compiler-side constant resolution with a
+`syz-extract`-style table, and grow annotations only where behavior cannot be
+derived. Integrating generated cases into a test suite is separate work from
+this prototype.

@@ -1,0 +1,63 @@
+set -e
+echo 'KTAP version 1'
+echo '1..1'
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo async_block=on > /proc/io_test_control
+echo async_block_depth=4 > /proc/io_test_control
+echo async_block_wait=hybrid > /proc/io_test_control
+echo lwext4_async_read=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
+rm -f /ar_src /ar_copy /ar_pagefill /ar_pagefill_expected /ar_multi /ar_multi_read
+rm -f /ar_zero /ar_trunc /ar_trunc_tail /ar_sparse /ar_sparse_first /ar_frag /ar_gap /ar_frag_read
+dd if=/dev/zero of=/ar_zero bs=4096 count=1
+dd if=/bin/busybox of=/ar_src bs=4096 count=16
+sync
+dd if=/ar_src of=/ar_copy bs=4096 count=16
+cmp /ar_src /ar_copy
+dd if=/ar_src of=/ar_pagefill bs=1000 count=5
+dd if=/ar_src of=/ar_pagefill_expected bs=1000 count=5
+cmp /ar_pagefill /ar_pagefill_expected
+dd if=/bin/busybox of=/ar_multi bs=4096 count=2
+sync
+exec 7</ar_multi
+dd if=/dev/zero of=/ar_multi bs=4096 count=1 conv=notrunc
+dd of=/ar_multi_read bs=4096 count=1 <&7
+exec 7<&-
+cmp /ar_zero /ar_multi_read
+dd if=/bin/busybox of=/ar_trunc bs=4096 count=8
+truncate -s 4096 /ar_trunc
+dd if=/ar_trunc of=/ar_trunc_tail bs=4096 skip=1 count=1
+[ "$(wc -c < /ar_trunc_tail)" = 0 ]
+dd if=/bin/busybox of=/ar_sparse bs=4096 count=1 seek=1
+dd if=/ar_sparse of=/ar_sparse_first bs=4096 count=1
+cmp /ar_zero /ar_sparse_first
+dd if=/bin/busybox of=/ar_frag bs=4096 count=1
+dd if=/bin/busybox of=/ar_gap bs=4096 count=8
+dd if=/bin/busybox of=/ar_frag bs=4096 skip=1 seek=1 count=1 conv=notrunc
+dd if=/ar_frag of=/ar_frag_read bs=4096 count=2
+[ "$(wc -c < /ar_frag_read)" = 8192 ]
+stats=/proc/io_stats
+value() { awk -v key="$1" '$1 == key { value = $2 } END { gsub(/\r/, "", value); if (value == "") exit 1; print value }' "$stats"; }
+at_least() { [ "$(value "$1")" -ge "$2" ]; }
+zero() { [ "$(value "$1")" -eq 0 ]; }
+at_least ext4.async_mapped_read_enabled 1
+at_least ext4.async_mapped_read_hits 1
+at_least ext4.async_mapped_read_runs 1
+at_least ext4.async_mapped_read_bytes 4096
+at_least ext4.async_mapped_read_submit_batches 1
+at_least ext4.async_mapped_read_fallbacks 1
+at_least ext4.mapped_read_runs 1
+at_least virtio.blk_async_submit_batches 1
+at_least virtio.blk_async_submit_requests 1
+at_least virtio.blk_async_completed_requests 1
+[ "$(value virtio.blk_async_wait_policy)" -eq 0 ]
+zero virtio.blk_async_irq_first_waits
+zero ext4.async_mapped_read_cookie_rejects
+zero virtio.blk_async_completion_errors
+zero virtio.blk_async_resource_leaks
+echo test_policy=reset > /proc/io_test_control
+echo 'ok 1 - lwext4-async-read'
+echo '# THEKERNEL_SMOKE_COMPLETE'
+exit

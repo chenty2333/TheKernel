@@ -1,19 +1,20 @@
-"""Product-level QEMU execution primitives."""
+"""Internal QEMU command construction and process execution primitives."""
 
 from .command import build_qemu_command, drive_options
-from .images import prepare_image
 from .model import Drive, Interaction, RunLimits, RunResult
-from .runner import RunConfig, normalize_arch, run
+from .process import ProcessError
+from .runner import RunConfig, RunnerError, normalize_arch, run
 
 __all__ = [
     "Drive",
     "Interaction",
+    "ProcessError",
     "RunConfig",
     "RunLimits",
     "RunResult",
+    "RunnerError",
     "build_qemu_command",
     "drive_options",
     "normalize_arch",
-    "prepare_image",
     "run",
 ]

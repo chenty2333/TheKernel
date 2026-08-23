@@ -17,12 +17,12 @@ usage: scripts/build-x86-uefi-esp.sh --kernel PATH --output PATH [options]
 
 Create a GPT/FAT32 ESP containing GRUB's x86_64 EFI fallback loader and a
 Multiboot kernel named TheKernel.elf.  The default GRUB configuration is
-make/x86_64/grub.cfg.
+config/x86_64/grub.cfg.
 
 options:
   --kernel PATH          x86_64 Multiboot ELF to place at ESP root
   --output PATH          ESP disk image to create
-  --grub-config PATH     GRUB config (default: make/x86_64/grub.cfg)
+  --grub-config PATH     GRUB config (default: config/x86_64/grub.cfg)
   --size-mib N           image size, at least 128 MiB (default: 128)
   --grub-mkstandalone P  grub2-mkstandalone executable to use
 EOF
@@ -31,7 +31,7 @@ EOF
 
 kernel=
 output=
-grub_config="$REPO_ROOT/make/x86_64/grub.cfg"
+grub_config="$REPO_ROOT/config/x86_64/grub.cfg"
 size_mib=128
 grub_mkstandalone=${GRUB_MKSTANDALONE:-}
 

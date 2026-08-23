@@ -650,8 +650,8 @@ class SchedulerBaselineTests(unittest.TestCase):
                 "--vcpu-cpus", str(allowed[0]), "--io-cpus", str(allowed[1]),
             ])
 
-            def fake_run(config, *, input_stream=None, console_stream=None):
-                del input_stream, console_stream
+            def fake_run(config, *, console_stream=None):
+                del console_stream
                 log = (
                     "SCHED_BASELINE_RUN schema=thekernel-scheduler-baseline-run-v1 "
                     "arch=x86_64 workload=futex placement=same iterations=1 "
@@ -696,6 +696,8 @@ class SchedulerBaselineTests(unittest.TestCase):
         self.assertEqual(manifest["runs"][0]["status"], "incomplete")
         self.assertEqual(len(raw.splitlines()), 1)
         self.assertEqual(summary["raw_sample_count"], 0)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+        self.assertEqual(manifest["measurement_status"], "not-measured")
         self.assertEqual(summary["runs"], [])
 
     def test_nonzero_runner_samples_are_not_aggregated(self) -> None:
@@ -703,6 +705,8 @@ class SchedulerBaselineTests(unittest.TestCase):
         self.assertEqual(manifest["runs"][0]["status"], "runner-error")
         self.assertEqual(len(raw.splitlines()), 1)
         self.assertEqual(summary["raw_sample_count"], 0)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+        self.assertEqual(manifest["measurement_status"], "not-measured")
         self.assertEqual(summary["runs"], [])
 
     def test_zero_runner_with_missing_pin_proof_is_explicitly_unsupported(self) -> None:
@@ -712,6 +716,17 @@ class SchedulerBaselineTests(unittest.TestCase):
         self.assertEqual(manifest["runs"][0]["status"], "unsupported")
         self.assertEqual(len(raw.splitlines()), 1)
         self.assertEqual(summary["raw_sample_count"], 0)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+        self.assertEqual(manifest["measurement_status"], "not-measured")
+
+    def test_latency_only_scheduler_run_is_not_formal_performance_evidence(self) -> None:
+        manifest, _raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "measured-latency-only")
+        self.assertEqual(manifest["runs"][0]["evidence_class"], "measured-latency-only")
+        self.assertEqual(manifest["evidence_class"], "measured-latency-only")
+        self.assertEqual(summary["evidence_class"], "measured-latency-only")
 
     def test_guest_helper_emits_raw_samples_for_each_workload(self) -> None:
         for workload in ("futex", "pipe", "cpu-worker"):
@@ -908,15 +923,15 @@ class SchedulerBaselineTests(unittest.TestCase):
             ])
             configs = []
 
-            def fake_run(config, *, input_stream=None, console_stream=None):
-                del input_stream, console_stream
+            def fake_run(config, *, console_stream=None):
+                del console_stream
                 configs.append(config)
                 config.log_path.write_text(
                     "SCHED_BASELINE_RUN schema=thekernel-scheduler-baseline-run-v1 "
                     "arch=x86_64 workload=futex placement=same iterations=1 "
                     "warmup=0 cpus=1 cpu_work=1\n"
                     "SCHED_BASELINE_SAMPLE schema=thekernel-scheduler-baseline-sample-v1 "
-                    "workload=futex placement=same worker=0 sample=0 latency_ns=1\n"
+                    "workload=futex placement=same worker=0 sample=0 latency_ns=1 cpu_cost_ns=1\n"
                     "SCHED_BASELINE_RESULT schema=thekernel-scheduler-baseline-result-v1 "
                     "workload=futex placement=same status=ok count=1 p50_ns=1 "
                     "p99_ns=1 p999_ns=1 checksum=7122294161688811748\n"
