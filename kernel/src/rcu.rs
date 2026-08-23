@@ -131,7 +131,7 @@ unsafe impl EpochPlatform for KernelEpochPlatform {
             // threads are preemptible task contexts for the test platform;
             // the generic domain still rejects an active local reader before
             // reclamation can proceed.
-            return true;
+            true
         }
 
         #[cfg(not(test))]

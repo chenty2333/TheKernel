@@ -319,6 +319,20 @@ impl FileNodeOps for SimpleFile {
     }
 }
 
+impl Pollable for SimpleFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::READABLE | IoEvents::WRITABLE
+    }
+
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -444,19 +458,5 @@ mod tests {
         let oversized = [0; PAGE_SIZE_4K];
         assert_eq!(file.write_at(&oversized, 0), Err(VfsError::InvalidInput));
         assert_eq!(dispatches.load(Ordering::Relaxed), 0);
-    }
-}
-
-impl Pollable for SimpleFile {
-    fn poll(&self) -> IoEvents {
-        IoEvents::READABLE | IoEvents::WRITABLE
-    }
-
-    fn register<'a>(
-        &'a self,
-        _context: &mut Context<'_>,
-        _events: IoEvents,
-    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
-        axpoll::PollRegistration::empty()
     }
 }
