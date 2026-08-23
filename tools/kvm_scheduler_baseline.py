@@ -1537,8 +1537,14 @@ def _target_images(args: argparse.Namespace, target: str) -> TargetImages:
     )
 
 
+def kvm_available() -> bool:
+    """Return whether the host exposes the KVM execution device."""
+
+    return Path("/dev/kvm").exists()
+
+
 def run_command(args: argparse.Namespace) -> int:
-    if not Path("/dev/kvm").exists():
+    if not kvm_available():
         print("kvm-scheduler-baseline: UNSUPPORTED: /dev/kvm is unavailable", file=sys.stderr)
         return 78
     qemu = shutil.which(args.qemu_binary or "qemu-system-x86_64")

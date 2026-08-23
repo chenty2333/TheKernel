@@ -682,7 +682,10 @@ class SchedulerBaselineTests(unittest.TestCase):
                     pin_path.write_text(json.dumps(pin_payload), encoding="utf-8")
                 return type("Result", (), {"returncode": returncode})()
 
-            with patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run):
+            with (
+                patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
+                patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
+            ):
                 from tools.kvm_scheduler_baseline import run_command
 
                 self.assertEqual(run_command(args), 1)
@@ -949,7 +952,10 @@ class SchedulerBaselineTests(unittest.TestCase):
                 )
                 return type("Result", (), {"returncode": 0})()
 
-            with patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run):
+            with (
+                patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
+                patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
+            ):
                 from tools.kvm_scheduler_baseline import run_command
 
                 self.assertEqual(run_command(args), 0)
