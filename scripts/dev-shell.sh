@@ -43,6 +43,12 @@ export LOCAL_UID="$(id -u)"
 export LOCAL_GID="$(id -g)"
 
 run_args=(run --rm --remove-orphans)
+if [[ "$THEKERNEL_DEV_IMAGE" == "thekernel-dev:local" ]]; then
+    # Keep the default local image synchronized with dev-env/Dockerfile. Docker
+    # reuses unchanged layers, so this is cheap while preventing a stale tag
+    # from silently overriding the repository's toolchain contract.
+    run_args+=(--build)
+fi
 
 canonical_sibling() {
     local label=$1
