@@ -22,6 +22,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+        DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -34,6 +37,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+        DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
     working_dir: /workspace
     privileged: true
     stdin_open: true

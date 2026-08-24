@@ -14,6 +14,9 @@ Usage:
 
 Environment:
   THEKERNEL_DEV_IMAGE        Docker image tag or digest (default: thekernel-dev:local)
+  THEKERNEL_DEBIAN_MIRROR    Temporary Debian package mirror for local image builds
+  THEKERNEL_DEBIAN_SECURITY_MIRROR
+                             Temporary Debian security mirror for local image builds
   THEKERNEL_AX_REPO          Maintained thekernel-ax checkout (default: ../thekernel-ax)
   THEKERNEL_LINUX_ABI_REPO   Maintained Linux ABI checkout (default: ../thekernel-linux-abi)
 EOF

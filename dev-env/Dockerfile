@@ -1,17 +1,26 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG DEBIAN_MIRROR=http://deb.debian.org/debian
+ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG QEMU_VERSION=9.2.1
 ARG QEMU_SHA256=72874fe9c395ced0c7fd7c22c43744072697f7ee1926a72237bd81784b2faf62
 
 FROM ${DEBIAN_IMAGE} AS qemu-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
 ARG QEMU_VERSION
 ARG QEMU_SHA256
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get -o Acquire::Retries=5 update \
+RUN sed -i \
+      -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+      -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+ && apt-get -o Acquire::Retries=5 update \
  && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+      aria2 \
       build-essential \
       bzip2 \
       ca-certificates \
@@ -32,8 +41,9 @@ RUN apt-get -o Acquire::Retries=5 update \
 
 WORKDIR /tmp/qemu
 
-RUN curl --http1.1 -L --fail --retry 5 --retry-all-errors --continue-at - \
-      --output "qemu-${QEMU_VERSION}.tar.xz" \
+RUN aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true \
+      --console-log-level=warn --download-result=hide --max-connection-per-server=8 \
+      --min-split-size=1M --out="qemu-${QEMU_VERSION}.tar.xz" --split=8 \
       "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" \
  && echo "${QEMU_SHA256}  qemu-${QEMU_VERSION}.tar.xz" | sha256sum -c - \
  && tar -xf "qemu-${QEMU_VERSION}.tar.xz" \
@@ -53,11 +63,17 @@ RUN curl --http1.1 -L --fail --retry 5 --retry-all-errors --continue-at - \
 FROM ${DEBIAN_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
 ARG QEMU_VERSION
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get -o Acquire::Retries=5 update \
+RUN sed -i \
+      -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+      -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+ && apt-get -o Acquire::Retries=5 update \
  && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
       bash-completion \
       binutils \
