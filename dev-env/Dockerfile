@@ -139,5 +139,8 @@ RUN /usr/local/bin/thekernel-dev-check
 
 WORKDIR /workspace
 
+ARG THEKERNEL_DEV_SOURCE_SHA256=unknown
+LABEL org.thekernel.dev-source-sha256="${THEKERNEL_DEV_SOURCE_SHA256}"
+
 ENTRYPOINT ["/usr/local/bin/thekernel-dev-entrypoint"]
 CMD ["/bin/bash"]

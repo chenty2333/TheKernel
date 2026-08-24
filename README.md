@@ -34,6 +34,12 @@ Enter the system-dependency development container with:
 ./scripts/dev-shell.sh
 ```
 
+Boot the interactive TheKernel guest shell directly from the host with:
+
+```bash
+./scripts/dev-shell.sh --guest-shell
+```
+
 The image deliberately contains no Rust runtime. Install rustup there, then
 run `rustup show` from this checkout to install the toolchain declared by the
 root [`rust-toolchain.toml`](rust-toolchain.toml): `nightly-2026-08-23`

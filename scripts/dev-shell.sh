@@ -9,6 +9,7 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/dev-shell.sh
+  scripts/dev-shell.sh --guest-shell [RUN_ARGS...]
   scripts/dev-shell.sh -- COMMAND [ARGS...]
   scripts/dev-shell.sh --service builder -- COMMAND [ARGS...]
 
@@ -33,7 +34,10 @@ if [[ "${1:-}" == "--service" ]]; then
     shift 2
 fi
 
-if [[ $# -gt 0 && "$1" == "--" ]]; then
+if [[ "${1:-}" == "--guest-shell" ]]; then
+    shift
+    set -- ./tools/thekernel.py run --profile shell --interactive "$@"
+elif [[ $# -gt 0 && "$1" == "--" ]]; then
     shift
 fi
 
@@ -47,10 +51,25 @@ export LOCAL_GID="$(id -g)"
 
 run_args=(run --rm --remove-orphans)
 if [[ "$THEKERNEL_DEV_IMAGE" == "thekernel-dev:local" ]]; then
-    # Keep the default local image synchronized with dev-env/Dockerfile. Docker
-    # reuses unchanged layers, so this is cheap while preventing a stale tag
-    # from silently overriding the repository's toolchain contract.
-    run_args+=(--build)
+    # Hash only the local inputs that define the image. Mirror URLs are
+    # transport choices and intentionally do not make an otherwise current
+    # image rebuild on every invocation.
+    THEKERNEL_DEV_SOURCE_SHA256=$(
+        cd "$DEV_ENV_DIR"
+        sha256sum Dockerfile entrypoint.sh check-image.sh \
+            | sha256sum \
+            | awk '{ print $1 }'
+    )
+    export THEKERNEL_DEV_SOURCE_SHA256
+
+    installed_source_sha256=$(docker image inspect "$THEKERNEL_DEV_IMAGE" \
+        --format '{{ index .Config.Labels "org.thekernel.dev-source-sha256" }}' \
+        2>/dev/null || true)
+    if [[ "$installed_source_sha256" != "$THEKERNEL_DEV_SOURCE_SHA256" ]]; then
+        printf 'dev-shell: refreshing %s for source %s\n' \
+            "$THEKERNEL_DEV_IMAGE" "$THEKERNEL_DEV_SOURCE_SHA256" >&2
+        run_args+=(--build)
+    fi
 fi
 
 canonical_sibling() {
