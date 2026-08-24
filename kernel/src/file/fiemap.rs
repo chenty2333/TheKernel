@@ -82,14 +82,11 @@ fn write_extent(
         .map_err(map_usercopy_error)
 }
 
-fn validate_fiemap_request(header: &LinuxFiemap) -> AxResult<()> {
+fn validate_fiemap_request(header: &LinuxFiemap) -> AxResult<u64> {
     // Check the filesystem-wide offset limit before zero-length, capacity, or
     // flag handling.  An offset at maxbytes is never an empty successful
     // query; Linux reports EFBIG for it.
     if header.fm_start >= FIEMAP_MAX_BYTES {
-        return Err(AxError::from(LinuxError::EFBIG));
-    }
-    if header.fm_length > FIEMAP_MAX_BYTES - header.fm_start {
         return Err(AxError::from(LinuxError::EFBIG));
     }
     if header.fm_extent_count as usize > axfs_ng_vfs::FILE_EXTENT_MAX {
@@ -98,7 +95,7 @@ fn validate_fiemap_request(header: &LinuxFiemap) -> AxResult<()> {
     if header.fm_extent_count > FIEMAP_MAX_EXTENTS {
         return Err(AxError::InvalidInput);
     }
-    Ok(())
+    Ok(header.fm_length.min(FIEMAP_MAX_BYTES - header.fm_start))
 }
 
 /// Executes `FS_IOC_FIEMAP` for one regular open file description.
@@ -113,7 +110,7 @@ pub(super) fn ioctl(file: &axfs::File, context: &IoctlContext, address: usize) -
         .read_value(address as *const LinuxFiemap)
         .map_err(map_usercopy_error)?;
 
-    validate_fiemap_request(&header)?;
+    let query_length = validate_fiemap_request(&header)?;
 
     if header.fm_length == 0 {
         header.fm_mapped_extents = 0;
@@ -136,7 +133,7 @@ pub(super) fn ioctl(file: &axfs::File, context: &IoctlContext, address: usize) -
     };
     let query = file.map_extents(
         header.fm_start,
-        header.fm_length,
+        query_length,
         max_extents,
         header.fm_flags & FIEMAP_FLAG_SYNC != 0,
     );
@@ -227,15 +224,20 @@ mod tests {
     }
 
     #[test]
-    fn range_overflow_is_ebig_after_a_valid_start() {
-        let header = LinuxFiemap {
-            fm_start: FIEMAP_MAX_BYTES - 1,
-            fm_length: 2,
+    fn overlong_range_is_clamped_after_a_valid_start() {
+        let full_range = LinuxFiemap {
+            fm_length: u64::MAX,
             ..LinuxFiemap::default()
         };
-        assert_eq!(
-            validate_fiemap_request(&header),
-            Err(AxError::from(LinuxError::EFBIG))
-        );
+        assert_eq!(validate_fiemap_request(&full_range), Ok(FIEMAP_MAX_BYTES));
+        assert_eq!(full_range.fm_length, u64::MAX);
+
+        let header = LinuxFiemap {
+            fm_start: FIEMAP_MAX_BYTES - 1,
+            fm_length: u64::MAX,
+            ..LinuxFiemap::default()
+        };
+        assert_eq!(validate_fiemap_request(&header), Ok(1));
+        assert_eq!(header.fm_length, u64::MAX);
     }
 }
