@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 
 mod mqueue;
 mod msg;
@@ -18,8 +18,67 @@ use crate::task::{Cred, Kgid, Kuid, UserNamespace, ns_capable};
 
 static IPC_ID: AtomicI32 = AtomicI32::new(0);
 
-fn next_ipc_id() -> i32 {
-    IPC_ID.fetch_add(1, Ordering::Relaxed)
+/// Allocate a Linux-visible SysV IPC ID while the caller holds its manager
+/// lock. With `n` live IDs, no more than `n + 1` distinct probes are needed
+/// to find a free ID unless the representable ID space is exhausted.
+pub(crate) fn allocate_ipc_id<F>(
+    requested: Option<i32>,
+    occupied_count: usize,
+    is_occupied: F,
+) -> AxResult<i32>
+where
+    F: FnMut(i32) -> bool,
+{
+    allocate_ipc_id_in_range(&IPC_ID, requested, occupied_count, i32::MAX, is_occupied)
+}
+
+fn allocate_ipc_id_in_range<F>(
+    cursor: &AtomicI32,
+    requested: Option<i32>,
+    occupied_count: usize,
+    maximum: i32,
+    mut is_occupied: F,
+) -> AxResult<i32>
+where
+    F: FnMut(i32) -> bool,
+{
+    debug_assert!(maximum >= 0);
+    if let Some(id) = requested
+        && id >= 0
+        && id <= maximum
+        && !is_occupied(id)
+    {
+        return Ok(id);
+    }
+
+    let probes = (occupied_count as u64)
+        .saturating_add(1)
+        .min(maximum as u64 + 1);
+    for _ in 0..probes {
+        let previous = cursor
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                let candidate = if current < 0 || current > maximum {
+                    0
+                } else {
+                    current
+                };
+                Some(if candidate == maximum {
+                    0
+                } else {
+                    candidate + 1
+                })
+            })
+            .unwrap_or(0);
+        let id = if previous < 0 || previous > maximum {
+            0
+        } else {
+            previous
+        };
+        if !is_occupied(id) {
+            return Ok(id);
+        }
+    }
+    Err(AxError::from(LinuxError::ENOSPC))
 }
 
 // IPC command constants
@@ -341,7 +400,8 @@ impl PreparedIpcPermissionUpdate {
 
 #[cfg(test)]
 mod credential_caller_tests {
-    use alloc::sync::Arc;
+    use alloc::{collections::BTreeSet, sync::Arc};
+    use core::sync::atomic::AtomicI32;
 
     use super::*;
     use crate::task::{Cred, UserNamespace};
@@ -553,5 +613,55 @@ mod credential_caller_tests {
         assert!(root_over_child.authority.resource_override);
         assert!(root_over_child.authority.chown_override);
         assert!(Arc::ptr_eq(root_over_child.governing_user_ns(), &child_ns));
+    }
+
+    #[test]
+    fn ipc_id_allocator_wraps_without_negative_ids_and_skips_live_ids() {
+        let cursor = AtomicI32::new(i32::MAX - 1);
+        assert_eq!(
+            allocate_ipc_id_in_range(&cursor, None, 0, i32::MAX, |_| false),
+            Ok(i32::MAX - 1)
+        );
+        assert_eq!(
+            allocate_ipc_id_in_range(&cursor, None, 0, i32::MAX, |_| false),
+            Ok(i32::MAX)
+        );
+        assert_eq!(
+            allocate_ipc_id_in_range(&cursor, None, 1, i32::MAX, |id| id == 0),
+            Ok(1)
+        );
+
+        let negative_cursor = AtomicI32::new(-7);
+        assert_eq!(
+            allocate_ipc_id_in_range(&negative_cursor, None, 0, 7, |_| false),
+            Ok(0)
+        );
+        assert_eq!(
+            allocate_ipc_id_in_range(&AtomicI32::new(3), Some(-1), 0, 7, |_| false,),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn ipc_id_allocator_rejects_a_full_test_range_without_unbounded_scan() {
+        let cursor = AtomicI32::new(0);
+        assert_eq!(
+            allocate_ipc_id_in_range(&cursor, None, 4, 3, |_| true),
+            Err(AxError::from(LinuxError::ENOSPC))
+        );
+    }
+
+    #[test]
+    fn ipc_id_allocation_and_publication_sequence_never_reuses_a_live_id() {
+        let cursor = AtomicI32::new(0);
+        let mut live = BTreeSet::new();
+        for _ in 0..8 {
+            let id = allocate_ipc_id_in_range(&cursor, None, live.len(), 7, |candidate| {
+                live.contains(&candidate)
+            })
+            .unwrap();
+            assert!(live.insert(id));
+        }
+        assert_eq!(live.len(), 8);
     }
 }

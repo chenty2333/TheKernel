@@ -1877,6 +1877,41 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_unlinks_the_raw_queue_owner_exactly_once() {
+        init_scheduler();
+
+        let entry = Arc::new(FutexEntry::new());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset: u32::MAX,
+            awakened: false,
+            cancelled: false,
+            owner: owner(&entry),
+            task: WeakAxTaskRef::new(),
+            waker: None,
+            next: None,
+        }));
+
+        // Keep this typed owner while the queue transfers its clone into a
+        // raw Arc.  The count makes the raw ownership observable without
+        // relying on a destructor after the test has lost the pointer.
+        entry.wq.queue.lock().push_back(waiter.clone());
+        assert_eq!(Arc::strong_count(&waiter), 2);
+        assert!(!entry.wq.is_empty());
+
+        assert_eq!(
+            resolve_waiter_terminal(waiter.clone()),
+            WaitTerminalOwnership::Cancelled
+        );
+
+        // Cancellation is the sole unlinker: DeferredWaiters reconstructs
+        // and drops the queue count once after releasing the queue gate.
+        assert!(entry.wq.is_empty());
+        assert_eq!(Arc::strong_count(&waiter), 1);
+        assert!(waiter.lock().next.is_none());
+    }
+
+    #[test]
     fn wake_and_requeue_keeps_remaining_waiters() {
         init_scheduler();
 

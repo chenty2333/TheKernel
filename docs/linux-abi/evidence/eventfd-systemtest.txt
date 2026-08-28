@@ -1,0 +1,37 @@
+# TheKernel Linux ABI evidence transcript v1
+# normalized-from-console-sha256: 55db854b695dfb50fbae35a9c8a8e6f8fcb5be84a21086710f026971f9517d31
+# runner-returncode: 0
+# guest-clean-shutdown: true
+# runner-terminated: false
+KTAP version 1
+1..28
+ok 1 - mounts
+ok 2 - rootfs
+ok 3 - tmpfs
+ok 4 - procfs
+ok 5 - memory-pressure
+ok 6 - process-exec
+ok 7 - vfork
+ok 8 - signal-mask-alias
+ok 9 - signal-wait
+ok 10 - pause
+ok 11 - alarm
+ok 12 - wait-boundary
+ok 13 - rseq
+ok 14 - futex
+ok 15 - futex2-waitv-signal
+ok 16 - epoll
+# eventfd: THEKERNEL_EVENTFD_OK
+ok 17 - eventfd
+ok 18 - signal-order
+ok 19 - io-uring-directio
+ok 20 - proc-zombie
+ok 21 - signal-fp
+ok 22 - io-uring
+ok 23 - io-uring-buffers
+ok 24 - ioprio
+ok 25 - membarrier
+ok 26 - userfaultfd
+ok 27 - packet
+ok 28 - seccomp
+# THEKERNEL_SYSTEM_TEST_COMPLETE

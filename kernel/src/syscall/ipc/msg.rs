@@ -23,7 +23,7 @@ use thekernel_linux_usercopy::{
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
     IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, MSG_INFO, MSG_STAT, MSG_STAT_ANY,
-    PreparedIpcPermissionUpdate, next_ipc_id,
+    PreparedIpcPermissionUpdate, allocate_ipc_id,
 };
 use crate::{
     mm::map_usercopy_error,
@@ -464,18 +464,13 @@ pub static MSG_MANAGER: Mutex<MsgManager> = Mutex::new(MsgManager::new());
 static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
 static MSG_NEXT_ID: AtomicI32 = AtomicI32::new(-1);
 
-fn allocate_msg_id(msg_manager: &MsgManager) -> i32 {
+fn allocate_msg_id(msg_manager: &MsgManager) -> AxResult<i32> {
     let desired = MSG_NEXT_ID.swap(-1, Ordering::Relaxed);
-    if desired >= 0 && !msg_manager.msqid_queues.contains_key(&desired) {
-        desired
-    } else {
-        loop {
-            let candidate = next_ipc_id();
-            if !msg_manager.msqid_queues.contains_key(&candidate) {
-                return candidate;
-            }
-        }
-    }
+    allocate_ipc_id(
+        (desired >= 0).then_some(desired),
+        msg_manager.msqid_queues.len(),
+        |id| msg_manager.msqid_queues.contains_key(&id),
+    )
 }
 
 pub(crate) fn msgmni_limit() -> usize {
@@ -631,7 +626,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         if msg_manager.queue_count() >= msgmni_limit() {
             return Err(AxError::from(LinuxError::ENOSPC)); // ENOSPC
         }
-        let msqid = allocate_msg_id(&msg_manager);
+        let msqid = allocate_msg_id(&msg_manager)?;
         let msg_queue = Arc::new(Mutex::new(MessageQueue::new(
             key,
             (msgflg & 0o777) as _,
@@ -678,7 +673,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ENOSPC)); // ENOSPC
     }
 
-    let msqid = allocate_msg_id(&msg_manager);
+    let msqid = allocate_msg_id(&msg_manager)?;
     let msg_queue = Arc::new(Mutex::new(MessageQueue::new(
         key,
         (msgflg & 0o777) as _,

@@ -439,7 +439,11 @@ struct PhysicalCompletionDeviceSlot {
     /// starts; a replacement slot therefore must never reuse the old token,
     /// even if allocator address reuse makes `identity` equal.
     callback_context: usize,
-    device: SharedBlockDevice,
+    // Production slots always carry `Some`.  A test-only registered-slot
+    // fixture may omit the lower handle after the callback has already
+    // supplied its terminal event; it can exercise upper acknowledgement
+    // without fabricating a concrete AxBlockDevice transport.
+    device: Option<SharedBlockDevice>,
     generation: u64,
     configured: bool,
     active: bool,
@@ -651,7 +655,7 @@ fn physical_completion_device_for(identity: usize) -> Option<SharedBlockDevice> 
         .iter()
         .flatten()
         .find(|slot| slot.identity == identity)
-        .map(|slot| slot.device.clone())
+        .and_then(|slot| slot.device.clone())
 }
 
 fn physical_completion_generation_for(identity: usize) -> Option<u64> {
@@ -784,7 +788,7 @@ fn register_physical_completion_device_slot(
     *slot = Some(PhysicalCompletionDeviceSlot {
         identity,
         callback_context,
-        device,
+        device: Some(device),
         generation,
         configured: false,
         active: false,
@@ -814,7 +818,7 @@ fn remove_physical_completion_device_slot(
             slot.identity == identity && slot.callback_context == callback_context
         })
     })?;
-    registry.slots[index].take().map(|slot| slot.device)
+    registry.slots[index].take().and_then(|slot| slot.device)
 }
 
 fn publish_physical_completion_device_slot(
@@ -3103,7 +3107,7 @@ pub(crate) fn stop_physical_completion_device() -> AxResult<()> {
                     .iter()
                     .flatten()
                     .find(|slot| slot.identity == identity)
-                    .map(|slot| slot.device.clone());
+                    .and_then(|slot| slot.device.clone());
             }
         }
         for (index, identity) in identities[..len].iter().copied().enumerate() {
@@ -3223,11 +3227,13 @@ pub(crate) fn note_physical_completion_worker_started() {
     let mut registry = PHYSICAL_COMPLETION_DEVICE_REGISTRY.lock();
     for slot in registry.slots.iter_mut().flatten() {
         if slot.configured
-            && matches!(
-                slot.device.completion_availability(),
-                BlockCompletionAvailability::Live { generation }
-                    if generation == slot.generation
-            )
+            && slot.device.as_ref().is_some_and(|device| {
+                matches!(
+                    device.completion_availability(),
+                    BlockCompletionAvailability::Live { generation }
+                        if generation == slot.generation
+                )
+            })
             && slot.terminal_state == PHYSICAL_COMPLETION_TERMINAL_NONE
             && !slot.progress_overflowed
         {
@@ -3601,6 +3607,29 @@ fn stabilize_physical_completion_reset_failure(device_identity: usize) {
     }
 }
 
+/// Applies an exact per-device lower terminal proof to upper physical-I/O
+/// custody.  Both the callback-first and reset-return paths use this helper:
+/// a quarantine marker is deliberately not a proof, while Quiesced/Retired
+/// first fence the exact generation and then retire every matching route/work
+/// owner as one transaction.  Slot/mailbox acknowledgement remains with the
+/// caller because it is tied to the particular lower notification source.
+fn retire_physical_completion_terminal_owners_for_device(
+    device_identity: usize,
+    event: PhysicalCompletionTerminalEvent,
+) -> AxResult<BlockResetOutcome> {
+    if event.state == PHYSICAL_COMPLETION_TERMINAL_QUARANTINED {
+        return Err(AxError::BadState);
+    }
+    if physical_completion_in_flight_for_device(device_identity) != 0 {
+        defer_physical_completion_reset_retry();
+        return Err(AxError::ResourceBusy);
+    }
+    let outcome = physical_completion_terminal_outcome(event.state).ok_or(AxError::BadState)?;
+    physical_completion_generation_store_for_device(device_identity, event.generation);
+    retire_physical_completion_after_reset_for_device(device_identity, outcome)?;
+    Ok(outcome)
+}
+
 /// Services one registry slot without consulting root-device globals.  The
 /// lower SharedBlockDevice callback supplies the exact terminal generation;
 /// only after that proof are this device's routes and ring owners retired.
@@ -3624,13 +3653,8 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
             }
             return Err(AxError::BadState);
         }
-        let outcome = physical_completion_terminal_outcome(event.state).ok_or(AxError::BadState)?;
-        if physical_completion_in_flight_for_device(device_identity) != 0 {
-            defer_physical_completion_reset_retry();
-            return Err(AxError::ResourceBusy);
-        }
-        physical_completion_generation_store_for_device(device_identity, event.generation);
-        retire_physical_completion_after_reset_for_device(device_identity, outcome)?;
+        let outcome =
+            retire_physical_completion_terminal_owners_for_device(device_identity, event)?;
         return finish_physical_completion_external_terminal_event_for_device(
             device_identity,
             event,
@@ -3660,7 +3684,7 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
             return Err(AxError::ResourceBusy);
         }
         slot.active = false;
-        slot.device.clone()
+        slot.device.clone().ok_or(AxError::OperationNotSupported)?
     };
 
     if device_identity == physical_completion_default_identity() {
@@ -3707,9 +3731,7 @@ fn service_physical_completion_reset_for_device(device_identity: usize) -> AxRes
         }
         return Err(AxError::BadState);
     }
-    let outcome = physical_completion_terminal_outcome(event.state).ok_or(AxError::BadState)?;
-    physical_completion_generation_store_for_device(device_identity, event.generation);
-    retire_physical_completion_after_reset_for_device(device_identity, outcome)?;
+    let outcome = retire_physical_completion_terminal_owners_for_device(device_identity, event)?;
     finish_physical_completion_external_terminal_event_for_device(device_identity, event, outcome)
 }
 
@@ -3894,12 +3916,14 @@ pub(crate) fn physical_completion_device_ready_for(device_identity: usize) -> bo
             && !slot.terminal_sequence_overflowed
             && PHYSICAL_COMPLETION_WORKER_STARTED.load(Ordering::Acquire)
             && !PHYSICAL_COMPLETION_WORKER_STOPPED.load(Ordering::Acquire)
-            && slot.device.physical_completion_broker_installed()
-            && matches!(
-                slot.device.completion_availability(),
-                BlockCompletionAvailability::Live { generation }
-                    if generation == slot.generation
-            )
+            && slot.device.as_ref().is_some_and(|device| {
+                device.physical_completion_broker_installed()
+                    && matches!(
+                        device.completion_availability(),
+                        BlockCompletionAvailability::Live { generation }
+                            if generation == slot.generation
+                    )
+            })
     })
 }
 
@@ -9370,6 +9394,47 @@ mod adapter_state_tests {
         state.requests.issue(prepared).unwrap()
     }
 
+    fn register_terminal_callback_test_slot(generation: u64) -> usize {
+        let callback_context = allocate_physical_completion_callback_context().unwrap();
+        let mut registry = PHYSICAL_COMPLETION_DEVICE_REGISTRY.lock();
+        assert!(registry.slots.iter().all(Option::is_none));
+        registry.slots[0] = Some(PhysicalCompletionDeviceSlot {
+            identity: 0,
+            callback_context,
+            device: None,
+            generation,
+            configured: true,
+            active: true,
+            admission_open: true,
+            removal_pending: false,
+            reset_pending: false,
+            in_flight: 0,
+            progress_pending: false,
+            progress_generation: 0,
+            progress_overflowed: false,
+            terminal_sequence_overflowed: false,
+            terminal_state: PHYSICAL_COMPLETION_TERMINAL_NONE,
+            terminal_generation: generation,
+            terminal_sequence: 0,
+            terminal_consumed_sequence: 0,
+        });
+        callback_context
+    }
+
+    fn remove_terminal_callback_test_slot(callback_context: usize) {
+        let mut registry = PHYSICAL_COMPLETION_DEVICE_REGISTRY.lock();
+        let index = registry
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.as_ref().is_some_and(|slot| {
+                    slot.identity == 0 && slot.callback_context == callback_context
+                })
+            })
+            .expect("terminal callback test slot");
+        registry.slots[index] = None;
+    }
+
     #[test]
     fn request_and_completion_capacity_are_retryable_backpressure() {
         assert!(reservation_is_backpressure(
@@ -10014,6 +10079,85 @@ mod adapter_state_tests {
             .store(PHYSICAL_COMPLETION_TERMINAL_NONE, Ordering::Release);
         PHYSICAL_COMPLETION_WORK_PENDING.store(false, Ordering::Release);
         PHYSICAL_COMPLETION_DEVICE_GENERATION.store(generation, Ordering::Release);
+    }
+
+    #[test]
+    fn quarantined_terminal_keeps_published_owner_until_quiesced_proof() {
+        let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
+        let _context = crate::test_support::scheduler_test_context();
+        // This fixture uses a synthetic PhysicalIoWork without a lower
+        // admission, whose test-only device generation is zero. Match its
+        // route generation explicitly instead of inheriting another test's
+        // global transport generation.
+        let previous_generation = PHYSICAL_COMPLETION_DEVICE_GENERATION.swap(0, Ordering::AcqRel);
+        let worker_started = PHYSICAL_COMPLETION_WORKER_STARTED.swap(true, Ordering::AcqRel);
+        let worker_stopped = PHYSICAL_COMPLETION_WORKER_STOPPED.swap(false, Ordering::AcqRel);
+        let device_active = PHYSICAL_COMPLETION_DEVICE_ACTIVE.swap(false, Ordering::AcqRel);
+        let reset_pending = PHYSICAL_COMPLETION_RESET_PENDING.swap(false, Ordering::AcqRel);
+        let work_pending = PHYSICAL_COMPLETION_WORK_PENDING.swap(false, Ordering::AcqRel);
+        let callback_context = register_terminal_callback_test_slot(0);
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let request = reserve_test_request_id(&ring);
+        let handle = 0xC057_0D1A;
+        let route = PhysicalCompletionRouteReservation::new(1).unwrap();
+        route.activate_test(&ring, request, 0, handle);
+        {
+            let mut state = ring.state.lock();
+            state.physical_work[0] = Some(PhysicalIoWork {
+                ring: Arc::clone(&ring),
+                slot: 0,
+                issued: None,
+                admission: None,
+                pending_publication: false,
+                test_handle: Some(handle),
+            });
+            state.physical_work_count = 1;
+        }
+        // Exercise the production per-device callback mailbox and consumer.
+        // The test slot intentionally has no lower handle: a real callback
+        // has already supplied this terminal state, so no driver operation
+        // is needed to validate upper acknowledgement and custody.
+        physical_completion_terminal_notifier(
+            callback_context,
+            BlockCompletionAvailability::Quarantined { generation: 1 },
+        );
+        assert_eq!(
+            service_physical_completion_reset_for_device(0),
+            Err(AxError::BadState)
+        );
+        assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().work_count, 1);
+        assert_eq!(physical_completion_route_count(), 1);
+        assert!(lookup_physical_completion_route(handle).is_some());
+        assert_eq!(ring.physical_worker_len(), 1);
+
+        assert!(physical_completion_terminal_event_for_device(0).is_none());
+        {
+            let registry = PHYSICAL_COMPLETION_DEVICE_REGISTRY.lock();
+            let slot = registry.slots[0].as_ref().unwrap();
+            assert_eq!(slot.terminal_sequence, slot.terminal_consumed_sequence);
+        }
+
+        // A later typed Quiesced callback retires that exact generation once.
+        physical_completion_terminal_notifier(
+            callback_context,
+            BlockCompletionAvailability::Live { generation: 2 },
+        );
+        service_physical_completion_reset_for_device(0).unwrap();
+        assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().work_count, 0);
+        assert_eq!(physical_completion_route_count(), 0);
+        assert!(lookup_physical_completion_route(handle).is_none());
+        assert_eq!(ring.physical_worker_len(), 0);
+
+        remove_terminal_callback_test_slot(callback_context);
+        PHYSICAL_COMPLETION_DEVICE_GENERATION.store(previous_generation, Ordering::Release);
+        PHYSICAL_COMPLETION_WORKER_STARTED.store(worker_started, Ordering::Release);
+        PHYSICAL_COMPLETION_WORKER_STOPPED.store(worker_stopped, Ordering::Release);
+        PHYSICAL_COMPLETION_DEVICE_ACTIVE.store(device_active, Ordering::Release);
+        PHYSICAL_COMPLETION_RESET_PENDING.store(reset_pending, Ordering::Release);
+        PHYSICAL_COMPLETION_WORK_PENDING.store(work_pending, Ordering::Release);
     }
 
     #[test]
@@ -10818,6 +10962,7 @@ mod adapter_state_tests {
     #[test]
     fn production_completion_owner_stop_and_reset_are_fail_closed_when_uninstalled() {
         let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
+        let generation = PHYSICAL_COMPLETION_DEVICE_GENERATION.load(Ordering::Acquire);
         note_physical_completion_worker_stopped();
         assert!(stop_physical_completion_device().is_ok());
         assert!(!physical_completion_device_ready());
@@ -10826,5 +10971,6 @@ mod adapter_state_tests {
             Err(AxError::OperationNotSupported)
         );
         note_physical_completion_worker_started();
+        PHYSICAL_COMPLETION_DEVICE_GENERATION.store(generation, Ordering::Release);
     }
 }

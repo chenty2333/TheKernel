@@ -161,6 +161,44 @@ impl AioManager {
             contexts: BTreeMap::new(),
         }
     }
+
+    /// Call while holding the manager lock and insert the returned ID before
+    /// releasing it. This makes allocation and publication one transaction.
+    fn allocate_context_id(&self) -> AxResult<u64> {
+        self.allocate_context_id_in_range(u64::MAX)
+    }
+
+    fn allocate_context_id_in_range(&self, maximum: u64) -> AxResult<u64> {
+        if maximum == 0 {
+            return Err(LinuxError::EAGAIN.into());
+        }
+        let probes = (self.contexts.len() as u64).saturating_add(1).min(maximum);
+        for _ in 0..probes {
+            let previous = NEXT_AIO_CTX
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    let candidate = if current == 0 || current > maximum {
+                        1
+                    } else {
+                        current
+                    };
+                    Some(if candidate == maximum {
+                        1
+                    } else {
+                        candidate + 1
+                    })
+                })
+                .unwrap_or(1);
+            let id = if previous == 0 || previous > maximum {
+                1
+            } else {
+                previous
+            };
+            if id != 0 && id <= maximum && !self.contexts.contains_key(&id) {
+                return Ok(id);
+            }
+        }
+        Err(LinuxError::EAGAIN.into())
+    }
 }
 
 pub fn aio_nr() -> usize {
@@ -173,15 +211,6 @@ pub fn aio_max_nr() -> usize {
 
 pub fn set_aio_max_nr(value: usize) {
     AIO_MAX_NR.store(value, Ordering::Release);
-}
-
-fn next_aio_context_id() -> u64 {
-    loop {
-        let id = NEXT_AIO_CTX.fetch_add(1, Ordering::Relaxed);
-        if id != 0 {
-            return id;
-        }
-    }
 }
 
 fn try_reserve_aio_events(count: usize) -> AxResult {
@@ -470,20 +499,29 @@ pub fn sys_io_setup<M: UserMemory + ?Sized>(
     }
     try_reserve_aio_events(nr_events)?;
 
-    let id = next_aio_context_id();
-    AIO_CONTEXTS.lock().contexts.insert(
-        id,
-        Arc::new(AioContext {
-            owner: current_aio_owner(),
-            max_events: nr_events,
-            state: Mutex::new(AioContextState {
-                events: VecDeque::new(),
-                in_flight: 0,
-                accepting: true,
-            }),
-            waiters: PollSet::new(),
+    let context = Arc::new(AioContext {
+        owner: current_aio_owner(),
+        max_events: nr_events,
+        state: Mutex::new(AioContextState {
+            events: VecDeque::new(),
+            in_flight: 0,
+            accepting: true,
         }),
-    );
+        waiters: PollSet::new(),
+    });
+    let id = {
+        let mut manager = AIO_CONTEXTS.lock();
+        let id = match manager.allocate_context_id() {
+            Ok(id) => id,
+            Err(error) => {
+                release_aio_events(nr_events);
+                return Err(error);
+            }
+        };
+        debug_assert!(!manager.contexts.contains_key(&id));
+        manager.contexts.insert(id, context);
+        id
+    };
     if let Err(err) = VmMutPtr::vm_write(ctxp, memory, id) {
         AIO_CONTEXTS.lock().contexts.remove(&id);
         release_aio_events(nr_events);
@@ -717,6 +755,8 @@ pub fn cleanup_process_aio(owner: Pid) {
 mod tests {
     use super::*;
 
+    static NEXT_AIO_CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn context(max_events: usize) -> AioContext {
         AioContext {
             owner: 1,
@@ -764,5 +804,38 @@ mod tests {
             reserve_submission_slots(&context, 1).unwrap_err(),
             AxError::InvalidInput
         );
+    }
+
+    #[test]
+    fn context_ids_wrap_skip_live_contexts_and_never_use_zero() {
+        let _serial = NEXT_AIO_CTX_TEST_LOCK.lock();
+        let saved_cursor = NEXT_AIO_CTX.swap(u64::MAX, Ordering::Relaxed);
+        let mut manager = AioManager::new();
+        let high = manager.allocate_context_id().unwrap();
+        assert_eq!(high, u64::MAX);
+        manager.contexts.insert(high, Arc::new(context(1)));
+
+        let wrapped = manager.allocate_context_id().unwrap();
+        assert_eq!(wrapped, 1);
+        assert!(!manager.contexts.contains_key(&wrapped));
+        NEXT_AIO_CTX.store(saved_cursor, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn context_id_exhaustion_leaves_existing_contexts_intact() {
+        let _serial = NEXT_AIO_CTX_TEST_LOCK.lock();
+        let saved_cursor = NEXT_AIO_CTX.swap(1, Ordering::Relaxed);
+        let mut manager = AioManager::new();
+        manager.contexts.insert(1, Arc::new(context(1)));
+        manager.contexts.insert(2, Arc::new(context(2)));
+
+        assert_eq!(
+            manager.allocate_context_id_in_range(2),
+            Err(LinuxError::EAGAIN.into())
+        );
+        assert_eq!(manager.contexts.len(), 2);
+        assert!(manager.contexts.contains_key(&1));
+        assert!(manager.contexts.contains_key(&2));
+        NEXT_AIO_CTX.store(saved_cursor, Ordering::Relaxed);
     }
 }

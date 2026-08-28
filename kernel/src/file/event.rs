@@ -70,7 +70,8 @@ impl FileLike for EventFd {
                 });
             match result {
                 Ok(count) => {
-                    dst.write(&count.to_ne_bytes())?;
+                    let value = if self.semaphore { 1 } else { count };
+                    dst.write(&value.to_ne_bytes())?;
                     self.poll_tx.wake();
                     Ok(size_of::<u64>())
                 }
@@ -80,7 +81,10 @@ impl FileLike for EventFd {
     }
 
     fn write(&self, src: &mut IoSrc) -> axio::Result<usize> {
-        if src.remaining() < size_of::<u64>() {
+        // Linux eventfd_write accepts exactly one 64-bit counter value.
+        // Unlike read (which may be given a larger destination), a larger
+        // write must fail rather than silently consume its first eight bytes.
+        if src.remaining() != size_of::<u64>() {
             return Err(AxError::InvalidInput);
         }
 
@@ -151,5 +155,129 @@ impl Pollable for EventFd {
             prepared.arm(&self.poll_tx, context.waker())?;
         }
         prepared.commit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use axio::{IoBuf, IoBufMut, Read, Write};
+
+    use super::*;
+
+    struct SliceSource {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl SliceSource {
+        fn counter(value: u64) -> Self {
+            Self {
+                bytes: value.to_ne_bytes().to_vec(),
+                position: 0,
+            }
+        }
+    }
+
+    impl Read for SliceSource {
+        fn read(&mut self, destination: &mut [u8]) -> axio::Result<usize> {
+            let source = &self.bytes[self.position..];
+            let copied = source.len().min(destination.len());
+            destination[..copied].copy_from_slice(&source[..copied]);
+            self.position += copied;
+            Ok(copied)
+        }
+    }
+
+    impl IoBuf for SliceSource {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.position
+        }
+    }
+
+    struct SliceDestination {
+        bytes: Vec<u8>,
+        remaining: usize,
+    }
+
+    impl SliceDestination {
+        fn counter() -> Self {
+            Self {
+                bytes: Vec::new(),
+                remaining: size_of::<u64>(),
+            }
+        }
+
+        fn value(&self) -> u64 {
+            u64::from_ne_bytes(self.bytes.clone().try_into().unwrap())
+        }
+    }
+
+    impl Write for SliceDestination {
+        fn write(&mut self, source: &[u8]) -> axio::Result<usize> {
+            self.bytes.extend_from_slice(source);
+            self.remaining -= source.len();
+            Ok(source.len())
+        }
+
+        fn flush(&mut self) -> axio::Result {
+            Ok(())
+        }
+    }
+
+    impl IoBufMut for SliceDestination {
+        fn remaining_mut(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    fn read_counter(event: &EventFd) -> u64 {
+        let mut destination = SliceDestination::counter();
+        assert_eq!(event.read(&mut destination), Ok(size_of::<u64>()));
+        destination.value()
+    }
+
+    #[test]
+    fn counter_read_write_and_poll_follow_eventfd_contract() {
+        let event = EventFd::new(0, false);
+        event.set_nonblocking(true).unwrap();
+        assert_eq!(event.poll(), IoEvents::WRITABLE);
+
+        let mut two = SliceSource::counter(2);
+        let mut three = SliceSource::counter(3);
+        assert_eq!(event.write(&mut two), Ok(size_of::<u64>()));
+        assert_eq!(event.write(&mut three), Ok(size_of::<u64>()));
+        assert_eq!(event.poll(), IoEvents::READABLE | IoEvents::WRITABLE);
+        assert_eq!(read_counter(&event), 5);
+        assert_eq!(event.poll(), IoEvents::WRITABLE);
+    }
+
+    #[test]
+    fn semaphore_reads_decrement_one_at_a_time() {
+        let event = EventFd::new(3, true);
+        event.set_nonblocking(true).unwrap();
+        assert_eq!(read_counter(&event), 1);
+        assert_eq!(read_counter(&event), 1);
+        assert_eq!(read_counter(&event), 1);
+        assert_eq!(
+            event.read(&mut SliceDestination::counter()),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn invalid_or_noncanonical_writes_preserve_counter() {
+        let event = EventFd::new(2, false);
+        let mut maximum = SliceSource::counter(u64::MAX);
+        assert_eq!(event.write(&mut maximum), Err(AxError::InvalidInput));
+        assert_eq!(event.count.load(Ordering::Acquire), 2);
+
+        let mut oversized = SliceSource {
+            bytes: vec![0; size_of::<u64>() + 1],
+            position: 0,
+        };
+        assert_eq!(event.write(&mut oversized), Err(AxError::InvalidInput));
+        assert_eq!(event.count.load(Ordering::Acquire), 2);
     }
 }

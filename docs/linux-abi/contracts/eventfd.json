@@ -1,0 +1,55 @@
+{
+  "schema": "thekernel-linux-abi-contracts-v1",
+  "family": "eventfd",
+  "cells": [
+    {
+      "id": "eventfd.legacy",
+      "syscall": "eventfd",
+      "subject": "legacy eventfd entry point aliases eventfd2 with flags zero",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.flags",
+      "syscall": "eventfd2",
+      "subject": "accepted and rejected flags",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.counter",
+      "syscall": "eventfd2",
+      "subject": "counter read/write semantics",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-unit.counter-poll", "eventfd.host-unit.invalid-write", "eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.semaphore",
+      "syscall": "eventfd2",
+      "subject": "EFD_SEMAPHORE read semantics",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-unit.semaphore", "eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.errno-ordering",
+      "syscall": "eventfd2",
+      "subject": "invalid flag and I/O errno behavior",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-unit.invalid-write", "eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.cloexec",
+      "syscall": "eventfd2",
+      "subject": "EFD_CLOEXEC descriptor flag",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    },
+    {
+      "id": "eventfd.teardown",
+      "syscall": "eventfd2",
+      "subject": "close and post-close EBADF behavior",
+      "review": "reviewed",
+      "evidence": ["eventfd.host-linux-differential.portable", "eventfd.guest-ktap.pinned-systemtest"]
+    }
+  ]
+}

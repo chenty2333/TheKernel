@@ -360,27 +360,31 @@ fn reverse_description_cleanup_list(
     reversed
 }
 
-fn pop_description_cleanup() -> Option<Box<DescriptionCleanupWork>> {
-    if DESCRIPTION_CLEANUP_PENDING
-        .load(Ordering::Relaxed)
-        .is_null()
-    {
-        let incoming = DESCRIPTION_CLEANUP_INCOMING.swap(ptr::null_mut(), Ordering::AcqRel);
-        DESCRIPTION_CLEANUP_PENDING.store(
+fn pop_description_cleanup_from(
+    incoming: &AtomicPtr<DescriptionCleanupWork>,
+    pending: &AtomicPtr<DescriptionCleanupWork>,
+) -> Option<Box<DescriptionCleanupWork>> {
+    if pending.load(Ordering::Relaxed).is_null() {
+        let incoming = incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+        pending.store(
             reverse_description_cleanup_list(incoming),
             Ordering::Relaxed,
         );
     }
-    let head = DESCRIPTION_CLEANUP_PENDING.load(Ordering::Relaxed);
+    let head = pending.load(Ordering::Relaxed);
     if head.is_null() {
         return None;
     }
     // SAFETY: only the drain-guard owner accesses the pending FIFO.
     let next = unsafe { (*head).next.load(Ordering::Relaxed) };
-    DESCRIPTION_CLEANUP_PENDING.store(next, Ordering::Relaxed);
+    pending.store(next, Ordering::Relaxed);
     unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
     // SAFETY: removing the head transfers its unique ownership to this caller.
     Some(unsafe { Box::from_raw(head) })
+}
+
+fn pop_description_cleanup() -> Option<Box<DescriptionCleanupWork>> {
+    pop_description_cleanup_from(&DESCRIPTION_CLEANUP_INCOMING, &DESCRIPTION_CLEANUP_PENDING)
 }
 
 struct DescriptionCleanupDrainGuard;
@@ -444,13 +448,27 @@ pub(crate) fn drain_deferred_description_resource_only_for_test() {
     let Some(_guard) = DescriptionCleanupDrainGuard::try_enter() else {
         return;
     };
-    let Some(mut work) = pop_description_cleanup() else {
-        return;
+    let _ = drain_deferred_description_resource_only_from_for_test(
+        &DESCRIPTION_CLEANUP_INCOMING,
+        &DESCRIPTION_CLEANUP_PENDING,
+    );
+}
+
+/// Drains one resource-only cleanup through the same raw `Box` handoff as the
+/// policy worker, with caller-owned queue state for deterministic host tests.
+#[cfg(test)]
+fn drain_deferred_description_resource_only_from_for_test(
+    incoming: &AtomicPtr<DescriptionCleanupWork>,
+    pending: &AtomicPtr<DescriptionCleanupWork>,
+) -> bool {
+    let Some(mut work) = pop_description_cleanup_from(incoming, pending) else {
+        return false;
     };
     debug_assert!(work.write_open_key.is_none());
     debug_assert!(work.account.is_none());
     debug_assert!(work.open_lease_registration.is_none());
     drop(work.resource.take());
+    true
 }
 
 #[cfg(test)]
@@ -2288,6 +2306,43 @@ mod tests {
         credited.complete();
         assert!(!account.has_pending());
         drop(oldest);
+    }
+
+    #[test]
+    fn cleanup_raw_box_is_unlinked_once_before_its_resource_is_dropped() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let incoming = AtomicPtr::new(ptr::null_mut());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut work = DescriptionCleanupWork::try_new(901).unwrap();
+        work.resource = Some(Box::new(DropProbe(drops.clone())));
+
+        // This is the real Box::into_raw publication path, but with a local
+        // incoming head so parallel host tests cannot consume this node.
+        publish_description_cleanup_to(&incoming, work);
+        assert!(!incoming.load(Ordering::Acquire).is_null());
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        let pending = AtomicPtr::new(ptr::null_mut());
+        assert!(drain_deferred_description_resource_only_from_for_test(
+            &incoming, &pending
+        ));
+        assert!(incoming.load(Ordering::Acquire).is_null());
+        assert!(pending.load(Ordering::Acquire).is_null());
+
+        // The production pop path restored unique Box ownership before this
+        // test adapter released its typed resource.
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(!drain_deferred_description_resource_only_from_for_test(
+            &incoming, &pending
+        ));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
     IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SHM_DEST, SHM_INFO, SHM_LOCK,
-    SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, next_ipc_id, shmall_limit,
+    SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, allocate_ipc_id, shmall_limit,
     shmmax_limit, shmmni_limit,
 };
 use crate::{
@@ -1551,18 +1551,13 @@ pub fn clear_proc_shm(pid: Pid) {
     clear_proc_shm_in(&SHM_TRANSACTION, &SHM_MANAGER, pid)
 }
 
-fn allocate_shm_id(shm_manager: &ShmManager) -> i32 {
+fn allocate_shm_id(shm_manager: &ShmManager) -> AxResult<i32> {
     let desired = SHM_NEXT_ID.swap(-1, Ordering::Relaxed);
-    if desired >= 0 && !shm_manager.contains_shmid(desired) {
-        desired
-    } else {
-        loop {
-            let candidate = next_ipc_id();
-            if !shm_manager.contains_shmid(candidate) {
-                return candidate;
-            }
-        }
-    }
+    allocate_ipc_id(
+        (desired >= 0).then_some(desired),
+        shm_manager.shmid_inner.len(),
+        |id| shm_manager.contains_shmid(id),
+    )
 }
 
 pub(crate) fn shm_next_id() -> i32 {
@@ -1693,21 +1688,19 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     if page_num == 0 {
         return Err(AxError::InvalidInput);
     }
-    let shmid = {
-        let mut manager = SHM_MANAGER.lock();
-        if manager.active_segment_count() >= shmmni_limit() {
-            return Err(AxError::from(LinuxError::ENOSPC));
-        }
-        if manager
-            .total_page_count()
-            .checked_add(page_num)
-            .is_none_or(|total| total > shmall_limit())
-        {
-            return Err(AxError::from(LinuxError::ENOSPC));
-        }
-        manager.try_reserve_segment(key != IPC_PRIVATE)?;
-        allocate_shm_id(&manager)
-    };
+    let mut manager = SHM_MANAGER.lock();
+    if manager.active_segment_count() >= shmmni_limit() {
+        return Err(AxError::from(LinuxError::ENOSPC));
+    }
+    if manager
+        .total_page_count()
+        .checked_add(page_num)
+        .is_none_or(|total| total > shmall_limit())
+    {
+        return Err(AxError::from(LinuxError::ENOSPC));
+    }
+    manager.try_reserve_segment(key != IPC_PRIVATE)?;
+    let shmid = allocate_shm_id(&manager)?;
 
     let shm_inner = Arc::try_new(Mutex::new(ShmInner::new(
         key,
@@ -1720,7 +1713,6 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         egid,
     )))
     .map_err(|_| AxError::NoMemory)?;
-    let mut manager = SHM_MANAGER.lock();
     manager.insert_shmid_inner(shmid, page_num, shm_inner)?;
     if key != IPC_PRIVATE {
         manager.insert_key_shmid(key, shmid);

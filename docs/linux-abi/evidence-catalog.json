@@ -1,0 +1,36 @@
+{
+  "schema": "thekernel-linux-abi-evidence-catalog-v1",
+  "evidence": [
+    {
+      "id": "eventfd.host-unit.counter-poll",
+      "lane": "host-unit",
+      "source": "kernel/src/file/event.rs::counter_read_write_and_poll_follow_eventfd_contract",
+      "assertion": "counter accumulation, destructive read, and poll readiness"
+    },
+    {
+      "id": "eventfd.host-unit.semaphore",
+      "lane": "host-unit",
+      "source": "kernel/src/file/event.rs::semaphore_reads_decrement_one_at_a_time",
+      "assertion": "semaphore reads return one and empty nonblocking read would-blocks"
+    },
+    {
+      "id": "eventfd.host-unit.invalid-write",
+      "lane": "host-unit",
+      "source": "kernel/src/file/event.rs::invalid_or_noncanonical_writes_preserve_counter",
+      "assertion": "invalid writes are rejected without changing the counter"
+    },
+    {
+      "id": "eventfd.host-linux-differential.portable",
+      "lane": "host-linux-differential",
+      "source": "tests/guest/portable/eventfd-differential.c",
+      "assertion": "host Linux portable differential exits successfully and prints THEKERNEL_EVENTFD_OK"
+    },
+    {
+      "id": "eventfd.guest-ktap.pinned-systemtest",
+      "lane": "guest-KTAP",
+      "source": "evidence/eventfd-systemtest.txt",
+      "source_sha256": "e588bb37818f8ea7c3a267a5a24cd29d09f0f93be52a2b49bf4d96fe289df09d",
+      "assertion": "single 1..28 plan, 28 ok, 0 not ok, 0 SKIP; eventfd is ok 17, completion is present, runner exit is 0"
+    }
+  ]
+}

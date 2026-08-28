@@ -550,6 +550,12 @@ static int test_epoll_differential(void) {
         "epoll-differential-child");
 }
 
+static int test_eventfd_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/eventfd-differential", NULL,
+        "eventfd-differential-child");
+}
+
 static int test_signal_order_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/signal-order-smoke", NULL,
@@ -662,6 +668,7 @@ int main(int argc, char **argv) {
         { "futex", test_futex_differential },
         { "futex2-waitv-signal", test_futex2_waitv_signal_differential },
         { "epoll", test_epoll_differential },
+        { "eventfd", test_eventfd_differential },
         { "signal-order", test_signal_order_differential },
         { "io-uring-directio", test_io_uring_directio_differential },
         { "proc-zombie", test_proc_zombie_differential },

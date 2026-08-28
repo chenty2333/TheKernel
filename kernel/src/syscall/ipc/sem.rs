@@ -21,7 +21,7 @@ use thekernel_linux_usercopy::{
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SEM_INFO,
-    SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, next_ipc_id,
+    SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, allocate_ipc_id,
 };
 use crate::{
     mm::map_usercopy_error,
@@ -356,18 +356,13 @@ impl SemManager {
     }
 }
 
-fn allocate_sem_id(manager: &SemManager) -> i32 {
+fn allocate_sem_id(manager: &SemManager) -> AxResult<i32> {
     let desired = SEM_NEXT_ID.swap(-1, Ordering::Relaxed);
-    if desired >= 0 && !manager.semid_arrays.contains_key(&desired) {
-        desired
-    } else {
-        loop {
-            let candidate = next_ipc_id();
-            if !manager.semid_arrays.contains_key(&candidate) {
-                return candidate;
-            }
-        }
-    }
+    allocate_ipc_id(
+        (desired >= 0).then_some(desired),
+        manager.semid_arrays.len(),
+        |id| manager.semid_arrays.contains_key(&id),
+    )
 }
 
 pub(crate) fn semmni_limit() -> usize {
@@ -586,7 +581,7 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
 
-    let semid = allocate_sem_id(&manager);
+    let semid = allocate_sem_id(&manager)?;
     let array = Arc::new(Mutex::new(SemArray::new(
         semid,
         key,
