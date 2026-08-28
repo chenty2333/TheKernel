@@ -14,6 +14,74 @@ from tools.qemu_runner.runner import RunConfig, RunnerError, run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_initrd_is_bound_to_inherited_fd_across_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            initrd = root / "initrd.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            initrd.write_bytes(b"trusted-initrd")
+            config = RunConfig(
+                arch="x86_64",
+                kernel=kernel,
+                rootfs=rootfs,
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                qemu_launcher=(sys.executable,),
+                direct_kernel=True,
+                extra_args=("-initrd", str(initrd)),
+            )
+            expected = RunResult(
+                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
+                log_path=config.log_path, workdir=config.workdir,
+            )
+
+            def complete_run(**kwargs):
+                command = kwargs["command"]
+                bound = command[command.index("-initrd") + 1]
+                self.assertRegex(bound, r"^/proc/self/fd/[0-9]+$")
+                inherited = tuple(int(value) for value in kwargs["environment"][
+                    "THEKERNEL_QEMU_LAUNCH_FDS"
+                ].split(","))
+                self.assertEqual(set(inherited), set(kwargs["pass_fds"]))
+                self.assertIn(int(bound.rsplit("/", 1)[1]), inherited)
+                self.assertEqual(Path(bound).read_bytes(), b"trusted-initrd")
+
+                saved = root / "initrd.saved"
+                initrd.rename(saved)
+                initrd.write_bytes(b"replacement")
+                try:
+                    self.assertEqual(Path(bound).read_bytes(), b"trusted-initrd")
+                finally:
+                    initrd.unlink()
+                    saved.rename(initrd)
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
+                self.assertIs(run(config), expected)
+
+    def test_initrd_extra_argument_shape_is_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            initrd = root / "initrd.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            initrd.write_bytes(b"initrd")
+            base = dict(
+                arch="x86_64", kernel=kernel, rootfs=rootfs,
+                workdir=root / "run", log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable, direct_kernel=True,
+            )
+            with self.assertRaisesRegex(RunnerError, "repeated -initrd"):
+                run(RunConfig(**base, extra_args=("-initrd", str(initrd), "-initrd", str(initrd))))
+            with self.assertRaisesRegex(RunnerError, "requires exactly one"):
+                run(RunConfig(**base, extra_args=("-initrd",)))
+
     def test_x86_default_requires_esp_instead_of_falling_back_to_kernel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -132,7 +200,7 @@ class RunnerTests(unittest.TestCase):
 
             command = " ".join(mocked.call_args.kwargs["command"])
             runtime_rootfs = config.workdir / "images" / "rootfs-root.img"
-            self.assertIn(str(runtime_rootfs), command)
+            self.assertIn("/proc/self/fd/", command)
             self.assertEqual(runtime_rootfs.read_bytes(), b"rootfs")
             evidence.assert_not_called()
             command_evidence.assert_not_called()
@@ -356,8 +424,8 @@ class RunnerTests(unittest.TestCase):
                 result = run(config)
             self.assertIs(result, expected)
             command = " ".join(mocked.call_args.kwargs["command"])
-            self.assertIn(str(rootfs.resolve()), command)
-            self.assertIn("images/extra-extra.img", command)
+            self.assertIn("/proc/self/fd/", command)
+            self.assertGreaterEqual(command.count("/proc/self/fd/"), 3)
             self.assertIn("virtio-blk-pci,drive=extra", command)
             receipt = json.loads(config.receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(receipt["state"], "recorded")

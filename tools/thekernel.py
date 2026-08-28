@@ -501,7 +501,7 @@ def system_test_cmd(args: argparse.Namespace) -> int:
         stop_after_marker=None,
         commands=None,
         extra_block=None,
-        receipt=None,
+        receipt=Path(args.receipt) if args.receipt else None,
         shutdown_after_marker=True,
         reject_ktap_skips=not args.allow_skip,
     )
@@ -563,6 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
     system_test.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     system_test.add_argument("--timeout", type=positive_timeout, default=300.0)
     system_test.add_argument("--workdir")
+    system_test.add_argument(
+        "--receipt",
+        help="write the QEMU launch receipt for a system-test evidence consumer",
+    )
     system_test.add_argument(
         "--allow-skip",
         action="store_true",

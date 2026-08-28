@@ -312,6 +312,8 @@ def run_process(
     input_stream: BinaryIO | None = None,
     console_stream: BinaryIO | None = None,
     capture_input_evidence: bool = False,
+    pass_fds: tuple[int, ...] = (),
+    environment: dict[str, str] | None = None,
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
 
@@ -358,6 +360,8 @@ def run_process(
                 text=False,
                 bufsize=0,
                 start_new_session=True,
+                pass_fds=pass_fds,
+                env=environment,
             )
             launched = True
             if proxy_input:

@@ -1,0 +1,6 @@
+objective = "Close gate, CI, reliability, ABI, and PMU evidence gaps for the x86_64 preview."
+done_when = [ "One clean source combination has a hashed passing gate; CI covers all maintained tests and pinned bootstrap inputs; SysV IPC/AIO IDs and selected teardown paths have passing regression tests; an evidence matrix closes one Linux 6.12.103 ABI vertical; five same-topology Linux/TheKernel repeats retain PMU, throughput, P50, P99, and P99.9 raw data." ]
+stop_when = [ "Required q35 inputs or KVM/perf PMU remain unavailable after bounded recovery." ]
+boundaries = [ "Keep x86_64-only and defer AVX.", "Linux-visible behavior is the oracle.", "No partial, skipped, terminated, unbound, or unmeasured claim." ]
+topics = [ "ci", "evidence", "linux-abi", "performance", "reliability" ]
+anchors = [ "R-44d5c3985f5ee669", "R-b8977a7f8156a6f6", "R-e416970e565dc8ae" ]

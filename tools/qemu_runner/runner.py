@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import lzma
 import os
 import shutil
@@ -61,6 +62,102 @@ class _DrivePlan:
     mode: DriveMode
     label: str
     compression_suffix: str | None
+
+
+@dataclass(frozen=True)
+class _LaunchHandle:
+    label: str
+    source_path: Path
+    fd: int
+    writable: bool
+    before: dict[str, str | int]
+    stat_fields: tuple[int, int, int, int, int]
+
+    @property
+    def proc_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.fd}")
+
+
+def _stat_fields(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _hash_open_fd(fd: int) -> tuple[int, str, tuple[int, int, int, int, int]]:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    before = os.fstat(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return before.st_size, digest.hexdigest(), _stat_fields(before)
+
+
+def _open_launch_handle(label: str, path: Path, *, writable: bool) -> _LaunchHandle:
+    path = path.resolve()
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    try:
+        fd = os.open(path, flags | os.O_CLOEXEC)
+    except OSError as error:
+        raise RunnerError(f"cannot open launch input {label}: {error}") from error
+    try:
+        size, digest, fields = _hash_open_fd(fd)
+        if _stat_fields(path.stat()) != fields:
+            raise RunnerError(f"launch input changed while opening: {path}")
+        return _LaunchHandle(
+            label, path, fd, writable,
+            {"path": str(path), "size_bytes": size, "sha256": digest}, fields,
+        )
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _post_launch_handle(handle: _LaunchHandle) -> dict[str, str | int]:
+    size, digest, fields = _hash_open_fd(handle.fd)
+    try:
+        path_fields = _stat_fields(handle.source_path.stat())
+    except OSError as error:
+        raise RunnerError(f"launch input disappeared after run: {handle.source_path}") from error
+    if fields != path_fields:
+        raise RunnerError(f"launch input path was replaced after run: {handle.source_path}")
+    return {"path": str(handle.source_path), "size_bytes": size, "sha256": digest}
+
+
+def _bind_command_handles(command: tuple[str, ...], handles: list[_LaunchHandle]) -> tuple[str, ...]:
+    """Replace every QEMU file argument with the inherited opened handle."""
+
+    bound = list(command)
+    for handle in handles:
+        source = str(handle.source_path)
+        escaped = source.replace(",", ",,")
+        replacement = str(handle.proc_path)
+        bound = [item.replace(escaped, replacement).replace(source, replacement) for item in bound]
+    return tuple(bound)
+
+
+def _close_launch_handles(handles: list[_LaunchHandle]) -> None:
+    for handle in reversed(handles):
+        try:
+            os.close(handle.fd)
+        except OSError:
+            pass
+
+
+def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
+    """Extract the only supported file-valued initrd option fail-closed."""
+
+    positions = [index for index, value in enumerate(extra_args) if value == "-initrd"]
+    if not positions:
+        return None
+    if len(positions) != 1:
+        raise RunnerError("extra_args contains repeated -initrd")
+    index = positions[0]
+    if index + 1 >= len(extra_args) or extra_args[index + 1].startswith("-"):
+        raise RunnerError("-initrd requires exactly one file path")
+    path = Path(extra_args[index + 1]).expanduser().resolve()
+    if not path.is_file():
+        raise RunnerError(f"initrd does not exist: {path}")
+    return path
 
 
 def normalize_arch(value: str) -> Arch:
@@ -256,6 +353,7 @@ def run(
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
     network = _validate_network(config)
+    initrd = _initrd_from_extra_args(config.extra_args)
     input_path = None
     if config.input_path is not None:
         input_path = config.input_path.expanduser().resolve()
@@ -413,6 +511,32 @@ def run(
     if qemu_executable is not None and effective_qemu_launcher is None:
         command = (str(qemu_executable), *command[1:])
 
+    launch_handles: list[_LaunchHandle] = []
+    try:
+        if config.direct_kernel:
+            launch_handles.append(_open_launch_handle("kernel", kernel, writable=False))
+        launch_handles.append(_open_launch_handle("rootfs", rootfs.path.resolve(), writable=rootfs.mode == "rw"))
+        if esp is not None:
+            launch_handles.append(_open_launch_handle("esp", esp.path.resolve(), writable=False))
+        if ovmf_code is not None:
+            launch_handles.append(_open_launch_handle("ovmf_code", ovmf_code, writable=False))
+        if ovmf_vars_runtime is not None:
+            launch_handles.append(_open_launch_handle("ovmf_vars", ovmf_vars_runtime, writable=True))
+        if extra_block is not None:
+            launch_handles.append(_open_launch_handle("extra_block", extra_block.path.resolve(), writable=extra_block.mode == "rw"))
+        if initrd is not None:
+            launch_handles.append(_open_launch_handle("initrd", initrd, writable=False))
+        command = _bind_command_handles(command, launch_handles)
+    except Exception:
+        _close_launch_handles(launch_handles)
+        raise
+    process_environment = None
+    if effective_qemu_launcher is not None:
+        process_environment = os.environ.copy()
+        process_environment["THEKERNEL_QEMU_LAUNCH_FDS"] = ",".join(
+            str(handle.fd) for handle in launch_handles
+        )
+
     rootfs_source_path = rootfs_plan.source
     rootfs_runtime_path = rootfs.path.resolve()
     if config.receipt_path is not None:
@@ -477,18 +601,8 @@ def run(
             receipt["extra_block_runtime_before"] = file_evidence(extra_block.path.resolve())
         assert receipt_path is not None
 
-    if input_path is None:
-        result = run_process(
-            arch=config.arch,
-            command=command,
-            workdir=workdir,
-            log_path=log_path,
-            limits=config.limits,
-            interaction=config.interaction,
-            console_stream=console_stream,
-        )
-    else:
-        with input_path.open("rb") as input_stream:
+    try:
+        if input_path is None:
             result = run_process(
                 arch=config.arch,
                 command=command,
@@ -496,41 +610,72 @@ def run(
                 log_path=log_path,
                 limits=config.limits,
                 interaction=config.interaction,
-                input_stream=input_stream,
                 console_stream=console_stream,
-                capture_input_evidence=receipt_path is not None,
+                pass_fds=tuple(handle.fd for handle in launch_handles),
+                environment=process_environment,
             )
-    if receipt_path is not None:
-        receipt["rootfs_runtime_after"] = file_evidence(rootfs_runtime_path)
-        receipt["log"] = file_evidence(result.log_path)
-        if config.extra_block is not None and extra_block is not None:
-            receipt["extra_block_runtime_after"] = file_evidence(extra_block.path.resolve())
-        from .receipt import command_stream_evidence, input_forwarding_payload
+        else:
+            with input_path.open("rb") as input_stream:
+                result = run_process(
+                    arch=config.arch,
+                    command=command,
+                    workdir=workdir,
+                    log_path=log_path,
+                    limits=config.limits,
+                    interaction=config.interaction,
+                    input_stream=input_stream,
+                    console_stream=console_stream,
+                    capture_input_evidence=receipt_path is not None,
+                    pass_fds=tuple(handle.fd for handle in launch_handles),
+                    environment=process_environment,
+                )
+        launch_post = {handle.label: _post_launch_handle(handle) for handle in launch_handles}
+    except Exception:
+        _close_launch_handles(launch_handles)
+        raise
+    try:
+        if receipt_path is not None:
+            receipt["rootfs_runtime_after"] = file_evidence(rootfs_runtime_path)
+            receipt["log"] = file_evidence(result.log_path)
+            if config.extra_block is not None and extra_block is not None:
+                receipt["extra_block_runtime_after"] = file_evidence(extra_block.path.resolve())
+            from .receipt import command_stream_evidence, input_forwarding_payload
 
-        assert input_path is not None
-        assert result.input_forwarding is not None
-        receipt["stdin"] = input_forwarding_payload(
-            result.input_forwarding,
-            source=input_evidence,
-            source_unchanged=command_stream_evidence(input_path) == input_evidence,
-        )
-        receipt.update(
-            {
-                "state": "recorded",
-                "returncode": result.returncode,
-                "duration_ms": result.duration_ms,
-                "error_message": result.error_message,
-                "timed_out": result.timed_out,
-                "interrupted": result.interrupted,
-                "intentionally_stopped": result.intentionally_stopped,
-                "marker_success": result.marker_success,
-                "guest_clean_shutdown": result.guest_clean_shutdown,
-                "runner_terminated": result.runner_terminated,
-                "runner_termination_reason": result.runner_termination_reason,
-                # QEMU process exit observes neither device quiescence nor
-                # kernel-internal physical retirement.
-                "physical_retirement_proven": False,
-            }
-        )
-        atomic_write_receipt(receipt_path, receipt)
+            assert input_path is not None
+            assert result.input_forwarding is not None
+            receipt["stdin"] = input_forwarding_payload(
+                result.input_forwarding,
+                source=input_evidence,
+                source_unchanged=command_stream_evidence(input_path) == input_evidence,
+            )
+            receipt.update(
+                {
+                    "state": "recorded",
+                    "returncode": result.returncode,
+                    "duration_ms": result.duration_ms,
+                    "error_message": result.error_message,
+                    "timed_out": result.timed_out,
+                    "interrupted": result.interrupted,
+                    "intentionally_stopped": result.intentionally_stopped,
+                    "marker_success": result.marker_success,
+                    "guest_clean_shutdown": result.guest_clean_shutdown,
+                    "runner_terminated": result.runner_terminated,
+                    "runner_termination_reason": result.runner_termination_reason,
+                    # QEMU process exit observes neither device quiescence nor
+                    # kernel-internal physical retirement.
+                    "physical_retirement_proven": False,
+                    "launch_handles": {
+                        handle.label: {
+                            "source": handle.before,
+                            "handle": str(handle.proc_path),
+                            "access": "rw" if handle.writable else "ro",
+                            "post": launch_post[handle.label],
+                        }
+                        for handle in launch_handles
+                    },
+                }
+            )
+            atomic_write_receipt(receipt_path, receipt)
+    finally:
+        _close_launch_handles(launch_handles)
     return result

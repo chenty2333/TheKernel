@@ -117,7 +117,7 @@ jobs:
 
       - name: Test product tools
         run: |
-          python3 -m unittest tests.ci.test_source_combination -v
+          python3 -m unittest discover -s tests/ci -p 'test_*.py' -v
           python3 -m unittest discover -s tests/qemu_runner -v
           python3 -m unittest \
             tests.test_thekernel_system_test \
@@ -173,6 +173,8 @@ jobs:
     timeout-minutes: 90
     container:
       image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:279c82be5d0a98814293912e3c8f87ccbcc1471a1781690768c1771cefd78fe7' }}
+      # The unified gate runs the same portable Linux oracles as the fast job.
+      options: --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -226,11 +228,20 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
-      - name: Lint x86_64 product profile
+      - name: Lint MM performance product profile
         run: |
-          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4
           ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4 \
             --profile mm-performance
 
-      - name: Run q35 UEFI SMP4 TCG system test
-        run: ./tools/thekernel.py system-test --machine q35 --firmware uefi --smp 4 --accel tcg
+      - name: Run the unified clean-source q35 preview gate
+        run: |
+          python3 -m tools.qemu_runner.gate_manifest \
+            --output .state/gate/q35-preview-v0/manifest.json
+
+      - name: Publish the gate manifest and bound logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: q35-preview-v0-${{ steps.source_combination.outputs.combination_id }}
+          path: TheKernel/.state/gate/q35-preview-v0
+          if-no-files-found: error

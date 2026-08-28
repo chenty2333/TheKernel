@@ -5,40 +5,50 @@ Linux-compatible userspace ABI on ArceOS components. x86_64 is the only
 supported product architecture; the reference machine is QEMU `q35` with
 UEFI/OVMF.
 
-The durable design, selected direction, current position, and known pitfalls
-are in [`maproom/terrain.md`](maproom/terrain.md),
-[`maproom/route.md`](maproom/route.md),
-[`maproom/basecamp.md`](maproom/basecamp.md), and
-[`maproom/hazards.md`](maproom/hazards.md).
+The bounded project intent and durable engineering decisions are maintained in
+[`RSH.md`](RSH.md) and [`.rsh/records/`](.rsh/records/). Local working focus is
+stored in `.rsh/focus.toml`; it is not a release-status or compatibility claim.
 Unsafe review islands and their invariants are indexed in
 [`docs/unsafe-boundaries.md`](docs/unsafe-boundaries.md).
 
 ## Checkout and development environment
 
-The workspace expects maintained sibling repositories:
-
-```text
-parent/
-  TheKernel/
-  thekernel-ax/
-  thekernel-linux-abi/
-```
-
-CI reads its exact sibling checkout combination from
-[`config/source-combination.toml`](config/source-combination.toml) and prints
-a stable ID that also includes the checked-out TheKernel commit.
-
-Enter the system-dependency development container with:
+Create the three-checkout workspace from a single TheKernel clone. The
+bootstrap command reads the immutable repository/ref/path records in
+[`config/source-combination.toml`](config/source-combination.toml), fetches
+each listed commit, and checks out that exact commit detached:
 
 ```bash
-./scripts/dev-shell.sh
+mkdir thekernel-workspace
+git clone https://github.com/chenty2333/TheKernel.git thekernel-workspace/TheKernel
+cd thekernel-workspace/TheKernel
+python3 scripts/ci/bootstrap_sources.py
 ```
 
-Boot the interactive TheKernel guest shell directly from the host with:
+The resulting workspace is `thekernel-workspace/{TheKernel,thekernel-ax,thekernel-linux-abi}`.
+On later runs, the bootstrap tool only verifies existing sibling checkouts: it
+never overwrites them, and it refuses a dirty checkout or a different commit.
+Update or remove an existing sibling explicitly before rerunning it. CI uses
+the same manifest and prints a stable combination ID that includes the checked-out
+TheKernel commit.
+
+Use the same immutable development image as CI:
 
 ```bash
-./scripts/dev-shell.sh --guest-shell
+export THEKERNEL_DEV_IMAGE=ghcr.io/chenty2333/thekernel-dev@sha256:279c82be5d0a98814293912e3c8f87ccbcc1471a1781690768c1771cefd78fe7
+./scripts/dev-shell.sh -- bash
 ```
+
+Alternatively, build the local image from the checked-in `dev-env/Dockerfile`
+and enter it (the script rebuilds when its Dockerfile inputs change):
+
+```bash
+export THEKERNEL_DEV_IMAGE=thekernel-dev:local
+./scripts/dev-shell.sh -- bash
+```
+
+Boot the interactive TheKernel guest shell directly from the host with
+`./scripts/dev-shell.sh --guest-shell`.
 
 The image deliberately contains no Rust runtime. Install rustup there, then
 run `rustup show` from this checkout to install the toolchain declared by the
@@ -102,6 +112,15 @@ without a per-case wrapper:
 
 ```bash
 ./scripts/host-differential.sh
+```
+
+For the source-bound product gate, run all four product checks through one
+manifest writer. It refuses a dirty checkout or mismatched sibling commit and
+hashes the command logs, final kernel/ESP/rootfs, and complete guest console:
+
+```bash
+python3 -m tools.qemu_runner.gate_manifest \
+  --output .state/gate/q35-preview-v0/manifest.json
 ```
 
 Run a named semantic smoke with:

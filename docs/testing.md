@@ -10,8 +10,8 @@ The current product candidate is limited to x86_64 QEMU `q35`, UEFI/OVMF,
 built from a clean worktree whose repositories match one
 `config/source-combination.toml` identity, and must pass formatting/lint, the
 host suites, portable Linux differential, and guest KTAP with zero FAIL and
-zero SKIP. The guest must then shut down normally: a suite marker, timeout, or
-runner-terminated QEMU is not a pass.
+zero SKIP. The guest must then shut down normally: a suite marker alone,
+timeout, or runner-terminated QEMU is not a pass.
 
 This preview covers untrusted local guest processes only for implemented ABI
 surfaces. It does not claim unmodified distribution/systemd/container support,
@@ -23,6 +23,21 @@ Linux semantic and performance comparisons use Linux stable `v6.12.103`
 configuration, OVMF, rootfs, helpers, virtual topology, and CPU placement
 identified in the result. Syscall dispatcher branch count is not coverage
 evidence.
+
+The source-bound product portion of the gate is emitted as one machine-readable
+manifest:
+
+```bash
+python3 -m tools.qemu_runner.gate_manifest \
+  --output .state/gate/q35-preview-v0/manifest.json
+```
+
+It runs build, product lint, the portable Linux differentials, and the guest
+system test in order. A pass binds the exact clean three-checkout combination,
+per-command stdout/stderr, the final kernel/ESP/rootfs launched by the system
+test, a complete numbered KTAP plan with zero FAIL/SKIP, the post-suite marker,
+and normal guest shutdown. Formatting and host suites remain explicit checks
+in the same CI workflow and are not silently folded into this product receipt.
 
 ## Host suite
 
