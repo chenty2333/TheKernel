@@ -94,6 +94,54 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertTrue(calls["reject_ktap_skips"])
         self.assertIsNone(calls["stop_after_marker"])
 
+    def test_explicit_new_workdir_exists_before_shutdown_commands_are_written(self) -> None:
+        product = load_product()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = product.Artifacts(
+                root / "state", product.Variant(cpus=4, memory="1G"), "system"
+            )
+            for path in (artifacts.kernel, artifacts.esp, artifacts.rootfs):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"artifact")
+            workdir = root / "new" / "system-test"
+            observed = {}
+
+            def fake_run(config):
+                observed["config"] = config
+                self.assertTrue(config.workdir.is_dir())
+                self.assertEqual(
+                    config.input_path.read_text(encoding="utf-8"),
+                    product.SYSTEM_TEST_SHUTDOWN_COMMANDS,
+                )
+                return type("Result", (), {
+                    "returncode": 0,
+                    "log_path": config.log_path,
+                    "guest_clean_shutdown": True,
+                    "intentionally_stopped": False,
+                })()
+
+            original_run = product.run
+            try:
+                product.run = fake_run
+                self.assertEqual(product.run_product(
+                    artifacts,
+                    accel="tcg",
+                    timeout=30,
+                    workdir=workdir,
+                    interactive=False,
+                    input_after_marker=None,
+                    stop_after_marker=None,
+                    commands=None,
+                    extra_block=None,
+                    receipt=None,
+                    shutdown_after_marker=True,
+                ), 0)
+            finally:
+                product.run = original_run
+
+            self.assertEqual(observed["config"].workdir, workdir.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

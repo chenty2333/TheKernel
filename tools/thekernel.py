@@ -369,6 +369,10 @@ def run_product(
         runs_root = artifacts.root / "runs"
         runs_root.mkdir(parents=True, exist_ok=True)
         run_dir = Path(tempfile.mkdtemp(prefix=f"{artifacts.profile}-", dir=runs_root))
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ProductError(f"cannot create run directory: {error}") from error
     command_path = None
     if shutdown_after_marker:
         if commands is not None or input_after_marker is not None or stop_after_marker is not None:
