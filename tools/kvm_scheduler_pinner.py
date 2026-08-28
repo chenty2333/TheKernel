@@ -34,11 +34,15 @@ from pathlib import Path
 from typing import Mapping
 
 
-PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v4"
+PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v5"
+# v4 remains readable by the baseline as a historical report, but formal
+# runs write v5: v4's exit-TID list cannot describe CLONE_UNTRACED shutdown.
+PREVIOUS_PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v4"
 LEGACY_PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v2"
 CPU_RE = re.compile(r"(?:CPU\s+|vcpu[ -]?|VCPU[ -]?)(?P<index>\d+)", re.IGNORECASE)
 PF_USER_WORKER = 0x00004000
 KVM_NX_RECOVERY_COMM = "kvm-nx-lpage-re"
+KVM_NX_HUGE_PAGES_PARAMETER = Path("/sys/module/kvm/parameters/nx_huge_pages")
 
 
 @dataclass
@@ -48,6 +52,8 @@ class KvmNxPrearm:
     enabled: bool
     deadline: float
     worker_tid: int | None = None
+    worker_affinity_housekeeping: bool = True
+    vcpus_housekeeping_until_arm: bool = True
 
     @property
     def armed(self) -> bool:
@@ -79,6 +85,26 @@ class KvmNxPrearm:
         self.worker_tid = tid
         return None
 
+    def observe_vcpu(self, affinity: tuple[int, ...], *, housekeeping: tuple[int, ...]) -> None:
+        """Retain the prearm interval invariant, including repeated samples."""
+
+        if self.enabled and not self.armed and not set(affinity).issubset(set(housekeeping)):
+            self.vcpus_housekeeping_until_arm = False
+
+    def terminally_closed(
+        self, tid: int, *, qemu_pid: int, root_exited: bool
+    ) -> bool:
+        """vhost_task_stop closes the worker only after QEMU teardown."""
+
+        return (
+            self.enabled
+            and self.worker_tid == tid
+            and self.worker_affinity_housekeeping
+            and self.vcpus_housekeeping_until_arm
+            and root_exited
+            and untraced_worker_left_qemu_group(tid, qemu_pid)
+        )
+
     def timed_out(self, now: float) -> bool:
         return self.enabled and not self.armed and now >= self.deadline
 
@@ -90,6 +116,7 @@ PTRACE_TRACEME = 0
 PTRACE_CONT = 7
 PTRACE_SETOPTIONS = 0x4200
 PTRACE_GETEVENTMSG = 0x4201
+PTRACE_GETSIGINFO = 0x4202
 PTRACE_O_TRACEFORK = 1 << 1
 PTRACE_O_TRACEVFORK = 1 << 2
 PTRACE_O_TRACECLONE = 1 << 3
@@ -120,6 +147,27 @@ class BackendIdentityUnavailable(ValueError):
 
 
 BACKEND_IDENTITY_KEYS = frozenset({"pid", "tgid", "exe", "starttime"})
+QEMU_LAUNCH_FDS_ENV = "THEKERNEL_QEMU_LAUNCH_FDS"
+
+
+def qemu_launch_fds() -> tuple[int, ...]:
+    """Read only the runner-authorized descriptors inherited by this launcher."""
+
+    raw = os.environ.get(QEMU_LAUNCH_FDS_ENV, "")
+    if not raw:
+        return ()
+    try:
+        fds = tuple(int(value) for value in raw.split(","))
+    except ValueError as error:
+        raise PtraceUnavailable("invalid QEMU launch FD environment") from error
+    if not fds or any(fd < 3 for fd in fds) or len(set(fds)) != len(fds):
+        raise PtraceUnavailable("invalid QEMU launch FD environment")
+    try:
+        for fd in fds:
+            os.fstat(fd)
+    except OSError as error:
+        raise PtraceUnavailable(f"missing QEMU launch FD: {error}") from error
+    return fds
 
 
 class TracedProcess:
@@ -188,6 +236,56 @@ def _ptrace_event_message(pid: int) -> int:
     return int(message.value)
 
 
+def _ptrace_signal_info(pid: int) -> int:
+    """Return ``siginfo.si_code`` for a signal-delivery stop.
+
+    Linux returns EINVAL for a group-stop; that boundary is not a second
+    delivery of the stopping signal and must not be reinjected.
+    """
+
+    # siginfo_t is ABI-sized and its first two ints are signo/code.  We need
+    # only si_code, but retain a conservatively sized native buffer.
+    info = (ctypes.c_byte * 128)()
+    result = _LIBC.ptrace(
+        ctypes.c_ulong(PTRACE_GETSIGINFO),
+        ctypes.c_long(pid),
+        ctypes.c_void_p(0),
+        ctypes.cast(ctypes.pointer(info), ctypes.c_void_p),
+    )
+    if result == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return int(ctypes.cast(ctypes.pointer(info), ctypes.POINTER(ctypes.c_int))[1])
+
+
+def ptrace_resume_signal(tid: int, status: int) -> int:
+    """Choose the signal argument for resuming a ptrace stop.
+
+    Event stops and kernel-generated synthetic traps are tracer protocol, not
+    tracee signals.  A genuine delivery stop is resumed with the exact signal
+    so QEMU's vCPU kick/shutdown paths retain their Linux semantics.
+    """
+
+    if status >> 16:
+        return 0
+    signo = os.WSTOPSIG(status)
+    try:
+        code = _ptrace_signal_info(tid)
+    except OSError as error:
+        if error.errno == errno.EINVAL:
+            # PTRACE_GETSIGINFO deliberately distinguishes a group-stop.
+            # The group-stop state is already established; CONT must not
+            # manufacture a fresh delivery of SIGSTOP/SIGTSTP/etc.
+            return 0
+        raise PtraceUnavailable(f"cannot inspect ptrace stop signal: {error}") from error
+    # SI_KERNEL is the Linux synthetic-trap code.  PTRACE_EVENT_* was handled
+    # above; this covers the remaining protocol trap without swallowing a
+    # user-generated or breakpoint SIGTRAP.
+    if signo == signal.SIGTRAP and code == 0x80:
+        return 0
+    return signo
+
+
 def _trace_exec_child() -> None:
     """Popen child hook: stop before exec so the parent can set ptrace opts."""
 
@@ -203,10 +301,13 @@ def _trace_exec_child() -> None:
 def _start_traced(command: list[str], housekeeping: tuple[int, ...]) -> TracedProcess:
     process: TracedProcess | None = None
     try:
+        launch_fds = qemu_launch_fds()
         pid = os.fork()
         if pid == 0:
             _trace_exec_child()
             try:
+                for fd in launch_fds:
+                    os.set_inheritable(fd, True)
                 os.execv(command[0], command)
             except OSError:
                 os._exit(78)
@@ -451,6 +552,44 @@ def exit_role_closed(prior_clone_proof: bool, role_observed: bool) -> bool:
 
     _ = prior_clone_proof
     return role_observed
+
+
+def historical_measurement_role(
+    tid: int,
+    vcpus: Mapping[str, Mapping[str, object]],
+    io_threads: Mapping[int, Mapping[str, object]],
+    backend_threads: Mapping[int, Mapping[str, object]],
+) -> str | None:
+    """Keep a role after QEMU replaces its comm during teardown."""
+
+    if any(record.get("tid") == tid for record in vcpus.values()):
+        return "vcpu"
+    if tid in io_threads:
+        return "iothread"
+    if tid in backend_threads:
+        return "backend"
+    return None
+
+
+def task_has_observation(
+    tid: int,
+    vcpus: Mapping[str, Mapping[str, object]],
+    io_threads: Mapping[int, Mapping[str, object]],
+    backend_threads: Mapping[int, Mapping[str, object]],
+    unknown_threads: Mapping[int, Mapping[str, object]],
+    qemu_main: Mapping[str, object] | None,
+    external_processes: Mapping[int, Mapping[str, object]],
+) -> bool:
+    """Return whether the exact TID already has any accepted role record."""
+
+    return (
+        any(record.get("tid") == tid for record in vcpus.values())
+        or tid in io_threads
+        or tid in backend_threads
+        or tid in unknown_threads
+        or (qemu_main is not None and qemu_main.get("tid") == tid)
+        or any(record.get("main_tid") == tid for record in external_processes.values())
+    )
 
 
 def process_identity(pid: int) -> dict[str, object] | None:
@@ -758,6 +897,7 @@ def write_report(
     measurement_smt_siblings: tuple[int, ...] | None = None,
     exit_readback_tids: tuple[int, ...] = (),
     exit_readback_proof: bool = False,
+    terminal_proofs: list[dict[str, object]] | None = None,
     declared_external_backends: tuple[dict[str, object], ...] = (),
     proof_failures: list[dict[str, object]] | None = None,
 ) -> None:
@@ -772,6 +912,7 @@ def write_report(
     external_processes = list(external_processes or [])
     unknown_threads = list(unknown_threads or [])
     proof_failures = list(proof_failures or [])
+    terminal_proofs = list(terminal_proofs or [])
     # Formal vCPU/IO records carry the QEMU thread-group identity.  Keep the
     # writer usable by small synthetic tests that provide the older shape by
     # binding omitted role identities to the report's QEMU PID; live pinner
@@ -862,6 +1003,10 @@ def write_report(
         "unknown_thread_proof": "ptrace-clone-event" if ptrace_clone_events else "unsupported",
         "exit_readback_tids": list(exit_readback_tids),
         "exit_readback_proof": bool(exit_readback_proof),
+        # v5 distinguishes a stopped ptrace task from KVM's intentionally
+        # untraced vhost worker.  Do not present a last /proc sample as a
+        # ptrace exit readback for the latter.
+        "terminal_proofs": terminal_proofs,
         "proof_failures": proof_failures,
     }
     if path is None:
@@ -902,6 +1047,21 @@ def _housekeeping_cpus(
             "housekeeping CPUs overlap measurement CPUs or their SMT siblings"
         )
     return result
+
+
+def kvm_nx_prearm_required() -> bool:
+    """Return whether KVM can create the CLONE_UNTRACED NX recovery worker.
+
+    ``never`` is the only hard-disabled setting.  Any other value means that
+    a worker can be created; an unreadable parameter is deliberately not
+    treated as that hard-disabled case.
+    """
+
+    try:
+        return KVM_NX_HUGE_PAGES_PARAMETER.read_text(encoding="ascii").strip() != "never"
+    except (OSError, UnicodeDecodeError):
+        # The caller turns this into an explicit unsupported formal lane.
+        raise PtraceUnavailable("cannot-read-kvm-nx-huge-pages-parameter")
 
 
 def main() -> int:
@@ -950,16 +1110,26 @@ def main() -> int:
             allowed,
             measurement_smt_siblings=measurement_smt_siblings,
         )
-        prearm_raw = os.environ.get("THEKERNEL_KVM_PREARM_KVM_NX_WORKER", "0")
+        prearm_raw = os.environ.get("THEKERNEL_KVM_PREARM_KVM_NX_WORKER")
+        nx_prearm_required = kvm_nx_prearm_required()
+        if prearm_raw is None:
+            prearm_raw = "1" if nx_prearm_required else "0"
         if prearm_raw not in {"0", "1"}:
             raise ValueError(
                 "THEKERNEL_KVM_PREARM_KVM_NX_WORKER must be 0 or 1"
+            )
+        if nx_prearm_required and prearm_raw != "1":
+            raise ValueError(
+                "KVM NX recovery worker may be enabled; prearm cannot be disabled"
             )
         prearm_timeout = float(
             os.environ.get("THEKERNEL_KVM_PREARM_KVM_NX_TIMEOUT", "2.0")
         )
         if not (0.0 < prearm_timeout <= 10.0):
             raise ValueError("KVM NX prearm timeout must be in (0, 10] seconds")
+    except PtraceUnavailable as error:
+        print(f"KVM_PINNING_UNSUPPORTED reason={error}", file=sys.stderr)
+        return 78
     except CpuTopologyUnavailable as error:
         print(f"KVM_PINNING_UNSUPPORTED reason=cpu-topology:{error}", file=sys.stderr)
         return 78
@@ -1028,6 +1198,7 @@ def main() -> int:
     clone_proof = True
     exit_stops: set[int] = set()
     exit_readback_tids: set[int] = set()
+    terminal_proofs: dict[int, dict[str, object]] = {}
     exit_contamination_tids: set[int] = set()
     exit_readback_failures: dict[int, str] = {}
     deferred_poll_failures: set[int] = set()
@@ -1092,6 +1263,17 @@ def main() -> int:
         def observed() -> None:
             deferred_poll_failures.discard(tid)
 
+        # QEMU can rename a thread to its generic worker comm while it exits.
+        # The first exact role observation remains its lifetime role; do not
+        # create a duplicate unknown record or overwrite its measurement
+        # placement from that transient terminal name.
+        prior_role = historical_measurement_role(
+            tid, observed_vcpus, observed_io, observed_backend
+        )
+        if prior_role is not None and classification != prior_role:
+            observed()
+            return True
+
         if classification == "vcpu":
             index = vcpu_index(name)
             if index is None:
@@ -1111,7 +1293,10 @@ def main() -> int:
             if record is None:
                 failed()
                 return False
-            elif index < expected_vcpu_count:
+            nx_prearm.observe_vcpu(
+                tuple(record["affinity"]), housekeeping=housekeeping
+            )
+            if index < expected_vcpu_count:
                 observed()
                 observed_unknown.pop(tid, None)
                 observed_vcpus[str(index)] = record
@@ -1295,6 +1480,7 @@ def main() -> int:
                         measurement=measurement,
                     )
                     if prearm_error is not None:
+                        nx_prearm.worker_affinity_housekeeping = False
                         record_proof_failure(
                             f"kvm-nx-prearm-{prearm_error}",
                             tid,
@@ -1309,6 +1495,9 @@ def main() -> int:
                             stopped_affinity=pre_affinity,
                             defer_poll_race=defer_poll_race,
                         )
+                        # A successful live record is only provisional for a
+                        # CLONE_UNTRACED worker: there will be no ptrace EXIT.
+                        deferred_poll_failures.add(tid)
                 elif not _pre_exit_affinity_safe(
                     "unknown", pre_affinity, measurement
                 ):
@@ -1365,6 +1554,14 @@ def main() -> int:
             exit_readback_failures[tid] = f"untracked-tgid-{tgid}"
             clone_proof = False
             return False
+        # A QEMU IO/vCPU/backend may have reverted to a generic worker comm
+        # before its ptrace exit-stop.  Preserve its first accepted role for
+        # the terminal affinity policy, while passing the live comm to
+        # observe_task() so its sticky-role path cannot overwrite that record.
+        historical_role = historical_measurement_role(
+            tid, observed_vcpus, observed_io, observed_backend
+        )
+        affinity_classification = historical_role or classification
         # This is a live read from the exact TID at its ptrace exit-stop, not
         # a stale record from the last /proc poll.  The stopped task cannot
         # execute again, so a safe readback is already its terminal affinity
@@ -1377,7 +1574,7 @@ def main() -> int:
             clone_proof = False
             return False
         contaminated = not _pre_exit_affinity_safe(
-            classification,
+            affinity_classification,
             pre_affinity,
             measurement,
             requested_backend=requested_backend,
@@ -1434,6 +1631,11 @@ def main() -> int:
             clone_proof = False
             return False
         exit_readback_tids.add(tid)
+        terminal_proofs[tid] = {
+            "tid": tid,
+            "method": "ptrace-exit-stop",
+            "affinity": list(final_affinity),
+        }
         deferred_poll_failures.discard(tid)
         return True
 
@@ -1608,9 +1810,14 @@ def main() -> int:
                             new_tid, process.pid, child_name
                         )
                         observe_task(new_tid, child_name, child_classification)
-                        if (
-                            new_tid not in observed_unknown
-                            and child_classification == "unknown"
+                        if not task_has_observation(
+                            new_tid,
+                            observed_vcpus,
+                            observed_io,
+                            observed_backend,
+                            observed_unknown,
+                            observed_main,
+                            observed_external_processes,
                         ):
                             raise PtraceUnavailable(
                                 f"cannot record affinity for clone thread {new_tid}"
@@ -1683,7 +1890,15 @@ def main() -> int:
                     return_code = 78
                     break
             try:
-                _ptrace(PTRACE_CONT, waited)
+                _ptrace(PTRACE_CONT, waited, ptrace_resume_signal(waited, status))
+            except PtraceUnavailable as error:
+                print(
+                    f"kvm_scheduler_pinner: ptrace stop proof failed: {error}",
+                    file=sys.stderr,
+                )
+                clone_proof = False
+                return_code = 78
+                break
             except OSError as error:
                 if error.errno != errno.ESRCH:
                     print(
@@ -1724,8 +1939,21 @@ def main() -> int:
             # completion before KVM VM teardown returns.  Once the QEMU
             # thread group has exited and the original TID is no longer in
             # that group, its last safe readback is terminal evidence.
-            if untraced_worker_left_qemu_group(tid, process.pid):
+            if nx_prearm.terminally_closed(
+                tid, qemu_pid=process.pid, root_exited=True
+            ):
                 deferred_poll_failures.discard(tid)
+                terminal_proofs[tid] = {
+                    "tid": tid,
+                    "method": "kvm-vhost-stop",
+                    "affinity": list(observed_unknown[tid]["affinity"]),
+                    "comm": KVM_NX_RECOVERY_COMM,
+                    "tgid": process.pid,
+                    "user_worker": True,
+                    "prearm_vcpus_housekeeping": True,
+                    "worker_housekeeping": True,
+                    "left_qemu_tgid": True,
+                }
     if deferred_poll_failures:
         print(
             "kvm_scheduler_pinner: unresolved polling observations for tasks "
@@ -1763,6 +1991,7 @@ def main() -> int:
         measurement_smt_siblings=measurement_smt_siblings,
         exit_readback_tids=tuple(sorted(exit_readback_tids)),
         exit_readback_proof=clone_proof and bool(exit_readback_tids),
+        terminal_proofs=[terminal_proofs[tid] for tid in sorted(terminal_proofs)],
         declared_external_backends=declared_external_backends,
         proof_failures=proof_failures,
     )
@@ -1772,7 +2001,7 @@ def main() -> int:
     # the first clone/fork/vfork; surface that boundary explicitly so the
     # harness records ``unsupported`` instead of treating a v4 report with no
     # proof as a runner success.
-    if not clone_proof or clone_event_count <= 0:
+    if clone_event_count <= 0:
         print(
             "KVM_PINNING_UNSUPPORTED reason=no-observed-ptrace-task-event",
             file=sys.stderr,

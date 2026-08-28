@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,15 +22,26 @@ from tools.kvm_scheduler_pinner import (
     _smt_siblings,
     classify_thread,
     exit_role_closed,
+    historical_measurement_role,
     is_untraced_kvm_nx_worker,
+    kvm_nx_prearm_required,
     parse_external_backend_identities,
+    qemu_launch_fds,
+    ptrace_resume_signal,
     task_name,
+    task_has_observation,
     untraced_worker_left_qemu_group,
     write_report,
 )
 
 
 class SchedulerPinnerTests(unittest.TestCase):
+    def test_launcher_consumes_only_explicit_inherited_launch_fds(self) -> None:
+        with tempfile.TemporaryFile() as source, patch.dict(
+            os.environ, {"THEKERNEL_QEMU_LAUNCH_FDS": str(source.fileno())}, clear=False
+        ):
+            self.assertEqual(qemu_launch_fds(), (source.fileno(),))
+
     def test_kvm_nx_prearm_holds_then_releases_vcpu(self) -> None:
         state = KvmNxPrearm(enabled=True, deadline=10.0)
         self.assertEqual(state.vcpu_cpus((2, 3), (6, 7), 1), (6, 7))
@@ -63,9 +76,65 @@ class SchedulerPinnerTests(unittest.TestCase):
         self.assertFalse(state.armed)
         self.assertTrue(state.timed_out(10.0))
 
+    def test_kvm_nx_prearm_terminal_lifecycle_requires_vhost_stop_conditions(self) -> None:
+        state = KvmNxPrearm(enabled=True, deadline=10.0)
+        state.observe_vcpu((6,), housekeeping=(6, 7))
+        self.assertIsNone(
+            state.observe_worker(41, (6, 7), housekeeping=(6, 7), measurement={2})
+        )
+        with patch("tools.kvm_scheduler_pinner.untraced_worker_left_qemu_group", return_value=True):
+            self.assertTrue(state.terminally_closed(41, qemu_pid=40, root_exited=True))
+            self.assertFalse(state.terminally_closed(42, qemu_pid=40, root_exited=True))
+            self.assertFalse(state.terminally_closed(41, qemu_pid=40, root_exited=False))
+
+    def test_kvm_nx_prearm_policy_only_skips_hard_disabled_never(self) -> None:
+        with patch.object(Path, "read_text", return_value="never\n"):
+            self.assertFalse(kvm_nx_prearm_required())
+        with patch.object(Path, "read_text", return_value="always\n"):
+            self.assertTrue(kvm_nx_prearm_required())
+        with patch.object(Path, "read_text", side_effect=OSError("unreadable")):
+            with self.assertRaisesRegex(Exception, "cannot-read-kvm-nx"):
+                kvm_nx_prearm_required()
+
     def test_exit_role_closes_even_when_an_earlier_task_failed_proof(self) -> None:
         self.assertTrue(exit_role_closed(False, True))
         self.assertFalse(exit_role_closed(True, False))
+
+    def test_ptrace_resume_reinjects_real_signal_but_not_protocol_or_group_stop(self) -> None:
+        delivery_status = signal.SIGUSR1 << 8
+        with patch("tools.kvm_scheduler_pinner._ptrace_signal_info", return_value=0):
+            self.assertEqual(ptrace_resume_signal(41, delivery_status), signal.SIGUSR1)
+        with patch("tools.kvm_scheduler_pinner._ptrace_signal_info", return_value=0):
+            self.assertEqual(ptrace_resume_signal(41, delivery_status | (6 << 16)), 0)
+        with patch("tools.kvm_scheduler_pinner._ptrace_signal_info", return_value=0x80):
+            self.assertEqual(ptrace_resume_signal(41, signal.SIGTRAP << 8), 0)
+        with patch(
+            "tools.kvm_scheduler_pinner._ptrace_signal_info",
+            side_effect=OSError(errno.EINVAL, "group stop"),
+        ):
+            self.assertEqual(ptrace_resume_signal(41, signal.SIGSTOP << 8), 0)
+
+    def test_measurement_role_stays_sticky_across_terminal_comm_rename(self) -> None:
+        vcpus = {"0": {"tid": 41}}
+        self.assertEqual(historical_measurement_role(41, vcpus, {}, {}), "vcpu")
+        self.assertEqual(
+            historical_measurement_role(42, {}, {42: {"tid": 42}}, {}), "iothread"
+        )
+        self.assertEqual(
+            historical_measurement_role(43, {}, {}, {43: {"tid": 43}}), "backend"
+        )
+        self.assertIsNone(historical_measurement_role(44, vcpus, {}, {}))
+
+    def test_terminal_renamed_io_uses_historical_measurement_affinity_policy(self) -> None:
+        role = historical_measurement_role(299, {}, {299: {"tid": 299}}, {})
+        self.assertEqual(role, "iothread")
+        self.assertTrue(_pre_exit_affinity_safe(role or "unknown", (4,), {0, 1, 2, 3, 4}))
+        self.assertFalse(_pre_exit_affinity_safe("unknown", (4,), {0, 1, 2, 3, 4}))
+
+    def test_clone_postcondition_accepts_stale_unknown_name_with_prior_vcpu_record(self) -> None:
+        vcpus = {"0": {"tid": 51}}
+        self.assertTrue(task_has_observation(51, vcpus, {}, {}, {}, None, {}))
+        self.assertFalse(task_has_observation(52, vcpus, {}, {}, {}, None, {}))
 
     def test_kvm_nx_worker_requires_exact_comm_tgid_and_user_worker_flag(self) -> None:
         with (

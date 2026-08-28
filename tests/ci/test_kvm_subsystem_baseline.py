@@ -747,6 +747,48 @@ class SubsystemBaselineTests(unittest.TestCase):
                 backend_cpus=(),
             ))
 
+    def test_pin_validator_v5_requires_exact_terminal_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "thread-pinning.json"
+            write_report(
+                path,
+                pid=10,
+                expected_vcpu_count=1,
+                vcpus={"0": {"tid": 11, "name": "CPU 0/KVM", "affinity": [2]}},
+                io_threads=[{"tid": 12, "name": "IO thread", "affinity": [3]}],
+                requested_vcpu=(2,), requested_io=(3,), housekeeping=(0, 1),
+                measurement_smt_siblings=(2, 3),
+                qemu_main={"tid": 10, "name": "qemu", "affinity": [0, 1]},
+                unknown_threads=[{"tid": 14, "name": "kvm-nx-lpage-re", "affinity": [1]}],
+                ptrace_clone_events=True, clone_event_count=1,
+                exit_readback_tids=(10, 11, 12), exit_readback_proof=True,
+                terminal_proofs=[
+                    {"tid": 10, "method": "ptrace-exit-stop", "affinity": [0, 1]},
+                    {"tid": 11, "method": "ptrace-exit-stop", "affinity": [2]},
+                    {"tid": 12, "method": "ptrace-exit-stop", "affinity": [3]},
+                    {"tid": 14, "method": "kvm-vhost-stop", "affinity": [1],
+                     "comm": "kvm-nx-lpage-re", "tgid": 10, "user_worker": True,
+                     "prearm_vcpus_housekeeping": True, "worker_housekeeping": True,
+                     "left_qemu_tgid": True},
+                ],
+            )
+            kwargs = dict(expected_vcpu_count=1, vcpu_cpus=(2,), io_cpus=(3,), backend_cpus=())
+            self.assertTrue(_pin_report_valid(path, **kwargs))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["terminal_proofs"].pop()
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(_pin_report_valid(path, **kwargs))
+            # A structurally complete historical v4 report remains an
+            # artefact for classification, but the same admission gate used
+            # by run_command must not admit it to formal samples.
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["schema"] = "thekernel-kvm-thread-pinning-v4"
+            payload.pop("terminal_proofs")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            pin_valid = _pin_report_valid(path, **kwargs)
+            self.assertFalse(pin_valid)
+            self.assertFalse(eligible_for_stats(parse_text(seccomp_log()), runner_returncode=0, pin_valid=pin_valid))
+
     def test_zero_runner_with_missing_pin_proof_is_unsupported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "thread-pinning.json"

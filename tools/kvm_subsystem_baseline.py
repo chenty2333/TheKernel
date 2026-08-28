@@ -2209,7 +2209,11 @@ def _pin_report_valid(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
-    if not isinstance(payload, dict) or payload.get("schema") != "thekernel-kvm-thread-pinning-v4":
+    # Formal subsystem admission is deliberately current-schema-only.  v4
+    # remains parseable by failure classification for historical artefacts,
+    # but cannot certify a new formal measurement because it lacks terminal
+    # lifecycle proof.
+    if not isinstance(payload, dict) or payload.get("schema") != "thekernel-kvm-thread-pinning-v5":
         return False
     declared_external_backends = payload.get("declared_external_backends")
     if not isinstance(declared_external_backends, list):
@@ -2307,6 +2311,7 @@ def _pin_report_valid(
     external_collision_tids: set[int] = set()
     external_backend_tids: set[int] = set()
     affinity_by_tid: dict[int, tuple[int, ...]] = {}
+    measurement_role_tids: set[int] = set()
     for index in range(expected_vcpu_count):
         record = vcpu_threads[str(index)]
         if not isinstance(record, dict) or set(record) != {
@@ -2325,6 +2330,7 @@ def _pin_report_valid(
         ):
             return False
         used_tids.add(tid)
+        measurement_role_tids.add(tid)
         external_collision_tids.add(tid)
         affinity_by_tid[tid] = tuple(affinity)
     for field, requested in (("io_threads", io_cpus), ("backend_threads", backend_cpus)):
@@ -2394,6 +2400,7 @@ def _pin_report_valid(
                 ):
                     return False
             used_tids.add(tid)
+            measurement_role_tids.add(tid)
             if field == "io_threads":
                 external_collision_tids.add(tid)
             elif record.get("tgid") == payload.get("pid"):
@@ -2491,7 +2498,62 @@ def _pin_report_valid(
             return False
     if not expected_identity_tuples.issubset(external_process_identities):
         return False
-    if not used_tids.issubset(set(exit_readback_tids)):
+    if payload.get("schema") == "thekernel-kvm-thread-pinning-v5":
+        proofs = payload.get("terminal_proofs")
+        if not isinstance(proofs, list):
+            return False
+        proof_by_tid: dict[int, Mapping[str, object]] = {}
+        ptrace_tids: set[int] = set()
+        for proof in proofs:
+            if not isinstance(proof, dict):
+                return False
+            tid = proof.get("tid")
+            if (
+                isinstance(tid, bool) or not isinstance(tid, int) or tid <= 0
+                or tid in proof_by_tid
+            ):
+                return False
+            method = proof.get("method")
+            affinity = proof.get("affinity")
+            if not _pin_affinity(affinity):
+                return False
+            if method == "ptrace-exit-stop":
+                if set(proof) != {"tid", "method", "affinity"}:
+                    return False
+                ptrace_tids.add(tid)
+            elif method == "kvm-vhost-stop":
+                if set(proof) != {
+                    "tid", "method", "affinity", "comm", "tgid", "user_worker",
+                    "prearm_vcpus_housekeeping", "worker_housekeeping", "left_qemu_tgid",
+                }:
+                    return False
+                if (
+                    proof.get("comm") != "kvm-nx-lpage-re"
+                    or proof.get("tgid") != payload.get("pid")
+                    or proof.get("user_worker") is not True
+                    or proof.get("prearm_vcpus_housekeeping") is not True
+                    or proof.get("worker_housekeeping") is not True
+                    or proof.get("left_qemu_tgid") is not True
+                    or not set(affinity).issubset(set(housekeeping))
+                ):
+                    return False
+            else:
+                return False
+            observed_affinity = affinity_by_tid.get(tid)
+            if observed_affinity is None:
+                return False
+            if method == "ptrace-exit-stop":
+                if tid in measurement_role_tids:
+                    if tuple(affinity) != observed_affinity and not set(affinity).issubset(set(housekeeping)):
+                        return False
+                elif not set(affinity).issubset(set(housekeeping)):
+                    return False
+            proof_by_tid[tid] = proof
+        if set(proof_by_tid) != used_tids:
+            return False
+        if set(exit_readback_tids) != ptrace_tids:
+            return False
+    elif not used_tids.issubset(set(exit_readback_tids)):
         return False
     return True
 
@@ -2513,7 +2575,9 @@ def pin_report_failure_status(path: Path, pin_valid: bool) -> str:
         return "unsupported"
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "pinning-error"
-    if not isinstance(payload, dict) or payload.get("schema") != "thekernel-kvm-thread-pinning-v4":
+    if not isinstance(payload, dict) or payload.get("schema") not in {
+        "thekernel-kvm-thread-pinning-v4", "thekernel-kvm-thread-pinning-v5"
+    }:
         return "pinning-error"
     required = {
         "schema", "pid", "expected_vcpu_count", "requested_vcpu_cpus",
@@ -2528,6 +2592,8 @@ def pin_report_failure_status(path: Path, pin_valid: bool) -> str:
         "clone_event_count", "unknown_thread_proof", "exit_readback_tids",
         "exit_readback_proof", "proof_failures",
     }
+    if payload["schema"] == "thekernel-kvm-thread-pinning-v5":
+        required.add("terminal_proofs")
     if set(payload) != required:
         return "pinning-error"
     def affinity_shape(record: Mapping[str, object]) -> bool:

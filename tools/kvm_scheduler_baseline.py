@@ -35,6 +35,8 @@ if __package__ in {None, ""}:
 
 from tools.qemu_runner.model import Interaction, RunLimits
 from tools.qemu_runner.runner import RunConfig, RunnerError, run
+from tools.qemu_runner.evidence import file_evidence
+from tools.qemu_runner.receipt import ReceiptError, source_identity
 from tools.kvm_scheduler_pinner import (
     BackendIdentityUnavailable,
     parse_external_backend_identities,
@@ -49,13 +51,20 @@ from tools.kvm_subsystem_baseline import (
     validate_cpu_roles,
     validate_cpu_selection,
 )
+from tools.host_pmu import PmuUnavailable, UserProcessTreePmu
+from scripts.ci import source_combination
 
 
+# Raw guest observations and their recomputable summaries retain the v1 wire
+# schema.  The run manifest is v2 because it records run-scoped PMU raw-data
+# collection without changing per-sample evidence semantics.
 SCHEMA = "thekernel-kvm-scheduler-baseline-v1"
+MANIFEST_SCHEMA = "thekernel-kvm-scheduler-baseline-v2"
 RUN_SCHEMA = "thekernel-scheduler-baseline-run-v1"
 SAMPLE_SCHEMA = "thekernel-scheduler-baseline-sample-v1"
 RESULT_SCHEMA = "thekernel-scheduler-baseline-result-v1"
-PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v4"
+PIN_REPORT_SCHEMA = "thekernel-kvm-thread-pinning-v5"
+PIN_REPORT_PREVIOUS_SCHEMA = "thekernel-kvm-thread-pinning-v4"
 PIN_REPORT_LEGACY_SCHEMA = "thekernel-kvm-thread-pinning-v2"
 PIN_REPORT_V3_SCHEMA = PIN_REPORT_SCHEMA
 PIN_REPORT_KEYS = frozenset(
@@ -121,6 +130,16 @@ PIN_REPORT_V3_KEYS = frozenset(
         "unknown_thread_proof",
         "exit_readback_tids",
         "exit_readback_proof",
+        "terminal_proofs",
+        "proof_failures",
+    }
+)
+PIN_REPORT_V4_KEYS = PIN_REPORT_V3_KEYS - frozenset({"terminal_proofs"})
+PIN_PTRACE_TERMINAL_PROOF_KEYS = frozenset({"tid", "method", "affinity"})
+PIN_KVM_TERMINAL_PROOF_KEYS = frozenset(
+    {
+        "tid", "method", "affinity", "comm", "tgid", "user_worker",
+        "prearm_vcpus_housekeeping", "worker_housekeeping", "left_qemu_tgid",
     }
 )
 WORKLOADS = ("futex", "pipe", "cpu-worker")
@@ -367,19 +386,43 @@ def validate_pin_report(
         missing = sorted(PIN_REPORT_KEYS - set(payload))
         extra = sorted(set(payload) - PIN_REPORT_KEYS)
         return f"invalid pin report fields: missing={missing} extra={extra}"
-    if schema not in (PIN_REPORT_SCHEMA, PIN_REPORT_LEGACY_SCHEMA):
+    if schema not in (
+        PIN_REPORT_SCHEMA, PIN_REPORT_PREVIOUS_SCHEMA, PIN_REPORT_LEGACY_SCHEMA
+    ):
         return f"unsupported pin report schema: {schema!r}"
     # A v3 report is accepted only with the complete housekeeping and launcher
     # inheritance proof.  The legacy shape is accepted only when it declares
     # the legacy schema; a v3 report cannot silently downgrade to old evidence.
-    is_v3 = schema == PIN_REPORT_V3_SCHEMA
-    expected_keys = PIN_REPORT_V3_KEYS if is_v3 else PIN_REPORT_KEYS
+    is_v3 = schema in (PIN_REPORT_SCHEMA, PIN_REPORT_PREVIOUS_SCHEMA)
+    is_v5 = schema == PIN_REPORT_SCHEMA
+    expected_keys = (
+        PIN_REPORT_V3_KEYS if is_v5
+        else PIN_REPORT_V4_KEYS if is_v3
+        else PIN_REPORT_KEYS
+    )
     if set(payload) != expected_keys:
         missing = sorted(expected_keys - set(payload))
         extra = sorted(set(payload) - expected_keys)
         return f"invalid pin report fields: missing={missing} extra={extra}"
-    if payload["schema"] not in (PIN_REPORT_SCHEMA, PIN_REPORT_LEGACY_SCHEMA):
+    if payload["schema"] not in (
+        PIN_REPORT_SCHEMA, PIN_REPORT_PREVIOUS_SCHEMA, PIN_REPORT_LEGACY_SCHEMA
+    ):
         return f"unsupported pin report schema: {payload['schema']!r}"
+    if is_v3 and payload["proof_failures"]:
+        failure = payload["proof_failures"][0]
+        if (
+            not isinstance(failure, dict)
+            or not isinstance(failure.get("reason"), str)
+            or not failure["reason"]
+            or isinstance(failure.get("tid"), bool)
+            or not isinstance(failure.get("tid"), int)
+            or failure["tid"] <= 0
+        ):
+            return "invalid pin report proof_failures"
+        return (
+            "pin report contains proof failure: "
+            f"{failure['reason']} tid={failure['tid']}"
+        )
 
     pid = payload["pid"]
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -513,12 +556,14 @@ def validate_pin_report(
             return "external process tracking is not a list"
         observed_tids: set[int] = set()
         role_tids: dict[int, tuple[int, ...]] = {}
+        measurement_role_tids: set[int] = set()
         external_collision_tids: set[int] = set()
         external_backend_tids: set[int] = set()
         external_identity_by_pid: dict[int, tuple[int, int, str, int]] = {}
         for record in payload["vcpu_threads"].values():
             if isinstance(record, dict) and isinstance(record.get("tid"), int):
                 observed_tids.add(record["tid"])
+                measurement_role_tids.add(record["tid"])
                 external_collision_tids.add(record["tid"])
                 affinity = record.get("affinity")
                 if isinstance(affinity, list) and all(isinstance(cpu, int) for cpu in affinity):
@@ -530,6 +575,8 @@ def validate_pin_report(
             for record in records:
                 if isinstance(record, dict) and isinstance(record.get("tid"), int):
                     observed_tids.add(record["tid"])
+                    if field == "io_threads":
+                        measurement_role_tids.add(record["tid"])
                     external_collision_tids.add(record["tid"])
                     affinity = record.get("affinity")
                     if isinstance(affinity, list) and all(isinstance(cpu, int) for cpu in affinity):
@@ -541,6 +588,7 @@ def validate_pin_report(
             if isinstance(record, dict) and isinstance(record.get("tid"), int):
                 backend_tid = record["tid"]
                 observed_tids.add(backend_tid)
+                measurement_role_tids.add(backend_tid)
                 backend_tgid = record.get("tgid")
                 if backend_tgid == pid:
                     # Internal QEMU backends are still QEMU-owned TIDs; an
@@ -658,8 +706,9 @@ def validate_pin_report(
         if not main_affinity or not set(main_affinity).issubset(set(report_housekeeping)):
             return "QEMU main affinity is not housekeeping-only"
         observed_tids.add(main_tid)
+        role_tids[main_tid] = main_affinity
         external_collision_tids.add(main_tid)
-        if not observed_tids.issubset(set(exit_readback_tids)):
+        if not is_v5 and not observed_tids.issubset(set(exit_readback_tids)):
             return "pin report has a task without final affinity readback"
         if payload["housekeeping_status"] != "ok":
             return f"housekeeping pinning status is not ok: {payload['housekeeping_status']!r}"
@@ -810,6 +859,81 @@ def validate_pin_report(
             if isinstance(tid, bool) or not isinstance(tid, int) or tid <= 0 or tid in backend_tids:
                 return "invalid or duplicate unknown TID"
             backend_tids.add(tid)
+    if is_v5:
+        terminal_records = payload["terminal_proofs"]
+        if not isinstance(terminal_records, list):
+            return "invalid terminal proof records"
+        terminal_by_tid: dict[int, Mapping[str, object]] = {}
+        ptrace_terminal_tids: set[int] = set()
+        for proof in terminal_records:
+            if not isinstance(proof, dict):
+                return "invalid terminal proof record"
+            tid = proof.get("tid")
+            if (
+                isinstance(tid, bool) or not isinstance(tid, int) or tid <= 0
+                or tid in terminal_by_tid
+            ):
+                return "invalid or duplicate terminal proof TID"
+            method = proof.get("method")
+            if method == "ptrace-exit-stop":
+                if set(proof) != PIN_PTRACE_TERMINAL_PROOF_KEYS:
+                    return "invalid ptrace exit terminal proof"
+                ptrace_terminal_tids.add(tid)
+            elif method == "kvm-vhost-stop":
+                if set(proof) != PIN_KVM_TERMINAL_PROOF_KEYS:
+                    return "invalid KVM vhost terminal proof"
+                if (
+                    proof.get("comm") != "kvm-nx-lpage-re"
+                    or proof.get("tgid") != pid
+                    or proof.get("user_worker") is not True
+                    or proof.get("prearm_vcpus_housekeeping") is not True
+                    or proof.get("worker_housekeeping") is not True
+                    or proof.get("left_qemu_tgid") is not True
+                ):
+                    return "KVM vhost terminal lifecycle proof is incomplete"
+            else:
+                return "unsupported terminal proof method"
+            try:
+                proof_affinity = _pin_cpu_array(proof.get("affinity"), label="terminal proof affinity")
+            except BaselineError as error:
+                return str(error)
+            role_affinity = role_tids.get(tid)
+            if role_affinity is None:
+                return "terminal proof has no observed task"
+            if method == "kvm-vhost-stop":
+                if not set(proof_affinity).issubset(set(report_housekeeping)):
+                    return "KVM vhost terminal affinity is not housekeeping-only"
+            elif tid in measurement_role_tids:
+                if (
+                    proof_affinity != role_affinity
+                    and not set(proof_affinity).issubset(set(report_housekeeping))
+                ):
+                    return "measurement role terminal affinity is neither role nor housekeeping"
+            elif not set(proof_affinity).issubset(set(report_housekeeping)):
+                return "housekeeping task terminal affinity is not housekeeping-only"
+            terminal_by_tid[tid] = proof
+        if set(terminal_by_tid) != observed_tids:
+            return "pin report terminal proofs do not cover exactly all observed tasks"
+        if set(exit_readback_tids) != ptrace_terminal_tids:
+            return "ptrace exit readback list does not match terminal proofs"
+    return None
+
+
+def _current_pin_schema_reason(path: Path) -> str | None:
+    """Historical reports remain parseable but cannot admit a new run."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None  # The complete validator reports malformed/missing input.
+    if not isinstance(payload, dict):
+        return None
+    schema = payload.get("schema")
+    if schema != PIN_REPORT_SCHEMA:
+        return (
+            "current scheduler run requires "
+            f"{PIN_REPORT_SCHEMA}, got {schema!r}"
+        )
     return None
 
 
@@ -824,6 +948,17 @@ def _pin_report_shape_valid(payload: object) -> bool:
         )
 
     if not isinstance(payload, dict) or set(payload) != PIN_REPORT_V3_KEYS:
+        return False
+    proof_failures = payload.get("proof_failures")
+    if not isinstance(proof_failures, list) or any(
+        not isinstance(failure, dict)
+        or not isinstance(failure.get("reason"), str)
+        or not failure["reason"]
+        or isinstance(failure.get("tid"), bool)
+        or not isinstance(failure.get("tid"), int)
+        or failure["tid"] <= 0
+        for failure in proof_failures
+    ):
         return False
     if not isinstance(payload.get("vcpu_threads"), dict):
         return False
@@ -939,6 +1074,8 @@ def pin_report_failure_status(path: Path, reason: str | None) -> str:
         return "pinning-error"
     if not isinstance(payload, dict):
         return "pinning-error"
+    if reason.startswith("current scheduler run requires "):
+        return "unsupported"
     if not _pin_report_shape_valid(payload):
         return "pinning-error"
     for field in ("process_inherited_housekeeping", "new_threads_inherit_housekeeping"):
@@ -958,6 +1095,8 @@ def pin_report_failure_status(path: Path, reason: str | None) -> str:
         "backend pinning status is not ok: 'not_observed'",
     )
     if reason in capability_reasons:
+        return "unsupported"
+    if reason.startswith("pin report contains proof failure: "):
         return "unsupported"
     if reason == "launcher did not prove process housekeeping inheritance":
         return (
@@ -1543,6 +1682,201 @@ def kvm_available() -> bool:
     return Path("/dev/kvm").exists()
 
 
+def _write_run_pmu(
+    path: Path,
+    *,
+    capture: UserProcessTreePmu | None,
+    unavailable: str | None,
+) -> dict[str, object]:
+    """Finish one PMU window and retain its non-sample-scoped evidence.
+
+    These counters are deliberately kept out of raw-samples.tsv: they cover
+    the controller's complete QEMU launch/boot/workload/shutdown interval and
+    inherited descendants, not an individual guest operation.
+    """
+
+    payload: dict[str, object] = {
+        "schema": "thekernel-host-pmu-run-v1",
+        "scope": (
+            "inherited process tree from the scheduler controller "
+            "while one QEMU run is active; includes controller/pinner/QEMU descendants, "
+            "boot and shutdown; exclude_guest=false so guest-mode user execution may contribute; "
+            "not guest-scoped, QEMU-PID-exclusive, or per-sample"
+        ),
+        "exclude_kernel": True,
+        "exclude_hv": True,
+        "exclude_guest": False,
+        "events": ["cycles", "instructions", "cache_misses", "branch_misses"],
+    }
+    if capture is None:
+        payload.update({"status": "unavailable", "reason": unavailable or "not-started"})
+    else:
+        try:
+            reading = capture.stop()
+        except PmuUnavailable as error:
+            payload.update({"status": "unavailable", "reason": str(error)})
+        else:
+            payload.update({
+                "status": "measured",
+                "raw_counters": reading.counters,
+                "time_enabled_ns": reading.time_enabled,
+                "time_running_ns": reading.time_running,
+                "multiplexed": reading.multiplexed,
+                "scale": reading.scale,
+                "counter_scaling": "raw_with_scale_factor",
+            })
+        finally:
+            capture.close()
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return payload
+
+
+def _latency_derived_throughput(samples: Iterable[Sample]) -> dict[str, object]:
+    """Report only an explicit serial estimate derived from raw latency sums."""
+
+    captured = tuple(samples)
+    total_ns = sum(sample.latency_ns for sample in captured)
+    if not captured or total_ns <= 0:
+        return {"status": "not-available", "reason": "no-complete-raw-latency-samples"}
+    return {
+        "status": "latency-sum-derived",
+        "operations": len(captured),
+        "latency_sum_ns": total_ns,
+        "operations_per_second": len(captured) * 1_000_000_000 / total_ns,
+        "scope": (
+            "serial estimate from sum(raw guest operation latency); it is not "
+            "wall-clock QEMU throughput and does not model concurrent workers"
+        ),
+    }
+
+
+def _same_evidence(expected: object, observed: object) -> bool:
+    return (
+        isinstance(expected, dict)
+        and isinstance(observed, dict)
+        and all(observed.get(key) == expected.get(key) for key in ("path", "size_bytes", "sha256"))
+    )
+
+
+def _validate_source_identity(identity: object) -> str | None:
+    """Require the exact declared clean source combination at launch time."""
+
+    if not isinstance(identity, dict) or identity.get("schema") != 1:
+        return "invalid source identity"
+    sources = identity.get("sources")
+    if not isinstance(sources, dict):
+        return "source identity has no source map"
+    try:
+        declared = source_combination.load(
+            Path(__file__).resolve().parents[1] / "config" / "source-combination.toml"
+        )
+    except source_combination.SourceCombinationError as error:
+        return f"cannot load declared source combination: {error}"
+    expected_names = {"thekernel", *declared}
+    if set(sources) != expected_names:
+        return "source identity sources do not match declaration"
+    thekernel = sources.get("thekernel")
+    if not isinstance(thekernel, dict):
+        return "source identity has invalid TheKernel source"
+    for name in sorted(expected_names):
+        source = sources.get(name)
+        if not isinstance(source, dict):
+            return f"source identity has invalid {name} source"
+        if source.get("worktree_dirty") is not False:
+            return f"source {name} is dirty"
+        if source.get("match_declared") is not True:
+            return f"source {name} does not match declaration"
+        for field in ("repository_root", "commit", "tree"):
+            if not isinstance(source.get(field), str) or not source[field]:
+                return f"source {name} has invalid {field}"
+        expected_root = (
+            Path(__file__).resolve().parents[1]
+            if name == "thekernel"
+            else Path(__file__).resolve().parents[1].parent / declared[name].path
+        )
+        if source.get("repository_root") != str(expected_root.resolve()):
+            return f"source {name} repository root does not match declaration"
+        if name in declared and source.get("commit") != declared[name].ref:
+            return f"source {name} commit does not match declaration"
+    commit = thekernel.get("commit")
+    if not isinstance(commit, str):
+        return "source identity TheKernel commit is invalid"
+    expected_combination = source_combination.combination_id(declared, commit)
+    if identity.get("combination_id") != expected_combination:
+        return "source identity combination ID does not match declaration"
+    return None
+
+
+def _capture_clean_source_identity() -> tuple[dict[str, object] | None, str | None]:
+    try:
+        identity = source_identity()
+    except ReceiptError as error:
+        return None, f"cannot capture source identity: {error}"
+    reason = _validate_source_identity(identity)
+    # Retain an invalid postflight snapshot for the manifest instead of
+    # silently falling back to the last clean identity.  Callers still reject
+    # it through ``reason``.
+    return identity, reason
+
+
+def _validate_run_input_evidence(
+    receipt_path: Path,
+    target_inputs: Mapping[str, object],
+    images: TargetImages,
+    preflight_identity: Mapping[str, object],
+) -> tuple[str | None, dict[str, object] | None]:
+    """Bind each run receipt and post-run files to its target manifest input.
+
+    QEMU's receipt captures launch-time kernel/rootfs/ESP evidence and
+    inherited-FD bindings for every file-valued launch input.
+    """
+
+    # Capture completion identity before any receipt/artifact rejection can
+    # return. Every attempted run therefore has an actual source postflight,
+    # not only runs whose artifact evidence was already valid.
+    postflight_identity, postflight_reason = _capture_clean_source_identity()
+    if postflight_reason is not None or postflight_identity is None:
+        return f"source postflight failed: {postflight_reason}", postflight_identity
+    if postflight_identity != preflight_identity:
+        return "source identity changed during QEMU run", postflight_identity
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return f"missing or invalid qemu receipt: {error}", postflight_identity
+    if not isinstance(receipt, dict):
+        return "invalid qemu receipt object", postflight_identity
+    receipt_identity = receipt.get("source_identity")
+    source_identity_reason = _validate_source_identity(receipt_identity)
+    if source_identity_reason is not None:
+        return f"qemu receipt {source_identity_reason}", postflight_identity
+    if receipt_identity != preflight_identity:
+        return "qemu receipt source identity differs from preflight", postflight_identity
+    receipt_fields = {"kernel": "kernel", "rootfs": "rootfs_source", "esp": "esp_source"}
+    for artifact, receipt_field in receipt_fields.items():
+        expected = target_inputs.get(artifact)
+        if expected is None:
+            if receipt_field in receipt:
+                return f"qemu receipt unexpectedly contains {artifact} evidence", postflight_identity
+            continue
+        if not _same_evidence(expected, receipt.get(receipt_field)):
+            return f"qemu receipt {artifact} evidence does not match target manifest", postflight_identity
+    if images.initrd is not None:
+        expected_initrd = target_inputs.get("initrd")
+        handles = receipt.get("launch_handles")
+        if not isinstance(handles, dict) or not isinstance(expected_initrd, dict):
+            return "invalid target initrd evidence", postflight_identity
+        binding = handles.get("initrd")
+        if not isinstance(binding, dict) or not _same_evidence(expected_initrd, binding.get("source")):
+            return "qemu receipt initrd handle does not match target manifest", postflight_identity
+    for artifact, path in (
+        ("kernel", images.kernel), ("rootfs", images.rootfs),
+        ("esp", images.esp), ("initrd", images.initrd),
+    ):
+        if path is not None and not _same_evidence(target_inputs.get(artifact), file_evidence(path)):
+            return f"target {artifact} changed during or after QEMU run", postflight_identity
+    return None, postflight_identity
+
+
 def run_command(args: argparse.Namespace) -> int:
     if not kvm_available():
         print("kvm-scheduler-baseline: UNSUPPORTED: /dev/kvm is unavailable", file=sys.stderr)
@@ -1626,16 +1960,25 @@ def run_command(args: argparse.Namespace) -> int:
             raise
     for target, images in images_by_target.items():
         target_manifest = {
-            "kernel": str(images.kernel),
-            "rootfs": str(images.rootfs),
-            "esp": str(images.esp) if images.esp is not None else None,
-            "initrd": str(images.initrd) if images.initrd is not None else None,
+            # Paths alone do not bind a repeat to immutable boot inputs.
+            # Capture a stable, change-detecting content identity once before
+            # the first target run; runner receipts retain their own runtime
+            # drive evidence separately.
+            "kernel": file_evidence(images.kernel),
+            "rootfs": file_evidence(images.rootfs),
+            "esp": file_evidence(images.esp) if images.esp is not None else None,
+            "initrd": file_evidence(images.initrd) if images.initrd is not None else None,
             "boot": "direct-kernel" if images.direct_kernel else "uefi",
             "firmware": None if images.direct_kernel else "OVMF",
         }
         if images.cmdline is not None:
             target_manifest["cmdline"] = images.cmdline
         target_manifests[target] = target_manifest
+    source_preflight, source_preflight_reason = _capture_clean_source_identity()
+    if source_preflight_reason is not None or source_preflight is None:
+        raise BaselineError(f"source preflight failed: {source_preflight_reason}")
+    source_postflight: dict[str, object] | None = source_preflight
+    source_identity_unchanged = True
     # Keep target ordering inside the repeat loop.  Running all repeats for one
     # target first creates a systematic time/thermal drift in ``--target both``
     # comparisons.
@@ -1660,9 +2003,16 @@ def run_command(args: argparse.Namespace) -> int:
                         "THEKERNEL_KVM_HOUSEKEEPING_CPUS": ",".join(map(str, housekeeping_cpus)),
                         "THEKERNEL_KVM_VCPU_COUNT": str(args.cpus),
                         "THEKERNEL_KVM_PIN_REPORT": str(pin_report),
+                        # Confirmed pinner path: it keeps initial vCPUs on
+                        # housekeeping until the KVM NX recovery worker has
+                        # been observed and pinned, then releases them.
+                        "THEKERNEL_KVM_PREARM_KVM_NX_WORKER": "1",
                     })
                     previous = {key: os.environ.get(key) for key in env if key.startswith("THEKERNEL_KVM_")}
                     os.environ.update({key: value for key, value in env.items() if key.startswith("THEKERNEL_KVM_")})
+                    pmu_path = run_dir / "host-pmu.json"
+                    pmu_capture: UserProcessTreePmu | None = None
+                    pmu_unavailable: str | None = None
                     try:
                         extra_args = [
                             "-name",
@@ -1678,8 +2028,18 @@ def run_command(args: argparse.Namespace) -> int:
                             ]
                             if images.initrd is not None:
                                 extra_args[0:0] = ["-initrd", str(images.initrd)]
-                        result = run(
-                            RunConfig(
+                        try:
+                            pmu_capture = UserProcessTreePmu()
+                            pmu_capture.open()
+                            pmu_capture.start()
+                        except PmuUnavailable as error:
+                            if pmu_capture is not None:
+                                pmu_capture.close()
+                            pmu_capture = None
+                            pmu_unavailable = str(error)
+                        try:
+                            result = run(
+                                RunConfig(
                                 arch="x86_64", kernel=images.kernel, rootfs=images.rootfs,
                                 esp=images.esp, direct_kernel=images.direct_kernel,
                                 workdir=run_dir, log_path=run_dir / "console.log",
@@ -1695,13 +2055,17 @@ def run_command(args: argparse.Namespace) -> int:
                                                         input_after_marker=args.ready_marker),
                                 ovmf_code=Path(args.ovmf_code).resolve() if args.ovmf_code else None,
                                 ovmf_vars=Path(args.ovmf_vars).resolve() if args.ovmf_vars else None,
-                            ),
-                        )
+                                ),
+                            )
+                        finally:
+                            pmu_evidence = _write_run_pmu(
+                                pmu_path, capture=pmu_capture, unavailable=pmu_unavailable
+                            )
                     finally:
                         for key in ("THEKERNEL_KVM_QEMU", "THEKERNEL_KVM_VCPU_CPUS",
                                     "THEKERNEL_KVM_IO_CPUS", "THEKERNEL_KVM_BACKEND_CPUS",
                                     "THEKERNEL_KVM_HOUSEKEEPING_CPUS", "THEKERNEL_KVM_VCPU_COUNT",
-                                    "THEKERNEL_KVM_PIN_REPORT"):
+                                    "THEKERNEL_KVM_PIN_REPORT", "THEKERNEL_KVM_PREARM_KVM_NX_WORKER"):
                             if previous.get(key) is None:
                                 os.environ.pop(key, None)
                             else:
@@ -1720,18 +2084,31 @@ def run_command(args: argparse.Namespace) -> int:
                             requested_backend=backend_cpus,
                             expected_external_backends=expected_external_backends,
                         )
+                        if pinning_reason is None:
+                            pinning_reason = _current_pin_schema_reason(pin_report)
                     guest = parse_guest_log(run_dir / "console.log", target=target, repeat=repeat)
+                    input_evidence_reason, run_postflight_identity = _validate_run_input_evidence(
+                        run_dir / "qemu-receipt.json", target_manifests[target], images,
+                        source_preflight,
+                    )
+                    source_postflight = run_postflight_identity
+                    if run_postflight_identity != source_preflight:
+                        source_identity_unchanged = False
                     measured = (
                         pinning_reason is None
                         and result.returncode == 0
                         and guest.status == "ok"
+                        and input_evidence_reason is None
                     )
                     evidence_class = scheduler_evidence_class(
                         guest.samples if measured else ()
                     )
-                    formal = measured and evidence_class in {
-                        "cpu-cost-evidenced", "pmu-evidenced"
-                    }
+                    host_pmu_measured = pmu_evidence.get("status") == "measured"
+                    # The PMU is run-scoped and never upgrades a per-sample
+                    # witness.  Together these files are only a prerequisite
+                    # raw-data collection record, never formal performance
+                    # evidence or a performance-change gate.
+                    collected = measured and host_pmu_measured
                     if measured:
                         raw_samples.extend(guest.samples)
                     pin_status = pin_report_failure_status(pin_report, pinning_reason)
@@ -1748,20 +2125,41 @@ def run_command(args: argparse.Namespace) -> int:
                     elif pinning_reason is not None:
                         status = pin_status
                         reason = pinning_reason
+                    elif input_evidence_reason is not None:
+                        status = "input-evidence-error"
+                        reason = input_evidence_reason
                     else:
                         status = guest.status if result.returncode == 0 else "runner-error"
                         reason = guest.reason if status != "ok" else None
-                    if measured and not formal:
-                        status = "measured-latency-only"
-                        reason = "missing-per-sample-cpu-or-pmu-cost-witness"
+                    if collected:
+                        status = "collected"
+                        reason = None
+                    elif measured:
+                        status = "collection-incomplete"
+                        reason = "missing-run-scoped-pmu-evidence"
                     runs.append({"target": target, "repeat": repeat, "workload": workload,
                                  "placement": placement, "status": status,
+                                  "measurement_complete": measured,
+                                 "guest_status": guest.status,
+                                 "formal_performance_evidence": False,
+                                 "performance_change_gate_eligible": False,
                                  "evidence_class": evidence_class,
+                                 "combined_evidence_class": (
+                                     "latency-plus-run-scoped-pmu-prerequisite"
+                                     if collected else evidence_class
+                                 ),
                                  "reason": reason,
                                  "returncode": result.returncode,
                                  "pin_report": str(pin_report.relative_to(output)),
+                                 "qemu_receipt": str((run_dir / "qemu-receipt.json").relative_to(output)),
+                                 "input_evidence": "ok" if input_evidence_reason is None else "failed",
+                                 "host_pmu": str(pmu_path.relative_to(output)),
+                                 "host_pmu_status": pmu_evidence.get("status"),
+                                 "throughput": _latency_derived_throughput(
+                                     guest.samples if measured else ()
+                                 ),
                                  "log": str((run_dir / "console.log").relative_to(output))})
-                    if status != "ok":
+                    if status not in {"collected"}:
                         overall_status = 1
     _write_tsv(output / "raw-samples.tsv", RAW_COLUMNS, ({
         "schema": SCHEMA, "target": sample.target, "repeat": sample.repeat,
@@ -1775,7 +2173,10 @@ def run_command(args: argparse.Namespace) -> int:
     ) != 0:
         overall_status = 1
     cost_capabilities = host_cost_capabilities()
-    manifest = {"schema": SCHEMA, "qemu": qemu, "accel": "kvm", "cpu": "host",
+    collection_complete = bool(runs) and all(
+        run.get("status") == "collected" for run in runs
+    )
+    manifest = {"schema": MANIFEST_SCHEMA, "qemu": qemu, "accel": "kvm", "cpu": "host",
                 "machine": "q35", "cpus": args.cpus,
                 "memory": args.memory, "warmup": args.warmup, "repeat": args.repeat,
                 "vcpu_cpus": list(vcpu_cpus), "io_cpus": list(io_cpus),
@@ -1797,7 +2198,28 @@ def run_command(args: argparse.Namespace) -> int:
                 },
                 "host_cpu_topology": host_topology_manifest(topology),
                 "measurement_status": "measured" if raw_samples else "not-measured",
-                "evidence_class": scheduler_evidence_class(raw_samples),
+                "evidence_class": (
+                    "latency-plus-run-scoped-pmu-prerequisite"
+                    if collection_complete
+                    else scheduler_evidence_class(raw_samples)
+                ),
+                "host_pmu_scope": (
+                    "per-run inherited process-tree counters over the QEMU lifetime; "
+                    "exclude_guest=false, so guest-mode user execution may contribute; "
+                    "never copied into guest samples or summary quantiles"
+                ),
+                "formal_performance_evidence": False,
+                "performance_change_gate_eligible": False,
+                "collection_status": "collected" if collection_complete else "incomplete",
+                "source_identity": {
+                    "preflight": source_preflight,
+                    "postflight": source_postflight,
+                    "combination_id": source_preflight["combination_id"],
+                    "status": (
+                        "unchanged-clean"
+                        if source_identity_unchanged else "changed-or-incomplete"
+                    ),
+                },
                 "cost_capabilities": cost_capabilities,
                 "boot_comparison": (
                     "TheKernel uses UEFI/OVMF; Linux uses direct bzImage when selected; "

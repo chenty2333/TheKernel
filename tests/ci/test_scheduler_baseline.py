@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.kvm_scheduler_baseline import (
     DEFAULT_LINUX_CMDLINE,
     PIN_REPORT_LEGACY_SCHEMA,
+    PIN_REPORT_PREVIOUS_SCHEMA,
     PIN_REPORT_SCHEMA,
     RAW_COLUMNS,
     Sample,
@@ -29,8 +31,11 @@ from tools.kvm_scheduler_baseline import (
     stats,
     validate_pin_report,
 )
+from tools.host_pmu import PmuReading, PmuUnavailable
 from tools.kvm_subsystem_baseline import HostCpu, HostTopology
 from tools.qemu_runner.command import build_qemu_command
+from tools.qemu_runner.evidence import file_evidence
+from scripts.ci import source_combination
 from tools.qemu_runner.model import Drive
 
 
@@ -38,6 +43,49 @@ SOURCE = REPO_ROOT / "tests" / "guest" / "tools" / "scheduler-baseline.c"
 
 
 class SchedulerBaselineTests(unittest.TestCase):
+    @staticmethod
+    def clean_source_identity() -> dict:
+        declared = source_combination.load(REPO_ROOT / "config" / "source-combination.toml")
+        thekernel_commit = "a" * 40
+        sources = {
+            "thekernel": {
+                "repository_root": str(REPO_ROOT), "commit": thekernel_commit,
+                "tree": "b" * 40, "worktree_dirty": False, "match_declared": True,
+            },
+        }
+        for name, item in declared.items():
+            sources[name] = {
+                "repository_root": str((REPO_ROOT.parent / item.path).resolve()),
+                "commit": item.ref, "tree": "c" * 40,
+                "worktree_dirty": False, "match_declared": True,
+            }
+        return {
+            "schema": 1,
+            "combination_id": source_combination.combination_id(declared, thekernel_commit),
+            "sources": sources,
+        }
+
+    @classmethod
+    def write_receipt(cls, config, *, initrd: Path | None = None) -> None:
+        receipt = {
+            "kernel": file_evidence(config.kernel),
+            "rootfs_source": file_evidence(config.rootfs),
+            "extra_args": list(config.extra_args),
+            "source_identity": cls.clean_source_identity(),
+        }
+        if config.esp is not None:
+            receipt["esp_source"] = file_evidence(config.esp)
+        if initrd is not None:
+            receipt["launch_handles"] = {
+                "initrd": {
+                    "source": file_evidence(initrd),
+                    "handle": "/proc/self/fd/99",
+                    "access": "ro",
+                    "post": file_evidence(initrd),
+                }
+            }
+        config.receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
     @classmethod
     def setUpClass(cls) -> None:
         compiler = shutil.which("cc")
@@ -106,6 +154,13 @@ class SchedulerBaselineTests(unittest.TestCase):
         if housekeeping_cpus is None:
             housekeeping_cpus = (max(vcpu_cpus + io_cpus) + 1,)
         measurement = sorted(set(vcpu_cpus) | set(io_cpus))
+        terminal_tids = sorted([1234, 3000, 4000] + [2000 + index for index in range(count)])
+        terminal_affinity = {
+            1234: list(housekeeping_cpus),
+            3000: list(io_cpus),
+            4000: list(housekeeping_cpus),
+            **{2000 + index: [vcpu_cpus[index % len(vcpu_cpus)]] for index in range(count)},
+        }
         path.write_text(json.dumps({
             "schema": PIN_REPORT_SCHEMA,
             "pid": 1234,
@@ -147,10 +202,13 @@ class SchedulerBaselineTests(unittest.TestCase):
             "ptrace_clone_events": True,
             "clone_event_count": 1,
             "unknown_thread_proof": "ptrace-clone-event",
-            "exit_readback_tids": sorted(
-                [1234, 3000, 4000] + [2000 + index for index in range(count)]
-            ),
+            "exit_readback_tids": terminal_tids,
             "exit_readback_proof": True,
+            "terminal_proofs": [
+                {"tid": tid, "method": "ptrace-exit-stop", "affinity": terminal_affinity[tid]}
+                for tid in terminal_tids
+            ],
+            "proof_failures": [],
         }) + "\n", encoding="utf-8")
 
     def test_pin_report_requires_complete_vcpu_set(self) -> None:
@@ -199,7 +257,23 @@ class SchedulerBaselineTests(unittest.TestCase):
                 requested_vcpu=(0, 1), requested_io=(2,),
             ))
 
-    def test_pin_report_requires_final_exit_affinity_readback(self) -> None:
+    def test_pin_report_v4_rejects_reported_proof_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "thread-pinning.json"
+            self.write_pin_report(path, vcpu_cpus=(0,), io_cpus=(1,))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["proof_failures"] = [{"reason": "unresolved-poll-observation", "tid": 4000}]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            reason = validate_pin_report(
+                path, expected_pid=None, expected_vcpu_count=1,
+                requested_vcpu=(0,), requested_io=(1,),
+            )
+            self.assertEqual(
+                reason,
+                "pin report contains proof failure: unresolved-poll-observation tid=4000",
+            )
+
+    def test_pin_report_requires_complete_terminal_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "thread-pinning.json"
             self.write_pin_report(path, vcpu_cpus=(0,), io_cpus=(1,))
@@ -213,10 +287,46 @@ class SchedulerBaselineTests(unittest.TestCase):
             payload["exit_readback_proof"] = True
             payload["exit_readback_tids"].remove(3000)
             path.write_text(json.dumps(payload), encoding="utf-8")
-            self.assertIn("without final affinity", validate_pin_report(
+            self.assertIn("does not match terminal proofs", validate_pin_report(
                 path, expected_pid=None, expected_vcpu_count=1,
                 requested_vcpu=(0,), requested_io=(1,),
             ) or "")
+
+    def test_pin_report_rejects_forged_kvm_vhost_terminal_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "thread-pinning.json"
+            self.write_pin_report(path, vcpu_cpus=(0,), io_cpus=(1,))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            proof = next(item for item in payload["terminal_proofs"] if item["tid"] == 4000)
+            proof.update({
+                "method": "kvm-vhost-stop",
+                "comm": "kvm-nx-lpage-re",
+                "tgid": 1234,
+                "user_worker": True,
+                "prearm_vcpus_housekeeping": True,
+                "worker_housekeeping": True,
+                "left_qemu_tgid": False,
+            })
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIn("lifecycle proof is incomplete", validate_pin_report(
+                path, expected_pid=None, expected_vcpu_count=1,
+                requested_vcpu=(0,), requested_io=(1,),
+            ) or "")
+
+    def test_measurement_role_allows_housekeeping_terminal_affinity_after_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "thread-pinning.json"
+            self.write_pin_report(path, vcpu_cpus=(0,), io_cpus=(1,))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            io_proof = next(item for item in payload["terminal_proofs"] if item["tid"] == 3000)
+            # An exiting IO worker can revert its comm and be placed back on
+            # housekeeping; this must not erase its historical IO role.
+            io_proof["affinity"] = [2]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIsNone(validate_pin_report(
+                path, expected_pid=None, expected_vcpu_count=1,
+                requested_vcpu=(0,), requested_io=(1,),
+            ))
 
     def test_unrequested_backend_must_remain_housekeeping_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -315,6 +425,9 @@ class SchedulerBaselineTests(unittest.TestCase):
             }]
             payload["exit_readback_tids"].append(5000)
             payload["exit_readback_tids"].sort()
+            payload["terminal_proofs"].append(
+                {"tid": 5000, "method": "ptrace-exit-stop", "affinity": [2]}
+            )
             path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertIn("backend-authorized", validate_pin_report(
                 path, expected_pid=None, expected_vcpu_count=1,
@@ -627,7 +740,7 @@ class SchedulerBaselineTests(unittest.TestCase):
                 "unknown_off_measurement", "launcher_affinity",
                 "process_inherited_housekeeping", "new_threads_inherit_housekeeping",
                 "ptrace_clone_events", "clone_event_count", "unknown_thread_proof",
-                "exit_readback_tids", "exit_readback_proof",
+                "exit_readback_tids", "exit_readback_proof", "terminal_proofs", "proof_failures",
             ):
                 payload.pop(key)
             for record in payload["vcpu_threads"].values():
@@ -648,6 +761,10 @@ class SchedulerBaselineTests(unittest.TestCase):
         returncode: int,
         complete_guest: bool,
         complete_pin: bool = True,
+        mutate_input: bool = False,
+        pin_schema: str | None = None,
+        dirty_receipt_source: bool = False,
+        postflight_source_move: bool = False,
     ) -> tuple[dict, str, dict]:
         """Run one mocked lane and return manifest, raw TSV, and summary JSON."""
         with tempfile.TemporaryDirectory() as directory:
@@ -698,6 +815,35 @@ class SchedulerBaselineTests(unittest.TestCase):
                         for value in os.environ["THEKERNEL_KVM_HOUSEKEEPING_CPUS"].split(",")
                     ),
                 )
+                self.write_receipt(config)
+                if mutate_input:
+                    config.rootfs.write_bytes(b"changed-after-receipt")
+                if pin_schema is not None:
+                    pin_path = config.workdir / "thread-pinning.json"
+                    pin_payload = json.loads(pin_path.read_text(encoding="utf-8"))
+                    pin_payload["schema"] = pin_schema
+                    if pin_schema == PIN_REPORT_PREVIOUS_SCHEMA:
+                        pin_payload.pop("terminal_proofs")
+                    elif pin_schema == PIN_REPORT_LEGACY_SCHEMA:
+                        for key in tuple(pin_payload):
+                            if key not in {
+                                "schema", "pid", "expected_vcpu_count",
+                                "requested_vcpu_cpus", "requested_io_cpus",
+                                "vcpu_threads", "io_threads", "vcpu_status", "io_status",
+                            }:
+                                pin_payload.pop(key)
+                        for record in pin_payload["vcpu_threads"].values():
+                            record.pop("name")
+                            record.pop("tgid")
+                        for record in pin_payload["io_threads"]:
+                            record.pop("name")
+                            record.pop("tgid")
+                    pin_path.write_text(json.dumps(pin_payload), encoding="utf-8")
+                if dirty_receipt_source:
+                    receipt_path = config.receipt_path
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    receipt["source_identity"]["sources"]["ax"]["worktree_dirty"] = True
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
                 if not complete_pin:
                     pin_path = config.workdir / "thread-pinning.json"
                     pin_payload = json.loads(pin_path.read_text(encoding="utf-8"))
@@ -705,11 +851,25 @@ class SchedulerBaselineTests(unittest.TestCase):
                     pin_path.write_text(json.dumps(pin_payload), encoding="utf-8")
                 return type("Result", (), {"returncode": returncode})()
 
+            source_preflight = self.clean_source_identity()
+            source_postflight = json.loads(json.dumps(source_preflight))
+            if postflight_source_move:
+                source_postflight["sources"]["thekernel"]["commit"] = "d" * 40
+                declared = source_combination.load(REPO_ROOT / "config" / "source-combination.toml")
+                source_postflight["combination_id"] = source_combination.combination_id(
+                    declared, "d" * 40
+                )
             with (
                 patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
                 patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
                 patch("tools.kvm_scheduler_baseline.read_host_topology", return_value=topology),
+                patch(
+                    "tools.kvm_scheduler_baseline.source_identity",
+                    side_effect=[source_preflight, source_postflight],
+                ),
+                patch("tools.kvm_scheduler_baseline.UserProcessTreePmu") as pmu,
             ):
+                pmu.return_value.open.side_effect = PmuUnavailable("test PMU unavailable")
                 from tools.kvm_scheduler_baseline import run_command
 
                 self.assertEqual(run_command(args), 1)
@@ -726,6 +886,7 @@ class SchedulerBaselineTests(unittest.TestCase):
         self.assertEqual(summary["measurement_status"], "not-measured")
         self.assertEqual(manifest["measurement_status"], "not-measured")
         self.assertEqual(summary["runs"], [])
+        self.assertEqual(manifest["evidence_class"], "not-measured")
 
     def test_nonzero_runner_samples_are_not_aggregated(self) -> None:
         manifest, raw, summary = self.run_mocked_baseline(returncode=4, complete_guest=True)
@@ -750,10 +911,57 @@ class SchedulerBaselineTests(unittest.TestCase):
         manifest, _raw, summary = self.run_mocked_baseline(
             returncode=0, complete_guest=True
         )
-        self.assertEqual(manifest["runs"][0]["status"], "measured-latency-only")
+        self.assertEqual(manifest["runs"][0]["status"], "collection-incomplete")
         self.assertEqual(manifest["runs"][0]["evidence_class"], "measured-latency-only")
         self.assertEqual(manifest["evidence_class"], "measured-latency-only")
         self.assertEqual(summary["evidence_class"], "measured-latency-only")
+
+    def test_historical_pin_report_cannot_admit_current_scheduler_run(self) -> None:
+        manifest, raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True, pin_schema=PIN_REPORT_PREVIOUS_SCHEMA
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "unsupported")
+        self.assertIn("current scheduler run requires", manifest["runs"][0]["reason"])
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+
+    def test_legacy_pin_report_cannot_admit_current_scheduler_run(self) -> None:
+        manifest, raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True, pin_schema=PIN_REPORT_LEGACY_SCHEMA
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "unsupported")
+        self.assertIn("current scheduler run requires", manifest["runs"][0]["reason"])
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+
+    def test_mutated_target_input_rejects_receipt_binding(self) -> None:
+        manifest, raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True, mutate_input=True
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "input-evidence-error")
+        self.assertEqual(manifest["runs"][0]["input_evidence"], "failed")
+        self.assertIn("changed during or after", manifest["runs"][0]["reason"])
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+
+    def test_dirty_receipt_source_rejects_current_run_admission(self) -> None:
+        manifest, raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True, dirty_receipt_source=True
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "input-evidence-error")
+        self.assertIn("source ax is dirty", manifest["runs"][0]["reason"])
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(summary["measurement_status"], "not-measured")
+
+    def test_source_move_during_run_rejects_collection(self) -> None:
+        manifest, raw, summary = self.run_mocked_baseline(
+            returncode=0, complete_guest=True, postflight_source_move=True
+        )
+        self.assertEqual(manifest["runs"][0]["status"], "input-evidence-error")
+        self.assertIn("source identity changed during", manifest["runs"][0]["reason"])
+        self.assertEqual(manifest["source_identity"]["status"], "changed-or-incomplete")
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(summary["measurement_status"], "not-measured")
 
     def test_guest_helper_emits_raw_samples_for_each_workload(self) -> None:
         for workload in ("futex", "pipe", "cpu-worker"):
@@ -979,13 +1187,20 @@ class SchedulerBaselineTests(unittest.TestCase):
                         for value in os.environ["THEKERNEL_KVM_HOUSEKEEPING_CPUS"].split(",")
                     ),
                 )
+                self.write_receipt(config, initrd=initrd)
                 return type("Result", (), {"returncode": 0})()
 
             with (
                 patch("tools.kvm_scheduler_baseline.run", side_effect=fake_run),
                 patch("tools.kvm_scheduler_baseline.kvm_available", return_value=True),
                 patch("tools.kvm_scheduler_baseline.read_host_topology", return_value=topology),
+                patch("tools.kvm_scheduler_baseline.source_identity", return_value=self.clean_source_identity()),
+                patch("tools.kvm_scheduler_baseline.UserProcessTreePmu") as pmu,
             ):
+                pmu.return_value.stop.return_value = PmuReading(
+                    {"cycles": 1, "instructions": 1, "cache_misses": 0, "branch_misses": 0},
+                    time_enabled=1, time_running=1,
+                )
                 from tools.kvm_scheduler_baseline import run_command
 
                 self.assertEqual(run_command(args), 0)
@@ -999,7 +1214,30 @@ class SchedulerBaselineTests(unittest.TestCase):
             self.assertEqual(manifest["targets"]["linux"]["boot"], "direct-kernel")
             self.assertIsNone(manifest["targets"]["linux"]["firmware"])
             self.assertIsNone(manifest["targets"]["linux"]["esp"])
-            self.assertEqual(manifest["targets"]["linux"]["initrd"], str(initrd.resolve()))
+            for name, artifact in (("kernel", kernel), ("rootfs", rootfs), ("initrd", initrd)):
+                evidence = manifest["targets"]["linux"][name]
+                self.assertEqual(evidence["path"], str(artifact.resolve()))
+                self.assertEqual(evidence["size_bytes"], artifact.stat().st_size)
+                self.assertEqual(evidence["sha256"], hashlib.sha256(artifact.read_bytes()).hexdigest())
+            run_record = manifest["runs"][0]
+            self.assertEqual(run_record["host_pmu_status"], "measured")
+            pmu = json.loads((output / run_record["host_pmu"]).read_text(encoding="utf-8"))
+            self.assertEqual(pmu["scope"].split(";", 1)[0], (
+                "inherited process tree from the scheduler controller while one QEMU run is active"
+            ))
+            self.assertEqual(pmu["raw_counters"]["cycles"], 1)
+            self.assertEqual(pmu["counter_scaling"], "raw_with_scale_factor")
+            self.assertFalse(pmu["exclude_guest"])
+            raw = (output / "raw-samples.tsv").read_text(encoding="utf-8")
+            self.assertNotIn("cycles=", raw)
+            self.assertEqual(manifest["schema"], "thekernel-kvm-scheduler-baseline-v2")
+            self.assertEqual(manifest["evidence_class"], "latency-plus-run-scoped-pmu-prerequisite")
+            self.assertEqual(run_record["status"], "collected")
+            self.assertEqual(run_record["combined_evidence_class"], "latency-plus-run-scoped-pmu-prerequisite")
+            self.assertFalse(run_record["formal_performance_evidence"])
+            self.assertFalse(run_record["performance_change_gate_eligible"])
+            self.assertEqual(manifest["collection_status"], "collected")
+            self.assertFalse(manifest["formal_performance_evidence"])
 
     def test_linux_esp_option_is_not_part_of_the_cli_contract(self) -> None:
         with self.assertRaises(SystemExit):
