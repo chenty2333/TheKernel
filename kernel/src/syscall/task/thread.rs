@@ -13,17 +13,34 @@ pub fn sys_getpid() -> AxResult<isize> {
 }
 
 pub fn sys_getppid() -> AxResult<isize> {
-    current()
-        .as_thread()
-        .proc_data
-        .proc
-        .parent()
-        .ok_or(AxError::NoSuchProcess)
-        .map(|p| p.pid() as _)
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    Ok(render_parent_pid(
+        proc_data.proc.parent().as_deref(),
+        &proc_data.pid_ns(),
+    ))
+}
+
+fn render_parent_pid<C, R>(
+    parent: Option<&thekernel_linux_process_adapter::Process<C, R>>,
+    caller_pid_ns: &crate::task::PidNamespace,
+) -> isize {
+    let Some(parent) = parent else {
+        return 0;
+    };
+    let Some(parent_pid_ns) = parent.identity::<alloc::sync::Arc<crate::task::PidNamespace>>()
+    else {
+        return 0;
+    };
+    caller_pid_ns
+        .visible_pid_for(parent_pid_ns, parent.pid())
+        .unwrap_or(0) as _
 }
 
 pub fn sys_gettid() -> AxResult<isize> {
-    Ok(current().as_thread().tid() as _)
+    let curr = current();
+    let thread = curr.as_thread();
+    Ok(thread.proc_data.pid_ns().visible_pid(thread.tid()) as _)
 }
 
 /// ARCH_PRCTL codes
@@ -54,8 +71,34 @@ enum ArchPrctlCode {
 /// The set_tid_address() always succeeds
 pub fn sys_set_tid_address(clear_child_tid: usize) -> AxResult<isize> {
     let curr = current();
-    curr.as_thread().set_clear_child_tid(clear_child_tid);
-    Ok(curr.as_thread().tid() as isize)
+    let thread = curr.as_thread();
+    thread.set_clear_child_tid(clear_child_tid);
+    Ok(thread.proc_data.pid_ns().visible_pid(thread.tid()) as isize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_parent_pid;
+    use crate::task::{PidNamespace, UserNamespace};
+
+    #[test]
+    fn getppid_parent_identity_obeys_pid_namespace_visibility() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let root_pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let child_pid_ns = root_pid_ns.try_fork(20, user_ns).unwrap();
+        let domain = thekernel_linux_process_adapter::ProcessDomain::<()>::try_new().unwrap();
+        let init = domain
+            .try_new_init_with_identity(1, None, root_pid_ns.clone())
+            .unwrap();
+        let _child = domain
+            .prepare_fork_with_identity(&init, 20, None, child_pid_ns.clone())
+            .unwrap();
+
+        assert_eq!(render_parent_pid::<(), ()>(None, &root_pid_ns), 0);
+        assert_eq!(render_parent_pid(Some(&init), &root_pid_ns), 1);
+        assert_eq!(render_parent_pid(Some(&init), &child_pid_ns), 0);
+        assert_eq!(root_pid_ns.visible_pid_for(&child_pid_ns, 20), Some(20));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

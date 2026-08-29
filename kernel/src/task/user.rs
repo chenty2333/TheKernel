@@ -65,7 +65,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 // the child context. A copy fault does not cancel the clone.
                 let capability = UserMemoryCapability::new(thr.proc_data.aspace());
                 let _ = capability
-                    .write_value(child_tid, thr.tid())
+                    .write_value(child_tid, thr.proc_data.pid_ns().visible_pid(thr.tid()))
                     .map_err(map_usercopy_error);
             }
             while !thr.pending_exit() {

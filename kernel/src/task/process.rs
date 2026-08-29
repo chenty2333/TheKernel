@@ -255,9 +255,17 @@ pub(crate) type ThreadExitTransition =
 /// Type-bound unpublished process plus initial-thread publication transaction.
 pub(crate) type InitialProcessAdmission =
     thekernel_linux_process_adapter::InitialProcessAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
+pub(crate) type ScopedInitialProcessAdmission =
+    thekernel_linux_process_adapter::ScopedInitialProcessAdmission<
+        Arc<Cred>,
+        GroupLeaderSignalOwner,
+    >;
 /// The kernel's sole process lifecycle and topology owner.
 pub(crate) type ProcessDomain =
     thekernel_linux_process_adapter::ProcessDomain<Arc<Cred>, GroupLeaderSignalOwner>;
+/// Core reparenting scope bound one-for-one to a live PID namespace.
+pub(crate) type ProcessReaperScope =
+    thekernel_linux_process_adapter::ReaperScope<Arc<Cred>, GroupLeaderSignalOwner>;
 type StarryThreadAdmission =
     thekernel_linux_process_adapter::ThreadAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 
@@ -284,6 +292,12 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     let reaped = process_domain()?.reap(process).map_err(process_error)?;
     if !reaped {
         return Ok(false);
+    }
+
+    // The immutable core identity remains available after registry unlink.
+    // Only this successful reap edge makes its namespace-local PID reusable.
+    if let Some(pid_ns) = process.identity::<Arc<PidNamespace>>() {
+        pid_ns.release_reaped_process(process.pid());
     }
 
     let snapshot = snapshot.ok_or(AxError::BadState)?;
@@ -470,25 +484,147 @@ impl CgroupNamespace {
 pub(crate) struct PidNamespace {
     id: u64,
     parent: Option<Arc<PidNamespace>>,
-    init_pid: Option<Pid>,
+    /// Namespace-local PID bindings. A process owns one binding in its own
+    /// namespace and every ancestor. The bindings are retained through zombie
+    /// state and released only by `reap_process`.
+    pids: SpinNoIrq<PidNamespacePids>,
+    reaper_scope: Option<Arc<ProcessReaperScope>>,
     owner_user_ns: Arc<UserNamespace>,
+}
+
+/// Linux reserves PID 0 and uses a bounded positive PID domain. Keeping the
+/// bound below `i32::MAX` also preserves every syscall ABI conversion site.
+const PID_NAMESPACE_MAX_PID: Pid = 0x3fff_ffff;
+
+struct PidNamespacePids {
+    by_global: HashMap<Pid, Pid>,
+    by_local: HashMap<Pid, Pid>,
+    next: Pid,
+}
+
+impl PidNamespacePids {
+    fn try_new(init_pid: Option<Pid>) -> AxResult<Self> {
+        let mut pids = Self {
+            by_global: HashMap::new(),
+            by_local: HashMap::new(),
+            next: 1,
+        };
+        if let Some(init_pid) = init_pid {
+            pids.try_insert(init_pid, 1)?;
+            pids.next = 2;
+        }
+        Ok(pids)
+    }
+
+    fn try_insert(&mut self, global_pid: Pid, local_pid: Pid) -> AxResult<()> {
+        if local_pid == 0 || local_pid > PID_NAMESPACE_MAX_PID {
+            return Err(AxError::NoMemory);
+        }
+        self.by_global
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        self.by_local
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        if self.by_global.contains_key(&global_pid) || self.by_local.contains_key(&local_pid) {
+            return Err(AxError::AlreadyExists);
+        }
+        self.by_global.insert(global_pid, local_pid);
+        self.by_local.insert(local_pid, global_pid);
+        Ok(())
+    }
+
+    fn try_reserve(&mut self, global_pid: Pid) -> AxResult<bool> {
+        if self.by_global.contains_key(&global_pid) {
+            return Ok(false);
+        }
+        let first = self.next.max(1);
+        let mut candidate = first;
+        loop {
+            if !self.by_local.contains_key(&candidate) {
+                self.try_insert(global_pid, candidate)?;
+                self.next = if candidate == PID_NAMESPACE_MAX_PID {
+                    1
+                } else {
+                    candidate + 1
+                };
+                return Ok(true);
+            }
+            candidate = if candidate == PID_NAMESPACE_MAX_PID {
+                1
+            } else {
+                candidate + 1
+            };
+            if candidate == first {
+                return Err(AxError::NoMemory);
+            }
+        }
+    }
+
+    fn release(&mut self, global_pid: Pid) {
+        let Some(local_pid) = self.by_global.remove(&global_pid) else {
+            return;
+        };
+        let removed = self.by_local.remove(&local_pid);
+        debug_assert_eq!(removed, Some(global_pid));
+    }
+}
+
+/// Rollback guard for a pre-publication process PID binding. Commit leaves the
+/// binding owned by the namespace until successful process reap.
+pub(crate) struct PidNamespaceReservation {
+    namespace: Arc<PidNamespace>,
+    global_pid: Pid,
+    allocated_here: bool,
+    parent: Option<Box<PidNamespaceReservation>>,
+    committed: bool,
+}
+
+impl PidNamespaceReservation {
+    pub(crate) fn commit(mut self) {
+        self.commit_recursive();
+    }
+
+    fn commit_recursive(&mut self) {
+        self.committed = true;
+        if let Some(parent) = self.parent.as_mut() {
+            parent.commit_recursive();
+        }
+    }
+}
+
+impl Drop for PidNamespaceReservation {
+    fn drop(&mut self) {
+        if !self.committed && self.allocated_here {
+            self.namespace.pids.lock().release(self.global_pid);
+        }
+    }
 }
 
 impl PidNamespace {
     pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
-        Self::try_new(None, None, owner_user_ns)
+        Self::try_new(None, None, None, owner_user_ns)
+    }
+
+    pub(crate) fn try_new_root_with_reaper_scope(
+        owner_user_ns: Arc<UserNamespace>,
+        reaper_scope: Arc<ProcessReaperScope>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_new(None, None, Some(reaper_scope), owner_user_ns)
     }
 
     fn try_new(
         parent: Option<Arc<Self>>,
         init_pid: Option<Pid>,
+        reaper_scope: Option<Arc<ProcessReaperScope>>,
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
         let id = try_allocate_proc_namespace_id()?;
         Arc::try_new(Self {
             id,
             parent,
-            init_pid,
+            pids: SpinNoIrq::new(PidNamespacePids::try_new(init_pid)?),
+            reaper_scope,
             owner_user_ns,
         })
         .map_err(|_| AxError::NoMemory)
@@ -499,11 +635,71 @@ impl PidNamespace {
         init_pid: Pid,
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
-        Self::try_new(Some(self.clone()), Some(init_pid), owner_user_ns)
+        Self::try_new(Some(self.clone()), Some(init_pid), None, owner_user_ns)
+    }
+
+    pub(crate) fn try_fork_with_reaper_scope(
+        self: &Arc<Self>,
+        init_pid: Pid,
+        owner_user_ns: Arc<UserNamespace>,
+        reaper_scope: Arc<ProcessReaperScope>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_new(
+            Some(self.clone()),
+            Some(init_pid),
+            Some(reaper_scope),
+            owner_user_ns,
+        )
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
+    }
+
+    pub(crate) fn reaper_scope(&self) -> Option<Arc<ProcessReaperScope>> {
+        self.reaper_scope.clone()
+    }
+
+    /// Reserves one local PID in this namespace and all of its ancestors.
+    /// The returned guard must be committed only once the child has reached
+    /// process publication; otherwise it restores every newly allocated slot.
+    pub(crate) fn reserve_process(
+        self: &Arc<Self>,
+        global_pid: Pid,
+    ) -> AxResult<PidNamespaceReservation> {
+        let parent = self
+            .parent()
+            .map(|parent| parent.reserve_process(global_pid))
+            .transpose()?
+            .map(Box::new);
+        let allocated_here = self.pids.lock().try_reserve(global_pid)?;
+        Ok(PidNamespaceReservation {
+            namespace: self.clone(),
+            global_pid,
+            allocated_here,
+            parent,
+            committed: false,
+        })
+    }
+
+    /// Releases the namespace PID bindings after the process has been
+    /// authoritatively reaped. Exit intentionally does not call this: zombies
+    /// retain numeric identity until wait/autoreap consumes them.
+    fn release_reaped_process(&self, global_pid: Pid) {
+        self.pids.lock().release(global_pid);
+        if let Some(parent) = self.parent() {
+            parent.release_reaped_process(global_pid);
+        }
+    }
+
+    /// Releases a non-leader thread ID after its core membership has been
+    /// unlinked. Process IDs deliberately use `release_reaped_process` so a
+    /// zombie remains numerically addressable until wait/autoreap.
+    pub(crate) fn release_exited_thread(&self, global_tid: Pid) {
+        self.pids.lock().release(global_tid);
+        if let Some(parent) = self.parent() {
+            parent.release_exited_thread(global_tid);
+        }
     }
 
     /// Returns whether `target` is this namespace or one of its descendants.
@@ -527,13 +723,8 @@ impl PidNamespace {
         target_namespace: &Arc<Self>,
         global_pid: Pid,
     ) -> Option<Pid> {
-        self.contains(target_namespace).then(|| {
-            if core::ptr::eq(self, &**target_namespace) {
-                self.visible_pid(global_pid)
-            } else {
-                global_pid
-            }
-        })
+        self.contains(target_namespace)
+            .then(|| self.visible_pid(global_pid))
     }
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
@@ -541,11 +732,15 @@ impl PidNamespace {
     }
 
     pub(crate) fn visible_pid(&self, global_pid: Pid) -> Pid {
-        if self.init_pid == Some(global_pid) {
-            1
-        } else {
-            global_pid
-        }
+        // Kernel-created processes always hold a binding until reap. Retain a
+        // global fallback for synthetic/unit-test identities that predate the
+        // allocator and have not been admitted through the kernel lifecycle.
+        self.pids
+            .lock()
+            .by_global
+            .get(&global_pid)
+            .copied()
+            .unwrap_or(global_pid)
     }
 
     pub(crate) fn proc_inode(&self) -> u64 {
@@ -2306,8 +2501,22 @@ impl ProcessThreadAdmission {
 /// Unpublished process plus initial thread held across runtime construction.
 pub(crate) struct InitialProcessThreadAdmission {
     // Roll back the core composite before making exec observe no pending clone.
-    publication: InitialProcessAdmission,
+    publication: ProcessInitialAdmission,
     pending: PendingThreadAddition,
+}
+
+pub(crate) enum ProcessInitialAdmission {
+    Ordinary(InitialProcessAdmission),
+    ScopeInit(ScopedInitialProcessAdmission),
+}
+
+impl ProcessInitialAdmission {
+    pub(crate) fn process(&self) -> &Arc<Process> {
+        match self {
+            Self::Ordinary(admission) => admission.process(),
+            Self::ScopeInit(admission) => admission.process(),
+        }
+    }
 }
 
 impl InitialProcessThreadAdmission {
@@ -2318,7 +2527,12 @@ impl InitialProcessThreadAdmission {
             publication,
             pending,
         } = self;
-        let process = publication.commit();
+        let process = match publication {
+            ProcessInitialAdmission::Ordinary(publication) => publication.commit(),
+            ProcessInitialAdmission::ScopeInit(publication) => publication
+                .commit()
+                .expect("scoped init publication lost its reserved reaper scope"),
+        };
         (
             process,
             PendingThreadPublication {
@@ -3881,6 +4095,20 @@ impl ProcessData {
     pub(crate) fn prepare_initial_thread(
         self: &Arc<Self>,
         publication: InitialProcessAdmission,
+    ) -> AxResult<InitialProcessThreadAdmission> {
+        self.prepare_initial_thread_admission(ProcessInitialAdmission::Ordinary(publication))
+    }
+
+    pub(crate) fn prepare_scoped_initial_thread(
+        self: &Arc<Self>,
+        publication: ScopedInitialProcessAdmission,
+    ) -> AxResult<InitialProcessThreadAdmission> {
+        self.prepare_initial_thread_admission(ProcessInitialAdmission::ScopeInit(publication))
+    }
+
+    pub(crate) fn prepare_initial_thread_admission(
+        self: &Arc<Self>,
+        publication: ProcessInitialAdmission,
     ) -> AxResult<InitialProcessThreadAdmission> {
         let pending = self.prepare_thread_addition()?;
         Ok(InitialProcessThreadAdmission {
@@ -5714,6 +5942,44 @@ mod tests {
     fn implementation_signal_queue_ceilings_are_bounded() {
         assert_eq!(SIGNAL_QUEUE_PER_USER_HARD_LIMIT, 4_096);
         assert_eq!(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, 16_384);
+    }
+
+    #[test]
+    fn pid_namespace_bindings_cover_ancestors_and_survive_until_reap() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let root = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let root_init = root.reserve_process(10).unwrap();
+        root_init.commit();
+        assert_eq!(root.visible_pid(10), 1);
+
+        // A CLONE_NEWPID child is PID 1 locally, while the parent namespace
+        // receives its independent next local PID binding.
+        let child = root.try_fork(20, user_ns).unwrap();
+        let child_init = child.reserve_process(20).unwrap();
+        child_init.commit();
+        assert_eq!(child.visible_pid(20), 1);
+        assert_eq!(root.visible_pid_for(&child, 20), Some(2));
+
+        let unpublished = child.reserve_process(21).unwrap();
+        assert_eq!(child.visible_pid(21), 2);
+        drop(unpublished);
+        assert!(!child.pids.lock().by_global.contains_key(&21));
+        assert!(!root.pids.lock().by_global.contains_key(&21));
+
+        let live = child.reserve_process(22).unwrap();
+        live.commit();
+        assert_eq!(child.visible_pid(22), 2);
+        assert_eq!(root.visible_pid_for(&child, 22), Some(3));
+        child.release_reaped_process(22);
+        assert!(!child.pids.lock().by_global.contains_key(&22));
+        assert!(!root.pids.lock().by_global.contains_key(&22));
+
+        // Allocation is cyclic rather than LIFO: a released PID is reusable,
+        // but Linux need not return it for the immediately following fork.
+        let next = child.reserve_process(23).unwrap();
+        next.commit();
+        assert_eq!(child.visible_pid(23), 3);
+        assert_eq!(root.visible_pid_for(&child, 23), Some(4));
     }
 
     #[test]

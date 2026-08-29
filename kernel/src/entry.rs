@@ -129,8 +129,16 @@ pub fn init(args: &[String], envs: &[String]) {
     let process_domain = init_process_domain().expect("Failed to allocate process domain");
     let prepared_zombie_snapshot =
         ProcessData::try_prepare_zombie_snapshot().expect("Failed to reserve init zombie snapshot");
+    let init_pid_ns = PidNamespace::try_new_root_with_reaper_scope(
+        user_ns.clone(),
+        process_domain.root_reaper_scope(),
+    )
+    .expect("Failed to allocate init pid namespace");
+    let init_pid_reservation = init_pid_ns
+        .reserve_process(INIT_PID)
+        .expect("Failed to reserve init pid namespace identity");
     let proc = process_domain
-        .try_new_init(INIT_PID, None)
+        .try_new_init_with_identity(INIT_PID, None, init_pid_ns.clone())
         .expect("Failed to allocate init process");
 
     N_TTY.bind_to(&proc).expect("Failed to bind ntty");
@@ -183,11 +191,12 @@ pub fn init(args: &[String], envs: &[String]) {
         init_net_ns,
         CgroupNamespace::try_new_root(user_ns.clone())
             .expect("Failed to allocate init cgroup namespace"),
-        PidNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init pid namespace"),
+        init_pid_ns,
         init_uts_ns,
         TimeNamespace::try_new_root(user_ns).expect("Failed to allocate init time namespace"),
     )
     .expect("Failed to allocate init process runtime state");
+    init_pid_reservation.commit();
 
     {
         let mut scope = proc.scope.write();

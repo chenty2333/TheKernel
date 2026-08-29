@@ -1509,6 +1509,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             fail_closed_exit(error);
         });
     let final_thread = final_exit.is_some();
+    // A process PID must survive until its zombie is reaped, but every other
+    // thread's namespace TID becomes reusable once its core membership is
+    // gone. `exit_thread` above is that authoritative removal edge.
+    if tid != process.pid() {
+        thr.proc_data.pid_ns().release_exited_thread(tid);
+    }
     if final_exit.is_some() {
         // Freeze shared generation before zombie publication. A concurrent
         // sender that prepared outside the endpoint lock must fail its commit

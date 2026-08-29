@@ -284,6 +284,8 @@ pub type ProcessGroup<C, R = ()> = thekernel_linux_process::ProcessGroup<ZombieS
 pub type Session<C, R = ()> = thekernel_linux_process::Session<ZombieSnapshot<C, R>>;
 /// TheKernel explicit process-domain owner.
 pub type ProcessDomain<C, R = ()> = thekernel_linux_process::ProcessDomain<ZombieSnapshot<C, R>>;
+/// One PID-namespace reparenting scope owned by a process domain.
+pub type ReaperScope<C, R = ()> = thekernel_linux_process::ReaperScope<ZombieSnapshot<C, R>>;
 /// Read-only registry handle supplied by the explicit domain.
 pub type ProcessRegistry<C, R = ()> =
     thekernel_linux_process::ProcessRegistry<ZombieSnapshot<C, R>>;
@@ -293,6 +295,9 @@ pub type ProcessAdmission<C, R = ()> =
 /// Type-bound unpublished process plus initial-thread publication transaction.
 pub type InitialProcessAdmission<C, R = ()> =
     thekernel_linux_process::InitialProcessAdmission<ZombieSnapshot<C, R>>;
+/// Reserved namespace-init process plus its initial-thread publication.
+pub type ScopedInitialProcessAdmission<C, R = ()> =
+    thekernel_linux_process::ScopedInitialProcessAdmission<ZombieSnapshot<C, R>>;
 /// Fully validated final process-exit transaction.
 pub type ProcessExitAdmission<C, R = ()> =
     thekernel_linux_process::ProcessExitAdmission<ZombieSnapshot<C, R>>;

@@ -26,10 +26,10 @@ use crate::{
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
-        ProcessAccessState, ProcessData, ProcessThreadAdmission, TaskParentChoice, Thread,
-        get_process_data, linux_pid_from_task_id, lock_task_parent_publication,
-        prepare_task_table_admission, process_domain, send_signal_thread_inner,
-        set_task_user_address_space, try_new_user_task, try_tasks,
+        ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
+        TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
+        lock_task_parent_publication, prepare_task_table_admission, process_domain,
+        send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
     },
 };
 
@@ -530,25 +530,27 @@ impl CloneArgs {
                 .map(|parent| parent.lock_process_lifecycle())
         };
 
-        let (new_proc_data, thread_publication) = if flags.contains(CloneFlags::THREAD) {
+        let (new_proc_data, thread_publication, pid_reservation) = if flags
+            .contains(CloneFlags::THREAD)
+        {
             set_task_user_address_space(
                 new_task.ctx_mut(),
                 parent_aspace.lock().address_space_token(),
             );
             let proc_data = old_proc_data.clone();
+            // Threads have distinct Linux TIDs even though they share the
+            // process PID. Reserve their namespace identity before core/task
+            // admission so `gettid` never observes a global task ID.
+            let tid_reservation = proc_data.pid_ns().reserve_process(tid)?;
             let thread_admission = proc_data.prepare_thread(tid)?;
-            (proc_data, CloneThreadPublication::Live(thread_admission))
+            (
+                proc_data,
+                CloneThreadPublication::Live(thread_admission),
+                Some(tid_reservation),
+            )
         } else {
             let parent = fork_parent_data.as_ref().ok_or(AxError::BadState)?;
             let prepared_zombie_snapshot = ProcessData::try_prepare_zombie_snapshot()?;
-            let process_admission = process_domain()?
-                .prepare_fork(&parent.proc, tid, exit_signal.map(|signo| signo as u8))
-                .map_err(map_process_error)?;
-            let process_admission = process_admission
-                .prepare_initial_thread(tid)
-                .map_err(map_process_error)?;
-            let proc = process_admission.process().clone();
-
             let aspace = if flags.contains(CloneFlags::VM) {
                 parent_aspace
             } else {
@@ -588,13 +590,58 @@ impl CloneArgs {
             } else {
                 old_proc_data.cgroup_ns()
             };
-            let pid_ns = if flags.contains(CloneFlags::NEWPID) {
-                old_proc_data
-                    .pid_ns()
-                    .try_fork(tid, namespace_owner.clone())?
+            let (pid_ns, child_reaper_scope) = if flags.contains(CloneFlags::NEWPID) {
+                let reaper_scope = process_domain()?
+                    .try_new_reaper_scope()
+                    .map_err(map_process_error)?;
+                (
+                    old_proc_data.pid_ns().try_fork_with_reaper_scope(
+                        tid,
+                        namespace_owner.clone(),
+                        reaper_scope.clone(),
+                    )?,
+                    Some(reaper_scope),
+                )
             } else {
-                old_proc_data.pid_ns()
+                (old_proc_data.pid_ns(), None)
             };
+            // Reserve this process's locally rendered PID before core process
+            // publication. The reservation rolls back on every remaining
+            // fallible construction path and is committed with the initial
+            // thread/process identity below.
+            let pid_reservation = pid_ns.reserve_process(tid)?;
+            let domain = process_domain()?;
+            let process_admission = if let Some(reaper_scope) = child_reaper_scope {
+                ProcessInitialAdmission::ScopeInit(
+                    domain
+                        .prepare_fork_as_reaper_scope_init_with_identity(
+                            &parent.proc,
+                            &reaper_scope,
+                            tid,
+                            exit_signal.map(|signo| signo as u8),
+                            pid_ns.clone(),
+                        )
+                        .map_err(map_process_error)?
+                        .prepare_initial_thread(tid)
+                        .map_err(map_process_error)?,
+                )
+            } else {
+                let reaper_scope = pid_ns.reaper_scope().ok_or(AxError::BadState)?;
+                ProcessInitialAdmission::Ordinary(
+                    domain
+                        .prepare_fork_in_reaper_scope_with_identity(
+                            &parent.proc,
+                            &reaper_scope,
+                            tid,
+                            exit_signal.map(|signo| signo as u8),
+                            pid_ns.clone(),
+                        )
+                        .map_err(map_process_error)?
+                        .prepare_initial_thread(tid)
+                        .map_err(map_process_error)?,
+                )
+            };
+            let proc = process_admission.process().clone();
             let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
                 old_proc_data.uts_ns().try_fork(namespace_owner)?
             } else {
@@ -656,8 +703,12 @@ impl CloneArgs {
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
-            let thread_admission = proc_data.prepare_initial_thread(process_admission)?;
-            (proc_data, CloneThreadPublication::Initial(thread_admission))
+            let thread_admission = proc_data.prepare_initial_thread_admission(process_admission)?;
+            (
+                proc_data,
+                CloneThreadPublication::Initial(thread_admission),
+                Some(pid_reservation),
+            )
         };
         let (thr, signal_registration) = Thread::try_new_with_io_context(
             tid,
@@ -781,6 +832,9 @@ impl CloneArgs {
             pending_key_fork.commit();
             completion
         });
+        if let Some(pid_reservation) = pid_reservation {
+            pid_reservation.commit();
+        }
         drop(task_parent_publication);
 
         // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden
@@ -811,13 +865,18 @@ impl CloneArgs {
             );
         }
 
+        // Read only after the reservation has committed with process/thread
+        // publication. This is the caller namespace's view, including the
+        // outer binding of a CLONE_NEWPID init child.
+        let caller_visible_tid = old_proc_data.pid_ns().visible_pid(tid);
+
         // Linux performs PARENT_SETTID only after child construction succeeds,
         // and a copy fault does not cancel an otherwise successful clone. The
         // CHILD_SETTID address was attached to the private Thread above; the
         // child consumes it before first entering user mode, after publication.
         if flags.contains(CloneFlags::PARENT_SETTID) {
             let _ = caller_memory
-                .write_value(parent_tid as *mut Pid, tid)
+                .write_value(parent_tid as *mut Pid, caller_visible_tid)
                 .map_err(map_usercopy_error);
         }
         release_clone_lifecycle_then(fork_lifecycle, || {
@@ -841,7 +900,7 @@ impl CloneArgs {
             Self::wait_for_vfork(&new_proc_data)?;
         }
 
-        Ok(tid as _)
+        Ok(caller_visible_tid as _)
     }
 }
 
