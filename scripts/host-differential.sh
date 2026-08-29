@@ -8,18 +8,19 @@ CC=${CC:-cc}
 
 usage() {
     cat <<'EOF'
-Usage: scripts/host-differential.sh
+Usage: scripts/host-differential.sh [tests/guest/portable/<test>.c ...]
 
-Build and run every portable guest C test against the host Linux kernel.
+Build and run every portable guest C test against the host Linux kernel.  With
+one or more paths, build and run only those existing portable C tests.
 Each test returns 0 for PASS, 1 for FAIL, or 4 for SKIP.
 EOF
 }
 
-case ${1:-} in
-    '') ;;
-    -h|--help) usage; exit 0 ;;
-    *) printf 'host-differential: unknown argument: %s\n' "$1" >&2; exit 2 ;;
-esac
+if (($# == 1)); then
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+    esac
+fi
 
 command -v "$CC" >/dev/null 2>&1 || {
     printf 'host-differential: C compiler not found: %s\n' "$CC" >&2
@@ -31,10 +32,50 @@ command -v timeout >/dev/null 2>&1 || {
 }
 
 shopt -s nullglob
-sources=("$PORTABLE_DIR"/*.c)
-if ((${#sources[@]} == 0)); then
+all_sources=("$PORTABLE_DIR"/*.c)
+if ((${#all_sources[@]} == 0)); then
     printf 'host-differential: no portable tests in %s\n' "$PORTABLE_DIR" >&2
     exit 1
+fi
+
+if (($# == 0)); then
+    sources=("${all_sources[@]}")
+else
+    declare -A selected=()
+    for requested in "$@"; do
+        relative=${requested#./}
+        case $relative in
+            tests/guest/portable/*.c)
+                filename=${relative#tests/guest/portable/}
+                ;;
+            *)
+                printf 'host-differential: invalid portable test: %s\n' "$requested" >&2
+                exit 2
+                ;;
+        esac
+
+        # The selected path must name a direct child of portable/, which keeps
+        # syntactic paths such as "../" from escaping the allowed directory.
+        if [[ $filename == */* ]] || [[ -z $filename ]] || [[ ! -f $PORTABLE_DIR/$filename ]]; then
+            printf 'host-differential: invalid portable test: %s\n' "$requested" >&2
+            exit 2
+        fi
+        if [[ -v selected[$filename] ]]; then
+            printf 'host-differential: duplicate portable test: %s\n' "$requested" >&2
+            exit 2
+        fi
+        selected[$filename]=1
+    done
+
+    # Preserve the portable directory's deterministic glob order rather than
+    # inheriting caller argument order.
+    sources=()
+    for source in "${all_sources[@]}"; do
+        filename=${source##*/}
+        if [[ -v selected[$filename] ]]; then
+            sources+=("$source")
+        fi
+    done
 fi
 
 state_dir="$REPO_ROOT/.state/host-differential"
@@ -153,6 +194,7 @@ for index in "${!sources[@]}"; do
         0)
             passes=$((passes + 1))
             printf 'ok %d - %s\n' "$((index + 1))" "$name"
+            emit_diagnostics "$name" "$log"
             ;;
         4)
             skips=$((skips + 1))

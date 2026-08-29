@@ -10,10 +10,43 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.qemu_runner.model import InputForwarding, Interaction, RunResult
-from tools.qemu_runner.runner import RunConfig, RunnerError, run
+from tools.qemu_runner.runner import (
+    Q35_OVMF_CODE_SHA256,
+    RunConfig,
+    RunnerError,
+    _resolve_ovmf_image,
+    run,
+)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_implicit_ovmf_selection_rejects_incompatible_host_firmware(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incompatible = root / "OVMF_CODE.fd"
+            incompatible.write_bytes(b"host-specific-ecam-layout")
+            with self.assertRaisesRegex(RunnerError, "requires the pinned OVMF code"):
+                _resolve_ovmf_image(
+                    None,
+                    "THEKERNEL_TEST_OVMF_CODE",
+                    (str(incompatible),),
+                    "OVMF code",
+                    Q35_OVMF_CODE_SHA256,
+                )
+
+    def test_explicit_ovmf_override_cannot_bypass_q35_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "OVMF_CODE.fd"
+            image.write_bytes(b"explicit")
+            with self.assertRaisesRegex(RunnerError, "does not match q35 pin"):
+                _resolve_ovmf_image(
+                    image,
+                    "THEKERNEL_TEST_OVMF_CODE",
+                    (),
+                    "OVMF code",
+                    Q35_OVMF_CODE_SHA256,
+                )
+
     def test_initrd_is_bound_to_inherited_fd_across_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -136,9 +169,19 @@ class RunnerTests(unittest.TestCase):
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
-            with patch(
-                "tools.qemu_runner.runner.run_process", side_effect=complete_run
-            ) as mocked:
+            with (
+                patch(
+                    "tools.qemu_runner.runner.Q35_OVMF_CODE_SHA256",
+                    hashlib.sha256(b"code").hexdigest(),
+                ),
+                patch(
+                    "tools.qemu_runner.runner.Q35_OVMF_VARS_SHA256",
+                    hashlib.sha256(b"vars").hexdigest(),
+                ),
+                patch(
+                    "tools.qemu_runner.runner.run_process", side_effect=complete_run
+                ) as mocked,
+            ):
                 run(config)
 
             command = " ".join(mocked.call_args.kwargs["command"])
@@ -644,7 +687,17 @@ class RunnerTests(unittest.TestCase):
                 ovmf_vars=ovmf_vars,
             )
 
-            with self.assertRaisesRegex(RunnerError, "OVMF vars runtime aliases"):
+            with (
+                patch(
+                    "tools.qemu_runner.runner.Q35_OVMF_CODE_SHA256",
+                    hashlib.sha256(b"code").hexdigest(),
+                ),
+                patch(
+                    "tools.qemu_runner.runner.Q35_OVMF_VARS_SHA256",
+                    hashlib.sha256(b"vars").hexdigest(),
+                ),
+                self.assertRaisesRegex(RunnerError, "OVMF vars runtime aliases"),
+            ):
                 run(config)
             self.assertEqual(kernel.read_bytes(), b"kernel")
 

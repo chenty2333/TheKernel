@@ -1,0 +1,5093 @@
+{
+  "dispatcher_arm_count": 346,
+  "linux_ni_count": 17,
+  "missing_dispatch_syscalls": [
+    "cachestat",
+    "futimesat",
+    "getdents",
+    "ioperm",
+    "iopl",
+    "kexec_file_load",
+    "kexec_load",
+    "landlock_add_rule",
+    "landlock_create_ruleset",
+    "landlock_restrict_self",
+    "listmount",
+    "lsm_get_self_attr",
+    "lsm_list_modules",
+    "lsm_set_self_attr",
+    "map_shadow_stack",
+    "modify_ldt",
+    "mseal",
+    "pivot_root",
+    "pkey_alloc",
+    "pkey_free",
+    "pkey_mprotect",
+    "process_mrelease",
+    "remap_file_pages",
+    "set_mempolicy_home_node",
+    "statmount",
+    "sysfs",
+    "time",
+    "uretprobe",
+    "ustat"
+  ],
+  "schema": "thekernel-linux-abi-static-inventory-v1",
+  "scope": "x86_64 common+64 Linux syscall table; static routing only, not implementation evidence",
+  "sources": {
+    "dispatch": {
+      "path": "kernel/src/syscall/dispatch.rs",
+      "sha256": "c10fa2ee57798ba3d6d8cea4ddab8bf97f2efb2defc87ea4813ca499ae724308"
+    },
+    "linux_cond_syscall": {
+      "conditional_syscall_count": 162,
+      "linux_commit": "25c09b42358e73e1476e517b296edb6344f2e4bd",
+      "mechanism": "fixed native-table intersection of COND_SYSCALL/COND_SYSCALL_COMPAT",
+      "path": "kernel/sys_ni.c"
+    },
+    "syscall_64_tbl": {
+      "path": "docs/linux-abi/linux-v6.12.103-arch-x86-entry-syscalls-syscall_64.tbl",
+      "sha256": "980ce3115028c71c5618e7864d262017bde8103bcfe7b413147a14fd312c92ac"
+    }
+  },
+  "static_gaps": [
+    {
+      "name": "getdents",
+      "nr": 78,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "ustat",
+      "nr": 136,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "sysfs",
+      "nr": 139,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "modify_ldt",
+      "nr": 154,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "pivot_root",
+      "nr": 155,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "iopl",
+      "nr": 172,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "ioperm",
+      "nr": 173,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "time",
+      "nr": 201,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "remap_file_pages",
+      "nr": 216,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "kexec_load",
+      "nr": 246,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "futimesat",
+      "nr": 261,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "perf_event_open",
+      "nr": 298,
+      "reason": "shared explicit unsupported-fd route; runtime behavior requires evidence"
+    },
+    {
+      "name": "kexec_file_load",
+      "nr": 320,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "bpf",
+      "nr": 321,
+      "reason": "route is compiled only with feature=bpf"
+    },
+    {
+      "name": "pkey_mprotect",
+      "nr": 329,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "pkey_alloc",
+      "nr": 330,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "pkey_free",
+      "nr": 331,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "uretprobe",
+      "nr": 335,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "landlock_create_ruleset",
+      "nr": 444,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "landlock_add_rule",
+      "nr": 445,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "landlock_restrict_self",
+      "nr": 446,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "memfd_secret",
+      "nr": 447,
+      "reason": "shared explicit unsupported-fd route; runtime behavior requires evidence"
+    },
+    {
+      "name": "process_mrelease",
+      "nr": 448,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "set_mempolicy_home_node",
+      "nr": 450,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "cachestat",
+      "nr": 451,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "map_shadow_stack",
+      "nr": 453,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "statmount",
+      "nr": 457,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "listmount",
+      "nr": 458,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "lsm_get_self_attr",
+      "nr": 459,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "lsm_set_self_attr",
+      "nr": 460,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "lsm_list_modules",
+      "nr": 461,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    },
+    {
+      "name": "mseal",
+      "nr": 462,
+      "reason": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported"
+    }
+  ],
+  "syscall_count": 375,
+  "syscalls": [
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_read"
+      },
+      "implementation_root": "sys_read",
+      "linux_route": "direct",
+      "name": "read",
+      "nr": 0,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_write"
+      },
+      "implementation_root": "sys_write",
+      "linux_route": "direct",
+      "name": "write",
+      "nr": 1,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_open"
+      },
+      "implementation_root": "sys_open",
+      "linux_route": "direct",
+      "name": "open",
+      "nr": 2,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_close"
+      },
+      "implementation_root": "sys_close",
+      "linux_route": "direct",
+      "name": "close",
+      "nr": 3,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_stat"
+      },
+      "implementation_root": "sys_stat",
+      "linux_route": "direct",
+      "name": "stat",
+      "nr": 4,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fstat"
+      },
+      "implementation_root": "sys_fstat",
+      "linux_route": "direct",
+      "name": "fstat",
+      "nr": 5,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lstat"
+      },
+      "implementation_root": "sys_lstat",
+      "linux_route": "direct",
+      "name": "lstat",
+      "nr": 6,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_poll"
+      },
+      "implementation_root": "sys_poll",
+      "linux_route": "direct",
+      "name": "poll",
+      "nr": 7,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lseek"
+      },
+      "implementation_root": "sys_lseek",
+      "linux_route": "direct",
+      "name": "lseek",
+      "nr": 8,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mmap"
+      },
+      "implementation_root": "sys_mmap",
+      "linux_route": "direct",
+      "name": "mmap",
+      "nr": 9,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mprotect"
+      },
+      "implementation_root": "sys_mprotect",
+      "linux_route": "conditional",
+      "name": "mprotect",
+      "nr": 10,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_munmap"
+      },
+      "implementation_root": "sys_munmap",
+      "linux_route": "direct",
+      "name": "munmap",
+      "nr": 11,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_brk"
+      },
+      "implementation_root": "sys_brk",
+      "linux_route": "direct",
+      "name": "brk",
+      "nr": 12,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigaction"
+      },
+      "implementation_root": "sys_rt_sigaction",
+      "linux_route": "direct",
+      "name": "rt_sigaction",
+      "nr": 13,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigprocmask"
+      },
+      "implementation_root": "sys_rt_sigprocmask",
+      "linux_route": "direct",
+      "name": "rt_sigprocmask",
+      "nr": 14,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigreturn"
+      },
+      "implementation_root": "sys_rt_sigreturn",
+      "linux_route": "direct",
+      "name": "rt_sigreturn",
+      "nr": 15,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ioctl"
+      },
+      "implementation_root": "sys_ioctl",
+      "linux_route": "direct",
+      "name": "ioctl",
+      "nr": 16,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pread64"
+      },
+      "implementation_root": "sys_pread64",
+      "linux_route": "direct",
+      "name": "pread64",
+      "nr": 17,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pwrite64"
+      },
+      "implementation_root": "sys_pwrite64",
+      "linux_route": "direct",
+      "name": "pwrite64",
+      "nr": 18,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_readv"
+      },
+      "implementation_root": "sys_readv",
+      "linux_route": "direct",
+      "name": "readv",
+      "nr": 19,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_writev"
+      },
+      "implementation_root": "sys_writev",
+      "linux_route": "direct",
+      "name": "writev",
+      "nr": 20,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_access"
+      },
+      "implementation_root": "sys_access",
+      "linux_route": "direct",
+      "name": "access",
+      "nr": 21,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pipe2"
+      },
+      "implementation_root": "sys_pipe2",
+      "linux_route": "direct",
+      "name": "pipe",
+      "nr": 22,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_select"
+      },
+      "implementation_root": "sys_select",
+      "linux_route": "direct",
+      "name": "select",
+      "nr": 23,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_yield"
+      },
+      "implementation_root": "sys_sched_yield",
+      "linux_route": "direct",
+      "name": "sched_yield",
+      "nr": 24,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mremap"
+      },
+      "implementation_root": "sys_mremap",
+      "linux_route": "conditional",
+      "name": "mremap",
+      "nr": 25,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_msync"
+      },
+      "implementation_root": "sys_msync",
+      "linux_route": "conditional",
+      "name": "msync",
+      "nr": 26,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mincore"
+      },
+      "implementation_root": "sys_mincore",
+      "linux_route": "conditional",
+      "name": "mincore",
+      "nr": 27,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_madvise"
+      },
+      "implementation_root": "sys_madvise",
+      "linux_route": "conditional",
+      "name": "madvise",
+      "nr": 28,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_shmget"
+      },
+      "implementation_root": "sys_shmget",
+      "linux_route": "conditional",
+      "name": "shmget",
+      "nr": 29,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_shmat"
+      },
+      "implementation_root": "sys_shmat",
+      "linux_route": "conditional",
+      "name": "shmat",
+      "nr": 30,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_shmctl"
+      },
+      "implementation_root": "sys_shmctl",
+      "linux_route": "conditional",
+      "name": "shmctl",
+      "nr": 31,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_dup"
+      },
+      "implementation_root": "sys_dup",
+      "linux_route": "direct",
+      "name": "dup",
+      "nr": 32,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_dup2"
+      },
+      "implementation_root": "sys_dup2",
+      "linux_route": "direct",
+      "name": "dup2",
+      "nr": 33,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pause"
+      },
+      "implementation_root": "sys_pause",
+      "linux_route": "direct",
+      "name": "pause",
+      "nr": 34,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_nanosleep"
+      },
+      "implementation_root": "sys_nanosleep",
+      "linux_route": "direct",
+      "name": "nanosleep",
+      "nr": 35,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getitimer"
+      },
+      "implementation_root": "sys_getitimer",
+      "linux_route": "conditional",
+      "name": "getitimer",
+      "nr": 36,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_alarm"
+      },
+      "implementation_root": "sys_alarm",
+      "linux_route": "conditional",
+      "name": "alarm",
+      "nr": 37,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setitimer"
+      },
+      "implementation_root": "sys_setitimer",
+      "linux_route": "conditional",
+      "name": "setitimer",
+      "nr": 38,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getpid"
+      },
+      "implementation_root": "sys_getpid",
+      "linux_route": "direct",
+      "name": "getpid",
+      "nr": 39,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sendfile"
+      },
+      "implementation_root": "sys_sendfile",
+      "linux_route": "direct",
+      "name": "sendfile",
+      "nr": 40,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_socket"
+      },
+      "implementation_root": "sys_socket",
+      "linux_route": "conditional",
+      "name": "socket",
+      "nr": 41,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_connect"
+      },
+      "implementation_root": "sys_connect",
+      "linux_route": "conditional",
+      "name": "connect",
+      "nr": 42,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_accept"
+      },
+      "implementation_root": "sys_accept",
+      "linux_route": "conditional",
+      "name": "accept",
+      "nr": 43,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sendto"
+      },
+      "implementation_root": "sys_sendto",
+      "linux_route": "conditional",
+      "name": "sendto",
+      "nr": 44,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_recvfrom"
+      },
+      "implementation_root": "sys_recvfrom",
+      "linux_route": "conditional",
+      "name": "recvfrom",
+      "nr": 45,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sendmsg"
+      },
+      "implementation_root": "sys_sendmsg",
+      "linux_route": "conditional",
+      "name": "sendmsg",
+      "nr": 46,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_recvmsg"
+      },
+      "implementation_root": "sys_recvmsg",
+      "linux_route": "conditional",
+      "name": "recvmsg",
+      "nr": 47,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_shutdown"
+      },
+      "implementation_root": "sys_shutdown",
+      "linux_route": "conditional",
+      "name": "shutdown",
+      "nr": 48,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_bind"
+      },
+      "implementation_root": "sys_bind",
+      "linux_route": "conditional",
+      "name": "bind",
+      "nr": 49,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_listen"
+      },
+      "implementation_root": "sys_listen",
+      "linux_route": "conditional",
+      "name": "listen",
+      "nr": 50,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getsockname"
+      },
+      "implementation_root": "sys_getsockname",
+      "linux_route": "conditional",
+      "name": "getsockname",
+      "nr": 51,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getpeername"
+      },
+      "implementation_root": "sys_getpeername",
+      "linux_route": "conditional",
+      "name": "getpeername",
+      "nr": 52,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_socketpair"
+      },
+      "implementation_root": "sys_socketpair",
+      "linux_route": "conditional",
+      "name": "socketpair",
+      "nr": 53,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setsockopt"
+      },
+      "implementation_root": "sys_setsockopt",
+      "linux_route": "conditional",
+      "name": "setsockopt",
+      "nr": 54,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getsockopt"
+      },
+      "implementation_root": "sys_getsockopt",
+      "linux_route": "conditional",
+      "name": "getsockopt",
+      "nr": 55,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clone"
+      },
+      "implementation_root": "sys_clone",
+      "linux_route": "direct",
+      "name": "clone",
+      "nr": 56,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fork"
+      },
+      "implementation_root": "sys_fork",
+      "linux_route": "direct",
+      "name": "fork",
+      "nr": 57,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_vfork"
+      },
+      "implementation_root": "sys_vfork",
+      "linux_route": "direct",
+      "name": "vfork",
+      "nr": 58,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_execve"
+      },
+      "implementation_root": "sys_execve",
+      "linux_route": "direct",
+      "name": "execve",
+      "nr": 59,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_exit"
+      },
+      "implementation_root": "sys_exit",
+      "linux_route": "direct",
+      "name": "exit",
+      "nr": 60,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_waitpid"
+      },
+      "implementation_root": "sys_waitpid",
+      "linux_route": "direct",
+      "name": "wait4",
+      "nr": 61,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_kill"
+      },
+      "implementation_root": "sys_kill",
+      "linux_route": "direct",
+      "name": "kill",
+      "nr": 62,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_uname"
+      },
+      "implementation_root": "sys_uname",
+      "linux_route": "direct",
+      "name": "uname",
+      "nr": 63,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_semget"
+      },
+      "implementation_root": "sys_semget",
+      "linux_route": "conditional",
+      "name": "semget",
+      "nr": 64,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_semop"
+      },
+      "implementation_root": "sys_semop",
+      "linux_route": "conditional",
+      "name": "semop",
+      "nr": 65,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_semctl"
+      },
+      "implementation_root": "sys_semctl",
+      "linux_route": "conditional",
+      "name": "semctl",
+      "nr": 66,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_shmdt"
+      },
+      "implementation_root": "sys_shmdt",
+      "linux_route": "conditional",
+      "name": "shmdt",
+      "nr": 67,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_msgget"
+      },
+      "implementation_root": "sys_msgget",
+      "linux_route": "conditional",
+      "name": "msgget",
+      "nr": 68,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_msgsnd"
+      },
+      "implementation_root": "sys_msgsnd",
+      "linux_route": "conditional",
+      "name": "msgsnd",
+      "nr": 69,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_msgrcv"
+      },
+      "implementation_root": "sys_msgrcv",
+      "linux_route": "conditional",
+      "name": "msgrcv",
+      "nr": 70,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_msgctl"
+      },
+      "implementation_root": "sys_msgctl",
+      "linux_route": "conditional",
+      "name": "msgctl",
+      "nr": 71,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fcntl"
+      },
+      "implementation_root": "sys_fcntl",
+      "linux_route": "direct",
+      "name": "fcntl",
+      "nr": 72,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_flock"
+      },
+      "implementation_root": "sys_flock",
+      "linux_route": "conditional",
+      "name": "flock",
+      "nr": 73,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fsync"
+      },
+      "implementation_root": "sys_fsync",
+      "linux_route": "direct",
+      "name": "fsync",
+      "nr": 74,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fdatasync"
+      },
+      "implementation_root": "sys_fdatasync",
+      "linux_route": "direct",
+      "name": "fdatasync",
+      "nr": 75,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_truncate"
+      },
+      "implementation_root": "sys_truncate",
+      "linux_route": "direct",
+      "name": "truncate",
+      "nr": 76,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ftruncate"
+      },
+      "implementation_root": "sys_ftruncate",
+      "linux_route": "direct",
+      "name": "ftruncate",
+      "nr": 77,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "getdents",
+      "nr": 78,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getcwd"
+      },
+      "implementation_root": "sys_getcwd",
+      "linux_route": "direct",
+      "name": "getcwd",
+      "nr": 79,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_chdir"
+      },
+      "implementation_root": "sys_chdir",
+      "linux_route": "direct",
+      "name": "chdir",
+      "nr": 80,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchdir"
+      },
+      "implementation_root": "sys_fchdir",
+      "linux_route": "direct",
+      "name": "fchdir",
+      "nr": 81,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rename"
+      },
+      "implementation_root": "sys_rename",
+      "linux_route": "direct",
+      "name": "rename",
+      "nr": 82,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mkdir"
+      },
+      "implementation_root": "sys_mkdir",
+      "linux_route": "direct",
+      "name": "mkdir",
+      "nr": 83,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rmdir"
+      },
+      "implementation_root": "sys_rmdir",
+      "linux_route": "direct",
+      "name": "rmdir",
+      "nr": 84,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_creat"
+      },
+      "implementation_root": "sys_creat",
+      "linux_route": "direct",
+      "name": "creat",
+      "nr": 85,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_link"
+      },
+      "implementation_root": "sys_link",
+      "linux_route": "direct",
+      "name": "link",
+      "nr": 86,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_unlink"
+      },
+      "implementation_root": "sys_unlink",
+      "linux_route": "direct",
+      "name": "unlink",
+      "nr": 87,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_symlink"
+      },
+      "implementation_root": "sys_symlink",
+      "linux_route": "direct",
+      "name": "symlink",
+      "nr": 88,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_readlink"
+      },
+      "implementation_root": "sys_readlink",
+      "linux_route": "direct",
+      "name": "readlink",
+      "nr": 89,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_chmod"
+      },
+      "implementation_root": "sys_chmod",
+      "linux_route": "direct",
+      "name": "chmod",
+      "nr": 90,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchmod"
+      },
+      "implementation_root": "sys_fchmod",
+      "linux_route": "direct",
+      "name": "fchmod",
+      "nr": 91,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_chown"
+      },
+      "implementation_root": "sys_chown",
+      "linux_route": "direct",
+      "name": "chown",
+      "nr": 92,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchown"
+      },
+      "implementation_root": "sys_fchown",
+      "linux_route": "direct",
+      "name": "fchown",
+      "nr": 93,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lchown"
+      },
+      "implementation_root": "sys_lchown",
+      "linux_route": "direct",
+      "name": "lchown",
+      "nr": 94,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_umask"
+      },
+      "implementation_root": "sys_umask",
+      "linux_route": "direct",
+      "name": "umask",
+      "nr": 95,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_gettimeofday"
+      },
+      "implementation_root": "sys_gettimeofday",
+      "linux_route": "direct",
+      "name": "gettimeofday",
+      "nr": 96,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getrlimit"
+      },
+      "implementation_root": "sys_getrlimit",
+      "linux_route": "direct",
+      "name": "getrlimit",
+      "nr": 97,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getrusage"
+      },
+      "implementation_root": "sys_getrusage",
+      "linux_route": "direct",
+      "name": "getrusage",
+      "nr": 98,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sysinfo"
+      },
+      "implementation_root": "sys_sysinfo",
+      "linux_route": "direct",
+      "name": "sysinfo",
+      "nr": 99,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_times"
+      },
+      "implementation_root": "sys_times",
+      "linux_route": "direct",
+      "name": "times",
+      "nr": 100,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ptrace"
+      },
+      "implementation_root": "sys_ptrace",
+      "linux_route": "direct",
+      "name": "ptrace",
+      "nr": 101,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getuid"
+      },
+      "implementation_root": "sys_getuid",
+      "linux_route": "direct",
+      "name": "getuid",
+      "nr": 102,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_syslog"
+      },
+      "implementation_root": "sys_syslog",
+      "linux_route": "conditional",
+      "name": "syslog",
+      "nr": 103,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getgid"
+      },
+      "implementation_root": "sys_getgid",
+      "linux_route": "direct",
+      "name": "getgid",
+      "nr": 104,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setuid"
+      },
+      "implementation_root": "sys_setuid",
+      "linux_route": "conditional",
+      "name": "setuid",
+      "nr": 105,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setgid"
+      },
+      "implementation_root": "sys_setgid",
+      "linux_route": "conditional",
+      "name": "setgid",
+      "nr": 106,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_geteuid"
+      },
+      "implementation_root": "sys_geteuid",
+      "linux_route": "direct",
+      "name": "geteuid",
+      "nr": 107,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getegid"
+      },
+      "implementation_root": "sys_getegid",
+      "linux_route": "direct",
+      "name": "getegid",
+      "nr": 108,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setpgid"
+      },
+      "implementation_root": "sys_setpgid",
+      "linux_route": "direct",
+      "name": "setpgid",
+      "nr": 109,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getppid"
+      },
+      "implementation_root": "sys_getppid",
+      "linux_route": "direct",
+      "name": "getppid",
+      "nr": 110,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_getpgrp"
+      },
+      "implementation_root": "sys_getpgid",
+      "linux_route": "direct",
+      "name": "getpgrp",
+      "nr": 111,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setsid"
+      },
+      "implementation_root": "sys_setsid",
+      "linux_route": "direct",
+      "name": "setsid",
+      "nr": 112,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setreuid"
+      },
+      "implementation_root": "sys_setreuid",
+      "linux_route": "conditional",
+      "name": "setreuid",
+      "nr": 113,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setregid"
+      },
+      "implementation_root": "sys_setregid",
+      "linux_route": "conditional",
+      "name": "setregid",
+      "nr": 114,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getgroups"
+      },
+      "implementation_root": "sys_getgroups",
+      "linux_route": "conditional",
+      "name": "getgroups",
+      "nr": 115,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setgroups"
+      },
+      "implementation_root": "sys_setgroups",
+      "linux_route": "conditional",
+      "name": "setgroups",
+      "nr": 116,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setresuid"
+      },
+      "implementation_root": "sys_setresuid",
+      "linux_route": "conditional",
+      "name": "setresuid",
+      "nr": 117,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getresuid"
+      },
+      "implementation_root": "sys_getresuid",
+      "linux_route": "conditional",
+      "name": "getresuid",
+      "nr": 118,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setresgid"
+      },
+      "implementation_root": "sys_setresgid",
+      "linux_route": "conditional",
+      "name": "setresgid",
+      "nr": 119,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getresgid"
+      },
+      "implementation_root": "sys_getresgid",
+      "linux_route": "conditional",
+      "name": "getresgid",
+      "nr": 120,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getpgid"
+      },
+      "implementation_root": "sys_getpgid",
+      "linux_route": "direct",
+      "name": "getpgid",
+      "nr": 121,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setfsuid"
+      },
+      "implementation_root": "sys_setfsuid",
+      "linux_route": "conditional",
+      "name": "setfsuid",
+      "nr": 122,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setfsgid"
+      },
+      "implementation_root": "sys_setfsgid",
+      "linux_route": "conditional",
+      "name": "setfsgid",
+      "nr": 123,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getsid"
+      },
+      "implementation_root": "sys_getsid",
+      "linux_route": "direct",
+      "name": "getsid",
+      "nr": 124,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_capget"
+      },
+      "implementation_root": "sys_capget",
+      "linux_route": "conditional",
+      "name": "capget",
+      "nr": 125,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_capset"
+      },
+      "implementation_root": "sys_capset",
+      "linux_route": "conditional",
+      "name": "capset",
+      "nr": 126,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigpending"
+      },
+      "implementation_root": "sys_rt_sigpending",
+      "linux_route": "direct",
+      "name": "rt_sigpending",
+      "nr": 127,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigtimedwait"
+      },
+      "implementation_root": "sys_rt_sigtimedwait",
+      "linux_route": "direct",
+      "name": "rt_sigtimedwait",
+      "nr": 128,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigqueueinfo"
+      },
+      "implementation_root": "sys_rt_sigqueueinfo",
+      "linux_route": "direct",
+      "name": "rt_sigqueueinfo",
+      "nr": 129,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_sigsuspend"
+      },
+      "implementation_root": "sys_rt_sigsuspend",
+      "linux_route": "direct",
+      "name": "rt_sigsuspend",
+      "nr": 130,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sigaltstack"
+      },
+      "implementation_root": "sys_sigaltstack",
+      "linux_route": "direct",
+      "name": "sigaltstack",
+      "nr": 131,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_utime"
+      },
+      "implementation_root": "sys_utime",
+      "linux_route": "direct",
+      "name": "utime",
+      "nr": 132,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_mknod"
+      },
+      "implementation_root": "sys_mknodat",
+      "linux_route": "direct",
+      "name": "mknod",
+      "nr": 133,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "uselib",
+      "nr": 134,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_personality"
+      },
+      "implementation_root": "sys_personality",
+      "linux_route": "direct",
+      "name": "personality",
+      "nr": 135,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "ustat",
+      "nr": 136,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_statfs"
+      },
+      "implementation_root": "sys_statfs",
+      "linux_route": "direct",
+      "name": "statfs",
+      "nr": 137,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fstatfs"
+      },
+      "implementation_root": "sys_fstatfs",
+      "linux_route": "direct",
+      "name": "fstatfs",
+      "nr": 138,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "sysfs",
+      "nr": 139,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getpriority"
+      },
+      "implementation_root": "sys_getpriority",
+      "linux_route": "direct",
+      "name": "getpriority",
+      "nr": 140,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setpriority"
+      },
+      "implementation_root": "sys_setpriority",
+      "linux_route": "direct",
+      "name": "setpriority",
+      "nr": 141,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_setparam"
+      },
+      "implementation_root": "sys_sched_setparam",
+      "linux_route": "direct",
+      "name": "sched_setparam",
+      "nr": 142,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_getparam"
+      },
+      "implementation_root": "sys_sched_getparam",
+      "linux_route": "direct",
+      "name": "sched_getparam",
+      "nr": 143,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_setscheduler"
+      },
+      "implementation_root": "sys_sched_setscheduler",
+      "linux_route": "direct",
+      "name": "sched_setscheduler",
+      "nr": 144,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_getscheduler"
+      },
+      "implementation_root": "sys_sched_getscheduler",
+      "linux_route": "direct",
+      "name": "sched_getscheduler",
+      "nr": 145,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_get_priority_max"
+      },
+      "implementation_root": "sys_sched_get_priority_max",
+      "linux_route": "direct",
+      "name": "sched_get_priority_max",
+      "nr": 146,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_get_priority_min"
+      },
+      "implementation_root": "sys_sched_get_priority_min",
+      "linux_route": "direct",
+      "name": "sched_get_priority_min",
+      "nr": 147,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_rr_get_interval"
+      },
+      "implementation_root": "sys_sched_rr_get_interval",
+      "linux_route": "direct",
+      "name": "sched_rr_get_interval",
+      "nr": 148,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mlock"
+      },
+      "implementation_root": "sys_mlock",
+      "linux_route": "conditional",
+      "name": "mlock",
+      "nr": 149,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_munlock"
+      },
+      "implementation_root": "sys_munlock",
+      "linux_route": "conditional",
+      "name": "munlock",
+      "nr": 150,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mlockall"
+      },
+      "implementation_root": "sys_mlockall",
+      "linux_route": "conditional",
+      "name": "mlockall",
+      "nr": 151,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_munlockall"
+      },
+      "implementation_root": "sys_munlockall",
+      "linux_route": "conditional",
+      "name": "munlockall",
+      "nr": 152,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_vhangup"
+      },
+      "implementation_root": "sys_vhangup",
+      "linux_route": "direct",
+      "name": "vhangup",
+      "nr": 153,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "modify_ldt",
+      "nr": 154,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "pivot_root",
+      "nr": 155,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "_sysctl",
+      "nr": 156,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_prctl"
+      },
+      "implementation_root": "sys_prctl",
+      "linux_route": "direct",
+      "name": "prctl",
+      "nr": 157,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_arch_prctl"
+      },
+      "implementation_root": "sys_arch_prctl",
+      "linux_route": "direct",
+      "name": "arch_prctl",
+      "nr": 158,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_adjtimex"
+      },
+      "implementation_root": "sys_adjtimex",
+      "linux_route": "direct",
+      "name": "adjtimex",
+      "nr": 159,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setrlimit"
+      },
+      "implementation_root": "sys_setrlimit",
+      "linux_route": "direct",
+      "name": "setrlimit",
+      "nr": 160,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_chroot"
+      },
+      "implementation_root": "sys_chroot",
+      "linux_route": "direct",
+      "name": "chroot",
+      "nr": 161,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sync"
+      },
+      "implementation_root": "sys_sync",
+      "linux_route": "direct",
+      "name": "sync",
+      "nr": 162,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_acct"
+      },
+      "implementation_root": "sys_acct",
+      "linux_route": "conditional",
+      "name": "acct",
+      "nr": 163,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_settimeofday"
+      },
+      "implementation_root": "sys_settimeofday",
+      "linux_route": "direct",
+      "name": "settimeofday",
+      "nr": 164,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mount"
+      },
+      "implementation_root": "sys_mount",
+      "linux_route": "direct",
+      "name": "mount",
+      "nr": 165,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_umount2"
+      },
+      "implementation_root": "sys_umount2",
+      "linux_route": "direct",
+      "name": "umount2",
+      "nr": 166,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_swapon"
+      },
+      "implementation_root": "sys_swapon",
+      "linux_route": "conditional",
+      "name": "swapon",
+      "nr": 167,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_swapoff"
+      },
+      "implementation_root": "sys_swapoff",
+      "linux_route": "conditional",
+      "name": "swapoff",
+      "nr": 168,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_reboot"
+      },
+      "implementation_root": "sys_reboot",
+      "linux_route": "direct",
+      "name": "reboot",
+      "nr": 169,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sethostname"
+      },
+      "implementation_root": "sys_sethostname",
+      "linux_route": "direct",
+      "name": "sethostname",
+      "nr": 170,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setdomainname"
+      },
+      "implementation_root": "sys_setdomainname",
+      "linux_route": "direct",
+      "name": "setdomainname",
+      "nr": 171,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "iopl",
+      "nr": 172,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "ioperm",
+      "nr": 173,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "create_module",
+      "nr": 174,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_init_module"
+      },
+      "implementation_root": "sys_init_module",
+      "linux_route": "conditional",
+      "name": "init_module",
+      "nr": 175,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_delete_module"
+      },
+      "implementation_root": "sys_delete_module",
+      "linux_route": "conditional",
+      "name": "delete_module",
+      "nr": 176,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "get_kernel_syms",
+      "nr": 177,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "query_module",
+      "nr": 178,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_quotactl"
+      },
+      "implementation_root": "sys_quotactl",
+      "linux_route": "conditional",
+      "name": "quotactl",
+      "nr": 179,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "nfsservctl",
+      "nr": 180,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "getpmsg",
+      "nr": 181,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "putpmsg",
+      "nr": 182,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "afs_syscall",
+      "nr": 183,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "tuxcall",
+      "nr": 184,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "security",
+      "nr": 185,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_gettid"
+      },
+      "implementation_root": "sys_gettid",
+      "linux_route": "direct",
+      "name": "gettid",
+      "nr": 186,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_readahead"
+      },
+      "implementation_root": "sys_readahead",
+      "linux_route": "direct",
+      "name": "readahead",
+      "nr": 187,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setxattr"
+      },
+      "implementation_root": "sys_setxattr",
+      "linux_route": "direct",
+      "name": "setxattr",
+      "nr": 188,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lsetxattr"
+      },
+      "implementation_root": "sys_lsetxattr",
+      "linux_route": "direct",
+      "name": "lsetxattr",
+      "nr": 189,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fsetxattr"
+      },
+      "implementation_root": "sys_fsetxattr",
+      "linux_route": "direct",
+      "name": "fsetxattr",
+      "nr": 190,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getxattr"
+      },
+      "implementation_root": "sys_getxattr",
+      "linux_route": "direct",
+      "name": "getxattr",
+      "nr": 191,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lgetxattr"
+      },
+      "implementation_root": "sys_lgetxattr",
+      "linux_route": "direct",
+      "name": "lgetxattr",
+      "nr": 192,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fgetxattr"
+      },
+      "implementation_root": "sys_fgetxattr",
+      "linux_route": "direct",
+      "name": "fgetxattr",
+      "nr": 193,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_listxattr"
+      },
+      "implementation_root": "sys_listxattr",
+      "linux_route": "direct",
+      "name": "listxattr",
+      "nr": 194,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_llistxattr"
+      },
+      "implementation_root": "sys_llistxattr",
+      "linux_route": "direct",
+      "name": "llistxattr",
+      "nr": 195,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_flistxattr"
+      },
+      "implementation_root": "sys_flistxattr",
+      "linux_route": "direct",
+      "name": "flistxattr",
+      "nr": 196,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_removexattr"
+      },
+      "implementation_root": "sys_removexattr",
+      "linux_route": "direct",
+      "name": "removexattr",
+      "nr": 197,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_lremovexattr"
+      },
+      "implementation_root": "sys_lremovexattr",
+      "linux_route": "direct",
+      "name": "lremovexattr",
+      "nr": 198,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fremovexattr"
+      },
+      "implementation_root": "sys_fremovexattr",
+      "linux_route": "direct",
+      "name": "fremovexattr",
+      "nr": 199,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_tkill"
+      },
+      "implementation_root": "sys_tkill",
+      "linux_route": "direct",
+      "name": "tkill",
+      "nr": 200,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "time",
+      "nr": 201,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_futex"
+      },
+      "implementation_root": "sys_futex",
+      "linux_route": "conditional",
+      "name": "futex",
+      "nr": 202,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_setaffinity"
+      },
+      "implementation_root": "sys_sched_setaffinity",
+      "linux_route": "direct",
+      "name": "sched_setaffinity",
+      "nr": 203,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_getaffinity"
+      },
+      "implementation_root": "sys_sched_getaffinity",
+      "linux_route": "direct",
+      "name": "sched_getaffinity",
+      "nr": 204,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "set_thread_area",
+      "nr": 205,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_setup"
+      },
+      "implementation_root": "sys_io_setup",
+      "linux_route": "conditional",
+      "name": "io_setup",
+      "nr": 206,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_destroy"
+      },
+      "implementation_root": "sys_io_destroy",
+      "linux_route": "conditional",
+      "name": "io_destroy",
+      "nr": 207,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_getevents"
+      },
+      "implementation_root": "sys_io_getevents",
+      "linux_route": "conditional",
+      "name": "io_getevents",
+      "nr": 208,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_submit"
+      },
+      "implementation_root": "sys_io_submit",
+      "linux_route": "conditional",
+      "name": "io_submit",
+      "nr": 209,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_cancel"
+      },
+      "implementation_root": "sys_io_cancel",
+      "linux_route": "conditional",
+      "name": "io_cancel",
+      "nr": 210,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "get_thread_area",
+      "nr": 211,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "lookup_dcookie",
+      "nr": 212,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_epoll_create"
+      },
+      "implementation_root": "sys_epoll_create1",
+      "linux_route": "conditional",
+      "name": "epoll_create",
+      "nr": 213,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "epoll_ctl_old",
+      "nr": 214,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "epoll_wait_old",
+      "nr": 215,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "remap_file_pages",
+      "nr": 216,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getdents64"
+      },
+      "implementation_root": "sys_getdents64",
+      "linux_route": "direct",
+      "name": "getdents64",
+      "nr": 217,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_set_tid_address"
+      },
+      "implementation_root": "sys_set_tid_address",
+      "linux_route": "direct",
+      "name": "set_tid_address",
+      "nr": 218,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_restart_syscall"
+      },
+      "implementation_root": "sys_restart_syscall",
+      "linux_route": "direct",
+      "name": "restart_syscall",
+      "nr": 219,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_semtimedop"
+      },
+      "implementation_root": "sys_semtimedop",
+      "linux_route": "conditional",
+      "name": "semtimedop",
+      "nr": 220,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fadvise64"
+      },
+      "implementation_root": "sys_fadvise64",
+      "linux_route": "conditional",
+      "name": "fadvise64",
+      "nr": 221,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timer_create"
+      },
+      "implementation_root": "sys_timer_create",
+      "linux_route": "conditional",
+      "name": "timer_create",
+      "nr": 222,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timer_settime"
+      },
+      "implementation_root": "sys_timer_settime",
+      "linux_route": "conditional",
+      "name": "timer_settime",
+      "nr": 223,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timer_gettime"
+      },
+      "implementation_root": "sys_timer_gettime",
+      "linux_route": "conditional",
+      "name": "timer_gettime",
+      "nr": 224,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timer_getoverrun"
+      },
+      "implementation_root": "sys_timer_getoverrun",
+      "linux_route": "conditional",
+      "name": "timer_getoverrun",
+      "nr": 225,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timer_delete"
+      },
+      "implementation_root": "sys_timer_delete",
+      "linux_route": "conditional",
+      "name": "timer_delete",
+      "nr": 226,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clock_settime"
+      },
+      "implementation_root": "sys_clock_settime",
+      "linux_route": "direct",
+      "name": "clock_settime",
+      "nr": 227,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clock_gettime"
+      },
+      "implementation_root": "sys_clock_gettime",
+      "linux_route": "direct",
+      "name": "clock_gettime",
+      "nr": 228,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clock_getres"
+      },
+      "implementation_root": "sys_clock_getres",
+      "linux_route": "direct",
+      "name": "clock_getres",
+      "nr": 229,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clock_nanosleep"
+      },
+      "implementation_root": "sys_clock_nanosleep",
+      "linux_route": "direct",
+      "name": "clock_nanosleep",
+      "nr": 230,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_exit_group"
+      },
+      "implementation_root": "sys_exit_group",
+      "linux_route": "direct",
+      "name": "exit_group",
+      "nr": 231,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_epoll_wait"
+      },
+      "implementation_root": "sys_epoll_wait",
+      "linux_route": "conditional",
+      "name": "epoll_wait",
+      "nr": 232,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_epoll_ctl"
+      },
+      "implementation_root": "sys_epoll_ctl",
+      "linux_route": "conditional",
+      "name": "epoll_ctl",
+      "nr": 233,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_tgkill"
+      },
+      "implementation_root": "sys_tgkill",
+      "linux_route": "direct",
+      "name": "tgkill",
+      "nr": 234,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_utimes"
+      },
+      "implementation_root": "sys_utimes",
+      "linux_route": "direct",
+      "name": "utimes",
+      "nr": 235,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "native-ni",
+        "target": "sys_ni_syscall"
+      },
+      "implementation_root": "sys_ni_syscall",
+      "linux_route": "ni",
+      "name": "vserver",
+      "nr": 236,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mbind"
+      },
+      "implementation_root": "sys_mbind",
+      "linux_route": "conditional",
+      "name": "mbind",
+      "nr": 237,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_set_mempolicy"
+      },
+      "implementation_root": "sys_set_mempolicy",
+      "linux_route": "conditional",
+      "name": "set_mempolicy",
+      "nr": 238,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_get_mempolicy"
+      },
+      "implementation_root": "sys_get_mempolicy",
+      "linux_route": "conditional",
+      "name": "get_mempolicy",
+      "nr": 239,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_open"
+      },
+      "implementation_root": "sys_mq_open",
+      "linux_route": "conditional",
+      "name": "mq_open",
+      "nr": 240,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_unlink"
+      },
+      "implementation_root": "sys_mq_unlink",
+      "linux_route": "conditional",
+      "name": "mq_unlink",
+      "nr": 241,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_timedsend"
+      },
+      "implementation_root": "sys_mq_timedsend",
+      "linux_route": "conditional",
+      "name": "mq_timedsend",
+      "nr": 242,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_timedreceive"
+      },
+      "implementation_root": "sys_mq_timedreceive",
+      "linux_route": "conditional",
+      "name": "mq_timedreceive",
+      "nr": 243,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_notify"
+      },
+      "implementation_root": "sys_mq_notify",
+      "linux_route": "conditional",
+      "name": "mq_notify",
+      "nr": 244,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mq_getsetattr"
+      },
+      "implementation_root": "sys_mq_getsetattr",
+      "linux_route": "conditional",
+      "name": "mq_getsetattr",
+      "nr": 245,
+      "static_gap": null,
+      "uapi_family": "ipc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "kexec_load",
+      "nr": 246,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_waitid"
+      },
+      "implementation_root": "sys_waitid",
+      "linux_route": "direct",
+      "name": "waitid",
+      "nr": 247,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_add_key"
+      },
+      "implementation_root": "sys_add_key",
+      "linux_route": "conditional",
+      "name": "add_key",
+      "nr": 248,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_request_key"
+      },
+      "implementation_root": "sys_request_key",
+      "linux_route": "conditional",
+      "name": "request_key",
+      "nr": 249,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_keyctl"
+      },
+      "implementation_root": "sys_keyctl",
+      "linux_route": "conditional",
+      "name": "keyctl",
+      "nr": 250,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ioprio_set"
+      },
+      "implementation_root": "sys_ioprio_set",
+      "linux_route": "conditional",
+      "name": "ioprio_set",
+      "nr": 251,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ioprio_get"
+      },
+      "implementation_root": "sys_ioprio_get",
+      "linux_route": "conditional",
+      "name": "ioprio_get",
+      "nr": 252,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_inotify_init"
+      },
+      "implementation_root": "sys_inotify_init1",
+      "linux_route": "conditional",
+      "name": "inotify_init",
+      "nr": 253,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_inotify_add_watch"
+      },
+      "implementation_root": "sys_inotify_add_watch",
+      "linux_route": "conditional",
+      "name": "inotify_add_watch",
+      "nr": 254,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_inotify_rm_watch"
+      },
+      "implementation_root": "sys_inotify_rm_watch",
+      "linux_route": "conditional",
+      "name": "inotify_rm_watch",
+      "nr": 255,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_migrate_pages"
+      },
+      "implementation_root": "sys_migrate_pages",
+      "linux_route": "conditional",
+      "name": "migrate_pages",
+      "nr": 256,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_openat"
+      },
+      "implementation_root": "sys_openat",
+      "linux_route": "direct",
+      "name": "openat",
+      "nr": 257,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mkdirat"
+      },
+      "implementation_root": "sys_mkdirat",
+      "linux_route": "direct",
+      "name": "mkdirat",
+      "nr": 258,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mknodat"
+      },
+      "implementation_root": "sys_mknodat",
+      "linux_route": "direct",
+      "name": "mknodat",
+      "nr": 259,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchownat"
+      },
+      "implementation_root": "sys_fchownat",
+      "linux_route": "direct",
+      "name": "fchownat",
+      "nr": 260,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "futimesat",
+      "nr": 261,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fstatat"
+      },
+      "implementation_root": "sys_fstatat",
+      "linux_route": "direct",
+      "name": "newfstatat",
+      "nr": 262,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_unlinkat"
+      },
+      "implementation_root": "sys_unlinkat",
+      "linux_route": "direct",
+      "name": "unlinkat",
+      "nr": 263,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_renameat"
+      },
+      "implementation_root": "sys_renameat",
+      "linux_route": "direct",
+      "name": "renameat",
+      "nr": 264,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_linkat"
+      },
+      "implementation_root": "sys_linkat",
+      "linux_route": "direct",
+      "name": "linkat",
+      "nr": 265,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_symlinkat"
+      },
+      "implementation_root": "sys_symlinkat",
+      "linux_route": "direct",
+      "name": "symlinkat",
+      "nr": 266,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_readlinkat"
+      },
+      "implementation_root": "sys_readlinkat",
+      "linux_route": "direct",
+      "name": "readlinkat",
+      "nr": 267,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchmodat"
+      },
+      "implementation_root": "sys_fchmodat",
+      "linux_route": "direct",
+      "name": "fchmodat",
+      "nr": 268,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_faccessat"
+      },
+      "implementation_root": "sys_faccessat",
+      "linux_route": "direct",
+      "name": "faccessat",
+      "nr": 269,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pselect6"
+      },
+      "implementation_root": "sys_pselect6",
+      "linux_route": "direct",
+      "name": "pselect6",
+      "nr": 270,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_ppoll"
+      },
+      "implementation_root": "sys_ppoll",
+      "linux_route": "direct",
+      "name": "ppoll",
+      "nr": 271,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_unshare"
+      },
+      "implementation_root": "sys_unshare",
+      "linux_route": "direct",
+      "name": "unshare",
+      "nr": 272,
+      "static_gap": null,
+      "uapi_family": "namespace"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_set_robust_list"
+      },
+      "implementation_root": "sys_set_robust_list",
+      "linux_route": "conditional",
+      "name": "set_robust_list",
+      "nr": 273,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_get_robust_list"
+      },
+      "implementation_root": "sys_get_robust_list",
+      "linux_route": "conditional",
+      "name": "get_robust_list",
+      "nr": 274,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_splice"
+      },
+      "implementation_root": "sys_splice",
+      "linux_route": "direct",
+      "name": "splice",
+      "nr": 275,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_tee"
+      },
+      "implementation_root": "sys_tee",
+      "linux_route": "direct",
+      "name": "tee",
+      "nr": 276,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sync_file_range"
+      },
+      "implementation_root": "sys_sync_file_range",
+      "linux_route": "direct",
+      "name": "sync_file_range",
+      "nr": 277,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_vmsplice"
+      },
+      "implementation_root": "sys_vmsplice",
+      "linux_route": "direct",
+      "name": "vmsplice",
+      "nr": 278,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_move_pages"
+      },
+      "implementation_root": "sys_move_pages",
+      "linux_route": "conditional",
+      "name": "move_pages",
+      "nr": 279,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_utimensat"
+      },
+      "implementation_root": "sys_utimensat",
+      "linux_route": "direct",
+      "name": "utimensat",
+      "nr": 280,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_epoll_pwait"
+      },
+      "implementation_root": "sys_epoll_pwait",
+      "linux_route": "conditional",
+      "name": "epoll_pwait",
+      "nr": 281,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_signalfd"
+      },
+      "implementation_root": "sys_signalfd4",
+      "linux_route": "conditional",
+      "name": "signalfd",
+      "nr": 282,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timerfd_create"
+      },
+      "implementation_root": "sys_timerfd_create",
+      "linux_route": "conditional",
+      "name": "timerfd_create",
+      "nr": 283,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "alias",
+        "target": "compat_eventfd"
+      },
+      "implementation_root": "sys_eventfd2",
+      "linux_route": "conditional",
+      "name": "eventfd",
+      "nr": 284,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fallocate"
+      },
+      "implementation_root": "sys_fallocate",
+      "linux_route": "direct",
+      "name": "fallocate",
+      "nr": 285,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timerfd_settime"
+      },
+      "implementation_root": "sys_timerfd_settime",
+      "linux_route": "conditional",
+      "name": "timerfd_settime",
+      "nr": 286,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_timerfd_gettime"
+      },
+      "implementation_root": "sys_timerfd_gettime",
+      "linux_route": "conditional",
+      "name": "timerfd_gettime",
+      "nr": 287,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_accept4"
+      },
+      "implementation_root": "sys_accept4",
+      "linux_route": "conditional",
+      "name": "accept4",
+      "nr": 288,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_signalfd4"
+      },
+      "implementation_root": "sys_signalfd4",
+      "linux_route": "conditional",
+      "name": "signalfd4",
+      "nr": 289,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_eventfd2"
+      },
+      "implementation_root": "sys_eventfd2",
+      "linux_route": "conditional",
+      "name": "eventfd2",
+      "nr": 290,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_epoll_create1"
+      },
+      "implementation_root": "sys_epoll_create1",
+      "linux_route": "conditional",
+      "name": "epoll_create1",
+      "nr": 291,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_dup3"
+      },
+      "implementation_root": "sys_dup3",
+      "linux_route": "direct",
+      "name": "dup3",
+      "nr": 292,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pipe2"
+      },
+      "implementation_root": "sys_pipe2",
+      "linux_route": "direct",
+      "name": "pipe2",
+      "nr": 293,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_inotify_init1"
+      },
+      "implementation_root": "sys_inotify_init1",
+      "linux_route": "conditional",
+      "name": "inotify_init1",
+      "nr": 294,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_preadv"
+      },
+      "implementation_root": "sys_preadv",
+      "linux_route": "direct",
+      "name": "preadv",
+      "nr": 295,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pwritev"
+      },
+      "implementation_root": "sys_pwritev",
+      "linux_route": "direct",
+      "name": "pwritev",
+      "nr": 296,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rt_tgsigqueueinfo"
+      },
+      "implementation_root": "sys_rt_tgsigqueueinfo",
+      "linux_route": "direct",
+      "name": "rt_tgsigqueueinfo",
+      "nr": 297,
+      "static_gap": null,
+      "uapi_family": "signal"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "sys_unsupported_fd"
+      },
+      "implementation_root": "sys_unsupported_fd",
+      "linux_route": "conditional",
+      "name": "perf_event_open",
+      "nr": 298,
+      "static_gap": "shared explicit unsupported-fd route; runtime behavior requires evidence",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_recvmmsg"
+      },
+      "implementation_root": "sys_recvmmsg",
+      "linux_route": "conditional",
+      "name": "recvmmsg",
+      "nr": 299,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fanotify_init"
+      },
+      "implementation_root": "sys_fanotify_init",
+      "linux_route": "conditional",
+      "name": "fanotify_init",
+      "nr": 300,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fanotify_mark"
+      },
+      "implementation_root": "sys_fanotify_mark",
+      "linux_route": "conditional",
+      "name": "fanotify_mark",
+      "nr": 301,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_prlimit64"
+      },
+      "implementation_root": "sys_prlimit64",
+      "linux_route": "direct",
+      "name": "prlimit64",
+      "nr": 302,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_name_to_handle_at"
+      },
+      "implementation_root": "sys_name_to_handle_at",
+      "linux_route": "conditional",
+      "name": "name_to_handle_at",
+      "nr": 303,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_open_by_handle_at"
+      },
+      "implementation_root": "sys_open_by_handle_at",
+      "linux_route": "conditional",
+      "name": "open_by_handle_at",
+      "nr": 304,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clock_adjtime"
+      },
+      "implementation_root": "sys_clock_adjtime",
+      "linux_route": "conditional",
+      "name": "clock_adjtime",
+      "nr": 305,
+      "static_gap": null,
+      "uapi_family": "time"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_syncfs"
+      },
+      "implementation_root": "sys_syncfs",
+      "linux_route": "direct",
+      "name": "syncfs",
+      "nr": 306,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sendmmsg"
+      },
+      "implementation_root": "sys_sendmmsg",
+      "linux_route": "conditional",
+      "name": "sendmmsg",
+      "nr": 307,
+      "static_gap": null,
+      "uapi_family": "net"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_setns"
+      },
+      "implementation_root": "sys_setns",
+      "linux_route": "direct",
+      "name": "setns",
+      "nr": 308,
+      "static_gap": null,
+      "uapi_family": "namespace"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getcpu"
+      },
+      "implementation_root": "sys_getcpu",
+      "linux_route": "direct",
+      "name": "getcpu",
+      "nr": 309,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_process_vm_readv"
+      },
+      "implementation_root": "sys_process_vm_readv",
+      "linux_route": "conditional",
+      "name": "process_vm_readv",
+      "nr": 310,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_process_vm_writev"
+      },
+      "implementation_root": "sys_process_vm_writev",
+      "linux_route": "conditional",
+      "name": "process_vm_writev",
+      "nr": 311,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_kcmp"
+      },
+      "implementation_root": "sys_kcmp",
+      "linux_route": "conditional",
+      "name": "kcmp",
+      "nr": 312,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_finit_module"
+      },
+      "implementation_root": "sys_finit_module",
+      "linux_route": "conditional",
+      "name": "finit_module",
+      "nr": 313,
+      "static_gap": null,
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_setattr"
+      },
+      "implementation_root": "sys_sched_setattr",
+      "linux_route": "direct",
+      "name": "sched_setattr",
+      "nr": 314,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_sched_getattr"
+      },
+      "implementation_root": "sys_sched_getattr",
+      "linux_route": "direct",
+      "name": "sched_getattr",
+      "nr": 315,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_renameat2"
+      },
+      "implementation_root": "sys_renameat2",
+      "linux_route": "direct",
+      "name": "renameat2",
+      "nr": 316,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_seccomp"
+      },
+      "implementation_root": "sys_seccomp",
+      "linux_route": "conditional",
+      "name": "seccomp",
+      "nr": 317,
+      "static_gap": null,
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_getrandom"
+      },
+      "implementation_root": "sys_getrandom",
+      "linux_route": "direct",
+      "name": "getrandom",
+      "nr": 318,
+      "static_gap": null,
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_memfd_create"
+      },
+      "implementation_root": "sys_memfd_create",
+      "linux_route": "conditional",
+      "name": "memfd_create",
+      "nr": 319,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "kexec_file_load",
+      "nr": 320,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "admin"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "feature",
+        "target": "sys_bpf"
+      },
+      "implementation_root": "sys_bpf",
+      "linux_route": "conditional",
+      "name": "bpf",
+      "nr": 321,
+      "static_gap": "route is compiled only with feature=bpf",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_execveat"
+      },
+      "implementation_root": "sys_execveat",
+      "linux_route": "conditional",
+      "name": "execveat",
+      "nr": 322,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_userfaultfd"
+      },
+      "implementation_root": "sys_userfaultfd",
+      "linux_route": "conditional",
+      "name": "userfaultfd",
+      "nr": 323,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_membarrier"
+      },
+      "implementation_root": "sys_membarrier",
+      "linux_route": "conditional",
+      "name": "membarrier",
+      "nr": 324,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mlock2"
+      },
+      "implementation_root": "sys_mlock2",
+      "linux_route": "conditional",
+      "name": "mlock2",
+      "nr": 325,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_copy_file_range"
+      },
+      "implementation_root": "sys_copy_file_range",
+      "linux_route": "conditional",
+      "name": "copy_file_range",
+      "nr": 326,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_preadv2"
+      },
+      "implementation_root": "sys_preadv2",
+      "linux_route": "direct",
+      "name": "preadv2",
+      "nr": 327,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "64",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pwritev2"
+      },
+      "implementation_root": "sys_pwritev2",
+      "linux_route": "direct",
+      "name": "pwritev2",
+      "nr": 328,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "pkey_mprotect",
+      "nr": 329,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "pkey_alloc",
+      "nr": 330,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "pkey_free",
+      "nr": 331,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_statx"
+      },
+      "implementation_root": "sys_statx",
+      "linux_route": "direct",
+      "name": "statx",
+      "nr": 332,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_pgetevents"
+      },
+      "implementation_root": "sys_io_pgetevents",
+      "linux_route": "conditional",
+      "name": "io_pgetevents",
+      "nr": 333,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_rseq"
+      },
+      "implementation_root": "sys_rseq",
+      "linux_route": "conditional",
+      "name": "rseq",
+      "nr": 334,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "uretprobe",
+      "nr": 335,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pidfd_send_signal"
+      },
+      "implementation_root": "sys_pidfd_send_signal",
+      "linux_route": "direct",
+      "name": "pidfd_send_signal",
+      "nr": 424,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_uring_setup"
+      },
+      "implementation_root": "sys_io_uring_setup",
+      "linux_route": "conditional",
+      "name": "io_uring_setup",
+      "nr": 425,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_uring_enter"
+      },
+      "implementation_root": "sys_io_uring_enter",
+      "linux_route": "conditional",
+      "name": "io_uring_enter",
+      "nr": 426,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_io_uring_register"
+      },
+      "implementation_root": "sys_io_uring_register",
+      "linux_route": "conditional",
+      "name": "io_uring_register",
+      "nr": 427,
+      "static_gap": null,
+      "uapi_family": "async-io"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_open_tree"
+      },
+      "implementation_root": "sys_open_tree",
+      "linux_route": "direct",
+      "name": "open_tree",
+      "nr": 428,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_move_mount"
+      },
+      "implementation_root": "sys_move_mount",
+      "linux_route": "direct",
+      "name": "move_mount",
+      "nr": 429,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fsopen"
+      },
+      "implementation_root": "sys_fsopen",
+      "linux_route": "direct",
+      "name": "fsopen",
+      "nr": 430,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fsconfig"
+      },
+      "implementation_root": "sys_fsconfig",
+      "linux_route": "direct",
+      "name": "fsconfig",
+      "nr": 431,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fsmount"
+      },
+      "implementation_root": "sys_fsmount",
+      "linux_route": "direct",
+      "name": "fsmount",
+      "nr": 432,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fspick"
+      },
+      "implementation_root": "sys_fspick",
+      "linux_route": "direct",
+      "name": "fspick",
+      "nr": 433,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pidfd_open"
+      },
+      "implementation_root": "sys_pidfd_open",
+      "linux_route": "direct",
+      "name": "pidfd_open",
+      "nr": 434,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_clone3"
+      },
+      "implementation_root": "sys_clone3",
+      "linux_route": "direct",
+      "name": "clone3",
+      "nr": 435,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_close_range"
+      },
+      "implementation_root": "sys_close_range",
+      "linux_route": "direct",
+      "name": "close_range",
+      "nr": 436,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_openat2"
+      },
+      "implementation_root": "sys_openat2",
+      "linux_route": "direct",
+      "name": "openat2",
+      "nr": 437,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_pidfd_getfd"
+      },
+      "implementation_root": "sys_pidfd_getfd",
+      "linux_route": "direct",
+      "name": "pidfd_getfd",
+      "nr": 438,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_faccessat2"
+      },
+      "implementation_root": "sys_faccessat2",
+      "linux_route": "direct",
+      "name": "faccessat2",
+      "nr": 439,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_process_madvise"
+      },
+      "implementation_root": "sys_process_madvise",
+      "linux_route": "conditional",
+      "name": "process_madvise",
+      "nr": 440,
+      "static_gap": null,
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_epoll_pwait2"
+      },
+      "implementation_root": "sys_epoll_pwait2",
+      "linux_route": "conditional",
+      "name": "epoll_pwait2",
+      "nr": 441,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_mount_setattr"
+      },
+      "implementation_root": "sys_mount_setattr",
+      "linux_route": "direct",
+      "name": "mount_setattr",
+      "nr": 442,
+      "static_gap": null,
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_quotactl_fd"
+      },
+      "implementation_root": "sys_quotactl_fd",
+      "linux_route": "conditional",
+      "name": "quotactl_fd",
+      "nr": 443,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "landlock_create_ruleset",
+      "nr": 444,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "landlock_add_rule",
+      "nr": 445,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "landlock_restrict_self",
+      "nr": 446,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "sys_unsupported_fd"
+      },
+      "implementation_root": "sys_unsupported_fd",
+      "linux_route": "conditional",
+      "name": "memfd_secret",
+      "nr": 447,
+      "static_gap": "shared explicit unsupported-fd route; runtime behavior requires evidence",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "process_mrelease",
+      "nr": 448,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_futex_waitv"
+      },
+      "implementation_root": "sys_futex_waitv",
+      "linux_route": "conditional",
+      "name": "futex_waitv",
+      "nr": 449,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "set_mempolicy_home_node",
+      "nr": 450,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "memory"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "cachestat",
+      "nr": 451,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_fchmodat"
+      },
+      "implementation_root": "sys_fchmodat",
+      "linux_route": "direct",
+      "name": "fchmodat2",
+      "nr": 452,
+      "static_gap": null,
+      "uapi_family": "fs"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "map_shadow_stack",
+      "nr": 453,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_futex_wake"
+      },
+      "implementation_root": "sys_futex_wake",
+      "linux_route": "conditional",
+      "name": "futex_wake",
+      "nr": 454,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_futex_wait"
+      },
+      "implementation_root": "sys_futex_wait",
+      "linux_route": "conditional",
+      "name": "futex_wait",
+      "nr": 455,
+      "static_gap": null,
+      "uapi_family": "task"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "dispatch-arm",
+        "target": "sys_futex_requeue"
+      },
+      "implementation_root": "sys_futex_requeue",
+      "linux_route": "conditional",
+      "name": "futex_requeue",
+      "nr": 456,
+      "static_gap": null,
+      "uapi_family": "sync"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "statmount",
+      "nr": 457,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "direct",
+      "name": "listmount",
+      "nr": 458,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "mount"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "lsm_get_self_attr",
+      "nr": 459,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "lsm_set_self_attr",
+      "nr": 460,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "lsm_list_modules",
+      "nr": 461,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "security"
+    },
+    {
+      "abi": "common",
+      "dispatch": {
+        "kind": "fallback",
+        "target": "AxError::Unsupported"
+      },
+      "implementation_root": "AxError::Unsupported",
+      "linux_route": "conditional",
+      "name": "mseal",
+      "nr": 462,
+      "static_gap": "no explicit Sysno arm; dispatch_syscall fallback returns AxError::Unsupported",
+      "uapi_family": "misc"
+    }
+  ]
+}

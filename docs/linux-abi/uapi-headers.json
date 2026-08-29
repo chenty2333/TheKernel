@@ -1,0 +1,17 @@
+{
+  "schema": "thekernel-linux-uapi-headers-v1",
+  "linux": {
+    "version": "v6.12.103",
+    "ref": "v6.12.103",
+    "commit": "25c09b42358e73e1476e517b296edb6344f2e4bd",
+    "architecture": "x86_64",
+    "source": {
+      "tarball_path": ".state/linux-6.12.103/linux-6.12.103.tar.xz",
+      "tarball_sha256": "f143aaade8877ba5616e788b4482576db28481bcf557ef537f4fcc3938fc3176"
+    }
+  },
+  "headers": {
+    "materialized_path": ".state/linux-6.12.103/uapi/include",
+    "tree_sha256": "53f5a259b0daa68e5dde797ccc94d5c5dc8aba1c3d8cd76e45f68a572e0a98a9"
+  }
+}

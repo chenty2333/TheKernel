@@ -20,6 +20,14 @@ class RunnerError(ValueError):
     """Raised for an invalid product-run configuration."""
 
 
+# The q35 platform description currently uses the PCIe ECAM layout assigned by
+# Debian bookworm's OVMF.  A different OVMF may boot GRUB successfully while
+# placing ECAM elsewhere, which makes every PCI device invisible to the guest.
+# Fail before launch instead of silently selecting an incompatible host image.
+Q35_OVMF_CODE_SHA256 = "d9b568def24088c92f34b5479e0ed7e44d0a4d4cea8a0f5716719180bba48106"
+Q35_OVMF_VARS_SHA256 = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc"
+
+
 @dataclass(frozen=True)
 class RunConfig:
     arch: Arch
@@ -171,19 +179,33 @@ def _resolve_ovmf_image(
     environment: str,
     candidates: tuple[str, ...],
     label: str,
+    default_sha256: str,
 ) -> Path:
     raw = configured or (Path(os.environ[environment]) if os.environ.get(environment) else None)
     if raw is None:
-        raw = next((Path(path) for path in candidates if Path(path).is_file()), None)
+        raw = next(
+            (
+                path
+                for candidate in candidates
+                if (path := Path(candidate)).is_file()
+                and hashlib.sha256(path.read_bytes()).hexdigest() == default_sha256
+            ),
+            None,
+        )
     if raw is None:
         option = environment.removeprefix("THEKERNEL_").lower().replace("_", "-")
         raise RunnerError(
-            f"x86_64 UEFI requires {label}; pass --{option} "
-            f"or set {environment}"
+            f"x86_64 q35 requires the pinned {label} ({default_sha256}); "
+            f"pass --{option} or set {environment} to an explicit compatible image"
         )
     path = raw.expanduser().resolve()
     if not path.is_file():
         raise RunnerError(f"{label} does not exist: {path}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != default_sha256:
+        raise RunnerError(
+            f"{label} does not match q35 pin: expected {default_sha256}, got {actual}"
+        )
     return path
 
 
@@ -422,6 +444,7 @@ def run(
                 "/usr/share/OVMF/OVMF_CODE.fd",
             ),
             "OVMF code",
+            Q35_OVMF_CODE_SHA256,
         )
         ovmf_vars_source = _resolve_ovmf_image(
             config.ovmf_vars,
@@ -432,6 +455,7 @@ def run(
                 "/usr/share/OVMF/OVMF_VARS.fd",
             ),
             "OVMF vars",
+            Q35_OVMF_VARS_SHA256,
         )
         ovmf_vars_runtime = (workdir / "firmware" / "OVMF_VARS.fd").resolve()
 

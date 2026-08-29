@@ -1,0 +1,22 @@
+{
+  "schema": "thekernel-linux-abi-gap-catalog-v1",
+  "gaps": [
+    {"id": "review.dynamic-contract-evidence-unclosed", "dispositions": ["partial"], "description": "Static routing was audited, but the syscall has no reviewed behavior contract with passing host and guest evidence across its Linux ABI semantics."},
+    {"id": "dispatch.fallback-not-linux-ni", "dispositions": ["partial"], "description": "TheKernel dispatcher reaches its unsupported fallback; this is not evidence that Linux defines the syscall as sys_ni_syscall."},
+    {"id": "dispatch.feature-path-unverified", "dispositions": ["partial"], "description": "The syscall is guarded by a feature-dependent dispatch path whose enabled behavior has not yet been contract-tested."},
+    {"id": "family.admin-semantics-unclosed", "dispositions": ["partial"], "description": "Administrative syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.async-io-semantics-unclosed", "dispositions": ["partial"], "description": "Asynchronous-I/O syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.fs-semantics-unclosed", "dispositions": ["partial"], "description": "Filesystem syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.ipc-semantics-unclosed", "dispositions": ["partial"], "description": "IPC syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.memory-semantics-unclosed", "dispositions": ["partial"], "description": "Memory-management syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.misc-semantics-unclosed", "dispositions": ["partial"], "description": "Miscellaneous syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.mount-semantics-unclosed", "dispositions": ["partial"], "description": "Mount and filesystem-topology syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.namespace-semantics-unclosed", "dispositions": ["partial"], "description": "Namespace syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.net-semantics-unclosed", "dispositions": ["partial"], "description": "Networking syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.security-semantics-unclosed", "dispositions": ["partial"], "description": "Security syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.signal-semantics-unclosed", "dispositions": ["partial"], "description": "Signal syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.sync-semantics-unclosed", "dispositions": ["partial"], "description": "Synchronization syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.task-semantics-unclosed", "dispositions": ["partial"], "description": "Task and process syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."},
+    {"id": "family.time-semantics-unclosed", "dispositions": ["partial"], "description": "Timekeeping syscall family behavior lacks reviewed Linux-compatible contract and runtime evidence."}
+  ]
+}

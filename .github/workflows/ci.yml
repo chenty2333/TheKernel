@@ -126,6 +126,15 @@ jobs:
             tests.ci.test_kvm_subsystem_baseline \
             -v
 
+      - name: Enforce reviewed Linux ABI baseline
+        run: |
+          python3 tools/abi_cases.py
+          python3 tools/abi_cohorts.py
+          python3 tools/abi_conditions.py --validate
+          python3 tools/abi_surfaces.py validate
+          python3 tools/abi_matrix.py phase1-gate
+          python3 scripts/ci/verify_linux_oracles.py
+
       - name: Test local adapters
         run: |
           cargo test --locked -p thekernel-readiness-adapter
@@ -228,6 +237,28 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
+      - name: Materialize pinned Linux ABI inputs
+        run: |
+          set -euo pipefail
+          ./dev-env/check-image.sh
+          linux_state=.state/linux-6.12.103
+          linux_tarball="$linux_state/linux-6.12.103.tar.xz"
+          linux_download="$linux_tarball.download"
+          mkdir -p "$linux_state"
+          trap 'rm -f "$linux_download"' EXIT
+          curl --fail --location --retry 3 \
+            --output "$linux_download" \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.103.tar.xz
+          printf '%s  %s\n' \
+            f143aaade8877ba5616e788b4482576db28481bcf557ef537f4fcc3938fc3176 \
+            "$linux_download" | sha256sum --check --strict
+          mv "$linux_download" "$linux_tarball"
+          trap - EXIT
+          python3 scripts/ci/materialize_linux_oracles.py
+          python3 scripts/ci/verify_linux_oracles.py --require-materialized
+          python3 scripts/ci/materialize_linux_uapi.py
+          python3 tools/abi_uapi.py --require-materialized
+
       - name: Lint MM performance product profile
         run: |
           ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4 \
@@ -235,13 +266,30 @@ jobs:
 
       - name: Run the unified clean-source q35 preview gate
         run: |
-          python3 -m tools.qemu_runner.gate_manifest \
+          THEKERNEL_ABI_UAPI_INCLUDE="$PWD/.state/linux-6.12.103/uapi/include" \
+            python3 -m tools.qemu_runner.gate_manifest \
             --output .state/gate/q35-preview-v0/manifest.json
 
-      - name: Publish the gate manifest and bound logs
+      - name: Run formal Linux ABI differential gate
+        run: |
+          python3 tools/abi_runner.py \
+            --repo-root "$PWD" \
+            --rootfs .state/out/rootfs/x86/rootfs-x86.img \
+            --linux-kernel .state/linux-6.12.103/build/arch/x86/boot/bzImage \
+            --thekernel-kernel .state/out/x86_64/q35-uefi/system/smp4-mem1g/kernel-x86_64 \
+            --thekernel-esp .state/out/x86_64/q35-uefi/system/smp4-mem1g/kernel-x86_64.esp \
+            --thekernel-launch-receipt .state/gate/q35-preview-v0/system-test/qemu-receipt.json \
+            --uapi-headers .state/linux-6.12.103/uapi/include \
+            --output .state/gate/linux-abi-v1
+
+      - name: Publish q35 and Linux ABI receipts
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: q35-preview-v0-${{ steps.source_combination.outputs.combination_id }}
-          path: TheKernel/.state/gate/q35-preview-v0
+          name: q35-abi-v1-${{ steps.source_combination.outputs.combination_id }}
+          path: |
+            TheKernel/.state/gate/q35-preview-v0
+            TheKernel/.state/gate/linux-abi-v1
+            TheKernel/.state/linux-6.12.103
+            TheKernel/.state/abi-binaries
           if-no-files-found: error

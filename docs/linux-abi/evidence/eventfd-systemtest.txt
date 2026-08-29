@@ -1,10 +1,10 @@
 # TheKernel Linux ABI evidence transcript v1
-# normalized-from-console-sha256: 55db854b695dfb50fbae35a9c8a8e6f8fcb5be84a21086710f026971f9517d31
+# normalized-from-console-sha256: 1fb4cd8835226f5519cf7e8752bf416e6bb6ed851e9318f427c0f57aaa9a8034
 # runner-returncode: 0
 # guest-clean-shutdown: true
 # runner-terminated: false
 KTAP version 1
-1..28
+1..30
 ok 1 - mounts
 ok 2 - rootfs
 ok 3 - tmpfs
@@ -26,12 +26,16 @@ ok 17 - eventfd
 ok 18 - signal-order
 ok 19 - io-uring-directio
 ok 20 - proc-zombie
-ok 21 - signal-fp
-ok 22 - io-uring
-ok 23 - io-uring-buffers
-ok 24 - ioprio
-ok 25 - membarrier
-ok 26 - userfaultfd
-ok 27 - packet
-ok 28 - seccomp
+# native-ni: THEKERNEL_NATIVE_NI_OK
+ok 21 - native-ni
+# creat: THEKERNEL_CREAT_OK
+ok 22 - creat
+ok 23 - signal-fp
+ok 24 - io-uring
+ok 25 - io-uring-buffers
+ok 26 - ioprio
+ok 27 - membarrier
+ok 28 - userfaultfd
+ok 29 - packet
+ok 30 - seccomp
 # THEKERNEL_SYSTEM_TEST_COMPLETE

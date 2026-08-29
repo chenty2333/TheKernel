@@ -76,7 +76,9 @@ RUN sed -i \
  && apt-get -o Acquire::Retries=5 update \
  && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
       bash-completion \
+      bc \
       binutils \
+      bison \
       build-essential \
       bzip2 \
       ca-certificates \
@@ -87,6 +89,7 @@ RUN sed -i \
       e2fsprogs \
       fakeroot \
       file \
+      flex \
       gawk \
       gdb \
       git \
@@ -95,10 +98,12 @@ RUN sed -i \
       iproute2 \
       less \
       libclang-dev \
+      libelf-dev \
       libfdt1 \
       libglib2.0-0 \
       libpixman-1-0 \
       libslirp0 \
+      libssl-dev \
       mtools \
       make \
       ovmf \

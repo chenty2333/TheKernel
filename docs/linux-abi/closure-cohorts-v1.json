@@ -1,0 +1,1604 @@
+{
+  "schema": "thekernel-linux-abi-closure-cohorts-v1",
+  "baseline": {
+    "table": {
+      "path": "docs/linux-abi/linux-v6.12.103-arch-x86-entry-syscalls-syscall_64.tbl",
+      "sha256": "980ce3115028c71c5618e7864d262017bde8103bcfe7b413147a14fd312c92ac"
+    },
+    "matrix": {
+      "path": "docs/linux-abi/syscall-matrix.json",
+      "sha256": "aa18e3afadcadeaf2f2685ffaad16672c580fbd3a3dd33089ee7d6eed3162d20"
+    }
+  },
+  "cohorts": [
+    {
+      "id": "native-ni",
+      "members": [
+        {
+          "nr": 134,
+          "name": "uselib"
+        },
+        {
+          "nr": 156,
+          "name": "_sysctl"
+        },
+        {
+          "nr": 174,
+          "name": "create_module"
+        },
+        {
+          "nr": 177,
+          "name": "get_kernel_syms"
+        },
+        {
+          "nr": 178,
+          "name": "query_module"
+        },
+        {
+          "nr": 180,
+          "name": "nfsservctl"
+        },
+        {
+          "nr": 181,
+          "name": "getpmsg"
+        },
+        {
+          "nr": 182,
+          "name": "putpmsg"
+        },
+        {
+          "nr": 183,
+          "name": "afs_syscall"
+        },
+        {
+          "nr": 184,
+          "name": "tuxcall"
+        },
+        {
+          "nr": 185,
+          "name": "security"
+        },
+        {
+          "nr": 205,
+          "name": "set_thread_area"
+        },
+        {
+          "nr": 211,
+          "name": "get_thread_area"
+        },
+        {
+          "nr": 212,
+          "name": "lookup_dcookie"
+        },
+        {
+          "nr": 214,
+          "name": "epoll_ctl_old"
+        },
+        {
+          "nr": 215,
+          "name": "epoll_wait_old"
+        },
+        {
+          "nr": 236,
+          "name": "vserver"
+        }
+      ]
+    },
+    {
+      "id": "phase3",
+      "members": [
+        {
+          "nr": 16,
+          "name": "ioctl"
+        },
+        {
+          "nr": 101,
+          "name": "ptrace"
+        },
+        {
+          "nr": 103,
+          "name": "syslog"
+        },
+        {
+          "nr": 125,
+          "name": "capget"
+        },
+        {
+          "nr": 126,
+          "name": "capset"
+        },
+        {
+          "nr": 135,
+          "name": "personality"
+        },
+        {
+          "nr": 153,
+          "name": "vhangup"
+        },
+        {
+          "nr": 154,
+          "name": "modify_ldt"
+        },
+        {
+          "nr": 155,
+          "name": "pivot_root"
+        },
+        {
+          "nr": 157,
+          "name": "prctl"
+        },
+        {
+          "nr": 158,
+          "name": "arch_prctl"
+        },
+        {
+          "nr": 159,
+          "name": "adjtimex"
+        },
+        {
+          "nr": 161,
+          "name": "chroot"
+        },
+        {
+          "nr": 163,
+          "name": "acct"
+        },
+        {
+          "nr": 164,
+          "name": "settimeofday"
+        },
+        {
+          "nr": 165,
+          "name": "mount"
+        },
+        {
+          "nr": 166,
+          "name": "umount2"
+        },
+        {
+          "nr": 167,
+          "name": "swapon"
+        },
+        {
+          "nr": 168,
+          "name": "swapoff"
+        },
+        {
+          "nr": 169,
+          "name": "reboot"
+        },
+        {
+          "nr": 170,
+          "name": "sethostname"
+        },
+        {
+          "nr": 171,
+          "name": "setdomainname"
+        },
+        {
+          "nr": 172,
+          "name": "iopl"
+        },
+        {
+          "nr": 173,
+          "name": "ioperm"
+        },
+        {
+          "nr": 175,
+          "name": "init_module"
+        },
+        {
+          "nr": 176,
+          "name": "delete_module"
+        },
+        {
+          "nr": 179,
+          "name": "quotactl"
+        },
+        {
+          "nr": 206,
+          "name": "io_setup"
+        },
+        {
+          "nr": 207,
+          "name": "io_destroy"
+        },
+        {
+          "nr": 208,
+          "name": "io_getevents"
+        },
+        {
+          "nr": 209,
+          "name": "io_submit"
+        },
+        {
+          "nr": 210,
+          "name": "io_cancel"
+        },
+        {
+          "nr": 216,
+          "name": "remap_file_pages"
+        },
+        {
+          "nr": 227,
+          "name": "clock_settime"
+        },
+        {
+          "nr": 237,
+          "name": "mbind"
+        },
+        {
+          "nr": 238,
+          "name": "set_mempolicy"
+        },
+        {
+          "nr": 239,
+          "name": "get_mempolicy"
+        },
+        {
+          "nr": 246,
+          "name": "kexec_load"
+        },
+        {
+          "nr": 248,
+          "name": "add_key"
+        },
+        {
+          "nr": 249,
+          "name": "request_key"
+        },
+        {
+          "nr": 250,
+          "name": "keyctl"
+        },
+        {
+          "nr": 256,
+          "name": "migrate_pages"
+        },
+        {
+          "nr": 272,
+          "name": "unshare"
+        },
+        {
+          "nr": 279,
+          "name": "move_pages"
+        },
+        {
+          "nr": 298,
+          "name": "perf_event_open"
+        },
+        {
+          "nr": 300,
+          "name": "fanotify_init"
+        },
+        {
+          "nr": 301,
+          "name": "fanotify_mark"
+        },
+        {
+          "nr": 303,
+          "name": "name_to_handle_at"
+        },
+        {
+          "nr": 304,
+          "name": "open_by_handle_at"
+        },
+        {
+          "nr": 305,
+          "name": "clock_adjtime"
+        },
+        {
+          "nr": 308,
+          "name": "setns"
+        },
+        {
+          "nr": 312,
+          "name": "kcmp"
+        },
+        {
+          "nr": 313,
+          "name": "finit_module"
+        },
+        {
+          "nr": 317,
+          "name": "seccomp"
+        },
+        {
+          "nr": 320,
+          "name": "kexec_file_load"
+        },
+        {
+          "nr": 321,
+          "name": "bpf"
+        },
+        {
+          "nr": 323,
+          "name": "userfaultfd"
+        },
+        {
+          "nr": 329,
+          "name": "pkey_mprotect"
+        },
+        {
+          "nr": 330,
+          "name": "pkey_alloc"
+        },
+        {
+          "nr": 331,
+          "name": "pkey_free"
+        },
+        {
+          "nr": 333,
+          "name": "io_pgetevents"
+        },
+        {
+          "nr": 335,
+          "name": "uretprobe"
+        },
+        {
+          "nr": 425,
+          "name": "io_uring_setup"
+        },
+        {
+          "nr": 426,
+          "name": "io_uring_enter"
+        },
+        {
+          "nr": 427,
+          "name": "io_uring_register"
+        },
+        {
+          "nr": 428,
+          "name": "open_tree"
+        },
+        {
+          "nr": 429,
+          "name": "move_mount"
+        },
+        {
+          "nr": 430,
+          "name": "fsopen"
+        },
+        {
+          "nr": 431,
+          "name": "fsconfig"
+        },
+        {
+          "nr": 432,
+          "name": "fsmount"
+        },
+        {
+          "nr": 433,
+          "name": "fspick"
+        },
+        {
+          "nr": 440,
+          "name": "process_madvise"
+        },
+        {
+          "nr": 442,
+          "name": "mount_setattr"
+        },
+        {
+          "nr": 443,
+          "name": "quotactl_fd"
+        },
+        {
+          "nr": 444,
+          "name": "landlock_create_ruleset"
+        },
+        {
+          "nr": 445,
+          "name": "landlock_add_rule"
+        },
+        {
+          "nr": 446,
+          "name": "landlock_restrict_self"
+        },
+        {
+          "nr": 447,
+          "name": "memfd_secret"
+        },
+        {
+          "nr": 448,
+          "name": "process_mrelease"
+        },
+        {
+          "nr": 450,
+          "name": "set_mempolicy_home_node"
+        },
+        {
+          "nr": 453,
+          "name": "map_shadow_stack"
+        },
+        {
+          "nr": 457,
+          "name": "statmount"
+        },
+        {
+          "nr": 458,
+          "name": "listmount"
+        },
+        {
+          "nr": 459,
+          "name": "lsm_get_self_attr"
+        },
+        {
+          "nr": 460,
+          "name": "lsm_set_self_attr"
+        },
+        {
+          "nr": 461,
+          "name": "lsm_list_modules"
+        },
+        {
+          "nr": 462,
+          "name": "mseal"
+        }
+      ]
+    },
+    {
+      "id": "phase2",
+      "members": [
+        {
+          "nr": 0,
+          "name": "read"
+        },
+        {
+          "nr": 1,
+          "name": "write"
+        },
+        {
+          "nr": 2,
+          "name": "open"
+        },
+        {
+          "nr": 3,
+          "name": "close"
+        },
+        {
+          "nr": 4,
+          "name": "stat"
+        },
+        {
+          "nr": 5,
+          "name": "fstat"
+        },
+        {
+          "nr": 6,
+          "name": "lstat"
+        },
+        {
+          "nr": 7,
+          "name": "poll"
+        },
+        {
+          "nr": 8,
+          "name": "lseek"
+        },
+        {
+          "nr": 9,
+          "name": "mmap"
+        },
+        {
+          "nr": 10,
+          "name": "mprotect"
+        },
+        {
+          "nr": 11,
+          "name": "munmap"
+        },
+        {
+          "nr": 12,
+          "name": "brk"
+        },
+        {
+          "nr": 13,
+          "name": "rt_sigaction"
+        },
+        {
+          "nr": 14,
+          "name": "rt_sigprocmask"
+        },
+        {
+          "nr": 15,
+          "name": "rt_sigreturn"
+        },
+        {
+          "nr": 17,
+          "name": "pread64"
+        },
+        {
+          "nr": 18,
+          "name": "pwrite64"
+        },
+        {
+          "nr": 19,
+          "name": "readv"
+        },
+        {
+          "nr": 20,
+          "name": "writev"
+        },
+        {
+          "nr": 21,
+          "name": "access"
+        },
+        {
+          "nr": 22,
+          "name": "pipe"
+        },
+        {
+          "nr": 23,
+          "name": "select"
+        },
+        {
+          "nr": 24,
+          "name": "sched_yield"
+        },
+        {
+          "nr": 25,
+          "name": "mremap"
+        },
+        {
+          "nr": 26,
+          "name": "msync"
+        },
+        {
+          "nr": 27,
+          "name": "mincore"
+        },
+        {
+          "nr": 28,
+          "name": "madvise"
+        },
+        {
+          "nr": 29,
+          "name": "shmget"
+        },
+        {
+          "nr": 30,
+          "name": "shmat"
+        },
+        {
+          "nr": 31,
+          "name": "shmctl"
+        },
+        {
+          "nr": 32,
+          "name": "dup"
+        },
+        {
+          "nr": 33,
+          "name": "dup2"
+        },
+        {
+          "nr": 34,
+          "name": "pause"
+        },
+        {
+          "nr": 35,
+          "name": "nanosleep"
+        },
+        {
+          "nr": 36,
+          "name": "getitimer"
+        },
+        {
+          "nr": 37,
+          "name": "alarm"
+        },
+        {
+          "nr": 38,
+          "name": "setitimer"
+        },
+        {
+          "nr": 39,
+          "name": "getpid"
+        },
+        {
+          "nr": 40,
+          "name": "sendfile"
+        },
+        {
+          "nr": 41,
+          "name": "socket"
+        },
+        {
+          "nr": 42,
+          "name": "connect"
+        },
+        {
+          "nr": 43,
+          "name": "accept"
+        },
+        {
+          "nr": 44,
+          "name": "sendto"
+        },
+        {
+          "nr": 45,
+          "name": "recvfrom"
+        },
+        {
+          "nr": 46,
+          "name": "sendmsg"
+        },
+        {
+          "nr": 47,
+          "name": "recvmsg"
+        },
+        {
+          "nr": 48,
+          "name": "shutdown"
+        },
+        {
+          "nr": 49,
+          "name": "bind"
+        },
+        {
+          "nr": 50,
+          "name": "listen"
+        },
+        {
+          "nr": 51,
+          "name": "getsockname"
+        },
+        {
+          "nr": 52,
+          "name": "getpeername"
+        },
+        {
+          "nr": 53,
+          "name": "socketpair"
+        },
+        {
+          "nr": 54,
+          "name": "setsockopt"
+        },
+        {
+          "nr": 55,
+          "name": "getsockopt"
+        },
+        {
+          "nr": 56,
+          "name": "clone"
+        },
+        {
+          "nr": 57,
+          "name": "fork"
+        },
+        {
+          "nr": 58,
+          "name": "vfork"
+        },
+        {
+          "nr": 59,
+          "name": "execve"
+        },
+        {
+          "nr": 60,
+          "name": "exit"
+        },
+        {
+          "nr": 61,
+          "name": "wait4"
+        },
+        {
+          "nr": 62,
+          "name": "kill"
+        },
+        {
+          "nr": 63,
+          "name": "uname"
+        },
+        {
+          "nr": 64,
+          "name": "semget"
+        },
+        {
+          "nr": 65,
+          "name": "semop"
+        },
+        {
+          "nr": 66,
+          "name": "semctl"
+        },
+        {
+          "nr": 67,
+          "name": "shmdt"
+        },
+        {
+          "nr": 68,
+          "name": "msgget"
+        },
+        {
+          "nr": 69,
+          "name": "msgsnd"
+        },
+        {
+          "nr": 70,
+          "name": "msgrcv"
+        },
+        {
+          "nr": 71,
+          "name": "msgctl"
+        },
+        {
+          "nr": 72,
+          "name": "fcntl"
+        },
+        {
+          "nr": 73,
+          "name": "flock"
+        },
+        {
+          "nr": 74,
+          "name": "fsync"
+        },
+        {
+          "nr": 75,
+          "name": "fdatasync"
+        },
+        {
+          "nr": 76,
+          "name": "truncate"
+        },
+        {
+          "nr": 77,
+          "name": "ftruncate"
+        },
+        {
+          "nr": 78,
+          "name": "getdents"
+        },
+        {
+          "nr": 79,
+          "name": "getcwd"
+        },
+        {
+          "nr": 80,
+          "name": "chdir"
+        },
+        {
+          "nr": 81,
+          "name": "fchdir"
+        },
+        {
+          "nr": 82,
+          "name": "rename"
+        },
+        {
+          "nr": 83,
+          "name": "mkdir"
+        },
+        {
+          "nr": 84,
+          "name": "rmdir"
+        },
+        {
+          "nr": 85,
+          "name": "creat"
+        },
+        {
+          "nr": 86,
+          "name": "link"
+        },
+        {
+          "nr": 87,
+          "name": "unlink"
+        },
+        {
+          "nr": 88,
+          "name": "symlink"
+        },
+        {
+          "nr": 89,
+          "name": "readlink"
+        },
+        {
+          "nr": 90,
+          "name": "chmod"
+        },
+        {
+          "nr": 91,
+          "name": "fchmod"
+        },
+        {
+          "nr": 92,
+          "name": "chown"
+        },
+        {
+          "nr": 93,
+          "name": "fchown"
+        },
+        {
+          "nr": 94,
+          "name": "lchown"
+        },
+        {
+          "nr": 95,
+          "name": "umask"
+        },
+        {
+          "nr": 96,
+          "name": "gettimeofday"
+        },
+        {
+          "nr": 97,
+          "name": "getrlimit"
+        },
+        {
+          "nr": 98,
+          "name": "getrusage"
+        },
+        {
+          "nr": 99,
+          "name": "sysinfo"
+        },
+        {
+          "nr": 100,
+          "name": "times"
+        },
+        {
+          "nr": 102,
+          "name": "getuid"
+        },
+        {
+          "nr": 104,
+          "name": "getgid"
+        },
+        {
+          "nr": 105,
+          "name": "setuid"
+        },
+        {
+          "nr": 106,
+          "name": "setgid"
+        },
+        {
+          "nr": 107,
+          "name": "geteuid"
+        },
+        {
+          "nr": 108,
+          "name": "getegid"
+        },
+        {
+          "nr": 109,
+          "name": "setpgid"
+        },
+        {
+          "nr": 110,
+          "name": "getppid"
+        },
+        {
+          "nr": 111,
+          "name": "getpgrp"
+        },
+        {
+          "nr": 112,
+          "name": "setsid"
+        },
+        {
+          "nr": 113,
+          "name": "setreuid"
+        },
+        {
+          "nr": 114,
+          "name": "setregid"
+        },
+        {
+          "nr": 115,
+          "name": "getgroups"
+        },
+        {
+          "nr": 116,
+          "name": "setgroups"
+        },
+        {
+          "nr": 117,
+          "name": "setresuid"
+        },
+        {
+          "nr": 118,
+          "name": "getresuid"
+        },
+        {
+          "nr": 119,
+          "name": "setresgid"
+        },
+        {
+          "nr": 120,
+          "name": "getresgid"
+        },
+        {
+          "nr": 121,
+          "name": "getpgid"
+        },
+        {
+          "nr": 122,
+          "name": "setfsuid"
+        },
+        {
+          "nr": 123,
+          "name": "setfsgid"
+        },
+        {
+          "nr": 124,
+          "name": "getsid"
+        },
+        {
+          "nr": 127,
+          "name": "rt_sigpending"
+        },
+        {
+          "nr": 128,
+          "name": "rt_sigtimedwait"
+        },
+        {
+          "nr": 129,
+          "name": "rt_sigqueueinfo"
+        },
+        {
+          "nr": 130,
+          "name": "rt_sigsuspend"
+        },
+        {
+          "nr": 131,
+          "name": "sigaltstack"
+        },
+        {
+          "nr": 132,
+          "name": "utime"
+        },
+        {
+          "nr": 133,
+          "name": "mknod"
+        },
+        {
+          "nr": 136,
+          "name": "ustat"
+        },
+        {
+          "nr": 137,
+          "name": "statfs"
+        },
+        {
+          "nr": 138,
+          "name": "fstatfs"
+        },
+        {
+          "nr": 139,
+          "name": "sysfs"
+        },
+        {
+          "nr": 140,
+          "name": "getpriority"
+        },
+        {
+          "nr": 141,
+          "name": "setpriority"
+        },
+        {
+          "nr": 142,
+          "name": "sched_setparam"
+        },
+        {
+          "nr": 143,
+          "name": "sched_getparam"
+        },
+        {
+          "nr": 144,
+          "name": "sched_setscheduler"
+        },
+        {
+          "nr": 145,
+          "name": "sched_getscheduler"
+        },
+        {
+          "nr": 146,
+          "name": "sched_get_priority_max"
+        },
+        {
+          "nr": 147,
+          "name": "sched_get_priority_min"
+        },
+        {
+          "nr": 148,
+          "name": "sched_rr_get_interval"
+        },
+        {
+          "nr": 149,
+          "name": "mlock"
+        },
+        {
+          "nr": 150,
+          "name": "munlock"
+        },
+        {
+          "nr": 151,
+          "name": "mlockall"
+        },
+        {
+          "nr": 152,
+          "name": "munlockall"
+        },
+        {
+          "nr": 160,
+          "name": "setrlimit"
+        },
+        {
+          "nr": 162,
+          "name": "sync"
+        },
+        {
+          "nr": 186,
+          "name": "gettid"
+        },
+        {
+          "nr": 187,
+          "name": "readahead"
+        },
+        {
+          "nr": 188,
+          "name": "setxattr"
+        },
+        {
+          "nr": 189,
+          "name": "lsetxattr"
+        },
+        {
+          "nr": 190,
+          "name": "fsetxattr"
+        },
+        {
+          "nr": 191,
+          "name": "getxattr"
+        },
+        {
+          "nr": 192,
+          "name": "lgetxattr"
+        },
+        {
+          "nr": 193,
+          "name": "fgetxattr"
+        },
+        {
+          "nr": 194,
+          "name": "listxattr"
+        },
+        {
+          "nr": 195,
+          "name": "llistxattr"
+        },
+        {
+          "nr": 196,
+          "name": "flistxattr"
+        },
+        {
+          "nr": 197,
+          "name": "removexattr"
+        },
+        {
+          "nr": 198,
+          "name": "lremovexattr"
+        },
+        {
+          "nr": 199,
+          "name": "fremovexattr"
+        },
+        {
+          "nr": 200,
+          "name": "tkill"
+        },
+        {
+          "nr": 201,
+          "name": "time"
+        },
+        {
+          "nr": 202,
+          "name": "futex"
+        },
+        {
+          "nr": 203,
+          "name": "sched_setaffinity"
+        },
+        {
+          "nr": 204,
+          "name": "sched_getaffinity"
+        },
+        {
+          "nr": 213,
+          "name": "epoll_create"
+        },
+        {
+          "nr": 217,
+          "name": "getdents64"
+        },
+        {
+          "nr": 218,
+          "name": "set_tid_address"
+        },
+        {
+          "nr": 219,
+          "name": "restart_syscall"
+        },
+        {
+          "nr": 220,
+          "name": "semtimedop"
+        },
+        {
+          "nr": 221,
+          "name": "fadvise64"
+        },
+        {
+          "nr": 222,
+          "name": "timer_create"
+        },
+        {
+          "nr": 223,
+          "name": "timer_settime"
+        },
+        {
+          "nr": 224,
+          "name": "timer_gettime"
+        },
+        {
+          "nr": 225,
+          "name": "timer_getoverrun"
+        },
+        {
+          "nr": 226,
+          "name": "timer_delete"
+        },
+        {
+          "nr": 228,
+          "name": "clock_gettime"
+        },
+        {
+          "nr": 229,
+          "name": "clock_getres"
+        },
+        {
+          "nr": 230,
+          "name": "clock_nanosleep"
+        },
+        {
+          "nr": 231,
+          "name": "exit_group"
+        },
+        {
+          "nr": 232,
+          "name": "epoll_wait"
+        },
+        {
+          "nr": 233,
+          "name": "epoll_ctl"
+        },
+        {
+          "nr": 234,
+          "name": "tgkill"
+        },
+        {
+          "nr": 235,
+          "name": "utimes"
+        },
+        {
+          "nr": 240,
+          "name": "mq_open"
+        },
+        {
+          "nr": 241,
+          "name": "mq_unlink"
+        },
+        {
+          "nr": 242,
+          "name": "mq_timedsend"
+        },
+        {
+          "nr": 243,
+          "name": "mq_timedreceive"
+        },
+        {
+          "nr": 244,
+          "name": "mq_notify"
+        },
+        {
+          "nr": 245,
+          "name": "mq_getsetattr"
+        },
+        {
+          "nr": 247,
+          "name": "waitid"
+        },
+        {
+          "nr": 251,
+          "name": "ioprio_set"
+        },
+        {
+          "nr": 252,
+          "name": "ioprio_get"
+        },
+        {
+          "nr": 253,
+          "name": "inotify_init"
+        },
+        {
+          "nr": 254,
+          "name": "inotify_add_watch"
+        },
+        {
+          "nr": 255,
+          "name": "inotify_rm_watch"
+        },
+        {
+          "nr": 257,
+          "name": "openat"
+        },
+        {
+          "nr": 258,
+          "name": "mkdirat"
+        },
+        {
+          "nr": 259,
+          "name": "mknodat"
+        },
+        {
+          "nr": 260,
+          "name": "fchownat"
+        },
+        {
+          "nr": 261,
+          "name": "futimesat"
+        },
+        {
+          "nr": 262,
+          "name": "newfstatat"
+        },
+        {
+          "nr": 263,
+          "name": "unlinkat"
+        },
+        {
+          "nr": 264,
+          "name": "renameat"
+        },
+        {
+          "nr": 265,
+          "name": "linkat"
+        },
+        {
+          "nr": 266,
+          "name": "symlinkat"
+        },
+        {
+          "nr": 267,
+          "name": "readlinkat"
+        },
+        {
+          "nr": 268,
+          "name": "fchmodat"
+        },
+        {
+          "nr": 269,
+          "name": "faccessat"
+        },
+        {
+          "nr": 270,
+          "name": "pselect6"
+        },
+        {
+          "nr": 271,
+          "name": "ppoll"
+        },
+        {
+          "nr": 273,
+          "name": "set_robust_list"
+        },
+        {
+          "nr": 274,
+          "name": "get_robust_list"
+        },
+        {
+          "nr": 275,
+          "name": "splice"
+        },
+        {
+          "nr": 276,
+          "name": "tee"
+        },
+        {
+          "nr": 277,
+          "name": "sync_file_range"
+        },
+        {
+          "nr": 278,
+          "name": "vmsplice"
+        },
+        {
+          "nr": 280,
+          "name": "utimensat"
+        },
+        {
+          "nr": 281,
+          "name": "epoll_pwait"
+        },
+        {
+          "nr": 282,
+          "name": "signalfd"
+        },
+        {
+          "nr": 283,
+          "name": "timerfd_create"
+        },
+        {
+          "nr": 284,
+          "name": "eventfd"
+        },
+        {
+          "nr": 285,
+          "name": "fallocate"
+        },
+        {
+          "nr": 286,
+          "name": "timerfd_settime"
+        },
+        {
+          "nr": 287,
+          "name": "timerfd_gettime"
+        },
+        {
+          "nr": 288,
+          "name": "accept4"
+        },
+        {
+          "nr": 289,
+          "name": "signalfd4"
+        },
+        {
+          "nr": 290,
+          "name": "eventfd2"
+        },
+        {
+          "nr": 291,
+          "name": "epoll_create1"
+        },
+        {
+          "nr": 292,
+          "name": "dup3"
+        },
+        {
+          "nr": 293,
+          "name": "pipe2"
+        },
+        {
+          "nr": 294,
+          "name": "inotify_init1"
+        },
+        {
+          "nr": 295,
+          "name": "preadv"
+        },
+        {
+          "nr": 296,
+          "name": "pwritev"
+        },
+        {
+          "nr": 297,
+          "name": "rt_tgsigqueueinfo"
+        },
+        {
+          "nr": 299,
+          "name": "recvmmsg"
+        },
+        {
+          "nr": 302,
+          "name": "prlimit64"
+        },
+        {
+          "nr": 306,
+          "name": "syncfs"
+        },
+        {
+          "nr": 307,
+          "name": "sendmmsg"
+        },
+        {
+          "nr": 309,
+          "name": "getcpu"
+        },
+        {
+          "nr": 310,
+          "name": "process_vm_readv"
+        },
+        {
+          "nr": 311,
+          "name": "process_vm_writev"
+        },
+        {
+          "nr": 314,
+          "name": "sched_setattr"
+        },
+        {
+          "nr": 315,
+          "name": "sched_getattr"
+        },
+        {
+          "nr": 316,
+          "name": "renameat2"
+        },
+        {
+          "nr": 318,
+          "name": "getrandom"
+        },
+        {
+          "nr": 319,
+          "name": "memfd_create"
+        },
+        {
+          "nr": 322,
+          "name": "execveat"
+        },
+        {
+          "nr": 324,
+          "name": "membarrier"
+        },
+        {
+          "nr": 325,
+          "name": "mlock2"
+        },
+        {
+          "nr": 326,
+          "name": "copy_file_range"
+        },
+        {
+          "nr": 327,
+          "name": "preadv2"
+        },
+        {
+          "nr": 328,
+          "name": "pwritev2"
+        },
+        {
+          "nr": 332,
+          "name": "statx"
+        },
+        {
+          "nr": 334,
+          "name": "rseq"
+        },
+        {
+          "nr": 424,
+          "name": "pidfd_send_signal"
+        },
+        {
+          "nr": 434,
+          "name": "pidfd_open"
+        },
+        {
+          "nr": 435,
+          "name": "clone3"
+        },
+        {
+          "nr": 436,
+          "name": "close_range"
+        },
+        {
+          "nr": 437,
+          "name": "openat2"
+        },
+        {
+          "nr": 438,
+          "name": "pidfd_getfd"
+        },
+        {
+          "nr": 439,
+          "name": "faccessat2"
+        },
+        {
+          "nr": 441,
+          "name": "epoll_pwait2"
+        },
+        {
+          "nr": 449,
+          "name": "futex_waitv"
+        },
+        {
+          "nr": 451,
+          "name": "cachestat"
+        },
+        {
+          "nr": 452,
+          "name": "fchmodat2"
+        },
+        {
+          "nr": 454,
+          "name": "futex_wake"
+        },
+        {
+          "nr": 455,
+          "name": "futex_wait"
+        },
+        {
+          "nr": 456,
+          "name": "futex_requeue"
+        }
+      ]
+    }
+  ],
+  "alias_groups": [
+    {
+      "members": [
+        {
+          "nr": 284,
+          "name": "eventfd"
+        },
+        {
+          "nr": 290,
+          "name": "eventfd2"
+        }
+      ]
+    },
+    {
+      "members": [
+        {
+          "nr": 282,
+          "name": "signalfd"
+        },
+        {
+          "nr": 289,
+          "name": "signalfd4"
+        }
+      ]
+    },
+    {
+      "members": [
+        {
+          "nr": 253,
+          "name": "inotify_init"
+        },
+        {
+          "nr": 294,
+          "name": "inotify_init1"
+        }
+      ]
+    },
+    {
+      "members": [
+        {
+          "nr": 213,
+          "name": "epoll_create"
+        },
+        {
+          "nr": 291,
+          "name": "epoll_create1"
+        }
+      ]
+    },
+    {
+      "members": [
+        {
+          "nr": 43,
+          "name": "accept"
+        },
+        {
+          "nr": 288,
+          "name": "accept4"
+        }
+      ]
+    },
+    {
+      "members": [
+        {
+          "nr": 22,
+          "name": "pipe"
+        },
+        {
+          "nr": 293,
+          "name": "pipe2"
+        }
+      ]
+    }
+  ]
+}

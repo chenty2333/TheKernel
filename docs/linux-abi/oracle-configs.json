@@ -1,0 +1,75 @@
+{
+  "schema": "thekernel-linux-oracle-configs-v1",
+  "linux": {
+    "version": "v6.12.103",
+    "commit": "25c09b42358e73e1476e517b296edb6344f2e4bd",
+    "architecture": "x86_64",
+    "source": {
+      "tarball_path": ".state/linux-6.12.103/linux-6.12.103.tar.xz",
+      "tarball_sha256": "f143aaade8877ba5616e788b4482576db28481bcf557ef537f4fcc3938fc3176"
+    },
+    "build_identity": {
+      "user": "thekernel",
+      "host": "q35-linux-oracle",
+      "timestamp": "2026-08-10T00:00:00Z",
+      "version": 1
+    }
+  },
+  "oracles": [
+    {
+      "id": "q35-product",
+      "machine": "q35",
+      "configuration": {
+        "identity_assertions": "config/linux-6.12.103/q35-product-identity.config",
+        "seed": "config/linux-6.12.103/q35-product-defconfig",
+        "seed_sha256": "743c2f02999a3683777f5b1df67fd099e3e59d99ff725e4266525f970c3f9ab4",
+        "materialized_path": ".state/linux-6.12.103/build/.config",
+        "final_config_sha256": "1d1e509ec721e649ff2f1fbc3312dcee17047c1ecfce82d2cded58cac38a1214"
+      },
+      "artifact": {
+        "path": ".state/linux-6.12.103/build/arch/x86/boot/bzImage",
+        "sha256": "6cf11d54cee825b1c17ae5b6b2a00252878e5f381a14e8897c55fd0d36de66f9"
+      }
+    },
+    {
+      "id": "q35-feature-witness",
+      "machine": "q35",
+      "configuration": {
+        "fragment": "config/linux-6.12.103/q35-feature-witness.config",
+        "materialized_path": ".state/linux-6.12.103/feature-witness/build-materialized/.config",
+        "final_config_sha256": "5128e9343d5e3c307d0f66b765386fde5a52dbb9fe83c991769723f7008534a5"
+      },
+      "feature_witness": {
+        "explicitly_enabled": {
+          "CONFIG_MODULES": "y",
+          "CONFIG_MODULE_UNLOAD": "y",
+          "CONFIG_KEXEC_FILE": "y",
+          "CONFIG_BPF_SYSCALL": "y",
+          "CONFIG_USER_NS": "y",
+          "CONFIG_SECURITY_LANDLOCK": "y",
+          "CONFIG_USERFAULTFD": "y"
+        },
+        "current_already_on": [
+          "CONFIG_KEXEC",
+          "CONFIG_PERF_EVENTS",
+          "CONFIG_KEYS",
+          "CONFIG_SWAP",
+          "CONFIG_QUOTA",
+          "CONFIG_PID_NS",
+          "CONFIG_NET_NS",
+          "CONFIG_UTS_NS",
+          "CONFIG_IPC_NS",
+          "CONFIG_TIME_NS",
+          "CONFIG_IO_URING",
+          "CONFIG_SECCOMP",
+          "CONFIG_SECURITY",
+          "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS"
+        ]
+      },
+      "artifact": {
+        "path": ".state/linux-6.12.103/feature-witness/build-materialized/arch/x86/boot/bzImage",
+        "sha256": "90a827a48c3c6047315ad95c1fb18618a40262b9ff634fbf0dd1400418ef3caa"
+      }
+    }
+  ]
+}
