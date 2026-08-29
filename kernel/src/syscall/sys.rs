@@ -127,10 +127,11 @@ fn getgroups_to_user<M: UserMemory + ?Sized>(
     Ok(groups.len() as isize)
 }
 
-/// Copy the three visible UIDs in the same order as Linux's `getresuid`.
+/// Copy three visible IDs in the same order as Linux's `getresuid` and
+/// `getresgid`.
 /// Each destination is faulted only when reached, so an earlier successful
 /// write remains visible if a later destination faults.
-fn resuid_to_user<M: UserMemory + ?Sized>(
+fn resids_to_user<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ruid: *mut u32,
     euid: *mut u32,
@@ -196,7 +197,7 @@ pub fn sys_getresuid<M: UserMemory + ?Sized>(
         namespace.from_kuid_munged(ids.euid),
         namespace.from_kuid_munged(ids.suid),
     ];
-    resuid_to_user(memory, ruid, euid, suid, values)?;
+    resids_to_user(memory, ruid, euid, suid, values)?;
     Ok(0)
 }
 
@@ -220,18 +221,12 @@ pub fn sys_getresgid<M: UserMemory + ?Sized>(
     let cred = curr.as_thread().current_cred();
     let ids = cred.ids();
     let namespace = cred.user_ns();
-    if !rgid.is_null() {
-        VmMutPtr::vm_write(rgid, memory, namespace.from_kgid_munged(ids.rgid))
-            .map_err(map_usercopy_error)?;
-    }
-    if !egid.is_null() {
-        VmMutPtr::vm_write(egid, memory, namespace.from_kgid_munged(ids.egid))
-            .map_err(map_usercopy_error)?;
-    }
-    if !sgid.is_null() {
-        VmMutPtr::vm_write(sgid, memory, namespace.from_kgid_munged(ids.sgid))
-            .map_err(map_usercopy_error)?;
-    }
+    let values = [
+        namespace.from_kgid_munged(ids.rgid),
+        namespace.from_kgid_munged(ids.egid),
+        namespace.from_kgid_munged(ids.sgid),
+    ];
+    resids_to_user(memory, rgid, egid, sgid, values)?;
     Ok(0)
 }
 
@@ -888,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn getresuid_address_zero_faults_without_later_writes() {
+    fn getresids_address_zero_faults_without_later_writes() {
         let mut provider = GroupMemory {
             bytes: vec![0; 16],
             reads: Vec::new(),
@@ -900,7 +895,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
 
         assert_eq!(
-            resuid_to_user(
+            resids_to_user(
                 &mut memory,
                 core::ptr::null_mut(),
                 4 as *mut u32,
@@ -913,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn getresuid_keeps_ruid_prefix_on_euid_fault() {
+    fn getresids_keeps_first_id_prefix_on_second_fault() {
         let mut provider = GroupMemory {
             bytes: vec![0; 16],
             reads: Vec::new(),
@@ -925,7 +920,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
 
         assert_eq!(
-            resuid_to_user(
+            resids_to_user(
                 &mut memory,
                 4 as *mut u32,
                 8 as *mut u32,
@@ -940,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn getresuid_maps_nomemory_and_writes_values_in_order() {
+    fn getresids_maps_nomemory_and_writes_values_in_order() {
         let mut failing_provider = GroupMemory {
             bytes: vec![0; 16],
             reads: Vec::new(),
@@ -951,7 +946,7 @@ mod tests {
         };
         let mut failing_memory = UserMemoryContext::new(&mut failing_provider);
         assert_eq!(
-            resuid_to_user(
+            resids_to_user(
                 &mut failing_memory,
                 4 as *mut u32,
                 8 as *mut u32,
@@ -972,7 +967,7 @@ mod tests {
         };
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            resuid_to_user(
+            resids_to_user(
                 &mut memory,
                 4 as *mut u32,
                 8 as *mut u32,
