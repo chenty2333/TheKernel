@@ -7,6 +7,7 @@ mod creds;
 mod exec_cred;
 mod futex;
 mod jobctl;
+mod loadavg;
 mod ops;
 mod process;
 mod resources;
@@ -51,6 +52,7 @@ pub(crate) use self::{
         ContinueResult, PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession,
         StopReport,
     },
+    loadavg::{load_average_sample_now, load_average_sysinfo},
     process::{
         CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageCommit,
         InitialProcessThreadAdmission, MempolicySnapshot, NetworkNamespace,

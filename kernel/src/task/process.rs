@@ -301,6 +301,10 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     }
 
     let snapshot = snapshot.ok_or(AxError::BadState)?;
+    // The final thread remains visible as a zombie until this successful
+    // wait/reap edge; release it here rather than when scheduler references
+    // happen to disappear.
+    super::ops::account_released_thread();
     retire_group_leader_signal_owner(&snapshot.reap_owner);
     Ok(true)
 }

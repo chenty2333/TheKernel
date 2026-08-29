@@ -707,7 +707,7 @@ pub fn sys_mmap(
                 Some(PreparedFileMmapBackend::SharedAnonymous { may_protect }) => {
                     Backend::new_shared_with_may_protect(
                         start,
-                        Arc::new(SharedPages::new(length, PageSize::Size4K)?),
+                        Arc::new(SharedPages::new_shmem(length, PageSize::Size4K)?),
                         may_protect,
                     )
                 }
@@ -729,7 +729,7 @@ pub fn sys_mmap(
                     max_size,
                 }) => Backend::new_linear(start, physical_start, max_size),
                 None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
-                    Backend::new_shared(start, Arc::new(SharedPages::new(length, page_size)?))
+                    Backend::new_shared(start, Arc::new(SharedPages::new_shmem(length, page_size)?))
                 }
                 None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
                 None => return Err(AxError::InvalidInput),

@@ -2311,21 +2311,32 @@ pub struct PageCache {
     prefetched: bool,
     pins: u32,
     writeback: u32,
+    shmem: bool,
+}
+
+static IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn in_memory_page_cache_pages() -> usize {
+    IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire)
 }
 
 impl PageCache {
-    fn new() -> VfsResult<Self> {
+    fn new(shmem: bool) -> VfsResult<Self> {
         let addr = global_allocator()
             .alloc_pages(1, PAGE_SIZE, UsageKind::PageCache)
             .inspect_err(|err| {
                 warn!("Failed to allocate page cache: {:?}", err);
             })?;
+        if shmem {
+            IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_add(1, Ordering::Release);
+        }
         Ok(Self {
             addr: addr.into(),
             dirty: false,
             prefetched: false,
             pins: 0,
             writeback: 0,
+            shmem,
         })
     }
 
@@ -2418,6 +2429,9 @@ impl Drop for PageCache {
             warn!("dirty page dropped without flushing");
         }
         global_allocator().dealloc_pages(self.addr.as_usize(), 1, UsageKind::PageCache);
+        if self.shmem {
+            let _ = IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
     }
 }
 
@@ -4733,7 +4747,7 @@ impl CachedFile {
         // Load the replacement before touching the resident cache. Once an
         // owner defers PTE detachment, no fallible work remains between removal
         // of the old page and returning its ownership to the caller.
-        let mut replacement = PageCache::new()?;
+        let mut replacement = PageCache::new(self.shared.in_memory)?;
         replacement.data().fill(0);
         let offset = u64::from(pn) * PAGE_SIZE as u64;
         file.read_at(replacement.data(), offset)?;
@@ -4810,7 +4824,7 @@ impl CachedFile {
         }
 
         if !load_from_file {
-            let mut page = PageCache::new()?;
+            let mut page = PageCache::new(self.shared.in_memory)?;
             page.data().fill(0);
             cache.put(pn, page);
             record_cached_file_counter(&WRITE_NO_READ_INSERT_PAGES, 1);
@@ -4842,7 +4856,7 @@ impl CachedFile {
             let mut buf = vec![0u8; ra * PAGE_SIZE];
             let read = file.read_at(&mut buf, base)?;
 
-            let mut page = PageCache::new()?;
+            let mut page = PageCache::new(self.shared.in_memory)?;
             let data = page.data();
             data.fill(0);
             let n0 = read.min(PAGE_SIZE);
@@ -4877,7 +4891,7 @@ impl CachedFile {
                         }
                     }
                 }
-                let mut np = PageCache::new()?;
+                let mut np = PageCache::new(self.shared.in_memory)?;
                 let nd = np.data();
                 nd.fill(0);
                 let chunk_end = (off + PAGE_SIZE).min(read);
@@ -4896,7 +4910,7 @@ impl CachedFile {
 
         let mut pages = Vec::with_capacity(ra);
         for _ in 0..ra {
-            let mut page = PageCache::new()?;
+            let mut page = PageCache::new(self.shared.in_memory)?;
             page.data().fill(0);
             pages.push(page);
         }
@@ -7354,7 +7368,7 @@ mod tests {
             },
             false,
         ));
-        let mut page = PageCache::new().unwrap();
+        let mut page = PageCache::new(false).unwrap();
         page.data().fill(0x5a);
         assert!(shared.page_cache.lock().put(0, page).is_none());
         shared.unlinked.store(true, Ordering::Release);

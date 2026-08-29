@@ -19,6 +19,13 @@ pub(crate) fn task_state(task: &AxTaskRef) -> char {
         return 'T';
     }
 
+    // A pending signal never wakes a Linux TASK_UNINTERRUPTIBLE waiter.  Test
+    // this authoritative blocked+D pairing before the generic interrupt bit;
+    // the readiness raw-wake edge clears D before publishing Ready.
+    if state == TaskState::Blocked && thread.proc_state_hint() == ProcStateHint::Uninterruptible {
+        return 'D';
+    }
+
     // Signal interruption makes an interruptible sleeper runnable before the
     // handler executes, so procfs must not keep reporting it as sleeping.
     if task.is_interrupted() {

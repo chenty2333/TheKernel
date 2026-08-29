@@ -1798,7 +1798,10 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
         let backend = Backend::try_new_shared(start_addr, pages.clone())?;
         (pages, backend, false)
     } else {
-        let pages = Arc::try_new(SharedPages::new(length, PageSize::Size4K)?)
+        let pages = Arc::try_new(SharedPages::new_sysv_charged(
+            length,
+            PageSize::Size4K,
+        )?)
             .map_err(|_| AxError::NoMemory)?;
         let backend = Backend::try_new_shared(start_addr, pages.clone())?;
         (pages, backend, true)

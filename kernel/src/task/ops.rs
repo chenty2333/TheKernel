@@ -8,7 +8,7 @@ extern crate std;
 use core::cell::Cell;
 use core::{
     ffi::c_long,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
@@ -188,6 +188,7 @@ impl<W: RegistryWeak> WeakRegistry<W> {
 
 static TASK_TABLE: Lazy<RegistryMutex<WeakRegistry<WeakAxTaskRef>>> =
     Lazy::new(|| RegistryMutex::new(WeakRegistry::new()));
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static TASK_ALIAS_TABLE: Lazy<RegistryMutex<WeakRegistry<WeakAxTaskRef>>> =
     Lazy::new(|| RegistryMutex::new(WeakRegistry::new()));
 
@@ -558,6 +559,7 @@ impl TaskTableAdmission {
             .flatten();
         let result = publish();
         self.committed = true;
+        account_published_thread();
 
         drop(process_table);
         drop(alias_table);
@@ -755,6 +757,19 @@ fn try_registry_values<W: RegistryWeak>(
 /// Fallibly snapshots all task references.
 pub fn try_tasks() -> AxResult<Vec<AxTaskRef>> {
     try_registry_values(&TASK_TABLE)
+}
+
+/// Returns the current number of live thread objects without allocating a
+/// snapshot.  Linux's `sysinfo.procs` is `nr_threads`, not process groups.
+pub fn live_thread_count() -> usize {
+    LIVE_THREADS.load(Ordering::Acquire)
+}
+
+pub(crate) fn account_published_thread() {
+    LIVE_THREADS.fetch_add(1, Ordering::Release);
+}
+pub(crate) fn account_released_thread() {
+    let _ = LIVE_THREADS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
 }
 
 /// Fallibly snapshots all live process runtime objects.
@@ -1435,6 +1450,7 @@ fn deliver_exact_parent_death(child: Arc<TaskParentNode>, raw_signo: u32) {
 pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let curr = current();
     let thr = curr.as_thread();
+    thr.set_proc_state_hint(ProcStateHint::None);
     let tid = linux_pid_from_task_id(curr.id().as_u64())?;
     let visible_tid = thr.tid();
 
@@ -1483,7 +1499,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         Ok(ThreadExitTransition::NotFound) => {
             fail_closed_exit(AxError::BadState);
         }
-        Ok(ThreadExitTransition::LiveThreadsRemain) => None,
+        Ok(ThreadExitTransition::LiveThreadsRemain) => {
+            // Non-leader threads have no waitable zombie.  The core task-list
+            // unlink is their release edge, regardless of scheduler Arc GC.
+            account_released_thread();
+            None
+        }
         Ok(ThreadExitTransition::FinalThread(exit)) => Some(exit),
         Err(error) => {
             error!(

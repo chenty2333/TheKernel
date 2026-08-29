@@ -21,6 +21,13 @@ use crate::{
 };
 
 static FIXED_SHARED_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+// Resident anonymous/SysV shared pages. File-backed mappings deliberately do
+// not use this path: their cache pages are not anonymous shmem pages.
+static SHMEM_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn shmem_resident_pages() -> usize {
+    SHMEM_RESIDENT_PAGES.load(Ordering::Acquire)
+}
 
 pub struct SharedPages {
     phys_pages: Mutex<Vec<PhysAddr>>,
@@ -32,6 +39,7 @@ pub struct SharedPages {
     published_len: AtomicUsize,
     pub size: PageSize,
     fixed: bool,
+    resident_charge: Option<&'static AtomicUsize>,
 }
 impl SharedPages {
     pub fn new(size: usize, page_size: PageSize) -> AxResult<Self> {
@@ -44,7 +52,32 @@ impl SharedPages {
         Self::new_with_growth(size, page_size, false)
     }
 
+    /// Allocates SysV shared pages and charges only frames that were actually
+    /// obtained.  The charge lives with the backing Arc through its final drop.
+    pub fn new_sysv_charged(
+        size: usize,
+        page_size: PageSize,
+    ) -> AxResult<Self> {
+        // SysV segments have a fixed shm_segsz; unlike anonymous shared
+        // mappings they cannot grow through a later range extension.
+        Self::new_with_growth_charged(size, page_size, false, Some(&SHMEM_RESIDENT_PAGES))
+    }
+
+    /// Constructs a growable anonymous MAP_SHARED backing accounted as shmem.
+    pub fn new_shmem(size: usize, page_size: PageSize) -> AxResult<Self> {
+        Self::new_with_growth_charged(size, page_size, true, Some(&SHMEM_RESIDENT_PAGES))
+    }
+
     fn new_with_growth(size: usize, page_size: PageSize, growable: bool) -> AxResult<Self> {
+        Self::new_with_growth_charged(size, page_size, growable, None)
+    }
+
+    fn new_with_growth_charged(
+        size: usize,
+        page_size: PageSize,
+        growable: bool,
+        resident_charge: Option<&'static AtomicUsize>,
+    ) -> AxResult<Self> {
         if !page_size.is_aligned(size) {
             return Err(AxError::InvalidInput);
         }
@@ -64,11 +97,15 @@ impl SharedPages {
                 }
             }
         }
+        if let Some(charge) = resident_charge {
+            charge.fetch_add(num_pages, Ordering::Release);
+        }
         Ok(Self {
             phys_pages: Mutex::new(phys_pages),
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
+            resident_charge,
         })
     }
 
@@ -131,6 +168,9 @@ impl SharedPages {
         }
         let unused = new_pages.split_off(needed);
         pages.extend(new_pages);
+        if let Some(charge) = self.resident_charge {
+            charge.fetch_add(needed, Ordering::Release);
+        }
         let published_len = pages.len();
         drop(pages);
         self.published_len.store(published_len, Ordering::Release);
@@ -307,6 +347,10 @@ impl Drop for SharedPages {
     fn drop(&mut self) {
         for frame in self.phys_pages.lock().iter() {
             dealloc_frame(*frame, self.size);
+        }
+        if let Some(charge) = self.resident_charge {
+            let pages = self.published_len.load(Ordering::Relaxed);
+            let _ = charge.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(pages));
         }
     }
 }

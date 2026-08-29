@@ -1218,12 +1218,21 @@ impl Thread {
 
     /// Replaces the current procfs state hint and returns the previous value.
     pub(crate) fn swap_proc_state_hint(&self, hint: ProcStateHint) -> ProcStateHint {
-        ProcStateHint::from(self.proc_state_hint.swap(hint as u8, Ordering::AcqRel))
+        let previous = ProcStateHint::from(self.proc_state_hint.swap(hint as u8, Ordering::AcqRel));
+        super::loadavg::account_uninterruptible_transition(
+            previous == ProcStateHint::Uninterruptible,
+            hint == ProcStateHint::Uninterruptible,
+        );
+        previous
     }
 
     /// Restores the procfs state hint.
     pub(crate) fn set_proc_state_hint(&self, hint: ProcStateHint) {
-        self.proc_state_hint.store(hint as u8, Ordering::Release);
+        let previous = ProcStateHint::from(self.proc_state_hint.swap(hint as u8, Ordering::AcqRel));
+        super::loadavg::account_uninterruptible_transition(
+            previous == ProcStateHint::Uninterruptible,
+            hint == ProcStateHint::Uninterruptible,
+        );
     }
 
     fn pause_cpu_accounting_for_switch(&self) {
@@ -1333,7 +1342,16 @@ impl TaskExt for Box<Thread> {
         self.release_active_scope_read();
     }
 
+    fn on_ready_wake(&self, _task: &TaskInner) {
+        // A readiness waker is about to publish Blocked -> Ready.  Clear the
+        // D-state at that same wake edge, before the scheduler exposes R.
+        if self.proc_state_hint() == ProcStateHint::Uninterruptible {
+            self.set_proc_state_hint(ProcStateHint::None);
+        }
+    }
+
     fn on_timer_tick(&self, _task: &TaskInner) -> bool {
+        super::load_average_sample_now();
         self.poll_cpu_accounting_for_tick()
     }
 }

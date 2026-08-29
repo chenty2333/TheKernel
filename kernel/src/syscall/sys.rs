@@ -19,7 +19,11 @@ use thekernel_linux_usercopy::{
 use super::sync::restart_futex_wait;
 use crate::{
     mm::{map_usercopy_error, system_memory_stats},
-    task::{AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, ns_capable, try_processes},
+    mm::shmem_resident_pages,
+    task::{
+        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, live_thread_count, load_average_sample_now,
+        load_average_sysinfo, ns_capable,
+    },
 };
 
 // These generated UAPI structs do not carry bytemuck's object-representation
@@ -538,9 +542,15 @@ pub fn sys_sysinfo<M: UserMemory + ?Sized>(
         .as_secs()
         .saturating_add(u64::from(uptime.subsec_nanos() != 0));
     kinfo.uptime = uptime_secs.min(i64::MAX as u64) as _;
-    kinfo.procs = try_processes()?.len() as _;
+    load_average_sample_now();
+    kinfo.loads = load_average_sysinfo().map(|load| load as _);
+    // Linux assigns `nr_threads` directly to the u16 ABI member.
+    kinfo.procs = live_thread_count() as _;
     kinfo.totalram = stats.total_bytes as _;
     kinfo.freeram = stats.free_bytes as _;
+    kinfo.sharedram = shmem_resident_pages()
+        .saturating_add(axfs::in_memory_page_cache_pages())
+        .saturating_mul(memory_addr::PAGE_SIZE_4K) as _;
     // axfs uses a page cache, not Linux's separate block-buffer cache.
     kinfo.bufferram = 0;
     kinfo.mem_unit = 1;

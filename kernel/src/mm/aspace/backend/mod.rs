@@ -21,7 +21,7 @@ mod linear;
 mod phys_pin;
 mod shared;
 
-pub use self::shared::{SharedAtomicU32, SharedPages};
+pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
 pub(crate) use self::{
     cow::PreparedCowPage,
     file::WritableMappingAdmission,

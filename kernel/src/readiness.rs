@@ -8,6 +8,7 @@ use axpoll::{
     IoEvents, NestedRegistrationError, PollRegistration, PollRegistrationError, PollSet, Pollable,
     ReadinessWait, RegisterError,
 };
+use crate::task::{ProcStateHint, with_proc_state_hint};
 
 struct PollSetSource<'a, const CAPACITY: usize>(&'a PollSet<CAPACITY>);
 
@@ -277,6 +278,7 @@ where
     F: FnMut() -> Result<T, AxError>,
 {
     let pollable = PollSetSource(source);
+    axtask::current().clear_interrupt_waker();
     loop {
         match operation() {
             Ok(value) => return Ok(value),
@@ -297,7 +299,12 @@ where
             Err(_) => {}
         }
 
-        axtask::future::block_on(wait).map_err(AxError::from)?;
+        // This is the sole readiness primitive for kernel waits that must
+        // ignore signals (vfork/AIO lifecycle handshakes).  Publish a real
+        // Linux D-state for precisely the interval the task is parked.
+        with_proc_state_hint(ProcStateHint::Uninterruptible, || {
+            axtask::future::block_on(wait).map_err(AxError::from)
+        })?;
     }
 }
 
