@@ -12,7 +12,9 @@ use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
+};
 
 use super::sync::restart_futex_wait;
 use crate::{
@@ -74,6 +76,57 @@ fn setgroups_size(raw: usize) -> AxResult<usize> {
     Ok(size as usize)
 }
 
+/// Decode getgroups' `int gidsetsize` from the x86_64 syscall argument
+/// register.  The C prototype makes negative values invalid after truncating
+/// the register value to its low 32 bits.
+fn getgroups_size(raw: usize) -> AxResult<usize> {
+    let size = raw as u32 as i32;
+    if size < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(size as usize)
+}
+
+/// Copy supplementary GIDs one at a time as Linux's `groups_to_user` does.
+/// In particular, do not preflight the destination: a later fault preserves
+/// the prefix that has already reached user memory.
+fn groups_to_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    list: *mut u32,
+    groups: &[Kgid],
+    mut visible: impl FnMut(Kgid) -> u32,
+) -> AxResult<()> {
+    let list_address = list as usize;
+    for (index, gid) in groups.iter().copied().enumerate() {
+        let offset = index
+            .checked_mul(size_of::<u32>())
+            .ok_or(AxError::BadAddress)?;
+        let address = list_address
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        VmMutPtr::vm_write(address as *mut u32, memory, visible(gid))
+            .map_err(|_| AxError::BadAddress)?;
+    }
+    Ok(())
+}
+
+fn getgroups_to_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    size: usize,
+    list: *mut u32,
+    groups: &[Kgid],
+    visible: impl FnMut(Kgid) -> u32,
+) -> AxResult<isize> {
+    if size == 0 {
+        return Ok(groups.len() as isize);
+    }
+    if size < groups.len() {
+        return Err(AxError::InvalidInput);
+    }
+    groups_to_user(memory, list, groups, visible)?;
+    Ok(groups.len() as isize)
+}
+
 /// Copy and translate supplementary GIDs one at a time, matching Linux's
 /// `groups_from_user`: the first invalid GID wins over any later user-memory
 /// fault.
@@ -93,8 +146,10 @@ fn load_setgroups<M: UserMemory + ?Sized>(
         let offset = index
             .checked_mul(size_of::<u32>())
             .ok_or(AxError::BadAddress)?;
-        let address = list_address.checked_add(offset).ok_or(AxError::BadAddress)?;
-        let gid = VmPtr::vm_read(address as *const u32, memory).map_err(map_usercopy_error)?;
+        let address = list_address
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        let gid = VmPtr::vm_read(address as *const u32, memory).map_err(|_| AxError::BadAddress)?;
         groups.push(make_kgid(gid).ok_or(AxError::InvalidInput)?);
     }
     Ok(groups)
@@ -221,28 +276,13 @@ pub fn sys_getgroups<M: UserMemory + ?Sized>(
     size: usize,
     list: *mut u32,
 ) -> AxResult<isize> {
+    let size = getgroups_size(size)?;
     debug!("sys_getgroups <= size: {size}");
     let cred = current().as_thread().current_cred();
     let groups = cred.groups().as_slice();
-    if size == 0 {
-        return Ok(groups.len() as isize);
-    }
-    if size < groups.len() {
-        return Err(AxError::InvalidInput);
-    }
-    if !groups.is_empty() {
-        let mut visible = Vec::new();
-        visible
-            .try_reserve_exact(groups.len())
-            .map_err(|_| AxError::NoMemory)?;
-        visible.extend(
-            groups
-                .iter()
-                .map(|gid| cred.user_ns().from_kgid_munged(*gid)),
-        );
-        vm_write_slice(memory, list, &visible).map_err(map_usercopy_error)?;
-    }
-    Ok(groups.len() as isize)
+    getgroups_to_user(memory, size, list, groups, |gid| {
+        cred.user_ns().from_kgid_munged(gid)
+    })
 }
 
 pub fn sys_setgroups<M: UserMemory + ?Sized>(
@@ -566,13 +606,18 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
 mod tests {
     use core::{cell::Cell, mem::MaybeUninit};
 
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
     use super::*;
     use crate::task::{IdMapInputExtent, Kuid, UserNamespace};
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
 
     struct GroupMemory {
         bytes: Vec<u8>,
         reads: Vec<usize>,
+        writes: Vec<usize>,
+        read_error: Option<UserCopyError>,
+        fail_write_at: Option<usize>,
+        write_error: Option<UserCopyError>,
     }
 
     // SAFETY: GroupMemory treats user pointers as checked byte offsets and
@@ -580,18 +625,39 @@ mod tests {
     unsafe impl UserMemory for GroupMemory {
         fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
             self.reads.push(start);
+            if let Some(error) = self.read_error {
+                return Err(error);
+            }
             let end = start
                 .checked_add(dst.len())
                 .ok_or(UserCopyError::BadAddress)?;
-            let source = self.bytes.get(start..end).ok_or(UserCopyError::BadAddress)?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
             for (output, input) in dst.iter_mut().zip(source) {
                 output.write(*input);
             }
             Ok(())
         }
 
-        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
-            Err(UserCopyError::BadAddress)
+        fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+            self.writes.push(start);
+            if self.fail_write_at == Some(start) {
+                return Err(UserCopyError::BadAddress);
+            }
+            if let Some(error) = self.write_error {
+                return Err(error);
+            }
+            let end = start
+                .checked_add(src.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let destination = self
+                .bytes
+                .get_mut(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            destination.copy_from_slice(src);
+            Ok(())
         }
     }
 
@@ -679,12 +745,18 @@ mod tests {
     #[test]
     fn setgroups_size_matches_linux_int_then_unsigned_max_check() {
         assert_eq!(setgroups_size(0), Ok(0));
-        assert_eq!(setgroups_size(NGROUPS_MAX as usize), Ok(NGROUPS_MAX as usize));
+        assert_eq!(
+            setgroups_size(NGROUPS_MAX as usize),
+            Ok(NGROUPS_MAX as usize)
+        );
         assert_eq!(
             setgroups_size((NGROUPS_MAX + 1) as usize),
             Err(AxError::InvalidInput)
         );
-        assert_eq!(setgroups_size((-1_isize) as usize), Err(AxError::InvalidInput));
+        assert_eq!(
+            setgroups_size((-1_isize) as usize),
+            Err(AxError::InvalidInput)
+        );
         // Syscall arguments are register-width, while gidsetsize is an int.
         assert_eq!(setgroups_size(1_usize << 32), Ok(0));
     }
@@ -694,6 +766,10 @@ mod tests {
         let mut provider = GroupMemory {
             bytes: vec![7, 0, 0, 0, 99, 0, 0, 0],
             reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
         };
         let mut memory = UserMemoryContext::new(&mut provider);
 
@@ -704,5 +780,142 @@ mod tests {
             Err(AxError::InvalidInput)
         );
         assert_eq!(memory.memory_mut().reads, &[0]);
+    }
+
+    #[test]
+    fn getgroups_size_matches_linux_low_32_bit_int() {
+        assert_eq!(getgroups_size(0), Ok(0));
+        assert_eq!(getgroups_size(1_usize << 32), Ok(0));
+        assert_eq!(getgroups_size((1_usize << 32) | 3), Ok(3));
+        assert_eq!(
+            getgroups_size((-1_isize) as usize),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            getgroups_size((1_usize << 32) | (i32::MIN as u32 as usize)),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn getgroups_zero_size_and_empty_groups_do_not_touch_pointer() {
+        let groups = [Kgid::from_raw(7).unwrap()];
+        let mut provider = GroupMemory {
+            bytes: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            getgroups_to_user(
+                &mut memory,
+                0,
+                core::ptr::null_mut(),
+                &groups,
+                Kgid::into_raw
+            ),
+            Ok(1)
+        );
+        assert!(memory.memory_mut().writes.is_empty());
+        assert_eq!(
+            getgroups_to_user(&mut memory, 1, core::ptr::null_mut(), &[], Kgid::into_raw),
+            Ok(0)
+        );
+        assert!(memory.memory_mut().writes.is_empty());
+    }
+
+    #[test]
+    fn groups_to_user_preserves_duplicate_order() {
+        let groups = [
+            Kgid::from_raw(42).unwrap(),
+            Kgid::from_raw(7).unwrap(),
+            Kgid::from_raw(42).unwrap(),
+        ];
+        let mut provider = GroupMemory {
+            bytes: vec![0; groups.len() * size_of::<u32>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            groups_to_user(&mut memory, core::ptr::null_mut(), &groups, Kgid::into_raw),
+            Ok(())
+        );
+        assert_eq!(memory.memory_mut().writes, &[0, 4, 8]);
+        assert_eq!(
+            memory.memory_mut().bytes,
+            [42, 0, 0, 0, 7, 0, 0, 0, 42, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn groups_to_user_keeps_prefix_on_later_fault() {
+        let groups = [Kgid::from_raw(1).unwrap(), Kgid::from_raw(2).unwrap()];
+        let mut provider = GroupMemory {
+            bytes: vec![0; groups.len() * size_of::<u32>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: Some(size_of::<u32>()),
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            groups_to_user(&mut memory, core::ptr::null_mut(), &groups, Kgid::into_raw),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(memory.memory_mut().writes, &[0, 4]);
+        assert_eq!(memory.memory_mut().bytes, [1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn group_helpers_map_all_usercopy_errors_to_efault() {
+        let mut read_provider = GroupMemory {
+            bytes: vec![1, 0, 0, 0],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: Some(UserCopyError::NoMemory),
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut read_memory = UserMemoryContext::new(&mut read_provider);
+        assert_eq!(
+            load_setgroups(
+                &mut read_memory,
+                core::ptr::null(),
+                1,
+                |raw| Kgid::from_raw(raw)
+            ),
+            Err(AxError::BadAddress)
+        );
+
+        let groups = [Kgid::from_raw(1).unwrap()];
+        let mut write_provider = GroupMemory {
+            bytes: vec![0; size_of::<u32>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: Some(UserCopyError::NoMemory),
+        };
+        let mut write_memory = UserMemoryContext::new(&mut write_provider);
+        assert_eq!(
+            groups_to_user(
+                &mut write_memory,
+                core::ptr::null_mut(),
+                &groups,
+                Kgid::into_raw
+            ),
+            Err(AxError::BadAddress)
+        );
     }
 }
