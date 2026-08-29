@@ -69,9 +69,19 @@ struct local_futex_waitv {
     uint32_t reserved;
 };
 
+enum clock_worker_phase {
+    CLOCK_WORKER_PHASE_STARTED,
+    CLOCK_WORKER_PHASE_AFFINITY_SET,
+    CLOCK_WORKER_PHASE_WAIT_PREPARED,
+    CLOCK_WORKER_PHASE_WAIT_ENTERED,
+    CLOCK_WORKER_PHASE_WAIT_RETURNED,
+    CLOCK_WORKER_PHASE_EXIT,
+};
+
 struct clock_worker {
     int cpu;
     int error;
+    _Atomic int phase;
 };
 
 struct futex_timeout_case {
@@ -176,6 +186,58 @@ static int join_bounded(pthread_t thread)
     }
 }
 
+static const char *clock_worker_phase_name(int phase)
+{
+    switch (phase) {
+    case CLOCK_WORKER_PHASE_AFFINITY_SET:
+        return "affinity-set";
+    case CLOCK_WORKER_PHASE_WAIT_PREPARED:
+        return "wait-prepared";
+    case CLOCK_WORKER_PHASE_WAIT_ENTERED:
+        return "wait-entered";
+    case CLOCK_WORKER_PHASE_WAIT_RETURNED:
+        return "wait-returned";
+    case CLOCK_WORKER_PHASE_EXIT:
+        return "exit";
+    default:
+        return "started";
+    }
+}
+
+static int join_clock_worker_bounded(pthread_t thread,
+                                     const struct clock_worker *worker)
+{
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        fail_and_exit("thread-join-clock");
+    }
+
+    for (;;) {
+        int result = pthread_tryjoin_np(thread, NULL);
+        if (result == 0) {
+            return 0;
+        }
+        if (result != EBUSY) {
+            errno = result;
+            fail_and_exit("thread-join-error");
+        }
+        int64_t now = monotonic_ns();
+        if (now < 0) {
+            fail_and_exit("thread-join-clock");
+        }
+        if (now - start >= CASE_TIMEOUT_NS) {
+            int phase = atomic_load_explicit(&worker->phase,
+                                             memory_order_acquire);
+            fprintf(stderr,
+                    "CI_WAIT_BOUNDARY_DIAG thread-join-timeout target_cpu=%d phase=%s\n",
+                    worker->cpu, clock_worker_phase_name(phase));
+            errno = ETIMEDOUT;
+            fail_and_exit("thread-join-timeout");
+        }
+        sched_yield();
+    }
+}
+
 static void *clock_worker_main(void *opaque)
 {
     struct clock_worker *worker = opaque;
@@ -187,21 +249,35 @@ static void *clock_worker_main(void *opaque)
     int result = pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
     if (result != 0) {
         worker->error = result;
+        atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_EXIT,
+                              memory_order_release);
         return NULL;
     }
     if (sched_getcpu() != worker->cpu) {
         worker->error = EXDEV;
+        atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_EXIT,
+                              memory_order_release);
         return NULL;
     }
+    atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_AFFINITY_SET,
+                          memory_order_release);
 
     int64_t start = monotonic_ns();
     if (start < 0) {
         worker->error = errno;
+        atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_EXIT,
+                              memory_order_release);
         return NULL;
     }
+    atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_WAIT_PREPARED,
+                          memory_order_release);
     do {
+        atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_WAIT_ENTERED,
+                              memory_order_release);
         result = clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &request);
     } while (result == EINTR);
+    atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_WAIT_RETURNED,
+                          memory_order_release);
     int64_t end = monotonic_ns();
     if (result != 0) {
         worker->error = result;
@@ -212,6 +288,8 @@ static void *clock_worker_main(void *opaque)
     } else if (sched_getcpu() != worker->cpu) {
         worker->error = EXDEV;
     }
+    atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_EXIT,
+                          memory_order_release);
     return NULL;
 }
 
@@ -245,7 +323,8 @@ static int test_clock_per_cpu(long expected_cpus)
 
     int failed = created != online_cpus;
     for (long cpu = 0; cpu < created; cpu++) {
-        if (join_bounded(threads[cpu]) != 0 || workers[cpu].error != 0) {
+        if (join_clock_worker_bounded(threads[cpu], &workers[cpu]) != 0 ||
+            workers[cpu].error != 0) {
             if (workers[cpu].error != 0) {
                 errno = workers[cpu].error;
             }
