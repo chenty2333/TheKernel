@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::{ffi::c_int, time::Duration};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::DeviceId;
+use axfs_ng_vfs::{DeviceId, WritebackErrorState};
 use axio::prelude::*;
 use axpoll::Pollable;
 use axsync::Mutex;
@@ -467,6 +467,20 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
+    }
+
+    /// Synchronizes the object's durable state.  This is a capability, rather
+    /// than a classification by object kind: regular files, directories, and
+    /// sync-capable pseudo/devices opt in explicitly while pipes and sockets
+    /// retain Linux's `EINVAL` result.
+    fn sync(&self, _data_only: bool) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    /// Non-VFS objects receive a private sequence.  Sync-capable VFS objects
+    /// override this with their inode-owned source.
+    fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
+        Arc::try_new(WritebackErrorState::default()).map_err(|_| AxError::NoMemory)
     }
 
     /// Prepares an object-owned mapping without holding address-space or page

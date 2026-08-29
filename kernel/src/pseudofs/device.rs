@@ -156,6 +156,10 @@ impl NodeOps for Device {
     fn flags(&self) -> NodeFlags {
         self.ops.flags()
     }
+
+    fn persistent_user_data(&self) -> Option<&axfs_ng_vfs::NodeUserData> {
+        Some(&self.node.user_data)
+    }
 }
 
 impl FileNodeOps for Device {

@@ -149,6 +149,14 @@ pub trait NodeOps: Send + Sync + 'static {
         None
     }
 
+    /// Returns the writeback error sequence owned by this stable backend node.
+    /// The default uses persistent inode data when the backend exposes it.
+    fn writeback_error_state(&self) -> VfsResult<Arc<WritebackErrorState>> {
+        self.persistent_user_data()
+            .ok_or(VfsError::OperationNotSupported)?
+            .writeback_error_state()
+    }
+
     /// Returns the stable per-inode extended-attribute provider, when this
     /// backend has one. A missing provider means honest `EOPNOTSUPP` rather
     /// than an ephemeral VFS-side store.
@@ -434,8 +442,71 @@ impl TypeMap {
 }
 
 /// Type-erased runtime attachments owned by one stable backend inode.
+pub struct NodeUserData {
+    data: Mutex<TypeMap>,
+    // Kept outside the bounded generic attachment map: writeback error
+    // reporting is core inode state and must remain available even when
+    // optional runtime attachments have filled that map.
+    writeback_errors: Mutex<Option<Arc<WritebackErrorState>>>,
+}
+
+impl Default for NodeUserData {
+    fn default() -> Self {
+        Self {
+            data: Mutex::default(),
+            writeback_errors: Mutex::new(None),
+        }
+    }
+}
+
+/// Shared writeback-error state for one live VFS entry.  File descriptions
+/// hold independent cursors against this sequence.
 #[derive(Default)]
-pub struct NodeUserData(Mutex<TypeMap>);
+pub struct WritebackErrorState {
+    record: Mutex<WritebackErrorRecord>,
+}
+
+#[derive(Default)]
+struct WritebackErrorRecord {
+    sequence: u64,
+    seen: bool,
+    error: Option<VfsError>,
+}
+
+impl WritebackErrorState {
+    pub fn publish(&self, error: VfsError) {
+        let mut record = self.record.lock();
+        record.sequence = record.sequence.wrapping_add(1);
+        record.seen = false;
+        record.error = Some(error);
+    }
+
+    /// Linux `errseq_sample()`: an outstanding unconsumed error is sampled as
+    /// zero so a newly opened OFD reports it once; once any fsync advances the
+    /// sequence, later opens begin at the current value.
+    pub fn sample(&self) -> u64 {
+        let record = self.record.lock();
+        if record.error.is_some() && !record.seen {
+            0
+        } else {
+            record.sequence
+        }
+    }
+
+    /// Linux `errseq_check_and_advance()` equivalent for one OFD cursor.
+    pub fn check_and_advance(&self, cursor: &mut u64) -> Option<VfsError> {
+        let mut record = self.record.lock();
+        if *cursor == record.sequence {
+            return None;
+        }
+        *cursor = record.sequence;
+        let error = record.error;
+        if error.is_some() {
+            record.seen = true;
+        }
+        error
+    }
+}
 
 fn install_initial_data_cell(cell: &Mutex<TypeMap>, data: InitialNodeData) -> VfsResult<()> {
     let mut candidate = Some(data);
@@ -462,13 +533,24 @@ impl NodeUserData {
     }
 
     fn lock(&self) -> MutexGuard<'_, TypeMap> {
-        self.0.lock()
+        self.data.lock()
     }
 
     /// Installs one preallocated value without allocating while the cell is
     /// locked. This is used before a backend publishes a fresh inode name.
     pub fn install_initial_data(&self, data: InitialNodeData) -> VfsResult<()> {
-        install_initial_data_cell(&self.0, data)
+        install_initial_data_cell(&self.data, data)
+    }
+
+    pub fn writeback_error_state(&self) -> VfsResult<Arc<WritebackErrorState>> {
+        let mut state = self.writeback_errors.lock();
+        if let Some(state) = state.as_ref() {
+            return Ok(state.clone());
+        }
+        let created =
+            Arc::try_new(WritebackErrorState::default()).map_err(|_| VfsError::NoMemory)?;
+        *state = Some(created.clone());
+        Ok(created)
     }
 }
 
@@ -719,6 +801,8 @@ impl DirEntry {
     pub fn open(&self, read: bool, write: bool) -> VfsResult<()>;
 
     pub fn sync(&self, data_only: bool) -> VfsResult<()>;
+
+    pub fn writeback_error_state(&self) -> VfsResult<Arc<WritebackErrorState>>;
 }
 
 impl DirEntry {

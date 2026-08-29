@@ -3,7 +3,7 @@ use core::{any::Any, mem, ops::Deref, task::Context};
 
 use axfs_ng_vfs::{
     DirEntry, FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
-    NodeType, Reference, VfsError, VfsResult,
+    NodeType, NodeUserData, Reference, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use fatfs::{Read, Seek, SeekFrom, Write};
@@ -144,6 +144,10 @@ impl NodeOps for FatFileNode {
 
     fn flags(&self) -> NodeFlags {
         NodeFlags::BLOCKING
+    }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(self.state.user_data())
     }
 }
 

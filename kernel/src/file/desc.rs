@@ -12,7 +12,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::NodeFlags;
+use axfs_ng_vfs::{NodeFlags, WritebackErrorState};
 use axpoll::{IoEvents, PollSet, Pollable, RegisterError, RegistrationToken};
 #[cfg(not(test))]
 use axsync::Mutex as StatusTransitionMutex;
@@ -1102,6 +1102,10 @@ pub struct FileDescription {
     /// mutate after construction.
     id: FileDescriptionId,
     ofd: Mutex<OpenFileDescriptionState<AsyncIoState, ExternalOffset>>,
+    /// Source is shared by independent opens of one VFS entry; the cursor is
+    /// per OFD, and is consequently shared by dup.
+    sync_error_source: Arc<WritebackErrorState>,
+    sync_error: Mutex<SyncErrorCursor>,
     /// Serializes only status snapshots and short backend/OFD transitions.
     /// No user fault, wait, VFS I/O, or device operation may run under it.
     status_transition: StatusTransitionMutex<()>,
@@ -1110,6 +1114,11 @@ pub struct FileDescription {
     open_lease_publication: Option<lease::OpenLeasePublication>,
     notification_work: Option<Box<super::inotify::CloseWork>>,
     cleanup_work: Option<Box<DescriptionCleanupWork>>,
+}
+
+#[derive(Default)]
+struct SyncErrorCursor {
+    observed: u64,
 }
 
 struct WriteOpenRollback {
@@ -1217,6 +1226,11 @@ impl FileDescription {
         let open_security_credential = needs_open_security_credential
             .then(|| vfs_open_credential.clone())
             .flatten();
+        let sync_error_source = inner.writeback_error_state()?;
+        // A newly opened file samples the current errseq.  Earlier failures
+        // belong to already-open descriptions; dup retains that description's
+        // existing cursor instead of constructing a new one.
+        let observed = sync_error_source.sample();
         Arc::try_new(Self {
             inner,
             open_credentials: OpenCredentials::current(),
@@ -1228,6 +1242,8 @@ impl FileDescription {
                 status_flags,
                 AsyncIoState::default(),
             )),
+            sync_error_source,
+            sync_error: Mutex::new(SyncErrorCursor { observed }),
             status_transition: StatusTransitionMutex::new(()),
             descriptor_lifetime: SpinNoIrq::new(DescriptorLifetimeState::default()),
             open_committed: AtomicBool::new(false),
@@ -1320,6 +1336,35 @@ impl FileDescription {
         } else {
             Ok(())
         }
+    }
+
+    /// Publishes a completed asynchronous writeback error to the shared VFS
+    /// source.  Each independent OFD observes it once through its own cursor.
+    pub(crate) fn publish_sync_error(&self, error: AxError) {
+        self.sync_error_source.publish(error);
+    }
+
+    fn take_unseen_sync_error(&self) -> Option<AxError> {
+        let mut cursor = self.sync_error.lock();
+        self.sync_error_source
+            .check_and_advance(&mut cursor.observed)
+    }
+
+    /// Synchronizes the retained OFD without another numeric-fd lookup.
+    /// `O_PATH` installs empty file operations; fsync therefore returns
+    /// `EINVAL` from the missing synchronization callback.
+    pub(crate) fn sync(&self, data_only: bool) -> AxResult<()> {
+        if self.io_status_snapshot().path_only() {
+            return Err(AxError::InvalidInput);
+        }
+
+        if let Err(error) = self.inner.sync(data_only) {
+            // A direct fsync/device-flush failure is not a page-writeback
+            // errseq event.  Only asynchronous writeback completion invokes
+            // `publish_sync_error`; preserve this errno for this caller.
+            return Err(error);
+        }
+        self.take_unseen_sync_error().map_or(Ok(()), Err)
     }
 
     pub(crate) fn is_path_only(&self) -> bool {
@@ -1545,6 +1590,10 @@ impl FileLike for FileDescription {
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         self.inner.ioctl(context, cmd, arg)
+    }
+
+    fn sync(&self, data_only: bool) -> AxResult<()> {
+        FileDescription::sync(self, data_only)
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
@@ -1832,10 +1881,171 @@ mod tests {
     use axfs::{FileBackend, FileFlags};
     use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
     use axpoll::{IoEvents, Pollable};
-    use linux_raw_sys::general::O_WRONLY;
+    use linux_raw_sys::general::{O_PATH, O_WRONLY};
 
     use super::*;
     use crate::pseudofs::tmp::MemoryFs;
+
+    struct SyncProbe {
+        syncs: AtomicUsize,
+        errors: Arc<WritebackErrorState>,
+        fail_next_sync: AtomicBool,
+    }
+
+    fn sync_probe() -> Arc<SyncProbe> {
+        Arc::new(SyncProbe {
+            syncs: AtomicUsize::new(0),
+            errors: Arc::new(WritebackErrorState::default()),
+            fail_next_sync: AtomicBool::new(false),
+        })
+    }
+
+    impl Pollable for SyncProbe {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+
+    impl FileLike for SyncProbe {
+        fn stat(&self) -> AxResult<Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("sync-probe"))
+        }
+
+        fn sync(&self, _data_only: bool) -> AxResult<()> {
+            self.syncs.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+                Err(AxError::Io)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
+            Ok(self.errors.clone())
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_uses_retained_description_not_a_replacement() {
+        let original = sync_probe();
+        let replacement = sync_probe();
+        let retained = FileDescription::new(original.clone()).unwrap();
+        let _reused_number_now_names = FileDescription::new(replacement.clone()).unwrap();
+
+        retained.sync(false).unwrap();
+        assert_eq!(original.syncs.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.syncs.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn opath_sync_is_einval_without_invoking_backend() {
+        let probe = sync_probe();
+        let description = FileDescription::new_with_flags(probe.clone(), O_PATH).unwrap();
+
+        assert_eq!(description.sync(false), Err(AxError::InvalidInput));
+        assert_eq!(probe.syncs.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn sync_writeback_error_is_reported_once_per_ofd_cursor() {
+        let probe = sync_probe();
+        let description = FileDescription::new(probe.clone()).unwrap();
+        let duplicated_descriptor = description.clone();
+        let independently_opened = FileDescription::new(probe).unwrap();
+        description.publish_sync_error(AxError::Io);
+
+        assert_eq!(description.sync(false), Err(AxError::Io));
+        assert_eq!(duplicated_descriptor.sync(false), Ok(()));
+
+        // A new open has an independent cursor over the same backend source,
+        // so it sees the error published after it was opened once.
+        assert_eq!(independently_opened.sync(false), Err(AxError::Io));
+        assert_eq!(independently_opened.sync(false), Ok(()));
+    }
+
+    #[test]
+    fn direct_sync_failure_is_not_published_as_writeback_error() {
+        let probe = sync_probe();
+        let first = FileDescription::new(probe.clone()).unwrap();
+        let independently_opened = FileDescription::new(probe.clone()).unwrap();
+        probe.fail_next_sync.store(true, Ordering::Release);
+
+        assert_eq!(first.sync(false), Err(AxError::Io));
+        assert_eq!(independently_opened.sync(false), Ok(()));
+    }
+
+    #[test]
+    fn errseq_sample_and_advance_follow_linux_seen_semantics() {
+        let probe = sync_probe();
+        let before_publish = FileDescription::new(probe.clone()).unwrap();
+        before_publish.publish_sync_error(AxError::Io);
+
+        // The error is not globally SEEN yet, so a later open samples zero
+        // and reports it too.
+        let opened_before_seen = FileDescription::new(probe.clone()).unwrap();
+        assert_eq!(opened_before_seen.sync(false), Err(AxError::Io));
+
+        // Advancing any cursor marks this error globally seen. New opens now
+        // start at the current sequence, whereas an already-open cursor still
+        // reports its unseen event once.
+        let opened_after_seen = FileDescription::new(probe.clone()).unwrap();
+        assert_eq!(opened_after_seen.sync(false), Ok(()));
+        assert_eq!(before_publish.sync(false), Err(AxError::Io));
+
+        before_publish.publish_sync_error(AxError::Io);
+        assert_eq!(opened_after_seen.sync(false), Err(AxError::Io));
+    }
+
+    #[test]
+    fn hardlink_alias_and_relookup_share_the_inode_writeback_error_source() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let source = root
+            .create(
+                "writeback-source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let alias = root.link("writeback-alias", &source).unwrap();
+        let rebuilt_alias = root.lookup_no_follow_in_mount("writeback-alias").unwrap();
+        let source_file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(source),
+            FileFlags::READ,
+        )));
+        let alias_file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(alias),
+            FileFlags::READ,
+        )));
+        let rebuilt_file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(rebuilt_alias),
+            FileFlags::READ,
+        )));
+        let source_description = FileDescription::new(source_file).unwrap();
+        let alias_description = FileDescription::new(alias_file).unwrap();
+        let rebuilt_description = FileDescription::new(rebuilt_file).unwrap();
+
+        source_description.publish_sync_error(AxError::Io);
+        assert_eq!(alias_description.sync(false), Err(AxError::Io));
+        assert_eq!(rebuilt_description.sync(false), Err(AxError::Io));
+    }
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()

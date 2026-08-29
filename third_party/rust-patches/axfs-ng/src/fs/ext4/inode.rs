@@ -12,7 +12,7 @@ use axfs_ng_vfs::{
     NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
     PhysicalIoAttempt,
     PhysicalIoNotSubmittedReason, PhysicalIoSegment, Reference, RenameRequest, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    VfsError, VfsResult, WeakDirEntry, WritebackErrorState, XattrProvider, XattrSetMode,
     FILE_EXTENT_MAX, FILE_EXTENT_SCAN_CHUNK_BYTES,
 };
 use axhal::time::wall_time;
@@ -26,7 +26,7 @@ use lwext4_rust::{
 use spin::Once;
 
 use super::{
-    Ext4Filesystem, RuntimeReservation,
+    Ext4Filesystem, RuntimeReservation, WritebackErrorReservation,
     util::{into_vfs_err, into_vfs_type},
 };
 
@@ -138,6 +138,7 @@ pub(crate) struct PreparedInodeEntry {
     inode: Arc<Inode>,
     entry: DirEntry,
     runtime_reservation: Option<(RuntimeReservation, Arc<NodeUserData>)>,
+    writeback_error_reservation: WritebackErrorReservation,
 }
 
 impl PreparedInodeEntry {
@@ -157,7 +158,11 @@ impl PreparedInodeEntry {
             let runtime = reservation.commit(token, runtime);
             self.inode.attach_runtime(runtime);
         }
-        self.inode.bind(token, namespace_epoch);
+        self.inode.bind(
+            token,
+            namespace_epoch,
+            self.writeback_error_reservation.commit(token),
+        );
         self.entry
     }
 }
@@ -167,6 +172,7 @@ pub struct Inode {
     binding: Once<InodeBinding>,
     this: Once<WeakDirEntry>,
     runtime: Once<Arc<NodeUserData>>,
+    writeback_errors: Once<Arc<WritebackErrorState>>,
 }
 
 impl Inode {
@@ -175,11 +181,27 @@ impl Inode {
         inode_type: InodeType,
         reference: Reference,
     ) -> VfsResult<PreparedInodeEntry> {
+        let writeback_error_reservation = fs.reserve_writeback_error_state(None)?;
+        Self::try_prepare_entry_with_writeback_error_reservation(
+            fs,
+            inode_type,
+            reference,
+            writeback_error_reservation,
+        )
+    }
+
+    fn try_prepare_entry_with_writeback_error_reservation(
+        fs: Arc<Ext4Filesystem>,
+        inode_type: InodeType,
+        reference: Reference,
+        writeback_error_reservation: WritebackErrorReservation,
+    ) -> VfsResult<PreparedInodeEntry> {
         let inode = Arc::try_new(Self {
             fs,
             binding: Once::new(),
             this: Once::new(),
             runtime: Once::new(),
+            writeback_errors: Once::new(),
         })
         .map_err(|_| VfsError::NoMemory)?;
         let entry = if inode_type == InodeType::Directory {
@@ -197,14 +219,22 @@ impl Inode {
             inode,
             entry,
             runtime_reservation: None,
+            writeback_error_reservation,
         })
     }
 
-    fn bind(&self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) {
+    fn bind(
+        &self,
+        token: InodeToken,
+        namespace_epoch: Arc<AtomicU64>,
+        writeback_errors: Arc<WritebackErrorState>,
+    ) {
         self.binding.call_once(|| InodeBinding {
             token,
             namespace_epoch,
         });
+        let installed = self.writeback_errors.call_once(|| writeback_errors.clone());
+        debug_assert!(Arc::ptr_eq(installed, &writeback_errors));
     }
 
     fn attach_runtime(&self, runtime: Arc<NodeUserData>) {
@@ -232,6 +262,22 @@ impl Inode {
         )
     }
 
+    fn try_prepare_retained_child(
+        &self,
+        token: InodeToken,
+        inode_type: InodeType,
+        name: String,
+    ) -> VfsResult<PreparedInodeEntry> {
+        let writeback_error_reservation =
+            self.fs.reserve_writeback_error_state(Some(token))?;
+        Self::try_prepare_entry_with_writeback_error_reservation(
+            self.fs.clone(),
+            inode_type,
+            Reference::new(self.this.get().and_then(WeakDirEntry::upgrade), name),
+            writeback_error_reservation,
+        )
+    }
+
     /// Completes a retained low-level inode identity outside the ext4 spin
     /// lock. If VFS allocation fails, the retained handle is released before
     /// returning to the caller.
@@ -242,7 +288,7 @@ impl Inode {
         inode_type: InodeType,
         name: String,
     ) -> VfsResult<DirEntry> {
-        match self.try_prepare_child(inode_type, name) {
+        match self.try_prepare_retained_child(token, inode_type, name) {
             Ok(prepared) => {
                 if let Some(runtime) = self.fs.runtime_attachment(token) {
                     prepared.inode.attach_runtime(runtime);
@@ -388,6 +434,10 @@ impl NodeOps for Inode {
         self.runtime.get().map(Arc::as_ref)
     }
 
+    fn writeback_error_state(&self) -> VfsResult<Arc<WritebackErrorState>> {
+        self.writeback_errors.get().cloned().ok_or(VfsError::Io)
+    }
+
     fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
         Some(self)
     }
@@ -430,6 +480,10 @@ impl XattrProvider for Inode {
 impl Drop for Inode {
     fn drop(&mut self) {
         if let Some(binding) = self.binding.get() {
+            if let Some(writeback_errors) = self.writeback_errors.get() {
+                self.fs
+                    .release_writeback_error_state(binding.token, writeback_errors);
+            }
             self.fs.lock().release_inode_handle(binding.token);
         }
     }
@@ -923,17 +977,25 @@ impl FileNodeOps for Inode {
         Ok(total)
     }
 
-    fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
+    fn try_write_at_vectored_async(
+        &self,
+        bufs: &[&[u8]],
+        offset: u64,
+    ) -> VfsResult<axfs_ng_vfs::AsyncVectoredWriteOutcome> {
         let submission = {
             let mut fs = self.fs.lock();
             fs.write_at_aligned_hot_vectored_async_submit(self.ino(), bufs, offset)
                 .map_err(into_vfs_err)?
         };
         let Some(submission) = submission else {
-            return Ok(None);
+            return Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::NotSubmitted);
         };
-        self.fs.wait_async_write(&submission)?;
-        Ok(Some(submission.bytes))
+        match self.fs.wait_async_write(&submission) {
+            Ok(()) => Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::Completed(
+                submission.bytes,
+            )),
+            Err(error) => Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::CompletionError(error)),
+        }
     }
 
     unsafe fn try_write_at_physical_with_reason(

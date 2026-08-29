@@ -115,6 +115,24 @@ pub enum PhysicalIoNotSubmittedReason {
     DeviceAdmission,
 }
 
+/// Result of an asynchronous vectored write attempt.
+///
+/// Submission/admission failures remain the outer [`VfsResult`] error: no
+/// device request was accepted, so callers may retain their dirty state and
+/// must not report a writeback completion error.  Once a request is accepted,
+/// implementations return one of the two terminal outcomes below only after
+/// it has completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncVectoredWriteOutcome {
+    /// No asynchronous request was accepted and the caller may use its
+    /// synchronous fallback path.
+    NotSubmitted,
+    /// An accepted request completed successfully.
+    Completed(usize),
+    /// An accepted request completed with this error.
+    CompletionError(VfsError),
+}
+
 pub trait FileNodeOps: NodeOps + Pollable {
     /// Collects allocated file extents intersecting `[start, start + length)`.
     /// Holes are omitted.  A zero capacity is a complete count-only scan and
@@ -260,12 +278,17 @@ pub trait FileNodeOps: NodeOps + Pollable {
     ///
     /// Implementations must return only after accepted device requests have
     /// completed, but may split submit and wait internally to avoid holding
-    /// filesystem locks across a blocking wait. `Ok(None)` means the caller
-    /// should use [`write_at_vectored`](Self::write_at_vectored).
-    fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
+    /// filesystem locks across a blocking wait. [`AsyncVectoredWriteOutcome::NotSubmitted`]
+    /// means the caller should use [`write_at_vectored`](Self::write_at_vectored).
+    /// Errors in the outer result occurred before a request was accepted.
+    fn try_write_at_vectored_async(
+        &self,
+        bufs: &[&[u8]],
+        offset: u64,
+    ) -> VfsResult<AsyncVectoredWriteOutcome> {
         let _ = bufs;
         let _ = offset;
-        Ok(None)
+        Ok(AsyncVectoredWriteOutcome::NotSubmitted)
     }
 
     /// Attempts a synchronous direct overwrite from caller-pinned physical

@@ -4,7 +4,7 @@ use core::{any::Any, mem, ops::Deref, sync::atomic::Ordering, time::Duration};
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodeType,
-    Reference, RenameRequest, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
+    NodeUserData, Reference, RenameRequest, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
 };
 use spin::Once;
 
@@ -250,6 +250,10 @@ impl NodeOps for FatDirNode {
 
     fn flags(&self) -> NodeFlags {
         NodeFlags::BLOCKING
+    }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(self.state.user_data())
     }
 }
 

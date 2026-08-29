@@ -2926,27 +2926,17 @@ pub fn sys_fallocate(
 
 pub fn sys_fsync(fd: c_int) -> AxResult<isize> {
     debug!("sys_fsync <= {fd}");
-    let f = get_file_like(fd)?;
-    f.check_io_access()?;
-    match FileLikeKind::from_file_like(f.as_ref()) {
-        FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::InvalidInput),
-        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
-    }
-    let f = get_typed_file::<File>(fd)?;
-    f.inner().sync(false)?;
+    // Keep the Arc returned by this single lookup through completion: a close
+    // followed by fd-number reuse must not redirect fsync to another OFD.
+    let description = crate::file::get_file_description(fd)?;
+    description.sync(false)?;
     Ok(0)
 }
 
 pub fn sys_fdatasync(fd: c_int) -> AxResult<isize> {
     debug!("sys_fdatasync <= {fd}");
-    let f = get_file_like(fd)?;
-    f.check_io_access()?;
-    match FileLikeKind::from_file_like(f.as_ref()) {
-        FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::InvalidInput),
-        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
-    }
-    let f = get_typed_file::<File>(fd)?;
-    f.inner().sync(true)?;
+    let description = crate::file::get_file_description(fd)?;
+    description.sync(true)?;
     Ok(0)
 }
 

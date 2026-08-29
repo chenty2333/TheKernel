@@ -8,8 +8,8 @@ use core::{
 
 use axdriver::SharedBlockDevice;
 use axfs_ng_vfs::{
-    DirEntry, Filesystem, FilesystemOps, MetadataUpdateCapabilities, Reference, StatFs, VfsError,
-    VfsResult, path::MAX_NAME_LEN,
+    DirEntry, Filesystem, FilesystemOps, MetadataUpdateCapabilities, NodeUserData, Reference,
+    StatFs, VfsError, VfsResult, path::MAX_NAME_LEN,
 };
 use hashbrown::HashMap;
 use kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
@@ -118,6 +118,9 @@ struct FatEntryRecord {
     position: AtomicU64,
     generation: u64,
     namespace_epoch: AtomicU64,
+    /// Runtime state tied to this physical FAT directory-entry generation.
+    /// The registry returns this record on relookup while any node is live.
+    user_data: NodeUserData,
 }
 
 impl Drop for FatEntryRecord {
@@ -142,6 +145,7 @@ impl FatEntryState {
             position: AtomicU64::new(UNINSTALLED_ENTRY_POSITION),
             generation: 0,
             namespace_epoch: AtomicU64::new(0),
+            user_data: NodeUserData::default(),
         })
         .map(Self)
         .map_err(|_| VfsError::NoMemory)
@@ -157,6 +161,10 @@ impl FatEntryState {
 
     pub(crate) fn namespace_epoch(&self) -> &AtomicU64 {
         &self.0.namespace_epoch
+    }
+
+    pub(crate) fn user_data(&self) -> &NodeUserData {
+        &self.0.user_data
     }
 }
 
@@ -203,6 +211,7 @@ impl FatEntryRegistry {
             position: AtomicU64::new(UNINSTALLED_ENTRY_POSITION),
             generation,
             namespace_epoch: AtomicU64::new(0),
+            user_data: NodeUserData::default(),
         }) {
             Ok(record) => Ok(FatEntryState(record)),
             Err(_) => {

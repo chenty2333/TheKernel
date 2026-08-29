@@ -24,8 +24,9 @@ use axdriver::{
 #[cfg(feature = "times")]
 use axfs_ng_vfs::MetadataUpdate;
 use axfs_ng_vfs::{
-    FileExtentMap, FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission,
-    NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
+    AsyncVectoredWriteOutcome, FileExtentMap, FileNode, FilesystemOps, Location, Mountpoint,
+    NodeFlags, NodePermission, NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor,
+    path::Path,
 };
 pub use axfs_ng_vfs::{PhysicalIoAttempt, PhysicalIoSegment};
 use axfs_ng_vfs::PhysicalIoNotSubmittedReason as PhysicalIoAttemptNotSubmittedReason;
@@ -2906,6 +2907,16 @@ fn record_async_dirty_flush_writeback_restart() {
     record_cached_file_counter(&ASYNC_DIRTY_FLUSH_WRITEBACK_RESTARTS, 1);
 }
 
+/// Records a completed asynchronous dirty-page writeback failure on the
+/// backend inode that owns the cached pages.  Do not use this for synchronous
+/// writeback or the subsequent `fsync` metadata flush: those are returned to
+/// their immediate caller instead of becoming an errseq event.
+fn publish_async_dirty_writeback_completion_error(file: &FileNode, error: VfsError) {
+    if let Ok(state) = file.writeback_error_state() {
+        state.publish(error);
+    }
+}
+
 fn async_dirty_flush_sg_enabled() -> bool {
     ENABLE_ASYNC_DIRTY_FLUSH_SG.load(Ordering::Relaxed)
 }
@@ -2989,32 +3000,44 @@ fn flush_dirty_page_list_locked(
                         .iter()
                         .map(|page| unsafe { core::slice::from_raw_parts(page.ptr, page.len) })
                         .collect::<Vec<_>>();
-                    let mut used_async_submit = false;
+                    let mut accepted_async_submit = false;
                     let write_result =
                         match file.try_write_at_vectored_async(&slices, run.page_start) {
-                            Ok(Some(written)) => {
-                                used_async_submit = true;
+                            Ok(AsyncVectoredWriteOutcome::Completed(written)) => {
+                                accepted_async_submit = true;
                                 Ok(written)
                             }
-                            Ok(None) => file.write_at_vectored(&slices, run.page_start),
-                            Err(err) => Err(err),
+                            Ok(AsyncVectoredWriteOutcome::CompletionError(error)) => {
+                                accepted_async_submit = true;
+                                Err(error)
+                            }
+                            Ok(AsyncVectoredWriteOutcome::NotSubmitted) => {
+                                file.write_at_vectored(&slices, run.page_start)
+                            }
+                            Err(error) => Err(error),
                         };
                     match write_result {
                         Ok(written) if written == run.bytes => {
                             record_dirty_writeback(range_flush, run.pages.len(), run.bytes, true);
                             record_async_dirty_flush_sg(run.pages.len());
-                            if used_async_submit {
+                            if accepted_async_submit {
                                 record_async_dirty_flush_sg_async_submit(run.pages.len());
                             }
                             finish_sg_dirty_writeback_run(shared, &run, true);
                         }
                         Ok(_) => {
                             record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                            if accepted_async_submit {
+                                publish_async_dirty_writeback_completion_error(file, VfsError::Io);
+                            }
                             finish_sg_dirty_writeback_run(shared, &run, false);
                             return Err(VfsError::Io);
                         }
                         Err(err) => {
                             record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                            if accepted_async_submit {
+                                publish_async_dirty_writeback_completion_error(file, err);
+                            }
                             finish_sg_dirty_writeback_run(shared, &run, false);
                             return Err(err);
                         }
@@ -4654,8 +4677,9 @@ impl CachedFile {
         self.invalidate_cached_range(file, pages.clone(), &mutation)?;
 
         let written = match file.try_write_at_vectored_async(src, offset)? {
-            Some(written) => written,
-            None => file.write_at_vectored(src, offset)?,
+            AsyncVectoredWriteOutcome::Completed(written) => written,
+            AsyncVectoredWriteOutcome::NotSubmitted => file.write_at_vectored(src, offset)?,
+            AsyncVectoredWriteOutcome::CompletionError(error) => return Err(error),
         };
 
         self.invalidate_cached_range(file, pages, &mutation)?;
@@ -6055,8 +6079,9 @@ impl FileBackend {
             Self::Cached(cached) => cached.write_at_vectored(src, offset),
             Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let written = match file.try_write_at_vectored_async(src, offset)? {
-                    Some(written) => written,
-                    None => file.write_at_vectored(src, offset)?,
+                    AsyncVectoredWriteOutcome::Completed(written) => written,
+                    AsyncVectoredWriteOutcome::NotSubmitted => file.write_at_vectored(src, offset)?,
+                    AsyncVectoredWriteOutcome::CompletionError(error) => return Err(error),
                 };
                 Ok(written)
             }),
@@ -7201,9 +7226,9 @@ mod tests {
     };
 
     use axfs_ng_vfs::{
-        DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
-        MetadataUpdate, Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, Reference,
-        StatFs, VfsError, VfsResult,
+        AsyncVectoredWriteOutcome, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps,
+        Location, Metadata, MetadataUpdate, Mountpoint, NodeFlags, NodeOps, NodePermission,
+        NodeType, NodeUserData, Reference, StatFs, VfsError, VfsResult,
     };
     use axio::{Cursor, IoBuf, IoBufMut, Read, Seek, SeekFrom, Write};
     use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
@@ -7519,6 +7544,7 @@ mod tests {
         write_offsets: Mutex<Vec<u64>>,
         read_calls: AtomicUsize,
         async_read_calls: AtomicUsize,
+        async_write_mode: AtomicU8,
         write_calls: AtomicUsize,
         append_calls: AtomicUsize,
         open_calls: AtomicUsize,
@@ -7537,6 +7563,7 @@ mod tests {
         full_page_io: AtomicBool,
         stored_first_byte: AtomicU8,
         append_markers: StdMutex<Vec<u8>>,
+        user_data: NodeUserData,
     }
 
     impl AppendTestState {
@@ -7546,6 +7573,7 @@ mod tests {
                 write_offsets: Mutex::new(Vec::new()),
                 read_calls: AtomicUsize::new(0),
                 async_read_calls: AtomicUsize::new(0),
+                async_write_mode: AtomicU8::new(0),
                 write_calls: AtomicUsize::new(0),
                 append_calls: AtomicUsize::new(0),
                 open_calls: AtomicUsize::new(0),
@@ -7564,6 +7592,7 @@ mod tests {
                 full_page_io: AtomicBool::new(false),
                 stored_first_byte: AtomicU8::new(0),
                 append_markers: StdMutex::new(Vec::new()),
+                user_data: NodeUserData::new(),
             })
         }
     }
@@ -7622,6 +7651,10 @@ mod tests {
 
         fn flags(&self) -> NodeFlags {
             self.flags
+        }
+
+        fn persistent_user_data(&self) -> Option<&NodeUserData> {
+            Some(&self.state.user_data)
         }
     }
 
@@ -7704,6 +7737,19 @@ mod tests {
         ) -> VfsResult<Option<usize>> {
             self.state.async_read_calls.fetch_add(1, Ordering::AcqRel);
             Ok(None)
+        }
+
+        fn try_write_at_vectored_async(
+            &self,
+            _bufs: &[&[u8]],
+            _offset: u64,
+        ) -> VfsResult<AsyncVectoredWriteOutcome> {
+            match self.state.async_write_mode.load(Ordering::Acquire) {
+                1 => Err(VfsError::Io),
+                2 => Ok(AsyncVectoredWriteOutcome::CompletionError(VfsError::Io)),
+                3 => Ok(AsyncVectoredWriteOutcome::Completed(PAGE_SIZE)),
+                _ => Ok(AsyncVectoredWriteOutcome::NotSubmitted),
+            }
         }
 
         fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
@@ -7813,6 +7859,40 @@ mod tests {
             })
             .unwrap();
         paddr.unwrap()
+    }
+
+    #[test]
+    fn async_dirty_writeback_completion_error_is_published_on_the_backend_inode() {
+        let (_cached, location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let writeback_errors = location.writeback_error_state().unwrap();
+        let mut cursor = writeback_errors.sample();
+        let file = location.entry().as_file().unwrap();
+
+        super::publish_async_dirty_writeback_completion_error(file, VfsError::Io);
+
+        assert_eq!(
+            writeback_errors.check_and_advance(&mut cursor),
+            Some(VfsError::Io)
+        );
+    }
+
+    #[test]
+    fn async_dirty_writeback_presubmit_error_is_not_published() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x5a, true);
+        let writeback_errors = location.writeback_error_state().unwrap();
+        let mut cursor = writeback_errors.sample();
+        let file = location.entry().as_file().unwrap();
+
+        state.async_write_mode.store(1, Ordering::Release);
+        axdriver::set_virtio_async_block_enabled(true);
+        super::set_async_dirty_flush_sg_enabled(true);
+        let result = cached.flush_dirty_cache(file);
+        super::set_async_dirty_flush_sg_enabled(false);
+        axdriver::set_virtio_async_block_enabled(false);
+
+        assert_eq!(result, Err(VfsError::Io));
+        assert_eq!(writeback_errors.check_and_advance(&mut cursor), None);
     }
 
     #[test]

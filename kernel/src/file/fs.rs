@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{
     cell::Cell,
     ffi::c_int,
@@ -10,7 +10,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FsContext, WritePlacement};
 use axfs_ng_vfs::{
-    DirEntrySink, Location, Metadata, NodeFlags,
+    DirEntrySink, Location, Metadata, NodeFlags, WritebackErrorState,
     path::{MAX_NAME_LEN, Path},
 };
 use axio::{IoBuf, Read};
@@ -695,6 +695,14 @@ impl FileLike for File {
         device.inner().ioctl(context, cmd, arg)
     }
 
+    fn sync(&self, data_only: bool) -> AxResult<()> {
+        self.inner.sync(data_only)
+    }
+
+    fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
+        self.inner.location().writeback_error_state().map_err(Into::into)
+    }
+
     fn set_nonblocking(&self, flag: bool) -> AxResult {
         self.nonblock.store(flag, Ordering::Release);
         Ok(())
@@ -788,6 +796,17 @@ impl FileLike for Directory {
 
     fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         super::inode_flags::ioctl(&self.inner, cmd, arg).unwrap_or(Err(AxError::NotATty))
+    }
+
+    fn sync(&self, data_only: bool) -> AxResult<()> {
+        // A directory sync is a metadata durability request.  Preserve the
+        // caller's data-only bit for filesystems which distinguish it, but do
+        // not route through a regular-file handle (directories have none).
+        self.inner.entry().sync(data_only).map_err(Into::into)
+    }
+
+    fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
+        self.inner.writeback_error_state().map_err(Into::into)
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

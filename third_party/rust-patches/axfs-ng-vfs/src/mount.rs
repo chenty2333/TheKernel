@@ -899,6 +899,10 @@ impl Location {
         self.mountpoint().writeback_anchor(self.entry.clone())
     }
 
+    pub fn writeback_error_state(&self) -> VfsResult<Arc<crate::WritebackErrorState>> {
+        self.entry.writeback_error_state()
+    }
+
     pub fn name(&self) -> &str {
         self.entry.name()
     }

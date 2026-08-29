@@ -6,7 +6,7 @@ use core::{
 
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirNode, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeOps,
-    NodePermission, NodeType, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
+    NodePermission, NodeType, NodeUserData, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
 };
 use axhal::time::wall_time;
 use axsync::Mutex;
@@ -110,6 +110,7 @@ pub struct SimpleFsNode {
     ino: u64,
     tracked_inode: bool,
     pub(crate) metadata: Mutex<Metadata>,
+    pub(crate) user_data: NodeUserData,
 }
 
 impl SimpleFsNode {
@@ -139,6 +140,7 @@ impl SimpleFsNode {
             ino,
             tracked_inode: true,
             metadata: Mutex::new(metadata),
+            user_data: NodeUserData::new(),
         }
     }
 
@@ -175,6 +177,7 @@ impl SimpleFsNode {
             ino,
             tracked_inode: false,
             metadata: Mutex::new(metadata),
+            user_data: NodeUserData::new(),
         })
     }
 }
@@ -243,6 +246,10 @@ impl NodeOps for SimpleFsNode {
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
+    }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.user_data)
     }
 }
 

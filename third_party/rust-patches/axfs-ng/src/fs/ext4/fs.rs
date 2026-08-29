@@ -11,7 +11,7 @@ use core::{
 
 use axfs_ng_vfs::{
     DirEntry, Filesystem, FilesystemOps, NodeUserData, Reference, StatFs, VfsError, VfsResult,
-    path::MAX_NAME_LEN,
+    WritebackErrorState, path::MAX_NAME_LEN,
 };
 use axsync::{Mutex as SleepingMutex, MutexGuard as SleepingMutexGuard};
 use hashbrown::HashMap;
@@ -26,8 +26,6 @@ use super::{
 use crate::MountedBlockDevice;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
-const EXT4_RUNTIME_ATTACHMENT_SLOTS: usize = 4_096;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct RuntimeToken {
     ino: u32,
@@ -48,6 +46,90 @@ struct RuntimeRegistry {
     reservations: usize,
 }
 
+/// A bounded weak index of writeback-error state currently owned by live inode
+/// wrappers.  The wrapper owns the strong reference; this index merely lets a
+/// second wrapper for the same `(ino, generation)` share it.  In particular,
+/// dead inode generations do not retain error state until unmount.
+struct WritebackErrorRegistry {
+    entries: HashMap<RuntimeToken, Weak<WritebackErrorState>>,
+    reservations: usize,
+}
+
+impl WritebackErrorRegistry {
+    fn try_new() -> VfsResult<Self> {
+        Ok(Self {
+            entries: HashMap::new(),
+            reservations: 0,
+        })
+    }
+
+    fn try_reserve(&mut self) -> VfsResult<()> {
+        let desired_reservations = self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
+        self.entries
+            .len()
+            .checked_add(desired_reservations)
+            .ok_or(VfsError::NoMemory)?;
+        // `try_reserve` guarantees capacity for all live entries plus every
+        // pending publication. There is no fixed registry limit: normal
+        // opens are limited only by allocatable memory.
+        self.entries
+            .try_reserve(desired_reservations)
+            .map_err(|_| VfsError::NoMemory)?;
+        self.reservations = desired_reservations;
+        Ok(())
+    }
+
+    /// Returns a live state before admitting a new registry entry.  Reopening
+    /// an inode must not fail merely because a registry allocation would fail.
+    fn lookup_or_reserve(
+        &mut self,
+        token: RuntimeToken,
+    ) -> VfsResult<Option<Arc<WritebackErrorState>>> {
+        if let Some(state) = self.entries.get(&token).and_then(Weak::upgrade) {
+            return Ok(Some(state));
+        }
+        // A failed upgrade is a dead generation; remove it before calculating
+        // the actual allocation requirement for the new one.
+        self.entries.remove(&token);
+        self.try_reserve()?;
+        Ok(None)
+    }
+
+    fn cancel_reservation(&mut self) {
+        debug_assert!(self.reservations != 0);
+        self.reservations = self.reservations.saturating_sub(1);
+    }
+
+    fn commit(
+        &mut self,
+        token: RuntimeToken,
+        state: Arc<WritebackErrorState>,
+    ) -> Arc<WritebackErrorState> {
+        self.cancel_reservation();
+        if let Some(existing) = self.entries.get(&token).and_then(Weak::upgrade) {
+            return existing;
+        }
+        // Every unpublished dentry reserved one slot, so this insert cannot
+        // allocate after the namespace has made a new inode visible.
+        self.entries.insert(token, Arc::downgrade(&state));
+        state
+    }
+
+    /// Remove an entry eagerly when its inode wrapper is its last owner.
+    /// Aliased wrappers and in-flight fsync checks keep the weak index intact
+    /// until ordinary stale-entry reclamation can safely remove it.
+    fn remove_if_sole_owner(&mut self, token: RuntimeToken, state: &Arc<WritebackErrorState>) {
+        if Arc::strong_count(state) == 1
+            && self
+                .entries
+                .get(&token)
+                .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(state)))
+        {
+            self.entries.remove(&token);
+        }
+    }
+}
+
 impl RuntimeRegistry {
     fn try_new() -> VfsResult<Self> {
         Ok(Self {
@@ -57,39 +139,23 @@ impl RuntimeRegistry {
     }
 
     fn try_reserve(&mut self) -> VfsResult<()> {
-        let mut desired_reservations =
-            self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
-        if self
-            .entries
+        // Creation is rare and may pay to reclaim stale weak entries.
+        // Ordinary path lookup below remains an O(1) hash probe and pays
+        // nothing when no runtime attachments exist.
+        self.entries.retain(|_, data| data.strong_count() != 0);
+        let desired_reservations = self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
+        self.entries
             .len()
             .checked_add(desired_reservations)
-            .is_none_or(|used| used > EXT4_RUNTIME_ATTACHMENT_SLOTS)
-        {
-            // Creation is rare and may pay to reclaim stale weak entries.
-            // Ordinary path lookup below remains an O(1) hash probe and pays
-            // nothing when no runtime attachments exist.
-            self.entries.retain(|_, data| data.strong_count() != 0);
-        }
-        if self
-            .entries
-            .len()
-            .checked_add(desired_reservations)
-            .is_none_or(|used| used > EXT4_RUNTIME_ATTACHMENT_SLOTS)
-        {
-            return Err(VfsError::NoMemory);
-        }
+            .ok_or(VfsError::NoMemory)?;
 
         // Reserve for every outstanding transaction, not merely this caller:
         // several creators may prepare private inodes before any of them
         // commits. This keeps the post-namespace-publication insert infallible
-        // without charging every ext4 mount for 4096 empty buckets up front.
-        if self.entries.try_reserve(desired_reservations).is_err() {
-            self.entries.retain(|_, data| data.strong_count() != 0);
-            desired_reservations = self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
-            self.entries
-                .try_reserve(desired_reservations)
-                .map_err(|_| VfsError::NoMemory)?;
-        }
+        // while allowing the registry to grow with legitimate open files.
+        self.entries
+            .try_reserve(desired_reservations)
+            .map_err(|_| VfsError::NoMemory)?;
         self.reservations = desired_reservations;
         Ok(())
     }
@@ -149,7 +215,7 @@ mod runtime_registry_tests {
 
         registry.try_reserve().unwrap();
         assert!(registry.entries.capacity() >= 1);
-        assert!(registry.entries.capacity() < EXT4_RUNTIME_ATTACHMENT_SLOTS);
+        assert!(registry.entries.capacity() >= 1);
         registry.cancel_reservation();
     }
 
@@ -187,24 +253,107 @@ mod runtime_registry_tests {
     }
 
     #[test]
-    fn runtime_reservations_enforce_the_logical_ceiling() {
+    fn runtime_reservations_grow_past_the_former_logical_ceiling() {
         let mut registry = RuntimeRegistry::try_new().unwrap();
-        for _ in 0..EXT4_RUNTIME_ATTACHMENT_SLOTS {
+        for _ in 0..=4_096 {
             registry.try_reserve().unwrap();
         }
         assert!(registry.entries.capacity() >= registry.entries.len() + registry.reservations);
-        assert!(matches!(registry.try_reserve(), Err(VfsError::NoMemory)));
-        for _ in 0..EXT4_RUNTIME_ATTACHMENT_SLOTS {
+        for _ in 0..=4_096 {
             registry.cancel_reservation();
         }
-        registry.try_reserve().unwrap();
-        registry.cancel_reservation();
+    }
+
+    #[test]
+    fn writeback_errors_share_live_inode_state_and_reclaim_dead_generations() {
+        let mut registry = WritebackErrorRegistry::try_new().unwrap();
+        let token = RuntimeToken {
+            ino: 17,
+            generation: 3,
+        };
+
+        assert!(registry.lookup_or_reserve(token).unwrap().is_none());
+        let initial = registry.commit(token, Arc::new(WritebackErrorState::default()));
+        initial.publish(VfsError::Io);
+
+        let reservations_before_relookup = registry.reservations;
+        let relookup = registry.lookup_or_reserve(token).unwrap().unwrap();
+        assert_eq!(registry.reservations, reservations_before_relookup);
+        assert!(Arc::ptr_eq(&initial, &relookup));
+        let mut cursor = relookup.sample();
+        assert_eq!(cursor, 0);
+        assert_eq!(relookup.check_and_advance(&mut cursor), Some(VfsError::Io));
+        assert_eq!(relookup.sample(), 1);
+
+        drop(relookup);
+        registry.remove_if_sole_owner(token, &initial);
+        drop(initial);
+        assert!(registry.entries.is_empty());
+
+        assert!(
+            registry
+                .lookup_or_reserve(RuntimeToken {
+                    ino: token.ino,
+                    generation: token.generation + 1,
+                })
+                .unwrap()
+                .is_none()
+        );
+        let reused_ino = registry.commit(
+            RuntimeToken {
+                ino: token.ino,
+                generation: token.generation + 1,
+            },
+            Arc::new(WritebackErrorState::default()),
+        );
+        assert_eq!(reused_ino.sample(), 0);
+    }
+
+    #[test]
+    fn writeback_error_registry_grows_past_the_former_logical_ceiling() {
+        let mut registry = WritebackErrorRegistry::try_new().unwrap();
+        for _ in 0..=4_096 {
+            registry.try_reserve().unwrap();
+        }
+        assert!(registry.entries.capacity() >= registry.entries.len() + registry.reservations);
+        for _ in 0..=4_096 {
+            registry.cancel_reservation();
+        }
     }
 }
 
 pub(crate) struct RuntimeReservation {
     fs: Arc<Ext4Filesystem>,
     committed: bool,
+}
+
+pub(crate) struct WritebackErrorReservation {
+    fs: Arc<Ext4Filesystem>,
+    state: Arc<WritebackErrorState>,
+    reserved: bool,
+}
+
+impl WritebackErrorReservation {
+    pub(crate) fn commit(mut self, token: InodeToken) -> Arc<WritebackErrorState> {
+        if !self.reserved {
+            return self.state.clone();
+        }
+        let state = self
+            .fs
+            .writeback_errors
+            .lock()
+            .commit(token.into(), self.state.clone());
+        self.reserved = false;
+        state
+    }
+}
+
+impl Drop for WritebackErrorReservation {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.fs.writeback_errors.lock().cancel_reservation();
+        }
+    }
 }
 
 impl RuntimeReservation {
@@ -349,6 +498,7 @@ pub struct Ext4Filesystem {
     // their original non-preemptible spin semantics.
     root_dir: SpinMutex<Option<DirEntry>>,
     runtime_data: SpinMutex<RuntimeRegistry>,
+    writeback_errors: SpinMutex<WritebackErrorRegistry>,
 }
 
 impl Ext4Filesystem {
@@ -366,11 +516,13 @@ impl Ext4Filesystem {
         })
         .map_err(|_| VfsError::NoMemory)?;
         let runtime_data = RuntimeRegistry::try_new()?;
+        let writeback_errors = WritebackErrorRegistry::try_new()?;
         let fs = Arc::try_new(Self {
             inner: SleepingMutex::new(ManuallyDrop::new(finalizer)),
             disk,
             root_dir: SpinMutex::new(None),
             runtime_data: SpinMutex::new(runtime_data),
+            writeback_errors: SpinMutex::new(writeback_errors),
         })
         .map_err(|_| VfsError::NoMemory)?;
         // Allocate the wrapper before installing the backend root self-cycle;
@@ -397,6 +549,49 @@ impl Ext4Filesystem {
 
     pub(crate) fn runtime_attachment(&self, token: InodeToken) -> Option<Arc<NodeUserData>> {
         self.runtime_data.lock().attachment(token.into())
+    }
+
+    pub(crate) fn reserve_writeback_error_state(
+        self: &Arc<Self>,
+        token: Option<InodeToken>,
+    ) -> VfsResult<WritebackErrorReservation> {
+        if let Some(token) = token
+            && let Some(state) = self
+                .writeback_errors
+                .lock()
+                .lookup_or_reserve(token.into())?
+        {
+            return Ok(WritebackErrorReservation {
+                fs: self.clone(),
+                state,
+                reserved: false,
+            });
+        }
+        if token.is_none() {
+            self.writeback_errors.lock().try_reserve()?;
+        }
+        let state = match Arc::try_new(WritebackErrorState::default()) {
+            Ok(state) => state,
+            Err(_) => {
+                self.writeback_errors.lock().cancel_reservation();
+                return Err(VfsError::NoMemory);
+            }
+        };
+        Ok(WritebackErrorReservation {
+            fs: self.clone(),
+            state,
+            reserved: true,
+        })
+    }
+
+    pub(crate) fn release_writeback_error_state(
+        &self,
+        token: InodeToken,
+        state: &Arc<WritebackErrorState>,
+    ) {
+        self.writeback_errors
+            .lock()
+            .remove_if_sole_owner(token.into(), state);
     }
 
     pub(crate) fn wait_async_write(
