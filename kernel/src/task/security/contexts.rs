@@ -281,6 +281,21 @@ impl<'a> SecuritySchedulerContext<'a> {
     }
 }
 
+/// Frozen target credential for Linux's `security_task_getsid` hook.
+pub(crate) struct SecurityTaskGetsidContext<'a> {
+    target: &'a Cred,
+}
+
+impl<'a> SecurityTaskGetsidContext<'a> {
+    pub(crate) const fn new(target: &'a Cred) -> Self {
+        Self { target }
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
+}
+
 /// Kernel wrapper retaining the exact composite actor/target credentials and
 /// their module states around one already-core-authorized signal request.
 pub(crate) struct SecuritySignalContext<'a> {

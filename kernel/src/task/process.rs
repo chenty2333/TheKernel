@@ -289,15 +289,32 @@ pub(crate) fn process_domain() -> AxResult<&'static ProcessDomain> {
 /// queue ownership is destroyed.
 pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     let snapshot = process.zombie_payload();
+    // A session's SID is the leader's PID, but the session can outlive that
+    // leader while another process group still belongs to it. Keep the
+    // namespace binding through that lifetime so getsid can render its SID.
+    let session = process.group().session();
+    let session_sid = session.sid();
+    let pid_ns = process.identity::<Arc<PidNamespace>>();
     let reaped = process_domain()?.reap(process).map_err(process_error)?;
     if !reaped {
         return Ok(false);
     }
 
-    // The immutable core identity remains available after registry unlink.
-    // Only this successful reap edge makes its namespace-local PID reusable.
-    if let Some(pid_ns) = process.identity::<Arc<PidNamespace>>() {
-        pid_ns.release_reaped_process(process.pid());
+    if let Some(pid_ns) = pid_ns {
+        if !session.is_live() {
+            // The last process group left this session. This may release a
+            // previously reaped leader's SID binding from a different group.
+            pid_ns.release_reaped_process(session_sid);
+        }
+        if process.pid() != session_sid {
+            pid_ns.release_reaped_process(process.pid());
+        } else if !session.is_live() {
+            // The leader was also the last group member; the SID release
+            // above is its ordinary PID release.
+        } else {
+            // Preserve the leader's PID binding while the session remains
+            // live, matching Linux's PIDTYPE_SID lifetime.
+        }
     }
 
     let snapshot = snapshot.ok_or(AxError::BadState)?;
@@ -745,6 +762,16 @@ impl PidNamespace {
             .get(&global_pid)
             .copied()
             .unwrap_or(global_pid)
+    }
+
+    /// Resolves a positive PID visible in this namespace to its kernel-wide
+    /// identity. Unlike [`Self::visible_pid`], this never invents a fallback:
+    /// syscall lookup must not turn an unseen namespace-local number into a
+    /// global task lookup.
+    pub(crate) fn resolve_visible_pid(&self, visible_pid: Pid) -> Option<Pid> {
+        (visible_pid != 0)
+            .then(|| self.pids.lock().by_local.get(&visible_pid).copied())
+            .flatten()
     }
 
     pub(crate) fn proc_inode(&self) -> u64 {
@@ -6095,6 +6122,9 @@ mod tests {
         let root_init = root.reserve_process(10).unwrap();
         root_init.commit();
         assert_eq!(root.visible_pid(10), 1);
+        assert_eq!(root.resolve_visible_pid(1), Some(10));
+        assert_eq!(root.resolve_visible_pid(0), None);
+        assert_eq!(root.resolve_visible_pid(99), None);
 
         // A CLONE_NEWPID child is PID 1 locally, while the parent namespace
         // receives its independent next local PID binding.
@@ -6102,7 +6132,9 @@ mod tests {
         let child_init = child.reserve_process(20).unwrap();
         child_init.commit();
         assert_eq!(child.visible_pid(20), 1);
+        assert_eq!(child.resolve_visible_pid(1), Some(20));
         assert_eq!(root.visible_pid_for(&child, 20), Some(2));
+        assert_eq!(root.resolve_visible_pid(2), Some(20));
 
         let unpublished = child.reserve_process(21).unwrap();
         assert_eq!(child.visible_pid(21), 2);
@@ -6113,10 +6145,12 @@ mod tests {
         let live = child.reserve_process(22).unwrap();
         live.commit();
         assert_eq!(child.visible_pid(22), 2);
+        assert_eq!(child.resolve_visible_pid(2), Some(22));
         assert_eq!(root.visible_pid_for(&child, 22), Some(3));
         child.release_reaped_process(22);
         assert!(!child.pids.lock().by_global.contains_key(&22));
         assert!(!root.pids.lock().by_global.contains_key(&22));
+        assert_eq!(child.resolve_visible_pid(2), None);
 
         // Allocation is cyclic rather than LIFO: a released PID is reusable,
         // but Linux need not return it for the immediately following fork.

@@ -1105,6 +1105,33 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    pub(super) fn dispatch_task_getsid(
+        &self,
+        context: &SecurityTaskGetsidContext<'_>,
+    ) -> AxResult<()> {
+        for (index, registered) in self.modules.iter().enumerate() {
+            debug_assert_eq!(usize::from(registered.id.0), index);
+            registered.module.task_getsid(context)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn dispatch_task_getsid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetsidContext<'_>,
+    ) -> AxResult<()> {
+        let target = self.credential_slots(context.target())?;
+        for (registered, target_state) in self.modules.iter().zip(target) {
+            if registered.id != target_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .task_getsid_with_credential_state(context, target_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);

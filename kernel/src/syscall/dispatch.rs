@@ -1144,7 +1144,10 @@ pub(super) fn dispatch_syscall(
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
-        Sysno::getsid => sys_getsid(uctx.arg0() as _),
+        // `pid_t` is a signed 32-bit ABI value even though syscall registers
+        // are 64-bit.  Keep only its low word so negative PIDs reach getsid's
+        // ESRCH path rather than becoming unrelated wide identifiers.
+        Sysno::getsid => sys_getsid(uctx.arg0() as u32 as _),
         Sysno::setsid => sys_setsid(),
         Sysno::getpgrp => compat_getpgrp(),
         Sysno::getpgid => sys_getpgid(uctx.arg0() as _),

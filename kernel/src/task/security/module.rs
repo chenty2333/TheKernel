@@ -525,6 +525,19 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
         self.scheduler(context)
     }
 
+    /// Linux `security_task_getsid` authorization for one resolved task.
+    fn task_getsid(&self, _context: &SecurityTaskGetsidContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn task_getsid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetsidContext<'_>,
+        _target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.task_getsid(context)
+    }
+
     fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -735,6 +748,12 @@ pub(super) trait ErasedSecurityModule: Send + Sync {
         &self,
         context: &SecuritySchedulerContext<'_>,
         actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn task_getsid(&self, context: &SecurityTaskGetsidContext<'_>) -> AxResult<()>;
+    fn task_getsid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetsidContext<'_>,
         target_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
     fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()>;
@@ -1316,6 +1335,22 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
             self,
             context,
             owned_credential_state(self, actor_state)?,
+            owned_credential_state(self, target_state)?,
+        )
+    }
+
+    fn task_getsid(&self, context: &SecurityTaskGetsidContext<'_>) -> AxResult<()> {
+        SecurityModule::task_getsid(self, context)
+    }
+
+    fn task_getsid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetsidContext<'_>,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::task_getsid_with_credential_state(
+            self,
+            context,
             owned_credential_state(self, target_state)?,
         )
     }
