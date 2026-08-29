@@ -1,7 +1,6 @@
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_char, c_int, c_void},
-    mem::offset_of,
     time::Duration,
 };
 
@@ -49,7 +48,10 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::{AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, ns_capable},
+    task::{
+        AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, has_pending_syscall_signal,
+        ns_capable,
+    },
     time::{TimeValueLike, wall_time},
 };
 
@@ -64,7 +66,7 @@ enum TimeUpdate {
     Explicit,
 }
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
-const GETDENTS64_MAX_BUFFER: usize = 16 * 1024;
+const GETDENTS_NAME_PATH_MAX: usize = 4096;
 
 fn try_string(value: &str) -> AxResult<String> {
     let mut owned = String::new();
@@ -679,54 +681,190 @@ pub fn sys_mknodat<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-// Directory buffer for getdents64 syscall
-struct DirBuffer {
-    buf: Vec<u8>,
-    offset: usize,
+#[derive(Clone, Copy)]
+enum DirentFormat {
+    Legacy,
+    Dirent64,
 }
 
-impl DirBuffer {
-    fn try_new(len: usize) -> AxResult<Self> {
-        let len = len.min(GETDENTS64_MAX_BUFFER);
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
-        buf.resize(len, 0);
-        Ok(Self { buf, offset: 0 })
+fn getdents_count(count: usize) -> usize {
+    count as u32 as usize
+}
+
+fn getdents_has_room(count: usize, copied: usize, record_len: usize) -> bool {
+    // Linux stores the unsigned syscall argument in the callback's signed
+    // `int count`. Native values above INT_MAX therefore cannot admit even
+    // the first record (an empty directory still returns zero).
+    count <= i32::MAX as usize && record_len <= count.saturating_sub(copied)
+}
+
+fn dirent_record_len(format: DirentFormat, name: &[u8]) -> AxResult<usize> {
+    if name.is_empty()
+        || name.len() >= GETDENTS_NAME_PATH_MAX
+        || name.iter().any(|byte| *byte == b'/')
+    {
+        return Err(AxError::Io);
+    }
+    Ok(match format {
+        // struct linux_dirent: ino@0, off@8, reclen@16, name@18, type@last
+        DirentFormat::Legacy => (18 + name.len() + 2).next_multiple_of(8),
+        // struct linux_dirent64: ino@0, off@8, reclen@16, type@18, name@19
+        DirentFormat::Dirent64 => (19 + name.len() + 1).next_multiple_of(8),
+    })
+}
+
+/// Constructs one native x86_64 Linux directory record in reusable storage.
+fn fill_dirent(
+    record: &mut Vec<u8>,
+    format: DirentFormat,
+    ino: u64,
+    offset: u64,
+    node_type: NodeType,
+    name: &[u8],
+) -> AxResult<()> {
+    let reclen = dirent_record_len(format, name)?;
+    let name_offset = match format {
+        DirentFormat::Legacy => 18,
+        DirentFormat::Dirent64 => 19,
+    };
+    record.clear();
+    record
+        .try_reserve_exact(reclen)
+        .map_err(|_| AxError::NoMemory)?;
+    record.resize(reclen, 0);
+    record[0..8].copy_from_slice(&ino.to_ne_bytes());
+    record[8..16].copy_from_slice(&match format {
+        DirentFormat::Legacy => offset.to_ne_bytes(),
+        DirentFormat::Dirent64 => (offset as i64).to_ne_bytes(),
+    });
+    record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+    match format {
+        DirentFormat::Legacy => record[reclen - 1] = node_type as u8,
+        DirentFormat::Dirent64 => record[18] = node_type as u8,
+    }
+    record[name_offset..name_offset + name.len()].copy_from_slice(name);
+    Ok(())
+}
+
+#[cfg(test)]
+fn build_dirent(
+    format: DirentFormat,
+    ino: u64,
+    offset: u64,
+    node_type: NodeType,
+    name: &[u8],
+) -> AxResult<Vec<u8>> {
+    let mut record = Vec::new();
+    fill_dirent(&mut record, format, ino, offset, node_type, name)?;
+    Ok(record)
+}
+
+fn sys_getdents_common<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    buf: *mut u8,
+    count: usize,
+    format: DirentFormat,
+) -> AxResult<isize> {
+    let dir = Directory::from_fd(fd)?;
+    dir.check_io_access()?;
+    if dir.inner().metadata()?.nlink == 0 {
+        return Err(AxError::NotFound);
     }
 
-    fn remaining_space(&self) -> usize {
-        self.buf.len().saturating_sub(self.offset)
-    }
+    let count = getdents_count(count);
+    let result = {
+        let mut dir_offset = dir.offset.lock();
+        let mut copied = 0;
+        let mut stop_error = None;
+        let mut stopped_for_space = false;
+        let mut record = Vec::new();
+        let mut last_reclen = 0;
 
-    fn write_entry(&mut self, d_ino: u64, d_off: i64, d_type: NodeType, name: &[u8]) -> bool {
-        const NAME_OFFSET: usize = offset_of!(linux_dirent64, d_name);
+        let iteration = dir.read_dir(*dir_offset, &mut |name: &str, ino, node_type, offset| {
+            // Linux only checks signals between already completed records.
+            if copied != 0 && has_pending_syscall_signal(current().as_thread()) {
+                return false;
+            }
 
-        let len = NAME_OFFSET + name.len() + 1;
-        // alignment
-        let len = len.next_multiple_of(align_of::<linux_dirent64>());
-        if self.remaining_space() < len {
-            return false;
+            let record_len = match dirent_record_len(format, name.as_bytes()) {
+                Ok(record_len) => record_len,
+                Err(error) => {
+                    stop_error = Some(error);
+                    return false;
+                }
+            };
+            if !getdents_has_room(count, copied, record_len) {
+                stopped_for_space = true;
+                return false;
+            }
+            if let Err(error) =
+                fill_dirent(&mut record, format, ino, offset, node_type, name.as_bytes())
+            {
+                stop_error = Some(error);
+                return false;
+            }
+
+            // Any failure from the user-memory provider is EFAULT for this
+            // copyout, including provider-side allocation failures.
+            if vm_write_slice(memory, buf.wrapping_add(copied), &record).is_err() {
+                stop_error = Some(AxError::BadAddress);
+                return false;
+            }
+            *dir_offset = offset;
+            copied += record.len();
+            last_reclen = record.len();
+            true
+        });
+
+        if copied != 0 {
+            // Linux performs a final checked d_off store after iteration. A
+            // concurrent mprotect/unmap may therefore turn an otherwise
+            // successful prefix into EFAULT, while the OFD cookie remains
+            // committed to the last copied record.
+            let final_offset = match format {
+                DirentFormat::Legacy => dir_offset.to_ne_bytes(),
+                DirentFormat::Dirent64 => (*dir_offset as i64).to_ne_bytes(),
+            };
+            let last_d_off = buf.wrapping_add(copied - last_reclen + 8);
+            vm_write_slice(memory, last_d_off, &final_offset)
+                .map(|_| copied as isize)
+                .map_err(|_| AxError::BadAddress)
+        } else {
+            match iteration {
+                Err(error) => Err(error),
+                Ok(_) => match stop_error {
+                    Some(error) => Err(error),
+                    None if stopped_for_space => Err(AxError::InvalidInput),
+                    None => Ok(0),
+                },
+            }
         }
+    };
 
-        // FIXME: safety
-        unsafe {
-            let entry_ptr = self.buf.as_mut_ptr().add(self.offset);
-            entry_ptr.cast::<linux_dirent64>().write(linux_dirent64 {
-                d_ino,
-                d_off,
-                d_reclen: len as _,
-                d_type: d_type as _,
-                d_name: Default::default(),
-            });
-
-            let name_ptr = entry_ptr.add(NAME_OFFSET);
-            name_ptr.copy_from_nonoverlapping(name.as_ptr(), name.len());
-            name_ptr.add(name.len()).write(0);
-        }
-
-        self.offset += len;
-        true
+    // Linux marks every live-directory iteration as an access, including an
+    // empty result, EINVAL/EFAULT from the actor, or an iterator error.
+    // Metadata failures are best-effort and cannot change the syscall result.
+    if mounts::should_update_atime(dir.inner()) {
+        warn_notification(
+            "getdents atime",
+            dir.inner().update_supported_metadata(MetadataUpdate {
+                atime: Some(wall_time()),
+                ..Default::default()
+            }),
+        );
     }
+    result
+}
+
+pub fn sys_getdents<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fd: i32,
+    buf: *mut u8,
+    count: usize,
+) -> AxResult<isize> {
+    debug!("sys_getdents <= fd: {fd}, buf: {buf:?}, count: {count}");
+    sys_getdents_common(memory, fd, buf, count, DirentFormat::Legacy)
 }
 
 pub fn sys_getdents64<M: UserMemory + ?Sized>(
@@ -736,43 +874,7 @@ pub fn sys_getdents64<M: UserMemory + ?Sized>(
     len: usize,
 ) -> AxResult<isize> {
     debug!("sys_getdents64 <= fd: {fd}, buf: {buf:?}, len: {len}");
-
-    let dir = Directory::from_fd(fd)?;
-    // Reject path-only descriptions before inode state, allocation, or the
-    // shared directory offset can affect the Linux EBADF result. `read_dir`
-    // repeats the OFD-level check so future enumeration callers stay safe.
-    dir.check_io_access()?;
-    if dir.inner().metadata()?.nlink == 0 {
-        return Err(AxError::NotFound);
-    }
-
-    let mut buffer = DirBuffer::try_new(len)?;
-    let mut dir_offset = dir.offset.lock();
-
-    let mut has_remaining = false;
-
-    dir.read_dir(*dir_offset, &mut |name: &str, ino, node_type, offset| {
-        has_remaining = true;
-        if !buffer.write_entry(ino, offset as _, node_type, name.as_bytes()) {
-            return false;
-        }
-        *dir_offset = offset;
-        true
-    })?;
-
-    if has_remaining && buffer.offset == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if buffer.offset > 0 && mounts::should_update_atime(dir.inner()) {
-        dir.inner().update_supported_metadata(MetadataUpdate {
-            atime: Some(wall_time()),
-            ..Default::default()
-        })?;
-    }
-
-    vm_write_slice(memory, buf, &buffer.buf[..buffer.offset]).map_err(map_usercopy_error)?;
-
-    Ok(buffer.offset as _)
+    sys_getdents_common(memory, fd, buf, len, DirentFormat::Dirent64)
 }
 
 /// create a link from new_path to old_path
@@ -1816,6 +1918,76 @@ mod tests {
 
     use super::*;
     use crate::task::DacCredentialView;
+
+    #[test]
+    fn getdents_records_match_native_x86_64_layouts() {
+        let legacy = build_dirent(
+            DirentFormat::Legacy,
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            NodeType::Directory,
+            b"abc",
+        )
+        .unwrap();
+        assert_eq!(legacy.len(), 24);
+        assert_eq!(
+            u64::from_ne_bytes(legacy[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(
+            u64::from_ne_bytes(legacy[8..16].try_into().unwrap()),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(u16::from_ne_bytes(legacy[16..18].try_into().unwrap()), 24);
+        assert_eq!(&legacy[18..22], b"abc\0");
+        assert_eq!(legacy[22], 0);
+        assert_eq!(legacy[23], NodeType::Directory as u8);
+
+        let dirent64 = build_dirent(
+            DirentFormat::Dirent64,
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            NodeType::RegularFile,
+            b"abc",
+        )
+        .unwrap();
+        assert_eq!(dirent64.len(), 24);
+        assert_eq!(
+            u64::from_ne_bytes(dirent64[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(
+            i64::from_ne_bytes(dirent64[8..16].try_into().unwrap()),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(u16::from_ne_bytes(dirent64[16..18].try_into().unwrap()), 24);
+        assert_eq!(dirent64[18], NodeType::RegularFile as u8);
+        assert_eq!(&dirent64[19..23], b"abc\0");
+        assert_eq!(dirent64[23], 0);
+    }
+
+    #[test]
+    fn getdents_count_uses_unsigned_int_width() {
+        assert_eq!(getdents_count(u32::MAX as usize), u32::MAX as usize);
+        assert_eq!(getdents_count((u32::MAX as usize).saturating_add(9)), 8);
+        assert!(!getdents_has_room(i32::MAX as usize + 1, 0, 24));
+        assert!(getdents_has_room(i32::MAX as usize, 0, 24));
+    }
+
+    #[test]
+    fn getdents_first_record_requires_its_full_reclen() {
+        let record = build_dirent(
+            DirentFormat::Dirent64,
+            1,
+            2,
+            NodeType::RegularFile,
+            b"entry",
+        )
+        .unwrap();
+        assert!(!getdents_has_room(record.len() - 1, 0, record.len()));
+        assert!(getdents_has_room(record.len(), 0, record.len()));
+        assert_eq!(record.len(), 32);
+    }
 
     fn linkat_test_security() -> VfsSecurityContext {
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();

@@ -102,6 +102,9 @@ pub(super) fn dispatch_syscall(
         Sysno::getdents64 => with_user_memory(aspace(), |memory| {
             sys_getdents64(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
+        Sysno::getdents => with_user_memory(aspace(), |memory| {
+            sys_getdents(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
         Sysno::link => with_user_memory(aspace(), |memory| {
             sys_link(memory, uctx.arg0() as _, uctx.arg1() as _)
         }),
