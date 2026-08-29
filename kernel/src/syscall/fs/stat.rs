@@ -1,7 +1,7 @@
 use alloc::string::String;
 use core::{
     ffi::{c_char, c_int},
-    mem::{align_of, size_of},
+    mem::{align_of, offset_of, size_of},
 };
 
 use axerrno::{AxError, AxResult};
@@ -61,6 +61,19 @@ const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
 
+/// Native x86_64 `struct ustat`. Although obsolete, Linux still copies the
+/// complete 32-byte object, including its ABI padding and obsolete name fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Ustat {
+    f_tfree: i32,
+    _padding: u32,
+    f_tinode: u64,
+    f_fname: [u8; 6],
+    f_fpack: [u8; 6],
+    _tail_padding: [u8; 4],
+}
+
 // `linux_raw_sys` exposes these UAPI records without bytemuck's `NoUninit`
 // marker.  The x86_64 Linux layouts contain ABI padding/tail storage that is
 // part of the object copied by stat-family syscalls, so keep the unchecked
@@ -72,6 +85,12 @@ const _: () = {
     assert!(size_of::<statx>() == 256);
     assert!(align_of::<statfs>() == 8);
     assert!(size_of::<statfs>() == 120);
+    assert!(align_of::<Ustat>() == 8);
+    assert!(size_of::<Ustat>() == 32);
+    assert!(offset_of!(Ustat, f_tfree) == 0);
+    assert!(offset_of!(Ustat, f_tinode) == 8);
+    assert!(offset_of!(Ustat, f_fname) == 16);
+    assert!(offset_of!(Ustat, f_fpack) == 22);
 };
 
 fn load_user_path<M: UserMemory + ?Sized>(
@@ -111,6 +130,33 @@ fn write_statfs<M: UserMemory + ?Sized>(
     // SAFETY: `statfs` is integer-only on the supported x86_64 ABI and its
     // complete object size/alignment are asserted above.
     unsafe { VmMutPtr::vm_write_unchecked(buf, memory, value) }.map_err(map_usercopy_error)
+}
+
+fn write_ustat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut Ustat,
+    value: Ustat,
+) -> AxResult<()> {
+    // SAFETY: `Ustat` is integer-only and initialized from a zeroed complete
+    // object representation before its counters are filled in.
+    unsafe { VmMutPtr::vm_write_unchecked(buf, memory, value) }.map_err(|_| AxError::BadAddress)
+}
+
+#[inline]
+fn decode_ustat_device(raw: u64) -> DeviceId {
+    let raw = raw as u32;
+    let major = (raw & 0x0fff00) >> 8;
+    let minor = (raw & 0x0000ff) | ((raw >> 12) & 0x0fff00);
+    DeviceId::new(major, minor)
+}
+
+fn ustat_from_counts(blocks_free: u64, free_file_count: u64) -> Ustat {
+    // SAFETY: every field, explicit padding, and tail padding is zeroed before
+    // the two Linux-defined counters are populated.
+    let mut result: Ustat = unsafe { core::mem::zeroed() };
+    result.f_tfree = blocks_free as i32;
+    result.f_tinode = free_file_count;
+    result
 }
 
 fn node_type_from_mode(mode: u32) -> NodeType {
@@ -469,6 +515,21 @@ fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
     None
 }
 
+pub fn sys_ustat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dev: u64,
+    ubuf: *mut Ustat,
+) -> AxResult<isize> {
+    let loc = mounts::mounted_root_location(decode_ustat_device(dev))?;
+    let stat = loc.filesystem().stat()?;
+    write_ustat(
+        memory,
+        ubuf,
+        ustat_from_counts(stat.blocks_free, stat.free_file_count),
+    )?;
+    Ok(0)
+}
+
 pub fn sys_statfs<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
@@ -515,6 +576,39 @@ pub fn sys_fstatfs<M: UserMemory + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ustat_decodes_legacy_linux_device_numbers() {
+        assert_eq!(decode_ustat_device(0x800).major(), 8);
+        assert_eq!(decode_ustat_device(0x800).minor(), 0);
+        assert_eq!(
+            decode_ustat_device(0xdead_beef_0000_0800).0,
+            DeviceId::new(8, 0).0
+        );
+    }
+
+    #[test]
+    fn ustat_has_complete_zeroed_native_layout() {
+        let record = ustat_from_counts(0x1_0000_0001, u64::MAX);
+        assert_eq!(record.f_tfree, 1);
+        assert_eq!(record.f_tinode, u64::MAX);
+        assert_eq!(record.f_fname, [0; 6]);
+        assert_eq!(record.f_fpack, [0; 6]);
+        // SAFETY: `Ustat` has a complete initialized representation.
+        let bytes = unsafe {
+            core::slice::from_raw_parts((&raw const record).cast::<u8>(), size_of::<Ustat>())
+        };
+        assert_eq!(&bytes[4..8], &[0; 4]);
+        assert_eq!(&bytes[28..32], &[0; 4]);
+    }
+
+    #[test]
+    fn ustat_unknown_device_is_rejected_before_any_user_copy() {
+        assert!(matches!(
+            mounts::mounted_root_location(DeviceId::new(u32::MAX, u32::MAX)),
+            Err(AxError::InvalidInput)
+        ));
+    }
 
     #[test]
     fn empty_path_fd_detection_requires_the_flag_and_an_empty_path() {

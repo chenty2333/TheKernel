@@ -111,10 +111,19 @@ impl<'a> MountRecordIndex<'a> {
 }
 
 static MOUNT_RECORDS: BlockingMutex<Vec<MountRecord>> = BlockingMutex::new(Vec::new());
+// Detached mount FDs and lazily unmounted-but-referenced mounts remain live
+// superblocks even though they have no namespace record. Keep weak mount roots
+// so legacy device-number queries can follow Linux's user_get_super lifetime.
+static LIVE_SUPERBLOCK_MOUNTS: Lazy<BlockingMutex<HashMap<u64, Weak<Mountpoint>>>> =
+    Lazy::new(|| BlockingMutex::new(HashMap::new()));
 /// Linux defaults `/proc/sys/fs/mount-max` to 100,000 mounts per namespace.
 /// TheKernel currently has one global namespace, so use the same hard ceiling
 /// until mount namespace accounting is extracted into the ABI layer.
 const MAX_MOUNT_RECORDS: usize = 100_000;
+// Keep room for the namespace's attached mountpoints plus an equally large set
+// of distinct detached or lazily unmounted mountpoints retained by file
+// descriptors. Entries are deduplicated by stable mount ID.
+const MAX_LIVE_SUPERBLOCK_MOUNTS: usize = MAX_MOUNT_RECORDS * 2;
 static LINUX_DEVICE_IDS: Lazy<BlockingMutex<HashMap<u64, (DeviceId, WeakFilesystemIdentity)>>> =
     Lazy::new(|| BlockingMutex::new(HashMap::new()));
 
@@ -251,6 +260,76 @@ pub fn snapshot() -> AxResult<Vec<MountRecord>> {
     Ok(snapshot)
 }
 
+/// Returns the root location of the first live mount with this Linux device
+/// number. The returned mountpoint keeps the mount alive after the records
+/// lock is released, so callers may inspect its filesystem without holding
+/// namespace state locked.
+pub fn mounted_root_location(device: DeviceId) -> AxResult<Location> {
+    let detached_or_retained = {
+        let mut mounts = LIVE_SUPERBLOCK_MOUNTS.lock();
+        mounts.retain(|_, mountpoint| mountpoint.strong_count() != 0);
+        mounts.values().find_map(|mountpoint| {
+            let mountpoint = mountpoint.upgrade()?;
+            (linux_device_id(mountpoint.device()) == device).then_some(mountpoint)
+        })
+    };
+    if let Some(mountpoint) = detached_or_retained {
+        return Ok(mountpoint.root_location());
+    }
+
+    let attached = {
+        let records = MOUNT_RECORDS.lock();
+        records
+            .iter()
+            .find_map(|record| {
+                (record.dev == device.0)
+                    .then(|| record.mountpoint.upgrade())
+                    .flatten()
+            })
+            .ok_or(AxError::InvalidInput)?
+    };
+    Ok(attached.root_location())
+}
+
+fn register_live_superblock_mount(mountpoint: &Arc<Mountpoint>) -> VfsResult<()> {
+    let mut mounts = LIVE_SUPERBLOCK_MOUNTS.lock();
+    mounts.retain(|_, entry| entry.strong_count() != 0);
+    let mount_id = mountpoint.mount_id();
+    if mounts.contains_key(&mount_id) {
+        mounts.insert(mount_id, Arc::downgrade(mountpoint));
+        return Ok(());
+    }
+    if mounts.len() >= MAX_LIVE_SUPERBLOCK_MOUNTS {
+        return Err(AxError::StorageFull);
+    }
+    mounts.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    mounts.insert(mount_id, Arc::downgrade(mountpoint));
+    Ok(())
+}
+
+fn register_live_superblock_tree(records: &[MountRecord]) -> VfsResult<()> {
+    let mut mounts = LIVE_SUPERBLOCK_MOUNTS.lock();
+    mounts.retain(|_, entry| entry.strong_count() != 0);
+    let additional = records
+        .iter()
+        .filter(|record| !mounts.contains_key(&record.mount_id))
+        .count();
+    if mounts
+        .len()
+        .checked_add(additional)
+        .is_none_or(|total| total > MAX_LIVE_SUPERBLOCK_MOUNTS)
+    {
+        return Err(AxError::StorageFull);
+    }
+    mounts
+        .try_reserve(additional)
+        .map_err(|_| AxError::NoMemory)?;
+    for record in records {
+        mounts.insert(record.mount_id, record.mountpoint.clone());
+    }
+    Ok(())
+}
+
 fn mount_extensions(flags: u32, metadata: MountMetadata) -> VfsResult<TypeMap> {
     let mut extensions = TypeMap::new();
     let retired = extensions.try_insert(LinuxMountState {
@@ -327,7 +406,10 @@ pub fn new_detached_with_flags(
     flags: u32,
     metadata: MountMetadata,
 ) -> VfsResult<Arc<Mountpoint>> {
-    Mountpoint::new_detached_with_extensions(filesystem, mount_extensions(flags, metadata)?)
+    let mountpoint =
+        Mountpoint::new_detached_with_extensions(filesystem, mount_extensions(flags, metadata)?)?;
+    register_live_superblock_mount(&mountpoint)?;
+    Ok(mountpoint)
 }
 
 fn mount_state(mountpoint: &Mountpoint) -> AxResult<Arc<LinuxMountState>> {
@@ -536,6 +618,10 @@ pub fn attach_tree_and_record(root: &Arc<Mountpoint>, target: &Location) -> VfsR
     records
         .try_reserve(committed.len())
         .map_err(|_| axfs_ng_vfs::VfsError::NoMemory)?;
+    // Register every child before publication. Recursive bind children may
+    // refer to different superblocks and remain live through detached-tree or
+    // lazy-unmount references after their namespace records disappear.
+    register_live_superblock_tree(&committed)?;
     root.attach_to(target)?;
     records.extend(committed);
     Ok(())
@@ -1136,6 +1222,7 @@ mod tests {
     use alloc::string::ToString;
 
     use super::*;
+    use crate::pseudofs::MemoryFs;
 
     fn record(mount_id: u64, parent_id: u64, target: &str) -> MountRecord {
         MountRecord {
@@ -1151,6 +1238,22 @@ mod tests {
             expire_epoch: None,
             mountpoint: Weak::new(),
         }
+    }
+
+    #[test]
+    fn device_lookup_keeps_detached_live_superblocks_visible() {
+        let filesystem = MemoryFs::new().unwrap();
+        let mountpoint = new_detached_with_flags(
+            &filesystem,
+            0,
+            MountMetadata::try_from_strs("none", "tmpfs", "/", "").unwrap(),
+        )
+        .unwrap();
+        let device = linux_device_id(mountpoint.device());
+
+        let root = mounted_root_location(device).unwrap();
+        assert_eq!(root.mountpoint().device(), mountpoint.device());
+        assert!(!mountpoint.is_attached());
     }
 
     #[test]

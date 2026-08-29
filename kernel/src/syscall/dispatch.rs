@@ -827,6 +827,9 @@ pub(super) fn dispatch_syscall(
                 uctx.arg3() as _,
             )
         }),
+        Sysno::ustat => with_user_memory(aspace(), |memory| {
+            sys_ustat(memory, uctx.arg0() as u64, uctx.arg1() as _)
+        }),
         Sysno::statfs => with_user_memory(aspace(), |memory| {
             sys_statfs(memory, uctx.arg0() as _, uctx.arg1() as _)
         }),
