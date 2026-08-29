@@ -4,7 +4,6 @@ use core::{
     mem::{align_of, offset_of, size_of},
 };
 
-use axconfig::ARCH;
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{time::monotonic_time, uspace::UserContext};
 use axtask::current;
@@ -361,7 +360,9 @@ const fn pad_str(info: &str) -> [c_char; 65] {
 const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0002_0000;
 const SUPPORTED_PERSONALITY: u32 = UNAME26;
-const UNAME26_RELEASE: &[u8] = b"2.6.60";
+const UTS_RELEASE: &str = "6.12.103";
+const UTS_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC 2026-08-10T00:00:00Z";
+const UNAME26_RELEASE_PREFIX: &[u8] = b"2.6.72";
 
 fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
     for (dst, byte) in dst.iter_mut().zip(src.iter()) {
@@ -369,20 +370,51 @@ fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
     }
 }
 
+/// Match Linux `override_release()`: retain the first non-version suffix
+/// after translating every 4.x-and-later release to the UNAME26 2.6 series.
+fn uname26_release(release: &[c_char; 65]) -> [u8; 65] {
+    let mut result = [0u8; 65];
+    result[..UNAME26_RELEASE_PREFIX.len()].copy_from_slice(UNAME26_RELEASE_PREFIX);
+
+    let mut rest = 0;
+    let mut dots = 0;
+    while rest < release.len() && release[rest] != 0 {
+        let byte = release[rest] as u8;
+        if byte == b'.' {
+            dots += 1;
+            if dots >= 3 {
+                break;
+            }
+        }
+        if !byte.is_ascii_digit() && byte != b'.' {
+            break;
+        }
+        rest += 1;
+    }
+    let mut output = UNAME26_RELEASE_PREFIX.len();
+    while output < result.len() - 1 && rest < release.len() && release[rest] != 0 {
+        result[output] = release[rest] as u8;
+        output += 1;
+        rest += 1;
+    }
+    result
+}
+
 pub(crate) fn current_utsname() -> AxResult<new_utsname> {
     let mut utsname = new_utsname {
         sysname: pad_str("Linux"),
         nodename: [0; 65],
-        release: pad_str("6.6.0"),
-        version: pad_str("6.6.0"),
-        machine: pad_str(ARCH),
+        release: pad_str(UTS_RELEASE),
+        version: pad_str(UTS_VERSION),
+        machine: pad_str("x86_64"),
         domainname: [0; 65],
     };
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let uts_ns = proc_data.uts_ns();
-    fill_uts_field(&mut utsname.nodename, &uts_ns.nodename()?);
-    fill_uts_field(&mut utsname.domainname, &uts_ns.domainname()?);
+    let (nodename, domainname) = uts_ns.names_snapshot();
+    fill_uts_field(&mut utsname.nodename, &nodename);
+    fill_uts_field(&mut utsname.domainname, &domainname);
     Ok(utsname)
 }
 
@@ -487,15 +519,31 @@ pub fn sys_uname<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *mut new_utsname,
 ) -> AxResult<isize> {
-    let mut uts = current_utsname()?;
-    if current().as_thread().proc_data.personality() & UNAME26 != 0 {
-        uts.release = [0; 65];
-        fill_uts_field(&mut uts.release, UNAME26_RELEASE);
-    }
+    let uts = current_utsname()?;
+    let uname26 = current().as_thread().proc_data.personality() & UNAME26 != 0;
+    write_utsname(memory, name, uts, uname26)?;
+    Ok(0)
+}
+
+/// Linux first copies the native `new_utsname`, then overwrites only the
+/// release field for UNAME26. Keep this as two user copies: a fault in the
+/// latter exposes the already copied native result.
+fn write_utsname<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *mut new_utsname,
+    uts: new_utsname,
+    uname26: bool,
+) -> AxResult<()> {
     // SAFETY: all fields in `uts` are initialized, including the zero-filled
     // tail bytes, and the checked x86_64 layout has no padding.
-    unsafe { VmMutPtr::vm_write_unchecked(name, memory, uts) }.map_err(map_usercopy_error)?;
-    Ok(0)
+    unsafe { VmMutPtr::vm_write_unchecked(name, memory, uts) }.map_err(|_| AxError::BadAddress)?;
+    if uname26 {
+        let release = uname26_release(&uts.release);
+        // `release` begins 130 bytes into the packed native x86_64 layout.
+        let release_ptr = (name as *mut u8).wrapping_add(offset_of!(new_utsname, release));
+        vm_write_slice(memory, release_ptr, &release).map_err(|_| AxError::BadAddress)?;
+    }
+    Ok(())
 }
 
 pub fn sys_sethostname<M: UserMemory + ?Sized>(
@@ -800,6 +848,76 @@ mod tests {
     fn uts_bytes_before_nul_preserves_non_utf8_bytes() {
         assert_eq!(uts_bytes_before_nul(b"node\0suffix"), b"node");
         assert_eq!(uts_bytes_before_nul(&[b'n', 0xff, b'e']), &[b'n', 0xff, b'e']);
+    }
+
+    fn test_utsname() -> new_utsname {
+        new_utsname {
+            sysname: [b'S' as c_char; 65],
+            nodename: [b'N' as c_char; 65],
+            release: [b'R' as c_char; 65],
+            version: [b'V' as c_char; 65],
+            machine: [b'M' as c_char; 65],
+            domainname: [b'D' as c_char; 65],
+        }
+    }
+
+    #[test]
+    fn uname26_release_matches_linux_override_release() {
+        let mut release = [0; 65];
+        fill_uts_field(&mut release, b"6.12.103-custom");
+        assert_eq!(&uname26_release(&release)[..14], b"2.6.72-custom\0");
+    }
+
+    #[test]
+    fn uname_native_copy_is_one_complete_390_byte_write() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; size_of::<new_utsname>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), false).unwrap();
+        assert_eq!(memory.memory_mut().writes, &[0]);
+        assert_eq!(&memory.memory_mut().bytes[130..195], &[b'R'; 65]);
+    }
+
+    #[test]
+    fn uname26_overwrites_release_in_a_second_copy_after_native_result() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; size_of::<new_utsname>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), true).unwrap();
+        assert_eq!(memory.memory_mut().writes, &[0, 130]);
+        assert_eq!(&memory.memory_mut().bytes[130..137], b"2.6.72\0");
+        assert_eq!(&memory.memory_mut().bytes[137..195], &[0; 58]);
+    }
+
+    #[test]
+    fn uname26_second_copy_fault_keeps_native_prefix_visible_and_returns_efault() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; size_of::<new_utsname>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: Some(130),
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), true),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(memory.memory_mut().writes, &[0, 130]);
+        assert_eq!(&memory.memory_mut().bytes[130..195], &[b'R'; 65]);
     }
 
     #[test]

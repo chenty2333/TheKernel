@@ -1169,6 +1169,15 @@ impl UtsNamespace {
         Ok(state.domainname[..state.domainname_len].to_vec())
     }
 
+    /// Snapshot both UTS name fields under one lock acquisition.
+    ///
+    /// `uname(2)` observes the namespace state as one unit, so its nodename
+    /// and domainname must not come from separate writer generations.
+    pub(crate) fn names_snapshot(&self) -> ([u8; UTS_FIELD_LEN], [u8; UTS_FIELD_LEN]) {
+        let state = *self.state.lock();
+        (state.nodename, state.domainname)
+    }
+
     pub(crate) fn set_nodename(&self, value: &[u8]) -> AxResult<()> {
         self.state.lock().set_nodename(value);
         Ok(())
@@ -4432,6 +4441,17 @@ mod tests {
         source.set_nodename(b"changed-source").unwrap();
         assert_eq!(copy.nodename().unwrap(), b"source-node");
         assert_eq!(copy.domainname().unwrap(), b"source-domain");
+    }
+
+    #[test]
+    fn uts_namespace_names_snapshot_contains_both_current_fields() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let uts = UtsNamespace::try_new_root(owner).unwrap();
+        uts.set_nodename(b"snapshot-node").unwrap();
+        uts.set_domainname(b"snapshot-domain").unwrap();
+        let (nodename, domainname) = uts.names_snapshot();
+        assert_eq!(&nodename[..b"snapshot-node".len()], b"snapshot-node");
+        assert_eq!(&domainname[..b"snapshot-domain".len()], b"snapshot-domain");
     }
 
     #[test]
