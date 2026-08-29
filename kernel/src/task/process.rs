@@ -1477,11 +1477,51 @@ impl MempolicyState {
     }
 }
 
+/// Monotonically renewed token for one published group-leader identity.
+///
+/// A successful exec publishes a new token even when the executor already
+/// owns the same credential slot and private signal endpoint.  Consumers that
+/// authorize an operation before acquiring their final lifecycle gate can use
+/// it to reject that otherwise pointer-identical exec handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GroupLeaderIdentityToken(u64);
+
+/// One coherent, pinned view of the group-leader identity.
+///
+/// The token is deliberately paired with both owners: an exec can retain the
+/// same endpoint, and leader exec can retain the same credential slot.  The
+/// token therefore supplies the generation edge those pointer comparisons
+/// cannot represent by themselves.
+#[derive(Clone)]
+pub(crate) struct GroupLeaderIdentitySnapshot {
+    token: GroupLeaderIdentityToken,
+    credential: Arc<Cred>,
+    signal: Arc<ThreadSignalManager>,
+}
+
+impl GroupLeaderIdentitySnapshot {
+    pub(crate) fn token(&self) -> GroupLeaderIdentityToken {
+        self.token
+    }
+
+    pub(crate) fn credential(&self) -> &Arc<Cred> {
+        &self.credential
+    }
+
+    pub(crate) fn signal(&self) -> &Arc<ThreadSignalManager> {
+        &self.signal
+    }
+}
+
 /// Persistent binding to the credential slot and private signal endpoint that
 /// currently own Linux thread-group-leader identity.
 struct GroupLeaderIdentityBinding {
     current: SpinNoIrq<Arc<CredentialSlot>>,
     signal: GroupLeaderSignalOwner,
+    /// Starts nonzero and is renewed under the current/signal publication
+    /// locks by every exec handoff.  It is read only while those locks are
+    /// held, so a snapshot can never pair a new token with old owners.
+    identity_token: AtomicU64,
     /// The process PID namespace copied into the durable owner identity.
     pid_ns: Option<Arc<PidNamespace>>,
     scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
@@ -1499,6 +1539,7 @@ impl GroupLeaderIdentityBinding {
         Ok(Self {
             current: SpinNoIrq::new(initial),
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
+            identity_token: AtomicU64::new(1),
             pid_ns,
             scheduler: Arc::try_new(SpinNoIrq::new(ZombieSchedulerSnapshot::default()))
                 .map_err(|_| AxError::NoMemory)?,
@@ -1529,6 +1570,11 @@ impl GroupLeaderIdentityBinding {
     }
 
     fn current_cred_and_signal(&self) -> AxResult<(Arc<Cred>, Arc<ThreadSignalManager>)> {
+        let snapshot = self.identity_snapshot()?;
+        Ok((snapshot.credential, snapshot.signal))
+    }
+
+    fn identity_snapshot(&self) -> AxResult<GroupLeaderIdentitySnapshot> {
         let current = self.current.lock();
         let signal_guard = self.signal.lock();
         let slot = current.clone();
@@ -1536,9 +1582,14 @@ impl GroupLeaderIdentityBinding {
             .as_ref()
             .map(|identity| identity.manager.clone())
             .ok_or(AxError::BadState)?;
+        let token = GroupLeaderIdentityToken(self.identity_token.load(Ordering::Acquire));
         drop(signal_guard);
         drop(current);
-        Ok((slot.current(), signal))
+        Ok(GroupLeaderIdentitySnapshot {
+            token,
+            credential: slot.current(),
+            signal,
+        })
     }
 
     fn signal_matches(&self, expected: &Arc<ThreadSignalManager>) -> bool {
@@ -1546,6 +1597,19 @@ impl GroupLeaderIdentityBinding {
             .lock()
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(&current.manager, expected))
+    }
+
+    fn identity_snapshot_matches(&self, expected: &GroupLeaderIdentitySnapshot) -> bool {
+        let current = self.current.lock();
+        let signal = self.signal.lock();
+        let matches = self.identity_token.load(Ordering::Acquire) == expected.token.0
+            && Arc::ptr_eq(&current.current(), &expected.credential)
+            && signal
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.manager, &expected.signal));
+        drop(signal);
+        drop(current);
+        matches
     }
 
     fn signal_owner(&self) -> GroupLeaderSignalOwner {
@@ -1580,6 +1644,10 @@ impl GroupLeaderIdentityBinding {
             },
             _ => None,
         };
+        // Publish a new epoch while both identity owners remain locked.  This
+        // must happen even for leader exec, whose slot and endpoint can both
+        // be pointer-identical across the handoff.
+        self.identity_token.fetch_add(1, Ordering::Release);
         drop(current_signal);
         drop(current);
         #[cfg(test)]
@@ -2724,6 +2792,21 @@ impl ProcessData {
         &self,
     ) -> AxResult<(Arc<Cred>, Arc<ThreadSignalManager>)> {
         self.group_leader_identity.current_cred_and_signal()
+    }
+
+    /// Captures the complete published leader identity for an operation that
+    /// must validate it again after taking a later lifecycle gate.
+    pub(crate) fn group_leader_identity_snapshot(&self) -> AxResult<GroupLeaderIdentitySnapshot> {
+        self.group_leader_identity.identity_snapshot()
+    }
+
+    /// Returns whether `expected` still names this exact exec generation.
+    pub(crate) fn group_leader_identity_snapshot_matches(
+        &self,
+        expected: &GroupLeaderIdentitySnapshot,
+    ) -> bool {
+        self.group_leader_identity
+            .identity_snapshot_matches(expected)
     }
 
     pub(crate) fn group_leader_signal_identity_matches(
@@ -5425,6 +5508,43 @@ mod tests {
         assert!(old_signal_weak.upgrade().is_some());
         drop(retirement);
         assert!(old_signal_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn group_leader_identity_snapshot_reseeds_on_same_owner_exec_handoff() {
+        let slot = credential_slot(1000);
+        let signal = thread_signal_manager();
+        let binding = GroupLeaderIdentityBinding::try_new(slot.clone()).unwrap();
+        binding.bind_initial_signal(9, signal.clone()).unwrap();
+
+        let before = binding.identity_snapshot().unwrap();
+        assert!(binding.identity_snapshot_matches(&before));
+
+        // Leader exec retains both the task credential slot and its private
+        // endpoint.  The identity token must still invalidate work which was
+        // authorized before the image handoff.
+        let mut update = slot.prepare();
+        update.builder.ids.ruid = kuid(2000);
+        update.builder.ids.euid = kuid(2000);
+        update.builder.ids.suid = kuid(2000);
+        update.builder.ids.fsuid = kuid(2000);
+        let prepared = update.finish().unwrap();
+        drop(
+            binding
+                .publish_handoff(
+                    slot.clone(),
+                    Some(GroupLeaderSignalIdentity::new(9, signal)),
+                    Some(prepared),
+                )
+                .complete_post_commit(),
+        );
+
+        let after = binding.identity_snapshot().unwrap();
+        assert_ne!(before.token(), after.token());
+        assert!(Arc::ptr_eq(before.signal(), after.signal()));
+        assert!(!binding.identity_snapshot_matches(&before));
+        assert!(binding.identity_snapshot_matches(&after));
+        assert_eq!(after.credential().ids().ruid, kuid(2000));
     }
 
     #[test]
