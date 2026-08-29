@@ -32,11 +32,12 @@ use crate::{
         security::{
             ExistingInodeSecurityRef, FileOpenSecurityContext, InodeCreateSecurityContext,
             InodeLinkSecurityContext, InodeMkdirSecurityContext, InodeMknodSecurityContext,
-            InodePermissionSecurityContext, InodeRenameSecurityContext, InodeRmdirSecurityContext,
-            InodeSecurityRef, InodeSetattrCommittedSecurityRef, InodeSetattrSecurityAdmission,
-            InodeSetattrSecurityContext, InodeSymlinkSecurityContext, InodeUnlinkSecurityContext,
-            PlannedInodeSecurityRef, RenameDestinationSecurityRef, dispatch_file_open,
-            dispatch_inode_create, dispatch_inode_link, dispatch_inode_mkdir, dispatch_inode_mknod,
+            InodePermissionOperation, InodePermissionSecurityContext, InodeRenameSecurityContext,
+            InodeRmdirSecurityContext, InodeSecurityRef, InodeSetattrCommittedSecurityRef,
+            InodeSetattrSecurityAdmission, InodeSetattrSecurityContext,
+            InodeSymlinkSecurityContext, InodeUnlinkSecurityContext, PlannedInodeSecurityRef,
+            RenameDestinationSecurityRef, dispatch_file_open, dispatch_inode_create,
+            dispatch_inode_link, dispatch_inode_mkdir, dispatch_inode_mknod,
             dispatch_inode_permission, dispatch_inode_rename, dispatch_inode_rmdir,
             dispatch_inode_setattr, dispatch_inode_symlink, dispatch_inode_unlink,
             initial_user_namespace,
@@ -1537,6 +1538,38 @@ pub(crate) fn check_search_permissions_with_security(
         security.credentials(),
         security.filesystem_owner_user_ns(),
     )
+}
+
+/// Authorizes a directory selected by `fchdir(2)`.
+///
+/// The Linux request is `MAY_EXEC | MAY_CHDIR`: DAC receives execute/search
+/// access and the typed security hook receives the additional `MAY_CHDIR`
+/// operation intent.  `VfsSecurityContext` carries the filesystem owner
+/// namespace exposed by this kernel's mounts; idmapped mounts are not
+/// implemented, so there is no synthetic idmap to apply here.
+pub(crate) fn check_fchdir_permissions_with_security(
+    loc: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    let metadata = loc.metadata()?;
+    check_dac_permissions_with_actor(
+        metadata.mode.bits() as u32,
+        metadata.uid,
+        metadata.gid,
+        metadata.node_type,
+        X_OK,
+        security.actor(),
+        security.credentials(),
+    )?;
+    let object = InodeSecurityRef::new(loc, &metadata);
+    dispatch_inode_permission(&InodePermissionSecurityContext::new_for_operation(
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+        &object,
+        InodePermissionAccess::EXECUTE,
+        InodePermissionOperation::FchdirMayChdir,
+    ))
 }
 
 /// Computes Linux `vfs_prepare_mode()` plus `inode_init_owner()` attributes

@@ -37,8 +37,9 @@ use crate::{
         namespace_mutation,
         permission::{
             ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
-            VfsSecurityContext, check_open_permissions_with_security,
-            check_search_permissions_with_security, check_writable_mount,
+            VfsSecurityContext, check_fchdir_permissions_with_security,
+            check_open_permissions_with_security, check_search_permissions_with_security,
+            check_writable_mount,
         },
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
         resolve_at_with_security, validate_symlink_target, with_fs, with_path_fs,
@@ -557,14 +558,17 @@ pub fn sys_chdir<M: UserMemory + ?Sized>(
 pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     debug!("sys_fchdir <= dirfd: {dirfd}");
 
-    let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
+    // fdget_raw-equivalent: retain this exact open file description once and
+    // keep it live through the permission decision and cwd publication.
+    // Directory::from_fd also preserves Linux's EBADF-before-ENOTDIR order.
+    let directory = Directory::from_fd(dirfd)?;
+    let entry = directory.inner();
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    if entry.node_type() != NodeType::Directory {
-        return Err(AxError::NotADirectory);
-    }
-    check_search_permissions_with_security(&entry, &security)?;
-    FS_CONTEXT.lock().set_current_dir(entry)?;
+    check_fchdir_permissions_with_security(entry, &security)?;
+    // One FS-context critical section publishes the new pwd only after all
+    // fallible fd/type/permission stages succeeded, preserving CLONE_FS.
+    FS_CONTEXT.lock().set_current_dir(entry.clone())?;
     Ok(0)
 }
 

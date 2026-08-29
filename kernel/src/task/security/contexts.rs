@@ -339,6 +339,19 @@ impl<'a> SecuritySignalContext<'a> {
 pub(crate) struct InodePermissionSecurityContext<'context, 'location> {
     pub(super) actor: &'context Cred,
     pub(super) core: CoreInodePermissionContext<'context, 'location>,
+    operation: InodePermissionOperation,
+}
+
+/// The VFS intent associated with an inode permission check.
+///
+/// Linux represents `fchdir(2)` as `MAY_EXEC | MAY_CHDIR`.  The generic
+/// inode-permission contract carries the executable/search access bit, while
+/// this explicit operation retains the otherwise non-DAC `MAY_CHDIR` intent
+/// for security modules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InodePermissionOperation {
+    Generic,
+    FchdirMayChdir,
 }
 
 impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
@@ -349,6 +362,24 @@ impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
         target_object: &'context InodeSecurityRef<'location>,
         access: InodePermissionAccess,
     ) -> Self {
+        Self::new_for_operation(
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            target_object,
+            access,
+            InodePermissionOperation::Generic,
+        )
+    }
+
+    pub(crate) fn new_for_operation(
+        actor: &'context Cred,
+        dac_credential: &'context DacCredentialView,
+        target_owner_user_ns: &'context Arc<UserNamespace>,
+        target_object: &'context InodeSecurityRef<'location>,
+        access: InodePermissionAccess,
+        operation: InodePermissionOperation,
+    ) -> Self {
         Self {
             actor,
             core: CoreInodePermissionContext::new(
@@ -358,6 +389,7 @@ impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
                 target_object,
                 access,
             ),
+            operation,
         }
     }
 
@@ -383,6 +415,10 @@ impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
 
     pub(crate) const fn access(&self) -> InodePermissionAccess {
         self.core.access()
+    }
+
+    pub(crate) const fn operation(&self) -> InodePermissionOperation {
+        self.operation
     }
 }
 
