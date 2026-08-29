@@ -22,6 +22,25 @@ struct ProtectAction<A, F> {
     lineage: MappingLineage,
 }
 
+/// Outcome of a metadata-only VMA update that may have committed a prefix.
+/// Unlike protection changes, Linux `mseal` retains earlier VMA changes if a
+/// later split reaches the VMA-fragment limit.
+#[derive(Debug)]
+pub struct MetadataUpdateError {
+    error: MappingError,
+    changed: bool,
+}
+
+impl MetadataUpdateError {
+    pub const fn changed(&self) -> bool {
+        self.changed
+    }
+
+    pub fn into_parts(self) -> (MappingError, bool) {
+        (self.error, self.changed)
+    }
+}
+
 /// Resources retired by a deferred unmap or clear operation.
 ///
 /// The value owns every backend retirement token produced by the operation and
@@ -914,6 +933,121 @@ impl<B: MappingBackend> MemorySet<B> {
         for action in actions {
             self.merge_adjacent_at(action.start);
             self.merge_adjacent_at(action.end);
+        }
+        Ok(())
+    }
+
+    /// Applies one backend-metadata update to every VMA fragment intersecting
+    /// `start..start + size`, splitting boundary VMAs first. No page-table
+    /// operation occurs. VMAs are found, split, and updated one at a time in
+    /// address order. A later fragment-limit or allocation failure retains the
+    /// successfully updated prefix; the callback itself must be infallible.
+    pub fn update_metadata_with_limit(
+        &mut self,
+        start: B::Addr,
+        size: usize,
+        should_update: impl Fn(&B) -> bool,
+        update: impl Fn(&mut B),
+        max_areas: usize,
+    ) -> Result<(), MetadataUpdateError> {
+        let end = start.checked_add(size).ok_or(MetadataUpdateError {
+            error: MappingError::InvalidParam,
+            changed: false,
+        })?;
+        if start == end {
+            return Ok(());
+        }
+        let mut changed = false;
+        let mut cursor = start;
+        while cursor < end {
+            // Start from the crossing predecessor; if the cursor is in a
+            // hole, advance to the next VMA. Capture everything needed before
+            // mutating because splitting/merging invalidates map references.
+            let candidate = self
+                .areas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.end() > cursor)
+                .map(|(&area_start, _)| area_start)
+                .or_else(|| self.areas.range(cursor..).next().map(|(&area_start, _)| area_start));
+            let Some(area_start) = candidate else {
+                break;
+            };
+            let (action_start, action_end, old_end, flags, lineage, needs_update) = {
+                let area = self.areas.get(&area_start).unwrap();
+                if area.start() >= end {
+                    break;
+                }
+                (
+                    area_start.max(start),
+                    area.end().min(end),
+                    area.end(),
+                    area.flags(),
+                    area.lineage(),
+                    should_update(area.backend()),
+                )
+            };
+            // Advance using the pre-change end: the current action can split
+            // or merge this VMA, but no later work may revisit its prefix.
+            cursor = action_end;
+            if !needs_update {
+                continue;
+            }
+
+            let has_left = area_start < action_start;
+            let has_right = action_end < old_end;
+            let additional = usize::from(has_left) + usize::from(has_right);
+            let Some(peak) = self.len().checked_add(additional) else {
+                return Err(MetadataUpdateError {
+                    error: MappingError::NoMemory,
+                    changed,
+                });
+            };
+            if peak > max_areas {
+                return Err(MetadataUpdateError {
+                    error: MappingError::NoMemory,
+                    changed,
+                });
+            }
+
+            // BTreeMap has no fallible insert, so the bounded fragment check
+            // is the recoverable admission point. Each VMA then commits
+            // independently, matching Linux mseal's prefix semantics.
+            let (middle_backend, right_backend) = {
+                let area = self.areas.get(&area_start).unwrap();
+                (
+                    has_left.then(|| area.backend().clone()),
+                    has_right.then(|| area.backend().clone()),
+                )
+            };
+            self.areas
+                .get_mut(&area_start)
+                .unwrap()
+                .set_end(if has_left { action_start } else { action_end });
+            if let Some(backend) = middle_backend {
+                let area = MemoryArea::new_with_lineage(
+                    action_start,
+                    action_end.sub_addr(action_start),
+                    flags,
+                    backend,
+                    lineage,
+                );
+                assert!(self.areas.insert(area.start(), area).is_none());
+            }
+            if let Some(backend) = right_backend {
+                let area = MemoryArea::new_with_lineage(
+                    action_end,
+                    old_end.sub_addr(action_end),
+                    flags,
+                    backend,
+                    lineage,
+                );
+                assert!(self.areas.insert(area.start(), area).is_none());
+            }
+            update(self.areas.get_mut(&action_start).unwrap().backend_mut());
+            self.merge_adjacent_at(action_start);
+            self.merge_adjacent_at(action_end);
+            changed = true;
         }
         Ok(())
     }

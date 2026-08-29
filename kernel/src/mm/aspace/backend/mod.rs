@@ -565,6 +565,18 @@ impl Backend {
             && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.mapping_status().is_sealed()
+    }
+
+    pub(crate) fn set_sealed(&mut self) {
+        self.mapping_status_mut().set_sealed();
+    }
+
+    pub(crate) fn clear_sealed(&mut self) {
+        self.mapping_status_mut().clear_sealed();
+    }
+
     fn mapping_status(&self) -> &MappingStatus {
         match self {
             Backend::Linear(backend) => backend.mapping_status(),

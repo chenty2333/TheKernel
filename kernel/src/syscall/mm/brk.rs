@@ -66,7 +66,7 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             }
 
             let populate = locked && !aspace.locks_future_mappings_on_fault();
-            let Some((heap_lineage, heap_backend)) = expand_start
+            let Some((heap_lineage, mut heap_backend)) = expand_start
                 .checked_sub(1)
                 .and_then(|tail| aspace.find_area(tail))
                 .filter(|area| area.end() == expand_start && area.backend().is_private_anonymous())
@@ -74,6 +74,9 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             else {
                 return Ok(current_top as isize);
             };
+            // brk creates a new VMA tail.  Unlike growdown/fork, Linux does
+            // not carry VM_SEALED onto that newly allocated range.
+            heap_backend.clear_sealed();
             let growth = aspace.map_with_existing_lineage(
                 expand_start,
                 expand_size,

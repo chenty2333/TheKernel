@@ -15,7 +15,7 @@ mod tests;
 pub use self::{
     area::MemoryArea,
     backend::{DeferredUnmapBackend, MappingBackend},
-    set::{MemorySet, UnmapRetirement},
+    set::{MemorySet, MetadataUpdateError, UnmapRetirement},
 };
 
 /// Caller-allocated opaque identity shared by fragments of one logical mapping.

@@ -90,6 +90,14 @@ fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> 
     new_flags.contains(MappingFlags::EXECUTE) && !old_flags.contains(MappingFlags::EXECUTE)
 }
 
+fn wipe_on_fork_backend(start: VirtAddr, page_size: PageSize, sealed: bool) -> Backend {
+    let mut backend = Backend::new_alloc(start, page_size);
+    if sealed {
+        backend.set_sealed();
+    }
+    backend
+}
+
 fn present_leaf_satisfies_fault(page_flags: MappingFlags, access_flags: PageFaultFlags) -> bool {
     page_flags.contains(access_flags)
 }
@@ -1598,6 +1606,86 @@ impl AddrSpace {
         ranges
             .range(..end)
             .any(|(&range_start, &range_end)| range_end > start && range_start < end)
+    }
+
+    /// Linux mseal requires a mapped, gap-free range. The metadata transaction
+    /// splits boundary VMAs before setting VM_SEALED, with no PTE mutation.
+    pub(crate) fn seal(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+        if !range_is_fully_mapped(&self.areas, start, size) {
+            return Err(AxError::NoMemory);
+        }
+        if self
+            .areas
+            .iter_overlapping(VirtAddrRange::new(start, start + size))
+            .all(|area| area.backend().is_sealed())
+        {
+            return Ok(());
+        }
+        let next_topology_generation = self.next_topology_generation()?;
+        let updated = self.areas.update_metadata_with_limit(
+            start,
+            size,
+            |backend| !backend.is_sealed(),
+            Backend::set_sealed,
+            MAX_VMA_FRAGMENTS,
+        );
+        match updated {
+            Ok(()) => {
+                self.commit_topology_generation(next_topology_generation);
+                Ok(())
+            }
+            Err(error) => {
+                let (error, changed) = error.into_parts();
+                if changed {
+                    self.commit_topology_generation(next_topology_generation);
+                }
+                Err(AxError::from(error))
+            }
+        }
+    }
+
+    pub(crate) fn check_no_seal_overlap(&self, start: VirtAddr, size: usize) -> AxResult {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        if self
+            .areas
+            .iter_overlapping(VirtAddrRange::new(start, end))
+            .any(|area| area.backend().is_sealed())
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
+    }
+
+    /// mremap checks the initially looked-up VMA's seal before validating the
+    /// rest of its source geometry. Leave an unmapped address to the normal
+    /// source-range validator so it retains Linux's EFAULT/ENOMEM mapping.
+    pub(crate) fn check_vma_at_not_sealed(&self, address: VirtAddr) -> AxResult {
+        if self
+            .find_area(address)
+            .is_some_and(|area| area.backend().is_sealed())
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
+    }
+
+    /// `can_modify_vma_madv()` in Linux 6.12.103 only rejects discard-style
+    /// advice for sealed, read-only private anonymous VMAs.
+    pub(crate) fn sealed_ro_anon_in_range(&self, start: VirtAddr, size: usize) -> bool {
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        self.areas
+            .iter_overlapping(VirtAddrRange::new(start, end))
+            .any(|area| {
+                area.backend().is_sealed()
+                    && area.backend().is_private_anonymous()
+                    && !area.flags().contains(MappingFlags::WRITE)
+            })
     }
 
     fn fork_fragment_count(&self) -> AxResult<usize> {
@@ -3161,12 +3249,16 @@ impl AddrSpace {
             if !range_is_fully_mapped(&self.areas, source_start, source_size) {
                 return Err(MappingTransactionFailure::preserved(AxError::BadAddress));
             }
+            self.check_no_seal_overlap(source_start, source_size)
+                .map_err(MappingTransactionFailure::preserved)?;
 
             let replacing = matches!(destination, RemapDestination::Replace);
             if !replacing && !range_is_empty(&self.areas, destination_start, destination_size) {
                 return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
             }
             if replacing {
+                self.check_no_seal_overlap(destination_start, destination_size)
+                    .map_err(MappingTransactionFailure::preserved)?;
                 self.check_no_user_io_pin_overlap(
                     destination_start,
                     destination_size,
@@ -3307,6 +3399,8 @@ impl AddrSpace {
             }
             self.check_no_user_io_pin_overlap(source_start, source_size, InvalidationReason::Remap)
                 .map_err(MappingTransactionFailure::preserved)?;
+            self.check_no_seal_overlap(source_start, source_size)
+                .map_err(MappingTransactionFailure::preserved)?;
             let source_range = VirtAddrRange::from_start_size(source_start, source_size);
             let destination_range =
                 VirtAddrRange::from_start_size(destination_start, destination_size);
@@ -3319,6 +3413,8 @@ impl AddrSpace {
                 return Err(MappingTransactionFailure::preserved(AxError::InvalidInput));
             }
             if replacing {
+                self.check_no_seal_overlap(destination_start, destination_size)
+                    .map_err(MappingTransactionFailure::preserved)?;
                 self.check_no_user_io_pin_overlap(
                     destination_start,
                     destination_size,
@@ -3722,6 +3818,7 @@ impl AddrSpace {
         if size == 0 {
             return Ok(DeferredUffdWake::empty());
         }
+        self.check_no_seal_overlap(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
         let next_generation = self.next_topology_generation()?;
         let mapping_mutations =
@@ -4311,11 +4408,13 @@ impl AddrSpace {
                     let segment_end = wipe_end.min(area.end());
                     let wipe_size = segment_end.sub_addr(cursor);
                     debug_assert!(page_size.is_aligned(wipe_size));
+                    let child_backend =
+                        wipe_on_fork_backend(cursor, page_size, area.backend().is_sealed());
                     let new_area = MemoryArea::new_with_lineage(
                         cursor,
                         wipe_size,
                         area.flags(),
-                        Backend::new_alloc(cursor, page_size),
+                        child_backend,
                         child_lineage.expect("included parent lineage was not prepared"),
                     );
                     let aspace = guard.deref_mut();
@@ -4454,6 +4553,14 @@ mod tests {
     fn address_space_keeps_the_fixed_pin_ledger_off_stack() {
         assert!(core::mem::size_of::<UserIoPinRegistry>() > PAGE_SIZE_4K);
         assert!(core::mem::size_of::<AddrSpace>() <= PAGE_SIZE_4K);
+    }
+
+    #[test]
+    fn wipe_on_fork_child_keeps_parent_seal_without_its_backing() {
+        let child = wipe_on_fork_backend(VirtAddr::from(0x4000), PageSize::Size4K, true);
+        assert!(child.is_sealed());
+        assert!(child.is_private_anonymous());
+        assert!(child.file_mapping().is_none());
     }
 
     fn mock_lineage(raw: u64) -> MappingLineage {

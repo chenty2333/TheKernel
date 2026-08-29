@@ -302,6 +302,7 @@ impl FileLikeMappingLease {
 pub(super) struct MappingStatus {
     file: Option<FileMappingLease>,
     file_like: Option<FileLikeMappingLease>,
+    sealed: bool,
 }
 
 impl MappingStatus {
@@ -325,6 +326,20 @@ impl MappingStatus {
         self.file.is_some() || self.file_like.is_some()
     }
 
+    pub(super) const fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub(super) fn set_sealed(&mut self) {
+        self.sealed = true;
+    }
+
+    /// New mappings derived from an existing backing do not inherit Linux
+    /// VM_SEALED unless the operation explicitly preserves VMA metadata.
+    pub(super) fn clear_sealed(&mut self) {
+        self.sealed = false;
+    }
+
     pub(super) fn relocated(&self, old_start: VirtAddr, new_start: VirtAddr) -> AxResult<Self> {
         Ok(Self {
             file: self
@@ -337,6 +352,7 @@ impl MappingStatus {
                 .as_ref()
                 .map(|file| file.relocated(old_start, new_start))
                 .transpose()?,
+            sealed: self.sealed,
         })
     }
 
@@ -351,7 +367,7 @@ impl MappingStatus {
             (Some(lhs), Some(rhs)) => lhs.compatible_with(rhs),
             (None, Some(_)) | (Some(_), None) => false,
         };
-        file_compatible && file_like_compatible
+        file_compatible && file_like_compatible && self.sealed == other.sealed
     }
 }
 
@@ -531,6 +547,15 @@ mod tests {
         let mut status = MappingStatus::default();
         status.replace_file_mapping(Some(lease));
         status
+    }
+
+    #[test]
+    fn sealing_metadata_can_be_cleared_for_a_new_mapping_tail() {
+        let mut status = MappingStatus::default();
+        status.set_sealed();
+        assert!(status.is_sealed());
+        status.clear_sealed();
+        assert!(!status.is_sealed());
     }
 
     #[test]

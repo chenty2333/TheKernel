@@ -849,6 +849,7 @@ pub(super) fn dispatch_syscall(
         ),
         Sysno::munmap => sys_munmap(uctx.arg0(), uctx.arg1() as _),
         Sysno::mprotect => sys_mprotect(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::mseal => sys_mseal(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mincore => {
             let aspace = aspace();
             with_user_memory(aspace.clone(), |memory| {

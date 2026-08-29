@@ -21,6 +21,9 @@ struct MockBackend;
 struct MergeBackend;
 
 #[derive(Clone)]
+struct MetadataBackend(bool);
+
+#[derive(Clone)]
 struct FailingProtectBackend {
     preflight_calls: Arc<AtomicUsize>,
     protect_calls: Arc<AtomicUsize>,
@@ -193,6 +196,34 @@ impl MappingBackend for MergeBackend {
 
     fn can_merge(&self, _other: &Self) -> bool {
         true
+    }
+}
+
+impl MappingBackend for MetadataBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        MockBackend.unmap(start, size, pt)
+    }
+
+    fn protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        flags: MockFlags,
+        pt: &mut MockPageTable,
+    ) -> bool {
+        MockBackend.protect(start, size, flags, pt)
+    }
+
+    fn can_merge(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 
@@ -631,6 +662,72 @@ fn bounded_map_rejects_before_mapping_or_growing_the_area_tree() {
     assert_eq!(set.len(), 1);
     assert!(set.find(0x3000.into()).is_none());
     assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn metadata_update_splits_boundaries_and_is_idempotent_at_the_fragment_limit() {
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x3000, 1, MetadataBackend(false)),
+        &mut pt,
+        false,
+    ));
+
+    set.update_metadata_with_limit(
+        0x2000.into(),
+        0x1000,
+        |backend| !backend.0,
+        |backend| backend.0 = true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(set.len(), 3);
+    assert!(!set.find(0x1000.into()).unwrap().backend().0);
+    assert!(set.find(0x2000.into()).unwrap().backend().0);
+    assert!(!set.find(0x3000.into()).unwrap().backend().0);
+
+    set.update_metadata_with_limit(
+        0x2000.into(),
+        0x1000,
+        |backend| !backend.0,
+        |backend| backend.0 = true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(set.len(), 3);
+    assert_eq!(pt[0x1000], 1);
+}
+
+#[test]
+fn metadata_update_retains_committed_prefix_when_a_later_split_hits_the_limit() {
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x1000, 1, MetadataBackend(false)),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(0x3000.into(), 0x2000, 1, MetadataBackend(false)),
+        &mut pt,
+        false,
+    ));
+
+    let error = set
+        .update_metadata_with_limit(
+            0x1000.into(),
+            0x3000,
+            |backend| !backend.0,
+            |backend| backend.0 = true,
+            2,
+        )
+        .unwrap_err();
+    assert!(error.changed());
+    assert_eq!(error.into_parts().0, MappingError::NoMemory);
+    assert!(set.find(0x1000.into()).unwrap().backend().0);
+    assert!(!set.find(0x3000.into()).unwrap().backend().0);
+    assert_eq!(set.len(), 2);
 }
 
 #[test]

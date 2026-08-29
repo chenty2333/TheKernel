@@ -3,7 +3,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axhal::paging::MappingFlags;
+use axhal::paging::{MappingFlags, PageSize};
 use linux_raw_sys::general::RLIMIT_MEMLOCK;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingLineage;
@@ -12,7 +12,7 @@ use thekernel_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange,
 use crate::{
     mm::{
         AddrSpace, Backend, BackendOps, DeferredUffdWake, ExistingLineageMapError,
-        LockExternalUffdOutcome,
+        LockExternalUffdOutcome, checked_align_up,
     },
     task::ProcessData,
 };
@@ -169,8 +169,83 @@ fn validate_fixed_remap_dst(
     if !aspace.contains_range(dst, dst_size) {
         return Err(AxError::NoMemory);
     }
+    aspace.check_no_seal_overlap(dst, dst_size)?;
     Ok(())
 }
+
+/// Returns the destination range whose seal must be checked before mremap
+/// validates the complete source extent.  Linux uses a zero-length source
+/// interval for the `old_size == 0` duplication form when checking whether a
+/// fixed destination overlaps its source.
+fn fixed_destination_seal_probe_range(
+    request: MremapRequest,
+    page_size: usize,
+) -> AxResult<Option<(VirtAddr, usize)>> {
+    if !request.fixed {
+        return Ok(None);
+    }
+    if !request.new_addr.is_aligned(page_size) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let destination = VirtAddrRange::try_from_start_size(request.new_addr, request.new_size)
+        .ok_or(AxError::InvalidInput)?;
+    let overlap_size = if request.old_size == 0 {
+        0
+    } else {
+        request.old_size
+    };
+    let source = VirtAddrRange::try_from_start_size(request.addr, overlap_size)
+        .ok_or(AxError::InvalidInput)?;
+    if source.overlaps(destination) {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(Some((request.new_addr, request.new_size)))
+}
+
+fn probe_fixed_destination_seal(
+    aspace: &AddrSpace,
+    request: MremapRequest,
+    page_size: usize,
+) -> AxResult {
+    let Some((destination, destination_size)) =
+        fixed_destination_seal_probe_range(request, page_size)?
+    else {
+        return Ok(());
+    };
+    if !aspace.contains_range(destination, destination_size) {
+        return Err(AxError::NoMemory);
+    }
+    aspace.check_no_seal_overlap(destination, destination_size)
+}
+
+fn source_address_matches_initial_page_size(address: VirtAddr, page_size: PageSize) -> bool {
+    address.is_aligned(page_size)
+}
+
+fn check_initial_remap_source(aspace: &AddrSpace, address: VirtAddr) -> AxResult<PageSize> {
+    let area = aspace.find_area(address).ok_or(AxError::BadAddress)?;
+    aspace.check_vma_at_not_sealed(address)?;
+    let page_size = area.backend().page_size();
+    if !source_address_matches_initial_page_size(address, page_size) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(page_size)
+}
+
+fn normalize_remap_request_geometry(
+    mut request: MremapRequest,
+    page_size: PageSize,
+) -> AxResult<MremapRequest> {
+    let page_size = page_size as usize;
+    request.old_size =
+        checked_align_up(request.old_size, page_size).ok_or(AxError::InvalidInput)?;
+    request.new_size =
+        checked_align_up(request.new_size, page_size).ok_or(AxError::InvalidInput)?;
+    Ok(request)
+}
+
 struct PreparedRemapSegment {
     source_start: VirtAddr,
     destination_start: VirtAddr,
@@ -455,12 +530,15 @@ fn build_remap_plan(
     proc_data: &ProcessData,
     has_ipc_lock: bool,
     request: MremapRequest,
-) -> AxResult<RemapPlan> {
+) -> AxResult<(MremapRequest, RemapPlan)> {
     if request.old_size == 0 {
         if !request.may_move {
             return Err(AxError::InvalidInput);
         }
 
+        let source_page_size = check_initial_remap_source(aspace, request.addr)?;
+        let request = normalize_remap_request_geometry(request, source_page_size)?;
+        probe_fixed_destination_seal(aspace, request, source_page_size as usize)?;
         let source_segments = collect_remap_segments(aspace, request.addr, request.new_size)?;
         if !source_segments
             .iter()
@@ -496,12 +574,18 @@ fn build_remap_plan(
         if duplicated_locked != 0 {
             check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, duplicated_locked)?;
         }
-        return Ok(RemapPlan::Duplicate {
-            source_segments,
-            destination,
-        });
+        return Ok((
+            request,
+            RemapPlan::Duplicate {
+                source_segments,
+                destination,
+            },
+        ));
     }
 
+    let source_page_size = check_initial_remap_source(aspace, request.addr)?;
+    let request = normalize_remap_request_geometry(request, source_page_size)?;
+    probe_fixed_destination_seal(aspace, request, source_page_size as usize)?;
     let source_segments = collect_remap_segments(aspace, request.addr, request.old_size)?;
     let page_size = source_segments[0].backend.page_size();
     if !page_size.is_aligned(request.old_size) || !page_size.is_aligned(request.new_size) {
@@ -512,13 +596,16 @@ fn build_remap_plan(
     }
 
     if !request.fixed && request.new_size == request.old_size {
-        return Ok(RemapPlan::Return(request.addr));
+        return Ok((request, RemapPlan::Return(request.addr)));
     }
     if !request.fixed && request.new_size < request.old_size {
-        return Ok(RemapPlan::Shrink {
-            start: request.addr + request.new_size,
-            size: request.old_size - request.new_size,
-        });
+        return Ok((
+            request,
+            RemapPlan::Shrink {
+                start: request.addr + request.new_size,
+                size: request.old_size - request.new_size,
+            },
+        ));
     }
 
     let grow = request.new_size.saturating_sub(request.old_size);
@@ -532,7 +619,7 @@ fn build_remap_plan(
         if grow_locked {
             check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, grow)?;
         }
-        return Ok(RemapPlan::GrowInPlace { source_segments });
+        return Ok((request, RemapPlan::GrowInPlace { source_segments }));
     }
 
     if !request.may_move {
@@ -561,10 +648,13 @@ fn build_remap_plan(
     if grow_locked {
         check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, grow)?;
     }
-    Ok(RemapPlan::Move {
-        source_segments,
-        destination,
-    })
+    Ok((
+        request,
+        RemapPlan::Move {
+            source_segments,
+            destination,
+        },
+    ))
 }
 
 enum PreparedRemapPlan {
@@ -1080,7 +1170,7 @@ fn try_optimistic_mremap(
     if !proc_data.image_matches(&aspace_handle) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
-    let plan = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
+    let (request, plan) = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
     match plan {
         RemapPlan::Return(address) => {
             return Ok(OptimisticRemapOutcome::Complete(address.as_usize() as isize));
@@ -1123,7 +1213,7 @@ fn run_locked_mremap(
         if !proc_data.image_matches(&aspace_handle) {
             continue;
         }
-        let plan = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
+        let (request, plan) = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
         match plan {
             RemapPlan::Return(address) => return Ok(address.as_usize() as isize),
             RemapPlan::Shrink { start, size } => {
@@ -1186,6 +1276,7 @@ pub(crate) fn remap_user_mapping(
 
 #[cfg(test)]
 mod tests {
+    use axhal::paging::{MappingFlags, PageSize};
     use memory_addr::PAGE_SIZE_4K;
 
     use super::*;
@@ -1252,5 +1343,139 @@ mod tests {
         assert!(!grow.supports_unlocked_prepare(request));
         assert!(growth_prepare_is_discardable(false));
         assert!(!growth_prepare_is_discardable(true));
+    }
+
+    #[test]
+    fn sealed_fixed_destination_precedes_invalid_source_extent() {
+        let source = VirtAddr::from(0x2000);
+        let destination = VirtAddr::from(0x6000);
+        let mut aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x8000).unwrap();
+        aspace
+            .map(
+                source,
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(source, PageSize::Size4K),
+            )
+            .unwrap();
+        aspace
+            .map(
+                destination,
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(destination, PageSize::Size4K),
+            )
+            .unwrap();
+        aspace.seal(destination, PAGE_SIZE_4K).unwrap();
+
+        let request = MremapRequest {
+            addr: source,
+            old_size: PAGE_SIZE_4K * 2,
+            new_size: PAGE_SIZE_4K,
+            may_move: true,
+            fixed: true,
+            new_addr: destination,
+        };
+
+        // The initial lookup succeeds, but the requested extent crosses the
+        // source VMA boundary. A sealed fixed destination wins over that
+        // later EFAULT.
+        assert_eq!(
+            check_initial_remap_source(&aspace, source),
+            Ok(PageSize::Size4K)
+        );
+        assert_eq!(
+            probe_fixed_destination_seal(&aspace, request, PAGE_SIZE_4K),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert!(matches!(
+            collect_remap_segments(&aspace, source, request.old_size),
+            Err(AxError::BadAddress)
+        ));
+    }
+
+    #[test]
+    fn fixed_destination_probe_uses_zero_length_old_size_for_overlap() {
+        let request = MremapRequest {
+            addr: VirtAddr::from(0x4000),
+            old_size: 0,
+            new_size: PAGE_SIZE_4K,
+            may_move: true,
+            fixed: true,
+            new_addr: VirtAddr::from(0x4000),
+        };
+
+        assert_eq!(
+            fixed_destination_seal_probe_range(request, PAGE_SIZE_4K).unwrap(),
+            Some((request.new_addr, request.new_size))
+        );
+    }
+
+    #[test]
+    fn fixed_destination_probe_honors_initial_huge_page_alignment() {
+        let request = MremapRequest {
+            addr: VirtAddr::from(0x20_0000),
+            old_size: PageSize::Size2M as usize,
+            new_size: PAGE_SIZE_4K,
+            may_move: true,
+            fixed: true,
+            new_addr: VirtAddr::from(0x6000),
+        };
+
+        assert_eq!(
+            fixed_destination_seal_probe_range(request, PageSize::Size2M as usize),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn huge_initial_vma_requires_huge_aligned_source_address() {
+        assert!(!source_address_matches_initial_page_size(
+            VirtAddr::from(0x20_1000),
+            PageSize::Size2M
+        ));
+        assert!(source_address_matches_initial_page_size(
+            VirtAddr::from(0x20_0000),
+            PageSize::Size2M
+        ));
+    }
+
+    #[test]
+    fn huge_initial_vma_normalizes_fixed_destination_geometry_before_seal_probe() {
+        let request = MremapRequest {
+            addr: VirtAddr::from(0x20_0000),
+            old_size: PageSize::Size2M as usize,
+            new_size: PAGE_SIZE_4K,
+            may_move: true,
+            fixed: true,
+            new_addr: VirtAddr::from(0x40_0000),
+        };
+        let request = normalize_remap_request_geometry(request, PageSize::Size2M).unwrap();
+
+        assert_eq!(request.new_size, PageSize::Size2M as usize);
+        assert_eq!(
+            fixed_destination_seal_probe_range(request, PageSize::Size2M as usize).unwrap(),
+            Some((request.new_addr, PageSize::Size2M as usize))
+        );
+    }
+
+    #[test]
+    fn huge_initial_vma_normalization_catches_fixed_overlap() {
+        let request = MremapRequest {
+            addr: VirtAddr::from(0x20_1000),
+            old_size: PageSize::Size2M as usize - PAGE_SIZE_4K,
+            new_size: PAGE_SIZE_4K,
+            may_move: true,
+            fixed: true,
+            new_addr: VirtAddr::from(0x40_0000),
+        };
+        let request = normalize_remap_request_geometry(request, PageSize::Size2M).unwrap();
+
+        assert_eq!(
+            fixed_destination_seal_probe_range(request, PageSize::Size2M as usize),
+            Err(AxError::InvalidInput)
+        );
     }
 }

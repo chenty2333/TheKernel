@@ -80,6 +80,13 @@ impl<B: MappingBackend> MemoryArea<B> {
         &self.backend
     }
 
+    /// Mutates backend-owned VMA metadata without touching the page table.
+    /// Callers must use a set-level transaction when the update can require
+    /// VMA boundary splits.
+    pub(crate) fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     /// Returns the opaque lineage shared by fragments of this logical mapping.
     pub const fn lineage(&self) -> MappingLineage {
         self.lineage

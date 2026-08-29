@@ -43,16 +43,6 @@ fn authorize_mmap_candidate<T>(
     commit()
 }
 
-fn authorize_all<T>(
-    segments: impl IntoIterator<Item = T>,
-    mut authorize: impl FnMut(T) -> AxResult<()>,
-) -> AxResult<()> {
-    for segment in segments {
-        authorize(segment)?;
-    }
-    Ok(())
-}
-
 fn authorize_then_commit<P, T>(
     plan: P,
     authorize: impl FnOnce(&P) -> AxResult<()>,
@@ -272,6 +262,8 @@ bitflags::bitflags! {
         const WRITE = PROT_WRITE as usize;
         /// Page can be executed.
         const EXEC = PROT_EXEC as usize;
+        /// Preserve semaphore atomicity (mprotect only; no PTE permission effect).
+        const SEM = PROT_SEM as usize;
         /// Extend change to start of growsdown vma (mprotect only).
         const GROWDOWN = PROT_GROWSDOWN as usize;
         /// Extend change to start of growsup vma (mprotect only).
@@ -292,6 +284,30 @@ fn validate_page_aligned_range(addr: usize, length: usize) -> AxResult<(VirtAddr
         .checked_sub(start.as_usize())
         .ok_or(AxError::InvalidInput)?;
     Ok((start, length))
+}
+
+fn preflight_mprotect_geometry(
+    addr: usize,
+    length: usize,
+    prot: usize,
+) -> AxResult<Option<(usize, VirtAddr)>> {
+    let grow_flags = PROT_GROWSDOWN as usize | PROT_GROWSUP as usize;
+    if prot & grow_flags == grow_flags {
+        return Err(AxError::InvalidInput);
+    }
+    if !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    if length == 0 {
+        return Ok(None);
+    }
+    let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
+    let start = VirtAddr::from(addr);
+    let end = start.checked_add(length).ok_or(AxError::NoMemory)?;
+    if end <= start {
+        return Err(AxError::NoMemory);
+    }
+    Ok(Some((length, end)))
 }
 
 fn validate_file_mmap_access(
@@ -806,12 +822,15 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> {
     // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
+    let Some((length, end_addr)) = preflight_mprotect_geometry(addr, length, prot)? else {
+        return Ok(0);
+    };
     let Some(permission_flags) = MmapProt::from_bits(prot) else {
         return Err(AxError::InvalidInput);
     };
     debug!("sys_mprotect <= addr: {addr:#x}, length: {length:x}, prot: {permission_flags:?}");
 
-    if permission_flags.contains(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
+    if permission_flags.intersects(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
         return Err(AxError::InvalidInput);
     }
 
@@ -820,30 +839,55 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
     let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
     let aspace_handle = authorized_image.aspace().clone();
     let mut aspace = aspace_handle.lock();
-    let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
     let start_addr = VirtAddr::from(addr);
     let requested_protection: MappingFlags = permission_flags.into();
     let effective_protection = requested_protection;
-    let plan = aspace.prepare_protect(start_addr, length, effective_protection)?;
-    let wake = authorize_then_commit(
-        plan,
-        |plan| {
-            authorize_all(plan.segments(), |segment| {
-                file_mprotect(
-                    authorized_image.credential(),
-                    authorized_image.owner_user_ns(),
-                    segment,
-                    requested_protection,
-                    effective_protection,
-                )
-            })
-        },
-        |plan| commit_shared_writable_protection(plan, effective_protection),
-    )?;
+
+    // Match Linux's per-VMA order: a successful prefix remains protected if a
+    // later VMA is unmapped, disallows the requested protection, or is sealed.
+    // Re-find each VMA after committing because commit may split or merge it.
+    let mut cursor = start_addr;
+    let mut wake = DeferredUffdWake::empty();
+    let outcome = (|| {
+        while cursor < end_addr {
+            let Some(area) = aspace.find_area(cursor) else {
+                return Err(AxError::NoMemory);
+            };
+            if area.start() > cursor {
+                return Err(AxError::NoMemory);
+            }
+            let segment_end = area.end().min(end_addr);
+            let segment_size = segment_end.sub_addr(cursor);
+            let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
+            let segment_wake = authorize_then_commit(
+                plan,
+                |plan| {
+                    for segment in plan.segments() {
+                        // LSM authorization deliberately precedes the mseal check,
+                        // as it does in Linux's mprotect VMA walk.
+                        file_mprotect(
+                            authorized_image.credential(),
+                            authorized_image.owner_user_ns(),
+                            segment,
+                            requested_protection,
+                            effective_protection,
+                        )?;
+                        if segment.backend().is_sealed() {
+                            return Err(AxError::OperationNotPermitted);
+                        }
+                    }
+                    Ok(())
+                },
+                |plan| commit_shared_writable_protection(plan, effective_protection),
+            )?;
+            wake.merge(segment_wake);
+            cursor = segment_end;
+        }
+        Ok(0)
+    })();
     drop(aspace);
     wake.finish();
-
-    Ok(0)
+    outcome
 }
 
 pub fn sys_mremap(
@@ -887,6 +931,42 @@ pub fn sys_mremap(
         VirtAddr::from(new_addr),
     )
 }
+
+/// Linux 6.12 `mseal(2)`: `flags` is reserved and the length is rounded up
+/// before checking the complete mapped VMA span.
+fn normalize_mseal_length(addr: usize, length: usize, flags: usize) -> AxResult<usize> {
+    if flags != 0 || !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    let length = checked_align_up_4k(length).ok_or(AxError::InvalidInput)?;
+    addr.checked_add(length).ok_or(AxError::InvalidInput)?;
+    Ok(length)
+}
+
+pub fn sys_mseal(addr: usize, length: usize, flags: usize) -> AxResult<isize> {
+    let length = normalize_mseal_length(addr, length, flags)?;
+    if length == 0 {
+        return Ok(0);
+    }
+
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    aspace_handle.lock().seal(VirtAddr::from(addr), length)?;
+    Ok(0)
+}
+
+fn madvise_discard_behavior(advice: u32) -> bool {
+    matches!(
+        advice,
+        MADV_FREE
+            | MADV_DONTNEED
+            | MADV_DONTNEED_LOCKED
+            | MADV_REMOVE
+            | MADV_DONTFORK
+            | MADV_WIPEONFORK
+    )
+}
+
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
 
@@ -901,6 +981,10 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     let aspace_handle = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
+
+    if madvise_discard_behavior(advice) && aspace.sealed_ro_anon_in_range(start, length) {
+        return Err(AxError::OperationNotPermitted);
+    }
 
     match advice {
         // Hints the kernel may safely ignore once the range is known-valid.
@@ -1204,6 +1288,7 @@ mod tests {
     use core::cell::Cell;
 
     use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+    use memory_addr::PAGE_SIZE_4K;
     use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
 
     use super::*;
@@ -1212,6 +1297,52 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn mseal_normalizes_length_and_rejects_invalid_geometry() {
+        assert_eq!(normalize_mseal_length(0x4000, 1, 0), Ok(PAGE_SIZE_4K));
+        assert_eq!(normalize_mseal_length(0x4000, 0, 0), Ok(0));
+        assert_eq!(
+            normalize_mseal_length(0x4001, 0, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            normalize_mseal_length(0x4000, 1, 1),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            normalize_mseal_length(usize::MAX & !(PAGE_SIZE_4K - 1), 1, 0),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn mseal_madvise_discard_set_matches_linux_612() {
+        assert!(madvise_discard_behavior(MADV_FREE));
+        assert!(madvise_discard_behavior(MADV_DONTNEED));
+        assert!(madvise_discard_behavior(MADV_DONTNEED_LOCKED));
+        assert!(madvise_discard_behavior(MADV_REMOVE));
+        assert!(madvise_discard_behavior(MADV_DONTFORK));
+        assert!(madvise_discard_behavior(MADV_WIPEONFORK));
+        assert!(!madvise_discard_behavior(MADV_COLD));
+        assert!(!madvise_discard_behavior(MADV_PAGEOUT));
+    }
+
+    #[test]
+    fn mprotect_zero_length_preflight_matches_linux_order() {
+        assert_eq!(
+            preflight_mprotect_geometry(0x4001, 0, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(preflight_mprotect_geometry(0x4000, 0, usize::MAX), Ok(None));
+    }
+
+    #[test]
+    fn mprotect_prot_sem_is_accepted_without_page_permission_effect() {
+        let protection = MmapProt::from_bits(PROT_SEM as usize).unwrap();
+        assert_eq!(MappingFlags::from(protection), MappingFlags::USER);
+        assert!(preflight_mprotect_geometry(0x4000, 1, PROT_SEM as usize).is_ok());
+    }
 
     fn mmap_description(name: &str) -> Arc<FileDescription> {
         let fs = MemoryFs::new().unwrap();
@@ -1333,49 +1464,50 @@ mod tests {
     }
 
     #[test]
-    fn mprotect_authorizes_every_segment_before_one_commit() {
+    fn mprotect_commits_each_authorized_vma_before_later_failure() {
         let trace = Cell::new(0_u32);
         let commits = Cell::new(0_u32);
-        authorize_then_commit(
-            (),
-            |_| {
-                authorize_all([1, 2, 3], |segment| {
-                    trace.set(trace.get() * 10 + segment);
-                    Ok(())
-                })
-            },
-            |_| {
-                commits.set(commits.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(trace.get(), 123);
-        assert_eq!(commits.get(), 1);
-
-        trace.set(0);
-        commits.set(0);
-        assert_eq!(
+        for segment in [1, 2, 3] {
             authorize_then_commit(
-                (),
-                |_| {
-                    authorize_all([1, 2, 3], |segment| {
-                        trace.set(trace.get() * 10 + segment);
-                        if segment == 2 {
-                            return Err(AxError::PermissionDenied);
-                        }
-                        Ok(())
-                    })
+                segment,
+                |segment| {
+                    trace.set(trace.get() * 10 + *segment);
+                    Ok(())
                 },
                 |_| {
                     commits.set(commits.get() + 1);
                     Ok(())
                 },
-            ),
-            Err(AxError::PermissionDenied)
-        );
+            )
+            .unwrap();
+        }
+        assert_eq!(trace.get(), 123);
+        assert_eq!(commits.get(), 3);
+
+        trace.set(0);
+        commits.set(0);
+        let result: AxResult<()> = (|| {
+            for segment in [1, 2, 3] {
+                authorize_then_commit(
+                    segment,
+                    |segment| {
+                        trace.set(trace.get() * 10 + *segment);
+                        if *segment == 2 {
+                            return Err(AxError::PermissionDenied);
+                        }
+                        Ok(())
+                    },
+                    |_| {
+                        commits.set(commits.get() + 1);
+                        Ok(())
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Err(AxError::PermissionDenied));
         assert_eq!(trace.get(), 12);
-        assert_eq!(commits.get(), 0);
+        assert_eq!(commits.get(), 1);
     }
 
     #[test]
