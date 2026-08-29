@@ -12,12 +12,12 @@ use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, vm_load, vm_write_slice};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
     mm::{map_usercopy_error, system_memory_stats},
-    task::{AsThread, RestartBlock, UTS_FIELD_LEN, ns_capable, try_processes},
+    task::{AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, ns_capable, try_processes},
 };
 
 // These generated UAPI structs do not carry bytemuck's object-representation
@@ -61,6 +61,43 @@ fn setfsid_abi<Id>(
         return Ok(old_visible as isize);
     };
     Ok(visible(set(requested)?) as isize)
+}
+
+/// Decode setgroups' `int gidsetsize` from the x86_64 syscall argument
+/// register. Linux truncates to the C `int` before applying its unsigned
+/// maximum check, so negative values are rejected by the same comparison.
+fn setgroups_size(raw: usize) -> AxResult<usize> {
+    let size = raw as u32;
+    if size > NGROUPS_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(size as usize)
+}
+
+/// Copy and translate supplementary GIDs one at a time, matching Linux's
+/// `groups_from_user`: the first invalid GID wins over any later user-memory
+/// fault.
+fn load_setgroups<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    list: *const u32,
+    size: usize,
+    mut make_kgid: impl FnMut(u32) -> Option<Kgid>,
+) -> AxResult<Vec<Kgid>> {
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(size)
+        .map_err(|_| AxError::NoMemory)?;
+
+    let list_address = list as usize;
+    for index in 0..size {
+        let offset = index
+            .checked_mul(size_of::<u32>())
+            .ok_or(AxError::BadAddress)?;
+        let address = list_address.checked_add(offset).ok_or(AxError::BadAddress)?;
+        let gid = VmPtr::vm_read(address as *const u32, memory).map_err(map_usercopy_error)?;
+        groups.push(make_kgid(gid).ok_or(AxError::InvalidInput)?);
+    }
+    Ok(groups)
 }
 
 pub fn sys_getuid() -> AxResult<isize> {
@@ -219,27 +256,10 @@ pub fn sys_setgroups<M: UserMemory + ?Sized>(
     // array. The admission pins that one typed decision to this exact slot and
     // credential so publication can revalidate without auditing twice.
     let admission = thread.admit_setgroups()?;
-    if size > NGROUPS_MAX as usize {
-        return Err(AxError::InvalidInput);
-    }
-    let raw_groups = if size == 0 {
-        vec![]
-    } else {
-        vm_load(memory, list, size).map_err(map_usercopy_error)?
-    };
-    let mut groups = Vec::new();
-    groups
-        .try_reserve_exact(raw_groups.len())
-        .map_err(|_| AxError::NoMemory)?;
-    for gid in raw_groups {
-        groups.push(
-            admission
-                .credential()
-                .user_ns()
-                .make_kgid(gid)
-                .ok_or(AxError::InvalidInput)?,
-        );
-    }
+    let size = setgroups_size(size)?;
+    let groups = load_setgroups(memory, list, size, |gid| {
+        admission.credential().user_ns().make_kgid(gid)
+    })?;
     thread.set_supplementary_groups(admission, groups)?;
     Ok(0)
 }
@@ -544,10 +564,36 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use core::cell::Cell;
+    use core::{cell::Cell, mem::MaybeUninit};
 
     use super::*;
-    use crate::task::{IdMapInputExtent, Kgid, Kuid, UserNamespace};
+    use crate::task::{IdMapInputExtent, Kuid, UserNamespace};
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
+    struct GroupMemory {
+        bytes: Vec<u8>,
+        reads: Vec<usize>,
+    }
+
+    // SAFETY: GroupMemory treats user pointers as checked byte offsets and
+    // initializes every destination byte on a successful read.
+    unsafe impl UserMemory for GroupMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            self.reads.push(start);
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let source = self.bytes.get(start..end).ok_or(UserCopyError::BadAddress)?;
+            for (output, input) in dst.iter_mut().zip(source) {
+                output.write(*input);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
 
     fn mapped_child_namespace() -> alloc::sync::Arc<UserNamespace> {
         let initial = UserNamespace::try_new_root().unwrap();
@@ -628,5 +674,35 @@ mod tests {
         .unwrap();
         assert_eq!(result, 65_534);
         assert_eq!(writes.get(), 0);
+    }
+
+    #[test]
+    fn setgroups_size_matches_linux_int_then_unsigned_max_check() {
+        assert_eq!(setgroups_size(0), Ok(0));
+        assert_eq!(setgroups_size(NGROUPS_MAX as usize), Ok(NGROUPS_MAX as usize));
+        assert_eq!(
+            setgroups_size((NGROUPS_MAX + 1) as usize),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(setgroups_size((-1_isize) as usize), Err(AxError::InvalidInput));
+        // Syscall arguments are register-width, while gidsetsize is an int.
+        assert_eq!(setgroups_size(1_usize << 32), Ok(0));
+    }
+
+    #[test]
+    fn setgroups_stops_usercopy_at_first_unmapped_gid() {
+        let mut provider = GroupMemory {
+            bytes: vec![7, 0, 0, 0, 99, 0, 0, 0],
+            reads: Vec::new(),
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            load_setgroups(&mut memory, core::ptr::null(), 2, |raw| {
+                (raw != 7).then(|| Kgid::from_raw(raw).unwrap())
+            }),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(memory.memory_mut().reads, &[0]);
     }
 }

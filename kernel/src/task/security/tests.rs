@@ -6800,6 +6800,7 @@ fn ordinary_mutation_reports_every_changed_credential_family() {
     update.builder.groups = thekernel_linux_cred::GroupInfo::try_new(vec![
         Kgid::from_raw(100).unwrap(),
         Kgid::from_raw(200).unwrap(),
+        Kgid::from_raw(200).unwrap(),
     ])
     .unwrap();
     let caps = update.builder.caps;
@@ -6827,7 +6828,15 @@ fn ordinary_mutation_reports_every_changed_credential_family() {
     );
     assert_eq!(CRED_STATE_COMMIT_MUTATION_MASK.load(Ordering::SeqCst), 0);
 
-    prepared.commit();
+    let committed = prepared.commit();
+    assert_eq!(
+        committed.groups().as_slice(),
+        &[
+            Kgid::from_raw(100).unwrap(),
+            Kgid::from_raw(200).unwrap(),
+            Kgid::from_raw(200).unwrap(),
+        ]
+    );
     assert_eq!(
         CRED_STATE_COMMIT_MUTATION_MASK.load(Ordering::SeqCst),
         u32::from(expected.bits())

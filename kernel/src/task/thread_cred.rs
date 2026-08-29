@@ -313,15 +313,12 @@ impl Thread {
         admission: SetgroupsAdmission,
         groups: Vec<Kgid>,
     ) -> AxResult<()> {
-        // Sort, deduplicate, validate the bound, and allocate the shared group
-        // owner before entering the credential writer transaction.
+        // Sort, preserve duplicate GIDs, validate the bound, and allocate the
+        // shared group owner before entering the credential writer transaction.
         let groups = GroupInfo::try_new(groups).map_err(super::cred_error)?;
         let slot = self.credential_slot();
         let mut update = slot.prepare();
         admission.validate(&slot, update.old_arc())?;
-        if update.old().groups().as_slice() == groups.as_slice() {
-            return Ok(());
-        }
         update.builder.groups = groups;
         self.commit_credential(update.finish()?)?;
         Ok(())
