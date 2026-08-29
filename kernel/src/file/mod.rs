@@ -42,7 +42,7 @@ pub use self::{
     af_alg::AfAlgSocket,
     desc::*,
     fd_table::*,
-    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_path_fs},
     net::Socket,
     netlink::NetlinkSocket,
     pidfd::PidFd,

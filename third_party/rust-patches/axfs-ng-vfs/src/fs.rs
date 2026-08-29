@@ -3,7 +3,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
-use crate::{DirEntry, MetadataUpdateCapabilities, Mutex, VfsResult, WeakDirEntry};
+use crate::{
+    DirEntry, MetadataUpdateCapabilities, Mutex, VfsResult, WeakDirEntry, WritebackErrorState,
+};
 
 pub struct StatFs {
     pub fs_type: u32,
@@ -41,6 +43,12 @@ pub trait FilesystemOps: Send + Sync {
         Ok(())
     }
 
+    /// Superblock-scoped asynchronous writeback errors observed by syncfs.
+    /// Backends without asynchronous writeback need not allocate this state.
+    fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
+        None
+    }
+
     /// Breaks filesystem-owned root references after a mount is detached.
     ///
     /// Open nodes may continue to keep the filesystem alive. Implementations
@@ -53,6 +61,9 @@ struct FilesystemInner {
     ops: Arc<dyn FilesystemOps>,
     identity: FilesystemIdentity,
     root_cache_owner: Arc<RootCacheOwner>,
+    // Linux keeps errseq state at superblock scope for syncfs.  This is
+    // deliberately distinct from the inode state carried by DirEntry.
+    writeback_errors: Arc<WritebackErrorState>,
 }
 
 struct RootCacheOwner {
@@ -156,6 +167,13 @@ impl Filesystem {
         self.inner.ops.flush()
     }
 
+    pub fn writeback_error_state(&self) -> Arc<WritebackErrorState> {
+        self.inner
+            .ops
+            .syncfs_writeback_error_state()
+            .unwrap_or_else(|| self.inner.writeback_errors.clone())
+    }
+
     pub fn new(ops: Arc<dyn FilesystemOps>) -> Self {
         Self::new_with_identity_inner(
             ops,
@@ -180,6 +198,8 @@ impl Filesystem {
             ops,
             identity,
             root_cache_owner,
+            writeback_errors: Arc::try_new(WritebackErrorState::default())
+                .map_err(|_| crate::VfsError::NoMemory)?,
         })
         .map_err(|_| crate::VfsError::NoMemory)?;
         Ok(Self { inner })
@@ -206,14 +226,12 @@ impl Filesystem {
     /// Fallibly creates a filesystem view that shares the source tree's cache
     /// lifetime. Runtime mount paths should use this variant so allocation
     /// failure is reported before publishing any mount topology.
-    pub fn try_new_view(
-        ops: Arc<dyn FilesystemOps>,
-        source: &Filesystem,
-    ) -> VfsResult<Self> {
+    pub fn try_new_view(ops: Arc<dyn FilesystemOps>, source: &Filesystem) -> VfsResult<Self> {
         let inner = Arc::try_new(FilesystemInner {
             ops,
             identity: source.identity(),
             root_cache_owner: Arc::clone(&source.inner.root_cache_owner),
+            writeback_errors: source.writeback_error_state(),
         })
         .map_err(|_| crate::VfsError::NoMemory)?;
         Ok(Self { inner })
@@ -229,6 +247,7 @@ impl Filesystem {
                 ops,
                 identity,
                 root_cache_owner,
+                writeback_errors: Arc::new(WritebackErrorState::default()),
             }),
         }
     }

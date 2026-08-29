@@ -499,6 +499,7 @@ pub struct Ext4Filesystem {
     root_dir: SpinMutex<Option<DirEntry>>,
     runtime_data: SpinMutex<RuntimeRegistry>,
     writeback_errors: SpinMutex<WritebackErrorRegistry>,
+    syncfs_writeback_errors: Arc<WritebackErrorState>,
 }
 
 impl Ext4Filesystem {
@@ -517,12 +518,15 @@ impl Ext4Filesystem {
         .map_err(|_| VfsError::NoMemory)?;
         let runtime_data = RuntimeRegistry::try_new()?;
         let writeback_errors = WritebackErrorRegistry::try_new()?;
+        let syncfs_writeback_errors =
+            Arc::try_new(WritebackErrorState::default()).map_err(|_| VfsError::NoMemory)?;
         let fs = Arc::try_new(Self {
             inner: SleepingMutex::new(ManuallyDrop::new(finalizer)),
             disk,
             root_dir: SpinMutex::new(None),
             runtime_data: SpinMutex::new(runtime_data),
             writeback_errors: SpinMutex::new(writeback_errors),
+            syncfs_writeback_errors,
         })
         .map_err(|_| VfsError::NoMemory)?;
         // Allocate the wrapper before installing the backend root self-cycle;
@@ -713,6 +717,10 @@ impl FilesystemOps for Ext4Filesystem {
     fn flush(&self) -> VfsResult<()> {
         crate::highlevel::sync_cached_file_pages_for_filesystem(self)?;
         self.lock().flush().map_err(into_vfs_err)
+    }
+
+    fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
+        Some(self.syncfs_writeback_errors.clone())
     }
 
     fn unmount(&self) {

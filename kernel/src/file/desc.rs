@@ -1106,6 +1106,9 @@ pub struct FileDescription {
     /// per OFD, and is consequently shared by dup.
     sync_error_source: Arc<WritebackErrorState>,
     sync_error: Mutex<SyncErrorCursor>,
+    /// syncfs samples the filesystem (superblock) errseq separately from the
+    /// inode errseq used by fsync/fdatasync.
+    syncfs_error: Option<(Arc<WritebackErrorState>, Mutex<SyncErrorCursor>)>,
     /// Serializes only status snapshots and short backend/OFD transitions.
     /// No user fault, wait, VFS I/O, or device operation may run under it.
     status_transition: StatusTransitionMutex<()>,
@@ -1227,6 +1230,11 @@ impl FileDescription {
             .then(|| vfs_open_credential.clone())
             .flatten();
         let sync_error_source = inner.writeback_error_state()?;
+        let syncfs_error = inner.syncfs_filesystem().map(|filesystem| {
+            let source = filesystem.writeback_error_state();
+            let observed = source.sample();
+            (source, Mutex::new(SyncErrorCursor { observed }))
+        });
         // A newly opened file samples the current errseq.  Earlier failures
         // belong to already-open descriptions; dup retains that description's
         // existing cursor instead of constructing a new one.
@@ -1244,6 +1252,7 @@ impl FileDescription {
             )),
             sync_error_source,
             sync_error: Mutex::new(SyncErrorCursor { observed }),
+            syncfs_error,
             status_transition: StatusTransitionMutex::new(()),
             descriptor_lifetime: SpinNoIrq::new(DescriptorLifetimeState::default()),
             open_committed: AtomicBool::new(false),
@@ -1365,6 +1374,23 @@ impl FileDescription {
             return Err(error);
         }
         self.take_unseen_sync_error().map_or(Ok(()), Err)
+    }
+
+    /// Linux syncfs is superblock-scoped, not an f_op sync callback: any
+    /// retained fd with a filesystem anchor (including O_PATH and read-only
+    /// opens) can drive it.  Always advance the superblock errseq even when
+    /// the synchronous flush itself fails; that primary flush errno wins.
+    pub(crate) fn sync_filesystem(&self) -> AxResult<()> {
+        let Some(filesystem) = self.inner.syncfs_filesystem() else {
+            return Err(AxError::InvalidInput);
+        };
+        let result = filesystem.flush().map_err(Into::into);
+        let async_error = self.syncfs_error.as_ref().and_then(|(source, cursor)| {
+            source
+                .check_and_advance(&mut cursor.lock().observed)
+                .map(Into::into)
+        });
+        result.and_then(|()| async_error.map_or(Ok(()), Err))
     }
 
     pub(crate) fn is_path_only(&self) -> bool {
@@ -1960,6 +1986,39 @@ mod tests {
 
         assert_eq!(description.sync(false), Err(AxError::InvalidInput));
         assert_eq!(probe.syncs.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn syncfs_uses_filesystem_anchor_for_opath_and_has_an_ofd_cursor() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "syncfs-anchor",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(location),
+            FileFlags::READ,
+        )));
+        let first = FileDescription::new_with_flags(file.clone(), O_PATH).unwrap();
+        let second = FileDescription::new(file).unwrap();
+
+        // O_PATH carries a VFS anchor even though ordinary fsync rejects it.
+        assert_eq!(first.sync(false), Err(AxError::InvalidInput));
+        assert_eq!(first.sync_filesystem(), Ok(()));
+
+        let filesystem = first.inner.syncfs_filesystem().unwrap();
+        filesystem
+            .writeback_error_state()
+            .publish(axfs_ng_vfs::VfsError::Io);
+        assert_eq!(first.sync_filesystem(), Err(AxError::Io));
+        assert_eq!(first.sync_filesystem(), Ok(()));
+        // Independently opened OFDs own independent superblock errseq cursors.
+        assert_eq!(second.sync_filesystem(), Err(AxError::Io));
     }
 
     #[test]

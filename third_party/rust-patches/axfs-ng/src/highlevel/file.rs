@@ -23,13 +23,15 @@ use axdriver::{
 };
 #[cfg(feature = "times")]
 use axfs_ng_vfs::MetadataUpdate;
+#[cfg(not(feature = "ext4"))]
+pub use axfs_ng_vfs::PhysicalIoNotSubmittedReason;
 use axfs_ng_vfs::{
     AsyncVectoredWriteOutcome, FileExtentMap, FileNode, FilesystemOps, Location, Mountpoint,
-    NodeFlags, NodePermission, NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor,
-    path::Path,
+    NodeFlags, NodePermission, NodeType,
+    PhysicalIoNotSubmittedReason as PhysicalIoAttemptNotSubmittedReason, VfsError, VfsResult,
+    WeakDirEntry, WritebackAnchor, path::Path,
 };
 pub use axfs_ng_vfs::{PhysicalIoAttempt, PhysicalIoSegment};
-use axfs_ng_vfs::PhysicalIoNotSubmittedReason as PhysicalIoAttemptNotSubmittedReason;
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size};
 #[cfg(target_os = "none")]
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -43,12 +45,10 @@ use lru::LruCache;
 use lwext4_rust::PhysicalIoEffect as Ext4PhysicalIoEffect;
 #[cfg(feature = "ext4")]
 pub use lwext4_rust::{
-    PhysicalIoCompletion, PhysicalIoCompletionOutcome, PhysicalIoEffectState, PhysicalIoOperation,
-    PhysicalIoNotSubmittedReason, PhysicalIoPendingReason, PhysicalIoPlan, PhysicalIoPublication,
-    PhysicalIoPublishOutcome, PhysicalIoSettlement,
+    PhysicalIoCompletion, PhysicalIoCompletionOutcome, PhysicalIoEffectState,
+    PhysicalIoNotSubmittedReason, PhysicalIoOperation, PhysicalIoPendingReason, PhysicalIoPlan,
+    PhysicalIoPublication, PhysicalIoPublishOutcome, PhysicalIoSettlement,
 };
-#[cfg(not(feature = "ext4"))]
-pub use axfs_ng_vfs::PhysicalIoNotSubmittedReason;
 #[cfg(not(target_os = "none"))]
 use spin::Mutex;
 use spin::{Once, RwLock};
@@ -2431,7 +2431,11 @@ impl Drop for PageCache {
         }
         global_allocator().dealloc_pages(self.addr.as_usize(), 1, UsageKind::PageCache);
         if self.shmem {
-            let _ = IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            let _ = IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| n.checked_sub(1),
+            );
         }
     }
 }
@@ -2913,6 +2917,12 @@ fn record_async_dirty_flush_writeback_restart() {
 /// their immediate caller instead of becoming an errseq event.
 fn publish_async_dirty_writeback_completion_error(file: &FileNode, error: VfsError) {
     if let Ok(state) = file.writeback_error_state() {
+        state.publish(error);
+    }
+    // An accepted asynchronous completion also belongs to the filesystem's
+    // superblock errseq.  Synchronous writeback and explicit fsync failures
+    // never pass through this completion-only hook.
+    if let Some(state) = file.syncfs_writeback_error_state() {
         state.publish(error);
     }
 }
@@ -6080,7 +6090,9 @@ impl FileBackend {
             Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let written = match file.try_write_at_vectored_async(src, offset)? {
                     AsyncVectoredWriteOutcome::Completed(written) => written,
-                    AsyncVectoredWriteOutcome::NotSubmitted => file.write_at_vectored(src, offset)?,
+                    AsyncVectoredWriteOutcome::NotSubmitted => {
+                        file.write_at_vectored(src, offset)?
+                    }
                     AsyncVectoredWriteOutcome::CompletionError(error) => return Err(error),
                 };
                 Ok(written)
@@ -6782,7 +6794,10 @@ impl File {
         if sync {
             self.sync(false)?;
         }
-        self.location().entry().as_file()?.map_extents(start, length, max_extents)
+        self.location()
+            .entry()
+            .as_file()?
+            .map_extents(start, length, max_extents)
     }
 
     /// Reads data from the current position, advancing the cursor.

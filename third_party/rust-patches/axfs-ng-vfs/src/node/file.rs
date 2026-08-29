@@ -4,7 +4,7 @@ use core::ops::Deref;
 use axpoll::Pollable;
 
 use super::NodeOps;
-use crate::{VfsError, VfsResult};
+use crate::{VfsError, VfsResult, WritebackErrorState};
 
 /// Maximum number of file extents a normal FIEMAP caller retains in one
 /// query.  The typed VFS API still accepts a caller supplied `max_extents`;
@@ -134,18 +134,20 @@ pub enum AsyncVectoredWriteOutcome {
 }
 
 pub trait FileNodeOps: NodeOps + Pollable {
+    /// Returns the superblock errseq source when this node participates in
+    /// asynchronous filesystem writeback.  It is distinct from the inode
+    /// errseq returned through `NodeOps::writeback_error_state`.
+    fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
+        None
+    }
+
     /// Collects allocated file extents intersecting `[start, start + length)`.
     /// Holes are omitted.  A zero capacity is a complete count-only scan and
     /// must not allocate an extent buffer; a non-zero capacity retains only a
     /// prefix and reports the retained count in `mapped_extents`.
     ///
     /// No userspace pointers or Linux ABI structs cross this VFS boundary.
-    fn map_extents(
-        &self,
-        start: u64,
-        length: u64,
-        max_extents: usize,
-    ) -> VfsResult<FileExtentMap> {
+    fn map_extents(&self, start: u64, length: u64, max_extents: usize) -> VfsResult<FileExtentMap> {
         let _ = (start, length, max_extents);
         Err(VfsError::OperationNotSupported)
     }
@@ -225,12 +227,14 @@ pub trait FileNodeOps: NodeOps + Pollable {
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<PhysicalIoAttempt> {
-        Ok(match unsafe { self.try_read_at_physical(segments, offset)? } {
-            Some(bytes) => PhysicalIoAttempt::Completed(bytes),
-            None => PhysicalIoAttempt::NotSubmitted(
-                PhysicalIoNotSubmittedReason::DeviceAdmission,
-            ),
-        })
+        Ok(
+            match unsafe { self.try_read_at_physical(segments, offset)? } {
+                Some(bytes) => PhysicalIoAttempt::Completed(bytes),
+                None => {
+                    PhysicalIoAttempt::NotSubmitted(PhysicalIoNotSubmittedReason::DeviceAdmission)
+                }
+            },
+        )
     }
 
     /// Performs a side-effect-free capability and mapping preflight for a
@@ -316,12 +320,14 @@ pub trait FileNodeOps: NodeOps + Pollable {
         segments: &[PhysicalIoSegment],
         offset: u64,
     ) -> VfsResult<PhysicalIoAttempt> {
-        Ok(match unsafe { self.try_write_at_physical(segments, offset)? } {
-            Some(bytes) => PhysicalIoAttempt::Completed(bytes),
-            None => PhysicalIoAttempt::NotSubmitted(
-                PhysicalIoNotSubmittedReason::DeviceAdmission,
-            ),
-        })
+        Ok(
+            match unsafe { self.try_write_at_physical(segments, offset)? } {
+                Some(bytes) => PhysicalIoAttempt::Completed(bytes),
+                None => {
+                    PhysicalIoAttempt::NotSubmitted(PhysicalIoNotSubmittedReason::DeviceAdmission)
+                }
+            },
+        )
     }
 
     /// Performs a side-effect-free capability and mapping preflight for a

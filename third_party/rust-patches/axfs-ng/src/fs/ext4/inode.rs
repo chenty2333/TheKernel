@@ -8,12 +8,11 @@ use core::{
 use axdriver::prelude::BlockPhysicalCompletionRoute;
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
-    FileExtent, FileExtentMap, FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate,
-    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
-    PhysicalIoAttempt,
-    PhysicalIoNotSubmittedReason, PhysicalIoSegment, Reference, RenameRequest, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry, WritebackErrorState, XattrProvider, XattrSetMode,
-    FILE_EXTENT_MAX, FILE_EXTENT_SCAN_CHUNK_BYTES,
+    FILE_EXTENT_MAX, FILE_EXTENT_SCAN_CHUNK_BYTES, FileExtent, FileExtentMap, FileNode,
+    FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps,
+    NodePermission, NodeType, NodeUserData, PhysicalIoAttempt, PhysicalIoNotSubmittedReason,
+    PhysicalIoSegment, Reference, RenameRequest, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
+    WritebackErrorState, XattrProvider, XattrSetMode,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
@@ -268,8 +267,7 @@ impl Inode {
         inode_type: InodeType,
         name: String,
     ) -> VfsResult<PreparedInodeEntry> {
-        let writeback_error_reservation =
-            self.fs.reserve_writeback_error_state(Some(token))?;
+        let writeback_error_reservation = self.fs.reserve_writeback_error_state(Some(token))?;
         Self::try_prepare_entry_with_writeback_error_reservation(
             self.fs.clone(),
             inode_type,
@@ -692,12 +690,11 @@ impl Inode {
 }
 
 impl FileNodeOps for Inode {
-    fn map_extents(
-        &self,
-        start: u64,
-        length: u64,
-        max_extents: usize,
-    ) -> VfsResult<FileExtentMap> {
+    fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
+        self.fs.syncfs_writeback_error_state()
+    }
+
+    fn map_extents(&self, start: u64, length: u64, max_extents: usize) -> VfsResult<FileExtentMap> {
         if max_extents > FILE_EXTENT_MAX {
             return Err(VfsError::InvalidInput);
         }
@@ -764,8 +761,7 @@ impl FileNodeOps for Inode {
                     );
                     if let Some(previous) = retained.last_mut()
                         && previous.logical.checked_add(previous.length) == Some(extent.logical)
-                        && previous.physical.checked_add(previous.length)
-                            == Some(extent.physical)
+                        && previous.physical.checked_add(previous.length) == Some(extent.physical)
                         && previous.flags & !FILE_EXTENT_LAST_FLAG
                             == extent.flags & !FILE_EXTENT_LAST_FLAG
                     {
@@ -994,7 +990,9 @@ impl FileNodeOps for Inode {
             Ok(()) => Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::Completed(
                 submission.bytes,
             )),
-            Err(error) => Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::CompletionError(error)),
+            Err(error) => Ok(axfs_ng_vfs::AsyncVectoredWriteOutcome::CompletionError(
+                error,
+            )),
         }
     }
 

@@ -10,7 +10,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FsContext, WritePlacement};
 use axfs_ng_vfs::{
-    DirEntrySink, Location, Metadata, NodeFlags, WritebackErrorState,
+    DirEntrySink, Filesystem, Location, Metadata, NodeFlags, WritebackErrorState,
     path::{MAX_NAME_LEN, Path},
 };
 use axio::{IoBuf, Read};
@@ -700,7 +700,14 @@ impl FileLike for File {
     }
 
     fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
-        self.inner.location().writeback_error_state().map_err(Into::into)
+        self.inner
+            .location()
+            .writeback_error_state()
+            .map_err(Into::into)
+    }
+
+    fn syncfs_filesystem(&self) -> Option<Filesystem> {
+        Some(self.inner().location().mountpoint().filesystem_handle())
     }
 
     fn set_nonblocking(&self, flag: bool) -> AxResult {
@@ -807,6 +814,10 @@ impl FileLike for Directory {
 
     fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
         self.inner.writeback_error_state().map_err(Into::into)
+    }
+
+    fn syncfs_filesystem(&self) -> Option<Filesystem> {
+        Some(self.inner.mountpoint().filesystem_handle())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

@@ -32,7 +32,7 @@ use crate::file::permission::{
 use crate::{
     file::{
         Directory, File, FileDescription, FileLike, IoctlContext, executable,
-        filesystem_type_catalog, get_file_description, get_file_like,
+        filesystem_type_catalog, get_file_description,
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
@@ -42,7 +42,7 @@ use crate::{
             check_writable_mount,
         },
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
-        resolve_at_with_security, validate_symlink_target, with_fs, with_path_fs,
+        resolve_at_with_security, validate_symlink_target, with_path_fs,
     },
     mm::map_usercopy_error,
     mounts,
@@ -1899,17 +1899,11 @@ pub fn sys_sync() -> AxResult<isize> {
 }
 
 pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
-    let file = get_file_like(fd)?;
-    file.check_io_access()?;
-    if let Some(file) = file.downcast_ref::<crate::file::File>() {
-        file.inner().location().filesystem().flush()?;
-        return Ok(0);
-    }
-    if let Some(dir) = file.downcast_ref::<Directory>() {
-        dir.inner().filesystem().flush()?;
-        return Ok(0);
-    }
-    Err(AxError::InvalidInput)
+    // Retain this exact OFD: close/reuse must not redirect its errseq cursor
+    // or filesystem anchor.  Do not apply I/O access checks: Linux permits
+    // O_PATH and read-only descriptors for syncfs.
+    get_file_description(fd)?.sync_filesystem()?;
+    Ok(0)
 }
 
 pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {

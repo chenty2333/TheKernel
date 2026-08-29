@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::{ffi::c_int, time::Duration};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, WritebackErrorState};
+use axfs_ng_vfs::{DeviceId, Filesystem, WritebackErrorState};
 use axio::prelude::*;
 use axpoll::Pollable;
 use axsync::Mutex;
@@ -481,6 +481,13 @@ pub trait FileLike: Pollable + DowncastSync {
     /// override this with their inode-owned source.
     fn writeback_error_state(&self) -> AxResult<Arc<WritebackErrorState>> {
         Arc::try_new(WritebackErrorState::default()).map_err(|_| AxError::NoMemory)
+    }
+
+    /// A filesystem anchor is intentionally independent of ordinary I/O
+    /// permission.  syncfs accepts an O_PATH fd when its object belongs to a
+    /// mounted filesystem, while anonymous and special descriptors have none.
+    fn syncfs_filesystem(&self) -> Option<Filesystem> {
+        None
     }
 
     /// Prepares an object-owned mapping without holding address-space or page
