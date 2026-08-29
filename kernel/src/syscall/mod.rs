@@ -83,7 +83,7 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
         | Sysno::waitid
         | Sysno::flock => Some(RestartClass::Sys),
         #[cfg(target_arch = "x86_64")]
-        Sysno::open => Some(RestartClass::Sys),
+        Sysno::open | Sysno::creat => Some(RestartClass::Sys),
         Sysno::read | Sysno::readv => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
         }

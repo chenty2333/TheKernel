@@ -285,11 +285,24 @@ int main(int argc, char **argv) {
     }
     self_path = argv[0];
 
-    if (test_legacy_and_flags() || test_short_io_and_maximum() ||
-        test_nonblock_accumulation_and_poll() || test_semaphore() ||
-        test_cloexec_and_close())
+    puts("THEKERNEL_ABI_CASE eventfd.portable-differential");
+    if (test_legacy_and_flags())
         return 1;
+    puts("THEKERNEL_ABI_ASSERT eventfd.portable-differential LEGACY_FLAGS pass");
+    if (test_short_io_and_maximum())
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT eventfd.portable-differential IO_ERRNO_STATE pass");
+    if (test_nonblock_accumulation_and_poll())
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT eventfd.portable-differential COUNTER_POLL pass");
+    if (test_semaphore())
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT eventfd.portable-differential SEMAPHORE pass");
+    if (test_cloexec_and_close())
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT eventfd.portable-differential CLOEXEC_TEARDOWN pass");
 
     puts("THEKERNEL_EVENTFD_OK");
+    puts("THEKERNEL_ABI_RESULT eventfd.portable-differential pass");
     return 0;
 }

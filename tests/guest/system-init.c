@@ -574,6 +574,18 @@ static int test_proc_zombie_differential(void) {
         "proc-zombie-differential-child");
 }
 
+static int test_native_ni_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/native-ni-differential", NULL,
+        "native-ni-differential-child");
+}
+
+static int test_creat_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/creat-differential", NULL,
+        "creat-differential-child");
+}
+
 /* The only suite status protocol is the direct child status: 0 is pass, 1
  * is fail, and 4 is an explicit environmental skip.  Everything the child
  * writes is forwarded as KTAP diagnostics, never interpreted as a verdict. */
@@ -672,6 +684,8 @@ int main(int argc, char **argv) {
         { "signal-order", test_signal_order_differential },
         { "io-uring-directio", test_io_uring_directio_differential },
         { "proc-zombie", test_proc_zombie_differential },
+        { "native-ni", test_native_ni_differential },
+        { "creat", test_creat_differential },
         { "signal-fp", test_signal_fp },
         { "io-uring", test_io_uring },
         { "io-uring-buffers", test_io_uring_buffers },

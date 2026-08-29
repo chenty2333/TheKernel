@@ -68,6 +68,11 @@ fn compat_getpgrp() -> AxResult<isize> {
     sys_getpgid(0)
 }
 
+#[inline]
+fn sys_ni_syscall() -> AxResult<isize> {
+    Err(AxError::Unsupported)
+}
+
 pub(super) fn dispatch_syscall(
     sysno: Sysno,
     uctx: &mut UserContext,
@@ -403,6 +408,11 @@ pub(super) fn dispatch_syscall(
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
+        ),
+        Sysno::creat => sys_creat(
+            UserMemoryCapability::new(aspace()),
+            uctx.arg0() as _,
+            uctx.arg1() as _,
         ),
         Sysno::openat => sys_openat(
             UserMemoryCapability::new(aspace()),
@@ -1592,6 +1602,25 @@ pub(super) fn dispatch_syscall(
         }),
         Sysno::timer_delete => sys_timer_delete(uctx.arg0() as _),
 
+        // Linux x86_64's native sys_ni_syscall table slots.
+        Sysno::uselib
+        | Sysno::_sysctl
+        | Sysno::create_module
+        | Sysno::get_kernel_syms
+        | Sysno::query_module
+        | Sysno::nfsservctl
+        | Sysno::getpmsg
+        | Sysno::putpmsg
+        | Sysno::afs_syscall
+        | Sysno::tuxcall
+        | Sysno::security
+        | Sysno::set_thread_area
+        | Sysno::get_thread_area
+        | Sysno::lookup_dcookie
+        | Sysno::epoll_ctl_old
+        | Sysno::epoll_wait_old
+        | Sysno::vserver => sys_ni_syscall(),
+
         _ => {
             debug!("Unimplemented syscall: {sysno}");
             Err(AxError::Unsupported)
@@ -1636,5 +1665,41 @@ mod tests {
 
         assert_eq!(result, Err(AxError::Unsupported));
         assert_eq!(snapshots.get(), 0);
+    }
+
+    #[test]
+    fn linux_native_ni_slots_return_enosys_without_an_address_space() {
+        let native_ni = [
+            Sysno::uselib,
+            Sysno::_sysctl,
+            Sysno::create_module,
+            Sysno::get_kernel_syms,
+            Sysno::query_module,
+            Sysno::nfsservctl,
+            Sysno::getpmsg,
+            Sysno::putpmsg,
+            Sysno::afs_syscall,
+            Sysno::tuxcall,
+            Sysno::security,
+            Sysno::set_thread_area,
+            Sysno::get_thread_area,
+            Sysno::lookup_dcookie,
+            Sysno::epoll_ctl_old,
+            Sysno::epoll_wait_old,
+            Sysno::vserver,
+        ];
+
+        for sysno in native_ni {
+            let mut context =
+                UserContext::new(0x1234_5678, axhal::mem::VirtAddr::from_usize(0x8000), 0);
+            let snapshots = Cell::new(0);
+            let result = dispatch_syscall(sysno, &mut context, || {
+                snapshots.set(snapshots.get() + 1);
+                panic!("native NI syscall must not acquire an address space");
+            });
+
+            assert_eq!(result, Err(AxError::Unsupported), "{sysno}");
+            assert_eq!(snapshots.get(), 0, "{sysno}");
+        }
     }
 }

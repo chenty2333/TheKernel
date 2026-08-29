@@ -105,8 +105,16 @@ const fn open_has_data_write(flags: u32) -> bool {
 
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
-    status |=
-        flags & (O_APPEND | O_DIRECT | O_DSYNC | O_SYNC | O_NONBLOCK | FASYNC | O_NOATIME | O_PATH);
+    status |= flags
+        & (O_APPEND
+            | O_DIRECT
+            | O_DSYNC
+            | O_SYNC
+            | O_NONBLOCK
+            | FASYNC
+            | O_LARGEFILE
+            | O_NOATIME
+            | O_PATH);
     status
 }
 
@@ -1202,6 +1210,22 @@ pub fn sys_openat(
     openat_inner(dirfd, &path, flags, mode)
 }
 
+// Linux implements creat(2) as openat(AT_FDCWD, path,
+// O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, mode) when the native architecture
+// uses 64-bit off_t.  Keep the kernel-visible O_LARGEFILE bit even though
+// glibc exposes it as zero to x86_64 applications.
+#[cfg(target_arch = "x86_64")]
+const CREAT_OPEN_FLAGS: i32 = (O_CREAT | O_WRONLY | O_TRUNC | O_LARGEFILE) as i32;
+
+#[cfg(target_arch = "x86_64")]
+pub fn sys_creat(
+    capability: UserMemoryCapability,
+    path: *const c_char,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
+    sys_openat(capability, AT_FDCWD as _, path, CREAT_OPEN_FLAGS, mode)
+}
+
 pub fn sys_openat2(
     capability: UserMemoryCapability,
     dirfd: c_int,
@@ -1810,6 +1834,17 @@ mod namespace_operation_tests {
 
     use super::*;
     use crate::pseudofs::tmp::MemoryFs;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn creat_is_the_x86_64_openat_alias() {
+        assert_eq!(
+            CREAT_OPEN_FLAGS,
+            (O_CREAT | O_WRONLY | O_TRUNC | O_LARGEFILE) as i32
+        );
+        assert_eq!(O_LARGEFILE, 0o100000);
+        assert_ne!(open_status_flags(CREAT_OPEN_FLAGS as u32) & O_LARGEFILE, 0);
+    }
 
     #[test]
     fn creative_open_and_scoped_walk_share_one_namespace_lock_domain() {
