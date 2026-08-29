@@ -373,21 +373,12 @@ fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
     }
 }
 
-fn min_nice_for_threads<I>(threads: I) -> AxResult<i8>
-where
-    I: IntoIterator<Item = Pid>,
-{
-    let mut best: Option<i8> = None;
+fn record_lower_nice(best: &mut Option<i8>, nice: i8) {
+    *best = Some(best.map_or(nice, |current| current.min(nice)));
+}
 
-    for tid in threads {
-        let Ok(task) = get_task(tid) else {
-            continue;
-        };
-        let nice = sched_state(&task).nice;
-        best = Some(best.map_or(nice, |curr| curr.min(nice)));
-    }
-
-    best.ok_or(AxError::NoSuchProcess)
+fn getpriority_matches_real_uid<T: Eq>(real_uid: &T, requested_uid: &T) -> bool {
+    real_uid == requested_uid
 }
 
 fn clamp_nice(prio: i32) -> i8 {
@@ -997,49 +988,198 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
-    debug!("sys_getpriority <= which: {which}, who: {who}");
+/// Linux's `getpriority` parameters are C `int`s.  Decode the low ABI word
+/// explicitly: raw syscall callers are not required to sign-extend it to
+/// x86_64's register width.
+fn getpriority_int(raw: usize) -> i32 {
+    raw as u32 as i32
+}
 
-    match which {
-        PRIO_PROCESS => {
-            if who == 0 {
-                let curr = current();
-                Ok(raw_priority_from_nice(sched_state(&curr).nice))
-            } else {
-                let task = get_task(who)?;
-                Ok(raw_priority_from_nice(sched_state(&task).nice))
+fn visible_live_task_for_getpriority(
+    who: Pid,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> Option<AxTaskRef> {
+    for process in process_domain().ok()?.registry().processes() {
+        if process.is_zombie() {
+            continue;
+        }
+        for tid in process.thread_ids() {
+            let Ok(task) = get_task(tid) else {
+                continue;
+            };
+            if visible_tid_in_namespace(&task, caller_pid_ns) == Some(who) {
+                return Some(task);
             }
         }
-        PRIO_PGRP => {
-            let pgid = if who == 0 {
-                current().as_thread().proc_data.proc.group().pgid()
-            } else {
-                who
+    }
+    None
+}
+
+fn zombie_nice_for_getpriority(
+    who: Pid,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> Option<AxResult<i8>> {
+    for process in process_domain().ok()?.registry().processes() {
+        if !process.is_zombie() {
+            continue;
+        }
+        let Some(target_pid_ns) = zombie_pid_ns(&process) else {
+            continue;
+        };
+        if visible_process_pid_in_namespace(process.pid(), &target_pid_ns, caller_pid_ns)
+            == Some(who)
+        {
+            return Some(zombie_scheduler_state(&process).map(|state| state.nice));
+        }
+    }
+    None
+}
+
+fn process_pid_ns_for_getpriority(process: &Arc<Process>) -> Option<Arc<PidNamespace>> {
+    if process.is_zombie() {
+        return zombie_pid_ns(process);
+    }
+    process.thread_ids().find_map(|tid| {
+        get_task(tid)
+            .ok()
+            .map(|task| task.as_thread().proc_data.pid_ns())
+    })
+}
+
+fn getpriority_group_nice(
+    who: Pid,
+    caller_task: &AxTaskRef,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> AxResult<i8> {
+    let registry = process_domain()?.registry();
+    let target_group = if who == 0 {
+        caller_task.as_thread().proc_data.proc.group()
+    } else {
+        let mut found = None;
+        for process in registry.processes() {
+            let Some(target_pid_ns) = process_pid_ns_for_getpriority(&process) else {
+                continue;
             };
-            let group = get_process_group(pgid)?;
-            let group_processes = group
-                .try_processes(process_domain()?.registry())
-                .map_err(process_error)?;
-            Ok(raw_priority_from_nice(min_nice_for_threads(
-                group_processes
-                    .into_iter()
-                    .flat_map(|proc| proc.thread_ids()),
+            let group = process.group();
+            if visible_process_pid_in_namespace(group.pgid(), &target_pid_ns, caller_pid_ns)
+                == Some(who)
+            {
+                found = Some(group);
+                break;
+            }
+        }
+        found.ok_or(AxError::NoSuchProcess)?
+    };
+
+    let mut best = None;
+    for process in registry.processes() {
+        if !Arc::ptr_eq(&process.group(), &target_group) {
+            continue;
+        }
+        if process.is_zombie() {
+            let Some(target_pid_ns) = zombie_pid_ns(&process) else {
+                continue;
+            };
+            if caller_pid_ns.contains(&target_pid_ns) {
+                record_lower_nice(&mut best, zombie_scheduler_state(&process)?.nice);
+            }
+            continue;
+        }
+        for tid in process.thread_ids() {
+            let Ok(task) = get_task(tid) else {
+                continue;
+            };
+            let thread = task.as_thread();
+            if caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+                record_lower_nice(&mut best, sched_state(&task).nice);
+            }
+        }
+    }
+    best.ok_or(AxError::NoSuchProcess)
+}
+
+fn getpriority_user_nice(
+    who: i32,
+    caller_cred: &Cred,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> AxResult<i8> {
+    let uid = if who == 0 {
+        caller_cred.ids().ruid
+    } else {
+        caller_cred
+            .user_ns()
+            .make_kuid(who as u32)
+            .ok_or(AxError::NoSuchProcess)?
+    };
+
+    let mut best = None;
+    for process in process_domain()?.registry().processes() {
+        if process.is_zombie() {
+            let Some(target_pid_ns) = zombie_pid_ns(&process) else {
+                continue;
+            };
+            let Some(snapshot) = process.zombie_payload() else {
+                continue;
+            };
+            if caller_pid_ns.contains(&target_pid_ns) && snapshot.credential.ids().ruid == uid {
+                record_lower_nice(&mut best, zombie_scheduler_state(&process)?.nice);
+            }
+            continue;
+        }
+        for tid in process.thread_ids() {
+            let Ok(task) = get_task(tid) else {
+                continue;
+            };
+            let thread = task.as_thread();
+            if caller_pid_ns.contains(&thread.proc_data.pid_ns())
+                && getpriority_matches_real_uid(&thread.real_uid(), &uid)
+            {
+                record_lower_nice(&mut best, sched_state(&task).nice);
+            }
+        }
+    }
+    best.ok_or(AxError::NoSuchProcess)
+}
+
+pub fn sys_getpriority(which: usize, who: usize) -> AxResult<isize> {
+    let which = getpriority_int(which);
+    let who = getpriority_int(who);
+    debug!("sys_getpriority <= which: {which}, who: {who}");
+
+    let caller_task = current().clone();
+    let caller_pid_ns = caller_task.as_thread().proc_data.pid_ns();
+    match which as u32 {
+        PRIO_PROCESS => {
+            let nice = if who == 0 {
+                sched_state(&caller_task).nice
+            } else if who < 0 {
+                return Err(AxError::NoSuchProcess);
+            } else if let Some(task) = visible_live_task_for_getpriority(who as Pid, &caller_pid_ns)
+            {
+                sched_state(&task).nice
+            } else if let Some(nice) = zombie_nice_for_getpriority(who as Pid, &caller_pid_ns) {
+                nice?
+            } else {
+                return Err(AxError::NoSuchProcess);
+            };
+            Ok(raw_priority_from_nice(nice))
+        }
+        PRIO_PGRP => {
+            if who < 0 {
+                return Err(AxError::NoSuchProcess);
+            }
+            Ok(raw_priority_from_nice(getpriority_group_nice(
+                who as Pid,
+                &caller_task,
+                &caller_pid_ns,
             )?))
         }
         PRIO_USER => {
-            let current = current();
-            let cred = current.as_thread().current_cred();
-            let uid = if who == 0 {
-                cred.ids().ruid
-            } else {
-                cred.user_ns().make_kuid(who).ok_or(AxError::InvalidInput)?
-            };
-            Ok(raw_priority_from_nice(min_nice_for_threads(
-                try_tasks()?.into_iter().filter_map(|task| {
-                    let thread = task.try_as_thread()?;
-                    (thread.real_uid() == uid || thread.effective_uid() == uid)
-                        .then_some(thread.tid())
-                }),
+            let caller_cred = caller_task.as_thread().current_cred();
+            Ok(raw_priority_from_nice(getpriority_user_nice(
+                who,
+                &caller_cred,
+                &caller_pid_ns,
             )?))
         }
         _ => Err(AxError::InvalidInput),
@@ -1782,5 +1922,30 @@ mod tests {
             priorities.into_iter().min(),
             Some(ioprio_value(IOPRIO_CLASS_RT, 4))
         );
+    }
+
+    #[test]
+    fn getpriority_decodes_the_low_abi_int_word() {
+        assert_eq!(getpriority_int(0x1_0000_0002), 2);
+        assert_eq!(getpriority_int(0x0000_0000_ffff_ffff), -1);
+        assert_eq!(getpriority_int(0xffff_ffff_8000_0000), i32::MIN);
+    }
+
+    #[test]
+    fn getpriority_user_filter_is_real_uid_only() {
+        let real_uid = 1_000_u32;
+        let effective_uid = 0_u32;
+        assert!(getpriority_matches_real_uid(&real_uid, &real_uid));
+        assert!(!getpriority_matches_real_uid(&real_uid, &effective_uid));
+    }
+
+    #[test]
+    fn getpriority_aggregation_selects_the_lowest_nice() {
+        let mut best = None;
+        for nice in [8, -4, 12, 0] {
+            record_lower_nice(&mut best, nice);
+        }
+        assert_eq!(best, Some(-4));
+        assert_eq!(raw_priority_from_nice(best.unwrap()), 24);
     }
 }
