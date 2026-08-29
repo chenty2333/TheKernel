@@ -127,6 +127,22 @@ fn getgroups_to_user<M: UserMemory + ?Sized>(
     Ok(groups.len() as isize)
 }
 
+/// Copy the three visible UIDs in the same order as Linux's `getresuid`.
+/// Each destination is faulted only when reached, so an earlier successful
+/// write remains visible if a later destination faults.
+fn resuid_to_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ruid: *mut u32,
+    euid: *mut u32,
+    suid: *mut u32,
+    values: [u32; 3],
+) -> AxResult<()> {
+    for (destination, value) in [(ruid, values[0]), (euid, values[1]), (suid, values[2])] {
+        VmMutPtr::vm_write(destination, memory, value).map_err(|_| AxError::BadAddress)?;
+    }
+    Ok(())
+}
+
 /// Copy and translate supplementary GIDs one at a time, matching Linux's
 /// `groups_from_user`: the first invalid GID wins over any later user-memory
 /// fault.
@@ -175,18 +191,12 @@ pub fn sys_getresuid<M: UserMemory + ?Sized>(
     let cred = curr.as_thread().current_cred();
     let ids = cred.ids();
     let namespace = cred.user_ns();
-    if !ruid.is_null() {
-        VmMutPtr::vm_write(ruid, memory, namespace.from_kuid_munged(ids.ruid))
-            .map_err(map_usercopy_error)?;
-    }
-    if !euid.is_null() {
-        VmMutPtr::vm_write(euid, memory, namespace.from_kuid_munged(ids.euid))
-            .map_err(map_usercopy_error)?;
-    }
-    if !suid.is_null() {
-        VmMutPtr::vm_write(suid, memory, namespace.from_kuid_munged(ids.suid))
-            .map_err(map_usercopy_error)?;
-    }
+    let values = [
+        namespace.from_kuid_munged(ids.ruid),
+        namespace.from_kuid_munged(ids.euid),
+        namespace.from_kuid_munged(ids.suid),
+    ];
+    resuid_to_user(memory, ruid, euid, suid, values)?;
     Ok(0)
 }
 
@@ -875,6 +885,107 @@ mod tests {
         );
         assert_eq!(memory.memory_mut().writes, &[0, 4]);
         assert_eq!(memory.memory_mut().bytes, [1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn getresuid_address_zero_faults_without_later_writes() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; 16],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: Some(0),
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            resuid_to_user(
+                &mut memory,
+                core::ptr::null_mut(),
+                4 as *mut u32,
+                8 as *mut u32,
+                [11, 22, 33]
+            ),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(memory.memory_mut().writes, &[0]);
+    }
+
+    #[test]
+    fn getresuid_keeps_ruid_prefix_on_euid_fault() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; 16],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: Some(8),
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            resuid_to_user(
+                &mut memory,
+                4 as *mut u32,
+                8 as *mut u32,
+                12 as *mut u32,
+                [11, 22, 33]
+            ),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(memory.memory_mut().writes, &[4, 8]);
+        assert_eq!(&memory.memory_mut().bytes[4..8], &11_u32.to_ne_bytes());
+        assert_eq!(&memory.memory_mut().bytes[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn getresuid_maps_nomemory_and_writes_values_in_order() {
+        let mut failing_provider = GroupMemory {
+            bytes: vec![0; 16],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: Some(UserCopyError::NoMemory),
+        };
+        let mut failing_memory = UserMemoryContext::new(&mut failing_provider);
+        assert_eq!(
+            resuid_to_user(
+                &mut failing_memory,
+                4 as *mut u32,
+                8 as *mut u32,
+                12 as *mut u32,
+                [11, 22, 33]
+            ),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(failing_memory.memory_mut().writes, &[4]);
+
+        let mut provider = GroupMemory {
+            bytes: vec![0; 16],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            resuid_to_user(
+                &mut memory,
+                4 as *mut u32,
+                8 as *mut u32,
+                12 as *mut u32,
+                [11, 22, 33]
+            ),
+            Ok(())
+        );
+        assert_eq!(memory.memory_mut().writes, &[4, 8, 12]);
+        assert_eq!(
+            &memory.memory_mut().bytes[4..16],
+            &[11, 0, 0, 0, 22, 0, 0, 0, 33, 0, 0, 0]
+        );
     }
 
     #[test]
