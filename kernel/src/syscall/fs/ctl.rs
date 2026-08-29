@@ -20,7 +20,8 @@ use linux_raw_sys::{
     },
 };
 use thekernel_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_write_slice,
+    UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
+    vm_write_slice,
 };
 
 #[cfg(test)]
@@ -30,8 +31,8 @@ use crate::file::permission::{
 };
 use crate::{
     file::{
-        Directory, File, FileDescription, FileLike, IoctlContext, executable, get_file_description,
-        get_file_like,
+        Directory, File, FileDescription, FileLike, IoctlContext, executable,
+        filesystem_type_catalog, get_file_description, get_file_like,
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
@@ -67,6 +68,40 @@ enum TimeUpdate {
 }
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 const GETDENTS_NAME_PATH_MAX: usize = 4096;
+const SYSFS_NAME_PATH_MAX: usize = 4096;
+
+/// Implements the obsolete `sysfs(2)` filesystem-type catalog syscall.
+pub fn sys_sysfs<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    option: usize,
+    arg1: *const c_char,
+    arg2: *mut c_char,
+) -> AxResult<isize> {
+    match option as u32 as i32 {
+        1 => {
+            let name = vm_load_until_nul_bounded(memory, arg1.cast::<u8>(), SYSFS_NAME_PATH_MAX)
+                .map_err(map_usercopy_error)?;
+            if name.is_empty() {
+                return Err(LinuxError::ENOENT.into());
+            }
+            filesystem_type_catalog()
+                .iter()
+                .position(|entry| entry[..entry.len() - 1] == name)
+                .map(|index| index as isize)
+                .ok_or_else(|| AxError::InvalidInput)
+        }
+        2 => {
+            let index = arg1 as usize as u32 as usize;
+            let name = filesystem_type_catalog()
+                .get(index)
+                .ok_or(AxError::InvalidInput)?;
+            vm_write_slice(memory, arg2.cast::<u8>(), name).map_err(|_| AxError::BadAddress)?;
+            Ok(0)
+        }
+        3 => Ok(filesystem_type_catalog().len() as isize),
+        _ => Err(AxError::InvalidInput),
+    }
+}
 
 fn try_string(value: &str) -> AxResult<String> {
     let mut owned = String::new();
@@ -1909,7 +1944,7 @@ pub fn sys_vhangup() -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
     use core::{cell::Cell, mem::MaybeUninit, time::Duration};
 
     use axfs_ng_vfs::{Metadata, Mountpoint};
@@ -2010,6 +2045,163 @@ mod tests {
         fn write(&mut self, _start: usize, _src: &[u8]) -> Result<(), UserCopyError> {
             Err(UserCopyError::BadAddress)
         }
+    }
+
+    struct SysfsMemory {
+        bytes: Vec<u8>,
+        readable: bool,
+        writable: bool,
+    }
+
+    impl SysfsMemory {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                readable: true,
+                writable: true,
+            }
+        }
+    }
+
+    unsafe impl UserMemory for SysfsMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> Result<(), UserCopyError> {
+            if !self.readable {
+                return Err(UserCopyError::BadAddress);
+            }
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            for (destination, source) in dst.iter_mut().zip(source) {
+                destination.write(*source);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, start: usize, src: &[u8]) -> Result<(), UserCopyError> {
+            if !self.writable {
+                return Err(UserCopyError::BadAddress);
+            }
+            let end = start
+                .checked_add(src.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let destination = self
+                .bytes
+                .get_mut(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            destination.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sysfs_decodes_option_as_a_low_32_bit_signed_int_before_usercopy() {
+        let mut provider = NoUserMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            sys_sysfs(
+                &mut memory,
+                (1usize << 32) | u32::MAX as usize,
+                usize::MAX as *const c_char,
+                usize::MAX as *mut c_char,
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sys_sysfs(
+                &mut memory,
+                4,
+                usize::MAX as *const c_char,
+                usize::MAX as *mut c_char,
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sysfs_option_one_uses_raw_bounded_bytes() {
+        let mut provider = SysfsMemory::new(vec![0; SYSFS_NAME_PATH_MAX + 1]);
+        provider.bytes[..5].copy_from_slice(b"vfat\0");
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_sysfs(&mut memory, 1, core::ptr::null(), core::ptr::null_mut()),
+            Ok(1)
+        );
+
+        memory.memory_mut().bytes[..2].copy_from_slice(&[0xff, 0]);
+        assert_eq!(
+            sys_sysfs(&mut memory, 1, core::ptr::null(), core::ptr::null_mut()),
+            Err(AxError::InvalidInput)
+        );
+
+        memory.memory_mut().bytes[0] = 0;
+        assert_eq!(
+            sys_sysfs(&mut memory, 1, core::ptr::null(), core::ptr::null_mut()),
+            Err(LinuxError::ENOENT.into())
+        );
+
+        memory.memory_mut().readable = false;
+        assert_eq!(
+            sys_sysfs(&mut memory, 1, core::ptr::null(), core::ptr::null_mut()),
+            Err(AxError::BadAddress)
+        );
+        memory.memory_mut().readable = true;
+
+        memory.memory_mut().bytes[..SYSFS_NAME_PATH_MAX].fill(b'x');
+        assert_eq!(
+            sys_sysfs(&mut memory, 1, core::ptr::null(), core::ptr::null_mut()),
+            Err(AxError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn sysfs_option_two_writes_nul_and_validates_index_before_destination() {
+        let mut provider = SysfsMemory::new(vec![0; 64]);
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_sysfs(
+                &mut memory,
+                2,
+                ((1usize << 32) | 1) as *const c_char,
+                16usize as *mut c_char,
+            ),
+            Ok(0)
+        );
+        assert_eq!(&memory.memory_mut().bytes[16..21], b"vfat\0");
+
+        memory.memory_mut().writable = false;
+        assert_eq!(
+            sys_sysfs(
+                &mut memory,
+                2,
+                usize::MAX as *const c_char,
+                core::ptr::null_mut(),
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sys_sysfs(&mut memory, 2, core::ptr::null(), core::ptr::null_mut(),),
+            Err(AxError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn sysfs_option_three_ignores_both_pointers() {
+        let mut provider = NoUserMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_sysfs(
+                &mut memory,
+                3,
+                usize::MAX as *const c_char,
+                usize::MAX as *mut c_char,
+            ),
+            Ok(filesystem_type_catalog().len() as isize)
+        );
     }
 
     #[test]

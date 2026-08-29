@@ -31,6 +31,7 @@ pub(crate) mod xattr_provider;
 
 mod desc;
 mod fd_table;
+mod fs_types;
 mod metadata;
 mod socket;
 mod stdio;
@@ -54,6 +55,7 @@ pub(crate) use self::{
         allowed_write_len, check_resize_limit, resolve_at_with_security,
         resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,
     },
+    fs_types::filesystem_type_catalog,
     metadata::{PseudoInode, anon_inode_stat},
     packet_socket::PacketSocket,
     socket::{

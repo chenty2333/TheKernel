@@ -90,6 +90,9 @@ pub(super) fn dispatch_syscall(
                 uctx.arg2() as _,
             )
         }
+        Sysno::sysfs => with_user_memory(aspace(), |memory| {
+            sys_sysfs(memory, uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _)
+        }),
         Sysno::chdir => with_user_memory(aspace(), |memory| sys_chdir(memory, uctx.arg0() as _)),
         Sysno::fchdir => sys_fchdir(uctx.arg0() as _),
         Sysno::chroot => with_user_memory(aspace(), |memory| sys_chroot(memory, uctx.arg0() as _)),
