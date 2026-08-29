@@ -87,6 +87,40 @@ fn getgroups_size(raw: usize) -> AxResult<usize> {
     Ok(size as usize)
 }
 
+/// Decode sethostname's `int len` from the x86_64 syscall argument register.
+/// The syscall ABI supplies register-width arguments, but Linux truncates this
+/// parameter to C `int` before checking its range.
+fn sethostname_len(raw: usize) -> AxResult<usize> {
+    let len = raw as u32 as i32;
+    if !(0..=UTS_FIELD_LEN as i32).contains(&len) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(len as usize)
+}
+
+/// Linux's `copy_from_user` result for sethostname is always surfaced as
+/// EFAULT, including provider-side failures.  A zero-length copy does not
+/// inspect the user pointer.
+fn copy_sethostname_from_user<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    name: *const u8,
+    len: usize,
+) -> AxResult<[u8; UTS_FIELD_LEN]> {
+    let mut hostname = [0; UTS_FIELD_LEN];
+    if len == 0 {
+        return Ok(hostname);
+    }
+    let mut copied = [core::mem::MaybeUninit::<u8>::uninit(); UTS_FIELD_LEN];
+    memory
+        .read_bytes(name as usize, &mut copied[..len])
+        .map_err(|_| AxError::BadAddress)?;
+    for (destination, source) in hostname[..len].iter_mut().zip(&copied[..len]) {
+        // SAFETY: a successful read_bytes initializes every requested byte.
+        *destination = unsafe { source.assume_init() };
+    }
+    Ok(hostname)
+}
+
 /// Copy supplementary GIDs one at a time as Linux's `groups_to_user` does.
 /// In particular, do not preflight the destination: a later fault preserves
 /// the prefix that has already reached user memory.
@@ -384,7 +418,7 @@ pub(crate) fn current_hostname_string() -> AxResult<String> {
         .proc_data
         .uts_ns()
         .nodename()
-        .map(|value| value.into_iter().map(char::from).collect())
+        .map(|value| uts_bytes_to_string(&value))
 }
 
 pub(crate) fn current_domainname_string() -> AxResult<String> {
@@ -435,6 +469,14 @@ fn cstr_field_to_string(field: &[c_char; 65]) -> String {
         .collect();
 }
 
+fn uts_bytes_to_string(value: &[u8]) -> String {
+    value
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| char::from(byte))
+        .collect()
+}
+
 pub fn sys_uname<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *mut new_utsname,
@@ -458,14 +500,9 @@ pub fn sys_sethostname<M: UserMemory + ?Sized>(
     if !current_can_administer_uts() {
         return Err(AxError::OperationNotPermitted);
     }
-    if len > UTS_FIELD_LEN {
-        return Err(AxError::InvalidInput);
-    }
-    if name.is_null() {
-        return Err(AxError::BadAddress);
-    }
-    let hostname = vm_load(memory, name, len).map_err(map_usercopy_error)?;
-    set_hostname_bytes(&hostname)?;
+    let len = sethostname_len(len)?;
+    let hostname = copy_sethostname_from_user(memory, name, len)?;
+    set_hostname_bytes(&hostname[..len])?;
     Ok(0)
 }
 
@@ -687,6 +724,75 @@ mod tests {
             )
             .unwrap();
         child
+    }
+
+    #[test]
+    fn sethostname_len_matches_linux_int_abi() {
+        assert_eq!(sethostname_len(0), Ok(0));
+        assert_eq!(sethostname_len(UTS_FIELD_LEN), Ok(UTS_FIELD_LEN));
+        assert_eq!(sethostname_len(1_usize << 32), Ok(0));
+        assert_eq!(sethostname_len((1_usize << 32) | 12), Ok(12));
+        assert_eq!(
+            sethostname_len((-1_isize) as usize),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sethostname_len((UTS_FIELD_LEN + 1) as usize),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sethostname_usercopy_allows_mapped_zero_and_skips_zero_length() {
+        let mut mapped_provider = GroupMemory {
+            bytes: b"node".to_vec(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut mapped_memory = UserMemoryContext::new(&mut mapped_provider);
+        assert_eq!(
+            &copy_sethostname_from_user(&mut mapped_memory, core::ptr::null(), 4).unwrap()[..4],
+            b"node"
+        );
+        assert_eq!(mapped_memory.memory_mut().reads, &[0]);
+
+        let mut zero_provider = GroupMemory {
+            bytes: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: Some(UserCopyError::NoMemory),
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut zero_memory = UserMemoryContext::new(&mut zero_provider);
+        assert_eq!(
+            copy_sethostname_from_user(&mut zero_memory, core::ptr::null(), 0),
+            Ok([0; UTS_FIELD_LEN])
+        );
+        assert!(zero_memory.memory_mut().reads.is_empty());
+
+        let mut failing_provider = GroupMemory {
+            bytes: vec![0; 4],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: Some(UserCopyError::NoMemory),
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut failing_memory = UserMemoryContext::new(&mut failing_provider);
+        assert_eq!(
+            copy_sethostname_from_user(&mut failing_memory, core::ptr::null(), 4),
+            Err(AxError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn hostname_string_stops_at_embedded_nul() {
+        assert_eq!(uts_bytes_to_string(b"node\0suffix"), "node");
+        assert_eq!(uts_bytes_to_string(b"node"), "node");
     }
 
     #[test]
