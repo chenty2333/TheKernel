@@ -4,7 +4,7 @@ schema = 1
 
 [source.ax]
 repository = "chenty2333/thekernel-ax"
-ref = "5eb8b8a06d6907dd7b6429aa683bf00363fb4b54"
+ref = "b780f528d806844ce47653cb5c7fdcb6ee5082b5"
 path = "thekernel-ax"
 
 [source.linux_abi]

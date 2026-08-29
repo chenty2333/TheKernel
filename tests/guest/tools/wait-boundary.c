@@ -73,6 +73,7 @@ enum clock_worker_phase {
     CLOCK_WORKER_PHASE_CREATED,
     CLOCK_WORKER_PHASE_ENTERED,
     CLOCK_WORKER_PHASE_AFFINITY_CALL,
+    CLOCK_WORKER_PHASE_AFFINITY_RETURNED,
     CLOCK_WORKER_PHASE_AFFINITY_SET,
     CLOCK_WORKER_PHASE_WAIT_PREPARED,
     CLOCK_WORKER_PHASE_WAIT_ENTERED,
@@ -195,6 +196,8 @@ static const char *clock_worker_phase_name(int phase)
         return "entered";
     case CLOCK_WORKER_PHASE_AFFINITY_CALL:
         return "affinity-call";
+    case CLOCK_WORKER_PHASE_AFFINITY_RETURNED:
+        return "affinity-returned";
     case CLOCK_WORKER_PHASE_AFFINITY_SET:
         return "affinity-set";
     case CLOCK_WORKER_PHASE_WAIT_PREPARED:
@@ -263,6 +266,9 @@ static void *clock_worker_main(void *opaque)
                               memory_order_release);
         return NULL;
     }
+    atomic_store_explicit(&worker->phase,
+                          CLOCK_WORKER_PHASE_AFFINITY_RETURNED,
+                          memory_order_release);
     if (sched_getcpu() != worker->cpu) {
         worker->error = EXDEV;
         atomic_store_explicit(&worker->phase, CLOCK_WORKER_PHASE_EXIT,
