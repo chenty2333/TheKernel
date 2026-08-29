@@ -59,8 +59,8 @@ use crate::{
         try_boxed_names,
     },
     syscall::{
-        aio_max_nr, aio_nr, current_can_administer_uts, current_domainname_string,
-        current_hostname_string, current_machine_string, current_release_string,
+        aio_max_nr, aio_nr, current_can_administer_uts, current_domainname_bytes,
+        current_hostname_bytes, current_machine_string, current_release_string,
         current_sysname_string, current_version_string, mq_msg_max, mq_msgsize_max, mq_queues_max,
         msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string, sched_rr_timeslice_ms,
         sem_limits_string, sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes,
@@ -3801,9 +3801,11 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o644),
                     RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            format!("{}\n", current_domainname_string()?).into_bytes(),
-                        )),
+                        SimpleFileOperation::Read => {
+                            let mut value = current_domainname_bytes()?;
+                            value.push(b'\n');
+                            Ok(Some(value))
+                        }
                         SimpleFileOperation::Write(data) => {
                             if !current_can_administer_uts() {
                                 return Err(VfsError::PermissionDenied);
@@ -3822,9 +3824,11 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o644),
                     RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            format!("{}\n", current_hostname_string()?).into_bytes(),
-                        )),
+                        SimpleFileOperation::Read => {
+                            let mut value = current_hostname_bytes()?;
+                            value.push(b'\n');
+                            Ok(Some(value))
+                        }
                         SimpleFileOperation::Write(data) => {
                             if !current_can_administer_uts() {
                                 return Err(VfsError::PermissionDenied);
