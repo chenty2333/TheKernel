@@ -7,7 +7,7 @@ use linux_raw_sys::general::{
     rusage,
 };
 use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     mm::map_usercopy_error,
@@ -41,6 +41,19 @@ fn current_can_raise_hard_limit() -> bool {
     current()
         .as_thread()
         .has_effective_capability(CAP_SYS_RESOURCE)
+}
+
+// getrlimit(2) uses copy_to_user() directly: every copyout failure is EFAULT,
+// irrespective of the backing UserMemory provider's more specific reason.
+fn map_getrlimit_usercopy_error(_: UserCopyError) -> AxError {
+    AxError::BadAddress
+}
+
+fn native_rlimit(current: u64, max: u64) -> rlimit {
+    rlimit {
+        rlim_cur: current as _,
+        rlim_max: max as _,
+    }
 }
 
 fn update_resource_limit(
@@ -169,16 +182,72 @@ pub fn sys_getrlimit<M: UserMemory + ?Sized>(
     }
 
     let proc_data = current().as_thread().proc_data.clone();
-    let limit = &proc_data.rlim.read()[resource];
-    let old = rlimit {
-        rlim_cur: limit.current as _,
-        rlim_max: limit.max as _,
+    // Do not retain this lock while usercopy can fault and block the caller.
+    let old = {
+        let limits = proc_data.rlim.read();
+        let limit = &limits[resource];
+        native_rlimit(limit.current, limit.max)
     };
     // SAFETY: rlimit has no padding on the checked x86_64 ABI, and both
     // fields in `old` are initialized before this copyout.
-    unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }.map_err(map_usercopy_error)?;
+    unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
+        .map_err(map_getrlimit_usercopy_error)?;
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
+
+    use super::*;
+
+    struct WriteProbe {
+        writes: usize,
+    }
+
+    // SAFETY: this provider never successfully reads or writes user bytes.
+    unsafe impl UserMemory for WriteProbe {
+        fn read(&mut self, _: usize, _: &mut [MaybeUninit<u8>]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
+            self.writes += 1;
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    #[test]
+    fn getrlimit_rejects_resource_before_touching_output() {
+        let mut provider = WriteProbe { writes: 0 };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            sys_getrlimit(&mut memory, RLIM_NLIMITS, 0x1000usize as *mut rlimit),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(provider.writes, 0);
+    }
+
+    #[test]
+    fn getrlimit_copy_failure_is_efault() {
+        assert_eq!(
+            map_getrlimit_usercopy_error(UserCopyError::NoMemory),
+            AxError::BadAddress
+        );
+    }
+
+    #[test]
+    fn getrlimit_snapshot_contains_the_complete_native_value() {
+        let limit = native_rlimit(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+
+        assert_eq!(limit.rlim_cur, 0x0123_4567_89ab_cdef);
+        assert_eq!(limit.rlim_max, 0xfedc_ba98_7654_3210);
+        assert_eq!(core::mem::size_of_val(&limit), 16);
+    }
 }
 
 pub fn sys_getrusage<M: UserMemory + ?Sized>(
