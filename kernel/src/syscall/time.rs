@@ -616,12 +616,14 @@ fn timer_remaining(timer: &PosixTimer) -> Duration {
 }
 
 /// Converts the process ITIMER_REAL remainder to the unsigned-seconds result
-/// required by alarm(2). Linux rounds a non-integral remainder up and caps the
-/// result at UINT_MAX because the syscall's return type is unsigned int.
+/// required by alarm(2). Linux adds one second only for a sub-second remainder
+/// or one of at least 500ms, then returns the native unsigned-int low word.
 fn alarm_remaining_seconds_from_nanos(nanos: u128) -> u32 {
     let seconds = nanos / NANOS_PER_SEC as u128;
-    let rounded = seconds.saturating_add(u128::from(!nanos.is_multiple_of(NANOS_PER_SEC as u128)));
-    u32::try_from(rounded).unwrap_or(u32::MAX)
+    let subsecond_nanos = nanos % NANOS_PER_SEC as u128;
+    let round_up = (seconds == 0 && subsecond_nanos != 0)
+        || subsecond_nanos >= (NANOS_PER_SEC / 2) as u128;
+    seconds.wrapping_add(u128::from(round_up)) as u32
 }
 
 fn alarm_remaining_seconds(value: TimeValue) -> u32 {
@@ -1604,20 +1606,28 @@ mod tests {
     }
 
     #[test]
-    fn alarm_remaining_seconds_rounds_up_and_saturates() {
+    fn alarm_remaining_seconds_matches_linux_half_second_rule_and_wraps() {
         let second = NANOS_PER_SEC as u128;
         assert_eq!(alarm_remaining_seconds_from_nanos(0), 0);
+        assert_eq!(alarm_remaining_seconds_from_nanos(second / 10), 1);
         assert_eq!(alarm_remaining_seconds_from_nanos(second), 1);
-        assert_eq!(alarm_remaining_seconds_from_nanos(second - 1), 1);
+        assert_eq!(alarm_remaining_seconds_from_nanos(second + second / 10), 1);
         assert_eq!(
-            alarm_remaining_seconds_from_nanos(u128::from(u32::MAX - 1) * second + 1),
-            u32::MAX
+            alarm_remaining_seconds_from_nanos(second + second / 2 - 1),
+            1
         );
         assert_eq!(
-            alarm_remaining_seconds_from_nanos(u128::from(u32::MAX) * second),
-            u32::MAX
+            alarm_remaining_seconds_from_nanos(second + second / 2),
+            2
         );
-        assert_eq!(alarm_remaining_seconds_from_nanos(u128::MAX), u32::MAX);
+        assert_eq!(
+            alarm_remaining_seconds_from_nanos((u128::from(u32::MAX) + 1) * second),
+            0
+        );
+        assert_eq!(
+            alarm_remaining_seconds(TimeValue::new(u64::MAX, (NANOS_PER_SEC / 2) as u32)),
+            0
+        );
     }
 
     #[test]
