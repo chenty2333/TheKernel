@@ -9,11 +9,11 @@ use axtask::current;
 use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
-    CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE,
-    SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, timespec,
-    timeval, timezone,
+    __kernel_clockid_t, __kernel_old_time_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM,
+    CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
+    CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI,
+    CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID,
+    TIMER_ABSTIME, itimerspec, itimerval, timespec, timeval, timezone,
 };
 use thekernel_linux_signal::Signo;
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
@@ -637,6 +637,9 @@ fn alarm_seconds_to_nanos(seconds: u32) -> AxResult<usize> {
 // Keep the x86_64 Linux ABI premise executable instead of relying on the
 // generated binding's shape by inspection.
 const _: () = {
+    assert!(size_of::<__kernel_old_time_t>() == 8);
+    assert!(align_of::<__kernel_old_time_t>() == 8);
+    assert!(size_of::<isize>() == 8);
     assert!(align_of::<timeval>() == 8);
     assert!(size_of::<timeval>() == 16);
     assert!(offset_of!(timeval, tv_sec) == 0);
@@ -658,6 +661,25 @@ const _: () = {
     assert!(offset_of!(itimerspec, it_interval) == 0);
     assert!(offset_of!(itimerspec, it_value) == 16);
 };
+
+fn write_time_result<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *mut __kernel_old_time_t,
+    seconds: __kernel_old_time_t,
+) -> AxResult<()> {
+    // `time(2)` copies exactly one initialized x86_64 time_t word.  All
+    // provider failures are Linux EFAULT, including access and population
+    // failures, so do not expose provider-specific errors here.
+    if let Some(ptr) = VmPtr::nullable(ptr) {
+        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, seconds) }
+            .map_err(map_time_usercopy_error)?;
+    }
+    Ok(())
+}
+
+fn map_time_usercopy_error(_error: UserCopyError) -> AxError {
+    AxError::BadAddress
+}
 
 fn map_timer_usercopy_error(_error: UserCopyError) -> AxError {
     // Linux's POSIX timer entry points map failed get/put/copy_user operations
@@ -952,6 +974,16 @@ pub fn sys_clock_gettime<M: UserMemory + ?Sized>(
     unsafe { VmMutPtr::vm_write_unchecked(ts, memory, timespec::from_time_value(now)) }
         .map_err(map_usercopy_error)?;
     Ok(0)
+}
+
+pub fn sys_time<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    tloc: *mut __kernel_old_time_t,
+) -> AxResult<isize> {
+    // Sample once so the return value and optional stored value are identical.
+    let seconds = wall_time().as_secs() as __kernel_old_time_t;
+    write_time_result(memory, tloc, seconds)?;
+    Ok(seconds as isize)
 }
 
 pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
@@ -1380,6 +1412,32 @@ mod tests {
             map_timer_usercopy_error(UserCopyError::NoMemory),
             AxError::BadAddress
         );
+    }
+
+    #[test]
+    fn time_result_is_native_64bit_unaligned_and_maps_all_copyout_failures_to_efault() {
+        let seconds = 0x1_0000_0001_i64 as __kernel_old_time_t;
+        let mut provider = TestMemory {
+            bytes: vec![0; 32],
+            reject_writes: false,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        write_time_result(&mut memory, core::ptr::null_mut(), seconds).unwrap();
+        write_time_result(
+            &mut memory,
+            core::ptr::without_provenance_mut::<__kernel_old_time_t>(3),
+            seconds,
+        )
+        .unwrap();
+        assert_eq!(&provider.bytes[3..11], &seconds.to_ne_bytes());
+
+        for error in [
+            UserCopyError::BadAddress,
+            UserCopyError::AccessDenied,
+            UserCopyError::NoMemory,
+        ] {
+            assert_eq!(map_time_usercopy_error(error), AxError::BadAddress);
+        }
     }
 
     #[test]

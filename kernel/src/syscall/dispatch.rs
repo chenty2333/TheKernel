@@ -1297,6 +1297,7 @@ pub(super) fn dispatch_syscall(
         ),
 
         // time
+        Sysno::time => with_user_memory(aspace(), |memory| sys_time(memory, uctx.arg0() as _)),
         Sysno::gettimeofday => with_user_memory(aspace(), |memory| {
             sys_gettimeofday(memory, uctx.arg0() as _, uctx.arg1() as _)
         }),

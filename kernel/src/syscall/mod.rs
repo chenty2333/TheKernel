@@ -156,11 +156,17 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
     // Fast path for time-read syscalls: they don't block and aren't
     // restartable, so skip the per-syscall set_timer_state/enter_syscall/restart
-    // bookkeeping on the nonblocking time-read fast path. clock_gettime is
-    // gated to the non-CPUTIME clocks; CPUTIME clocks fall through to the full
-    // path for accurate CPU-time accounting. Signal delivery and preemption
-    // still run in the user-mode loop after handle_syscall returns.
+    // bookkeeping on the nonblocking time-read fast path. The clock_gettime
+    // shortcut is gated to non-CPUTIME clocks; CPUTIME clocks fall through to
+    // the full path for accurate CPU-time accounting. Signal delivery and
+    // preemption still run in the user-mode loop after handle_syscall returns.
     match sysno {
+        Sysno::time => {
+            let aspace = current().as_thread().proc_data.aspace();
+            let r = with_user_memory(aspace, |memory| sys_time(memory, uctx.arg0() as _));
+            uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+            return;
+        }
         Sysno::gettimeofday => {
             let aspace = current().as_thread().proc_data.aspace();
             let r = with_user_memory(aspace, |memory| {
