@@ -16,7 +16,7 @@
         },
         "thekernel": {
           "config_id": "source-combination",
-          "config_sha256": "953c48a314fad5c70c77b1ec8c8d44c5cb2f24d03cabe177f1d8b072d37095c1"
+          "config_sha256": "fb54d5eadedab210865ec07806f7d8eb1d0d37210a75e8cd727bf22e7b6cef42"
         }
       },
       "tier": "differential",
@@ -40,7 +40,7 @@
         },
         "thekernel": {
           "config_id": "source-combination",
-          "config_sha256": "953c48a314fad5c70c77b1ec8c8d44c5cb2f24d03cabe177f1d8b072d37095c1"
+          "config_sha256": "fb54d5eadedab210865ec07806f7d8eb1d0d37210a75e8cd727bf22e7b6cef42"
         }
       },
       "tier": "differential",
@@ -64,7 +64,7 @@
         },
         "thekernel": {
           "config_id": "source-combination",
-          "config_sha256": "953c48a314fad5c70c77b1ec8c8d44c5cb2f24d03cabe177f1d8b072d37095c1"
+          "config_sha256": "fb54d5eadedab210865ec07806f7d8eb1d0d37210a75e8cd727bf22e7b6cef42"
         }
       },
       "tier": "differential",
