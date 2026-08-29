@@ -43,9 +43,10 @@ fn current_can_raise_hard_limit() -> bool {
         .has_effective_capability(CAP_SYS_RESOURCE)
 }
 
-// getrlimit(2) uses copy_to_user() directly: every copyout failure is EFAULT,
-// irrespective of the backing UserMemory provider's more specific reason.
-fn map_getrlimit_usercopy_error(_: UserCopyError) -> AxError {
+// Linux uses copy_{from,to}_user() for every rlimit ABI structure. Its callers
+// collapse every partial or failed transfer to EFAULT, irrespective of the
+// backing UserMemory provider's more specific reason.
+fn map_rlimit_usercopy_error(_: UserCopyError) -> AxError {
     AxError::BadAddress
 }
 
@@ -117,7 +118,8 @@ pub fn sys_prlimit64<M: UserMemory + ?Sized>(
     // resource validation. Keep that observable precedence for combinations
     // of bad pointers, dead PIDs, and out-of-range resource numbers.
     let new_limit = if let Some(new_limit) = VmPtr::nullable(new_limit) {
-        let value = VmPtr::vm_read_uninit(new_limit, memory).map_err(map_usercopy_error)?;
+        let value =
+            VmPtr::vm_read_uninit(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
         // SAFETY: the explicit provider initialized the complete value and
         // rlimit64 contains only integer fields on the x86_64 Linux ABI.
         Some(unsafe { value.assume_init() })
@@ -136,7 +138,7 @@ pub fn sys_prlimit64<M: UserMemory + ?Sized>(
         // SAFETY: rlimit64 has no padding on the checked x86_64 ABI, and all
         // fields in `old` are initialized before this copyout.
         unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
-            .map_err(map_usercopy_error)?;
+            .map_err(map_rlimit_usercopy_error)?;
     }
 
     Ok(0)
@@ -153,7 +155,7 @@ pub fn sys_setrlimit<M: UserMemory + ?Sized>(
     // only integer fields on the checked x86_64 Linux ABI.
     let new_limit = unsafe {
         VmPtr::vm_read_uninit(new_limit, memory)
-            .map_err(map_usercopy_error)?
+            .map_err(map_rlimit_usercopy_error)?
             .assume_init()
     };
     if resource >= RLIM_NLIMITS {
@@ -191,7 +193,7 @@ pub fn sys_getrlimit<M: UserMemory + ?Sized>(
     // SAFETY: rlimit has no padding on the checked x86_64 ABI, and both
     // fields in `old` are initialized before this copyout.
     unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
-        .map_err(map_getrlimit_usercopy_error)?;
+        .map_err(map_rlimit_usercopy_error)?;
 
     Ok(0)
 }
@@ -208,6 +210,10 @@ mod tests {
         writes: usize,
     }
 
+    struct ReadProbe {
+        requested_len: usize,
+    }
+
     // SAFETY: this provider never successfully reads or writes user bytes.
     unsafe impl UserMemory for WriteProbe {
         fn read(&mut self, _: usize, _: &mut [MaybeUninit<u8>]) -> VmResult {
@@ -216,6 +222,19 @@ mod tests {
 
         fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
             self.writes += 1;
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    // SAFETY: this provider records the complete requested input span and
+    // reports a provider-specific fault without initializing user bytes.
+    unsafe impl UserMemory for ReadProbe {
+        fn read(&mut self, _: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            self.requested_len = dst.len();
+            Err(UserCopyError::NoMemory)
+        }
+
+        fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
             Err(UserCopyError::BadAddress)
         }
     }
@@ -235,9 +254,21 @@ mod tests {
     #[test]
     fn getrlimit_copy_failure_is_efault() {
         assert_eq!(
-            map_getrlimit_usercopy_error(UserCopyError::NoMemory),
+            map_rlimit_usercopy_error(UserCopyError::NoMemory),
             AxError::BadAddress
         );
+    }
+
+    #[test]
+    fn setrlimit_reads_all_16_bytes_and_maps_any_copy_failure_to_efault() {
+        let mut provider = ReadProbe { requested_len: 0 };
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        assert_eq!(
+            sys_setrlimit(&mut memory, RLIM_NLIMITS, 0x1000usize as *const rlimit),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(provider.requested_len, size_of::<rlimit>());
     }
 
     #[test]
