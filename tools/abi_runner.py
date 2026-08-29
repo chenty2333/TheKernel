@@ -341,8 +341,14 @@ def _run_target(*, target: str, cases: list[dict[str, Any]], repo_root: Path, ro
     ) if direct else ()
     target_output = output / target
     target_output.mkdir(parents=True, exist_ok=True)
-    command_input = target_output / "empty.commands"
-    command_input.write_bytes(b"")
+    command_input = target_output / ("empty.commands" if direct else "shutdown.commands")
+    command_input.write_bytes(
+        b"" if direct else b"/bin/busybox poweroff -f\nexit\n"
+    )
+    interaction = Interaction(
+        interactive=True,
+        input_after_marker=None if direct else THEKERNEL_COMPLETE,
+    )
     qemu_receipt = target_output / "qemu-receipt.json"
     config = RunConfig(
         arch="x86_64", kernel=kernel, rootfs=rootfs, esp=esp, workdir=target_output,
@@ -350,7 +356,7 @@ def _run_target(*, target: str, cases: list[dict[str, Any]], repo_root: Path, ro
         receipt_path=qemu_receipt, input_path=command_input,
         direct_kernel=direct, memory=f"{resources['memory_mib']}M", cpus=resources["cpus"], qemu_binary=qemu, accel=accel,
         limits=RunLimits(total_timeout_secs=resources["profile_timeout_seconds"]), extra_args=("-append", " ".join(commandline)) if direct else (),
-        interaction=Interaction(),
+        interaction=interaction,
     )
     result = run(config)
     transcript = result.log_path.read_text(encoding="utf-8", errors="replace")

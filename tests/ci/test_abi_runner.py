@@ -114,9 +114,11 @@ class AbiRunnerTests(unittest.TestCase):
             root = Path(temporary)
             args = self.arguments(root)
             configs = []
+            input_payloads = []
             receipt_transcripts = []
             def fake_run(config):
                 configs.append(config)
+                input_payloads.append(config.input_path.read_bytes())
                 config.log_path.parent.mkdir(parents=True, exist_ok=True)
                 if config.direct_kernel:
                     log = "THEKERNEL_ABI_CASE eventfd.portable-differential\nTHEKERNEL_ABI_ASSERT eventfd.portable-differential COUNTER pass\nTHEKERNEL_EVENTFD_OK\nTHEKERNEL_ABI_RESULT eventfd.portable-differential pass\nTHEKERNEL_ABI_INIT_COMPLETE\n"
@@ -152,6 +154,13 @@ class AbiRunnerTests(unittest.TestCase):
             self.assertEqual(configs[0].cpus, 4)
             self.assertEqual(configs[0].memory, "1024M")
             self.assertEqual(configs[0].limits.total_timeout_secs, 300)
+            self.assertTrue(configs[0].interaction.interactive)
+            self.assertIsNone(configs[0].interaction.input_after_marker)
+            self.assertTrue(configs[1].interaction.interactive)
+            self.assertEqual(configs[1].interaction.input_after_marker,
+                             "# THEKERNEL_SYSTEM_TEST_COMPLETE")
+            self.assertEqual(input_payloads,
+                             [b"", b"/bin/busybox poweroff -f\nexit\n"])
             self.assertEqual(len(receipt_transcripts), 2)
             self.assertTrue(all("ABI_INIT_COMPLETE" not in item for item in receipt_transcripts))
             published = json.loads((result / "receipts/linux-product/eventfd.portable-differential.json").read_text())
