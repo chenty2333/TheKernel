@@ -173,7 +173,7 @@ struct FsOpenState {
     created: bool,
 }
 
-struct FsOpenFd(Mutex<FsOpenState>);
+pub(crate) struct FsOpenFd(Mutex<FsOpenState>);
 
 impl FileLike for FsOpenFd {
     fn stat(&self) -> AxResult<Kstat> {
@@ -205,7 +205,7 @@ impl Pollable for FsOpenFd {
     }
 }
 
-struct FsMountFd {
+pub(crate) struct FsMountFd {
     root: axfs_ng_vfs::Location,
 }
 

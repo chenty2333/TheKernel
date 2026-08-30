@@ -20,7 +20,10 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, v
 use super::ctl::validate_pathname;
 use crate::{
     file::{
-        Directory, File, FileLike, Pipe, Socket, get_file_like,
+        AfAlgSocket, Directory, File, FileLike, IoUring, NamedPipe, NetlinkSocket, PacketSocket, Pipe, Socket,
+        UserfaultFile, get_file_like, PidFd,
+        epoll::Epoll, event::EventFd, fanotify::FanotifyFile, inotify::InotifyFile,
+        signalfd::Signalfd, timerfd::TimerFd,
         permission::{
             SecurityFsContextExt, VfsSecurityContext, check_dac_permissions,
             check_dac_permissions_with_security, check_inode_permissions_with_security,
@@ -30,7 +33,10 @@ use crate::{
     mm::map_usercopy_error,
     mounts,
     task::AsThread,
+    syscall::{MqFd, fs::mount::{FsMountFd, FsOpenFd}},
 };
+#[cfg(feature = "bpf")]
+use crate::file::bpf::{BpfMapFd, BpfProgFd};
 
 const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FSTATAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
@@ -60,6 +66,8 @@ const STATX_CHANGE_COOKIE: u32 = 0x4000_0000;
 const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
+const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+const MQUEUE_MAGIC: i64 = 0x1980_0202;
 
 /// Native x86_64 `struct ustat`. Although obsolete, Linux still copies the
 /// complete 32-byte object, including its ABI padding and obsolete name fields.
@@ -493,26 +501,58 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     Ok(result)
 }
 
+enum SpecialFdFilesystem {
+    Pipe,
+    Socket,
+    AnonymousInode,
+    Mqueue,
+}
+
+/// Explicit filesystem capability classification for every non-location fd
+/// family the kernel exports. Unknown `FileLike` implementations deliberately
+/// receive no synthetic statfs result.
+fn special_fd_filesystem(fd: &dyn FileLike) -> Option<SpecialFdFilesystem> {
+    if fd.downcast_ref::<Pipe>().is_some() { return Some(SpecialFdFilesystem::Pipe); }
+    if fd.downcast_ref::<Socket>().is_some()
+        || fd.downcast_ref::<NetlinkSocket>().is_some()
+        || fd.downcast_ref::<PacketSocket>().is_some()
+        || fd.downcast_ref::<AfAlgSocket>().is_some()
+    { return Some(SpecialFdFilesystem::Socket); }
+    if fd.downcast_ref::<MqFd>().is_some() { return Some(SpecialFdFilesystem::Mqueue); }
+    #[cfg(feature = "bpf")]
+    let bpf_anon_inode = fd.downcast_ref::<BpfMapFd>().is_some()
+        || fd.downcast_ref::<BpfProgFd>().is_some();
+    #[cfg(not(feature = "bpf"))]
+    let bpf_anon_inode = false;
+    if fd.downcast_ref::<EventFd>().is_some()
+        || fd.downcast_ref::<Signalfd>().is_some()
+        || fd.downcast_ref::<TimerFd>().is_some()
+        || fd.downcast_ref::<Epoll>().is_some()
+        || fd.downcast_ref::<InotifyFile>().is_some()
+        || fd.downcast_ref::<FanotifyFile>().is_some()
+        || fd.downcast_ref::<PidFd>().is_some()
+        || fd.downcast_ref::<IoUring>().is_some()
+        || fd.downcast_ref::<UserfaultFile>().is_some()
+        || fd.downcast_ref::<FsOpenFd>().is_some()
+        || fd.downcast_ref::<FsMountFd>().is_some()
+        || bpf_anon_inode
+    { return Some(SpecialFdFilesystem::AnonymousInode); }
+    None
+}
+
 fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
     let mut result: statfs = unsafe { core::mem::zeroed() };
-
-    if fd.downcast_ref::<Pipe>().is_some() {
-        result.f_type = PIPEFS_MAGIC;
-        result.f_bsize = 4096;
-        result.f_namelen = 255;
-        result.f_frsize = 4096;
-        return Some(Ok(result));
-    }
-
-    if fd.downcast_ref::<Socket>().is_some() {
-        result.f_type = SOCKFS_MAGIC;
-        result.f_bsize = 4096;
-        result.f_namelen = 255;
-        result.f_frsize = 4096;
-        return Some(Ok(result));
-    }
-
-    None
+    let kind = special_fd_filesystem(fd)?;
+    result.f_type = match kind {
+        SpecialFdFilesystem::Pipe => PIPEFS_MAGIC,
+        SpecialFdFilesystem::Socket => SOCKFS_MAGIC,
+        SpecialFdFilesystem::AnonymousInode => ANON_INODE_FS_MAGIC,
+        SpecialFdFilesystem::Mqueue => MQUEUE_MAGIC,
+    };
+    result.f_bsize = 4096;
+    result.f_namelen = 255;
+    result.f_frsize = 4096;
+    Some(Ok(result))
 }
 
 pub fn sys_ustat<M: UserMemory + ?Sized>(
@@ -565,6 +605,8 @@ pub fn sys_fstatfs<M: UserMemory + ?Sized>(
         write_statfs(memory, buf, statfs(file.inner().location())?)?;
     } else if let Some(dir) = file.downcast_ref::<Directory>() {
         write_statfs(memory, buf, statfs(dir.inner())?)?;
+    } else if let Some(pipe) = file.downcast_ref::<NamedPipe>() {
+        write_statfs(memory, buf, statfs(pipe.location())?)?;
     } else if let Some(result) = special_fd_statfs(file.as_ref()) {
         write_statfs(memory, buf, result?)?;
     } else {

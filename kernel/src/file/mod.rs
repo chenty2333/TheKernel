@@ -51,6 +51,7 @@ pub use self::{
     types::*,
 };
 pub(crate) use self::{
+    pipe::NamedPipe,
     fs::{
         allowed_write_len, check_resize_limit, resolve_at_with_security,
         resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,
@@ -58,6 +59,8 @@ pub(crate) use self::{
     fs_types::filesystem_type_catalog,
     metadata::{PseudoInode, anon_inode_stat},
     packet_socket::PacketSocket,
+    io_uring::IoUring,
+    userfaultfd::UserfaultFile,
     socket::{
         AcceptedSocketSecurityRef, BareAcceptedSocketSecurityRef, PACKET_SOCKADDR_STORAGE_LEN,
         PacketSockaddrSnapshot, PendingSocketSecurityRef, PinnedSocketDescription,
