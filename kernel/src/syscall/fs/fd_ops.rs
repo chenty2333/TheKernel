@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format, string::String, sync::Arc};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_char, c_int},
     fmt::Write as _,
@@ -299,22 +299,12 @@ const AT_HANDLE_FID: i32 = 0x200;
 const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
     (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32 | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE;
-const EXPORTED_HANDLE_TYPE: i32 = 1;
-const EXPORTED_FID_HANDLE_TYPE: i32 = 2;
-const EXPORTED_HANDLE_BYTES: u32 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxFileHandle {
     handle_bytes: u32,
     handle_type: i32,
-}
-
-fn export_handle_bytes(handle: axfs_ng_vfs::ExportHandle) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&handle.inode.to_ne_bytes());
-    bytes[8..].copy_from_slice(&handle.generation.to_ne_bytes());
-    bytes
 }
 
 fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
@@ -820,12 +810,10 @@ pub fn sys_name_to_handle_at(
     )?
     .into_file()
     .ok_or(AxError::InvalidInput)?;
-    let exported = location.mountpoint().encode_export_handle(&location)?;
-    let handle_type = if flags & AT_HANDLE_FID != 0 {
-        EXPORTED_FID_HANDLE_TYPE
-    } else {
-        EXPORTED_HANDLE_TYPE
-    };
+    let exported = location.mountpoint().encode_export_handle(
+        &location,
+        if flags & AT_HANDLE_FID != 0 { axfs_ng_vfs::ExportHandleMode::Fid } else { axfs_ng_vfs::ExportHandleMode::Openable },
+    )?;
     let header = unsafe {
         capability
             .read_value_uninit(handle.cast::<LinuxFileHandle>())
@@ -849,10 +837,11 @@ pub fn sys_name_to_handle_at(
             )
             .map_err(map_usercopy_error)?;
     }
-    if header.handle_bytes < EXPORTED_HANDLE_BYTES {
+    let required_bytes = u32::try_from(exported.bytes.len()).map_err(|_| LinuxError::EOVERFLOW)?;
+    if header.handle_bytes < required_bytes {
         let required_header = LinuxFileHandle {
-            handle_bytes: EXPORTED_HANDLE_BYTES,
-            handle_type,
+            handle_bytes: required_bytes,
+            handle_type: exported.handle_type,
         };
         let required_header = unsafe {
             slice::from_raw_parts(
@@ -869,12 +858,12 @@ pub fn sys_name_to_handle_at(
         return Err(AxError::InvalidInput);
     }
     capability
-        .write_bytes(handle as usize, &EXPORTED_HANDLE_BYTES.to_ne_bytes())
+        .write_bytes(handle as usize, &required_bytes.to_ne_bytes())
         .map_err(map_usercopy_error)?;
     capability
         .write_bytes(
             (handle as usize).checked_add(4).ok_or(LinuxError::EFAULT)?,
-            &handle_type.to_ne_bytes(),
+            &exported.handle_type.to_ne_bytes(),
         )
         .map_err(map_usercopy_error)?;
     capability
@@ -882,7 +871,7 @@ pub fn sys_name_to_handle_at(
             (handle as usize)
                 .checked_add(size_of::<LinuxFileHandle>())
                 .ok_or(LinuxError::EFAULT)?,
-            &export_handle_bytes(exported),
+            &exported.bytes,
         )
         .map_err(map_usercopy_error)?;
     Ok(0)
@@ -899,16 +888,16 @@ pub fn sys_open_by_handle_at(
     // Resolve and authorize the mount selector before touching the untrusted
     // handle so EBADF/EPERM retain their ABI priority over EFAULT/EINVAL.
     let (mount, directory_scope) = if mount_fd == AT_FDCWD {
-        (current_fs_context().lock().current_dir().clone(), Some(true))
+        (current_fs_context().lock().current_dir().clone(), true)
     } else {
         let selected = get_file_like(mount_fd)?;
         if let Some(directory) = selected.downcast_ref::<Directory>() {
             (
                 directory.inner().clone(),
-                Some(selected.directory_capability()),
+                true,
             )
         } else if let Some(file) = selected.downcast_ref::<File>() {
-            (file.inner().location().clone(), None)
+            (file.inner().location().clone(), false)
         } else {
             return Err(AxError::InvalidInput);
         }
@@ -919,7 +908,9 @@ pub fn sys_open_by_handle_at(
     let globally_authorized = thread.has_effective_capability(CAP_DAC_READ_SEARCH);
     let relaxed_directory_scope = if globally_authorized {
         None
-    } else if directory_scope == Some(true)
+    } else if directory_scope
+        && flags as u32 & O_DIRECTORY != 0
+        && thread.current_cred().has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
         && ns_capable(
             &thread.current_cred(),
             &crate::task::security::initial_user_namespace(thread.current_cred().user_ns()),
@@ -942,24 +933,24 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-    if header.handle_bytes != EXPORTED_HANDLE_BYTES || header.handle_type != EXPORTED_HANDLE_TYPE {
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ || header.handle_type == 2 {
         return Err(AxError::InvalidInput);
     }
 
     let body_addr = handle_addr
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
-    let mut body = [MaybeUninit::<u8>::uninit(); EXPORTED_HANDLE_BYTES as usize];
+    let mut body = Vec::<MaybeUninit<u8>>::new();
+    body.try_reserve_exact(header.handle_bytes as usize).map_err(|_| LinuxError::ENOMEM)?;
+    body.resize(header.handle_bytes as usize, MaybeUninit::uninit());
     capability
-        .read_bytes(body_addr, &mut body[..header.handle_bytes as usize])
+        .read_bytes(body_addr, &mut body)
         .map_err(map_usercopy_error)?;
+    let body = unsafe { slice::from_raw_parts(body.as_ptr().cast::<u8>(), body.len()) };
 
-    let body = unsafe { core::mem::transmute::<_, [u8; EXPORTED_HANDLE_BYTES as usize]>(body) };
-    let inode = u64::from_ne_bytes(body[..8].try_into().unwrap());
-    let generation = u64::from_ne_bytes(body[8..].try_into().unwrap());
     let location = mount
         .mountpoint()
-        .decode_export_handle(axfs_ng_vfs::ExportHandle { inode, generation })
+        .decode_export_handle(header.handle_type, &body)
         .map_err(|_| LinuxError::ESTALE)?;
     // Anonymous decoded references have no parent chain.  Ask the filesystem
     // to verify the stable namespace ancestry from the encoded inode instead.
@@ -968,10 +959,11 @@ pub fn sys_open_by_handle_at(
             .mountpoint()
             .export_handle_is_descendant(
                 &directory,
-                axfs_ng_vfs::ExportHandle { inode, generation },
+                header.handle_type,
+                &body,
             )?
     {
-        return Err(LinuxError::EPERM.into());
+        return Err(LinuxError::ESTALE.into());
     }
     let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     open_resolved_location_with_policy(
