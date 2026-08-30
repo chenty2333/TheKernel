@@ -152,9 +152,9 @@ pub(crate) struct ZombieSchedulerSnapshot {
     /// Linux's policy query exposes this flag as part of the returned policy,
     /// including while the group leader is an unreaped zombie.
     pub(crate) reset_on_fork: bool,
-    /// Effective affinity captured while the leader was still live. A waitable
-    /// zombie has no scheduler task after exit, yet Linux exposes its last
-    /// affinity until wait/reap.
+    /// The last successfully installed CPU affinity.  The group-leader
+    /// identity retains this cell after its live task has exited, matching the
+    /// still-addressable unreaped PID lifecycle.
     pub(crate) affinity: AxCpuMask,
     /// Generation of the persistent group-leader binding that owned this
     /// scheduler state. Scheduler commit versions are local to a task, so
@@ -170,7 +170,7 @@ impl Default for ZombieSchedulerSnapshot {
             nice: 0,
             rt_priority: 0,
             reset_on_fork: false,
-            affinity: AxCpuMask::new(),
+            affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
         }
@@ -184,7 +184,7 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
             nice: state.nice,
             rt_priority: state.rt_priority,
             reset_on_fork: false,
-            affinity: AxCpuMask::new(),
+            affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
         }
@@ -476,6 +476,22 @@ pub(crate) fn set_zombie_ioprio(process: &Process, priority: u16) -> AxResult<()
     // Linux accepts a setter for an unreaped zombie, but there is no live
     // io_context left to mutate. Keep the authoritative zombie reachability
     // check above and otherwise make this a successful no-op.
+    Ok(())
+}
+
+/// Updates the affinity retained for an authoritative unreaped zombie.  The
+/// durable leader owner is also the reap serialization point: if reap wins
+/// before we obtain it, this returns ESRCH; otherwise the update is ordered
+/// before that reap edge.
+pub(crate) fn set_zombie_affinity(process: &Process, affinity: AxCpuMask) -> AxResult<()> {
+    ensure_authoritative_zombie(process)?;
+    let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    let owner = snapshot.reap_owner.lock();
+    let scheduler = owner
+        .as_ref()
+        .and_then(|identity| identity.scheduler.as_ref())
+        .ok_or(AxError::NoSuchProcess)?;
+    scheduler.lock().affinity = affinity;
     Ok(())
 }
 
@@ -5811,6 +5827,7 @@ mod tests {
             nice: 19,
             rt_priority: 0,
             reset_on_fork: false,
+            affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
         };
@@ -5871,6 +5888,7 @@ mod tests {
                 nice: 0,
                 rt_priority: 73,
                 reset_on_fork: false,
+                affinity: AxCpuMask::full(),
                 identity_epoch: 1,
                 version: 3,
             }
@@ -5903,6 +5921,7 @@ mod tests {
                 nice: 4,
                 rt_priority: 0,
                 reset_on_fork: false,
+                affinity: AxCpuMask::full(),
                 identity_epoch: 1,
                 version: 4,
             }

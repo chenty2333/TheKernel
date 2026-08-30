@@ -14,7 +14,7 @@ use axtask::{
     sched_state, scheduler_state_snapshot, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
     task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus,
-    update_sched_state_versioned_with_reset,
+    update_sched_state_versioned_with_reset, validate_affinity_mask,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
@@ -39,7 +39,8 @@ use crate::{
             SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
             dispatch_scheduler, dispatch_task_getscheduler,
         },
-        try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
+        set_zombie_affinity, try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns,
+        zombie_scheduler_state,
     },
     time::TimeValueLike,
 };
@@ -872,6 +873,24 @@ fn linux_cpumask_bytes(cpu_count: usize) -> usize {
     cpu_count.max(1).div_ceil(usize::BITS as usize) * size_of::<usize>()
 }
 
+fn sched_setaffinity_copy_len(raw_size: usize, kernel_mask_bytes: usize) -> usize {
+    (raw_size as u32 as usize).min(kernel_mask_bytes)
+}
+
+fn sched_setaffinity_mask_from_bytes(bytes: &[u8], cpu_count: usize) -> AxCpuMask {
+    let mut cpu_mask = AxCpuMask::new();
+    for cpu in 0..cpu_count {
+        // An absent byte is the zero-filled tail of a short user cpumask.
+        if bytes
+            .get(cpu / u8::BITS as usize)
+            .is_some_and(|byte| byte & (1 << (cpu % u8::BITS as usize)) != 0)
+        {
+            cpu_mask.set(cpu, true);
+        }
+    }
+    cpu_mask
+}
+
 pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
@@ -879,28 +898,29 @@ pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     user_mask: *const u8,
 ) -> AxResult<isize> {
     let cpu_count = axhal::cpu_num().max(1);
-    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes {
-        return Err(AxError::InvalidInput);
+    let kernel_mask_bytes = linux_cpumask_bytes(axconfig::plat::MAX_CPU_NUM);
+    // x86_64 syscall ABI truncates `size_t` to the low C unsigned word here.
+    let copy_len = sched_setaffinity_copy_len(cpusetsize, kernel_mask_bytes);
+    let copied = vm_load(memory, user_mask, copy_len).map_err(map_usercopy_error)?;
+    let cpu_mask = sched_setaffinity_mask_from_bytes(&copied, cpu_count);
+
+    if pid < 0 {
+        return Err(AxError::NoSuchProcess);
     }
-
-    let user_mask = vm_load(memory, user_mask, kernel_mask_bytes).map_err(map_usercopy_error)?;
-    let mut cpu_mask = AxCpuMask::new();
-
-    for i in 0..cpu_count {
-        if user_mask[i / 8] & (1 << (i % 8)) != 0 {
-            cpu_mask.set(i, true);
-        }
-    }
-
-    let task = sched_target(pid)?;
-    scheduler_authority_snapshot(&task)?.authorize(SchedulerSecurityOperation::SetAffinity)?;
-
-    if pid == 0 {
-        axtask::set_current_affinity(cpu_mask)?;
+    let target = if pid == 0 {
+        SchedGetSchedulerTarget::Live(current().clone())
     } else {
-        set_task_affinity(&task, cpu_mask)?;
-    }
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
+            SchedGetSchedulerTarget::Live(task)
+        } else {
+            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+        }
+    };
+    let (_, actor_cred) = scheduler_actor_snapshot();
+    SchedulerAuthoritySnapshot::new(actor_cred, target.credential()?)
+        .authorize(SchedulerSecurityOperation::SetAffinity)?;
+    target.set_affinity(cpu_mask)?;
 
     Ok(0)
 }
@@ -1663,6 +1683,20 @@ impl SchedGetSchedulerTarget {
             Self::Zombie(process) => Ok(zombie_scheduler_state(process)?.affinity),
         }
     }
+
+    fn set_affinity(&self, affinity: AxCpuMask) -> AxResult<()> {
+        match self {
+            Self::Live(task) => set_task_affinity(task, affinity),
+            Self::Zombie(process) => {
+                // Use the exact active-CPU admission used by a live migration
+                // before touching the durable zombie snapshot.  The axtask
+                // run-queue registry is append-only (no CPU hotplug removal),
+                // so its Acquire snapshot remains valid through this commit.
+                validate_affinity_mask(affinity)?;
+                set_zombie_affinity(process, affinity)
+            }
+        }
+    }
 }
 
 impl IoprioTarget {
@@ -2000,6 +2034,17 @@ mod tests {
             linux_cpumask_bytes(usize::BITS as usize + 1),
             size_of::<usize>() * 2
         );
+    }
+
+    #[test]
+    fn setaffinity_short_mask_is_zero_filled_and_size_is_abi_u32() {
+        let native = linux_cpumask_bytes(axconfig::plat::MAX_CPU_NUM);
+        assert_eq!(sched_setaffinity_copy_len(1, native), 1);
+        assert_eq!(sched_setaffinity_copy_len(usize::MAX, native), native);
+
+        let mask = sched_setaffinity_mask_from_bytes(&[0b0000_0010], 16);
+        assert!(mask.get(1));
+        assert!(!mask.get(9), "short-mask tail must be zero-filled");
     }
 
     #[test]
