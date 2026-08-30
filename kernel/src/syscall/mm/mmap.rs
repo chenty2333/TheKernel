@@ -890,7 +890,7 @@ pub fn sys_remap_file_pages(
     pgoff: usize,
     flags: usize,
 ) -> AxResult<isize> {
-    if prot != 0 || flags & !(MAP_NONBLOCK as usize) != 0 {
+    if prot != 0 {
         return Err(AxError::InvalidInput);
     }
     let start = start & !(PageSize::Size4K as usize - 1);
@@ -910,13 +910,20 @@ pub fn sys_remap_file_pages(
         let aspace = aspace_handle.lock();
         aspace.remap_shared_span_snapshot(start_addr, size)?
     };
-    let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize | (flags & MAP_NONBLOCK as usize);
+    let flags = flags & MAP_NONBLOCK as usize;
+    let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize | flags;
     mmap_file(
         image.credential(),
         Some((lease.filesystem_owner_user_ns(), lease.file())),
         snapshot_flags,
         snapshot_flags,
         raw_flags,
+    )?;
+    mmap_addr(
+        image.credential(),
+        image.owner_user_ns(),
+        &aspace_handle,
+        start_addr,
     )?;
 
     let mut aspace = aspace_handle.lock();
@@ -934,6 +941,14 @@ pub fn sys_remap_file_pages(
     )?;
     drop(aspace);
     wake.finish();
+    if populate {
+        // Linux treats post-commit population faults as best-effort here: the
+        // fixed alias remains installed even when a later page cannot be
+        // brought resident.
+        let _ = aspace_handle
+            .lock()
+            .populate_area(start_addr, size, snapshot_flags);
+    }
     Ok(0)
 }
 

@@ -3046,7 +3046,12 @@ impl AddrSpace {
                 Backend::Shared(_) => source.clone_shared_rebased(cursor, offset)?,
                 _ => return Err(AxError::InvalidInput),
             };
-            fragments.push((cursor, length, area.flags(), self.range_is_locked(cursor, length), rollback, replacement));
+            // Preserve only a fully locked fragment here; a partially locked
+            // source is rejected by the syscall planner rather than expanding
+            // its mlock accounting to the whole replacement VMA.
+            let locked_bytes = self.locked_bytes_in_range(cursor, length);
+            if locked_bytes != 0 && locked_bytes != length { return Err(AxError::InvalidInput); }
+            fragments.push((cursor, length, area.flags(), locked_bytes == length, rollback, replacement));
             cursor = end;
         }
         if cursor != range.end { return Err(AxError::InvalidInput); }
@@ -3054,9 +3059,9 @@ impl AddrSpace {
         let mut committed = 0usize;
         for (_, _, flags, locked, _, replacement) in &fragments {
             let (address, length, _, _, _, _) = fragments[committed];
-            if let Err(error) = self.map_with_lock_state(address, length, *flags, populate, replacement.clone(), *locked) {
+            if let Err(error) = self.map_with_lock_state(address, length, *flags, false, replacement.clone(), *locked) {
                 self.unmap(start, size).ok();
-                for (address, length, flags, locked, rollback, _) in fragments.into_iter().take(committed) {
+                for (address, length, flags, locked, rollback, _) in fragments.into_iter() {
                     self.map_with_lock_state(address, length, flags, false, rollback, locked).map_err(|_| AxError::BadState)?;
                 }
                 return Err(error);
