@@ -69,6 +69,17 @@ pub trait FilesystemOps: Send + Sync {
         Err(crate::VfsError::OperationNotSupported)
     }
 
+    /// Tests whether an exported inode is reachable through `ancestor` in the
+    /// live namespace.  Export decoding may deliberately return an anonymous
+    /// reference, so callers must not infer ancestry from that decoded alias.
+    fn export_handle_is_descendant(
+        &self,
+        _ancestor: &DirEntry,
+        _handle: ExportHandle,
+    ) -> VfsResult<bool> {
+        Ok(false)
+    }
+
     /// Returns which inode metadata fields this filesystem can persist.
     fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {
         MetadataUpdateCapabilities::ALL
@@ -207,6 +218,14 @@ impl Filesystem {
     pub fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
         self.inner.ops.decode_export_handle(handle)
 >>>>>>> 955e94c8 (feat(vfs): add generation-safe export handles)
+    }
+
+    pub fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        handle: ExportHandle,
+    ) -> VfsResult<bool> {
+        self.inner.ops.export_handle_is_descendant(ancestor, handle)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

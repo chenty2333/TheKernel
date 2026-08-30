@@ -443,6 +443,18 @@ impl Mountpoint {
         Ok(result)
     }
 
+    pub fn export_handle_is_descendant(
+        self: &Arc<Self>,
+        ancestor: &Location,
+        handle: ExportHandle,
+    ) -> VfsResult<bool> {
+        if !Arc::ptr_eq(self, ancestor.mountpoint()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        self.filesystem
+            .export_handle_is_descendant(ancestor.entry(), handle)
+    }
+
     pub fn filesystem_identity_weak(self: &Arc<Self>) -> WeakFilesystemIdentity {
         self.filesystem.identity_weak()
     }

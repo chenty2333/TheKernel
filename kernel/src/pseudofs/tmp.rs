@@ -313,6 +313,51 @@ impl FilesystemOps for MemoryFs {
         MemoryNode::try_new_entry(fs, inode, node_type, Reference::anonymous())
     }
 
+    fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        handle: ExportHandle,
+    ) -> VfsResult<bool> {
+        if handle.generation != 0 {
+            return Ok(false);
+        }
+        let Some(target) = self.get(handle.inode) else {
+            return Ok(false);
+        };
+        let ancestor = ancestor.downcast::<MemoryNode>()?;
+        if !core::ptr::eq(self, ancestor.fs.as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+
+        // The decoded export alias has Reference::anonymous(), so walk the
+        // namespace's stable inode-parent graph instead of its reference.
+        let _namespace = self.namespace.lock();
+        let inode_count = self.inodes.lock().len();
+        let mut pending = Vec::new();
+        pending.try_reserve(inode_count).map_err(|_| VfsError::NoMemory)?;
+        let mut visited = HashSet::new();
+        visited.try_reserve(inode_count).map_err(|_| VfsError::NoMemory)?;
+        pending.push(ancestor.inode.clone());
+        while let Some(inode) = pending.pop() {
+            if !visited.insert(inode.ino) {
+                continue;
+            }
+            if Arc::ptr_eq(&inode, &target) {
+                return Ok(true);
+            }
+            let Ok(directory) = inode.as_dir() else {
+                continue;
+            };
+            for (name, child) in directory.entries.lock().iter() {
+                if name.0 == "." || name.0 == ".." {
+                    continue;
+                }
+                pending.push(child.get().ok_or(VfsError::Io)?);
+            }
+        }
+        Ok(false)
+    }
+
     fn unmount(&self) {
         let root = self.root.lock().take();
         drop(root);
@@ -2200,6 +2245,43 @@ mod tests {
             root.link("exclusive", &unpublishable).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
+    }
+
+    #[test]
+    fn export_handle_descendant_uses_namespace_inode_ancestry() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let subtree = root
+            .create(
+                "subtree",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        let child = subtree
+            .create(
+                "child",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let sibling = root
+            .create(
+                "sibling",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let child_handle = mount.encode_export_handle(&child).unwrap();
+        let sibling_handle = mount.encode_export_handle(&sibling).unwrap();
+        assert!(mount
+            .export_handle_is_descendant(&subtree, child_handle)
+            .unwrap());
+        assert!(!mount
+            .export_handle_is_descendant(&subtree, sibling_handle)
+            .unwrap());
     }
 
     #[test]
