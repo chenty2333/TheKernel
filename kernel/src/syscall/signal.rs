@@ -29,11 +29,13 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 use crate::{
     mm::{AddressSpaceUserMemory, map_usercopy_error},
     task::{
-        AsThread, Cred, ProcStateHint, Process, ProcessData, SignalDeliveryScope, SignalNumber,
-        SignalSecurityOperation, SignalSecuritySource, SignalTargetKind, Thread,
+        AsThread, Cred, ProcStateHint, Process, ProcessData, SignalCheckResult,
+        SignalDeliveryScope, SignalNumber, SignalSecurityOperation, SignalSecuritySource,
+        SignalTargetKind, Thread,
         acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
-        check_current_zombie_signal_access, check_signals, commit_current_legacy_fp_state,
+        check_current_zombie_signal_access, check_signals_with_retry,
+        commit_current_legacy_fp_state,
         complete_signal_delivery, force_rseq_fault_signal_current_thread,
         force_signal_current_thread, generate_signal_for_exited_leader, get_process_data,
         get_process_group, get_process_including_zombie, get_visible_task, process_domain,
@@ -1448,18 +1450,41 @@ fn wait_for_caught_signal(
             }
 
             let handler_depth = thr.signal_handler_depth();
-            if check_signals(thr, uctx, Some(restore_blocked)) {
-                if thr.signal_handler_depth() > handler_depth {
-                    on_handler();
-                    return Ok(());
+            match check_signals_with_retry(thr, uctx, Some(restore_blocked)) {
+                SignalCheckResult::Handled => {
+                    if thr.signal_handler_depth() > handler_depth {
+                        on_handler();
+                        return Ok(());
+                    }
+                    if thr.pending_exit() {
+                        return Ok(());
+                    }
+                    // Default stop/continue actions do not complete either
+                    // wait. A stopped task resumes here and keeps waiting
+                    // until a userspace handler is actually entered.
+                    continue;
                 }
-                if thr.pending_exit() {
-                    return Ok(());
+                SignalCheckResult::Retry => {
+                    // The signal manager has returned the exact selected
+                    // record to its source queue. The interrupt which brought
+                    // us here may already have been consumed, so never block
+                    // again until the rseq nofault operation has had its
+                    // task-context recovery pass.
+                    let aspace = thr.proc_data.aspace();
+                    if thr.prepare_rseq_retry(&aspace).is_err() {
+                        if !force_rseq_fault_signal_current_thread() {
+                            terminate_rseq_fault_current_thread();
+                            return Ok(());
+                        }
+                    } else {
+                        // Recovery may populate a page or wait for an
+                        // address-space lock. Yield pending scheduler work
+                        // before retrying delivery, avoiding a busy-spin.
+                        axtask::resched_if_needed();
+                    }
+                    continue;
                 }
-                // Default stop/continue actions do not complete either wait.
-                // A stopped task resumes here and keeps waiting until a
-                // userspace handler is actually entered.
-                continue;
+                SignalCheckResult::None => {}
             }
 
             match block.wait() {

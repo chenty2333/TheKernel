@@ -251,13 +251,27 @@ pub(crate) fn reset_current_legacy_fp_state() {
         .reset();
 }
 
-pub fn check_signals(
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SignalCheckResult {
+    /// A signal was delivered, a default action was handled, or a forced
+    /// replacement was published. The caller should scan again before
+    /// deciding whether to block.
+    Handled,
+    /// No deliverable signal was observed.
+    None,
+    /// A pre-delivery operation rejected a selected signal transiently. The
+    /// caller must perform task-context recovery before scanning again; this
+    /// is distinct from `None` because the selected record was requeued.
+    Retry,
+}
+
+pub fn check_signals_with_retry(
     thr: &Thread,
     uctx: &mut UserContext,
     restore_blocked: Option<SignalSet>,
-) -> bool {
+) -> SignalCheckResult {
     if thr.pending_exit() {
-        return false;
+        return SignalCheckResult::None;
     }
     // The signal manager invokes this callback only after selecting a
     // non-ignored signal and before it can write a frame or publish a handler
@@ -302,19 +316,19 @@ pub fn check_signals(
     match result {
         SignalDeliveryResult::Delivered(delivered) => {
             complete_signal_delivery(thr, uctx, delivered);
-            true
+            SignalCheckResult::Handled
         }
-        SignalDeliveryResult::None => false,
+        SignalDeliveryResult::None => SignalCheckResult::None,
         SignalDeliveryResult::Replaced => {
             // The selected handler record was consumed and replaced by an
             // origin-bound forced SIGSEGV. Keep scanning immediately so its
             // exact-generation bypass is the next delivery candidate.
-            true
+            SignalCheckResult::Handled
         }
         SignalDeliveryResult::Fatal => {
             *uctx = saved_uctx;
             terminate_rseq_fault_current_thread();
-            false
+            SignalCheckResult::None
         }
         SignalDeliveryResult::Retry => {
             // The final rseq hook may have updated the saved context before a
@@ -322,7 +336,7 @@ pub fn check_signals(
             // retain that partial context, and the manager has already
             // returned the selected signal to its original queue.
             *uctx = saved_uctx;
-            false
+            SignalCheckResult::Retry
         }
         SignalDeliveryResult::Fault => {
             // Preserve the old generic-fault boundary for callers which still
@@ -331,10 +345,37 @@ pub fn check_signals(
             // requeue loop.
             *uctx = saved_uctx;
             if force_rseq_fault_signal_current_thread() {
-                true
+                SignalCheckResult::Handled
             } else {
                 terminate_rseq_fault_current_thread();
-                false
+                SignalCheckResult::None
+            }
+        }
+    }
+}
+
+pub fn check_signals(
+    thr: &Thread,
+    uctx: &mut UserContext,
+    restore_blocked: Option<SignalSet>,
+) -> bool {
+    loop {
+        match check_signals_with_retry(thr, uctx, restore_blocked) {
+            SignalCheckResult::Handled => return true,
+            SignalCheckResult::None => return false,
+            SignalCheckResult::Retry => {
+                // A selected record was requeued. Recover the nofault rseq
+                // area in task context before scanning it again; treating
+                // this as "no signal" lets blocking callers sleep forever.
+                let aspace = thr.proc_data.aspace();
+                if thr.prepare_rseq_retry(&aspace).is_err() {
+                    if !force_rseq_fault_signal_current_thread() {
+                        terminate_rseq_fault_current_thread();
+                        return false;
+                    }
+                } else {
+                    axtask::resched_if_needed();
+                }
             }
         }
     }
