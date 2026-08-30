@@ -15,11 +15,10 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, v
 
 use super::sync::restart_futex_wait;
 use crate::{
-    mm::{map_usercopy_error, system_memory_stats},
-    mm::shmem_resident_pages,
+    mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats},
     task::{
-        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, live_thread_count, load_average_sample_now,
-        load_average_sysinfo, ns_capable,
+        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal, live_thread_count,
+        load_average_sample_now, load_average_sysinfo, ns_capable,
     },
 };
 
@@ -645,11 +644,38 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
     len: usize,
     flags: u32,
 ) -> AxResult<isize> {
-    const GETRANDOM_CHUNK_SIZE: usize = 4096;
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const CHACHA_BLOCK: usize = 64;
+    const PAGE_SIZE: usize = 4096;
 
     let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     if flags.contains(GetRandomFlags::RANDOM) && flags.contains(GetRandomFlags::INSECURE) {
         return Err(AxError::InvalidInput);
+    }
+    // Linux waits for CRNG readiness even for a zero-length secure request.
+    if !flags.contains(GetRandomFlags::INSECURE) {
+        loop {
+            match crate::random::ensure_ready() {
+                Ok(()) => break,
+                Err(AxError::WouldBlock) if flags.contains(GetRandomFlags::NONBLOCK) => {
+                    return Err(AxError::WouldBlock);
+                }
+                Err(AxError::WouldBlock) => {
+                    if has_pending_syscall_signal(current().as_thread()) {
+                        return Err(AxError::Interrupted);
+                    }
+                    axtask::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let len = len.min(MAX_RW_COUNT);
+    if len != 0 {
+        (buf as usize).checked_add(len).ok_or(AxError::BadAddress)?;
+        memory
+            .validate_write_range(buf as usize, len)
+            .map_err(map_usercopy_error)?;
     }
     if len == 0 {
         return Ok(0);
@@ -658,12 +684,15 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 
     let mut total = 0;
-    let mut kbuf = [0u8; GETRANDOM_CHUNK_SIZE];
+    let mut kbuf = [0u8; CHACHA_BLOCK];
     while total < len {
-        let chunk = (len - total).min(kbuf.len());
+        let address = (buf as usize)
+            .checked_add(total)
+            .ok_or(AxError::BadAddress)?;
+        let page_left = PAGE_SIZE - (address & (PAGE_SIZE - 1));
+        let chunk = (len - total).min(kbuf.len()).min(page_left);
         let fill_result = if flags.contains(GetRandomFlags::INSECURE) {
-            crate::random::fill_insecure(&mut kbuf[..chunk]);
-            Ok(())
+            crate::random::fill_insecure(&mut kbuf[..chunk])
         } else {
             crate::random::fill_secure(&mut kbuf[..chunk])
         };
@@ -674,8 +703,8 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
                 Ok(total as isize)
             };
         }
-        if let Err(error) = vm_write_slice(memory, buf.wrapping_add(total), &kbuf[..chunk])
-            .map_err(map_usercopy_error)
+        if let Err(error) =
+            vm_write_slice(memory, address as *mut u8, &kbuf[..chunk]).map_err(map_usercopy_error)
         {
             return if total == 0 {
                 Err(error)
@@ -684,6 +713,12 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
             };
         }
         total += chunk;
+        if total % PAGE_SIZE == 0 {
+            if has_pending_syscall_signal(current().as_thread()) {
+                return Ok(total as isize);
+            }
+            axtask::yield_now();
+        }
     }
 
     Ok(total as isize)
