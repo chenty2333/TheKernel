@@ -15,6 +15,7 @@ mod boot_info;
 mod console;
 mod cpu;
 mod init;
+pub mod kexec;
 mod mem;
 mod power;
 mod time;

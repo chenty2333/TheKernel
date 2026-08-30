@@ -82,6 +82,48 @@ pub mod power {
     pub use axplat::power::system_off;
 }
 
+/// Terminal x86_64 kexec platform operations.
+pub mod kexec {
+    #[cfg(all(target_os = "none", feature = "defplat"))]
+    pub use axplat_x86_pc::kexec::{
+        boot_memory_regions, boot_rsdp, fence_pci_bus_mastering, transition,
+        transition_assembly_range, transition32, transition32_blob, transition32_entry_range,
+    };
+
+    // Keep syscall/parser code type-checkable in host and non-default-platform
+    // builds; these paths never reach the terminal transition there.
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn boot_memory_regions() -> &'static [(usize, usize)] {
+        &[]
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn boot_rsdp() -> Option<&'static [u8; 36]> {
+        None
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn fence_pci_bus_mastering() {}
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub unsafe fn transition(_: usize, _: usize, _: usize, _: usize) -> ! {
+        panic!("kexec platform unavailable")
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn transition32_blob() -> &'static [u8] {
+        &[]
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn transition32_entry_range() -> (usize, usize) {
+        (0, 0)
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn transition_assembly_range() -> (usize, usize) {
+        (0, 0)
+    }
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub unsafe fn transition32(_: usize, _: usize, _: usize, _: usize, _: usize) -> ! {
+        panic!("kexec platform unavailable")
+    }
+}
+
 /// Trap handling.
 pub mod trap {
     pub use axcpu::trap::{IRQ, PAGE_FAULT, PageFaultFlags, register_trap_handler};

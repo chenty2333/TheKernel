@@ -210,6 +210,24 @@ impl PciRoot {
         }
     }
 
+    /// Writes the 16-bit PCI command register without touching the adjacent
+    /// status register, whose upper-half bits are write-one-to-clear.
+    pub(crate) fn config_write_half(
+        &mut self,
+        device_function: DeviceFunction,
+        register_offset: u8,
+        data: u16,
+    ) {
+        let address = self.cam_offset(device_function, register_offset);
+        unsafe {
+            self.mmio_base
+                .cast::<u8>()
+                .add(address as usize)
+                .cast::<u16>()
+                .write_volatile(data)
+        }
+    }
+
     /// Enumerates PCI devices on the given bus.
     pub fn enumerate_bus(&self, bus: u8) -> BusDeviceIterator {
         // Safe because the BusDeviceIterator only reads read-only fields.
@@ -248,11 +266,7 @@ impl PciRoot {
 
     /// Sets the command register of the given device function.
     pub fn set_command(&mut self, device_function: DeviceFunction, command: Command) {
-        self.config_write_word(
-            device_function,
-            STATUS_COMMAND_OFFSET,
-            command.bits().into(),
-        );
+        self.config_write_half(device_function, STATUS_COMMAND_OFFSET, command.bits());
     }
 
     /// Gets an iterator over the capabilities of the given device function.

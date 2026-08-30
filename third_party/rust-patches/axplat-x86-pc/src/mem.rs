@@ -14,6 +14,10 @@ const MAX_REGIONS: usize = boot_info::MAX_REGIONS;
 
 static RAM_REGIONS: LazyInit<Vec<RawRange, MAX_REGIONS>> = LazyInit::new();
 
+pub(crate) fn ram_regions() -> &'static [RawRange] {
+    RAM_REGIONS.as_slice()
+}
+
 pub fn init() {
     let boot_info = boot_info::get();
     let mut regions = Vec::new();

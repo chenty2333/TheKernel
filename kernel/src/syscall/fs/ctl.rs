@@ -2090,6 +2090,10 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
             ax_println!("System is shutting down");
             system_off();
         }
+        LINUX_REBOOT_CMD_KEXEC => {
+            sys_sync()?;
+            crate::syscall::task::execute_loaded()
+        }
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Err(LinuxError::EOPNOTSUPP.into()),
         _ => Err(AxError::InvalidInput),
     }
