@@ -1525,7 +1525,7 @@ impl Mempolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MempolicyRange {
     start: usize,
     end: usize,
@@ -1690,34 +1690,47 @@ impl MempolicyState {
     /// first policy as covering the whole VMA.  The sorted traversal provides
     /// Linux's address-order partial-update behavior if a later policy is not
     /// supported by `set_mempolicy_home_node`.
-    fn set_home_node_in_range(
-        &mut self,
+    fn try_set_home_node_in_range(
+        old_ranges: &[MempolicyRange],
         start: usize,
         end: usize,
         home_node: usize,
-    ) -> AxResult<bool> {
-        let mut old_ranges = core::mem::take(&mut self.ranges);
+    ) -> AxResult<(Vec<MempolicyRange>, bool)> {
+        let capacity = old_ranges
+            .len()
+            .checked_mul(3)
+            .ok_or(AxError::NoMemory)?;
+        let mut new_ranges = Vec::new();
+        new_ranges
+            .try_reserve_exact(capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut old_ranges_sorted = Vec::new();
+        old_ranges_sorted
+            .try_reserve_exact(old_ranges.len())
+            .map_err(|_| AxError::NoMemory)?;
+        old_ranges_sorted.extend(old_ranges.iter().copied());
+        let mut old_ranges = old_ranges_sorted;
         old_ranges.sort_unstable_by_key(|range| range.start);
         let mut updated = false;
 
         let mut ranges = old_ranges.into_iter();
         while let Some(range) = ranges.next() {
             if range.end <= start || range.start >= end {
-                self.ranges.push(range);
+                new_ranges.push(range);
                 continue;
             }
             if range.policy.mode != linux_raw_sys::mempolicy::MPOL_BIND as u32
                 && range.policy.mode != linux_raw_sys::mempolicy::MPOL_PREFERRED_MANY as u32
             {
-                self.ranges.push(range);
-                self.ranges.extend(ranges);
+                new_ranges.push(range);
+                new_ranges.extend(ranges);
                 return Err(AxError::OperationNotSupported);
             }
 
             let overlap_start = range.start.max(start);
             let overlap_end = range.end.min(end);
             if range.start < overlap_start {
-                self.ranges.push(MempolicyRange {
+                new_ranges.push(MempolicyRange {
                     start: range.start,
                     end: overlap_start,
                     policy: range.policy,
@@ -1725,13 +1738,13 @@ impl MempolicyState {
             }
             let mut policy = range.policy;
             policy.home_node = Some(home_node);
-            self.ranges.push(MempolicyRange {
+            new_ranges.push(MempolicyRange {
                 start: overlap_start,
                 end: overlap_end,
                 policy,
             });
             if overlap_end < range.end {
-                self.ranges.push(MempolicyRange {
+                new_ranges.push(MempolicyRange {
                     start: overlap_end,
                     end: range.end,
                     policy: range.policy,
@@ -1739,7 +1752,7 @@ impl MempolicyState {
             }
             updated = true;
         }
-        Ok(updated)
+        Ok((new_ranges, updated))
     }
 }
 
@@ -3788,9 +3801,31 @@ impl ProcessData {
         let Some(end) = start.checked_add(size) else {
             return Err(AxError::InvalidInput);
         };
-        self.mempolicy
-            .lock()
-            .set_home_node_in_range(start, end, home_node)
+        let mut snapshot = Vec::new();
+        loop {
+            let required = self.mempolicy.lock().ranges.len();
+            if snapshot.capacity() < required {
+                snapshot
+                    .try_reserve_exact(required - snapshot.capacity())
+                    .map_err(|_| AxError::NoMemory)?;
+            }
+            snapshot.clear();
+            {
+                let state = self.mempolicy.lock();
+                if snapshot.capacity() < state.ranges.len() {
+                    continue;
+                }
+                snapshot.extend(state.ranges.iter().copied());
+            }
+            let (new_ranges, updated) =
+                MempolicyState::try_set_home_node_in_range(&snapshot, start, end, home_node)?;
+            let mut state = self.mempolicy.lock();
+            if state.ranges != snapshot {
+                continue;
+            }
+            state.ranges = new_ranges;
+            return Ok(updated);
+        }
     }
 }
 
@@ -5560,7 +5595,11 @@ mod tests {
             }],
         };
 
-        assert!(state.set_home_node_in_range(0x2000, 0x3000, 0).unwrap());
+        let (ranges, updated) =
+            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x2000, 0x3000, 0)
+                .unwrap();
+        state.ranges = ranges;
+        assert!(updated);
         assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, None);
         assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, Some(0));
         assert_eq!(state.policy_for_addr(0x3000).unwrap().home_node, None);
@@ -5585,7 +5624,7 @@ mod tests {
         };
 
         assert_eq!(
-            state.set_home_node_in_range(0x1000, 0x3000, 0),
+            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x1000, 0x3000, 0),
             Err(AxError::OperationNotSupported)
         );
         assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, Some(0));

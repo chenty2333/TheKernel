@@ -982,6 +982,9 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
+    if len == 0 {
+        return Ok(0);
+    }
     if !aspace.can_access_range(start, len, MappingFlags::USER) {
         return Err(AxError::BadAddress);
     }
