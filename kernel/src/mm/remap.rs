@@ -4,6 +4,8 @@ use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
+#[cfg(target_arch = "x86_64")]
+use axtask::current;
 use linux_raw_sys::general::RLIMIT_MEMLOCK;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingLineage;
@@ -15,8 +17,20 @@ use crate::{
         LockExternalUffdOutcome, checked_align_up,
     },
     syscall::ensure_4k_granularity_across_aliases,
-    task::ProcessData,
+    task::{AsThread, ProcessData},
 };
+
+/// Reconciliation runs under the mm mutex, but a task's live CET context is
+/// scheduler-owned.  Consume the invalidation receipt only after releasing
+/// that mutex, and only for the calling task (remote CLONE_VM owners are
+/// repaired when they next execute a VMA-mutating path or exit).
+#[cfg(target_arch = "x86_64")]
+fn clear_current_cet_if_invalidated(invalidated: &[u32]) {
+    let curr = current();
+    if invalidated.contains(&curr.as_thread().kernel_tid()) {
+        crate::task::reset_current_user_cet_state();
+    }
+}
 
 #[derive(Clone)]
 struct RemapSegment {
@@ -815,7 +829,7 @@ fn commit_prepared_remap(
     has_ipc_lock: bool,
     request: MremapRequest,
     prepared: PreparedRemapPlan,
-) -> LockExternalUffdOutcome<isize, AxError> {
+) -> LockExternalUffdOutcome<(isize, Vec<u32>), AxError> {
     debug_assert!(!request.fixed);
     let mut wake = DeferredUffdWake::empty();
     let outcome = (|| match prepared {
@@ -926,16 +940,19 @@ fn commit_prepared_remap(
             Ok(destination.as_usize() as isize)
         }
     })();
-    #[cfg(target_arch = "x86_64")]
-    if let Ok(destination) = outcome.as_ref() {
+    let outcome = outcome.map(|destination| {
         // The registry belongs to this mm, not the caller's ProcessData:
         // reconcile every CLONE_VM owner before releasing the VMA lock.
-        let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+        #[cfg(target_arch = "x86_64")]
+        let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
             request.addr,
             request.old_size,
-            VirtAddr::from(*destination as usize),
+            VirtAddr::from(destination as usize),
         );
-    }
+        #[cfg(not(target_arch = "x86_64"))]
+        let invalidated = Vec::new();
+        (destination, invalidated)
+    });
     LockExternalUffdOutcome::new(outcome, wake)
 }
 
@@ -946,7 +963,7 @@ fn commit_locked_remap(
     has_ipc_lock: bool,
     request: MremapRequest,
     plan: RemapPlan,
-) -> LockExternalUffdOutcome<isize, AxError> {
+) -> LockExternalUffdOutcome<(isize, Vec<u32>), AxError> {
     let mut wake = DeferredUffdWake::empty();
     let outcome = (|| match plan {
         RemapPlan::Return(address) => Ok(address.as_usize() as isize),
@@ -1168,14 +1185,17 @@ fn commit_locked_remap(
             Ok(destination.as_usize() as isize)
         }
     })();
-    #[cfg(target_arch = "x86_64")]
-    if let Ok(destination) = outcome.as_ref() {
-        let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+    let outcome = outcome.map(|destination| {
+        #[cfg(target_arch = "x86_64")]
+        let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
             request.addr,
             request.old_size,
-            VirtAddr::from(*destination as usize),
+            VirtAddr::from(destination as usize),
         );
-    }
+        #[cfg(not(target_arch = "x86_64"))]
+        let invalidated = Vec::new();
+        (destination, invalidated)
+    });
     LockExternalUffdOutcome::new(outcome, wake)
 }
 
@@ -1220,11 +1240,13 @@ fn try_optimistic_mremap(
             let wake = aspace.unmap(start, size)?;
             proc_data.clear_mempolicy_range(start.as_usize(), size);
             #[cfg(target_arch = "x86_64")]
-            let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+            let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
                 request.addr, request.old_size, request.addr,
             );
             drop(aspace);
             wake.finish();
+            #[cfg(target_arch = "x86_64")]
+            clear_current_cet_if_invalidated(&invalidated);
             return Ok(OptimisticRemapOutcome::Complete(
                 request.addr.as_usize() as isize
             ));
@@ -1243,7 +1265,9 @@ fn try_optimistic_mremap(
     }
     let committed = commit_prepared_remap(&mut aspace, proc_data, has_ipc_lock, request, prepared);
     drop(aspace);
-    let result = committed.finish()?;
+    let (result, invalidated) = committed.finish()?;
+    #[cfg(target_arch = "x86_64")]
+    clear_current_cet_if_invalidated(&invalidated);
     Ok(OptimisticRemapOutcome::Complete(result))
 }
 
@@ -1281,11 +1305,13 @@ fn run_locked_mremap(
                 let wake = aspace.unmap(start, size)?;
                 proc_data.clear_mempolicy_range(start.as_usize(), size);
                 #[cfg(target_arch = "x86_64")]
-                let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+                let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
                     request.addr, request.old_size, request.addr,
                 );
                 drop(aspace);
                 wake.finish();
+                #[cfg(target_arch = "x86_64")]
+                clear_current_cet_if_invalidated(&invalidated);
                 return Ok(request.addr.as_usize() as isize);
             }
             _ => {}
@@ -1299,7 +1325,10 @@ fn run_locked_mremap(
             plan,
         );
         drop(aspace);
-        return committed.finish();
+        let (result, invalidated) = committed.finish()?;
+        #[cfg(target_arch = "x86_64")]
+        clear_current_cet_if_invalidated(&invalidated);
+        return Ok(result);
     }
 }
 
