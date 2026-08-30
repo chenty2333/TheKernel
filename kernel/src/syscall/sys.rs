@@ -4,22 +4,22 @@ use core::{
     mem::{align_of, offset_of, size_of},
 };
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axhal::{time::monotonic_time, uspace::UserContext};
+use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::{
-    general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
+    general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
-    mm::{map_usercopy_error, system_memory_stats},
-    mm::shmem_resident_pages,
+    mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats},
     task::{
-        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, live_thread_count, load_average_sample_now,
-        load_average_sysinfo, ns_capable,
+        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal, live_thread_count,
+        load_average_sample_now, load_average_sysinfo, ns_capable,
     },
 };
 
@@ -654,8 +654,115 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-pub fn sys_syslog(_kind: i32, _buf: *mut c_char, _len: isize) -> AxResult<isize> {
-    Err(LinuxError::ENOSYS.into())
+const SYSLOG_ACTION_CLOSE: i32 = 0;
+const SYSLOG_ACTION_OPEN: i32 = 1;
+const SYSLOG_ACTION_READ: i32 = 2;
+const SYSLOG_ACTION_READ_ALL: i32 = 3;
+const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+const SYSLOG_ACTION_CLEAR: i32 = 5;
+const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+static SYSLOG_READ_LOCK: Mutex<()> = Mutex::new(());
+
+fn current_can_read_klog() -> bool {
+    let current = current();
+    let thread = current.as_thread();
+    thread.has_effective_capability(CAP_SYSLOG) || thread.has_effective_capability(CAP_SYS_ADMIN)
+}
+
+fn syslog_copy<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut c_char,
+    len: isize,
+    consume: bool,
+) -> AxResult<(isize, u64)> {
+    if len < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let len = len as usize;
+    if len == 0 {
+        return Ok((0, 0));
+    }
+    let mut output = vec![0; len.min(axruntime::klog::CAPACITY)];
+    loop {
+        let (copied, end) = axruntime::klog::snapshot_into(&mut output, consume);
+        if copied != 0 || !consume {
+            vm_write_slice(memory, buf.cast::<u8>(), &output[..copied])
+                .map_err(map_usercopy_error)?;
+            if consume {
+                axruntime::klog::commit_read(end);
+            }
+            return Ok((copied as isize, end));
+        }
+        // `READ` is the only blocking syslog action. Recheck pending signals
+        // between scheduler yields so an interrupted empty read is EINTR.
+        if has_pending_syscall_signal(current().as_thread()) {
+            return Err(AxError::Interrupted);
+        }
+        axtask::yield_now();
+    }
+}
+
+/// Linux legacy `syslog(2)` / `klogctl(3)` interface.
+///
+/// The ring is fed at the runtime console boundary, before console filtering,
+/// so reads retain messages emitted while the console is disabled.
+pub fn sys_syslog<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    kind: i32,
+    buf: *mut c_char,
+    len: isize,
+) -> AxResult<isize> {
+    if !(SYSLOG_ACTION_CLOSE..=SYSLOG_ACTION_SIZE_BUFFER).contains(&kind) {
+        return Err(AxError::InvalidInput);
+    }
+    // Linux allows the non-destructive full snapshot and capacity query to
+    // unprivileged callers unless dmesg_restrict is set; TheKernel has no
+    // dmesg_restrict sysctl, so retain that default.
+    if !matches!(kind, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_SIZE_BUFFER)
+        && !current_can_read_klog()
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    match kind {
+        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => Ok(0),
+        SYSLOG_ACTION_READ => {
+            let _serialized = SYSLOG_READ_LOCK.lock();
+            Ok(syslog_copy(memory, buf, len, true)?.0)
+        }
+        SYSLOG_ACTION_READ_ALL => Ok(syslog_copy(memory, buf, len, false)?.0),
+        SYSLOG_ACTION_READ_CLEAR => {
+            let (copied, end) = syslog_copy(memory, buf, len, false)?;
+            axruntime::klog::commit_clear(end);
+            Ok(copied)
+        }
+        SYSLOG_ACTION_CLEAR => {
+            axruntime::klog::clear();
+            Ok(0)
+        }
+        SYSLOG_ACTION_CONSOLE_OFF => {
+            axruntime::klog::set_console_enabled(false);
+            Ok(0)
+        }
+        SYSLOG_ACTION_CONSOLE_ON => {
+            axruntime::klog::set_console_enabled(true);
+            Ok(0)
+        }
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            // Linux accepts 1..=8, where 8 is the most verbose threshold.
+            if !(1..=8).contains(&len) {
+                return Err(AxError::InvalidInput);
+            }
+            axruntime::klog::set_console_level(len as u8);
+            Ok(0)
+        }
+        SYSLOG_ACTION_SIZE_UNREAD => Ok(axruntime::klog::unread_len() as isize),
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(axruntime::klog::CAPACITY as isize),
+        _ => unreachable!(),
+    }
 }
 
 bitflags::bitflags! {
