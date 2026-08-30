@@ -1571,7 +1571,8 @@ impl AddrSpace {
         handle: &Arc<Mutex<Self>>,
     ) -> AxResult<axsync::MutexGuard<'_, Self>> {
         axsync::lock_interruptible(handle, || {
-            let thread = axtask::current().as_thread();
+            let current = axtask::current();
+            let thread = current.as_thread();
             has_pending_sigkill(thread)
                 || thread
                     .proc_data
