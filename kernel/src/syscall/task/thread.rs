@@ -5,12 +5,11 @@ use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use crate::{
     mm::{
-        UserMemoryCapability,
+        AddrSpace, Backend, UserMemoryCapability,
         ldt::{BYTES as LDT_BYTES, UserDesc},
         map_usercopy_error,
     },
     task::AsThread,
-    mm::{AddrSpace, Backend},
 };
 
 pub fn sys_modify_ldt(
@@ -118,22 +117,22 @@ pub fn sys_gettid() -> AxResult<isize> {
 #[repr(i32)]
 enum ArchPrctlCode {
     /// Set the GS segment base
-    SetGs    = 0x1001,
+    SetGs        = 0x1001,
     /// Set the FS segment base
-    SetFs    = 0x1002,
+    SetFs        = 0x1002,
     /// Get the FS segment base
-    GetFs    = 0x1003,
+    GetFs        = 0x1003,
     /// Get the GS segment base
-    GetGs    = 0x1004,
+    GetGs        = 0x1004,
     /// The setting of the flag manipulated by ARCH_SET_CPUID
-    GetCpuid = 0x1011,
+    GetCpuid     = 0x1011,
     /// Enable (addr != 0) or disable (addr == 0) the cpuid instruction for the
     /// calling thread.
-    SetCpuid = 0x1012,
-    EnableShstk = 0x5001,
+    SetCpuid     = 0x1012,
+    EnableShstk  = 0x5001,
     DisableShstk = 0x5002,
-    LockShstk = 0x5003,
-    StatusShstk = 0x5005,
+    LockShstk    = 0x5003,
+    StatusShstk  = 0x5005,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -153,29 +152,46 @@ pub(crate) fn map_cet_default_shadow_stack(
     aspace: &mut AddrSpace,
     task_id: u32,
 ) -> AxResult<axhal::asm::UserCetState> {
-    let total = CET_DEFAULT_SHSTK_SIZE.checked_add(PAGE_SIZE_4K).ok_or(AxError::NoMemory)?;
-    let base = aspace.find_kernel_area(
-        VirtAddr::from(CET_SHSTK_MIN_ADDR), total,
-        VirtAddrRange::new(aspace.base(), aspace.end()), PAGE_SIZE_4K,
-    ).ok_or(AxError::NoMemory)?;
+    let total = CET_DEFAULT_SHSTK_SIZE
+        .checked_add(PAGE_SIZE_4K)
+        .ok_or(AxError::NoMemory)?;
+    let base = aspace
+        .find_kernel_area(
+            VirtAddr::from(CET_SHSTK_MIN_ADDR),
+            total,
+            VirtAddrRange::new(aspace.base(), aspace.end()),
+            PAGE_SIZE_4K,
+        )
+        .ok_or(AxError::NoMemory)?;
     let start = base + PAGE_SIZE_4K;
     let result = (|| {
         aspace.map(
-            start, CET_DEFAULT_SHSTK_SIZE,
+            start,
+            CET_DEFAULT_SHSTK_SIZE,
             MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
-            false, Backend::new_alloc(start, PageSize::Size4K),
+            false,
+            Backend::new_alloc(start, PageSize::Size4K),
         )?;
         // A restore token at the architectural top is required before CET is
         // made visible; an enabled task must never enter userspace with only
         // U_CET set and no valid PL3_SSP landing stack.
         aspace.populate_area(start, CET_DEFAULT_SHSTK_SIZE, MappingFlags::READ)?;
         let token = start.as_usize() + CET_DEFAULT_SHSTK_SIZE - core::mem::size_of::<u64>();
-        aspace.write(VirtAddr::from(token), &((token + 8) as u64 | 1).to_ne_bytes())?;
+        aspace.write(
+            VirtAddr::from(token),
+            &((token + 8) as u64 | 1).to_ne_bytes(),
+        )?;
         aspace.register_cet_default_shadow_stack(task_id, start, CET_DEFAULT_SHSTK_SIZE)?;
-        Ok(axhal::asm::UserCetState { u_cet: CET_SHSTK_EN, pl3_ssp: (token + 8) as u64, locked: false })
+        Ok(axhal::asm::UserCetState {
+            u_cet: CET_SHSTK_EN,
+            pl3_ssp: (token + 8) as u64,
+            locked: false,
+        })
     })();
     if result.is_err() {
-        if let Ok(wake) = aspace.unmap(start, CET_DEFAULT_SHSTK_SIZE) { wake.finish(); }
+        if let Ok(wake) = aspace.unmap(start, CET_DEFAULT_SHSTK_SIZE) {
+            wake.finish();
+        }
     }
     result
 }
@@ -261,11 +277,19 @@ pub fn sys_arch_prctl(
         ArchPrctlCode::SetCpuid if addr != 0 => Ok(0),
         ArchPrctlCode::SetCpuid => Err(axerrno::AxError::NoSuchDevice),
         ArchPrctlCode::EnableShstk => {
-            if addr != ARCH_SHSTK_SHSTK { return Err(AxError::InvalidInput); }
-            if !axhal::asm::user_shadow_stack_enabled() { return Err(AxError::NoSuchDevice); }
-            let mut state = crate::task::current_user_cet_state();
-            if state.locked && state.u_cet & CET_SHSTK_EN == 0 { return Err(LinuxError::EPERM.into()); }
-            if state.u_cet & CET_SHSTK_EN != 0 { return Ok(0); }
+            if addr != ARCH_SHSTK_SHSTK {
+                return Err(AxError::InvalidInput);
+            }
+            if !axhal::asm::user_shadow_stack_enabled() {
+                return Err(AxError::NoSuchDevice);
+            }
+            let mut state = crate::task::current_user_live_cet_state();
+            if state.locked && state.u_cet & CET_SHSTK_EN == 0 {
+                return Err(LinuxError::EPERM.into());
+            }
+            if state.u_cet & CET_SHSTK_EN != 0 {
+                return Ok(0);
+            }
             let curr = current();
             let thread = curr.as_thread();
             let aspace_handle = thread.proc_data.aspace();
@@ -274,28 +298,39 @@ pub fn sys_arch_prctl(
             Ok(0)
         }
         ArchPrctlCode::DisableShstk => {
-            if addr != ARCH_SHSTK_SHSTK { return Err(AxError::InvalidInput); }
-            let mut state = crate::task::current_user_cet_state();
-            if state.locked && state.u_cet & CET_SHSTK_EN != 0 { return Err(LinuxError::EPERM.into()); }
-            if state.u_cet & CET_SHSTK_EN == 0 { return Ok(0); }
+            if addr != ARCH_SHSTK_SHSTK {
+                return Err(AxError::InvalidInput);
+            }
+            let mut state = crate::task::current_user_live_cet_state();
+            if state.locked && state.u_cet & CET_SHSTK_EN != 0 {
+                return Err(LinuxError::EPERM.into());
+            }
+            if state.u_cet & CET_SHSTK_EN == 0 {
+                return Ok(0);
+            }
             let curr = current();
             let thread = curr.as_thread();
             let aspace_handle = thread.proc_data.aspace();
             unmap_cet_default_shadow_stack(&mut aspace_handle.lock(), thread.kernel_tid());
+            thread.clear_cet_signal_frames();
             state = axhal::asm::UserCetState::default();
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
         ArchPrctlCode::LockShstk => {
-            if addr == 0 || addr & !ARCH_SHSTK_SHSTK != 0 { return Err(AxError::InvalidInput); }
-            let mut state = crate::task::current_user_cet_state();
+            if addr == 0 || addr & !ARCH_SHSTK_SHSTK != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let mut state = crate::task::current_user_live_cet_state();
             state.locked = true;
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
         ArchPrctlCode::StatusShstk => {
-            let state = crate::task::current_user_cet_state();
-            memory.write_value(addr as *mut usize, (state.u_cet & CET_SHSTK_EN) as usize).map_err(map_usercopy_error)?;
+            let state = crate::task::current_user_live_cet_state();
+            memory
+                .write_value(addr as *mut usize, (state.u_cet & CET_SHSTK_EN) as usize)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
     }

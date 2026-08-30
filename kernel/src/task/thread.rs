@@ -11,12 +11,11 @@ use core::{
     },
 };
 
-use axerrno::{AxError, AxResult};
 use axcpu::ioport::{self, IO_BITMAP_BYTES};
+use axerrno::{AxError, AxResult};
 use axfs::FsContext;
 use axpoll::PollSet;
-use axsync::Mutex;
-use axsync::spin::SpinNoIrq;
+use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::{SchedState, SwitchReason, TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
@@ -42,6 +41,134 @@ const TASK_PARENT_RELATION_HARD_LIMIT: usize =
     thekernel_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
+
+#[cfg(target_arch = "x86_64")]
+const CET_SIGNAL_FRAME_LIMIT: usize = 64;
+
+/// Kernel-owned authentication record for one CET signal transition.  Nothing
+/// in this record is reconstructed from the user frame on sigreturn.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub(crate) struct CetPendingSignalFrame {
+    pub(crate) frame: usize,
+    pub(crate) saved_ssp: u64,
+    pub(crate) handler_ssp: u64,
+    pub(crate) epoch: u64,
+    pub(crate) nonce: u64,
+    pub(crate) token: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct CetPendingSignalFrames {
+    epoch: u64,
+    next_nonce: u64,
+    frames: [Option<CetPendingSignalFrame>; CET_SIGNAL_FRAME_LIMIT],
+    depth: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CetPendingSignalFrames {
+    const fn new() -> Self {
+        Self {
+            epoch: 1,
+            next_nonce: 1,
+            frames: [None; CET_SIGNAL_FRAME_LIMIT],
+            depth: 0,
+        }
+    }
+
+    fn reserve(&mut self) -> Option<(u64, u64)> {
+        if self.depth == CET_SIGNAL_FRAME_LIMIT {
+            return None;
+        }
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.wrapping_add(1).max(1);
+        Some((self.epoch, nonce))
+    }
+
+    const fn has_capacity(&self) -> bool {
+        self.depth < CET_SIGNAL_FRAME_LIMIT
+    }
+
+    fn push(&mut self, frame: CetPendingSignalFrame) -> bool {
+        if self.depth == CET_SIGNAL_FRAME_LIMIT || frame.epoch != self.epoch {
+            return false;
+        }
+        self.frames[self.depth] = Some(frame);
+        self.depth += 1;
+        true
+    }
+
+    fn top(&self) -> Option<CetPendingSignalFrame> {
+        self.depth
+            .checked_sub(1)
+            .and_then(|index| self.frames[index])
+    }
+
+    fn pop_if(&mut self, frame: CetPendingSignalFrame) -> bool {
+        if self.top().is_some_and(|top| {
+            top.frame == frame.frame
+                && top.epoch == frame.epoch
+                && top.nonce == frame.nonce
+                && top.token == frame.token
+        }) {
+            self.depth -= 1;
+            self.frames[self.depth] = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.depth = 0;
+        self.frames = [None; CET_SIGNAL_FRAME_LIMIT];
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod cet_signal_frame_tests {
+    use super::*;
+
+    fn frame(epoch: u64, nonce: u64) -> CetPendingSignalFrame {
+        CetPendingSignalFrame {
+            frame: nonce as usize,
+            saved_ssp: 0x8000,
+            handler_ssp: 0x7fe8,
+            epoch,
+            nonce,
+            token: nonce ^ 0x55,
+        }
+    }
+
+    #[test]
+    fn cet_signal_frames_are_lifo_and_epoch_bound() {
+        let mut frames = CetPendingSignalFrames::new();
+        let (epoch, first_nonce) = frames.reserve().unwrap();
+        let first = frame(epoch, first_nonce);
+        assert!(frames.push(first));
+        let (_, second_nonce) = frames.reserve().unwrap();
+        let second = frame(epoch, second_nonce);
+        assert!(frames.push(second));
+        assert!(!frames.pop_if(first));
+        assert!(frames.pop_if(second));
+        frames.invalidate();
+        assert!(!frames.push(first));
+        assert!(frames.top().is_none());
+    }
+
+    #[test]
+    fn cet_signal_frames_have_a_hard_bound() {
+        let mut frames = CetPendingSignalFrames::new();
+        let epoch = frames.epoch;
+        for nonce in 0..CET_SIGNAL_FRAME_LIMIT as u64 {
+            assert!(frames.push(frame(epoch, nonce)));
+        }
+        assert!(frames.reserve().is_none());
+        assert!(!frames.push(frame(epoch, 99)));
+    }
+}
 
 /// Linux x86 I/O-port state. It is deliberately task-local: threads in one
 /// process may grant different port ranges. The grant bitmap is shared after
@@ -147,7 +274,10 @@ impl IoPortState {
 
     fn bitmap_and_revocations(
         &self,
-    ) -> (Option<&[u8; IO_BITMAP_BYTES]>, Option<&[u8; IO_BITMAP_BYTES]>) {
+    ) -> (
+        Option<&[u8; IO_BITMAP_BYTES]>,
+        Option<&[u8; IO_BITMAP_BYTES]>,
+    ) {
         let bitmap = self.bitmap.as_deref();
         let revoked = (!self.revoked.iter().all(|&byte| byte == 0)).then_some(&self.revoked);
         (bitmap, revoked)
@@ -839,14 +969,23 @@ pub struct FdTableSlot {
 
 impl FdTableSlot {
     pub(crate) fn new(table: Arc<crate::file::FdTable>) -> Arc<Self> {
-        Arc::new(Self { table, task_users: AtomicUsize::new(0) })
+        Arc::new(Self {
+            table,
+            task_users: AtomicUsize::new(0),
+        })
     }
     fn share_for_task(slot: &Arc<Self>) -> Arc<Self> {
         slot.clone()
     }
-    fn acquire_task(&self) { self.task_users.fetch_add(1, Ordering::Relaxed); }
-    fn release_task(&self) { self.task_users.fetch_sub(1, Ordering::Relaxed); }
-    pub(crate) fn table(&self) -> Arc<crate::file::FdTable> { self.table.clone() }
+    fn acquire_task(&self) {
+        self.task_users.fetch_add(1, Ordering::Relaxed);
+    }
+    fn release_task(&self) {
+        self.task_users.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub(crate) fn table(&self) -> Arc<crate::file::FdTable> {
+        self.table.clone()
+    }
     pub(crate) fn has_task_users(&self) -> bool {
         self.task_users.load(Ordering::Acquire) != 0
     }
@@ -864,7 +1003,9 @@ impl FsContextSlot {
         slot.clone()
     }
 
-    fn acquire_task(&self) { self.task_users.fetch_add(1, Ordering::Relaxed); }
+    fn acquire_task(&self) {
+        self.task_users.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn release_task(&self) {
         self.task_users.fetch_sub(1, Ordering::Relaxed);
@@ -880,12 +1021,25 @@ struct TaskResourceAdmission {
 }
 impl TaskResourceAdmission {
     fn new(fs: Arc<FsContextSlot>, fd: Arc<FdTableSlot>) -> Self {
-        fs.acquire_task(); fd.acquire_task(); Self { fs, fd, committed: false }
+        fs.acquire_task();
+        fd.acquire_task();
+        Self {
+            fs,
+            fd,
+            committed: false,
+        }
     }
-    fn commit(mut self) { self.committed = true; }
+    fn commit(mut self) {
+        self.committed = true;
+    }
 }
 impl Drop for TaskResourceAdmission {
-    fn drop(&mut self) { if !self.committed { self.fs.release_task(); self.fd.release_task(); } }
+    fn drop(&mut self) {
+        if !self.committed {
+            self.fs.release_task();
+            self.fd.release_task();
+        }
+    }
 }
 
 /// The inner data of a thread.
@@ -979,6 +1133,12 @@ pub struct Thread {
 
     /// The head of the robust list
     robust_list_head: AtomicUsize,
+
+    /// CET signal frames are deliberately task-local: an address-space
+    /// mutation never reaches back into this lock, and stale mappings are
+    /// rejected when the frame is consumed.
+    #[cfg(target_arch = "x86_64")]
+    cet_signal_frames: SpinNoIrq<CetPendingSignalFrames>,
 
     /// The thread-level signal manager
     pub signal: Arc<ThreadSignalManager>,
@@ -1175,6 +1335,8 @@ impl Thread {
             kernel_tid: tid,
             task_parent,
             robust_list_head: AtomicUsize::new(0),
+            #[cfg(target_arch = "x86_64")]
+            cet_signal_frames: SpinNoIrq::new(CetPendingSignalFrames::new()),
             time: AssumeSync(RefCell::new(time)),
             live_usage: AtomicTaskUsage::new(),
             minor_faults: AtomicU64::new(0),
@@ -1214,8 +1376,42 @@ impl Thread {
         self.personality.load(Ordering::Acquire)
     }
 
-    pub(crate) fn landlock_domain(&self) -> LandlockDomain { self.landlock.lock().clone() }
-    pub(crate) fn replace_landlock_domain(&self, domain: LandlockDomain) { *self.landlock.lock() = domain; }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_reserve(&self) -> Option<(u64, u64)> {
+        self.cet_signal_frames.lock().reserve()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_has_capacity(&self) -> bool {
+        self.cet_signal_frames.lock().has_capacity()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_push(&self, frame: CetPendingSignalFrame) -> bool {
+        self.cet_signal_frames.lock().push(frame)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_top(&self) -> Option<CetPendingSignalFrame> {
+        self.cet_signal_frames.lock().top()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_pop_if(&self, frame: CetPendingSignalFrame) -> bool {
+        self.cet_signal_frames.lock().pop_if(frame)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn clear_cet_signal_frames(&self) {
+        self.cet_signal_frames.lock().invalidate();
+    }
+
+    pub(crate) fn landlock_domain(&self) -> LandlockDomain {
+        self.landlock.lock().clone()
+    }
+    pub(crate) fn replace_landlock_domain(&self, domain: LandlockDomain) {
+        *self.landlock.lock() = domain;
+    }
 
     pub(crate) fn set_personality(&self, personality: u32) {
         self.personality.store(personality, Ordering::Release);
@@ -1227,13 +1423,21 @@ impl Thread {
 
     /// Snapshot this task's current Linux filesystem context pointer.
     pub(crate) fn fs_context(&self) -> Arc<Mutex<FsContext>> {
-        self.fs_context.lock().as_ref().expect("retired fs_struct").context.clone()
+        self.fs_context
+            .lock()
+            .as_ref()
+            .expect("retired fs_struct")
+            .context
+            .clone()
     }
 
     /// Takes a live fs_struct reference without treating an exiting task's
     /// already-retired slot as a kernel invariant violation.
     pub(crate) fn try_fs_context(&self) -> Option<Arc<Mutex<FsContext>>> {
-        self.fs_context.lock().as_ref().map(|slot| slot.context.clone())
+        self.fs_context
+            .lock()
+            .as_ref()
+            .map(|slot| slot.context.clone())
     }
 
     /// Acquires one Linux task ownership of this `fs_struct`.
@@ -1241,24 +1445,64 @@ impl Thread {
         FsContextSlot::share_for_task(self.fs_context.lock().as_ref().expect("retired fs_struct"))
     }
 
-    pub(crate) fn fd_table(&self) -> Arc<crate::file::FdTable> { self.fd_table.lock().as_ref().expect("retired files_struct").table.clone() }
-    pub(crate) fn fd_table_is_shared(&self) -> bool { self.fd_table.lock().as_ref().expect("retired files_struct").task_users.load(Ordering::Relaxed) != 1 }
-    pub(crate) fn fd_table_for_child(&self) -> Arc<FdTableSlot> { FdTableSlot::share_for_task(self.fd_table.lock().as_ref().expect("retired files_struct")) }
+    pub(crate) fn fd_table(&self) -> Arc<crate::file::FdTable> {
+        self.fd_table
+            .lock()
+            .as_ref()
+            .expect("retired files_struct")
+            .table
+            .clone()
+    }
+    pub(crate) fn fd_table_is_shared(&self) -> bool {
+        self.fd_table
+            .lock()
+            .as_ref()
+            .expect("retired files_struct")
+            .task_users
+            .load(Ordering::Relaxed)
+            != 1
+    }
+    pub(crate) fn fd_table_for_child(&self) -> Arc<FdTableSlot> {
+        FdTableSlot::share_for_task(self.fd_table.lock().as_ref().expect("retired files_struct"))
+    }
     pub(crate) fn try_clone_fd_table_if_shared(&self) -> AxResult<Option<Arc<FdTableSlot>>> {
-        let table = { let slot = self.fd_table.lock(); (slot.as_ref().expect("retired files_struct").task_users.load(Ordering::Relaxed) != 1).then(|| slot.as_ref().expect("retired files_struct").table.clone()) };
-        table.map(|table| Arc::try_new(FdTableSlot { table: Arc::try_new(table.fork_copy()?).map_err(|_| AxError::NoMemory)?, task_users: AtomicUsize::new(0) }).map_err(|_| AxError::NoMemory)).transpose()
+        let table = {
+            let slot = self.fd_table.lock();
+            (slot
+                .as_ref()
+                .expect("retired files_struct")
+                .task_users
+                .load(Ordering::Relaxed)
+                != 1)
+                .then(|| slot.as_ref().expect("retired files_struct").table.clone())
+        };
+        table
+            .map(|table| {
+                Arc::try_new(FdTableSlot {
+                    table: Arc::try_new(table.fork_copy()?).map_err(|_| AxError::NoMemory)?,
+                    task_users: AtomicUsize::new(0),
+                })
+                .map_err(|_| AxError::NoMemory)
+            })
+            .transpose()
     }
     pub(crate) fn replace_fd_table(&self, replacement: Arc<FdTableSlot>) -> Arc<FdTableSlot> {
         replacement.acquire_task();
-        let old = core::mem::replace(&mut *self.fd_table.lock(), Some(replacement)).expect("retired files_struct");
-        old.release_task(); old
+        let old = core::mem::replace(&mut *self.fd_table.lock(), Some(replacement))
+            .expect("retired files_struct");
+        old.release_task();
+        old
     }
     /// Retire the Linux task ownership at the authoritative task-unhash edge.
     /// Takes the exact task-owned table at authoritative unlink.  Subsequent
     /// accesses are invalid, and dropping the returned Arc performs final
     /// descriptor/resource close when it was the last owner.
     pub(crate) fn retire_fd_table(&self) -> Arc<FdTableSlot> {
-        let slot = self.fd_table.lock().take().expect("files_struct retired twice");
+        let slot = self
+            .fd_table
+            .lock()
+            .take()
+            .expect("files_struct retired twice");
         slot.release_task();
         slot
     }
@@ -1266,9 +1510,7 @@ impl Thread {
     /// Creates a private `fs_struct` only when this task's slot actually
     /// shares one. The count is checked before making a local Arc clone, so
     /// an already-private `unshare(CLONE_FS)` needs no allocation.
-    pub(crate) fn try_clone_fs_context_if_shared(
-        &self,
-    ) -> AxResult<Option<Arc<FsContextSlot>>> {
+    pub(crate) fn try_clone_fs_context_if_shared(&self) -> AxResult<Option<Arc<FsContextSlot>>> {
         let cloned = {
             let fs_context = self.fs_context.lock();
             let fs_context = fs_context.as_ref().expect("retired fs_struct");
@@ -1290,19 +1532,21 @@ impl Thread {
     }
 
     /// Replaces this task's `fs_struct`, used by `unshare(CLONE_FS)`.
-    pub(crate) fn replace_fs_context(
-        &self,
-        replacement: Arc<FsContextSlot>,
-    ) -> Arc<FsContextSlot> {
+    pub(crate) fn replace_fs_context(&self, replacement: Arc<FsContextSlot>) -> Arc<FsContextSlot> {
         replacement.acquire_task();
-        let old = core::mem::replace(&mut *self.fs_context.lock(), Some(replacement)).expect("retired fs_struct");
+        let old = core::mem::replace(&mut *self.fs_context.lock(), Some(replacement))
+            .expect("retired fs_struct");
         old.release_task();
         old
     }
 
     /// Removes the exact task owner's fs_struct at authoritative task unlink.
     pub(crate) fn retire_fs_context(&self) -> Arc<FsContextSlot> {
-        let slot = self.fs_context.lock().take().expect("fs_struct retired twice");
+        let slot = self
+            .fs_context
+            .lock()
+            .take()
+            .expect("fs_struct retired twice");
         slot.release_task();
         slot
     }
@@ -1790,7 +2034,9 @@ impl Thread {
 
 impl Drop for Thread {
     fn drop(&mut self) {
-        if let Some(slot) = self.fs_context.get_mut().take() { slot.release_task(); }
+        if let Some(slot) = self.fs_context.get_mut().take() {
+            slot.release_task();
+        }
         if let Some(slot) = self.fd_table.get_mut().take() {
             slot.release_task();
         }
@@ -1837,8 +2083,8 @@ impl TaskExt for Box<Thread> {
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
         let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::PREEMPT);
-        let exit_was_preaccounted =
-            reason == SwitchReason::Exit && self.exit_switch_preaccounted.swap(false, Ordering::AcqRel);
+        let exit_was_preaccounted = reason == SwitchReason::Exit
+            && self.exit_switch_preaccounted.swap(false, Ordering::AcqRel);
         if reason.counts_as_context_switch() && !exit_was_preaccounted {
             self.account_context_switch(!reason.is_involuntary());
         }

@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::future::pending;
+use core::{future::pending, mem::MaybeUninit};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{
@@ -11,9 +11,8 @@ use axtask::{
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_AUTODISARM,
-    SS_DISABLE, SS_ONSTACK,
-    siginfo, timespec,
+    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_AUTODISARM, SS_DISABLE,
+    SS_ONSTACK, siginfo, timespec,
 };
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{
@@ -29,18 +28,17 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 use crate::{
     mm::{AddressSpaceUserMemory, map_usercopy_error},
     task::{
-        AsThread, Cred, ProcStateHint, Process, ProcessData, SignalCheckResult,
-        SignalDeliveryScope, SignalNumber, SignalSecurityOperation, SignalSecuritySource,
-        SignalTargetKind, Thread,
-        acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
+        AsThread, CetPendingSignalFrame, Cred, ProcStateHint, Process, ProcessData,
+        SignalCheckResult, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
+        SignalSecuritySource, SignalTargetKind, Thread, acknowledge_posix_timer_signal,
+        check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
         check_current_zombie_signal_access, check_signals_with_retry,
-        commit_current_legacy_fp_state,
-        complete_signal_delivery, force_rseq_fault_signal_current_thread,
-        force_signal_current_thread, generate_signal_for_exited_leader, get_process_data,
-        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
-        process_error, send_authorized_signal_thread_inner,
-        send_queued_signal_to_process_data_with_credential,
+        commit_current_legacy_fp_state, complete_signal_delivery,
+        force_rseq_fault_signal_current_thread, force_signal_current_thread,
+        generate_signal_for_exited_leader, get_process_data, get_process_group,
+        get_process_including_zombie, get_visible_task, process_domain, process_error,
+        send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
         send_signal_to_process_data_with_credential, snapshot_current_legacy_fp_state,
         terminate_rseq_fault_current_thread, with_proc_state_hint,
     },
@@ -1200,6 +1198,12 @@ pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
         }
     };
 
+    #[cfg(target_arch = "x86_64")]
+    let cet_restore = match validate_cet_sigreturn(thr, memory, uctx.sp()) {
+        Ok(state) => state,
+        Err(reason) => return reject_bad_sigreturn(reason),
+    };
+
     // Validate and commit the FP image before publishing GPR/mask/stack state.
     // The cloned token keeps the manager-owned prepared restore intact for its
     // no-fail commit below; a bad MXCSR leaves every task state untouched.
@@ -1209,12 +1213,103 @@ pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
         return reject_bad_sigreturn("invalid signal FP state");
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if let Some((pending, state)) = cet_restore {
+        // Every fallible read and mapping check completed above.  Popping the
+        // exact LIFO record and changing the hardware image are now the
+        // no-fail commit edge for this signal return.
+        if !thr.cet_signal_pop_if(pending) {
+            return reject_bad_sigreturn("CET signal-frame order changed");
+        }
+        crate::task::set_current_user_cet_state(state);
+    }
+
     // No operation after this point may fail: the complete fixed frame and FP
     // payload passed validation, FP state is committed, and manager commit
     // only publishes the already-prepared GPR/mask/stack values.
     thr.signal.commit_restore(uctx, prepared);
     thr.complete_sigreturn(uctx);
     Ok(uctx.retval() as isize)
+}
+
+#[cfg(target_arch = "x86_64")]
+const CET_SIGNAL_METADATA_OFFSET: usize = 40 + 192;
+#[cfg(target_arch = "x86_64")]
+const CET_SIGNAL_MAGIC: u64 = 0x544b_4345_5453_4947;
+
+#[cfg(target_arch = "x86_64")]
+fn validate_cet_sigreturn<M: UserMemory + ?Sized>(
+    thr: &Thread,
+    memory: &mut UserMemoryContext<'_, M>,
+    syscall_sp: usize,
+) -> Result<Option<(CetPendingSignalFrame, axhal::asm::UserCetState)>, &'static str> {
+    let current = crate::task::current_user_live_cet_state();
+    let pending = thr.cet_signal_top();
+    if current.u_cet & 1 == 0 {
+        return if pending.is_none() {
+            Ok(None)
+        } else {
+            Err("CET disabled with pending signal frame")
+        };
+    }
+    let pending = pending.ok_or("missing CET signal-frame record")?;
+    let frame = syscall_sp
+        .checked_add(core::mem::size_of::<usize>())
+        .ok_or("CET frame overflow")?;
+    if frame != pending.frame || current.pl3_ssp != pending.handler_ssp {
+        return Err("CET signal-frame sequence mismatch");
+    }
+    let metadata_addr = frame
+        .checked_add(CET_SIGNAL_METADATA_OFFSET)
+        .ok_or("CET metadata overflow")?;
+    let mut bytes = [MaybeUninit::<u8>::uninit(); 64];
+    memory
+        .read_bytes(metadata_addr, &mut bytes)
+        .map_err(|_| "unreadable CET metadata")?;
+    let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
+    let mut words = [0u64; 8];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap());
+    }
+    if words
+        != [
+            CET_SIGNAL_MAGIC,
+            1,
+            pending.epoch,
+            pending.nonce,
+            pending.frame as u64,
+            pending.saved_ssp,
+            pending.handler_ssp,
+            pending.token,
+        ]
+    {
+        return Err("forged CET signal metadata");
+    }
+    let words = thr
+        .proc_data
+        .aspace()
+        .lock()
+        .read_cet_signal_frame(thr.kernel_tid(), pending.handler_ssp)
+        .map_err(|_| "stale CET shadow-stack mapping")?;
+    // The first word is the generic frame's restorer.  It is protected by the
+    // shadow-stack copy, while the remaining words bind this exact nesting
+    // layer to the opaque kernel record.
+    let mut restorer = [MaybeUninit::<u8>::uninit(); 8];
+    memory
+        .read_bytes(syscall_sp, &mut restorer)
+        .map_err(|_| "unreadable signal restorer")?;
+    let restorer = u64::from_ne_bytes(restorer.map(|byte| unsafe { byte.assume_init() }));
+    if words != [restorer, pending.nonce, pending.token] {
+        return Err("modified CET shadow-stack record");
+    }
+    Ok(Some((
+        pending,
+        axhal::asm::UserCetState {
+            u_cet: current.u_cet,
+            pl3_ssp: pending.saved_ssp,
+            locked: current.locked,
+        },
+    )))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1809,7 +1904,9 @@ mod tests {
 
     use axerrno::AxError;
     use axtask::future::TimerRegistrationError;
-    use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK};
+    use linux_raw_sys::general::{
+        MINSIGSTKSZ, SI_TKILL, SI_USER, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK,
+    };
     use thekernel_linux_signal::{
         RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalSet,
         SignalStack, Signo,
@@ -2230,6 +2327,9 @@ mod tests {
     fn sigaltstack_accepts_autodisarm_configuration() {
         let current = SignalStack::default();
         let configured = SignalStack::new(0x8000, SS_AUTODISARM, MINSIGSTKSZ as usize);
-        assert_eq!(prepare_sigaltstack_update(&current, 0x4000, configured), Ok(configured));
+        assert_eq!(
+            prepare_sigaltstack_update(&current, 0x4000, configured),
+            Ok(configured)
+        );
     }
 }

@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::convert::Infallible;
+use core::{convert::Infallible, mem::MaybeUninit};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{UserContext, UserReturnHookAction};
@@ -18,9 +18,9 @@ use thekernel_linux_signal::{
 use thekernel_linux_usercopy::UserMemoryContext;
 
 use super::{
-    AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    fail_closed_exit, get_process_data, get_process_group, get_task, get_visible_task,
-    linux_pid_from_task_id, process_domain, process_error,
+    AsThread, CetPendingSignalFrame, ContinueResult, Cred, ProcessData, Thread,
+    acknowledge_posix_timer_signal, do_exit, fail_closed_exit, get_process_data, get_process_group,
+    get_task, get_visible_task, linux_pid_from_task_id, process_domain, process_error,
 };
 use crate::{mm::AddressSpaceUserMemory, readiness::block_on_poll_set};
 
@@ -294,6 +294,10 @@ pub fn check_signals_with_retry(
             if thr.signal.take_signal_delivery_bypass(sig.signo()) {
                 return SignalDeliveryPreflight::Proceed;
             }
+            #[cfg(target_arch = "x86_64")]
+            if !preflight_cet_signal_delivery(thr, &aspace) {
+                return SignalDeliveryPreflight::Fatal;
+            }
             match thr.pre_signal_rseq_delivery(uctx, &aspace) {
                 UserReturnHookAction::EnterUser => SignalDeliveryPreflight::Proceed,
                 UserReturnHookAction::Retry => SignalDeliveryPreflight::Retry,
@@ -315,6 +319,20 @@ pub fn check_signals_with_retry(
     );
     match result {
         SignalDeliveryResult::Delivered(delivered) => {
+            #[cfg(target_arch = "x86_64")]
+            if matches!(delivered.os_action, SignalOSAction::Handler)
+                && let Err(error) = publish_cet_signal_frame(thr, &mut memory, uctx)
+            {
+                // The generic signal crate has already published its ABI
+                // frame.  Do not return to a handler with an unauthenticated
+                // CET transition: leave the old context live and take the
+                // existing fatal path.  The shadow-stack write (if any) is
+                // unreachable because PL3_SSP was not advanced or recorded.
+                warn!("CET signal-frame publication failed: {error:?}");
+                *uctx = saved_uctx;
+                terminate_rseq_fault_current_thread();
+                return SignalCheckResult::None;
+            }
             complete_signal_delivery(thr, uctx, delivered);
             SignalCheckResult::Handled
         }
@@ -352,6 +370,121 @@ pub fn check_signals_with_retry(
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+const CET_SIGNAL_METADATA_OFFSET: usize = 40 + 192;
+#[cfg(target_arch = "x86_64")]
+const CET_SIGNAL_MAGIC: u64 = 0x544b_4345_5453_4947;
+
+/// The x86 ABI reserves these eight words in `mcontext`.  Keeping this local
+/// repr(C) record avoids changing the sibling signal crate's public ABI.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct CetSignalFrameMetadata([u64; 8]);
+
+#[cfg(target_arch = "x86_64")]
+fn preflight_cet_signal_delivery(
+    thr: &Thread,
+    aspace: &alloc::sync::Arc<axsync::Mutex<crate::mm::AddrSpace>>,
+) -> bool {
+    let state = super::current_user_live_cet_state();
+    if state.u_cet & 1 == 0 {
+        return true;
+    }
+    state.pl3_ssp != 0
+        && state
+            .pl3_ssp
+            .is_multiple_of(core::mem::size_of::<u64>() as u64)
+        && aspace
+            .lock()
+            .cet_default_shadow_stack_contains(thr.kernel_tid(), state.pl3_ssp)
+        && thr.cet_signal_has_capacity()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cet_signal_token(epoch: u64, nonce: u64, frame: usize, saved_ssp: u64, handler_ssp: u64) -> u64 {
+    epoch.rotate_left(13)
+        ^ nonce.rotate_left(29)
+        ^ (frame as u64).rotate_left(41)
+        ^ saved_ssp.rotate_left(7)
+        ^ handler_ssp.rotate_left(53)
+        ^ CET_SIGNAL_MAGIC
+}
+
+#[cfg(target_arch = "x86_64")]
+fn publish_cet_signal_frame(
+    thr: &Thread,
+    memory: &mut UserMemoryContext<'_, AddressSpaceUserMemory>,
+    handler: &UserContext,
+) -> AxResult<()> {
+    let state = super::current_user_live_cet_state();
+    if state.u_cet & 1 == 0 {
+        return Ok(());
+    }
+    let frame = handler
+        .sp()
+        .checked_add(core::mem::size_of::<usize>())
+        .ok_or(AxError::BadAddress)?;
+    let metadata = frame
+        .checked_add(CET_SIGNAL_METADATA_OFFSET)
+        .ok_or(AxError::BadAddress)?;
+    memory
+        .validate_write_range(metadata, core::mem::size_of::<CetSignalFrameMetadata>())
+        .map_err(|_| AxError::BadAddress)?;
+    let mut restorer = [MaybeUninit::<u8>::uninit(); 8];
+    memory
+        .read_bytes(handler.sp(), &mut restorer)
+        .map_err(|_| AxError::BadAddress)?;
+    let restorer = u64::from_ne_bytes(restorer.map(|byte| unsafe { byte.assume_init() }));
+    let (epoch, nonce) = thr.cet_signal_reserve().ok_or(AxError::StorageFull)?;
+    let saved_ssp = state.pl3_ssp;
+    let handler_ssp = saved_ssp.checked_sub(24).ok_or(AxError::BadAddress)?;
+    let token = cet_signal_token(epoch, nonce, frame, saved_ssp, handler_ssp);
+    {
+        let aspace = thr.proc_data.aspace();
+        aspace.lock().write_cet_signal_frame(
+            thr.kernel_tid(),
+            saved_ssp,
+            [restorer, nonce, token],
+        )?;
+    }
+    let metadata = CetSignalFrameMetadata([
+        CET_SIGNAL_MAGIC,
+        1,
+        epoch,
+        nonce,
+        frame as u64,
+        saved_ssp,
+        handler_ssp,
+        token,
+    ]);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&metadata as *const CetSignalFrameMetadata).cast::<u8>(),
+            core::mem::size_of_val(&metadata),
+        )
+    };
+    memory
+        .write_bytes(frame + CET_SIGNAL_METADATA_OFFSET, bytes)
+        .map_err(|_| AxError::BadAddress)?;
+    let pending = CetPendingSignalFrame {
+        frame,
+        saved_ssp,
+        handler_ssp,
+        epoch,
+        nonce,
+        token,
+    };
+    if !thr.cet_signal_push(pending) {
+        return Err(AxError::BadState);
+    }
+    super::set_current_user_cet_state(axhal::asm::UserCetState {
+        u_cet: state.u_cet,
+        pl3_ssp: handler_ssp,
+        locked: state.locked,
+    });
+    Ok(())
 }
 
 pub fn check_signals(

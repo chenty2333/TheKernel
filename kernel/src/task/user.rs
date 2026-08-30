@@ -201,6 +201,25 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     }
                 }
 
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // A shared-mm peer may have unmapped this task's default
+                    // stack.  The MM never takes a Thread lock; this return
+                    // boundary consumes its lease and prevents a stale PL3_SSP
+                    // from reaching userspace.
+                    let cet = super::current_user_live_cet_state();
+                    if cet.u_cet & 1 != 0
+                        && !thr
+                            .proc_data
+                            .aspace()
+                            .lock()
+                            .cet_default_shadow_stack_contains(thr.kernel_tid(), cet.pl3_ssp)
+                    {
+                        thr.clear_cet_signal_frames();
+                        super::reset_current_user_cet_state();
+                    }
+                }
+
                 while check_signals(thr, &mut uctx, None) {}
 
                 // Block if the process has been stopped (by this or another thread).

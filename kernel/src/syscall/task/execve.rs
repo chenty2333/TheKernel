@@ -35,8 +35,8 @@ use crate::{
         check_signals, commit_exec_identity_handoff, fail_closed_exit, get_task,
         has_pending_fatal_signal, linux_pid_from_task_id, map_exec_dumpability,
         notify_ptrace_attach_stop, ns_capable, prepare_task_alias_admission, process_error,
-        release_exec_action_then_complete, reset_current_task_extended_state, reset_current_user_cet_state,
-        set_current_user_address_space,
+        release_exec_action_then_complete, reset_current_task_extended_state,
+        reset_current_user_cet_state, set_current_user_address_space,
     },
 };
 
@@ -767,6 +767,7 @@ fn do_execve(
 
     install_exec_user_context(uctx, entry_point.as_usize(), user_stack_base);
     reset_current_task_extended_state();
+    thr.clear_cet_signal_frames();
     reset_current_user_cet_state();
     axtask::reset_current_task_pkru();
     let _ = rseq_exec.commit();

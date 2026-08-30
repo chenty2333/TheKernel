@@ -28,9 +28,9 @@ use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
     ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
     PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
-    TimerState, fs_context_publication, futex_table_for, lock_task_parent_publication, process_domain, reap_process,
-    request_process_cpu_evaluation, send_signal_to_process, send_signal_to_process_data,
-    send_signal_to_thread, user::linux_pid_from_task_id,
+    TimerState, fs_context_publication, futex_table_for, lock_task_parent_publication,
+    process_domain, reap_process, request_process_cpu_evaluation, send_signal_to_process,
+    send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
     keyring::{self, KeyTaskOwner},
@@ -959,7 +959,36 @@ pub fn current_user_cet_state() -> axhal::asm::UserCetState {
     let _guard = NoPreemptIrqSave::new();
     let curr = current();
     // SAFETY: preemption is disabled and this is the running task.
-    unsafe { (*((&***curr) as *const TaskInner as *mut TaskInner)).ctx_mut().user_cet }
+    unsafe {
+        (*((&***curr) as *const TaskInner as *mut TaskInner))
+            .ctx_mut()
+            .user_cet
+    }
+}
+
+/// Snapshots the current task's live CET MSRs and synchronizes the scheduler
+/// image before a kernel path relies on PL3_SSP.  On hosted builds CET MSRs
+/// are deliberately unavailable, so the saved test image remains authoritative.
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_live_cet_state() -> axhal::asm::UserCetState {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: preemption is disabled and this is the running task.
+    let context = unsafe { (*((&***curr) as *const TaskInner as *mut TaskInner)).ctx_mut() };
+    #[cfg(target_os = "none")]
+    {
+        if context.user_cet.u_cet == 0 {
+            return context.user_cet;
+        }
+        let mut live = axhal::asm::read_user_cet_state();
+        live.locked = context.user_cet.locked;
+        context.user_cet = live;
+        live
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        context.user_cet
+    }
 }
 
 /// Replaces CET state for the running task and its live CPU image.
@@ -1561,6 +1590,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // record and is therefore untouched.
     #[cfg(target_arch = "x86_64")]
     {
+        thr.clear_cet_signal_frames();
         let aspace = thr.proc_data.aspace();
         let wake = {
             let mut aspace = aspace.lock();
@@ -1585,13 +1615,16 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // Do not defer cwd/root release to scheduler Arc destruction.
     drop(retired_fs_context);
     if final_exit.is_none() {
-        let retired = retired_fd_table.take().expect("nonfinal exit retains files_struct");
+        let retired = retired_fd_table
+            .take()
+            .expect("nonfinal exit retains files_struct");
         // A private files_struct must take the normal close path while this
         // exiting task still supplies the POSIX-lock owner context. Shared
         // CLONE_FILES tables retain another task owner and are left intact.
         if !retired.has_task_users() {
             let table = retired.table();
-            let closed = crate::file::close_fd_table(&table).unwrap_or_else(|_| fail_closed_exit(AxError::BadState));
+            let closed = crate::file::close_fd_table(&table)
+                .unwrap_or_else(|_| fail_closed_exit(AxError::BadState));
             drop(closed);
             crate::file::inotify::wait_current_close_notifications();
         }
@@ -1722,7 +1755,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         thr.proc_data.release_executable();
         crate::syscall::cleanup_process_aio(process.pid());
         crate::syscall::cleanup_process_mqueue_notifications(process.pid());
-        let closed_fds = retired_fd_table.take().expect("final exit retains files_struct");
+        let closed_fds = retired_fd_table
+            .take()
+            .expect("final exit retains files_struct");
         // wait(2) may return as soon as the parent observes the zombie state.
         // Release process-owned POSIX locks before the old files_struct can
         // drop its descriptions. Their Drop path publishes IN_CLOSE/FAN_CLOSE

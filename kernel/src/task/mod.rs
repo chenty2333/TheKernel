@@ -69,8 +69,8 @@ pub(crate) use self::{
     seccomp::{SeccompPublicationError, init_seccomp_filter_budget, seccomp_filter_budget},
     security::{LandlockDomain, PendingCredentialPublication, SignalTargetKind},
     thread::{
-        ProcStateHint, TaskParentChoice, TaskParentCredentialPin, TaskParentNode,
-        TaskParentPublicationGuard, lock_task_parent_publication,
+        CetPendingSignalFrame, ProcStateHint, TaskParentChoice, TaskParentCredentialPin,
+        TaskParentNode, TaskParentPublicationGuard, lock_task_parent_publication,
     },
 };
 
@@ -84,6 +84,7 @@ pub(crate) fn cred_error(error: CredError) -> axerrno::AxError {
         _ => axerrno::AxError::OperationNotPermitted,
     }
 }
+pub(crate) use self::thread::SchedulerSeed;
 pub use self::{
     accounting::*,
     futex::*,
@@ -96,8 +97,6 @@ pub use self::{
     timer::*,
     user::*,
 };
-
-pub(crate) use self::thread::SchedulerSeed;
 
 /// Linearizes creation/replacement of a task's `fs_struct` with namespace-root
 /// replacement. The required lock order is this gate, then an individual
