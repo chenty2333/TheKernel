@@ -1179,6 +1179,13 @@ pub struct Thread {
     voluntary_switches: AtomicU64,
     involuntary_switches: AtomicU64,
     perf_events: SpinNoIrq<Vec<Arc<crate::file::PerfGroup>>>,
+    /// Scheduler-owned utilization clamps, published as a coherent pair.
+    ///
+    /// `sched_clamp_sequence` is a tiny seqlock: writers are serialized with
+    /// its low bit and readers retry instead of allocating or locking in a
+    /// scheduler callback.  The scheduler's own commit serial is retained
+    /// separately so a delayed completion cannot replace a newer clamp.
+    sched_clamp: SchedulerClampCache,
     /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
     /// The scheduler Exit callback consumes this marker so `nvcsw` is
     /// published exactly once before the frozen usage snapshot is queued.
@@ -1221,7 +1228,89 @@ pub struct Thread {
 pub(crate) struct SchedulerSeed {
     pub(crate) state: SchedState,
     pub(crate) reset_on_fork: bool,
+    pub(crate) util_min: u16,
+    pub(crate) util_max: u16,
     pub(crate) version: u64,
+}
+
+const SCHED_CLAMP_MASK: u32 = 0x7ff;
+
+const fn pack_sched_clamp(min: u16, max: u16) -> u32 {
+    debug_assert!(min <= max && max <= 1024);
+    u32::from(min) | (u32::from(max) << 11)
+}
+
+const fn unpack_sched_clamp(packed: u32) -> (u16, u16) {
+    ((packed & SCHED_CLAMP_MASK) as u16, ((packed >> 11) & SCHED_CLAMP_MASK) as u16)
+}
+
+/// Serial-number ordering for scheduler commit streams, including wraparound.
+const fn scheduler_commit_is_newer_or_equal(candidate: u64, published: u64) -> bool {
+    candidate.wrapping_sub(published) < (1_u64 << 63)
+}
+
+struct SchedulerClampCache {
+    packed: AtomicU32,
+    version: AtomicU64,
+    sequence: AtomicU64,
+}
+
+impl SchedulerClampCache {
+    const fn new(min: u16, max: u16, version: u64) -> Self {
+        Self {
+            packed: AtomicU32::new(pack_sched_clamp(min, max)),
+            version: AtomicU64::new(version),
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> (u16, u16, u64) {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let packed = self.packed.load(Ordering::Relaxed);
+            let version = self.version.load(Ordering::Relaxed);
+            if self.sequence.load(Ordering::Acquire) == before {
+                let (min, max) = unpack_sched_clamp(packed);
+                return (min, max, version);
+            }
+        }
+    }
+
+    fn publish(&self, min: u32, max: u32, version: u64) {
+        debug_assert!(min <= max && max <= 1024);
+        let packed = pack_sched_clamp(min as u16, max as u16);
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let published = self.version.load(Ordering::Acquire);
+            if !scheduler_commit_is_newer_or_equal(version, published) {
+                return;
+            }
+            if self
+                .sequence
+                .compare_exchange_weak(
+                    sequence,
+                    sequence.wrapping_add(1),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            self.packed.store(packed, Ordering::Relaxed);
+            self.version.store(version, Ordering::Relaxed);
+            self.sequence.store(sequence.wrapping_add(2), Ordering::Release);
+            return;
+        }
+    }
 }
 
 /// The thread-local signal execution state which survives `fork`/`clone`.
@@ -1403,6 +1492,11 @@ impl Thread {
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             perf_events: SpinNoIrq::new({ let mut groups = Vec::new(); groups.try_reserve_exact(crate::file::MAX_GROUPS_PER_THREAD).map_err(|_| AxError::NoMemory)?; groups }),
+            sched_clamp: SchedulerClampCache::new(
+                scheduler_seed.util_min,
+                scheduler_seed.util_max,
+                scheduler_seed.version,
+            ),
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             io_context: SpinNoIrq::new(io_context),
@@ -1431,6 +1525,30 @@ impl Thread {
 
     pub(crate) fn personality(&self) -> u32 {
         self.personality.load(Ordering::Acquire)
+    }
+
+    /// Reads the scheduler clamp and its commit version as one coherent tuple.
+    pub(crate) fn scheduler_clamp_snapshot(&self) -> (u16, u16, u64) {
+        self.sched_clamp.snapshot()
+    }
+
+    /// Publishes a successfully committed scheduler clamp.  A delayed commit
+    /// is harmlessly ignored once a newer serial has become visible.
+    pub(crate) fn publish_scheduler_clamp(&self, min: u32, max: u32, version: u64) {
+        self.sched_clamp.publish(min, max, version);
+    }
+
+    #[cfg(feature = "hwp-uclamp")]
+    fn apply_current_hwp_clamp(&self) {
+        let (min, max, _) = self.scheduler_clamp_snapshot();
+        // Unsupported firmware/host stubs are an intentional no-op.  HWP
+        // policy must never turn a scheduler transition into a failure.
+        let _ = axhal::hwp::apply_current_clamp(min, max);
+    }
+
+    #[cfg(feature = "hwp-uclamp")]
+    fn clear_current_hwp_clamp() {
+        let _ = axhal::hwp::apply_current_clamp(0, 1024);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2134,6 +2252,8 @@ impl From<u8> for ProcStateHint {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self, _task: &TaskInner) {
+        #[cfg(feature = "hwp-uclamp")]
+        self.apply_current_hwp_clamp();
         self.perf_on_enter();
         let state = self.proc_data.aspace_tlb_state();
         state.enter_current();
@@ -2148,6 +2268,8 @@ impl TaskExt for Box<Thread> {
 
     fn on_leave(&self, task: &TaskInner, reason: SwitchReason) {
         let _ = task;
+        #[cfg(feature = "hwp-uclamp")]
+        Self::clear_current_hwp_clamp();
         // Every scheduler leave is a preemption observation.  The final
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
@@ -2172,6 +2294,8 @@ impl TaskExt for Box<Thread> {
     }
 
     fn on_timer_tick(&self, _task: &TaskInner) -> bool {
+        #[cfg(feature = "hwp-uclamp")]
+        self.apply_current_hwp_clamp();
         super::load_average_sample_now();
         self.poll_cpu_accounting_for_tick()
     }
@@ -2192,6 +2316,37 @@ impl AsThread for TaskInner {
     fn try_as_thread(&self) -> Option<&Thread> {
         self.task_ext()
             .map(|ext| ext.downcast_ref::<Box<Thread>>().as_ref())
+    }
+}
+
+#[cfg(test)]
+mod scheduler_clamp_tests {
+    use super::{
+        SchedulerClampCache, pack_sched_clamp, scheduler_commit_is_newer_or_equal,
+        unpack_sched_clamp,
+    };
+
+    #[test]
+    fn clamp_pack_round_trips_scheduler_boundaries() {
+        for (min, max) in [(0, 1024), (0, 0), (1, 1023), (1024, 1024)] {
+            assert_eq!(unpack_sched_clamp(pack_sched_clamp(min, max)), (min, max));
+        }
+    }
+
+    #[test]
+    fn scheduler_commit_versions_handle_wrap_and_reject_stale_updates() {
+        assert!(scheduler_commit_is_newer_or_equal(8, 7));
+        assert!(scheduler_commit_is_newer_or_equal(0, u64::MAX));
+        assert!(!scheduler_commit_is_newer_or_equal(7, 8));
+        assert!(!scheduler_commit_is_newer_or_equal(u64::MAX, 0));
+    }
+
+    #[test]
+    fn stale_clamp_publication_cannot_regress_a_newer_commit() {
+        let cache = SchedulerClampCache::new(0, 1024, 5);
+        cache.publish(200, 700, 6);
+        cache.publish(10, 20, 5);
+        assert_eq!(cache.snapshot(), (200, 700, 6));
     }
 }
 

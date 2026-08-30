@@ -236,6 +236,10 @@ static STOP_ACKS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "smp-tlb-shootdown")]
 fn kexec_stop_handler() {
+    #[cfg(feature = "hwp-uclamp")]
+    // Restore this CPU's firmware-owned request before acknowledging the
+    // terminal stop; the initiator may hand execution to another kernel.
+    let _ = axhal::hwp::restore_current_request();
     STOP_ACKS.fetch_add(1, Ordering::Release);
     axhal::asm::disable_irqs();
     loop {
@@ -1042,6 +1046,10 @@ pub(crate) fn execute_loaded() -> AxResult<isize> {
         if stop_other_cpus().is_err() {
             axhal::power::system_off();
         }
+        #[cfg(feature = "hwp-uclamp")]
+        // Remote CPUs restored before their ACK.  Restore the initiator only
+        // after every ACK and immediately before the non-returning handoff.
+        let _ = axhal::hwp::restore_current_request();
         axhal::kexec::fence_pci_bus_mastering();
         for segment in &image.segments {
             let destination = phys_to_virt(segment.paddr.into()).as_mut_ptr();

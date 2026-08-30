@@ -231,6 +231,8 @@ pub fn init(args: &[String], envs: &[String]) {
         SchedulerSeed {
             state: SchedState::default(),
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
             version: 0,
         },
     )

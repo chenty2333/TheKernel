@@ -347,6 +347,12 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
 }
 
 fn publish_sched_commit(task: &AxTaskRef, commit: axtask::TaskSchedCommit) {
+    if let Some(thread) = task.try_as_thread() {
+        // Do this before the durable leader snapshot.  The Thread cache is
+        // the CPU-local HWP consumer and rejects a delayed, older commit by
+        // serial number, while ProcessData retains the existing zombie view.
+        thread.publish_scheduler_clamp(commit.util_min, commit.util_max, commit.version);
+    }
     if let Some(thread) = task.try_as_thread()
         && let Some(token) = thread
             .proc_data
@@ -530,17 +536,7 @@ fn set_task_nice(
         TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
         TaskSchedError::Scheduler(_) => AxError::InvalidInput,
     })?;
-    if let Some(thread) = task.try_as_thread()
-        && let Some(token) = thread
-            .proc_data
-            .scheduler_publication_token(thread.kernel_tid())
-    {
-        let tid = thread.kernel_tid();
-        let thread = task.as_thread();
-        thread
-            .proc_data
-            .publish_scheduler_state(tid, token, task, commit);
-    }
+    publish_sched_commit(task, commit);
     Ok(())
 }
 
