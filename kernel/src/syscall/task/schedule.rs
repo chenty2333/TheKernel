@@ -1,24 +1,26 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{mem::size_of, time::Duration};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::TimeValue;
 use axtask::{
-    AxCpuMask, AxTaskRef, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass, SchedState, TaskSchedError,
-    current,
+    AxCpuMask, AxTaskRef, DeadlineConfig, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
+    SchedClass, SchedState, TaskSchedAttrUpdate, TaskSchedError, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    rr_timeslice_ms, sched_state, scheduler_attr_snapshot, scheduler_state_snapshot,
-    set_rr_timeslice_ms as set_scheduler_rr_timeslice_ms, set_sched_state_versioned,
+    sched_state, scheduler_attr_snapshot, scheduler_state_snapshot, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
-    task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus, task_timeslice,
-    update_sched_state_versioned_with_reset, validate_affinity_mask,
+    update_sched_attr_versioned,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
     PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
-    SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR,
-    TIMER_ABSTIME, timespec,
+    SCHED_FLAG_KEEP_PARAMS, SCHED_FLAG_KEEP_POLICY, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use thekernel_linux_process_adapter::{Pid, ProcessError};
 use thekernel_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
@@ -31,20 +33,35 @@ use crate::{
     task::{
         AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
         get_process_including_zombie, get_task, get_visible_task, has_pending_syscall_signal,
-        prepare_clock_sleep, process_domain,
+        ns_capable, prepare_clock_sleep, process_domain,
         security::{
             SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
             dispatch_scheduler, dispatch_task_getscheduler,
         },
-        set_zombie_affinity, try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns,
-        zombie_scheduler_state,
+        try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
     time::TimeValueLike,
 };
 
 const SUPPORTED_SCHED_ATTR_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK as u64;
+const SCHED_ATTR_INPUT_FLAGS: u64 =
+    SUPPORTED_SCHED_ATTR_FLAGS | SCHED_FLAG_KEEP_POLICY as u64 | SCHED_FLAG_KEEP_PARAMS as u64;
+const SCHED_FLAG_RECLAIM: u64 = 0x02;
+const SCHED_FLAG_DL_OVERRUN: u64 = 0x04;
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+const SCHED_ATTR_KNOWN_FLAGS: u64 = SCHED_ATTR_INPUT_FLAGS
+    | SCHED_FLAG_RECLAIM
+    | SCHED_FLAG_DL_OVERRUN
+    | SCHED_FLAG_UTIL_CLAMP_MIN
+    | SCHED_FLAG_UTIL_CLAMP_MAX;
 const SCHED_ATTR_SIZE_VER0: usize = 48;
 const SCHED_ATTR_MAX_SIZE: usize = 4096;
+const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
+    let ms = (RR_TIMESLICE_TICKS * 1000) / axconfig::TICKS_PER_SEC;
+    if ms == 0 { 1 } else { ms as u32 }
+};
+static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub(crate) struct SchedParam {
@@ -73,37 +90,8 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid == 0 {
         Ok(current().clone())
     } else {
-        // sched_setscheduler resolves PIDTYPE_PID in the caller's active
-        // namespace.  Setters never operate on an exiting task or a zombie.
-        let caller_ns = current().as_thread().proc_data.pid_ns();
-        visible_task_for_ioprio(pid as Pid, &caller_ns)
+        get_task(pid as Pid)
     }
-}
-
-/// Resolves the `sched_rr_get_interval(2)` target in the calling task's PID
-/// namespace. Unlike scheduler setters, this ABI names an exact live TID:
-/// resolve the vpid through the caller namespace before reading scheduler
-/// state.
-fn sched_rr_interval_target(pid: i32) -> AxResult<AxTaskRef> {
-    if pid < 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let caller = current();
-    if pid == 0 {
-        return Ok(caller.clone());
-    }
-
-    let caller_ns = caller.as_thread().proc_data.pid_ns();
-    let global_tid = caller_ns
-        .resolve_visible_pid(pid as Pid)
-        .ok_or(AxError::NoSuchProcess)?;
-    let task = get_visible_task(global_tid)?;
-    let target_ns = task.as_thread().proc_data.pid_ns();
-    if !caller_ns.contains(&target_ns) {
-        return Err(AxError::NoSuchProcess);
-    }
-    Ok(task)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -126,7 +114,7 @@ fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
         // known capability as unsupported instead of running it as EEVDF.
         SCHED_DEADLINE => match abi {
             SchedSetAbi::Legacy => Err(AxError::InvalidInput),
-            SchedSetAbi::Attr => Err(AxError::OperationNotSupported),
+            SchedSetAbi::Attr => Ok(SchedClass::Deadline),
         },
         _ => Err(AxError::InvalidInput),
     }
@@ -199,6 +187,24 @@ fn validate_nice(nice: i32) -> AxResult<i8> {
     }
 }
 
+fn validate_deadline_parameters(attr: &SchedAttr) -> AxResult<()> {
+    if attr.sched_priority != 0
+        || attr.sched_runtime == 0
+        || attr.sched_deadline == 0
+        || attr.sched_runtime > attr.sched_deadline
+        || (attr.sched_period != 0 && attr.sched_deadline > attr.sched_period)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn sched_reset_on_fork(task: &AxTaskRef) -> AxResult<bool> {
+    scheduler_state_snapshot(task)
+        .map(|commit| commit.reset_on_fork)
+        .map_err(map_sched_error)
+}
+
 fn linux_policy_from_state(state: SchedState, reset_on_fork: bool) -> i32 {
     linux_policy_from_parts(state, reset_on_fork)
 }
@@ -214,6 +220,7 @@ fn linux_policy_from_class(class: SchedClass, reset_on_fork: bool) -> i32 {
         SchedClass::Idle => SCHED_IDLE as i32,
         SchedClass::Fifo => SCHED_FIFO as i32,
         SchedClass::RoundRobin => SCHED_RR as i32,
+        SchedClass::Deadline => SCHED_DEADLINE as i32,
     };
 
     if reset_on_fork {
@@ -226,7 +233,7 @@ fn linux_policy_from_class(class: SchedClass, reset_on_fork: bool) -> i32 {
 fn state_static_priority(state: SchedState) -> i32 {
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => state.rt_priority as i32,
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle | SchedClass::Deadline => 0,
     }
 }
 
@@ -234,6 +241,7 @@ fn state_nice(state: SchedState) -> i32 {
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => 0,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => state.nice as i32,
+        SchedClass::Deadline => 0,
     }
 }
 
@@ -257,7 +265,9 @@ fn read_sched_attr<M: UserMemory + ?Sized>(
         attr_size = SCHED_ATTR_SIZE_VER0;
     }
     if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&attr_size) {
-        write_sched_attr_kernel_size(memory, attr)?;
+        // Linux returns E2BIG after a readable size even if this best-effort
+        // write-back lands on a read-only mapping.
+        let _ = write_sched_attr_kernel_size(memory, attr);
         return Err(LinuxError::E2BIG.into());
     }
 
@@ -277,7 +287,7 @@ fn read_sched_attr<M: UserMemory + ?Sized>(
         )
         .map_err(map_usercopy_error)?;
         if extra.iter().any(|byte| *byte != 0) {
-            write_sched_attr_kernel_size(memory, attr)?;
+            let _ = write_sched_attr_kernel_size(memory, attr);
             return Err(LinuxError::E2BIG.into());
         }
     }
@@ -290,39 +300,12 @@ fn raw_priority_from_nice(nice: i8) -> isize {
     20 - nice as isize
 }
 
-fn interval_from_scheduler_ticks(ticks: usize) -> Duration {
-    let ticks = ticks as u128;
-    let hz = axconfig::TICKS_PER_SEC as u128;
-    let milliseconds = ticks.saturating_mul(1_000).div_ceil(hz);
-    Duration::from_millis(milliseconds.min(u64::MAX as u128) as u64)
-}
-
-fn sched_query_error(error: TaskSchedError) -> AxError {
-    match error {
-        TaskSchedError::Unsupported => AxError::OperationNotSupported,
-        TaskSchedError::TaskExited => AxError::NoSuchProcess,
-        TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
-            AxError::WouldBlock
-        }
-    }
-}
-
-fn rr_interval_for_task(task: &AxTaskRef) -> AxResult<Duration> {
-    let snapshot = task_timeslice(task).map_err(sched_query_error)?;
-    match snapshot.class {
-        SchedClass::RoundRobin | SchedClass::Normal | SchedClass::Batch => {
-            Ok(interval_from_scheduler_ticks(snapshot.interval_ticks))
-        }
-        SchedClass::Idle | SchedClass::Fifo => Ok(Duration::ZERO),
-    }
-}
-
 fn fair_runtime_ns(class: SchedClass) -> u64 {
     let ticks = match class {
         SchedClass::Normal => axtask::EEVDF_PROFILE.normal_target_ticks,
         SchedClass::Batch => axtask::EEVDF_PROFILE.batch_target_ticks,
         SchedClass::Idle => axtask::EEVDF_PROFILE.idle_target_ticks,
-        SchedClass::Fifo | SchedClass::RoundRobin => return 0,
+        SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => return 0,
     };
     ticks
         .saturating_mul(1_000_000_000)
@@ -331,12 +314,25 @@ fn fair_runtime_ns(class: SchedClass) -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn rr_interval_for_state(state: SchedState) -> Duration {
+    if matches!(state.class, SchedClass::RoundRobin) {
+        Duration::from_millis(sched_rr_timeslice_ms() as u64)
+    } else {
+        Duration::ZERO
+    }
+}
+
 pub fn sched_rr_timeslice_ms() -> u32 {
-    rr_timeslice_ms()
+    SCHED_RR_TIMESLICE_MS.load(Ordering::Relaxed)
 }
 
 pub fn set_sched_rr_timeslice_ms(value: i32) {
-    set_scheduler_rr_timeslice_ms(value);
+    let value = if value <= 0 {
+        SCHED_RR_TIMESLICE_MS_DEFAULT
+    } else {
+        value as u32
+    };
+    SCHED_RR_TIMESLICE_MS.store(value, Ordering::Relaxed);
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
@@ -369,15 +365,8 @@ fn apply_sched_state_with_reset(
     state: SchedState,
     reset_on_fork: bool,
 ) -> AxResult<isize> {
-    let commit =
-        set_sched_state_versioned_with_reset(task, state, reset_on_fork).map_err(|error| {
-            match error {
-                TaskSchedError::Unsupported => AxError::OperationNotSupported,
-                TaskSchedError::TaskExited => AxError::NoSuchProcess,
-                TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
-                TaskSchedError::Scheduler(_) => AxError::InvalidInput,
-            }
-        })?;
+    let commit = set_sched_state_versioned_with_reset(task, state, reset_on_fork)
+        .map_err(map_sched_error)?;
     publish_sched_commit(task, commit);
     Ok(0)
 }
@@ -410,113 +399,84 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
         SchedSetAbi::Legacy,
     )?;
-    // Linux rejects malformed policy/priority tuples before DAC/capability or
-    // LSM policy checks, so an invalid request cannot be turned into EPERM.
+    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let old_state = sched_state(task);
     let requested_rt_priority = match class {
         SchedClass::Fifo | SchedClass::RoundRobin => validate_rt_priority(priority)?,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-            validate_static_priority(priority)?;
-            // SCHED_IDLE is a scheduling class, not an implicit nice(19).
-            // Keep the current nice value exactly as Linux does.
-            0
+            validate_static_priority(priority)?
         }
+        SchedClass::Deadline => return Err(AxError::InvalidInput),
     };
     let authority = scheduler_authority_snapshot(task)?;
-    let rlimit_rtprio = task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current;
-    let rlimit_nice = task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
-    // Decide authority and commit class, priority, reset bit, and version in
-    // one run-queue transaction.  A failed policy check cannot roll back a
-    // concurrent scheduler update through a stale whole-state snapshot.
-    let commit = update_sched_state_versioned_with_reset(task, |old| {
-        let current_realtime = matches!(old.state.class, SchedClass::Fifo | SchedClass::RoundRobin);
-        let requested_realtime = matches!(class, SchedClass::Fifo | SchedClass::RoundRobin);
-        authority.authorize(SchedulerSecurityOperation::SetPolicy {
-            policy_changed: old.state.class != class,
-            current_realtime,
-            current_rt_priority: old.state.rt_priority,
-            requested_realtime,
-            requested_rt_priority,
-            rlimit_rtprio,
-            current_idle: matches!(old.state.class, SchedClass::Idle),
-            requested_idle: matches!(class, SchedClass::Idle),
-            current_nice: old.state.nice,
-            requested_nice: old.state.nice,
-            rlimit_nice,
-            current_reset_on_fork: old.reset_on_fork,
-            reset_on_fork,
-        })?;
-        let mut state = old.state;
-        state.class = class;
-        state.rt_priority = requested_rt_priority;
-        // RT scheduling does not erase the task's saved nice value. Linux
-        // restores that value when a later policy change returns to a fair
-        // class, so it must travel through this transaction untouched.
-        Ok::<_, AxError>((state, reset_on_fork))
-    })
-    .map_err(map_sched_error)??;
-    publish_sched_commit(task, commit);
-    Ok(0)
+    authority.authorize(SchedulerSecurityOperation::SetPolicy {
+        policy_changed: old_state.class != class,
+        current_realtime: matches!(
+            old_state.class,
+            SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline
+        ),
+        current_rt_priority: old_state.rt_priority,
+        requested_realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
+        requested_rt_priority,
+        rlimit_rtprio: thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current,
+        current_idle: matches!(old_state.class, SchedClass::Idle),
+        requested_idle: matches!(class, SchedClass::Idle),
+        current_nice: old_state.nice,
+        requested_nice: old_state.nice,
+        rlimit_nice: thread.proc_data.rlim.read()[RLIMIT_NICE].current,
+        current_reset_on_fork: sched_reset_on_fork(task)?,
+        reset_on_fork,
+    })?;
+    let mut state = sched_state(task);
+    state.class = class;
+    match class {
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            state.rt_priority = validate_rt_priority(priority)?;
+            state.nice = 0;
+        }
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            state.rt_priority = validate_static_priority(priority)?;
+            if matches!(class, SchedClass::Idle) {
+                state.nice = 19;
+            }
+        }
+        SchedClass::Deadline => return Err(AxError::InvalidInput),
+    }
+    apply_sched_state_with_reset(task, state, reset_on_fork)
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
-    let (actor_task, actor_cred) = scheduler_actor_snapshot();
-    let result = update_sched_state_versioned_with_reset(task, |commit| {
-        let realtime = matches!(
-            commit.state.class,
-            SchedClass::Fifo | SchedClass::RoundRobin
-        );
-        let new_rt_priority = if realtime {
-            validate_rt_priority(priority)?
-        } else {
-            validate_static_priority(priority)?;
-            0
-        };
-        let target_cred = scheduler_target_credential(&actor_task, &actor_cred, task)?;
-        let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-        let rlimit_rtprio = target_thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current;
-        SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred).authorize(
-            SchedulerSecurityOperation::SetParam {
-                realtime,
-                old_rt_priority: commit.state.rt_priority,
-                new_rt_priority,
-                rlimit_rtprio,
-            },
-        )?;
-        let mut state = commit.state;
-        state.rt_priority = new_rt_priority;
-        Ok((state, commit.reset_on_fork))
-    });
-    match result {
-        Ok(Ok(commit)) => {
-            publish_sched_commit(task, commit);
-            Ok(0)
+    let mut state = sched_state(task);
+    let realtime = matches!(state.class, SchedClass::Fifo | SchedClass::RoundRobin);
+    let new_rt_priority = if realtime {
+        validate_rt_priority(priority)?
+    } else {
+        validate_static_priority(priority)?;
+        0
+    };
+    let rlimit_rtprio = task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current;
+    scheduler_authority_snapshot(task)?.authorize(SchedulerSecurityOperation::SetParam {
+        realtime,
+        old_rt_priority: state.rt_priority,
+        new_rt_priority,
+        rlimit_rtprio,
+    })?;
+    match state.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            state.rt_priority = new_rt_priority;
         }
-        Ok(Err(error)) => Err(error),
-        Err(error) => Err(match error {
-            TaskSchedError::Unsupported => AxError::OperationNotSupported,
-            TaskSchedError::TaskExited => AxError::NoSuchProcess,
-            TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
-            TaskSchedError::Scheduler(_) => AxError::InvalidInput,
-        }),
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            state.rt_priority = 0;
+        }
+        SchedClass::Deadline => return Err(AxError::InvalidInput),
     }
-}
-
-fn validate_sched_setparam_arguments(pid: i32, param: *const SchedParam) -> AxResult {
-    // Linux rejects an invalid pid before touching the user pointer.  Keeping
-    // this separate makes that errno ordering explicit and testable.
-    if pid < 0 || param.is_null() {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
+    apply_sched_state(task, state)
 }
 
 fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
-    // SCHED_EXT is a queryable Linux policy even though this kernel has no
-    // sched_ext execution class.
-    const SCHED_EXT: u32 = 7;
     match policy as u32 {
         SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN as isize, RT_PRIORITY_MAX as isize)),
-        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Ok((0, 0)),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -873,38 +833,19 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
     cpusetsize: usize,
     user_mask: *mut u8,
 ) -> AxResult<isize> {
-    // The native x86_64 ABI argument is C `unsigned int`; raw callers are
-    // not required to clear the high register word.
-    let cpusetsize = syscall_c_uint(cpusetsize);
-    let nr_cpu_ids = task_affinity_nr_cpu_ids();
-    let kernel_mask_bytes = task_affinity_mask_bytes();
-    if cpusetsize < nr_cpu_ids.div_ceil(u8::BITS as usize) || cpusetsize % size_of::<usize>() != 0 {
+    let cpu_count = axhal::cpu_num().max(1);
+    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
+    if cpusetsize < kernel_mask_bytes {
         return Err(AxError::InvalidInput);
     }
 
-    let target = if pid == 0 {
-        SchedGetSchedulerTarget::Live(current().clone())
-    } else {
-        let caller_ns = current().as_thread().proc_data.pid_ns();
-        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_ns) {
-            SchedGetSchedulerTarget::Live(task)
-        } else {
-            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_ns)?)
-        }
-    };
-    let (_, actor_cred) = scheduler_actor_snapshot();
-    let target_cred = target.credential()?;
-    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
-        &actor_cred,
-        &target_cred,
-    ))?;
-    let mask = target.affinity()?;
+    let mask = sched_target(pid)?.cpumask();
     let mut mask_bytes = Vec::new();
     mask_bytes
         .try_reserve_exact(kernel_mask_bytes)
         .map_err(|_| AxError::NoMemory)?;
     mask_bytes.resize(kernel_mask_bytes, 0);
-    for cpu in 0..nr_cpu_ids {
+    for cpu in 0..cpu_count {
         if mask.get(cpu) {
             mask_bytes[cpu / u8::BITS as usize] |= 1 << (cpu % u8::BITS as usize);
         }
@@ -919,24 +860,6 @@ fn linux_cpumask_bytes(cpu_count: usize) -> usize {
     cpu_count.max(1).div_ceil(usize::BITS as usize) * size_of::<usize>()
 }
 
-fn sched_setaffinity_copy_len(raw_size: usize, kernel_mask_bytes: usize) -> usize {
-    (raw_size as u32 as usize).min(kernel_mask_bytes)
-}
-
-fn sched_setaffinity_mask_from_bytes(bytes: &[u8], cpu_count: usize) -> AxCpuMask {
-    let mut cpu_mask = AxCpuMask::new();
-    for cpu in 0..cpu_count {
-        // An absent byte is the zero-filled tail of a short user cpumask.
-        if bytes
-            .get(cpu / u8::BITS as usize)
-            .is_some_and(|byte| byte & (1 << (cpu % u8::BITS as usize)) != 0)
-        {
-            cpu_mask.set(cpu, true);
-        }
-    }
-    cpu_mask
-}
-
 pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
@@ -944,29 +867,28 @@ pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     user_mask: *const u8,
 ) -> AxResult<isize> {
     let cpu_count = axhal::cpu_num().max(1);
-    let kernel_mask_bytes = linux_cpumask_bytes(axconfig::plat::MAX_CPU_NUM);
-    // x86_64 syscall ABI truncates `size_t` to the low C unsigned word here.
-    let copy_len = sched_setaffinity_copy_len(cpusetsize, kernel_mask_bytes);
-    let copied = vm_load(memory, user_mask, copy_len).map_err(map_usercopy_error)?;
-    let cpu_mask = sched_setaffinity_mask_from_bytes(&copied, cpu_count);
-
-    if pid < 0 {
-        return Err(AxError::NoSuchProcess);
+    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
+    if cpusetsize < kernel_mask_bytes {
+        return Err(AxError::InvalidInput);
     }
-    let target = if pid == 0 {
-        SchedGetSchedulerTarget::Live(current().clone())
-    } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
-        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
-            SchedGetSchedulerTarget::Live(task)
-        } else {
-            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+
+    let user_mask = vm_load(memory, user_mask, kernel_mask_bytes).map_err(map_usercopy_error)?;
+    let mut cpu_mask = AxCpuMask::new();
+
+    for i in 0..cpu_count {
+        if user_mask[i / 8] & (1 << (i % 8)) != 0 {
+            cpu_mask.set(i, true);
         }
-    };
-    let (_, actor_cred) = scheduler_actor_snapshot();
-    SchedulerAuthoritySnapshot::new(actor_cred, target.credential()?)
-        .authorize(SchedulerSecurityOperation::SetAffinity)?;
-    target.set_affinity(cpu_mask)?;
+    }
+
+    let task = sched_target(pid)?;
+    scheduler_authority_snapshot(&task)?.authorize(SchedulerSecurityOperation::SetAffinity)?;
+
+    if pid == 0 {
+        axtask::set_current_affinity(cpu_mask)?;
+    } else {
+        set_task_affinity(&task, cpu_mask)?;
+    }
 
     Ok(0)
 }
@@ -991,30 +913,8 @@ pub fn sys_getcpu<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
-    if pid < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let target = if pid == 0 {
-        SchedGetSchedulerTarget::Live(current().clone())
-    } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
-        // Linux resolves a nonzero argument as PIDTYPE_PID in the caller's
-        // active namespace.  Do not let a global TID or a hidden namespace
-        // collision escape through the task registry fast path.
-        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
-            SchedGetSchedulerTarget::Live(task)
-        } else {
-            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
-        }
-    };
-    let (actor_task, actor_cred) = scheduler_actor_snapshot();
-    let target_cred = target.credential()?;
-    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
-        &actor_cred,
-        &target_cred,
-    ))?;
-    let _ = actor_task;
-    Ok(target.policy()? as isize)
+    let task = sched_target(pid)?;
+    Ok(linux_policy_from_state(sched_state(&task), sched_reset_on_fork(&task)?) as isize)
 }
 
 pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
@@ -1022,7 +922,9 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
     pid: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    validate_sched_setparam_arguments(pid, param)?;
+    if param.is_null() {
+        return Err(AxError::InvalidInput);
+    }
     let priority = unsafe {
         param
             .vm_read_uninit(memory)
@@ -1030,13 +932,7 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .sched_priority;
-    let task = if pid == 0 {
-        current().clone()
-    } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
-        visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns)
-            .ok_or(AxError::NoSuchProcess)?
-    };
+    let task = sched_target(pid)?;
     update_sched_param(&task, priority)
 }
 
@@ -1046,9 +942,7 @@ pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
     policy: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    // Linux validates these scalar ABI arguments before attempting usercopy.
-    // Keep the ordering observable for invalid pointers and hidden PIDs.
-    if policy < 0 || pid < 0 || param.is_null() {
+    if param.is_null() {
         return Err(AxError::InvalidInput);
     }
     let priority = unsafe {
@@ -1070,25 +964,7 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    if pid < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let target = if pid == 0 {
-        SchedGetSchedulerTarget::Live(current().clone())
-    } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
-        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
-            SchedGetSchedulerTarget::Live(task)
-        } else {
-            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
-        }
-    };
-    let (_, actor_cred) = scheduler_actor_snapshot();
-    let target_cred = target.credential()?;
-    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
-        &actor_cred,
-        &target_cred,
-    ))?;
+    let task = sched_target(pid)?;
     // `SchedParam` is a complete `repr(C)` value containing only its i32
     // priority field, so its initialized representation is safe to copy out
     // through the explicitly bound user-memory context.
@@ -1097,7 +973,7 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
             param,
             memory,
             SchedParam {
-                sched_priority: target.static_priority()?,
+                sched_priority: state_static_priority(sched_state(&task)),
             },
         )
         .map_err(map_usercopy_error)?;
@@ -1118,23 +994,12 @@ pub fn sys_sched_rr_get_interval<M: UserMemory + ?Sized>(
     pid: i32,
     interval: *mut timespec,
 ) -> AxResult<isize> {
-    let task = sched_rr_interval_target(pid)?;
-    // Authorize this exact live TID after PID-namespace resolution, before
-    // sampling scheduler state or touching user memory.
-    let (_, actor_cred) = scheduler_actor_snapshot();
-    let target_cred = task
-        .try_as_thread()
-        .ok_or(AxError::NoSuchProcess)?
-        .current_cred();
-    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
-        &actor_cred,
-        &target_cred,
-    ))?;
+    let task = sched_target(pid)?;
     unsafe {
         VmMutPtr::vm_write_unchecked(
             interval,
             memory,
-            timespec::from_time_value(rr_interval_for_task(&task)?),
+            timespec::from_time_value(rr_interval_for_state(sched_state(&task))),
         )
         .map_err(map_usercopy_error)?;
     }
@@ -1152,66 +1017,241 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
     }
 
     let attr = read_sched_attr(memory, attr)?;
-    if attr.sched_flags & !SUPPORTED_SCHED_ATTR_FLAGS != 0 {
+    if (attr.sched_policy as i32) < 0 {
         return Err(AxError::InvalidInput);
     }
-    if attr.sched_util_min != 0 || attr.sched_util_max != 0 {
+    let keep_policy = attr.sched_flags & SCHED_FLAG_KEEP_POLICY as u64 != 0;
+    let keep_params = attr.sched_flags & SCHED_FLAG_KEEP_PARAMS as u64 != 0;
+    let task = if pid == 0 {
+        current().clone()
+    } else {
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns)
+            .filter(|task| !task.as_thread().pending_exit())
+            .ok_or(AxError::NoSuchProcess)?
+    };
+    if attr.sched_flags & !SCHED_ATTR_KNOWN_FLAGS != 0 {
         return Err(AxError::InvalidInput);
+    }
+    if attr.sched_flags & (SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_UTIL_CLAMP_MAX) != 0
+        && (attr.size as usize) < size_of::<SchedAttr>()
+    {
+        return Err(AxError::InvalidInput);
+    }
+    let requested_class = if keep_policy {
+        None
+    } else {
+        if attr.sched_policy == SCHED_DEADLINE {
+            validate_deadline_parameters(&attr)?;
+        }
+        Some(sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?)
+    };
+    let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
+    let (actor_task, actor_cred) = scheduler_actor_snapshot();
+    let result = update_sched_attr_versioned(&task, |old| {
+        let class = requested_class.unwrap_or(old.state.class);
+        let target_cred = scheduler_target_credential(&actor_task, &actor_cred, &task)?;
+        let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+        let rlimit_rtprio = target_thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current;
+        let rlimit_nice = target_thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+        let authority = SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred);
+        let mut state = old.state;
+        let old_class = state.class;
+        let old_nice = state.nice;
+        let old_rt_priority = state.rt_priority;
+        state.class = class;
+        // SCHED_DEADLINE admission is never relaxed by RLIMIT_RTPRIO: Linux
+        // requires CAP_SYS_NICE both to enter it and to change its parameters.
+        if matches!(class, SchedClass::Deadline)
+            && !ns_capable(&actor_cred, target_cred.user_ns(), CAP_SYS_NICE)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        match class {
+            SchedClass::Fifo | SchedClass::RoundRobin => {
+                state.rt_priority = if keep_params {
+                    validate_rt_priority(old_rt_priority as i32)?
+                } else {
+                    if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0
+                    {
+                        return Err(AxError::InvalidInput);
+                    }
+                    validate_rt_priority(attr.sched_priority as i32)?
+                };
+            }
+            SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+                if keep_params {
+                    validate_static_priority(0)?;
+                } else {
+                    if attr.sched_runtime != 0 {
+                        return Err(AxError::OperationNotSupported);
+                    }
+                    if attr.sched_deadline != 0 || attr.sched_period != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    validate_static_priority(attr.sched_priority as i32)?;
+                }
+                state.rt_priority = 0;
+                state.nice = if keep_params {
+                    old_nice
+                } else {
+                    validate_nice(attr.sched_nice)?
+                };
+            }
+            SchedClass::Deadline => {
+                let deadline = if keep_params {
+                    old.deadline
+                } else {
+                    validate_deadline_parameters(&attr)?;
+                    DeadlineConfig {
+                        runtime_ns: attr.sched_runtime,
+                        deadline_ns: attr.sched_deadline,
+                        period_ns: attr.sched_period,
+                    }
+                };
+                if deadline.normalized_linux().is_none() {
+                    return Err(AxError::InvalidInput);
+                }
+                state.rt_priority = 0;
+                state.nice = 0;
+            }
+        }
+        authority.authorize(SchedulerSecurityOperation::SetPolicy {
+            policy_changed: old_class != class,
+            current_realtime: matches!(
+                old_class,
+                SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline
+            ),
+            current_rt_priority: old_rt_priority,
+            requested_realtime: matches!(
+                class,
+                SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline
+            ),
+            requested_rt_priority: state.rt_priority,
+            rlimit_rtprio,
+            current_idle: matches!(old_class, SchedClass::Idle),
+            requested_idle: matches!(class, SchedClass::Idle),
+            current_nice: old_nice,
+            requested_nice: state.nice,
+            rlimit_nice,
+            current_reset_on_fork: old.reset_on_fork,
+            reset_on_fork,
+        })?;
+        let util_min = if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN != 0 {
+            attr.sched_util_min
+        } else {
+            old.util_min
+        };
+        let util_max = if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX != 0 {
+            attr.sched_util_max
+        } else {
+            old.util_max
+        };
+        if util_min > util_max || util_max > 1024 {
+            return Err(AxError::InvalidInput);
+        }
+        let fair_runtime_ns = match class {
+            SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+                if keep_params {
+                    old.fair_runtime_ns
+                } else {
+                    0
+                }
+            }
+            SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => 0,
+        };
+        let deadline = if matches!(class, SchedClass::Deadline) {
+            if keep_params {
+                old.deadline
+            } else {
+                DeadlineConfig {
+                    runtime_ns: attr.sched_runtime,
+                    deadline_ns: attr.sched_deadline,
+                    period_ns: attr.sched_period,
+                }
+            }
+        } else {
+            DeadlineConfig::default()
+        };
+        Ok::<_, AxError>(TaskSchedAttrUpdate {
+            state,
+            reset_on_fork,
+            fair_runtime_ns,
+            deadline,
+            util_min,
+            util_max,
+        })
+    });
+    match result {
+        Ok(Ok(commit)) => {
+            publish_sched_commit(&task, commit);
+            Ok(0)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(map_sched_error(error)),
+    }
+}
+
+enum SchedGetAttrTarget {
+    Live(AxTaskRef),
+    Zombie(Arc<Process>),
+}
+
+impl SchedGetAttrTarget {
+    fn credential(&self) -> AxResult<Arc<Cred>> {
+        match self {
+            Self::Live(task) => task
+                .try_as_thread()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|thread| thread.current_cred()),
+            Self::Zombie(process) => process
+                .zombie_payload()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|snapshot| snapshot.credential.clone()),
+        }
     }
 
-    // Reject the known-but-unimplemented class before task lookup, permission
-    // checks, or scheduler-state publication. This keeps failure free of
-    // target-dependent side effects and prevents a fake Deadline snapshot.
-    let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
-    let task = sched_target(pid)?;
-    let authority = scheduler_authority_snapshot(&task)?;
-    let mut state = sched_state(&task);
-    let old_nice = state.nice;
-    let old_class = state.class;
-    let old_rt_priority = state.rt_priority;
-    let old_reset_on_fork = scheduler_state_snapshot(&task)
-        .map_err(|_| AxError::NoSuchProcess)?
-        .reset_on_fork;
-    state.class = class;
-    match class {
-        SchedClass::Fifo | SchedClass::RoundRobin => {
-            if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
-                return Err(AxError::InvalidInput);
+    fn snapshot(&self) -> AxResult<(SchedState, bool, u64, u64, u64, u64, u32, u32)> {
+        match self {
+            Self::Live(task) => scheduler_attr_snapshot(task)
+                .map(|snapshot| {
+                    (
+                        snapshot.commit.state,
+                        snapshot.commit.reset_on_fork,
+                        snapshot.fair_runtime_ns,
+                        snapshot.deadline_runtime_ns,
+                        snapshot.deadline_ns,
+                        snapshot.period_ns,
+                        snapshot.util_min,
+                        snapshot.util_max,
+                    )
+                })
+                .map_err(|error| match error {
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                }),
+            Self::Zombie(process) => {
+                let snapshot = zombie_scheduler_state(process)?;
+                Ok((
+                    SchedState {
+                        class: snapshot.class,
+                        nice: snapshot.nice,
+                        rt_priority: snapshot.rt_priority,
+                    },
+                    snapshot.reset_on_fork,
+                    fair_runtime_ns(snapshot.class),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
             }
-            state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
-        }
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-            if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
-            let requested_nice = validate_nice(attr.sched_nice)?;
-            let rlimit_nice = current().as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
-            authority.authorize(SchedulerSecurityOperation::SetNice {
-                current_nice: old_nice,
-                requested_nice,
-                rlimit_nice,
-            })?;
-            state.nice = requested_nice;
         }
     }
-    authority.authorize(SchedulerSecurityOperation::SetPolicy {
-        policy_changed: old_class != class,
-        current_realtime: matches!(old_class, SchedClass::Fifo | SchedClass::RoundRobin),
-        current_rt_priority: old_rt_priority,
-        requested_realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
-        requested_rt_priority: state.rt_priority,
-        rlimit_rtprio: task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current,
-        current_idle: matches!(old_class, SchedClass::Idle),
-        requested_idle: matches!(class, SchedClass::Idle),
-        current_nice: old_nice,
-        requested_nice: state.nice,
-        rlimit_nice: task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current,
-        current_reset_on_fork: old_reset_on_fork,
-        reset_on_fork: attr.sched_flags & SCHED_FLAG_RESET_ON_FORK as u64 != 0,
-    })?;
-    let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
-    apply_sched_state_with_reset(&task, state, reset_on_fork)
 }
 
 pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
@@ -1231,13 +1271,13 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     }
 
     let target = if pid == 0 {
-        SchedGetSchedulerTarget::Live(current().clone())
+        SchedGetAttrTarget::Live(current().clone())
     } else {
         let caller_pid_ns = current().as_thread().proc_data.pid_ns();
         if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
-            SchedGetSchedulerTarget::Live(task)
+            SchedGetAttrTarget::Live(task)
         } else {
-            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+            SchedGetAttrTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
         }
     };
     let (_, actor_cred) = scheduler_actor_snapshot();
@@ -1246,30 +1286,41 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         &actor_cred,
         &target_cred,
     ))?;
-    let snapshot = target.attr_snapshot()?;
+    let (
+        state,
+        reset_on_fork,
+        fair_runtime_ns,
+        deadline_runtime_ns,
+        deadline_ns,
+        period_ns,
+        util_min,
+        util_max,
+    ) = target.snapshot()?;
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
-        sched_policy: linux_policy_from_state(snapshot.state, snapshot.reset_on_fork) as u32
-            & !SCHED_RESET_ON_FORK,
-        sched_flags: if snapshot.reset_on_fork {
+        sched_policy: linux_policy_from_state(state, reset_on_fork) as u32 & !SCHED_RESET_ON_FORK,
+        sched_flags: if reset_on_fork {
             SUPPORTED_SCHED_ATTR_FLAGS
         } else {
             0
         },
-        sched_nice: state_nice(snapshot.state),
-        sched_priority: state_static_priority(snapshot.state) as u32,
-        sched_runtime: snapshot.fair_runtime_ns,
-        sched_deadline: snapshot.deadline_ns,
-        sched_period: snapshot.period_ns,
-        sched_util_min: snapshot.util_min,
-        sched_util_max: snapshot.util_max,
+        sched_nice: state_nice(state),
+        sched_priority: state_static_priority(state) as u32,
+        sched_runtime: if matches!(state.class, SchedClass::Deadline) {
+            deadline_runtime_ns
+        } else {
+            fair_runtime_ns
+        },
+        sched_deadline: deadline_ns,
+        sched_period: period_ns,
+        sched_util_min: util_min,
+        sched_util_max: util_max,
     };
     out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
 
     memory
         .validate_write_range(attr as usize, out_size)
         .map_err(map_usercopy_error)?;
-
     let copy_size = out_size.min(size_of::<SchedAttr>());
     vm_write_slice(memory, attr.cast::<u8>(), unsafe {
         core::slice::from_raw_parts((&out as *const SchedAttr).cast::<u8>(), copy_size)
@@ -1284,10 +1335,6 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
 /// x86_64's register width.
 fn syscall_c_int(raw: usize) -> i32 {
     raw as u32 as i32
-}
-
-fn syscall_c_uint(raw: usize) -> usize {
-    raw as u32 as usize
 }
 
 fn visible_live_task_for_getpriority(
@@ -1650,7 +1697,7 @@ fn validate_ioprio(actor: &Cred, ioprio: u32) -> AxResult<()> {
 fn ioprio_default_for_sched(class: SchedClass, nice: i8) -> u16 {
     let class = match class {
         SchedClass::Idle => IOPRIO_CLASS_IDLE,
-        SchedClass::Fifo | SchedClass::RoundRobin => IOPRIO_CLASS_RT,
+        SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => IOPRIO_CLASS_RT,
         SchedClass::Normal | SchedClass::Batch => IOPRIO_CLASS_BE,
     };
     let level = ((nice as i32 + 20) / 5).clamp(0, 7) as u32;
@@ -1677,150 +1724,6 @@ fn ioprio_raw_for_task(task: &AxTaskRef) -> AxResult<u16> {
 enum IoprioTarget {
     Live(AxTaskRef),
     Zombie(Arc<Process>),
-}
-
-/// The only two Linux-visible scheduler-query lifetimes.  A nonzero PID
-/// selects an exact live TID first; after final exit the process PID remains
-/// addressable until wait reaps its zombie payload.
-enum SchedGetSchedulerTarget {
-    Live(AxTaskRef),
-    Zombie(Arc<Process>),
-}
-
-#[derive(Clone, Copy)]
-struct SchedGetAttrSnapshot {
-    state: SchedState,
-    reset_on_fork: bool,
-    fair_runtime_ns: u64,
-    deadline_ns: u64,
-    period_ns: u64,
-    util_min: u32,
-    util_max: u32,
-}
-
-impl SchedGetSchedulerTarget {
-    fn credential(&self) -> AxResult<Arc<Cred>> {
-        match self {
-            Self::Live(task) => task
-                .try_as_thread()
-                .ok_or(AxError::NoSuchProcess)
-                .map(|thread| thread.current_cred()),
-            Self::Zombie(process) => process
-                .zombie_payload()
-                .ok_or(AxError::NoSuchProcess)
-                .map(|snapshot| snapshot.credential.clone()),
-        }
-    }
-
-    fn policy(&self) -> AxResult<i32> {
-        match self {
-            Self::Live(task) => {
-                let commit = scheduler_state_snapshot(task).map_err(|error| match error {
-                    // A task can terminalize after PID resolution. Linux
-                    // exposes no stale policy across that lifecycle edge.
-                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
-                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
-                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
-                        AxError::NoSuchProcess
-                    }
-                })?;
-                Ok(linux_policy_from_parts(commit.state, commit.reset_on_fork))
-            }
-            Self::Zombie(process) => {
-                let snapshot = zombie_scheduler_state(process)?;
-                Ok(linux_policy_from_class(
-                    snapshot.class,
-                    snapshot.reset_on_fork,
-                ))
-            }
-        }
-    }
-
-    fn static_priority(&self) -> AxResult<i32> {
-        match self {
-            Self::Live(task) => scheduler_state_snapshot(task)
-                .map(|commit| state_static_priority(commit.state))
-                .map_err(|error| match error {
-                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
-                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
-                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
-                        AxError::NoSuchProcess
-                    }
-                }),
-            Self::Zombie(process) => {
-                let snapshot = zombie_scheduler_state(process)?;
-                Ok(match snapshot.class {
-                    SchedClass::Fifo | SchedClass::RoundRobin => snapshot.rt_priority as i32,
-                    SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
-                })
-            }
-        }
-    }
-
-    fn affinity(&self) -> AxResult<AxCpuMask> {
-        match self {
-            Self::Live(task) => task_allowed_active_cpus(task).map_err(|error| match error {
-                TaskSchedError::TaskExited => AxError::NoSuchProcess,
-                TaskSchedError::Unsupported => AxError::OperationNotSupported,
-                TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
-                    AxError::NoSuchProcess
-                }
-            }),
-            Self::Zombie(process) => Ok(zombie_scheduler_state(process)?.affinity),
-        }
-    }
-
-    fn set_affinity(&self, affinity: AxCpuMask) -> AxResult<()> {
-        match self {
-            Self::Live(task) => set_task_affinity(task, affinity),
-            Self::Zombie(process) => {
-                // Use the exact active-CPU admission used by a live migration
-                // before touching the durable zombie snapshot.  The axtask
-                // run-queue registry is append-only (no CPU hotplug removal),
-                // so its Acquire snapshot remains valid through this commit.
-                validate_affinity_mask(affinity)?;
-                set_zombie_affinity(process, affinity)
-            }
-        }
-    }
-
-    fn attr_snapshot(&self) -> AxResult<SchedGetAttrSnapshot> {
-        match self {
-            Self::Live(task) => scheduler_attr_snapshot(task)
-                .map(|snapshot| SchedGetAttrSnapshot {
-                    state: snapshot.commit.state,
-                    reset_on_fork: snapshot.commit.reset_on_fork,
-                    fair_runtime_ns: snapshot.fair_runtime_ns,
-                    deadline_ns: snapshot.deadline_ns,
-                    period_ns: snapshot.period_ns,
-                    util_min: snapshot.util_min,
-                    util_max: snapshot.util_max,
-                })
-                .map_err(|error| match error {
-                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
-                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
-                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
-                        AxError::NoSuchProcess
-                    }
-                }),
-            Self::Zombie(process) => {
-                let snapshot = zombie_scheduler_state(process)?;
-                Ok(SchedGetAttrSnapshot {
-                    state: SchedState {
-                        class: snapshot.class,
-                        nice: snapshot.nice,
-                        rt_priority: snapshot.rt_priority,
-                    },
-                    reset_on_fork: snapshot.reset_on_fork,
-                    fair_runtime_ns: fair_runtime_ns(snapshot.class),
-                    deadline_ns: 0,
-                    period_ns: 0,
-                    util_min: 0,
-                    util_max: 0,
-                })
-            }
-        }
-    }
 }
 
 impl IoprioTarget {
@@ -2161,17 +2064,6 @@ mod tests {
     }
 
     #[test]
-    fn setaffinity_short_mask_is_zero_filled_and_size_is_abi_u32() {
-        let native = linux_cpumask_bytes(axconfig::plat::MAX_CPU_NUM);
-        assert_eq!(sched_setaffinity_copy_len(1, native), 1);
-        assert_eq!(sched_setaffinity_copy_len(usize::MAX, native), native);
-
-        let mask = sched_setaffinity_mask_from_bytes(&[0b0000_0010], 16);
-        assert!(mask.get(1));
-        assert!(!mask.get(9), "short-mask tail must be zero-filled");
-    }
-
-    #[test]
     fn clock_sleep_result_distinguishes_interrupt_from_completion() {
         assert_eq!(
             flatten_clock_sleep_result(Ok(Err(Interrupted))),
@@ -2296,35 +2188,33 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_policy_keeps_reset_on_fork_in_the_abi_word() {
-        assert_eq!(
-            linux_policy_from_class(SchedClass::RoundRobin, true),
-            SCHED_RR as i32 | SCHED_RESET_ON_FORK as i32
+    fn scheduler_update_rejects_missing_target_before_any_store() {
+        let state_updates = Cell::new(0);
+        let flag_updates = Cell::new(0);
+        let result = apply_sched_state_with_reset::<()>(
+            None,
+            || {
+                state_updates.set(state_updates.get() + 1);
+                Ok(0)
+            },
+            |_| flag_updates.set(flag_updates.get() + 1),
         );
-        assert_eq!(
-            linux_policy_from_class(SchedClass::Normal, false),
-            SCHED_NORMAL as i32
-        );
+        assert_eq!(result, Err(AxError::NoSuchProcess));
+        assert_eq!(state_updates.get(), 0);
+        assert_eq!(flag_updates.get(), 0);
     }
 
     #[test]
-    fn sched_getattr_fair_runtime_is_profile_owned_and_rt_is_zero() {
-        assert!(fair_runtime_ns(SchedClass::Normal) > 0);
-        assert!(fair_runtime_ns(SchedClass::Batch) > 0);
-        assert_eq!(fair_runtime_ns(SchedClass::Fifo), 0);
-        assert_eq!(fair_runtime_ns(SchedClass::RoundRobin), 0);
-    }
-
-    #[test]
-    fn sched_setparam_rejects_negative_pid_before_user_pointer() {
-        assert_eq!(
-            validate_sched_setparam_arguments(-1, core::ptr::null()),
-            Err(AxError::InvalidInput)
+    fn scheduler_failure_never_partially_stores_reset_on_fork() {
+        let target = ();
+        let flag_updates = Cell::new(0);
+        let result = apply_sched_state_with_reset(
+            Some(&target),
+            || Err(AxError::NoSuchProcess),
+            |_| flag_updates.set(flag_updates.get() + 1),
         );
-        assert_eq!(
-            validate_sched_setparam_arguments(0, core::ptr::null()),
-            Err(AxError::InvalidInput)
-        );
+        assert_eq!(result, Err(AxError::NoSuchProcess));
+        assert_eq!(flag_updates.get(), 0);
     }
 
     #[test]
@@ -2352,70 +2242,6 @@ mod tests {
         assert_eq!(
             linux_priority_bounds(SCHED_DEADLINE as i32).unwrap(),
             (0, 0)
-        );
-    }
-
-    #[test]
-    fn sched_get_priority_min_matches_linux_query_policy_set() {
-        for (policy, expected) in [
-            (SCHED_NORMAL as i32, 0),
-            (SCHED_FIFO as i32, RT_PRIORITY_MIN as isize),
-            (SCHED_RR as i32, RT_PRIORITY_MIN as isize),
-            (SCHED_BATCH as i32, 0),
-            (SCHED_IDLE as i32, 0),
-            (SCHED_DEADLINE as i32, 0),
-            (7, 0), // SCHED_EXT
-        ] {
-            assert_eq!(sys_sched_get_priority_min(policy), Ok(expected));
-        }
-        assert_eq!(sys_sched_get_priority_min(4), Err(AxError::InvalidInput));
-        assert_eq!(
-            sys_sched_get_priority_min(7 | SCHED_RESET_ON_FORK as i32),
-            Err(AxError::InvalidInput)
-        );
-    }
-
-    #[test]
-    fn sched_get_priority_min_uses_the_x86_64_low_i32_syscall_argument() {
-        let sched_ext_with_high_bits = (1usize << 32) | 7;
-        let invalid_with_high_bits = (1usize << 32) | 4;
-        assert_eq!(
-            sys_sched_get_priority_min(sched_ext_with_high_bits as i32),
-            Ok(0)
-        );
-        assert_eq!(
-            sys_sched_get_priority_min(invalid_with_high_bits as i32),
-            Err(AxError::InvalidInput)
-        );
-    }
-
-    #[test]
-    fn sched_get_priority_max_accepts_sched_ext_only_as_plain_i32_policy() {
-        const SCHED_EXT: i32 = 7;
-        assert_eq!(sys_sched_get_priority_max(SCHED_EXT), Ok(0));
-        assert_eq!(
-            sys_sched_get_priority_max(SCHED_EXT | SCHED_RESET_ON_FORK as i32),
-            Err(AxError::InvalidInput)
-        );
-    }
-
-    #[test]
-    fn sched_getparam_priority_is_rt_only() {
-        assert_eq!(
-            state_static_priority(SchedState {
-                class: SchedClass::Fifo,
-                nice: 0,
-                rt_priority: 73,
-            }),
-            73
-        );
-        assert_eq!(
-            state_static_priority(SchedState {
-                class: SchedClass::Normal,
-                nice: -20,
-                rt_priority: 0,
-            }),
-            0
         );
     }
 
@@ -2494,12 +2320,6 @@ mod tests {
     }
 
     #[test]
-    fn affinity_cpusetsize_decodes_the_x86_64_unsigned_int_word() {
-        assert_eq!(syscall_c_uint(0x1_0000_0000), 0);
-        assert_eq!(syscall_c_uint(0x1_0000_0008), 8);
-    }
-
-    #[test]
     fn setpriority_accumulator_preserves_target_failures() {
         let mut result = Err(AxError::NoSuchProcess);
         // A first success clears only the initial ESRCH accumulator.
@@ -2533,45 +2353,5 @@ mod tests {
         }
         assert_eq!(best, Some(-4));
         assert_eq!(raw_priority_from_nice(best.unwrap()), 24);
-    }
-
-    #[test]
-    fn sched_rr_interval_rounds_scheduler_ticks_up_to_milliseconds() {
-        assert_eq!(interval_from_scheduler_ticks(0), Duration::ZERO);
-        assert_eq!(
-            interval_from_scheduler_ticks(1),
-            Duration::from_millis(
-                (1_000u128).div_ceil(axconfig::TICKS_PER_SEC as u128) as u64
-            )
-        );
-    }
-
-    #[test]
-    fn sched_rr_interval_rejects_negative_pid_before_current_task_lookup() {
-        assert_eq!(sched_rr_interval_target(-1), Err(AxError::InvalidInput));
-    }
-
-    #[test]
-    fn sched_rr_timeslice_proc_value_roundtrips_requested_milliseconds() {
-        let previous = sched_rr_timeslice_ms();
-        set_sched_rr_timeslice_ms(1);
-        assert_eq!(sched_rr_timeslice_ms(), 1);
-        set_sched_rr_timeslice_ms(previous as i32);
-    }
-
-    #[test]
-    fn sched_rr_interval_query_maps_exited_task_to_esrch() {
-        assert_eq!(
-            sched_query_error(TaskSchedError::TaskExited),
-            AxError::NoSuchProcess
-        );
-    }
-
-    #[test]
-    fn sched_rr_interval_query_maps_bounded_scheduler_retry_to_eagain() {
-        assert_eq!(
-            LinuxError::from(sched_query_error(TaskSchedError::RunQueueUnavailable(0))),
-            LinuxError::EAGAIN
-        );
     }
 }
