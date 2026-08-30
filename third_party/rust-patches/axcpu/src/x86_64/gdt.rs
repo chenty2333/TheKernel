@@ -1,18 +1,25 @@
+use core::arch::asm;
+
 use x86_64::{
     PrivilegeLevel,
     instructions::tables::load_tss,
     registers::segmentation::{CS, Segment, SegmentSelector},
     structures::tss::TaskStateSegment,
 };
-use core::arch::asm;
 
 #[percpu::def_percpu]
 #[unsafe(no_mangle)]
 static TSS: TaskStateSegment = TaskStateSegment::new();
 
 #[repr(C, align(16))]
-struct CpuGdt { entries: [u64; 9] }
-impl CpuGdt { const fn new() -> Self { Self { entries: [0; 9] } } }
+struct CpuGdt {
+    entries: [u64; 9],
+}
+impl CpuGdt {
+    const fn new() -> Self {
+        Self { entries: [0; 9] }
+    }
+}
 
 #[percpu::def_percpu]
 static GDT: CpuGdt = CpuGdt::new();
@@ -29,11 +36,64 @@ pub const UCODE64: SegmentSelector = SegmentSelector::new(4, PrivilegeLevel::Rin
 pub const LDT: SegmentSelector = SegmentSelector::new(7, PrivilegeLevel::Ring0);
 
 #[repr(C, packed)]
-struct GdtPointer { limit: u16, base: u64 }
+struct GdtPointer {
+    limit: u16,
+    base: u64,
+}
 
 fn load_gdt(gdt: &CpuGdt) {
-    let pointer = GdtPointer { limit: (core::mem::size_of::<CpuGdt>() - 1) as u16, base: gdt.entries.as_ptr() as u64 };
-    unsafe { asm!("lgdt [{}]", in(reg) &pointer, options(nostack, preserves_flags)); }
+    let pointer = GdtPointer {
+        limit: (core::mem::size_of::<CpuGdt>() - 1) as u16,
+        base: gdt.entries.as_ptr() as u64,
+    };
+    unsafe {
+        asm!("lgdt [{}]", in(reg) &pointer, options(nostack, preserves_flags));
+    }
+}
+
+fn ldt_data_selector_is_usable(base: *const u8, bytes: usize, selector: u16) -> bool {
+    let index = (selector as usize) >> 3;
+    if index >= bytes / core::mem::size_of::<u64>() {
+        return false;
+    }
+    let descriptor = unsafe { core::ptr::read_unaligned(base.cast::<u64>().add(index)) };
+    let ty = (descriptor >> 40) & 0xf;
+    // LDT entries emitted by modify_ldt are ring-3 code/data descriptors.
+    // DS/ES accept data descriptors and readable code descriptors only.
+    descriptor & (1 << 47) != 0
+        && descriptor & (1 << 44) != 0
+        && (descriptor >> 45) & 3 == 3
+        && (ty & 8 == 0 || ty & 2 != 0)
+}
+
+unsafe fn refresh_ldt_data_segments(base: *const u8, bytes: usize) {
+    macro_rules! refresh {
+        ($segment:literal) => {{
+            let selector: u16;
+            unsafe {
+                asm!(
+                    concat!("mov {selector:x}, ", $segment),
+                    selector = out(reg) selector,
+                    options(nostack, preserves_flags)
+                )
+            };
+            if selector & 4 != 0 {
+                let selector = ldt_data_selector_is_usable(base, bytes, selector)
+                    .then_some(selector)
+                    .unwrap_or(0);
+                unsafe {
+                    asm!(
+                        concat!("mov ", $segment, ", {selector:x}"),
+                        selector = in(reg) selector,
+                        options(nostack, preserves_flags)
+                    )
+                };
+            }
+        }};
+    }
+
+    refresh!("ds");
+    refresh!("es");
 }
 
 /// Initializes the per-CPU TSS and GDT structures and loads them into the
@@ -46,8 +106,11 @@ pub(super) fn init() {
     gdt.entries[4] = 0x00affb000000ffff;
     let base = unsafe { TSS.current_ref_raw() } as *const _ as u64;
     let limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;
-    gdt.entries[5] = (limit & 0xffff) | ((base & 0xffffff) << 16)
-        | (9 << 40) | (1 << 47) | (((limit >> 16) & 0xf) << 48)
+    gdt.entries[5] = (limit & 0xffff)
+        | ((base & 0xffffff) << 16)
+        | (9 << 40)
+        | (1 << 47)
+        | (((limit >> 16) & 0xf) << 48)
         | (((base >> 24) & 0xff) << 56);
     gdt.entries[6] = base >> 32;
     let tss = SegmentSelector::new(5, PrivilegeLevel::Ring0);
@@ -64,17 +127,28 @@ pub unsafe fn load_ldt(base: *const u8, bytes: usize) {
     debug_assert!(!crate::asm::irqs_enabled());
     let gdt = unsafe { GDT.current_ref_mut_raw() };
     if bytes == 0 {
-        gdt.entries[7] = 0; gdt.entries[8] = 0;
+        gdt.entries[7] = 0;
+        gdt.entries[8] = 0;
         let selector: u16 = 0;
-        unsafe { asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags)); }
+        unsafe {
+            asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags));
+        }
+        unsafe { refresh_ldt_data_segments(base, bytes) };
         return;
     }
+    let table_base = base;
     let base = base as u64;
     let limit = (bytes - 1) as u64;
-    gdt.entries[7] = (limit & 0xffff) | ((base & 0xffffff) << 16)
-        | (2 << 40) | (1 << 47) | (((limit >> 16) & 0xf) << 48)
+    gdt.entries[7] = (limit & 0xffff)
+        | ((base & 0xffffff) << 16)
+        | (2 << 40)
+        | (1 << 47)
+        | (((limit >> 16) & 0xf) << 48)
         | (((base >> 24) & 0xff) << 56);
     gdt.entries[8] = base >> 32;
     let selector = LDT.0;
-    unsafe { asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags));
+    }
+    unsafe { refresh_ldt_data_segments(table_base, bytes) };
 }

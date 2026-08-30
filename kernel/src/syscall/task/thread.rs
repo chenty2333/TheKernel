@@ -19,20 +19,32 @@ pub fn sys_modify_ldt(
     const ZERO: [u8; 128] = [0; 128];
 
     match func {
-        0 | 2 => {
-            let bytes = bytes.min(if func == 0 { LDT_BYTES } else { ZERO.len() });
-            let table = (func == 0)
-                .then(|| memory.address_space().lock().ldt_snapshot())
-                .flatten();
-            let copied = table
-                .as_ref()
-                .map_or(0, |table| table.bytes().len().min(bytes));
+        0 => {
+            let Some(table) = memory.address_space().lock().ldt_snapshot() else {
+                // Linux reports an uninitialized LDT as empty without
+                // validating or touching the destination.
+                return Ok(0);
+            };
+            let bytes = bytes.min(LDT_BYTES);
+            let copied = table.bytes().len().min(bytes);
             if copied != 0 {
                 memory
-                    .write_bytes(ptr as usize, &table.as_ref().unwrap().bytes()[..copied])
+                    .write_bytes(ptr as usize, &table.bytes()[..copied])
                     .map_err(map_usercopy_error)?;
             }
             let mut offset = copied;
+            while offset < bytes {
+                let chunk = (bytes - offset).min(ZERO.len());
+                memory
+                    .write_bytes(ptr.wrapping_add(offset) as usize, &ZERO[..chunk])
+                    .map_err(map_usercopy_error)?;
+                offset += chunk;
+            }
+            Ok(bytes as isize)
+        }
+        2 => {
+            let bytes = bytes.min(ZERO.len());
+            let mut offset = 0;
             while offset < bytes {
                 let chunk = (bytes - offset).min(ZERO.len());
                 memory
