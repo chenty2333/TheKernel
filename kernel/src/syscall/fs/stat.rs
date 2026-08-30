@@ -23,11 +23,11 @@ use crate::{
         AfAlgSocket, Directory, File, FileLike, IoUring, NamedPipe, NetlinkSocket, PacketSocket, Pipe, Socket,
         UserfaultFile, get_file_like, PidFd,
         epoll::Epoll, event::EventFd, fanotify::FanotifyFile, inotify::InotifyFile,
+        signalfd::Signalfd, timerfd::TimerFd,
         permission::{
             SecurityFsContextExt, VfsSecurityContext, check_dac_permissions,
             check_dac_permissions_with_security, check_inode_permissions_with_security,
         },
-        signalfd::Signalfd, timerfd::TimerFd,
         resolve_at, resolve_at_with_security, resolve_at_with_synthetic_credentials, with_path_fs,
     },
     mm::map_usercopy_error,
@@ -214,16 +214,8 @@ fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
     result.stx_dev_major = dev.major();
     result.stx_dev_minor = dev.minor();
     if value.mnt_id != 0 {
-        result.stx_mask |= if request_mask & STATX_MNT_ID_UNIQUE != 0 {
-            STATX_MNT_ID_UNIQUE
-        } else {
-            STATX_MNT_ID
-        };
-        result.stx_mnt_id = if request_mask & STATX_MNT_ID_UNIQUE != 0 {
-            value.mnt_id
-        } else {
-            mounts::legacy_mount_id(value.mnt_id).unwrap_or(value.mnt_id as u32) as u64
-        };
+        result.stx_mask |= STATX_MNT_ID;
+        result.stx_mnt_id = value.mnt_id;
     }
 
     let request_mask = request_mask & !STATX_CHANGE_COOKIE;

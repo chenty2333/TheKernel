@@ -200,24 +200,6 @@ pub(super) fn dispatch_syscall(
                 uctx.arg4() as _,
             )
         }),
-        Sysno::statmount => with_user_memory(aspace(), |memory| {
-            sys_statmount(
-                memory,
-                uctx.arg0() as _,
-                uctx.arg1() as _,
-                uctx.arg2() as _,
-                uctx.arg3() as _,
-            )
-        }),
-        Sysno::listmount => with_user_memory(aspace(), |memory| {
-            sys_listmount(
-                memory,
-                uctx.arg0() as _,
-                uctx.arg1() as _,
-                uctx.arg2() as _,
-                uctx.arg3() as _,
-            )
-        }),
         Sysno::open_tree => with_user_memory(aspace(), |memory| {
             sys_open_tree(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
@@ -1031,10 +1013,6 @@ pub(super) fn dispatch_syscall(
             sys_finit_module(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }
         Sysno::delete_module => sys_delete_module(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::kexec_load => with_user_memory(aspace(), |memory| {
-            sys_kexec_load(memory, uctx.arg0(), uctx.arg1(), uctx.arg2() as _, uctx.arg3() as _)
-        }),
-        Sysno::kexec_file_load => sys_kexec_file_load(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2(), uctx.arg3() as _, uctx.arg4() as _),
         Sysno::set_tid_address => sys_set_tid_address(uctx.arg0()),
         Sysno::arch_prctl => sys_arch_prctl(
             UserMemoryCapability::new(aspace()),
