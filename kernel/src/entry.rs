@@ -39,13 +39,11 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::mm::init_hardware_asids();
     crate::rcu::init().expect("Failed to initialize kernel RCU domains");
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
-    #[cfg(feature = "bpf")]
     if let Err(error) = crate::jit_memory::init() {
-        // Native cBPF execution is an optional optimization. The verified
-        // interpreter remains the canonical executor when the arena cannot
-        // be established, while ForceJit admissions still receive an
-        // explicit unavailable/publication error from the JIT adapter.
-        error!("optional bounded W^X JIT arena unavailable: {error:?}; using interpreter fallback");
+        // Native cBPF and native ET_REL modules share this strictly W^X
+        // arena. Their optional admission paths return the captured error;
+        // boot must not weaken alias safety when reservation fails.
+        error!("native executable arena unavailable: {error:?}");
     }
     if let Err(error) = executable::init() {
         error!("failed to initialize bounded executable registry: {error}");
