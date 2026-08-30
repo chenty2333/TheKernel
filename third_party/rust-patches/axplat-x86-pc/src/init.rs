@@ -38,6 +38,8 @@ impl InitIf for InitIfImpl {
     fn init_later(cpu_id: usize, _arg: usize) {
         crate::apic::init_primary(cpu_id);
         crate::time::init_primary();
+        #[cfg(feature = "hwp")]
+        let _ = crate::hwp::init_current();
     }
 
     /// Initializes the platform at the later stage for secondary cores.
@@ -45,5 +47,7 @@ impl InitIf for InitIfImpl {
     fn init_later_secondary(cpu_id: usize) {
         crate::apic::init_secondary(cpu_id);
         crate::time::init_secondary();
+        #[cfg(feature = "hwp")]
+        let _ = crate::hwp::init_current();
     }
 }

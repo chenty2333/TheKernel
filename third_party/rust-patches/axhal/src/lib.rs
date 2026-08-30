@@ -59,6 +59,60 @@ pub mod mem;
 pub mod percpu;
 pub mod time;
 
+/// Experimental Intel Hardware P-state clamp control for the current CPU.
+///
+/// The platform implementation never enables HWP. It is available only when
+/// firmware has already enabled it for the running CPU.
+#[cfg(feature = "hwp-uclamp")]
+pub mod hwp {
+    #[cfg(target_os = "none")]
+    pub use axplat_x86_pc::hwp::*;
+
+    #[cfg(not(target_os = "none"))]
+    mod host {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum Error {
+            Unsupported,
+            InvalidClamp,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct Capabilities {
+            pub lowest: u8,
+            pub highest: u8,
+        }
+
+        pub fn init_current() -> Result<(), Error> {
+            Err(Error::Unsupported)
+        }
+        pub fn capabilities() -> Result<Capabilities, Error> {
+            Err(Error::Unsupported)
+        }
+        pub fn apply_current_clamp(_: u16, _: u16) -> Result<(), Error> {
+            Err(Error::Unsupported)
+        }
+        pub fn restore_current_request() -> Result<(), Error> {
+            Err(Error::Unsupported)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn host_hwp_is_an_unsupported_stub() {
+                assert_eq!(init_current(), Err(Error::Unsupported));
+                assert_eq!(capabilities(), Err(Error::Unsupported));
+                assert_eq!(apply_current_clamp(0, 1024), Err(Error::Unsupported));
+                assert_eq!(restore_current_request(), Err(Error::Unsupported));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub use host::*;
+}
+
 /// x86_64 hardware performance-monitoring counters.
 ///
 /// This API is deliberately local-CPU only. A lease is a linear token; each

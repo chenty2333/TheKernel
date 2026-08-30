@@ -52,6 +52,8 @@ targets = ["x86_64-unknown-none"]
 [features]
 fp-simd = ["axcpu/fp-simd"]
 irq = ["axplat/irq"]
+## Intel Hardware P-states for the current CPU only.
+hwp = []
 pmu = []
 reboot-on-system-off = []
 rtc = ["x86_rtc"]

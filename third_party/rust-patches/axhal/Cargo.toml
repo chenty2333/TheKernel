@@ -48,6 +48,10 @@ hv = [
     "paging",
     "axplat-dyn?/hv",
 ]
+hwp-uclamp = [
+    "dep:axplat-x86-pc",
+    "axplat-x86-pc/hwp",
+]
 ipi = ["irq"]
 irq = [
     "dep:linkme",

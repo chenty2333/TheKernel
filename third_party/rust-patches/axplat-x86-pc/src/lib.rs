@@ -15,6 +15,8 @@ mod boot_info;
 mod console;
 mod cpu;
 mod init;
+#[cfg(feature = "hwp")]
+pub mod hwp;
 pub mod kexec;
 mod mem;
 mod power;
