@@ -193,6 +193,19 @@ impl RestartTracker {
         })
     }
 
+    /// Copies only the state needed to continue already-entered signal
+    /// handlers after fork. The destination reserved its bounded ledger at
+    /// thread construction, so this cannot allocate or import signal queues.
+    pub(crate) fn copy_handler_state_from(&mut self, source: &Self) {
+        self.signal_handler_depth = source.signal_handler_depth;
+        self.current_restart = source.current_restart;
+        self.armed_restart_block = source.armed_restart_block;
+        self.restart_states.clear();
+        self.restart_states
+            .extend_from_slice(&source.restart_states);
+        self.resume_restored_context = source.resume_restored_context;
+    }
+
     fn enter_syscall(
         &mut self,
         uctx: &UserContext,

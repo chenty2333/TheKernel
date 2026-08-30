@@ -7057,7 +7057,14 @@ impl AddrSpace {
             .checked_sub(first_page)
             .and_then(|delta| delta.checked_add(PAGE_SIZE_4K))
             .ok_or(AxError::BadAddress)?;
-        self.populate_area(VirtAddr::from(first_page), population, MappingFlags::READ)?;
+        // This is the kernel-authorized equivalent of a CET write: it must
+        // fault a fork-demoted RO COW leaf privately and restore its SHSTK
+        // PTE encoding, without granting ordinary user WRITE permission.
+        self.populate_area(
+            VirtAddr::from(first_page),
+            population,
+            MappingFlags::SHADOW_STACK | MappingFlags::WRITE,
+        )?;
         for address in [start, saved_ssp as usize - core::mem::size_of::<u64>()] {
             let (_, flags, _) = self.page_table().query(VirtAddr::from(address))?;
             if !flags.contains(MappingFlags::USER) || !flags.contains(MappingFlags::SHADOW_STACK) {

@@ -1430,6 +1430,9 @@ impl Thread {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn clone_cet_signal_frames_from(&self, source: &Self) {
         *self.cet_signal_frames.lock() = source.cet_signal_frames.lock().clone();
+        self.restart
+            .lock()
+            .copy_handler_state_from(&source.restart.lock());
     }
 
     pub(crate) fn landlock_domain(&self) -> LandlockDomain {

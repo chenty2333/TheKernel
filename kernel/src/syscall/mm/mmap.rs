@@ -76,16 +76,16 @@ fn find_nonfixed_mmap_area(
     // automatic placement.  The VMA itself is not enlarged, so fixed mappings
     // retain Linux's explicit-address semantics.
     let end = candidate.checked_add(length)?;
-    let guard_end = aspace.areas().find_map(|area| {
-        area.flags()
-            .contains(MappingFlags::SHADOW_STACK)
-            .then(|| area.start())
-    });
-    if let Some(guard_end) = guard_end
-        && let Some(guard_start) = guard_end.checked_sub(PAGE_SIZE_4K)
-        && candidate < guard_end
-        && guard_start < end
-    {
+    let guard_end = aspace
+        .areas()
+        .filter(|area| area.flags().contains(MappingFlags::SHADOW_STACK))
+        .filter_map(|area| {
+            let guard_end = area.start();
+            let guard_start = guard_end.checked_sub(PAGE_SIZE_4K)?;
+            (candidate < guard_end && guard_start < end).then_some(guard_end)
+        })
+        .max();
+    if let Some(guard_end) = guard_end {
         aspace.find_free_area(guard_end, length, limit, align)
     } else {
         Some(candidate)

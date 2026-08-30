@@ -182,7 +182,7 @@ pub(crate) fn map_cet_default_shadow_stack(
             // ARCH_SHSTK_ENABLE's default stack does not install a restore
             // token (Linux set_res_tok=false); the top itself is the SSP.
             pl3_ssp: (start.as_usize() + CET_DEFAULT_SHSTK_SIZE) as u64,
-            locked: false,
+            locked: 0,
         })
     })();
     if result.is_err() {
@@ -282,7 +282,7 @@ pub fn sys_arch_prctl(
             } else {
                 CET_WRSS_EN
             };
-            if state.locked && state.u_cet & feature == 0 {
+            if state.locked & feature != 0 && state.u_cet & feature == 0 {
                 return Err(LinuxError::EPERM.into());
             }
             if state.u_cet & feature != 0 {
@@ -314,7 +314,7 @@ pub fn sys_arch_prctl(
             } else {
                 CET_WRSS_EN
             };
-            if state.locked && state.u_cet & feature != 0 {
+            if state.locked & feature != 0 && state.u_cet & feature != 0 {
                 return Err(LinuxError::EPERM.into());
             }
             if state.u_cet & feature == 0 {
@@ -339,7 +339,7 @@ pub fn sys_arch_prctl(
                 return Err(AxError::InvalidInput);
             }
             let mut state = crate::task::current_user_live_cet_state();
-            state.locked = true;
+            state.locked |= addr as u64;
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
