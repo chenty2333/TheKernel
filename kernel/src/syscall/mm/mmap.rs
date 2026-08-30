@@ -1144,11 +1144,17 @@ fn sys_mprotect_inner(
             }
             let segment_end = area.end().min(end_addr);
             let segment_size = segment_end.sub_addr(cursor);
+            let shadow_stack = area.flags().contains(MappingFlags::SHADOW_STACK);
+            // CET leaves are architecturally W=0,D=1; generic mprotect may
+            // retain read access but never convert them into ordinary pages.
+            if shadow_stack && requested_protection != MappingFlags::READ {
+                return Err(AxError::InvalidInput);
+            }
             let may_execute = area
                 .backend()
                 .file_mapping()
                 .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
-            let effective_protection = if may_execute {
+            let mut effective_protection = if may_execute {
                 personality_mmap_protection(thread.personality(), requested_protection)
             } else {
                 requested_protection
@@ -1157,6 +1163,9 @@ fn sys_mprotect_inner(
             // protection-key attribute so a later demand fault or COW leaf
             // is coloured exactly like the resident mapping.
             .with_pkey(requested_pkey.unwrap_or_else(|| area.flags().pkey()));
+            if shadow_stack {
+                effective_protection |= MappingFlags::SHADOW_STACK;
+            }
             let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
             let segment_wake = authorize_then_commit(
                 plan,
