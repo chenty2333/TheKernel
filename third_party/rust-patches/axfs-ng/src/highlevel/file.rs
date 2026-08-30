@@ -4120,6 +4120,32 @@ impl CachedPageInvalidationTransaction {
         Ok(count)
     }
 
+    /// Detaches one evictable page without notifying its mappings yet.
+    ///
+    /// Pageout writes dirty data before its mappings are detached.  Keeping
+    /// the page in this transaction until the listener acknowledgement has
+    /// succeeded makes a failed acknowledgement lossless: `Drop` restores the
+    /// original (still dirty) page to the cache.
+    fn stage_page_for_pageout(&mut self, pn: u32) -> VfsResult<bool> {
+        let mut cache = self.shared.page_cache.lock();
+        let Some(page) = cache.get(&pn) else {
+            return Ok(false);
+        };
+        if page.is_pinned() || page.is_writeback() {
+            return Ok(false);
+        }
+        let page = cache
+            .pop(&pn)
+            .expect("page cache entry disappeared while holding its lock");
+        self.pages.push((pn, page));
+        Ok(true)
+    }
+
+    fn acknowledge_pageout(&self) -> VfsResult<()> {
+        let listeners = evict_listeners_snapshot(&self.shared)?;
+        self.acknowledge_staged_pages(&listeners)
+    }
+
     fn stage_from(&mut self, first_page: u64) -> VfsResult<usize> {
         self.shadow_domain = Some(InvalidationShadowDomain::From(first_page));
         let mut cache = self.shared.page_cache.lock();
@@ -5444,6 +5470,54 @@ impl CachedFile {
     fn range_has_cached_page(&self, pages: &Range<u32>) -> bool {
         let guard = self.shared.page_cache.lock();
         pages.clone().any(|pn| guard.contains(&pn))
+    }
+
+    /// Demotes resident cache pages in `pages` to the cold end of the LRU.
+    /// Missing pages are deliberately left untouched: MADV_COLD must not
+    /// fault or allocate file-cache entries.
+    pub fn cold_pages(&self, pages: Range<u32>) -> VfsResult<usize> {
+        let mut cache = self.shared.page_cache.lock();
+        let mut demoted = 0usize;
+        for pn in pages {
+            if cache.contains(&pn) {
+                cache.demote(&pn);
+                demoted = demoted.checked_add(1).ok_or(VfsError::NoMemory)?;
+            }
+        }
+        Ok(demoted)
+    }
+
+    /// Writes back and evicts resident file-cache pages in `pages`.
+    ///
+    /// This never creates pages.  In-memory files and pages that are pinned,
+    /// under writeback, or blocked by a concurrent cache user are skipped;
+    /// pageout is advisory and must not discard data merely to satisfy a
+    /// reclaim hint.  Each page owns an invalidation transaction so earlier
+    /// successful evictions remain committed if a later page fails.
+    pub fn pageout_pages(&self, pages: Range<u32>) -> VfsResult<usize> {
+        if self.in_memory {
+            return Ok(0);
+        }
+        let _direct_guard = self.shared.direct_io_lock.write();
+        let mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let file = self.inner.entry().as_file()?;
+        let mut evicted = 0usize;
+        for pn in pages {
+            let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
+            if !invalidation.stage_page_for_pageout(pn)? {
+                continue;
+            }
+            invalidation.writeback(file, true)?;
+            invalidation.acknowledge_pageout()?;
+            invalidation.commit_discard();
+            evicted = evicted.checked_add(1).ok_or(VfsError::NoMemory)?;
+        }
+        release_cached_file_writeback_anchor_if_clean(&self.shared);
+        Ok(evicted)
     }
 
     fn invalidate_cached_range(
@@ -9370,6 +9444,40 @@ mod tests {
             })
             .unwrap();
         paddr.unwrap()
+    }
+
+    #[test]
+    fn cold_pages_demotes_only_resident_cache_entries() {
+        let (cached, _location, _state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x11, false);
+        seed_cached_page(&cached, 1, 0x22, false);
+        cached.with_page(0, |_| {});
+        assert_eq!(cached.shared.page_cache.lock().peek_lru().unwrap().0, &1);
+
+        assert_eq!(cached.cold_pages(0..1).unwrap(), 1);
+        assert_eq!(cached.shared.page_cache.lock().peek_lru().unwrap().0, &0);
+        assert_eq!(cached.cold_pages(2..3).unwrap(), 0);
+    }
+
+    #[test]
+    fn pageout_writes_back_then_evicts_each_resident_page() {
+        let (cached, _location, state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x31, true);
+        seed_cached_page(&cached, 1, 0x32, false);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notified = notifications.clone();
+        let handle = cached.add_evict_listener(CachedFileEvictionOwner::new(7).unwrap(), move |_, _| {
+            notified.fetch_add(1, Ordering::AcqRel);
+            true
+        });
+
+        assert_eq!(cached.pageout_pages(0..3).unwrap(), 2);
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 1);
+        assert_eq!(notifications.load(Ordering::Acquire), 2);
+        assert!(!cached.shared.page_cache.lock().contains(&0));
+        assert!(!cached.shared.page_cache.lock().contains(&1));
+
+        unsafe { cached.remove_evict_listener(handle) };
     }
 
     #[test]

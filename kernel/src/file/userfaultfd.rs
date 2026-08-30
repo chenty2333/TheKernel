@@ -32,7 +32,7 @@ use linux_raw_sys::{
         UFFDIO_WAKE as UFFDIO_WAKE_CMD, UFFDIO_ZEROPAGE as UFFDIO_ZEROPAGE_CMD,
     },
 };
-use memory_addr::PAGE_SIZE_4K;
+use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 use thekernel_linux_mm::{
     FaultAccess, FaultDisposition, FaultHandlerId, MmError, PageRange, UffdApiNegotiation,
     UffdApiState, UffdCopyMode, UffdCopyRequest, UffdCreateFlags, UffdIoctls, UffdRegisterMode,
@@ -303,6 +303,11 @@ impl AttachedUffdHandler {
                 // Linux reports ENOMEM when mmget_not_zero() cannot retain the
                 // old mm for REGISTER/UNREGISTER.
                 let aspace = aspace.upgrade().ok_or(AxError::NoMemory)?;
+                crate::syscall::ensure_4k_granularity_across_aliases(
+                    &aspace,
+                    VirtAddr::from(range.start()),
+                    range.len(),
+                )?;
                 aspace
                     .lock()
                     .register_uffd_range(api, self.handler, range, mode)
@@ -657,7 +662,7 @@ impl UserfaultFile {
         // is a zero-progress lower error that must be written to the signed
         // output field.
         let preflight = {
-            let locked = target.lock();
+            let mut locked = target.lock();
             locked.preflight_uffd_resolver_range(destination)
         };
         let lease = match preflight {
@@ -760,7 +765,7 @@ impl UserfaultFile {
         // Linux resolves target-mm/range errors before reporting that mode
         // mismatch through the signed `uffdio_copy.copy` field.
         let preflight = {
-            let locked = target.lock();
+            let mut locked = target.lock();
             locked
                 .preflight_uffd_resolver_range(destination)
                 .map(|_lease| ())

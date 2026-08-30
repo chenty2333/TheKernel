@@ -20,7 +20,7 @@ pub use self::{
     arch::*,
     bits64::{
         MAX_PREPARED_TABLE_FRAMES_64, PageTable64, PageTable64Cursor, PrepareTableFramesError,
-        PreparedMapCommit, PreparedMapError, PreparedPageTableFrames,
+        PreparedMapCommit, PreparedMapError, PreparedPageTableFrames, ReplacedPteRun,
     },
 };
 
@@ -38,6 +38,10 @@ pub enum PagingError {
     /// The page table entry represents a huge page, but the target physical
     /// frame is 4K in size.
     MappedToHugePage,
+    /// A 4 KiB leaf run cannot be represented by one huge-page leaf.
+    NotPromotable,
+    /// A huge-page promotion rollback no longer matches its committed leaf.
+    RollbackMismatch,
 }
 
 #[cfg(feature = "axerrno")]

@@ -173,6 +173,13 @@ impl<H: PagingHandler> PreparedPageTableFrames<H> {
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
+
+    /// Transfers one preallocated, zeroed table frame to a caller building an
+    /// unreachable table.  The caller must either publish the table or retain
+    /// responsibility for returning it through the normal handler path.
+    fn take_one(&mut self) -> Option<PhysAddr> {
+        self.frames.pop()
+    }
 }
 
 impl<H: PagingHandler> fmt::Debug for PreparedPageTableFrames<H> {
@@ -249,6 +256,46 @@ pub struct PageTable64<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> {
     #[cfg(feature = "copy-from")]
     borrowed_entries: bitmaps::Bitmap<ENTRY_COUNT>,
     _phantom: PhantomData<(M, PTE, H)>,
+}
+
+/// A detached, fully populated P1 table replaced by a caller-owned 2 MiB leaf.
+///
+/// The replacement frame is deliberately *not* owned by this value: its
+/// allocator and the code that copied the source contents retain that
+/// responsibility. The detached P1 frame remains owned by this value after
+/// replacement. Dropping it releases that table frame; passing it to
+/// [`PageTable64Cursor::rollback_2m_pte_replacement`] makes it reachable
+/// again.
+/// `leaves` is an exact pre-publication snapshot, including architecture
+/// private bits such as x86 accessed and dirty state.
+pub struct ReplacedPteRun<PTE: GenericPTE, H: PagingHandler> {
+    p1_table: PhysAddr,
+    leaves: ArrayVec<PTE, ENTRY_COUNT>,
+    replacement: PTE,
+    _handler: PhantomData<H>,
+}
+
+impl<PTE: GenericPTE, H: PagingHandler> ReplacedPteRun<PTE, H> {
+    /// Physical address of the detached P1 table frame.
+    pub const fn p1_table(&self) -> PhysAddr {
+        self.p1_table
+    }
+
+    /// Exact old PTEs in increasing virtual-address order.
+    pub fn leaves(&self) -> &[PTE] {
+        &self.leaves
+    }
+
+    /// Exact huge leaf published by the replacement transaction.
+    pub const fn replacement(&self) -> PTE {
+        self.replacement
+    }
+}
+
+impl<PTE: GenericPTE, H: PagingHandler> Drop for ReplacedPteRun<PTE, H> {
+    fn drop(&mut self) {
+        H::dealloc_frame(self.p1_table);
+    }
 }
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H> {
@@ -513,6 +560,25 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let p1 = self.next_table_mut_or_create(p2e)?;
         let p1e = &mut p1[p1_index(vaddr)];
         Ok(p1e)
+    }
+
+    /// Locates the P2 entry covering one 2 MiB-aligned address.
+    fn p2_entry_location(&self, vaddr: M::VirtAddr) -> PagingResult<(PhysAddr, usize)> {
+        let vaddr: usize = vaddr.into();
+        let p3 = if M::LEVELS == 3 {
+            self.table_of(self.root_paddr())
+        } else if M::LEVELS == 4 {
+            let p4 = self.table_of(self.root_paddr());
+            self.next_table(&p4[p4_index(vaddr)])?
+        } else {
+            unreachable!()
+        };
+        let p3e = &p3[p3_index(vaddr)];
+        if p3e.is_huge() {
+            return Err(PagingError::MappedToHugePage);
+        }
+        let _ = self.next_table(p3e)?;
+        Ok((p3e.paddr(), p2_index(vaddr)))
     }
 
     fn prepared_target_level(page_size: PageSize) -> PagingResult<usize> {
@@ -960,6 +1026,155 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             }
         }
 
+        Ok(())
+    }
+
+    /// Atomically replaces a homogeneous P1 run with one
+    /// caller-preallocated 2 MiB P2 leaf.
+    ///
+    /// Validation completes before the live P2 entry is changed. The only
+    /// publication is one release-ordered aligned entry store, so a walker
+    /// can observe either the old P1 table or the new huge leaf, never an
+    /// unmapped interval. The caller must have copied all source content into
+    /// `replacement` before this call; this operation only changes translation
+    /// state. The returned value owns the detached P1 frame and an exact PTE
+    /// snapshot for rollback/accounting.
+    ///
+    /// Present source leaves need not be physically contiguous; all present
+    /// 4 KiB leaves must have identical flags. Absent leaves are demand-zero
+    /// slots already initialized in `replacement`. `replacement` must name
+    /// one aligned, preallocated 2 MiB frame; its ownership remains with the
+    /// caller on both success and failure.
+    pub fn replace_2m_pte_run(
+        &mut self,
+        vaddr: M::VirtAddr,
+        replacement: PhysAddr,
+        flags: MappingFlags,
+    ) -> PagingResult<ReplacedPteRun<PTE, H>> {
+        let vaddr_usize: usize = vaddr.into();
+        if !PageSize::Size2M.is_aligned(vaddr_usize)
+            || !PageSize::Size2M.is_aligned(replacement.as_usize())
+        {
+            return Err(PagingError::NotAligned);
+        }
+
+        let (p2_table, p2_index) = self.inner.p2_entry_location(vaddr)?;
+        let p1_table = {
+            let p2e = &self.inner.table_of(p2_table)[p2_index];
+            if p2e.is_huge() {
+                return Err(PagingError::NotPromotable);
+            }
+            if p2e.paddr().as_usize() == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            p2e.paddr()
+        };
+
+        let mut leaves = ArrayVec::<PTE, ENTRY_COUNT>::new();
+        let p1 = self.inner.table_of(p1_table);
+        let mut source_flags = None;
+        for leaf in p1.iter().copied() {
+            if !leaf.is_present() {
+                leaves.push(leaf);
+                continue;
+            }
+            if leaf.is_huge()
+                || source_flags.is_some_and(|source_flags| leaf.flags() != source_flags)
+            {
+                return Err(PagingError::NotPromotable);
+            }
+            source_flags = Some(leaf.flags());
+            // Capacity is exactly the P1 fanout and no allocation occurs.
+            leaves.push(leaf);
+        }
+        if source_flags.is_some_and(|source_flags| source_flags != flags) {
+            return Err(PagingError::NotPromotable);
+        }
+
+        let replacement_entry = PTE::new_page(replacement, flags, true);
+        let p2e = &mut self.inner.table_of_mut(p2_table)[p2_index];
+        // The cursor is exclusive. Recheck the link anyway so malformed page
+        // tables cannot detach a frame different from the one validated.
+        if p2e.is_huge() || p2e.paddr() != p1_table {
+            return Err(PagingError::RollbackMismatch);
+        }
+        publish_prepared_entry(p2e, replacement_entry);
+        // A single INVLPG cannot invalidate arbitrary old 4 KiB translations
+        // elsewhere in this 2 MiB span. Defer a full flush on cursor drop.
+        self.flusher = TlbFlusher::Full;
+
+        Ok(ReplacedPteRun {
+            p1_table,
+            leaves,
+            replacement: replacement_entry,
+            _handler: PhantomData,
+        })
+    }
+
+    /// Atomically replaces one 2 MiB leaf with a caller-prepared, fully
+    /// populated P1 table.  All new 4 KiB leaves and the P1 frame are checked
+    /// and initialized before the live PDE is published, so failure leaves
+    /// the huge mapping intact.
+    pub fn replace_2m_huge_leaf_with_pte_run(
+        &mut self,
+        vaddr: M::VirtAddr,
+        replacements: &[PhysAddr],
+        flags: MappingFlags,
+        prepared: &mut PreparedPageTableFrames<H>,
+    ) -> PagingResult<PhysAddr> {
+        let vaddr_usize: usize = vaddr.into();
+        if !PageSize::Size2M.is_aligned(vaddr_usize) || replacements.len() != ENTRY_COUNT {
+            return Err(PagingError::NotAligned);
+        }
+        if replacements
+            .iter()
+            .any(|paddr| !PageSize::Size4K.is_aligned(paddr.as_usize()))
+        {
+            return Err(PagingError::NotAligned);
+        }
+        let (p2_table, p2_index) = self.inner.p2_entry_location(vaddr)?;
+        let original = self.inner.table_of(p2_table)[p2_index];
+        if !original.is_present() || !original.is_huge() || original.flags() != flags {
+            return Err(PagingError::NotPromotable);
+        }
+        let p1_table = prepared.take_one().ok_or(PagingError::NoMemory)?;
+        let p1 = self.inner.table_of_mut(p1_table);
+        for (entry, paddr) in p1.iter_mut().zip(replacements.iter().copied()) {
+            *entry = PTE::new_page(paddr, flags, false);
+        }
+        let p2e = &mut self.inner.table_of_mut(p2_table)[p2_index];
+        if !p2e.is_huge() || p2e.bits() != original.bits() {
+            H::dealloc_frame(p1_table);
+            return Err(PagingError::RollbackMismatch);
+        }
+        publish_prepared_entry(p2e, PTE::new_table(p1_table));
+        self.flusher = TlbFlusher::Full;
+        Ok(original.paddr())
+    }
+
+    /// Restores a replacement returned by [`Self::replace_2m_pte_run`].
+    ///
+    /// Like promotion, rollback has one publication store and therefore never
+    /// exposes a hole. The exact promoted leaf must still be installed.
+    pub fn rollback_2m_pte_replacement(
+        &mut self,
+        vaddr: M::VirtAddr,
+        replacement: ReplacedPteRun<PTE, H>,
+    ) -> PagingResult {
+        let vaddr_usize: usize = vaddr.into();
+        if !PageSize::Size2M.is_aligned(vaddr_usize) {
+            return Err(PagingError::NotAligned);
+        }
+        let (p2_table, p2_index) = self.inner.p2_entry_location(vaddr)?;
+        let p2e = &mut self.inner.table_of_mut(p2_table)[p2_index];
+        if !p2e.is_huge() || p2e.bits() != replacement.replacement.bits() {
+            return Err(PagingError::RollbackMismatch);
+        }
+        publish_prepared_entry(p2e, PTE::new_table(replacement.p1_table));
+        self.flusher = TlbFlusher::Full;
+        // The P1 table is reachable again. Its PTE payload was never touched,
+        // so only relinquish this transaction's detached-table ownership.
+        core::mem::forget(replacement);
         Ok(())
     }
 

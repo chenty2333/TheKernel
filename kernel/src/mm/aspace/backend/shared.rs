@@ -11,9 +11,9 @@ use axsync::Mutex;
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId, FutexBackingIdentity,
-    FutexWordOffset, MappingStatus, PopulateOutcome, SharedFutexKey, alloc_frame, dealloc_frame,
-    divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
+    super::SharedBackingKey, AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId,
+    FutexBackingIdentity, FutexWordOffset, MappingStatus, PopulateOutcome, SharedFutexKey,
+    alloc_frame, dealloc_frame, divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 use crate::{
     file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
@@ -24,6 +24,29 @@ static FIXED_SHARED_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
 // Resident anonymous/SysV shared pages. File-backed mappings deliberately do
 // not use this path: their cache pages are not anonymous shmem pages.
 static SHMEM_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+const FOLIO_4K_PAGES: usize = PageSize::Size2M as usize / PageSize::Size4K as usize;
+
+/// An owned 2 MiB allocation represented by 512 indexed 4 KiB entries.
+///
+/// `SharedPageStorage::pages` remains the authoritative indexed lookup table:
+/// callers never need to know whether an entry was originally allocated as a
+/// base page or as part of a folio.  This side table exists only to give the
+/// allocator the correct lifetime and deallocation granularity.
+#[derive(Clone)]
+struct SharedFolio {
+    start_index: usize,
+    paddr: PhysAddr,
+    /// The exact former base frames stay owned until the folio is demoted.
+    /// Keeping them is what makes a failed cross-mm publication reversible:
+    /// rolling the PTEs back never revives already-freed physical memory.
+    old_pages: Vec<PhysAddr>,
+}
+
+struct SharedPageStorage {
+    pages: Vec<PhysAddr>,
+    folios: Vec<SharedFolio>,
+}
 
 pub fn shmem_resident_pages() -> usize {
     SHMEM_RESIDENT_PAGES.load(Ordering::Acquire)
@@ -54,7 +77,8 @@ fn uncharge_shmem_pages(charge: &AtomicUsize, resident_frames: usize, page_size:
 }
 
 pub struct SharedPages {
-    phys_pages: Mutex<Vec<PhysAddr>>,
+    backing_key: SharedBackingKey,
+    phys_pages: Mutex<SharedPageStorage>,
     // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
     // the published length separate from `phys_pages`: taking that mutex in
     // the gate would be a blocking operation. The backing only grows, so a
@@ -78,10 +102,7 @@ impl SharedPages {
 
     /// Allocates SysV shared pages and charges only frames that were actually
     /// obtained.  The charge lives with the backing Arc through its final drop.
-    pub fn new_sysv_charged(
-        size: usize,
-        page_size: PageSize,
-    ) -> AxResult<Self> {
+    pub fn new_sysv_charged(size: usize, page_size: PageSize) -> AxResult<Self> {
         // SysV segments have a fixed shm_segsz; unlike anonymous shared
         // mappings they cannot grow through a later range extension.
         Self::new_with_growth_charged(size, page_size, false, Some(&SHMEM_RESIDENT_PAGES))
@@ -105,6 +126,9 @@ impl SharedPages {
         if !page_size.is_aligned(size) {
             return Err(AxError::InvalidInput);
         }
+        // Reserve identity before acquiring frames so key exhaustion leaves no
+        // allocation or resident charge to unwind.
+        let backing_key = SharedBackingKey::allocate()?;
         let num_pages = size / page_size as usize;
         let mut phys_pages = Vec::new();
         phys_pages
@@ -125,12 +149,21 @@ impl SharedPages {
             charge_shmem_pages(charge, num_pages, page_size);
         }
         Ok(Self {
-            phys_pages: Mutex::new(phys_pages),
+            backing_key,
+            phys_pages: Mutex::new(SharedPageStorage {
+                pages: phys_pages,
+                folios: Vec::new(),
+            }),
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
             resident_charge,
         })
+    }
+
+    /// Stable reverse-map identity for this backing's complete lifetime.
+    pub(crate) const fn backing_key(&self) -> SharedBackingKey {
+        self.backing_key
     }
 
     pub const fn page_size(&self) -> PageSize {
@@ -142,15 +175,15 @@ impl SharedPages {
     }
 
     pub fn len(&self) -> usize {
-        self.phys_pages.lock().len()
+        self.phys_pages.lock().pages.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.phys_pages.lock().is_empty()
+        self.phys_pages.lock().pages.is_empty()
     }
 
     pub fn ensure_len(&self, len: usize) -> AxResult {
-        let current_len = self.phys_pages.lock().len();
+        let current_len = self.phys_pages.lock().pages.len();
         if current_len >= len {
             return Ok(());
         }
@@ -175,15 +208,15 @@ impl SharedPages {
         }
 
         let mut pages = self.phys_pages.lock();
-        if pages.len() >= len {
+        if pages.pages.len() >= len {
             drop(pages);
             for frame in new_pages {
                 dealloc_frame(frame, self.size);
             }
             return Ok(());
         }
-        let needed = len - pages.len();
-        if pages.try_reserve_exact(needed).is_err() {
+        let needed = len - pages.pages.len();
+        if pages.pages.try_reserve_exact(needed).is_err() {
             drop(pages);
             for frame in new_pages {
                 dealloc_frame(frame, self.size);
@@ -191,11 +224,11 @@ impl SharedPages {
             return Err(AxError::NoMemory);
         }
         let unused = new_pages.split_off(needed);
-        pages.extend(new_pages);
+        pages.pages.extend(new_pages);
         if let Some(charge) = self.resident_charge {
             charge_shmem_pages(charge, needed, self.size);
         }
-        let published_len = pages.len();
+        let published_len = pages.pages.len();
         drop(pages);
         self.published_len.store(published_len, Ordering::Release);
         for frame in unused {
@@ -223,7 +256,7 @@ impl SharedPages {
         let mut page_offset = offset % page_bytes;
 
         while !buf.is_empty() {
-            let phys = pages[page_index];
+            let phys = pages.pages[page_index];
             let src = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
             unsafe {
@@ -249,7 +282,7 @@ impl SharedPages {
         let mut page_offset = offset % page_bytes;
 
         while !buf.is_empty() {
-            let phys = pages[page_index];
+            let phys = pages.pages[page_index];
             let dst = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
             unsafe {
@@ -273,18 +306,159 @@ impl SharedPages {
         let end = start_index
             .checked_add(count)
             .ok_or(AxError::InvalidInput)?;
-        if end > pages.len() {
+        if end > pages.pages.len() {
             return Err(AxError::NoMemory);
         }
-        use_pages(&pages[start_index..end])
+        use_pages(&pages.pages[start_index..end])
     }
 
-    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+    /// Returns the physical address for a 4 KiB indexed backing entry.
+    ///
+    /// A promoted folio still exposes all 512 entries through this interface,
+    /// as consecutive physical addresses derived from its 2 MiB base.
+    pub fn paddr_at(&self, index: usize) -> AxResult<PhysAddr> {
         self.phys_pages
             .lock()
+            .pages
             .get(index)
             .copied()
             .ok_or(AxError::InvalidInput)
+    }
+
+    /// Snapshots the source 4 KiB frames retained by a promoted folio.
+    ///
+    /// Callers use this before changing any alias PTE so all allocation can
+    /// fail before publication.  The returned frames stay owned by the folio
+    /// until [`Self::demote_4k_folio`] commits the ownership transition.
+    pub fn demote_4k_folio_frames(&self, start_index: usize) -> AxResult<Vec<PhysAddr>> {
+        if self.size != PageSize::Size4K || !start_index.is_multiple_of(FOLIO_4K_PAGES) {
+            return Err(AxError::InvalidInput);
+        }
+        let storage = self.phys_pages.lock();
+        let folio = storage
+            .folios
+            .iter()
+            .find(|folio| folio.start_index == start_index)
+            .ok_or(AxError::InvalidInput)?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(FOLIO_4K_PAGES)
+            .map_err(|_| AxError::NoMemory)?;
+        frames.extend_from_slice(&folio.old_pages);
+        Ok(frames)
+    }
+
+    pub fn has_4k_folio(&self, start_index: usize) -> bool {
+        self.size == PageSize::Size4K
+            && self
+                .phys_pages
+                .lock()
+                .folios
+                .iter()
+                .any(|folio| folio.start_index == start_index)
+    }
+
+    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+        self.paddr_at(index)
+    }
+
+    /// Transactionally replace 512 base-page entries with one 2 MiB folio.
+    ///
+    /// Allocation, metadata reservation, and copying complete before the
+    /// indexed table is published.  Consequently a failure leaves the old
+    /// backing untouched; after publication the old frames are released.
+    pub fn promote_4k_folio(&self, start_index: usize) -> AxResult<PhysAddr> {
+        if self.size != PageSize::Size4K || !start_index.is_multiple_of(FOLIO_4K_PAGES) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start_index
+            .checked_add(FOLIO_4K_PAGES)
+            .ok_or(AxError::InvalidInput)?;
+        let mut storage = self.phys_pages.lock();
+        if end > storage.pages.len()
+            || storage.folios.iter().any(|folio| {
+                let folio_end = folio.start_index + FOLIO_4K_PAGES;
+                start_index < folio_end && folio.start_index < end
+            })
+        {
+            return Err(AxError::InvalidInput);
+        }
+        storage
+            .folios
+            .try_reserve_exact(1)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut old_pages = Vec::new();
+        old_pages
+            .try_reserve_exact(FOLIO_4K_PAGES)
+            .map_err(|_| AxError::NoMemory)?;
+        old_pages.extend_from_slice(&storage.pages[start_index..end]);
+
+        let folio = alloc_frame(false, PageSize::Size2M)?;
+        for (offset, &source) in old_pages.iter().enumerate() {
+            let destination = axhal::mem::phys_to_virt(PhysAddr::from(
+                folio.as_usize() + offset * PageSize::Size4K as usize,
+            ));
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    axhal::mem::phys_to_virt(source).as_ptr(),
+                    destination.as_mut_ptr(),
+                    PageSize::Size4K as usize,
+                );
+            }
+        }
+
+        for (offset, entry) in storage.pages[start_index..end].iter_mut().enumerate() {
+            *entry = PhysAddr::from(folio.as_usize() + offset * PageSize::Size4K as usize);
+        }
+        storage.folios.push(SharedFolio {
+            start_index,
+            paddr: folio,
+            old_pages,
+        });
+        Ok(folio)
+    }
+
+    /// Transactionally restore the base-page backing for a promoted folio.
+    ///
+    /// This is the inverse ownership transition.  The exact source 4 KiB
+    /// frames are retained by the promoted folio, so no allocation is needed
+    /// and a transaction can restore the original backing identity exactly.
+    pub fn demote_4k_folio(&self, start_index: usize) -> AxResult {
+        if self.size != PageSize::Size4K || !start_index.is_multiple_of(FOLIO_4K_PAGES) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start_index
+            .checked_add(FOLIO_4K_PAGES)
+            .ok_or(AxError::InvalidInput)?;
+        let mut storage = self.phys_pages.lock();
+        let folio_index = storage
+            .folios
+            .iter()
+            .position(|folio| folio.start_index == start_index)
+            .ok_or(AxError::InvalidInput)?;
+        if end > storage.pages.len() {
+            return Err(AxError::BadState);
+        }
+        let folio = &storage.folios[folio_index];
+        if folio.old_pages.len() != FOLIO_4K_PAGES {
+            return Err(AxError::BadState);
+        }
+        for (offset, &destination) in folio.old_pages.iter().enumerate() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    axhal::mem::phys_to_virt(PhysAddr::from(
+                        folio.paddr.as_usize() + offset * PageSize::Size4K as usize,
+                    ))
+                    .as_ptr(),
+                    axhal::mem::phys_to_virt(destination).as_mut_ptr(),
+                    PageSize::Size4K as usize,
+                );
+            }
+        }
+        let folio = storage.folios.remove(folio_index);
+        storage.pages[start_index..end].copy_from_slice(&folio.old_pages);
+        dealloc_frame(folio.paddr, PageSize::Size2M);
+        Ok(())
     }
 
     /// Returns an aligned, bounds-checked atomic view into a fixed backing.
@@ -369,8 +543,19 @@ fn atomic_store_release(address: NonNull<AtomicU32>, value: u32) {
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
-        for frame in self.phys_pages.lock().iter() {
-            dealloc_frame(*frame, self.size);
+        let storage = self.phys_pages.lock();
+        for (index, &frame) in storage.pages.iter().enumerate() {
+            if !storage.folios.iter().any(|folio| {
+                (folio.start_index..folio.start_index + FOLIO_4K_PAGES).contains(&index)
+            }) {
+                dealloc_frame(frame, self.size);
+            }
+        }
+        for folio in &storage.folios {
+            dealloc_frame(folio.paddr, PageSize::Size2M);
+            for &frame in &folio.old_pages {
+                dealloc_frame(frame, PageSize::Size4K);
+            }
         }
         if let Some(charge) = self.resident_charge {
             uncharge_shmem_pages(
@@ -667,6 +852,23 @@ impl BackendOps for SharedBackend {
 }
 
 impl Backend {
+    pub(crate) fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
+        match self {
+            Self::Shared(shared) => Some(shared.pages()),
+            Self::Linear(_) | Self::Cow(_) | Self::File(_) => None,
+        }
+    }
+
+    /// Stable reverse-map identity for an anonymous/shared-memory backing.
+    /// File mappings have their own cache identity and are deliberately not
+    /// folded into this shmem alias registry.
+    pub(crate) fn shared_backing_key(&self) -> Option<super::super::SharedBackingKey> {
+        match self {
+            Self::Shared(shared) => Some(shared.pages.backing_key()),
+            Self::Linear(_) | Self::Cow(_) | Self::File(_) => None,
+        }
+    }
+
     pub fn new_shared(start: VirtAddr, pages: Arc<SharedPages>) -> Self {
         Self::new_shared_with_may_protect(start, pages, access_flags())
     }

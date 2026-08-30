@@ -1,5 +1,5 @@
 //! Memory mapping backends.
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::mem::ManuallyDrop;
 
 use axalloc::{UsageKind, global_allocator};
@@ -23,7 +23,7 @@ mod shared;
 
 pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
 pub(crate) use self::{
-    cow::PreparedCowPage,
+    cow::{PreparedCowHugeFrame, PreparedCowPage},
     file::WritableMappingAdmission,
     phys_pin::{PhysicalFramePins, PreparedPhysicalFramePins, prepare_physical_pin_registry},
     shared::PreparedFixedSharedMapping,
@@ -499,6 +499,70 @@ impl DeferredUnmapBackend for Backend {
 }
 
 impl Backend {
+    /// Prepares the privately owned PMD frame used to collapse one anonymous
+    /// 4 KiB COW run.  Translation and VMA publication deliberately remain
+    /// the address-space transaction's responsibility.
+    pub(crate) fn prepare_collapse_2m_frame(
+        &self,
+        sources: &[Option<PhysAddr>],
+    ) -> AxResult<PreparedCowHugeFrame> {
+        match self {
+            Self::Cow(cow) => cow.prepare_collapse_2m_frame(sources),
+            Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
+        }
+    }
+
+    /// Produces the backend metadata for the one PMD VMA fragment published
+    /// by a successful private-COW collapse.
+    pub(crate) fn collapsed_2m_backend(&self) -> AxResult<Self> {
+        match self {
+            Self::Cow(cow) => Ok(Self::Cow(cow.collapsed_2m_backend()?)),
+            Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
+        }
+    }
+
+    pub(crate) fn prepare_demote_2m_frames(
+        &self,
+        source: PhysAddr,
+    ) -> AxResult<cow::PreparedCowDemotionFrames> {
+        match self {
+            Self::Cow(cow) => cow.prepare_demote_2m_frames(source),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
+    pub(crate) fn demoted_4k_backend(&self) -> AxResult<Self> {
+        match self {
+            Self::Cow(cow) => Ok(Self::Cow(cow.demoted_4k_backend()?)),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
+    pub(crate) fn retire_demoted_2m_source(
+        &self,
+        vaddr: VirtAddr,
+        frame: PhysAddr,
+        flags: MappingFlags,
+    ) -> AxResult<BackendRetirement> {
+        match self {
+            Self::Cow(cow) => cow.retire_demoted_2m_source(vaddr, frame, flags),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
+    /// Retains the former 4 KiB COW leaves until their detached PTE table is
+    /// no longer reachable through any CPU's TLB.
+    pub(crate) fn retire_collapsed_2m_sources(
+        &self,
+        start: VirtAddr,
+        leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+    ) -> AxResult<BackendRetirement> {
+        match self {
+            Self::Cow(cow) => cow.retire_collapsed_2m_sources(start, leaves),
+            Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
+        }
+    }
+
     pub(crate) fn supports_uffd_missing_resolver(&self) -> bool {
         matches!(self, Self::Cow(cow) if cow.is_4k_anonymous())
     }
@@ -606,6 +670,11 @@ impl Backend {
         self.mapping_status().file_mapping()
     }
 
+    pub(crate) fn has_file_cache_backing(&self) -> bool {
+        matches!(self, Self::File(_))
+            || matches!(self, Self::Cow(backend) if backend.has_file_backing())
+    }
+
     pub(crate) fn file_like_mapping(&self) -> Option<&FileLikeMappingLease> {
         self.mapping_status().file_like_mapping()
     }
@@ -693,6 +762,25 @@ impl Backend {
                 dirty_on_release,
             )?)),
             Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn cold_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        match self {
+            Self::File(backend) => backend.cold_pages(range),
+            Self::Cow(backend) => backend.cold_file_pages(range),
+            // There is currently no swap/reclaim representation for
+            // anonymous or shmem pages.  Reporting success here would turn
+            // COLD into a silent no-op and falsely promise data retention.
+            Self::Linear(_) | Self::Shared(_) => Err(AxError::OperationNotSupported),
+        }
+    }
+
+    pub(crate) fn pageout_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        match self {
+            Self::File(backend) => backend.pageout_pages(range),
+            Self::Cow(backend) => backend.pageout_file_pages(range),
+            Self::Linear(_) | Self::Shared(_) => Err(AxError::OperationNotSupported),
         }
     }
 
@@ -845,6 +933,21 @@ impl Backend {
         match self {
             Backend::File(backend) => backend.sync(data_only),
             Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(()),
+        }
+    }
+
+    /// Prefetch a file-backed VMA range without changing page-table
+    /// residency.  Other backends deliberately remain a no-op: in
+    /// particular, this must never manufacture anonymous pages for WILLNEED.
+    pub(crate) fn prefetch_file_backed(
+        &self,
+        range: VirtAddrRange,
+        aspace: &mut AddrSpace,
+    ) -> AxResult<usize> {
+        match self {
+            Backend::File(backend) => backend.prefetch(range, aspace),
+            Backend::Cow(backend) => backend.prefetch_file_pages(range),
+            Backend::Linear(_) | Backend::Shared(_) => Ok(0),
         }
     }
 }

@@ -20,6 +20,9 @@ use crate::{
 
 const PROCESS_VM_MAX_IOV: usize = 1024;
 const PROCESS_VM_COPY_CHUNK: usize = 16 * 1024;
+// Linux bounds vector I/O by MAX_RW_COUNT even on a 64-bit task.  Keeping the
+// cap below isize::MAX also makes the syscall's positive byte result lossless.
+const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 #[derive(Clone, Copy)]
 struct UserIoVec {
@@ -76,6 +79,32 @@ fn read_iovecs(
     Ok((result, total))
 }
 
+/// Imports a remote iovec array under process_madvise's aggregate byte cap.
+///
+/// Do the arithmetic checks while copyin is still the only operation: a bad
+/// user descriptor must win over pidfd lookup, ptrace, or advice validation.
+/// Linux truncates the request at MAX_RW_COUNT rather than allowing the
+/// eventual signed return value to overflow.
+fn read_process_madvise_iovecs(
+    caller: &UserMemoryCapability,
+    iovs: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<(Vec<UserIoVec>, usize)> {
+    let (mut iovecs, _) = read_iovecs(caller, iovs, iovcnt)?;
+    let mut remaining = MAX_RW_COUNT;
+    let mut total = 0usize;
+    for iov in &mut iovecs {
+        if iov.len != 0 {
+            iov.base.checked_add(iov.len).ok_or(AxError::BadAddress)?;
+        }
+        let accepted = iov.len.min(remaining);
+        iov.len = accepted;
+        total += accepted;
+        remaining -= accepted;
+    }
+    Ok((iovecs, total))
+}
+
 fn check_process_madvise_capability() -> AxResult<()> {
     let curr = current();
     if curr.as_thread().has_effective_capability(CAP_SYS_NICE) {
@@ -106,8 +135,7 @@ fn process_madvise_is_remote(
 
 fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
     match behavior {
-        MADV_WILLNEED => Ok(()),
-        MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => Err(AxError::OperationNotSupported),
+        MADV_WILLNEED | MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => Ok(()),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -450,19 +478,85 @@ pub fn sys_process_madvise(
     if flags != 0 {
         return Err(AxError::InvalidInput);
     }
-    validate_process_madvise_behavior(behavior)?;
-
     let caller = UserMemoryCapability::new(caller_aspace);
-    let (remote, total_len) = read_iovecs(&caller, iovs, iovcnt)?;
+    let (remote, total_len) = read_process_madvise_iovecs(&caller, iovs, iovcnt)?;
 
     let pidfd = PidFd::from_fd(pidfd)?;
     let target = pidfd.process_data()?;
     let target_image = pidfd.image_access_snapshot()?;
+    validate_process_madvise_behavior(behavior)?;
     check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
     check_process_madvise_capability_if_remote(caller.address_space(), target_image.aspace())?;
     let target_aspace = target_image.into_aspace();
-    validate_remote_iovecs(&target_aspace, &remote)?;
-    Ok(total_len as isize)
+    let mut pageout_work = Vec::new();
+    let mut completed = 0usize;
+    let mut terminal_error = None;
+    for iov in remote.into_iter().filter(|iov| iov.len != 0) {
+        let result = match behavior {
+            // COLLAPSE may transact every shared alias.  It owns its lock
+            // acquisition so it can order every participating mm by ID.
+            MADV_COLLAPSE => crate::syscall::mm::mmap::process_madvise_collapse(
+                &target_aspace,
+                iov.base,
+                iov.len,
+            ),
+            MADV_COLD | MADV_PAGEOUT => {
+                crate::syscall::mm::mmap::ensure_4k_granularity_across_aliases(
+                    &target_aspace,
+                    VirtAddr::from(iov.base),
+                    iov.len,
+                )
+                .and_then(|_| {
+                    let mut aspace = target_aspace.lock();
+                    match behavior {
+                        MADV_WILLNEED => crate::syscall::mm::mmap::process_madvise_willneed(
+                            &mut aspace, iov.base, iov.len,
+                        ),
+                        MADV_COLD => crate::syscall::mm::mmap::process_madvise_cold(
+                            &mut aspace, iov.base, iov.len,
+                        ),
+                        MADV_PAGEOUT => crate::syscall::mm::mmap::process_madvise_collect_pageout(
+                            &mut aspace,
+                            iov.base,
+                            iov.len,
+                            &mut pageout_work,
+                        ),
+                        _ => unreachable!("behavior was validated before ptrace access"),
+                    }
+                })
+            }
+            MADV_WILLNEED => {
+                let mut aspace = target_aspace.lock();
+                crate::syscall::mm::mmap::process_madvise_willneed(&mut aspace, iov.base, iov.len)
+            }
+            _ => unreachable!("behavior was validated before ptrace access"),
+        };
+        match result {
+            Ok(()) => {
+                completed = completed
+                    .checked_add(iov.len)
+                    .ok_or(AxError::InvalidInput)?
+            }
+            Err(error) => {
+                terminal_error = Some(error);
+                break;
+            }
+        }
+    }
+    for (backend, range) in pageout_work {
+        // PAGEOUT is advisory: per-page cache writeback/eviction failure
+        // preserves that page and does not retract already planned effects.
+        let _ = backend.pageout_file_pages(range);
+    }
+    if let Some(error) = terminal_error {
+        return if completed == 0 {
+            Err(error)
+        } else {
+            Ok(completed as isize)
+        };
+    }
+    debug_assert_eq!(completed, total_len);
+    Ok(completed as isize)
 }
 
 /// Linux 6.12 `process_mrelease(2)`: synchronously run the OOM-reaper portion
@@ -678,13 +772,9 @@ mod tests {
     }
 
     #[test]
-    fn process_madvise_only_accepts_implemented_behavior() {
-        assert_eq!(validate_process_madvise_behavior(MADV_WILLNEED), Ok(()));
-        for behavior in [MADV_COLD, MADV_PAGEOUT, MADV_COLLAPSE] {
-            assert_eq!(
-                validate_process_madvise_behavior(behavior),
-                Err(AxError::OperationNotSupported)
-            );
+    fn process_madvise_accepts_implemented_behavior() {
+        for behavior in [MADV_WILLNEED, MADV_COLD, MADV_PAGEOUT, MADV_COLLAPSE] {
+            assert_eq!(validate_process_madvise_behavior(behavior), Ok(()));
         }
         assert_eq!(
             validate_process_madvise_behavior(u32::MAX),

@@ -1,6 +1,7 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     mem::MaybeUninit,
+    ops::Range,
     slice,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -90,6 +91,135 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 pub(crate) struct PreparedCowPage {
     frame: PreparedCowFrame,
     tables: PreparedPageTableFrames,
+}
+
+/// One privately owned 2 MiB frame prepared for an anonymous COW collapse.
+///
+/// The frame is allocated and filled before the page-table transaction starts.
+/// Until [`Self::commit_frame`] is called it remains owned by this guard, so a
+/// failed PMD replacement cannot leak the new frame.  The source 4 KiB frames
+/// are deliberately *not* touched here: their ownership is returned as a
+/// [`CowUnmapRetirement`] only after a successful replacement and must remain
+/// live through the TLB grace period.
+#[must_use = "prepared huge-frame ownership must be committed or dropped"]
+pub(crate) struct PreparedCowHugeFrame {
+    frame: PreparedCowFrame,
+}
+
+/// Privately owned 4 KiB frames prepared to demote one materialized PMD.
+#[must_use = "prepared demotion frames must be committed or dropped"]
+pub(crate) struct PreparedCowDemotionFrames {
+    frames: Vec<PhysAddr>,
+}
+
+impl PreparedCowDemotionFrames {
+    pub(crate) fn copy_from_2m_frame(source: PhysAddr) -> AxResult<Self> {
+        if !PageSize::Size2M.is_aligned(source.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        let mut prepared = Self { frames: Vec::new() };
+        prepared
+            .frames
+            .try_reserve_exact(PageSize::Size2M as usize / PAGE_SIZE_4K)
+            .map_err(|_| AxError::NoMemory)?;
+        for offset in (0..PageSize::Size2M as usize).step_by(PAGE_SIZE_4K) {
+            let frame = alloc_frame(false, PageSize::Size4K)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(source).as_ptr().add(offset),
+                    phys_to_virt(frame).as_mut_ptr(),
+                    PAGE_SIZE_4K,
+                );
+            }
+            prepared.frames.push(frame);
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn frames(&self) -> &[PhysAddr] {
+        &self.frames
+    }
+
+    pub(crate) fn commit_frames(&mut self) {
+        self.frames.clear();
+    }
+}
+
+impl Drop for PreparedCowDemotionFrames {
+    fn drop(&mut self) {
+        for frame in self.frames.drain(..) {
+            dealloc_frame(frame, PageSize::Size4K);
+        }
+    }
+}
+
+impl PreparedCowHugeFrame {
+    /// Allocates a PMD-sized frame and copies exactly its 512 source 4 KiB
+    /// pages in virtual-address order.
+    ///
+    /// This is intentionally separate from page-table publication.  In
+    /// particular it does not install a PTE, mutate a frame reference count,
+    /// or make any source frame reclaimable.
+    pub(crate) fn copy_from_4k_frames(sources: &[Option<PhysAddr>]) -> AxResult<Self> {
+        validate_collapse_2m_source_frames(sources)?;
+        let frame = alloc_frame(true, PageSize::Size2M)?;
+        let mut prepared = Self {
+            frame: PreparedCowFrame::Incomplete(frame),
+        };
+        for (index, source) in sources.iter().copied().enumerate() {
+            let Some(source) = source else {
+                continue;
+            };
+            let offset = index * PAGE_SIZE_4K;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(source).as_ptr(),
+                    phys_to_virt(frame).as_mut_ptr().add(offset),
+                    PAGE_SIZE_4K,
+                );
+            }
+        }
+        prepared.frame = PreparedCowFrame::Ready(frame);
+        Ok(prepared)
+    }
+
+    pub(crate) fn frame(&self) -> AxResult<PhysAddr> {
+        match self.frame {
+            PreparedCowFrame::Ready(frame) => Ok(frame),
+            PreparedCowFrame::Empty | PreparedCowFrame::Incomplete(_) => Err(AxError::BadState),
+        }
+    }
+
+    /// Transfers the prepared frame to the successful page-table replacement.
+    pub(crate) fn commit_frame(&mut self) {
+        debug_assert!(matches!(self.frame, PreparedCowFrame::Ready(_)));
+        self.frame = PreparedCowFrame::Empty;
+    }
+}
+
+impl Drop for PreparedCowHugeFrame {
+    fn drop(&mut self) {
+        let frame = match self.frame {
+            PreparedCowFrame::Empty => None,
+            PreparedCowFrame::Incomplete(frame) | PreparedCowFrame::Ready(frame) => Some(frame),
+        };
+        self.frame = PreparedCowFrame::Empty;
+        if let Some(frame) = frame {
+            dealloc_frame(frame, PageSize::Size2M);
+        }
+    }
+}
+
+fn validate_collapse_2m_source_frames(sources: &[Option<PhysAddr>]) -> AxResult {
+    const COLLAPSE_2M_PAGES: usize = PageSize::Size2M as usize / PAGE_SIZE_4K;
+    if sources.len() != COLLAPSE_2M_PAGES
+        || sources
+            .iter()
+            .any(|frame| frame.is_some_and(|frame| !PageSize::Size4K.is_aligned(frame.as_usize())))
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
 }
 
 enum PreparedCowFrame {
@@ -594,6 +724,99 @@ impl CowBackend {
         self.size == PageSize::Size4K && self.file.is_none()
     }
 
+    pub(crate) fn has_file_backing(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Prepares a replacement PMD frame for a private anonymous 4 KiB COW
+    /// mapping.  Page-table replacement and retirement of `sources` stay with
+    /// the caller so both can be committed as one transaction.
+    pub(crate) fn prepare_collapse_2m_frame(
+        &self,
+        sources: &[Option<PhysAddr>],
+    ) -> AxResult<PreparedCowHugeFrame> {
+        if !self.is_4k_anonymous() {
+            return Err(AxError::InvalidInput);
+        }
+        PreparedCowHugeFrame::copy_from_4k_frames(sources)
+    }
+
+    /// Returns the otherwise-identical COW backend used after a successful
+    /// 4 KiB-to-PMD replacement.  This must be installed only after the PTE
+    /// transaction commits; changing the backend first would make rollback
+    /// unable to interpret the old leaves.
+    pub(crate) fn collapsed_2m_backend(&self) -> AxResult<Self> {
+        if !self.is_4k_anonymous() {
+            return Err(AxError::InvalidInput);
+        }
+        let mut collapsed = self.clone();
+        collapsed.size = PageSize::Size2M;
+        collapsed.mark_materialized();
+        Ok(collapsed)
+    }
+
+    pub(crate) fn prepare_demote_2m_frames(
+        &self,
+        source: PhysAddr,
+    ) -> AxResult<PreparedCowDemotionFrames> {
+        if self.size != PageSize::Size2M || self.file.is_some() {
+            return Err(AxError::InvalidInput);
+        }
+        PreparedCowDemotionFrames::copy_from_2m_frame(source)
+    }
+
+    pub(crate) fn demoted_4k_backend(&self) -> AxResult<Self> {
+        if self.size != PageSize::Size2M || self.file.is_some() {
+            return Err(AxError::InvalidInput);
+        }
+        let mut demoted = self.clone();
+        demoted.size = PageSize::Size4K;
+        demoted.mark_materialized();
+        Ok(demoted)
+    }
+
+    pub(crate) fn retire_demoted_2m_source(
+        &self,
+        vaddr: VirtAddr,
+        frame: PhysAddr,
+        flags: MappingFlags,
+    ) -> AxResult<BackendRetirement> {
+        if self.size != PageSize::Size2M || !PageSize::Size2M.is_aligned(frame.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(BackendRetirement::cow(CowUnmapRetirement {
+            leaves: alloc::vec![(vaddr, frame, flags, PageSize::Size2M)],
+        }))
+    }
+
+    /// Takes ownership of the detached 4 KiB leaves after a successful
+    /// collapse.  Dropping the returned retirement decrements existing COW
+    /// reference counts (or frees unshared frames) only after its owner has
+    /// waited for TLB grace.
+    pub(crate) fn retire_collapsed_2m_sources(
+        &self,
+        start: VirtAddr,
+        leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+    ) -> AxResult<BackendRetirement> {
+        if !self.is_4k_anonymous() {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start + PageSize::Size2M as usize;
+        let mut previous = None;
+        for (vaddr, paddr, _flags, page_size) in &leaves {
+            if *vaddr < start
+                || *vaddr >= end
+                || previous.is_some_and(|previous| *vaddr <= previous)
+                || *page_size != PageSize::Size4K
+                || !PageSize::Size4K.is_aligned(paddr.as_usize())
+            {
+                return Err(AxError::InvalidInput);
+            }
+            previous = Some(*vaddr);
+        }
+        Ok(BackendRetirement::cow(CowUnmapRetirement { leaves }))
+    }
+
     /// Atomically publishes one fully initialized anonymous page.
     ///
     /// This path performs no allocation or deallocation. On every error all
@@ -829,6 +1052,87 @@ impl CowBackend {
             resident = page.is_some();
         });
         resident
+    }
+
+    /// Converts a virtual subrange of this private file mapping into 4 KiB
+    /// page-cache indices.  Private COW leaves are not page-cache aliases,
+    /// but their untouched file contents are still backed by this cache.
+    fn cache_page_range(&self, range: VirtAddrRange) -> AxResult<Range<u32>> {
+        let Some((_, file_start, ..)) = &self.file else {
+            return Err(AxError::OperationNotSupported);
+        };
+        if range.is_empty() {
+            return Ok(0..0);
+        }
+        let start = range
+            .start
+            .as_usize()
+            .checked_sub(self.start.as_usize())
+            .ok_or(AxError::InvalidInput)?;
+        if !start.is_multiple_of(PAGE_SIZE_4K) || !range.size().is_multiple_of(PAGE_SIZE_4K) {
+            return Err(AxError::InvalidInput);
+        }
+        let first = file_start
+            .checked_add(u64::try_from(start).map_err(|_| AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
+        if !first.is_multiple_of(PAGE_SIZE_4K as u64) {
+            return Err(AxError::InvalidInput);
+        }
+        let first =
+            u32::try_from(first / PAGE_SIZE_4K as u64).map_err(|_| AxError::InvalidInput)?;
+        let count =
+            u32::try_from(range.size() / PAGE_SIZE_4K).map_err(|_| AxError::InvalidInput)?;
+        let end = first.checked_add(count).ok_or(AxError::InvalidInput)?;
+        Ok(first..end)
+    }
+
+    /// Brings the untouched file portion of a MAP_PRIVATE mapping into the
+    /// inode cache without allocating an anonymous COW leaf or installing a
+    /// PTE.  Once a private page is materialized it remains private and is
+    /// intentionally not treated as a cache alias.
+    pub(crate) fn prefetch_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        let Some((file, ..)) = &self.file else {
+            return Ok(0);
+        };
+        let pages = self.cache_page_range(range)?;
+        let mut prefetched = 0usize;
+        file.with_direct_io_excluded(|| {
+            for (vaddr, pn) in pages_in(range, PageSize::Size4K)?.zip(pages) {
+                // MAP_PRIVATE mappings preserve the same SIGBUS-at-EOF
+                // boundary as their fault path; there is no backing cache
+                // page to prefetch beyond it.
+                if self.faults_with_sigbus(vaddr) {
+                    continue;
+                }
+                file.with_page_or_insert(pn, |_, evicted| {
+                    drop(evicted);
+                    Ok(())
+                })?;
+                prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+            }
+            Ok::<(), AxError>(())
+        })?;
+        Ok(prefetched)
+    }
+
+    /// Demotes resident source-file cache pages for an unmaterialized private
+    /// mapping.  This cannot affect anonymous COW pages, which have no safe
+    /// reclaim representation without swap.
+    pub(crate) fn cold_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        let Some((file, ..)) = &self.file else {
+            return Err(AxError::OperationNotSupported);
+        };
+        Ok(file.cold_pages(self.cache_page_range(range)?)?)
+    }
+
+    /// Writes back and evicts resident source-file cache pages.  Private COW
+    /// leaves keep their data independently, so eviction is safe and does not
+    /// discard a process-private modification.
+    pub(crate) fn pageout_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        let Some((file, ..)) = &self.file else {
+            return Err(AxError::OperationNotSupported);
+        };
+        Ok(file.pageout_pages(self.cache_page_range(range)?)?)
     }
 
     pub(crate) fn clone_for_range(
@@ -1134,6 +1438,59 @@ mod tests {
     }
 
     #[test]
+    fn collapse_huge_frame_requires_exactly_aligned_4k_sources() {
+        let sources = [Some(PhysAddr::from(0x2000)); PageSize::Size2M as usize / PAGE_SIZE_4K];
+        assert_eq!(validate_collapse_2m_source_frames(&sources), Ok(()));
+        let mut sparse = sources;
+        sparse[17] = None;
+        assert_eq!(validate_collapse_2m_source_frames(&sparse), Ok(()));
+        assert_eq!(
+            validate_collapse_2m_source_frames(&sources[..sources.len() - 1]),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut unaligned = sources;
+        unaligned[17] = Some(PhysAddr::from(0x2001));
+        assert_eq!(
+            validate_collapse_2m_source_frames(&unaligned),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn collapse_huge_frame_is_not_publishable_until_copy_completes() {
+        let mut prepared = PreparedCowHugeFrame {
+            frame: PreparedCowFrame::Incomplete(PhysAddr::from(0x20_0000)),
+        };
+        assert_eq!(prepared.frame(), Err(AxError::BadState));
+        // Synthetic physical address: prevent Drop from reclaiming it.
+        prepared.frame = PreparedCowFrame::Empty;
+    }
+
+    #[test]
+    fn collapse_promotes_only_private_anonymous_4k_cow_backend() {
+        let Backend::Cow(anonymous) =
+            Backend::new_alloc(VirtAddr::from(0x20_0000), PageSize::Size4K)
+        else {
+            unreachable!()
+        };
+        let collapsed = anonymous.collapsed_2m_backend().unwrap();
+        assert_eq!(collapsed.page_size(), PageSize::Size2M);
+        assert!(collapsed.is_private_anonymous());
+        assert!(collapsed.is_materialized());
+
+        let Backend::Cow(already_huge) =
+            Backend::new_alloc(VirtAddr::from(0x20_0000), PageSize::Size2M)
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            already_huge.collapsed_2m_backend(),
+            Err(AxError::InvalidInput)
+        ));
+    }
+
+    #[test]
     fn materialized_growdown_must_clone_backend_identity_to_remerge() {
         let Backend::Cow(original) = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K)
         else {
@@ -1192,6 +1549,58 @@ mod tests {
         assert!(file_private.needs_eager_fork_copy(pinned, &[pinned]));
         assert!(!anonymous.needs_eager_fork_copy(other, &[pinned]));
         assert!(!huge.needs_eager_fork_copy(pinned, &[pinned]));
+    }
+
+    #[test]
+    fn private_file_cow_madvise_uses_source_page_cache_without_cow_faulting() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "private-cow-madvise-cache",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let Backend::Cow(backend) = Backend::new_cow(
+            VirtAddr::from(0x8000),
+            PageSize::Size4K,
+            location,
+            0,
+            None,
+            false,
+        ) else {
+            unreachable!()
+        };
+        let address = VirtAddr::from(0x8000);
+        let range = VirtAddrRange::new(address, address + PAGE_SIZE_4K);
+
+        assert!(!backend.cached_page_resident(address));
+        assert_eq!(backend.prefetch_file_pages(range), Ok(1));
+        assert!(backend.cached_page_resident(address));
+        assert_eq!(backend.cold_file_pages(range), Ok(1));
+        // Memory files are not writeback-backed, so PAGEOUT correctly keeps
+        // the resident cache page while still taking the real cache path.
+        assert_eq!(backend.pageout_file_pages(range), Ok(0));
+    }
+
+    #[test]
+    fn anonymous_cow_rejects_unimplementable_cold_and_pageout() {
+        let Backend::Cow(backend) = Backend::new_alloc(VirtAddr::from(0x8000), PageSize::Size4K)
+        else {
+            unreachable!()
+        };
+        let range = VirtAddrRange::new(VirtAddr::from(0x8000), VirtAddr::from(0x9000));
+
+        assert_eq!(
+            backend.cold_file_pages(range),
+            Err(AxError::OperationNotSupported)
+        );
+        assert_eq!(
+            backend.pageout_file_pages(range),
+            Err(AxError::OperationNotSupported)
+        );
     }
 
     struct MockCowCloneOps {

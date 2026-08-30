@@ -3,10 +3,10 @@ use alloc::{sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{CachedFile, FileBackend, FileFlags};
 use axfs_ng_vfs::Location;
-use axhal::paging::{MappingFlags, PageSize};
+use axhal::paging::{MappingFlags, PageSize, PreparedPageTableFrames};
 use axtask::current;
 use linux_raw_sys::general::*;
-use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use crate::{
     file::{
@@ -696,6 +696,16 @@ pub fn sys_mmap(
         flags,
     )?;
 
+    if map_flags.contains(MmapFlags::FIXED) && !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
+        // A replacement can cut through a compound shared folio.  Demote the
+        // complete alias set before taking this mm's single-map unmap path.
+        ensure_4k_granularity_across_aliases(
+            &aspace_handle,
+            VirtAddr::from(normalized_start),
+            length,
+        )?;
+    }
+
     // All file/object-specific validation, VFS access, backing allocation, and
     // deferred-owner allocation has completed. From this point through VMA
     // publication, the fixed shared path only moves prepared resources.
@@ -833,7 +843,23 @@ pub fn sys_mmap(
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);
             proc_data.clear_mempolicy_range(start.as_usize(), length);
         }
+        let pending_alias = backend
+            .shared_backing_key()
+            .map(|key| aspace.prepare_shared_alias_binding(key, &aspace_handle))
+            .transpose()?
+            .flatten();
         aspace.map(start, length, effective_protection, populate, backend)?;
+        if let Some(pending_alias) = pending_alias {
+            aspace.commit_shared_alias_binding(pending_alias);
+        }
+        if let Err(error) = aspace.sync_shared_alias_bindings(&aspace_handle) {
+            // The reverse-map lease is part of publishing a shared mapping:
+            // never expose a new shmem VMA that a later cross-mm collapse
+            // cannot discover.  This VMA was just installed by this syscall,
+            // so rollback cannot retire an unrelated mapping.
+            deferred_uffd_wake.merge(aspace.unmap(start, length)?);
+            return Err(error);
+        }
         if let Some(admission) = mapping_admission {
             admission
                 .complete()
@@ -870,9 +896,10 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
     let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
     let length = checked_align_up_4k(length).ok_or(AxError::InvalidInput)?;
     let start_addr = VirtAddr::from(addr);
+    ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
+    let mut aspace = aspace_handle.lock();
     let wake = aspace.unmap(start_addr, length)?;
     proc_data.clear_mempolicy_range(start_addr.as_usize(), length);
     drop(aspace);
@@ -989,8 +1016,9 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
     let thread = curr.as_thread();
     let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
     let aspace_handle = authorized_image.aspace().clone();
-    let mut aspace = aspace_handle.lock();
     let start_addr = VirtAddr::from(addr);
+    ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
+    let mut aspace = aspace_handle.lock();
     let requested_protection: MappingFlags = permission_flags.into();
 
     // Match Linux's per-VMA order: a successful prefix remains protected if a
@@ -1126,6 +1154,494 @@ fn madvise_discard_behavior(advice: u32) -> bool {
     )
 }
 
+/// Applies the subset of `madvise` which can be safely driven against a
+/// caller-pinned foreign address space.  This function intentionally has no
+/// current-task lookup: `process_madvise` must retain the pidfd image it
+/// authorized rather than switching the current address-space context.
+pub(crate) fn process_madvise_willneed(
+    aspace: &mut AddrSpace,
+    addr: usize,
+    length: usize,
+) -> AxResult {
+    if !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    if length == 0 {
+        return Ok(());
+    }
+    let (start, length) = validate_page_aligned_range(addr, length)?;
+    let end = start + length;
+    let mut cursor = start;
+
+    // Linux applies advice to the mapped prefix and reports ENOMEM only on
+    // reaching a hole.  Do not preflight the complete range: that would
+    // incorrectly discard useful file-cache work before a later hole.
+    while cursor < end {
+        let Some(area) = aspace.find_area(cursor) else {
+            return Err(AxError::NoMemory);
+        };
+        if area.start() > cursor {
+            return Err(AxError::NoMemory);
+        }
+        let area_end = area.end().min(end);
+        let backend = area.backend().clone();
+        backend.prefetch_file_backed(VirtAddrRange::new(cursor, area_end), aspace)?;
+        cursor = area_end;
+    }
+    Ok(())
+}
+
+/// Demotes resident file-cache pages in each mapped segment.  No fault is
+/// taken and anonymous mappings retain their data unchanged.
+pub(crate) fn process_madvise_cold(aspace: &mut AddrSpace, addr: usize, length: usize) -> AxResult {
+    process_madvise_walk(aspace, addr, length, true, |aspace, backend, range| {
+        // Clearing the x86 accessed state is a real LRU demotion for every
+        // resident mapping kind. File-backed mappings additionally demote
+        // their cache entry; anonymous and shmem backing is retained because
+        // this kernel has no swap representation.
+        aspace.cold_resident_pages(range)?;
+        if backend.has_file_cache_backing() {
+            backend.cold_file_pages(range)?;
+        }
+        Ok(())
+    })
+}
+
+/// Collects file-cache eviction work while the target VMA layout is stable.
+/// The caller must run the returned work only after dropping the address-space
+/// lock: cache eviction listeners need to detach aliases from that same mm.
+pub(crate) fn process_madvise_collect_pageout(
+    aspace: &mut AddrSpace,
+    addr: usize,
+    length: usize,
+    work: &mut Vec<(Backend, VirtAddrRange)>,
+) -> AxResult {
+    process_madvise_walk(aspace, addr, length, true, |aspace, backend, range| {
+        // PAGEOUT first demotes resident PTEs. Without swap this is the
+        // Linux outcome for private anonymous and shmem leaves: retain data
+        // and make it reclaim-eligible, rather than falsely discarding it or
+        // rejecting an otherwise valid advisory request.
+        aspace.cold_resident_pages(range)?;
+        // File-private COW mappings retain their source cache separately from
+        // their anonymous leaves and therefore need the same PAGEOUT work as
+        // shared file mappings. Anonymous/shmem leaves have no swap target,
+        // so their completed PTE demotion is the real no-swap result.
+        if backend.has_file_cache_backing() {
+            work.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            work.push((backend, range));
+        }
+        Ok(())
+    })
+}
+
+fn process_madvise_walk(
+    aspace: &mut AddrSpace,
+    addr: usize,
+    length: usize,
+    reject_locked: bool,
+    mut apply: impl FnMut(&mut AddrSpace, Backend, VirtAddrRange) -> AxResult,
+) -> AxResult {
+    if !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    if length == 0 {
+        return Ok(());
+    }
+    let (start, length) = validate_page_aligned_range(addr, length)?;
+    let end = start + length;
+    let mut cursor = start;
+    while cursor < end {
+        let Some(area) = aspace.find_area(cursor) else {
+            return Err(AxError::NoMemory);
+        };
+        if area.start() > cursor {
+            return Err(AxError::NoMemory);
+        }
+        let area_end = area.end().min(end);
+        if reject_locked {
+            let locked = aspace.locked_segments_in_range(cursor, area_end.sub_addr(cursor));
+            if let Some((locked_start, _)) = locked.first().copied() {
+                if cursor < locked_start {
+                    apply(
+                        aspace,
+                        area.backend().clone(),
+                        VirtAddrRange::new(cursor, locked_start),
+                    )?;
+                }
+                return Err(AxError::InvalidInput);
+            }
+        }
+        let backend = area.backend().clone();
+        apply(aspace, backend, VirtAddrRange::new(cursor, area_end))?;
+        cursor = area_end;
+    }
+    Ok(())
+}
+
+/// Restores 4 KiB geometry for a range which may intersect a shared compound
+/// folio.  A normal alias-preserving PMD can be expanded under one mm lock,
+/// but a `SharedPages` folio owns replacement frames for every alias and must
+/// be demoted as one cross-mm transaction.
+pub(crate) fn ensure_4k_granularity_across_aliases(
+    aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
+    start: VirtAddr,
+    length: usize,
+) -> AxResult {
+    if length == 0 {
+        return Ok(());
+    }
+    let end = start.checked_add(length).ok_or(AxError::InvalidInput)?;
+    let mut cursor = VirtAddr::from(start.as_usize() & !(PageSize::Size2M as usize - 1));
+    while cursor < end {
+        let compound = {
+            let aspace = aspace_handle.lock();
+            match (
+                aspace.shared_pages_at(cursor),
+                aspace.shared_backing_offset_at(cursor),
+            ) {
+                (Some(pages), Some(offset)) => {
+                    let start_index = offset / PAGE_SIZE_4K;
+                    (pages.page_size() == PageSize::Size4K
+                        && offset.is_multiple_of(PageSize::Size2M as usize)
+                        && pages.has_4k_folio(start_index)
+                        && aspace
+                            .page_table()
+                            .query(cursor)
+                            .is_ok_and(|(_, _, size)| size == PageSize::Size2M))
+                    .then_some((pages, start_index))
+                }
+                _ => None,
+            }
+        };
+        if let Some((pages, start_index)) = compound {
+            demote_shared_folio_across_aliases(aspace_handle, pages, start_index)?;
+        } else {
+            aspace_handle
+                .lock()
+                .ensure_4k_granularity(cursor, PageSize::Size2M as usize)?;
+        }
+        cursor = cursor
+            .checked_add(PageSize::Size2M as usize)
+            .ok_or(AxError::InvalidInput)?;
+    }
+    Ok(())
+}
+
+fn demote_shared_folio_across_aliases(
+    target: &Arc<axsync::Mutex<AddrSpace>>,
+    pages: Arc<SharedPages>,
+    start_index: usize,
+) -> AxResult {
+    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key());
+    let mut participants = aliases
+        .into_iter()
+        .filter_map(|alias| alias.revalidate().map(|aspace| (alias.address_space_id(), aspace)))
+        .collect::<Vec<_>>();
+    let target_id = target.lock().address_space_id();
+    if !participants.iter().any(|(_, aspace)| Arc::ptr_eq(aspace, target)) {
+        participants.push((target_id, target.clone()));
+    }
+    participants.sort_unstable_by_key(|(id, _)| *id);
+    participants.dedup_by(|(_, left), (_, right)| Arc::ptr_eq(left, right));
+
+    let mut guards = Vec::new();
+    guards
+        .try_reserve_exact(participants.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (_, participant) in &participants {
+        guards.push(participant.lock());
+    }
+
+    // Snapshot every fallible backing resource before touching any PTE.  The
+    // old 4 KiB frames remain folio-owned until the final commit.
+    let frames = pages.demote_4k_folio_frames(start_index)?;
+    let mut plans = Vec::new();
+    for (guard_index, guard) in guards.iter().enumerate() {
+        for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
+            let flags = guard.preflight_shared_folio_demotion_2m(alias_start, &pages, start_index)?;
+            plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            plans.push((guard_index, alias_start, flags));
+        }
+    }
+    if plans.is_empty() {
+        return Err(AxError::BadState);
+    }
+    let mut tables = Vec::new();
+    tables
+        .try_reserve_exact(plans.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for _ in &plans {
+        tables.push(PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?);
+    }
+
+    let mut protected = 0usize;
+    for &(guard_index, alias_start, flags) in &plans {
+        if let Err(error) = guards[guard_index]
+            .write_protect_shared_folio_demotion_2m(alias_start, flags)
+        {
+            for &(rollback_guard, rollback_start, rollback_flags) in plans[..protected].iter().rev() {
+                guards[rollback_guard]
+                    .restore_shared_folio_demotion_pmd_permissions(rollback_start, rollback_flags)?;
+            }
+            return Err(error);
+        }
+        protected += 1;
+    }
+
+    let mut published = Vec::new();
+    published
+        .try_reserve_exact(plans.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (index, &(guard_index, alias_start, flags)) in plans.iter().enumerate() {
+        match guards[guard_index].publish_shared_folio_demotion_2m(
+            alias_start,
+            &frames,
+            flags,
+            &mut tables[index],
+        ) {
+            Ok(replacement) => published.push((guard_index, replacement)),
+            Err(error) => {
+                for (rollback_guard, replacement) in published.drain(..).rev() {
+                    guards[rollback_guard].rollback_shared_folio_demotion_2m(replacement)?;
+                }
+                for &(rollback_guard, rollback_start, rollback_flags) in plans.iter().rev() {
+                    guards[rollback_guard]
+                        .restore_shared_folio_demotion_pmd_permissions(rollback_start, rollback_flags)?;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    // No stale PMD may retain writable access while the folio is copied back.
+    for guard in guards.iter_mut() {
+        drop(guard.synchronize_tlb_after_mutation());
+    }
+    if let Err(error) = pages.demote_4k_folio(start_index) {
+        for (rollback_guard, replacement) in published.drain(..).rev() {
+            guards[rollback_guard].rollback_shared_folio_demotion_2m(replacement)?;
+        }
+        return Err(error);
+    }
+    for (guard_index, replacement) in published {
+        guards[guard_index]
+            .restore_shared_folio_permissions_2m(replacement.start, replacement.flags)?;
+    }
+    Ok(())
+}
+
+/// Returns the PMD-aligned subrange fully contained in a page-rounded
+/// MADV_COLLAPSE request.  `None` is a valid no-op when no full PMD fits.
+fn collapse_full_pmd_range(addr: usize, length: usize) -> AxResult<Option<(usize, usize)>> {
+    // Unlike most madvise range operations, Linux rejects an unaligned
+    // original MADV_COLLAPSE address.  Length is still rounded up below.
+    if !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    let unit = PageSize::Size2M as usize;
+    let (page_start, page_length) = validate_page_aligned_range(addr, length)?;
+    if page_length == 0 {
+        return Ok(None);
+    }
+    let page_end = page_start + page_length;
+    let start = page_start
+        .as_usize()
+        .checked_add(unit - 1)
+        .map(|value| value & !(unit - 1))
+        .ok_or(AxError::InvalidInput)?;
+    let end = page_end.as_usize() & !(unit - 1);
+    Ok((start < end).then_some((start, end)))
+}
+
+pub(crate) fn process_madvise_collapse(
+    aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
+    addr: usize,
+    length: usize,
+) -> AxResult {
+    let shared_key = {
+        let aspace = aspace_handle.lock();
+        let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
+            return Ok(());
+        };
+        // Select from the first *eligible PMD*, not the raw user address:
+        // MADV_COLLAPSE deliberately permits a leading partial VMA.
+        let key = aspace.shared_backing_key_at(VirtAddr::from(cursor));
+        while cursor < end {
+            let candidate = aspace.shared_backing_key_at(VirtAddr::from(cursor));
+            if candidate != key {
+                // A transaction cannot safely change from a private/file PMD
+                // to a shared backing (or between backings) mid-request.
+                return Err(AxError::InvalidInput);
+            }
+            cursor = cursor
+                .checked_add(PageSize::Size2M as usize)
+                .ok_or(AxError::InvalidInput)?;
+        }
+        key
+    };
+    if let Some(key) = shared_key {
+        // Alias leases are weak and may disappear between snapshot and lock.
+        // Upgrade and de-duplicate first, then acquire every live mm in the
+        // sole global order (AddressSpaceId).  No VMA mutation happens before
+        // all participants are locked.
+        let (_mutation, aliases) = crate::mm::reserve_alias_mutation(key);
+        let mut participants = aliases
+            .into_iter()
+            .filter_map(|alias| alias.revalidate().map(|aspace| (alias.address_space_id(), aspace)))
+            .collect::<Vec<_>>();
+        let target_id = aspace_handle.lock().address_space_id();
+        if !participants.iter().any(|(_, alias)| Arc::ptr_eq(alias, aspace_handle)) {
+            participants.push((target_id, aspace_handle.clone()));
+        }
+        participants.sort_unstable_by_key(|(id, _)| *id);
+        participants.dedup_by(|(_, left), (_, right)| Arc::ptr_eq(left, right));
+        let target_index = participants
+            .iter()
+            .position(|(_, alias)| Arc::ptr_eq(alias, aspace_handle))
+            .ok_or(AxError::BadState)?;
+        let mut guards = Vec::new();
+        guards
+            .try_reserve_exact(participants.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (_, participant) in &participants {
+            guards.push(participant.lock());
+        }
+        return process_madvise_collapse_shared_locked(&mut guards, target_index, addr, length);
+    }
+    let mut aspace = aspace_handle.lock();
+    process_madvise_collapse_locked(&mut aspace, addr, length)
+}
+
+fn process_madvise_collapse_shared_locked(
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+    target_index: usize,
+    addr: usize,
+    length: usize,
+) -> AxResult {
+    let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
+        return Ok(());
+    };
+    while cursor < end {
+        let start = VirtAddr::from(cursor);
+        let Some(pages) = guards[target_index].shared_pages_at(start) else {
+            let result = if guards[target_index]
+                .find_area(start)
+                .is_some_and(|area| area.backend().is_private_anonymous())
+            {
+                guards[target_index].collapse_private_cow_2m(start)
+            } else {
+                guards[target_index].collapse_alias_preserving_2m(start)
+            };
+            result?;
+            cursor = cursor.checked_add(PageSize::Size2M as usize).ok_or(AxError::InvalidInput)?;
+            continue;
+        };
+        let backing_offset = guards[target_index]
+            .shared_backing_offset_at(start)
+            .ok_or(AxError::BadState)?;
+        if !backing_offset.is_multiple_of(PageSize::Size2M as usize) {
+            return Err(AxError::InvalidInput);
+        }
+        let start_index = backing_offset / PAGE_SIZE_4K;
+        // Fixed shared objects can expose raw kernel atomic handles. Those
+        // handles are intentionally lifetime-pinned to their base frames and
+        // cannot be redirected by a userspace PTE transaction.
+        if pages.is_fixed() {
+            return Err(AxError::InvalidInput);
+        }
+        let mut plans = Vec::new();
+        for (guard_index, guard) in guards.iter().enumerate() {
+            for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
+                let flags = guard.preflight_shared_folio_collapse_2m(alias_start, &pages, start_index)?;
+                plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                plans.push((guard_index, alias_start, flags));
+            }
+        }
+        if !plans.iter().any(|(guard_index, alias_start, _)| {
+            *guard_index == target_index && *alias_start == start
+        }) {
+            return Err(AxError::BadState);
+        }
+        let mut published = Vec::new();
+        published
+            .try_reserve_exact(plans.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for &(guard_index, alias_start, flags) in &plans {
+            if let Err(error) = guards[guard_index]
+                .write_protect_shared_folio_collapse_2m(alias_start, flags)
+            {
+                for &(restore_guard, restore_start, restore_flags) in &plans {
+                    if restore_guard == guard_index && restore_start == alias_start {
+                        break;
+                    }
+                    guards[restore_guard]
+                        .restore_shared_folio_permissions_2m(restore_start, restore_flags)?;
+                }
+                return Err(error);
+            }
+        }
+        let folio = match pages.promote_4k_folio(start_index) {
+            Ok(folio) => folio,
+            Err(error) => {
+                for &(guard_index, alias_start, flags) in &plans {
+                    guards[guard_index].restore_shared_folio_permissions_2m(alias_start, flags)?;
+                }
+                return Err(error);
+            }
+        };
+        for &(guard_index, alias_start, flags) in &plans {
+            match guards[guard_index].publish_shared_folio_collapse_2m(alias_start, folio, flags) {
+                Ok(replacement) => published.push((guard_index, replacement)),
+                Err(error) => {
+                    for (rollback_guard, replacement) in published.drain(..).rev() {
+                        guards[rollback_guard].rollback_shared_folio_collapse_2m(replacement)?;
+                    }
+                    pages.demote_4k_folio(start_index)?;
+                    for &(restore_guard, restore_start, restore_flags) in &plans {
+                        guards[restore_guard]
+                            .restore_shared_folio_permissions_2m(restore_start, restore_flags)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for (commit_guard, replacement) in published {
+            guards[commit_guard].commit_shared_folio_collapse_2m(replacement);
+        }
+        cursor = cursor.checked_add(PageSize::Size2M as usize).ok_or(AxError::InvalidInput)?;
+    }
+    Ok(())
+}
+
+fn process_madvise_collapse_locked(
+    aspace: &mut AddrSpace,
+    addr: usize,
+    length: usize,
+) -> AxResult {
+    // MADV_COLLAPSE takes ordinary page-granular user ranges. Only PMD units
+    // wholly enclosed by the page-rounded range are candidates; a partial
+    // leading or trailing PMD retains its 4 KiB representation. This is
+    // deliberately not a nonzero/multiple-of-2MiB argument gate.
+    let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
+        return Ok(());
+    };
+    let unit = PageSize::Size2M as usize;
+    while cursor < end {
+        let start = VirtAddr::from(cursor);
+        let result = if aspace
+            .find_area(start)
+            .is_some_and(|area| area.backend().is_private_anonymous())
+        {
+            aspace.collapse_private_cow_2m(start)
+        } else {
+            aspace.collapse_alias_preserving_2m(start)
+        };
+        result?;
+        cursor = cursor.checked_add(unit).ok_or(AxError::InvalidInput)?;
+    }
+    Ok(())
+}
+
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
 
@@ -1153,6 +1669,10 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         }
         MADV_DONTFORK | MADV_DOFORK => {
             inspect_madvise_range(&aspace, start, length)?;
+            // Fork policy ranges can split a PMD.  Establish 4 KiB geometry
+            // first, rather than leaving later fork/duplicate transactions
+            // with a policy boundary through one huge COW leaf.
+            aspace.ensure_4k_granularity(start, length)?;
             aspace.set_dontfork(start, length, advice == MADV_DONTFORK)?;
             Ok(0)
         }
@@ -1200,11 +1720,13 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
                 }
                 cursor = area.end().min(end);
             }
+            aspace.ensure_4k_granularity(start, length)?;
             aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)?;
             Ok(0)
         }
         MADV_KEEPONFORK => {
             inspect_madvise_range(&aspace, start, length)?;
+            aspace.ensure_4k_granularity(start, length)?;
             aspace.set_wipe_on_fork(start, length, false)?;
             Ok(0)
         }
@@ -1520,6 +2042,30 @@ mod tests {
         assert!(madvise_discard_behavior(MADV_WIPEONFORK));
         assert!(!madvise_discard_behavior(MADV_COLD));
         assert!(!madvise_discard_behavior(MADV_PAGEOUT));
+    }
+
+    #[test]
+    fn collapse_uses_page_rounded_range_and_skips_partial_pmds() {
+        let unit = PageSize::Size2M as usize;
+
+        assert_eq!(
+            collapse_full_pmd_range(0x1234, 1),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(collapse_full_pmd_range(unit, 0), Ok(None));
+        assert_eq!(
+            collapse_full_pmd_range(0x1000, 2 * unit),
+            Ok(Some((unit, 2 * unit)))
+        );
+        assert_eq!(collapse_full_pmd_range(unit + 1, unit - 1), Ok(None));
+        assert_eq!(
+            collapse_full_pmd_range(unit, unit),
+            Ok(Some((unit, 2 * unit)))
+        );
+        assert_eq!(
+            collapse_full_pmd_range(unit, unit - 1),
+            Ok(Some((unit, 2 * unit)))
+        );
     }
 
     #[test]

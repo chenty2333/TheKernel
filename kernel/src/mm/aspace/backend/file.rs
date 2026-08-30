@@ -4,7 +4,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axfs::{
@@ -539,6 +542,29 @@ impl FileBackendInner {
             return true;
         }
 
+        // A cache eviction must never turn an mlocked mapping into a missing
+        // PTE.  Returning false keeps the cache page resident; PAGEOUT then
+        // treats this page as advisory work it could not reclaim.
+        if aspace.range_is_locked(vaddr, PageSize::Size4K as usize) {
+            return false;
+        }
+
+        // An alias-preserving COLLAPSE may have installed one PDE over these
+        // cache pages.  Cache eviction still has 4 KiB ownership, so expand
+        // that PDE before detaching this one cache-page alias.
+        if aspace
+            .page_table()
+            .query(vaddr)
+            .is_ok_and(|(_, _, size)| size == PageSize::Size2M)
+            && aspace
+                .demote_alias_preserving_2m(VirtAddr::from(
+                    vaddr.as_usize() & !(super::super::COLLAPSE_2M_SIZE - 1),
+                ))
+                .is_err()
+        {
+            return false;
+        }
+
         let result = aspace.page_table_mut().cursor().unmap(vaddr);
         match result {
             Ok(_) => {
@@ -892,6 +918,18 @@ impl FileBackend {
         Ok(())
     }
 
+    fn cache_page_range(&self, range: VirtAddrRange) -> AxResult<Range<u32>> {
+        self.validate_range(range)?;
+        if range.is_empty() {
+            return Ok(0..0);
+        }
+        let start = self.page_number_for(range.start)?;
+        let count =
+            u32::try_from(range.size() / PAGE_SIZE_4K).map_err(|_| AxError::InvalidInput)?;
+        let end = start.checked_add(count).ok_or(AxError::InvalidInput)?;
+        Ok(start..end)
+    }
+
     pub(crate) fn check_flags(&self, flags: MappingFlags) -> AxResult {
         let mut required_flags = FileFlags::empty();
         if flags.contains(MappingFlags::READ) {
@@ -1007,6 +1045,63 @@ impl FileBackend {
             resident = page.is_some();
         });
         resident
+    }
+
+    /// Demotes already resident file-cache pages without faulting them in.
+    pub(crate) fn cold_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        Ok(self.0.cache.cold_pages(self.cache_page_range(range)?)?)
+    }
+
+    /// Writes back and evicts resident file-cache pages for this mapping.
+    /// Missing, pinned, writeback, and in-memory pages are left in place by
+    /// the cache layer, matching the advisory nature of pageout.
+    pub(crate) fn pageout_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
+        Ok(self.0.cache.pageout_pages(self.cache_page_range(range)?)?)
+    }
+
+    /// Reads file-backed pages into the inode cache without installing PTEs.
+    ///
+    /// A caller holds `aspace`'s lock while this runs.  Cache replacement can
+    /// therefore make this mapping's eviction listener defer PTE detachment;
+    /// use the owner-aware cache insertion path and drain that deferred
+    /// eviction before releasing its retained page.  The ordinary insertion
+    /// path cannot do this: it would either reject the locked listener or
+    /// release an evicted page before its aliases had been detached.
+    pub(crate) fn prefetch(&self, range: VirtAddrRange, aspace: &mut AddrSpace) -> AxResult<usize> {
+        self.validate_range(range)?;
+
+        self.0.cache.with_direct_io_excluded(|| {
+            let mut prefetched = 0usize;
+            for vaddr in pages_in(range, PageSize::Size4K)? {
+                // A mapping wholly beyond its current file size faults with
+                // SIGBUS.  It has no backing page to bring into cache.
+                if self.faults_with_sigbus(vaddr) {
+                    continue;
+                }
+                let pn = self.page_number_for(vaddr)?;
+                let evicted = self.0.cache.with_page_or_insert_for_owner(
+                    pn,
+                    self.0.owner,
+                    |_, evicted| Ok(evicted),
+                )?;
+                if let Some(evicted) = evicted {
+                    if let Some(owner) = evicted.deferred_owner() {
+                        assert_eq!(owner, self.0.owner);
+                        assert!(
+                            self.0
+                                .on_evict_from_locked_aspace(evicted.page_number(), aspace),
+                            "failed to detach aliases for deferred cache eviction"
+                        );
+                    }
+                    // Keep a deferred page alive until every alias was
+                    // detached above; non-deferred pages were already
+                    // acknowledged by their listeners.
+                    drop(evicted);
+                }
+                prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+            }
+            Ok(prefetched)
+        })
     }
 
     pub(crate) fn begin_user_io_pin_window(&self) -> AxResult<CachedFilePinWindow> {
@@ -1544,6 +1639,24 @@ mod tests {
             }),
             Err(AxError::BadAddress)
         );
+    }
+
+    #[test]
+    fn prefetch_populates_file_cache_without_installing_a_pte() {
+        let _context = test_context();
+        let location = test_location("prefetch-without-pte");
+        let backend = test_backend(&location, Arc::new(()));
+        let address = VirtAddr::from(0x1000);
+        let range = VirtAddrRange::new(address, address + PAGE_SIZE_4K);
+        let mut aspace = AddrSpace::new_empty(address, PAGE_SIZE_4K).unwrap();
+
+        assert!(!backend.cached_page_resident(address));
+        assert_eq!(backend.prefetch(range, &mut aspace), Ok(1));
+        assert!(backend.cached_page_resident(address));
+        assert!(matches!(
+            aspace.page_table().query(address),
+            Err(PagingError::NotMapped)
+        ));
     }
 
     #[test]

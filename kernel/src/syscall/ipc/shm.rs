@@ -1809,7 +1809,24 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 
     let admission =
         prepare_shmat_admission_in(&SHM_MANAGER, shm_inner.clone(), pid, shmid, va_range)?;
+    let pending_alias = backend
+        .shared_backing_key()
+        .map(|key| aspace.prepare_shared_alias_binding(key, &aspace_handle))
+        .transpose()?
+        .flatten();
     aspace.map(start_addr, length, mapping_flags, false, backend)?;
+    if let Some(pending_alias) = pending_alias {
+        aspace.commit_shared_alias_binding(pending_alias);
+    }
+    if let Err(error) = aspace.sync_shared_alias_bindings(&aspace_handle) {
+        // Registration is part of publishing a shared mapping: without its
+        // reverse-map lease a later cross-mm folio transaction can miss this
+        // alias. Roll the just-created VMA back before exposing failure.
+        let wake = aspace.unmap(start_addr, length)?;
+        drop(aspace);
+        wake.finish();
+        return Err(error);
+    }
     if first_attach {
         shm_inner.lock().map_to_phys(pages);
     }
@@ -2006,6 +2023,11 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
             .ok_or(AxError::InvalidInput)?;
 
         let aspace_handle = proc_data.aspace();
+        crate::syscall::ensure_4k_granularity_across_aliases(
+            &aspace_handle,
+            va_range.start,
+            va_range.size(),
+        )?;
         let wake = {
             let mut aspace = aspace_handle.lock();
             aspace.unmap(va_range.start, va_range.size())?

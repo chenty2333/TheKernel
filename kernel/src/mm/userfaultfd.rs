@@ -2110,7 +2110,11 @@ impl AddrSpace {
             .ok_or(AxError::BadFileDescriptor)?
             .take_snapshot_scratch();
         snapshots.clear();
-        let scanned = self.append_uffd_mapping_snapshots(range, &mut snapshots);
+        // UFFD registrations describe 4 KiB VMAs.  Establish that geometry
+        // before taking their immutable snapshots.
+        let scanned = self
+            .ensure_4k_granularity(VirtAddr::from(range.start()), range.len())
+            .and_then(|()| self.append_uffd_mapping_snapshots(range, &mut snapshots));
         let result = match scanned {
             Ok(()) => self
                 .uffd

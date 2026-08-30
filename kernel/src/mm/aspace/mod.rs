@@ -13,9 +13,10 @@ use core::{
 use axerrno::{AxError, AxResult, ax_bail};
 use axhal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageSize, PageTable, PagingError},
+    paging::{MappingFlags, PageSize, PageTable, PagingError, PreparedPageTableFrames, PagingHandlerImpl},
     trap::PageFaultFlags,
 };
+use page_table_multiarch::{ReplacedPteRun, x86_64::X64PTE};
 use axsync::Mutex;
 use hashbrown::{HashMap, hash_map::Entry};
 use kernel_guard::NoPreemptIrqSave;
@@ -28,7 +29,7 @@ use thekernel_linux_mm::{
     AddressSpaceId, ExpectedMapping, FaultDisposition, FaultHandlerId, InvalidationRange,
     InvalidationReason, MappingAccess, MappingGeneration, MappingId, MappingKind, MappingSnapshot,
     MmError, PageRange, PinBudget, PinBudgetCharge, PinOwner, PinQuota, PinRegistry, PinRequest,
-    PinReservation, PinToken, UffdRegistration,
+    PinReservation, PinToken, UffdRegisterMode, UffdRegistration,
 };
 
 use super::{
@@ -42,10 +43,32 @@ use super::{
 use crate::task::{AsThread, has_pending_sigkill};
 
 mod backend;
+mod alias_registry;
 mod mapping;
 
 pub use self::backend::*;
+pub(crate) use self::alias_registry::{
+    AliasLease, PendingAliasLease, SharedBackingKey, reserve_alias_mutation,
+};
 pub(crate) use self::mapping::{FileLikeMappingLease, FileMappingLease, FileMappingSharing};
+
+type SharedFolioPteRun = ReplacedPteRun<X64PTE, PagingHandlerImpl>;
+
+/// A detached P1 run held until every alias has published its matching PMD.
+/// Dropping it commits the page-table half of the transaction; passing it to
+/// rollback restores the exact PTE bytes, including accessed/dirty state.
+pub(crate) struct SharedFolioPteReplacement {
+    start: VirtAddr,
+    run: SharedFolioPteRun,
+}
+
+/// One alias switched from a shared compound PMD back to protected 4 KiB
+/// leaves.  The old PMD can be restored until backing ownership commits.
+pub(crate) struct SharedFolioDemotionReplacement {
+    pub(crate) start: VirtAddr,
+    folio: PhysAddr,
+    pub(crate) flags: MappingFlags,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
@@ -150,6 +173,47 @@ fn validate_uffd_missing_backend_granule(page_size: PageSize) -> AxResult {
 const USER_IO_PIN_MAX_TOKENS: u64 = 64;
 const USER_IO_PIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const USER_IO_PIN_MAX_PAGES: u64 = USER_IO_PIN_MAX_BYTES / PAGE_SIZE_4K as u64;
+/// One PMD-sized anonymous promotion unit on x86_64.
+///
+/// Keep the eligibility test separate from the eventual page-table
+/// transaction.  The latter may allocate and fail; this predicate must be a
+/// side-effect-free proof that no VMA sidecar contract is crossed.
+pub(crate) const COLLAPSE_2M_SIZE: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Collapse2MCandidateFacts {
+    pub(crate) start: usize,
+    pub(crate) length: usize,
+    pub(crate) vma_covers_range: bool,
+    pub(crate) private_anonymous_cow: bool,
+    /// A write-protect registration changes the permission contract of a
+    /// present leaf.  MISSING-only registrations do not: once every source
+    /// PTE is resident, promotion can retain their fault-free semantics.
+    pub(crate) has_uffd_write_protect: bool,
+    pub(crate) has_locked_pages: bool,
+    /// This is an exact physical-frame fact, not an address-space-wide pin
+    /// count.  An unrelated long-term pin must not prevent promotion.
+    pub(crate) has_exact_long_term_cow_pin: bool,
+    pub(crate) has_fork_policy: bool,
+}
+
+/// Returns whether a single 2 MiB MADV_COLLAPSE unit can be promoted without
+/// crossing an address-space policy boundary.
+///
+/// A page-table implementation still has to prove that its 512 source leaves
+/// are present and suitably contiguous.  This deliberately only classifies
+/// VMA/sidecar eligibility, so it remains pure and can be checked before any
+/// allocation or PTE change.
+pub(crate) const fn collapse_2m_candidate_eligible(facts: Collapse2MCandidateFacts) -> bool {
+    facts.start & (COLLAPSE_2M_SIZE - 1) == 0
+        && facts.length == COLLAPSE_2M_SIZE
+        && facts.vma_covers_range
+        && facts.private_anonymous_cow
+        && !facts.has_uffd_write_protect
+        && !facts.has_locked_pages
+        && !facts.has_exact_long_term_cow_pin
+        && !facts.has_fork_policy
+}
 /// Internal live logical-mapping limit. Fragments sharing one lineage count
 /// once, so protection splits do not consume additional slots.
 const MAX_MAPPING_LINEAGES: usize = 65_536;
@@ -1071,6 +1135,11 @@ pub struct AddrSpace {
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// One weak reverse-map lease per live shared-memory backing referenced by
+    /// this mm.  Keeping leases on the address space, rather than individual
+    /// VMAs, makes split/merge/unmap lifecycle handling explicit and avoids a
+    /// backend-to-mm ownership cycle.
+    alias_bindings: BTreeMap<SharedBackingKey, AliasLease>,
     user_io_pins: Box<UserIoPinRegistry>,
     active_long_term_cow_pins: Vec<ActiveLongTermCowPin>,
     pub(super) uffd: Option<Box<super::userfaultfd::UffdAddressSpaceState>>,
@@ -1434,7 +1503,7 @@ impl AddrSpace {
     }
 
     /// Returns the stable policy identity of this address space.
-    pub(super) const fn address_space_id(&self) -> AddressSpaceId {
+    pub(crate) const fn address_space_id(&self) -> AddressSpaceId {
         self.address_space_id
     }
 
@@ -1517,7 +1586,7 @@ impl AddrSpace {
     /// The helper advances the generation before taking the active snapshot;
     /// callers must invoke it after publishing page-table stores but before
     /// releasing any retired mapping/frame ownership.
-    fn synchronize_tlb_after_mutation(&self) -> impl Drop {
+    pub(crate) fn synchronize_tlb_after_mutation(&self) -> impl Drop {
         self.tlb.synchronize_after_mutation()
     }
 
@@ -1554,6 +1623,7 @@ impl AddrSpace {
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
+            alias_bindings: BTreeMap::new(),
             user_io_pins,
             active_long_term_cow_pins,
             uffd: None,
@@ -1595,6 +1665,88 @@ impl AddrSpace {
             return false;
         }
         self.mapping_identities.remove(lineage).is_some()
+    }
+
+    /// Synchronizes this mm's reverse-map leases after a shared mapping
+    /// topology change.  The caller supplies the owning Arc at syscall/fork
+    /// boundaries; ordinary `map` remains a pure address-space operation.
+    pub(crate) fn sync_shared_alias_bindings(
+        &mut self,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult {
+        let mut keys = Vec::new();
+        keys.try_reserve(self.areas.len()).map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if let Some(key) = area.backend().shared_backing_key() {
+                keys.push(key);
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+
+        self.bind_shared_alias_keys(&keys, aspace)?;
+        self.alias_bindings
+            .retain(|key, _| keys.binary_search(key).is_ok());
+        Ok(())
+    }
+
+    fn bind_shared_alias_keys(
+        &mut self,
+        keys: &[SharedBackingKey],
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult {
+        let mut inserted = Vec::new();
+        inserted
+            .try_reserve(keys.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for key in keys.iter().copied() {
+            if self.alias_bindings.contains_key(&key) {
+                continue;
+            }
+            match AliasLease::try_new(key, aspace, self.address_space_id) {
+                Ok(lease) => {
+                    self.alias_bindings.insert(key, lease);
+                    inserted.push(key);
+                }
+                Err(error) => {
+                    for key in inserted {
+                        self.alias_bindings.remove(&key);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserves the reverse-map generation required for one newly published
+    /// shared VMA.  The outer syscall owns the returned guard across map and
+    /// must either commit it immediately after VMA publication or let Drop
+    /// abort it on every failure path.
+    pub(crate) fn prepare_shared_alias_binding(
+        &self,
+        key: SharedBackingKey,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Option<PendingAliasLease>> {
+        if self.alias_bindings.contains_key(&key) {
+            return Ok(None);
+        }
+        PendingAliasLease::prepare(key, aspace, self.address_space_id).map(Some)
+    }
+
+    pub(crate) fn commit_shared_alias_binding(&mut self, pending: PendingAliasLease) {
+        let lease = pending.commit();
+        let key = lease.key();
+        let previous = self.alias_bindings.insert(key, lease);
+        debug_assert!(previous.is_none(), "duplicate shared alias commit");
+    }
+
+    fn prune_shared_alias_bindings(&mut self) {
+        self.alias_bindings.retain(|key, _| {
+            self.areas
+                .iter()
+                .any(|area| area.backend().shared_backing_key() == Some(*key))
+        });
     }
 
     fn mapping_identity(&self, lineage: MappingLineage) -> AxResult<MappingIdentityState> {
@@ -2011,6 +2163,881 @@ impl AddrSpace {
             .any(|(&range_start, &range_end)| range_end > start && range_start < end)
     }
 
+    /// Classifies one PMD-sized private-anonymous range for MADV_COLLAPSE.
+    ///
+    /// This is intentionally a conservative VMA-side proof. Long-term COW
+    /// pins retain physical frames rather than virtual ranges, so their exact
+    /// intersection is checked after the source leaves are collected. The
+    /// caller still must validate all 4 KiB leaves and commit the replacement
+    /// atomically.
+    pub(crate) fn collapse_2m_candidate_eligible(&self, start: VirtAddr, length: usize) -> bool {
+        let Some(end_raw) = start.as_usize().checked_add(length) else {
+            return false;
+        };
+        let end = VirtAddr::from(end_raw);
+        let area = self.find_area(start);
+        let vma_covers_range = area.is_some_and(|area| area.start() <= start && area.end() >= end);
+        let private_anonymous_cow = area.is_some_and(|area| area.backend().is_private_anonymous());
+        let range = PageRange::new(start.as_usize(), length, PAGE_SIZE_4K).ok();
+        let has_uffd_write_protect = range.is_some_and(|range| {
+            self.uffd.as_ref().is_some_and(|state| {
+                state
+                    .registrations
+                    .intersecting(self.address_space_id, range)
+                    .any(|registration| {
+                        registration.mode().bits() & UffdRegisterMode::WP.bits() != 0
+                    })
+            })
+        });
+        let has_fork_policy = Self::interval_overlaps(&self.wipe_on_fork_ranges, start, end)
+            || Self::interval_overlaps(&self.dontfork_ranges, start, end);
+        collapse_2m_candidate_eligible(Collapse2MCandidateFacts {
+            start: start.as_usize(),
+            length,
+            vma_covers_range,
+            private_anonymous_cow,
+            has_uffd_write_protect,
+            has_locked_pages: self.range_is_locked(start, length),
+            // Exact pin ownership is established from the PTE source frames
+            // below; never reject a PMD merely because another PMD is pinned.
+            has_exact_long_term_cow_pin: false,
+            has_fork_policy,
+        })
+    }
+
+    /// Collapses one private anonymous COW PMD into a privately owned 2 MiB
+    /// leaf, materializing absent demand-zero leaves directly in the prepared
+    /// frame.
+    ///
+    /// The source leaves are first made read-only and observed through a TLB
+    /// grace period, so copying cannot race a stale writable translation.  A
+    /// new huge frame is then copied before the single PDE publication.  The
+    /// VMA fragment keeps its lineage while changing only its COW granule;
+    /// every detached 4 KiB frame and the former PTE table remain owned until
+    /// the replacement's TLB grace completes.
+    pub(crate) fn collapse_private_cow_2m(&mut self, start: VirtAddr) -> AxResult {
+        if !self.collapse_2m_candidate_eligible(start, COLLAPSE_2M_SIZE) {
+            return Err(AxError::InvalidInput);
+        }
+        // This is the only fallible bookkeeping step after PDE publication;
+        // admit it before changing either metadata or translations.
+        let next_topology_generation = self.next_topology_generation()?;
+
+        let source_backend = self
+            .find_area(start)
+            .ok_or(AxError::NoMemory)?
+            .backend()
+            .clone();
+        let vma_flags = self.find_area(start).ok_or(AxError::NoMemory)?.flags();
+        let collapsed_backend = source_backend.collapsed_2m_backend()?;
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(COLLAPSE_2M_SIZE / PAGE_SIZE_4K)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut source_slots = Vec::new();
+        source_slots
+            .try_reserve_exact(COLLAPSE_2M_SIZE / PAGE_SIZE_4K)
+            .map_err(|_| AxError::NoMemory)?;
+
+        let mut source_flags = None;
+        for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+            let vaddr = start + offset;
+            match self.pt.query(vaddr) {
+                Ok((paddr, flags, page_size)) => {
+                    if page_size != PageSize::Size4K
+                        || !PageSize::Size4K.is_aligned(paddr.as_usize())
+                        || source_flags.is_some_and(|expected| expected != flags)
+                    {
+                        return Err(AxError::InvalidInput);
+                    }
+                    source_flags = Some(flags);
+                    source_slots.push(Some(paddr));
+                    leaves.push((vaddr, paddr, flags, page_size));
+                }
+                Err(PagingError::NotMapped) => {
+                    let page = PageRange::new(vaddr.as_usize(), PAGE_SIZE_4K, PAGE_SIZE_4K)
+                        .map_err(mm_error)?;
+                    let uffd_missing = self.uffd.as_ref().is_some_and(|state| {
+                        state
+                            .registrations
+                            .intersecting(self.address_space_id, page)
+                            .any(|registration| {
+                                registration.mode().bits() & UffdRegisterMode::MISSING.bits() != 0
+                            })
+                    });
+                    if uffd_missing {
+                        return Err(AxError::InvalidInput);
+                    }
+                    source_slots.push(None);
+                }
+                Err(_) => return Err(AxError::BadAddress),
+            }
+        }
+        // For an entirely untouched anonymous VMA there is no PTE flag to
+        // inherit; its VMA access contract becomes the new PMD leaf flags.
+        let source_flags = source_flags.unwrap_or_else(|| {
+            if vma_flags.contains(MappingFlags::WRITE) {
+                vma_flags | MappingFlags::READ
+            } else {
+                vma_flags
+            }
+        });
+        if !source_flags.contains(MappingFlags::WRITE) {
+            return Err(AxError::InvalidInput);
+        }
+        let protected_flags = source_flags - MappingFlags::WRITE;
+
+        // Long-term writable pins are tracked by physical frame precisely so
+        // virtual remaps do not turn an unrelated pin into a global barrier.
+        // Reject only this PMD's own source frames, before write-protecting
+        // them or allocating the replacement frame.
+        let pinned_frames = self.active_long_term_cow_frames()?;
+        if leaves
+            .iter()
+            .any(|(_, frame, ..)| pinned_frames.binary_search(frame).is_ok())
+        {
+            return Err(AxError::ResourceBusy);
+        }
+
+        // The address-space lock prevents ordinary page-table mutation, but a
+        // running CPU can still hold a writable translation. Revoke it before
+        // taking the source snapshot.
+        let write_protection_failed = {
+            let mut cursor = self.pt.cursor();
+            let mut failed = false;
+            for (vaddr, ..) in &leaves {
+                match cursor.protect(*vaddr, protected_flags) {
+                    Ok(PageSize::Size4K) => {}
+                    Ok(_) | Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            failed
+        };
+        if write_protection_failed {
+            self.restore_collapse_2m_source_permissions(&leaves)?;
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+
+        let mut prepared = match source_backend.prepare_collapse_2m_frame(&source_slots) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.restore_collapse_2m_source_permissions(&leaves)?;
+                return Err(error);
+            }
+        };
+
+        // Split and update the one affected VMA before publishing the PDE.
+        // A failure here still has the old PTE run installed, so restoring
+        // permissions is sufficient rollback.
+        if let Err(error) =
+            self.replace_collapse_2m_backend_metadata(start, collapsed_backend.clone())
+        {
+            self.restore_collapse_2m_source_permissions(&leaves)?;
+            return Err(error);
+        }
+
+        let replacement = prepared.frame()?;
+        let replaced = {
+            let mut cursor = self.pt.cursor();
+            match cursor.replace_2m_pte_run(start, replacement, source_flags) {
+                Ok(replaced) => Ok(Some(replaced)),
+                // A completely untouched VMA need not have a P1 table yet.
+                // Publish the prepared PMD directly in that case; the map
+                // path constructs only unreachable intermediate tables before
+                // linking the huge leaf.
+                Err(PagingError::NotMapped) => cursor
+                    .map(start, replacement, PageSize::Size2M, source_flags)
+                    .map(|_| None)
+                    .map_err(|_| AxError::BadState),
+                Err(_) => Err(AxError::BadState),
+            }
+        };
+        let replaced = match replaced {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                // The metadata update is now an exact 2 MiB fragment, so this
+                // cannot allocate or split. Preserve the original lineage and
+                // restore the 4 KiB backend before returning the old PTEs to
+                // userspace.
+                self.replace_collapse_2m_backend_metadata(start, source_backend.clone())?;
+                self.restore_collapse_2m_source_permissions(&leaves)?;
+                return Err(error);
+            }
+        };
+        prepared.commit_frame();
+
+        // `leaves` was checked above and belongs to this exact 4 KiB COW
+        // backend, so retirement is now an infallible ownership conversion.
+        let retired = source_backend
+            .retire_collapsed_2m_sources(start, leaves)
+            .expect("validated COW collapse leaves must be retireable");
+        self.commit_topology_generation(next_topology_generation);
+
+        // `replaced` owns the detached P1 table and `retired` owns the old
+        // COW frames. Neither can be released before the PDE publication has
+        // reached every CPU which could retain a former 4 KiB translation.
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(retired);
+        drop(replaced);
+        drop(grace);
+        Ok(())
+    }
+
+    /// Promotes a fully resident, physically contiguous shared/file 4 KiB
+    /// run without changing its backing ownership.
+    ///
+    /// Unlike private anonymous collapse this must not copy into a new frame:
+    /// doing so would sever MAP_SHARED visibility or the file-cache's
+    /// writeback and eviction identity.  A naturally contiguous cache/shmem
+    /// run can instead be represented directly by a PDE referring to the
+    /// exact same frames.  Non-contiguous or sparse runs remain ineligible.
+    pub(crate) fn collapse_alias_preserving_2m(&mut self, start: VirtAddr) -> AxResult {
+        if !PageSize::Size2M.is_aligned(start.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start + COLLAPSE_2M_SIZE;
+        let area = self
+            .find_area(start)
+            .filter(|area| area.start() <= start && area.end() >= end)
+            .ok_or(AxError::NoMemory)?;
+        if !matches!(area.backend(), Backend::Shared(_) | Backend::File(_))
+            || self.range_is_locked(start, COLLAPSE_2M_SIZE)
+            || Self::interval_overlaps(&self.wipe_on_fork_ranges, start, end)
+            || Self::interval_overlaps(&self.dontfork_ranges, start, end)
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let range = PageRange::new(start.as_usize(), COLLAPSE_2M_SIZE, PAGE_SIZE_4K)
+            .map_err(|_| AxError::InvalidInput)?;
+        if self.uffd.as_ref().is_some_and(|state| {
+            state
+                .registrations
+                .intersecting(self.address_space_id, range)
+                .any(|registration| registration.mode().bits() & UffdRegisterMode::WP.bits() != 0)
+        }) {
+            return Err(AxError::InvalidInput);
+        }
+
+        let (base, flags, size) = self.pt.query(start).map_err(|error| match error {
+            PagingError::NotMapped => AxError::NoMemory,
+            _ => AxError::BadAddress,
+        })?;
+        if size != PageSize::Size4K || !PageSize::Size2M.is_aligned(base.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+            let (paddr, leaf_flags, leaf_size) = self.pt.query(start + offset).map_err(|error| {
+                match error {
+                    PagingError::NotMapped => AxError::NoMemory,
+                    _ => AxError::BadAddress,
+                }
+            })?;
+            let expected = base + offset;
+            if leaf_size != PageSize::Size4K || leaf_flags != flags || paddr != expected {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        let replaced = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_pte_run(start, base, flags)
+        }
+        .map_err(|error| match error {
+            PagingError::NoMemory => AxError::NoMemory,
+            _ => AxError::BadState,
+        })?;
+        // The detached P1 table is the only retired object.  The data frames
+        // remain owned by SharedPages/CachedFile throughout this transaction.
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(replaced);
+        drop(grace);
+        Ok(())
+    }
+
+    /// Finds every PMD-aligned mapping of one shared backing folio in this
+    /// address space.  A non-PMD alias of the same 2 MiB backing must make the
+    /// whole promotion ineligible: otherwise its old PTEs would keep pointing
+    /// at the pre-folio frames after the shared backing is switched.
+    pub(crate) fn shared_folio_alias_starts(
+        &self,
+        pages: &Arc<SharedPages>,
+        start_index: usize,
+    ) -> AxResult<Vec<VirtAddr>> {
+        let backing_start = start_index
+            .checked_mul(PAGE_SIZE_4K)
+            .ok_or(AxError::InvalidInput)?;
+        let backing_end = backing_start
+            .checked_add(COLLAPSE_2M_SIZE)
+            .ok_or(AxError::InvalidInput)?;
+        let mut starts = Vec::new();
+        starts
+            .try_reserve_exact(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            let Some(shared) = area.backend().shared_pages() else {
+                continue;
+            };
+            if !Arc::ptr_eq(shared, pages) {
+                continue;
+            }
+            let backend_start = match area.backend() {
+                Backend::Shared(shared) => shared.backing_offset(area.start().as_usize()).ok_or(AxError::BadState)?,
+                _ => unreachable!("shared pages originate only from SharedBackend"),
+            };
+            let backend_end = backend_start
+                .checked_add(area.size())
+                .ok_or(AxError::BadState)?;
+            if backing_start >= backend_end || backing_end <= backend_start {
+                continue;
+            }
+            // A partial overlap is still an alias of pages we are about to
+            // replace, but cannot be made into a PMD without changing its VMA
+            // geometry. Reject before any folio or PTE publication.
+            if backing_start < backend_start || backing_end > backend_end {
+                return Err(AxError::InvalidInput);
+            }
+            let start = area.start() + (backing_start - backend_start);
+            if !PageSize::Size2M.is_aligned(start.as_usize()) {
+                return Err(AxError::InvalidInput);
+            }
+            starts.push(start);
+        }
+        Ok(starts)
+    }
+
+    /// Validates an alias P1 run against the shared backing before its folio
+    /// is promoted.  It performs every fallible VMA/UFFD/pin/PTE check while
+    /// the old mapping remains live; publication below is then one PMD store.
+    pub(crate) fn preflight_shared_folio_collapse_2m(
+        &self,
+        start: VirtAddr,
+        pages: &Arc<SharedPages>,
+        start_index: usize,
+    ) -> AxResult<MappingFlags> {
+        let end = start + COLLAPSE_2M_SIZE;
+        let area = self
+            .find_area(start)
+            .filter(|area| area.start() <= start && area.end() >= end)
+            .ok_or(AxError::NoMemory)?;
+        if self.range_is_locked(start, COLLAPSE_2M_SIZE)
+            || Self::interval_overlaps(&self.wipe_on_fork_ranges, start, end)
+            || Self::interval_overlaps(&self.dontfork_ranges, start, end)
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let Some(mapped_pages) = area.backend().shared_pages() else {
+            return Err(AxError::InvalidInput);
+        };
+        if !Arc::ptr_eq(mapped_pages, pages) {
+            return Err(AxError::BadState);
+        }
+        self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
+        let range = PageRange::new(start.as_usize(), COLLAPSE_2M_SIZE, PAGE_SIZE_4K)
+            .map_err(|_| AxError::InvalidInput)?;
+        if self.uffd.as_ref().is_some_and(|state| {
+            state.registrations.intersecting(self.address_space_id, range).any(|registration| {
+                registration.mode().bits() & UffdRegisterMode::WP.bits() != 0
+            })
+        }) {
+            return Err(AxError::InvalidInput);
+        }
+        let (first, flags, size) = self.pt.query(start).map_err(|error| match error {
+            PagingError::NotMapped => AxError::NoMemory,
+            _ => AxError::BadAddress,
+        })?;
+        if size != PageSize::Size4K || first != pages.paddr_at(start_index)? {
+            return Err(AxError::InvalidInput);
+        }
+        for page in 0..(COLLAPSE_2M_SIZE / PAGE_SIZE_4K) {
+            let address = start + page * PAGE_SIZE_4K;
+            let (paddr, leaf_flags, leaf_size) = self.pt.query(address).map_err(|error| match error {
+                PagingError::NotMapped => AxError::NoMemory,
+                _ => AxError::BadAddress,
+            })?;
+            if leaf_size != PageSize::Size4K
+                || leaf_flags != flags
+                || paddr != pages.paddr_at(start_index + page)?
+            {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        Ok(flags)
+    }
+
+    pub(crate) fn publish_shared_folio_collapse_2m(
+        &mut self,
+        start: VirtAddr,
+        folio: PhysAddr,
+        flags: MappingFlags,
+    ) -> AxResult<SharedFolioPteReplacement> {
+        let source_flags = if flags.contains(MappingFlags::WRITE) {
+            flags - MappingFlags::WRITE
+        } else {
+            flags
+        };
+        let run = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_pte_run(start, folio, source_flags)
+        }
+        .map_err(|error| match error {
+            PagingError::NoMemory => AxError::NoMemory,
+            _ => AxError::BadState,
+        })?;
+        if source_flags != flags {
+            let restored = {
+                let mut cursor = self.pt.cursor();
+                cursor.protect(start, flags)
+            };
+            if !matches!(restored, Ok(PageSize::Size2M)) {
+                let rollback = {
+                    let mut cursor = self.pt.cursor();
+                    cursor.rollback_2m_pte_replacement(start, run)
+                };
+                return match rollback {
+                    Ok(()) => Err(AxError::BadState),
+                    Err(_) => Err(AxError::BadState),
+                };
+            }
+        }
+        Ok(SharedFolioPteReplacement { start, run })
+    }
+
+    /// Revokes writable 4 KiB translations before a shared-folio snapshot.
+    /// The address-space mutex alone does not evict translations that a CPU
+    /// installed before this transaction started.
+    pub(crate) fn write_protect_shared_folio_collapse_2m(
+        &mut self,
+        start: VirtAddr,
+        flags: MappingFlags,
+    ) -> AxResult {
+        if !flags.contains(MappingFlags::WRITE) {
+            return Ok(());
+        }
+        let protected = flags - MappingFlags::WRITE;
+        let result = {
+            let mut cursor = self.pt.cursor();
+            let mut result = Ok(());
+            for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+                if !matches!(cursor.protect(start + offset, protected), Ok(PageSize::Size4K)) {
+                    result = Err(AxError::BadState);
+                    break;
+                }
+            }
+            result
+        };
+        if result.is_err() {
+            self.restore_shared_folio_permissions_2m(start, flags)?;
+            return result;
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn restore_shared_folio_permissions_2m(
+        &mut self,
+        start: VirtAddr,
+        flags: MappingFlags,
+    ) -> AxResult {
+        if !flags.contains(MappingFlags::WRITE) {
+            return Ok(());
+        }
+        {
+            let mut cursor = self.pt.cursor();
+            for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+                if !matches!(cursor.protect(start + offset, flags), Ok(PageSize::Size4K)) {
+                    return Err(AxError::BadState);
+                }
+            }
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn rollback_shared_folio_collapse_2m(
+        &mut self,
+        replacement: SharedFolioPteReplacement,
+    ) -> AxResult {
+        {
+            let mut cursor = self.pt.cursor();
+            cursor.rollback_2m_pte_replacement(replacement.start, replacement.run)
+        }
+        .map_err(|_| AxError::BadState)?;
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn commit_shared_folio_collapse_2m(
+        &mut self,
+        replacement: SharedFolioPteReplacement,
+    ) {
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(replacement);
+        drop(grace);
+    }
+
+    fn replace_collapse_2m_backend_metadata(
+        &mut self,
+        start: VirtAddr,
+        replacement: Backend,
+    ) -> AxResult {
+        self.areas
+            .update_metadata_with_limit(
+                start,
+                COLLAPSE_2M_SIZE,
+                |_| true,
+                |backend| *backend = replacement.clone(),
+                MAX_VMA_FRAGMENTS,
+            )
+            .map_err(|error| AxError::from(error.into_parts().0))
+    }
+
+    fn restore_collapse_2m_source_permissions(
+        &mut self,
+        leaves: &[(VirtAddr, PhysAddr, MappingFlags, PageSize)],
+    ) -> AxResult {
+        {
+            let mut cursor = self.pt.cursor();
+            for (vaddr, _, flags, _) in leaves {
+                match cursor.protect(*vaddr, *flags) {
+                    Ok(PageSize::Size4K) => {}
+                    Ok(_) | Err(_) => return Err(AxError::BadState),
+                }
+            }
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    /// Demotes one private anonymous COW PMD into a prepared P1 run.
+    ///
+    /// A writable PMD is first revoked and flushed from the CPUs currently
+    /// running this address space.  Only after that grace period is its
+    /// content copied.  Thus no stale writable translation can modify the
+    /// source while the replacement frames are being made.  Every failure
+    /// before the PDE publication restores the exact original PMD flags;
+    /// after publication the old PMD frame stays owned through a second,
+    /// targeted TLB grace period.
+    pub(crate) fn demote_private_cow_2m(&mut self, start: VirtAddr) -> AxResult {
+        if !PageSize::Size2M.is_aligned(start.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start + COLLAPSE_2M_SIZE;
+        let source_backend = self
+            .find_area(start)
+            .filter(|area| area.start() == start && area.end() == end)
+            .ok_or(AxError::NoMemory)?
+            .backend()
+            .clone();
+        if !source_backend.is_private_anonymous() || source_backend.page_size() != PageSize::Size2M
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let (source_frame, source_flags, source_size) =
+            self.pt.query(start).map_err(|error| match error {
+                PagingError::NotMapped => AxError::NoMemory,
+                _ => AxError::BadAddress,
+            })?;
+        if source_size != PageSize::Size2M || !PageSize::Size2M.is_aligned(source_frame.as_usize())
+        {
+            return Err(AxError::BadState);
+        }
+        let next_topology_generation = self.next_topology_generation()?;
+        let demoted_backend = source_backend.demoted_4k_backend()?;
+        let mut tables = PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?;
+
+        // The address-space mutex serializes page-table writers, but CPUs
+        // which ran this mm before we acquired it can retain a writable PMD
+        // translation. Revoke WRITE and wait for precisely those CPUs before
+        // sampling the source frame.
+        let protected_flags = source_flags - MappingFlags::WRITE;
+        let protected = {
+            let mut cursor = self.pt.cursor();
+            cursor.protect(start, protected_flags)
+        };
+        if !matches!(protected, Ok(PageSize::Size2M)) {
+            // `protect` is expected to be all-or-nothing for one PMD. Still
+            // restore the observed PMD exactly in case a malformed table made
+            // the operation report after changing it.
+            self.restore_demote_2m_source_permissions(start, source_flags)?;
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+
+        let mut prepared = match source_backend.prepare_demote_2m_frames(source_frame) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.restore_demote_2m_source_permissions(start, source_flags)?;
+                return Err(error);
+            }
+        };
+
+        // All metadata allocation/splitting is admitted before the PDE store.
+        if let Err(error) = self.replace_collapse_2m_backend_metadata(start, demoted_backend) {
+            self.restore_demote_2m_source_permissions(start, source_flags)?;
+            return Err(error);
+        }
+        let published = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_huge_leaf_with_pte_run(
+                start,
+                prepared.frames(),
+                source_flags,
+                &mut tables,
+            )
+        };
+        let published = match published {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.replace_collapse_2m_backend_metadata(start, source_backend)?;
+                self.restore_demote_2m_source_permissions(start, source_flags)?;
+                return Err(match error {
+                    PagingError::NoMemory => AxError::NoMemory,
+                    _ => AxError::BadState,
+                });
+            }
+        };
+        debug_assert_eq!(published, source_frame);
+        prepared.commit_frames();
+        let retired = source_backend
+            .retire_demoted_2m_source(start, source_frame, source_flags)
+            .expect("validated huge COW leaf must be retireable");
+        self.commit_topology_generation(next_topology_generation);
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(retired);
+        drop(grace);
+        Ok(())
+    }
+
+    /// Expands an alias-preserving shared/file PDE back into 4 KiB leaves
+    /// referring to the same backing/cache frames.  No data frame changes
+    /// ownership, so this is safe for all MAP_SHARED aliases and cache pins.
+    pub(crate) fn demote_alias_preserving_2m(&mut self, start: VirtAddr) -> AxResult {
+        if !PageSize::Size2M.is_aligned(start.as_usize()) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start + COLLAPSE_2M_SIZE;
+        let area = self
+            .find_area(start)
+            .filter(|area| area.start() <= start && area.end() >= end)
+            .ok_or(AxError::NoMemory)?;
+        if !matches!(area.backend(), Backend::Shared(_) | Backend::File(_)) {
+            return Err(AxError::InvalidInput);
+        }
+        let (source, flags, size) = self.pt.query(start).map_err(|error| match error {
+            PagingError::NotMapped => AxError::NoMemory,
+            _ => AxError::BadAddress,
+        })?;
+        if size != PageSize::Size2M || !PageSize::Size2M.is_aligned(source.as_usize()) {
+            return Err(AxError::BadState);
+        }
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(COLLAPSE_2M_SIZE / PAGE_SIZE_4K)
+            .map_err(|_| AxError::NoMemory)?;
+        for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+            leaves.push(source + offset);
+        }
+        let mut tables = PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?;
+        let published = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_huge_leaf_with_pte_run(start, &leaves, flags, &mut tables)
+        }
+        .map_err(|error| match error {
+            PagingError::NoMemory => AxError::NoMemory,
+            _ => AxError::BadState,
+        })?;
+        debug_assert_eq!(published, source);
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn preflight_shared_folio_demotion_2m(
+        &self,
+        start: VirtAddr,
+        pages: &Arc<SharedPages>,
+        start_index: usize,
+    ) -> AxResult<MappingFlags> {
+        let end = start + COLLAPSE_2M_SIZE;
+        let area = self
+            .find_area(start)
+            .filter(|area| area.start() <= start && area.end() >= end)
+            .ok_or(AxError::NoMemory)?;
+        if !Arc::ptr_eq(area.backend().shared_pages().ok_or(AxError::InvalidInput)?, pages) {
+            return Err(AxError::BadState);
+        }
+        self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
+        let range = PageRange::new(start.as_usize(), COLLAPSE_2M_SIZE, PAGE_SIZE_4K)
+            .map_err(|_| AxError::InvalidInput)?;
+        if self.uffd.as_ref().is_some_and(|state| {
+            state.registrations.intersecting(self.address_space_id, range).any(|registration| {
+                registration.mode().bits() & UffdRegisterMode::WP.bits() != 0
+            })
+        }) {
+            return Err(AxError::InvalidInput);
+        }
+        let (folio, flags, size) = self.pt.query(start).map_err(|error| match error {
+            PagingError::NotMapped => AxError::NoMemory,
+            _ => AxError::BadAddress,
+        })?;
+        if size != PageSize::Size2M || folio != pages.paddr_at(start_index)? {
+            return Err(AxError::BadState);
+        }
+        Ok(flags)
+    }
+
+    pub(crate) fn write_protect_shared_folio_demotion_2m(
+        &mut self,
+        start: VirtAddr,
+        flags: MappingFlags,
+    ) -> AxResult {
+        if !flags.contains(MappingFlags::WRITE) {
+            return Ok(());
+        }
+        let result = {
+            let mut cursor = self.pt.cursor();
+            cursor.protect(start, flags - MappingFlags::WRITE)
+        };
+        if !matches!(result, Ok(PageSize::Size2M)) {
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn restore_shared_folio_demotion_pmd_permissions(
+        &mut self,
+        start: VirtAddr,
+        flags: MappingFlags,
+    ) -> AxResult {
+        if !flags.contains(MappingFlags::WRITE) {
+            return Ok(());
+        }
+        let result = {
+            let mut cursor = self.pt.cursor();
+            cursor.protect(start, flags)
+        };
+        if !matches!(result, Ok(PageSize::Size2M)) {
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    pub(crate) fn publish_shared_folio_demotion_2m(
+        &mut self,
+        start: VirtAddr,
+        frames: &[PhysAddr],
+        flags: MappingFlags,
+        tables: &mut PreparedPageTableFrames,
+    ) -> AxResult<SharedFolioDemotionReplacement> {
+        let protected = flags - MappingFlags::WRITE;
+        let folio = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_huge_leaf_with_pte_run(start, frames, protected, tables)
+        }
+        .map_err(|error| match error {
+            PagingError::NoMemory => AxError::NoMemory,
+            _ => AxError::BadState,
+        })?;
+        Ok(SharedFolioDemotionReplacement { start, folio, flags })
+    }
+
+    pub(crate) fn rollback_shared_folio_demotion_2m(
+        &mut self,
+        replacement: SharedFolioDemotionReplacement,
+    ) -> AxResult {
+        let protected = replacement.flags - MappingFlags::WRITE;
+        let run = {
+            let mut cursor = self.pt.cursor();
+            cursor.replace_2m_pte_run(replacement.start, replacement.folio, protected)
+        }
+        .map_err(|_| AxError::BadState)?;
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(run);
+        drop(grace);
+        self.restore_shared_folio_demotion_pmd_permissions(replacement.start, replacement.flags)
+    }
+
+    /// Restores the source PMD after a demotion failure which occurred before
+    /// replacement publication.  The target is one exact leaf, so restoring
+    /// its original hardware flags is a single page-table mutation followed
+    /// by the same targeted TLB grace used for write revocation.
+    fn restore_demote_2m_source_permissions(
+        &mut self,
+        start: VirtAddr,
+        source_flags: MappingFlags,
+    ) -> AxResult {
+        let restored = {
+            let mut cursor = self.pt.cursor();
+            cursor.protect(start, source_flags)
+        };
+        if !matches!(restored, Ok(PageSize::Size2M)) {
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        Ok(())
+    }
+
+    /// Ensures that mutations which operate at page granularity never leave a
+    /// private anonymous huge COW mapping or an alias-preserving shared/file
+    /// huge mapping behind them.
+    ///
+    /// Call this after the operation's non-MM admission gates, but before it
+    /// prepares VMA/PTE mutations or observes individual PTEs.
+    pub(crate) fn ensure_4k_granularity(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+
+        let end = start + size;
+        let mut candidate = VirtAddr::from(start.as_usize() & !(COLLAPSE_2M_SIZE - 1));
+        while candidate < end {
+            let demote_private = self.areas.find(candidate).is_some_and(|area| {
+                area.start() == candidate
+                    && area.size() == COLLAPSE_2M_SIZE
+                    && area.backend().is_private_anonymous()
+                    && area.backend().page_size() == PageSize::Size2M
+            });
+            if demote_private {
+                self.demote_private_cow_2m(candidate)?;
+            } else {
+                let demote_alias = self.areas.find(candidate).is_some_and(|area| {
+                    area.start() <= candidate
+                        && area.end() >= candidate + COLLAPSE_2M_SIZE
+                        && matches!(area.backend(), Backend::Shared(_) | Backend::File(_))
+                }) && self
+                    .pt
+                    .query(candidate)
+                    .is_ok_and(|(_, _, page_size)| page_size == PageSize::Size2M);
+                if demote_alias {
+                    if let (Some(pages), Some(offset)) = (
+                        self.shared_pages_at(candidate),
+                        self.shared_backing_offset_at(candidate),
+                    ) {
+                        if pages.page_size() == PageSize::Size4K
+                            && offset.is_multiple_of(COLLAPSE_2M_SIZE)
+                            && pages.has_4k_folio(offset / PAGE_SIZE_4K)
+                        {
+                            // A compound shmem folio owns one set of former
+                            // 4 KiB frames for every mm alias.  Its caller
+                            // must use the ordered cross-mm transaction.
+                            return Err(AxError::BadState);
+                        }
+                    }
+                    self.demote_alias_preserving_2m(candidate)?;
+                }
+            }
+            candidate = candidate
+                .checked_add(COLLAPSE_2M_SIZE)
+                .ok_or(AxError::InvalidInput)?;
+        }
+        Ok(())
+    }
+
     pub fn locked_bytes(&self) -> usize {
         self.locked_ranges
             .iter()
@@ -2309,9 +3336,10 @@ impl AddrSpace {
     /// page publication, allowing the long-running ioctl to release the
     /// address-space mutex between pages without weakening that rule.
     pub(crate) fn preflight_uffd_resolver_range(
-        &self,
+        &mut self,
         destination: PageRange,
     ) -> AxResult<UffdResolverLease> {
+        self.ensure_4k_granularity(VirtAddr::from(destination.start()), destination.len())?;
         let area = Self::uffd_resolver_area_in(&self.areas, destination)?;
         let mapping = self.mapping_snapshot(area)?;
         self.uffd
@@ -3481,6 +4509,7 @@ impl AddrSpace {
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        self.prune_shared_alias_bindings();
         if !self.remove_mapping_lineage_if_unused(lineage) {
             return Err(AxError::BadState);
         }
@@ -3493,6 +4522,7 @@ impl AddrSpace {
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        self.prune_shared_alias_bindings();
         Ok(())
     }
 
@@ -4035,6 +5065,11 @@ impl AddrSpace {
         access_flags: MappingFlags,
     ) -> AxResult {
         self.validate_region(start, size)?;
+        // All generic COW fault/populate users operate on 4 KiB spans.  Make
+        // that representation explicit here, rather than relying on each
+        // usercopy, process_vm, or task-fault caller to remember the huge-PMD
+        // boundary rule.
+        self.ensure_4k_granularity(start, size)?;
         let end = start + size;
 
         while let Some(area) = self.areas.find(start) {
@@ -4072,6 +5107,7 @@ impl AddrSpace {
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
+        self.ensure_4k_granularity(start, size)?;
         self.publish_resident_highwater();
         let next_generation = self.next_topology_generation()?;
         // Backend discard can make partial progress before reporting a later
@@ -4117,6 +5153,67 @@ impl AddrSpace {
         drop(grace);
         self.publish_resident_highwater();
         result
+    }
+
+    /// Moves already-resident leaves to the cold end of the local reclaim
+    /// policy without faulting or detaching their backing frames.
+    ///
+    /// x86 records the accessed bit in the PTE rather than in
+    /// [`MappingFlags`]. Reinstalling the exact translation clears that
+    /// hardware-owned state while retaining all software permissions and the
+    /// physical frame. This is the only safe anonymous/shmem COLD operation
+    /// available before swap exists: unmapping a COW leaf would release its
+    /// sole frame, and unmapping a shared leaf would not make its backing
+    /// reclaimable. A later PAGEOUT may reclaim file-cache pages, but has the
+    /// Linux no-swap outcome for these retained anonymous leaves.
+    pub(crate) fn cold_resident_pages(&mut self, range: VirtAddrRange) -> AxResult<usize> {
+        self.validate_region(range.start, range.size())?;
+        // COLD/PAGEOUT walk individual translations in order to clear the
+        // hardware accessed state.  Do not let a range which starts or ends
+        // inside a collapsed shared/file PMD retain that compound leaf: the
+        // next partial mprotect/munmap/mremap must see the same 4 KiB
+        // geometry, and ensure_4k_granularity performs the alias-preserving
+        // demotion before this page-by-page walk observes any PTE.
+        self.ensure_4k_granularity(range.start, range.size())?;
+        let mut cursor = range.start;
+        let mut cooled = 0usize;
+        let mut changed = false;
+        let result = {
+            let mut pt = self.pt.cursor();
+            (|| {
+                while cursor < range.end {
+                    match pt.query(cursor) {
+                        Ok((paddr, flags, page_size)) => {
+                            let leaf_start = cursor.align_down(page_size);
+                            let leaf_end = leaf_start + page_size as usize;
+                            let leaf_paddr = paddr.align_down(page_size);
+                            pt.remap(leaf_start, leaf_paddr, flags)
+                                .map_err(|_| AxError::BadAddress)?;
+                            changed = true;
+                            let covered_end = leaf_end.min(range.end);
+                            cooled = cooled
+                                .checked_add(covered_end.sub_addr(cursor))
+                                .ok_or(AxError::InvalidInput)?;
+                            cursor = covered_end;
+                        }
+                        Err(PagingError::NotMapped) => cursor += PAGE_SIZE_4K,
+                        Err(_) => return Err(AxError::BadAddress),
+                    }
+                }
+                if changed {
+                    pt.flush();
+                }
+                Ok(())
+            })()
+        };
+        if changed {
+            // The replacement PTEs retain their frame ownership, but remote
+            // CPUs may retain an accessed translation. Finish the required
+            // targeted invalidation before exposing the cold state.
+            drop(self.synchronize_tlb_after_mutation());
+        }
+        result?;
+        Ok(cooled)
     }
 
     /// Drops resident private anonymous pages while keeping the VMA layout.
@@ -4217,6 +5314,7 @@ impl AddrSpace {
         }
         self.check_no_seal_overlap(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
+        self.ensure_4k_granularity(start, size)?;
         let next_generation = self.next_topology_generation()?;
         let mapping_mutations =
             prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
@@ -4260,6 +5358,7 @@ impl AddrSpace {
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        self.prune_shared_alias_bindings();
         let wake = if let Some(plan) = uffd_plan {
             self.uffd
                 .as_mut()
@@ -4363,6 +5462,7 @@ impl AddrSpace {
         }
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Protect)?;
         self.check_protect_range(start, size, flags)?;
+        self.ensure_4k_granularity(start, size)?;
         let next_topology_generation = self.next_topology_generation()?;
         let mapping_mutations = prepare_mapping_generation_advances_for_range(
             &self.areas,
@@ -4471,6 +5571,11 @@ impl AddrSpace {
         // image. A sequence-exhaustion failure therefore leaves it untouched.
         let new_policy = new_user_io_policy()?;
         self.clear_areas_with_tlb_grace()?;
+        // Keep the registry exact even when the Arc survives an exec image
+        // replacement.  Otherwise a later cross-mm transaction needlessly
+        // locks this unrelated mm (and an identity reset makes snapshots
+        // impossible to revalidate).
+        self.alias_bindings.clear();
         drop(core::mem::take(&mut self.mapping_identities));
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
@@ -4810,6 +5915,35 @@ impl AddrSpace {
         child_parent_lineages.dedup();
 
         let mut guard = new_aspace.lock();
+        // Bind every shared source backing before clone_map can make a parent
+        // COW-visible change.  The child is not published yet, so a later
+        // failure drops these leases with the unpublished child; a successful
+        // final sync removes any DONTFORK-only provisional bindings.
+        let mut fork_shared_keys = Vec::new();
+        fork_shared_keys
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if let Some(key) = area.backend().shared_backing_key() {
+                fork_shared_keys.push(key);
+            }
+        }
+        fork_shared_keys.sort_unstable();
+        fork_shared_keys.dedup();
+        // The child has no VMA yet.  Reserve every potential shared backing
+        // as pending so a cross-mm folio transaction cannot snapshot between
+        // clone_map publication and the final child registry commit.
+        let mut fork_pending_aliases = Vec::new();
+        fork_pending_aliases
+            .try_reserve_exact(fork_shared_keys.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for key in fork_shared_keys {
+            fork_pending_aliases.push(PendingAliasLease::try_prepare(
+                key,
+                &new_aspace_clone,
+                guard.address_space_id,
+            )?);
+        }
         // Linux carries private membarrier registrations across an ordinary
         // fork, but the child starts with no CPUs resident and a fresh
         // barrier generation. CLONE_VM shares the address space (and hence
@@ -4923,6 +6057,10 @@ impl AddrSpace {
             }
         }
         guard.refresh_growdown_starts();
+        for pending in fork_pending_aliases.drain(..) {
+            guard.commit_shared_alias_binding(pending);
+        }
+        guard.sync_shared_alias_bindings(&new_aspace_clone)?;
         // A forked mm starts with the child's currently resident pages as its
         // initial peak; unlike CLONE_VM this is a distinct address space.
         guard.publish_resident_highwater();
@@ -4946,6 +6084,21 @@ impl AddrSpace {
     /// Exposing internal state for system introspection is a standard practice.
     pub fn areas(&self) -> impl Iterator<Item = &MemoryArea<Backend>> {
         self.areas.iter()
+    }
+
+    pub(crate) fn shared_backing_key_at(&self, address: VirtAddr) -> Option<SharedBackingKey> {
+        self.find_area(address)?.backend().shared_backing_key()
+    }
+
+    pub(crate) fn shared_pages_at(&self, address: VirtAddr) -> Option<Arc<SharedPages>> {
+        self.find_area(address)?.backend().shared_pages().cloned()
+    }
+
+    pub(crate) fn shared_backing_offset_at(&self, address: VirtAddr) -> Option<usize> {
+        match self.find_area(address)?.backend() {
+            Backend::Shared(shared) => shared.backing_offset(address.as_usize()),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::File(_) => None,
+        }
     }
 
     /// Returns only VMAs intersecting `range`, starting from the crossing
@@ -4998,6 +6151,90 @@ mod tests {
     fn address_space_keeps_the_fixed_pin_ledger_off_stack() {
         assert!(core::mem::size_of::<UserIoPinRegistry>() > PAGE_SIZE_4K);
         assert!(core::mem::size_of::<AddrSpace>() <= PAGE_SIZE_4K);
+    }
+
+    #[test]
+    fn cold_resident_pages_preserves_anonymous_frames() {
+        let start = VirtAddr::from(0x1000);
+        let mut aspace =
+            AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE - 0x1000).unwrap();
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        aspace
+            .map(
+                start,
+                PAGE_SIZE_4K * 2,
+                flags,
+                true,
+                Backend::new_alloc(start, PageSize::Size4K),
+            )
+            .unwrap();
+        let before = aspace.page_table().query(start).unwrap().0;
+
+        assert_eq!(
+            aspace.cold_resident_pages(VirtAddrRange::from_start_size(start, PAGE_SIZE_4K * 2,)),
+            Ok(PAGE_SIZE_4K * 2)
+        );
+
+        // No-swap advice must not detach private frames: both leaves stay
+        // present and retain their original physical identity.
+        assert_eq!(aspace.page_table().query(start).unwrap().0, before);
+        assert!(aspace.page_table().query(start + PAGE_SIZE_4K).is_ok());
+    }
+
+    fn eligible_collapse_2m_facts() -> Collapse2MCandidateFacts {
+        Collapse2MCandidateFacts {
+            start: COLLAPSE_2M_SIZE,
+            length: COLLAPSE_2M_SIZE,
+            vma_covers_range: true,
+            private_anonymous_cow: true,
+            has_uffd_write_protect: false,
+            has_locked_pages: false,
+            has_exact_long_term_cow_pin: false,
+            has_fork_policy: false,
+        }
+    }
+
+    #[test]
+    fn collapse_2m_eligibility_requires_one_aligned_private_cow_vma() {
+        let facts = eligible_collapse_2m_facts();
+        assert!(collapse_2m_candidate_eligible(facts));
+
+        let mut unaligned = facts;
+        unaligned.start += PAGE_SIZE_4K;
+        assert!(!collapse_2m_candidate_eligible(unaligned));
+
+        let mut partial = facts;
+        partial.length -= PAGE_SIZE_4K;
+        assert!(!collapse_2m_candidate_eligible(partial));
+
+        let mut crosses_vma = facts;
+        crosses_vma.vma_covers_range = false;
+        assert!(!collapse_2m_candidate_eligible(crosses_vma));
+
+        let mut non_private = facts;
+        non_private.private_anonymous_cow = false;
+        assert!(!collapse_2m_candidate_eligible(non_private));
+    }
+
+    #[test]
+    fn collapse_2m_eligibility_rejects_each_vma_sidecar_boundary() {
+        let facts = eligible_collapse_2m_facts();
+
+        let mut uffd = facts;
+        uffd.has_uffd_write_protect = true;
+        assert!(!collapse_2m_candidate_eligible(uffd));
+
+        let mut locked = facts;
+        locked.has_locked_pages = true;
+        assert!(!collapse_2m_candidate_eligible(locked));
+
+        let mut pinned = facts;
+        pinned.has_exact_long_term_cow_pin = true;
+        assert!(!collapse_2m_candidate_eligible(pinned));
+
+        let mut fork_policy = facts;
+        fork_policy.has_fork_policy = true;
+        assert!(!collapse_2m_candidate_eligible(fork_policy));
     }
 
     #[test]
@@ -5055,6 +6292,43 @@ mod tests {
         // A new fault generation may be reaped by a subsequent caller.
         assert_eq!(aspace.begin_oom_reap(), Ok(true));
         aspace.finish_oom_reap();
+    }
+
+    #[test]
+    fn cold_demotes_a_shared_huge_leaf_before_walking_partial_range() {
+        let start = VirtAddr::from(COLLAPSE_2M_SIZE);
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        let pages = Arc::new(SharedPages::new(COLLAPSE_2M_SIZE, PageSize::Size2M).unwrap());
+        let mut aspace = AddrSpace::new_empty(start, COLLAPSE_2M_SIZE).unwrap();
+        aspace
+            .map(
+                start,
+                COLLAPSE_2M_SIZE,
+                flags,
+                true,
+                Backend::new_shared(start, pages),
+            )
+            .unwrap();
+        let source = aspace.page_table().query(start).unwrap().0;
+
+        assert_eq!(
+            aspace.cold_resident_pages(VirtAddrRange::from_start_size(
+                start + PAGE_SIZE_4K,
+                PAGE_SIZE_4K
+            )),
+            Ok(PAGE_SIZE_4K)
+        );
+        assert_eq!(
+            aspace.page_table().query(start).unwrap().2,
+            PageSize::Size4K
+        );
+        assert_eq!(
+            aspace.page_table().query(start + PAGE_SIZE_4K).unwrap().0,
+            source + PAGE_SIZE_4K
+        );
+
+        // This host test has no task context for SharedPages reclamation.
+        core::mem::forget(aspace);
     }
 
     #[test]

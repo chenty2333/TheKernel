@@ -563,9 +563,15 @@ impl CloneArgs {
             let aspace = if flags.contains(CloneFlags::VM) {
                 parent_aspace
             } else {
-                let aspace = {
-                    let mut parent_guard = parent_aspace.lock();
-                    parent_guard.try_clone()?
+                let aspace = loop {
+                    let cloned = {
+                        let mut parent_guard = parent_aspace.lock();
+                        parent_guard.try_clone()
+                    };
+                    match cloned {
+                        Err(AxError::WouldBlock) => core::hint::spin_loop(),
+                        result => break result?,
+                    }
                 };
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace

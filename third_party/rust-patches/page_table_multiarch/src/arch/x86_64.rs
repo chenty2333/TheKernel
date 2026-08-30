@@ -1,7 +1,7 @@
 //! x86 specific page table structures.
 
 use memory_addr::VirtAddr;
-use page_table_entry::x86_64::X64PTE;
+pub use page_table_entry::x86_64::X64PTE;
 #[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
 use x86_64::{
     registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags},

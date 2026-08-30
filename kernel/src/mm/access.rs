@@ -27,7 +27,10 @@ use super::{
     UserIoMappingExpectation, UserMemoryCapability, map_usercopy_error,
     prepare_physical_pin_registry,
 };
-use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
+use crate::{
+    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
+    syscall::ensure_4k_granularity_across_aliases,
+};
 static ENABLE_USER_IO_PIN_COUNTERS: AtomicBool = AtomicBool::new(false);
 static USER_IO_PIN_TO_USER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_TO_USER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -922,6 +925,14 @@ fn prepare_user_io_pin_with_duration(
     };
     let page_len = page_end - page_start;
     let aspace_handle = capability.address_space().clone();
+    // Demote before installing our own full-range reservation: the demotion
+    // correctly rejects other pins, whereas this reservation would otherwise
+    // self-conflict with its pin preflight. Once reserved, the pin fence
+    // prevents a concurrent collapse from recreating a compound folio.
+    if ensure_4k_granularity_across_aliases(&aspace_handle, page_start, page_len).is_err() {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        return None;
+    }
     let admission = {
         let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinAdmission);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
@@ -977,7 +988,7 @@ fn prepare_user_io_pin_with_duration(
         while expectation_cursor < page_end {
             let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
             let expectation_result = {
-                let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
+                let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
                 aspace.append_user_io_mapping_expectations(
                     expectation_cursor,
                     chunk_end - expectation_cursor,
@@ -1887,6 +1898,8 @@ mod tests {
             PagingError::NotAligned,
             PagingError::AlreadyMapped,
             PagingError::MappedToHugePage,
+            PagingError::NotPromotable,
+            PagingError::RollbackMismatch,
         ] {
             assert_eq!(classify_nofault_query(error), UserNofaultError::BadAddress);
         }
@@ -2210,7 +2223,9 @@ fn classify_nofault_query(error: PagingError) -> UserNofaultError {
         PagingError::NoMemory
         | PagingError::NotAligned
         | PagingError::AlreadyMapped
-        | PagingError::MappedToHugePage => UserNofaultError::BadAddress,
+        | PagingError::MappedToHugePage
+        | PagingError::NotPromotable
+        | PagingError::RollbackMismatch => UserNofaultError::BadAddress,
     }
 }
 

@@ -14,6 +14,7 @@ use crate::{
         AddrSpace, Backend, BackendOps, DeferredUffdWake, ExistingLineageMapError,
         LockExternalUffdOutcome, checked_align_up,
     },
+    syscall::ensure_4k_granularity_across_aliases,
     task::ProcessData,
 };
 
@@ -1166,10 +1167,26 @@ fn try_optimistic_mremap(
     request: MremapRequest,
 ) -> AxResult<OptimisticRemapOutcome> {
     let aspace_handle = proc_data.aspace();
+    let source_size = if request.old_size == 0 {
+        request.new_size
+    } else {
+        request.old_size
+    };
+    ensure_4k_granularity_across_aliases(&aspace_handle, request.addr, source_size)?;
+    if request.fixed {
+        // MREMAP_FIXED replaces the destination through AddrSpace's ordinary
+        // single-mm unmap transaction.  Demote a shared compound destination
+        // across every alias before entering that path.
+        ensure_4k_granularity_across_aliases(&aspace_handle, request.new_addr, request.new_size)?;
+    }
     let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapOptimisticPlan);
     if !proc_data.image_matches(&aspace_handle) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
+    // A source range may start or end inside a promoted private-COW PMD.
+    // mremap's move/duplicate machinery is VMA/page granular, so restore PTE
+    // geometry before collecting source fragments or deriving backend offsets.
+    aspace.ensure_4k_granularity(request.addr, source_size)?;
     let (request, plan) = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
     match plan {
         RemapPlan::Return(address) => {
@@ -1209,10 +1226,26 @@ fn run_locked_mremap(
 ) -> AxResult<isize> {
     loop {
         let aspace_handle = proc_data.aspace();
+        let source_size = if request.old_size == 0 {
+            request.new_size
+        } else {
+            request.old_size
+        };
+        ensure_4k_granularity_across_aliases(&aspace_handle, request.addr, source_size)?;
+        if request.fixed {
+            ensure_4k_granularity_across_aliases(
+                &aspace_handle,
+                request.new_addr,
+                request.new_size,
+            )?;
+        }
         let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSerialized);
         if !proc_data.image_matches(&aspace_handle) {
             continue;
         }
+        // Keep the locked and optimistic paths identical: partial move and
+        // MREMAP_DONTUNMAP duplication must never slice one private huge leaf.
+        aspace.ensure_4k_granularity(request.addr, source_size)?;
         let (request, plan) = build_remap_plan(&aspace, proc_data, has_ipc_lock, request)?;
         match plan {
             RemapPlan::Return(address) => return Ok(address.as_usize() as isize),
