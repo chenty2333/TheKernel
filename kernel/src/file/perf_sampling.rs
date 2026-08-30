@@ -54,6 +54,7 @@ pub(crate) enum SamplingEvent {
 #[derive(Clone, Copy)]
 pub(crate) struct SamplingConfig {
     pub id: u64,
+    pub target_task_id: u64,
     pub event: SamplingEvent,
     pub period: u64,
     pub sample_type: u64,
@@ -78,6 +79,10 @@ struct SamplingState {
     closed: bool,
     failed: bool,
     value: u64,
+    enabled_total: u64,
+    running_total: u64,
+    enabled_since: u64,
+    running_since: Option<u64>,
     ring: Option<Ring>,
 }
 
@@ -100,12 +105,17 @@ static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
 
 impl PerfSamplingFile {
     pub(crate) fn try_new(config: SamplingConfig) -> AxResult<Arc<Self>> {
+        let now = axhal::time::monotonic_time_nanos();
         Arc::try_new(Self {
             state: SpinNoIrq::new(SamplingState {
                 enabled: !config.disabled,
                 closed: false,
                 failed: false,
                 value: 0,
+                enabled_total: 0,
+                running_total: 0,
+                enabled_since: now,
+                running_since: None,
                 ring: None,
             }),
             config,
@@ -119,7 +129,14 @@ impl PerfSamplingFile {
         state.enabled && !state.closed && !state.failed
     }
 
+    fn target_current(&self) -> bool {
+        axtask::current().id().as_u64() == self.config.target_task_id
+    }
+
     pub(crate) fn enter_current(self: &Arc<Self>) {
+        if !self.target_current() {
+            return;
+        }
         if !self.enabled() {
             return;
         }
@@ -150,6 +167,7 @@ impl PerfSamplingFile {
             token,
             cookie: self.config.id,
         });
+        self.state.lock().running_since = Some(axhal::time::monotonic_time_nanos());
     }
 
     pub(crate) fn leave_current() {
@@ -167,7 +185,17 @@ impl PerfSamplingFile {
                 let partial = sample.residual.wrapping_sub(preload) & caps.programmable_mask();
                 let mut state = custody.event.state.lock();
                 state.value = state.value.saturating_add(partial);
+                if let Some(since) = state.running_since.take() {
+                    state.running_total = state
+                        .running_total
+                        .saturating_add(axhal::time::monotonic_time_nanos().saturating_sub(since));
+                }
+                if sample.overflowed || sample.lost {
+                    state.failed = true;
+                }
             }
+        } else {
+            custody.event.state.lock().failed = true;
         }
     }
 
@@ -226,6 +254,9 @@ impl PerfSamplingFile {
     }
 
     fn install_ring(&self, request: FileMmapRequest) -> AxResult {
+        if !self.target_current() {
+            return Err(AxError::OperationNotSupported);
+        }
         if request.offset() != 0
             || request.sharing() != FileMmapSharing::Shared
             || request.protection().contains(FileMmapProtection::EXECUTE)
@@ -292,11 +323,25 @@ impl PerfSamplingFile {
     }
 
     fn read_count(&self, dst: &mut IoDst) -> AxResult<usize> {
+        if !self.target_current() {
+            return Err(AxError::OperationNotSupported);
+        }
         let state = self.state.lock();
         if state.failed {
             return Err(AxError::Io);
         }
+        let now = axhal::time::monotonic_time_nanos();
         let value = state.value;
+        let enabled = state.enabled_total.saturating_add(if state.enabled {
+            now.saturating_sub(state.enabled_since)
+        } else {
+            0
+        });
+        let running = state.running_total.saturating_add(
+            state
+                .running_since
+                .map_or(0, |since| now.saturating_sub(since)),
+        );
         drop(state);
         let words = 1
             + usize::from(self.config.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0)
@@ -307,10 +352,10 @@ impl PerfSamplingFile {
         }
         dst.write(&value.to_ne_bytes())?;
         if self.config.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
-            dst.write(&0_u64.to_ne_bytes())?;
+            dst.write(&enabled.to_ne_bytes())?;
         }
         if self.config.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-            dst.write(&0_u64.to_ne_bytes())?;
+            dst.write(&running.to_ne_bytes())?;
         }
         if self.config.read_format & PERF_FORMAT_ID != 0 {
             dst.write(&self.config.id.to_ne_bytes())?;
@@ -349,6 +394,9 @@ impl FileLike for PerfSamplingFile {
             .flatten())
     }
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if !self.target_current() {
+            return Err(AxError::OperationNotSupported);
+        }
         if cmd == PERF_EVENT_IOC_ID {
             context
                 .user_memory()
@@ -356,17 +404,31 @@ impl FileLike for PerfSamplingFile {
                 .map_err(crate::mm::map_usercopy_error)?;
             return Ok(0);
         }
+        if matches!(cmd, PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) {
+            Self::leave_current();
+        }
+        let now = axhal::time::monotonic_time_nanos();
         let mut state = self.state.lock();
         match cmd {
-            PERF_EVENT_IOC_ENABLE if arg == 0 => state.enabled = true,
-            PERF_EVENT_IOC_DISABLE if arg == 0 => state.enabled = false,
+            PERF_EVENT_IOC_ENABLE if arg == 0 => {
+                if !state.enabled {
+                    state.enabled = true;
+                    state.enabled_since = now;
+                }
+            }
+            PERF_EVENT_IOC_DISABLE if arg == 0 => {
+                if state.enabled {
+                    state.enabled_total = state
+                        .enabled_total
+                        .saturating_add(now.saturating_sub(state.enabled_since));
+                    state.enabled = false;
+                }
+            }
             PERF_EVENT_IOC_RESET if arg == 0 => {
                 state.value = 0;
                 state.failed = false;
                 if let Some(ring) = state.ring.as_mut() {
-                    ring.producer_head = 0;
                     ring.lost = 0;
-                    ring.head.store_release(0);
                 }
             }
             _ => return Err(AxError::InvalidInput),

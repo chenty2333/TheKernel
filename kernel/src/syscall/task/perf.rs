@@ -94,6 +94,7 @@ fn open_sampling(
     let file =
         crate::file::PerfSamplingFile::try_new(crate::file::perf_sampling::SamplingConfig {
             id,
+            target_task_id: current().id().as_u64(),
             event,
             period: attr.sample_period,
             sample_type: attr.sample_type,
