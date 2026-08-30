@@ -942,15 +942,15 @@ pub fn sys_remap_file_pages(
         return Err(AxError::InvalidInput);
     }
     let populate = flags & MAP_NONBLOCK as usize == 0;
-    let wake = aspace.replace_shared_mapping_span_at_offset(
+    let outcome = aspace.replace_shared_mapping_span_at_offset(
         &aspace_handle,
         start_addr,
         size,
         pgoff,
         populate,
-    )?;
+    );
     drop(aspace);
-    wake.finish();
+    outcome.finish()?;
     if populate {
         // Linux treats post-commit population faults as best-effort here: the
         // fixed alias remains installed even when a later page cannot be

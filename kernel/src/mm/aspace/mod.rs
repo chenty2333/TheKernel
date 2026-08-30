@@ -3026,16 +3026,35 @@ impl AddrSpace {
         start: VirtAddr,
         size: usize,
         page_offset: usize,
-        populate: bool,
-    ) -> AxResult<DeferredUffdWake> {
+        _populate: bool,
+    ) -> LockExternalUffdOutcome<(), AxError> {
+        let mut deferred_wake = DeferredUffdWake::empty();
+        let outcome = (|| -> AxResult {
         let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::InvalidInput)?;
+        self.check_no_seal_overlap(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
+        let source_mutations =
+            prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
+        let next_topology_generation = self.next_topology_generation()?;
+        let policy = self.prepare_remap_policy(start, size, size)?;
+        // Do not use `unmap()` below: that helper commits its UFFD plan
+        // immediately.  A nonlinear replacement must retain both outcomes
+        // until the replacement has either fully published or been restored.
+        let uffd_plan = self.preflight_remap_uffd(
+            UffdRemapKind::Move,
+            true,
+            start,
+            size,
+            start,
+            size,
+        )?;
         // `mlock` can cover only a prefix, suffix, or interior pages of a
-        // VMA.  Keep those exact intervals before unmap clears the ledger;
-        // remap_file_pages must neither drop the charge nor expand it to the
-        // whole replacement mapping.
-        let locked_segments = self.locked_segments_in_range(start, size);
+        // VMA.  `prepare_remap_policy` snapshots those exact intervals before
+        // unmap clears the ledger, so the replacement neither drops the
+        // charge nor expands it to the whole VMA.
         let mut cursor = start;
-        let mut fragments: Vec<(VirtAddr, usize, MappingFlags, Backend, Backend)> = Vec::new();
+        let mut fragments: Vec<(VirtAddr, usize, MappingFlags, MappingLineage, Backend, Backend)> =
+            Vec::new();
         for area in self.areas_overlapping(range) {
             if cursor >= range.end { break; }
             if area.start() > cursor { return Err(AxError::InvalidInput); }
@@ -3051,30 +3070,87 @@ impl AddrSpace {
                 Backend::Shared(_) => source.clone_shared_rebased(cursor, offset)?,
                 _ => return Err(AxError::InvalidInput),
             };
-            fragments.push((cursor, length, area.flags(), rollback, replacement));
+            fragments.push((
+                cursor,
+                length,
+                area.flags(),
+                area.lineage(),
+                rollback,
+                replacement,
+            ));
             cursor = end;
         }
         if cursor != range.end { return Err(AxError::InvalidInput); }
-        let wake = self.unmap(start, size)?;
+        if let Err(error) = self.unmap_areas_with_tlb_grace(start, size) {
+            deferred_wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved));
+            return Err(error.into());
+        }
+        self.refresh_growdown_starts();
+        Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+        Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        self.clear_locked_range(start, size);
         let mut committed = 0usize;
-        for (_, _, flags, _, replacement) in &fragments {
-            let (address, length, _, _, _) = fragments[committed];
+        for (_, _, flags, _, _, replacement) in &fragments {
+            let (address, length, _, _, _, _) = fragments[committed];
             if let Err(error) = self.map_with_lock_state(address, length, *flags, false, replacement.clone(), false) {
-                self.unmap(start, size).ok();
-                for (address, length, flags, rollback, _) in fragments.into_iter() {
-                    self.map_with_lock_state(address, length, flags, false, rollback, false).map_err(|_| AxError::BadState)?;
+                let replacement_mutations = prepare_unmap_mapping_mutations(
+                    &self.areas,
+                    &self.mapping_identities,
+                    start,
+                    size,
+                )
+                .ok();
+                let restored = self.unmap_areas_with_tlb_grace(start, size).is_ok();
+                if let Some(replacement_mutations) = replacement_mutations {
+                    commit_mapping_identity_mutations(
+                        &mut self.mapping_identities,
+                        &replacement_mutations,
+                    );
                 }
-                for (locked_start, locked_size) in locked_segments {
-                    self.insert_locked_range(locked_start, locked_start + locked_size);
+                for (address, length, flags, lineage, rollback, _) in fragments.into_iter() {
+                    if self
+                        .map_with_existing_lineage(
+                            address,
+                            length,
+                            flags,
+                            false,
+                            rollback,
+                            false,
+                            lineage,
+                        )
+                        .is_err()
+                    {
+                        deferred_wake.merge(self.resolve_remap_uffd(
+                            uffd_plan,
+                            RemapUffdOutcome::DestructiveFailure,
+                        ));
+                        self.commit_topology_generation(next_topology_generation);
+                        return Err(AxError::BadState);
+                    }
                 }
-                return Err(error);
+                if restored {
+                    self.apply_remap_policy(start, &policy);
+                    deferred_wake.merge(
+                        self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved),
+                    );
+                    return Err(error);
+                }
+                deferred_wake.merge(self.resolve_remap_uffd(
+                    uffd_plan,
+                    RemapUffdOutcome::DestructiveFailure,
+                ));
+                self.commit_topology_generation(next_topology_generation);
+                return Err(AxError::BadState);
             }
             committed += 1;
         }
-        for (locked_start, locked_size) in locked_segments {
-            self.insert_locked_range(locked_start, locked_start + locked_size);
-        }
-        Ok(wake)
+        self.apply_remap_policy(start, &policy);
+        commit_mapping_identity_mutations(&mut self.mapping_identities, &source_mutations);
+        self.commit_topology_generation(next_topology_generation);
+        deferred_wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed));
+        Ok(())
+        })();
+        LockExternalUffdOutcome::new(outcome, deferred_wake)
     }
 
     pub fn map_with_lock_state(
