@@ -25,12 +25,31 @@ static FIXED_SHARED_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
 // not use this path: their cache pages are not anonymous shmem pages.
 static SHMEM_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
 
+const FOLIO_4K_PAGES: usize = PageSize::Size2M as usize / PageSize::Size4K as usize;
+
+/// An owned 2 MiB allocation represented by 512 indexed 4 KiB entries.
+///
+/// `SharedPageStorage::pages` remains the authoritative indexed lookup table:
+/// callers never need to know whether an entry was originally allocated as a
+/// base page or as part of a folio.  This side table exists only to give the
+/// allocator the correct lifetime and deallocation granularity.
+#[derive(Clone, Copy)]
+struct SharedFolio {
+    start_index: usize,
+    paddr: PhysAddr,
+}
+
+struct SharedPageStorage {
+    pages: Vec<PhysAddr>,
+    folios: Vec<SharedFolio>,
+}
+
 pub fn shmem_resident_pages() -> usize {
     SHMEM_RESIDENT_PAGES.load(Ordering::Acquire)
 }
 
 pub struct SharedPages {
-    phys_pages: Mutex<Vec<PhysAddr>>,
+    phys_pages: Mutex<SharedPageStorage>,
     // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
     // the published length separate from `phys_pages`: taking that mutex in
     // the gate would be a blocking operation. The backing only grows, so a
@@ -54,10 +73,7 @@ impl SharedPages {
 
     /// Allocates SysV shared pages and charges only frames that were actually
     /// obtained.  The charge lives with the backing Arc through its final drop.
-    pub fn new_sysv_charged(
-        size: usize,
-        page_size: PageSize,
-    ) -> AxResult<Self> {
+    pub fn new_sysv_charged(size: usize, page_size: PageSize) -> AxResult<Self> {
         // SysV segments have a fixed shm_segsz; unlike anonymous shared
         // mappings they cannot grow through a later range extension.
         Self::new_with_growth_charged(size, page_size, false, Some(&SHMEM_RESIDENT_PAGES))
@@ -101,7 +117,10 @@ impl SharedPages {
             charge.fetch_add(num_pages, Ordering::Release);
         }
         Ok(Self {
-            phys_pages: Mutex::new(phys_pages),
+            phys_pages: Mutex::new(SharedPageStorage {
+                pages: phys_pages,
+                folios: Vec::new(),
+            }),
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
@@ -118,15 +137,15 @@ impl SharedPages {
     }
 
     pub fn len(&self) -> usize {
-        self.phys_pages.lock().len()
+        self.phys_pages.lock().pages.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.phys_pages.lock().is_empty()
+        self.phys_pages.lock().pages.is_empty()
     }
 
     pub fn ensure_len(&self, len: usize) -> AxResult {
-        let current_len = self.phys_pages.lock().len();
+        let current_len = self.phys_pages.lock().pages.len();
         if current_len >= len {
             return Ok(());
         }
@@ -151,15 +170,15 @@ impl SharedPages {
         }
 
         let mut pages = self.phys_pages.lock();
-        if pages.len() >= len {
+        if pages.pages.len() >= len {
             drop(pages);
             for frame in new_pages {
                 dealloc_frame(frame, self.size);
             }
             return Ok(());
         }
-        let needed = len - pages.len();
-        if pages.try_reserve_exact(needed).is_err() {
+        let needed = len - pages.pages.len();
+        if pages.pages.try_reserve_exact(needed).is_err() {
             drop(pages);
             for frame in new_pages {
                 dealloc_frame(frame, self.size);
@@ -167,11 +186,11 @@ impl SharedPages {
             return Err(AxError::NoMemory);
         }
         let unused = new_pages.split_off(needed);
-        pages.extend(new_pages);
+        pages.pages.extend(new_pages);
         if let Some(charge) = self.resident_charge {
             charge.fetch_add(needed, Ordering::Release);
         }
-        let published_len = pages.len();
+        let published_len = pages.pages.len();
         drop(pages);
         self.published_len.store(published_len, Ordering::Release);
         for frame in unused {
@@ -199,7 +218,7 @@ impl SharedPages {
         let mut page_offset = offset % page_bytes;
 
         while !buf.is_empty() {
-            let phys = pages[page_index];
+            let phys = pages.pages[page_index];
             let src = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
             unsafe {
@@ -225,7 +244,7 @@ impl SharedPages {
         let mut page_offset = offset % page_bytes;
 
         while !buf.is_empty() {
-            let phys = pages[page_index];
+            let phys = pages.pages[page_index];
             let dst = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
             unsafe {
@@ -249,18 +268,140 @@ impl SharedPages {
         let end = start_index
             .checked_add(count)
             .ok_or(AxError::InvalidInput)?;
-        if end > pages.len() {
+        if end > pages.pages.len() {
             return Err(AxError::NoMemory);
         }
-        use_pages(&pages[start_index..end])
+        use_pages(&pages.pages[start_index..end])
     }
 
-    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+    /// Returns the physical address for a 4 KiB indexed backing entry.
+    ///
+    /// A promoted folio still exposes all 512 entries through this interface,
+    /// as consecutive physical addresses derived from its 2 MiB base.
+    pub fn paddr_at(&self, index: usize) -> AxResult<PhysAddr> {
         self.phys_pages
             .lock()
+            .pages
             .get(index)
             .copied()
             .ok_or(AxError::InvalidInput)
+    }
+
+    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+        self.paddr_at(index)
+    }
+
+    /// Transactionally replace 512 base-page entries with one 2 MiB folio.
+    ///
+    /// Allocation, metadata reservation, and copying complete before the
+    /// indexed table is published.  Consequently a failure leaves the old
+    /// backing untouched; after publication the old frames are released.
+    pub fn promote_4k_folio(&self, start_index: usize) -> AxResult<PhysAddr> {
+        if self.size != PageSize::Size4K || !start_index.is_multiple_of(FOLIO_4K_PAGES) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start_index
+            .checked_add(FOLIO_4K_PAGES)
+            .ok_or(AxError::InvalidInput)?;
+        let mut storage = self.phys_pages.lock();
+        if end > storage.pages.len()
+            || storage.folios.iter().any(|folio| {
+                let folio_end = folio.start_index + FOLIO_4K_PAGES;
+                start_index < folio_end && folio.start_index < end
+            })
+        {
+            return Err(AxError::InvalidInput);
+        }
+        storage
+            .folios
+            .try_reserve_exact(1)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut old_pages = Vec::new();
+        old_pages
+            .try_reserve_exact(FOLIO_4K_PAGES)
+            .map_err(|_| AxError::NoMemory)?;
+        old_pages.extend_from_slice(&storage.pages[start_index..end]);
+
+        let folio = alloc_frame(false, PageSize::Size2M)?;
+        for (offset, &source) in old_pages.iter().enumerate() {
+            let destination = axhal::mem::phys_to_virt(PhysAddr::from(
+                folio.as_usize() + offset * PageSize::Size4K as usize,
+            ));
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    axhal::mem::phys_to_virt(source).as_ptr(),
+                    destination.as_mut_ptr(),
+                    PageSize::Size4K as usize,
+                );
+            }
+        }
+
+        for (offset, entry) in storage.pages[start_index..end].iter_mut().enumerate() {
+            *entry = PhysAddr::from(folio.as_usize() + offset * PageSize::Size4K as usize);
+        }
+        storage.folios.push(SharedFolio {
+            start_index,
+            paddr: folio,
+        });
+        for old in old_pages {
+            dealloc_frame(old, PageSize::Size4K);
+        }
+        Ok(folio)
+    }
+
+    /// Transactionally restore the base-page backing for a promoted folio.
+    ///
+    /// This is the inverse ownership transition: all replacement frames are
+    /// allocated and populated before the indexed table stops referencing the
+    /// folio.  Failed allocation therefore leaves the folio fully intact.
+    pub fn demote_4k_folio(&self, start_index: usize) -> AxResult {
+        if self.size != PageSize::Size4K || !start_index.is_multiple_of(FOLIO_4K_PAGES) {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start_index
+            .checked_add(FOLIO_4K_PAGES)
+            .ok_or(AxError::InvalidInput)?;
+        let mut storage = self.phys_pages.lock();
+        let folio_index = storage
+            .folios
+            .iter()
+            .position(|folio| folio.start_index == start_index)
+            .ok_or(AxError::InvalidInput)?;
+        if end > storage.pages.len() {
+            return Err(AxError::BadState);
+        }
+        let folio = storage.folios[folio_index].paddr;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(FOLIO_4K_PAGES)
+            .map_err(|_| AxError::NoMemory)?;
+        for _ in 0..FOLIO_4K_PAGES {
+            match alloc_frame(false, PageSize::Size4K) {
+                Ok(frame) => replacement.push(frame),
+                Err(error) => {
+                    for frame in replacement {
+                        dealloc_frame(frame, PageSize::Size4K);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for (offset, &destination) in replacement.iter().enumerate() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    axhal::mem::phys_to_virt(PhysAddr::from(
+                        folio.as_usize() + offset * PageSize::Size4K as usize,
+                    ))
+                    .as_ptr(),
+                    axhal::mem::phys_to_virt(destination).as_mut_ptr(),
+                    PageSize::Size4K as usize,
+                );
+            }
+        }
+        storage.pages[start_index..end].copy_from_slice(&replacement);
+        storage.folios.remove(folio_index);
+        dealloc_frame(folio, PageSize::Size2M);
+        Ok(())
     }
 
     /// Returns an aligned, bounds-checked atomic view into a fixed backing.
@@ -345,12 +486,22 @@ fn atomic_store_release(address: NonNull<AtomicU32>, value: u32) {
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
-        for frame in self.phys_pages.lock().iter() {
-            dealloc_frame(*frame, self.size);
+        let storage = self.phys_pages.lock();
+        for (index, &frame) in storage.pages.iter().enumerate() {
+            if !storage.folios.iter().any(|folio| {
+                (folio.start_index..folio.start_index + FOLIO_4K_PAGES).contains(&index)
+            }) {
+                dealloc_frame(frame, self.size);
+            }
+        }
+        for folio in &storage.folios {
+            dealloc_frame(folio.paddr, PageSize::Size2M);
         }
         if let Some(charge) = self.resident_charge {
             let pages = self.published_len.load(Ordering::Relaxed);
-            let _ = charge.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(pages));
+            let _ = charge.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_sub(pages)
+            });
         }
     }
 }
