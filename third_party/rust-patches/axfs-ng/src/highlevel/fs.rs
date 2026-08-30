@@ -1354,6 +1354,7 @@ mod tests {
                 node_type: NodeType::RegularFile,
                 uid: 0,
                 gid: 0,
+                project_id: 0,
                 size: self.contents.len() as u64,
                 block_size: 4096,
                 blocks: 0,

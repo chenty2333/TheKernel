@@ -4,8 +4,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
 use crate::{
-    DirEntry, MetadataUpdateCapabilities, Mutex, VfsResult, WeakDirEntry, WritebackErrorState,
+    DirEntry, Metadata, MetadataUpdateCapabilities, Mutex, VfsError, VfsResult, WeakDirEntry,
+    WritebackErrorState,
 };
+
+/// Callback used by [`FilesystemOps::enumerate_inodes`].
+///
+/// The callback receives a point-in-time metadata snapshot for every inode
+/// which is still live in the filesystem, including an unlinked inode held
+/// open by a file descriptor.  Filesystems which cannot make that guarantee
+/// must return [`VfsError::OperationNotSupported`] rather than walking their
+/// visible directory tree and claiming that it is complete.
+pub type InodeVisitor<'a> = dyn FnMut(Metadata) -> VfsResult<()> + 'a;
 
 pub struct StatFs {
     pub fs_type: u32,
@@ -32,6 +42,16 @@ pub trait FilesystemOps: Send + Sync {
 
     /// Returns statistics about the filesystem
     fn stat(&self) -> VfsResult<StatFs>;
+
+    /// Enumerates all live inode identities in this filesystem.
+    ///
+    /// This is deliberately a visitor, rather than a returned collection: an
+    /// ext4 image can contain far more allocated inodes than fit in a
+    /// temporary VFS allocation.  The default is fail-closed because a
+    /// namespace walk misses unlinked-but-open files and hard-link aliases.
+    fn enumerate_inodes(&self, _visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
+        Err(VfsError::OperationNotSupported)
+    }
 
     /// Returns which inode metadata fields this filesystem can persist.
     fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {
@@ -157,6 +177,11 @@ impl Filesystem {
 
     pub fn stat(&self) -> VfsResult<StatFs> {
         self.inner.ops.stat()
+    }
+
+    /// Enumerates every live inode supplied by the backend.
+    pub fn enumerate_inodes(&self, visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
+        self.inner.ops.enumerate_inodes(visitor)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

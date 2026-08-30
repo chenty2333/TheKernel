@@ -34,6 +34,11 @@ const MAX_PHYSICAL_INPUT_SG: usize = 64;
 const MAX_PHYSICAL_IO_BYTES: usize = 256 * 1024;
 const PHYSICAL_IO_ALIGNMENT: usize = 512;
 const FILE_EXTENT_LAST_FLAG: u32 = 1;
+const PROJECT_ID_XATTR: &[u8] = b"trusted.thekernel.project_id";
+
+fn project_id_from_xattr(value: &[u8]) -> u32 {
+    <[u8; 4]>::try_from(value).map(u32::from_le_bytes).unwrap_or(0)
+}
 
 fn to_lwext4_physical_segments(
     segments: &[PhysicalIoSegment],
@@ -343,9 +348,16 @@ impl NodeOps for Inode {
 
     fn metadata(&self) -> VfsResult<Metadata> {
         let mut attr = FileAttr::default();
+        let mut project_id = 0;
         self.fs
             .lock()
-            .get_attr(self.ino(), &mut attr)
+            .with_inode_ref(self.ino(), |inode| {
+                inode.get_attr(&mut attr);
+                if let Ok(value) = inode.get_xattr(PROJECT_ID_XATTR) {
+                    project_id = project_id_from_xattr(&value);
+                }
+                Ok(())
+            })
             .map_err(into_vfs_err)?;
         Ok(Metadata {
             inode: self.ino() as _,
@@ -355,6 +367,7 @@ impl NodeOps for Inode {
             node_type: into_vfs_type(attr.node_type),
             uid: attr.uid,
             gid: attr.gid,
+            project_id,
             size: attr.size,
             block_size: attr.block_size,
             blocks: attr.blocks,
@@ -387,6 +400,10 @@ impl NodeOps for Inode {
             }
             if let Some((uid, gid)) = update.owner {
                 inode.set_owner(uid as _, gid as _);
+                status_changed = true;
+            }
+            if let Some(project_id) = update.project_id {
+                inode.set_xattr(PROJECT_ID_XATTR, &project_id.to_le_bytes())?;
                 status_changed = true;
             }
             if let Some(rdev) = update.rdev {

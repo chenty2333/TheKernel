@@ -177,6 +177,16 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref);
 int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			  struct ext4_inode_ref *ref);
 
+/**
+ * Check an inode's allocation bit without opening its inode-table entry.
+ *
+ * The index is the usual one-based ext4 inode number.  The bitmap block is
+ * acquired and released within this helper so callers cannot leak cache
+ * references while doing a full filesystem scan.
+ */
+int ext4_fs_inode_is_allocated(struct ext4_fs *fs, uint32_t index,
+			       bool *allocated);
+
 /**@brief Reset blocks field of i-node.
  * @param fs        Filesystem to reset blocks field of i-inode on
  * @param inode_ref ref Pointer for inode to be operated on

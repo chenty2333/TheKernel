@@ -143,13 +143,16 @@ bitflags::bitflags! {
         const ATIME = 1 << 3;
         const MTIME = 1 << 4;
         const CTIME = 1 << 5;
+        /// Linux FSXATTR project identifier.
+        const PROJECT_ID = 1 << 6;
 
         const ALL = Self::MODE.bits()
             | Self::OWNER.bits()
             | Self::RDEV.bits()
             | Self::ATIME.bits()
             | Self::MTIME.bits()
-            | Self::CTIME.bits();
+            | Self::CTIME.bits()
+            | Self::PROJECT_ID.bits();
     }
 }
 
@@ -170,6 +173,8 @@ pub struct Metadata {
     pub uid: u32,
     /// Group ID of owner
     pub gid: u32,
+    /// Filesystem project identifier used by project quota.
+    pub project_id: u32,
     /// Total size in bytes
     pub size: u64,
     /// Block size for filesystem I/O
@@ -196,6 +201,8 @@ pub struct MetadataUpdate {
     pub mode: Option<NodePermission>,
     /// The owner (uid, gid)
     pub owner: Option<(u32, u32)>,
+    /// Filesystem project identifier.
+    pub project_id: Option<u32>,
     /// Device ID for special files
     pub rdev: Option<DeviceId>,
 
@@ -214,6 +221,9 @@ impl MetadataUpdate {
         }
         if !capabilities.contains(MetadataUpdateCapabilities::OWNER) {
             self.owner = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::PROJECT_ID) {
+            self.project_id = None;
         }
         if !capabilities.contains(MetadataUpdateCapabilities::RDEV) {
             self.rdev = None;

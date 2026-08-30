@@ -7,6 +7,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use super::admit_resize;
 use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent,
     PathwalkPolicy,
@@ -682,7 +683,9 @@ fn commit_open_truncate(
 ) -> AxResult<()> {
     let _memfd_mutation = memfd::begin_resize(loc, 0)?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
+    let quota_charge = admit_resize(loc, loc.len()?, 0)?;
     file.inner().backend()?.set_len(0)?;
+    quota_charge.commit_actual_blocks(loc)?;
     // A post-truncate metadata failure cannot be reported without lying that
     // this destructive open left the inode untouched. Filesystems should
     // update truncate timestamps as part of set_len; retain this compatibility

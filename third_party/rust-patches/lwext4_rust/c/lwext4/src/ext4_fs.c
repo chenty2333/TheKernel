@@ -801,6 +801,53 @@ int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	return __ext4_fs_get_inode_ref(fs, index, ref, true);
 }
 
+int ext4_fs_inode_is_allocated(struct ext4_fs *fs, uint32_t index,
+			       bool *allocated)
+{
+	if (!allocated || !index || index > ext4_get32(&fs->sb, inodes_count))
+		return EINVAL;
+
+	uint32_t inodes_per_group = ext4_get32(&fs->sb, inodes_per_group);
+	uint32_t zero_index = index - 1;
+	uint32_t group = zero_index / inodes_per_group;
+	uint32_t bit = zero_index % inodes_per_group;
+	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
+	uint32_t descriptors_per_block = block_size / ext4_sb_get_desc_size(&fs->sb);
+	uint64_t descriptor_block = ext4_fs_get_descriptor_block(&fs->sb, group,
+						    descriptors_per_block);
+	uint32_t descriptor_offset =
+		(group % descriptors_per_block) * ext4_sb_get_desc_size(&fs->sb);
+	struct ext4_block descriptor;
+	struct ext4_block bitmap;
+	int rc = ext4_trans_block_get(fs->bdev, &descriptor, descriptor_block);
+	if (rc != EOK)
+		return rc;
+	struct ext4_bgroup *block_group =
+		(void *)(descriptor.data + descriptor_offset);
+
+	/* Do not use ext4_fs_get_block_group_ref here: it materializes lazy
+	 * inode groups and dirties their descriptors. An uninitialized inode
+	 * bitmap denotes no allocated inodes in this group. */
+	if (ext4_bg_has_flag(block_group, EXT4_BLOCK_GROUP_INODE_UNINIT)) {
+		*allocated = false;
+		return ext4_block_set(fs->bdev, &descriptor);
+	}
+
+	ext4_fsblk_t bitmap_block =
+		ext4_bg_get_inode_bitmap(block_group, &fs->sb);
+	rc = ext4_trans_block_get(fs->bdev, &bitmap, bitmap_block);
+	if (rc == EOK) {
+		*allocated = ext4_bmap_is_bit_set(bitmap.data, bit);
+		int release_rc = ext4_block_set(fs->bdev, &bitmap);
+		if (release_rc != EOK)
+			rc = release_rc;
+	}
+	int descriptor_release_rc = ext4_block_set(fs->bdev, &descriptor);
+	if (rc == EOK && descriptor_release_rc != EOK)
+		rc = descriptor_release_rc;
+	return rc;
+}
+
 int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref)
 {
 	/* Check if reference modified */

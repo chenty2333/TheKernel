@@ -126,6 +126,7 @@ impl SimpleFsNode {
             node_type,
             uid: 0,
             gid: 0,
+            project_id: 0,
             size: 0,
             block_size: 0,
             blocks: 0,
@@ -163,6 +164,7 @@ impl SimpleFsNode {
             node_type,
             uid: 0,
             gid: 0,
+            project_id: 0,
             size: 0,
             block_size: 0,
             blocks: 0,
@@ -215,6 +217,10 @@ impl NodeOps for SimpleFsNode {
         if let Some((uid, gid)) = update.owner {
             metadata.uid = uid;
             metadata.gid = gid;
+            status_changed = true;
+        }
+        if let Some(project_id) = update.project_id {
+            metadata.project_id = project_id;
             status_changed = true;
         }
         if let Some(rdev) = update.rdev {

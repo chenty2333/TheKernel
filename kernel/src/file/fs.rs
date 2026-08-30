@@ -38,6 +38,7 @@ use crate::{
     readiness::block_on_poll_io,
     task::{AsThread, DacCredentialView, current_fs_context, send_signal_to_process},
 };
+use crate::syscall::admit_resize;
 
 const PATH_MAX: usize = 4096;
 
@@ -510,6 +511,7 @@ impl File {
         let mut write = || {
             replay.begin_attempt();
             let mut privilege_guard = None;
+            let mut quota_charge = None;
             let result = inner.write_with_placement_and_admission(
                 &mut replay,
                 placement,
@@ -528,11 +530,21 @@ impl File {
                         validate_direct,
                     )?;
                     privilege_guard = guard;
+                    quota_charge = Some(admit_resize(
+                        inner.location(),
+                        file_len,
+                        file_len.max(offset.saturating_add(allowed as u64)),
+                    )?);
                     admitted.set(Some(allowed));
                     Ok(allowed)
                 },
             );
             drop(privilege_guard);
+            if result.is_ok() {
+                if let Some(charge) = quota_charge {
+                    charge.commit_actual_blocks(inner.location())?;
+                }
+            }
             result
         };
         if likely(self.is_blocking()) {

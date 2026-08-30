@@ -24,3 +24,4 @@ pub use self::{
     mount::*, pidfd::*, pipe::*, quota::*, signalfd::*, stat::*, timerfd::*, userfaultfd::*,
     xattr::*,
 };
+pub(crate) use quota::{admit_chown, admit_inode_create, admit_resize, admit_unlink};

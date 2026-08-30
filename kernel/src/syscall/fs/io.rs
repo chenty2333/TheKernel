@@ -15,6 +15,8 @@ use linux_raw_sys::{
 use spin::Lazy;
 use syscalls::Sysno;
 
+use super::admit_resize;
+
 use crate::{
     file::{
         Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst,
@@ -2750,7 +2752,9 @@ pub fn sys_truncate(
             .into_file()?;
         let backend = file.access(FileFlags::WRITE)?;
         let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+        let quota_charge = admit_resize(&loc, loc.len()?, length as u64)?;
         backend.set_len(length as _)?;
+        quota_charge.commit_actual_blocks(&loc)?;
         if let Err(error) = touch_modified_metadata(&loc) {
             warn!("truncate metadata update failed after size mutation: {error}");
         }
@@ -2799,7 +2803,9 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         status.nonblocking(),
     )?;
     let _privilege_guard = begin_inode_content_write(f.inner().location(), &security)?;
+    let quota_charge = admit_resize(f.inner().location(), f.inner().location().len()?, length as u64)?;
     backend.set_len(length as _)?;
+    quota_charge.commit_actual_blocks(f.inner().location())?;
     if let Err(error) = touch_modified_metadata(f.inner().location()) {
         warn!("ftruncate metadata update failed after size mutation: {error}");
     }
@@ -2864,17 +2870,27 @@ pub fn sys_fallocate(
             check_resize_limit(size.max(end))?;
             let _memfd_mutation = memfd::begin_resize(&loc, size.max(end))?;
             let _privilege_guard = begin_inode_content_write(&loc, &security)?;
-            if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, true) {
-                result?;
+            if tmp::supports_fallocate_range(&loc) {
+                let quota_charge = admit_resize(&loc, size, size.max(end))?;
+                tmp::reserve_fallocate_range(&loc, offset, len, true)
+                    .ok_or(AxError::BadState)??;
+                quota_charge.commit_actual_blocks(&loc)?;
             } else {
+                let quota_charge = admit_resize(&loc, size, size.max(end))?;
                 backend.set_len(size.max(end))?;
+                quota_charge.commit_actual_blocks(&loc)?;
             }
         }
         FALLOC_FL_KEEP_SIZE => {
             let _memfd_mutation = memfd::begin_resize(&loc, size)?;
             let _privilege_guard = begin_inode_content_write(&loc, &security)?;
-            if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, false) {
-                result?;
+            if tmp::supports_fallocate_range(&loc) {
+                // KEEP_SIZE may still allocate blocks beyond EOF. Reserve the
+                // full possible extent, then settle against Metadata.blocks.
+                let quota_charge = admit_resize(&loc, size, size.max(end))?;
+                tmp::reserve_fallocate_range(&loc, offset, len, false)
+                    .ok_or(AxError::BadState)??;
+                quota_charge.commit_actual_blocks(&loc)?;
             }
         }
         mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
@@ -2890,8 +2906,10 @@ pub fn sys_fallocate(
                 usize::try_from(hole_len).map_err(|_| AxError::from(LinuxError::EFBIG))?,
             )?;
             let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let quota_charge = admit_resize(&loc, size, size)?;
             write_zero_range(file, offset, hole_len)?;
             tmp::punch_hole_fallocate_range(&loc, offset, len).ok_or(AxError::BadState)??;
+            quota_charge.commit_actual_blocks(&loc)?;
         }
         mode if mode == FALLOC_FL_ZERO_RANGE
             || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
@@ -2914,7 +2932,9 @@ pub fn sys_fallocate(
             };
             let _privilege_guard = begin_inode_content_write(&loc, &security)?;
             if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                let quota_charge = admit_resize(&loc, size, size.max(end))?;
                 backend.set_len(size.max(end))?;
+                quota_charge.commit_actual_blocks(&loc)?;
             }
             write_zero_range(file, offset, zero_len)?;
             if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, zero_len, false) {
@@ -2936,7 +2956,9 @@ pub fn sys_fallocate(
             } else {
                 copy_within_file(file, end, offset, size - end)?;
             }
+            let quota_charge = admit_resize(&loc, size, size - len)?;
             backend.set_len(size - len)?;
+            quota_charge.commit_actual_blocks(&loc)?;
         }
         FALLOC_FL_INSERT_RANGE => {
             if len == 0
@@ -2953,7 +2975,9 @@ pub fn sys_fallocate(
             check_resize_limit(new_size)?;
             let _memfd_mutation = memfd::begin_write_resize(&loc, offset, len_usize, new_size)?;
             let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let quota_charge = admit_resize(&loc, size, new_size)?;
             backend.set_len(new_size)?;
+            quota_charge.commit_actual_blocks(&loc)?;
             if let Some(result) = tmp::insert_fallocate_range(&loc, offset, len) {
                 result?;
             } else {
@@ -5909,6 +5933,7 @@ mod tests {
                 node_type: self.fs.node_type,
                 uid: 0,
                 gid: 0,
+                project_id: 0,
                 size: self.fs.size,
                 block_size: 4096,
                 blocks: 0,

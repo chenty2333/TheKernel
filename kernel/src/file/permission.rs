@@ -1933,6 +1933,7 @@ mod tests {
             node_type: NodeType::Directory,
             uid,
             gid,
+            project_id: 0,
             size: 0,
             block_size: 4096,
             blocks: 0,

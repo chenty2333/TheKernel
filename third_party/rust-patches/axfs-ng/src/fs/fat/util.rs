@@ -88,6 +88,7 @@ pub fn file_metadata(
         node_type,
         uid: fs.mount_options.uid,
         gid: fs.mount_options.gid,
+        project_id: 0,
         size,
         block_size: block_size as _,
         blocks: size.div_ceil(512),

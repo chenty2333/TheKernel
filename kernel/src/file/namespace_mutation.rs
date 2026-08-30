@@ -19,6 +19,7 @@ use super::permission::{
     check_writable_mount, initial_named_create_owner_mode_with_security,
 };
 use crate::mounts::NamespaceOperationGuard;
+use crate::syscall::{admit_inode_create, admit_unlink};
 
 const GENERATION_SNAPSHOT_RETRIES: usize = 4;
 
@@ -256,7 +257,14 @@ impl KernelMutationRequest for CreateRequest<'_> {
     fn publish(reservation: &mut Self::Reservation) -> AxResult<Self::Output> {
         let PreparedCreateAttributes { permission, owner } =
             reservation.attributes.take().ok_or(AxError::BadState)?;
-        reservation
+        let mut metadata = reservation.name.parent.metadata()?;
+        metadata.uid = owner.0;
+        metadata.gid = owner.1;
+        metadata.size = 0;
+        metadata.blocks = 0;
+        metadata.node_type = reservation.node_type;
+        let charge = admit_inode_create(&reservation.name.parent, &metadata)?;
+        let created = reservation
             .name
             .parent
             .create_named(
@@ -270,7 +278,9 @@ impl KernelMutationRequest for CreateRequest<'_> {
                 },
                 CreateDisposition::Exclusive,
             )
-            .map(|outcome| outcome.entry)
+            .map(|outcome| outcome.entry)?;
+        charge.commit();
+        Ok(created)
     }
 }
 
@@ -368,12 +378,21 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
     fn publish(reservation: &mut Self::Reservation) -> AxResult<Self::Output> {
         let PreparedSymlinkAttributes { owner } =
             reservation.attributes.take().ok_or(AxError::BadState)?;
-        reservation.name.parent.create_symlink(
+        let mut metadata = reservation.name.parent.metadata()?;
+        metadata.uid = owner.0;
+        metadata.gid = owner.1;
+        metadata.size = 0;
+        metadata.blocks = 0;
+        metadata.node_type = NodeType::Symlink;
+        let charge = admit_inode_create(&reservation.name.parent, &metadata)?;
+        let created = reservation.name.parent.create_symlink(
             &reservation.name.name,
             &reservation.target,
             NodePermission::from_bits_truncate(0o777),
             Some(owner),
-        )
+        )?;
+        charge.commit();
+        Ok(created)
     }
 }
 
@@ -667,11 +686,20 @@ impl KernelMutationRequest for UnlinkRequest<'_> {
             is_dir,
             loses_last_link,
         } = reservation.admission.take().ok_or(AxError::BadState)?;
+        let metadata = reservation.target.metadata()?;
+        // A non-final hard-link removal does not destroy the inode (nor its
+        // data blocks), so it must not release quota usage.
+        let charge = (reservation.remove_dir || metadata.nlink <= 1)
+            .then(|| admit_unlink(&reservation.target, &metadata))
+            .transpose()?;
         reservation.name.parent.unlink_checked(
             &reservation.name.name,
             reservation.remove_dir,
             &reservation.target,
         )?;
+        if let Some(charge) = charge {
+            charge.commit();
+        }
         Ok(UnlinkOutcome {
             is_dir,
             loses_last_link,
@@ -1045,6 +1073,7 @@ mod tests {
                 node_type: NodeType::Directory,
                 uid: 0,
                 gid: 0,
+                project_id: 0,
                 size: 0,
                 block_size: 4096,
                 blocks: 0,

@@ -10,6 +10,7 @@ use axfs_ng_vfs::{
     DeviceId, Location, MetadataUpdate, NodePermission, NodeType, Timestamp,
     path::{FinalComponent, FinalComponentKind, Path},
 };
+use super::admit_chown;
 use axhal::power::system_off;
 use axtask::current;
 use linux_raw_sys::{
@@ -1389,6 +1390,8 @@ fn do_fchownat(
 
         // notify_change() validates the target filesystem mapping before the
         // inode hook, but setattr_prepare's owner/CAP checks remain later.
+        let old_metadata = loc.metadata()?;
+        let transfer = admit_chown(&loc, &old_metadata, policy.metadata())?;
         let prepared = policy.admit(&security, privilege_cleanup)?.prepare()?;
 
         // Publication consumes the admitted cleanup token first, then mutates
@@ -1406,6 +1409,8 @@ fn do_fchownat(
             crate::file::inotify::notify_exact(&loc, IN_ATTRIB),
         );
         published.commit();
+        transfer.0.commit();
+        transfer.1.commit();
         Ok(())
     })?;
     Ok(0)
@@ -1581,6 +1586,7 @@ fn pseudo_metadata(stat: &crate::file::Kstat) -> axfs_ng_vfs::Metadata {
         node_type: NodeType::from((stat.mode >> 12) as u8),
         uid: stat.uid,
         gid: stat.gid,
+        project_id: 0,
         size: stat.size,
         block_size: stat.blksize as u64,
         blocks: stat.blocks,
@@ -2976,6 +2982,7 @@ mod tests {
             node_type: NodeType::RegularFile,
             uid,
             gid,
+            project_id: 0,
             size: 0,
             block_size: 4096,
             blocks: 0,

@@ -271,6 +271,24 @@ impl FilesystemOps for MemoryFs {
         })
     }
 
+    fn enumerate_inodes(&self, visitor: &mut axfs_ng_vfs::InodeVisitor<'_>) -> VfsResult<()> {
+        // Never acquire an inode's metadata lock while holding the registry
+        // lock: unlink finalization takes these locks in the opposite order.
+        // The registry is explicitly bounded, so snapshotting Arc handles is
+        // bounded as well and keeps quota callbacks out of tmpfs lock domains.
+        let inodes = {
+            let registry = self.inodes.lock();
+            let mut inodes = Vec::new();
+            inodes.try_reserve_exact(registry.len()).map_err(|_| VfsError::NoMemory)?;
+            inodes.extend(registry.values().cloned());
+            inodes
+        };
+        for inode in inodes {
+            visitor(inode.snapshot_metadata())?;
+        }
+        Ok(())
+    }
+
     fn unmount(&self) {
         let root = self.root.lock().take();
         drop(root);
@@ -752,6 +770,19 @@ struct Inode {
 }
 
 impl Inode {
+    fn snapshot_metadata(&self) -> Metadata {
+        let mut metadata = self.metadata.lock().clone();
+        match &self.content {
+            NodeContent::File(content) => {
+                metadata.size = *content.length.lock();
+                metadata.block_size = TMPFS_BLOCK_SIZE;
+                metadata.blocks = content.blocks();
+            }
+            NodeContent::Dir(dir) => metadata.size = dir.entries.lock().len() as u64,
+        }
+        metadata
+    }
+
     /// Builds a complete inode without publishing it in the filesystem's live
     /// identity map. Directory dot entries and the per-inode xattr ownership
     /// are admitted here, so later registry/namespace insertion cannot fail.
@@ -771,6 +802,7 @@ impl Inode {
             node_type,
             uid: 0,
             gid: 0,
+            project_id: 0,
             size: 0,
             block_size: TMPFS_BLOCK_SIZE,
             blocks: 0,
@@ -1044,6 +1076,10 @@ impl NodeOps for MemoryNode {
         if let Some((uid, gid)) = update.owner {
             metadata.uid = uid;
             metadata.gid = gid;
+            status_changed = true;
+        }
+        if let Some(project_id) = update.project_id {
+            metadata.project_id = project_id;
             status_changed = true;
         }
         if let Some(rdev) = update.rdev {

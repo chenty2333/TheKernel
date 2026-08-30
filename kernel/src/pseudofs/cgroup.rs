@@ -369,6 +369,7 @@ impl CgroupNode {
             node_type,
             uid: 0,
             gid: 0,
+            project_id: 0,
             size: 0,
             block_size: 0,
             blocks: 0,

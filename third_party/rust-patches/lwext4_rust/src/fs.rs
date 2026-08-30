@@ -1541,6 +1541,38 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         })
     }
 
+    /// Returns whether the one-based inode number is set in the on-disk inode
+    /// bitmap.
+    pub fn inode_is_allocated(&mut self, ino: u32) -> Ext4Result<bool> {
+        let mut allocated = false;
+        unsafe {
+            ext4_fs_inode_is_allocated(self.inner.as_mut(), ino, &mut allocated)
+                .context("ext4_fs_inode_is_allocated")?;
+        }
+        Ok(allocated)
+    }
+
+    /// Visits every allocated inode-table entry.
+    ///
+    /// The allocation decision comes from the on-disk inode bitmap, rather
+    /// than from an inode-table heuristic. Visiting one table entry at a time
+    /// bounds memory and releases its cache reference before advancing.
+    pub fn enumerate_allocated_inodes(
+        &mut self,
+        visitor: &mut dyn FnMut(FileAttr) -> Ext4Result<()>,
+    ) -> Ext4Result<()> {
+        let count = self.stat()?.inodes_count;
+        for ino in 1..=count {
+            if !self.inode_is_allocated(ino)? {
+                continue;
+            }
+            let mut attr = FileAttr::default();
+            self.get_attr(ino, &mut attr)?;
+            visitor(attr)?;
+        }
+        Ok(())
+    }
+
     /// Builds a single fully-written contiguous extent plan while the caller
     /// owns the ext4 filesystem lock. No device operation is performed here;
     /// the copyable plan lets the caller release that lock before a

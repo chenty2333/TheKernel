@@ -10,13 +10,13 @@ use core::{
 };
 
 use axfs_ng_vfs::{
-    DirEntry, Filesystem, FilesystemOps, NodeUserData, Reference, StatFs, VfsError, VfsResult,
-    WritebackErrorState, path::MAX_NAME_LEN,
+    DeviceId, DirEntry, Filesystem, FilesystemOps, Metadata, NodePermission, NodeType,
+    NodeUserData, Reference, StatFs, VfsError, VfsResult, WritebackErrorState, path::MAX_NAME_LEN,
 };
 use axsync::{Mutex as SleepingMutex, MutexGuard as SleepingMutexGuard};
 use hashbrown::HashMap;
 use kspin::SpinNoPreempt as SpinMutex;
-use lwext4_rust::{FsConfig, InodeToken, InodeType, ffi::EXT4_ROOT_INO};
+use lwext4_rust::{FileAttr, FsConfig, InodeToken, InodeType, ffi::EXT4_ROOT_INO};
 use spin::Once;
 
 use super::{
@@ -26,6 +26,41 @@ use super::{
 use crate::MountedBlockDevice;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
+const PROJECT_ID_XATTR: &[u8] = b"trusted.thekernel.project_id";
+
+fn inode_metadata(attr: FileAttr, project_id: u32) -> Metadata {
+    Metadata {
+        inode: attr.ino as u64,
+        device: attr.device,
+        nlink: attr.nlink,
+        mode: NodePermission::from_bits_truncate(attr.mode as u16),
+        node_type: match attr.node_type {
+            InodeType::Fifo => NodeType::Fifo,
+            InodeType::CharacterDevice => NodeType::CharacterDevice,
+            InodeType::Directory => NodeType::Directory,
+            InodeType::BlockDevice => NodeType::BlockDevice,
+            InodeType::RegularFile => NodeType::RegularFile,
+            InodeType::Socket => NodeType::Socket,
+            InodeType::Symlink => NodeType::Symlink,
+            InodeType::Unknown => NodeType::Unknown,
+        },
+        uid: attr.uid,
+        gid: attr.gid,
+        project_id,
+        size: attr.size,
+        block_size: attr.block_size,
+        blocks: attr.blocks,
+        rdev: DeviceId(attr.rdev),
+        atime: axfs_ng_vfs::Timestamp::new(attr.atime.seconds(), attr.atime.subsec_nanos()),
+        btime: axfs_ng_vfs::Timestamp::new(attr.btime.seconds(), attr.btime.subsec_nanos()),
+        mtime: axfs_ng_vfs::Timestamp::new(attr.mtime.seconds(), attr.mtime.subsec_nanos()),
+        ctime: axfs_ng_vfs::Timestamp::new(attr.ctime.seconds(), attr.ctime.subsec_nanos()),
+    }
+}
+
+fn project_id_from_xattr(value: &[u8]) -> u32 {
+    <[u8; 4]>::try_from(value).map(u32::from_le_bytes).unwrap_or(0)
+}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct RuntimeToken {
     ino: u32,
@@ -712,6 +747,35 @@ impl FilesystemOps for Ext4Filesystem {
             fragment_size: 0,
             mount_flags: 0,
         })
+    }
+
+    fn enumerate_inodes(&self, visitor: &mut axfs_ng_vfs::InodeVisitor<'_>) -> VfsResult<()> {
+        let mut fs = self.lock();
+        let count = fs.stat().map_err(into_vfs_err)?.inodes_count;
+        for ino in 1..=count {
+            if !fs.inode_is_allocated(ino).map_err(into_vfs_err)? {
+                continue;
+            }
+            let mut attr = FileAttr::default();
+            fs.get_attr(ino, &mut attr).map_err(into_vfs_err)?;
+            // Quota usage is released at unlink, while lwext4 retains an
+            // unlinked inode's blocks until its final open handle closes.
+            // Do not resurrect that already-refunded usage during Q_QUOTAON.
+            if attr.nlink == 0 {
+                continue;
+            }
+            // Project IDs are an ext4 xattr in this VFS, so retrieve it from
+            // the same inode-table entry before publishing the snapshot.
+            let mut project_id = 0;
+            fs.with_inode_ref(attr.ino, |inode| {
+                if let Ok(value) = inode.get_xattr(PROJECT_ID_XATTR) {
+                    project_id = project_id_from_xattr(&value);
+                }
+                Ok(())
+            }).map_err(into_vfs_err)?;
+            visitor(inode_metadata(attr, project_id))?;
+        }
+        Ok(())
     }
 
     fn flush(&self) -> VfsResult<()> {

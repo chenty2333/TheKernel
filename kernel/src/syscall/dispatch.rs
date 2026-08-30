@@ -222,18 +222,12 @@ pub(super) fn dispatch_syscall(
             sys_open_tree(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
         Sysno::fspick => sys_fspick(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::quotactl => sys_quotactl(
-            uctx.arg0() as _,
-            uctx.arg1() as _,
-            uctx.arg2() as _,
-            uctx.arg3() as _,
-        ),
-        Sysno::quotactl_fd => sys_quotactl_fd(
-            uctx.arg0() as _,
-            uctx.arg1() as _,
-            uctx.arg2() as _,
-            uctx.arg3() as _,
-        ),
+        Sysno::quotactl => with_user_memory(aspace(), |memory| {
+            sys_quotactl(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _)
+        }),
+        Sysno::quotactl_fd => with_user_memory(aspace(), |memory| {
+            sys_quotactl_fd(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _)
+        }),
 
         // file ops
         Sysno::chown => with_user_memory(aspace(), |memory| {

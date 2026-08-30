@@ -202,6 +202,7 @@ impl NodeOps for FatDirNode {
             node_type: NodeType::Directory,
             uid: fs.mount_options.uid,
             gid: fs.mount_options.gid,
+            project_id: 0,
             size: block_size,
             block_size,
             blocks: 1,
