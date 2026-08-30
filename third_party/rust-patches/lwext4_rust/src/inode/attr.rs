@@ -30,29 +30,95 @@ pub struct FileAttr {
     pub rdev: u64,
 
     /// Time of last access
-    pub atime: Duration,
+    pub atime: Timestamp,
     /// Time of creation
-    pub btime: Duration,
+    pub btime: Timestamp,
     /// Time of last modification
-    pub mtime: Duration,
+    pub mtime: Timestamp,
     /// Time of last status change
-    pub ctime: Duration,
+    pub ctime: Timestamp,
 }
 
-fn encode_time(dur: &Duration) -> (u32, u32) {
-    let sec = dur.as_secs();
-    let nsec = dur.subsec_nanos();
-    let time = u32::to_le(sec as u32);
-    let extra = u32::to_le((nsec << 2) | (sec >> 32) as u32);
+/// ext4's signed 34-bit timestamp representation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Timestamp {
+    seconds: i64,
+    nanoseconds: u32,
+}
+
+impl Timestamp {
+    pub const ZERO: Self = Self::new(0, 0);
+    pub const MIN_SECONDS: i64 = i32::MIN as i64;
+    pub const MAX_SECONDS: i64 = (3_i64 << 32) + i32::MAX as i64;
+
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
+        Self {
+            seconds,
+            nanoseconds,
+        }
+    }
+
+    pub const fn seconds(self) -> i64 {
+        self.seconds
+    }
+
+    pub const fn subsec_nanos(self) -> u32 {
+        self.nanoseconds
+    }
+
+    pub const fn is_ext4_representable(self) -> bool {
+        self.nanoseconds < 1_000_000_000
+            && self.seconds >= Self::MIN_SECONDS
+            && self.seconds <= Self::MAX_SECONDS
+    }
+}
+
+impl From<Duration> for Timestamp {
+    fn from(value: Duration) -> Self {
+        Self::new(
+            value.as_secs().min(i64::MAX as u64) as i64,
+            value.subsec_nanos(),
+        )
+    }
+}
+
+impl From<&Duration> for Timestamp {
+    fn from(value: &Duration) -> Self {
+        (*value).into()
+    }
+}
+
+impl PartialEq<Duration> for Timestamp {
+    fn eq(&self, other: &Duration) -> bool {
+        self.seconds >= 0
+            && self.seconds as u64 == other.as_secs()
+            && self.nanoseconds == other.subsec_nanos()
+    }
+}
+
+impl PartialEq<Timestamp> for Duration {
+    fn eq(&self, other: &Timestamp) -> bool {
+        other == self
+    }
+}
+
+fn encode_time(time: Timestamp) -> (u32, u32) {
+    debug_assert!(time.is_ext4_representable());
+    let sec = time.seconds();
+    let nsec = time.subsec_nanos();
+    let low = sec as i32;
+    let epoch = (sec - low as i64) >> 32;
+    let time = u32::to_le(low as u32);
+    let extra = u32::to_le((nsec << 2) | epoch as u32);
     (time, extra)
 }
-fn decode_time(time: u32, extra: u32) -> Duration {
-    let sec = u32::from_le(time);
+fn decode_time(time: u32, extra: u32) -> Timestamp {
+    let low = u32::from_le(time) as i32;
     let extra = u32::from_le(extra);
     let epoch = extra & 3;
     let nsec = extra >> 2;
 
-    Duration::new(sec as u64 + ((epoch as u64) << 32), nsec)
+    Timestamp::new(low as i64 + ((epoch as i64) << 32), nsec)
 }
 
 impl<Hal: SystemHal> InodeRef<Hal> {
@@ -108,29 +174,29 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         }
     }
 
-    pub fn set_atime(&mut self, dur: &Duration) {
-        let (time, extra) = encode_time(dur);
+    pub fn set_atime(&mut self, time: impl Into<Timestamp>) {
+        let (time, extra) = encode_time(time.into());
         let inode = self.raw_inode_mut();
         inode.access_time = time;
         inode.atime_extra = extra;
         self.mark_dirty();
     }
-    pub fn set_mtime(&mut self, dur: &Duration) {
-        let (time, extra) = encode_time(dur);
+    pub fn set_mtime(&mut self, time: impl Into<Timestamp>) {
+        let (time, extra) = encode_time(time.into());
         let inode = self.raw_inode_mut();
         inode.modification_time = time;
         inode.mtime_extra = extra;
         self.mark_dirty();
     }
-    pub fn set_ctime(&mut self, dur: &Duration) {
-        let (time, extra) = encode_time(dur);
+    pub fn set_ctime(&mut self, time: impl Into<Timestamp>) {
+        let (time, extra) = encode_time(time.into());
         let inode = self.raw_inode_mut();
         inode.change_inode_time = time;
         inode.ctime_extra = extra;
         self.mark_dirty();
     }
-    pub fn set_btime(&mut self, dur: &Duration) {
-        let (time, extra) = encode_time(dur);
+    pub fn set_btime(&mut self, time: impl Into<Timestamp>) {
+        let (time, extra) = encode_time(time.into());
         let inode = self.raw_inode_mut();
         inode.crtime = time;
         inode.crtime_extra = extra;
@@ -139,17 +205,17 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
     pub fn update_atime(&mut self) {
         if let Some(dur) = Hal::now() {
-            self.set_atime(&dur);
+            self.set_atime(dur);
         }
     }
     pub fn update_mtime(&mut self) {
         if let Some(dur) = Hal::now() {
-            self.set_mtime(&dur);
+            self.set_mtime(dur);
         }
     }
     pub fn update_ctime(&mut self) {
         if let Some(dur) = Hal::now() {
-            self.set_ctime(&dur);
+            self.set_ctime(dur);
         }
     }
 
@@ -173,5 +239,23 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         attr.btime = decode_time(inode.crtime, inode.crtime_extra);
         attr.mtime = decode_time(inode.modification_time, inode.mtime_extra);
         attr.ctime = decode_time(inode.change_inode_time, inode.ctime_extra);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Timestamp, decode_time, encode_time};
+
+    #[test]
+    fn ext4_signed_34_bit_time_round_trips_pre_epoch_values() {
+        for time in [
+            Timestamp::new(-1, 123),
+            Timestamp::new(Timestamp::MIN_SECONDS, 999_999_999),
+            Timestamp::new(0, 0),
+            Timestamp::new(Timestamp::MAX_SECONDS, 1),
+        ] {
+            let (seconds, extra) = encode_time(time);
+            assert_eq!(decode_time(seconds, extra), time);
+        }
     }
 }

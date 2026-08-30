@@ -6,7 +6,7 @@ mod xattr;
 use alloc::boxed::Box;
 use core::{marker::PhantomData, mem};
 
-pub use attr::FileAttr;
+pub use attr::{FileAttr, Timestamp};
 pub use dir::{DirEntry, DirLookupResult, DirReader};
 
 use crate::{Ext4Error, Ext4Result, SystemHal, error::Context, ffi::*, hot::ExtentStatusCache};
