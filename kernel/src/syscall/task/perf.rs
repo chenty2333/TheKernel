@@ -200,7 +200,7 @@ pub(crate) fn sys_perf_event_open(
         flags & PERF_FLAG_FD_CLOEXEC != 0,
     );
     match result {
-        Ok(fd) => { if target_is_current { group.on_enter(); } Ok(fd as isize) }
+        Ok(fd) => { if target_is_current { group.reconfigure_current(); } Ok(fd as isize) }
         Err(error) => { target.as_thread().detach_empty_perf_group(&group); Err(error) }
     }
 }

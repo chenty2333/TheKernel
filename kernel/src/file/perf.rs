@@ -39,6 +39,11 @@ pub(crate) enum HardwareEvent { Cycles, Instructions }
 pub(crate) enum PerfEvent { Software(SoftwareEvent), Hardware(HardwareEvent) }
 impl PerfEvent { fn hardware(self) -> Option<HardwareEvent> { if let Self::Hardware(event) = self { Some(event) } else { None } } }
 
+/// Combines a completed interval with a non-destructive local PMU sample.
+/// Hardware values are never stored here; `stop_locked` performs that single
+/// settlement when it terminates the lease.
+fn compose_live_count(settled: u64, live: u64) -> u64 { settled.saturating_add(live) }
+
 struct Member { file: Weak<PerfEventFile>, dead: bool }
 struct ActiveGroup {
     // Temporary strong custody makes an FD close racing with a switch safe.
@@ -76,9 +81,8 @@ impl PerfGroup {
         state.members.push(Member { file: Arc::downgrade(event), dead: false }); state.active.files.push(None); Ok(())
     }
     fn live<'a>(state: &'a mut GroupState) -> impl Iterator<Item = (usize, Arc<PerfEventFile>)> + 'a { state.members.iter_mut().enumerate().filter_map(|(slot, member)| { let file = member.file.upgrade(); member.dead = file.is_none(); file.map(|file| (slot, file)) }) }
-    fn control(&self, op: fn(&PerfEventFile, u64)) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); for (_, file) in Self::live(&mut state) { op(&file, now); } }
-    pub(crate) fn on_enter(&self) {
-        let now = monotonic_time_nanos(); let mut state = self.state.lock(); if state.active.running { return; }
+    fn start_locked(state: &mut GroupState, now: u64) {
+        if state.active.running { return; }
         for slot in 0..state.members.len() {
             let file = state.members[slot].file.upgrade();
             state.members[slot].dead = file.is_none();
@@ -101,8 +105,8 @@ impl PerfGroup {
         for file in state.active.files.iter().filter_map(Option::as_ref) { file.start_running(now); }
         state.active.running = true;
     }
-    pub(crate) fn on_leave(&self) {
-        let now = monotonic_time_nanos(); let mut state = self.state.lock(); if !state.active.running { return; }
+    fn stop_locked(state: &mut GroupState, now: u64, count_context_switch: bool) {
+        if !state.active.running { return; }
         #[cfg(feature = "pmu")]
         for slot in 0..state.active.leases.len() {
             let sample = state.active.leases[slot].take().and_then(|(id, lease)| {
@@ -110,11 +114,37 @@ impl PerfGroup {
             });
             if let Some((id, value)) = sample { if let Some(file) = state.active.files.iter().filter_map(Option::as_ref).find(|file| file.id == id) { file.add_count(value); } }
         }
-        for file in state.active.files.iter_mut().filter_map(Option::take) { let was_running = file.stop_running(now); if was_running && file.event == PerfEvent::Software(SoftwareEvent::ContextSwitches) && file.enabled() { file.add_count(1); } }
+        for file in state.active.files.iter_mut().filter_map(Option::take) { let was_running = file.stop_running(now); if count_context_switch && was_running && file.event == PerfEvent::Software(SoftwareEvent::ContextSwitches) && file.enabled() { file.add_count(1); } }
         state.active.running = false;
     }
+    fn control(&self, member: &PerfEventFile, group_control: bool, op: fn(&PerfEventFile, u64)) {
+        let now = monotonic_time_nanos(); let mut state = self.state.lock();
+        Self::stop_locked(&mut state, now, false);
+        if group_control { for (_, file) in Self::live(&mut state) { op(&file, now); } } else { op(member, now); }
+        Self::start_locked(&mut state, now);
+    }
+    pub(crate) fn reconfigure_current(&self) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); Self::stop_locked(&mut state, now, false); Self::start_locked(&mut state, now); }
+    pub(crate) fn on_enter(&self) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); Self::start_locked(&mut state, now); }
+    pub(crate) fn on_leave(&self) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); Self::stop_locked(&mut state, now, true); }
     pub(crate) fn on_fault(&self) { let state = self.state.lock(); if !state.active.running { return; } for file in state.active.files.iter().filter_map(Option::as_ref) { if file.event == PerfEvent::Software(SoftwareEvent::PageFaults) && file.running() { file.add_count(1); } } }
-    fn snapshots(&self, out: &mut Vec<Sample>) { let state = self.state.lock(); for member in &state.members { if let Some(file) = member.file.upgrade() { out.push(file.sample()); } } }
+    fn snapshots(&self, out: &mut Vec<Sample>) -> AxResult<()> {
+        let mut state = self.state.lock();
+        for member in &state.members {
+            if let Some(file) = member.file.upgrade() {
+                #[cfg(feature = "pmu")]
+                let live = if state.active.running && current().id().as_u64() == self.target_task_id {
+                    match state.active.leases.iter().filter_map(Option::as_ref).find(|(id, _)| *id == file.id) {
+                        Some((_, lease)) => match lease.read() { Ok(value) => Some(value), Err(_) => { Self::stop_locked(&mut state, monotonic_time_nanos(), false); return Err(AxError::OperationNotSupported); } },
+                        None => None,
+                    }
+                } else { None };
+                #[cfg(not(feature = "pmu"))]
+                let live = None;
+                out.push(file.sample_with_live(live));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct PerfEventState { enabled: bool, running: bool, count: u64, enabled_total: u64, running_total: u64, enabled_since: u64, running_since: u64 }
@@ -136,11 +166,12 @@ impl PerfEventFile {
     fn disable_at(&self, now: u64) { let mut state = self.state.lock(); if state.running { state.running_total = state.running_total.saturating_add(now.saturating_sub(state.running_since)); state.running = false; } if state.enabled { state.enabled_total = state.enabled_total.saturating_add(now.saturating_sub(state.enabled_since)); state.enabled = false; } }
     fn reset_at(&self, _: u64) { self.state.lock().count = 0; }
     fn sample(&self) -> Sample { let now = monotonic_time_nanos(); let state = self.state.lock(); Sample { id: self.id, value: state.count, enabled: state.enabled_total.saturating_add(if state.enabled { now.saturating_sub(state.enabled_since) } else { 0 }), running: state.running_total.saturating_add(if state.running { now.saturating_sub(state.running_since) } else { 0 }) } }
+    fn sample_with_live(&self, live: Option<u64>) -> Sample { let mut sample = self.sample(); if let Some(live) = live { sample.value = compose_live_count(sample.value, live); } sample }
     pub(crate) fn on_enter(&self) { if let Some(group) = self.group() { group.on_enter(); } } pub(crate) fn on_leave(&self) { if let Some(group) = self.group() { group.on_leave(); } } pub(crate) fn on_fault(&self) { if let Some(group) = self.group() { group.on_fault(); } }
     fn check_hardware_local(&self) -> AxResult { self.group().ok_or(AxError::BadFileDescriptor)?.require_local_for_hardware() }
     fn read_samples(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.check_hardware_local()?; let group_read = self.read_format & PERF_FORMAT_GROUP != 0; let mut samples = Vec::new();
-        if group_read { samples.try_reserve(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?; self.group().ok_or(AxError::BadFileDescriptor)?.snapshots(&mut samples); } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(self.sample()); }
+        if group_read { samples.try_reserve(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?; self.group().ok_or(AxError::BadFileDescriptor)?.snapshots(&mut samples)?; } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(self.sample()); }
         let ids = self.read_format & PERF_FORMAT_ID != 0; let timing = ((self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0) as usize) + ((self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0) as usize);
         let words = if group_read { (1 + timing).checked_add(samples.len().checked_mul(1 + ids as usize).ok_or(AxError::InvalidInput)?).ok_or(AxError::InvalidInput)? } else { 1 + timing + ids as usize }; let bytes = words.checked_mul(size_of::<u64>()).ok_or(AxError::InvalidInput)?; if dst.remaining_mut() < bytes { return Err(AxError::InvalidInput); }
         let leader = samples.iter().copied().find(|sample| sample.id == self.group().map_or(self.id, |group| group.leader_id)).unwrap_or(Sample { id: self.id, value: 0, enabled: 0, running: 0 });
@@ -157,21 +188,14 @@ impl FileLike for PerfEventFile {
         if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_REFRESH | PERF_EVENT_IOC_RESET) && arg & !PERF_IOC_FLAG_GROUP != 0 { return Err(AxError::InvalidInput); }
         if cmd == PERF_EVENT_IOC_REFRESH { return Err(AxError::OperationNotSupported); }
         if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { self.check_hardware_local()?; }
-        let now = monotonic_time_nanos(); let perf_group = self.group().ok_or(AxError::BadFileDescriptor)?;
-        // A self-target ioctl may run in the counted task. Stop it before
-        // changing the member state, then acquire a fresh local lease. This
-        // never attempts a remote MSR access; remote software events retain
-        // their historical descriptor-only behavior.
-        let local = perf_group.accepts_target(current().id().as_u64());
-        if local && matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { perf_group.on_leave(); }
+        let perf_group = self.group().ok_or(AxError::BadFileDescriptor)?;
         let result = match cmd {
-            PERF_EVENT_IOC_ENABLE => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::enable_at); } else { self.enable_at(now); } Ok(0) }
-            PERF_EVENT_IOC_DISABLE => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::disable_at); } else { self.disable_at(now); } Ok(0) }
-            PERF_EVENT_IOC_RESET => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::reset_at); } else { self.reset_at(now); } Ok(0) }
+            PERF_EVENT_IOC_ENABLE => { perf_group.control(self, arg & PERF_IOC_FLAG_GROUP != 0, PerfEventFile::enable_at); Ok(0) }
+            PERF_EVENT_IOC_DISABLE => { perf_group.control(self, arg & PERF_IOC_FLAG_GROUP != 0, PerfEventFile::disable_at); Ok(0) }
+            PERF_EVENT_IOC_RESET => { perf_group.control(self, arg & PERF_IOC_FLAG_GROUP != 0, PerfEventFile::reset_at); Ok(0) }
             PERF_EVENT_IOC_ID => { context.user_memory().write_value(arg as *mut u64, self.id).map_err(map_usercopy_error)?; Ok(0) }
             _ => Err(AxError::InvalidInput),
         };
-        if local && matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { perf_group.on_enter(); }
         result
     }
     fn nonblocking(&self) -> bool { false } fn set_nonblocking(&self, _: bool) -> AxResult { Ok(()) }
@@ -198,5 +222,11 @@ mod tests {
         let file = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Instructions), true, &group, 0).unwrap();
         assert_eq!(Arc::strong_count(&group), 1);
         drop(file);
+    }
+
+    #[test]
+    fn live_count_composition_saturates_without_settlement() {
+        assert_eq!(super::compose_live_count(7, 9), 16);
+        assert_eq!(super::compose_live_count(u64::MAX - 1, 8), u64::MAX);
     }
 }
