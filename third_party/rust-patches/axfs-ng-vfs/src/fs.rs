@@ -1,4 +1,7 @@
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
@@ -16,6 +19,25 @@ use crate::{
 /// must return [`VfsError::OperationNotSupported`] rather than walking their
 /// visible directory tree and claiming that it is complete.
 pub type InodeVisitor<'a> = dyn FnMut(Metadata) -> VfsResult<()> + 'a;
+/// Filesystem-owned opaque identity for one live inode generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportHandle {
+    pub handle_type: i32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportHandleMode {
+    Openable,
+    Fid,
+}
+
+/// Restrictions supplied by handle consumers while resolving an export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportHandleDecodeMode {
+    Any,
+    DirectoryOnly,
+}
 
 pub struct StatFs {
     pub fs_type: u32,
@@ -51,6 +73,47 @@ pub trait FilesystemOps: Send + Sync {
     /// namespace walk misses unlinked-but-open files and hard-link aliases.
     fn enumerate_inodes(&self, _visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotSupported)
+    }
+    /// Exports a backend-validated inode generation.  The VFS deliberately
+    /// does not synthesize a handle from a pathname or a bare inode number.
+    fn encode_export_handle(
+        &self,
+        _entry: &DirEntry,
+        _mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
+        Err(crate::VfsError::OperationNotSupported)
+    }
+
+    /// Resolves a previously exported live inode generation.  `NotFound`
+    /// means stale; other errors preserve backend failure information.
+    fn decode_export_handle(&self, _handle_type: i32, _bytes: &[u8]) -> VfsResult<DirEntry> {
+        Err(crate::VfsError::OperationNotSupported)
+    }
+
+    /// Resolves an export under the caller's required object kind. Backends
+    /// may override this when their native decoder can enforce it earlier.
+    fn decode_export_handle_with_mode(
+        &self,
+        handle_type: i32,
+        bytes: &[u8],
+        mode: ExportHandleDecodeMode,
+    ) -> VfsResult<DirEntry> {
+        let entry = self.decode_export_handle(handle_type, bytes)?;
+        if mode == ExportHandleDecodeMode::DirectoryOnly && !entry.is_dir() {
+            return Err(crate::VfsError::NotFound);
+        }
+        Ok(entry)
+    }
+
+    /// Tests whether an exported inode is reachable through `ancestor` in the
+    /// live namespace.  Export decoding may deliberately return an anonymous
+    /// reference, so callers must not infer ancestry from that decoded alias.
+    fn export_handle_is_descendant(
+        &self,
+        _ancestor: &DirEntry,
+        _descendant: &DirEntry,
+    ) -> VfsResult<bool> {
+        Ok(false)
     }
 
     /// Returns which inode metadata fields this filesystem can persist.
@@ -182,6 +245,39 @@ impl Filesystem {
     /// Enumerates every live inode supplied by the backend.
     pub fn enumerate_inodes(&self, visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         self.inner.ops.enumerate_inodes(visitor)
+    }
+
+    pub fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
+        self.inner.ops.encode_export_handle(entry, mode)
+    }
+
+    pub fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        self.inner.ops.decode_export_handle(handle_type, bytes)
+    }
+
+    pub fn decode_export_handle_with_mode(
+        &self,
+        handle_type: i32,
+        bytes: &[u8],
+        mode: ExportHandleDecodeMode,
+    ) -> VfsResult<DirEntry> {
+        self.inner
+            .ops
+            .decode_export_handle_with_mode(handle_type, bytes, mode)
+    }
+
+    pub fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        descendant: &DirEntry,
+    ) -> VfsResult<bool> {
+        self.inner
+            .ops
+            .export_handle_is_descendant(ancestor, descendant)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

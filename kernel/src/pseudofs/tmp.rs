@@ -20,10 +20,10 @@ use axfs::{
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
-    DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, Reference,
-    RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider,
-    XattrSetMode, path::MAX_NAME_LEN,
+    DirNodeOps, ExportHandle, ExportHandleMode, FileNode, FileNodeOps, Filesystem, FilesystemOps,
+    Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType,
+    NodeUserData, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
+    WeakDirEntry, XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
@@ -287,6 +287,92 @@ impl FilesystemOps for MemoryFs {
             visitor(inode.snapshot_metadata())?;
         }
         Ok(())
+    }
+    fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
+        let node = entry.downcast::<MemoryNode>()?;
+        if !core::ptr::eq(self, node.fs.as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(16)
+            .map_err(|_| VfsError::NoMemory)?;
+        bytes.extend_from_slice(&node.inode.ino.to_ne_bytes());
+        bytes.extend_from_slice(&0u64.to_ne_bytes());
+        let _ = mode;
+        Ok(ExportHandle {
+            handle_type: 1,
+            bytes,
+        })
+    }
+
+    fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        if handle_type != 1 || bytes.len() != 16 {
+            return Err(VfsError::NotFound);
+        }
+        let inode_number =
+            u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
+        let generation = u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| VfsError::NotFound)?);
+        if generation != 0 {
+            return Err(VfsError::NotFound);
+        }
+        let inode = self.get(inode_number).ok_or(VfsError::NotFound)?;
+        let node_type = inode.metadata.lock().node_type;
+        // This is an anonymous VFS alias, not a namespace link: it retains
+        // the exact live inode generation without changing nlink or inventing
+        // a pathname. Once unlink drops the final inode registry reference,
+        // future handle decoding returns ESTALE at the syscall boundary.
+        let root = self.root_dir();
+        let fs = root.downcast::<MemoryNode>()?.fs.clone();
+        MemoryNode::try_new_entry(fs, inode, node_type, Reference::anonymous())
+    }
+
+    fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        descendant: &DirEntry,
+    ) -> VfsResult<bool> {
+        let target = descendant.downcast::<MemoryNode>()?;
+        let ancestor = ancestor.downcast::<MemoryNode>()?;
+        if !core::ptr::eq(self, ancestor.fs.as_ref()) || !core::ptr::eq(self, target.fs.as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+
+        // The decoded export alias has Reference::anonymous(), so walk the
+        // namespace's stable inode-parent graph instead of its reference.
+        let _namespace = self.namespace.lock();
+        let inode_count = self.inodes.lock().len();
+        let mut pending = Vec::new();
+        let mut visited = HashSet::new();
+        visited
+            .try_reserve(inode_count)
+            .map_err(|_| VfsError::NoMemory)?;
+        pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        visited.insert(ancestor.inode.ino);
+        pending.push(ancestor.inode.clone());
+        while let Some(inode) = pending.pop() {
+            if Arc::ptr_eq(&inode, &target.inode) {
+                return Ok(true);
+            }
+            let Ok(directory) = inode.as_dir() else {
+                continue;
+            };
+            for (name, child) in directory.entries.lock().iter() {
+                if name.0 == "." || name.0 == ".." {
+                    continue;
+                }
+                let child = child.get().ok_or(VfsError::Io)?;
+                if visited.insert(child.ino) {
+                    pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn unmount(&self) {
@@ -1679,8 +1765,9 @@ mod tests {
 
     use axerrno::LinuxError;
     use axfs_ng_vfs::{
-        AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
-        NamedCreateOptions, NodePermission, NodeType, Timestamp, VfsError, XattrSetMode,
+        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleDecodeMode, ExportHandleMode, InitialNodeData,
+        MetadataUpdate, Mountpoint, NamedCreateOptions, NodePermission, NodeType, Timestamp,
+        VfsError, XattrSetMode,
     };
 
     use super::{MemoryFs, TMPFS_XATTR_SIZE_MAX};
@@ -2175,6 +2262,89 @@ mod tests {
         assert_eq!(
             root.link("exclusive", &unpublishable).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
+        );
+    }
+
+    #[test]
+    fn export_handle_descendant_uses_namespace_inode_ancestry() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let subtree = root
+            .create(
+                "subtree",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        let child = subtree
+            .create(
+                "child",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let sibling = root
+            .create(
+                "sibling",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let child_handle = mount
+            .encode_export_handle(&child, ExportHandleMode::Openable)
+            .unwrap();
+        let sibling_handle = mount
+            .encode_export_handle(&sibling, ExportHandleMode::Openable)
+            .unwrap();
+        let child = mount
+            .decode_export_handle(
+                child_handle.handle_type,
+                &child_handle.bytes,
+                axfs_ng_vfs::ExportHandleDecodeMode::Any,
+            )
+            .unwrap();
+        let sibling = mount
+            .decode_export_handle(
+                sibling_handle.handle_type,
+                &sibling_handle.bytes,
+                axfs_ng_vfs::ExportHandleDecodeMode::Any,
+            )
+            .unwrap();
+        assert!(mount.export_handle_is_descendant(&subtree, &child).unwrap());
+        assert!(
+            !mount
+                .export_handle_is_descendant(&subtree, &sibling)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn directory_only_export_decode_rejects_regular_inode_as_stale() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let file = mount
+            .root_location()
+            .create(
+                "file",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let handle = mount
+            .encode_export_handle(&file, ExportHandleMode::Openable)
+            .unwrap();
+
+        assert_eq!(
+            mount
+                .decode_export_handle(
+                    handle.handle_type,
+                    &handle.bytes,
+                    ExportHandleDecodeMode::DirectoryOnly,
+                )
+                .unwrap_err(),
+            VfsError::NotFound
         );
     }
 

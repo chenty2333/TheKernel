@@ -1,6 +1,8 @@
 use alloc::{
     boxed::Box,
+    string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     mem::ManuallyDrop,
@@ -10,8 +12,9 @@ use core::{
 };
 
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, Filesystem, FilesystemOps, Metadata, NodePermission, NodeType,
-    NodeUserData, Reference, StatFs, VfsError, VfsResult, WritebackErrorState, path::MAX_NAME_LEN,
+    DeviceId, DirEntry, ExportHandle, ExportHandleMode, Filesystem, FilesystemOps, Metadata,
+    NodePermission, NodeType, NodeUserData, Reference, StatFs, VfsError, VfsResult,
+    WritebackErrorState, path::MAX_NAME_LEN,
 };
 use axsync::{Mutex as SleepingMutex, MutexGuard as SleepingMutexGuard};
 use hashbrown::HashMap;
@@ -776,6 +779,100 @@ impl FilesystemOps for Ext4Filesystem {
             visitor(inode_metadata(attr, project_id))?;
         }
         Ok(())
+    }
+    fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
+        let inode = entry.downcast::<Inode>()?;
+        if !core::ptr::eq(self, inode.filesystem().as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let token = inode.export_handle().ok_or(VfsError::NotFound)?;
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.try_reserve_exact(8).map_err(|_| VfsError::NoMemory)?;
+        bytes.extend_from_slice(&(token.ino() as u32).to_ne_bytes());
+        bytes.extend_from_slice(&(token.generation() as u32).to_ne_bytes());
+        let _ = mode;
+        Ok(ExportHandle {
+            handle_type: 1,
+            bytes,
+        })
+    }
+
+    fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        if handle_type != 1 || bytes.len() != 8 {
+            return Err(VfsError::NotFound);
+        }
+        let ino = u32::from_ne_bytes(bytes[..4].try_into().map_err(|_| VfsError::NotFound)?);
+        let generation = u32::from_ne_bytes(bytes[4..].try_into().map_err(|_| VfsError::NotFound)?);
+        let fs = self.root_dir().downcast::<Inode>()?.filesystem();
+        let (token, epoch, inode_type) = {
+            let mut low = fs.lock();
+            let (token, epoch) = low.retain_inode_handle(ino).map_err(into_vfs_err)?;
+            if token.generation() != generation {
+                low.release_inode_handle(token);
+                return Err(VfsError::NotFound);
+            }
+            let mut attr = FileAttr::default();
+            if let Err(error) = low.get_attr(ino, &mut attr) {
+                low.release_inode_handle(token);
+                return Err(into_vfs_err(error));
+            }
+            (token, epoch, attr.node_type)
+        };
+        Inode::try_finish_exported_entry(fs, token, epoch, inode_type)
+    }
+
+    fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        descendant: &DirEntry,
+    ) -> VfsResult<bool> {
+        let target = self.encode_export_handle(descendant, ExportHandleMode::Openable)?;
+        let mut pending = Vec::new();
+        pending.try_reserve(16).map_err(|_| VfsError::NoMemory)?;
+        pending.push(ancestor.clone());
+        while let Some(entry) = pending.pop() {
+            let exported = self.encode_export_handle(&entry, ExportHandleMode::Openable)?;
+            if exported == target {
+                return Ok(true);
+            }
+            let Ok(directory) = entry.as_dir() else {
+                continue;
+            };
+            let mut names = Vec::<String>::new();
+            let listed = directory.read_dir(0, &mut |name: &str, _: u64, _: NodeType, _: u64| {
+                if name != "." && name != ".." {
+                    names.push(String::from(name));
+                }
+                true
+            });
+            if let Err(error) = listed {
+                return match error {
+                    VfsError::NoMemory | VfsError::StorageFull => Err(error),
+                    _ => Ok(false),
+                };
+            }
+            for name in names {
+                let child = match directory.lookup(&name) {
+                    Ok(child) => child,
+                    Err(error @ (VfsError::NoMemory | VfsError::StorageFull)) => return Err(error),
+                    Err(_) => return Ok(false),
+                };
+                if child.is_dir() {
+                    pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                    pending.push(child);
+                } else {
+                    let exported = self.encode_export_handle(&child, ExportHandleMode::Openable)?;
+                    if exported == target {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn flush(&self) -> VfsResult<()> {

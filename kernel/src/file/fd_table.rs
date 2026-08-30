@@ -798,6 +798,7 @@ pub(crate) fn prepare_file_description_with_resource(
 pub(crate) fn prepare_file_description_with_open_lease(
     f: Arc<dyn FileLike>,
     status_flags: u32,
+    directory_capability: bool,
     write_open_key: Option<ExecutableKey>,
     resource: Option<DescriptionResource>,
     open_lease_admission: super::lease::OpenLeaseAdmission,
@@ -806,6 +807,7 @@ pub(crate) fn prepare_file_description_with_open_lease(
     FileDescription::new_with_open_lease_admission_and_resource(
         f,
         status_flags,
+        directory_capability,
         write_open_key,
         resource,
         open_lease_admission,

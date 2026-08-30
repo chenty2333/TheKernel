@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format, string::String, sync::Arc};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_char, c_int},
     fmt::Write as _,
@@ -11,7 +11,7 @@ use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
 use axfs_ng_vfs::{
-    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
+    DirEntry, ExportHandleDecodeMode, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
 };
 use axio::{Seek, SeekFrom};
 use axtask::current;
@@ -297,13 +297,71 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
-const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
+const FILEID_INVALID: i32 = 255;
+const AT_HANDLE_FID: i32 = 0x200;
+const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
+const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
+    (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32 | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxFileHandle {
     handle_bytes: u32,
     handle_type: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandleDecodeAuthorization {
+    Global,
+    Superblock,
+    MountNamespace,
+}
+
+impl HandleDecodeAuthorization {
+    const fn decode_mode(self, flags: u32) -> ExportHandleDecodeMode {
+        match self {
+            Self::Global => ExportHandleDecodeMode::Any,
+            Self::Superblock | Self::MountNamespace if flags & O_DIRECTORY != 0 => {
+                ExportHandleDecodeMode::DirectoryOnly
+            }
+            Self::Superblock | Self::MountNamespace => ExportHandleDecodeMode::Any,
+        }
+    }
+}
+
+const fn short_handle_probe_header(required_bytes: u32) -> LinuxFileHandle {
+    LinuxFileHandle {
+        handle_bytes: required_bytes,
+        handle_type: FILEID_INVALID,
+    }
+}
+
+fn classify_handle_decode_authorization(
+    global_dac_search: bool,
+    caller_dac_search: bool,
+    superblock_admin: bool,
+    mount_namespace_admin: bool,
+    mount_attached: bool,
+    directory_scope: bool,
+    flags: u32,
+) -> Option<HandleDecodeAuthorization> {
+    if global_dac_search {
+        return Some(HandleDecodeAuthorization::Global);
+    }
+    if !caller_dac_search {
+        return None;
+    }
+    if superblock_admin {
+        return Some(HandleDecodeAuthorization::Superblock);
+    }
+    if mount_namespace_admin && mount_attached && directory_scope && flags & O_DIRECTORY != 0 {
+        return Some(HandleDecodeAuthorization::MountNamespace);
+    }
+    None
+}
+
+const fn usable_export_handle_bytes(handle_bytes: u32) -> usize {
+    (handle_bytes as usize >> 2) * size_of::<u32>()
 }
 
 fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
@@ -705,6 +763,7 @@ fn prepare_open_description(
     prepare_file_description_with_open_lease(
         f,
         open_status_flags(flags),
+        flags & O_DIRECTORY != 0,
         write_open_key,
         description_resource,
         open_lease_admission,
@@ -825,8 +884,8 @@ pub fn sys_name_to_handle_at(
     capability: UserMemoryCapability,
     dirfd: c_int,
     path: *const c_char,
-    _handle: *mut u8,
-    _mount_id: *mut i32,
+    handle: *mut u8,
+    mount_id: *mut i32,
     flags: i32,
 ) -> AxResult<isize> {
     if flags & !NAME_TO_HANDLE_ALLOWED_FLAGS != 0 {
@@ -834,24 +893,142 @@ pub fn sys_name_to_handle_at(
     }
 
     let path = load_user_string(&capability, path)?;
-    if !(path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD) {
-        let _ = resolve_at(
-            dirfd,
-            Some(path.as_str()),
-            name_to_handle_resolve_flags(flags),
-        )?;
+    let location = resolve_at(
+        dirfd,
+        Some(path.as_str()),
+        name_to_handle_resolve_flags(flags),
+    )?
+    .into_file()
+    .ok_or(AxError::InvalidInput)?;
+    let exported = location.mountpoint().encode_export_handle(
+        &location,
+        if flags & AT_HANDLE_FID != 0 {
+            axfs_ng_vfs::ExportHandleMode::Fid
+        } else {
+            axfs_ng_vfs::ExportHandleMode::Openable
+        },
+    )?;
+    let header = unsafe {
+        capability
+            .read_value_uninit(handle.cast::<LinuxFileHandle>())
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
+        return Err(AxError::InvalidInput);
     }
-
-    // axfs-ng has no exportable mount/inode/generation handle contract yet.
-    Err(LinuxError::EOPNOTSUPP.into())
+    let unique = flags & AT_HANDLE_MNT_ID_UNIQUE != 0;
+    // Linux writes the mount ID before reporting a short handle buffer.
+    if unique {
+        capability
+            .write_bytes(
+                mount_id as usize,
+                &location.mountpoint().mount_id().to_ne_bytes(),
+            )
+            .map_err(map_usercopy_error)?;
+    } else {
+        capability
+            .write_bytes(
+                mount_id as usize,
+                &crate::mounts::legacy_mount_id(location.mountpoint())?.to_ne_bytes(),
+            )
+            .map_err(map_usercopy_error)?;
+    }
+    let required_bytes = u32::try_from(exported.bytes.len()).map_err(|_| LinuxError::EOVERFLOW)?;
+    if header.handle_bytes < required_bytes {
+        // Linux stores exportfs_encode_fh()'s FILEID_INVALID result in the
+        // fixed header while reporting the required variable payload size.
+        let required_header = short_handle_probe_header(required_bytes);
+        let required_header = unsafe {
+            slice::from_raw_parts(
+                (&required_header as *const LinuxFileHandle).cast::<u8>(),
+                size_of::<LinuxFileHandle>(),
+            )
+        };
+        capability
+            .write_bytes(handle as usize, required_header)
+            .map_err(map_usercopy_error)?;
+        return Err(LinuxError::EOVERFLOW.into());
+    }
+    capability
+        .write_bytes(handle as usize, &required_bytes.to_ne_bytes())
+        .map_err(map_usercopy_error)?;
+    capability
+        .write_bytes(
+            (handle as usize).checked_add(4).ok_or(LinuxError::EFAULT)?,
+            &exported.handle_type.to_ne_bytes(),
+        )
+        .map_err(map_usercopy_error)?;
+    capability
+        .write_bytes(
+            (handle as usize)
+                .checked_add(size_of::<LinuxFileHandle>())
+                .ok_or(LinuxError::EFAULT)?,
+            &exported.bytes,
+        )
+        .map_err(map_usercopy_error)?;
+    Ok(0)
 }
 
 pub fn sys_open_by_handle_at(
     capability: UserMemoryCapability,
     mount_fd: c_int,
     handle: *const u8,
-    _flags: i32,
+    flags: i32,
 ) -> AxResult<isize> {
+    let curr = current();
+    let thread = curr.as_thread();
+    // Resolve and authorize the mount selector before touching the untrusted
+    // handle so EBADF/EPERM retain their ABI priority over EFAULT/EINVAL.
+    let (mount, directory_scope) = if mount_fd == AT_FDCWD {
+        (current_fs_context().lock().current_dir().clone(), true)
+    } else {
+        let selected = get_file_like(mount_fd)?;
+        if let Some(directory) = selected.downcast_ref::<Directory>() {
+            (directory.inner().clone(), true)
+        } else if let Some(file) = selected.downcast_ref::<File>() {
+            (file.inner().location().clone(), false)
+        } else {
+            return Err(AxError::InvalidInput);
+        }
+    };
+    // Keep Linux's global, superblock, and mount-namespace decode authorities
+    // distinct. The current VFS has one mount namespace and superblock owner
+    // domain (the initial user namespace), but the enum preserves the policy
+    // boundary as namespace ownership becomes per-mount.
+    let selected_superblock_user_ns =
+        crate::task::security::initial_user_namespace(thread.current_cred().user_ns());
+    let mount_namespace_user_ns = selected_superblock_user_ns.clone();
+    let authorization = classify_handle_decode_authorization(
+        thread.has_effective_capability(CAP_DAC_READ_SEARCH),
+        thread
+            .current_cred()
+            .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH),
+        ns_capable(
+            &thread.current_cred(),
+            &selected_superblock_user_ns,
+            CAP_SYS_ADMIN,
+        ),
+        ns_capable(
+            &thread.current_cred(),
+            &mount_namespace_user_ns,
+            CAP_SYS_ADMIN,
+        ),
+        mount.mountpoint().is_attached(),
+        directory_scope,
+        flags as u32,
+    )
+    .ok_or(LinuxError::EPERM)?;
+    let decode_mode = authorization.decode_mode(flags as u32);
+    let relaxed_directory_scope = match authorization {
+        HandleDecodeAuthorization::MountNamespace => Some(mount.clone()),
+        HandleDecodeAuthorization::Global | HandleDecodeAuthorization::Superblock => None,
+    };
+
+    let flags = normalize_legacy_open_flags(flags)?;
+    let _mount_namespace =
+        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
+
     let handle_addr = handle as usize;
     let header = unsafe {
         capability
@@ -859,36 +1036,58 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ
-        || header.handle_bytes == 0
-        || header.handle_type < 0
-    {
+    if header.handle_bytes == 0 || header.handle_bytes > MAX_FILE_HANDLE_SZ {
         return Err(AxError::InvalidInput);
-    }
-
-    if mount_fd != AT_FDCWD {
-        get_file_like(mount_fd)?;
-    }
-
-    let curr = current();
-    if !curr
-        .as_thread()
-        .has_effective_capability(CAP_DAC_READ_SEARCH)
-    {
-        return Err(LinuxError::EPERM.into());
     }
 
     let body_addr = handle_addr
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
-    let mut body = [MaybeUninit::<u8>::uninit(); MAX_FILE_HANDLE_SZ as usize];
+    let mut body = Vec::<MaybeUninit<u8>>::new();
+    body.try_reserve_exact(header.handle_bytes as usize)
+        .map_err(|_| LinuxError::ENOMEM)?;
+    body.resize(header.handle_bytes as usize, MaybeUninit::uninit());
     capability
-        .read_bytes(body_addr, &mut body[..header.handle_bytes as usize])
+        .read_bytes(body_addr, &mut body)
         .map_err(map_usercopy_error)?;
+    let body = unsafe { slice::from_raw_parts(body.as_ptr().cast::<u8>(), body.len()) };
+    // exportfs consumes handle words, not arbitrary bytes. Retain the full
+    // user copy for fault/bounds behavior, then ignore a 1–3 byte tail.
+    let body = &body[..usable_export_handle_bytes(header.handle_bytes)];
 
-    // A well-formed handle cannot be decoded until the VFS exports stable IDs.
-    Err(LinuxError::ESTALE.into())
+    let location = mount
+        .mountpoint()
+        .decode_export_handle(header.handle_type, &body, decode_mode)
+        .map_err(map_decode_export_handle_error)?;
+    // Anonymous decoded references have no parent chain.  Ask the filesystem
+    // to verify the stable namespace ancestry from the encoded inode instead.
+    if let Some(directory) = relaxed_directory_scope
+        && !mount
+            .mountpoint()
+            .export_handle_is_descendant(&directory, &location)
+            .map_err(map_decode_export_handle_error)?
+    {
+        return Err(LinuxError::ESTALE.into());
+    }
+    let security =
+        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    if (flags as u32 & O_TMPFILE) == O_TMPFILE {
+        if !location.is_dir() {
+            return Err(AxError::NotADirectory);
+        }
+        let mut fs = FsContext::new(location);
+        let mut policy = Openat2PathwalkPolicy::legacy()?;
+        return open_tmpfile_in_fs(&mut fs, ".", flags, 0, &security, &mut policy);
+    }
+    open_resolved_location_with_policy("", location, false, flags, 0, &security)
+}
+
+fn map_decode_export_handle_error(error: AxError) -> AxError {
+    if error == AxError::NoMemory {
+        error
+    } else {
+        LinuxError::ESTALE.into()
+    }
 }
 
 fn open_in_fs(
@@ -917,13 +1116,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     let uid = credentials.uid().into_raw();
     let gid = credentials.gid().into_raw();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
-    let masked_mode =
-        NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
     let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));
-    // Linux reserves a numeric slot before path lookup can create a name or
-    // truncate an existing inode. The reservation is invisible until the OFD
-    // is fully constructed and published below.
-    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
     let (loc, created) = resolve_options.resolve_location_with_policy(
         fs,
         path,
@@ -966,6 +1159,33 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         policy,
     )?;
 
+    open_resolved_location_with_policy(path, loc, created, flags, mode, security)
+}
+
+/// Complete the post-lookup open transaction for an already-resolved inode.
+///
+/// Keeping this separate from pathname resolution is required by
+/// `open_by_handle_at`: handle lookup must receive precisely the same FD
+/// reservation, LSM/fanotify/lease admission, executable-write accounting,
+/// truncate, and notification ordering as a pathname open.
+fn open_resolved_location_with_policy(
+    path: &str,
+    loc: Location,
+    created: bool,
+    flags: i32,
+    mode: __kernel_mode_t,
+    security: &OpenPathSecurityContext,
+) -> AxResult<isize> {
+    let credentials = security.credentials();
+    let uid = credentials.uid().into_raw();
+    let gid = credentials.gid().into_raw();
+    let requested_mode = NodePermission::from_bits_truncate(mode as u16);
+    let masked_mode =
+        NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
+    // Keep the FD unpublished until every admission and (when requested)
+    // destructive side effect has succeeded.
+    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
+
     if created {
         if let Some(parent) = loc.parent() {
             if let Err(error) =
@@ -983,6 +1203,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         && (flags as u32) & O_TRUNC != 0
         && loc.node_type() == NodeType::RegularFile;
     let open_result = (|| {
+        if opened_existing && (flags as u32 & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
+            return Err(AxError::AlreadyExists);
+        }
         enforce_trailing_slash_directory(path, &loc)?;
         enforce_special_open_rules(&loc, flags, security)?;
         if loc.is_dir() && invalid_directory_open(flags) {
@@ -1979,6 +2202,92 @@ mod namespace_operation_tests {
         let unnamed_no_data = file_open_operation(O_ACCMODE, true, true).unwrap().unwrap();
         assert_eq!(unnamed_no_data.access(), FileOpenAccess::NoData);
         assert!(unnamed_no_data.unnamed());
+    }
+
+    #[test]
+    fn legacy_path_open_masks_truncate_before_handle_open() {
+        let flags = normalize_legacy_open_flags((O_PATH | O_TRUNC | O_CLOEXEC) as i32).unwrap();
+        assert_eq!(flags as u32 & O_PATH, O_PATH);
+        assert_eq!(flags as u32 & O_CLOEXEC, O_CLOEXEC);
+        assert_eq!(flags as u32 & O_TRUNC, 0);
+    }
+
+    #[test]
+    fn handle_decode_staleness_mapping_preserves_allocation_failure() {
+        for error in [
+            AxError::NotFound,
+            AxError::InvalidInput,
+            AxError::OperationNotSupported,
+            AxError::Io,
+        ] {
+            assert_eq!(
+                map_decode_export_handle_error(error),
+                LinuxError::ESTALE.into()
+            );
+        }
+        assert_eq!(
+            map_decode_export_handle_error(AxError::NoMemory),
+            AxError::NoMemory
+        );
+    }
+
+    #[test]
+    fn short_handle_probe_reports_fileid_invalid() {
+        let header = short_handle_probe_header(24);
+        assert_eq!(header.handle_bytes, 24);
+        assert_eq!(header.handle_type, FILEID_INVALID);
+    }
+
+    #[test]
+    fn handle_decode_authorization_keeps_superblock_and_mount_paths_distinct() {
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, true, false, false, false, 0),
+            Some(HandleDecodeAuthorization::Superblock)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, true, true, O_DIRECTORY),
+            Some(HandleDecodeAuthorization::MountNamespace)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, true, false, O_DIRECTORY),
+            None
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, true, true, 0),
+            None
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(true, false, false, false, false, false, 0),
+            Some(HandleDecodeAuthorization::Global)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, false, true, O_DIRECTORY),
+            None
+        );
+    }
+
+    #[test]
+    fn relaxed_handle_decode_uses_directory_only_mode() {
+        assert_eq!(
+            HandleDecodeAuthorization::Global.decode_mode(O_DIRECTORY),
+            ExportHandleDecodeMode::Any
+        );
+        assert_eq!(
+            HandleDecodeAuthorization::Superblock.decode_mode(O_DIRECTORY),
+            ExportHandleDecodeMode::DirectoryOnly
+        );
+        assert_eq!(
+            HandleDecodeAuthorization::MountNamespace.decode_mode(O_TMPFILE),
+            ExportHandleDecodeMode::DirectoryOnly
+        );
+    }
+
+    #[test]
+    fn export_handle_decode_uses_complete_dwords_only() {
+        assert_eq!(usable_export_handle_bytes(8), 8);
+        assert_eq!(usable_export_handle_bytes(9), 8);
+        assert_eq!(usable_export_handle_bytes(11), 8);
+        assert_eq!(usable_export_handle_bytes(12), 12);
     }
 
     #[test]
