@@ -7,6 +7,7 @@ mod aspace;
 mod diagnostics;
 mod fault;
 mod io;
+pub(crate) mod ldt;
 mod loader;
 mod pressure;
 mod remap;

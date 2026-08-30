@@ -20,6 +20,8 @@ mod imp {
     };
     use kernel_guard::NoPreempt;
 
+    use crate::task::AsThread;
+
     const SHOOTDOWN_TIMEOUT_NS: u64 = 5_000_000_000;
     const RETRY_INITIAL_NS: u64 = 1_000_000;
     const RETRY_MAX_NS: u64 = 128_000_000;
@@ -458,6 +460,13 @@ mod imp {
         CPU_RUNTIME[cpu]
             .ipi_handler_entries
             .fetch_add(1, Ordering::Relaxed);
+        // An LDT update shares this maintenance grace with TLB invalidation.
+        // If the interrupted task still uses the modified address space, load
+        // its newly published descriptor before acknowledging the grace that
+        // permits the old LDT backing allocation to be dropped.
+        if let Some(thread) = axtask::current().try_as_thread() {
+            thread.proc_data.aspace_tlb_state().reload_current_ldt();
+        }
         service_cpu(cpu);
     }
 

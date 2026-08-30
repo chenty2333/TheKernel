@@ -37,6 +37,7 @@ use super::{
     UffdPagePublication, UffdRemapKind, UffdResolverLease,
     asid::{AddressSpaceToken, HardwareAddressSpaceId, reserve_hardware_address_space_id},
     checked_align_up_4k,
+    ldt::{ENTRIES, Ldt, UserDesc},
 };
 use crate::task::AsThread;
 
@@ -954,6 +955,7 @@ pub(crate) struct TlbState {
     resident_cpus: [AtomicBool; axconfig::plat::MAX_CPU_NUM],
     seen_generations: [AtomicU64; axconfig::plat::MAX_CPU_NUM],
     membarrier: MembarrierState,
+    ldt: SpinNoIrq<Option<Arc<Ldt>>>,
 }
 
 impl TlbState {
@@ -963,6 +965,7 @@ impl TlbState {
             resident_cpus: [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM],
             seen_generations: [const { AtomicU64::new(0) }; axconfig::plat::MAX_CPU_NUM],
             membarrier: MembarrierState::new(),
+            ldt: SpinNoIrq::new(None),
         }
     }
 
@@ -972,6 +975,7 @@ impl TlbState {
             resident_cpus: [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM],
             seen_generations: [const { AtomicU64::new(0) }; axconfig::plat::MAX_CPU_NUM],
             membarrier: self.membarrier.fork_clone(),
+            ldt: SpinNoIrq::new(None),
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -999,6 +1003,25 @@ impl TlbState {
             self.seen_generations[cpu].store(generation, Ordering::SeqCst);
         }
         self.membarrier.synchronize_entering_cpu(cpu);
+        self.reload_current_ldt();
+    }
+
+    /// Reloads the current CPU's descriptor. Callers keep IRQs/preemption
+    /// disabled so the per-CPU GDT cannot be concurrently changed.
+    pub(crate) fn reload_current_ldt(&self) {
+        let ldt = self.ldt.lock();
+        let (base, len) = ldt.as_ref().map_or((core::ptr::null(), 0), |table| {
+            (table.bytes().as_ptr(), table.bytes().len())
+        });
+        unsafe { axhal::asm::load_user_ldt(base, len) };
+    }
+
+    fn replace_ldt(&self, new: Option<Arc<Ldt>>) -> Option<Arc<Ldt>> {
+        core::mem::replace(&mut *self.ldt.lock(), new)
+    }
+
+    fn snapshot_ldt(&self) -> Option<Arc<Ldt>> {
+        self.ldt.lock().clone()
     }
 
     pub(crate) fn membarrier_state(&self) -> &MembarrierState {
@@ -1449,6 +1472,40 @@ impl AddrSpace {
     /// the targeted shootdown.
     pub(crate) fn tlb_state(&self) -> Arc<TlbState> {
         self.tlb.clone()
+    }
+
+    pub(crate) fn ldt_snapshot(&self) -> Option<Arc<Ldt>> {
+        self.tlb.snapshot_ldt()
+    }
+
+    pub(crate) fn replace_ldt_entry(&mut self, info: UserDesc, oldmode: bool) -> AxResult {
+        let index = info.entry_number as usize;
+        if index >= ENTRIES {
+            return Err(AxError::InvalidInput);
+        }
+        let old = self.tlb.snapshot_ldt();
+        let mut next = Ldt::new(core::cmp::max(
+            index + 1,
+            old.as_ref().map_or(0, |table| table.len()),
+        ))?;
+        if let Some(old) = old.as_ref() {
+            old.copy_into(&mut next);
+        }
+        next.set(index, Ldt::descriptor(info, oldmode)?);
+        let retired = self
+            .tlb
+            .replace_ldt(Some(Arc::try_new(next).map_err(|_| AxError::NoMemory)?));
+
+        // Publish the new descriptor locally before remote acknowledgements
+        // make the old backing allocation reclaimable.
+        {
+            let _guard = NoPreemptIrqSave::new();
+            self.tlb.reload_current_ldt();
+        }
+        let grace = self.synchronize_tlb_after_mutation();
+        drop(grace);
+        drop(retired);
+        Ok(())
     }
 
     /// Completes one PTE mutation's full local flush and targeted grace.
@@ -4471,6 +4528,11 @@ impl AddrSpace {
         // barrier generation. CLONE_VM shares the address space (and hence
         // this state) through the existing Arc path instead.
         guard.tlb = self.tlb.fork_clone()?;
+        if let Some(old) = self.tlb.snapshot_ldt() {
+            guard.tlb.replace_ldt(Some(
+                Arc::try_new(old.copy()?).map_err(|_| AxError::NoMemory)?,
+            ));
+        }
         guard.growdown_starts = self.growdown_starts.clone();
         let mut child_lineages = Vec::new();
         child_lineages

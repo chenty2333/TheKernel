@@ -519,6 +519,15 @@ pub unsafe fn write_thread_pointer(fs_base: usize) {
     unsafe { msr::wrmsr(msr::IA32_FS_BASE, fs_base as u64) }
 }
 
+/// Loads this CPU's kernel-owned LDT system descriptor and LDTR.
+///
+/// Callers must disable IRQs/preemption and keep `base..base + bytes` alive
+/// until every CPU that may have loaded it has crossed its maintenance grace.
+#[inline]
+pub unsafe fn load_user_ldt(base: *const u8, bytes: usize) {
+    unsafe { super::gdt::load_ldt(base, bytes) }
+}
+
 #[cfg(feature = "uspace")]
 core::arch::global_asm!(include_str!("user_copy.S"));
 
