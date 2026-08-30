@@ -1675,6 +1675,15 @@ impl MempolicyState {
         }
     }
 
+    /// Linux represents an `mbind(MPOL_DEFAULT)` range by removing its VMA
+    /// policy rather than by recording a synthetic default-policy interval.
+    fn bind_range(&mut self, start: usize, end: usize, policy: Mempolicy) {
+        self.remove_range(start, end);
+        if policy.mode != linux_raw_sys::mempolicy::MPOL_DEFAULT as u32 {
+            self.ranges.push(MempolicyRange { start, end, policy });
+        }
+    }
+
     fn policy_for_addr(&self, addr: usize) -> Option<Mempolicy> {
         self.ranges
             .iter()
@@ -3766,9 +3775,7 @@ impl ProcessData {
         let Some(end) = start.checked_add(size) else {
             return;
         };
-        let mut state = self.mempolicy.lock();
-        state.remove_range(start, end);
-        state.ranges.push(MempolicyRange { start, end, policy });
+        self.mempolicy.lock().bind_range(start, end, policy);
     }
 
     pub fn clear_mempolicy_range(&self, start: usize, size: usize) {
@@ -5636,6 +5643,24 @@ mod tests {
         assert_eq!(error, Some(axerrno::LinuxError::EOPNOTSUPP));
         assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, Some(0));
         assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, None);
+    }
+
+    #[test]
+    fn mbind_default_clears_the_vma_policy_range() {
+        let mut state = MempolicyState {
+            process_policy: Mempolicy::new(0, 0),
+            ranges: vec![MempolicyRange {
+                start: 0x1000,
+                end: 0x4000,
+                policy: Mempolicy::new(linux_raw_sys::mempolicy::MPOL_BIND as u32, 1),
+            }],
+        };
+
+        state.bind_range(0x2000, 0x3000, Mempolicy::new(0, 0));
+
+        assert!(state.policy_for_addr(0x1800).is_some());
+        assert_eq!(state.policy_for_addr(0x2800), None);
+        assert!(state.policy_for_addr(0x3800).is_some());
     }
 
     #[test]
