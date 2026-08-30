@@ -1,4 +1,4 @@
-use alloc::sync::{Arc, Weak};
+use alloc::{sync::{Arc, Weak}, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
@@ -17,10 +17,16 @@ use crate::{
 /// visible directory tree and claiming that it is complete.
 pub type InodeVisitor<'a> = dyn FnMut(Metadata) -> VfsResult<()> + 'a;
 /// Filesystem-owned opaque identity for one live inode generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportHandle {
-    pub inode: u64,
-    pub generation: u64,
+    pub handle_type: i32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportHandleMode {
+    Openable,
+    Fid,
 }
 
 pub struct StatFs {
@@ -57,15 +63,16 @@ pub trait FilesystemOps: Send + Sync {
     /// namespace walk misses unlinked-but-open files and hard-link aliases.
     fn enumerate_inodes(&self, _visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotSupported)
+    }
     /// Exports a backend-validated inode generation.  The VFS deliberately
     /// does not synthesize a handle from a pathname or a bare inode number.
-    fn encode_export_handle(&self, _entry: &DirEntry) -> VfsResult<ExportHandle> {
+    fn encode_export_handle(&self, _entry: &DirEntry, _mode: ExportHandleMode) -> VfsResult<ExportHandle> {
         Err(crate::VfsError::OperationNotSupported)
     }
 
     /// Resolves a previously exported live inode generation.  `NotFound`
     /// means stale; other errors preserve backend failure information.
-    fn decode_export_handle(&self, _handle: ExportHandle) -> VfsResult<DirEntry> {
+    fn decode_export_handle(&self, _handle_type: i32, _bytes: &[u8]) -> VfsResult<DirEntry> {
         Err(crate::VfsError::OperationNotSupported)
     }
 
@@ -75,7 +82,8 @@ pub trait FilesystemOps: Send + Sync {
     fn export_handle_is_descendant(
         &self,
         _ancestor: &DirEntry,
-        _handle: ExportHandle,
+        _handle_type: i32,
+        _bytes: &[u8],
     ) -> VfsResult<bool> {
         Ok(false)
     }
@@ -206,26 +214,26 @@ impl Filesystem {
         self.inner.ops.stat()
     }
 
-<<<<<<< HEAD
     /// Enumerates every live inode supplied by the backend.
     pub fn enumerate_inodes(&self, visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         self.inner.ops.enumerate_inodes(visitor)
-=======
-    pub fn encode_export_handle(&self, entry: &DirEntry) -> VfsResult<ExportHandle> {
-        self.inner.ops.encode_export_handle(entry)
     }
 
-    pub fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
-        self.inner.ops.decode_export_handle(handle)
->>>>>>> 955e94c8 (feat(vfs): add generation-safe export handles)
+    pub fn encode_export_handle(&self, entry: &DirEntry, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+        self.inner.ops.encode_export_handle(entry, mode)
+    }
+
+    pub fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        self.inner.ops.decode_export_handle(handle_type, bytes)
     }
 
     pub fn export_handle_is_descendant(
         &self,
         ancestor: &DirEntry,
-        handle: ExportHandle,
+        handle_type: i32,
+        bytes: &[u8],
     ) -> VfsResult<bool> {
-        self.inner.ops.export_handle_is_descendant(ancestor, handle)
+        self.inner.ops.export_handle_is_descendant(ancestor, handle_type, bytes)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

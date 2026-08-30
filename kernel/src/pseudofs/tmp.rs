@@ -20,7 +20,7 @@ use axfs::{
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
-    DirNodeOps, ExportHandle, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
+    DirNodeOps, ExportHandle, ExportHandleMode, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
     MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
     Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
     XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
@@ -287,22 +287,27 @@ impl FilesystemOps for MemoryFs {
             visitor(inode.snapshot_metadata())?;
         }
         Ok(())
-    fn encode_export_handle(&self, entry: &DirEntry) -> VfsResult<ExportHandle> {
+    }
+    fn encode_export_handle(&self, entry: &DirEntry, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
         let node = entry.downcast::<MemoryNode>()?;
         if !core::ptr::eq(self, node.fs.as_ref()) {
             return Err(VfsError::CrossesDevices);
         }
-        Ok(ExportHandle {
-            inode: node.inode.ino,
-            generation: 0,
-        })
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(16).map_err(|_| VfsError::NoMemory)?;
+        bytes.extend_from_slice(&node.inode.ino.to_ne_bytes());
+        bytes.extend_from_slice(&0u64.to_ne_bytes());
+        Ok(ExportHandle { handle_type: if mode == ExportHandleMode::Fid { 2 } else { 1 }, bytes })
     }
 
-    fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
-        if handle.generation != 0 {
+    fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        if handle_type != 1 || bytes.len() != 16 {
             return Err(VfsError::NotFound);
         }
-        let inode = self.get(handle.inode).ok_or(VfsError::NotFound)?;
+        let inode_number = u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
+        let generation = u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| VfsError::NotFound)?);
+        if generation != 0 { return Err(VfsError::NotFound); }
+        let inode = self.get(inode_number).ok_or(VfsError::NotFound)?;
         let node_type = inode.metadata.lock().node_type;
         // This is an anonymous VFS alias, not a namespace link: it retains
         // the exact live inode generation without changing nlink or inventing
@@ -316,12 +321,16 @@ impl FilesystemOps for MemoryFs {
     fn export_handle_is_descendant(
         &self,
         ancestor: &DirEntry,
-        handle: ExportHandle,
+        handle_type: i32,
+        bytes: &[u8],
     ) -> VfsResult<bool> {
-        if handle.generation != 0 {
+        if handle_type != 1 || bytes.len() != 16 {
             return Ok(false);
         }
-        let Some(target) = self.get(handle.inode) else {
+        let inode_number = u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
+        let generation = u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| VfsError::NotFound)?);
+        if generation != 0 { return Ok(false); }
+        let Some(target) = self.get(inode_number) else {
             return Ok(false);
         };
         let ancestor = ancestor.downcast::<MemoryNode>()?;
@@ -2274,13 +2283,17 @@ mod tests {
             )
             .unwrap();
 
-        let child_handle = mount.encode_export_handle(&child).unwrap();
-        let sibling_handle = mount.encode_export_handle(&sibling).unwrap();
+        let child_handle = mount
+            .encode_export_handle(&child, ExportHandleMode::Openable)
+            .unwrap();
+        let sibling_handle = mount
+            .encode_export_handle(&sibling, ExportHandleMode::Openable)
+            .unwrap();
         assert!(mount
-            .export_handle_is_descendant(&subtree, child_handle)
+            .export_handle_is_descendant(&subtree, child_handle.handle_type, &child_handle.bytes)
             .unwrap());
         assert!(!mount
-            .export_handle_is_descendant(&subtree, sibling_handle)
+            .export_handle_is_descendant(&subtree, sibling_handle.handle_type, &sibling_handle.bytes)
             .unwrap());
     }
 
