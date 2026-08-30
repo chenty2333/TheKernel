@@ -105,6 +105,27 @@ struct CpuCustody {
     cookie: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileAction {
+    Arm,
+    Stop,
+    Keep,
+}
+
+#[derive(Clone, Copy)]
+enum StopSettlement {
+    Normal,
+    RunningOnly,
+}
+
+const fn reconcile_action(live: bool, matching_owner: bool, token_armed: bool) -> ReconcileAction {
+    match (live, matching_owner, token_armed) {
+        (true, _, false) => ReconcileAction::Arm,
+        (false, true, true) => ReconcileAction::Stop,
+        _ => ReconcileAction::Keep,
+    }
+}
+
 static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
@@ -147,7 +168,17 @@ impl PerfSamplingFile {
         }
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
-        if cpu >= CUSTODY.len() || CUSTODY[cpu].lock().is_some() {
+        if cpu >= CUSTODY.len() {
+            return;
+        }
+        let reusable = {
+            let custody = CUSTODY[cpu].lock();
+            match custody.as_ref() {
+                None => true,
+                Some(custody) => Arc::ptr_eq(&custody.event, self) && custody.token.is_none(),
+            }
+        };
+        if !reusable {
             return;
         }
         let event = match self.config.event {
@@ -164,11 +195,29 @@ impl PerfSamplingFile {
         let Ok(token) = axhal::pmu::sampling_arm_local(program) else {
             return;
         };
-        *CUSTODY[cpu].lock() = Some(CpuCustody {
-            event: self.clone(),
-            token: Some(token),
-            cookie: self.config.id,
-        });
+        let mut token = Some(token);
+        let installed = {
+            let mut custody = CUSTODY[cpu].lock();
+            match custody.as_mut() {
+                None => {
+                    *custody = Some(CpuCustody {
+                        event: self.clone(),
+                        token: token.take(),
+                        cookie: self.config.id,
+                    });
+                    true
+                }
+                Some(custody) if Arc::ptr_eq(&custody.event, self) && custody.token.is_none() => {
+                    custody.token = token.take();
+                    true
+                }
+                Some(_) => false,
+            }
+        };
+        if !installed {
+            let _ = axhal::pmu::sampling_stop_local(token.expect("unpublished sampling token"));
+            return;
+        }
         let mut state = self.state.lock();
         if state.enabled && !state.closed && !state.failed && state.ring.is_some() {
             state.running_since = Some(axhal::time::monotonic_time_nanos());
@@ -186,7 +235,7 @@ impl PerfSamplingFile {
         let Some(mut custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) else {
             return;
         };
-        Self::stop_custody(&mut custody);
+        Self::stop_custody(&mut custody, StopSettlement::Normal);
     }
 
     fn live(&self) -> bool {
@@ -218,12 +267,38 @@ impl PerfSamplingFile {
         }
     }
 
-    fn stop_custody(custody: &mut CpuCustody) {
+    fn settle_after_pmi(event: &Self, sample: axhal::pmu::StopSample) {
+        let mut state = event.state.lock();
+        if let Ok(caps) = axhal::pmu::capabilities() {
+            // The completed PMI period was accounted before rearm.  The stop
+            // sample can only contribute post-overflow residual progress.
+            state.value = state
+                .value
+                .saturating_add(sample.residual & caps.programmable_mask());
+        } else {
+            state.failed = true;
+        }
+        if let Some(since) = state.running_since.take() {
+            state.running_total = state
+                .running_total
+                .saturating_add(axhal::time::monotonic_time_nanos().saturating_sub(since));
+        }
+        if sample.lost {
+            if let Some(ring) = state.ring.as_mut() {
+                ring.lost = ring.lost.saturating_add(1);
+            }
+        }
+    }
+
+    fn stop_custody(custody: &mut CpuCustody, settlement: StopSettlement) {
         let Some(token) = custody.token.take() else {
             return;
         };
         match axhal::pmu::sampling_stop_local(token) {
-            Ok(sample) => Self::settle_stop(&custody.event, sample),
+            Ok(sample) => match settlement {
+                StopSettlement::Normal => Self::settle_stop(&custody.event, sample),
+                StopSettlement::RunningOnly => Self::settle_after_pmi(&custody.event, sample),
+            },
             Err(_) => {
                 let mut state = custody.event.state.lock();
                 state.failed = true;
@@ -239,12 +314,20 @@ impl PerfSamplingFile {
     /// Stop this CPU's sampler while retaining custody until scheduler leave.
     /// This is safe from IRQ/tick/final-close contexts and never drops Arc.
     pub(crate) fn stop_current() {
+        Self::stop_current_with(StopSettlement::Normal);
+    }
+
+    fn stop_current_after_pmi() {
+        Self::stop_current_with(StopSettlement::RunningOnly);
+    }
+
+    fn stop_current_with(settlement: StopSettlement) {
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
         if let Some(slot) = CUSTODY.get(cpu) {
             let mut custody = slot.lock();
             if let Some(custody) = custody.as_mut() {
-                Self::stop_custody(custody);
+                Self::stop_custody(custody, settlement);
             }
         }
     }
@@ -257,17 +340,19 @@ impl PerfSamplingFile {
         }
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
-        let owned = CUSTODY.get(cpu).is_some_and(|slot| {
-            slot.lock()
-                .as_ref()
-                .is_some_and(|c| Arc::ptr_eq(&c.event, self))
-        });
-        if self.live() {
-            if !owned {
-                self.enter_current();
-            }
-        } else if owned {
-            Self::stop_current();
+        let (matching_owner, token_armed) = CUSTODY
+            .get(cpu)
+            .and_then(|slot| {
+                let custody = slot.lock();
+                custody
+                    .as_ref()
+                    .and_then(|c| Arc::ptr_eq(&c.event, self).then_some((true, c.token.is_some())))
+            })
+            .unwrap_or((false, false));
+        match reconcile_action(self.live(), matching_owner, token_armed) {
+            ReconcileAction::Arm => self.enter_current(),
+            ReconcileAction::Stop => Self::stop_current(),
+            ReconcileAction::Keep => {}
         }
     }
 
@@ -302,7 +387,12 @@ impl PerfSamplingFile {
             let Some(custody) = custody_slot.as_ref() else {
                 return;
             };
-            if custody.cookie != sample.cookie || custody.token.is_none() {
+            if custody.token.is_none() {
+                // A previous stop has already terminated hardware; do not
+                // turn an empty retained custody into a false running fault.
+                return;
+            }
+            if custody.cookie != sample.cookie {
                 custody.event.state.lock().failed = true;
                 None
             } else {
@@ -353,7 +443,7 @@ impl PerfSamplingFile {
             }
             event.state.lock().failed = true;
         }
-        Self::stop_current();
+        Self::stop_current_after_pmi();
     }
 
     pub(crate) fn init_irq() -> bool {
@@ -804,6 +894,19 @@ mod tests {
         assert!(u64::MAX.checked_add(1).is_none());
         assert_eq!(producer_window(96, 64, 64), Some(32));
     }
+
+    #[test]
+    fn stopped_custody_rearms_for_read_reset_and_reenable() {
+        // A read stop, RESET stop, and DISABLE -> ENABLE all retain custody
+        // but clear its token; each live transition must arm it again.
+        for _ in 0..3 {
+            assert_eq!(reconcile_action(true, true, false), ReconcileAction::Arm);
+        }
+        assert_eq!(reconcile_action(true, true, true), ReconcileAction::Keep);
+        assert_eq!(reconcile_action(false, true, true), ReconcileAction::Stop);
+        assert_eq!(reconcile_action(false, true, false), ReconcileAction::Keep);
+    }
+
     #[test]
     fn sample_type_sizes_cover_each_field() {
         for bit in [
