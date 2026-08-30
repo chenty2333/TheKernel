@@ -25,4 +25,4 @@ pub use kspin::{SpinNoIrq as Mutex, SpinNoIrqGuard as MutexGuard};
 
 #[cfg(feature = "multitask")]
 #[doc(cfg(feature = "multitask"))]
-pub use self::mutex::{Mutex, MutexGuard, RawMutex};
+pub use self::mutex::{lock_interruptible, Mutex, MutexGuard, RawMutex};
