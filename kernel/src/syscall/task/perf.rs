@@ -27,6 +27,12 @@ const PERF_FLAG_FD_NO_GROUP: u64 = 1;
 const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
 const PERF_ATTR_SIZE_VER0: u32 = 64;
+// Linux extends perf_event_attr by appending fields.  This implementation
+// understands only v0, but it must not silently discard a requested newer
+// field.  Keep the probe bounded so a malicious size cannot make perf open
+// perform unbounded usercopy work.
+const PERF_ATTR_MAX_SIZE: u32 = 4096;
+const PERF_ATTR_EXTENSION_CHUNK_SIZE: usize = 64;
 const ATTR_DISABLED: u64 = 1;
 const ATTR_EXCLUDE_USER: u64 = 1 << 4;
 const ATTR_EXCLUDE_KERNEL: u64 = 1 << 5;
@@ -173,6 +179,57 @@ fn read_attr(
         .map(|value| unsafe { value.assume_init() })
 }
 
+/// Returns the number of bytes following the v0 prefix that have to be
+/// verified.  An extension is compatible only when every byte is zero.
+fn attr_extension_len(size: u32) -> AxResult<usize> {
+    if size < PERF_ATTR_SIZE_VER0 {
+        return Err(AxError::InvalidInput);
+    }
+    if size > PERF_ATTR_MAX_SIZE {
+        return Err(AxError::ArgumentListTooLong);
+    }
+    Ok(size as usize - PERF_ATTR_SIZE_VER0 as usize)
+}
+
+fn validate_extension_bytes(bytes: &[u8]) -> AxResult<()> {
+    if bytes.iter().any(|&byte| byte != 0) {
+        Err(AxError::ArgumentListTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks the appended portion in fixed-size reads, preserving usercopy fault
+/// reporting while avoiding a large stack allocation or an attacker-controlled
+/// iteration count.
+fn validate_attr_extensions(
+    memory: &UserMemoryCapability,
+    attr: *const PerfEventAttrV0,
+    size: u32,
+) -> AxResult<()> {
+    let extension_len = attr_extension_len(size)?;
+    let extension_start = (attr as usize)
+        .checked_add(PERF_ATTR_SIZE_VER0 as usize)
+        .ok_or(AxError::BadAddress)?;
+    let mut extension = [core::mem::MaybeUninit::<u8>::uninit(); PERF_ATTR_EXTENSION_CHUNK_SIZE];
+    let mut offset = 0;
+    while offset < extension_len {
+        let chunk_len = (extension_len - offset).min(extension.len());
+        let address = extension_start
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        memory
+            .read_bytes(address, &mut extension[..chunk_len])
+            .map_err(map_usercopy_error)?;
+        // SAFETY: read_bytes initialized every byte in the requested prefix.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(extension.as_ptr().cast::<u8>(), chunk_len) };
+        validate_extension_bytes(bytes)?;
+        offset += chunk_len;
+    }
+    Ok(())
+}
+
 /// Implements the ABI-valid software-clock subset.  Unsupported perf types
 /// fail at creation, rather than producing a descriptor whose samples lie.
 pub(crate) fn sys_perf_event_open(
@@ -183,10 +240,9 @@ pub(crate) fn sys_perf_event_open(
     group_fd: i32,
     flags: u64,
 ) -> AxResult<isize> {
-    let attr = read_attr(&memory, attr)?;
-    if attr.size < PERF_ATTR_SIZE_VER0 {
-        return Err(AxError::InvalidInput);
-    }
+    let attr_value = read_attr(&memory, attr)?;
+    validate_attr_extensions(&memory, attr, attr_value.size)?;
+    let attr = attr_value;
     #[cfg(feature = "perf-sampling")]
     if attr.sample_period != 0 {
         return open_sampling(attr, pid, cpu, group_fd, flags);
@@ -300,7 +356,12 @@ pub(crate) fn sys_perf_event_open(
 
 #[cfg(test)]
 mod tests {
-    use super::{ATTR_DISABLED, supported_attr_flags};
+    use axerrno::AxError;
+
+    use super::{
+        ATTR_DISABLED, PERF_ATTR_MAX_SIZE, PERF_ATTR_SIZE_VER0, attr_extension_len,
+        supported_attr_flags, validate_extension_bytes,
+    };
     use crate::file::PerfGroup;
 
     #[test]
@@ -320,5 +381,23 @@ mod tests {
         assert!(!group.is_group_leader_for_test(8));
         assert!(group.accepts_target(41));
         assert!(!group.accepts_target(42));
+    }
+
+    #[test]
+    fn perf_attr_extension_validator_accepts_only_zero_tail_with_bounded_size() {
+        assert_eq!(attr_extension_len(PERF_ATTR_SIZE_VER0).unwrap(), 0);
+        assert_eq!(attr_extension_len(PERF_ATTR_SIZE_VER0 + 1).unwrap(), 1);
+        assert_eq!(attr_extension_len(PERF_ATTR_MAX_SIZE).unwrap(), 4032);
+        assert!(attr_extension_len(PERF_ATTR_SIZE_VER0 - 1).is_err());
+        assert_eq!(
+            attr_extension_len(PERF_ATTR_MAX_SIZE + 1),
+            Err(AxError::ArgumentListTooLong)
+        );
+
+        assert_eq!(validate_extension_bytes(&[0; 3]), Ok(()));
+        assert_eq!(
+            validate_extension_bytes(&[0, 0, 1]),
+            Err(AxError::ArgumentListTooLong)
+        );
     }
 }
