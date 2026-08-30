@@ -1,8 +1,8 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
-use core::{ffi::c_int, time::Duration};
+use core::ffi::c_int;
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, Filesystem, WritebackErrorState};
+use axfs_ng_vfs::{DeviceId, Filesystem, Timestamp, WritebackErrorState};
 use axio::prelude::*;
 use axpoll::Pollable;
 use axsync::Mutex;
@@ -39,10 +39,10 @@ pub struct Kstat {
     pub rdev: DeviceId,
     pub attributes: u64,
     pub attributes_mask: u64,
-    pub atime: Duration,
-    pub btime: Duration,
-    pub mtime: Duration,
-    pub ctime: Duration,
+    pub atime: Timestamp,
+    pub btime: Timestamp,
+    pub mtime: Timestamp,
+    pub ctime: Timestamp,
 }
 
 impl Default for Kstat {
@@ -61,10 +61,10 @@ impl Default for Kstat {
             rdev: DeviceId::default(),
             attributes: 0,
             attributes_mask: 0,
-            atime: Duration::default(),
-            btime: Duration::default(),
-            mtime: Duration::default(),
-            ctime: Duration::default(),
+            atime: Timestamp::ZERO,
+            btime: Timestamp::ZERO,
+            mtime: Timestamp::ZERO,
+            ctime: Timestamp::ZERO,
         }
     }
 }
@@ -84,11 +84,11 @@ impl From<Kstat> for stat {
         stat.st_blocks = value.blocks as _;
         stat.st_rdev = value.rdev.0 as _;
 
-        stat.st_atime = value.atime.as_secs() as _;
+        stat.st_atime = value.atime.seconds() as _;
         stat.st_atime_nsec = value.atime.subsec_nanos() as _;
-        stat.st_mtime = value.mtime.as_secs() as _;
+        stat.st_mtime = value.mtime.seconds() as _;
         stat.st_mtime_nsec = value.mtime.subsec_nanos() as _;
-        stat.st_ctime = value.ctime.as_secs() as _;
+        stat.st_ctime = value.ctime.seconds() as _;
         stat.st_ctime_nsec = value.ctime.subsec_nanos() as _;
 
         stat
@@ -113,9 +113,9 @@ impl From<Kstat> for statx {
         statx.stx_rdev_major = value.rdev.major();
         statx.stx_rdev_minor = value.rdev.minor();
 
-        fn time_to_statx(time: &Duration) -> statx_timestamp {
+        fn time_to_statx(time: &Timestamp) -> statx_timestamp {
             statx_timestamp {
-                tv_sec: time.as_secs() as _,
+                tv_sec: time.seconds() as _,
                 tv_nsec: time.subsec_nanos() as _,
                 __reserved: 0,
             }
@@ -463,9 +463,9 @@ pub trait FileLike: Pollable + DowncastSync {
     /// through their inode setattr transaction instead.
     fn update_timestamps(
         &self,
-        _atime: Option<Duration>,
-        _mtime: Option<Duration>,
-        _ctime: Duration,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+        _ctime: Timestamp,
     ) -> AxResult<()> {
         Err(AxError::OperationNotSupported)
     }

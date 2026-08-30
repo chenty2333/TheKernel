@@ -208,7 +208,7 @@ pub(crate) fn resolve_peer(
     // update atime does not invalidate the already admitted connection.
     if mounts::should_update_atime(&location) {
         let _ = location.update_metadata(axfs_ng_vfs::MetadataUpdate {
-            atime: Some(wall_time()),
+            atime: Some(wall_time().into()),
             ..Default::default()
         });
     }

@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FsContext;
 use axfs_ng_vfs::{
-    Location, Metadata, MetadataUpdate, NodePermission, NodeType,
+    Location, Metadata, MetadataUpdate, NodePermission, NodeType, Timestamp,
     path::{FinalComponent, FinalComponentKind, Path},
 };
 use linux_raw_sys::general::{
@@ -181,17 +181,17 @@ impl<'context, 'location> PreparedInodeSetattr<'context, 'location> {
 pub(crate) struct TimestampSetattrPolicy<'a> {
     location: &'a Location,
     metadata: Metadata,
-    atime: Option<core::time::Duration>,
-    mtime: Option<core::time::Duration>,
-    ctime: core::time::Duration,
+    atime: Option<Timestamp>,
+    mtime: Option<Timestamp>,
+    ctime: Timestamp,
     intent: InodeTimestampIntent,
 }
 
 impl<'a> TimestampSetattrPolicy<'a> {
     pub(crate) fn new(
         location: &'a Location,
-        atime: Option<core::time::Duration>,
-        mtime: Option<core::time::Duration>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
         intent: InodeTimestampIntent,
     ) -> AxResult<Self> {
         Ok(Self {
@@ -199,7 +199,7 @@ impl<'a> TimestampSetattrPolicy<'a> {
             metadata: location.metadata()?,
             atime,
             mtime,
-            ctime: wall_time(),
+            ctime: wall_time().into(),
             intent,
         })
     }
@@ -299,7 +299,7 @@ impl Drop for PublishedInodeSetattr<'_, '_> {
 pub(crate) struct ChmodSetattrPolicy<'a> {
     location: &'a Location,
     metadata: Metadata,
-    ctime: core::time::Duration,
+    ctime: Timestamp,
     actor: &'a Cred,
     credentials: &'a DacCredentialView,
     plan: LinuxChmodSetattrPlan<'static, KernelDacCredentials<'a>>,
@@ -312,7 +312,7 @@ impl<'a> ChmodSetattrPolicy<'a> {
         security: &'a VfsSecurityContext,
     ) -> AxResult<Self> {
         let metadata = location.metadata()?;
-        let ctime = wall_time();
+        let ctime = wall_time().into();
         let node = linux_metadata_snapshot(&metadata);
         let request = LinuxChmodRequest::new(requested_mode as u16);
         let actor = security.actor();
@@ -406,7 +406,7 @@ impl<'context, 'location> AdmittedChmodSetattr<'_, 'context, 'location> {
 pub(crate) struct ChownSetattrPolicy<'a> {
     location: &'a Location,
     metadata: Metadata,
-    ctime: core::time::Duration,
+    ctime: Timestamp,
     requested_user: Option<Kuid>,
     requested_group: Option<Kgid>,
     actor: &'a Cred,
@@ -422,7 +422,7 @@ impl<'a> ChownSetattrPolicy<'a> {
         security: &'a VfsSecurityContext,
     ) -> AxResult<Self> {
         let metadata = location.metadata()?;
-        let ctime = wall_time();
+        let ctime = wall_time().into();
         let node = linux_metadata_snapshot(&metadata);
         let request = LinuxChownRequest::new(
             requested_user.map(Kuid::into_raw),
@@ -586,7 +586,7 @@ pub(crate) fn prepare_chown_metadata_setattr_for_test(
     requested_user: Option<Kuid>,
     requested_group: Option<Kgid>,
     credentials: &DacCredentialView,
-    ctime: core::time::Duration,
+    ctime: Timestamp,
 ) -> AxResult<PreparedMetadataSetattr> {
     let prepared = chown_plan_for_test(metadata, requested_user, requested_group, credentials)
         .prepare()
@@ -599,7 +599,7 @@ pub(crate) fn prepare_chmod_metadata_setattr_for_test(
     metadata: &Metadata,
     requested_mode: u32,
     credentials: &DacCredentialView,
-    ctime: core::time::Duration,
+    ctime: Timestamp,
 ) -> AxResult<PreparedMetadataSetattr> {
     let node = linux_metadata_snapshot(metadata);
     let request = LinuxChmodRequest::new(requested_mode as u16);
@@ -637,7 +637,7 @@ fn validate_setattr_owner_pair(
 fn prepare_metadata_setattr(
     metadata: &Metadata,
     prepared: LinuxPreparedSetattr<u32, u32>,
-    ctime: core::time::Duration,
+    ctime: Timestamp,
 ) -> PreparedMetadataSetattr {
     let update = MetadataUpdate {
         owner: prepared.owner(),
@@ -1897,7 +1897,7 @@ mod tests {
             atime: core::time::Duration::ZERO,
             btime: core::time::Duration::ZERO,
             mtime: core::time::Duration::ZERO,
-            ctime: core::time::Duration::ZERO,
+            ctime: Timestamp::ZERO,
         }
     }
 

@@ -1150,10 +1150,11 @@ pub fn should_update_atime(loc: &Location) -> bool {
         return true;
     }
 
-    let now = wall_time();
+    let now: axfs_ng_vfs::Timestamp = wall_time().into();
     metadata.atime <= metadata.mtime
         || metadata.atime <= metadata.ctime
-        || now.saturating_sub(metadata.atime).as_secs() >= RELATIME_MAX_AGE_SECS
+        || now.seconds().saturating_sub(metadata.atime.seconds())
+            >= RELATIME_MAX_AGE_SECS as i64
 }
 
 pub fn mount_options(flags: u32) -> String {

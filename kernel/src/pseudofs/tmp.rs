@@ -775,10 +775,10 @@ impl Inode {
             block_size: TMPFS_BLOCK_SIZE,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: now,
-            btime: now,
-            mtime: now,
-            ctime: now,
+            atime: now.into(),
+            btime: now.into(),
+            mtime: now.into(),
+            ctime: now.into(),
         };
         let content = match node_type {
             NodeType::Directory => NodeContent::Dir(DirContent::try_new()?),
@@ -860,7 +860,7 @@ impl InodeRef {
             *anonymous_linkable = false;
         }
         metadata.nlink = metadata.nlink.checked_add(1).ok_or(VfsError::StorageFull)?;
-        metadata.ctime = ctime;
+        metadata.ctime = ctime.into();
         Ok(Self {
             fs: Arc::downgrade(fs),
             ino: inode.ino,
@@ -936,14 +936,14 @@ impl MemoryNode {
 
     fn touch_directory(inode: &Inode, now: core::time::Duration) {
         let mut metadata = inode.metadata.lock();
-        metadata.mtime = now;
-        metadata.ctime = now;
+        metadata.mtime = now.into();
+        metadata.ctime = now.into();
     }
 
     fn touch_renamed_inodes(source: &Inode, victim: Option<&Inode>, now: core::time::Duration) {
-        source.metadata.lock().ctime = now;
+        source.metadata.lock().ctime = now.into();
         if let Some(victim) = victim {
-            victim.metadata.lock().ctime = now;
+            victim.metadata.lock().ctime = now.into();
         }
     }
 
@@ -1060,7 +1060,7 @@ impl NodeOps for MemoryNode {
         if let Some(ctime) = update.ctime {
             metadata.ctime = ctime;
         } else if status_changed {
-            metadata.ctime = wall_time();
+            metadata.ctime = wall_time().into();
         }
         Ok(())
     }
@@ -1527,7 +1527,7 @@ impl DirNodeOps for MemoryNode {
         dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         entries.remove(request.name);
         let now = wall_time();
-        inode.metadata.lock().ctime = now;
+        inode.metadata.lock().ctime = now.into();
         drop(entries);
         Self::touch_directory(&self.inode, now);
 

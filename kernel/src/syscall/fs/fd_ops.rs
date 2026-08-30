@@ -208,8 +208,8 @@ fn open_requires_writable_mount(flags: c_int) -> bool {
 fn touch_truncated_metadata(loc: &Location) -> AxResult<()> {
     let now = wall_time();
     loc.update_supported_metadata(MetadataUpdate {
-        mtime: Some(now),
-        ctime: Some(now),
+        mtime: Some(now.into()),
+        ctime: Some(now.into()),
         ..Default::default()
     })?;
     Ok(())

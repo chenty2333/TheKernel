@@ -1,9 +1,6 @@
-use core::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use axfs_ng_vfs::DeviceId;
+use axfs_ng_vfs::{DeviceId, Timestamp};
 use axsync::Mutex;
 use axtask::current_may_uninit;
 use linux_raw_sys::general::{S_IFIFO, S_IFREG, S_IFSOCK};
@@ -33,9 +30,9 @@ pub(crate) struct PseudoInode {
 
 #[derive(Debug)]
 struct PseudoTimes {
-    atime: Duration,
-    mtime: Duration,
-    ctime: Duration,
+    atime: Timestamp,
+    mtime: Timestamp,
+    ctime: Timestamp,
 }
 
 impl PseudoInode {
@@ -47,9 +44,9 @@ impl PseudoInode {
             uid,
             gid,
             times: Mutex::new(PseudoTimes {
-                atime: Duration::ZERO,
-                mtime: Duration::ZERO,
-                ctime: Duration::ZERO,
+                atime: Timestamp::ZERO,
+                mtime: Timestamp::ZERO,
+                ctime: Timestamp::ZERO,
             }),
         }
     }
@@ -98,9 +95,9 @@ impl PseudoInode {
 
     pub(crate) fn update_timestamps(
         &self,
-        atime: Option<Duration>,
-        mtime: Option<Duration>,
-        ctime: Duration,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+        ctime: Timestamp,
     ) {
         let mut times = self.times.lock();
         if let Some(atime) = atime {
@@ -138,7 +135,7 @@ fn current_fs_owner() -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use core::time::Duration;
+    use axfs_ng_vfs::Timestamp;
 
     use super::PseudoInode;
 
@@ -146,13 +143,13 @@ mod tests {
     fn pseudo_inode_timestamp_publication_is_single_snapshot() {
         let inode = PseudoInode::pipe();
         inode.update_timestamps(
-            Some(Duration::from_secs(11)),
-            Some(Duration::from_secs(12)),
-            Duration::from_secs(13),
+            Some(Timestamp::new(11, 0)),
+            Some(Timestamp::new(12, 0)),
+            Timestamp::new(13, 0),
         );
         let stat = inode.stat();
-        assert_eq!(stat.atime, Duration::from_secs(11));
-        assert_eq!(stat.mtime, Duration::from_secs(12));
-        assert_eq!(stat.ctime, Duration::from_secs(13));
+        assert_eq!(stat.atime, Timestamp::new(11, 0));
+        assert_eq!(stat.mtime, Timestamp::new(12, 0));
+        assert_eq!(stat.ctime, Timestamp::new(13, 0));
     }
 }

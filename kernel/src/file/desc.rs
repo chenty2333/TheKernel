@@ -1619,9 +1619,9 @@ impl FileLike for FileDescription {
 
     fn update_timestamps(
         &self,
-        atime: Option<core::time::Duration>,
-        mtime: Option<core::time::Duration>,
-        ctime: core::time::Duration,
+        atime: Option<axfs_ng_vfs::Timestamp>,
+        mtime: Option<axfs_ng_vfs::Timestamp>,
+        ctime: axfs_ng_vfs::Timestamp,
     ) -> AxResult<()> {
         self.inner.update_timestamps(atime, mtime, ctime)
     }

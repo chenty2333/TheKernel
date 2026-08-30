@@ -373,10 +373,10 @@ impl CgroupNode {
             block_size: 0,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: now,
-            btime: now,
-            mtime: now,
-            ctime: now,
+            atime: now.into(),
+            btime: now.into(),
+            mtime: now.into(),
+            ctime: now.into(),
         };
         Ok(Self {
             fs,
@@ -415,7 +415,7 @@ impl CgroupNode {
         if let Some(ctime) = update.ctime {
             metadata.ctime = ctime;
         } else if status_changed {
-            metadata.ctime = wall_time();
+            metadata.ctime = wall_time().into();
         }
     }
 }
@@ -509,8 +509,8 @@ impl CgroupDir {
 
     fn touch_namespace(&self, now: core::time::Duration) {
         self.node.update_metadata(MetadataUpdate {
-            mtime: Some(now),
-            ctime: Some(now),
+            mtime: Some(now.into()),
+            ctime: Some(now.into()),
             ..Default::default()
         });
     }
@@ -1622,7 +1622,7 @@ impl DirNodeOps for CgroupDir {
             let now = wall_time();
             drop(children);
             child.node.update_metadata(MetadataUpdate {
-                ctime: Some(now),
+                ctime: Some(now.into()),
                 ..Default::default()
             });
             self.touch_namespace(now);
@@ -1699,7 +1699,7 @@ impl DirNodeOps for CgroupDir {
         }
         let now = wall_time();
         child.node.update_metadata(MetadataUpdate {
-            ctime: Some(now),
+            ctime: Some(now.into()),
             ..Default::default()
         });
         self.touch_namespace(now);

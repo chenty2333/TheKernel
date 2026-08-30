@@ -7,7 +7,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
 use axfs_ng_vfs::{
-    DeviceId, Location, MetadataUpdate, NodePermission, NodeType,
+    DeviceId, Location, MetadataUpdate, NodePermission, NodeType, Timestamp,
     path::{FinalComponent, FinalComponentKind, Path},
 };
 use axhal::power::system_off;
@@ -52,8 +52,8 @@ use crate::{
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
     task::{
-        AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context, has_pending_syscall_signal,
-        ns_capable,
+        AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context,
+        has_pending_syscall_signal, ns_capable,
     },
     time::{TimeValueLike, wall_time},
 };
@@ -890,7 +890,7 @@ fn sys_getdents_common<M: UserMemory + ?Sized>(
         warn_notification(
             "getdents atime",
             dir.inner().update_supported_metadata(MetadataUpdate {
-                atime: Some(wall_time()),
+                atime: Some(wall_time().into()),
                 ..Default::default()
             }),
         );
@@ -1494,8 +1494,8 @@ fn update_times<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     path: *const c_char,
-    atime: Option<Duration>,
-    mtime: Option<Duration>,
+    atime: Option<Timestamp>,
+    mtime: Option<Timestamp>,
     atime_intent: TimeUpdate,
     mtime_intent: TimeUpdate,
     flags: u32,
@@ -1515,7 +1515,7 @@ fn update_times<M: UserMemory + ?Sized>(
     // metadata update.
     let _metadata_writer = mounts::namespace_operation();
     match resolve_at_with_security(dirfd, path.as_deref(), flags, &security)? {
-        crate::file::fs::ResolveAtResult::File(loc) => {
+        crate::file::ResolveAtResult::File(loc) => {
             // Linux's mount-write admission precedes notify_change's DAC and
             // setattr path, so a read-only mount wins over EPERM/EACCES.
             check_writable_mount(&loc)?;
@@ -1529,10 +1529,10 @@ fn update_times<M: UserMemory + ?Sized>(
             published.commit();
             Ok(())
         }
-        crate::file::fs::ResolveAtResult::Other(file) => {
+        crate::file::ResolveAtResult::Other(file) => {
             // A NULL pathname plus a descriptor denotes that exact struct
             // file; pipes and sockets have mutable pseudo-inode timestamps.
-            file.update_timestamps(atime, mtime, wall_time())
+            file.update_timestamps(atime, mtime, wall_time().into())
         }
     }
 }
@@ -1566,12 +1566,12 @@ pub fn sys_utime<M: UserMemory + ?Sized>(
                 .assume_init()
         };
         (
-            Duration::from_secs(times.actime as _),
-            Duration::from_secs(times.modtime as _),
+            Timestamp::from(Duration::from_secs(times.actime as _)),
+            Timestamp::from(Duration::from_secs(times.modtime as _)),
         )
     } else {
         let time = wall_time();
-        (time, time)
+        (time.into(), time.into())
     };
     let intent = if times.is_null() {
         TimeUpdate::Now
@@ -1604,10 +1604,13 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
                 .map_err(map_usercopy_error)?
                 .assume_init()
         };
-        (atime.try_into_time_value()?, mtime.try_into_time_value()?)
+        (
+            Timestamp::from(atime.try_into_time_value()?),
+            Timestamp::from(mtime.try_into_time_value()?),
+        )
     } else {
         let time = wall_time();
-        (time, time)
+        (time.into(), time.into())
     };
     let intent = if times.is_null() {
         TimeUpdate::Now
@@ -1634,18 +1637,12 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
 /// hidden by the `* 1000` conversion.
 fn legacy_futimesat_pair(
     times: [linux_raw_sys::general::__kernel_old_timeval; 2],
-) -> AxResult<(Duration, Duration)> {
-    fn convert(time: linux_raw_sys::general::__kernel_old_timeval) -> AxResult<Duration> {
+) -> AxResult<(Timestamp, Timestamp)> {
+    fn convert(time: linux_raw_sys::general::__kernel_old_timeval) -> AxResult<Timestamp> {
         if !(0..1_000_000).contains(&time.tv_usec) {
             return Err(AxError::InvalidInput);
         }
-        // timeval's seconds field deliberately has no ABI-level validity
-        // restriction.  The VFS time representation/backend performs the
-        // eventual representability check, just as do_utimes does.
-        Ok(Duration::new(
-            time.tv_sec as u64,
-            (time.tv_usec as u32) * 1_000,
-        ))
+        Timestamp::try_new(time.tv_sec, (time.tv_usec as u32) * 1_000).ok_or(AxError::InvalidInput)
     }
     Ok((convert(times[0])?, convert(times[1])?))
 }
@@ -1672,7 +1669,7 @@ pub fn sys_futimesat<M: UserMemory + ?Sized>(
         (Some(atime), Some(mtime), TimeUpdate::Explicit)
     } else {
         let now = wall_time();
-        (Some(now), Some(now), TimeUpdate::Now)
+        (Some(now.into()), Some(now.into()), TimeUpdate::Now)
     };
 
     // `do_utimes` treats a null pathname as an fd target only when dfd is a
@@ -1730,14 +1727,19 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
         let (atime, atime_intent) = utime_to_duration(&atime);
         let (mtime, mtime_intent) = utime_to_duration(&mtime);
         (
-            atime.transpose()?,
-            mtime.transpose()?,
+            atime.transpose()?.map(Into::into),
+            mtime.transpose()?.map(Into::into),
             atime_intent,
             mtime_intent,
         )
     } else {
         let time = wall_time();
-        (Some(time), Some(time), TimeUpdate::Now, TimeUpdate::Now)
+        (
+            Some(time.into()),
+            Some(time.into()),
+            TimeUpdate::Now,
+            TimeUpdate::Now,
+        )
     };
     update_times(
         memory,
@@ -2045,7 +2047,7 @@ mod tests {
         ];
         assert_eq!(
             legacy_futimesat_pair(valid),
-            Ok((Duration::new(7, 999_999_000), Duration::new(9, 0)))
+            Ok((Timestamp::new(7, 999_999_000), Timestamp::new(9, 0)))
         );
 
         for usec in [-1, 1_000_000] {
@@ -2906,10 +2908,10 @@ mod tests {
             block_size: 4096,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: Duration::ZERO,
-            btime: Duration::ZERO,
-            mtime: Duration::ZERO,
-            ctime: Duration::ZERO,
+            atime: Timestamp::ZERO,
+            btime: Timestamp::ZERO,
+            mtime: Timestamp::ZERO,
+            ctime: Timestamp::ZERO,
         }
     }
 
@@ -2937,7 +2939,7 @@ mod tests {
             requested_user,
             requested_group,
             credentials,
-            ctime,
+            ctime.into(),
         )?
         .into_parts()
         .0)
@@ -2950,7 +2952,12 @@ mod tests {
         ctime: Duration,
     ) -> AxResult<MetadataUpdate> {
         Ok(
-            prepare_chmod_metadata_setattr_for_test(metadata, requested_mode, credentials, ctime)?
+            prepare_chmod_metadata_setattr_for_test(
+                metadata,
+                requested_mode,
+                credentials,
+                ctime.into(),
+            )?
                 .into_parts()
                 .0,
         )

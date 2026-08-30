@@ -130,10 +130,10 @@ impl SimpleFsNode {
             block_size: 0,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: now,
-            btime: now,
-            mtime: now,
-            ctime: now,
+            atime: now.into(),
+            btime: now.into(),
+            mtime: now.into(),
+            ctime: now.into(),
         };
         Self {
             fs,
@@ -167,10 +167,10 @@ impl SimpleFsNode {
             block_size: 0,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: now,
-            btime: now,
-            mtime: now,
-            ctime: now,
+            atime: now.into(),
+            btime: now.into(),
+            mtime: now.into(),
+            ctime: now.into(),
         };
         Ok(Self {
             fs,
@@ -231,7 +231,7 @@ impl NodeOps for SimpleFsNode {
         if let Some(ctime) = update.ctime {
             metadata.ctime = ctime;
         } else if status_changed {
-            metadata.ctime = wall_time();
+            metadata.ctime = wall_time().into();
         }
         Ok(())
     }

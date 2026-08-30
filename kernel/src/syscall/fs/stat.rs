@@ -183,9 +183,9 @@ fn readonly_access_check_applies(node_type: NodeType) -> bool {
     )
 }
 
-fn statx_timestamp_from_duration(time: core::time::Duration) -> statx_timestamp {
+fn statx_timestamp_from_duration(time: axfs_ng_vfs::Timestamp) -> statx_timestamp {
     statx_timestamp {
-        tv_sec: time.as_secs() as _,
+        tv_sec: time.seconds() as _,
         tv_nsec: time.subsec_nanos() as _,
         __reserved: 0,
     }
