@@ -11,7 +11,7 @@ use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
     SchedState, TaskSchedError, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    sched_state, set_sched_state, set_task_affinity,
+    sched_state, set_sched_state_versioned, set_task_affinity, set_task_nice as update_task_nice,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
@@ -29,7 +29,7 @@ use crate::{
     mm::map_usercopy_error,
     task::{
         AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
-        get_process_group, get_process_including_zombie, get_task, get_visible_task,
+        get_process_including_zombie, get_task, get_visible_task,
         has_pending_syscall_signal, prepare_clock_sleep, process_domain,
         security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
         try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
@@ -280,14 +280,22 @@ pub fn set_sched_rr_timeslice_ms(value: i32) {
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
-    set_sched_state(task, state).map_err(|error| match error {
+    let commit = set_sched_state_versioned(task, state).map_err(|error| match error {
         TaskSchedError::Unsupported => AxError::OperationNotSupported,
         TaskSchedError::TaskExited => AxError::NoSuchProcess,
         TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
         TaskSchedError::Scheduler(_) => AxError::InvalidInput,
     })?;
-    if let Some(thread) = task.try_as_thread() {
-        thread.proc_data.publish_scheduler_state(state);
+    if let Some(thread) = task.try_as_thread()
+        && let Some(token) = thread
+            .proc_data
+            .scheduler_publication_token(thread.kernel_tid())
+    {
+        let tid = thread.kernel_tid();
+        let thread = task.as_thread();
+        thread
+            .proc_data
+            .publish_scheduler_state(tid, token, task, commit);
     }
     Ok(0)
 }
@@ -400,23 +408,40 @@ fn scheduler_nice_target(
 }
 
 fn set_task_nice(
+    actor_task: &AxTaskRef,
     actor_cred: &Arc<Cred>,
     target: &SchedulerNiceTarget,
     new_nice: i8,
 ) -> AxResult<()> {
     let task = &target.task;
-    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let mut state = sched_state(task);
-    let rlimit_nice = target_thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+    task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let rlimit_nice = actor_task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
+    let current_nice = sched_state(task).nice;
     SchedulerAuthoritySnapshot::new(actor_cred.clone(), target.credential.clone()).authorize(
         SchedulerSecurityOperation::SetNice {
-            current_nice: state.nice,
+            current_nice,
             requested_nice: new_nice,
             rlimit_nice,
         },
     )?;
-    state.nice = new_nice;
-    apply_sched_state(task, state).map(|_| ())
+    let commit = update_task_nice(task, new_nice).map_err(|error| match error {
+        TaskSchedError::Unsupported => AxError::OperationNotSupported,
+        TaskSchedError::TaskExited => AxError::NoSuchProcess,
+        TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+        TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+    })?;
+    if let Some(thread) = task.try_as_thread()
+        && let Some(token) = thread
+            .proc_data
+            .scheduler_publication_token(thread.kernel_tid())
+    {
+        let tid = thread.kernel_tid();
+        let thread = task.as_thread();
+        thread
+            .proc_data
+            .publish_scheduler_state(tid, token, task, commit);
+    }
+    Ok(())
 }
 
 pub fn sys_sched_yield() -> AxResult<isize> {
@@ -926,7 +951,7 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
             }
             state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
             let requested_nice = validate_nice(attr.sched_nice)?;
-            let rlimit_nice = thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+            let rlimit_nice = current().as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
             authority.authorize(SchedulerSecurityOperation::SetNice {
                 current_nice: old_nice,
                 requested_nice,
@@ -991,7 +1016,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
 /// Linux's `getpriority` parameters are C `int`s.  Decode the low ABI word
 /// explicitly: raw syscall callers are not required to sign-extend it to
 /// x86_64's register width.
-fn getpriority_int(raw: usize) -> i32 {
+fn syscall_c_int(raw: usize) -> i32 {
     raw as u32 as i32
 }
 
@@ -1142,8 +1167,8 @@ fn getpriority_user_nice(
 }
 
 pub fn sys_getpriority(which: usize, who: usize) -> AxResult<isize> {
-    let which = getpriority_int(which);
-    let who = getpriority_int(who);
+    let which = syscall_c_int(which);
+    let who = syscall_c_int(who);
     debug!("sys_getpriority <= which: {which}, who: {who}");
 
     let caller_task = current().clone();
@@ -1186,39 +1211,87 @@ pub fn sys_getpriority(which: usize, who: usize) -> AxResult<isize> {
     }
 }
 
-pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
+fn record_setpriority_result(result: &mut AxResult<()>, attempt: AxResult<()>) {
+    // Linux starts at ESRCH. A success proves that at least one target was
+    // affected, but never erases an earlier target failure; later failures
+    // replace the accumulator while the walk continues.
+    match attempt {
+        Ok(()) if matches!(result, Err(AxError::NoSuchProcess)) => *result = Ok(()),
+        Ok(()) => {}
+        Err(error) => *result = Err(error),
+    }
+}
+
+fn setpriority_one(
+    result: &mut AxResult<()>,
+    actor_task: &AxTaskRef,
+    actor_cred: &Arc<Cred>,
+    task: AxTaskRef,
+    new_nice: i8,
+) {
+    let attempt = scheduler_nice_target(actor_task, actor_cred, task)
+        .and_then(|target| set_task_nice(actor_task, actor_cred, &target, new_nice));
+    record_setpriority_result(result, attempt);
+}
+
+pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize> {
+    let which = syscall_c_int(which);
+    let who = syscall_c_int(who);
+    let prio = syscall_c_int(prio);
     debug!("sys_setpriority <= which: {which}, who: {who}, prio: {prio}");
 
+    if !matches!(which as u32, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
+        return Err(AxError::InvalidInput);
+    }
     let new_nice = clamp_nice(prio);
     let (actor_task, actor_cred) = scheduler_actor_snapshot();
-    let mut targets = Vec::new();
-    match which {
+    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let mut result = Err(AxError::NoSuchProcess);
+    match which as u32 {
         PRIO_PROCESS => {
             let task = if who == 0 {
                 actor_task.clone()
+            } else if who > 0 {
+                visible_live_task_for_getpriority(who as Pid, &caller_pid_ns)
+                    .ok_or(AxError::NoSuchProcess)?
             } else {
-                get_task(who)?
+                return Err(AxError::NoSuchProcess);
             };
-            let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
-            targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-            targets.push(target);
+            setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
         }
         PRIO_PGRP => {
-            let pgid = if who == 0 {
-                actor_task.as_thread().proc_data.proc.group().pgid()
+            if who < 0 {
+                return Err(AxError::NoSuchProcess);
+            }
+            let registry = process_domain()?.registry();
+            let target_group = if who == 0 {
+                Some(actor_task.as_thread().proc_data.proc.group())
             } else {
-                who
+                registry.processes().find_map(|process| {
+                    (!process.is_zombie())
+                        .then(|| process_pid_ns_for_getpriority(&process))
+                        .flatten()
+                        .filter(|pid_ns| {
+                            visible_process_pid_in_namespace(
+                                process.group().pgid(),
+                                pid_ns,
+                                &caller_pid_ns,
+                            ) == Some(who as Pid)
+                        })
+                        .map(|_| process.group())
+                })
             };
-            let group = get_process_group(pgid)?;
-            for process in group
-                .try_processes(process_domain()?.registry())
-                .map_err(process_error)?
-            {
+            let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
+            for process in registry.processes() {
+                if process.is_zombie() || !Arc::ptr_eq(&process.group(), &target_group) {
+                    continue;
+                }
                 for tid in process.thread_ids() {
-                    if let Ok(task) = get_task(tid) {
-                        let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
-                        targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                        targets.push(target);
+                    if let Ok(task) = get_task(tid)
+                        && !task.as_thread().pending_exit()
+                        && caller_pid_ns.contains(&task.as_thread().proc_data.pid_ns())
+                    {
+                        setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
                     }
                 }
             }
@@ -1229,33 +1302,30 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
             } else {
                 actor_cred
                     .user_ns()
-                    .make_kuid(who)
-                    .ok_or(AxError::InvalidInput)?
+                    .make_kuid(who as u32)
+                    .ok_or(AxError::NoSuchProcess)?
             };
-            for task in try_tasks()? {
-                if task.try_as_thread().is_none() {
+            for process in process_domain()?.registry().processes() {
+                if process.is_zombie() {
                     continue;
                 }
-                let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
-                let ids = target.credential.ids();
-                if ids.ruid == uid || ids.euid == uid {
-                    targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    targets.push(target);
+                for tid in process.thread_ids() {
+                    let Ok(task) = get_task(tid) else {
+                        continue;
+                    };
+                    let thread = task.as_thread();
+                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+                        continue;
+                    }
+                    if thread.current_cred().ids().ruid == uid {
+                        setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
+                    }
                 }
             }
         }
         _ => return Err(AxError::InvalidInput),
     }
-
-    if targets.is_empty() {
-        return Err(AxError::NoSuchProcess);
-    }
-
-    for target in &targets {
-        set_task_nice(&actor_cred, target, new_nice)?;
-    }
-
-    Ok(0)
+    result.map(|_| 0)
 }
 
 const IOPRIO_CLASS_SHIFT: u32 = 13;
@@ -1926,9 +1996,27 @@ mod tests {
 
     #[test]
     fn getpriority_decodes_the_low_abi_int_word() {
-        assert_eq!(getpriority_int(0x1_0000_0002), 2);
-        assert_eq!(getpriority_int(0x0000_0000_ffff_ffff), -1);
-        assert_eq!(getpriority_int(0xffff_ffff_8000_0000), i32::MIN);
+        assert_eq!(syscall_c_int(0x1_0000_0002), 2);
+        assert_eq!(syscall_c_int(0x0000_0000_ffff_ffff), -1);
+        assert_eq!(syscall_c_int(0xffff_ffff_8000_0000), i32::MIN);
+    }
+
+    #[test]
+    fn setpriority_accumulator_preserves_target_failures() {
+        let mut result = Err(AxError::NoSuchProcess);
+        // A first success clears only the initial ESRCH accumulator.
+        record_setpriority_result(&mut result, Ok(()));
+        assert_eq!(result, Ok(()));
+        // A later failure is returned even though an earlier target changed.
+        record_setpriority_result(&mut result, Err(AxError::PermissionDenied));
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        // Success after that failure must not hide it.
+        record_setpriority_result(&mut result, Ok(()));
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        // A later failure replaces the recorded error while enumeration
+        // continues, matching the kernel's per-target assignment.
+        record_setpriority_result(&mut result, Err(AxError::InvalidInput));
+        assert_eq!(result, Err(AxError::InvalidInput));
     }
 
     #[test]

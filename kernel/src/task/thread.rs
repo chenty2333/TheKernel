@@ -875,7 +875,9 @@ impl Thread {
                     }
                 }
             }
-            proc_data.publish_scheduler_state(state);
+            // `proc.pid() == tid` above is the construction-time group-leader
+            // identity; no Thread object exists yet to query it from.
+            proc_data.seed_scheduler_state(state, 0);
         }
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;

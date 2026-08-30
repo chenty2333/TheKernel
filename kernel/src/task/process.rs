@@ -19,7 +19,9 @@ use axhal::time::monotonic_time_nanos;
 use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
-use axtask::{SchedClass, SchedState};
+use axtask::{
+    AxTaskRef, SchedClass, SchedState, TaskSchedCommit, current, scheduler_state_snapshot,
+};
 use hashbrown::HashMap;
 use scope_local::Scope;
 use spin::{Once, RwLock};
@@ -141,6 +143,11 @@ use crate::{
 pub(crate) struct ZombieSchedulerSnapshot {
     pub(crate) class: SchedClass,
     pub(crate) nice: i8,
+    /// Generation of the persistent group-leader binding that owned this
+    /// scheduler state. Scheduler commit versions are local to a task, so
+    /// they are comparable only within one binding generation.
+    identity_epoch: u64,
+    version: u64,
 }
 
 impl Default for ZombieSchedulerSnapshot {
@@ -148,6 +155,8 @@ impl Default for ZombieSchedulerSnapshot {
         Self {
             class: SchedClass::Normal,
             nice: 0,
+            identity_epoch: 0,
+            version: 0,
         }
     }
 }
@@ -157,8 +166,23 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
         Self {
             class: state.class,
             nice: state.nice,
+            identity_epoch: 0,
+            version: 0,
         }
     }
+}
+
+fn scheduler_version_is_newer_or_equal(candidate: u64, published: u64) -> bool {
+    candidate.wrapping_sub(published) < (1_u64 << 63)
+}
+
+fn scheduler_publication_matches(
+    published_token: u64,
+    expected_token: u64,
+    commit: TaskSchedCommit,
+    current: Option<TaskSchedCommit>,
+) -> bool {
+    published_token == expected_token && current == Some(commit)
 }
 
 #[derive(Clone)]
@@ -171,6 +195,10 @@ pub(crate) struct GroupLeaderSignalIdentity {
     /// Shared scheduler snapshot updated by successful scheduler transactions
     /// and retained by the zombie owner after the live scheduler node disappears.
     scheduler: Option<Arc<SpinNoIrq<ZombieSchedulerSnapshot>>>,
+    /// Uniquely identifies this installed leader endpoint.  It changes on
+    /// every exec replacement, including when per-task scheduler versions
+    /// restart from zero on the executor.
+    scheduler_identity_token: u64,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -180,6 +208,7 @@ impl GroupLeaderSignalIdentity {
             manager,
             pid_ns: None,
             scheduler: None,
+            scheduler_identity_token: 0,
         }
     }
 
@@ -193,6 +222,7 @@ impl GroupLeaderSignalIdentity {
             manager,
             pid_ns,
             scheduler: None,
+            scheduler_identity_token: 0,
         }
     }
 
@@ -207,6 +237,7 @@ impl GroupLeaderSignalIdentity {
             manager,
             pid_ns,
             scheduler: Some(scheduler),
+            scheduler_identity_token: 0,
         }
     }
 
@@ -1560,6 +1591,12 @@ struct GroupLeaderIdentityBinding {
     identity_token: AtomicU64,
     /// The process PID namespace copied into the durable owner identity.
     pid_ns: Option<Arc<PidNamespace>>,
+    /// Changes with each replacement of the private endpoint that owns the
+    /// process's group-leader identity. Access is serialized with `current`
+    /// and `signal`, which makes a handoff and its scheduler reseed one
+    /// durable binding transaction.
+    scheduler_identity_epoch: SpinNoIrq<u64>,
+    scheduler_identity_token: SpinNoIrq<u64>,
     scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
 }
 
@@ -1577,6 +1614,8 @@ impl GroupLeaderIdentityBinding {
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
             identity_token: AtomicU64::new(1),
             pid_ns,
+            scheduler_identity_epoch: SpinNoIrq::new(0),
+            scheduler_identity_token: SpinNoIrq::new(0),
             scheduler: Arc::try_new(SpinNoIrq::new(ZombieSchedulerSnapshot::default()))
                 .map_err(|_| AxError::NoMemory)?,
         })
@@ -1652,8 +1691,93 @@ impl GroupLeaderIdentityBinding {
         self.signal.clone()
     }
 
-    fn publish_scheduler_state(&self, state: SchedState) {
-        *self.scheduler.lock() = state.into();
+    fn publication_token_for(&self, kernel_tid: Pid) -> Option<u64> {
+        self.signal.lock().as_ref().and_then(|identity| {
+            (identity.registration_tid == kernel_tid).then_some(identity.scheduler_identity_token)
+        })
+    }
+
+    /// Seeds the not-yet-bound initial process identity. The first thread is
+    /// constructed before its private endpoint exists, so no live identity
+    /// can race this one-time initialization.
+    fn seed_scheduler_state(&self, state: SchedState, version: u64) {
+        let mut snapshot = self.scheduler.lock();
+        debug_assert_eq!(snapshot.identity_epoch, 0);
+        // Serial numbers wrap. A candidate is newer when it lies less than
+        // half the u64 sequence space ahead of the published version.
+        if scheduler_version_is_newer_or_equal(version, snapshot.version) {
+            *snapshot = ZombieSchedulerSnapshot {
+                identity_epoch: 0,
+                version,
+                ..state.into()
+            };
+        }
+    }
+
+    /// Publishes a successful scheduler transaction only if its task still
+    /// owns the bound group-leader endpoint. Holding the binding locks through
+    /// the epoch check prevents a former leader from publishing into the new
+    /// leader's durable snapshot after an exec handoff.
+    fn publish_scheduler_commit(
+        &self,
+        registration_tid: Pid,
+        token: u64,
+        task: &AxTaskRef,
+        commit: TaskSchedCommit,
+    ) {
+        let current = self.current.lock();
+        let signal = self.signal.lock();
+        let Some(identity) = signal.as_ref() else {
+            return;
+        };
+        if identity.registration_tid != registration_tid {
+            return;
+        }
+        // Reject a delayed publisher after a newer transaction on this same
+        // task.  The state and version are one run-queue-lock snapshot, never
+        // independently sampled values.
+        if !scheduler_publication_matches(
+            identity.scheduler_identity_token,
+            token,
+            commit,
+            scheduler_state_snapshot(task).ok(),
+        ) {
+            return;
+        }
+        let epoch = *self.scheduler_identity_epoch.lock();
+        let mut snapshot = self.scheduler.lock();
+        if snapshot.identity_epoch == epoch {
+            *snapshot = ZombieSchedulerSnapshot {
+                identity_epoch: epoch,
+                version: commit.version,
+                ..commit.state.into()
+            };
+        }
+        drop(snapshot);
+        drop(signal);
+        drop(current);
+    }
+
+    #[cfg(test)]
+    fn publish_scheduler_state(&self, registration_tid: Pid, state: SchedState, version: u64) {
+        let signal = self.signal.lock();
+        let Some(identity) = signal.as_ref() else {
+            return;
+        };
+        if identity.registration_tid != registration_tid {
+            return;
+        }
+        let epoch = *self.scheduler_identity_epoch.lock();
+        let mut snapshot = self.scheduler.lock();
+        if snapshot.identity_epoch == epoch
+            && scheduler_version_is_newer_or_equal(version, snapshot.version)
+        {
+            *snapshot = ZombieSchedulerSnapshot {
+                identity_epoch: epoch,
+                version,
+                ..state.into()
+            };
+        }
     }
 
     fn publish_handoff<'a>(
@@ -1661,6 +1785,7 @@ impl GroupLeaderIdentityBinding {
         credential: Arc<CredentialSlot>,
         signal: Option<GroupLeaderSignalIdentity>,
         prepared: Option<PreparedCred<'a>>,
+        executor_scheduler: Option<(SchedState, u64)>,
     ) -> GroupLeaderCommit<'a> {
         let signal = signal.map(|mut signal| {
             signal.pid_ns = self.pid_ns.clone();
@@ -1673,17 +1798,41 @@ impl GroupLeaderIdentityBinding {
         let group_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::GroupLeader);
         let publication = prepared.map(PreparedCred::publish);
         let retired = core::mem::replace(&mut *current, credential);
-        let retired_signal = match (current_signal.as_mut(), signal) {
+        let (retired_signal, identity_replaced) = match (current_signal.as_mut(), signal) {
             (Some(current), Some(signal)) => match current.as_ref() {
-                Some(existing) if existing.same_endpoint(&signal) => None,
-                _ => (**current).replace(signal),
+                Some(existing) if existing.same_endpoint(&signal) => (None, false),
+                _ => ((**current).replace(signal), true),
             },
-            _ => None,
+            _ => (None, false),
         };
         // Publish a new epoch while both identity owners remain locked.  This
         // must happen even for leader exec, whose slot and endpoint can both
         // be pointer-identical across the handoff.
         self.identity_token.fetch_add(1, Ordering::Release);
+        if identity_replaced {
+            // Task scheduler versions belong to individual scheduler nodes.
+            // Advance the binding epoch and publish the executor's exact
+            // state while the identity locks are still held; no old leader
+            // publication can be ordered into this new generation.
+            let mut epoch = self.scheduler_identity_epoch.lock();
+            let mut token = self.scheduler_identity_token.lock();
+            *epoch = epoch.wrapping_add(1);
+            *token = token.wrapping_add(1);
+            // The installed endpoint, epoch advance, and forced executor
+            // seed form one leader-identity transaction.
+            current_signal
+                .as_mut()
+                .and_then(|signal| signal.as_mut())
+                .expect("replaced leader endpoint must be installed")
+                .scheduler_identity_token = *token;
+            if let Some((state, version)) = executor_scheduler {
+                *self.scheduler.lock() = ZombieSchedulerSnapshot {
+                    identity_epoch: *epoch,
+                    version,
+                    ..state.into()
+                };
+            }
+        }
         drop(current_signal);
         drop(current);
         #[cfg(test)]
@@ -1945,13 +2094,15 @@ fn replace_process_image_with_group_handoff<'a, A>(
     credential: Arc<CredentialSlot>,
     signal: Option<GroupLeaderSignalIdentity>,
     prepared: Option<PreparedCred<'a>>,
+    executor_scheduler: Option<(SchedState, u64)>,
     new_image: ProcessImageBinding<A>,
     finish_image_publication: impl FnOnce(),
 ) -> (GroupLeaderCommit<'a>, ProcessImageBinding<A>) {
     let mut image = image_binding.write();
     #[cfg(test)]
     let image_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::ProcessImage);
-    let group_leader = group_leader.publish_handoff(credential, signal, prepared);
+    let group_leader =
+        group_leader.publish_handoff(credential, signal, prepared, executor_scheduler);
     let retired_image = core::mem::replace(&mut *image, new_image);
     finish_image_publication();
     drop(image);
@@ -2861,8 +3012,30 @@ impl ProcessData {
     /// identity. The owner and its scheduler cell are shared with any
     /// already-published zombie payload, so this remains valid even after the
     /// runtime process membership is removed.
-    pub(crate) fn publish_scheduler_state(&self, state: SchedState) {
-        self.group_leader_identity.publish_scheduler_state(state);
+    pub(crate) fn seed_scheduler_state(&self, state: SchedState, version: u64) {
+        self.group_leader_identity
+            .seed_scheduler_state(state, version);
+    }
+
+    pub(crate) fn publish_scheduler_state(
+        &self,
+        registration_tid: Pid,
+        token: u64,
+        task: &AxTaskRef,
+        commit: TaskSchedCommit,
+    ) {
+        self.group_leader_identity
+            .publish_scheduler_commit(registration_tid, token, task, commit);
+    }
+
+    /// Returns the token only when `kernel_tid` is the authoritative current
+    /// leader endpoint. This intentionally does not consult a task's visible
+    /// TID: non-leader exec installs this endpoint before its TID alias is
+    /// published. Scheduler publishers query it after their run-queue commit,
+    /// so exec excludes a retired leader and admits its executor immediately.
+    pub(crate) fn scheduler_publication_token(&self, kernel_tid: Pid) -> Option<u64> {
+        self.group_leader_identity
+            .publication_token_for(kernel_tid)
     }
 
     /// Takes process-directed identity, dumpability, and image through one
@@ -2992,6 +3165,10 @@ impl ProcessData {
             thread.set_pdeath_signal(0);
         }
         let new_tlb_state = new_aspace.lock().tlb_state();
+        let executor = current().clone();
+        let executor_scheduler = scheduler_state_snapshot(&executor).ok().map(|commit| {
+            (commit.state, commit.version)
+        });
         // `publish_exec_image` is the only production image writer. Exec has
         // already drained the thread group to `owner`, so preventing this
         // thread from being switched out closes the only scheduler race: an
@@ -3007,6 +3184,7 @@ impl ProcessData {
                 thread.signal.clone(),
             )),
             Some(prepared),
+            executor_scheduler,
             ProcessImageBinding {
                 aspace: new_aspace,
                 access_state: new_access_state,
@@ -4329,7 +4507,7 @@ mod tests {
 
     use axerrno::AxError;
     use axsync::spin::SpinNoIrq;
-    use axtask::{SchedClass, SchedState};
+    use axtask::{SchedClass, SchedState, TaskSchedCommit};
     use linux_raw_sys::general::CAP_CHOWN;
     use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, Signo,
@@ -4349,7 +4527,7 @@ mod tests {
         release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
         scheduler_tlb_state_snapshot, snapshot_credential_image, snapshot_group_credential_image,
-        try_allocate_namespace_id, try_increment_bounded,
+        scheduler_publication_matches, try_allocate_namespace_id, try_increment_bounded,
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
@@ -5183,6 +5361,7 @@ mod tests {
             new_slot.clone(),
             None,
             Some(prepared),
+            None,
             ProcessImageBinding {
                 aspace: 2,
                 access_state: new_state,
@@ -5328,6 +5507,7 @@ mod tests {
                     executor_slot.clone(),
                     Some(GroupLeaderSignalIdentity::new(executor_tid, new_signal)),
                     Some(prepared),
+                    None,
                     ProcessImageBinding {
                         aspace: new_image,
                         access_state: new_state,
@@ -5465,20 +5645,30 @@ mod tests {
 
         assert_eq!(*scheduler.lock(), ZombieSchedulerSnapshot::default());
 
-        group.publish_scheduler_state(SchedState {
-            class: SchedClass::Normal,
-            nice: 19,
-            rt_priority: 0,
-        });
-        group.publish_scheduler_state(SchedState {
-            class: SchedClass::Idle,
-            nice: 19,
-            rt_priority: 0,
-        });
+        group.publish_scheduler_state(
+            41,
+            SchedState {
+                class: SchedClass::Normal,
+                nice: 19,
+                rt_priority: 0,
+            },
+            0,
+        );
+        group.publish_scheduler_state(
+            41,
+            SchedState {
+                class: SchedClass::Idle,
+                nice: 19,
+                rt_priority: 0,
+            },
+            0,
+        );
 
         let expected = ZombieSchedulerSnapshot {
             class: SchedClass::Idle,
             nice: 19,
+            identity_epoch: 0,
+            version: 0,
         };
         assert_eq!(*scheduler.lock(), expected);
         assert_eq!(
@@ -5490,6 +5680,212 @@ mod tests {
                 .lock(),
             expected
         );
+    }
+
+    #[test]
+    fn group_leader_handoff_reseeds_scheduler_snapshot_in_a_new_identity_epoch() {
+        let binding = GroupLeaderIdentityBinding::try_new(credential_slot(1000)).unwrap();
+        binding
+            .bind_initial_signal(9, thread_signal_manager())
+            .unwrap();
+        let owner = binding.signal_owner();
+
+        binding.publish_scheduler_state(
+            9,
+            SchedState {
+                class: SchedClass::Idle,
+                nice: 19,
+                rt_priority: 0,
+            },
+            100,
+        );
+        let handoff = binding.publish_handoff(
+            credential_slot(2000),
+            Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
+            None,
+            Some((
+                SchedState {
+                    class: SchedClass::Normal,
+                    nice: -5,
+                    rt_priority: 0,
+                },
+                3,
+            )),
+        );
+        drop(handoff.complete_post_commit());
+
+        let scheduler = owner
+            .lock()
+            .as_ref()
+            .and_then(|identity| identity.scheduler.clone())
+            .unwrap();
+        assert_eq!(
+            *scheduler.lock(),
+            ZombieSchedulerSnapshot {
+                class: SchedClass::Normal,
+                nice: -5,
+                identity_epoch: 1,
+                version: 3,
+            }
+        );
+
+        // The retired leader's larger local version is not comparable with
+        // the executor's stream and must not overwrite the new binding.
+        binding.publish_scheduler_state(
+            9,
+            SchedState {
+                class: SchedClass::Fifo,
+                nice: 0,
+                rt_priority: 1,
+            },
+            101,
+        );
+        binding.publish_scheduler_state(
+            10,
+            SchedState {
+                class: SchedClass::Batch,
+                nice: 4,
+                rt_priority: 0,
+            },
+            4,
+        );
+        assert_eq!(
+            *scheduler.lock(),
+            ZombieSchedulerSnapshot {
+                class: SchedClass::Batch,
+                nice: 4,
+                identity_epoch: 1,
+                version: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn scheduler_handoff_accepts_new_task_version_zero_after_old_version_five() {
+        let old = TaskSchedCommit {
+            state: SchedState {
+                class: SchedClass::Fifo,
+                nice: 0,
+                rt_priority: 1,
+            },
+            version: 5,
+        };
+        let new = TaskSchedCommit {
+            state: SchedState {
+                class: SchedClass::Normal,
+                nice: -4,
+                rt_priority: 0,
+            },
+            version: 0,
+        };
+        // The token changes with identity, so version streams are never
+        // compared across the old leader and a new executor.
+        assert!(scheduler_publication_matches(18, 18, new, Some(new)));
+        assert_ne!(old.version, new.version);
+    }
+
+    #[test]
+    fn scheduler_publication_rejects_remote_state_version_change() {
+        let committed = TaskSchedCommit {
+            state: SchedState {
+                class: SchedClass::Normal,
+                nice: 3,
+                rt_priority: 0,
+            },
+            version: 7,
+        };
+        let remote = TaskSchedCommit {
+            state: SchedState {
+                class: SchedClass::Batch,
+                nice: 8,
+                rt_priority: 0,
+            },
+            version: 8,
+        };
+        assert!(!scheduler_publication_matches(4, 4, committed, Some(remote)));
+    }
+
+    #[test]
+    fn delayed_old_leader_scheduler_publication_is_rejected_by_token() {
+        let commit = TaskSchedCommit {
+            state: SchedState::default(),
+            version: 5,
+        };
+        assert!(!scheduler_publication_matches(12, 11, commit, Some(commit)));
+    }
+
+    #[test]
+    fn scheduler_commit_before_exec_cannot_admit_after_leader_handoff() {
+        let binding = GroupLeaderIdentityBinding::try_new(credential_slot(1000)).unwrap();
+        binding
+            .bind_initial_signal(9, thread_signal_manager())
+            .unwrap();
+        let old_token = binding.publication_token_for(9);
+        let handoff = binding.publish_handoff(
+            credential_slot(2000),
+            Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
+            None,
+            Some((SchedState::default(), 0)),
+        );
+        drop(handoff.complete_post_commit());
+
+        // The commit completed before exec but publication admission is after
+        // exec: the retired executor is no longer the durable leader.
+        assert_eq!(old_token, Some(0));
+        assert_eq!(binding.publication_token_for(9), None);
+    }
+
+    #[test]
+    fn scheduler_commit_after_exec_seed_admits_under_new_leader_token() {
+        let binding = GroupLeaderIdentityBinding::try_new(credential_slot(1000)).unwrap();
+        binding
+            .bind_initial_signal(9, thread_signal_manager())
+            .unwrap();
+        let handoff = binding.publish_handoff(
+            credential_slot(2000),
+            Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
+            None,
+            Some((SchedState::default(), 0)),
+        );
+        drop(handoff.complete_post_commit());
+
+        let commit = TaskSchedCommit {
+            state: SchedState {
+                class: SchedClass::Batch,
+                nice: 6,
+                rt_priority: 0,
+            },
+            version: 1,
+        };
+        let token = binding.publication_token_for(10);
+        assert_eq!(token, Some(1));
+        assert!(scheduler_publication_matches(
+            token.unwrap(),
+            token.unwrap(),
+            commit,
+            Some(commit)
+        ));
+    }
+
+    #[test]
+    fn binding_switched_before_visible_tid_alias_admits_new_executor_only() {
+        let binding = GroupLeaderIdentityBinding::try_new(credential_slot(1000)).unwrap();
+        binding
+            .bind_initial_signal(9, thread_signal_manager())
+            .unwrap();
+        let handoff = binding.publish_handoff(
+            credential_slot(2000),
+            Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
+            None,
+            Some((SchedState::default(), 0)),
+        );
+        drop(handoff.complete_post_commit());
+
+        // This is the window before exec publishes the executor's visible-TID
+        // alias.  Admission follows the installed kernel-TID endpoint, not
+        // the old/new user-visible TID value.
+        assert_eq!(binding.publication_token_for(9), None);
+        assert_eq!(binding.publication_token_for(10), Some(1));
     }
 
     #[test]
@@ -5543,6 +5939,7 @@ mod tests {
         let commit = binding.publish_handoff(
             new_slot,
             Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
+            None,
             None,
         );
         let (credential, signal) = binding.current_cred_and_signal().unwrap();
@@ -5641,6 +6038,7 @@ mod tests {
             new_slot.clone(),
             Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
             None,
+            None,
         );
         assert_eq!(old_user.queued(), 1);
         drop(replacement.complete_post_commit());
@@ -5652,6 +6050,7 @@ mod tests {
         let same_endpoint = binding.publish_handoff(
             new_slot,
             Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
+            None,
             None,
         );
         drop(same_endpoint.complete_post_commit());
@@ -5676,6 +6075,7 @@ mod tests {
                     credential_slot(2000),
                     Some(GroupLeaderSignalIdentity::new(10, second.clone())),
                     None,
+                    None,
                 )
                 .complete_post_commit(),
         );
@@ -5684,6 +6084,7 @@ mod tests {
                 .publish_handoff(
                     credential_slot(3000),
                     Some(GroupLeaderSignalIdentity::new(11, third.clone())),
+                    None,
                     None,
                 )
                 .complete_post_commit(),
@@ -5725,7 +6126,7 @@ mod tests {
         update.builder.ids.fsuid = kuid(3000);
         let prepared = update.finish().unwrap();
         start.wait();
-        let commit = binding.publish_handoff(new.clone(), None, Some(prepared));
+        let commit = binding.publish_handoff(new.clone(), None, Some(prepared), None);
         assert_eq!(binding.current_cred().ids().ruid, kuid(3000));
         let retirement = commit.complete_post_commit();
         drop(retirement);
@@ -6173,5 +6574,12 @@ mod tests {
             Err(axerrno::LinuxError::ENOSPC.into())
         );
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn scheduler_snapshot_versions_order_across_wrap() {
+        assert!(super::scheduler_version_is_newer_or_equal(0, u64::MAX));
+        assert!(super::scheduler_version_is_newer_or_equal(1, u64::MAX));
+        assert!(!super::scheduler_version_is_newer_or_equal(u64::MAX, 1));
     }
 }
