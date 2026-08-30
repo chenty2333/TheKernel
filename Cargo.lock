@@ -2064,8 +2064,6 @@ dependencies = [
 [[package]]
 name = "page_table_entry"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e9a63b9b86d32f64c3874a90936939281d045ef1751d0aca3d82d5e4e06b2ef"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "bitflags 2.11.0",
