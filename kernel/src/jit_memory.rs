@@ -293,6 +293,17 @@ impl WritableCode {
     pub(crate) fn code_address(&self) -> usize {
         self.code.as_usize()
     }
+
+    /// Views the unpublished final mapping through its writable, NX alias.
+    /// This is deliberately restricted to the builder lifetime: callers must
+    /// finish all relocation and initialization before publishing or dropping
+    /// the allocation.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `WritableCode` exclusively owns this RW/NX mapping while it
+        // is armed. Publication consumes `self`, so the returned borrow cannot
+        // survive a permission transition.
+        unsafe { core::slice::from_raw_parts_mut(self.code.as_mut_ptr(), self.len) }
+    }
     /// Copies bytes into the unpublished NX alias.
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> AxResult<()> {
         let end = offset
