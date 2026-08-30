@@ -162,7 +162,6 @@ all-features = true
 # Force all direct and transitive users onto the vendored axnet-ng so feature
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
-page_table_entry = { path = "third_party/rust-patches/page_table_entry" }
 axhal = { path = "third_party/rust-patches/axhal" }
 axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
