@@ -2772,30 +2772,25 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
-    // Secretmem participates in the same RLIMIT_FSIZE admission and SIGXFSZ
-    // delivery as every other ftruncate target.
-    check_resize_limit(length as u64)?;
     let file_like = get_file_like(fd)?;
+    let kind = FileLikeKind::from_file_like(file_like.as_ref());
+    match kind {
+        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Socket | FileLikeKind::Other => return Err(AxError::InvalidInput),
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Regular => {}
+    }
+    file_like.check_io_access()?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
+        // All descriptor/type admission precedes RLIMIT_FSIZE, so an invalid
+        // fd never gains SIGXFSZ merely because the requested size is large.
+        check_resize_limit(length as u64)?;
         secret.truncate(length as u64)?;
         return Ok(0);
     }
     let security = current_vfs_security();
-    let kind = FileLikeKind::from_file_like(file_like.as_ref());
-    match kind {
-        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
-        FileLikeKind::Socket => return Err(AxError::InvalidInput),
-        FileLikeKind::Directory => return Err(AxError::IsADirectory),
-        FileLikeKind::Regular | FileLikeKind::Other => {}
-    }
     let f = file_like.downcast::<File>()?;
-    let backend = f
-        .inner()
-        .access(FileFlags::WRITE)
-        .map_err(|err| match err {
-            AxError::BadFileDescriptor => AxError::InvalidInput,
-            other => other,
-        })?;
+    let backend = f.inner().access(FileFlags::WRITE)?;
     check_writable_mount(f.inner().location())?;
     crate::mm::check_not_active(f.inner().location())?;
     let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
@@ -2803,6 +2798,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::PermissionDenied);
     }
     executable::check_not_active(f.inner().location())?;
+    check_resize_limit(length as u64)?;
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;
     let status = f.io_status_snapshot();
