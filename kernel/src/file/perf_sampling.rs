@@ -5,7 +5,11 @@
 //! overflow interrupt from acquiring the counting group's lifecycle lock.
 
 use alloc::{borrow::Cow, sync::Arc};
-use core::task::Context;
+use core::{
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    task::Context,
+};
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
@@ -95,7 +99,28 @@ pub(crate) struct PerfSamplingFile {
     config: SamplingConfig,
     state: SpinNoIrq<SamplingState>,
     waiters: PollSet<4>,
+    retire_next: AtomicPtr<PerfSamplingFile>,
+    retire_queued: AtomicBool,
 }
+
+struct SamplingRetireQueue {
+    incoming: AtomicPtr<PerfSamplingFile>,
+    pending: AtomicPtr<PerfSamplingFile>,
+    draining: AtomicBool,
+}
+
+impl SamplingRetireQueue {
+    const fn new() -> Self {
+        Self {
+            incoming: AtomicPtr::new(ptr::null_mut()),
+            pending: AtomicPtr::new(ptr::null_mut()),
+            draining: AtomicBool::new(false),
+        }
+    }
+}
+
+static RETIRED_CUSTODY: SamplingRetireQueue = SamplingRetireQueue::new();
+const RETIRE_BATCH: usize = 16;
 
 struct CpuCustody {
     event: Arc<PerfSamplingFile>,
@@ -129,6 +154,89 @@ const fn reconcile_action(live: bool, matching_owner: bool, token_armed: bool) -
 static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
+fn defer_custody_retire(event: Arc<PerfSamplingFile>) {
+    if event
+        .retire_queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // The already-published raw Arc remains an owner until task-context
+        // drain, so this IRQ-side drop can never be the final reference.
+        drop(event);
+        return;
+    }
+    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
+    loop {
+        let head = RETIRED_CUSTODY.incoming.load(Ordering::Acquire);
+        // SAFETY: this raw Arc is uniquely owned by the queue publication.
+        unsafe { (*node).retire_next.store(head, Ordering::Relaxed) };
+        if RETIRED_CUSTODY
+            .incoming
+            .compare_exchange_weak(head, node, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn reverse_retire_list(mut head: *mut PerfSamplingFile) -> *mut PerfSamplingFile {
+    let mut reversed = ptr::null_mut();
+    while !head.is_null() {
+        // SAFETY: nodes are detached from incoming by the sole consumer.
+        let next = unsafe { (*head).retire_next.load(Ordering::Relaxed) };
+        unsafe { (*head).retire_next.store(reversed, Ordering::Relaxed) };
+        reversed = head;
+        head = next;
+    }
+    reversed
+}
+
+pub(crate) fn has_deferred_custody_retire_work() -> bool {
+    !RETIRED_CUSTODY.incoming.load(Ordering::Acquire).is_null()
+        || !RETIRED_CUSTODY.pending.load(Ordering::Acquire).is_null()
+}
+
+pub(crate) fn drain_deferred_custody_retire_work() {
+    if RETIRED_CUSTODY
+        .draining
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let mut list = RETIRED_CUSTODY
+        .pending
+        .swap(ptr::null_mut(), Ordering::AcqRel);
+    if list.is_null() {
+        list = reverse_retire_list(
+            RETIRED_CUSTODY
+                .incoming
+                .swap(ptr::null_mut(), Ordering::AcqRel),
+        );
+    }
+    let mut count = 0;
+    while !list.is_null() && count < RETIRE_BATCH {
+        let node = list;
+        // SAFETY: `node` is exclusively held by this consumer list.
+        list = unsafe { (*node).retire_next.load(Ordering::Relaxed) };
+        unsafe {
+            (*node)
+                .retire_next
+                .store(ptr::null_mut(), Ordering::Relaxed)
+        };
+        // SAFETY: `into_raw` in defer_custody_retire creates exactly this Arc.
+        let event = unsafe { Arc::from_raw(node) };
+        event.retire_queued.store(false, Ordering::Release);
+        drop(event);
+        count += 1;
+    }
+    if !list.is_null() {
+        RETIRED_CUSTODY.pending.store(list, Ordering::Release);
+    }
+    RETIRED_CUSTODY.draining.store(false, Ordering::Release);
+}
+
 impl PerfSamplingFile {
     pub(crate) fn try_new(config: SamplingConfig) -> AxResult<Arc<Self>> {
         let now = axhal::time::monotonic_time_nanos();
@@ -146,6 +254,8 @@ impl PerfSamplingFile {
             }),
             config,
             waiters: PollSet::new(),
+            retire_next: AtomicPtr::new(ptr::null_mut()),
+            retire_queued: AtomicBool::new(false),
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -236,6 +346,7 @@ impl PerfSamplingFile {
             return;
         };
         Self::stop_custody(&mut custody, StopSettlement::Normal);
+        defer_custody_retire(custody.event);
     }
 
     fn live(&self) -> bool {
@@ -433,10 +544,11 @@ impl PerfSamplingFile {
         // The state lock spans the rearm decision: close/disable can neither
         // win after the period was accounted nor leave a live counter behind.
         let rearm = !state.failed && state.enabled && !state.closed && state.ring.is_some();
-        if published.published {
+        let wake_needed = published.published;
+        drop(state);
+        if wake_needed {
             event.waiters.wake();
         }
-        drop(state);
         if rearm {
             if axhal::pmu::sampling_rearm_local(sample.cookie, generation).is_ok() {
                 return;

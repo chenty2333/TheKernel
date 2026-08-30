@@ -89,7 +89,7 @@ static PROCESS_TIMER_FALLBACK_SEEN: [AtomicUsize; axconfig::plat::MAX_CPU_NUM] =
 static FILESYSTEM_FINALIZER_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 fn policy_work_pending() -> bool {
-    crate::rcu::credential_retire_pending()
+    let pending = crate::rcu::credential_retire_pending()
         || crate::rcu::seccomp_retire_pending()
         || axfs_ng_vfs::has_deferred_dentry_cache_cleanup_work()
         || axnet::unix::has_deferred_receive_cleanup_work()
@@ -97,7 +97,15 @@ fn policy_work_pending() -> bool {
         || crate::file::dnotify::has_deferred_table_cleanup_work()
         || crate::file::fanotify::has_deferred_cleanup_work()
         || crate::file::inotify::has_deferred_notification_work()
-        || crate::file::io_uring::has_deferred_io_uring_work()
+        || crate::file::io_uring::has_deferred_io_uring_work();
+    #[cfg(feature = "perf-sampling")]
+    {
+        pending || crate::file::perf_sampling::has_deferred_custody_retire_work()
+    }
+    #[cfg(not(feature = "perf-sampling"))]
+    {
+        pending
+    }
 }
 
 fn finalizer_work_pending() -> bool {
@@ -208,6 +216,8 @@ fn policy_worker() {
             crate::file::inotify::drain_close_notifications();
             crate::file::inotify::drain_filesystem_release_notifications();
             crate::file::io_uring::drain_deferred_io_uring_work();
+            #[cfg(feature = "perf-sampling")]
+            crate::file::perf_sampling::drain_deferred_custody_retire_work();
             if policy_work_pending() {
                 axtask::yield_now();
             }

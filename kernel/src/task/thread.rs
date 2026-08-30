@@ -1414,11 +1414,13 @@ impl Thread {
     }
 
     fn perf_on_leave(&self) {
-        let mut events = self.perf_events.lock();
-        events.retain(|group| {
-            group.on_leave();
-            !group.is_prunable()
-        });
+        {
+            let mut events = self.perf_events.lock();
+            events.retain(|group| {
+                group.on_leave();
+                !group.is_prunable()
+            });
+        }
         #[cfg(feature = "perf-sampling")]
         crate::file::PerfSamplingFile::leave_current();
     }
