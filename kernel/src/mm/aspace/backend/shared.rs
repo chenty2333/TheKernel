@@ -817,7 +817,10 @@ impl SharedBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
     ) -> AxResult<Self> {
-        if self.pages.is_fixed() {
+        // mremap(old_size = 0) duplicates a MAP_SHARED secret VMA.  It must
+        // retain the same secret object but gets an independent map identity;
+        // ordinary fixed control mappings remain non-duplicable.
+        if self.pages.is_fixed() && !self.pages.is_secret() {
             return Err(AxError::OperationNotSupported);
         }
         let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
@@ -825,6 +828,12 @@ impl SharedBackend {
     }
 
     pub(crate) fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
+        // Growing a secret VMA never grows its immutable file backing.  New
+        // pages are valid mappings but fault as SIGBUS once their backing
+        // offset reaches i_size.
+        if self.pages.is_secret() {
+            return Ok(());
+        }
         let offset = start
             .as_usize()
             .checked_sub(self.start.as_usize())
@@ -1217,6 +1226,28 @@ mod tests {
         assert!(!backend.faults_with_sigbus(VirtAddr::from(0x4000)));
         assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5000)));
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
+    }
+
+    #[test]
+    fn secret_fixed_mapping_can_grow_and_duplicate_without_backing_growth() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        backend.ensure_range_covered(VirtAddr::from(0x4000), PAGE_SIZE_4K * 2).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+
+        let duplicate = backend
+            .duplicate_mapping(VirtAddr::from(0x4000), VirtAddr::from(0x8000))
+            .unwrap();
+        assert!(Arc::ptr_eq(backend.pages(), duplicate.pages()));
+        assert_eq!(duplicate.futex_id(0x8000), backend.futex_id(0x4000));
     }
 
     #[test]
