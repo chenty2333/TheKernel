@@ -63,7 +63,7 @@ impl RawMutex {
         loop {
             if cancelled() {
                 if owns_handoff {
-                    self.pass_handoff();
+                    self.pass_handoff(false);
                 }
                 return false;
             }
@@ -129,12 +129,24 @@ impl RawMutex {
         }
     }
 
-    fn pass_handoff(&self) {
+    /// Passes a selected turn. `caller_interest_live` is explicit because a
+    /// cancel path may have removed its own registration before handing off;
+    /// inferring that from the aggregate waiter count loses the final other
+    /// waiter in the two-waiter cancellation interleave.
+    fn pass_handoff(&self, caller_interest_live: bool) {
         debug_assert_eq!(self.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
-        // This waiter is still counted. If it is the last one, opening the
-        // lock is safe: a concurrently registering waiter rechecks owner
-        // after listener publication and therefore cannot sleep past it.
-        if self.waiters.load(Ordering::SeqCst) <= 1 {
+        // The caller may or may not still be represented in `waiters`; the
+        // explicit parameter above is the only reliable distinction.  If no
+        // waiter remains, opening the lock is safe: a concurrently
+        // registering waiter rechecks owner after listener publication and
+        // therefore cannot sleep past it.
+        let waiters = self.waiters.load(Ordering::SeqCst);
+        let remaining = if caller_interest_live {
+            waiters.saturating_sub(1)
+        } else {
+            waiters
+        };
+        if remaining == 0 {
             let _ = self.owner_id.compare_exchange(
                 HANDOFF_OWNER,
                 0,
@@ -165,7 +177,7 @@ impl RawMutex {
                 .is_ok()
             {
                 self.owner_id.store(HANDOFF_OWNER, Ordering::Release);
-                self.pass_handoff();
+                self.pass_handoff(false);
                 return;
             }
         }
@@ -398,6 +410,7 @@ pub fn lock_interruptible<T>(
 
 #[cfg(test)]
 mod tests {
+    use super::{RawMutex, WaiterInterest, HANDOFF_OWNER};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{
         alloc::{GlobalAlloc, Layout, System},
@@ -596,6 +609,27 @@ mod tests {
         drop(guard);
         queued.join().unwrap();
         barger.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_selected_waiter_notifies_the_last_other_waiter() {
+        // Precise cancellation/unlock interleave: two listeners registered,
+        // unlock selected the first one, and that first listener withdrew its
+        // own interest before it could observe the notification.  The count
+        // of one is the *other* listener, not the cancelling caller.
+        let raw = RawMutex::new();
+        let cancelled = WaiterInterest::new(&raw.waiters);
+        let _remaining = WaiterInterest::new(&raw.waiters);
+        raw.owner_id.store(HANDOFF_OWNER, Ordering::SeqCst);
+        drop(cancelled);
+
+        raw.pass_handoff(false);
+
+        // Keep the handoff sentinel closed to bargers and wake the remaining
+        // listener.  Treating `waiters == 1` as the cancelling caller would
+        // instead open this lock without a notification.
+        assert_eq!(raw.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
+        assert_eq!(raw.notify_count(), 1);
     }
 
     #[test]
