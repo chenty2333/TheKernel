@@ -3084,6 +3084,13 @@ impl ProcessData {
         self.process_lifecycle.lock()
     }
 
+    /// Returns whether this process has crossed the only exit states for
+    /// which Linux permits `process_mrelease`.  A live sibling sharing an mm
+    /// is rejected by the syscall before this state transition is attempted.
+    pub(crate) fn oom_reap_eligible(&self) -> bool {
+        self.group_exit_in_progress() || self.proc.is_zombie()
+    }
+
     /// Binds this process's sole payload reservation only after the process
     /// domain has validated and exclusively reserved final exit.
     pub(crate) fn prepare_zombie_exit(

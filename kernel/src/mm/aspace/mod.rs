@@ -1055,6 +1055,10 @@ pub struct AddrSpace {
     /// owners and remote memory operations all observe the same Linux
     /// process-wide high-water mark.
     maxrss_kb: AtomicU64,
+    /// Shared mm-level OOM-reaper ownership.  This is part of the address
+    /// space rather than ProcessData because separate CLONE_VM process groups
+    /// must never concurrently retire the same PTE/backing ownership.
+    oom_reap_state: AtomicU8,
     /// Monotonic PTE invalidation generation and bounded per-CPU residency.
     /// The state is shared with scheduler hooks so they can publish residency
     /// without taking the address-space mutex.
@@ -1540,6 +1544,7 @@ impl AddrSpace {
             address_space_id,
             hardware_asid,
             maxrss_kb: AtomicU64::new(0),
+            oom_reap_state: AtomicU8::new(0),
             tlb: Arc::try_new(TlbState::new()).map_err(|_| AxError::NoMemory)?,
             topology_mapping_id,
             topology_generation,
@@ -2671,6 +2676,25 @@ impl AddrSpace {
                 resident_bytes
             })
             .sum()
+    }
+
+    /// Claims this shared mm's OOM reaper.  Completed mm teardown is a
+    /// successful no-op; a concurrent pass must be retried by its caller.
+    pub(crate) fn begin_oom_reap(&self) -> AxResult<bool> {
+        match self
+            .oom_reap_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(true),
+            Err(2) => Ok(false),
+            Err(_) => Err(AxError::ResourceBusy),
+        }
+    }
+
+    /// Completes (or makes retryable) the reaper ownership claimed above.
+    pub(crate) fn finish_oom_reap(&self, completed: bool) {
+        self.oom_reap_state
+            .store(if completed { 2 } else { 0 }, Ordering::Release);
     }
 
     /// Merges an already-observed peak into this mm's high-water mark.
@@ -3878,6 +3902,36 @@ impl AddrSpace {
         }
     }
 
+    /// Reclaim the PTEs and backing frames the Linux OOM reaper may discard.
+    ///
+    /// The caller holds the address-space mmap-equivalent lock.  Do not race
+    /// active user-I/O pins or userfaultfd registrations: this kernel has no
+    /// nonblocking notifier protocol for either, so retaining the complete
+    /// image and asking the caller to retry is the only safe outcome.
+    /// Private file COW mappings are included, matching Linux's
+    /// `vma_is_anonymous(vma) || !(vma->vm_flags & VM_SHARED)` rule.
+    pub(crate) fn oom_reap_private_pages(&mut self) -> bool {
+        if self.user_io_pins.progress().total() != 0 || self.uffd.is_some() {
+            return false;
+        }
+
+        let ranges = self
+            .areas
+            .iter()
+            .filter(|area| area.backend().is_oom_reapable_private())
+            .map(|area| (area.start(), area.size()))
+            .collect::<Vec<_>>();
+
+        for (start, size) in ranges {
+            // discard_pages drains PTEs through the backend, waits for the
+            // TLB generation grace period, and only then retires frames.
+            if self.discard_pages(start, size).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn sync_backends_in_range(
         &self,
         mut start: VirtAddr,
@@ -4719,6 +4773,40 @@ mod tests {
         assert_eq!(aspace.merge_resident_highwater(12), 12);
         assert_eq!(aspace.merge_resident_highwater(7), 12);
         assert_eq!(aspace.merge_resident_highwater(19), 19);
+    }
+
+    #[test]
+    fn oom_reap_drains_private_cow_ptes_but_keeps_vmas() {
+        let start = VirtAddr::from(0x1000);
+        let mut aspace = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+        aspace
+            .map(
+                start,
+                PAGE_SIZE_4K * 2,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                true,
+                Backend::new_alloc(start, PageSize::Size4K),
+            )
+            .unwrap();
+        assert_eq!(aspace.current_mapping_bytes(), PAGE_SIZE_4K * 2);
+        assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K * 2);
+
+        assert!(aspace.oom_reap_private_pages());
+        assert_eq!(aspace.current_mapping_bytes(), PAGE_SIZE_4K * 2);
+        assert_eq!(aspace.resident_user_bytes(), 0);
+        // A completed reaper pass is idempotent at the page-table layer.
+        assert!(aspace.oom_reap_private_pages());
+    }
+
+    #[test]
+    fn oom_reaper_mm_owner_is_exactly_once_and_retryable() {
+        let aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE).unwrap();
+        assert_eq!(aspace.begin_oom_reap(), Ok(true));
+        assert_eq!(aspace.begin_oom_reap(), Err(AxError::ResourceBusy));
+        aspace.finish_oom_reap(false);
+        assert_eq!(aspace.begin_oom_reap(), Ok(true));
+        aspace.finish_oom_reap(true);
+        assert_eq!(aspace.begin_oom_reap(), Ok(false));
     }
 
     #[test]

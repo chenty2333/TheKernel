@@ -901,6 +901,7 @@ pub(super) fn dispatch_syscall(
             uctx.arg3() as _,
             uctx.arg4() as _,
         ),
+        Sysno::process_mrelease => sys_process_mrelease(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::madvise => sys_madvise(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::msync => sys_msync(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mlock => sys_mlock(uctx.arg0(), uctx.arg1() as _),

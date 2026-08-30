@@ -565,6 +565,13 @@ impl Backend {
             && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
+    /// Linux's OOM reaper drops every private COW mapping, including a
+    /// MAP_PRIVATE file mapping.  Shared/file/device mappings must retain
+    /// their backing and are deliberately left alone.
+    pub(crate) fn is_oom_reapable_private(&self) -> bool {
+        matches!(self, Backend::Cow(_))
+    }
+
     pub(crate) fn is_sealed(&self) -> bool {
         self.mapping_status().is_sealed()
     }

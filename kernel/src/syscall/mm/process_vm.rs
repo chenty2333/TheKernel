@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::mem::MaybeUninit;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use axtask::current;
@@ -13,7 +13,8 @@ use crate::{
     mm::{AddrSpace, IoVec, UserMemoryCapability, checked_align_up_4k, map_usercopy_error},
     task::{
         AsThread, PtraceAccessMode, check_current_ptrace_image_snapshot,
-        check_current_thread_ptrace_image_access, get_visible_task,
+        check_current_thread_ptrace_image_access, get_process_data, get_visible_task,
+        has_pending_syscall_signal, process_domain, process_error,
     },
 };
 
@@ -451,6 +452,77 @@ pub fn sys_process_madvise(
     let target_aspace = target_image.into_aspace();
     validate_remote_iovecs(&target_aspace, &remote)?;
     Ok(total_len as isize)
+}
+
+/// Linux 6.12 `process_mrelease(2)`: synchronously run the OOM-reaper portion
+/// for an exiting pidfd target.  This never tears down VMAs themselves; it
+/// drains only reclaimable private COW PTEs/backing and preserves the mm for
+/// the normal exit/reap lifecycle.
+pub fn sys_process_mrelease(pidfd: i32, flags: u32) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    // Preserve pidfd_get_task-style descriptor/type/liveness errors exactly.
+    let pidfd = PidFd::from_fd(pidfd)?;
+    let target = pidfd.process_data()?;
+    if !target.oom_reap_eligible() {
+        return Err(AxError::InvalidInput);
+    }
+
+    // `mmap_read_lock_killable()` observes an already pending deliverable
+    // signal before sleeping.  axsync exposes no interruptible mutex wait, so
+    // contention is reported as the Linux retry result below.
+    if has_pending_syscall_signal(current().as_thread()) {
+        return Err(AxError::Interrupted);
+    }
+
+    let aspace = target.aspace();
+    // `mm_users` in Linux includes other CLONE_VM process groups.  Snapshot
+    // the process domain before claiming teardown and refuse a live sharer;
+    // every remaining sharer has already crossed its permanent exit gate, so
+    // none can publish a new CLONE_VM child after this point.
+    for process in process_domain()?
+        .registry()
+        .try_processes()
+        .map_err(process_error)?
+    {
+        if core::ptr::eq(&*process, &*target.proc) {
+            continue;
+        }
+        let Ok(sharer) = get_process_data(process.pid()) else {
+            continue;
+        };
+        if Arc::ptr_eq(&aspace, &sharer.aspace()) && !sharer.oom_reap_eligible() {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    let claimed = aspace.lock().begin_oom_reap().map_err(|error| match error {
+        AxError::ResourceBusy => LinuxError::EAGAIN.into(),
+        _ => error,
+    })?;
+    if !claimed {
+        return Ok(0);
+    }
+
+    let Some(mut aspace) = aspace.try_lock() else {
+        target.aspace().lock().finish_oom_reap(false);
+        return Err(LinuxError::EAGAIN.into());
+    };
+    if has_pending_syscall_signal(current().as_thread()) {
+        drop(aspace);
+        target.aspace().lock().finish_oom_reap(false);
+        return Err(AxError::Interrupted);
+    }
+    let completed = aspace.oom_reap_private_pages();
+    aspace.finish_oom_reap(completed);
+    drop(aspace);
+    if completed {
+        Ok(0)
+    } else {
+        Err(LinuxError::EAGAIN.into())
+    }
 }
 
 #[cfg(test)]

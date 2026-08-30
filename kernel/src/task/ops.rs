@@ -1664,7 +1664,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         let _ = thr.proc_data.sample_maxrss_kb();
         let aspace = thr.proc_data.aspace();
         if Arc::strong_count(&aspace) == 2 {
-            aspace.lock().discard_private_anonymous_pages();
+            let mut aspace = aspace.lock();
+            if let Ok(true) = aspace.begin_oom_reap() {
+                let completed = aspace.oom_reap_private_pages();
+                aspace.finish_oom_reap(completed);
+            }
         }
         let self_usage = thr.proc_data.self_usage();
         let child_usage = thr.proc_data.children_usage();
