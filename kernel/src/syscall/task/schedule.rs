@@ -902,7 +902,25 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let task = sched_target(pid)?;
+    if pid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let target = if pid == 0 {
+        SchedGetSchedulerTarget::Live(current().clone())
+    } else {
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
+            SchedGetSchedulerTarget::Live(task)
+        } else {
+            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+        }
+    };
+    let (_, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = target.credential()?;
+    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
+        &actor_cred,
+        &target_cred,
+    ))?;
     // `SchedParam` is a complete `repr(C)` value containing only its i32
     // priority field, so its initialized representation is safe to copy out
     // through the explicitly bound user-memory context.
@@ -911,7 +929,7 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
             param,
             memory,
             SchedParam {
-                sched_priority: state_static_priority(sched_state(&task)),
+                sched_priority: target.static_priority()?,
             },
         )
         .map_err(map_usercopy_error)?;
@@ -1489,6 +1507,27 @@ impl SchedGetSchedulerTarget {
             }
         }
     }
+
+    fn static_priority(&self) -> AxResult<i32> {
+        match self {
+            Self::Live(task) => scheduler_state_snapshot(task)
+                .map(|commit| state_static_priority(commit.state))
+                .map_err(|error| match error {
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                }),
+            Self::Zombie(process) => {
+                let snapshot = zombie_scheduler_state(process)?;
+                Ok(match snapshot.class {
+                    SchedClass::Fifo | SchedClass::RoundRobin => snapshot.rt_priority as i32,
+                    SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
+                })
+            }
+        }
+    }
 }
 
 impl IoprioTarget {
@@ -2033,6 +2072,26 @@ mod tests {
         assert_eq!(
             sys_sched_get_priority_max(SCHED_EXT | SCHED_RESET_ON_FORK as i32),
             Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sched_getparam_priority_is_rt_only() {
+        assert_eq!(
+            state_static_priority(SchedState {
+                class: SchedClass::Fifo,
+                nice: 0,
+                rt_priority: 73,
+            }),
+            73
+        );
+        assert_eq!(
+            state_static_priority(SchedState {
+                class: SchedClass::Normal,
+                nice: -20,
+                rt_priority: 0,
+            }),
+            0
         );
     }
 

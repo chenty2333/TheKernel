@@ -143,6 +143,11 @@ use crate::{
 pub(crate) struct ZombieSchedulerSnapshot {
     pub(crate) class: SchedClass,
     pub(crate) nice: i8,
+    /// The real-time priority belongs to the same scheduler transaction as
+    /// class, nice, reset-on-fork and version.  It must survive the live task
+    /// disappearing so sched_getparam can observe an unreaped zombie exactly
+    /// as Linux does.
+    pub(crate) rt_priority: u8,
     /// Linux's policy query exposes this flag as part of the returned policy,
     /// including while the group leader is an unreaped zombie.
     pub(crate) reset_on_fork: bool,
@@ -158,6 +163,7 @@ impl Default for ZombieSchedulerSnapshot {
         Self {
             class: SchedClass::Normal,
             nice: 0,
+            rt_priority: 0,
             reset_on_fork: false,
             identity_epoch: 0,
             version: 0,
@@ -170,6 +176,7 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
         Self {
             class: state.class,
             nice: state.nice,
+            rt_priority: state.rt_priority,
             reset_on_fork: false,
             identity_epoch: 0,
             version: 0,
@@ -5772,6 +5779,7 @@ mod tests {
         let expected = ZombieSchedulerSnapshot {
             class: SchedClass::Idle,
             nice: 19,
+            rt_priority: 0,
             reset_on_fork: false,
             identity_epoch: 0,
             version: 0,
@@ -5811,9 +5819,9 @@ mod tests {
             None,
             Some((
                 SchedState {
-                    class: SchedClass::Normal,
-                    nice: -5,
-                    rt_priority: 0,
+                    class: SchedClass::Fifo,
+                    nice: 0,
+                    rt_priority: 73,
                 },
                 3,
                 false,
@@ -5829,8 +5837,9 @@ mod tests {
         assert_eq!(
             *scheduler.lock(),
             ZombieSchedulerSnapshot {
-                class: SchedClass::Normal,
-                nice: -5,
+                class: SchedClass::Fifo,
+                nice: 0,
+                rt_priority: 73,
                 reset_on_fork: false,
                 identity_epoch: 1,
                 version: 3,
@@ -5862,6 +5871,7 @@ mod tests {
             ZombieSchedulerSnapshot {
                 class: SchedClass::Batch,
                 nice: 4,
+                rt_priority: 0,
                 reset_on_fork: false,
                 identity_epoch: 1,
                 version: 4,
