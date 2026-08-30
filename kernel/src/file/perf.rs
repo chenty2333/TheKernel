@@ -135,21 +135,34 @@ impl PerfGroup {
     pub(crate) fn on_enter(&self) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); state.active.task_active = true; Self::start_locked(&mut state, now); }
     pub(crate) fn on_leave(&self) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); Self::stop_locked(&mut state, now, true); state.active.task_active = false; }
     pub(crate) fn on_fault(&self) { let state = self.state.lock(); if !state.active.running { return; } for file in state.active.files.iter().filter_map(Option::as_ref) { if file.event == PerfEvent::Software(SoftwareEvent::PageFaults) && file.running() { file.add_count(1); } } }
+    fn snapshot_file_locked(&self, state: &mut GroupState, file: &PerfEventFile) -> AxResult<Sample> {
+        if file.invalid() { return Err(AxError::Io); }
+        #[cfg(feature = "pmu")]
+        let live = if state.active.running && current().id().as_u64() == self.target_task_id {
+            match state.active.leases.iter().filter_map(Option::as_ref).find(|(id, _)| *id == file.id) {
+                Some((_, lease)) => match lease.read() { Ok(value) => Some(value), Err(_) => { Self::stop_locked(state, monotonic_time_nanos(), false); return Err(AxError::OperationNotSupported); } },
+                None => None,
+            }
+        } else { None };
+        #[cfg(not(feature = "pmu"))]
+        let live = None;
+        Ok(file.sample_with_live(live))
+    }
+    fn snapshot_member(&self, id: u64) -> AxResult<Sample> {
+        let mut state = self.state.lock();
+        let Some(file) = state.members.iter().find_map(|member| member.file.upgrade().filter(|file| file.id == id)) else { return Err(AxError::BadFileDescriptor); };
+        self.snapshot_file_locked(&mut state, &file)
+    }
     fn snapshots(&self, out: &mut Vec<Sample>) -> AxResult<()> {
         let mut state = self.state.lock();
-        for member in &state.members {
-            if let Some(file) = member.file.upgrade() {
-                if file.invalid() { return Err(AxError::Io); }
-                #[cfg(feature = "pmu")]
-                let live = if state.active.running && current().id().as_u64() == self.target_task_id {
-                    match state.active.leases.iter().filter_map(Option::as_ref).find(|(id, _)| *id == file.id) {
-                        Some((_, lease)) => match lease.read() { Ok(value) => Some(value), Err(_) => { Self::stop_locked(&mut state, monotonic_time_nanos(), false); return Err(AxError::OperationNotSupported); } },
-                        None => None,
-                    }
-                } else { None };
-                #[cfg(not(feature = "pmu"))]
-                let live = None;
-                out.push(file.sample_with_live(live));
+        // Group format has group-level leader time fields. Once the leader
+        // FD is gone we fail explicitly rather than silently substituting a
+        // child descriptor's independent enabled/running timeline.
+        if !state.members.iter().any(|member| member.file.upgrade().is_some_and(|file| file.id == self.leader_id)) { return Err(AxError::BadFileDescriptor); }
+        for slot in 0..state.members.len() {
+            if let Some(file) = state.members[slot].file.upgrade() {
+                let sample = self.snapshot_file_locked(&mut state, &file)?;
+                out.push(sample);
             }
         }
         Ok(())
@@ -181,12 +194,11 @@ impl PerfEventFile {
     pub(crate) fn on_enter(&self) { if let Some(group) = self.group() { group.on_enter(); } } pub(crate) fn on_leave(&self) { if let Some(group) = self.group() { group.on_leave(); } } pub(crate) fn on_fault(&self) { if let Some(group) = self.group() { group.on_fault(); } }
     fn check_hardware_local(&self) -> AxResult { self.group().ok_or(AxError::BadFileDescriptor)?.require_local_for_hardware() }
     fn read_samples(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.check_hardware_local()?; let group_read = self.read_format & PERF_FORMAT_GROUP != 0; let mut samples = Vec::new();
-        samples.try_reserve(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?;
-        self.group().ok_or(AxError::BadFileDescriptor)?.snapshots(&mut samples)?;
+        self.check_hardware_local()?; let group_read = self.read_format & PERF_FORMAT_GROUP != 0; let group = self.group().ok_or(AxError::BadFileDescriptor)?; let mut samples = Vec::new();
+        if group_read { samples.try_reserve(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?; group.snapshots(&mut samples)?; } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(group.snapshot_member(self.id)?); }
         let ids = self.read_format & PERF_FORMAT_ID != 0; let timing = ((self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0) as usize) + ((self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0) as usize);
         let words = if group_read { (1 + timing).checked_add(samples.len().checked_mul(1 + ids as usize).ok_or(AxError::InvalidInput)?).ok_or(AxError::InvalidInput)? } else { 1 + timing + ids as usize }; let bytes = words.checked_mul(size_of::<u64>()).ok_or(AxError::InvalidInput)?; if dst.remaining_mut() < bytes { return Err(AxError::InvalidInput); }
-        let leader = samples.iter().copied().find(|sample| sample.id == self.group().map_or(self.id, |group| group.leader_id)).unwrap_or(Sample { id: self.id, value: 0, enabled: 0, running: 0 });
+        let leader = if group_read { samples.iter().copied().find(|sample| sample.id == group.leader_id).ok_or(AxError::BadFileDescriptor)? } else { samples[0] };
         if group_read { dst.write(&(samples.len() as u64).to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } for sample in samples { dst.write(&sample.value.to_ne_bytes())?; if ids { dst.write(&sample.id.to_ne_bytes())?; } } } else { dst.write(&leader.value.to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } if ids { dst.write(&leader.id.to_ne_bytes())?; } }
         Ok(bytes)
     }
@@ -218,7 +230,8 @@ impl Pollable for PerfEventFile { fn poll(&self) -> IoEvents { IoEvents::READABL
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use super::{HardwareEvent, PerfEvent, PerfEventFile, PerfGroup};
+    use alloc::vec::Vec;
+    use super::{HardwareEvent, PerfEvent, PerfEventFile, PerfGroup, SoftwareEvent};
 
     #[test]
     fn group_rejects_duplicate_hardware_event() {
@@ -259,5 +272,17 @@ mod tests {
         assert!(!active.running);
         active.task_active = true;
         assert!(!active.running);
+    }
+
+    #[test]
+    fn group_read_rejects_a_closed_leader_instead_of_using_child_time() {
+        let group = PerfGroup::new(1, 1).unwrap();
+        let leader = PerfEventFile::new(1, PerfEvent::Software(SoftwareEvent::CpuClock), true, &group, 0).unwrap();
+        let child = PerfEventFile::new(2, PerfEvent::Software(SoftwareEvent::TaskClock), true, &group, 0).unwrap();
+        drop(leader);
+        let mut samples = Vec::new();
+        samples.try_reserve_exact(super::MAX_GROUP_MEMBERS).unwrap();
+        assert!(group.snapshots(&mut samples).is_err());
+        drop(child);
     }
 }
