@@ -51,6 +51,38 @@ const _: () = {
     assert!(offset_of!(sysinfo, mem_unit) == 104);
 };
 
+const SYSINFO_MEM_UNIT: u32 = 1;
+
+/// Linux reports only `NR_SHMEM` in `sharedram`; ordinary file cache does not
+/// contribute to this field.
+fn sysinfo_sharedram_bytes(shmem_pages: usize) -> usize {
+    shmem_pages.saturating_mul(memory_addr::PAGE_SIZE_4K)
+}
+
+fn set_sysinfo_memory_fields(
+    kinfo: &mut sysinfo,
+    total_bytes: usize,
+    free_bytes: usize,
+    shmem_pages: usize,
+) {
+    kinfo.totalram = total_bytes as _;
+    kinfo.freeram = free_bytes as _;
+    kinfo.sharedram = sysinfo_sharedram_bytes(shmem_pages) as _;
+    // axfs uses a page cache, not Linux's separate block-buffer cache.
+    kinfo.bufferram = 0;
+    kinfo.mem_unit = SYSINFO_MEM_UNIT;
+}
+
+fn write_sysinfo<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    info: *mut sysinfo,
+    kinfo: sysinfo,
+) -> AxResult {
+    // SAFETY: `kinfo` starts zeroed and every exported field is initialized;
+    // the checked x86_64 layout includes the ABI padding and tail exactly.
+    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(map_usercopy_error)
+}
+
 fn setfsid_abi<Id>(
     raw: u32,
     old: Id,
@@ -598,17 +630,13 @@ pub fn sys_sysinfo<M: UserMemory + ?Sized>(
     kinfo.loads = load_average_sysinfo().map(|load| load as _);
     // Linux assigns `nr_threads` directly to the u16 ABI member.
     kinfo.procs = live_thread_count() as _;
-    kinfo.totalram = stats.total_bytes as _;
-    kinfo.freeram = stats.free_bytes as _;
-    kinfo.sharedram = shmem_resident_pages()
-        .saturating_add(axfs::in_memory_page_cache_pages())
-        .saturating_mul(memory_addr::PAGE_SIZE_4K) as _;
-    // axfs uses a page cache, not Linux's separate block-buffer cache.
-    kinfo.bufferram = 0;
-    kinfo.mem_unit = 1;
-    // SAFETY: `kinfo` starts zeroed and every exported field is initialized;
-    // the checked x86_64 layout includes the ABI padding and tail exactly.
-    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(map_usercopy_error)?;
+    set_sysinfo_memory_fields(
+        &mut kinfo,
+        stats.total_bytes,
+        stats.free_bytes,
+        shmem_resident_pages(),
+    );
+    write_sysinfo(memory, info, kinfo)?;
     Ok(0)
 }
 
@@ -792,6 +820,48 @@ mod tests {
             destination.copy_from_slice(src);
             Ok(())
         }
+    }
+
+    #[test]
+    fn sysinfo_memory_fields_use_bytes_and_only_shmem_pages() {
+        assert_eq!(core::mem::size_of::<sysinfo>(), 112);
+        assert_eq!(core::mem::align_of::<sysinfo>(), 8);
+        assert_eq!(core::mem::offset_of!(sysinfo, sharedram), 48);
+        assert_eq!(core::mem::offset_of!(sysinfo, mem_unit), 104);
+
+        let mut info: sysinfo = unsafe { core::mem::zeroed() };
+        set_sysinfo_memory_fields(
+            &mut info,
+            9 * memory_addr::PAGE_SIZE_4K,
+            3 * memory_addr::PAGE_SIZE_4K,
+            2,
+        );
+
+        assert_eq!(info.totalram as usize, 9 * memory_addr::PAGE_SIZE_4K);
+        assert_eq!(info.freeram as usize, 3 * memory_addr::PAGE_SIZE_4K);
+        assert_eq!(info.sharedram as usize, 2 * memory_addr::PAGE_SIZE_4K);
+        assert_eq!(info.bufferram, 0);
+        assert_eq!(info.mem_unit, SYSINFO_MEM_UNIT);
+    }
+
+    #[test]
+    fn sysinfo_copyout_fault_is_efault() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; core::mem::size_of::<sysinfo>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: Some(0),
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let info: sysinfo = unsafe { core::mem::zeroed() };
+
+        assert_eq!(
+            write_sysinfo(&mut memory, core::ptr::null_mut(), info),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(memory.memory_mut().writes, &[0]);
     }
 
     fn mapped_child_namespace() -> alloc::sync::Arc<UserNamespace> {
