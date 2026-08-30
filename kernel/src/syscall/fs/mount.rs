@@ -11,7 +11,8 @@ use axfs::{
     open_block_device,
 };
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, Filesystem, FilesystemOps, NodePermission, NodeType, StatFs, VfsResult,
+    DeviceId, DirEntry, ExportHandle, ExportHandleMode, Filesystem, FilesystemOps, NodePermission,
+    NodeType, StatFs, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
@@ -673,11 +674,17 @@ pub(crate) struct FsMountFd {
 struct BindFilesystem {
     root: DirEntry,
     name: String,
+    source: Filesystem,
 }
 
 impl BindFilesystem {
     fn try_new(root: DirEntry, name: String, source: &Filesystem) -> AxResult<Filesystem> {
-        let ops = Arc::try_new(Self { root, name }).map_err(|_| AxError::NoMemory)?;
+        let ops = Arc::try_new(Self {
+            root,
+            name,
+            source: source.clone(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
         Filesystem::try_new_view(ops, source)
     }
 }
@@ -697,6 +704,29 @@ impl FilesystemOps for BindFilesystem {
 
     fn flush(&self) -> VfsResult<()> {
         self.root.filesystem().flush()
+    }
+
+    // A bind mount is a distinct mount view, not a new superblock.  Preserve
+    // the source export operations and their opaque handle/error semantics.
+    fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
+        self.source.encode_export_handle(entry, mode)
+    }
+
+    fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
+        self.source.decode_export_handle(handle_type, bytes)
+    }
+
+    fn export_handle_is_descendant(
+        &self,
+        ancestor: &DirEntry,
+        descendant: &DirEntry,
+    ) -> VfsResult<bool> {
+        self.source
+            .export_handle_is_descendant(ancestor, descendant)
     }
 }
 
@@ -1704,7 +1734,74 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use axfs_ng_vfs::{ExportHandleMode, Mountpoint, NodePermission, NodeType};
+
     use super::*;
+    use crate::pseudofs::MemoryFs;
+
+    #[test]
+    fn bind_filesystem_forwards_export_handles_with_its_own_mount_identity() {
+        let source_fs = MemoryFs::new().unwrap();
+        let source_mount = Mountpoint::new_root(&source_fs);
+        let source_root = source_mount.root_location();
+        let scoped = source_root
+            .create(
+                "scoped",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        let child = scoped
+            .create(
+                "child",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let outside = source_root
+            .create(
+                "outside",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let bind_fs = bind_filesystem_for(&scoped, "tmpfs").unwrap();
+        let bind_mount = Mountpoint::new_root(&bind_fs);
+        let bind_root = bind_mount.root_location();
+        assert_ne!(bind_mount.mount_id(), source_mount.mount_id());
+
+        let source_handle = source_mount
+            .encode_export_handle(&child, ExportHandleMode::Openable)
+            .unwrap();
+        let bind_handle = bind_mount
+            .encode_export_handle(&child, ExportHandleMode::Openable)
+            .unwrap();
+        assert_eq!(bind_handle, source_handle);
+
+        let decoded = bind_mount
+            .decode_export_handle(bind_handle.handle_type, &bind_handle.bytes)
+            .unwrap();
+        assert_eq!(decoded.mountpoint().mount_id(), bind_mount.mount_id());
+        assert_eq!(decoded.inode(), child.inode());
+        assert!(
+            bind_mount
+                .export_handle_is_descendant(&bind_root, &decoded)
+                .unwrap()
+        );
+
+        let outside_handle = source_mount
+            .encode_export_handle(&outside, ExportHandleMode::Openable)
+            .unwrap();
+        let decoded_outside = bind_mount
+            .decode_export_handle(outside_handle.handle_type, &outside_handle.bytes)
+            .unwrap();
+        assert!(
+            !bind_mount
+                .export_handle_is_descendant(&bind_root, &decoded_outside)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn fat_mount_defaults_follow_mounting_process_identity_and_umask() {
