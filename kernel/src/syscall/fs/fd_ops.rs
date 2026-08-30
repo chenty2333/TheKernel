@@ -46,7 +46,9 @@ use crate::{
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
-    syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
+    syscall::fs::{
+        ctl::validate_pathname, io::check_mandatory_fd_truncate_lock, mount::FsMountFd,
+    },
     task::{AX_FILE_LIMIT, AsThread, Cred, current_fs_context, ns_capable},
     time::wall_time,
 };
@@ -835,15 +837,26 @@ pub fn sys_name_to_handle_at(
             )
             .map_err(map_usercopy_error)?;
     } else {
-        let legacy =
-            u32::try_from(location.mountpoint().mount_id()).map_err(|_| LinuxError::EOVERFLOW)?;
         capability
-            .write_bytes(mount_id as usize, &(legacy as i32).to_ne_bytes())
+            .write_bytes(
+                mount_id as usize,
+                &crate::mounts::legacy_mount_id(location.mountpoint())?.to_ne_bytes(),
+            )
             .map_err(map_usercopy_error)?;
     }
     if header.handle_bytes < EXPORTED_HANDLE_BYTES {
+        let required_header = LinuxFileHandle {
+            handle_bytes: EXPORTED_HANDLE_BYTES,
+            handle_type: EXPORTED_HANDLE_TYPE,
+        };
+        let required_header = unsafe {
+            slice::from_raw_parts(
+                (&required_header as *const LinuxFileHandle).cast::<u8>(),
+                size_of::<LinuxFileHandle>(),
+            )
+        };
         capability
-            .write_bytes(handle as usize, &EXPORTED_HANDLE_BYTES.to_ne_bytes())
+            .write_bytes(handle as usize, required_header)
             .map_err(map_usercopy_error)?;
         return Err(LinuxError::EOVERFLOW.into());
     }
@@ -876,6 +889,33 @@ pub fn sys_open_by_handle_at(
     handle: *const u8,
     flags: i32,
 ) -> AxResult<isize> {
+    let curr = current();
+    let thread = curr.as_thread();
+    // Resolve and authorize the mount selector before touching the untrusted
+    // handle so EBADF/EPERM retain their ABI priority over EFAULT/EINVAL.
+    let (mount, directory_scope) = if mount_fd == AT_FDCWD {
+        (current_fs_context().lock().current_dir().clone(), true)
+    } else {
+        let selected = get_file_like(mount_fd)?;
+        if let Some(directory) = selected.downcast_ref::<Directory>() {
+            (directory.inner().clone(), true)
+        } else if let Some(file) = selected.downcast_ref::<File>() {
+            (file.inner().location().clone(), false)
+        } else if let Some(mount) = selected.downcast_ref::<FsMountFd>() {
+            (mount.root().clone(), false)
+        } else {
+            return Err(AxError::InvalidInput);
+        }
+    };
+    // Linux admits this through the caller's user namespace, after the mount
+    // descriptor has supplied the target superblock/mount authority.
+    if !thread
+        .current_cred()
+        .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
+    {
+        return Err(LinuxError::EPERM.into());
+    }
+
     let handle_addr = handle as usize;
     let header = unsafe {
         capability
@@ -883,24 +923,10 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-
     if header.handle_bytes != EXPORTED_HANDLE_BYTES
         || header.handle_type != EXPORTED_HANDLE_TYPE
     {
         return Err(AxError::InvalidInput);
-    }
-    // Unlike pathname-at syscalls, this argument is a real mount selector;
-    // AT_FDCWD is not a valid substitute for a mount file descriptor.
-    if mount_fd < 0 {
-        return Err(LinuxError::EBADF.into());
-    }
-
-    let curr = current();
-    if !curr
-        .as_thread()
-        .has_effective_capability(CAP_DAC_READ_SEARCH)
-    {
-        return Err(LinuxError::EPERM.into());
     }
 
     let body_addr = handle_addr
@@ -914,19 +940,28 @@ pub fn sys_open_by_handle_at(
     let body = unsafe { core::mem::transmute::<_, [u8; EXPORTED_HANDLE_BYTES as usize]>(body) };
     let inode = u64::from_ne_bytes(body[..8].try_into().unwrap());
     let generation = u64::from_ne_bytes(body[8..].try_into().unwrap());
-    // The mount fd selects the filesystem/mount view.  Empty-path resolution
-    // also preserves Linux's EBADF/ENOTDIR distinction for invalid descriptors.
-    let mount = resolve_at(mount_fd, Some(""), AT_EMPTY_PATH)?
-        .into_file()
-        .ok_or(AxError::InvalidInput)?;
     let location = mount
         .mountpoint()
         .decode_export_handle(axfs_ng_vfs::ExportHandle { inode, generation })
         .map_err(|_| LinuxError::ESTALE)?;
-    let curr = current();
-    let thread = curr.as_thread();
+    // A directory fd is a scoped mount capability: decoding may not escape
+    // either its mount view or its directory subtree.  A mount fd and a
+    // non-directory file fd retain their whole-superblock authority.
+    if directory_scope
+        && (!Arc::ptr_eq(mount.mountpoint(), location.mountpoint())
+            || !mount.entry().is_ancestor_of(location.entry())?)
+    {
+        return Err(LinuxError::ESTALE.into());
+    }
     let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
-    open_resolved_location_with_policy("", location, false, flags, 0, &security)
+    open_resolved_location_with_policy(
+        "",
+        location,
+        false,
+        normalize_legacy_open_flags(flags)?,
+        0,
+        &security,
+    )
 }
 
 fn open_in_fs(
@@ -2033,6 +2068,14 @@ mod namespace_operation_tests {
         let unnamed_no_data = file_open_operation(O_ACCMODE, true, true).unwrap().unwrap();
         assert_eq!(unnamed_no_data.access(), FileOpenAccess::NoData);
         assert!(unnamed_no_data.unnamed());
+    }
+
+    #[test]
+    fn legacy_path_open_masks_truncate_before_handle_open() {
+        let flags = normalize_legacy_open_flags((O_PATH | O_TRUNC | O_CLOEXEC) as i32).unwrap();
+        assert_eq!(flags as u32 & O_PATH, O_PATH);
+        assert_eq!(flags as u32 & O_CLOEXEC, O_CLOEXEC);
+        assert_eq!(flags as u32 & O_TRUNC, 0);
     }
 
     #[test]
