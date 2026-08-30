@@ -1177,7 +1177,7 @@ pub struct Thread {
     io_write_bytes: AtomicU64,
     voluntary_switches: AtomicU64,
     involuntary_switches: AtomicU64,
-    perf_events: SpinNoIrq<Vec<Weak<crate::file::PerfEventFile>>>,
+    perf_events: SpinNoIrq<Vec<Arc<crate::file::PerfGroup>>>,
     /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
     /// The scheduler Exit callback consumes this marker so `nvcsw` is
     /// published exactly once before the frozen usage snapshot is queued.
@@ -1226,48 +1226,29 @@ pub(crate) struct SchedulerSeed {
 impl Thread {
     /// Publishes an event into this exact task's scheduler-owned lifecycle.
     /// Reservation occurs in perf_event_open, never in a switch callback.
-    pub(crate) fn attach_perf_event(
-        &self,
-        event: &Arc<crate::file::PerfEventFile>,
-    ) -> AxResult<()> {
+    pub(crate) fn attach_perf_group(&self, group: Arc<crate::file::PerfGroup>) -> AxResult<()> {
         let mut events = self.perf_events.lock();
+        if events.iter().any(|attached| Arc::ptr_eq(attached, &group)) {
+            return Ok(());
+        }
         events.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        events.push(Arc::downgrade(event));
-        drop(events);
+        events.push(group);
         Ok(())
     }
 
     fn perf_on_enter(&self) {
         let mut events = self.perf_events.lock();
-        events.retain(|event| {
-            let Some(event) = event.upgrade() else {
-                return false;
-            };
-            event.on_enter();
-            true
-        });
+        events.retain(|group| { group.on_enter(); !group.is_prunable() });
     }
 
     fn perf_on_leave(&self) {
         let mut events = self.perf_events.lock();
-        events.retain(|event| {
-            let Some(event) = event.upgrade() else {
-                return false;
-            };
-            event.on_leave();
-            true
-        });
+        events.retain(|group| { group.on_leave(); !group.is_prunable() });
     }
 
     fn perf_on_fault(&self) {
         let mut events = self.perf_events.lock();
-        events.retain(|event| {
-            let Some(event) = event.upgrade() else {
-                return false;
-            };
-            event.on_fault();
-            true
-        });
+        events.retain(|group| { group.on_fault(); !group.is_prunable() });
     }
 
     /// Create a new [`Thread`].

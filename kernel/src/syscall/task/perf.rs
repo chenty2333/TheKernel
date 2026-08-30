@@ -8,14 +8,17 @@ use axerrno::{AxError, AxResult};
 use axtask::current;
 
 use crate::{
-    file::{PerfEventFile, PerfGroup, SoftwareEvent, add_file_like, get_typed_file},
+    file::{PerfEvent, PerfEventFile, PerfGroup, SoftwareEvent, add_file_like, get_typed_file},
     mm::{UserMemoryCapability, map_usercopy_error},
     task::{
         AsThread, PtraceAccessMode, check_current_thread_ptrace_image_access, get_visible_task,
     },
 };
 
+const PERF_TYPE_HARDWARE: u32 = 0;
 const PERF_TYPE_SOFTWARE: u32 = 1;
+const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
 const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
 const PERF_COUNT_SW_PAGE_FAULTS: u64 = 2;
@@ -25,7 +28,6 @@ const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
 const PERF_ATTR_SIZE_VER0: u32 = 64;
 const ATTR_DISABLED: u64 = 1;
-const PERF_FORMAT_GROUP: u64 = 1 << 3;
 
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,6 +39,26 @@ fn supported_attr_flags(flags: u64) -> AxResult<bool> {
         return Err(AxError::OperationNotSupported);
     }
     Ok(flags & ATTR_DISABLED != 0)
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::{ATTR_DISABLED, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE, supported_attr_flags};
+
+    #[test]
+    fn perf_attr_accepts_only_disabled_bit() {
+        assert!(!supported_attr_flags(0).unwrap());
+        assert!(supported_attr_flags(ATTR_DISABLED).unwrap());
+        assert!(supported_attr_flags(ATTR_DISABLED | (1 << 8)).is_err());
+    }
+
+    #[test]
+    fn hardware_abi_configs_are_distinct_and_linux_numbered() {
+        assert_eq!(PERF_TYPE_HARDWARE, 0);
+        assert_eq!(PERF_TYPE_SOFTWARE, 1);
+        assert_eq!(PERF_COUNT_HW_CPU_CYCLES, 0);
+        assert_eq!(PERF_COUNT_HW_INSTRUCTIONS, 1);
+    }
 }
 
 #[repr(C)]
@@ -126,20 +148,36 @@ pub(crate) fn sys_perf_event_open(
             leader.group(),
         )
     };
-    if attr.event_type != PERF_TYPE_SOFTWARE {
-        return Err(AxError::OperationNotSupported);
-    }
-    let event = match attr.config {
-        PERF_COUNT_SW_CPU_CLOCK => SoftwareEvent::CpuClock,
-        PERF_COUNT_SW_TASK_CLOCK => SoftwareEvent::TaskClock,
-        PERF_COUNT_SW_PAGE_FAULTS => SoftwareEvent::PageFaults,
-        PERF_COUNT_SW_CONTEXT_SWITCHES => SoftwareEvent::ContextSwitches,
+    let event = match attr.event_type {
+        PERF_TYPE_SOFTWARE => PerfEvent::Software(match attr.config {
+            PERF_COUNT_SW_CPU_CLOCK => SoftwareEvent::CpuClock,
+            PERF_COUNT_SW_TASK_CLOCK => SoftwareEvent::TaskClock,
+            PERF_COUNT_SW_PAGE_FAULTS => SoftwareEvent::PageFaults,
+            PERF_COUNT_SW_CONTEXT_SWITCHES => SoftwareEvent::ContextSwitches,
+            _ => return Err(AxError::OperationNotSupported),
+        }),
+        PERF_TYPE_HARDWARE => {
+            // Hardware leases are strictly local: opening another task would
+            // either need a remote MSR operation or expose a stale sample.
+            if !target_is_current { return Err(AxError::OperationNotSupported); }
+            #[cfg(not(feature = "pmu"))]
+            return Err(AxError::OperationNotSupported);
+            #[cfg(feature = "pmu")]
+            {
+                if axhal::pmu::capabilities().is_err() { return Err(AxError::OperationNotSupported); }
+                PerfEvent::Hardware(match attr.config {
+                    PERF_COUNT_HW_CPU_CYCLES => crate::file::HardwareEvent::Cycles,
+                    PERF_COUNT_HW_INSTRUCTIONS => crate::file::HardwareEvent::Instructions,
+                    _ => return Err(AxError::OperationNotSupported),
+                })
+            }
+        }
         _ => return Err(AxError::OperationNotSupported),
     };
     // Sampling, output routing and read-format extensions are not fabricated.
     if attr.sample_period != 0
         || attr.sample_type != 0
-        || attr.read_format & !PERF_FORMAT_GROUP != 0
+        || attr.read_format & !crate::file::PERF_FORMAT_SUPPORTED != 0
     {
         return Err(AxError::OperationNotSupported);
     }
@@ -148,9 +186,9 @@ pub(crate) fn sys_perf_event_open(
         event,
         disabled,
         group,
-        attr.read_format & PERF_FORMAT_GROUP != 0,
+        attr.read_format,
     )?;
-    target.as_thread().attach_perf_event(&file)?;
+    target.as_thread().attach_perf_group(file.group())?;
     if target_is_current {
         file.on_enter();
     }

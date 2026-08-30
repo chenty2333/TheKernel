@@ -1,27 +1,20 @@
-//! The descriptor half of the initial perf-event implementation.
+//! perf-event descriptors and their IRQ-safe task-group runtime.
 //!
-//! It deliberately only represents software clocks.  Hardware PMU scheduling
-//! is kept out of this object so an event FD remains an ordinary anonymous
-//! descriptor while the per-CPU backend is introduced separately.
+//! A group, rather than an individual descriptor, is the scheduler unit. The
+//! switch callbacks only take `SpinNoIrq` locks and never allocate or copy to
+//! userspace.
 
-use alloc::{
-    borrow::Cow,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{borrow::Cow, sync::{Arc, Weak}, vec::Vec};
 use core::{mem::size_of, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axhal::time::monotonic_time_nanos;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
-use axsync::Mutex;
+use axsync::spin::SpinNoIrq;
+use axtask::current;
 
-use crate::{
-    file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat, anon_inode_stat},
-    mm::map_usercopy_error,
-};
+use crate::{file::{anon_inode_stat, FileLike, IoDst, IoSrc, IoctlContext, Kstat}, mm::map_usercopy_error};
 
-/// Linux's `_IO('$', n)` encodings for the operations supported by this stage.
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_REFRESH: u32 = 0x2402;
@@ -29,299 +22,173 @@ const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_IOC_FLAG_GROUP: usize = 1;
 
-pub(crate) struct PerfGroup {
-    /// A perf group is scoped to one exact task context. Task IDs are never
-    /// reused by a live `AxTask`, so this remains stable even if the Linux TID
-    /// namespace later recycles its visible number.
-    target_task_id: u64,
-    /// The only descriptor accepted as `group_fd`.
-    leader_id: u64,
-    members: Mutex<Vec<Weak<PerfEventFile>>>,
+pub(crate) const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
+pub(crate) const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
+pub(crate) const PERF_FORMAT_ID: u64 = 4;
+pub(crate) const PERF_FORMAT_GROUP: u64 = 8;
+pub(crate) const PERF_FORMAT_SUPPORTED: u64 = PERF_FORMAT_TOTAL_TIME_ENABLED
+    | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID | PERF_FORMAT_GROUP;
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) enum SoftwareEvent { CpuClock, TaskClock, PageFaults, ContextSwitches }
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) enum HardwareEvent { Cycles, Instructions }
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) enum PerfEvent { Software(SoftwareEvent), Hardware(HardwareEvent) }
+impl PerfEvent { fn hardware(self) -> Option<HardwareEvent> { if let Self::Hardware(event) = self { Some(event) } else { None } } }
+
+struct Member { file: Weak<PerfEventFile>, dead: bool }
+struct ActiveGroup {
+    // Temporary strong custody makes an FD close racing with a switch safe.
+    // Files retain only a Weak group pointer, so this is not a cycle.
+    files: Vec<Option<Arc<PerfEventFile>>>,
+    #[cfg(feature = "pmu")]
+    leases: [Option<(u64, axhal::pmu::CounterLease)>; 2],
+    running: bool,
 }
+impl ActiveGroup { const fn new() -> Self { Self { files: Vec::new(), #[cfg(feature = "pmu")] leases: [None, None], running: false } } }
+struct GroupState { members: Vec<Member>, active: ActiveGroup }
+
+pub(crate) struct PerfGroup { target_task_id: u64, leader_id: u64, state: SpinNoIrq<GroupState> }
 
 impl PerfGroup {
-    pub(crate) fn new(target_task_id: u64, leader_id: u64) -> Arc<Self> {
-        Arc::new(Self {
-            target_task_id,
-            leader_id,
-            members: Mutex::new(Vec::new()),
-        })
-    }
-
-    pub(crate) fn accepts_target(&self, target_task_id: u64) -> bool {
-        self.target_task_id == target_task_id
-    }
-
-    fn is_leader(&self, id: u64) -> bool {
-        self.leader_id == id
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_group_leader_for_test(&self, id: u64) -> bool {
-        self.is_leader(id)
-    }
-
+    pub(crate) fn new(target_task_id: u64, leader_id: u64) -> Arc<Self> { Arc::new(Self { target_task_id, leader_id, state: SpinNoIrq::new(GroupState { members: Vec::new(), active: ActiveGroup::new() }) }) }
+    pub(crate) fn accepts_target(&self, id: u64) -> bool { self.target_task_id == id }
+    fn is_leader(&self, id: u64) -> bool { self.leader_id == id }
+    #[cfg(test)] pub(crate) fn is_group_leader_for_test(&self, id: u64) -> bool { self.is_leader(id) }
+    pub(crate) fn has_hardware(&self) -> bool { self.state.lock().members.iter().filter_map(|member| member.file.upgrade()).any(|file| file.event.hardware().is_some()) }
+    pub(crate) fn is_prunable(&self) -> bool { let state = self.state.lock(); !state.active.running && state.members.iter().all(|member| member.file.upgrade().is_none()) }
+    fn require_local_for_hardware(&self) -> AxResult { if self.has_hardware() && current().id().as_u64() != self.target_task_id { Err(AxError::OperationNotSupported) } else { Ok(()) } }
     fn add(&self, event: &Arc<PerfEventFile>) -> AxResult<()> {
-        let mut members = self.members.lock();
-        members.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        members.push(Arc::downgrade(event));
-        Ok(())
-    }
-
-    fn with_live(&self, operation: impl Fn(&PerfEventFile)) {
-        let mut members = self.members.lock();
-        members.retain(|member| {
-            let Some(member) = member.upgrade() else {
-                return false;
-            };
-            operation(&member);
-            true
-        });
-    }
-
-    fn counts(&self, dst: &mut IoDst) -> AxResult<usize> {
-        let members = self.members.lock();
-        let mut live = Vec::new();
-        live.try_reserve(members.len())
-            .map_err(|_| AxError::NoMemory)?;
-        live.extend(members.iter().filter_map(Weak::upgrade));
-        let count = live.len();
-        let bytes = (count + 1)
-            .checked_mul(size_of::<u64>())
-            .ok_or(AxError::InvalidInput)?;
-        if dst.remaining_mut() < bytes {
-            return Err(AxError::InvalidInput);
+        let mut state = self.state.lock();
+        if let Some(hw) = event.event.hardware() {
+            if state.members.iter().filter_map(|member| member.file.upgrade()).any(|member| member.event.hardware() == Some(hw)) { return Err(AxError::OperationNotSupported); }
         }
-        dst.write(&(count as u64).to_ne_bytes())?;
-        for member in &live {
-            dst.write(&member.count().to_ne_bytes())?;
+        state.members.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        state.active.files.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        state.members.push(Member { file: Arc::downgrade(event), dead: false }); state.active.files.push(None); Ok(())
+    }
+    fn live<'a>(state: &'a mut GroupState) -> impl Iterator<Item = (usize, Arc<PerfEventFile>)> + 'a { state.members.iter_mut().enumerate().filter_map(|(slot, member)| { let file = member.file.upgrade(); member.dead = file.is_none(); file.map(|file| (slot, file)) }) }
+    fn control(&self, op: fn(&PerfEventFile, u64)) { let now = monotonic_time_nanos(); let mut state = self.state.lock(); for (_, file) in Self::live(&mut state) { op(&file, now); } }
+    pub(crate) fn on_enter(&self) {
+        let now = monotonic_time_nanos(); let mut state = self.state.lock(); if state.active.running { return; }
+        for slot in 0..state.members.len() {
+            let file = state.members[slot].file.upgrade();
+            state.members[slot].dead = file.is_none();
+            state.active.files[slot] = file;
         }
+        #[cfg(feature = "pmu")]
+        {
+            let mut wanted: [(u64, HardwareEvent); 2] = [(0, HardwareEvent::Cycles); 2]; let mut count = 0;
+            for file in state.active.files.iter().filter_map(Option::as_ref) { if file.enabled() { if let Some(event) = file.event.hardware() { wanted[count] = (file.id, event); count += 1; } } }
+            for index in 0..count {
+                let (id, event) = wanted[index]; let event = match event { HardwareEvent::Cycles => axhal::pmu::Event::Cycles, HardwareEvent::Instructions => axhal::pmu::Event::Instructions };
+                match axhal::pmu::CounterLease::acquire(event, axhal::pmu::CounterKind::Fixed).or_else(|_| axhal::pmu::CounterLease::acquire(event, axhal::pmu::CounterKind::Programmable)) {
+                    Ok(lease) => state.active.leases[index] = Some((id, lease)),
+                    Err(_) => { for lease in &mut state.active.leases { if let Some((_, lease)) = lease.take() { let _ = lease.finish(); } } return; }
+                }
+            }
+        }
+        #[cfg(not(feature = "pmu"))]
+        if state.active.files.iter().filter_map(Option::as_ref).any(|file| file.enabled() && file.event.hardware().is_some()) { return; }
+        for file in state.active.files.iter().filter_map(Option::as_ref) { file.start_running(now); }
+        state.active.running = true;
+    }
+    pub(crate) fn on_leave(&self) {
+        let now = monotonic_time_nanos(); let mut state = self.state.lock(); if !state.active.running { return; }
+        #[cfg(feature = "pmu")]
+        for slot in 0..state.active.leases.len() {
+            let sample = state.active.leases[slot].take().and_then(|(id, lease)| {
+                lease.finish().ok().filter(|sample| !sample.overflowed).map(|sample| (id, sample.value))
+            });
+            if let Some((id, value)) = sample { if let Some(file) = state.active.files.iter().filter_map(Option::as_ref).find(|file| file.id == id) { file.add_count(value); } }
+        }
+        for file in state.active.files.iter_mut().filter_map(Option::take) { file.stop_running(now); if file.event == PerfEvent::Software(SoftwareEvent::ContextSwitches) && file.enabled() { file.add_count(1); } }
+        state.active.running = false;
+    }
+    pub(crate) fn on_fault(&self) { let state = self.state.lock(); for file in state.members.iter().filter_map(|member| member.file.upgrade()) { if file.event == PerfEvent::Software(SoftwareEvent::PageFaults) && file.enabled() { file.add_count(1); } } }
+    fn snapshots(&self, out: &mut Vec<Sample>) { let state = self.state.lock(); for member in &state.members { if let Some(file) = member.file.upgrade() { out.push(file.sample()); } } }
+}
+
+struct PerfEventState { enabled: bool, running: bool, count: u64, enabled_total: u64, running_total: u64, enabled_since: u64, running_since: u64 }
+pub struct PerfEventFile { id: u64, event: PerfEvent, group: Weak<PerfGroup>, read_format: u64, state: SpinNoIrq<PerfEventState> }
+#[derive(Clone, Copy)] struct Sample { id: u64, value: u64, enabled: u64, running: u64 }
+
+impl PerfEventFile {
+    pub fn new(id: u64, event: PerfEvent, disabled: bool, group: Arc<PerfGroup>, read_format: u64) -> AxResult<Arc<Self>> {
+        let now = monotonic_time_nanos(); let file = Arc::try_new(Self { id, event, group: Arc::downgrade(&group), read_format, state: SpinNoIrq::new(PerfEventState { enabled: !disabled, running: false, count: 0, enabled_total: 0, running_total: 0, enabled_since: now, running_since: now }) }).map_err(|_| AxError::NoMemory)?; group.add(&file)?; Ok(file)
+    }
+    pub(crate) fn group(&self) -> Arc<PerfGroup> { self.group.upgrade().expect("perf group retained by target thread") }
+    pub(crate) fn is_group_leader(&self) -> bool { self.group().is_leader(self.id) }
+    fn enabled(&self) -> bool { self.state.lock().enabled }
+    fn start_running(&self, now: u64) { let mut state = self.state.lock(); if state.enabled && !state.running { state.running = true; state.running_since = now; } }
+    fn stop_running(&self, now: u64) { let mut state = self.state.lock(); if state.running { let elapsed = now.saturating_sub(state.running_since); state.running_total = state.running_total.saturating_add(elapsed); state.running = false; if matches!(self.event, PerfEvent::Software(SoftwareEvent::CpuClock | SoftwareEvent::TaskClock)) { state.count = state.count.saturating_add(elapsed); } } }
+    fn add_count(&self, value: u64) { let mut state = self.state.lock(); state.count = state.count.saturating_add(value); }
+    fn enable_at(&self, now: u64) { let mut state = self.state.lock(); if !state.enabled { state.enabled = true; state.enabled_since = now; } }
+    fn disable_at(&self, now: u64) { let mut state = self.state.lock(); if state.running { state.running_total = state.running_total.saturating_add(now.saturating_sub(state.running_since)); state.running = false; } if state.enabled { state.enabled_total = state.enabled_total.saturating_add(now.saturating_sub(state.enabled_since)); state.enabled = false; } }
+    fn reset_at(&self, _: u64) { self.state.lock().count = 0; }
+    fn sample(&self) -> Sample { let now = monotonic_time_nanos(); let state = self.state.lock(); Sample { id: self.id, value: state.count, enabled: state.enabled_total.saturating_add(if state.enabled { now.saturating_sub(state.enabled_since) } else { 0 }), running: state.running_total.saturating_add(if state.running { now.saturating_sub(state.running_since) } else { 0 }) } }
+    pub(crate) fn on_enter(&self) { self.group().on_enter() } pub(crate) fn on_leave(&self) { self.group().on_leave() } pub(crate) fn on_fault(&self) { self.group().on_fault() }
+    fn check_hardware_local(&self) -> AxResult { self.group().require_local_for_hardware() }
+    fn read_samples(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.check_hardware_local()?; let group_read = self.read_format & PERF_FORMAT_GROUP != 0; let mut samples = Vec::new();
+        if group_read { let reserve = self.group().state.lock().members.len(); samples.try_reserve(reserve).map_err(|_| AxError::NoMemory)?; self.group().snapshots(&mut samples); } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(self.sample()); }
+        let ids = self.read_format & PERF_FORMAT_ID != 0; let timing = ((self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0) as usize) + ((self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0) as usize);
+        let words = if group_read { (1 + timing).checked_add(samples.len().checked_mul(1 + ids as usize).ok_or(AxError::InvalidInput)?).ok_or(AxError::InvalidInput)? } else { 1 + timing + ids as usize }; let bytes = words.checked_mul(size_of::<u64>()).ok_or(AxError::InvalidInput)?; if dst.remaining_mut() < bytes { return Err(AxError::InvalidInput); }
+        let leader = samples.first().copied().unwrap_or(Sample { id: self.id, value: 0, enabled: 0, running: 0 });
+        if group_read { dst.write(&(samples.len() as u64).to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } for sample in samples { dst.write(&sample.value.to_ne_bytes())?; if ids { dst.write(&sample.id.to_ne_bytes())?; } } } else { dst.write(&leader.value.to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } if ids { dst.write(&leader.id.to_ne_bytes())?; } }
         Ok(bytes)
     }
 }
 
-/// An enabled software perf event. `accumulated` is always a complete stopped
-/// interval; the running interval is sampled atomically from the monotonic
-/// clock, avoiding a reader/ioctl lock in the common read path.
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum SoftwareEvent {
-    CpuClock,
-    TaskClock,
-    PageFaults,
-    ContextSwitches,
-}
-
-pub struct PerfEventFile {
-    id: u64,
-    event: SoftwareEvent,
-    group: Arc<PerfGroup>,
-    read_group: bool,
-    state: Mutex<PerfEventState>,
-}
-
-struct PerfEventState {
-    enabled: bool,
-    running: bool,
-    accumulated: u64,
-    started: u64,
-}
-
-impl PerfEventFile {
-    pub fn new(
-        id: u64,
-        event: SoftwareEvent,
-        disabled: bool,
-        group: Arc<PerfGroup>,
-        read_group: bool,
-    ) -> AxResult<Arc<Self>> {
-        let now = monotonic_time_nanos();
-        let file = Arc::try_new(Self {
-            id,
-            event,
-            group: group.clone(),
-            read_group,
-            state: Mutex::new(PerfEventState {
-                enabled: !disabled,
-                running: false,
-                accumulated: 0,
-                started: now,
-            }),
-        })
-        .map_err(|_| AxError::NoMemory)?;
-        group.add(&file)?;
-        Ok(file)
-    }
-
-    pub(crate) fn group(&self) -> Arc<PerfGroup> {
-        self.group.clone()
-    }
-
-    pub(crate) fn is_group_leader(&self) -> bool {
-        self.group.is_leader(self.id)
-    }
-
-    fn count(&self) -> u64 {
-        let state = self.state.lock();
-        if state.running {
-            state
-                .accumulated
-                .saturating_add(monotonic_time_nanos().saturating_sub(state.started))
-        } else {
-            state.accumulated
-        }
-    }
-
-    fn disable(&self) {
-        let mut state = self.state.lock();
-        if state.running {
-            state.accumulated = state
-                .accumulated
-                .saturating_add(monotonic_time_nanos().saturating_sub(state.started));
-            state.running = false;
-        }
-        state.enabled = false;
-    }
-
-    fn enable(&self) {
-        let mut state = self.state.lock();
-        if !state.enabled {
-            state.enabled = true;
-        }
-    }
-
-    fn reset(&self) {
-        let mut state = self.state.lock();
-        state.accumulated = 0;
-        state.started = monotonic_time_nanos();
-    }
-
-    pub(crate) fn on_enter(&self) {
-        if !matches!(
-            self.event,
-            SoftwareEvent::CpuClock | SoftwareEvent::TaskClock
-        ) {
-            return;
-        }
-        let mut state = self.state.lock();
-        if state.enabled && !state.running {
-            state.started = monotonic_time_nanos();
-            state.running = true;
-        }
-    }
-
-    pub(crate) fn on_leave(&self) {
-        let mut state = self.state.lock();
-        if state.running {
-            state.accumulated = state
-                .accumulated
-                .saturating_add(monotonic_time_nanos().saturating_sub(state.started));
-            state.running = false;
-        }
-        if state.enabled && self.event == SoftwareEvent::ContextSwitches {
-            state.accumulated = state.accumulated.saturating_add(1);
-        }
-    }
-
-    pub(crate) fn on_fault(&self) {
-        if self.event == SoftwareEvent::PageFaults {
-            let mut state = self.state.lock();
-            if state.enabled {
-                state.accumulated = state.accumulated.saturating_add(1);
-            }
-        }
-    }
-}
-
 impl FileLike for PerfEventFile {
-    fn stat(&self) -> AxResult<Kstat> {
-        Ok(anon_inode_stat())
-    }
-
-    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        if self.read_group {
-            return self.group.counts(dst);
-        }
-        if dst.remaining_mut() < size_of::<u64>() {
-            return Err(AxError::InvalidInput);
-        }
-        dst.write(&self.count().to_ne_bytes())?;
-        Ok(size_of::<u64>())
-    }
-
-    fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
-        Err(AxError::BadFileDescriptor)
-    }
-
+    fn stat(&self) -> AxResult<Kstat> { Ok(anon_inode_stat()) }
+    fn read(&self, dst: &mut IoDst) -> AxResult<usize> { self.read_samples(dst) }
+    fn write(&self, _: &mut IoSrc) -> AxResult<usize> { Err(AxError::BadFileDescriptor) }
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
-        // PERF_IOC_FLAG_GROUP is intentionally not accepted before group
-        // scheduling is installed; silently applying it to one member would
-        // be observably wrong.
-        if matches!(
-            cmd,
-            PERF_EVENT_IOC_ENABLE
-                | PERF_EVENT_IOC_DISABLE
-                | PERF_EVENT_IOC_REFRESH
-                | PERF_EVENT_IOC_RESET
-        ) && arg & !PERF_IOC_FLAG_GROUP != 0
-        {
-            return Err(AxError::InvalidInput);
-        }
-        match cmd {
-            PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_REFRESH => {
-                if arg & PERF_IOC_FLAG_GROUP != 0 {
-                    self.group.with_live(Self::enable);
-                } else {
-                    self.enable();
-                }
-                Ok(0)
-            }
-            PERF_EVENT_IOC_DISABLE => {
-                if arg & PERF_IOC_FLAG_GROUP != 0 {
-                    self.group.with_live(Self::disable);
-                } else {
-                    self.disable();
-                }
-                Ok(0)
-            }
-            PERF_EVENT_IOC_RESET => {
-                if arg & PERF_IOC_FLAG_GROUP != 0 {
-                    self.group.with_live(Self::reset);
-                } else {
-                    self.reset();
-                }
-                Ok(0)
-            }
-            PERF_EVENT_IOC_ID => {
-                context
-                    .user_memory()
-                    .write_value(arg as *mut u64, self.id)
-                    .map_err(map_usercopy_error)?;
-                Ok(0)
-            }
+        if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_REFRESH | PERF_EVENT_IOC_RESET) && arg & !PERF_IOC_FLAG_GROUP != 0 { return Err(AxError::InvalidInput); }
+        if cmd == PERF_EVENT_IOC_REFRESH { return Err(AxError::OperationNotSupported); }
+        if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { self.check_hardware_local()?; }
+        let now = monotonic_time_nanos(); let perf_group = self.group();
+        // A self-target ioctl may run in the counted task. Stop it before
+        // changing the member state, then acquire a fresh local lease. This
+        // never attempts a remote MSR access; remote software events retain
+        // their historical descriptor-only behavior.
+        let local = perf_group.accepts_target(current().id().as_u64());
+        if local && matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { perf_group.on_leave(); }
+        let result = match cmd {
+            PERF_EVENT_IOC_ENABLE => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::enable_at); } else { self.enable_at(now); } Ok(0) }
+            PERF_EVENT_IOC_DISABLE => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::disable_at); } else { self.disable_at(now); } Ok(0) }
+            PERF_EVENT_IOC_RESET => { if arg & PERF_IOC_FLAG_GROUP != 0 { perf_group.control(PerfEventFile::reset_at); } else { self.reset_at(now); } Ok(0) }
+            PERF_EVENT_IOC_ID => { context.user_memory().write_value(arg as *mut u64, self.id).map_err(map_usercopy_error)?; Ok(0) }
             _ => Err(AxError::InvalidInput),
-        }
+        };
+        if local && matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { perf_group.on_enter(); }
+        result
     }
-
-    fn nonblocking(&self) -> bool {
-        false
-    }
-    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
-        Ok(())
-    }
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[perf_event]".into())
-    }
+    fn nonblocking(&self) -> bool { false } fn set_nonblocking(&self, _: bool) -> AxResult { Ok(()) }
+    fn path(&self) -> AxResult<Cow<'_, str>> { Ok("anon_inode:[perf_event]".into()) }
 }
+impl Pollable for PerfEventFile { fn poll(&self) -> IoEvents { IoEvents::READABLE } fn register<'a>(&'a self, _: &mut Context<'_>, _: IoEvents) -> Result<PollRegistration<'a>, PollRegistrationError> { PollRegistration::empty() } }
 
-impl Pollable for PerfEventFile {
-    fn poll(&self) -> IoEvents {
-        IoEvents::READABLE
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use super::{HardwareEvent, PerfEvent, PerfEventFile, PerfGroup};
+
+    #[test]
+    fn group_rejects_duplicate_hardware_event() {
+        let group = PerfGroup::new(1, 1);
+        let first = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Cycles), true, group.clone(), 0).unwrap();
+        assert!(PerfEventFile::new(2, PerfEvent::Hardware(HardwareEvent::Cycles), true, group, 0).is_err());
+        drop(first);
     }
-    fn register<'a>(
-        &'a self,
-        _context: &mut Context<'_>,
-        _events: IoEvents,
-    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        PollRegistration::empty()
+
+    #[test]
+    fn file_holds_only_weak_group_reference() {
+        let group = PerfGroup::new(1, 1);
+        let file = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Instructions), true, group.clone(), 0).unwrap();
+        assert_eq!(Arc::strong_count(&group), 1);
+        drop(file);
     }
 }

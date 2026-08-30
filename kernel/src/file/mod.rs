@@ -75,7 +75,7 @@ pub use self::{
     stdio::add_stdio,
     types::*,
 };
-pub(crate) use self::perf::{PerfEventFile, PerfGroup, SoftwareEvent};
+pub(crate) use self::perf::{HardwareEvent, PERF_FORMAT_SUPPORTED, PerfEvent, PerfEventFile, PerfGroup, SoftwareEvent};
 pub(crate) use self::{
     pipe::NamedPipe,
     fs::{
