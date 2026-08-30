@@ -953,6 +953,34 @@ pub fn reset_current_task_extended_state() {
     super::signal::reset_current_legacy_fp_state();
 }
 
+/// Returns CET state saved for the running task.
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_cet_state() -> axhal::asm::UserCetState {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: preemption is disabled and this is the running task.
+    unsafe { (*((&***curr) as *const TaskInner as *mut TaskInner)).ctx_mut().user_cet }
+}
+
+/// Replaces CET state for the running task and its live CPU image.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_cet_state(state: axhal::asm::UserCetState) {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: preemption is disabled and this is the running task.
+    unsafe {
+        (*((&***curr) as *const TaskInner as *mut TaskInner))
+            .ctx_mut()
+            .set_current_user_cet_state(state);
+    }
+}
+
+/// Clears CET state after an exec image replacement.
+#[cfg(target_arch = "x86_64")]
+pub fn reset_current_user_cet_state() {
+    set_current_user_cet_state(axhal::asm::UserCetState::default());
+}
+
 struct ProcessPtraceExitRetirements {
     _traced_relationship: Option<PtraceRelationshipSnapshot>,
     _reverse_links: super::process::PtraceReverseLinkDrain,

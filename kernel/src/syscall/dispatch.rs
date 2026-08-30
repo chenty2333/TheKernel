@@ -883,6 +883,7 @@ pub(super) fn dispatch_syscall(
         ),
         Sysno::munmap => sys_munmap(uctx.arg0(), uctx.arg1() as _),
         Sysno::mprotect => sys_mprotect(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::map_shadow_stack => sys_map_shadow_stack(uctx.arg0(), uctx.arg1(), uctx.arg2()),
         Sysno::pkey_mprotect => sys_pkey_mprotect(
             uctx.arg0(),
             uctx.arg1() as _,

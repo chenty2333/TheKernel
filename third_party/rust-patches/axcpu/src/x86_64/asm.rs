@@ -28,6 +28,76 @@ static PCID_CPUS_ENABLED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "asid-fast-switch")]
 static PCID_CPUS_FAILED: AtomicUsize = AtomicUsize::new(0);
 
+/// Architectural user-CET state owned by one schedulable task.  CET is
+/// switched explicitly, independently from PKRU and XSAVE state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UserCetState {
+    /// IA32_U_CET value.
+    pub u_cet: u64,
+    /// IA32_PL3_SSP value.
+    pub pl3_ssp: u64,
+    /// Software ABI lock state.
+    pub locked: bool,
+}
+
+#[cfg(target_os = "none")]
+const IA32_U_CET: u32 = 0x6a0;
+#[cfg(target_os = "none")]
+const IA32_PL3_SSP: u32 = 0x6a7;
+
+/// Whether this CPU has enabled user shadow-stack support. Hosted builds must
+/// always return false: touching privileged CET state there would be invalid.
+#[inline]
+pub fn user_shadow_stack_enabled() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
+        return cpuid.ecx & (1 << 7) != 0
+            && x86::controlregs::cr4() & (1 << 23) != 0;
+    }
+    #[cfg(not(target_os = "none"))]
+    false
+}
+
+/// Enables CR4.CET on capable CPUs only. It does not enable CET for a task.
+pub fn init_user_shadow_stack() {
+    #[cfg(target_os = "none")]
+    {
+        let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
+        if cpuid.ecx & (1 << 7) != 0 {
+            unsafe { x86::controlregs::cr4_write(x86::controlregs::cr4() | (1 << 23)) };
+        }
+    }
+}
+
+/// Reads the user CET MSRs when CET is active on this CPU.
+#[inline]
+pub fn read_user_cet_state() -> UserCetState {
+    #[cfg(target_os = "none")]
+    if user_shadow_stack_enabled() {
+        return UserCetState {
+            u_cet: unsafe { msr::rdmsr(IA32_U_CET) },
+            pl3_ssp: unsafe { msr::rdmsr(IA32_PL3_SSP) },
+            locked: false,
+        };
+    }
+    UserCetState::default()
+}
+
+/// Writes the user CET MSRs when CET is active on this CPU.
+#[inline]
+pub fn write_user_cet_state(state: UserCetState) {
+    #[cfg(target_os = "none")]
+    if user_shadow_stack_enabled() {
+        unsafe {
+            msr::wrmsr(IA32_PL3_SSP, state.pl3_ssp);
+            msr::wrmsr(IA32_U_CET, state.u_cet);
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = state;
+}
+
 /// The architectural PKRU value that permits access through every user key.
 #[cfg(feature = "pkeys")]
 pub const PKRU_DEFAULT: u32 = 0;

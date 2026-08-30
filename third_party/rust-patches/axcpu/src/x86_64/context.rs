@@ -314,6 +314,8 @@ pub struct TaskContext {
     pub rsp: u64,
     /// Thread pointer (FS segment base address)
     pub fs_base: usize,
+    /// Per-task user CET MSR state, switched separately from PKRU.
+    pub user_cet: crate::asm::UserCetState,
     /// Extended states, i.e., FP/SIMD states.
     #[cfg(feature = "fp-simd")]
     pub ext_state: ExtendedState,
@@ -347,6 +349,7 @@ impl TaskContext {
             kstack_top: va!(0),
             rsp: 0,
             fs_base: 0,
+            user_cet: crate::asm::UserCetState::default(),
             #[cfg(feature = "uspace")]
             cr3: crate::asm::read_kernel_page_table(),
             #[cfg(all(feature = "uspace", feature = "asid-fast-switch"))]
@@ -442,6 +445,13 @@ impl TaskContext {
         self.set_current_pkru(crate::asm::PKRU_DEFAULT);
     }
 
+    /// Replaces CET state for the running task and hardware CPU state.
+    #[inline]
+    pub fn set_current_user_cet_state(&mut self, state: crate::asm::UserCetState) {
+        self.user_cet = state;
+        crate::asm::write_user_cet_state(state);
+    }
+
     /// Changes the page table root in this context.
     ///
     /// The hardware register for page table root (`CR3` for x86) will be
@@ -482,6 +492,10 @@ impl TaskContext {
     /// It first saves the current task's context from CPU to this place, and then
     /// restores the next task's context from `next_ctx` to CPU.
     pub fn switch_to(&mut self, next_ctx: &Self) {
+        let live_cet = crate::asm::read_user_cet_state();
+        self.user_cet.u_cet = live_cet.u_cet;
+        self.user_cet.pl3_ssp = live_cet.pl3_ssp;
+        crate::asm::write_user_cet_state(next_ctx.user_cet);
         #[cfg(feature = "pkeys")]
         {
             self.save_current_pkru();

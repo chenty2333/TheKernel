@@ -1,4 +1,4 @@
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 
 use crate::{
@@ -127,7 +127,16 @@ enum ArchPrctlCode {
     /// Enable (addr != 0) or disable (addr == 0) the cpuid instruction for the
     /// calling thread.
     SetCpuid = 0x1012,
+    EnableShstk = 0x5001,
+    DisableShstk = 0x5002,
+    LockShstk = 0x5003,
+    StatusShstk = 0x5005,
 }
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_SHSTK_SHSTK: usize = 1;
+#[cfg(target_arch = "x86_64")]
+const CET_SHSTK_EN: u64 = 1;
 
 /// To set the clear_child_tid field in the task extended data.
 ///
@@ -200,5 +209,34 @@ pub fn sys_arch_prctl(
         ArchPrctlCode::GetCpuid => Ok(1),
         ArchPrctlCode::SetCpuid if addr != 0 => Ok(0),
         ArchPrctlCode::SetCpuid => Err(axerrno::AxError::NoSuchDevice),
+        ArchPrctlCode::EnableShstk => {
+            if addr != ARCH_SHSTK_SHSTK { return Err(AxError::InvalidInput); }
+            if !axhal::asm::user_shadow_stack_enabled() { return Err(AxError::NoSuchDevice); }
+            let mut state = crate::task::current_user_cet_state();
+            if state.locked && state.u_cet & CET_SHSTK_EN == 0 { return Err(LinuxError::EPERM.into()); }
+            state.u_cet |= CET_SHSTK_EN;
+            crate::task::set_current_user_cet_state(state);
+            Ok(0)
+        }
+        ArchPrctlCode::DisableShstk => {
+            if addr != ARCH_SHSTK_SHSTK { return Err(AxError::InvalidInput); }
+            let mut state = crate::task::current_user_cet_state();
+            if state.locked && state.u_cet & CET_SHSTK_EN != 0 { return Err(LinuxError::EPERM.into()); }
+            state.u_cet &= !CET_SHSTK_EN;
+            crate::task::set_current_user_cet_state(state);
+            Ok(0)
+        }
+        ArchPrctlCode::LockShstk => {
+            if addr == 0 || addr & !ARCH_SHSTK_SHSTK != 0 { return Err(AxError::InvalidInput); }
+            let mut state = crate::task::current_user_cet_state();
+            state.locked = true;
+            crate::task::set_current_user_cet_state(state);
+            Ok(0)
+        }
+        ArchPrctlCode::StatusShstk => {
+            let state = crate::task::current_user_cet_state();
+            memory.write_value(addr as *mut usize, (state.u_cet & CET_SHSTK_EN) as usize).map_err(map_usercopy_error)?;
+            Ok(0)
+        }
     }
 }

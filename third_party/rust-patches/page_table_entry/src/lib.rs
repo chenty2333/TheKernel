@@ -33,6 +33,9 @@ bitflags::bitflags! {
         const PKEY1         = 1 << 7;
         const PKEY2         = 1 << 8;
         const PKEY3         = 1 << 9;
+        /// x86 CET shadow-stack memory. On x86-64 this is encoded as a
+        /// present, user, read-only, dirty leaf PTE (W=0, D=1).
+        const SHADOW_STACK  = 1 << 10;
     }
 }
 

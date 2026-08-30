@@ -51,6 +51,9 @@ impl From<PTF> for MappingFlags {
         let mut ret = Self::READ;
         if f.contains(PTF::WRITABLE) {
             ret |= Self::WRITE;
+        } else if f.contains(PTF::DIRTY) {
+            // CET classifies a W=0,D=1 user leaf as a shadow-stack page.
+            ret |= Self::SHADOW_STACK;
         }
         if !f.contains(PTF::NO_EXECUTE) {
             ret |= Self::EXECUTE;
@@ -73,6 +76,10 @@ impl From<MappingFlags> for PTF {
         let mut ret = Self::PRESENT;
         if f.contains(MappingFlags::WRITE) {
             ret |= Self::WRITABLE;
+        }
+        if f.contains(MappingFlags::SHADOW_STACK) {
+            debug_assert!(!f.contains(MappingFlags::WRITE));
+            ret |= PTF::DIRTY;
         }
         if !f.contains(MappingFlags::EXECUTE) {
             ret |= Self::NO_EXECUTE;

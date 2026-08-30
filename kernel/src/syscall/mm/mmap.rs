@@ -32,6 +32,8 @@ const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 /// Use Linux's bottom-up compatibility mmap placement rather than the normal
 /// append-biased layout.
 const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
+const SHADOW_STACK_SET_TOKEN: usize = 1;
+const SHADOW_STACK_MIN_ADDR: usize = 1usize << 32;
 
 fn personality_mmap_protection(personality: u32, mut protection: MappingFlags) -> MappingFlags {
     if personality & READ_IMPLIES_EXEC != 0 && protection.contains(MappingFlags::READ) {
@@ -74,6 +76,54 @@ fn find_nonfixed_mmap_area(
 
 fn lookup_mmap_fd_once<T>(fd: i32, lookup: impl FnOnce(i32) -> AxResult<T>) -> AxResult<T> {
     lookup(fd).map_err(|_| AxError::BadFileDescriptor)
+}
+
+/// Linux x86-64 `map_shadow_stack(2)`.  Explicit mappings are intentionally
+/// not registered as default task stacks: the ABI owns their lifetime.
+pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<isize> {
+    if !axhal::asm::user_shadow_stack_enabled() {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & !SHADOW_STACK_SET_TOKEN != 0 || size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & SHADOW_STACK_SET_TOKEN != 0
+        && (size < core::mem::size_of::<u64>() || !size.is_multiple_of(core::mem::size_of::<u64>()))
+    {
+        return Err(LinuxError::ENOSPC.into());
+    }
+    let size = checked_align_up_4k(size).ok_or(LinuxError::EOVERFLOW)?;
+    if addr != 0 && (!addr.is_multiple_of(PAGE_SIZE_4K) || addr < SHADOW_STACK_MIN_ADDR) {
+        return Err(AxError::InvalidInput);
+    }
+    let aspace_handle = current().as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+    let start = if addr == 0 {
+        aspace
+            .find_kernel_area(
+                VirtAddr::from(SHADOW_STACK_MIN_ADDR), size,
+                VirtAddrRange::new(aspace.base(), aspace.end()), PAGE_SIZE_4K,
+            )
+            .ok_or(AxError::NoMemory)?
+    } else {
+        let start = VirtAddr::from(addr);
+        if !aspace.contains_range(start, size) { return Err(AxError::NoMemory); }
+        start
+    };
+    aspace.map(
+        start, size,
+        MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
+        false, Backend::new_alloc(start, PageSize::Size4K),
+    )?;
+    if flags & SHADOW_STACK_SET_TOKEN != 0 {
+        let token = start.as_usize() + size - core::mem::size_of::<u64>();
+        aspace.populate_area(VirtAddr::from(token & !(PAGE_SIZE_4K - 1)), PAGE_SIZE_4K, MappingFlags::READ)?;
+        let (frame, leaf, _) = aspace.page_table().query(VirtAddr::from(token))?;
+        if !leaf.contains(MappingFlags::SHADOW_STACK) { return Err(AxError::BadState); }
+        let offset = token & (PAGE_SIZE_4K - 1);
+        unsafe { (axhal::mem::phys_to_virt(frame).as_mut_ptr().add(offset) as *mut u64).write((token + 8) as u64 | 1) };
+    }
+    Ok(start.as_usize() as isize)
 }
 
 #[cfg(test)]

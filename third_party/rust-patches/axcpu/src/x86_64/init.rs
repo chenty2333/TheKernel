@@ -28,6 +28,7 @@ pub fn init_trap() {
     crate::asm::init_pcid();
     #[cfg(feature = "pkeys")]
     crate::asm::init_pkeys();
+    crate::asm::init_user_shadow_stack();
     #[cfg(feature = "uspace")]
     crate::uspace_common::init_exception_table();
     super::gdt::init();
