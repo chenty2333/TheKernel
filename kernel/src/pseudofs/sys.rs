@@ -8,7 +8,10 @@ use axfs_ng_vfs::{DeviceId, Filesystem, NodeType};
 
 use crate::{
     mounts,
-    pseudofs::{DirMapping, SimpleDir, SimpleFile, SimpleFs, dev::r#loop as loopdev},
+    pseudofs::{
+        DirMapping, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, dev::r#loop as loopdev,
+        device_registry,
+    },
 };
 
 const LOOP_MAJOR: u32 = 7;
@@ -22,9 +25,7 @@ pub fn new_sysfs() -> Filesystem {
 fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut root = DirMapping::new();
 
-    if axdisplay::has_display() {
-        root.add("class", graphics_class_dir(fs.clone()));
-    }
+    root.add("class", class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));
@@ -32,17 +33,11 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     SimpleDir::new_maker(fs, Arc::new(root))
 }
 
-fn graphics_class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
-    let mut class = DirMapping::new();
-    let mut graphics = DirMapping::new();
-    let fb0 = DirMapping::new();
-    graphics.add("fb0", SimpleDir::new_maker(fs.clone(), Arc::new(fb0)));
-    class.add(
-        "graphics",
-        SimpleDir::new_maker(fs.clone(), Arc::new(graphics)),
-    );
-
-    SimpleDir::new_maker(fs, Arc::new(class))
+fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    // Device-registry publication supplies the complete graphics class
+    // object.  A static empty fb0 directory would shadow that object and
+    // prevent udev from reading its dev/uevent attributes.
+    SimpleDir::new_maker(fs.clone(), Arc::new(device_registry::class_root(fs)))
 }
 
 fn block_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -112,6 +107,13 @@ fn dev_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     }
 
     dev.add("block", SimpleDir::new_maker(fs.clone(), Arc::new(block)));
+    dev.add(
+        "char",
+        SimpleDir::new_maker(
+            fs.clone(),
+            Arc::new(device_registry::dev_char_root(fs.clone())),
+        ),
+    );
     SimpleDir::new_maker(fs, Arc::new(dev))
 }
 
@@ -127,7 +129,10 @@ fn devices_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     system.add("cpu", cpu_root_dir(fs.clone()));
     system.add("node", node_root_dir(fs.clone()));
     devices.add("system", SimpleDir::new_maker(fs.clone(), Arc::new(system)));
-    SimpleDir::new_maker(fs, Arc::new(devices))
+    SimpleDir::new_maker(
+        fs.clone(),
+        Arc::new(devices.chain(device_registry::devices_root(fs))),
+    )
 }
 
 fn contiguous_index_list(count: usize) -> String {

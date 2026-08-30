@@ -1,6 +1,7 @@
 //! VirtIO transports.
 
 #[cfg(test)]
+/// In-memory transport used by device unit tests.
 pub mod fake;
 pub mod mmio;
 pub mod pci;

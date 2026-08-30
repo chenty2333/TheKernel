@@ -6,11 +6,7 @@ members = [
     "crates/readiness-adapter",
     "third_party/rust-patches/axsync",
 ]
-exclude = [
-    "arceos",
-    "third_party/rust-patches/axalloc",
-    "third_party/rust-patches/axallocator",
-]
+exclude = ["arceos"]
 
 # Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
 # directly and promotes every warning not explicitly allowed here to an error.
@@ -69,6 +65,7 @@ axalloc = { version = "0.3.0-preview.2" }
 axconfig = { version = "0.3.0-preview.2" }
 axdisplay = { version = "0.3.0-preview.2" }
 axdriver = { version = "0.3.0-preview.2" }
+axdriver_display = { version = "0.1.4-preview.3" }
 axfs = { version = "0.3.0-preview.2", package = "axfs-ng" }
 axhal = { version = "0.3.0-preview.2" }
 axinput = { version = "0.3.0-preview.2" }
@@ -166,12 +163,12 @@ all-features = true
 # Force all direct and transitive users onto the vendored axnet-ng so feature
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
-axalloc = { path = "third_party/rust-patches/axalloc" }
-axallocator = { path = "third_party/rust-patches/axallocator" }
 axhal = { path = "third_party/rust-patches/axhal" }
 axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
 axdriver = { path = "third_party/rust-patches/axdriver" }
+axdriver_display = { path = "third_party/rust-patches/axdriver_display" }
+axdriver_input = { path = "third_party/rust-patches/axdriver_input" }
 axdriver_block = { path = "third_party/rust-patches/axdriver_block" }
 axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
 axio = { path = "third_party/rust-patches/axio" }
@@ -181,6 +178,7 @@ axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
 axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
 scope-local = { path = "third_party/rust-patches/scope-local" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
+axdisplay = { path = "third_party/rust-patches/axdisplay" }
 axsync = { path = "third_party/rust-patches/axsync" }
 thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
@@ -204,7 +202,6 @@ thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
 thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
-page_table_entry = { path = "third_party/rust-patches/page_table_entry" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
 lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
 starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }

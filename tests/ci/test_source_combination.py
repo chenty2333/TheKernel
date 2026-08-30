@@ -19,25 +19,29 @@ SPEC.loader.exec_module(source_combination)
 
 
 class SourceCombinationTests(unittest.TestCase):
-    def test_repository_record_and_id_are_stable(self) -> None:
+    def test_repository_record_produces_checkout_outputs(self) -> None:
         sources = source_combination.load(
             REPO_ROOT / "config/source-combination.toml"
         )
 
         self.assertEqual(sources["ax"].repository, "chenty2333/thekernel-ax")
         self.assertEqual(
-            sources["linux_abi"].ref,
-            "f0721ef792ecd0c4826a00b90b88a524f6411d47",
+            sources["linux_abi"].repository,
+            "chenty2333/thekernel-linux-abi",
         )
-        self.assertEqual(
-            source_combination.combination_id(sources, "a" * 40),
-            source_combination.combination_id(
-                dict(reversed(list(sources.items()))), "a" * 40
-            ),
-        )
-        values = source_combination.outputs(sources, "a" * 40)
+        values = source_combination.outputs(sources)
         self.assertEqual(values["ax_path"], "thekernel-ax")
-        self.assertTrue(values["combination_id"].startswith("source-combination-v1-"))
+        self.assertEqual(
+            values,
+            {
+                "ax_repository": "chenty2333/thekernel-ax",
+                "ax_ref": "b780f528d806844ce47653cb5c7fdcb6ee5082b5",
+                "ax_path": "thekernel-ax",
+                "linux_abi_repository": "chenty2333/thekernel-linux-abi",
+                "linux_abi_ref": "f0721ef792ecd0c4826a00b90b88a524f6411d47",
+                "linux_abi_path": "thekernel-linux-abi",
+            },
+        )
 
     def test_rejects_non_commit_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -54,6 +58,7 @@ path = "thekernel-ax"
 repository = "chenty2333/thekernel-linux-abi"
 ref = "f0721ef792ecd0c4826a00b90b88a524f6411d47"
 path = "thekernel-linux-abi"
+
 """,
                 encoding="utf-8",
             )
@@ -78,6 +83,7 @@ path = "thekernel-ax"
 repository = "chenty2333/thekernel-linux-abi"
 ref = "f0721ef792ecd0c4826a00b90b88a524f6411d47"
 path = "thekernel-linux-abi"
+
 """,
                 encoding="utf-8",
             )
@@ -115,16 +121,6 @@ path = "vISA"
                 source_combination.SourceCombinationError, "exactly"
             ):
                 source_combination.load(record)
-
-    def test_id_requires_thekernel_full_commit(self) -> None:
-        sources = source_combination.load(
-            REPO_ROOT / "config/source-combination.toml"
-        )
-        with self.assertRaisesRegex(
-            source_combination.SourceCombinationError, "TheKernel commit"
-        ):
-            source_combination.combination_id(sources, "not-a-commit")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::CMsgData;
-use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
+use linux_raw_sys::net::{SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, ucred};
 
 use crate::{
     file::{FileDescription, Socket, epoll::Epoll, get_file_description, try_reserve_fd},
@@ -68,6 +68,21 @@ const fn cmsg_space(body_len: usize) -> Option<usize> {
         (Some(header_len), Some(body_len)) => header_len.checked_add(body_len),
         _ => None,
     }
+}
+
+fn credentials_cmsg(pid: u32, uid: u32, gid: u32) -> Option<(cmsghdr, ucred)> {
+    Some((
+        cmsghdr {
+            cmsg_len: cmsg_len(size_of::<ucred>())?,
+            cmsg_level: SOL_SOCKET as _,
+            cmsg_type: SCM_CREDENTIALS as _,
+        },
+        ucred {
+            pid: pid as _,
+            uid,
+            gid,
+        },
+    ))
 }
 
 fn try_box<T>(value: T) -> AxResult<Box<T>> {
@@ -334,6 +349,59 @@ impl<'a> CMsgBuilder<'a> {
             published: true,
         }
     }
+
+    /// Publishes one fixed-size SCM_CREDENTIALS message when it fits.  Unlike
+    /// SCM_RIGHTS, credentials allocate neither descriptors nor queued state:
+    /// a short or unreadable control buffer is simply reported as MSG_CTRUNC
+    /// by the caller after the payload has been consumed.
+    pub fn push_credentials(&mut self, pid: u32, uid: u32, gid: u32) -> bool {
+        let Some(remaining) = self.capacity.checked_sub(*self.len) else {
+            return false;
+        };
+        let Some(message_len) = cmsg_len(size_of::<ucred>()) else {
+            return false;
+        };
+        let Some(message_space) = cmsg_space(size_of::<ucred>()) else {
+            return false;
+        };
+        if remaining < message_len {
+            return false;
+        }
+        let base = self.hdr.address().as_usize();
+        let Some(header_len) = cmsg_align(cmsg_header_len()) else {
+            return false;
+        };
+        let Some(data_addr) = base.checked_add(header_len) else {
+            return false;
+        };
+        let Some((header, credentials)) = credentials_cmsg(pid, uid, gid) else {
+            return false;
+        };
+        debug_assert_eq!(header.cmsg_len, message_len);
+        // Copy the payload before the header.  A fault leaves msg_controllen
+        // at its previous value and therefore cannot advertise an incomplete
+        // ancillary message.
+        if unsafe {
+            self.capability
+                .write_value_unchecked(data_addr as *mut ucred, credentials)
+        }
+        .is_err()
+            || unsafe {
+                self.capability
+                    .write_value_unchecked(base as *mut cmsghdr, header)
+            }
+            .is_err()
+        {
+            return false;
+        }
+        let used = message_space.min(remaining);
+        let Some(next) = base.checked_add(used) else {
+            return false;
+        };
+        self.hdr = UserPtr::from(next);
+        *self.len += used;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +423,17 @@ mod tests {
     #[test]
     fn rights_limit_is_linux_scm_max_fd() {
         assert_eq!(SCM_MAX_FD, 253);
+    }
+
+    #[test]
+    fn credentials_cmsg_has_linux_header_and_preserves_kernel_identity() {
+        let (header, credentials) = credentials_cmsg(0, 0, 0).unwrap();
+        assert_eq!(header.cmsg_len, cmsg_len(size_of::<ucred>()).unwrap());
+        assert_eq!(header.cmsg_level as u32, SOL_SOCKET);
+        assert_eq!(header.cmsg_type as u32, SCM_CREDENTIALS);
+        assert_eq!(credentials.pid, 0);
+        assert_eq!(credentials.uid, 0);
+        assert_eq!(credentials.gid, 0);
     }
 
     #[test]

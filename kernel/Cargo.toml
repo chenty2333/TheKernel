@@ -58,15 +58,16 @@ axalloc.workspace = true
 axconfig.workspace = true
 axdisplay.workspace = true
 axdriver.workspace = true
+axdriver_display.workspace = true
 axfs = { workspace = true, features = ["task-io-accounting"] }
-axhal = { workspace = true, features = ["pkeys"] }
+axhal.workspace = true
 axinput = { workspace = true, optional = true }
 axlog.workspace = true
 axmm.workspace = true
 axnet.workspace = true
 axruntime = { workspace = true, features = ["irq-exit"] }
 axsync.workspace = true
-axtask = { workspace = true, features = ["legacy-fxsave", "pkeys"] }
+axtask = { workspace = true, features = ["legacy-fxsave"] }
 
 axbacktrace = "0.1"
 axcbpf.workspace = true

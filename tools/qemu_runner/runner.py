@@ -6,18 +6,142 @@ import gzip
 import hashlib
 import lzma
 import os
+import re
 import shutil
-import sys
+import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .command import VALID_DRIVE_MODES, VALID_NETWORK_MODES, build_qemu_command
-from .model import Arch, Drive, DriveMode, Interaction, RunLimits, RunResult
+from .command import VALID_DRIVE_MODES, build_qemu_command
+from .model import (
+    Arch,
+    Drive,
+    DriveMode,
+    GraphicsProfile,
+    Interaction,
+    QmpControls,
+    RunLimits,
+    RunResult,
+)
 from .process import run_process
 
 
 class RunnerError(ValueError):
     """Raised for an invalid product-run configuration."""
+
+
+_QEMU_DEVICE_HELP_NAME = re.compile(r'^\s*name "([^\"]+)"', re.MULTILINE)
+
+
+def _parse_qemu_device_help(output: str) -> frozenset[str]:
+    """Return device names from QEMU's stable ``-device help`` listing."""
+
+    return frozenset(_QEMU_DEVICE_HELP_NAME.findall(output))
+
+
+def _parse_qemu_display_help(output: str) -> frozenset[str]:
+    """Return display backend names from QEMU's ``-display help`` listing."""
+
+    lines = iter(output.splitlines())
+    for line in lines:
+        if line.strip() == "Available display backend types:":
+            break
+    else:
+        return frozenset()
+    backends: set[str] = set()
+    for line in lines:
+        name = line.strip()
+        if not name:
+            break
+        backends.add(name.split(",", 1)[0])
+    return frozenset(backends)
+
+
+def _qemu_help_output(qemu: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            [str(qemu), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RunnerError(
+            f"could not inspect QEMU graphics capabilities with {qemu}: {error}"
+        ) from error
+    if completed.returncode != 0:
+        raise RunnerError(
+            f"could not inspect QEMU graphics capabilities with {qemu}: "
+            f"{' '.join(arguments)} exited {completed.returncode}"
+        )
+    return completed.stdout
+
+
+def _probe_virgl_headless(qemu: Path) -> None:
+    """Parse and initialize the headless GL topology without booting a guest."""
+
+    command = [
+        str(qemu),
+        "-machine",
+        "q35",
+        "-nodefaults",
+        "-S",
+        "-display",
+        "egl-headless,gl=on",
+        "-device",
+        "virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600",
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise RunnerError(f"could not start virgl-headless capability probe: {error}") from error
+    try:
+        _stdout, stderr = process.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        return
+    detail = (stderr or "").strip()
+    lowered = detail.lower()
+    if "invalid parameter" in lowered or "invalid option" in lowered:
+        raise RunnerError(
+            "SKIP: QEMU rejected virgl-headless argv egl-headless,gl=on: "
+            f"{detail or f'exit {process.returncode}'}"
+        )
+    raise RunnerError(
+        "SKIP: QEMU virgl-headless EGL runtime is unavailable: "
+        f"{detail or f'exit {process.returncode}'}"
+    )
+
+
+def _validate_virgl_capabilities(profile: GraphicsProfile, qemu: Path | None) -> None:
+    """Fail before launch when the explicitly requested virgl topology is absent."""
+
+    if profile not in {"virgl-headless", "virgl-interactive"}:
+        return
+    if qemu is None:
+        raise RunnerError("virgl profile requires a resolvable QEMU executable for capability checks")
+    devices = _parse_qemu_device_help(_qemu_help_output(qemu, "-device", "help"))
+    displays = _parse_qemu_display_help(_qemu_help_output(qemu, "-display", "help"))
+    if "virtio-gpu-gl-pci" not in devices:
+        raise RunnerError("SKIP: QEMU does not provide required virgl device virtio-gpu-gl-pci")
+    backend = "egl-headless" if profile == "virgl-headless" else "gtk"
+    if backend not in displays:
+        raise RunnerError(f"SKIP: QEMU does not provide required virgl display backend {backend}")
+    if profile == "virgl-headless":
+        _probe_virgl_headless(qemu)
 
 
 # The q35 platform description currently uses the PCIe ECAM layout assigned by
@@ -44,22 +168,13 @@ class RunConfig:
     memory: str = "1G"
     cpus: int = 1
     qemu_binary: str | None = None
-    qemu_launcher: tuple[str, ...] | None = None
     accel: str | None = None
-    cpu: str | None = None
-    iothread_id: str | None = None
-    # Correctness lanes retain QEMU's user-mode network by default.  The
-    # performance lane opts into ``passt`` (or ``tap-vhost``) explicitly so
-    # a normal qemu-runner invocation never unexpectedly requires host setup.
-    network: str = "user"
-    network_mode: str | None = None
-    network_topology: str | None = None
-    tap_name: str | None = None
+    graphics_profile: GraphicsProfile = "headless"
+    qmp: QmpControls = QmpControls()
     extra_args: tuple[str, ...] = ()
     ovmf_code: Path | None = None
     ovmf_vars: Path | None = None
     direct_kernel: bool = False
-    receipt_path: Path | None = None
     input_path: Path | None = None
 
 
@@ -70,85 +185,6 @@ class _DrivePlan:
     mode: DriveMode
     label: str
     compression_suffix: str | None
-
-
-@dataclass(frozen=True)
-class _LaunchHandle:
-    label: str
-    source_path: Path
-    fd: int
-    writable: bool
-    before: dict[str, str | int]
-    stat_fields: tuple[int, int, int, int, int]
-
-    @property
-    def proc_path(self) -> Path:
-        return Path(f"/proc/self/fd/{self.fd}")
-
-
-def _stat_fields(stat: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-
-
-def _hash_open_fd(fd: int) -> tuple[int, str, tuple[int, int, int, int, int]]:
-    digest = hashlib.sha256()
-    os.lseek(fd, 0, os.SEEK_SET)
-    while chunk := os.read(fd, 1024 * 1024):
-        digest.update(chunk)
-    before = os.fstat(fd)
-    os.lseek(fd, 0, os.SEEK_SET)
-    return before.st_size, digest.hexdigest(), _stat_fields(before)
-
-
-def _open_launch_handle(label: str, path: Path, *, writable: bool) -> _LaunchHandle:
-    path = path.resolve()
-    flags = os.O_RDWR if writable else os.O_RDONLY
-    try:
-        fd = os.open(path, flags | os.O_CLOEXEC)
-    except OSError as error:
-        raise RunnerError(f"cannot open launch input {label}: {error}") from error
-    try:
-        size, digest, fields = _hash_open_fd(fd)
-        if _stat_fields(path.stat()) != fields:
-            raise RunnerError(f"launch input changed while opening: {path}")
-        return _LaunchHandle(
-            label, path, fd, writable,
-            {"path": str(path), "size_bytes": size, "sha256": digest}, fields,
-        )
-    except Exception:
-        os.close(fd)
-        raise
-
-
-def _post_launch_handle(handle: _LaunchHandle) -> dict[str, str | int]:
-    size, digest, fields = _hash_open_fd(handle.fd)
-    try:
-        path_fields = _stat_fields(handle.source_path.stat())
-    except OSError as error:
-        raise RunnerError(f"launch input disappeared after run: {handle.source_path}") from error
-    if fields != path_fields:
-        raise RunnerError(f"launch input path was replaced after run: {handle.source_path}")
-    return {"path": str(handle.source_path), "size_bytes": size, "sha256": digest}
-
-
-def _bind_command_handles(command: tuple[str, ...], handles: list[_LaunchHandle]) -> tuple[str, ...]:
-    """Replace every QEMU file argument with the inherited opened handle."""
-
-    bound = list(command)
-    for handle in handles:
-        source = str(handle.source_path)
-        escaped = source.replace(",", ",,")
-        replacement = str(handle.proc_path)
-        bound = [item.replace(escaped, replacement).replace(source, replacement) for item in bound]
-    return tuple(bound)
-
-
-def _close_launch_handles(handles: list[_LaunchHandle]) -> None:
-    for handle in reversed(handles):
-        try:
-            os.close(handle.fd)
-        except OSError:
-            pass
 
 
 def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
@@ -228,26 +264,6 @@ def _validate_mode(name: str, mode: str) -> DriveMode:
     return mode  # type: ignore[return-value]
 
 
-def _validate_network(config: RunConfig) -> str:
-    network = config.network
-    if config.network_mode is not None:
-        if network != "user" and network != config.network_mode:
-            raise RunnerError("network and network_mode disagree")
-        network = config.network_mode
-    if config.network_topology is not None:
-        if network != "user" and network != config.network_topology:
-            raise RunnerError("network and network_topology disagree")
-        network = config.network_topology
-    if network not in VALID_NETWORK_MODES:
-        raise RunnerError(f"unsupported network topology: {network}")
-    if config.tap_name is not None and (
-        not config.tap_name
-        or any(char in config.tap_name for char in ",=\n\r")
-    ):
-        raise RunnerError("tap name must be a non-empty QEMU-safe value")
-    return network
-
-
 def _plan_drive(
     source: Path,
     *,
@@ -303,6 +319,40 @@ def _prepare_drive(plan: _DrivePlan) -> Drive:
     return Drive(path=runtime, mode=plan.mode)
 
 
+def _open_qemu_input(
+    path: Path,
+    *,
+    label: str,
+    writable: bool = False,
+) -> tuple[int, Path]:
+    """Open one validated input once and expose that exact object to QEMU."""
+
+    access = os.O_RDWR if writable else os.O_RDONLY
+    flags = access | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise RunnerError(f"could not open {label} input {path}: {error}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RunnerError(f"{label} input is not a regular file: {path}")
+        if os.fstat(fd).st_size == 0:
+            raise RunnerError(f"{label} input is empty: {path}")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd, Path(f"/proc/self/fd/{fd}")
+
+
+def _initrd_args_with_path(extra_args: tuple[str, ...], path: Path | None) -> tuple[str, ...]:
+    if path is None:
+        return extra_args
+    index = extra_args.index("-initrd")
+    rewritten = list(extra_args)
+    rewritten[index + 1] = str(path)
+    return tuple(rewritten)
+
+
 def _resolve_executable(requested: str) -> Path | None:
     resolved = shutil.which(requested)
     if resolved is None and "/" in requested:
@@ -310,16 +360,6 @@ def _resolve_executable(requested: str) -> Path | None:
         if candidate.is_file():
             resolved = str(candidate)
     return Path(resolved).resolve() if resolved is not None else None
-
-
-def _qemu_evidence(requested: str) -> dict[str, str | int | None]:
-    from .evidence import file_evidence
-
-    resolved = _resolve_executable(requested)
-    if resolved is None:
-        return {"requested": requested, "path": None, "size_bytes": None, "sha256": None}
-    evidence = file_evidence(resolved)
-    return {"requested": requested, **evidence}
 
 
 def _validate_output_destination(
@@ -374,7 +414,6 @@ def run(
     workdir = config.workdir.expanduser().resolve()
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
-    network = _validate_network(config)
     initrd = _initrd_from_extra_args(config.extra_args)
     input_path = None
     if config.input_path is not None:
@@ -383,25 +422,27 @@ def run(
             raise RunnerError(f"input file does not exist: {input_path}")
         if not config.interaction.interactive:
             raise RunnerError("input file requires interactive mode")
-    if config.receipt_path is not None and input_path is None:
-        raise RunnerError("receipt requires an input file")
-    effective_qemu_launcher = config.qemu_launcher
+    qmp_socket = config.qmp.socket
     if (
-        effective_qemu_launcher is None
-        and config.qemu_binary is not None
-        and config.qemu_binary.endswith(".py")
-    ):
-        # The scheduler pinner is a source-controlled Python entry point and
-        # intentionally need not carry an executable bit in a checkout.
-        effective_qemu_launcher = (sys.executable, config.qemu_binary)
+        config.qmp.screenshot is not None
+        or config.qmp.input_events
+        or config.qmp.input_after_marker is not None
+        or config.qmp.screenshot_after_marker is not None
+    ) and qmp_socket is None:
+        raise RunnerError("QMP screenshot and input injection require a QMP socket")
+    if qmp_socket is not None:
+        qmp_socket = qmp_socket.expanduser().resolve()
+        if qmp_socket.exists():
+            raise RunnerError(f"QMP socket already exists: {qmp_socket}")
+    screenshot = (
+        config.qmp.screenshot.expanduser().resolve()
+        if config.qmp.screenshot is not None
+        else None
+    )
 
     qemu_requested = config.qemu_binary or "qemu-system-x86_64"
     qemu_executable = _resolve_executable(qemu_requested)
-    launcher_executable = (
-        _resolve_executable(effective_qemu_launcher[0])
-        if effective_qemu_launcher is not None
-        else None
-    )
+    _validate_virgl_capabilities(config.graphics_profile, qemu_executable)
 
     rootfs_plan = _plan_drive(
         config.rootfs,
@@ -462,6 +503,8 @@ def run(
     run_input_paths = [kernel, rootfs_plan.source]
     if input_path is not None:
         run_input_paths.append(input_path)
+    if initrd is not None:
+        run_input_paths.append(initrd)
     if esp_plan is not None:
         run_input_paths.append(esp_plan.source)
     if ovmf_code is not None:
@@ -472,8 +515,6 @@ def run(
         run_input_paths.append(extra_plan.source)
     if qemu_executable is not None:
         run_input_paths.append(qemu_executable)
-    if launcher_executable is not None:
-        run_input_paths.append(launcher_executable)
 
     planned_outputs: list[tuple[str, Path]] = []
     for plan in (rootfs_plan, extra_plan, esp_plan):
@@ -495,139 +536,91 @@ def run(
             ]
         )
     planned_outputs.append(("log", config.log_path))
-    if config.receipt_path is not None:
-        planned_outputs.append(("receipt", config.receipt_path))
+    if qmp_socket is not None:
+        planned_outputs.append(("QMP socket", qmp_socket))
+    if screenshot is not None:
+        planned_outputs.append(("screenshot", screenshot))
     resolved_outputs = _validate_output_destinations(
         tuple(planned_outputs), protected_paths=tuple(run_input_paths)
     )
     log_path = resolved_outputs["log"]
-    receipt_path = (
-        resolved_outputs["receipt"] if config.receipt_path is not None else None
-    )
 
     workdir.mkdir(parents=True, exist_ok=True)
+    if qmp_socket is not None:
+        qmp_socket.parent.mkdir(parents=True, exist_ok=True)
+    if screenshot is not None:
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
     rootfs = _prepare_drive(rootfs_plan)
     extra_block = _prepare_drive(extra_plan) if extra_plan is not None else None
     esp = _prepare_drive(esp_plan) if esp_plan is not None else None
     if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
         ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, ovmf_vars_runtime)
 
-    command = build_qemu_command(
-        arch=config.arch,
-        kernel=kernel,
-        rootfs=rootfs,
-        extra_block=extra_block,
-        esp=esp,
-        ovmf_code=ovmf_code,
-        ovmf_vars=ovmf_vars_runtime,
-        direct_kernel=config.direct_kernel,
-        memory=config.memory,
-        cpus=config.cpus,
-        qemu_binary=config.qemu_binary,
-        qemu_launcher=effective_qemu_launcher,
-        accel=config.accel,
-        cpu=config.cpu,
-        iothread_id=config.iothread_id,
-        network=network,
-        tap_name=config.tap_name,
-        extra_args=config.extra_args,
-    )
-    if qemu_executable is not None and effective_qemu_launcher is None:
-        command = (str(qemu_executable), *command[1:])
-
-    launch_handles: list[_LaunchHandle] = []
+    opened_fds: list[int] = []
     try:
-        if config.direct_kernel:
-            launch_handles.append(_open_launch_handle("kernel", kernel, writable=False))
-        launch_handles.append(_open_launch_handle("rootfs", rootfs.path.resolve(), writable=rootfs.mode == "rw"))
-        if esp is not None:
-            launch_handles.append(_open_launch_handle("esp", esp.path.resolve(), writable=False))
-        if ovmf_code is not None:
-            launch_handles.append(_open_launch_handle("ovmf_code", ovmf_code, writable=False))
-        if ovmf_vars_runtime is not None:
-            launch_handles.append(_open_launch_handle("ovmf_vars", ovmf_vars_runtime, writable=True))
+        kernel_fd, qemu_kernel = _open_qemu_input(kernel, label="kernel")
+        opened_fds.append(kernel_fd)
+        rootfs_fd, qemu_rootfs = _open_qemu_input(
+            rootfs.path,
+            label="rootfs",
+            writable=rootfs.mode == "rw",
+        )
+        opened_fds.append(rootfs_fd)
+        qemu_extra_block = None
         if extra_block is not None:
-            launch_handles.append(_open_launch_handle("extra_block", extra_block.path.resolve(), writable=extra_block.mode == "rw"))
-        if initrd is not None:
-            launch_handles.append(_open_launch_handle("initrd", initrd, writable=False))
-        command = _bind_command_handles(command, launch_handles)
-    except Exception:
-        _close_launch_handles(launch_handles)
-        raise
-    process_environment = None
-    if effective_qemu_launcher is not None:
-        process_environment = os.environ.copy()
-        process_environment["THEKERNEL_QEMU_LAUNCH_FDS"] = ",".join(
-            str(handle.fd) for handle in launch_handles
-        )
-
-    rootfs_source_path = rootfs_plan.source
-    rootfs_runtime_path = rootfs.path.resolve()
-    if config.receipt_path is not None:
-        # Receipts are a performance-comparator input.  Keep their evidence
-        # capture out of the ordinary correctness path entirely.
-        from .evidence import file_evidence
-        from .receipt import (
-            RECEIPT_SCHEMA_VERSION,
-            atomic_write_receipt,
-            command_stream_evidence,
-            source_identity,
-        )
-
-        qemu = _qemu_evidence(qemu_requested)
-        rootfs_source = file_evidence(rootfs_source_path)
-        rootfs_runtime = (
-            rootfs_source.copy()
-            if rootfs_runtime_path == rootfs_source_path
-            else file_evidence(rootfs_runtime_path)
-        )
-        receipt = {
-            "schema_version": RECEIPT_SCHEMA_VERSION,
-            "source_identity": source_identity(),
-            "arch": config.arch,
-            "cpus": config.cpus,
-            "memory": config.memory,
-            "accel": config.accel,
-            "cpu": config.cpu,
-            "iothread_id": config.iothread_id,
-            "network": network,
-            "tap_name": config.tap_name,
-            "extra_args": list(config.extra_args),
-            "kernel": file_evidence(kernel),
-            "rootfs_source": rootfs_source,
-            "rootfs_runtime_before": rootfs_runtime,
-            "qemu": qemu,
-            "command": list(command),
-            "qemu_launcher": list(effective_qemu_launcher) if effective_qemu_launcher is not None else None,
-            "workdir": str(workdir),
-            "log_path": str(log_path),
-            "rootfs_mode": rootfs_mode,
-            "direct_kernel": config.direct_kernel,
-            "extra_block_mode": extra_mode,
-            "interaction": {
-                "interactive": config.interaction.interactive,
-                "input_after_marker": config.interaction.input_after_marker,
-                "stop_after_marker": config.interaction.stop_after_marker,
-            },
-        }
-        assert input_path is not None
-        input_evidence = command_stream_evidence(input_path)
-        if config.esp is not None and esp is not None:
-            receipt["esp_source"] = file_evidence(config.esp.expanduser().resolve())
-            receipt["esp_runtime"] = file_evidence(esp.path.resolve())
+            extra_fd, qemu_extra_path = _open_qemu_input(
+                extra_block.path,
+                label="extra",
+                writable=extra_block.mode == "rw",
+            )
+            opened_fds.append(extra_fd)
+            qemu_extra_block = Drive(path=qemu_extra_path, mode=extra_block.mode)
+        qemu_esp = None
+        if esp is not None:
+            esp_fd, qemu_esp_path = _open_qemu_input(esp.path, label="esp")
+            opened_fds.append(esp_fd)
+            qemu_esp = Drive(path=qemu_esp_path, mode=esp.mode)
+        qemu_ovmf_code = None
         if ovmf_code is not None:
-            receipt["ovmf_code"] = file_evidence(ovmf_code)
-        if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
-            receipt["ovmf_vars_source"] = file_evidence(ovmf_vars_source)
-            receipt["ovmf_vars_runtime"] = file_evidence(ovmf_vars_runtime)
-        if config.extra_block is not None and extra_block is not None:
-            receipt["extra_block_source"] = file_evidence(config.extra_block.expanduser().resolve())
-            receipt["extra_block_runtime_before"] = file_evidence(extra_block.path.resolve())
-        assert receipt_path is not None
+            ovmf_code_fd, qemu_ovmf_code = _open_qemu_input(
+                ovmf_code, label="OVMF code"
+            )
+            opened_fds.append(ovmf_code_fd)
+        qemu_ovmf_vars = None
+        if ovmf_vars_runtime is not None:
+            ovmf_vars_fd, qemu_ovmf_vars = _open_qemu_input(
+                ovmf_vars_runtime,
+                label="OVMF vars",
+                writable=True,
+            )
+            opened_fds.append(ovmf_vars_fd)
+        qemu_initrd = None
+        if initrd is not None:
+            initrd_fd, qemu_initrd = _open_qemu_input(initrd, label="initrd")
+            opened_fds.append(initrd_fd)
 
-    try:
+        command = build_qemu_command(
+            arch=config.arch,
+            kernel=qemu_kernel,
+            rootfs=Drive(path=qemu_rootfs, mode=rootfs.mode),
+            extra_block=qemu_extra_block,
+            esp=qemu_esp,
+            ovmf_code=qemu_ovmf_code,
+            ovmf_vars=qemu_ovmf_vars,
+            direct_kernel=config.direct_kernel,
+            memory=config.memory,
+            cpus=config.cpus,
+            qemu_binary=config.qemu_binary,
+            accel=config.accel,
+            graphics_profile=config.graphics_profile,
+            qmp_socket=qmp_socket,
+            extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd),
+        )
+        if qemu_executable is not None:
+            command = (str(qemu_executable), *command[1:])
+
         if input_path is None:
-            result = run_process(
+            return run_process(
                 arch=config.arch,
                 command=command,
                 workdir=workdir,
@@ -635,71 +628,36 @@ def run(
                 limits=config.limits,
                 interaction=config.interaction,
                 console_stream=console_stream,
-                pass_fds=tuple(handle.fd for handle in launch_handles),
-                environment=process_environment,
+                pass_fds=tuple(opened_fds),
+                qmp_socket=qmp_socket,
+                screenshot=screenshot,
+                qmp_input_events=config.qmp.input_events,
+                qmp_input_after_marker=config.qmp.input_after_marker,
+                qmp_screenshot_after_marker=config.qmp.screenshot_after_marker,
+                qmp_timeout_secs=config.qmp.timeout_secs,
+                qmp_screenshot_size=config.qmp.screenshot_size,
+                qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
             )
-        else:
-            with input_path.open("rb") as input_stream:
-                result = run_process(
-                    arch=config.arch,
-                    command=command,
-                    workdir=workdir,
-                    log_path=log_path,
-                    limits=config.limits,
-                    interaction=config.interaction,
-                    input_stream=input_stream,
-                    console_stream=console_stream,
-                    capture_input_evidence=receipt_path is not None,
-                    pass_fds=tuple(handle.fd for handle in launch_handles),
-                    environment=process_environment,
-                )
-        launch_post = {handle.label: _post_launch_handle(handle) for handle in launch_handles}
-    except Exception:
-        _close_launch_handles(launch_handles)
-        raise
-    try:
-        if receipt_path is not None:
-            receipt["rootfs_runtime_after"] = file_evidence(rootfs_runtime_path)
-            receipt["log"] = file_evidence(result.log_path)
-            if config.extra_block is not None and extra_block is not None:
-                receipt["extra_block_runtime_after"] = file_evidence(extra_block.path.resolve())
-            from .receipt import command_stream_evidence, input_forwarding_payload
-
-            assert input_path is not None
-            assert result.input_forwarding is not None
-            receipt["stdin"] = input_forwarding_payload(
-                result.input_forwarding,
-                source=input_evidence,
-                source_unchanged=command_stream_evidence(input_path) == input_evidence,
+        with input_path.open("rb") as input_stream:
+            return run_process(
+                arch=config.arch,
+                command=command,
+                workdir=workdir,
+                log_path=log_path,
+                limits=config.limits,
+                interaction=config.interaction,
+                input_stream=input_stream,
+                console_stream=console_stream,
+                pass_fds=tuple(opened_fds),
+                qmp_socket=qmp_socket,
+                screenshot=screenshot,
+                qmp_input_events=config.qmp.input_events,
+                qmp_input_after_marker=config.qmp.input_after_marker,
+                qmp_screenshot_after_marker=config.qmp.screenshot_after_marker,
+                qmp_timeout_secs=config.qmp.timeout_secs,
+                qmp_screenshot_size=config.qmp.screenshot_size,
+                qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
             )
-            receipt.update(
-                {
-                    "state": "recorded",
-                    "returncode": result.returncode,
-                    "duration_ms": result.duration_ms,
-                    "error_message": result.error_message,
-                    "timed_out": result.timed_out,
-                    "interrupted": result.interrupted,
-                    "intentionally_stopped": result.intentionally_stopped,
-                    "marker_success": result.marker_success,
-                    "guest_clean_shutdown": result.guest_clean_shutdown,
-                    "runner_terminated": result.runner_terminated,
-                    "runner_termination_reason": result.runner_termination_reason,
-                    # QEMU process exit observes neither device quiescence nor
-                    # kernel-internal physical retirement.
-                    "physical_retirement_proven": False,
-                    "launch_handles": {
-                        handle.label: {
-                            "source": handle.before,
-                            "handle": str(handle.proc_path),
-                            "access": "rw" if handle.writable else "ro",
-                            "post": launch_post[handle.label],
-                        }
-                        for handle in launch_handles
-                    },
-                }
-            )
-            atomic_write_receipt(receipt_path, receipt)
     finally:
-        _close_launch_handles(launch_handles)
-    return result
+        for fd in reversed(opened_fds):
+            os.close(fd)

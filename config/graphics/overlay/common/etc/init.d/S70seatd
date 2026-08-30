@@ -1,0 +1,32 @@
+#!/bin/sh
+# Starts after eudev's S10 script.  The socket is root:seat and 0660, so only
+# session users in the seat group can ask seatd to hand out activated devices.
+set -eu
+
+DAEMON=/usr/bin/seatd
+PIDFILE=/run/seatd.pid
+
+running() {
+    [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+start() {
+    running && return 0
+    mkdir -p /run
+    printf 'Starting seatd: '
+    start-stop-daemon -S -x "$DAEMON" -p "$PIDFILE" -m -b -- -g seat
+    echo OK
+}
+
+stop() {
+    running || return 0
+    printf 'Stopping seatd: '
+    start-stop-daemon -K -x "$DAEMON" -p "$PIDFILE"
+    echo OK
+}
+
+case "${1:-}" in
+    start|stop) "$1" ;;
+    restart) stop; start ;;
+    *) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
+esac

@@ -54,8 +54,9 @@ pub fn sys_iopl(level: u32) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use super::ioperm_end;
     use axerrno::AxError;
+
+    use super::ioperm_end;
 
     #[test]
     fn ioperm_range_matches_linux_unsigned_long_checks() {

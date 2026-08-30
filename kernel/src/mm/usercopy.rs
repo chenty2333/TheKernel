@@ -225,18 +225,6 @@ unsafe impl UserMemory for AddressSpaceUserMemory {
             .write(start, src)
             .map_err(map_address_space_error)
     }
-
-    fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
-        let address_space = self.address_space.lock();
-        let start = VirtAddr::from(start);
-        if len != 0
-            && (!address_space.contains_range(start, len)
-                || !address_space.can_access_range(start, len, MappingFlags::WRITE))
-        {
-            return Err(UserCopyError::BadAddress);
-        }
-        Ok(())
-    }
 }
 
 pub(crate) fn map_usercopy_error(error: UserCopyError) -> AxError {

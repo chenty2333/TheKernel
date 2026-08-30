@@ -877,10 +877,33 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
 
     pub fn readiness_source(&self) -> Option<&Arc<PollSet>> {
         match &self.processor {
-            Processor::Manual(_) => None,
+            // Injected console input wakes `poll_tx`; manual transports use
+            // the same stable source so epoll can sleep until the router
+            // delivers bytes to this specific line discipline.
+            Processor::Manual(_) => Some(&self.poll_tx),
             Processor::External(processor) => Some(&processor.poll_rx),
             Processor::None(_, set) => Some(set),
         }
+    }
+
+    /// Delivers bytes from a single owning transport into a manually-driven
+    /// line discipline.  The bounded staging buffer deliberately reports
+    /// backpressure rather than stealing bytes into another terminal.
+    pub fn inject_input(&mut self, bytes: &[u8]) -> AxResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let Processor::Manual(reader) = &mut self.processor else {
+            return Err(AxError::BadState);
+        };
+        if !reader.read_range.is_empty() || bytes.len() > reader.read_buf.len() {
+            return Err(AxError::WouldBlock);
+        }
+        reader.read_buf[..bytes.len()].copy_from_slice(bytes);
+        reader.read_range = 0..bytes.len();
+        reader.poll()?;
+        self.poll_tx.wake();
+        Ok(())
     }
 
     /// Stops input processing and wakes all readers waiting on this discipline.

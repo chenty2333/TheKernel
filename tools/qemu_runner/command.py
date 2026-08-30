@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .model import Arch, Drive, DriveMode
+from .model import Arch, Drive, DriveMode, GraphicsProfile
 
 
 class CommandError(ValueError):
@@ -12,26 +12,8 @@ class CommandError(ValueError):
 
 
 VALID_DRIVE_MODES = frozenset({"snapshot", "readonly", "rw"})
-VALID_NETWORK_MODES = frozenset({"user", "passt", "tap-vhost"})
-
-# Keep the performance block policy in one place.  The baseline lanes use a
-# single queue deliberately: the host-side iothread and the guest-side queue
-# then describe one measurable serialization point instead of an accidental
-# QEMU default that can vary by version.  These are virtio-blk-pci property
-# names, not shell arguments, and are appended only to the optional data
-# disk; the boot/root filesystem remains compatible with the correctness
-# lanes.
-PERFORMANCE_BLOCK_PROPERTIES = (
-    "num-queues=1",
-    "queue-size=128",
-    "request-merging=off",
-    # Keep guest-side optional discard/write-zeroes offloads out of the
-    # latency path.  ioeventfd/event_idx are explicit virtio notification
-    # offloads and are supported by the QEMU virtio-blk-pci device.
-    "discard=off",
-    "write-zeroes=off",
-    "ioeventfd=on",
-    "event_idx=on",
+VALID_GRAPHICS_PROFILES = frozenset(
+    {"headless", "interactive", "virgl-headless", "virgl-interactive"}
 )
 
 
@@ -45,7 +27,6 @@ def drive_options(
     drive_id: str,
     *,
     mode: DriveMode,
-    cache_none: bool = False,
 ) -> str:
     if mode not in VALID_DRIVE_MODES:
         raise CommandError(f"unsupported drive mode: {mode}")
@@ -58,8 +39,6 @@ def drive_options(
     elif mode == "readonly":
         options += ",readonly=on"
     options += ",aio=threads"
-    if cache_none:
-        options += ",cache=none"
     return options
 
 
@@ -67,24 +46,12 @@ def _append_pci_drive(
     command: list[str],
     drive: Drive,
     drive_id: str,
-    *,
-    iothread_id: str | None = None,
-    performance: bool = False,
 ) -> None:
     device = f"virtio-blk-pci,drive={drive_id}"
-    if iothread_id is not None:
-        device += f",iothread={iothread_id}"
-    if performance:
-        device += "," + ",".join(PERFORMANCE_BLOCK_PROPERTIES)
     command.extend(
         [
             "-drive",
-            drive_options(
-                drive.path,
-                drive_id,
-                mode=drive.mode,
-                cache_none=performance,
-            ),
+            drive_options(drive.path, drive_id, mode=drive.mode),
             "-device",
             device,
         ]
@@ -104,14 +71,9 @@ def build_qemu_command(
     memory: str = "1G",
     cpus: int = 1,
     qemu_binary: str | None = None,
-    qemu_launcher: tuple[str, ...] | None = None,
     accel: str | None = None,
-    cpu: str | None = None,
-    iothread_id: str | None = None,
-    network: str = "user",
-    network_mode: str | None = None,
-    network_topology: str | None = None,
-    tap_name: str | None = None,
+    graphics_profile: GraphicsProfile = "headless",
+    qmp_socket: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
@@ -120,23 +82,13 @@ def build_qemu_command(
         raise CommandError("CPU count must be positive")
     if not memory:
         raise CommandError("memory size must not be empty")
-    if network_mode is not None:
-        if network != "user" and network != network_mode:
-            raise CommandError("network and network_mode disagree")
-        network = network_mode
-    if network_topology is not None:
-        if network != "user" and network != network_topology:
-            raise CommandError("network and network_topology disagree")
-        network = network_topology
-    if network not in VALID_NETWORK_MODES:
-        raise CommandError(f"unsupported network topology: {network}")
-    if tap_name is not None and (not tap_name or any(char in tap_name for char in ",=\n\r")):
-        raise CommandError("tap name must be a non-empty QEMU-safe value")
-    if qemu_launcher is not None and (
-        not qemu_launcher or any(not item for item in qemu_launcher)
+    if graphics_profile not in VALID_GRAPHICS_PROFILES:
+        raise CommandError(f"unsupported graphics profile: {graphics_profile}")
+    if qmp_socket is not None and (
+        not str(qmp_socket) or any(char in str(qmp_socket) for char in ",\n\r")
     ):
-        raise CommandError("qemu launcher must contain non-empty argv entries")
-    qemu_argv = list(qemu_launcher or (qemu_binary or "qemu-system-x86_64",))
+        raise CommandError("QMP socket path must be QEMU-safe")
+    qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
         if direct_kernel:
             command = [
@@ -147,7 +99,6 @@ def build_qemu_command(
                 str(kernel),
                 "-m",
                 memory,
-                "-nographic",
                 "-smp",
                 str(cpus),
             ]
@@ -174,12 +125,36 @@ def build_qemu_command(
                 f"file={_escaped_path(esp.path)},if=ide,format=raw,snapshot=on,aio=threads",
                 "-m",
                 memory,
-                "-nographic",
                 "-smp",
                 str(cpus),
             ]
         command.extend(
             [
+                # q35's defaults include VGA and PS/2 input.  Define the
+                # entire guest-visible graphics/input topology instead.
+                "-nodefaults",
+                "-serial",
+                "stdio",
+                "-display",
+                (
+                    "none"
+                    if graphics_profile == "headless"
+                    else "gtk"
+                    if graphics_profile == "interactive"
+                    else "egl-headless,gl=on"
+                    if graphics_profile == "virgl-headless"
+                    else "gtk,gl=on"
+                ),
+                "-device",
+                (
+                    "virtio-gpu-pci,max_outputs=1,xres=800,yres=600"
+                    if graphics_profile in {"headless", "interactive"}
+                    else "virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600"
+                ),
+                "-device",
+                "virtio-keyboard-pci",
+                "-device",
+                "virtio-tablet-pci",
                 "-object",
                 "rng-random,filename=/dev/urandom,id=rng0",
                 "-device",
@@ -188,40 +163,22 @@ def build_qemu_command(
         )
         if accel is not None:
             command.extend(["-accel", accel])
-        if cpu is not None:
-            command.extend(["-cpu", cpu])
-        if iothread_id is not None:
-            command.extend(["-object", f"iothread,id={iothread_id}"])
-        _append_pci_drive(command, rootfs, "rootfs", iothread_id=iothread_id)
-        if network == "user":
-            netdev = "user,id=net0"
-        elif network == "passt":
-            # QEMU's passt backend starts a rootless passt helper.  No tap
-            # device, uid 0, or host-side setup is implied by this topology.
-            netdev = "passt,id=net0"
-        else:
-            netdev = "tap,id=net0,vhost=on"
-            if tap_name is not None:
-                netdev += f",ifname={tap_name}"
+        if qmp_socket is not None:
+            command.extend(["-qmp", f"unix:{qmp_socket},server=on,wait=off"])
+        _append_pci_drive(command, rootfs, "rootfs")
         command.extend(
             [
                 "-no-reboot",
                 "-device",
                 "virtio-net-pci,netdev=net0",
                 "-netdev",
-                netdev,
+                "user,id=net0",
                 "-rtc",
                 "base=utc",
             ]
         )
         if extra_block is not None:
-            _append_pci_drive(
-                command,
-                extra_block,
-                "extra",
-                iothread_id=iothread_id,
-                performance=True,
-            )
+            _append_pci_drive(command, extra_block, "extra")
         if extra_args:
             command.extend(extra_args)
         return tuple(command)

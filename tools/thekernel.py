@@ -26,6 +26,7 @@ from tools.qemu_runner import (
     RunnerError,
     run,
 )
+from tools.qemu_runner.model import QmpColorBlock, QmpControls
 
 
 TARGET = "x86_64-unknown-none"
@@ -223,14 +224,8 @@ def generate_config(artifacts: Artifacts) -> None:
 def kernel_features(artifacts: Artifacts) -> str:
     variant = artifacts.variant
     features = ["qemu"]
-    if artifacts.profile in {"shell", "io-test", "mm-performance"}:
+    if artifacts.profile == "shell":
         features.append("boot-shell")
-    if artifacts.profile in {"io-test", "mm-performance"}:
-        features.append("test-io-control")
-    if artifacts.profile == "mm-performance":
-        features.extend(
-            ["mm-lock-diagnostics", "asid-switch-diagnostics", "pmu-diagnostics"]
-        )
     if variant.cpus > 1:
         features.append("smp")
     if variant.asid_fast_switch:
@@ -355,13 +350,19 @@ def run_product(
     stop_after_marker: str | None,
     commands: Path | None,
     extra_block: Path | None,
-    receipt: Path | None,
     shutdown_after_marker: bool = False,
     reject_ktap_skips: bool = False,
+    graphics_profile: str = "headless",
+    rootfs: Path | None = None,
+    qmp_screenshot: Path | None = None,
+    qmp_screenshot_after_marker: str | None = None,
+    qmp_screenshot_size: tuple[int, int] | None = None,
+    qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = (),
 ) -> int:
     if not artifacts.kernel.is_file() or not artifacts.esp.is_file():
         raise ProductError("kernel and ESP are required; run `thekernel.py build` first")
-    if not artifacts.rootfs.is_file():
+    selected_rootfs = rootfs if rootfs is not None else artifacts.rootfs
+    if not selected_rootfs.is_file():
         raise ProductError("rootfs is required; run `thekernel.py rootfs` first")
     if workdir is not None:
         run_dir = workdir.expanduser().resolve()
@@ -388,14 +389,22 @@ def run_product(
         command_path = commands.expanduser().resolve()
         if not command_path.is_file():
             raise ProductError(f"commands file does not exist: {command_path}")
+    qmp = QmpControls()
+    if qmp_screenshot is not None:
+        qmp = QmpControls(
+            socket=run_dir / "graphics-smoke.qmp",
+            screenshot=qmp_screenshot.expanduser().resolve(),
+            screenshot_after_marker=qmp_screenshot_after_marker,
+            screenshot_size=qmp_screenshot_size,
+            screenshot_color_blocks=qmp_screenshot_color_blocks,
+        )
     result = run(
         RunConfig(
             arch="x86_64",
             kernel=artifacts.kernel,
-            rootfs=artifacts.rootfs,
+            rootfs=selected_rootfs,
             esp=artifacts.esp,
             extra_block=extra_block.expanduser().resolve() if extra_block else None,
-            receipt_path=receipt.expanduser().resolve() if receipt else None,
             input_path=command_path,
             workdir=run_dir,
             log_path=run_dir / "console.log",
@@ -408,7 +417,8 @@ def run_product(
             memory=artifacts.variant.memory,
             cpus=artifacts.variant.cpus,
             accel=accel,
-            network="user",
+            graphics_profile=graphics_profile,
+            qmp=qmp,
         ),
     )
     print(f"qemu-runner exit={result.returncode} log={result.log_path}", file=sys.stderr)
@@ -464,17 +474,19 @@ def lint_cmd(args: argparse.Namespace) -> int:
 
 
 def run_cmd(args: argparse.Namespace) -> int:
-    if args.receipt and not args.commands:
-        raise ProductError("--receipt requires --commands")
     artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
+    rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else None
+    if rootfs is not None and not rootfs.is_file():
+        raise ProductError(f"rootfs does not exist: {rootfs}")
     if not args.no_build:
         build_kernel(artifacts)
-        build_rootfs(artifacts)
+        if rootfs is None:
+            build_rootfs(artifacts)
     input_after_marker = args.input_after_marker
     if (
         args.commands
         and input_after_marker is None
-        and artifacts.profile in {"shell", "io-test", "mm-performance"}
+        and artifacts.profile == "shell"
     ):
         input_after_marker = "THEKERNEL_SHELL_READY"
     return run_product(
@@ -483,11 +495,12 @@ def run_cmd(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         workdir=Path(args.workdir) if args.workdir else None,
         interactive=args.interactive,
+        graphics_profile=args.graphics_profile,
         input_after_marker=input_after_marker,
         stop_after_marker=args.stop_after_marker,
         commands=Path(args.commands) if args.commands else None,
         extra_block=Path(args.extra_block) if args.extra_block else None,
-        receipt=Path(args.receipt) if args.receipt else None,
+        rootfs=rootfs,
     )
 
 
@@ -501,13 +514,56 @@ def system_test_cmd(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         workdir=Path(args.workdir) if args.workdir else None,
         interactive=False,
+        graphics_profile="headless",
         input_after_marker=None,
         stop_after_marker=None,
         commands=None,
         extra_block=None,
-        receipt=Path(args.receipt) if args.receipt else None,
         shutdown_after_marker=True,
         reject_ktap_skips=not args.allow_skip,
+    )
+
+
+def graphics_smoke_cmd(args: argparse.Namespace) -> int:
+    artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
+    rootfs = Path(args.rootfs).expanduser().resolve()
+    screenshot = Path(args.screenshot).expanduser().resolve()
+    if not rootfs.is_file():
+        raise ProductError(f"rootfs does not exist: {rootfs}")
+    if args.graphics_profile == "virgl-headless":
+        raise ProductError(
+            "virgl-headless graphics smoke is unsupported: its EGL-headless "
+            "display has no QMP pixel-oracle surface; use virgl-interactive"
+        )
+    if args.graphics_profile == "virgl-interactive" and args.flavor != "q35-software-desktop":
+        raise ProductError("virgl-interactive graphics smoke requires --flavor q35-software-desktop")
+    if not args.no_build:
+        build_kernel(artifacts)
+    marker = (
+        "THEKERNEL_Q35_VIRGL_READY"
+        if args.graphics_profile == "virgl-interactive"
+        else "THEKERNEL_Q35_WESTON_READY"
+        if args.flavor == "q35-software-desktop"
+        else "THEKERNEL_GRAPHICS_ABI_SMOKE_READY"
+    )
+    blocks = (QmpColorBlock(300, 200, 200, 200, (255, 0, 0)),) if args.flavor == "q35-software-desktop" else ()
+    size = (800, 600) if args.flavor == "q35-software-desktop" else None
+    return run_product(
+        artifacts,
+        accel=args.accel,
+        timeout=args.timeout,
+        workdir=Path(args.workdir) if args.workdir else None,
+        interactive=False,
+        graphics_profile=args.graphics_profile,
+        input_after_marker=None,
+        stop_after_marker=marker,
+        commands=None,
+        extra_block=None,
+        rootfs=rootfs,
+        qmp_screenshot=screenshot,
+        qmp_screenshot_after_marker=marker,
+        qmp_screenshot_size=size,
+        qmp_screenshot_color_blocks=blocks,
     )
 
 
@@ -520,7 +576,7 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     if profiles:
         parser.add_argument(
             "--profile",
-            choices=("system", "shell", "io-test", "mm-performance"),
+            choices=("system", "shell"),
             default="system",
         )
 
@@ -536,11 +592,37 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument(
+        "--graphics-profile",
+        choices=("headless", "interactive", "virgl-headless", "virgl-interactive"),
+        default="headless",
+        help="select the explicit QEMU display and virtio-gpu topology",
+    )
     parser.add_argument("--commands", help="forward this command file to the guest in this process")
     parser.add_argument("--input-after-marker")
     parser.add_argument("--stop-after-marker")
     parser.add_argument("--extra-block")
-    parser.add_argument("--receipt", help="optional performance-run receipt path")
+    parser.add_argument(
+        "--rootfs",
+        help="boot this existing rootfs image instead of the standard generated rootfs",
+    )
+
+
+def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
+    add_variant_arguments(parser)
+    parser.add_argument("--rootfs", required=True, help="existing graphics rootfs.ext2 image")
+    parser.add_argument("--flavor", choices=("headless-abi-smoke", "q35-software-desktop"), default="headless-abi-smoke")
+    parser.add_argument("--screenshot", required=True, help="QMP screendump PPM output path")
+    parser.add_argument("--no-build", action="store_true", help="reuse existing kernel and ESP artifacts")
+    parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
+    parser.add_argument("--timeout", type=positive_timeout, default=300.0)
+    parser.add_argument("--workdir")
+    parser.add_argument(
+        "--graphics-profile",
+        choices=("headless", "interactive", "virgl-interactive"),
+        default="headless",
+        help="QEMU display topology; headless uses QMP screendump without a host window",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -562,15 +644,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_arguments(run_parser)
     run_parser.set_defaults(func=run_cmd)
 
+    graphics_smoke = sub.add_parser(
+        "graphics-smoke",
+        help="boot a graphics rootfs and capture a marker-gated QMP screenshot",
+    )
+    add_graphics_smoke_arguments(graphics_smoke)
+    graphics_smoke.set_defaults(func=graphics_smoke_cmd)
+
     system_test = sub.add_parser("system-test", help="build and run the product system-test suite")
     add_variant_arguments(system_test, profiles=False)
     system_test.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     system_test.add_argument("--timeout", type=positive_timeout, default=300.0)
     system_test.add_argument("--workdir")
-    system_test.add_argument(
-        "--receipt",
-        help="write the QEMU launch receipt for a system-test evidence consumer",
-    )
     system_test.add_argument(
         "--allow-skip",
         action="store_true",

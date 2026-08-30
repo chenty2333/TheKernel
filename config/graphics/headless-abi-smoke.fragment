@@ -1,0 +1,9 @@
+# No kernel DRM device is needed.  This flavor checks the dynamic userspace,
+# AF_UNIX Wayland socket, event loop, shared-memory and seat-management path.
+BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/headless"
+BR2_PACKAGE_WESTON_DEFAULT_HEADLESS=y
+BR2_PACKAGE_WESTON_HEADLESS=y
+# BR2_PACKAGE_WESTON_DRM is not set
+# BR2_PACKAGE_MESA3D is not set
+# BR2_PACKAGE_XORG7 is not set
+# BR2_PACKAGE_WLROOTS is not set

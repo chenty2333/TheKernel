@@ -10,9 +10,9 @@ use linux_raw_sys::{
     net::{
         AF_INET, AF_PACKET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_ATTACH_FILTER,
         SO_ATTACH_REUSEPORT_CBPF, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_BPF, SO_DETACH_REUSEPORT_BPF,
-        SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_SNDBUF,
-        SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW, SOL_IPV6, SOL_NETLINK, SOL_PACKET,
-        SOL_SOCKET, socklen_t,
+        SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER, SO_PASSCRED, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE,
+        SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW, SOL_IPV6, SOL_NETLINK,
+        SOL_PACKET, SOL_SOCKET, socklen_t,
     },
 };
 use thekernel_linux_packet::{
@@ -522,6 +522,14 @@ pub fn sys_getsockopt(
         return Err(AxError::InvalidInput);
     }
     if pinned.backend()? == SocketBackendKind::Netlink {
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            let value = i32::from(pinned.netlink()?.passcred());
+            write_option(&capability, optval, &mut optlen, value)?;
+            capability
+                .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+                .map_err(map_usercopy_error)?;
+            return Ok(0);
+        }
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
@@ -658,6 +666,15 @@ pub fn sys_setsockopt(
     }
 
     if pinned.backend()? == SocketBackendKind::Netlink {
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            // Linux's sock_setsockopt accepts an int prefix (including a
+            // larger optlen), rejects shorter inputs, and normalizes any
+            // non-zero value to true.
+            pinned
+                .netlink()?
+                .set_passcred(read_option_prefix_i32(&capability, optval, optlen)? != 0);
+            return Ok(0);
+        }
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }

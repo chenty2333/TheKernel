@@ -1,0 +1,10 @@
+[package]
+name = "axdriver_input"
+version = "0.1.4-preview.3"
+edition = "2021"
+description = "Common traits and types for input device drivers"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+
+[dependencies]
+axdriver_base = "0.1.4-preview.3"
+strum = { version = "0.27.2", default-features = false, features = ["derive"] }

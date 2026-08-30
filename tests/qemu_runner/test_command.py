@@ -1,14 +1,48 @@
 from __future__ import annotations
 
 import unittest
-import sys
 from pathlib import Path
 
-from tools.qemu_runner.command import CommandError, build_qemu_command, drive_options
+from tools.qemu_runner.command import build_qemu_command, drive_options
 from tools.qemu_runner.model import Drive
 
 
 class CommandTests(unittest.TestCase):
+    def test_q35_graphics_profiles_are_explicit_and_virtio_only(self) -> None:
+        base = dict(
+            arch="x86_64", kernel=Path("kernel"), rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+        )
+        headless = build_qemu_command(**base, qmp_socket=Path("run/qmp.sock"))
+        interactive = build_qemu_command(**base, graphics_profile="interactive", qmp_socket=Path("run/qmp.sock"))
+        headless_text = " ".join(headless)
+        interactive_text = " ".join(interactive)
+        self.assertNotIn("-nographic", headless)
+        self.assertIn("-nodefaults", headless)
+        self.assertIn("-serial stdio", headless_text)
+        self.assertIn("-display none", headless_text)
+        self.assertIn("-display gtk", interactive_text)
+        self.assertIn("virtio-gpu-pci,max_outputs=1,xres=800,yres=600", headless_text)
+        self.assertIn("virtio-keyboard-pci", headless_text)
+        self.assertIn("virtio-tablet-pci", headless_text)
+        self.assertIn("-qmp unix:run/qmp.sock,server=on,wait=off", headless_text)
+        self.assertIn("-qmp unix:run/qmp.sock,server=on,wait=off", interactive_text)
+
+    def test_q35_virgl_profiles_use_only_explicit_gl_topologies(self) -> None:
+        base = dict(
+            arch="x86_64", kernel=Path("kernel"), rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+        )
+        headless = build_qemu_command(**base, graphics_profile="virgl-headless")
+        interactive = build_qemu_command(**base, graphics_profile="virgl-interactive")
+        headless_text = " ".join(headless)
+        interactive_text = " ".join(interactive)
+        self.assertIn("-display egl-headless,gl=on", headless_text)
+        self.assertIn("-display gtk,gl=on", interactive_text)
+        self.assertIn("virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600", headless_text)
+        self.assertIn("virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600", interactive_text)
+        self.assertNotIn("blob=on", headless_text)
+        self.assertNotIn("venus=on", headless_text)
     def test_drive_modes_are_explicit(self) -> None:
         path = Path("/tmp/root,image.img")
         self.assertIn("aio=threads", drive_options(path, "rootfs", mode="rw"))
@@ -70,66 +104,6 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("-kernel", command)
         self.assertNotIn("if=pflash", " ".join(command))
-
-    def test_performance_topology_selects_rootless_passt(self) -> None:
-        command = build_qemu_command(
-            arch="x86_64",
-            kernel=Path("kernel-x86_64"),
-            rootfs=Drive(Path("root.img"), "snapshot"),
-            extra_block=Drive(Path("data.img"), "rw"),
-            direct_kernel=True,
-            iothread_id="perf-io",
-            network="passt",
-        )
-        text = " ".join(command)
-        self.assertIn("-netdev passt,id=net0", text)
-        self.assertIn("cache=none", text)
-        self.assertIn("aio=threads", text)
-        self.assertIn("num-queues=1", text)
-        self.assertIn("queue-size=128", text)
-        self.assertIn("request-merging=off", text)
-        self.assertIn("discard=off", text)
-        self.assertIn("write-zeroes=off", text)
-        self.assertIn("ioeventfd=on", text)
-        self.assertIn("event_idx=on", text)
-        self.assertIn("virtio-blk-pci,drive=extra,iothread=perf-io", text)
-
-    def test_tap_vhost_has_explicit_tap_backend(self) -> None:
-        command = build_qemu_command(
-            arch="x86_64",
-            kernel=Path("kernel-x86_64"),
-            rootfs=Drive(Path("root.img"), "snapshot"),
-            direct_kernel=True,
-            network_mode="tap-vhost",
-            tap_name="tk0",
-        )
-        self.assertIn("tap,id=net0,vhost=on,ifname=tk0", " ".join(command))
-
-    def test_tap_names_allow_common_net_names_and_reject_injection(self) -> None:
-        base = dict(
-            arch="x86_64",
-            kernel=Path("kernel-x86_64"),
-            rootfs=Drive(Path("root.img"), "snapshot"),
-            direct_kernel=True,
-            network="tap-vhost",
-        )
-        self.assertIn("ifname=tap-net0", " ".join(build_qemu_command(**base, tap_name="tap-net0")))
-        for invalid in ("tap,net0", "tap=net0", "tap\nnet0", "tap\rnet0"):
-            with self.assertRaises(CommandError):
-                build_qemu_command(**base, tap_name=invalid)
-
-    def test_python_launcher_is_a_full_argv_prefix(self) -> None:
-        command = build_qemu_command(
-            arch="x86_64",
-            kernel=Path("kernel-x86_64"),
-            rootfs=Drive(Path("root.img"), "snapshot"),
-            direct_kernel=True,
-            qemu_binary="/usr/bin/qemu-system-x86_64",
-            qemu_launcher=(sys.executable, "tools/kvm_scheduler_pinner.py"),
-        )
-        self.assertEqual(command[:2], (sys.executable, "tools/kvm_scheduler_pinner.py"))
-        self.assertNotIn("/usr/bin/qemu-system-x86_64", command)
-
 
 if __name__ == "__main__":
     unittest.main()

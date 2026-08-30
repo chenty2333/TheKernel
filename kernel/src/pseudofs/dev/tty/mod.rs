@@ -1,8 +1,10 @@
+pub(crate) mod fbcon;
 mod ntty;
 mod ptm;
 mod pts;
 mod pty;
 mod terminal;
+mod vt;
 
 use alloc::sync::{Arc, Weak};
 use core::{
@@ -26,6 +28,7 @@ pub use self::{
     ptm::Ptmx,
     pts::PtsDir,
     pty::PtyDriver,
+    vt::{VT_MANAGER, VtDevice, VtManager, notify_vt_owner_exit},
 };
 use self::{
     pts::PtsLease,
@@ -131,6 +134,13 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
 }
 
 impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
+    /// Routes bytes from a uniquely-owned transport into this terminal's
+    /// manual line discipline. Virtual consoles use this instead of letting
+    /// every VT race to read the hardware console.
+    pub(crate) fn inject_input(&self, bytes: &[u8]) -> AxResult<()> {
+        self.ldisc.lock().inject_input(bytes)
+    }
+
     fn this_arc(&self) -> AxResult<Arc<Self>> {
         self.this
             .get()
@@ -232,6 +242,15 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
     }
 
+    /// Whether this tty is currently claimed as a controlling terminal.
+    ///
+    /// This is deliberately an association query, rather than an FD-count
+    /// query: a session may retain its ctty after every file description has
+    /// been closed.
+    pub(crate) fn has_controlling_session(&self) -> bool {
+        self.terminal.job_control.session().is_some()
+    }
+
     /// Synchronously tears down this terminal's controlling-session state.
     ///
     /// The terminal job-control association is the synchronization point for
@@ -309,7 +328,6 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             endpoint.wake_waiters();
         }
     }
-
 }
 
 /// Hangs up `session`'s controlling terminal, if it has one.
@@ -815,8 +833,7 @@ mod tests {
         assert_eq!(slave.write_at(b"x", 0), Err(AxError::Io));
         assert_eq!(
             slave.poll().bits(),
-            (IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP)
-                .bits()
+            (IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP).bits()
         );
     }
 

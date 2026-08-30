@@ -1,7 +1,14 @@
-use alloc::{borrow::Cow, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::VecDeque,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     task::Context,
 };
 
@@ -9,16 +16,18 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axnet::{InterfaceInfo, InterfaceKind, IpAddress, RecvFlags, RouteInfo};
 use axpoll::{IoEvents, PollSet, Pollable};
-use linux_raw_sys::net::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
+use axtask::current;
+use linux_raw_sys::{
+    general::CAP_SYS_ADMIN,
+    net::{AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t},
 };
-use spin::Mutex;
+use spin::{Lazy, Mutex};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
     readiness::block_on_poll_io,
-    task::NetworkNamespace,
+    task::{AsThread, Cred, NetworkNamespace, ns_capable},
 };
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
@@ -30,7 +39,11 @@ const NETLINK_DEFAULT_SEND_BUFFER_BYTES: usize = 208 * 1024;
 const NETLINK_SEND_BUFFER_OVERHEAD: usize = 32;
 const NETLINK_MAX_MESSAGE_BYTES: usize =
     NETLINK_DEFAULT_SEND_BUFFER_BYTES - NETLINK_SEND_BUFFER_OVERHEAD;
+const NETLINK_QUEUE_LIMIT_BYTES: usize = NETLINK_DEFAULT_SEND_BUFFER_BYTES;
 const NETLINK_ROUTE: u32 = 0;
+const NETLINK_KOBJECT_UEVENT: u32 = 15;
+const KOBJECT_UEVENT_GROUP: u32 = 1;
+const NETLINK_NO_ENOBUFS: u32 = 5;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
 const NLMSG_ERROR: u16 = 2;
@@ -175,6 +188,8 @@ struct NetlinkState {
     port_id: u32,
     groups: u32,
     option_flags: u32,
+    passcred: bool,
+    bound: bool,
 }
 
 pub struct NetlinkSocket {
@@ -182,9 +197,65 @@ pub struct NetlinkSocket {
     net_ns: Arc<NetworkNamespace>,
     inode: PseudoInode,
     state: Mutex<NetlinkState>,
-    queue: Mutex<VecDeque<Vec<u8>>>,
+    queue: Mutex<NetlinkQueue>,
+    overrun: AtomicBool,
     nonblocking: AtomicBool,
     poll_rx: PollSet,
+}
+
+struct NetlinkDatagram {
+    data: Vec<u8>,
+    source_groups: u32,
+    credentials: Option<NetlinkCredentials>,
+}
+
+struct NetlinkQueue {
+    datagrams: VecDeque<NetlinkDatagram>,
+    bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NetlinkReceived {
+    pub(crate) len: usize,
+    pub(crate) source_groups: u32,
+    pub(crate) credentials: Option<NetlinkCredentials>,
+}
+
+/// Sender identity captured when a kobject uevent is queued.  This is kept
+/// beside the datagram rather than sampled at receive time: a synthetic event
+/// must retain its originating task, while kernel-originated events have the
+/// Linux kernel identity (pid 0, root).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NetlinkCredentials {
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+const KERNEL_UEVENT_CREDENTIALS: NetlinkCredentials = NetlinkCredentials {
+    pid: 0,
+    uid: 0,
+    gid: 0,
+};
+
+static KOBJECT_UEVENT_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+// Kobject/device discovery is global to init-net.  The namespace is a kernel
+// lifetime object: device notifications must not disappear merely because
+// init exits and its process-owned reference is reaped.  This one-way global
+// reference forms no ownership cycle.
+static INIT_NETWORK_NAMESPACE: Lazy<Mutex<Option<Arc<NetworkNamespace>>>> =
+    Lazy::new(|| Mutex::new(None));
+static NETLINK_PORTS: Lazy<Mutex<Vec<NetlinkPortBinding>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static KOBJECT_UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
+static KOBJECT_UEVENT_SEND_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static NETLINK_NEXT_PORT_ID: AtomicU32 = AtomicU32::new(1);
+
+struct NetlinkPortBinding {
+    net_ns: Weak<NetworkNamespace>,
+    protocol: u32,
+    port_id: u32,
+    socket_inode: u64,
 }
 
 impl NetlinkSocket {
@@ -196,29 +267,56 @@ impl NetlinkSocket {
         if !matches!(ty, SOCK_RAW | SOCK_DGRAM) {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
-        if protocol > NETLINK_MAX_PROTOCOL || protocol != NETLINK_ROUTE {
+        if protocol > NETLINK_MAX_PROTOCOL
+            || !matches!(protocol, NETLINK_ROUTE | NETLINK_KOBJECT_UEVENT)
+        {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
         Ok(())
     }
 
     pub(crate) fn try_new(protocol: u32, net_ns: Arc<NetworkNamespace>) -> AxResult<Arc<Self>> {
-        Arc::try_new(Self {
+        let socket = Arc::try_new(Self {
             protocol,
             net_ns,
             inode: PseudoInode::socket(),
             state: Mutex::new(NetlinkState::default()),
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(NetlinkQueue {
+                datagrams: VecDeque::new(),
+                bytes: 0,
+            }),
+            overrun: AtomicBool::new(false),
             nonblocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
         })
-        .map_err(|_| AxError::NoMemory)
+        .map_err(|_| AxError::NoMemory)?;
+        if protocol == NETLINK_KOBJECT_UEVENT {
+            let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
+            sockets.retain(|socket| socket.strong_count() != 0);
+            sockets.push(Arc::downgrade(&socket));
+        }
+        Ok(socket)
     }
 
     pub fn bind(&self, port_id: u32, groups: u32) -> AxResult {
+        self.bind_port_id(port_id, groups, port_id == 0)
+    }
+
+    /// Linux treats `nl_pid = 0` as an automatic port-ID request.  Prefer the
+    /// caller's TGID, then use a collision-free generated ID when it is taken.
+    pub fn bind_auto(&self, preferred_port_id: u32, groups: u32) -> AxResult {
+        self.bind_port_id(preferred_port_id, groups, true)
+    }
+
+    fn bind_port_id(&self, preferred_port_id: u32, groups: u32, automatic: bool) -> AxResult {
         let mut state = self.state.lock();
+        if state.bound {
+            return Err(LinuxError::EINVAL.into());
+        }
+        let port_id = reserve_netlink_port(self, preferred_port_id, automatic)?;
         state.port_id = port_id;
         state.groups = groups;
+        state.bound = true;
         Ok(())
     }
 
@@ -260,6 +358,17 @@ impl NetlinkSocket {
         }
     }
 
+    /// NETLINK sockets expose SO_PASSCRED per open file description.  Sender
+    /// credentials are retained in queued uevents, so this receive-side flag
+    /// may be changed after enqueue without losing the original identity.
+    pub(crate) fn set_passcred(&self, enabled: bool) {
+        self.state.lock().passcred = enabled;
+    }
+
+    pub(crate) fn passcred(&self) -> bool {
+        self.state.lock().passcred
+    }
+
     pub fn write_local_addr(
         &self,
         capability: &UserMemoryCapability,
@@ -292,17 +401,46 @@ impl NetlinkSocket {
     }
 
     pub fn enqueue_kernel(&self, data: Vec<u8>) {
+        self.enqueue_kernel_from(data, 0, None);
+    }
+
+    fn enqueue_kernel_from(
+        &self,
+        data: Vec<u8>,
+        source_groups: u32,
+        credentials: Option<NetlinkCredentials>,
+    ) {
         let mut queue = self.queue.lock();
-        if queue.len() >= NETLINK_QUEUE_LIMIT {
-            queue.pop_front();
+        if queue.datagrams.len() >= NETLINK_QUEUE_LIMIT
+            || data.len() > NETLINK_QUEUE_LIMIT_BYTES.saturating_sub(queue.bytes)
+        {
+            drop(queue);
+            self.note_queue_drop();
+            return;
         }
-        queue.push_back(data);
+        queue.bytes += data.len();
+        queue.datagrams.push_back(NetlinkDatagram {
+            data,
+            source_groups,
+            credentials,
+        });
         drop(queue);
+        self.poll_rx.wake();
+    }
+
+    /// Report one multicast delivery which this listener could not retain.
+    /// This is shared by queue admission and per-listener clone failures so
+    /// NETLINK_NO_ENOBUFS has the same meaning for either loss mode.
+    fn note_queue_drop(&self) {
+        if self.state.lock().option_flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
+            self.overrun.store(true, Ordering::Release);
+        }
         self.poll_rx.wake();
     }
 
     pub fn recv(&self, dst: &mut IoDst, flags: RecvFlags) -> AxResult<usize> {
         self.recv_with_nonblocking(dst, flags, self.nonblocking())
+            .map(|received| received.len)
     }
 
     pub(crate) fn recv_with_nonblocking(
@@ -310,36 +448,48 @@ impl NetlinkSocket {
         dst: &mut IoDst,
         flags: RecvFlags,
         nonblocking: bool,
-    ) -> AxResult<usize> {
+    ) -> AxResult<NetlinkReceived> {
         block_on_poll_io(
             self,
             IoEvents::READABLE,
             nonblocking || flags.contains(RecvFlags::DONT_WAIT),
             || {
+                if self.overrun.swap(false, Ordering::AcqRel) {
+                    return Err(LinuxError::ENOBUFS.into());
+                }
                 let mut queue = self.queue.lock();
-                let Some(packet) = queue.front() else {
+                let Some(packet) = queue.datagrams.front() else {
                     return Err(AxError::WouldBlock);
                 };
 
-                let packet_len = packet.len();
+                let packet_len = packet.data.len();
                 let copy_len = packet_len.min(dst.remaining_mut());
-                dst.write(&packet[..copy_len])?;
+                dst.write(&packet.data[..copy_len])?;
+                let source_groups = packet.source_groups;
+                let credentials = packet.credentials;
                 if !flags.contains(RecvFlags::PEEK) {
-                    queue.pop_front();
+                    let packet = queue.datagrams.pop_front().expect("front packet vanished");
+                    queue.bytes -= packet.data.len();
                 }
 
-                Ok(if flags.contains(RecvFlags::TRUNCATE) {
-                    packet_len
-                } else {
-                    copy_len
+                Ok(NetlinkReceived {
+                    len: if flags.contains(RecvFlags::TRUNCATE) {
+                        packet_len
+                    } else {
+                        copy_len
+                    },
+                    source_groups,
+                    credentials,
                 })
             },
         )
     }
 
     fn handle_write(&self, data: &[u8]) -> AxResult {
-        if self.protocol != NETLINK_ROUTE {
-            return Err(AxError::OperationNotSupported);
+        match self.protocol {
+            NETLINK_ROUTE => {}
+            NETLINK_KOBJECT_UEVENT => return Err(LinuxError::EPERM.into()),
+            _ => return Err(AxError::OperationNotSupported),
         }
 
         let mut offset = 0usize;
@@ -374,6 +524,62 @@ impl NetlinkSocket {
         }
 
         Ok(())
+    }
+
+    /// Linux's uevent_net_rcv_skb equivalent.  The netlink framing is only a
+    /// userspace submission envelope: listeners receive its payload plus the
+    /// kernel-assigned SEQNUM field, as a group-1 kernel multicast datagram.
+    pub(crate) fn send_uevent_from_user(
+        &self,
+        data: &[u8],
+        actor: &Cred,
+        sender_pid: u32,
+    ) -> AxResult {
+        if self.protocol != NETLINK_KOBJECT_UEVENT {
+            return self.handle_write(data);
+        }
+        if !ns_capable(actor, self.net_ns.owner_user_ns(), CAP_SYS_ADMIN) {
+            return Err(LinuxError::EPERM.into());
+        }
+        if data.len() < size_of::<NlMsgHdr>() {
+            return Err(AxError::InvalidInput);
+        }
+        let header = read_unaligned::<NlMsgHdr>(data)?;
+        let message_len = header.nlmsg_len as usize;
+        if message_len < size_of::<NlMsgHdr>() || message_len != data.len() {
+            return Err(AxError::InvalidInput);
+        }
+        let payload = &data[size_of::<NlMsgHdr>()..];
+        let ids = actor.ids();
+        broadcast_user_uevent(
+            &self.net_ns,
+            payload,
+            NetlinkCredentials {
+                pid: sender_pid,
+                uid: ids.euid.into_raw(),
+                gid: ids.egid.into_raw(),
+            },
+        )
+    }
+
+    pub(crate) fn write_with_actor(
+        &self,
+        src: &mut IoSrc,
+        actor: &Cred,
+        sender_pid: u32,
+    ) -> AxResult<usize> {
+        let len = src.remaining();
+        if len > NETLINK_MAX_MESSAGE_BYTES {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+        data.resize(len, 0);
+        src.read_exact(&mut data)?;
+        self.send_uevent_from_user(&data, actor, sender_pid)?;
+        Ok(len)
     }
 
     fn handle_route_message(&self, hdr: &NlMsgHdr, payload: &[u8]) -> AxResult {
@@ -451,6 +657,275 @@ impl NetlinkSocket {
         self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
     }
+
+    fn subscribed_to(&self, group: u32) -> bool {
+        self.state.lock().groups & group != 0
+    }
+}
+
+fn reserve_netlink_port(
+    socket: &NetlinkSocket,
+    preferred_port_id: u32,
+    automatic: bool,
+) -> AxResult<u32> {
+    let mut ports = NETLINK_PORTS.lock();
+    ports.retain(|binding| binding.net_ns.strong_count() != 0);
+    let net_ns = Arc::downgrade(&socket.net_ns);
+    let in_use = |port_id| {
+        ports.iter().any(|binding| {
+            binding.protocol == socket.protocol
+                && binding.port_id == port_id
+                && Weak::ptr_eq(&binding.net_ns, &net_ns)
+        })
+    };
+    let port_id = if automatic && (preferred_port_id == 0 || in_use(preferred_port_id)) {
+        let mut candidate = NETLINK_NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut attempts = 0;
+        loop {
+            if candidate != 0 && !in_use(candidate) {
+                break candidate;
+            }
+            attempts += 1;
+            if attempts == u32::MAX {
+                return Err(LinuxError::EADDRINUSE.into());
+            }
+            candidate = NETLINK_NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        if in_use(preferred_port_id) {
+            return Err(LinuxError::EADDRINUSE.into());
+        }
+        preferred_port_id
+    };
+    ports.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    ports.push(NetlinkPortBinding {
+        net_ns,
+        protocol: socket.protocol,
+        port_id,
+        socket_inode: socket.inode.inode(),
+    });
+    Ok(port_id)
+}
+
+impl Drop for NetlinkSocket {
+    fn drop(&mut self) {
+        let inode = self.inode.inode();
+        if self.protocol == NETLINK_KOBJECT_UEVENT {
+            // Never leave a dead weak entry for the next sender to scan.  This
+            // lock is also taken by broadcast, but Drop does not acquire any
+            // socket-local locks, preserving the broadcast lock order.
+            let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
+            let this = core::ptr::from_ref(self);
+            // Do not upgrade here: upgrading our own weak reference can make
+            // it the final Arc, whose release recursively enters Drop while
+            // the registry lock remains held.
+            sockets.retain(|weak| weak.as_ptr() != this && weak.strong_count() != 0);
+            // A burst of unprivileged open/close must not permanently retain a
+            // large sparse backing allocation for future broadcasts.
+            let retained = sockets.len();
+            if sockets.capacity() > retained.saturating_mul(2).max(16) {
+                sockets.shrink_to(retained.max(16));
+            }
+        }
+        NETLINK_PORTS
+            .lock()
+            .retain(|binding| binding.socket_inode != inode);
+    }
+}
+
+/// Establish the network namespace to which all kernel kobject uevents are
+/// broadcast.  Boot registers init-net before publishing devices; repeating
+/// that registration is harmless, while replacing it is rejected.
+pub(crate) fn register_init_network_namespace(net_ns: &Arc<NetworkNamespace>) -> AxResult {
+    let mut init_net_ns = INIT_NETWORK_NAMESPACE.lock();
+    match init_net_ns.as_ref() {
+        Some(existing) if Arc::ptr_eq(existing, net_ns) => Ok(()),
+        Some(_) => Err(AxError::AlreadyExists),
+        None => {
+            *init_net_ns = Some(net_ns.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Publish a kobject uevent exclusively to the boot-established init network
+/// namespace.  Before boot has registered init-net, there can be no
+/// publishable device listener, so retain the historical best-effort behavior
+/// and drop the notification.
+pub(crate) fn emit_init_net_kobject_uevent(
+    action: &str,
+    devpath: &str,
+    subsystem: &str,
+    extra_environment: &[(&str, &str)],
+) -> AxResult<Option<u64>> {
+    let init_net_ns = INIT_NETWORK_NAMESPACE.lock().clone();
+    let Some(init_net_ns) = init_net_ns else {
+        return Ok(None);
+    };
+    emit_kobject_uevent(&init_net_ns, action, devpath, subsystem, extra_environment).map(Some)
+}
+
+/// Publish a kernel kobject uevent to NETLINK_KOBJECT_UEVENT group 1.
+///
+/// The payload follows the Linux wire format: an action/path header followed
+/// by NUL-separated environment strings, with a globally monotonic SEQNUM.
+/// This is intentionally independent from the route netlink request parser.
+pub(crate) fn emit_kobject_uevent(
+    net_ns: &NetworkNamespace,
+    action: &str,
+    devpath: &str,
+    subsystem: &str,
+    extra_environment: &[(&str, &str)],
+) -> AxResult<u64> {
+    if action.is_empty()
+        || devpath.is_empty()
+        || subsystem.is_empty()
+        || action.contains('\0')
+        || devpath.contains('\0')
+        || subsystem.contains('\0')
+        || extra_environment
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains('\0') || value.contains('\0'))
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    // A single sender domain keeps sequence allocation and delivery ordered:
+    // listeners can never receive SEQNUM n + 1 before n.
+    let _send_guard = KOBJECT_UEVENT_SEND_LOCK.lock();
+    let sequence = KOBJECT_UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
+    let sequence_text = sequence.to_string();
+    let mut payload_len = action
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_add(devpath.len()))
+        .and_then(|len| len.checked_add(1))
+        .ok_or(AxError::NoMemory)?;
+    for (key, value) in [
+        ("ACTION", action),
+        ("DEVPATH", devpath),
+        ("SUBSYSTEM", subsystem),
+        ("SEQNUM", sequence_text.as_str()),
+    ]
+    .into_iter()
+    .chain(extra_environment.iter().copied())
+    {
+        payload_len = payload_len
+            .checked_add(key.len())
+            .and_then(|len| len.checked_add(1))
+            .and_then(|len| len.checked_add(value.len()))
+            .and_then(|len| len.checked_add(1))
+            .ok_or(AxError::NoMemory)?;
+    }
+    if payload_len > NETLINK_MAX_MESSAGE_BYTES {
+        return Err(LinuxError::EMSGSIZE.into());
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_len)
+        .map_err(|_| AxError::NoMemory)?;
+    append_uevent_field(&mut payload, action)?;
+    payload.push(b'@');
+    append_uevent_field(&mut payload, devpath)?;
+    payload.push(0);
+    append_uevent_assignment(&mut payload, "ACTION", action)?;
+    append_uevent_assignment(&mut payload, "DEVPATH", devpath)?;
+    append_uevent_assignment(&mut payload, "SUBSYSTEM", subsystem)?;
+    append_uevent_assignment(&mut payload, "SEQNUM", &sequence_text)?;
+    for &(key, value) in extra_environment {
+        append_uevent_assignment(&mut payload, key, value)?;
+    }
+    debug_assert_eq!(payload.len(), payload_len);
+
+    broadcast_uevent_to_namespace(net_ns, &payload, KERNEL_UEVENT_CREDENTIALS);
+    Ok(sequence)
+}
+
+fn broadcast_user_uevent(
+    net_ns: &NetworkNamespace,
+    payload: &[u8],
+    credentials: NetlinkCredentials,
+) -> AxResult {
+    // Keep synthetic and kernel-originated uevents in one sequence/delivery
+    // domain, matching uevent_sock_mutex plus the global Linux sequence.
+    let _send_guard = KOBJECT_UEVENT_SEND_LOCK.lock();
+    let sequence = KOBJECT_UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
+    let sequence_text = sequence.to_string();
+    let suffix_len = "SEQNUM="
+        .len()
+        .checked_add(sequence_text.len())
+        .and_then(|len| len.checked_add(1))
+        .ok_or(AxError::NoMemory)?;
+    let message_len = payload
+        .len()
+        .checked_add(suffix_len)
+        .ok_or(AxError::NoMemory)?;
+    if message_len > NETLINK_MAX_MESSAGE_BYTES {
+        return Err(LinuxError::EMSGSIZE.into());
+    }
+    let mut message = Vec::new();
+    message
+        .try_reserve_exact(message_len)
+        .map_err(|_| AxError::NoMemory)?;
+    message.extend_from_slice(payload);
+    append_uevent_assignment(&mut message, "SEQNUM", &sequence_text)?;
+    debug_assert_eq!(message.len(), message_len);
+    broadcast_uevent_to_namespace(net_ns, &message, credentials);
+    Ok(())
+}
+
+fn broadcast_uevent_to_namespace(
+    net_ns: &NetworkNamespace,
+    payload: &[u8],
+    credentials: NetlinkCredentials,
+) {
+    let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
+    sockets.retain(|socket| {
+        let Some(socket) = socket.upgrade() else {
+            return false;
+        };
+        if core::ptr::eq(socket.net_ns.as_ref(), net_ns)
+            && socket.subscribed_to(KOBJECT_UEVENT_GROUP)
+        {
+            // Keep per-socket buffers isolated: an allocation failure for one
+            // listener never makes another listener observe its datagram.
+            let mut message = Vec::new();
+            if message.try_reserve_exact(payload.len()).is_ok() {
+                message.extend_from_slice(&payload);
+                socket.enqueue_kernel_from(message, KOBJECT_UEVENT_GROUP, Some(credentials));
+            } else {
+                socket.note_queue_drop();
+            }
+        }
+        true
+    });
+}
+
+#[cfg(test)]
+fn kobject_uevent_socket_is_registered(socket: *const NetlinkSocket) -> bool {
+    KOBJECT_UEVENT_SOCKETS
+        .lock()
+        .iter()
+        .any(|weak| weak.as_ptr() == socket && weak.strong_count() != 0)
+}
+
+fn append_uevent_field(payload: &mut Vec<u8>, value: &str) -> AxResult {
+    payload
+        .try_reserve(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    payload.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn append_uevent_assignment(payload: &mut Vec<u8>, key: &str, value: &str) -> AxResult {
+    payload
+        .try_reserve(key.len() + 1 + value.len() + 1)
+        .map_err(|_| AxError::NoMemory)?;
+    payload.extend_from_slice(key.as_bytes());
+    payload.push(b'=');
+    payload.extend_from_slice(value.as_bytes());
+    payload.push(0);
+    Ok(())
 }
 
 impl FileLike for NetlinkSocket {
@@ -459,18 +934,13 @@ impl FileLike for NetlinkSocket {
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        let len = src.remaining();
-        if len > NETLINK_MAX_MESSAGE_BYTES {
-            return Err(LinuxError::EMSGSIZE.into());
-        }
-
-        let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
-        data.resize(len, 0);
-        src.read_exact(&mut data)?;
-        self.handle_write(&data)?;
-        Ok(len)
+        // write(2) has no syscall socket snapshot.  Capture the current
+        // credential at this FileLike boundary and use the same helper as the
+        // send/sendmsg paths below.
+        let current = current();
+        let thread = current.as_thread();
+        let actor = thread.current_cred();
+        self.write_with_actor(src, &actor, thread.proc_data.proc.pid() as u32)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -757,7 +1227,10 @@ fn align4(value: usize) -> usize {
 impl Pollable for NetlinkSocket {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::WRITABLE;
-        events.set(IoEvents::READABLE, !self.queue.lock().is_empty());
+        events.set(
+            IoEvents::READABLE,
+            self.overrun.load(Ordering::Acquire) || !self.queue.lock().datagrams.is_empty(),
+        );
         events
     }
 
@@ -781,19 +1254,23 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::{MaybeUninit, size_of};
 
-    use axerrno::LinuxError;
+    use axerrno::{AxError, LinuxError};
     use axhal::paging::{MappingFlags, PageSize};
     use axio::{IoBuf, Read};
+    use axnet::RecvFlags;
     use axsync::Mutex;
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
     use super::{
-        NETLINK_MAX_MESSAGE_BYTES, NetlinkSocket, NlMsgHdr, RTM_GETLINK, SockaddrNl, write_struct,
+        NETLINK_KOBJECT_UEVENT, NETLINK_MAX_MESSAGE_BYTES, NETLINK_NO_ENOBUFS, NETLINK_ROUTE,
+        NetlinkSocket, NlMsgHdr, RTM_GETLINK, SockaddrNl, emit_init_net_kobject_uevent,
+        emit_kobject_uevent, kobject_uevent_socket_is_registered, register_init_network_namespace,
+        write_struct,
     };
     use crate::{
         file::FileLike,
         mm::{AddrSpace, Backend, UserMemoryCapability, UserPtr},
-        task::{NetworkNamespace, UserNamespace},
+        task::{Cred, Kgid, Kuid, NetworkNamespace, UserNamespace},
     };
 
     struct UnreadableLengthSource {
@@ -837,6 +1314,31 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         NetlinkSocket::try_new(0, net_ns).unwrap()
+    }
+
+    fn uevent_socket(groups: u32) -> Arc<NetlinkSocket> {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        socket.bind(42, groups).unwrap();
+        socket
+    }
+
+    fn uevent_frame(payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut frame = alloc::vec![0; size_of::<NlMsgHdr>() + payload.len()];
+        let frame_len = frame.len();
+        write_struct(
+            &mut frame,
+            &NlMsgHdr {
+                nlmsg_len: frame_len as u32,
+                nlmsg_type: 0,
+                nlmsg_flags: 0,
+                nlmsg_seq: 0,
+                nlmsg_pid: 0,
+            },
+        );
+        frame[size_of::<NlMsgHdr>()..].copy_from_slice(payload);
+        frame
     }
 
     fn mapped_capability() -> UserMemoryCapability {
@@ -955,5 +1457,378 @@ mod tests {
         let mut source = &message[..];
 
         assert_eq!(socket.write(&mut source).unwrap(), message.len());
+    }
+
+    #[test]
+    fn kobject_uevent_group_one_gets_nul_payload_and_kernel_source() {
+        let socket = uevent_socket(1);
+        let sequence = emit_kobject_uevent(
+            socket.net_namespace(),
+            "add",
+            "/devices/virtual/test0",
+            "test",
+            &[("MAJOR", "1")],
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 256];
+        let mut dst = &mut bytes[..];
+        let received = socket
+            .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+            .unwrap();
+
+        assert_eq!(received.source_groups, 1);
+        assert_eq!(received.credentials, Some(super::KERNEL_UEVENT_CREDENTIALS));
+        let expected = alloc::format!(
+            "add@{}\0ACTION=add\0DEVPATH={}\0SUBSYSTEM=test\0SEQNUM={}\0MAJOR=1\0",
+            "/devices/virtual/test0",
+            "/devices/virtual/test0",
+            sequence,
+        );
+        assert_eq!(&bytes[..received.len], expected.as_bytes());
+    }
+
+    #[test]
+    fn ordinary_netlink_datagrams_do_not_gain_uevent_credentials() {
+        let socket = route_socket();
+        socket.enqueue_kernel(alloc::vec![1]);
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        let received = socket
+            .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+            .unwrap();
+
+        assert_eq!(received.credentials, None);
+    }
+
+    #[test]
+    fn passcred_is_per_socket_and_can_be_enabled_after_uevent_enqueue() {
+        let socket = uevent_socket(1);
+        emit_kobject_uevent(
+            socket.net_namespace(),
+            "change",
+            "/devices/virtual/test0",
+            "test",
+            &[],
+        )
+        .unwrap();
+        assert!(!socket.passcred());
+        socket.set_passcred(true);
+        assert!(socket.passcred());
+
+        let mut bytes = [0_u8; 128];
+        let mut dst = &mut bytes[..];
+        let received = socket
+            .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+            .unwrap();
+        assert_eq!(received.credentials, Some(super::KERNEL_UEVENT_CREDENTIALS));
+    }
+
+    #[test]
+    fn kobject_uevents_require_group_one_subscription() {
+        let socket = uevent_socket(0);
+        emit_kobject_uevent(
+            socket.net_namespace(),
+            "remove",
+            "/devices/virtual/test0",
+            "test",
+            &[],
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        assert_eq!(
+            socket.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn synthetic_uevent_requires_admin_in_the_socket_namespace_owner() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        let child = owner
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let actor = Cred::try_with_user_namespace(&Cred::try_root(owner).unwrap(), child).unwrap();
+
+        assert_eq!(
+            socket.send_uevent_from_user(&uevent_frame(b"change@/devices/test0\0"), &actor, 17),
+            Err(LinuxError::EPERM.into())
+        );
+    }
+
+    #[test]
+    fn synthetic_uevent_requires_one_complete_nlmsghdr_frame() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        let actor = Cred::try_root(owner).unwrap();
+
+        assert_eq!(
+            socket.send_uevent_from_user(&[0; size_of::<NlMsgHdr>() - 1], &actor, 17),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut frame = uevent_frame(b"change@/devices/test0\0");
+        let truncated_len = frame.len() - 1;
+        write_struct(
+            &mut frame,
+            &NlMsgHdr {
+                nlmsg_len: truncated_len as u32,
+                nlmsg_type: 0,
+                nlmsg_flags: 0,
+                nlmsg_seq: 0,
+                nlmsg_pid: 0,
+            },
+        );
+        assert_eq!(
+            socket.send_uevent_from_user(&frame, &actor, 17),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn synthetic_uevent_strips_header_appends_sequence_and_stays_in_namespace() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let first_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
+        let second_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
+        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns.clone()).unwrap();
+        let listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns).unwrap();
+        let isolated = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, second_ns).unwrap();
+        listener.bind(101, 1).unwrap();
+        isolated.bind(101, 1).unwrap();
+        let actor = Cred::try_root(owner).unwrap();
+        let payload = b"change@/devices/test0\0ACTION=change\0";
+
+        sender
+            .send_uevent_from_user(&uevent_frame(payload), &actor, 1234)
+            .unwrap();
+        let mut bytes = [0_u8; 128];
+        let mut dst = &mut bytes[..];
+        let received = listener
+            .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+            .unwrap();
+        let message = &bytes[..received.len];
+        assert_eq!(received.source_groups, 1);
+        assert_eq!(
+            received.credentials,
+            Some(super::NetlinkCredentials {
+                pid: 1234,
+                uid: 0,
+                gid: 0,
+            })
+        );
+        assert!(message.starts_with(payload));
+        assert!(message.ends_with(b"\0"));
+        assert!(message[payload.len()..].starts_with(b"SEQNUM="));
+
+        let mut isolated_bytes = [0_u8; 1];
+        let mut isolated_dst = &mut isolated_bytes[..];
+        assert_eq!(
+            isolated.recv_with_nonblocking(&mut isolated_dst, RecvFlags::empty(), true),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn uevent_socket_drop_unlinks_its_weak_registration() {
+        let socket = uevent_socket(0);
+        let socket_ptr = Arc::as_ptr(&socket);
+        assert!(kobject_uevent_socket_is_registered(socket_ptr));
+        drop(socket);
+        assert!(!kobject_uevent_socket_is_registered(socket_ptr));
+    }
+
+    #[test]
+    fn kobject_uevent_accepts_datagram_and_raw_socket_types() {
+        assert!(
+            NetlinkSocket::validate_socket_type(
+                linux_raw_sys::net::SOCK_DGRAM,
+                NETLINK_KOBJECT_UEVENT,
+            )
+            .is_ok()
+        );
+        assert!(
+            NetlinkSocket::validate_socket_type(
+                linux_raw_sys::net::SOCK_RAW,
+                NETLINK_KOBJECT_UEVENT,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kobject_uevent_port_ids_are_unique_rebindable_only_after_close() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let first = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
+        let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
+
+        first.bind(42, 1).unwrap();
+        assert_eq!(second.bind(42, 1), Err(LinuxError::EADDRINUSE.into()));
+        assert_eq!(first.bind(43, 1), Err(LinuxError::EINVAL.into()));
+
+        second.bind_auto(42, 1).unwrap();
+        assert_ne!(second.state.lock().port_id, 42);
+        drop(first);
+
+        let replacement = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        replacement.bind(42, 1).unwrap();
+    }
+
+    #[test]
+    fn kobject_uevent_delivery_is_limited_to_its_network_namespace() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let first_ns = NetworkNamespace::try_new_loopback_only(user_ns.clone()).unwrap();
+        let second_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let first = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns.clone()).unwrap();
+        let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, second_ns).unwrap();
+        first.bind(42, 1).unwrap();
+        second.bind(42, 1).unwrap();
+
+        emit_kobject_uevent(&first_ns, "change", "/devices/test0", "test", &[]).unwrap();
+        let mut first_bytes = [0_u8; 128];
+        let mut first_dst = &mut first_bytes[..];
+        assert!(
+            first
+                .recv_with_nonblocking(&mut first_dst, RecvFlags::empty(), true)
+                .is_ok()
+        );
+        let mut second_bytes = [0_u8; 1];
+        let mut second_dst = &mut second_bytes[..];
+        assert_eq!(
+            second.recv_with_nonblocking(&mut second_dst, RecvFlags::empty(), true),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn device_uevents_always_use_registered_init_network_namespace() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let init_net_ns = NetworkNamespace::try_new_loopback_only(user_ns.clone()).unwrap();
+        let other_net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        register_init_network_namespace(&init_net_ns).unwrap();
+        // Re-establishing the same boot namespace is idempotent, but a
+        // different namespace must never become the device-event target.
+        assert!(register_init_network_namespace(&init_net_ns).is_ok());
+        assert_eq!(
+            register_init_network_namespace(&other_net_ns),
+            Err(AxError::AlreadyExists)
+        );
+
+        let init_listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, init_net_ns).unwrap();
+        let other_listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, other_net_ns).unwrap();
+        init_listener.bind(101, 1).unwrap();
+        other_listener.bind(101, 1).unwrap();
+
+        assert!(
+            emit_init_net_kobject_uevent("change", "/devices/test0", "test", &[])
+                .unwrap()
+                .is_some()
+        );
+        let mut init_bytes = [0_u8; 128];
+        let mut init_dst = &mut init_bytes[..];
+        assert!(
+            init_listener
+                .recv_with_nonblocking(&mut init_dst, RecvFlags::empty(), true)
+                .is_ok()
+        );
+        let mut other_bytes = [0_u8; 1];
+        let mut other_dst = &mut other_bytes[..];
+        assert_eq!(
+            other_listener.recv_with_nonblocking(&mut other_dst, RecvFlags::empty(), true),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn route_and_uevent_port_ids_are_reserved_per_namespace_and_protocol() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let route = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns.clone()).unwrap();
+        let route_collision = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns.clone()).unwrap();
+        let uevent = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
+
+        route.bind(77, 0).unwrap();
+        assert_eq!(
+            route_collision.bind(77, 0),
+            Err(LinuxError::EADDRINUSE.into())
+        );
+        // The protocol is part of a netlink port identity.
+        uevent.bind(77, 1).unwrap();
+        assert_eq!(route.bind(78, 0), Err(LinuxError::EINVAL.into()));
+        route_collision.bind_auto(77, 0).unwrap();
+        assert_ne!(route_collision.state.lock().port_id, 77);
+
+        drop(route);
+        let replacement = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns).unwrap();
+        replacement.bind(77, 0).unwrap();
+    }
+
+    #[test]
+    fn netlink_queue_reports_one_overrun_unless_suppressed() {
+        let socket = route_socket();
+        for _ in 0..=super::NETLINK_QUEUE_LIMIT {
+            socket.enqueue_kernel(alloc::vec![1]);
+        }
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        assert_eq!(
+            socket.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
+            Err(LinuxError::ENOBUFS.into())
+        );
+        assert_eq!(
+            socket
+                .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+                .unwrap()
+                .len,
+            1
+        );
+
+        let suppressed = route_socket();
+        suppressed.set_option(NETLINK_NO_ENOBUFS, 1).unwrap();
+        for _ in 0..=super::NETLINK_QUEUE_LIMIT {
+            suppressed.enqueue_kernel(alloc::vec![1]);
+        }
+        assert_eq!(
+            suppressed
+                .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+                .unwrap()
+                .len,
+            1
+        );
+    }
+
+    #[test]
+    fn netlink_queue_drop_helper_honors_no_enobufs() {
+        let socket = route_socket();
+        socket.note_queue_drop();
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        assert_eq!(
+            socket.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
+            Err(LinuxError::ENOBUFS.into())
+        );
+
+        let suppressed = route_socket();
+        suppressed.set_option(NETLINK_NO_ENOBUFS, 1).unwrap();
+        suppressed.note_queue_drop();
+        assert_eq!(
+            suppressed.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
+            Err(AxError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn netlink_queue_rejects_messages_past_its_byte_limit() {
+        let socket = route_socket();
+        socket.enqueue_kernel(alloc::vec![0; super::NETLINK_QUEUE_LIMIT_BYTES + 1]);
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        assert_eq!(
+            socket.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
+            Err(LinuxError::ENOBUFS.into())
+        );
     }
 }

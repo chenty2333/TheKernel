@@ -586,6 +586,12 @@ static int test_creat_differential(void) {
         "creat-differential-child");
 }
 
+static int test_time_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/time-differential", NULL,
+        "time-differential-child");
+}
+
 static int test_umask_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/umask-differential", NULL,
@@ -692,6 +698,7 @@ int main(int argc, char **argv) {
         { "proc-zombie", test_proc_zombie_differential },
         { "native-ni", test_native_ni_differential },
         { "creat", test_creat_differential },
+        { "time", test_time_differential },
         { "umask", test_umask_differential },
         { "signal-fp", test_signal_fp },
         { "io-uring", test_io_uring },

@@ -1,0 +1,4 @@
+# SHA-256 of the sorted, relative-path sha256sum listing for the compatible
+# installed Perl share tree. It supplies the dependency closure of the four
+# Buildroot-required module families, without writing to the system Perl.
+cdaf6375c0678b0c39d6e701f01881c2431f3202617673ebad436d14df8e6492  .

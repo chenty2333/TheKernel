@@ -30,6 +30,7 @@ pub mod bpf;
 
 mod config;
 mod deferred_work;
+pub mod drm;
 mod file;
 #[cfg(feature = "bpf")]
 mod jit_memory;

@@ -1,8 +1,3 @@
-use super::{DeviceStatus, DeviceType, Transport};
-use crate::{
-    queue::{fake_read_write_queue, Descriptor},
-    PhysAddr, Result,
-};
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     any::TypeId,
@@ -12,13 +7,24 @@ use core::{
 };
 use std::{sync::Mutex, thread};
 
+use super::{DeviceStatus, DeviceType, Transport};
+use crate::{
+    PhysAddr, Result,
+    queue::{Descriptor, fake_read_write_queue},
+};
+
 /// A fake implementation of [`Transport`] for unit tests.
 #[derive(Debug)]
 pub struct FakeTransport<C: 'static> {
+    /// VirtIO device type exposed by the fake transport.
     pub device_type: DeviceType,
+    /// Maximum queue size advertised to the driver.
     pub max_queue_size: u32,
+    /// Device feature bits advertised during negotiation.
     pub device_features: u64,
+    /// Typed configuration-space allocation owned by the test.
     pub config_space: NonNull<C>,
+    /// Shared device-side state observed by the test worker.
     pub state: Arc<Mutex<State>>,
 }
 
@@ -107,11 +113,17 @@ impl<C> Transport for FakeTransport<C> {
 }
 
 #[derive(Debug, Default)]
+/// Mutable device-side state for a [`FakeTransport`].
 pub struct State {
+    /// Current VirtIO device status bits.
     pub status: DeviceStatus,
+    /// Feature bits accepted by the driver.
     pub driver_features: u64,
+    /// Legacy guest page size selected by the driver.
     pub guest_page_size: u32,
+    /// Whether the fake device has a pending interrupt.
     pub interrupt_pending: bool,
+    /// Per-queue configuration and notification state.
     pub queues: Vec<QueueStatus>,
 }
 
@@ -198,10 +210,16 @@ impl State {
 }
 
 #[derive(Debug, Default)]
+/// Device-visible state for one fake virtqueue.
 pub struct QueueStatus {
+    /// Configured queue length.
     pub size: u32,
+    /// Physical address of the descriptor table.
     pub descriptors: PhysAddr,
+    /// Physical address of the driver area.
     pub driver_area: PhysAddr,
+    /// Physical address of the device area.
     pub device_area: PhysAddr,
+    /// Notification latch set by the driver and consumed by the worker.
     pub notified: AtomicBool,
 }

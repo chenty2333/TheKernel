@@ -694,11 +694,11 @@ pub fn get_file_like(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
     })
 }
 
-/// Returns the files table selected by the current process scope.
+/// Returns the files table selected by the current thread.
 ///
 /// Syscall entry points that need a stable object graph snapshot must clone
 /// this once and carry it through the operation instead of resolving the
-/// scope-local table again in a leaf object.
+/// task-local slot again in a leaf object.
 pub(crate) fn current_fd_table() -> Arc<FdTable> {
     current().as_thread().fd_table()
 }
@@ -1105,6 +1105,111 @@ mod tests {
             description.register_descriptor_close(&waker).err(),
             Some(DescriptorCloseRegistrationError::Closed)
         );
+    }
+
+    #[test]
+    fn device_ofds_are_per_open_but_shared_by_dup_fork_and_rights_transfer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = FdTable::new().unwrap();
+        let receiver = FdTable::new().unwrap();
+        let separate_open = FdTable::new().unwrap();
+
+        // These model two successful DeviceOps::open_description calls.  A
+        // descriptor duplication, a fork snapshot, and SCM_RIGHTS must reuse
+        // the first returned OFD rather than invoke the device factory again.
+        let first_open = descriptor_for(&drops).description;
+        let second_open = descriptor_for(&drops).description;
+        source
+            .add_at_least(first_open.clone(), 3, 4, false)
+            .unwrap();
+        source
+            .add_at_least(first_open.clone(), 7, 8, false)
+            .unwrap();
+        let forked = source.fork_copy().unwrap();
+        receiver
+            .add_at_least(first_open.clone(), 9, 10, false)
+            .unwrap();
+        separate_open
+            .add_at_least(second_open.clone(), 3, 4, false)
+            .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &source.get_description(3).unwrap(),
+            &first_open
+        ));
+        assert!(Arc::ptr_eq(
+            &source.get_description(7).unwrap(),
+            &first_open
+        ));
+        assert!(Arc::ptr_eq(
+            &forked.get_description(3).unwrap(),
+            &first_open
+        ));
+        assert!(Arc::ptr_eq(
+            &receiver.get_description(9).unwrap(),
+            &first_open
+        ));
+        assert!(!Arc::ptr_eq(
+            &separate_open.get_description(3).unwrap(),
+            &first_open
+        ));
+        assert_eq!(first_open.descriptor_reference_count(), 4);
+        assert_eq!(second_open.descriptor_reference_count(), 1);
+
+        drop(source.close(3).unwrap());
+        drop(source.close(7).unwrap());
+        assert_eq!(first_open.descriptor_reference_count(), 2);
+        drop(forked);
+        assert_eq!(first_open.descriptor_reference_count(), 1);
+        drop(receiver.close(9).unwrap());
+        assert_eq!(first_open.descriptor_reference_count(), 0);
+        drop(separate_open.close(3).unwrap());
+        assert_eq!(second_open.descriptor_reference_count(), 0);
+
+        drop(first_open);
+        drop(second_open);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cloexec_close_keeps_a_shared_device_ofd_and_its_status_flags_alive() {
+        use linux_raw_sys::general::O_NONBLOCK;
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(FdTable::new().unwrap());
+        let description = descriptor_for(&drops).description;
+        table.add_at_least(description.clone(), 3, 4, true).unwrap();
+        table
+            .add_at_least(description.clone(), 7, 8, false)
+            .unwrap();
+
+        description
+            .transition_status_flags(|old| old.raw() | O_NONBLOCK, |_old, _new| Ok(()))
+            .unwrap();
+        assert_ne!(
+            table.get_description(3).unwrap().status_flags() & O_NONBLOCK,
+            0
+        );
+        assert_ne!(
+            table.get_description(7).unwrap().status_flags() & O_NONBLOCK,
+            0
+        );
+
+        // exec closes only the marked descriptor.  The non-CLOEXEC duplicate
+        // still names the same OFD, including its mutable status flags.
+        table.prepare_cloexec().unwrap().commit();
+        assert!(matches!(
+            table.get_description(3),
+            Err(AxError::BadFileDescriptor)
+        ));
+        let surviving = table.get_description(7).unwrap();
+        assert!(Arc::ptr_eq(&surviving, &description));
+        assert_ne!(surviving.status_flags() & O_NONBLOCK, 0);
+        assert_eq!(description.descriptor_reference_count(), 1);
+
+        drop(surviving);
+        drop(table.close(7).unwrap());
+        assert_eq!(description.descriptor_reference_count(), 0);
     }
 
     #[test]

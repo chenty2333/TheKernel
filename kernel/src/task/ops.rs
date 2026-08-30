@@ -36,7 +36,6 @@ use crate::{
     keyring::{self, KeyTaskOwner},
     mm::{
         AddrSpace, AddressSpaceToken, UserMemoryCapability, map_usercopy_error,
-        unregister_address_space,
         try_read_user_u32_nofault_locked,
     },
     pseudofs::cgroup,
@@ -1709,7 +1708,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             "authoritative process reparent handoff left exact children behind"
         );
         drop(task_parent_publication.take());
-        unregister_address_space(&thr.proc_data.aspace());
         remove_process_runtime(&thr.proc_data);
 
         let parent = committed.notification_parent().cloned();
@@ -1779,6 +1777,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // edits cannot accidentally move credential free callbacks back under it.
     drop(task_parent_publication.take());
     drop(lifecycle);
+    if final_thread {
+        // VT_PROCESS owners are process-scoped.  Do this only after the
+        // final process-exit transaction has released its lifecycle locks:
+        // notifying a pending VT switch can route a signal to another task.
+        crate::pseudofs::dev::tty::notify_vt_owner_exit(process.pid());
+    }
     keyring::exit_committed(
         KeyTaskOwner::new(thr.kernel_tid(), process.pid()),
         final_thread,

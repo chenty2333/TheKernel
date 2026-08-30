@@ -1,5 +1,6 @@
 //! Special devices
 
+mod dri;
 #[cfg(feature = "input")]
 mod event;
 mod fb;
@@ -17,7 +18,8 @@ use core::any::Any;
 use axdriver::{SharedBlockDevice, prelude::DevError};
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodePermission, NodeType, VfsResult};
+use axfs_ng_vfs::{DeviceId, Filesystem, Location, NodeFlags, NodePermission, NodeType, VfsResult};
+use axpoll::Pollable;
 use linux_raw_sys::{
     general::CAP_SYS_ADMIN,
     ioctl::{
@@ -36,6 +38,60 @@ use crate::{
 };
 
 const LOOP_NODE_MODE: u16 = 0o600;
+const VT_NODE_MODE: u16 = 0o620;
+const FB_NODE_MODE: u16 = 0o660;
+
+/// Devfs-facing VT endpoint.
+///
+/// Virtual terminals share the normal TTY stream semantics even though their
+/// switching ioctls are implemented independently from the serial console.
+/// Keep the VFS flags here with the node publication, rather than changing
+/// the VT state machine for a devfs-specific concern.
+struct VtNode(tty::VtDevice);
+
+impl VtNode {
+    fn new(number: u16) -> Self {
+        Self(tty::VtDevice::new(number))
+    }
+}
+
+impl DeviceOps for VtNode {
+    fn open_description(
+        &self,
+        location: &Location,
+        flags: u32,
+    ) -> VfsResult<Option<crate::pseudofs::DeviceOpen>> {
+        self.0.open_description(location, flags)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        self.0.read_at(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        self.0.write_at(buf, offset)
+    }
+
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
+        self.0.ioctl(context, cmd, arg)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_pollable(&self) -> Option<&dyn Pollable> {
+        self.0.as_pollable()
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+            | NodeFlags::STREAM
+            | NodeFlags::NO_POSITIONED_READ
+            | NodeFlags::NO_POSITIONED_WRITE
+            | NodeFlags::NO_SEEK
+    }
+}
 
 fn require_blkroset_admin(credential: &Cred) -> VfsResult<()> {
     if credential.has_effective_capability(CAP_SYS_ADMIN) {
@@ -337,15 +393,25 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         match fb::FrameBuffer::try_new() {
             Ok(framebuffer) => root.add(
                 "fb0",
-                Device::new(
+                Device::new_with_permissions(
                     fs.clone(),
                     NodeType::CharacterDevice,
-                    DeviceId::new(29, 0),
+                    fb::FB_DEVICE_ID,
+                    NodePermission::from_bits_truncate(FB_NODE_MODE),
                     Arc::new(framebuffer),
                 ),
             ),
             Err(error) => error!("Failed to initialize framebuffer device: {error}"),
         }
+    }
+
+    if let Some(device) = crate::drm::primary_device() {
+        let mut dri = DirMapping::new();
+        dri.add("card0", dri::primary_node(fs.clone(), device.clone()));
+        if let Some(render) = dri::render_node(fs.clone(), device) {
+            dri.add("renderD128", render);
+        }
+        root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
     }
 
     root.add(
@@ -363,9 +429,24 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(5, 1),
-            tty::N_TTY.clone(),
+            Arc::new(VtNode::new(0)),
         ),
     );
+
+    // Linux reserves major 4 for virtual consoles: tty0 is an alias for the
+    // active console and tty1..tty63 are fixed VT endpoints.
+    for number in 0..=63 {
+        root.add(
+            format!("tty{number}"),
+            Device::new_with_permissions(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(4, number),
+                NodePermission::from_bits_truncate(VT_NODE_MODE),
+                Arc::new(VtNode::new(number as u16)),
+            ),
+        );
+    }
 
     root.add(
         "ptmx",
@@ -486,10 +567,53 @@ mod tests {
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
 
     #[test]
+    fn devfs_publishes_linux_virtual_console_nodes() {
+        let devfs = new_devfs();
+        let root = devfs.root_dir();
+        let root = root.as_dir().unwrap();
+
+        for number in 0..=63 {
+            let node = root.lookup(&format!("tty{number}")).unwrap();
+            let metadata = node.metadata().unwrap();
+            assert_eq!(metadata.node_type, NodeType::CharacterDevice);
+            assert_eq!(metadata.rdev, DeviceId::new(4, number));
+            assert_eq!(metadata.mode.bits(), VT_NODE_MODE);
+            let expected_flags = NodeFlags::NON_CACHEABLE
+                | NodeFlags::STREAM
+                | NodeFlags::NO_POSITIONED_READ
+                | NodeFlags::NO_POSITIONED_WRITE
+                | NodeFlags::NO_SEEK;
+            assert_eq!(node.flags().bits(), expected_flags.bits());
+        }
+
+        // These existing character devices are separate Linux ABI nodes.
+        assert_eq!(
+            root.lookup("tty").unwrap().metadata().unwrap().rdev,
+            DeviceId::new(5, 0)
+        );
+        assert_eq!(
+            root.lookup("console").unwrap().metadata().unwrap().rdev,
+            DeviceId::new(5, 1)
+        );
+        let console = root.lookup("console").unwrap();
+        let console = console.downcast::<Device>().unwrap();
+        let console = console.inner().as_any().downcast_ref::<VtNode>().unwrap();
+        assert!(console.0.is_active_alias());
+    }
+
+    #[test]
     fn loop_nodes_are_owner_only_by_default() {
         assert_eq!(
             NodePermission::from_bits_truncate(LOOP_NODE_MODE).bits(),
             0o600
+        );
+    }
+
+    #[test]
+    fn framebuffer_node_is_not_world_writable() {
+        assert_eq!(
+            NodePermission::from_bits_truncate(FB_NODE_MODE).bits(),
+            0o660
         );
     }
 

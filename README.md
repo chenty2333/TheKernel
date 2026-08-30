@@ -5,12 +5,6 @@ Linux-compatible userspace ABI on ArceOS components. x86_64 is the only
 supported product architecture; the reference machine is QEMU `q35` with
 UEFI/OVMF.
 
-The bounded project intent and durable engineering decisions are maintained in
-[`RSH.md`](RSH.md) and [`.rsh/records/`](.rsh/records/). Local working focus is
-stored in `.rsh/focus.toml`; it is not a release-status or compatibility claim.
-Unsafe review islands and their invariants are indexed in
-[`docs/unsafe-boundaries.md`](docs/unsafe-boundaries.md).
-
 ## Checkout and development environment
 
 Create the three-checkout workspace from a single TheKernel clone. The
@@ -29,8 +23,7 @@ The resulting workspace is `thekernel-workspace/{TheKernel,thekernel-ax,thekerne
 On later runs, the bootstrap tool only verifies existing sibling checkouts: it
 never overwrites them, and it refuses a dirty checkout or a different commit.
 Update or remove an existing sibling explicitly before rerunning it. CI uses
-the same manifest and prints a stable combination ID that includes the checked-out
-TheKernel commit.
+the same source configuration.
 
 Use the same immutable development image as CI:
 
@@ -107,36 +100,19 @@ env \
 ```
 
 Run the QEMU system suite with `./tools/thekernel.py system-test`; it reports
-the guest KTAP suite. The same portable C assertions can be run against Linux
-without a per-case wrapper:
+the guest KTAP suite.
+
+For the Q35 product gate, build and run the guest KTAP suite. A pass requires
+the complete suite to finish without failures or skips and the guest to shut
+down normally:
 
 ```bash
-./scripts/host-differential.sh
+./tools/thekernel.py system-test --smp 4 --accel tcg
 ```
-
-For the source-bound product gate, run all four product checks through one
-manifest writer. It refuses a dirty checkout or mismatched sibling commit and
-hashes the command logs, final kernel/ESP/rootfs, and complete guest console:
-
-```bash
-python3 -m tools.qemu_runner.gate_manifest \
-  --output .state/gate/q35-preview-v0/manifest.json
-```
-
-Run a named semantic smoke with:
-
-```bash
-./scripts/smoke.sh list
-./scripts/smoke.sh lwext4-io-boost
-```
-
-See [`docs/testing.md`](docs/testing.md) for the testing boundary, and
-[`PROVENANCE.md`](PROVENANCE.md) for source and generated-rootfs provenance.
 
 The current bounded product claim is `q35-preview-v0`; it is not a claim of
 complete Linux ABI coverage, distribution/container compatibility, bare-metal
-support, or general performance superiority. Its exact gate and fixed Linux
-comparison baseline are defined in [`docs/testing.md`](docs/testing.md).
+support, or general performance superiority.
 
 CI may override its checked-in development-image digest with the
 `THEKERNEL_DEV_IMAGE` repository variable. When set, it must be an immutable
@@ -154,7 +130,6 @@ by the root `rust-toolchain.toml` for product builds and CI.
 
 ## License
 
-TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE),
-[NOTICE](NOTICE), and [PROVENANCE.md](PROVENANCE.md). Third-party and vendored
-directories retain their upstream license terms, authorship, immutable source
-records, and patch provenance.
+TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE) and
+[NOTICE](NOTICE). Third-party and vendored directories retain their upstream
+license terms and authorship notices.

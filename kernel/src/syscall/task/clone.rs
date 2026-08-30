@@ -27,9 +27,10 @@ use crate::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data, linux_pid_from_task_id,
-        lock_task_parent_publication, prepare_task_table_admission, process_domain,
-        send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
+        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data,
+        linux_pid_from_task_id, lock_task_parent_publication, prepare_task_table_admission,
+        process_domain, send_signal_thread_inner, set_task_user_address_space, try_new_user_task,
+        try_tasks,
     },
 };
 
@@ -451,11 +452,6 @@ impl CloneArgs {
         }
         let child_io_context = clone_io_context(flags, calling_thread)?;
         let child_ioport = calling_thread.ioport_snapshot();
-        // Protection-key allocation is mm state.  Threads share it through
-        // `ProcessData`; an ordinary fork gets an exact bitmap copy while
-        // retaining the copied PTE key fields in its cloned address space.
-        let child_pkeys = (!flags.contains(CloneFlags::THREAD))
-            .then(|| old_proc_data.pkey_snapshot());
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
         // this CPU. Nudge its pinned recycler before allocating another child
@@ -473,7 +469,7 @@ impl CloneArgs {
         let child_reset_on_fork = false;
         if parent_reset_on_fork {
             match child_sched_state.class {
-                SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => {
+                SchedClass::Fifo | SchedClass::RoundRobin => {
                     child_sched_state.class = SchedClass::Normal;
                     child_sched_state.nice = 0;
                     child_sched_state.rt_priority = 0;
@@ -489,10 +485,6 @@ impl CloneArgs {
 
         let task_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
         let mut new_task = try_new_user_task(task_name, new_uctx)?;
-        // PKRU is a per-thread architectural register.  It is inherited by
-        // both CLONE_THREAD and fork children, independently of the mm-wide
-        // allocation bitmap captured below.
-        new_task.inherit_current_pkru();
 
         let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
         let child_credential = CredentialSlot::try_new(child_cred.clone())?;
@@ -576,15 +568,9 @@ impl CloneArgs {
             let aspace = if flags.contains(CloneFlags::VM) {
                 parent_aspace
             } else {
-                let aspace = loop {
-                    let cloned = {
-                        let mut parent_guard = parent_aspace.lock();
-                        parent_guard.try_clone()
-                    };
-                    match cloned {
-                        Err(AxError::WouldBlock) => core::hint::spin_loop(),
-                        result => break result?,
-                    }
+                let aspace = {
+                    let mut parent_guard = parent_aspace.lock();
+                    parent_guard.try_clone()?
                 };
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace
@@ -707,9 +693,6 @@ impl CloneArgs {
                 uts_ns,
                 time_ns,
             )?;
-            proc_data.install_pkey_snapshot(
-                child_pkeys.expect("new process must carry a pkey bitmap snapshot"),
-            );
             let inherited_rlimits = old_proc_data.rlim.read().clone();
             let inherited_cpu_limit_active = inherited_rlimits[linux_raw_sys::general::RLIMIT_CPU]
                 .current
@@ -739,7 +722,6 @@ impl CloneArgs {
             child_fs_context,
             child_fd_table,
             calling_thread.personality(),
-            calling_thread.landlock_domain(),
             SchedulerSeed {
                 state: child_sched_state,
                 reset_on_fork: child_reset_on_fork,
@@ -753,11 +735,7 @@ impl CloneArgs {
         // either task's first ioperm mutation.
         thr.install_ioport_snapshot(child_ioport);
         if thread_publication.is_initial() {
-            new_proc_data.bind_initial_group_leader_signal(
-                tid,
-                thr.signal.clone(),
-                thr.landlock_domain(),
-            )?;
+            new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
         }
         let task_parent_choice = if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
             TaskParentChoice::Inherit(calling_thread.task_parent_node().clone())

@@ -1,6 +1,0 @@
-objective = "Close the Linux 6.12.103 native x86_64 syscall/UAPI matrix truthfully."
-done_when = [ "reviewed=resolved=375, implemented=358, explicit-enosys=17, partial=unknown=0, and the clean q35 gate passes." ]
-stop_when = [ "A Linux contract would violate ownership or bounded failure semantics." ]
-boundaries = [ "Close one vertical at a time; only Linux's exact 17 native sys_ni rows are ENOSYS.", "Linux common/64 is the oracle; x32 and other architectures are excluded.", "Phase 1 is complete; Phase 2 rows remain partial until four-lane clean-source evidence closes them.", "Reject incomplete KTAP from the intermittent q35 wait-boundary failure." ]
-topics = [ "ci", "evidence", "linux-abi", "syscalls", "x86_64" ]
-anchors = [ "R-2a9795ab44b0cc22", "R-3f8613d0c1a92b82", "R-bde8b5e96faa2a6f" ]

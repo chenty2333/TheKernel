@@ -34,12 +34,8 @@ use crate::{
     },
     mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
-        AsThread, NetworkNamespace, ns_capable,
-        security::{
-            SocketCreateSpec, SocketListenBacklog, SocketSecurityContext,
-            abstract_unix_socket_endpoint_is_in_scope, dispatch_socket,
-            reserve_abstract_unix_socket_label,
-        },
+        NetworkNamespace, ns_capable,
+        security::{SocketCreateSpec, SocketListenBacklog, SocketSecurityContext, dispatch_socket},
     },
 };
 
@@ -47,43 +43,6 @@ const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const SOCK_DCCP: u32 = 6;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
-const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1;
-const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 2;
-
-fn check_landlock_tcp_port(socket: &SocketInner, addr: &SocketAddrEx, access: u64) -> AxResult<()> {
-    let (SocketInner::Tcp(_), SocketAddrEx::Ip(address)) = (socket, addr) else {
-        return Ok(());
-    };
-    if axtask::current()
-        .as_thread()
-        .landlock_domain()
-        .allows_net_port(address.port(), access)
-    {
-        Ok(())
-    } else {
-        Err(AxError::PermissionDenied)
-    }
-}
-
-fn check_landlock_abstract_unix_scope(
-    net_namespace: &Arc<NetworkNamespace>,
-    name: &[u8],
-    endpoint: axnet::unix::UnixEndpointIdentity,
-) -> AxResult<()> {
-    let current = axtask::current();
-    let thread = current.as_thread();
-    let net_namespace = Arc::as_ptr(net_namespace) as usize;
-    if abstract_unix_socket_endpoint_is_in_scope(
-        net_namespace,
-        name,
-        endpoint,
-        &thread.landlock_domain(),
-    ) {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
-}
 
 const fn socket_status_flags(nonblocking: bool) -> u32 {
     O_RDWR | if nonblocking { O_NONBLOCK } else { 0 }
@@ -376,11 +335,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
     };
-    let mut socket = Socket::new(socket, net_ns);
-    socket.capture_creator_security(
-        actor.clone(),
-        axtask::current().as_thread().landlock_domain(),
-    );
+    let socket = Socket::new(socket, net_ns);
     let socket = prepare_new_socket_like(socket, nonblocking)?;
     dispatch_socket_post_create(actor, &socket, spec)?;
     publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)
@@ -430,11 +385,6 @@ pub fn sys_bind(
             if addr.nl_family as u32 != AF_NETLINK {
                 return Err(AxError::from(LinuxError::EAFNOSUPPORT));
             }
-            let port_id = if addr.nl_pid == 0 {
-                snapshot.pid()
-            } else {
-                addr.nl_pid
-            };
             let prepared = PreparedSocketAddress::Netlink(addr);
             dispatch_socket(&SocketSecurityContext::bind(
                 actor,
@@ -442,7 +392,13 @@ pub fn sys_bind(
                 &prepared,
                 addrlen as usize,
             ))?;
-            pinned.netlink()?.bind(port_id, addr.nl_groups)?;
+            if addr.nl_pid == 0 {
+                pinned
+                    .netlink()?
+                    .bind_auto(snapshot.pid(), addr.nl_groups)?;
+            } else {
+                pinned.netlink()?.bind(addr.nl_pid, addr.nl_groups)?;
+            }
         }
         SocketBackendKind::Packet => {
             let address = snapshot_address(&capability, addr, addrlen)?;
@@ -474,7 +430,6 @@ pub fn sys_bind(
                 unreachable!();
             };
 
-            check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_BIND_TCP)?;
             if let (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) =
                 (&socket.inner, &addr)
             {
@@ -488,26 +443,7 @@ pub fn sys_bind(
                 )?;
             } else {
                 require_bind_permissions(&addr, socket.net_namespace(), actor)?;
-                let label = if let SocketAddrEx::Unix(UnixSocketAddr::Abstract(name)) = &addr {
-                    Some(reserve_abstract_unix_socket_label(
-                        Arc::as_ptr(socket.net_namespace()) as usize,
-                        name,
-                        socket.creator_landlock_domain()?,
-                    )?)
-                } else {
-                    None
-                };
-                if let Some(label) = label {
-                    let SocketInner::Unix(unix) = &socket.inner else {
-                        unreachable!()
-                    };
-                    unix.bind_abstract_with_publish(addr.into_unix()?, |endpoint| {
-                        label.commit(endpoint)
-                    })?;
-                    socket.install_abstract_landlock_label(label);
-                } else {
-                    socket.bind(addr)?;
-                }
+                socket.bind(addr)?;
             }
         }
     }
@@ -579,7 +515,6 @@ pub fn sys_connect(
     let PreparedSocketAddress::Network(addr) = prepared else {
         unreachable!();
     };
-    check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_CONNECT_TCP)?;
     let result = match (&socket.inner, &addr) {
         (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
             let security = VfsSecurityContext::new(actor.clone());
@@ -589,43 +524,6 @@ pub fn sys_connect(
             } else {
                 let reservation =
                     unix.prepare_stream_connect_resolved_as(target, snapshot.unix_credentials())?;
-                let listening = crate::file::UnixEndpointSecurityRef::new(
-                    reservation.listening_identity(),
-                    socket.net_namespace(),
-                    &reservation,
-                );
-                let accepted = crate::file::UnixEndpointSecurityRef::new(
-                    reservation.accepted_identity(),
-                    socket.net_namespace(),
-                    &reservation,
-                );
-                dispatch_socket(&SocketSecurityContext::unix_stream_connect(
-                    actor,
-                    &socket_ref,
-                    &listening,
-                    &accepted,
-                ))?;
-                reservation.commit()
-            }
-        }
-        (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Abstract(name))) => {
-            // Resolve and pin the concrete endpoint before looking up its
-            // retained creator label.  The target stays alive through the
-            // eventual connect commit, so a close/rebind cannot retarget this
-            // authorization to the replacement name binding.
-            let target = unix.resolve_abstract_target(name)?;
-            check_landlock_abstract_unix_scope(
-                socket.net_namespace(),
-                name,
-                target.endpoint_identity()?,
-            )?;
-            if unix.is_datagram() {
-                unix.connect_resolved_as(target, snapshot.unix_credentials())
-            } else {
-                let reservation = unix.prepare_stream_connect_resolved_as(
-                    target,
-                    snapshot.unix_credentials(),
-                )?;
                 let listening = crate::file::UnixEndpointSecurityRef::new(
                     reservation.listening_identity(),
                     socket.net_namespace(),
@@ -895,11 +793,8 @@ pub fn sys_socketpair(
             return Err(AxError::InvalidInput);
         }
     };
-    let mut sock1 = Socket::new(SocketInner::Unix(sock1), net_ns.clone());
-    let mut sock2 = Socket::new(SocketInner::Unix(sock2), net_ns);
-    let creator_domain = axtask::current().as_thread().landlock_domain();
-    sock1.capture_creator_security(actor.clone(), creator_domain.clone());
-    sock2.capture_creator_security(actor.clone(), creator_domain);
+    let sock1 = Socket::new(SocketInner::Unix(sock1), net_ns.clone());
+    let sock2 = Socket::new(SocketInner::Unix(sock2), net_ns);
 
     if nonblocking {
         sock1.set_nonblocking(true)?;

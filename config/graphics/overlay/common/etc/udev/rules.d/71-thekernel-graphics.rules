@@ -1,0 +1,7 @@
+# Graphics node policy for the non-logind, seatd/libseat session.  seatd runs
+# as root and opens devices for its seat clients; the weston user is only in
+# the seat group and therefore cannot bypass seat activation with direct opens.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="render", MODE="0660"
+SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", GROUP="video", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", GROUP="input", MODE="0660"

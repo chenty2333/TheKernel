@@ -3,6 +3,7 @@
 pub mod cgroup;
 pub mod dev;
 mod device;
+pub(crate) mod device_registry;
 mod dir;
 mod file;
 mod fs;

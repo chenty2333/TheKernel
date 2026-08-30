@@ -1,0 +1,57 @@
+#!/bin/sh
+# This is intentionally after S70seatd.  It prepares a per-user runtime
+# directory on /run (a tmpfs from Buildroot's SysV skeleton) before dropping
+# privileges to the compositor account.
+set -eu
+
+USER=weston
+UID=$(id -u "$USER")
+RUNTIME_DIR=/run/user/$UID
+PIDFILE=/run/weston.pid
+SESSION=/usr/local/bin/graphics-session
+FLAVOR_FILE=/etc/thekernel-graphics-flavor
+
+running() {
+    [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+graphics_flavor() {
+    [ -r "$FLAVOR_FILE" ] || {
+        echo "missing graphics flavor file: $FLAVOR_FILE" >&2
+        return 1
+    }
+    flavor=$(cat "$FLAVOR_FILE")
+    case "$flavor" in
+        headless-abi-smoke|q35-software-desktop) printf '%s\n' "$flavor" ;;
+        *)
+            echo "invalid graphics flavor in $FLAVOR_FILE" >&2
+            return 1
+            ;;
+    esac
+}
+
+start() {
+    running && return 0
+    flavor=$(graphics_flavor)
+    mkdir -p "$RUNTIME_DIR"
+    chown "$USER:$USER" "$RUNTIME_DIR"
+    chmod 0700 "$RUNTIME_DIR"
+    printf 'Starting Weston (%s): ' "$flavor"
+    start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -c "$USER" -- \
+        "$flavor"
+    echo OK
+}
+
+stop() {
+    running || { rm -f "$PIDFILE"; return 0; }
+    printf 'Stopping Weston: '
+    start-stop-daemon -K -p "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo OK
+}
+
+case "${1:-}" in
+    start|stop) "$1" ;;
+    restart) stop; start ;;
+    *) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
+esac

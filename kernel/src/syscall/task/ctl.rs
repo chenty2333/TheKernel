@@ -1,5 +1,8 @@
 use alloc::{string::String, sync::Arc};
-use core::{mem::{self, MaybeUninit}, sync::atomic::{AtomicU64, Ordering}};
+use core::{
+    mem::{self, MaybeUninit},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::MappingFlags;
@@ -29,9 +32,9 @@ use crate::{
         namespace_target_from_proc_file,
     },
     task::{
-        AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
-        cred_error, fs_context_publication, get_process_data, get_visible_task,
-        linux_pid_from_task_id, ns_capable,
+        AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode, cred_error,
+        fs_context_publication, get_process_data, get_visible_task, linux_pid_from_task_id,
+        ns_capable,
     },
 };
 
@@ -290,7 +293,9 @@ fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
 fn kcmp_cookie(type_: i32) -> AxResult<u64> {
     let cookie = &KCMP_POINTER_COOKIES[type_ as usize];
     let existing = cookie.load(Ordering::Acquire);
-    if existing != 0 { return Ok(existing); }
+    if existing != 0 {
+        return Ok(existing);
+    }
     let mut bytes = [0u8; 8];
     // KCMP deliberately fails rather than falling back to predictable time or
     // address material when the boot entropy source is unavailable.
@@ -305,13 +310,21 @@ fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<is
     let mix = |ptr: *const T| {
         let value = ptr as *const () as usize;
         let mut value = (value as u64) ^ key;
-        value ^= value >> 30; value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value ^= value >> 27; value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^ (value >> 31)
     };
     let left = mix(Arc::as_ptr(left));
     let right = mix(Arc::as_ptr(right));
-    Ok(if left == right { 0 } else if left < right { 1 } else { 2 })
+    Ok(if left == right {
+        0
+    } else if left < right {
+        1
+    } else {
+        2
+    })
 }
 
 struct KcmpAuthorizedImage<T> {
@@ -340,32 +353,48 @@ fn validate_kcmp_fd_image<T>(
     }
 }
 
-fn kcmp_file_description(thread: &crate::task::Thread, fd: usize) -> AxResult<Arc<FileDescription>> {
-    thread.fd_table()
+fn kcmp_file_description(
+    thread: &crate::task::Thread,
+    fd: usize,
+) -> AxResult<Arc<FileDescription>> {
+    thread
+        .fd_table()
         .get_description_number(u32::try_from(fd).map_err(|_| AxError::BadFileDescriptor)?)
 }
 
 pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> AxResult<isize> {
     debug!("sys_kcmp <= pid1: {pid1}, pid2: {pid2}, type: {type_}, idx1: {idx1}, idx2: {idx2}");
 
-    if pid1 <= 0 || pid2 <= 0 { return Err(AxError::NoSuchProcess); }
+    if pid1 <= 0 || pid2 <= 0 {
+        return Err(AxError::NoSuchProcess);
+    }
     let task1 = get_visible_task(pid1 as u32)?;
     let task2 = get_visible_task(pid2 as u32)?;
     let thread1 = task1.as_thread();
     let thread2 = task2.as_thread();
     let proc1 = thread1.proc_data.clone();
     let proc2 = thread2.proc_data.clone();
-    let authorized1 = crate::task::check_current_thread_ptrace_image_access(thread1, PtraceAccessMode::ReadReal)?;
-    let authorized2 = crate::task::check_current_thread_ptrace_image_access(thread2, PtraceAccessMode::ReadReal)?;
+    let authorized1 =
+        crate::task::check_current_thread_ptrace_image_access(thread1, PtraceAccessMode::ReadReal)?;
+    let authorized2 =
+        crate::task::check_current_thread_ptrace_image_access(thread2, PtraceAccessMode::ReadReal)?;
     if type_ == KCMP_FS {
         let image1 = KcmpAuthorizedImage::new(authorized1.into_aspace());
         let image2 = KcmpAuthorizedImage::new(authorized2.into_aspace());
-        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| proc1.image_matches(image))?;
-        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| proc2.image_matches(image))?;
+        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+            proc1.image_matches(image)
+        })?;
+        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+            proc2.image_matches(image)
+        })?;
         let fs1 = thread1.fs_context();
         let fs2 = thread2.fs_context();
-        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| proc1.image_matches(image))?;
-        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| proc2.image_matches(image))?;
+        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+            proc1.image_matches(image)
+        })?;
+        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+            proc2.image_matches(image)
+        })?;
         return kcmp_ptr(KCMP_FS, &fs1, &fs2);
     }
 
@@ -411,7 +440,11 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             kcmp_ptr(KCMP_FILES, &files1, &files2)
         }
         KCMP_FS => unreachable!("handled before process-target resolution"),
-        KCMP_SIGHAND => kcmp_ptr(KCMP_SIGHAND, &proc1.signal.shared_actions(), &proc2.signal.shared_actions()),
+        KCMP_SIGHAND => kcmp_ptr(
+            KCMP_SIGHAND,
+            &proc1.signal.shared_actions(),
+            &proc2.signal.shared_actions(),
+        ),
         KCMP_IO | KCMP_SYSVSEM => Err(LinuxError::EOPNOTSUPP.into()),
         KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
         _ => Err(AxError::InvalidInput),
@@ -435,7 +468,9 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
         // Namespace changes remain group-scoped; FS and FILES are task-local.
         // Prepare every fallible replacement before committing any of them.
         let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-        if flags & !(CLONE_FS | CLONE_FILES) != 0 && !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
+        if flags & !(CLONE_FS | CLONE_FILES) != 0
+            && !thread.proc_data.begin_single_thread_scope_change(curr_tid)
+        {
             return Err(AxError::OperationNotSupported);
         }
 
@@ -447,8 +482,7 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             };
             // Serialize the COW snapshot and replacement with pivot_root's
             // all-task fs-context update.
-            let _fs_context_publication = (flags & CLONE_FS != 0)
-                .then(fs_context_publication);
+            let _fs_context_publication = (flags & CLONE_FS != 0).then(fs_context_publication);
             let private_fs_context = if flags & CLONE_FS != 0 {
                 thread.try_clone_fs_context_if_shared()?
             } else {
@@ -477,8 +511,10 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
                 None
             };
 
-            let old_fd_table = private_fd_table.map(|replacement| thread.replace_fd_table(replacement));
-            let old_fs_context = private_fs_context.map(|replacement| thread.replace_fs_context(replacement));
+            let old_fd_table =
+                private_fd_table.map(|replacement| thread.replace_fd_table(replacement));
+            let old_fs_context =
+                private_fs_context.map(|replacement| thread.replace_fs_context(replacement));
             // Arc destructors can cascade into filesystem or file-description
             // cleanup. Keep all such work outside the IRQ/preempt-off scope gate.
             drop(old_fd_table);
@@ -815,7 +851,11 @@ pub fn sys_capset<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_umask(mask: u32) -> AxResult<isize> {
-    let old = current().as_thread().fs_context().lock().replace_umask(mask & 0o777);
+    let old = current()
+        .as_thread()
+        .fs_context()
+        .lock()
+        .replace_umask(mask & 0o777);
     Ok(old as isize)
 }
 
@@ -1049,7 +1089,9 @@ pub fn sys_set_mempolicy_home_node(
         )?;
         cursor = range_end;
     }
-    updated.then_some(0).ok_or_else(|| LinuxError::ENOENT.into())
+    updated
+        .then_some(0)
+        .ok_or_else(|| LinuxError::ENOENT.into())
 }
 
 pub fn sys_move_pages<M: UserMemory + ?Sized>(

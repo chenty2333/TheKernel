@@ -32,9 +32,6 @@ Environment overrides:
   THEKERNEL_MUSL_ROOT         local musl root (default: .tmp/musl-root)
   THEKERNEL_MUSL_LINUX_UAPI_INCLUDE Linux UAPI headers (default: /usr/include)
   THEKERNEL_MUSL_LINUX_ARCH_INCLUDE architecture UAPI headers (optional)
-  THEKERNEL_ABI_UAPI_INCLUDE     pinned Linux UAPI headers for portable ABI
-                                  binaries (must resolve to the materialized
-                                  project tree)
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
   THEKERNEL_SOURCE_CACHE      Download cache
@@ -69,7 +66,7 @@ case "$ROOTFS_OWNER_MODE" in
     *) printf 'invalid THEKERNEL_ROOTFS_OWNER_MODE: %s\n' "$ROOTFS_OWNER_MODE" >&2; exit 2 ;;
 esac
 
-for command in curl debugfs find make mke2fs \
+for command in curl debugfs make mke2fs \
     realpath sha256sum tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
@@ -245,7 +242,6 @@ mkdir -p "$STAGE/etc/thekernel" \
     "$STAGE/usr/share/licenses/busybox" \
     "$STAGE/usr/share/licenses/thekernel" \
     "$STAGE/usr/share/doc/thekernel" \
-    "$STAGE/usr/share/thekernel" \
     "$STAGE/dev" "$STAGE/proc" "$STAGE/sys" "$STAGE/tmp" \
     "$STAGE/var/tmp" "$STAGE/root"
 chmod 1777 "$STAGE/tmp" "$STAGE/var/tmp"
@@ -257,12 +253,8 @@ install -m 0644 "$REPO_ROOT/LICENSE" \
     "$STAGE/usr/share/licenses/thekernel/LICENSE"
 install -m 0644 "$REPO_ROOT/NOTICE" \
     "$STAGE/usr/share/licenses/thekernel/NOTICE"
-install -m 0644 "$REPO_ROOT/PROVENANCE.md" \
-    "$STAGE/usr/share/doc/thekernel/PROVENANCE.md"
 install -m 0755 "$REPO_ROOT/tests/guest/shell-init.sh" \
     "$STAGE/etc/thekernel/shell-init.sh"
-install -m 0755 "$REPO_ROOT/tests/guest/abi-init.sh" \
-    "$STAGE/etc/thekernel/abi-init.sh"
 rm -f "$STAGE/sbin/init"
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
     "$REPO_ROOT/tests/guest/system-init.c" \
@@ -277,80 +269,22 @@ for source in "$REPO_ROOT"/tests/guest/tools/*.c; do
         -o "$STAGE/opt/thekernel-tests/bin/thekernel-$name"
 done
 
-# Formal ABI binaries may be compiled against the project's materialized,
-# pinned UAPI tree.  Keep this override out of BusyBox, init, and general test
-# tools: it is ABI-case provenance rather than a replacement toolchain.
-ABI_UAPI_SHA256=unbound
-ABI_UAPI_CFLAGS=()
-if [ -n "${THEKERNEL_ABI_UAPI_INCLUDE:-}" ]; then
-    command -v python3 >/dev/null 2>&1 || {
-        printf '%s\n' 'pinned ABI UAPI headers require python3' >&2
-        exit 1
-    }
-    ABI_UAPI_INCLUDE=$(realpath -e "$THEKERNEL_ABI_UAPI_INCLUDE") || {
-        printf 'pinned ABI UAPI include directory does not exist: %s\n' \
-            "$THEKERNEL_ABI_UAPI_INCLUDE" >&2
-        exit 1
-    }
-    ABI_UAPI_EXPECTED=$(realpath -e \
-        "$REPO_ROOT/.state/linux-6.12.103/uapi/include") || {
-        printf '%s\n' 'pinned ABI UAPI tree is not materialized' >&2
-        exit 1
-    }
-    [ "$ABI_UAPI_INCLUDE" = "$ABI_UAPI_EXPECTED" ] || {
-        printf 'pinned ABI UAPI include must resolve to: %s\n' \
-            "$ABI_UAPI_EXPECTED" >&2
-        exit 1
-    }
-    PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tools/abi_uapi.py" \
-        --require-materialized >/dev/null
-    ABI_UAPI_SHA256=$(PYTHONDONTWRITEBYTECODE=1 \
-        PYTHONPATH="$REPO_ROOT/tools" python3 -c \
-        'import abi_uapi; print(abi_uapi.tree_sha256(abi_uapi.ROOT / abi_uapi.MATERIALIZED_PATH))')
-    ABI_UAPI_CFLAGS=(-I "$ABI_UAPI_INCLUDE")
-fi
-printf '%s\n' "$ABI_UAPI_SHA256" >"$WORK_ROOT/abi-uapi-sha256"
-install -m 0644 "$WORK_ROOT/abi-uapi-sha256" \
-    "$STAGE/usr/share/thekernel/abi-uapi-sha256"
-
-ABI_BINARY_STAGE="$WORK_ROOT/abi-binaries"
-mkdir -p "$ABI_BINARY_STAGE"
 for source in "$REPO_ROOT"/tests/guest/portable/*.c; do
     [ -f "$source" ] || continue
     name=${source##*/}
     name=${name%.c}
     "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
-        "${ABI_UAPI_CFLAGS[@]}" \
         -pthread "$source" \
-        -o "$ABI_BINARY_STAGE/$name"
-    install -m 0755 "$ABI_BINARY_STAGE/$name" \
-        "$STAGE/opt/thekernel-tests/portable/$name"
-done
-install -m 0644 "$WORK_ROOT/abi-uapi-sha256" \
-    "$ABI_BINARY_STAGE/.uapi-sha256"
-
-for script in "$REPO_ROOT"/tests/guest/nightly/*; do
-    [ -f "$script" ] || continue
-    install -m 0755 "$script" \
-        "$STAGE/opt/thekernel-tests/bin/thekernel-nightly-${script##*/}"
+        -o "$STAGE/opt/thekernel-tests/portable/$name"
 done
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \
     --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \
     --owner-mode "$ROOTFS_OWNER_MODE"
 
-# ABI receipts bind the exact host-side bytes copied into the shared rootfs.
-# Publish the image and the receipt binaries as one transaction.  Individual
-# renames are atomic, but the pair is not, so retain both previous outputs until
-# both replacements have succeeded.
-ABI_BINARY_OUTPUT="$REPO_ROOT/.state/abi-binaries"
-ABI_BINARY_PUBLISH="$WORK_ROOT/abi-binaries-publish"
-ABI_BINARY_BACKUP="$WORK_ROOT/abi-binaries-previous"
 ROOTFS_BACKUP="$WORK_ROOT/rootfs-previous"
 ROOTFS_HAD_PREVIOUS=0
-ABI_BINARY_HAD_PREVIOUS=0
 ROOTFS_PUBLISHED=0
-ABI_BINARY_PUBLISHED=0
 
 if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
     [ ! -d "$OUTPUT" ] || {
@@ -358,35 +292,12 @@ if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
         exit 1
     }
 fi
-if [ -e "$ABI_BINARY_OUTPUT" ] || [ -L "$ABI_BINARY_OUTPUT" ]; then
-    [ -d "$ABI_BINARY_OUTPUT" ] || {
-        printf 'ABI binary output must be a directory: %s\n' \
-            "$ABI_BINARY_OUTPUT" >&2
-        exit 1
-    }
-fi
-
-mkdir -p "$ABI_BINARY_PUBLISH"
-for binary in "$ABI_BINARY_STAGE"/*; do
-    [ -f "$binary" ] || continue
-    install -m 0755 "$binary" "$ABI_BINARY_PUBLISH/${binary##*/}"
-done
-install -m 0644 "$ABI_BINARY_STAGE/.uapi-sha256" \
-    "$ABI_BINARY_PUBLISH/.uapi-sha256"
-mkdir -p "$(dirname -- "$ABI_BINARY_OUTPUT")"
-
 rollback_publication() {
     local status=$1
 
     set +e
-    if [ "$ABI_BINARY_PUBLISHED" -eq 1 ]; then
-        rm -rf -- "$ABI_BINARY_OUTPUT"
-    fi
     if [ "$ROOTFS_PUBLISHED" -eq 1 ]; then
         rm -f -- "$OUTPUT"
-    fi
-    if [ "$ABI_BINARY_HAD_PREVIOUS" -eq 1 ]; then
-        mv -- "$ABI_BINARY_BACKUP" "$ABI_BINARY_OUTPUT"
     fi
     if [ "$ROOTFS_HAD_PREVIOUS" -eq 1 ]; then
         mv -- "$ROOTFS_BACKUP" "$OUTPUT"
@@ -400,20 +311,10 @@ if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
     fi
     ROOTFS_HAD_PREVIOUS=1
 fi
-if [ -e "$ABI_BINARY_OUTPUT" ] || [ -L "$ABI_BINARY_OUTPUT" ]; then
-    if ! mv -- "$ABI_BINARY_OUTPUT" "$ABI_BINARY_BACKUP"; then
-        rollback_publication 1
-    fi
-    ABI_BINARY_HAD_PREVIOUS=1
-fi
 if ! mv -- "$IMAGE" "$OUTPUT"; then
     rollback_publication 1
 fi
 ROOTFS_PUBLISHED=1
-if ! mv -- "$ABI_BINARY_PUBLISH" "$ABI_BINARY_OUTPUT"; then
-    rollback_publication 1
-fi
-ABI_BINARY_PUBLISHED=1
 
-rm -rf -- "$ROOTFS_BACKUP" "$ABI_BINARY_BACKUP"
+rm -f -- "$ROOTFS_BACKUP"
 printf '%s\n' "$OUTPUT"

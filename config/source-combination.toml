@@ -1,5 +1,4 @@
-# Exact sibling sources used by CI integration jobs. The checked-out TheKernel
-# commit is added at run time when the combination ID is derived.
+# Exact sibling sources used by CI integration jobs.
 schema = 1
 
 [source.ax]

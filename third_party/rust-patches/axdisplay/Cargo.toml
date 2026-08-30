@@ -1,0 +1,11 @@
+[package]
+name = "axdisplay"
+version = "0.3.0-preview.2"
+edition = "2024"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+
+[dependencies]
+axdriver = { version = "=0.3.0-preview.2", features = ["display"] }
+axsync = "=0.3.0-preview.2"
+lazyinit = "0.2"
+log = "0.4"

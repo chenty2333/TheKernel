@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, format, string::String, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
     fmt::Write as _,
@@ -7,7 +7,6 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use super::admit_resize;
 use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
@@ -38,10 +37,9 @@ use crate::{
         lease, memfd,
         permission::{
             VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
-            check_create_permissions_with_security, check_landlock_truncate,
-            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
-            check_writable_mount, initial_named_create_owner_mode_with_security,
-            landlock_allows_access,
+            check_create_permissions_with_security, check_open_permissions_with_security,
+            check_pathwalk_search_permission_with_security, check_writable_mount,
+            initial_named_create_owner_mode_with_security,
         },
         pipe::NamedPipe,
         prepare_file_description_with_open_lease, reserve_fd, resolve_at, with_path_fs,
@@ -584,75 +582,86 @@ fn prepare_open_description(
                 .map_err(|_| AxError::NoMemory)?
             } else {
                 let mut pty_guard = None;
-                // /dev/xx handling
+                let mut device_file = None;
                 if flags & O_PATH == 0
                     && let Ok(device) = file.location().entry().downcast::<Device>()
                 {
-                    let inner = device.inner().as_any();
-                    if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
-                        // Opening /dev/ptmx creates a new pseudo-terminal
-                        let (master, master_tty, pty_number) = ptmx.create_pty()?;
-                        let pts = file
-                            .location()
-                            .parent()
-                            .ok_or(AxError::NotFound)?
-                            .lookup_no_follow("pts")?;
-                        let pty_name = try_pty_name(pty_number)?;
-                        let entry = DirEntry::try_new_file(
-                            FileNode::new(master),
-                            NodeType::CharacterDevice,
-                            Reference::new(Some(pts.entry().clone()), pty_name),
-                        )?;
-                        let loc = Location::new(file.location().mountpoint().clone(), entry);
-                        file = axfs::File::new(FileBackend::Direct(loc), file.flags());
-                        pty_guard = Some(master_tty.open_description()?);
-                    } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
-                        if pty.is_locked_pty_slave() {
-                            return Err(AxError::Io);
+                    if let Some(open) = device.open_description(file.location(), flags)? {
+                        let (file, resource) = open.into_parts();
+                        description_resource = resource;
+                        file
+                    } else {
+                        let inner = device.inner().as_any();
+                        if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
+                            // Opening /dev/ptmx creates a new pseudo-terminal
+                            let (master, master_tty, pty_number) = ptmx.create_pty()?;
+                            let pts = file
+                                .location()
+                                .parent()
+                                .ok_or(AxError::NotFound)?
+                                .lookup_no_follow("pts")?;
+                            let pty_name = try_pty_name(pty_number)?;
+                            let entry = DirEntry::try_new_file(
+                                FileNode::new(master),
+                                NodeType::CharacterDevice,
+                                Reference::new(Some(pts.entry().clone()), pty_name),
+                            )?;
+                            let loc = Location::new(file.location().mountpoint().clone(), entry);
+                            file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                            pty_guard = Some(master_tty.open_description()?);
+                        } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
+                            if pty.is_locked_pty_slave() {
+                                return Err(AxError::Io);
+                            }
+                            pty_guard = Some(pty.open_description()?);
+                        } else if inner.is::<tty::CurrentTty>() {
+                            let term = current()
+                                .as_thread()
+                                .proc_data
+                                .proc
+                                .group()
+                                .session()
+                                .terminal()
+                                .ok_or(AxError::NotFound)?;
+                            let dev_dir = file.location().parent().ok_or(AxError::NotFound)?;
+                            let loc = if let Some(number) =
+                                tty::VT_MANAGER.number_for_tty(term.as_ref())
+                            {
+                                dev_dir.lookup_no_follow(&format!("tty{number}"))?
+                            } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
+                                pty_guard = Some(pts.open_description()?);
+                                let pty_name = try_pty_name(pts.pty_number())?;
+                                dev_dir
+                                    .lookup_no_follow("pts")?
+                                    .lookup_no_follow(&pty_name)?
+                            } else {
+                                return Err(LinuxError::ENODEV.into());
+                            };
+                            if let Ok(device) = loc.entry().downcast::<Device>()
+                                && let Some(open) = device.open_description(&loc, flags)?
+                            {
+                                let (opened, resource) = open.into_parts();
+                                description_resource = resource;
+                                device_file = Some(opened);
+                            } else {
+                                file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                            }
                         }
-                        pty_guard = Some(pty.open_description()?);
-                    } else if inner.is::<tty::CurrentTty>() {
-                        let term = current()
-                            .as_thread()
-                            .proc_data
-                            .proc
-                            .group()
-                            .session()
-                            .terminal()
-                            .ok_or(AxError::NotFound)?;
-                        let dev_dir = file.location().parent().ok_or(AxError::NotFound)?;
-                        let loc = if term.is::<tty::NTtyDriver>() {
-                            dev_dir.lookup_no_follow("console")?
-                        } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
-                            pty_guard = Some(pts.open_description()?);
-                            let pty_name = try_pty_name(pts.pty_number())?;
-                            dev_dir
-                                .lookup_no_follow("pts")?
-                                .lookup_no_follow(&pty_name)?
+                        if let Some(file) = device_file {
+                            file
                         } else {
-                            return Err(LinuxError::ENODEV.into());
-                        };
-                        file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                            let file = File::new(file);
+                            if let Some(guard) = pty_guard {
+                                description_resource =
+                                    Some(Box::try_new(guard).map_err(|_| AxError::NoMemory)?
+                                        as DescriptionResource);
+                            }
+                            Arc::try_new(file).map_err(|_| AxError::NoMemory)?
+                        }
                     }
+                } else {
+                    Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
                 }
-                let ioctl_allowed = !matches!(
-                    file.location().node_type(),
-                    NodeType::CharacterDevice | NodeType::BlockDevice
-                ) || landlock_allows_access(
-                    file.location(),
-                    crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
-                );
-                let truncate_allowed = landlock_allows_access(
-                    file.location(),
-                    crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
-                );
-                let file = File::with_landlock_permissions(file, ioctl_allowed, truncate_allowed);
-                if let Some(guard) = pty_guard {
-                    description_resource =
-                        Some(Box::try_new(guard).map_err(|_| AxError::NoMemory)?
-                            as DescriptionResource);
-                }
-                Arc::try_new(file).map_err(|_| AxError::NoMemory)?
             }
         }
         OpenResult::Dir(dir) => Arc::try_new(Directory::new(dir)).map_err(|_| AxError::NoMemory)?,
@@ -668,6 +677,34 @@ fn prepare_open_description(
         open_lease_admission,
         open_credential,
     )
+}
+
+/// Opens one bootstrap stdio endpoint through the same device-specific OFD
+/// construction used by ordinary opens.  Init runs before a current thread
+/// exists, so it cannot take the syscall path's credential/lease admission;
+/// it nevertheless must retain a device's final-close resource (notably a
+/// VT alias's resolved `VtFile`) instead of wrapping the shared node object.
+pub(crate) fn open_init_description(
+    cx: &FsContext,
+    options: &mut OpenOptions,
+    path: &str,
+    status_flags: u32,
+) -> AxResult<Arc<FileDescription>> {
+    let file = options.open(cx, path)?.into_file()?;
+    let mut resource = None;
+    let opened: Arc<dyn FileLike> = if let Ok(device) = file.location().entry().downcast::<Device>()
+        && let Some(open) = device.open_description(file.location(), status_flags)?
+    {
+        let (file, close_resource) = open.into_parts();
+        resource = close_resource;
+        file
+    } else {
+        Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
+    };
+    if status_flags & O_NONBLOCK != 0 {
+        opened.set_nonblocking(true)?;
+    }
+    crate::file::prepare_file_description_with_resource(opened, status_flags, None, resource)
 }
 
 /// Runs a fallible policy admission against the exact resolved location before
@@ -693,9 +730,7 @@ fn commit_open_truncate(
 ) -> AxResult<()> {
     let _memfd_mutation = memfd::begin_resize(loc, 0)?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let quota_charge = admit_resize(loc, loc.len()?, 0)?;
     file.inner().backend()?.set_len(0)?;
-    quota_charge.commit_actual_blocks(loc)?;
     // A post-truncate metadata failure cannot be reported without lying that
     // this destructive open left the inode untouched. Filesystems should
     // update truncate timestamps as part of set_len; retain this compatibility
@@ -929,9 +964,6 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
-            if truncates_regular {
-                check_landlock_truncate(&loc)?;
-            }
         }
 
         let file_open_operation = file_open_operation(flags as u32, created, false)?;
@@ -1013,8 +1045,6 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         )?;
         let publication = reservation.prepare_publication(description.clone())?;
         if truncates_regular {
-            crate::mm::check_not_active(&loc)?;
-            let _swap_mutation = crate::mm::admit_mutation(&loc)?;
             let status = description.io_status_snapshot();
             check_mandatory_fd_truncate_lock(
                 &loc,

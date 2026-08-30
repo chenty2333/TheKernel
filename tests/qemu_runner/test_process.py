@@ -1,19 +1,76 @@
 from __future__ import annotations
 
-import hashlib
 import io
+import json
 import os
 import pty
+import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
-from tools.qemu_runner.model import Interaction, RunLimits
-from tools.qemu_runner.process import run_process
+from tools.qemu_runner.model import Interaction, QmpColorBlock, RunLimits
+from tools.qemu_runner.process import ProcessError, run_process
 
 
 class ProcessTests(unittest.TestCase):
+    def start_qmp_server(
+        self,
+        path: Path,
+        *,
+        reject: str | None = None,
+        screendump_delay_secs: float = 0.0,
+    ):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(1)
+        commands: list[dict[str, object]] = []
+        ready = threading.Event()
+
+        def server() -> None:
+            ready.set()
+            try:
+                client, _ = listener.accept()
+                with client:
+                    client.sendall(b'{"event":"RESET"}\r\n')
+                    client.sendall(b'{"QMP":{"version":{},"capabilities":[]}}\r\n')
+                    buffer = bytearray()
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            return
+                        buffer.extend(chunk)
+                        while b"\n" in buffer:
+                            raw, _, remainder = buffer.partition(b"\n")
+                            buffer[:] = remainder
+                            request = json.loads(raw)
+                            commands.append(request)
+                            command = request["execute"]
+                            request_id = request["id"]
+                            client.sendall(b'{"event":"DEVICE_DELETED"}\r\n')
+                            client.sendall(b'{"id":"unrelated","return":{}}\r\n')
+                            if command == reject:
+                                client.sendall(json.dumps({"id": request_id, "error": {"class": "GenericError"}}).encode() + b"\r\n")
+                                return
+                            if command == "screendump":
+                                if screendump_delay_secs:
+                                    time.sleep(screendump_delay_secs)
+                                target = Path(request["arguments"]["filename"])
+                                target.write_bytes(b"P6\n2 1\n255\n\x01\x02\x03\x01\x02\x03")
+                            client.sendall(json.dumps({"id": request_id, "return": {}}).encode() + b"\r\n")
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=server, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 1.0)
+        self.addCleanup(listener.close)
+        self.assertTrue(ready.wait(1.0))
+        return commands
+
     def run_child(
         self,
         script: str,
@@ -39,7 +96,6 @@ class ProcessTests(unittest.TestCase):
             interaction=interaction,
             input_stream=input_file,
             console_stream=console,
-            capture_input_evidence=True,
         )
         return result, (root / "console.log").read_bytes(), console.getvalue()
 
@@ -81,15 +137,6 @@ class ProcessTests(unittest.TestCase):
         self.assertTrue(result.ok, result.error_message)
         self.assertIn(b"GOT:payload", log)
         self.assertEqual(console, log)
-        self.assertIsNotNone(result.input_forwarding)
-        forwarding = result.input_forwarding
-        assert forwarding is not None
-        self.assertEqual(forwarding.sha256, hashlib.sha256(b"payload\n").hexdigest())
-        self.assertEqual(forwarding.bytes_forwarded, len(b"payload\n"))
-        self.assertEqual(forwarding.line_count, 1)
-        self.assertTrue(forwarding.source_eof)
-        self.assertFalse(forwarding.broken_pipe)
-        self.assertTrue(forwarding.relay_complete)
 
     def test_plain_interactive_mode_preserves_tty_stdin(self) -> None:
         master_fd, slave_fd = pty.openpty()
@@ -118,7 +165,6 @@ class ProcessTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.error_message)
         self.assertEqual((root / "console.log").read_bytes(), b"TTY=True\n")
-        self.assertIsNone(result.input_forwarding)
 
     def test_early_guest_exit_does_not_claim_complete_input(self) -> None:
         payload = b"command-padding\n" * 100_000
@@ -129,11 +175,6 @@ class ProcessTests(unittest.TestCase):
             input_text=payload,
         )
         self.assertTrue(result.ok, result.error_message)
-        forwarding = result.input_forwarding
-        assert forwarding is not None
-        self.assertFalse(forwarding.relay_complete)
-        self.assertLess(forwarding.bytes_forwarded, len(payload))
-        self.assertFalse(forwarding.source_eof)
 
     def test_nonreading_guest_does_not_bypass_timeout_while_forwarding(self) -> None:
         result, _, _ = self.run_child(
@@ -144,10 +185,6 @@ class ProcessTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 124)
         self.assertIn("timed out", result.error_message or "")
-        forwarding = result.input_forwarding
-        assert forwarding is not None
-        self.assertFalse(forwarding.relay_complete)
-        self.assertFalse(forwarding.relay_complete)
 
     def test_near_marker_does_not_open_input(self) -> None:
         result, _, _ = self.run_child(
@@ -179,6 +216,173 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(result.runner_termination_reason, "stop-after-marker")
         self.assertFalse(result.guest_clean_shutdown)
         self.assertIn(b"STOP", log)
+
+    def test_rejects_negative_passed_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ProcessError, "non-negative"):
+                run_process(
+                    arch="x86_64",
+                    command=(sys.executable, "-c", "pass"),
+                    workdir=root,
+                    log_path=root / "console.log",
+                    limits=RunLimits(),
+                    interaction=Interaction(),
+                    pass_fds=(-1,),
+                )
+
+    def test_passed_descriptor_is_available_to_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "image"
+            image.write_bytes(b"opened-once")
+            fd = os.open(image, os.O_RDONLY)
+            self.addCleanup(os.close, fd)
+            result = run_process(
+                arch="x86_64",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import os, sys; os.write(1, os.read(int(sys.argv[1]), 64))",
+                    str(fd),
+                ),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(),
+                interaction=Interaction(),
+                pass_fds=(fd,),
+            )
+            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual((root / "console.log").read_bytes(), b"opened-once")
+
+    def test_qmp_waits_for_serial_markers_and_ignores_events_and_other_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            screenshot = root / "screen.ppm"
+            commands = self.start_qmp_server(qmp_socket)
+            result = run_process(
+                arch="x86_64",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import time; print('INPUT_READY', flush=True); time.sleep(.15); print('VISUAL_READY', flush=True); time.sleep(.3)",
+                ),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(total_timeout_secs=2.0),
+                interaction=Interaction(),
+                qmp_socket=qmp_socket,
+                screenshot=screenshot,
+                qmp_input_events=(({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},),),
+                qmp_input_after_marker="INPUT_READY",
+                qmp_screenshot_after_marker="VISUAL_READY",
+                qmp_screenshot_size=(2, 1),
+                qmp_screenshot_color_blocks=(QmpColorBlock(0, 0, 2, 1, (1, 2, 3)),),
+            )
+            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual([command["execute"] for command in commands], ["qmp_capabilities", "input-send-event", "screendump"])
+            self.assertFalse(qmp_socket.exists())
+
+    def test_stop_after_graphics_marker_waits_for_screendump_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            screenshot = root / "screen.ppm"
+            commands = self.start_qmp_server(qmp_socket, screendump_delay_secs=0.1)
+            result = run_process(
+                arch="x86_64",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import time; print('GRAPHICS_READY', flush=True); time.sleep(5)",
+                ),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(total_timeout_secs=2.0),
+                interaction=Interaction(stop_after_marker="GRAPHICS_READY"),
+                qmp_socket=qmp_socket,
+                screenshot=screenshot,
+                qmp_input_events=(({
+                    "type": "key",
+                    "data": {"down": True, "key": {"type": "qcode", "data": "a"}},
+                },),),
+                qmp_input_after_marker="GRAPHICS_READY",
+                qmp_screenshot_after_marker="GRAPHICS_READY",
+                qmp_screenshot_size=(2, 1),
+                qmp_screenshot_color_blocks=(QmpColorBlock(0, 0, 2, 1, (1, 2, 3)),),
+            )
+            self.assertTrue(result.intentionally_stopped, result.error_message)
+            self.assertEqual(
+                [command["execute"] for command in commands],
+                ["qmp_capabilities", "input-send-event", "screendump"],
+            )
+            self.assertTrue(screenshot.is_file())
+
+    def test_stop_after_graphics_marker_returns_qmp_oracle_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            self.start_qmp_server(qmp_socket, reject="screendump")
+            result = run_process(
+                arch="x86_64",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import time; print('GRAPHICS_READY', flush=True); time.sleep(5)",
+                ),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(total_timeout_secs=2.0),
+                interaction=Interaction(stop_after_marker="GRAPHICS_READY"),
+                qmp_socket=qmp_socket,
+                screenshot=root / "screen.ppm",
+                qmp_screenshot_after_marker="GRAPHICS_READY",
+            )
+            self.assertEqual(result.returncode, 4)
+            self.assertFalse(result.intentionally_stopped)
+            self.assertIn("rejected screendump", result.error_message or "")
+
+    def test_qmp_error_terminates_guest_and_cleans_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            self.start_qmp_server(qmp_socket, reject="input-send-event")
+            result = run_process(
+                arch="x86_64",
+                command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(5)"),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(total_timeout_secs=2.0),
+                interaction=Interaction(),
+                qmp_socket=qmp_socket,
+                qmp_input_events=(({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},),),
+                qmp_input_after_marker="READY",
+            )
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("rejected input-send-event", result.error_message or "")
+            self.assertFalse(qmp_socket.exists())
+
+    def test_qmp_marker_timeout_terminates_guest_and_cleans_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            self.start_qmp_server(qmp_socket)
+            result = run_process(
+                arch="x86_64",
+                command=(sys.executable, "-c", "import time; print('BOOTING', flush=True); time.sleep(5)"),
+                workdir=root,
+                log_path=root / "console.log",
+                limits=RunLimits(total_timeout_secs=2.0),
+                interaction=Interaction(),
+                qmp_socket=qmp_socket,
+                qmp_input_events=(({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},),),
+                qmp_input_after_marker="NEVER",
+                qmp_timeout_secs=0.15,
+            )
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("timeout waiting for input marker", result.error_message or "")
+            self.assertFalse(qmp_socket.exists())
 
 
 if __name__ == "__main__":

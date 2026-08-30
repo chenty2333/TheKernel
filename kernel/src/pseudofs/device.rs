@@ -11,7 +11,29 @@ use inherit_methods_macro::inherit_methods;
 use memory_addr::PhysAddrRange;
 
 use super::{SimpleFs, SimpleFsNode};
-use crate::file::IoctlContext;
+use crate::file::{DescriptionResource, FileLike, IoctlContext};
+
+/// A device-specific open file description payload.
+///
+/// Device drivers may replace the ordinary VFS-backed [`FileLike`] with this
+/// per-open object. Its optional resource is retained by the resulting open
+/// file description, so it is shared by descriptor duplication and released
+/// only after the final close.
+pub struct DeviceOpen {
+    file: Arc<dyn FileLike>,
+    resource: Option<DescriptionResource>,
+}
+
+impl DeviceOpen {
+    /// Constructs a device-specific open description payload.
+    pub(crate) fn new(file: Arc<dyn FileLike>, resource: Option<DescriptionResource>) -> Self {
+        Self { file, resource }
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<dyn FileLike>, Option<DescriptionResource>) {
+        (self.file, self.resource)
+    }
+}
 
 /// Mmap behavior for devices.
 pub enum DeviceMmap {
@@ -29,6 +51,20 @@ pub enum DeviceMmap {
 
 /// Trait for device operations.
 pub trait DeviceOps: Send + Sync {
+    /// Optionally creates state for one open file description.
+    ///
+    /// This is invoked once for each non-`O_PATH` open after VFS open has
+    /// succeeded. Returning `None` preserves the ordinary VFS-backed file.
+    /// Returning a [`DeviceOpen`] replaces it and attaches any final-close
+    /// resource to that same OFD.
+    fn open_description(
+        &self,
+        _location: &axfs_ng_vfs::Location,
+        _flags: u32,
+    ) -> VfsResult<Option<DeviceOpen>> {
+        Ok(None)
+    }
+
     /// Reads data from the device at the specified offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
     /// Writes data to the device at the specified offset.
@@ -123,6 +159,16 @@ impl Device {
     /// Returns the inner device operations.
     pub fn inner(&self) -> &Arc<dyn DeviceOps> {
         &self.ops
+    }
+
+    /// Creates an optional device-specific payload for one open file
+    /// description.
+    pub(crate) fn open_description(
+        &self,
+        location: &axfs_ng_vfs::Location,
+        flags: u32,
+    ) -> VfsResult<Option<DeviceOpen>> {
+        self.ops.open_description(location, flags)
     }
 
     /// Returns the memory mapping behavior of the device.

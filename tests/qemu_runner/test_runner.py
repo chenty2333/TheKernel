@@ -2,24 +2,91 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from tools.qemu_runner.model import InputForwarding, Interaction, RunResult
+from tools.qemu_runner.model import Interaction, RunResult
 from tools.qemu_runner.runner import (
     Q35_OVMF_CODE_SHA256,
     RunConfig,
     RunnerError,
     _resolve_ovmf_image,
+    _parse_qemu_device_help,
+    _parse_qemu_display_help,
+    _probe_virgl_headless,
+    _validate_virgl_capabilities,
     run,
 )
 
 
 class RunnerTests(unittest.TestCase):
+    def test_qemu_graphics_help_parsers_identify_host_capabilities(self) -> None:
+        self.assertEqual(
+            _parse_qemu_device_help(
+                'name "virtio-gpu-pci", bus PCI\n'
+                'name "virtio-gpu-gl-pci", bus PCI, alias "virtio-gpu-gl"\n'
+            ),
+            frozenset({"virtio-gpu-pci", "virtio-gpu-gl-pci"}),
+        )
+        self.assertEqual(
+            _parse_qemu_display_help(
+                "Available display backend types:\nnone\ngtk\negl-headless\n\nMore help\n"
+            ),
+            frozenset({"none", "gtk", "egl-headless"}),
+        )
+
+    def test_virgl_headless_probe_accepts_a_running_qemu(self) -> None:
+        process = MagicMock()
+        process.communicate.side_effect = (
+            subprocess.TimeoutExpired("qemu", 0.5),
+            ("", ""),
+        )
+        with patch("tools.qemu_runner.runner.subprocess.Popen", return_value=process) as popen:
+            _probe_virgl_headless(Path("/qemu"))
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/qemu", "-machine", "q35", "-nodefaults", "-S",
+                "-display", "egl-headless,gl=on", "-device",
+                "virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600",
+            ],
+        )
+        process.terminate.assert_called_once_with()
+
+    def test_virgl_headless_probe_distinguishes_argv_rejection(self) -> None:
+        process = MagicMock(returncode=1)
+        process.communicate.return_value = ("", "Invalid parameter 'gl'")
+        with patch("tools.qemu_runner.runner.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RunnerError, "rejected virgl-headless argv"):
+                _probe_virgl_headless(Path("/qemu"))
+
+    def test_virgl_headless_capability_check_runs_the_probe(self) -> None:
+        device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
+        display_help = "Available display backend types:\negl-headless\n\n"
+        with patch(
+            "tools.qemu_runner.runner._qemu_help_output",
+            side_effect=(device_help, display_help),
+        ), patch("tools.qemu_runner.runner._probe_virgl_headless") as probe:
+            _validate_virgl_capabilities("virgl-headless", Path("/qemu"))
+        probe.assert_called_once_with(Path("/qemu"))
+
+    def test_virgl_interactive_requires_gl_device_and_gtk_gl_syntax(self) -> None:
+        device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
+        display_help = "Available display backend types:\ngtk\n\n"
+        with patch(
+            "tools.qemu_runner.runner._qemu_help_output",
+            side_effect=(device_help, display_help),
+        ) as capability_help:
+            _validate_virgl_capabilities("virgl-interactive", Path("/qemu"))
+        self.assertEqual(
+            [call.args[1:] for call in capability_help.call_args_list],
+            [("-device", "help"), ("-display", "help")],
+        )
+
     def test_implicit_ovmf_selection_rejects_incompatible_host_firmware(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -47,7 +114,7 @@ class RunnerTests(unittest.TestCase):
                     Q35_OVMF_CODE_SHA256,
                 )
 
-    def test_initrd_is_bound_to_inherited_fd_across_path_replacement(self) -> None:
+    def test_initrd_is_passed_to_qemu_after_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernel"
@@ -62,7 +129,7 @@ class RunnerTests(unittest.TestCase):
                 rootfs=rootfs,
                 workdir=root / "run",
                 log_path=root / "run" / "console.log",
-                qemu_launcher=(sys.executable,),
+                qemu_binary=sys.executable,
                 direct_kernel=True,
                 extra_args=("-initrd", str(initrd)),
             )
@@ -73,23 +140,10 @@ class RunnerTests(unittest.TestCase):
 
             def complete_run(**kwargs):
                 command = kwargs["command"]
-                bound = command[command.index("-initrd") + 1]
-                self.assertRegex(bound, r"^/proc/self/fd/[0-9]+$")
-                inherited = tuple(int(value) for value in kwargs["environment"][
-                    "THEKERNEL_QEMU_LAUNCH_FDS"
-                ].split(","))
-                self.assertEqual(set(inherited), set(kwargs["pass_fds"]))
-                self.assertIn(int(bound.rsplit("/", 1)[1]), inherited)
-                self.assertEqual(Path(bound).read_bytes(), b"trusted-initrd")
-
-                saved = root / "initrd.saved"
-                initrd.rename(saved)
-                initrd.write_bytes(b"replacement")
-                try:
-                    self.assertEqual(Path(bound).read_bytes(), b"trusted-initrd")
-                finally:
-                    initrd.unlink()
-                    saved.rename(initrd)
+                initrd_arg = command[command.index("-initrd") + 1]
+                self.assertTrue(initrd_arg.startswith("/proc/self/fd/"))
+                self.assertEqual(Path(initrd_arg).read_bytes(), b"trusted-initrd")
+                self.assertIn(int(initrd_arg.rsplit("/", 1)[1]), kwargs["pass_fds"])
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
@@ -166,6 +220,28 @@ class RunnerTests(unittest.TestCase):
             )
 
             def complete_run(**kwargs):
+                command = kwargs["command"]
+                vars_option = next(
+                    value
+                    for value in command
+                    if value.startswith("if=pflash,format=raw,aio=threads,file=")
+                )
+                forwarded = Path(vars_option.split("file=", 1)[1])
+                self.assertTrue(str(forwarded).startswith("/proc/self/fd/"))
+                vars_runtime = config.workdir / "firmware" / "OVMF_VARS.fd"
+                saved = config.workdir / "firmware" / "OVMF_VARS.saved"
+                vars_runtime.rename(saved)
+                vars_runtime.write_bytes(b"replacement")
+                try:
+                    self.assertEqual(forwarded.read_bytes(), b"vars")
+                    with forwarded.open("r+b") as output:
+                        output.seek(0)
+                        output.write(b"updated")
+                        output.truncate()
+                    self.assertEqual(saved.read_bytes(), b"updated")
+                finally:
+                    vars_runtime.unlink()
+                    saved.rename(vars_runtime)
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
@@ -188,11 +264,12 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("-kernel", command)
             self.assertIn(",if=ide,format=raw,snapshot=on", command)
             self.assertIn("virtio-blk-pci,drive=rootfs", command)
+            self.assertIn("readonly=on,aio=threads,file=/proc/self/fd/", command)
             vars_runtime = config.workdir / "firmware" / "OVMF_VARS.fd"
-            self.assertEqual(vars_runtime.read_bytes(), ovmf_vars.read_bytes())
+            self.assertEqual(vars_runtime.read_bytes(), b"updated")
             self.assertNotEqual(vars_runtime.resolve(), ovmf_vars.resolve())
 
-    def test_normal_run_uses_run_local_decompression_without_evidence(self) -> None:
+    def test_normal_run_uses_run_local_decompression(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernel"
@@ -226,197 +303,15 @@ class RunnerTests(unittest.TestCase):
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
-            with (
-                patch(
-                    "tools.qemu_runner.runner.run_process", side_effect=complete_run
-                ) as mocked,
-                patch(
-                    "tools.qemu_runner.evidence.file_evidence",
-                    side_effect=AssertionError("normal run hashed an input"),
-                ) as evidence,
-                patch(
-                    "tools.qemu_runner.receipt.command_stream_evidence",
-                    side_effect=AssertionError("normal run hashed command input"),
-                ) as command_evidence,
-            ):
+            with patch(
+                "tools.qemu_runner.runner.run_process", side_effect=complete_run
+            ) as mocked:
                 self.assertIs(run(config), expected)
 
             command = " ".join(mocked.call_args.kwargs["command"])
             runtime_rootfs = config.workdir / "images" / "rootfs-root.img"
             self.assertIn("/proc/self/fd/", command)
             self.assertEqual(runtime_rootfs.read_bytes(), b"rootfs")
-            evidence.assert_not_called()
-            command_evidence.assert_not_called()
-            self.assertFalse((config.workdir / "receipt.json").exists())
-
-    def test_receipt_is_completed_from_runner_owned_input_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            commands = root / "commands"
-            receipt_path = root / "run" / "receipt.json"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            payload = b"first\nsecond\n"
-            commands.write_bytes(payload)
-            forwarding = InputForwarding(
-                sha256=hashlib.sha256(payload).hexdigest(),
-                bytes_forwarded=len(payload),
-                line_count=2,
-                source_eof=True,
-                broken_pipe=False,
-                relay_complete=True,
-            )
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=receipt_path,
-                input_path=commands,
-                interaction=Interaction(interactive=True),
-            )
-            expected = RunResult(
-                arch="x86_64",
-                command=("qemu",),
-                returncode=0,
-                duration_ms=1,
-                log_path=config.log_path,
-                workdir=config.workdir,
-                input_forwarding=forwarding,
-            )
-
-            def complete_run(**kwargs):
-                kwargs["log_path"].write_bytes(b"guest console\n")
-                return expected
-
-            with patch(
-                "tools.qemu_runner.runner.run_process", side_effect=complete_run
-            ) as mocked:
-                run(config)
-            self.assertTrue(mocked.call_args.kwargs["capture_input_evidence"])
-            completed = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(completed["schema_version"], 4)
-            self.assertEqual(completed["state"], "recorded")
-            self.assertEqual(
-                set(completed["source_identity"]),
-                {"schema", "combination_id", "sources"},
-            )
-            self.assertIn("thekernel", completed["source_identity"]["sources"])
-            for source in completed["source_identity"]["sources"].values():
-                self.assertEqual(
-                    set(source),
-                    {"repository_root", "commit", "tree", "worktree_dirty", "match_declared"},
-                )
-            self.assertTrue(completed["guest_clean_shutdown"])
-            self.assertFalse(completed["marker_success"])
-            self.assertFalse(completed["runner_terminated"])
-            self.assertIsNone(completed["runner_termination_reason"])
-            self.assertFalse(completed["physical_retirement_proven"])
-            self.assertEqual(completed["stdin"]["source"]["sha256"], forwarding.sha256)
-            self.assertEqual(completed["stdin"]["forwarded"]["sha256"], forwarding.sha256)
-            self.assertTrue(completed["stdin"]["source_unchanged"])
-
-    def test_receipt_records_partial_input_forwarding(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            commands = root / "commands"
-            receipt_path = root / "receipt.json"
-            payload = b"first\nsecond\n"
-            prefix = b"first\n"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            commands.write_bytes(payload)
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=receipt_path,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
-            forwarding = InputForwarding(
-                sha256=hashlib.sha256(prefix).hexdigest(),
-                bytes_forwarded=len(prefix),
-                line_count=1,
-                source_eof=True,
-                broken_pipe=False,
-                relay_complete=True,
-            )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir, input_forwarding=forwarding,
-            )
-
-            def complete_run(**kwargs):
-                kwargs["log_path"].write_bytes(b"guest console\n")
-                return expected
-
-            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
-                run(config)
-            completed = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(completed["state"], "recorded")
-            self.assertNotEqual(
-                completed["stdin"]["source"]["sha256"],
-                completed["stdin"]["forwarded"]["sha256"],
-            )
-
-    def test_receipt_records_a_changed_command_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            commands = root / "commands"
-            receipt_path = root / "receipt.json"
-            payload = b"first\n"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            commands.write_bytes(payload)
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=receipt_path,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
-            forwarding = InputForwarding(
-                sha256=hashlib.sha256(payload).hexdigest(),
-                bytes_forwarded=len(payload),
-                line_count=1,
-                source_eof=True,
-                broken_pipe=False,
-                relay_complete=True,
-            )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir, input_forwarding=forwarding,
-            )
-
-            def complete_run(**kwargs):
-                commands.write_bytes(b"changed\n")
-                kwargs["log_path"].write_bytes(b"guest console\n")
-                return expected
-
-            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
-                run(config)
-            completed = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertFalse(completed["stdin"]["source_unchanged"])
-
     def test_explicit_artifacts_are_composed_without_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -438,17 +333,8 @@ class RunnerTests(unittest.TestCase):
                 log_path=root / "run" / "console.log",
                 qemu_binary=sys.executable,
                 direct_kernel=True,
-                receipt_path=root / "run" / "receipt.json",
                 input_path=commands,
                 interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
-            forwarding = InputForwarding(
-                sha256=hashlib.sha256(commands.read_bytes()).hexdigest(),
-                bytes_forwarded=commands.stat().st_size,
-                line_count=1,
-                source_eof=True,
-                broken_pipe=False,
-                relay_complete=True,
             )
             expected = RunResult(
                 arch="x86_64",
@@ -457,110 +343,71 @@ class RunnerTests(unittest.TestCase):
                 duration_ms=1,
                 log_path=config.log_path,
                 workdir=config.workdir,
-                input_forwarding=forwarding,
             )
+
             def complete_run(**kwargs):
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
-            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run) as mocked:
-                result = run(config)
-            self.assertIs(result, expected)
-            command = " ".join(mocked.call_args.kwargs["command"])
-            self.assertIn("/proc/self/fd/", command)
-            self.assertGreaterEqual(command.count("/proc/self/fd/"), 3)
-            self.assertIn("virtio-blk-pci,drive=extra", command)
-            receipt = json.loads(config.receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(receipt["state"], "recorded")
-            self.assertEqual(receipt["returncode"], 0)
-            self.assertEqual(receipt["command"][0], str(Path(sys.executable).resolve()))
-            self.assertEqual(
-                receipt["kernel"]["sha256"],
-                "6923dd1bc0460082c5d55a831908c24a282860b7f1cd6c2b79cf1bc8857c639c",
-            )
-            self.assertEqual(list(config.receipt_path.parent.glob(".receipt.json.*.tmp")), [])
-
-    def test_runner_error_does_not_publish_a_performance_receipt(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            receipt_path = root / "run" / "receipt.json"
-            commands = root / "commands"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            commands.write_bytes(b"exit\n")
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=receipt_path,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
             with patch(
-                "tools.qemu_runner.runner.run_process",
-                side_effect=RuntimeError("injected runner failure"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "injected runner failure"):
-                    run(config)
-            self.assertFalse(receipt_path.exists())
+                "tools.qemu_runner.runner.run_process", side_effect=complete_run
+            ) as mocked:
+                run(config)
+            command = " ".join(mocked.call_args.kwargs["command"])
+            self.assertIn("virtio-blk-pci,drive=extra", command)
 
-    def test_receipt_must_not_alias_a_run_input(self) -> None:
+    def test_qemu_uses_opened_input_fds_after_paths_are_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
-            commands = root / "commands"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            commands.write_bytes(b"exit\n")
+            extra = root / "extra.img"
+            initrd = root / "initrd.img"
+            kernel.write_bytes(b"trusted-kernel")
+            rootfs.write_bytes(b"trusted-rootfs")
+            extra.write_bytes(b"trusted-extra")
+            initrd.write_bytes(b"trusted-initrd")
             config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=kernel,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
+                arch="x86_64", kernel=kernel, rootfs=rootfs, extra_block=extra,
+                workdir=root / "run", log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable, direct_kernel=True,
+                extra_args=("-initrd", str(initrd)),
             )
-            with self.assertRaisesRegex(RunnerError, "receipt aliases"):
-                run(config)
-            self.assertEqual(kernel.read_bytes(), b"kernel")
+            expected = RunResult(
+                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
+                log_path=config.log_path, workdir=config.workdir,
+            )
 
-    def test_receipt_must_not_hardlink_a_run_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            receipt_path = root / "receipt.json"
-            commands = root / "commands"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            commands.write_bytes(b"exit\n")
-            receipt_path.hardlink_to(kernel)
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                receipt_path=receipt_path,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
-            with self.assertRaisesRegex(RunnerError, "receipt aliases"):
-                run(config)
-            self.assertEqual(kernel.read_bytes(), b"kernel")
+            def complete_run(**kwargs):
+                for path in (kernel, rootfs, extra, initrd):
+                    path.unlink()
+                    path.write_bytes(b"replacement")
+                command = kwargs["command"]
+                forwarded = {
+                    "kernel": Path(command[command.index("-kernel") + 1]),
+                    "rootfs": Path(next(value for value in command if "id=rootfs" in value).split("file=", 1)[1].split(",", 1)[0]),
+                    "extra": Path(next(value for value in command if "id=extra" in value).split("file=", 1)[1].split(",", 1)[0]),
+                    "initrd": Path(command[command.index("-initrd") + 1]),
+                }
+                self.assertEqual(
+                    {label: path.read_bytes() for label, path in forwarded.items()},
+                    {
+                        "kernel": b"trusted-kernel",
+                        "rootfs": b"trusted-rootfs",
+                        "extra": b"trusted-extra",
+                        "initrd": b"trusted-initrd",
+                    },
+                )
+                self.assertEqual(
+                    {int(path.name) for path in forwarded.values()}, set(kwargs["pass_fds"])
+                )
+                kwargs["log_path"].write_bytes(b"guest console\n")
+                return expected
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=complete_run):
+                self.assertIs(run(config), expected)
+
+            self.assertEqual(kernel.read_bytes(), b"replacement")
 
     def test_log_must_not_alias_a_run_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -701,7 +548,7 @@ class RunnerTests(unittest.TestCase):
                 run(config)
             self.assertEqual(kernel.read_bytes(), b"kernel")
 
-    def test_log_must_not_alias_resolved_qemu_without_receipt(self) -> None:
+    def test_log_must_not_alias_resolved_qemu(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernel"

@@ -14,7 +14,10 @@ use thekernel_linux_signal::api::{SharedSignalActions, SignalActions};
 use crate::{
     file::{FdTable, executable, try_new_process_scope},
     mm::{copy_from_kernel, load_user_app_trusted, new_user_aspace_empty},
-    pseudofs::{self, dev::tty::N_TTY},
+    pseudofs::{
+        self,
+        dev::tty::{N_TTY, VT_MANAGER},
+    },
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, FsContextSlot, NetworkNamespace,
         PidNamespace, ProcessAccessState, ProcessData, SchedulerSeed, Thread, TimeNamespace,
@@ -90,13 +93,22 @@ pub fn init(args: &[String], envs: &[String]) {
     let credential =
         CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
     let init_net_stack = axnet::default_stack().clone();
+    let init_net_ns = NetworkNamespace::try_new(init_net_stack.clone(), user_ns.clone())
+        .expect("Failed to allocate init network namespace");
+    crate::file::netlink::register_init_network_namespace(&init_net_ns)
+        .expect("Failed to register init network namespace for device uevents");
+    // Device publication below (including DRM's initial registration) may
+    // emit uevents, so init-net must be established first.
+    match crate::drm::init_virtio_gpu() {
+        Ok(true) => info!("registered VirtIO GPU as DRM primary device"),
+        Ok(false) => info!("no DRM-capable VirtIO GPU found"),
+        Err(error) => error!("failed to initialize DRM VirtIO GPU: {error}"),
+    }
     {
         let fs = FS_CONTEXT.lock();
         pseudofs::mount_all(&fs, &boot_security, init_net_stack.unix_namespace())
             .expect("Failed to mount pseudofs");
     }
-    let init_net_ns = NetworkNamespace::try_new(init_net_stack, user_ns.clone())
-        .expect("Failed to allocate init network namespace");
 
     let loc = FS_CONTEXT
         .lock()
@@ -143,7 +155,13 @@ pub fn init(args: &[String], envs: &[String]) {
         .try_new_init_with_identity(INIT_PID, None, init_pid_ns.clone())
         .expect("Failed to allocate init process");
 
-    N_TTY.bind_to(&proc).expect("Failed to bind ntty");
+    // N_TTY owns only the physical input pump; init's controlling terminal
+    // is the session-ownable VT1 endpoint exposed through /dev/console.
+    let _ = &*N_TTY;
+    VT_MANAGER
+        .tty_for(1)
+        .bind_to(&proc)
+        .expect("Failed to bind VT1");
 
     let mut exe_path = String::new();
     exe_path
@@ -219,7 +237,7 @@ pub fn init(args: &[String], envs: &[String]) {
         },
     )
     .expect("Failed to allocate init thread state");
-    proc.bind_initial_group_leader_signal(tid, thr.signal.clone(), thr.landlock_domain())
+    proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
         .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);

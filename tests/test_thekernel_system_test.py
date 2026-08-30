@@ -134,7 +134,6 @@ class SystemTestGateTests(unittest.TestCase):
                     stop_after_marker=None,
                     commands=None,
                     extra_block=None,
-                    receipt=None,
                     shutdown_after_marker=True,
                 ), 0)
             finally:

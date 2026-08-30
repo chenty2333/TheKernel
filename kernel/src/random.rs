@@ -1,56 +1,57 @@
-use core::{
-    ptr,
-    sync::atomic::{AtomicU64, Ordering, compiler_fence},
-};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
 use chacha20::{
     ChaCha20,
     cipher::{KeyIvInit, StreamCipher},
 };
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use spin::Mutex;
 
 const ENTROPY_BITS_READY: i32 = 256;
 const SECURE_RESEED_INTERVAL: usize = 1024 * 1024;
 
-struct RandomState {
-    ready: bool,
-    secure: Option<ChaCha20>,
-    insecure: Option<ChaCha20>,
+struct SecureRandomState {
+    rng: Option<ChaCha20>,
     generated: usize,
 }
 
-struct Zeroizing([u8; 32]);
-
-impl Zeroizing {
-    const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    fn as_mut(&mut self) -> &mut [u8; 32] {
-        &mut self.0
-    }
-
-    fn as_ref(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl Drop for Zeroizing {
-    fn drop(&mut self) {
-        wipe(&mut self.0);
-    }
-}
-
-static RANDOM: Mutex<RandomState> = Mutex::new(RandomState {
-    ready: false,
-    secure: None,
-    insecure: None,
+static SECURE_RANDOM: Mutex<SecureRandomState> = Mutex::new(SecureRandomState {
+    rng: None,
     generated: 0,
 });
+static INSECURE_RANDOM: Mutex<Option<SmallRng>> = Mutex::new(None);
 static INSECURE_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn insecure_seed() -> Zeroizing {
+fn reseed_secure(state: &mut SecureRandomState) -> AxResult<()> {
+    let mut seed = [0u8; 32];
+    axdriver::fill_entropy(&mut seed).map_err(|_| AxError::WouldBlock)?;
+    let nonce = [0u8; 12];
+    state.rng = Some(ChaCha20::new((&seed).into(), (&nonce).into()));
+    state.generated = 0;
+    Ok(())
+}
+
+pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
+    let mut state = SECURE_RANDOM.lock();
+    let mut offset = 0;
+    while offset < buf.len() {
+        if state.rng.is_none() || state.generated == SECURE_RESEED_INTERVAL {
+            reseed_secure(&mut state)?;
+        }
+        let chunk = (buf.len() - offset).min(SECURE_RESEED_INTERVAL - state.generated);
+        buf[offset..offset + chunk].fill(0);
+        let Some(rng) = state.rng.as_mut() else {
+            return Err(AxError::Io);
+        };
+        rng.apply_keystream(&mut buf[offset..offset + chunk]);
+        state.generated += chunk;
+        offset += chunk;
+    }
+    Ok(())
+}
+
+fn insecure_seed() -> [u8; 32] {
     let counter = INSECURE_SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stack_marker = 0u8;
     let words = [
@@ -63,92 +64,21 @@ fn insecure_seed() -> Zeroizing {
     for (dst, word) in seed.as_chunks_mut::<8>().0.iter_mut().zip(words) {
         dst.copy_from_slice(&word.to_ne_bytes());
     }
-    Zeroizing::new(seed)
+    seed
 }
 
-fn chacha(seed: &[u8; 32]) -> ChaCha20 {
-    ChaCha20::new(seed.into(), (&[0u8; 12]).into())
-}
+pub fn fill_insecure(buf: &mut [u8]) {
+    if fill_secure(buf).is_ok() {
+        return;
+    }
 
-fn wipe(bytes: &mut [u8]) {
-    for byte in bytes {
-        // SAFETY: each byte belongs to the exclusive stack buffer supplied.
-        unsafe { ptr::write_volatile(byte, 0) };
-    }
-    compiler_fence(Ordering::SeqCst);
-}
-
-/// Attempts the one-way first seed without holding the RNG lock during the
-/// driver call. A failed later reseed never discards an already-ready key.
-pub fn ensure_ready() -> AxResult<()> {
-    if RANDOM.lock().ready {
-        return Ok(());
-    }
-    let mut seed = Zeroizing::new([0u8; 32]);
-    if axdriver::fill_entropy(seed.as_mut()).is_err() {
-        return Err(AxError::WouldBlock);
-    }
-    let mut state = RANDOM.lock();
-    if !state.ready {
-        state.secure = Some(chacha(seed.as_ref()));
-        state.generated = 0;
-        state.ready = true;
-    }
-    Ok(())
-}
-
-/// Returns `WouldBlock` until the CRNG has received its first real seed.
-pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
-    ensure_ready()?;
-    let mut state = RANDOM.lock();
-    if state.generated >= SECURE_RESEED_INTERVAL
-        || state.generated.saturating_add(buf.len()).saturating_add(32) > SECURE_RESEED_INTERVAL
-    {
-        let mut seed = Zeroizing::new([0u8; 32]);
-        if axdriver::fill_entropy(seed.as_mut()).is_ok() {
-            state.secure = Some(chacha(seed.as_ref()));
-            state.generated = 0;
-        }
-    }
-    // Extract a replacement key from the same stream, then immediately drop
-    // the old key. Compromise of the live state cannot reconstruct either
-    // this extraction or a later one.
-    let mut extract = [0u8; 96];
-    let extract_len = buf.len().checked_add(32).ok_or(AxError::InvalidInput)?;
-    if extract_len > extract.len() {
-        return Err(AxError::InvalidInput);
-    }
-    let rng = state.secure.as_mut().ok_or(AxError::Io)?;
-    rng.apply_keystream(&mut extract[..extract_len]);
-    buf.copy_from_slice(&extract[..buf.len()]);
-    let mut next_key = [0u8; 32];
-    next_key.copy_from_slice(&extract[buf.len()..extract_len]);
-    state.secure = Some(chacha(&next_key));
-    wipe(&mut next_key);
-    wipe(&mut extract[..extract_len]);
-    state.generated = state.generated.saturating_add(buf.len());
-    Ok(())
-}
-
-/// `GRND_INSECURE` uses a persistent ChaCha stream even before readiness.
-pub fn fill_insecure(buf: &mut [u8]) -> AxResult<()> {
-    let mut state = RANDOM.lock();
-    if state.ready {
-        drop(state);
-        return fill_secure(buf);
-    }
-    if state.insecure.is_none() {
-        let mut seed = insecure_seed();
-        state.insecure = Some(chacha(seed.as_ref()));
-    }
-    let rng = state.insecure.as_mut().expect("insecure RNG initialized");
-    buf.fill(0);
-    rng.apply_keystream(buf);
-    Ok(())
+    let mut rng = INSECURE_RANDOM.lock();
+    rng.get_or_insert_with(|| SmallRng::from_seed(insecure_seed()))
+        .fill_bytes(buf);
 }
 
 pub fn entropy_bits() -> i32 {
-    if RANDOM.lock().ready {
+    if axdriver::entropy_source_ready() || SECURE_RANDOM.lock().rng.is_some() {
         ENTROPY_BITS_READY
     } else {
         0

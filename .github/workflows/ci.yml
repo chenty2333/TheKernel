@@ -29,9 +29,6 @@ jobs:
       # digest, but the override must also use ghcr.io/...@sha256:....  The
       # compiler itself remains controlled only by rust-toolchain.toml.
       image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:279c82be5d0a98814293912e3c8f87ccbcc1471a1781690768c1771cefd78fe7' }}
-      # Portable Linux oracles exercise io_uring, seccomp, and isolated user/
-      # network namespaces. The job container must not mask those host ABIs.
-      options: --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -62,7 +59,7 @@ jobs:
           path: ${{ steps.source_combination.outputs.ax_path }}
           persist-credentials: false
 
-      - name: Checkout Linux ABI workspace from source combination
+      - name: Checkout Linux implementation workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
@@ -108,40 +105,21 @@ jobs:
             -p thekernel-readiness-adapter \
             -- --check
 
-      - name: Validate vendored provenance
-        run: |
-          python3 scripts/ci/validate_vendor_provenance.py \
-            --archive-policy if-present \
-            --ax-repo ../thekernel-ax \
-            --linux-abi-repo ../thekernel-linux-abi
-
       - name: Test product tools
         run: |
           python3 -m unittest discover -s tests/ci -p 'test_*.py' -v
           python3 -m unittest discover -s tests/qemu_runner -v
+          python3 -m unittest discover -s tests/host/graphics -p 'test_*.py' -v
+          scripts/build-graphics-rootfs.sh --check
           python3 -m unittest \
             tests.test_thekernel_system_test \
             tests.test_x86_uefi_esp \
-            tests.ci.test_scheduler_baseline \
-            tests.ci.test_kvm_subsystem_baseline \
             -v
-
-      - name: Enforce reviewed Linux ABI baseline
-        run: |
-          python3 tools/abi_cases.py
-          python3 tools/abi_cohorts.py
-          python3 tools/abi_conditions.py --validate
-          python3 tools/abi_surfaces.py validate
-          python3 tools/abi_matrix.py phase1-gate
-          python3 scripts/ci/verify_linux_oracles.py
 
       - name: Test local adapters
         run: |
           cargo test --locked -p thekernel-readiness-adapter
           cargo test --locked -p thekernel-linux-process-adapter
-
-      - name: Run portable Linux differentials
-        run: ./scripts/host-differential.sh
 
       - name: Check host kernel profile
         run: |
@@ -160,7 +138,7 @@ jobs:
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
             cargo test --locked --manifest-path kernel/Cargo.toml \
-              --tests --features bpf,axtask/test,test-io-control \
+              --tests --features bpf,axtask/test \
               --target x86_64-unknown-linux-gnu -- --test-threads=1
 
       - name: Lint host kernel profile
@@ -179,11 +157,11 @@ jobs:
   product:
     name: x86_64 product
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The product gate compiles the kernel, runs its guest suite, and builds a
+    # complete Buildroot desktop image from verified sources.
+    timeout-minutes: 180
     container:
       image: ${{ vars.THEKERNEL_DEV_IMAGE || 'ghcr.io/chenty2333/thekernel-dev@sha256:279c82be5d0a98814293912e3c8f87ccbcc1471a1781690768c1771cefd78fe7' }}
-      # The unified gate runs the same portable Linux oracles as the fast job.
-      options: --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -213,7 +191,7 @@ jobs:
           path: ${{ steps.source_combination.outputs.ax_path }}
           persist-credentials: false
 
-      - name: Checkout Linux ABI workspace from source combination
+      - name: Checkout Linux implementation workspace from source combination
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
@@ -237,59 +215,48 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
 
-      - name: Materialize pinned Linux ABI inputs
+      - name: Build Q35 product image
+        run: |
+          ./tools/thekernel.py build --machine q35 --firmware uefi --smp 4
+
+      - name: Lint Q35 product image
+        run: |
+          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4
+
+      - name: Run Q35 guest system tests
+        run: |
+          ./tools/thekernel.py system-test --machine q35 --firmware uefi \
+            --smp 4 --accel tcg
+
+      - name: Restore verified Buildroot package downloads
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: TheKernel/.state/ci/graphics-downloads
+          key: >-
+            thekernel-buildroot-downloads-${{
+            hashFiles('TheKernel/config/graphics/pins.env', 'TheKernel/config/graphics/*.config')
+            }}
+
+      - name: Build Q35 software desktop graphics rootfs
         run: |
           set -euo pipefail
-          ./dev-env/check-image.sh
-          linux_state=.state/linux-6.12.103
-          linux_tarball="$linux_state/linux-6.12.103.tar.xz"
-          linux_download="$linux_tarball.download"
-          mkdir -p "$linux_state"
-          trap 'rm -f "$linux_download"' EXIT
-          curl --fail --location --retry 3 \
-            --output "$linux_download" \
-            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.103.tar.xz
-          printf '%s  %s\n' \
-            f143aaade8877ba5616e788b4482576db28481bcf557ef537f4fcc3938fc3176 \
-            "$linux_download" | sha256sum --check --strict
-          mv "$linux_download" "$linux_tarball"
-          trap - EXIT
-          python3 scripts/ci/materialize_linux_oracles.py
-          python3 scripts/ci/verify_linux_oracles.py --require-materialized
-          python3 scripts/ci/materialize_linux_uapi.py
-          python3 tools/abi_uapi.py --require-materialized
+          graphics_state="$PWD/.state/ci/graphics"
+          scripts/build-graphics-rootfs.sh \
+            --flavor q35-software-desktop \
+            --fetch-buildroot \
+            --buildroot-dir "$graphics_state/buildroot/buildroot-2025.02.2" \
+            --output "$graphics_state/q35-software-desktop" \
+            --download-dir "$PWD/.state/ci/graphics-downloads"
 
-      - name: Lint MM performance product profile
+      - name: Run headless Q35 software desktop pixel oracle
         run: |
-          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4 \
-            --profile mm-performance
-
-      - name: Run the unified clean-source q35 preview gate
-        run: |
-          THEKERNEL_ABI_UAPI_INCLUDE="$PWD/.state/linux-6.12.103/uapi/include" \
-            python3 -m tools.qemu_runner.gate_manifest \
-            --output .state/gate/q35-preview-v0/manifest.json
-
-      - name: Run formal Linux ABI differential gate
-        run: |
-          python3 tools/abi_runner.py \
-            --repo-root "$PWD" \
-            --rootfs .state/out/rootfs/x86/rootfs-x86.img \
-            --linux-kernel .state/linux-6.12.103/build/arch/x86/boot/bzImage \
-            --thekernel-kernel .state/out/x86_64/q35-uefi/system/smp4-mem1g/kernel-x86_64 \
-            --thekernel-esp .state/out/x86_64/q35-uefi/system/smp4-mem1g/kernel-x86_64.esp \
-            --thekernel-launch-receipt .state/gate/q35-preview-v0/system-test/qemu-receipt.json \
-            --uapi-headers .state/linux-6.12.103/uapi/include \
-            --output .state/gate/linux-abi-v1
-
-      - name: Publish q35 and Linux ABI receipts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: q35-abi-v1-${{ steps.source_combination.outputs.combination_id }}
-          path: |
-            TheKernel/.state/gate/q35-preview-v0
-            TheKernel/.state/gate/linux-abi-v1
-            TheKernel/.state/linux-6.12.103
-            TheKernel/.state/abi-binaries
-          if-no-files-found: error
+          set -euo pipefail
+          graphics_state="$PWD/.state/ci/graphics"
+          ./tools/thekernel.py graphics-smoke \
+            --machine q35 --firmware uefi --smp 4 \
+            --no-build --accel tcg --timeout 300 \
+            --rootfs "$graphics_state/q35-software-desktop/images/rootfs.ext2" \
+            --flavor q35-software-desktop \
+            --graphics-profile headless \
+            --screenshot "$graphics_state/q35-software-desktop.ppm" \
+            --workdir "$graphics_state/q35-software-desktop-run"

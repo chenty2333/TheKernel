@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+weston_uid=$(id -u weston)
+runtime_dir=/run/user/$weston_uid
+socket=wayland-0
+
+# Exercise the installed init order: eudev (S10), seatd (S70), then the
+# unprivileged Weston profile (S80). No root compositor or logind fallback is
+# used by this probe.
+/etc/init.d/S70seatd start 2>/dev/null || true
+/etc/init.d/S80weston start
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+    [ -S "$runtime_dir/$socket" ] && break
+    attempt=$((attempt + 1))
+    sleep 1
+done
+[ -S "$runtime_dir/$socket" ]
+echo 'THEKERNEL_GRAPHICS_ABI_SMOKE_READY'

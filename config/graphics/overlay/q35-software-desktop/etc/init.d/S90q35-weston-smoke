@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+marker=THEKERNEL_Q35_WESTON_READY
+virgl_marker=THEKERNEL_Q35_VIRGL_READY
+[ -S /run/seatd.sock ] || { echo "$marker state=FAIL reason=seatd_socket"; exit 1; }
+pidof seatd >/dev/null || { echo "$marker state=FAIL reason=seatd_process"; exit 1; }
+[ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
+event=$(find /dev/input -maxdepth 1 -name 'event*' -type c -print -quit)
+[ -n "$event" ] || { echo "$marker state=FAIL reason=input"; exit 1; }
+input_properties=$(udevadm info -q property -n "$event") || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
+printf '%s\n' "$input_properties" | grep -qx 'ID_INPUT=1' || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
+printf '%s\n' "$input_properties" | grep -Eq '^ID_INPUT_(KEY|MOUSE)=1$' || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
+pidof weston >/dev/null || { echo "$marker state=FAIL reason=weston_process"; exit 1; }
+weston_uid=$(id -u weston)
+export HOME=/var/lib/weston
+export XDG_RUNTIME_DIR=/run/user/$weston_uid
+export WAYLAND_DISPLAY=wayland-0
+runtime_dir_is_private() {
+    [ -d "$XDG_RUNTIME_DIR" ] &&
+        [ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$weston_uid" ] &&
+        [ "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 ]
+}
+runtime_dir_is_private || { echo "$marker state=FAIL reason=runtime_dir"; exit 1; }
+[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || { echo "$marker state=FAIL reason=wayland_socket"; exit 1; }
+grep -q 'drm-backend.so' /proc/"$(pidof weston | awk '{print $1}')"/maps || { echo "$marker state=FAIL reason=drm_backend"; exit 1; }
+start-stop-daemon -S -x /usr/local/bin/q35-wayland-color-client -c weston
+
+# A software virtio-gpu device deliberately has no render node, and the first
+# client above is its complete workload.  A virgl device advertises renderD128;
+# only that topology runs the separate forced-virgl workload.
+[ -c /dev/dri/renderD128 ] || exit 0
+id -nG weston | tr ' ' '\n' | grep -qx render || { echo "$virgl_marker state=FAIL reason=weston_render_group"; exit 1; }
+exec start-stop-daemon -S -x /usr/bin/env -c weston -- \
+    MESA_LOADER_DRIVER_OVERRIDE=virgl THEKERNEL_Q35_VIRGL=1 \
+    /usr/local/bin/q35-wayland-color-client

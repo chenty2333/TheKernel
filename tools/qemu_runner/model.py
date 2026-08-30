@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 
 Arch = Literal["x86_64"]
 DriveMode = Literal["snapshot", "readonly", "rw"]
+GraphicsProfile = Literal[
+    "headless",
+    "interactive",
+    "virgl-headless",
+    "virgl-interactive",
+]
 
 INTENTIONAL_STOP_RETURN_CODE = 75
 
@@ -40,18 +46,34 @@ class Interaction:
 
 
 @dataclass(frozen=True)
-class InputForwarding:
-    """Evidence for bytes successfully forwarded to the QEMU stdin pipe.
+class QmpControls:
+    """Optional graphical QMP actions issued after QEMU has started.
 
-    The digest and counters cover only bytes accepted by the QEMU stdin pipe.
+    ``input_events`` contains the event arrays accepted by QMP's
+    ``input-send-event`` command.  Keeping this as data rather than a host
+    input-device abstraction makes the runner suitable for both keyboard and
+    tablet injection without reintroducing legacy PS/2 devices.
     """
 
-    sha256: str
-    bytes_forwarded: int
-    line_count: int
-    source_eof: bool
-    broken_pipe: bool
-    relay_complete: bool
+    socket: Path | None = None
+    screenshot: Path | None = None
+    input_events: tuple[tuple[Mapping[str, object], ...], ...] = ()
+    input_after_marker: str | None = None
+    screenshot_after_marker: str | None = None
+    timeout_secs: float = 5.0
+    screenshot_size: tuple[int, int] | None = None
+    screenshot_color_blocks: tuple["QmpColorBlock", ...] = ()
+
+
+@dataclass(frozen=True)
+class QmpColorBlock:
+    """An exact RGB rectangle expected in a QMP ``screendump`` PPM image."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+    rgb: tuple[int, int, int]
 
 
 @dataclass(frozen=True)
@@ -65,7 +87,6 @@ class RunResult:
     log_path: Path
     workdir: Path
     error_message: str | None = None
-    input_forwarding: InputForwarding | None = None
     marker_success: bool = False
     runner_terminated: bool = False
     runner_termination_reason: str | None = None

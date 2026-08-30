@@ -1,0 +1,24 @@
+#!/bin/sh
+# Run only as the unprivileged weston account (S80weston uses -c weston).
+set -eu
+
+runtime_dir=/run/user/$(id -u)
+export HOME=/var/lib/weston
+export XDG_RUNTIME_DIR="$runtime_dir"
+[ "$(id -u)" -ne 0 ]
+[ -d "$XDG_RUNTIME_DIR" ]
+[ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$(id -u)" ]
+[ "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 ]
+
+case "${1:-}" in
+    headless-abi-smoke)
+        exec weston --config=/etc/weston/weston-headless.ini
+        ;;
+    q35-software-desktop)
+        exec weston --config=/etc/weston/weston-drm.ini
+        ;;
+    *)
+        echo "Usage: $0 {headless-abi-smoke|q35-software-desktop}" >&2
+        exit 2
+        ;;
+esac

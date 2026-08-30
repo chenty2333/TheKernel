@@ -12,15 +12,36 @@ use super::{
 pub type NTtyDriver = Tty<Console, Console>;
 
 #[derive(Clone, Copy)]
-pub struct Console;
+pub struct Console {
+    vt: Option<u16>,
+}
 impl TtyRead for Console {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
-        Ok(axhal::console::read_bytes(buf))
+        let read = axhal::console::read_bytes(buf);
+        if self.vt.is_none() && read != 0 {
+            // N_TTY owns the hardware IRQ/read side.  VTs never call this
+            // transport directly; they receive only the active console's
+            // bytes through their own manual line disciplines.
+            // Input is bounded by the target discipline.  Backpressure means
+            // the active terminal is saturated; drop that batch rather than
+            // killing the sole hardware IRQ reader or leaking it to another
+            // VT.
+            let _ = super::VT_MANAGER.route_active_input(&buf[..read]);
+            return Ok(0);
+        }
+        Ok(0)
     }
 }
 impl TtyWrite for Console {
     fn write(&self, buf: &[u8]) -> AxResult<usize> {
         axhal::console::write_bytes(buf);
+        let vt = self.vt.unwrap_or_else(|| super::VT_MANAGER.active());
+        super::fbcon::write(
+            vt,
+            buf,
+            super::VT_MANAGER.active(),
+            super::VT_MANAGER.graphics(vt),
+        );
         Ok(buf.len())
     }
 }
@@ -47,11 +68,27 @@ fn new_n_tty() -> Arc<NTtyDriver> {
     Tty::try_new(
         terminal,
         TtyConfig {
-            reader: Console,
-            writer: Console,
+            reader: Console { vt: None },
+            writer: Console { vt: None },
             process_mode,
         },
         None,
     )
     .expect("failed to construct console tty")
+}
+
+/// Builds one independently session-ownable virtual-console terminal.  Input
+/// still comes from the hardware console, but termios/job-control/session
+/// state belongs to this VT alone.
+pub(crate) fn new_virtual_tty(number: u16) -> Arc<NTtyDriver> {
+    Tty::try_new(
+        Arc::try_new(Default::default()).expect("failed to allocate VT terminal"),
+        TtyConfig {
+            reader: Console { vt: Some(number) },
+            writer: Console { vt: Some(number) },
+            process_mode: ProcessMode::Manual,
+        },
+        None,
+    )
+    .expect("failed to construct virtual-console tty")
 }

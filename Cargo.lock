@@ -210,6 +210,8 @@ dependencies = [
 [[package]]
 name = "axalloc"
 version = "0.3.0-preview.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a10c400cbdf0f611f92fcdd6e2c658de329085d3156ba65e323da7eaa7c7aca"
 dependencies = [
  "axallocator",
  "axbacktrace",
@@ -225,6 +227,8 @@ dependencies = [
 [[package]]
 name = "axallocator"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3894f6027940d4b013f1d1f9e2e61b47a9e4a7dbf1a0ba10dd33e7bb265ea733"
 dependencies = [
  "ax_slab_allocator",
  "axerrno 0.1.2",
@@ -299,8 +303,6 @@ dependencies = [
 [[package]]
 name = "axdisplay"
 version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202dbb36844c1822040957ecfbcf467a7dddbc183fe3e89d098523d3fc00e64a"
 dependencies = [
  "axdriver",
  "axsync",
@@ -350,8 +352,6 @@ dependencies = [
 [[package]]
 name = "axdriver_display"
 version = "0.1.4-preview.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcbd2fab37c37193bd21fcee061c96fe6a2850911a6a74a890018541e14ba92a"
 dependencies = [
  "axdriver_base",
 ]
@@ -359,8 +359,6 @@ dependencies = [
 [[package]]
 name = "axdriver_input"
 version = "0.1.4-preview.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5703515bf1f113d272f1e6f6b7043976fbbee66553e21360e07cc7ba75866838"
 dependencies = [
  "axdriver_base",
  "strum 0.27.2",
@@ -2902,6 +2900,7 @@ dependencies = [
  "axcpu",
  "axdisplay",
  "axdriver",
+ "axdriver_display",
  "axerrno 0.2.2",
  "axfeat",
  "axfs-ng",

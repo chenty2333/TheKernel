@@ -1,0 +1,4 @@
+#!/bin/sh
+# The headless flavor is self-contained, so make its successful compositor
+# startup visible to the host graphics-smoke command on the serial console.
+exec /usr/local/bin/graphics-abi-smoke

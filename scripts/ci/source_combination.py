@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import re
-import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -81,36 +79,8 @@ def load(path: Path) -> dict[str, Source]:
     return sources
 
 
-def combination_id(sources: Mapping[str, Source], thekernel_commit: str) -> str:
-    if not HEX_40.fullmatch(thekernel_commit):
-        raise SourceCombinationError(
-            "TheKernel commit is not a lowercase 40-hex commit"
-        )
-    lines = [f"schema=1", f"thekernel={thekernel_commit}"]
-    lines.extend(
-        f"{name}={source.repository}@{source.ref}:{source.path}"
-        for name, source in sorted(sources.items())
-    )
-    digest = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
-    return f"source-combination-v1-{digest}"
-
-
-def current_commit() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD^{commit}"], text=True
-        ).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise SourceCombinationError(
-            "cannot resolve the current TheKernel commit"
-        ) from exc
-
-
-def outputs(sources: Mapping[str, Source], thekernel_commit: str) -> dict[str, str]:
-    result = {
-        "thekernel_commit": thekernel_commit,
-        "combination_id": combination_id(sources, thekernel_commit),
-    }
+def outputs(sources: Mapping[str, Source]) -> dict[str, str]:
+    result = {}
     for name, source in sorted(sources.items()):
         result[f"{name}_repository"] = source.repository
         result[f"{name}_ref"] = source.ref
@@ -127,21 +97,18 @@ def write_github_outputs(path: Path, values: Mapping[str, str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--thekernel-commit")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args(argv)
 
     try:
         sources = load(args.config)
-        commit = args.thekernel_commit or current_commit()
-        values = outputs(sources, commit)
+        values = outputs(sources)
     except SourceCombinationError as exc:
         print(f"source-combination: {exc}", file=sys.stderr)
         return 1
 
     if args.github_output:
         write_github_outputs(args.github_output, values)
-    print(values["combination_id"])
     return 0
 
 
