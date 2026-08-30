@@ -6,8 +6,8 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axhal::{time::monotonic_time, uspace::UserContext};
-use axtask::current;
 use axsync::Mutex;
+use axtask::current;
 use linux_raw_sys::{
     general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
@@ -16,11 +16,10 @@ use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, v
 
 use super::sync::restart_futex_wait;
 use crate::{
-    mm::{map_usercopy_error, system_memory_stats},
-    mm::shmem_resident_pages,
+    mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats},
     task::{
-        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, live_thread_count, load_average_sample_now,
-        load_average_sysinfo, ns_capable,
+        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal, live_thread_count,
+        load_average_sample_now, load_average_sysinfo, ns_capable,
     },
 };
 
@@ -693,7 +692,9 @@ fn syslog_copy<M: UserMemory + ?Sized>(
         if copied != 0 || !consume {
             vm_write_slice(memory, buf.cast::<u8>(), &output[..copied])
                 .map_err(map_usercopy_error)?;
-            if consume { axruntime::klog::commit_read(end); }
+            if consume {
+                axruntime::klog::commit_read(end);
+            }
             return Ok((copied as isize, end));
         }
         // `READ` is the only blocking syslog action. Recheck pending signals
