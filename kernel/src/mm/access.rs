@@ -2288,6 +2288,16 @@ fn prepare_user_nofault_span(
 
     for (index, page) in pages[..page_count].iter_mut().enumerate() {
         let page_start = first_page + index * PAGE_SIZE_4K;
+        // Nofault/process_vm-style paths copy through the direct map and are
+        // forbidden for secret frames.  They must fail rather than creating a
+        // transient physical alias outside the per-CPU secret window.
+        if aspace.areas().any(|area| {
+            area.start().as_usize() <= page_start
+                && page_start < area.end().as_usize()
+                && area.backend().is_secret()
+        }) {
+            return Err(UserNofaultError::BadAddress);
+        }
         let (paddr, pte_flags, page_size) =
             match aspace.page_table().query(VirtAddr::from(page_start)) {
                 Ok(translation) => translation,

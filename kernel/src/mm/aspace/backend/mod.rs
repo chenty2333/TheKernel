@@ -596,6 +596,9 @@ impl Backend {
         }
     }
 
+    pub(crate) fn is_secret(&self) -> bool {
+        matches!(self, Self::Shared(shared) if shared.is_secret())
+    }
     pub(crate) fn supports_uffd_missing_resolver(&self) -> bool {
         matches!(self, Self::Cow(cow) if cow.is_4k_anonymous())
     }
@@ -772,7 +775,11 @@ impl Backend {
     }
 
     pub fn supports_user_io_frame_pin(&self) -> bool {
-        matches!(self, Backend::Cow(_) | Backend::Shared(_))
+        match self {
+            Backend::Cow(_) => true,
+            Backend::Shared(shared) => !shared.is_secret(),
+            Backend::Linear(_) | Backend::File(_) => false,
+        }
     }
 
     pub fn begin_user_io_pin_window(&self) -> AxResult<Option<CachedFilePinWindow>> {

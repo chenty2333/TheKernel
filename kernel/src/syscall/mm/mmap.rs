@@ -656,17 +656,22 @@ pub fn sys_mmap(
 
     // Keep type errors at the historical backend-construction point, but
     // classify the exact OFD pinned above instead of looking up `fd` again.
-    let file = pinned_fd
-        .map(|handle| {
-            handle.downcast::<File>().map_err(|_| {
-                if handle.as_ref().downcast_ref::<Directory>().is_some() {
-                    AxError::IsADirectory
-                } else {
-                    AxError::BrokenPipe
-                }
+    let file = if prepared_fixed_mapping.is_some() {
+        None
+    } else {
+        pinned_fd
+            .map(|handle| {
+                handle.downcast::<File>().map_err(|_| {
+                    if handle.as_ref().downcast_ref::<Directory>().is_some() {
+                        AxError::IsADirectory
+                    } else {
+                        AxError::BrokenPipe
+                    }
+                })
             })
         })
-        .transpose()?;
+        .transpose()?
+    };
     if map_type != MmapFlags::PRIVATE && permission_flags.contains(MmapProt::WRITE) {
         if let Some(file) = file.as_ref() {
             crate::mm::check_not_active(file.inner().location())?;
@@ -842,8 +847,10 @@ pub fn sys_mmap(
         .then(|| backend.shared_file_location().cloned())
         .flatten();
 
-        let locked_mapping =
-            map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
+        let secret_mapping = backend.is_secret();
+        let locked_mapping = secret_mapping
+            || map_flags.contains(MmapFlags::LOCKED)
+            || aspace.locks_future_mappings();
         if locked_mapping {
             check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
         }
@@ -892,7 +899,7 @@ pub fn sys_mmap(
                 .expect("writable mapping admission vanished after mmap commit");
         }
         drop(privilege_guard);
-        if map_flags.contains(MmapFlags::LOCKED) {
+        if secret_mapping || map_flags.contains(MmapFlags::LOCKED) {
             aspace.set_locked(start, length, true)?;
         }
         if growdown_private_anon {

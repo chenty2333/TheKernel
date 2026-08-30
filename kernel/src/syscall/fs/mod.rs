@@ -8,6 +8,7 @@ mod inotify;
 mod io;
 mod io_uring;
 mod memfd;
+mod secretmem;
 mod mount;
 mod pidfd;
 mod pipe;
@@ -25,3 +26,4 @@ pub use self::{
     xattr::*,
 };
 pub(crate) use quota::{admit_chown, admit_inode_create, admit_resize, admit_unlink};
+pub(crate) use self::secretmem::*;

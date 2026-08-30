@@ -2716,6 +2716,7 @@ pub fn sys_truncate(
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
+    check_resize_limit(length as u64)?;
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
@@ -2772,9 +2773,15 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
-    let security = current_vfs_security();
+    // Secretmem participates in the same RLIMIT_FSIZE admission and SIGXFSZ
+    // delivery as every other ftruncate target.
     check_resize_limit(length as u64)?;
     let file_like = get_file_like(fd)?;
+    if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
+        secret.truncate(length as u64)?;
+        return Ok(0);
+    }
+    let security = current_vfs_security();
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
     match kind {
         FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),

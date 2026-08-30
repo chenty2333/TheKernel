@@ -5731,6 +5731,17 @@ impl AddrSpace {
         result
     }
 
+    /// Returns whether a range overlaps a secret-memory VMA.  Such frames
+    /// must never be accessed through the generic direct-map copy helpers.
+    pub(crate) fn has_secret_mapping(&self, start: VirtAddr, len: usize) -> bool {
+        len != 0
+            && start.checked_add(len).is_some_and(|end| {
+                self.areas.iter().any(|area| {
+                    area.start() < end && start < area.end() && area.backend().is_secret()
+                })
+            })
+    }
+
     /// Updates mapping within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not

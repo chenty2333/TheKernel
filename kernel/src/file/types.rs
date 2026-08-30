@@ -372,18 +372,20 @@ impl FixedSharedMmapRegion {
     /// A different offset is not an error so an object can probe several
     /// disjoint regions without weakening validation for the selected region.
     pub fn prepare(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
-        if request.offset != self.file_offset {
+        if request.offset < self.file_offset {
             return Ok(None);
         }
         validate_fixed_shared_request(
             self.file_offset,
             self.pages.total_bytes(),
+            self.pages.is_secret(),
             self.pages.page_size() as usize,
             self.may_protect,
             request,
         )?;
         Ok(Some(PreparedFileMmap {
             request,
+            region_offset: self.file_offset,
             pages: self.pages.clone(),
             may_protect: self.may_protect,
             retain_description: self.retain_description,
@@ -394,12 +396,19 @@ impl FixedSharedMmapRegion {
 fn validate_fixed_shared_request(
     expected_offset: u64,
     expected_length: usize,
+    allow_beyond_end: bool,
     expected_page_size: usize,
     may_protect: FileMmapProtection,
     request: FileMmapRequest,
 ) -> AxResult {
-    if request.offset != expected_offset
-        || request.length != expected_length
+    let Some(relative) = request.offset.checked_sub(expected_offset) else { return Err(AxError::InvalidInput); };
+    // secretmem follows normal file mmap admission: a shared mapping may
+    // extend past i_size.  Its fault handler rejects pages beyond EOF instead
+    // of turning mmap itself into EINVAL.  Other fixed control mappings keep
+    // their exact exported extent.
+    if relative
+        .checked_add(request.length as u64)
+        .is_none_or(|end| end > expected_length as u64 && !allow_beyond_end)
         || request.page_size != expected_page_size
         || request.sharing != FileMmapSharing::Shared
     {
@@ -419,6 +428,7 @@ fn validate_fixed_shared_request(
 /// or permissions after the owning [`FileLike`] accepted the request.
 pub struct PreparedFileMmap {
     request: FileMmapRequest,
+    region_offset: u64,
     pages: Arc<SharedPages>,
     may_protect: FileMmapProtection,
     retain_description: bool,
@@ -428,6 +438,7 @@ impl PreparedFileMmap {
     pub(crate) const fn request(&self) -> FileMmapRequest {
         self.request
     }
+    pub(crate) const fn region_offset(&self) -> u64 { self.region_offset }
 
     pub(crate) const fn pages(&self) -> &Arc<SharedPages> {
         &self.pages
@@ -695,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_shared_plan_rejects_private_exec_and_nonexact_requests() {
+    fn fixed_shared_plan_rejects_private_exec_and_out_of_range_requests() {
         let allowed = FileMmapProtection::READ | FileMmapProtection::WRITE;
         let accepted = mmap_request(
             0x20_000,
@@ -703,7 +714,7 @@ mod tests {
             FileMmapProtection::READ | FileMmapProtection::WRITE,
             FileMmapSharing::Shared,
         );
-        validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, accepted).unwrap();
+        validate_fixed_shared_request(0x20_000, 0x3000, false, 0x1000, allowed, accepted).unwrap();
 
         let private = mmap_request(
             0x20_000,
@@ -712,7 +723,7 @@ mod tests {
             FileMmapSharing::Private,
         );
         assert_eq!(
-            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, private),
+            validate_fixed_shared_request(0x20_000, 0x3000, false, 0x1000, allowed, private),
             Err(AxError::InvalidInput)
         );
 
@@ -723,7 +734,7 @@ mod tests {
             FileMmapSharing::Shared,
         );
         assert_eq!(
-            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, executable),
+            validate_fixed_shared_request(0x20_000, 0x3000, false, 0x1000, allowed, executable),
             Err(AxError::PermissionDenied)
         );
 
@@ -734,8 +745,8 @@ mod tests {
             FileMmapSharing::Shared,
         );
         assert_eq!(
-            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, short),
-            Err(AxError::InvalidInput)
+            validate_fixed_shared_request(0x20_000, 0x3000, false, 0x1000, allowed, short),
+            Ok(())
         );
 
         let wrong_offset = mmap_request(
@@ -745,7 +756,7 @@ mod tests {
             FileMmapSharing::Shared,
         );
         assert_eq!(
-            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, wrong_offset),
+            validate_fixed_shared_request(0x20_000, 0x3000, false, 0x1000, allowed, wrong_offset),
             Err(AxError::InvalidInput)
         );
     }
@@ -763,6 +774,7 @@ mod tests {
         validate_fixed_shared_request(
             0,
             backing_length,
+            false,
             0x1000,
             FileMmapProtection::READ | FileMmapProtection::WRITE,
             request,
@@ -778,5 +790,24 @@ mod tests {
             ),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn secret_shared_plan_allows_mapping_past_logical_end() {
+        let request = mmap_request(
+            0x1000,
+            0x3000,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+            FileMmapSharing::Shared,
+        );
+        validate_fixed_shared_request(
+            0,
+            0x1000,
+            true,
+            0x1000,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+            request,
+        )
+        .unwrap();
     }
 }

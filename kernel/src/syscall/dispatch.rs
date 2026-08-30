@@ -1719,7 +1719,8 @@ pub(super) fn dispatch_syscall(
         }),
 
         // Unsupported fd-producing syscalls.
-        Sysno::perf_event_open | Sysno::memfd_secret => sys_unsupported_fd(sysno),
+        Sysno::perf_event_open => sys_unsupported_fd(sysno),
+        Sysno::memfd_secret => sys_memfd_secret(uctx.arg0() as _),
 
         Sysno::timer_create => with_user_memory(aspace(), |memory| {
             sys_timer_create(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

@@ -189,6 +189,12 @@ fn prepare_range(
     if !address_space.contains_range(start, len) {
         return Err(UserCopyError::BadAddress);
     }
+    // Secret frames intentionally have no direct-map alias.  Usercopy ends
+    // in AddrSpace::{read,write}, whose ordinary path is a direct-map copy,
+    // so reject the complete request before population or copying anything.
+    if address_space.has_secret_mapping(start, len) {
+        return Err(UserCopyError::BadAddress);
+    }
     if !address_space.can_access_range(start, len, access_flags) {
         return Err(UserCopyError::AccessDenied);
     }
@@ -224,6 +230,19 @@ unsafe impl UserMemory for AddressSpaceUserMemory {
         address_space
             .write(start, src)
             .map_err(map_address_space_error)
+    }
+
+    fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
+        let address_space = self.address_space.lock();
+        let start = VirtAddr::from(start);
+        if len != 0
+            && (!address_space.contains_range(start, len)
+                || address_space.has_secret_mapping(start, len)
+                || !address_space.can_access_range(start, len, MappingFlags::WRITE))
+        {
+            return Err(UserCopyError::BadAddress);
+        }
+        Ok(())
     }
 }
 

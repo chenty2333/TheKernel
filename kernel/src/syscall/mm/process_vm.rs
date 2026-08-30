@@ -165,6 +165,11 @@ fn validate_address_range(
     if !aspace.contains_range(start, len) {
         return Err(AxError::BadAddress);
     }
+    // process_vm is implemented with AddrSpace::{read,write}; those use the
+    // direct map and must neither populate nor alias secret frames.
+    if aspace.has_secret_mapping(start, len) {
+        return Err(AxError::BadAddress);
+    }
     if !aspace.can_access_range(start, len, access_flags) {
         return Err(AxError::BadAddress);
     }
