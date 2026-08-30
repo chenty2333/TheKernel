@@ -39,8 +39,8 @@ use crate::{
         permission::{
             ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
             TimestampSetattrPolicy, VfsSecurityContext, check_fchdir_permissions_with_security,
-            check_open_permissions_with_security, check_search_permissions_with_security,
-            check_writable_mount, dac_access_allowed,
+            check_open_permissions_with_security, check_pseudo_inode_permissions_with_security,
+            check_search_permissions_with_security, check_writable_mount,
         },
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
         resolve_at_with_security, validate_symlink_target, with_path_fs,
@@ -55,10 +55,7 @@ use crate::{
         AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context,
         has_pending_syscall_signal, ns_capable, security::InodeSetattrCommittedSecurityRef,
     },
-    time::{
-        TimeValueLike, timestamp_from_seconds, timestamp_from_timespec, timestamp_from_timeval,
-        wall_time,
-    },
+    time::{timestamp_from_seconds, timestamp_from_timespec, timestamp_from_timeval, wall_time},
 };
 
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
@@ -1544,16 +1541,7 @@ fn update_times<M: UserMemory + ?Sized>(
                 if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
                     return Err(AxError::OperationNotPermitted);
                 }
-                if !dac_access_allowed(
-                    metadata.mode.bits() as u32,
-                    metadata.uid,
-                    metadata.gid,
-                    metadata.node_type,
-                    W_OK,
-                    credentials,
-                ) {
-                    return Err(AxError::PermissionDenied);
-                }
+                check_pseudo_inode_permissions_with_security(&metadata, W_OK, &security)?;
             }
             let intent = InodeTimestampIntent::new(
                 timestamp_value(atime_intent),

@@ -1034,6 +1034,35 @@ pub(crate) fn check_inode_permissions_with_security(
     )
 }
 
+/// Descriptor-only pseudo inodes use the same actor-bound DAC projection and
+/// inode-permission hook as a path-backed inode, but have no mount location.
+pub(crate) fn check_pseudo_inode_permissions_with_security(
+    metadata: &Metadata,
+    requested: u32,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    let Some(access) = inode_permission_access(requested)? else {
+        return Ok(());
+    };
+    check_dac_permissions_with_actor(
+        metadata.mode.bits() as u32,
+        metadata.uid,
+        metadata.gid,
+        metadata.node_type,
+        requested,
+        security.actor(),
+        security.credentials(),
+    )?;
+    let object = InodeSecurityRef::new_pseudo(metadata);
+    dispatch_inode_permission(&InodePermissionSecurityContext::new(
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+        &object,
+        access,
+    ))
+}
+
 fn check_inode_permissions_with_metadata(
     loc: &Location,
     metadata: &Metadata,

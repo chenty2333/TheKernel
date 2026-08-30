@@ -2305,9 +2305,9 @@ mod tests {
             .update_metadata(MetadataUpdate {
                 mode: Some(NodePermission::from_bits_truncate(0o640)),
                 owner: Some((1201, 1202)),
-                atime: Some(Duration::from_secs(11)),
-                mtime: Some(Duration::from_secs(12)),
-                ctime: Some(Duration::from_secs(13)),
+                atime: Some(Duration::from_secs(11).into()),
+                mtime: Some(Duration::from_secs(12).into()),
+                ctime: Some(Duration::from_secs(13).into()),
                 ..Default::default()
             })
             .unwrap();
@@ -2374,9 +2374,9 @@ mod tests {
             .update_metadata(MetadataUpdate {
                 mode: Some(NodePermission::from_bits_truncate(0o654)),
                 owner: Some((2301, 2302)),
-                atime: Some(Duration::from_secs(21)),
-                mtime: Some(Duration::from_secs(22)),
-                ctime: Some(Duration::from_secs(23)),
+                atime: Some(Duration::from_secs(21).into()),
+                mtime: Some(Duration::from_secs(22).into()),
+                ctime: Some(Duration::from_secs(23).into()),
                 ..Default::default()
             })
             .unwrap();
