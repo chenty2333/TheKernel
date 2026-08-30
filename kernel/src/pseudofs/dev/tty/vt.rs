@@ -144,13 +144,6 @@ struct SwitchSignal {
     pending: PendingSwitch,
 }
 
-#[cfg(test)]
-impl PartialEq<(Pid, i16)> for SwitchSignal {
-    fn eq(&self, other: &(Pid, i16)) -> bool {
-        (self.pid, self.signal) == *other
-    }
-}
-
 /// The global VT switch arbiter. Signal delivery happens after dropping
 /// `state`; text presentation deliberately takes it to serialize against VT
 /// mode and active-console changes.
@@ -567,7 +560,7 @@ impl VtManager {
     /// Retires a VT_PROCESS owner during process exit.  The process-exit path
     /// calls this without holding task/session locks; any acquire signal is
     /// delivered only after this method has dropped the VT lock.
-    pub(crate) fn owner_exited(&self, pid: Pid) -> Option<SwitchSignal> {
+    fn owner_exited(&self, pid: Pid) -> Option<SwitchSignal> {
         loop {
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
@@ -620,7 +613,7 @@ impl VtManager {
     /// equivalent to owner exit; that recovery can complete a release and
     /// produce an acquire signal, which is delivered by the next loop turn.
     /// No signal is sent while any VT lock is held.
-    pub(crate) fn deliver_switch_signal(&self, mut next: Option<SwitchSignal>) {
+    fn deliver_switch_signal(&self, mut next: Option<SwitchSignal>) {
         while let Some(ticket) = next {
             let claimed = {
                 let _delivery = self.delivery.lock();
@@ -1047,11 +1040,17 @@ impl VtDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_switch_signal(signal: Option<SwitchSignal>, expected: (Pid, i16)) {
+        let signal = signal.expect("expected a VT_PROCESS signal");
+        assert_eq!((signal.pid, signal.signal), expected);
+    }
+
     #[test]
     fn process_release_is_a_two_phase_switch() {
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2).unwrap(), Some((7, 1)));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
         assert_eq!(m.active(), 1);
         assert_eq!(m.release_reply(7, 1).unwrap(), None);
         assert_eq!(m.active(), 2);
@@ -1068,7 +1067,7 @@ mod tests {
     fn immediate_switch_starts_target_acquire_handshake() {
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2), Ok(Some((9, 2))));
+        assert_switch_signal(m.activate(2).unwrap(), (9, 2));
         assert_eq!(m.active(), 2);
         assert_eq!(m.release_reply(9, VT_ACKACQ), Ok(None));
     }
@@ -1083,9 +1082,9 @@ mod tests {
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2).unwrap(), Some((7, 1)));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
 
-        assert_eq!(m.owner_exited(7), Some((9, 2)));
+        assert_switch_signal(m.owner_exited(7), (9, 2));
         assert_eq!(m.active(), 2);
         assert!(m.state.lock().vts[0].process.is_none());
     }
@@ -1095,8 +1094,8 @@ mod tests {
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2), Ok(Some((7, 1))));
-        assert_eq!(m.owner_exited(7), Some((9, 2)));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
+        assert_switch_signal(m.owner_exited(7), (9, 2));
         assert_eq!(m.release_reply(9, VT_ACKACQ), Ok(None));
     }
 
@@ -1104,7 +1103,7 @@ mod tests {
     fn owner_exit_clears_pending_acquire_for_dead_owner() {
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2), Ok(Some((9, 2))));
+        assert_switch_signal(m.activate(2).unwrap(), (9, 2));
         assert_eq!(m.owner_exited(9), None);
         assert!(m.state.lock().pending.is_none());
         assert_eq!(m.release_reply(9, VT_ACKACQ), Err(AxError::InvalidInput));
@@ -1114,7 +1113,7 @@ mod tests {
     fn replacing_process_mode_cancels_its_pending_release_handshake() {
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2), Ok(Some((7, 1))));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
 
         // This is intentionally the same PID: a new VT_PROCESS mode still
         // invalidates the old mode instance's handshake.
@@ -1156,7 +1155,7 @@ mod tests {
     fn clearing_process_mode_cancels_its_pending_acquire_handshake() {
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
-        assert_eq!(m.activate(2), Ok(Some((9, 2))));
+        assert_switch_signal(m.activate(2).unwrap(), (9, 2));
 
         m.mode(2, 9, [VT_AUTO, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert!(m.state.lock().pending.is_none());
@@ -1170,8 +1169,8 @@ mod tests {
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
         m.state.lock().vts[0].graphics = true;
         m.state.lock().vts[0].kb_mode = K_OFF;
-        assert_eq!(m.activate(2), Ok(Some((7, 1))));
-        assert_eq!(m.owner_exited(7), Some((9, 2)));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
+        assert_switch_signal(m.owner_exited(7), (9, 2));
         assert!(!m.graphics(1));
         assert_eq!(m.state.lock().vts[0].kb_mode, K_XLATE);
         assert_eq!(m.owner_exited(9), None);
@@ -1234,8 +1233,8 @@ mod tests {
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
 
-        assert_eq!(m.activate(2).unwrap(), Some((7, 1)));
-        assert_eq!(m.release_reply(7, 1).unwrap(), Some((9, 2)));
+        assert_switch_signal(m.activate(2).unwrap(), (7, 1));
+        assert_switch_signal(m.release_reply(7, 1).unwrap(), (9, 2));
         assert_eq!(m.active(), 2);
         assert_eq!(m.release_reply(9, 1), Err(AxError::PermissionDenied));
         assert_eq!(m.release_reply(9, VT_ACKACQ), Ok(None));
