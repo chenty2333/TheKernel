@@ -46,9 +46,7 @@ use crate::{
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
-    syscall::fs::{
-        ctl::validate_pathname, io::check_mandatory_fd_truncate_lock, mount::FsMountFd,
-    },
+    syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
     task::{AX_FILE_LIMIT, AsThread, Cred, current_fs_context, ns_capable},
     time::wall_time,
 };
@@ -302,6 +300,7 @@ const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
     (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32 | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE;
 const EXPORTED_HANDLE_TYPE: i32 = 1;
+const EXPORTED_FID_HANDLE_TYPE: i32 = 2;
 const EXPORTED_HANDLE_BYTES: u32 = 16;
 
 #[repr(C)]
@@ -821,6 +820,11 @@ pub fn sys_name_to_handle_at(
     .into_file()
     .ok_or(AxError::InvalidInput)?;
     let exported = location.mountpoint().encode_export_handle(&location)?;
+    let handle_type = if flags & AT_HANDLE_FID != 0 {
+        EXPORTED_FID_HANDLE_TYPE
+    } else {
+        EXPORTED_HANDLE_TYPE
+    };
     let header = unsafe {
         capability
             .read_value_uninit(handle.cast::<LinuxFileHandle>())
@@ -847,7 +851,7 @@ pub fn sys_name_to_handle_at(
     if header.handle_bytes < EXPORTED_HANDLE_BYTES {
         let required_header = LinuxFileHandle {
             handle_bytes: EXPORTED_HANDLE_BYTES,
-            handle_type: EXPORTED_HANDLE_TYPE,
+            handle_type,
         };
         let required_header = unsafe {
             slice::from_raw_parts(
@@ -869,7 +873,7 @@ pub fn sys_name_to_handle_at(
     capability
         .write_bytes(
             (handle as usize).checked_add(4).ok_or(LinuxError::EFAULT)?,
-            &EXPORTED_HANDLE_TYPE.to_ne_bytes(),
+            &handle_type.to_ne_bytes(),
         )
         .map_err(map_usercopy_error)?;
     capability
@@ -894,27 +898,41 @@ pub fn sys_open_by_handle_at(
     // Resolve and authorize the mount selector before touching the untrusted
     // handle so EBADF/EPERM retain their ABI priority over EFAULT/EINVAL.
     let (mount, directory_scope) = if mount_fd == AT_FDCWD {
-        (current_fs_context().lock().current_dir().clone(), true)
+        (current_fs_context().lock().current_dir().clone(), Some(true))
     } else {
         let selected = get_file_like(mount_fd)?;
         if let Some(directory) = selected.downcast_ref::<Directory>() {
-            (directory.inner().clone(), true)
+            (
+                directory.inner().clone(),
+                Some(selected.status_flags() & O_DIRECTORY != 0),
+            )
         } else if let Some(file) = selected.downcast_ref::<File>() {
-            (file.inner().location().clone(), false)
-        } else if let Some(mount) = selected.downcast_ref::<FsMountFd>() {
-            (mount.root().clone(), false)
+            (file.inner().location().clone(), None)
         } else {
             return Err(AxError::InvalidInput);
         }
     };
-    // Linux admits this through the caller's user namespace, after the mount
-    // descriptor has supplied the target superblock/mount authority.
-    if !thread
-        .current_cred()
-        .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
+    // may_decode_fh() has an unscoped global-capability fast path.  The
+    // relaxed path is deliberately narrower: a real O_DIRECTORY anchor plus
+    // CAP_SYS_ADMIN in the target mount's governing user namespace.
+    let globally_authorized = thread.has_effective_capability(CAP_DAC_READ_SEARCH);
+    let relaxed_directory_scope = if globally_authorized {
+        None
+    } else if directory_scope == Some(true)
+        && ns_capable(
+            &thread.current_cred(),
+            &crate::task::security::initial_user_namespace(thread.current_cred().user_ns()),
+            CAP_SYS_ADMIN,
+        )
     {
+        Some(mount.clone())
+    } else {
         return Err(LinuxError::EPERM.into());
-    }
+    };
+
+    let flags = normalize_legacy_open_flags(flags)?;
+    let _mount_namespace = open_requires_namespace_operation(flags as u32, 0)
+        .then(crate::mounts::namespace_operation);
 
     let handle_addr = handle as usize;
     let header = unsafe {
@@ -923,9 +941,7 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-    if header.handle_bytes != EXPORTED_HANDLE_BYTES
-        || header.handle_type != EXPORTED_HANDLE_TYPE
-    {
+    if header.handle_bytes != EXPORTED_HANDLE_BYTES || header.handle_type != EXPORTED_HANDLE_TYPE {
         return Err(AxError::InvalidInput);
     }
 
@@ -944,21 +960,24 @@ pub fn sys_open_by_handle_at(
         .mountpoint()
         .decode_export_handle(axfs_ng_vfs::ExportHandle { inode, generation })
         .map_err(|_| LinuxError::ESTALE)?;
-    // A directory fd is a scoped mount capability: decoding may not escape
-    // either its mount view or its directory subtree.  A mount fd and a
-    // non-directory file fd retain their whole-superblock authority.
-    if directory_scope
-        && (!Arc::ptr_eq(mount.mountpoint(), location.mountpoint())
-            || !mount.entry().is_ancestor_of(location.entry())?)
+    // Anonymous decoded references have no parent chain.  Ask the filesystem
+    // to verify the stable namespace ancestry from the encoded inode instead.
+    if let Some(directory) = relaxed_directory_scope
+        && !mount
+            .mountpoint()
+            .export_handle_is_descendant(
+                &directory,
+                axfs_ng_vfs::ExportHandle { inode, generation },
+            )?
     {
-        return Err(LinuxError::ESTALE.into());
+        return Err(LinuxError::EPERM.into());
     }
     let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     open_resolved_location_with_policy(
         "",
         location,
         false,
-        normalize_legacy_open_flags(flags)?,
+        flags,
         0,
         &security,
     )
