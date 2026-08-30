@@ -226,7 +226,7 @@ fn attr_copy_len(size: u32) -> AxResult<usize> {
     if size > PERF_ATTR_MAX_SIZE {
         return Err(AxError::ArgumentListTooLong);
     }
-    Ok(size as usize - PERF_ATTR_SIZE_VER0 as usize)
+    Ok(size as usize)
 }
 
 fn validate_extension_bytes(bytes: &[u8]) -> AxResult<()> {
