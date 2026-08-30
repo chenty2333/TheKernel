@@ -11,7 +11,7 @@ use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
     SchedState, TaskSchedError, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    sched_state, scheduler_state_snapshot, set_sched_state_versioned,
+    sched_state, scheduler_attr_snapshot, scheduler_state_snapshot, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
     task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus,
     update_sched_state_versioned_with_reset, validate_affinity_mask,
@@ -278,6 +278,20 @@ fn rr_interval_for_state(state: SchedState) -> Duration {
     } else {
         Duration::ZERO
     }
+}
+
+fn fair_runtime_ns(class: SchedClass) -> u64 {
+    let ticks = match class {
+        SchedClass::Normal => axtask::EEVDF_PROFILE.normal_target_ticks,
+        SchedClass::Batch => axtask::EEVDF_PROFILE.batch_target_ticks,
+        SchedClass::Idle => axtask::EEVDF_PROFILE.idle_target_ticks,
+        SchedClass::Fifo | SchedClass::RoundRobin => return 0,
+    };
+    ticks
+        .saturating_mul(1_000_000_000)
+        .checked_div(axconfig::TICKS_PER_SEC as u128)
+        .unwrap_or(0)
+        .min(u64::MAX as u128) as u64
 }
 
 pub fn sched_rr_timeslice_ms() -> u32 {
@@ -1173,27 +1187,45 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
 
-    let task = sched_target(pid)?;
-    let commit = scheduler_state_snapshot(&task).map_err(|_| AxError::NoSuchProcess)?;
-    let state = commit.state;
+    let target = if pid == 0 {
+        SchedGetSchedulerTarget::Live(current().clone())
+    } else {
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
+            SchedGetSchedulerTarget::Live(task)
+        } else {
+            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+        }
+    };
+    let (_, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = target.credential()?;
+    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
+        &actor_cred,
+        &target_cred,
+    ))?;
+    let snapshot = target.attr_snapshot()?;
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
-        sched_policy: linux_policy_from_state(state, commit.reset_on_fork) as u32
+        sched_policy: linux_policy_from_state(snapshot.state, snapshot.reset_on_fork) as u32
             & !SCHED_RESET_ON_FORK,
-        sched_flags: if commit.reset_on_fork {
+        sched_flags: if snapshot.reset_on_fork {
             SUPPORTED_SCHED_ATTR_FLAGS
         } else {
             0
         },
-        sched_nice: state_nice(state),
-        sched_priority: state_static_priority(state) as u32,
-        sched_runtime: 0,
-        sched_deadline: 0,
-        sched_period: 0,
-        sched_util_min: 0,
-        sched_util_max: 0,
+        sched_nice: state_nice(snapshot.state),
+        sched_priority: state_static_priority(snapshot.state) as u32,
+        sched_runtime: snapshot.fair_runtime_ns,
+        sched_deadline: snapshot.deadline_ns,
+        sched_period: snapshot.period_ns,
+        sched_util_min: snapshot.util_min,
+        sched_util_max: snapshot.util_max,
     };
     out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
+
+    memory
+        .validate_write_range(attr as usize, out_size)
+        .map_err(map_usercopy_error)?;
 
     let copy_size = out_size.min(size_of::<SchedAttr>());
     vm_write_slice(memory, attr.cast::<u8>(), unsafe {
@@ -1612,6 +1644,17 @@ enum SchedGetSchedulerTarget {
     Zombie(Arc<Process>),
 }
 
+#[derive(Clone, Copy)]
+struct SchedGetAttrSnapshot {
+    state: SchedState,
+    reset_on_fork: bool,
+    fair_runtime_ns: u64,
+    deadline_ns: u64,
+    period_ns: u64,
+    util_min: u32,
+    util_max: u32,
+}
+
 impl SchedGetSchedulerTarget {
     fn credential(&self) -> AxResult<Arc<Cred>> {
         match self {
@@ -1694,6 +1737,44 @@ impl SchedGetSchedulerTarget {
                 // so its Acquire snapshot remains valid through this commit.
                 validate_affinity_mask(affinity)?;
                 set_zombie_affinity(process, affinity)
+            }
+        }
+    }
+
+    fn attr_snapshot(&self) -> AxResult<SchedGetAttrSnapshot> {
+        match self {
+            Self::Live(task) => scheduler_attr_snapshot(task)
+                .map(|snapshot| SchedGetAttrSnapshot {
+                    state: snapshot.commit.state,
+                    reset_on_fork: snapshot.commit.reset_on_fork,
+                    fair_runtime_ns: snapshot.fair_runtime_ns,
+                    deadline_ns: snapshot.deadline_ns,
+                    period_ns: snapshot.period_ns,
+                    util_min: snapshot.util_min,
+                    util_max: snapshot.util_max,
+                })
+                .map_err(|error| match error {
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                }),
+            Self::Zombie(process) => {
+                let snapshot = zombie_scheduler_state(process)?;
+                Ok(SchedGetAttrSnapshot {
+                    state: SchedState {
+                        class: snapshot.class,
+                        nice: snapshot.nice,
+                        rt_priority: snapshot.rt_priority,
+                    },
+                    reset_on_fork: snapshot.reset_on_fork,
+                    fair_runtime_ns: fair_runtime_ns(snapshot.class),
+                    deadline_ns: 0,
+                    period_ns: 0,
+                    util_min: 0,
+                    util_max: 0,
+                })
             }
         }
     }
@@ -2181,6 +2262,14 @@ mod tests {
             linux_policy_from_class(SchedClass::Normal, false),
             SCHED_NORMAL as i32
         );
+    }
+
+    #[test]
+    fn sched_getattr_fair_runtime_is_profile_owned_and_rt_is_zero() {
+        assert!(fair_runtime_ns(SchedClass::Normal) > 0);
+        assert!(fair_runtime_ns(SchedClass::Batch) > 0);
+        assert_eq!(fair_runtime_ns(SchedClass::Fifo), 0);
+        assert_eq!(fair_runtime_ns(SchedClass::RoundRobin), 0);
     }
 
     #[test]
