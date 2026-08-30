@@ -2773,6 +2773,10 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let file_like = get_file_like(fd)?;
+    // do_ftruncate rejects O_PATH at fd admission, before asking the target
+    // inode what type it is.  In particular, O_PATH directories are EBADF,
+    // while ordinary directories below remain EISDIR.
+    file_like.check_io_access()?;
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
     match kind {
         FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
@@ -2780,12 +2784,6 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         FileLikeKind::Directory => return Err(AxError::IsADirectory),
         FileLikeKind::Regular => {}
     }
-    file_like.check_io_access().map_err(|error| match error {
-        // The descriptor exists, so do_ftruncate's invalid file mode is
-        // EINVAL; only get_file_like above is allowed to report EBADF.
-        AxError::BadFileDescriptor => AxError::InvalidInput,
-        other => other,
-    })?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
         secret.check_truncate()?;
         if (length as u64) > secret.size() {
