@@ -685,6 +685,7 @@ fn prepare_open_description(
     prepare_file_description_with_open_lease(
         f,
         open_status_flags(flags),
+        flags & O_DIRECTORY != 0,
         write_open_key,
         description_resource,
         open_lease_admission,
@@ -904,7 +905,7 @@ pub fn sys_open_by_handle_at(
         if let Some(directory) = selected.downcast_ref::<Directory>() {
             (
                 directory.inner().clone(),
-                Some(selected.status_flags() & O_DIRECTORY != 0),
+                Some(selected.directory_capability()),
             )
         } else if let Some(file) = selected.downcast_ref::<File>() {
             (file.inner().location().clone(), None)

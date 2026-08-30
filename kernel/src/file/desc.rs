@@ -19,7 +19,7 @@ use axsync::Mutex as StatusTransitionMutex;
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    O_APPEND, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI,
+    O_APPEND, O_DIRECTORY, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI,
     POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND,
     POLLWRNORM, SI_SIGIO,
 };
@@ -1125,6 +1125,9 @@ impl OfdIoStatus {
 
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
+    /// Immutable `O_DIRECTORY` admission fact.  It is not an F_GETFL status
+    /// bit, but may_decode_fh's relaxed path needs the original open intent.
+    directory_capability: bool,
     open_credentials: OpenCredentials,
     /// Exact Linux credential captured when this open file description was
     /// created. Linux `file::f_cred` is shared by dup/fork with the OFD and is
@@ -1188,7 +1191,15 @@ impl FileDescription {
         inner: Arc<dyn FileLike>,
         status_flags: u32,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, None, None, None, None)
+        Self::new_inner(
+            inner,
+            status_flags,
+            status_flags & O_DIRECTORY != 0,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     pub(in crate::file) fn new_with_write_open_key_and_resource(
@@ -1197,12 +1208,21 @@ impl FileDescription {
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, write_open_key, resource, None, None)
+        Self::new_inner(
+            inner,
+            status_flags,
+            status_flags & O_DIRECTORY != 0,
+            write_open_key,
+            resource,
+            None,
+            None,
+        )
     }
 
     pub(in crate::file) fn new_with_open_lease_admission_and_resource(
         inner: Arc<dyn FileLike>,
         status_flags: u32,
+        directory_capability: bool,
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
         open_lease_admission: lease::OpenLeaseAdmission,
@@ -1211,6 +1231,7 @@ impl FileDescription {
         Self::new_inner(
             inner,
             status_flags,
+            directory_capability,
             write_open_key,
             resource,
             Some(open_lease_admission),
@@ -1221,6 +1242,7 @@ impl FileDescription {
     fn new_inner(
         inner: Arc<dyn FileLike>,
         status_flags: u32,
+        directory_capability: bool,
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
         open_lease_admission: Option<lease::OpenLeaseAdmission>,
@@ -1276,6 +1298,7 @@ impl FileDescription {
         let observed = sync_error_source.sample();
         Arc::try_new(Self {
             inner,
+            directory_capability,
             open_credentials: OpenCredentials::current(),
             vfs_open_credential,
             open_security_credential,
@@ -1361,6 +1384,10 @@ impl FileDescription {
 
     pub fn status_flags(&self) -> u32 {
         self.io_status_snapshot().raw()
+    }
+
+    pub(crate) fn directory_capability(&self) -> bool {
+        self.directory_capability
     }
 
     /// Admits an ordinary I/O operation on this description.
@@ -1798,6 +1825,10 @@ impl<T: ?Sized> FileHandle<T> {
 
     pub(crate) fn io_status_snapshot(&self) -> OfdIoStatus {
         self.description.io_status_snapshot()
+    }
+
+    pub(crate) fn directory_capability(&self) -> bool {
+        self.description.directory_capability()
     }
 
     pub(crate) fn capture_io_operation_context(
