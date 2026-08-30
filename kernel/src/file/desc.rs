@@ -1671,8 +1671,8 @@ impl FileDescription {
 impl Drop for FileDescription {
     fn drop(&mut self) {
         // This is the one true final-OFD boundary. It runs before this
-        // structure releases `inner`; mappings retain the inner object, not
-        // this description, so they cannot delay the notification. Do not
+        // structure releases `inner`; every legal OFD owner, including VMA
+        // split/fork leases, has already released its FileHandle. Do not
         // report a prepared but never-published description as an open-file
         // close. The FileLike contract makes this direct final-drop path
         // IRQ-safe.
