@@ -966,6 +966,9 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
     let (start, len) = validate_mapped_user_range(start, len)?;
+    if len == 0 {
+        return Ok(0);
+    }
     let nodemask = read_nodemask(memory, nodemask, maxnode)?;
     let policy = validate_mempolicy(mode, nodemask, current_allowed_nodemask())?;
     if flags & MPOL_MF_STRICT as usize != 0
@@ -982,9 +985,6 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
-    if len == 0 {
-        return Ok(0);
-    }
     if !aspace.can_access_range(start, len, MappingFlags::USER) {
         return Err(AxError::BadAddress);
     }

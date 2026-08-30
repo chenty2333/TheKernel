@@ -1695,7 +1695,7 @@ impl MempolicyState {
         start: usize,
         end: usize,
         home_node: usize,
-    ) -> AxResult<(Vec<MempolicyRange>, bool)> {
+    ) -> AxResult<(Vec<MempolicyRange>, bool, Option<axerrno::LinuxError>)> {
         let capacity = old_ranges
             .len()
             .checked_mul(3)
@@ -1724,7 +1724,11 @@ impl MempolicyState {
             {
                 new_ranges.push(range);
                 new_ranges.extend(ranges);
-                return Err(AxError::OperationNotSupported);
+                return Ok((
+                    new_ranges,
+                    updated,
+                    Some(axerrno::LinuxError::EOPNOTSUPP),
+                ));
             }
 
             let overlap_start = range.start.max(start);
@@ -1752,7 +1756,7 @@ impl MempolicyState {
             }
             updated = true;
         }
-        Ok((new_ranges, updated))
+        Ok((new_ranges, updated, None))
     }
 }
 
@@ -3817,14 +3821,14 @@ impl ProcessData {
                 }
                 snapshot.extend(state.ranges.iter().copied());
             }
-            let (new_ranges, updated) =
+            let (new_ranges, updated, error) =
                 MempolicyState::try_set_home_node_in_range(&snapshot, start, end, home_node)?;
             let mut state = self.mempolicy.lock();
             if state.ranges != snapshot {
                 continue;
             }
             state.ranges = new_ranges;
-            return Ok(updated);
+            return error.map_or(Ok(updated), |error| Err(error.into()));
         }
     }
 }
@@ -5595,11 +5599,12 @@ mod tests {
             }],
         };
 
-        let (ranges, updated) =
+        let (ranges, updated, error) =
             MempolicyState::try_set_home_node_in_range(&state.ranges, 0x2000, 0x3000, 0)
                 .unwrap();
         state.ranges = ranges;
         assert!(updated);
+        assert_eq!(error, None);
         assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, None);
         assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, Some(0));
         assert_eq!(state.policy_for_addr(0x3000).unwrap().home_node, None);
@@ -5623,10 +5628,12 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x1000, 0x3000, 0),
-            Err(AxError::OperationNotSupported)
-        );
+        let (ranges, updated, error) =
+            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x1000, 0x3000, 0)
+                .unwrap();
+        state.ranges = ranges;
+        assert!(updated);
+        assert_eq!(error, Some(axerrno::LinuxError::EOPNOTSUPP));
         assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, Some(0));
         assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, None);
     }
