@@ -1328,7 +1328,9 @@ pub(super) fn dispatch_syscall(
         Sysno::sysinfo => {
             with_user_memory(aspace(), |memory| sys_sysinfo(memory, uctx.arg0() as _))
         }
-        Sysno::syslog => sys_syslog(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as isize),
+        Sysno::syslog => with_user_memory(aspace(), |memory| {
+            sys_syslog(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as isize)
+        }),
         Sysno::getrandom => with_user_memory(aspace(), |memory| {
             sys_getrandom(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),

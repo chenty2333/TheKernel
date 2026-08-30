@@ -36,6 +36,179 @@
 #[macro_use]
 extern crate axlog;
 
+/// The kernel log buffer backing Linux's legacy `syslog(2)` interface.
+///
+/// It deliberately sits directly on the console-write boundary so all normal
+/// kernel log output is retained independently from console filtering.
+pub mod klog {
+    use kspin::SpinNoIrq;
+
+    /// Keep this bounded and allocation-free: logging is callable in early
+    /// boot, IRQ, and allocation-failure paths.
+    pub const CAPACITY: usize = 64 * 1024;
+
+    struct Ring {
+        bytes: [u8; CAPACITY],
+        oldest: u64,
+        end: u64,
+        read: u64,
+        clear: u64,
+        console_enabled: bool,
+        console_level: u8,
+    }
+
+    impl Ring {
+        const fn new() -> Self {
+            Self {
+                bytes: [0; CAPACITY],
+                oldest: 0, end: 0, read: 0, clear: 0,
+                console_enabled: true,
+                console_level: 7,
+            }
+        }
+
+        fn push(&mut self, byte: u8) {
+            self.bytes[(self.end as usize) % CAPACITY] = byte;
+            self.end += 1;
+            self.oldest = self.end.saturating_sub(CAPACITY as u64);
+            self.read = self.read.max(self.oldest);
+            self.clear = self.clear.max(self.oldest);
+        }
+
+        fn copy_into(&self, dst: &mut [u8]) -> usize {
+            let copied = dst.len().min((self.end - self.clear) as usize);
+            for (index, byte) in dst.iter_mut().take(copied).enumerate() {
+                *byte = self.bytes[((self.clear as usize) + index) % CAPACITY];
+            }
+            copied
+        }
+    }
+
+    static RING: SpinNoIrq<Ring> = SpinNoIrq::new(Ring::new());
+
+    /// Records bytes before they are emitted to the physical console.
+    pub fn record(bytes: &[u8]) {
+        let mut ring = RING.lock();
+        for &byte in bytes {
+            ring.push(byte);
+        }
+    }
+
+    /// Copies the oldest unread bytes; optionally consumes precisely those
+    /// bytes, matching `SYSLOG_ACTION_READ` rather than clearing new records
+    /// produced concurrently after the copy began.
+    pub fn snapshot_into(dst: &mut [u8], destructive: bool) -> (usize, u64) {
+        let ring = RING.lock();
+        let mut start = if destructive { ring.read } else { ring.clear };
+        let available = (ring.end - start) as usize;
+        let copied = dst.len().min(available);
+        // Linux READ_ALL/READ_CLEAR returns the newest records that fit.
+        if !destructive { start = ring.end - copied as u64; }
+        for (index, byte) in dst.iter_mut().take(copied).enumerate() {
+            *byte = ring.bytes[((start as usize) + index) % CAPACITY];
+        }
+        (copied, start + copied as u64)
+    }
+
+    /// Advances only a successful destructive read's independent cursor.
+    pub fn commit_read(end: u64) {
+        let mut ring = RING.lock();
+        ring.read = ring.read.max(end);
+    }
+
+    /// Clears only records included by an already copied snapshot.
+    pub fn commit_clear(end: u64) {
+        let mut ring = RING.lock();
+        ring.clear = ring.clear.max(end.min(ring.end));
+        ring.read = ring.read.max(ring.clear);
+    }
+
+    /// Returns unread bytes in the ring.
+    pub fn unread_len() -> usize {
+        let ring = RING.lock(); (ring.end - ring.read) as usize
+    }
+
+    /// Discards all unread bytes.
+    pub fn clear() {
+        let mut ring = RING.lock();
+        ring.clear = ring.end;
+        ring.read = ring.end;
+    }
+
+    /// Enables or disables physical console output. Logging still reaches the
+    /// ring while disabled.
+    pub fn set_console_enabled(enabled: bool) {
+        RING.lock().console_enabled = enabled;
+    }
+
+    /// Returns whether physical console output is enabled.
+    pub fn console_enabled() -> bool {
+        RING.lock().console_enabled
+    }
+
+    /// Stores the Linux console threshold (1 through 8). The current axlog
+    /// boundary does not preserve record priority, so it cannot filter output
+    /// by severity yet; retaining the value prevents silently accepting an
+    /// invalid control action and makes the setting observable to a priority-
+    /// aware logger backend.
+    pub fn set_console_level(level: u8) {
+        RING.lock().console_level = level;
+    }
+
+    /// Returns the configured Linux console threshold.
+    pub fn console_level() -> u8 {
+        RING.lock().console_level
+    }
+
+    /// Determines the Linux syslog priority from axlog's ANSI level color.
+    /// The ring gets the unfiltered stream; this only gates console output.
+    pub fn should_print_to_console(bytes: &[u8]) -> bool {
+        let ring = RING.lock();
+        if !ring.console_enabled {
+            return false;
+        }
+        let priority = if bytes.windows(4).any(|part| part == b"[31m") {
+            3 // error
+        } else if bytes.windows(4).any(|part| part == b"[33m") {
+            4 // warn
+        } else if bytes.windows(4).any(|part| part == b"[32m") {
+            6 // info
+        } else {
+            7 // debug, trace, and unclassified print output
+        };
+        priority < ring.console_level
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ring_wraps_and_consumes_in_fifo_order() {
+            let mut ring = Ring::new();
+            for byte in 0..(CAPACITY + 3) {
+                ring.push(byte as u8);
+            }
+            let mut out = [0; 4];
+            assert_eq!(ring.copy_into(&mut out), 4);
+            assert_eq!(out, [3, 4, 5, 6]);
+            ring.read = 7;
+            assert_eq!(ring.copy_into(&mut out), 4);
+            assert_eq!(out, [3, 4, 5, 6]);
+        }
+
+        #[test]
+        fn console_filter_uses_linux_priority_order() {
+            set_console_enabled(true);
+            set_console_level(5);
+            assert!(should_print_to_console(b"\x1b[31merror"));
+            assert!(should_print_to_console(b"\x1b[33mwarn"));
+            assert!(!should_print_to_console(b"\x1b[32minfo"));
+            set_console_level(8);
+        }
+    }
+}
+
 #[cfg(all(target_os = "none", not(test)))]
 mod lang_items;
 
@@ -84,7 +257,10 @@ impl axtask::IrqExitIf for IrqExitIfImpl {
 #[crate_interface::impl_interface]
 impl axlog::LogIf for LogIfImpl {
     fn console_write_str(s: &str) {
-        axhal::console::write_bytes(s.as_bytes());
+        klog::record(s.as_bytes());
+        if klog::should_print_to_console(s.as_bytes()) {
+            axhal::console::write_bytes(s.as_bytes());
+        }
     }
 
     fn current_time() -> core::time::Duration {
