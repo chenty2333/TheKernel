@@ -6263,6 +6263,19 @@ impl AddrSpace {
         )) {
             return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         }
+        // MAP_GROWSDOWN is automatic address-space growth too: do not let a
+        // fault turn a CET stack's policy-only lower guard into an ordinary
+        // stack page merely because no VMA occupies that page.
+        let grow_range = VirtAddrRange::from_start_size(fault_page, page_size as usize);
+        if self.find_free_area_avoiding_shadow_stack_guards(
+            fault_page,
+            page_size as usize,
+            grow_range,
+            page_size as usize,
+        ) != Some(fault_page)
+        {
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
+        }
 
         let locked = self.range_is_fully_locked(current_start, page_size as usize);
         if let Err(error) = self.extend_mapping_head_with_existing_lineage(

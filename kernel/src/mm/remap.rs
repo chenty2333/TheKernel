@@ -167,6 +167,21 @@ fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize)
     aspace.find_free_area(start, size, limit, align) == Some(start)
 }
 
+/// Exact-range variant for automatic growth: logical shadow-stack guards are
+/// reserved just like VMAs, while fixed-address operations keep their Linux
+/// VMA-only semantics.
+fn range_is_free_avoiding_shadow_stack_guards(
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    size: usize,
+    align: usize,
+) -> bool {
+    let Some(limit) = VirtAddrRange::try_from_start_size(start, size) else {
+        return false;
+    };
+    aspace.find_free_area_avoiding_shadow_stack_guards(start, size, limit, align) == Some(start)
+}
+
 /// Revalidates the complete automatic destination reservation.  A shadow
 /// stack's guard is policy-only (not a VMA), so it must be checked alongside
 /// the destination again after lock-external preparation.
@@ -710,7 +725,7 @@ fn build_remap_plan(
     let after = request.addr + request.old_size;
     if !request.fixed
         && request.new_size > request.old_size
-        && range_is_free(aspace, after, grow, page_size as usize)
+        && range_is_free_avoiding_shadow_stack_guards(aspace, after, grow, page_size as usize)
     {
         if grow_locked {
             check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, grow)?;
@@ -874,7 +889,7 @@ impl PreparedRemapPlan {
             } => {
                 let grow = request.new_size.saturating_sub(request.old_size);
                 remap_segments_match(aspace, request.addr, request.old_size, source_segments)
-                    && range_is_free(
+                    && range_is_free_avoiding_shadow_stack_guards(
                         aspace,
                         request.addr + request.old_size,
                         grow,
