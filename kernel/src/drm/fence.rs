@@ -80,7 +80,9 @@ impl Fence {
                 }
             }
             None => {
-                self.waiters.wait_until(|| self.is_signaled());
+                self.waiters
+                    .wait_until(|| self.is_signaled())
+                    .map_err(AxError::from)?;
                 Ok(())
             }
         }
@@ -102,7 +104,9 @@ impl Fence {
                     .ok_or(AxError::WouldBlock)
             }
             None => {
-                FENCE_SET_WAITERS.wait_until(|| fences.iter().any(|fence| fence.is_signaled()));
+                FENCE_SET_WAITERS
+                    .wait_until(|| fences.iter().any(|fence| fence.is_signaled()))
+                    .map_err(AxError::from)?;
                 fences
                     .iter()
                     .position(|fence| fence.is_signaled())

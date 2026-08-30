@@ -91,7 +91,10 @@ fn read_array<T: Copy>(
         return Err(AxError::InvalidInput);
     }
     let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| AxError::NoMemory)?;
     for index in 0..count {
         result.push(read_pod(
             copy,
@@ -111,7 +114,10 @@ fn read_bytes(copy: &impl UserCopy, address: u64, length: usize, max: usize) -> 
         return Err(AxError::InvalidInput);
     }
     let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
-    let mut bytes = Vec::with_capacity(length);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| AxError::NoMemory)?;
     bytes.resize(length, 0);
     // SAFETY: the initialized byte vector has exactly `length` contiguous bytes.
     let dst =
@@ -752,7 +758,10 @@ fn atomic(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     }
     let props = read_array::<u32>(copy, r.props_ptr, total, MAX_ATOMIC_PROPERTIES)?;
     let values = read_array::<u64>(copy, r.prop_values_ptr, total, MAX_ATOMIC_PROPERTIES)?;
-    let mut changes = Vec::with_capacity(total);
+    let mut changes = Vec::new();
+    changes
+        .try_reserve_exact(total)
+        .map_err(|_| AxError::NoMemory)?;
     let mut at = 0;
     for (o, n) in objects.iter().zip(counts) {
         for _ in 0..n {
@@ -818,7 +827,13 @@ fn mode_from_blob(b: &[u8]) -> AxResult<Mode> {
 fn resources(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut request: uapi::DrmModeCardRes = read_pod(copy, arg)?;
     let resources = file.resources();
-    let framebuffer_ids: Vec<u32> = file.device_state().framebuffers.keys().copied().collect();
+    let state = file.device_state();
+    let mut framebuffer_ids = Vec::new();
+    framebuffer_ids
+        .try_reserve_exact(state.framebuffers.len())
+        .map_err(|_| AxError::NoMemory)?;
+    framebuffer_ids.extend(state.framebuffers.keys().copied());
+    drop(state);
     let fb_capacity = request.count_fbs as usize;
     let crtc_capacity = request.count_crtcs as usize;
     let connector_capacity = request.count_connectors as usize;
@@ -1053,7 +1068,10 @@ fn set_gamma(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let red = read_array::<u16>(copy, r.red, expected, expected)?;
     let green = read_array::<u16>(copy, r.green, expected, expected)?;
     let blue = read_array::<u16>(copy, r.blue, expected, expected)?;
-    let mut gamma = Vec::with_capacity(expected * 3);
+    let mut gamma = Vec::new();
+    gamma
+        .try_reserve_exact(expected.checked_mul(3).ok_or(AxError::InvalidInput)?)
+        .map_err(|_| AxError::NoMemory)?;
     for index in 0..expected {
         gamma.extend_from_slice(&[red[index], green[index], blue[index]]);
     }
