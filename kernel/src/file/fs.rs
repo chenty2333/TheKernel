@@ -387,6 +387,9 @@ impl ContentWriteSecurity<'_> {
 }
 
 impl File {
+    pub(crate) fn sync_range(&self, offset: u64, len: u64) -> AxResult<()> {
+        self.inner.sync_range(offset, len, true)
+    }
     pub fn new(inner: axfs::File) -> Self {
         Self {
             inner,

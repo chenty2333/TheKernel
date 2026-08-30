@@ -1359,6 +1359,13 @@ impl FileDescription {
             .check_and_advance(&mut cursor.observed)
     }
 
+    /// Advances this exact OFD's inode writeback errseq cursor.  Duplicated
+    /// descriptors share this cursor; independently opened descriptions do
+    /// not, matching Linux file_check_and_advance_wb_err semantics.
+    pub(crate) fn check_and_advance_writeback_error(&self) -> AxResult<()> {
+        self.take_unseen_sync_error().map_or(Ok(()), Err)
+    }
+
     /// Synchronizes the retained OFD without another numeric-fd lookup.
     /// `O_PATH` installs empty file operations; fsync therefore returns
     /// `EINVAL` from the missing synchronization callback.

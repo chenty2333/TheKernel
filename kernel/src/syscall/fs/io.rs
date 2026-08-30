@@ -80,6 +80,35 @@ const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SP
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+
+fn sync_file_range_end(offset: __kernel_off_t, nbytes: __kernel_off_t) -> AxResult<u64> {
+    debug_assert!(offset >= 0 && nbytes >= 0);
+    if nbytes == 0 {
+        // Linux's zero-length form means through EOF; it is not an addition
+        // in loff_t space and therefore remains valid at LLONG_MAX.
+        return Ok(0);
+    }
+    offset
+        .checked_add(nbytes)
+        .map(|end| end as u64)
+        .ok_or(AxError::InvalidInput)
+}
+
+fn validate_sync_file_range_args(
+    offset: __kernel_off_t,
+    nbytes: __kernel_off_t,
+    flags: u32,
+) -> AxResult<u64> {
+    if offset < 0 || nbytes < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let valid_flags =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+    if flags & !valid_flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    sync_file_range_end(offset, nbytes)
+}
 // Regular-file O_DIRECT is constrained by logical sector alignment. Valid
 // 512-byte offsets and 1 KiB transfers must not inherit a 4 KiB alignment.
 const DIRECT_IO_ALIGNMENT: usize = 512;
@@ -2950,26 +2979,50 @@ pub fn sys_sync_file_range(
         "sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags:#x}"
     );
 
-    if offset < 0 || nbytes < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let valid_flags =
-        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
-    if flags & !valid_flags != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let file_like = get_file_like(fd)?;
-    file_like.check_io_access()?;
-    if !matches!(
-        FileLikeKind::from_file_like(file_like.as_ref()),
-        FileLikeKind::Regular
-    ) {
+    // Linux resolves and checks the descriptor before inspecting the range,
+    // so a bad descriptor wins over EINVAL from malformed arguments.
+    let description = crate::file::get_file_description(fd)?;
+    description.check_io_access()?;
+    let file_like = &description.inner;
+    // Range/flag validation follows the retained-fd lookup but precedes the
+    // file-operation type check, matching Linux's valid-pipe EINVAL order.
+    let end = validate_sync_file_range_args(offset, nbytes, flags)?;
+    let node_type = file_like
+        .downcast_ref::<File>()
+        .map(|file| file.inner().location().node_type())
+        .or_else(|| file_like.downcast_ref::<Directory>().map(|dir| dir.inner().node_type()));
+    if !matches!(node_type, Some(NodeType::RegularFile | NodeType::Directory | NodeType::BlockDevice)) {
         return Err(AxError::from(LinuxError::ESPIPE));
     }
 
-    let f = get_typed_file::<File>(fd)?;
-    f.inner().sync(true)?;
+    if flags != 0 && !matches!(node_type, Some(NodeType::Directory)) {
+        let f = get_typed_file::<File>(fd)?;
+        let len = if end == 0 { 0 } else { end - offset as u64 };
+        let finish_wait = |wait: AxResult<()>| {
+            // file_fdatawait_range advances the OFD errseq even when its
+            // primary wait failed/interrupted.  Preserve that primary errno
+            // while consuming a concurrent mapping error exactly once.
+            let errseq = description.check_and_advance_writeback_error();
+            wait.and(errseq)
+        };
+        // WAIT_BEFORE observes only requests accepted before this invocation.
+        // WRITE merely publishes an inode-shared request; WAIT_AFTER includes
+        // the request just published by this syscall.
+        let before = f.inner().range_writeback_snapshot()?;
+        if flags & SYNC_FILE_RANGE_WAIT_BEFORE != 0 {
+            finish_wait(f.inner().wait_range_writeback_through(&before, offset as u64, len))?;
+        }
+        if flags & SYNC_FILE_RANGE_WRITE != 0 {
+            let write_fence = f.inner().submit_range_writeback(offset as u64, len, true)?;
+            if flags & SYNC_FILE_RANGE_WAIT_AFTER != 0 {
+                finish_wait(f.inner().wait_range_writeback_through(&write_fence, offset as u64, len))?;
+            }
+        }
+        if flags & SYNC_FILE_RANGE_WAIT_AFTER != 0 && flags & SYNC_FILE_RANGE_WRITE == 0 {
+            let after = f.inner().range_writeback_snapshot()?;
+            finish_wait(f.inner().wait_range_writeback_through(&after, offset as u64, len))?;
+        }
+    }
     Ok(0)
 }
 
@@ -6533,5 +6586,25 @@ mod tests {
         assert_eq!(writer.write(b"cd"), Ok(0));
         assert_eq!(writer.written, 2);
         assert!(writer.destination_short);
+    }
+
+    #[test]
+    fn sync_file_range_checks_signed_loff_t_overflow_but_keeps_zero_to_eof() {
+        assert_eq!(
+            sync_file_range_end(i64::MAX, 1),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(sync_file_range_end(i64::MAX, 0), Ok(0));
+        assert_eq!(sync_file_range_end(i64::MAX - 1, 1), Ok(i64::MAX as u64));
+    }
+
+    #[test]
+    fn sync_file_range_validates_a_pipe_range_before_the_type_error() {
+        // `sys_sync_file_range` calls this helper after successful fd lookup
+        // and before its NodeType::Pipe ESPIPE branch.
+        assert_eq!(
+            validate_sync_file_range_args(i64::MAX, 1, 0),
+            Err(AxError::InvalidInput)
+        );
     }
 }
