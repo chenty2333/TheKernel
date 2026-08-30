@@ -138,7 +138,11 @@ enum ArchPrctlCode {
 #[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_SHSTK: usize = 1;
 #[cfg(target_arch = "x86_64")]
+const ARCH_SHSTK_WRSS: usize = 2;
+#[cfg(target_arch = "x86_64")]
 const CET_SHSTK_EN: u64 = 1;
+#[cfg(target_arch = "x86_64")]
+const CET_WRSS_EN: u64 = 2;
 #[cfg(target_arch = "x86_64")]
 const CET_DEFAULT_SHSTK_SIZE: usize = crate::config::USER_STACK_SIZE;
 #[cfg(target_arch = "x86_64")]
@@ -266,17 +270,31 @@ pub fn sys_arch_prctl(
         ArchPrctlCode::SetCpuid if addr != 0 => Ok(0),
         ArchPrctlCode::SetCpuid => Err(axerrno::AxError::NoSuchDevice),
         ArchPrctlCode::EnableShstk => {
-            if addr != ARCH_SHSTK_SHSTK {
+            if addr != ARCH_SHSTK_SHSTK && addr != ARCH_SHSTK_WRSS {
                 return Err(AxError::InvalidInput);
             }
             if !axhal::asm::user_shadow_stack_enabled() {
                 return Err(AxError::NoSuchDevice);
             }
             let mut state = crate::task::current_user_live_cet_state();
-            if state.locked && state.u_cet & CET_SHSTK_EN == 0 {
+            let feature = if addr == ARCH_SHSTK_SHSTK {
+                CET_SHSTK_EN
+            } else {
+                CET_WRSS_EN
+            };
+            if state.locked && state.u_cet & feature == 0 {
                 return Err(LinuxError::EPERM.into());
             }
-            if state.u_cet & CET_SHSTK_EN != 0 {
+            if state.u_cet & feature != 0 {
+                return Ok(0);
+            }
+            // Linux only enables WRSS when user shadow stacks are active.
+            if feature == CET_WRSS_EN && state.u_cet & CET_SHSTK_EN == 0 {
+                return Err(AxError::InvalidInput);
+            }
+            if feature == CET_WRSS_EN {
+                state.u_cet |= CET_WRSS_EN;
+                crate::task::set_current_user_cet_state(state);
                 return Ok(0);
             }
             let curr = current();
@@ -287,14 +305,24 @@ pub fn sys_arch_prctl(
             Ok(0)
         }
         ArchPrctlCode::DisableShstk => {
-            if addr != ARCH_SHSTK_SHSTK {
+            if addr != ARCH_SHSTK_SHSTK && addr != ARCH_SHSTK_WRSS {
                 return Err(AxError::InvalidInput);
             }
             let mut state = crate::task::current_user_live_cet_state();
-            if state.locked && state.u_cet & CET_SHSTK_EN != 0 {
+            let feature = if addr == ARCH_SHSTK_SHSTK {
+                CET_SHSTK_EN
+            } else {
+                CET_WRSS_EN
+            };
+            if state.locked && state.u_cet & feature != 0 {
                 return Err(LinuxError::EPERM.into());
             }
-            if state.u_cet & CET_SHSTK_EN == 0 {
+            if state.u_cet & feature == 0 {
+                return Ok(0);
+            }
+            if feature == CET_WRSS_EN {
+                state.u_cet &= !CET_WRSS_EN;
+                crate::task::set_current_user_cet_state(state);
                 return Ok(0);
             }
             let curr = current();
@@ -307,7 +335,7 @@ pub fn sys_arch_prctl(
             Ok(0)
         }
         ArchPrctlCode::LockShstk => {
-            if addr == 0 || addr & !ARCH_SHSTK_SHSTK != 0 {
+            if addr == 0 || addr & !(ARCH_SHSTK_SHSTK | ARCH_SHSTK_WRSS) != 0 {
                 return Err(AxError::InvalidInput);
             }
             let mut state = crate::task::current_user_live_cet_state();

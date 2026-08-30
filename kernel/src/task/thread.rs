@@ -61,6 +61,7 @@ pub(crate) struct CetPendingSignalFrame {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone)]
 struct CetPendingSignalFrames {
     epoch: u64,
     next_nonce: u64,
@@ -1420,6 +1421,15 @@ impl Thread {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn clear_cet_signal_frames(&self) {
         self.cet_signal_frames.lock().invalidate();
+    }
+
+    /// Fork copies the in-handler CET authentication stack so the child can
+    /// complete its inherited handler with a valid LIFO sigreturn. Pending
+    /// signal delivery state remains owned by the signal managers and is not
+    /// copied here.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn clone_cet_signal_frames_from(&self, source: &Self) {
+        *self.cet_signal_frames.lock() = source.cet_signal_frames.lock().clone();
     }
 
     pub(crate) fn landlock_domain(&self) -> LandlockDomain {

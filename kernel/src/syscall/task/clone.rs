@@ -778,6 +778,12 @@ impl CloneArgs {
                 version: 0,
             },
         )?;
+        #[cfg(target_arch = "x86_64")]
+        if !flags.contains(CloneFlags::VM) {
+            // A fork from inside a signal handler inherits the handler's
+            // authenticated CET nesting, but not pending signal queues.
+            thr.clone_cet_signal_frames_from(calling_thread);
+        }
         // Linux inherits ioperm/iopl state for every fork/clone child. The
         // state stays private after this point: the bitmap Arc is copied on
         // either task's first ioperm mutation.

@@ -6000,10 +6000,13 @@ impl AddrSpace {
                 if requested != MappingFlags::READ {
                     return Err(AxError::InvalidInput);
                 }
-                flags |= MappingFlags::SHADOW_STACK;
+                flags = (flags - MappingFlags::EXECUTE) | MappingFlags::SHADOW_STACK;
             }
             if read_implies_exec && may_execute && flags.contains(MappingFlags::READ) {
                 flags |= MappingFlags::EXECUTE;
+            }
+            if area.flags().contains(MappingFlags::SHADOW_STACK) {
+                flags -= MappingFlags::EXECUTE;
             }
             let segment_end = area.end().min(end);
             ranges.push(PreparedProtectRange {
@@ -6509,6 +6512,13 @@ impl AddrSpace {
         if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
             if flags.contains(access_flags) {
+                // A CET access is permissioned by SHADOW_STACK, but still
+                // has write semantics for private-COW allocation/copy.
+                let populate_access = if access_flags.contains(MappingFlags::SHADOW_STACK) {
+                    access_flags | MappingFlags::WRITE
+                } else {
+                    access_flags
+                };
                 let page = vaddr.align_down(PAGE_SIZE_4K);
                 if let Some(entry) = self.swapped.get(&page).copied() {
                     let backend = area.backend().clone();
@@ -6535,7 +6545,7 @@ impl AddrSpace {
                 if area.backend().faults_with_sigbus(start) {
                     return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
                 }
-                let fault_around = area.backend().fault_around_size(access_flags);
+                let fault_around = area.backend().fault_around_size(populate_access);
                 let fault_around_len = area
                     .end()
                     .sub_addr(start)
@@ -6576,7 +6586,7 @@ impl AddrSpace {
                 let populate_outcome = area.backend().populate(
                     VirtAddrRange::from_start_size(start, len),
                     flags,
-                    access_flags,
+                    populate_access,
                     &mut self.pt.cursor(),
                 );
                 let populate_result = populate_outcome.finish(self);

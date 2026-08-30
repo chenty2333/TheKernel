@@ -54,7 +54,7 @@ fn find_nonfixed_mmap_area(
     limit: VirtAddrRange,
     align: usize,
 ) -> Option<VirtAddr> {
-    if personality & ADDR_COMPAT_LAYOUT != 0 {
+    let candidate = if personality & ADDR_COMPAT_LAYOUT != 0 {
         let first = if hint > limit.start {
             hint
         } else {
@@ -71,6 +71,24 @@ fn find_nonfixed_mmap_area(
             })
     } else {
         aspace.find_kernel_area(hint, length, limit, align)
+    }?;
+    // Keep the page below every shadow-stack VMA permanently unavailable to
+    // automatic placement.  The VMA itself is not enlarged, so fixed mappings
+    // retain Linux's explicit-address semantics.
+    let end = candidate.checked_add(length)?;
+    let guard_end = aspace.areas().find_map(|area| {
+        area.flags()
+            .contains(MappingFlags::SHADOW_STACK)
+            .then(|| area.start())
+    });
+    if let Some(guard_end) = guard_end
+        && let Some(guard_start) = guard_end.checked_sub(PAGE_SIZE_4K)
+        && candidate < guard_end
+        && guard_start < end
+    {
+        aspace.find_free_area(guard_end, length, limit, align)
+    } else {
+        Some(candidate)
     }
 }
 
@@ -87,10 +105,11 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     if flags & !SHADOW_STACK_SET_TOKEN != 0 || size == 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & SHADOW_STACK_SET_TOKEN != 0
-        && (size < core::mem::size_of::<u64>() || !size.is_multiple_of(core::mem::size_of::<u64>()))
-    {
+    if flags & SHADOW_STACK_SET_TOKEN != 0 && size < core::mem::size_of::<u64>() {
         return Err(LinuxError::ENOSPC.into());
+    }
+    if flags & SHADOW_STACK_SET_TOKEN != 0 && !size.is_multiple_of(core::mem::size_of::<u64>()) {
+        return Err(AxError::InvalidInput);
     }
     let requested_size = size;
     let size = checked_align_up_4k(size).ok_or(LinuxError::EOVERFLOW)?;
@@ -103,13 +122,17 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     let aspace_handle = current().as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let start = if addr == 0 {
+        let total = size
+            .checked_add(PAGE_SIZE_4K)
+            .ok_or(LinuxError::EOVERFLOW)?;
         aspace
             .find_kernel_area(
                 VirtAddr::from(SHADOW_STACK_MIN_ADDR),
-                size,
+                total,
                 VirtAddrRange::new(aspace.base(), aspace.end()),
                 PAGE_SIZE_4K,
             )
+            .and_then(|base| base.checked_add(PAGE_SIZE_4K))
             .ok_or(AxError::NoMemory)?
     } else {
         let start = VirtAddr::from(addr);
@@ -1210,7 +1233,8 @@ fn sys_mprotect_inner(
             // is coloured exactly like the resident mapping.
             .with_pkey(requested_pkey.unwrap_or_else(|| area.flags().pkey()));
             if shadow_stack {
-                effective_protection |= MappingFlags::SHADOW_STACK;
+                effective_protection =
+                    (effective_protection - MappingFlags::EXECUTE) | MappingFlags::SHADOW_STACK;
             }
             let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
             let segment_wake = authorize_then_commit(

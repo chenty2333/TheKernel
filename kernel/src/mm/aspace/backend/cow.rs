@@ -747,7 +747,10 @@ impl<Ops: CowClonePageTableOps> Drop for CowCloneTransaction<'_, Ops> {
                     .as_ref()
                     .expect("retained COW page lost its frame reference")
                     .lock();
-                assert!(frame.references > 1, "COW rollback lost the source frame reference");
+                assert!(
+                    frame.references > 1,
+                    "COW rollback lost the source frame reference"
+                );
                 frame.drop_frame(entry.paddr, entry.page_size);
             }
 
@@ -1169,9 +1172,9 @@ impl CowBackend {
         // It is not represented by a per-P1 FRAME_TABLE entry, so retain it
         // explicitly in the COW decision until that sibling is also demoted
         // or unmapped.
-        let huge_sibling = backing.as_ref().is_some_and(|backing| {
-            backing.huge_references.load(Ordering::Acquire) != 0
-        });
+        let huge_sibling = backing
+            .as_ref()
+            .is_some_and(|backing| backing.huge_references.load(Ordering::Acquire) != 0);
         let references = frame.as_ref().map_or(1, |frame| frame.lock().references);
         assert!(references > 0, "invalid frame reference count");
         if !huge_sibling && references == 1 {
@@ -1560,7 +1563,16 @@ impl BackendOps for CowBackend {
         _new_aspace: &Arc<Mutex<AddrSpace>>,
         active_long_term_cow_frames: &[PhysAddr],
     ) -> AxResult<Backend> {
-        let cow_flags = page_table_flags(flags) - MappingFlags::WRITE;
+        // A resident shadow-stack leaf is W=0,D=1.  Fork must not retain that
+        // CET encoding in either sharing PTE: both sides first become ordinary
+        // read-only COW leaves (W=0,D=0), then a PFEC.SS write fault copies and
+        // restores the target leaf's W=0,D=1 encoding.
+        let shadow_stack = flags.contains(MappingFlags::SHADOW_STACK);
+        let cow_flags = if shadow_stack {
+            page_table_flags(flags - MappingFlags::SHADOW_STACK) - MappingFlags::WRITE
+        } else {
+            page_table_flags(flags) - MappingFlags::WRITE
+        };
         let eager_copy_flags = page_table_flags(flags);
         pages_in(range, self.size)?;
         if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
@@ -1580,7 +1592,8 @@ impl BackendOps for CowBackend {
         let pages = materialized
             .into_iter()
             .map(|(vaddr, paddr, source_flags, page_size)| {
-                let eager_copy = self.needs_eager_fork_copy(paddr, active_long_term_cow_frames);
+                let eager_copy =
+                    !shadow_stack && self.needs_eager_fork_copy(paddr, active_long_term_cow_frames);
                 CowClonePage {
                     source_vaddr: vaddr,
                     destination_vaddr: vaddr,
@@ -1596,7 +1609,8 @@ impl BackendOps for CowBackend {
                     // the VMA's current permissions. The parent and its
                     // escaped I/O owner keep the original physical identity,
                     // even if mprotect has since reduced the parent PTE.
-                    protect_source: !eager_copy && source_flags.contains(MappingFlags::WRITE),
+                    protect_source: !eager_copy
+                        && (source_flags.contains(MappingFlags::WRITE) || shadow_stack),
                     eager_copy,
                 }
             });

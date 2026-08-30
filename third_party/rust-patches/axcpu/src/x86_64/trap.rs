@@ -101,8 +101,9 @@ pub(super) fn err_code_to_flags(err_code: u64) -> Result<PageFaultFlags, u64> {
             flags |= PageFaultFlags::EXECUTE;
         }
         if code.contains(PageFaultErrorCode::SHADOW_STACK) {
-            // PFEC.SS is an architecturally distinct write-class access.
-            flags |= PageFaultFlags::SHADOW_STACK | PageFaultFlags::WRITE;
+            // PFEC.SS is authorized by a SHSTK VMA, never ordinary WRITE.
+            // The VM fault path separately treats it as write-like for COW.
+            flags |= PageFaultFlags::SHADOW_STACK;
         }
         Ok(flags)
     }
