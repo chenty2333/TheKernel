@@ -1132,6 +1132,26 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    pub(super) fn dispatch_task_getscheduler_with_credential_state(
+        &self,
+        context: &SecurityTaskGetSchedulerContext<'_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        let target = self.credential_slots(context.target())?;
+        for ((registered, actor_state), target_state) in self.modules.iter().zip(actor).zip(target)
+        {
+            if registered.id != actor_state.module_id || registered.id != target_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.task_getscheduler_with_credential_state(
+                context,
+                actor_state.erased.as_ref(),
+                target_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);

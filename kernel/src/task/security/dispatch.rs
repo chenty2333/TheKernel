@@ -708,6 +708,19 @@ pub(crate) fn dispatch_task_getsid(context: &SecurityTaskGetsidContext<'_>) -> A
         .dispatch_task_getsid_with_credential_state(context)
 }
 
+/// Runs Linux `security_task_getscheduler` hooks for one already-resolved
+/// actor/target credential snapshot.
+pub(crate) fn dispatch_task_getscheduler(
+    context: &SecurityTaskGetSchedulerContext<'_>,
+) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_task_getscheduler_with_credential_state(context)
+}
+
 /// Runs the frozen signal policy hooks after Linux core signal permission has
 /// admitted the exact actor/target pair. The first denial is returned without
 /// invoking later modules.

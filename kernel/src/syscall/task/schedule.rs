@@ -11,7 +11,8 @@ use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
     SchedState, TaskSchedError, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    sched_state, set_sched_state_versioned, set_task_affinity, set_task_nice as update_task_nice,
+    sched_state, scheduler_state_snapshot, set_sched_state_versioned,
+    set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
@@ -31,7 +32,10 @@ use crate::{
         AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
         get_process_including_zombie, get_task, get_visible_task, has_pending_syscall_signal,
         prepare_clock_sleep, process_domain,
-        security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
+        security::{
+            SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
+            dispatch_scheduler, dispatch_task_getscheduler,
+        },
         try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
     time::TimeValueLike,
@@ -170,13 +174,16 @@ fn validate_nice(nice: i32) -> AxResult<i8> {
     }
 }
 
-fn sched_reset_on_fork(task: &AxTaskRef) -> bool {
-    task.try_as_thread()
-        .is_some_and(|thread| thread.sched_reset_on_fork())
+fn linux_policy_from_state(state: SchedState, reset_on_fork: bool) -> i32 {
+    linux_policy_from_parts(state, reset_on_fork)
 }
 
-fn linux_policy_from_state(task: &AxTaskRef, state: SchedState) -> i32 {
-    let base = match state.class {
+fn linux_policy_from_parts(state: SchedState, reset_on_fork: bool) -> i32 {
+    linux_policy_from_class(state.class, reset_on_fork)
+}
+
+fn linux_policy_from_class(class: SchedClass, reset_on_fork: bool) -> i32 {
+    let base = match class {
         SchedClass::Normal => SCHED_NORMAL as i32,
         SchedClass::Batch => SCHED_BATCH as i32,
         SchedClass::Idle => SCHED_IDLE as i32,
@@ -184,7 +191,7 @@ fn linux_policy_from_state(task: &AxTaskRef, state: SchedState) -> i32 {
         SchedClass::RoundRobin => SCHED_RR as i32,
     };
 
-    if sched_reset_on_fork(task) {
+    if reset_on_fork {
         base | SCHED_RESET_ON_FORK as i32
     } else {
         base
@@ -286,6 +293,11 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
         TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
         TaskSchedError::Scheduler(_) => AxError::InvalidInput,
     })?;
+    publish_sched_commit(task, commit);
+    Ok(0)
+}
+
+fn publish_sched_commit(task: &AxTaskRef, commit: axtask::TaskSchedCommit) {
     if let Some(thread) = task.try_as_thread()
         && let Some(token) = thread
             .proc_data
@@ -297,18 +309,24 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
             .proc_data
             .publish_scheduler_state(tid, token, task, commit);
     }
-    Ok(0)
 }
 
-fn apply_sched_state_with_reset<T>(
-    target: Option<&T>,
-    apply: impl FnOnce() -> AxResult<isize>,
-    store_reset: impl FnOnce(&T),
+fn apply_sched_state_with_reset(
+    task: &AxTaskRef,
+    state: SchedState,
+    reset_on_fork: bool,
 ) -> AxResult<isize> {
-    let target = target.ok_or(AxError::NoSuchProcess)?;
-    let result = apply()?;
-    store_reset(target);
-    Ok(result)
+    let commit =
+        set_sched_state_versioned_with_reset(task, state, reset_on_fork).map_err(|error| {
+            match error {
+                TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+                TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+            }
+        })?;
+    publish_sched_commit(task, commit);
+    Ok(0)
 }
 
 fn process_error(error: ProcessError) -> AxError {
@@ -330,7 +348,6 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
         SchedSetAbi::Legacy,
     )?;
-    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     let authority = scheduler_authority_snapshot(task)?;
     authority.authorize(SchedulerSecurityOperation::SetPolicy {
         realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
@@ -349,11 +366,7 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
             }
         }
     }
-    apply_sched_state_with_reset(
-        Some(thread),
-        || apply_sched_state(task, state),
-        |thread| thread.set_sched_reset_on_fork(reset_on_fork),
-    )
+    apply_sched_state_with_reset(task, state, reset_on_fork)
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
@@ -816,8 +829,30 @@ pub fn sys_getcpu<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
-    let task = sched_target(pid)?;
-    Ok(linux_policy_from_state(&task, sched_state(&task)) as isize)
+    if pid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let target = if pid == 0 {
+        SchedGetSchedulerTarget::Live(current().clone())
+    } else {
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        // Linux resolves a nonzero argument as PIDTYPE_PID in the caller's
+        // active namespace.  Do not let a global TID or a hidden namespace
+        // collision escape through the task registry fast path.
+        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
+            SchedGetSchedulerTarget::Live(task)
+        } else {
+            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
+        }
+    };
+    let (actor_task, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = target.credential()?;
+    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
+        &actor_cred,
+        &target_cred,
+    ))?;
+    let _ = actor_task;
+    Ok(target.policy()? as isize)
 }
 
 pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
@@ -932,7 +967,6 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
     // target-dependent side effects and prevents a fake Deadline snapshot.
     let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
     let task = sched_target(pid)?;
-    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     let authority = scheduler_authority_snapshot(&task)?;
     authority.authorize(SchedulerSecurityOperation::SetPolicy {
         realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
@@ -964,11 +998,7 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         }
     }
     let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
-    apply_sched_state_with_reset(
-        Some(thread),
-        || apply_sched_state(&task, state),
-        |thread| thread.set_sched_reset_on_fork(reset_on_fork),
-    )
+    apply_sched_state_with_reset(&task, state, reset_on_fork)
 }
 
 pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
@@ -988,11 +1018,13 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     }
 
     let task = sched_target(pid)?;
-    let state = sched_state(&task);
+    let commit = scheduler_state_snapshot(&task).map_err(|_| AxError::NoSuchProcess)?;
+    let state = commit.state;
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
-        sched_policy: linux_policy_from_state(&task, state) as u32 & !SCHED_RESET_ON_FORK,
-        sched_flags: if sched_reset_on_fork(&task) {
+        sched_policy: linux_policy_from_state(state, commit.reset_on_fork) as u32
+            & !SCHED_RESET_ON_FORK,
+        sched_flags: if commit.reset_on_fork {
             SUPPORTED_SCHED_ATTR_FLAGS
         } else {
             0
@@ -1410,6 +1442,53 @@ fn ioprio_raw_for_task(task: &AxTaskRef) -> AxResult<u16> {
 enum IoprioTarget {
     Live(AxTaskRef),
     Zombie(Arc<Process>),
+}
+
+/// The only two Linux-visible scheduler-query lifetimes.  A nonzero PID
+/// selects an exact live TID first; after final exit the process PID remains
+/// addressable until wait reaps its zombie payload.
+enum SchedGetSchedulerTarget {
+    Live(AxTaskRef),
+    Zombie(Arc<Process>),
+}
+
+impl SchedGetSchedulerTarget {
+    fn credential(&self) -> AxResult<Arc<Cred>> {
+        match self {
+            Self::Live(task) => task
+                .try_as_thread()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|thread| thread.current_cred()),
+            Self::Zombie(process) => process
+                .zombie_payload()
+                .ok_or(AxError::NoSuchProcess)
+                .map(|snapshot| snapshot.credential.clone()),
+        }
+    }
+
+    fn policy(&self) -> AxResult<i32> {
+        match self {
+            Self::Live(task) => {
+                let commit = scheduler_state_snapshot(task).map_err(|error| match error {
+                    // A task can terminalize after PID resolution. Linux
+                    // exposes no stale policy across that lifecycle edge.
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                })?;
+                Ok(linux_policy_from_parts(commit.state, commit.reset_on_fork))
+            }
+            Self::Zombie(process) => {
+                let snapshot = zombie_scheduler_state(process)?;
+                Ok(linux_policy_from_class(
+                    snapshot.class,
+                    snapshot.reset_on_fork,
+                ))
+            }
+        }
+    }
 }
 
 impl IoprioTarget {
@@ -1874,33 +1953,15 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_update_rejects_missing_target_before_any_store() {
-        let state_updates = Cell::new(0);
-        let flag_updates = Cell::new(0);
-        let result = apply_sched_state_with_reset::<()>(
-            None,
-            || {
-                state_updates.set(state_updates.get() + 1);
-                Ok(0)
-            },
-            |_| flag_updates.set(flag_updates.get() + 1),
+    fn scheduler_policy_keeps_reset_on_fork_in_the_abi_word() {
+        assert_eq!(
+            linux_policy_from_class(SchedClass::RoundRobin, true),
+            SCHED_RR as i32 | SCHED_RESET_ON_FORK as i32
         );
-        assert_eq!(result, Err(AxError::NoSuchProcess));
-        assert_eq!(state_updates.get(), 0);
-        assert_eq!(flag_updates.get(), 0);
-    }
-
-    #[test]
-    fn scheduler_failure_never_partially_stores_reset_on_fork() {
-        let target = ();
-        let flag_updates = Cell::new(0);
-        let result = apply_sched_state_with_reset(
-            Some(&target),
-            || Err(AxError::NoSuchProcess),
-            |_| flag_updates.set(flag_updates.get() + 1),
+        assert_eq!(
+            linux_policy_from_class(SchedClass::Normal, false),
+            SCHED_NORMAL as i32
         );
-        assert_eq!(result, Err(AxError::NoSuchProcess));
-        assert_eq!(flag_updates.get(), 0);
     }
 
     #[test]

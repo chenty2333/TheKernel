@@ -97,6 +97,8 @@ pub use self::{
     user::*,
 };
 
+pub(crate) use self::thread::SchedulerSeed;
+
 /// Snapshot the calling task's Linux `fs_struct`.
 #[inline]
 pub(crate) fn current_fs_context() -> alloc::sync::Arc<axsync::Mutex<axfs::FsContext>> {

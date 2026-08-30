@@ -17,8 +17,9 @@ use crate::{
     pseudofs::{self, dev::tty::N_TTY},
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
-        FsContextSlot, ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
-        init_process_domain, init_seccomp_filter_budget, linux_pid_from_task_id,
+        FsContextSlot, ProcessAccessState, ProcessData, SchedulerSeed, Thread, TimeNamespace,
+        UserNamespace, UtsNamespace, init_process_domain, init_seccomp_filter_budget,
+        linux_pid_from_task_id,
         prepare_task_table_admission, set_task_user_address_space, spawn_alarm_task,
         try_new_user_task,
     },
@@ -213,6 +214,11 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::new(SeccompState::disabled()),
         FsContextSlot::new(init_fs_context.clone()),
         crate::task::FdTableSlot::new(init_fd_table),
+        SchedulerSeed {
+            state: SchedState::default(),
+            reset_on_fork: false,
+            version: 0,
+        },
     )
     .expect("Failed to allocate init thread state");
     proc.bind_initial_group_leader_signal(tid, thr.signal.clone())

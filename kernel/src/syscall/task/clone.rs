@@ -5,7 +5,8 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axtask::{
     AxTaskExt, SchedClass, current, prepare_task_with_sched_from, publish_prepared_task,
-    reclaim_exited_tasks, reserve_prepared_task, sched_state, yield_now,
+    reclaim_exited_tasks, reserve_prepared_task, scheduler_state_snapshot,
+    set_prepared_task_sched_reset_on_fork, yield_now,
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
@@ -26,7 +27,7 @@ use crate::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
+        SchedulerSeed, TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
         lock_task_parent_publication, prepare_task_table_admission, process_domain,
         send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
     },
@@ -458,10 +459,13 @@ impl CloneArgs {
         reclaim_exited_tasks();
         check_rlimit_nproc(calling_thread)?;
 
-        let mut child_sched_state = sched_state(&curr);
-        let parent_reset_on_fork = calling_thread.sched_reset_on_fork();
-        let child_reset_on_fork = flags.contains(CloneFlags::THREAD) && parent_reset_on_fork;
-        if !flags.contains(CloneFlags::THREAD) && parent_reset_on_fork {
+        let parent_sched = scheduler_state_snapshot(&curr).map_err(|_| AxError::NoSuchProcess)?;
+        let mut child_sched_state = parent_sched.state;
+        let parent_reset_on_fork = parent_sched.reset_on_fork;
+        // sched_fork applies RESET_ON_FORK before either a process or a
+        // thread child becomes runnable. The child never inherits the flag.
+        let child_reset_on_fork = false;
+        if parent_reset_on_fork {
             match child_sched_state.class {
                 SchedClass::Fifo | SchedClass::RoundRobin => {
                     child_sched_state.class = SchedClass::Normal;
@@ -708,6 +712,13 @@ impl CloneArgs {
             child_fs_context,
             child_fd_table,
             calling_thread.personality(),
+            SchedulerSeed {
+                state: child_sched_state,
+                reset_on_fork: child_reset_on_fork,
+                // The child owns a fresh scheduler commit stream. Its first
+                // prepared scheduler state is version zero.
+                version: 0,
+            },
         )?;
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
@@ -717,7 +728,6 @@ impl CloneArgs {
         } else {
             TaskParentChoice::Caller(calling_thread.task_parent_node().clone())
         };
-        thr.set_sched_reset_on_fork(child_reset_on_fork);
         if flags.contains(CloneFlags::CHILD_SETTID) {
             thr.set_child_tid_address(child_tid);
         }
@@ -765,6 +775,7 @@ impl CloneArgs {
         // task/process/group/session lookup bucket before copying the pidfd
         // number or publishing it into a possibly shared files_struct.
         let task = prepare_task_with_sched_from(new_task, child_sched_state, &curr)?;
+        set_prepared_task_sched_reset_on_fork(&task, child_reset_on_fork);
         if let Some((_, Some(pidfd))) = pending_pidfd.as_ref() {
             pidfd.bind_thread_task(&task)?;
         }

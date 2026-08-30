@@ -15,7 +15,7 @@ use axfs::FsContext;
 use axpoll::PollSet;
 use axsync::Mutex;
 use axsync::spin::SpinNoIrq;
-use axtask::{SchedClass, SwitchReason, TaskExt, TaskInner, current_may_uninit, sched_state};
+use axtask::{SchedState, SwitchReason, TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use thekernel_linux_process_adapter::Pid;
@@ -890,10 +890,6 @@ pub struct Thread {
     /// Best-effort user-visible blocking state used by procfs.
     proc_state_hint: AtomicU8,
 
-    /// Linux `SCHED_RESET_ON_FORK` policy, deliberately kept out of the
-    /// generic scheduler mechanism.
-    sched_reset_on_fork: AtomicBool,
-
     /// Linux per-task I/O priority context. Linux does not allocate an
     /// `io_context` until a task first needs one; `None` is therefore a real
     /// state, not an eagerly allocated `IOPRIO_CLASS_NONE` value. The
@@ -921,6 +917,14 @@ pub struct Thread {
     deferred_work: Arc<DeferredWorkAccount>,
 }
 
+/// Exact scheduler tuple admitted for an unpublished Linux task.
+#[derive(Clone, Copy)]
+pub(crate) struct SchedulerSeed {
+    pub(crate) state: SchedState,
+    pub(crate) reset_on_fork: bool,
+    pub(crate) version: u64,
+}
+
 impl Thread {
     /// Create a new [`Thread`].
     pub(crate) fn try_new(
@@ -930,6 +934,7 @@ impl Thread {
         seccomp: Arc<SeccompState>,
         fs_context: Arc<FsContextSlot>,
         fd_table: Arc<FdTableSlot>,
+        scheduler_seed: SchedulerSeed,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         Self::try_new_with_io_context(
             tid,
@@ -940,6 +945,7 @@ impl Thread {
             fs_context,
             fd_table,
             0,
+            scheduler_seed,
         )
     }
 
@@ -955,34 +961,19 @@ impl Thread {
         fs_context: Arc<FsContextSlot>,
         fd_table: Arc<FdTableSlot>,
         personality: u32,
+        scheduler_seed: SchedulerSeed,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         // ProcessData is created before the child scheduler object. Seed its
-        // durable scheduler identity from the caller now, including Linux's
-        // reset-on-fork transformation; later successful scheduler syscalls
-        // keep this cell current through final exit and zombie retention.
-        if let Some(current_task) = current_may_uninit()
-            && let Some(parent) = current_task.try_as_thread()
-            && proc_data.proc.pid() == tid
-        {
-            let mut state = sched_state(&current_task);
-            if parent.sched_reset_on_fork() {
-                match state.class {
-                    SchedClass::Fifo | SchedClass::RoundRobin => {
-                        state.class = SchedClass::Normal;
-                        state.nice = 0;
-                        state.rt_priority = 0;
-                    }
-                    SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-                        if state.nice < 0 {
-                            state.nice = 0;
-                        }
-                        state.rt_priority = 0;
-                    }
-                }
-            }
+        // durable identity from the creator's already admitted tuple; never
+        // resample a parent or substitute a default during allocation.
+        if proc_data.proc.pid() == tid {
             // `proc.pid() == tid` above is the construction-time group-leader
             // identity; no Thread object exists yet to query it from.
-            proc_data.seed_scheduler_state(state, 0);
+            proc_data.seed_scheduler_state(
+                scheduler_seed.state,
+                scheduler_seed.reset_on_fork,
+                scheduler_seed.version,
+            );
         }
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;
@@ -1024,7 +1015,6 @@ impl Thread {
             involuntary_switches: AtomicU64::new(0),
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
-            sched_reset_on_fork: AtomicBool::new(false),
             io_context: SpinNoIrq::new(io_context),
             exit,
             oom_score_adj: AtomicI32::new(200),
@@ -1351,14 +1341,6 @@ impl Thread {
             fallback_reaper,
             deliver,
         )
-    }
-
-    pub(crate) fn sched_reset_on_fork(&self) -> bool {
-        self.sched_reset_on_fork.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_sched_reset_on_fork(&self, enabled: bool) {
-        self.sched_reset_on_fork.store(enabled, Ordering::Release);
     }
 
     /// Temporarily releases the active-scope read lock so the current thread

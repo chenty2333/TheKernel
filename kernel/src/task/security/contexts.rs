@@ -13,6 +13,8 @@ pub(crate) type CorePtraceTracemeContext<'a> =
     thekernel_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
 pub(crate) type CoreSchedulerSecurityContext<'a> =
     thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
+pub(crate) type CoreTaskGetSchedulerContext<'a> =
+    thekernel_linux_cred::TaskGetSchedulerContext<'a, UserNamespace>;
 pub(crate) type CoreSignalSecurityContext<'a> =
     thekernel_linux_cred::SignalSecurityContext<'a, UserNamespace, SignalTargetSecurityRef<'a>>;
 pub(crate) type CoreInodePermissionContext<'context, 'location> =
@@ -284,6 +286,37 @@ impl<'a> SecuritySchedulerContext<'a> {
 /// Frozen target credential for Linux's `security_task_getsid` hook.
 pub(crate) struct SecurityTaskGetsidContext<'a> {
     target: &'a Cred,
+}
+
+/// Frozen actor/target credentials for Linux's `security_task_getscheduler`
+/// hook.  Both sides are retained before hook dispatch, so an exec or
+/// credential transition cannot splice together two authorization epochs.
+pub(crate) struct SecurityTaskGetSchedulerContext<'a> {
+    actor: &'a Cred,
+    target: &'a Cred,
+    core: CoreTaskGetSchedulerContext<'a>,
+}
+
+impl<'a> SecurityTaskGetSchedulerContext<'a> {
+    pub(crate) fn new(actor: &'a Cred, target: &'a Cred) -> Self {
+        Self {
+            actor,
+            target,
+            core: CoreTaskGetSchedulerContext::new(actor.core(), target.core()),
+        }
+    }
+
+    pub(super) fn core(&self) -> &CoreTaskGetSchedulerContext<'a> {
+        &self.core
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
 }
 
 impl<'a> SecurityTaskGetsidContext<'a> {

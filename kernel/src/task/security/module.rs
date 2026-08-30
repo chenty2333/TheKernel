@@ -538,6 +538,24 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
         self.task_getsid(context)
     }
 
+    /// Linux `security_task_getscheduler` authorization for one resolved
+    /// actor/target pair.
+    fn task_getscheduler(
+        &self,
+        _context: &SecurityTaskGetSchedulerContext<'_>,
+    ) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn task_getscheduler_with_credential_state(
+        &self,
+        context: &SecurityTaskGetSchedulerContext<'_>,
+        _actor_state: &Self::CredentialState,
+        _target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.task_getscheduler(context)
+    }
+
     fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -754,6 +772,13 @@ pub(super) trait ErasedSecurityModule: Send + Sync {
     fn task_getsid_with_credential_state(
         &self,
         context: &SecurityTaskGetsidContext<'_>,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn task_getscheduler(&self, context: &SecurityTaskGetSchedulerContext<'_>) -> AxResult<()>;
+    fn task_getscheduler_with_credential_state(
+        &self,
+        context: &SecurityTaskGetSchedulerContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
         target_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
     fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()>;
@@ -1351,6 +1376,24 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         SecurityModule::task_getsid_with_credential_state(
             self,
             context,
+            owned_credential_state(self, target_state)?,
+        )
+    }
+
+    fn task_getscheduler(&self, context: &SecurityTaskGetSchedulerContext<'_>) -> AxResult<()> {
+        SecurityModule::task_getscheduler(self, context)
+    }
+
+    fn task_getscheduler_with_credential_state(
+        &self,
+        context: &SecurityTaskGetSchedulerContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::task_getscheduler_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
             owned_credential_state(self, target_state)?,
         )
     }
