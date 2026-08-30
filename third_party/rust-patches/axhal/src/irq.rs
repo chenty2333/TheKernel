@@ -70,15 +70,22 @@ pub enum IpiReason {
     CallFunction   = 2,
     /// Acknowledge one private expedited membarrier generation.
     Membarrier     = 3,
+    /// Stop a remote CPU for the terminal x86_64 kexec transition.
+    ///
+    /// This lane is deliberately separate from maintenance and scheduler
+    /// work: its consumer never returns to ordinary execution after it has
+    /// acknowledged the handoff generation.
+    KexecStop      = 4,
 }
 
 #[cfg(feature = "ipi")]
 impl IpiReason {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::CpuMaintenance,
         Self::Reschedule,
         Self::CallFunction,
         Self::Membarrier,
+        Self::KexecStop,
     ];
 
     #[inline]

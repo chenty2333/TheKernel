@@ -276,6 +276,27 @@ fn validate_unique_mount_id(mount_id: u64) -> AxResult<()> {
     Ok(())
 }
 
+fn mount_point_under_root(root: &str, target: &str) -> Option<&str> {
+    if root == "/" {
+        return Some(target);
+    }
+    if target == root {
+        return Some("/");
+    }
+    target.strip_prefix(root).filter(|suffix| suffix.starts_with('/'))
+}
+
+fn visible_mount_point(record: &mounts::MountRecord) -> AxResult<Option<String>> {
+    let root = current_fs_context()
+        .lock()
+        .root()
+        .absolute_path()
+        .map_err(|_| AxError::Io)?;
+    mount_point_under_root(root.as_ref(), &record.target)
+        .map(try_string)
+        .transpose()
+}
+
 fn append_statmount_string(bytes: &mut Vec<u8>, value: &str) -> AxResult<u32> {
     let offset = u32::try_from(bytes.len() - STATMOUNT_PREFIX_SIZE)
         .map_err(|_| AxError::from(LinuxError::EOVERFLOW))?;
@@ -353,6 +374,7 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
         .iter()
         .find(|record| record.mount_id == req.mnt_id)
         .ok_or(AxError::NotFound)?;
+    let visible_point = visible_mount_point(record)?.ok_or(LinuxError::EPERM)?;
     let requested = req.param;
     let mask = requested & STATMOUNT_SUPPORTED;
     let mut output = Vec::new();
@@ -454,7 +476,7 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
         (
             STATMOUNT_MNT_POINT,
             offset_of!(StatmountPrefix, mnt_point),
-            record.target.as_str(),
+            visible_point.as_str(),
         ),
         (
             STATMOUNT_FS_TYPE,
@@ -533,7 +555,8 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
         .map_err(|_| AxError::NoMemory)?;
     pending.push(root_id);
     while let Some(parent) = pending.pop() {
-        if req.mnt_id == LSMT_ROOT || parent != root_id {
+        let record = records.iter().find(|record| record.mount_id == parent).ok_or(AxError::Io)?;
+        if (req.mnt_id == LSMT_ROOT || parent != root_id) && visible_mount_point(record)?.is_some() {
             selected.push(parent);
         }
         for record in records.iter().filter(|record| record.parent_id == parent) {
@@ -575,6 +598,14 @@ mod statmount_tests {
     #[test]
     fn mount_options_preserve_mount_policy() {
         assert_eq!(mount_options(MS_RDONLY | MS_NOSUID | MS_NODEV, "").unwrap(), "ro,nosuid,nodev");
+    }
+
+    #[test]
+    fn chroot_mount_points_are_relative_and_do_not_escape() {
+        assert_eq!(mount_point_under_root("/jail", "/jail"), Some("/"));
+        assert_eq!(mount_point_under_root("/jail", "/jail/tmp"), Some("/tmp"));
+        assert_eq!(mount_point_under_root("/jail", "/jailbreak"), None);
+        assert_eq!(mount_point_under_root("/jail", "/"), None);
     }
 }
 

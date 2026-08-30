@@ -6,7 +6,11 @@ members = [
     "crates/readiness-adapter",
     "third_party/rust-patches/axsync",
 ]
-exclude = ["arceos"]
+exclude = [
+    "arceos",
+    "third_party/rust-patches/axalloc",
+    "third_party/rust-patches/axallocator",
+]
 
 # Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
 # directly and promotes every warning not explicitly allowed here to an error.
@@ -162,6 +166,8 @@ all-features = true
 # Force all direct and transitive users onto the vendored axnet-ng so feature
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
+axalloc = { path = "third_party/rust-patches/axalloc" }
+axallocator = { path = "third_party/rust-patches/axallocator" }
 axhal = { path = "third_party/rust-patches/axhal" }
 axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
