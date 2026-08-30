@@ -6,7 +6,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, Pollable};
-use axsync::Mutex;
+use axsync::{Mutex, MutexGuard};
 use linux_raw_sys::general::S_IFREG;
 
 use crate::{
@@ -24,6 +24,16 @@ pub(crate) struct SecretMemFile {
     size: AtomicU64,
 }
 
+/// Serializes a secretmem `ftruncate` from its immutable-size admission
+/// through publication.  The guard deliberately spans the caller's resource
+/// limit check: otherwise two callers can both observe a zero size, after
+/// which a zero-length truncate may incorrectly succeed after another caller
+/// has fixed the object's size.
+pub(crate) struct SecretMemTruncateGuard<'a> {
+    secret: &'a SecretMemFile,
+    pages: MutexGuard<'a, Option<Arc<SharedPages>>>,
+}
+
 impl SecretMemFile {
     pub(crate) const fn new() -> Self {
         Self {
@@ -32,40 +42,52 @@ impl SecretMemFile {
         }
     }
 
-    pub(crate) fn truncate(&self, size: u64) -> AxResult<()> {
+    /// Acquires the immutable-size admission for an `ftruncate` operation.
+    ///
+    /// Callers must retain the returned guard until after every check that can
+    /// reject the mutation, and then use [`SecretMemTruncateGuard::truncate`]
+    /// to publish the first nonzero size.
+    pub(crate) fn begin_truncate(&self) -> AxResult<SecretMemTruncateGuard<'_>> {
+        let pages = self.pages.lock();
+        if self.size.load(Ordering::Acquire) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(SecretMemTruncateGuard {
+            secret: self,
+            pages,
+        })
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size.load(Ordering::Acquire)
+    }
+}
+
+impl SecretMemTruncateGuard<'_> {
+    pub(crate) fn truncate(mut self, size: u64) -> AxResult<()> {
         let size: usize = size.try_into().map_err(|_| AxError::NoMemory)?;
-        let mut current = self.pages.lock();
         // secretmem has a fixed size once it becomes nonempty; in particular
         // ftruncate(fd, 0) must not silently discard a live secret object.
+        // `begin_truncate` checked this under the same mutex; retain the
+        // assertion here so future callers cannot separate admission from
+        // mutation accidentally.
+        if self.secret.size.load(Ordering::Acquire) != 0 {
+            return Err(AxError::InvalidInput);
+        }
         if size == 0 {
             return Ok(());
         }
         // i_size is byte-granular; backing metadata is sparse, so truncation
         // only records the logical size and never reserves one entry/page.
-        if let Some(pages) = current.as_ref() {
+        if let Some(pages) = self.pages.as_ref() {
             pages.set_secret_size_once(size)?;
         } else {
             let pages = Arc::try_new(SharedPages::new_secret_fixed(size)?)
                 .map_err(|_| AxError::NoMemory)?;
-            *current = Some(pages);
+            *self.pages = Some(pages);
         }
-        self.size.store(size as u64, Ordering::Release);
+        self.secret.size.store(size as u64, Ordering::Release);
         Ok(())
-    }
-
-    /// Validates the immutable-after-first-size rule without allocating or
-    /// mutating.  ftruncate uses this before RLIMIT_FSIZE so a second secret
-    /// truncate retains Linux's EINVAL priority.
-    pub(crate) fn check_truncate(&self) -> AxResult<()> {
-        if self.size() != 0 {
-            Err(AxError::InvalidInput)
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(crate) fn size(&self) -> u64 {
-        self.size.load(Ordering::Acquire)
     }
 }
 
@@ -142,12 +164,31 @@ mod tests {
         assert!(mapped.is_secret());
         assert_eq!(mapped.total_bytes(), 0);
 
-        secret.check_truncate().unwrap();
-        secret.truncate(PAGE_SIZE_4K as u64).unwrap();
+        secret
+            .begin_truncate()
+            .unwrap()
+            .truncate(PAGE_SIZE_4K as u64)
+            .unwrap();
         let remapped = secret.prepare_mmap(shared_request()).unwrap().unwrap().into_pages();
         assert!(Arc::ptr_eq(&mapped, &remapped));
         assert_eq!(mapped.total_bytes(), PAGE_SIZE_4K);
 
         mapped.write_bytes(0, &[0]).unwrap();
+    }
+
+    #[test]
+    fn first_nonzero_size_freezes_later_zero_resize() {
+        let secret = SecretMemFile::new();
+        secret
+            .begin_truncate()
+            .unwrap()
+            .truncate(PAGE_SIZE_4K as u64)
+            .unwrap();
+
+        // `begin_truncate` is the serialized admission used by ftruncate;
+        // after a concurrent first-size publisher releases it, a queued zero
+        // resize observes the published size and must fail.
+        assert_eq!(secret.begin_truncate().err(), Some(AxError::InvalidInput));
+        assert_eq!(secret.size(), PAGE_SIZE_4K as u64);
     }
 }

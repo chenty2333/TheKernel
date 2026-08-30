@@ -2778,11 +2778,14 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     // EINVAL for either failure, all before the RLIMIT_FSIZE check below.
     ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
-        secret.check_truncate()?;
+        // Keep immutable-size admission through RLIMIT_FSIZE and publication.
+        // A separate pre-check allows a concurrent zero-length ftruncate to
+        // observe the old size and succeed after this call fixes it.
+        let truncate = secret.begin_truncate()?;
         if (length as u64) > secret.size() {
             check_resize_limit(length as u64)?;
         }
-        secret.truncate(length as u64)?;
+        truncate.truncate(length as u64)?;
         return Ok(0);
     }
     let security = current_vfs_security();
