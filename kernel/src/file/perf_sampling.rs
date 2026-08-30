@@ -957,6 +957,57 @@ fn write_record(ring: &Ring, head: u64, bytes: &[u8]) -> AxResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
+
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use spin::{Mutex, MutexGuard};
+
+    // These tests exercise the production global retire queue.  Keep their
+    // publication and draining isolated from each other so no test can
+    // consume another test's custody reference.
+    static RETIRE_QUEUE_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct RetireQueueTestContext {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl RetireQueueTestContext {
+        fn new() -> Self {
+            let serial = RETIRE_QUEUE_TEST_SERIAL.lock();
+            drain_retire_queue_fully();
+            Self { _serial: serial }
+        }
+    }
+
+    impl Drop for RetireQueueTestContext {
+        fn drop(&mut self) {
+            drain_retire_queue_fully();
+        }
+    }
+
+    fn drain_retire_queue_fully() {
+        while has_deferred_custody_retire_work() {
+            drain_deferred_custody_retire_work();
+        }
+        assert!(!has_deferred_custody_retire_work());
+    }
+
+    fn test_sampling_event() -> Arc<PerfSamplingFile> {
+        PerfSamplingFile::try_new(SamplingConfig {
+            id: 1,
+            target_task_id: 0,
+            event: SamplingEvent::Cycles,
+            period: 1,
+            sample_type: PERF_SAMPLE_IP,
+            count_user: true,
+            count_kernel: false,
+            disabled: true,
+            read_format: 0,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn sample_payload_order_and_misc() {
         let mut out = [0; 40];
@@ -1038,5 +1089,93 @@ mod tests {
             let mut out = [0; 40];
             assert_eq!(encode_sample(&mut out, bit, 0, 0, 0, 0, 0), 16);
         }
+    }
+
+    #[test]
+    fn repeated_retire_publication_keeps_one_queue_owner() {
+        let _context = RetireQueueTestContext::new();
+        let event = test_sampling_event();
+        let weak = Arc::downgrade(&event);
+
+        for _ in 0..1024 {
+            defer_custody_retire(event.clone());
+        }
+        drop(event);
+
+        assert!(has_deferred_custody_retire_work());
+        drain_deferred_custody_retire_work();
+        assert!(!has_deferred_custody_retire_work());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn retire_batch_leaves_the_seventeenth_event_pending() {
+        let _context = RetireQueueTestContext::new();
+        let events: alloc::vec::Vec<_> = (0..RETIRE_BATCH + 1)
+            .map(|_| test_sampling_event())
+            .collect();
+        let weak: alloc::vec::Vec<_> = events.iter().map(Arc::downgrade).collect();
+
+        for event in &events {
+            defer_custody_retire(event.clone());
+        }
+        drop(events);
+
+        drain_deferred_custody_retire_work();
+        assert!(has_deferred_custody_retire_work());
+        assert!(weak.iter().any(|event| event.upgrade().is_some()));
+
+        drain_deferred_custody_retire_work();
+        assert!(!has_deferred_custody_retire_work());
+        assert!(weak.iter().all(|event| event.upgrade().is_none()));
+    }
+
+    #[test]
+    fn consumed_event_with_external_owner_can_be_republished() {
+        let _context = RetireQueueTestContext::new();
+        let event = test_sampling_event();
+        let weak = Arc::downgrade(&event);
+
+        defer_custody_retire(event.clone());
+        drain_deferred_custody_retire_work();
+        assert!(!has_deferred_custody_retire_work());
+        assert!(weak.upgrade().is_some());
+
+        defer_custody_retire(event.clone());
+        drain_deferred_custody_retire_work();
+        assert!(!has_deferred_custody_retire_work());
+        assert!(weak.upgrade().is_some());
+
+        drop(event);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn concurrent_publishers_and_drainer_release_every_event() {
+        let _context = RetireQueueTestContext::new();
+        let event = test_sampling_event();
+        let weak = Arc::downgrade(&event);
+        let publishers = Arc::new(AtomicUsize::new(8));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let event = event.clone();
+                let publishers = publishers.clone();
+                scope.spawn(move || {
+                    for _ in 0..512 {
+                        defer_custody_retire(event.clone());
+                    }
+                    publishers.fetch_sub(1, Ordering::Release);
+                });
+            }
+            while publishers.load(Ordering::Acquire) != 0 || has_deferred_custody_retire_work() {
+                drain_deferred_custody_retire_work();
+                std::thread::yield_now();
+            }
+        });
+
+        drop(event);
+        drain_retire_queue_fully();
+        assert!(weak.upgrade().is_none());
     }
 }
