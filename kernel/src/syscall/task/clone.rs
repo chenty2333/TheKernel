@@ -700,6 +700,7 @@ impl CloneArgs {
                 inherited_cpu_limit_active,
                 core::sync::atomic::Ordering::Release,
             );
+            proc_data.set_heap_layout(old_proc_data.heap_base());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
@@ -716,6 +717,7 @@ impl CloneArgs {
             child_credential,
             inherited_seccomp,
             child_io_context,
+            calling_thread.personality(),
         )?;
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;

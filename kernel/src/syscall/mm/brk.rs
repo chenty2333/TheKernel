@@ -6,7 +6,7 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, align_up_4k};
 
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
-    config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
+    config::{USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
     mm::{DeferredUffdWake, check_memory_overcommit},
     task::AsThread,
 };
@@ -15,8 +15,9 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let current_top = proc_data.get_heap_top() as usize;
-    let heap_limit = USER_HEAP_BASE + USER_HEAP_SIZE_MAX;
-    let initial_heap_end = USER_HEAP_BASE + USER_HEAP_SIZE;
+    let heap_base = proc_data.heap_base();
+    let heap_limit = heap_base + USER_HEAP_SIZE_MAX;
+    let initial_heap_end = heap_base + USER_HEAP_SIZE;
 
     if addr == 0 {
         return Ok(current_top as isize);
@@ -46,7 +47,7 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             if aspace.brk_growth_collides(
                 current_top_aligned.into(),
                 collision_end.into(),
-                USER_HEAP_BASE.into(),
+                heap_base.into(),
             ) {
                 return Ok(current_top as isize);
             }

@@ -732,6 +732,10 @@ pub struct Thread {
     /// capacity.
     pub(in crate::task) seccomp_terminal_disabled: Arc<SeccompState>,
 
+    /// Linux personality is a task property.  A fork or clone snapshots the
+    /// caller, while siblings may subsequently change theirs independently.
+    personality: AtomicU32,
+
     /// Thread-local Linux restartable-sequence registration and event state.
     ///
     /// This deliberately lives on `Thread`, not `ProcessData`: rseq
@@ -833,7 +837,7 @@ impl Thread {
         credential: Arc<CredentialSlot>,
         seccomp: Arc<SeccompState>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
-        Self::try_new_with_io_context(tid, proc_data, credential, seccomp, None)
+        Self::try_new_with_io_context(tid, proc_data, credential, seccomp, None, 0)
     }
 
     /// Create a task with an explicitly selected Linux I/O-priority context.
@@ -845,6 +849,7 @@ impl Thread {
         credential: Arc<CredentialSlot>,
         seccomp: Arc<SeccompState>,
         io_context: Option<Arc<AtomicU16>>,
+        personality: u32,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         // ProcessData is created before the child scheduler object. Seed its
         // durable scheduler identity from the caller now, including Linux's
@@ -889,6 +894,7 @@ impl Thread {
             credential,
             seccomp,
             seccomp_terminal_disabled,
+            personality: AtomicU32::new(personality),
             rseq: SpinNoIrq::new(ThreadRseq::new()),
             file_operation_credential: SpinNoIrq::new(None),
             file_write_credentials: SpinNoIrq::new(None),
@@ -922,6 +928,18 @@ impl Thread {
                 | ThreadRegistrationError::Cancelled => AxError::BadState,
             })?;
         Ok((thread, registration))
+    }
+
+    pub(crate) fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_personality(&self, personality: u32) {
+        self.personality.store(personality, Ordering::Release);
+    }
+
+    pub(crate) fn clear_personality_flags(&self, flags: u32) {
+        self.personality.fetch_and(!flags, Ordering::AcqRel);
     }
 
     /// Returns the shared I/O-priority context used by `CLONE_IO`, if Linux

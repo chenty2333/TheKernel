@@ -2209,6 +2209,7 @@ pub struct ProcessData {
     exit_fd_table: Arc<FdTable>,
     /// The user heap top
     heap_top: AtomicUsize,
+    heap_base: AtomicUsize,
 
     /// The resource limits
     pub rlim: RwLock<Rlimits>,
@@ -2230,8 +2231,6 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
-    /// Linux personality flags shared by all threads in the process.
-    personality: AtomicU32,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
     /// Current timer slack in nanoseconds.
@@ -2719,6 +2718,7 @@ impl ProcessData {
             heap_top: AtomicUsize::new(
                 crate::config::USER_HEAP_BASE + crate::config::USER_HEAP_SIZE,
             ),
+            heap_base: AtomicUsize::new(crate::config::USER_HEAP_BASE),
 
             rlim: RwLock::default(),
 
@@ -2732,7 +2732,6 @@ impl ProcessData {
             futex_table,
 
             umask: AtomicU32::new(0o022),
-            personality: AtomicU32::new(0),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
@@ -3035,6 +3034,15 @@ impl ProcessData {
         self.heap_top.load(Ordering::Acquire)
     }
 
+    pub fn heap_base(&self) -> usize {
+        self.heap_base.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_heap_layout(&self, base: usize) {
+        self.heap_base.store(base, Ordering::Release);
+        self.set_heap_top(base + crate::config::USER_HEAP_SIZE);
+    }
+
     /// Fallibly snapshots the executable path without allocator work under
     /// the process metadata lock.
     pub(crate) fn try_exe_path(&self) -> AxResult<String> {
@@ -3250,14 +3258,6 @@ impl ProcessData {
 }
 
 impl ProcessData {
-    pub fn personality(&self) -> u32 {
-        self.personality.load(Ordering::Acquire)
-    }
-
-    pub fn set_personality(&self, personality: u32) {
-        self.personality.store(personality, Ordering::Release);
-    }
-
     pub fn mempolicy(&self) -> Mempolicy {
         self.mempolicy.lock().process_policy
     }

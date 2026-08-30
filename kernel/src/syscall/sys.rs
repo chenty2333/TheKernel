@@ -11,9 +11,7 @@ use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
-use thekernel_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice,
-};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
@@ -357,9 +355,13 @@ const fn pad_str(info: &str) -> [c_char; 65] {
     data
 }
 
-const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0002_0000;
-const SUPPORTED_PERSONALITY: u32 = UNAME26;
+pub(crate) const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+const MMAP_PAGE_ZERO: u32 = 0x0010_0000;
+const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
+const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+pub(crate) const PER_CLEAR_ON_SETID: u32 =
+    READ_IMPLIES_EXEC | ADDR_NO_RANDOMIZE | ADDR_COMPAT_LAYOUT | MMAP_PAGE_ZERO;
 const UTS_RELEASE: &str = "6.12.103";
 const UTS_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC 2026-08-10T00:00:00Z";
 const UNAME26_RELEASE_PREFIX: &[u8] = b"2.6.72";
@@ -512,7 +514,10 @@ fn cstr_field_to_string(field: &[c_char; 65]) -> String {
 }
 
 fn uts_bytes_before_nul(value: &[u8]) -> &[u8] {
-    &value[..value.iter().position(|&byte| byte == 0).unwrap_or(value.len())]
+    &value[..value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len())]
 }
 
 pub fn sys_uname<M: UserMemory + ?Sized>(
@@ -520,7 +525,7 @@ pub fn sys_uname<M: UserMemory + ?Sized>(
     name: *mut new_utsname,
 ) -> AxResult<isize> {
     let uts = current_utsname()?;
-    let uname26 = current().as_thread().proc_data.personality() & UNAME26 != 0;
+    let uname26 = current().as_thread().personality() & UNAME26 != 0;
     write_utsname(memory, name, uts, uname26)?;
     Ok(0)
 }
@@ -610,18 +615,14 @@ pub fn sys_sysinfo<M: UserMemory + ?Sized>(
 
 pub fn sys_personality(persona: u32) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let old = proc_data.personality();
+    let thread = curr.as_thread();
+    let old = thread.personality();
 
     if persona == u32::MAX {
         return Ok(old as isize);
     }
 
-    if persona & PER_MASK != 0 || persona & !SUPPORTED_PERSONALITY != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    proc_data.set_personality(persona);
+    thread.set_personality(persona);
     Ok(old as isize)
 }
 
@@ -847,7 +848,17 @@ mod tests {
     #[test]
     fn uts_bytes_before_nul_preserves_non_utf8_bytes() {
         assert_eq!(uts_bytes_before_nul(b"node\0suffix"), b"node");
-        assert_eq!(uts_bytes_before_nul(&[b'n', 0xff, b'e']), &[b'n', 0xff, b'e']);
+        assert_eq!(
+            uts_bytes_before_nul(&[b'n', 0xff, b'e']),
+            &[b'n', 0xff, b'e']
+        );
+    }
+
+    #[test]
+    fn personality_namespace_preserves_arbitrary_native_u32_bits() {
+        assert_eq!(PER_CLEAR_ON_SETID, 0x0074_0000);
+        assert_eq!(UNAME26_RELEASE_PREFIX, b"2.6.72");
+        assert_eq!(u32::MAX & !PER_CLEAR_ON_SETID, 0xff8b_ffff);
     }
 
     fn test_utsname() -> new_utsname {

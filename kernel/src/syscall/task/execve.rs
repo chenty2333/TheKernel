@@ -6,7 +6,10 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::NodeType;
-use axhal::uspace::UserContext;
+use axhal::{
+    paging::{MappingFlags, PageSize},
+    uspace::UserContext,
+};
 use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_PTRACE};
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
@@ -15,15 +18,14 @@ use thekernel_linux_signal::Signo;
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul};
 
 use crate::{
-    config::USER_HEAP_BASE,
     file::{
         FD_TABLE, ResolveAtResult, fanotify, permission::VfsSecurityContext,
         replace_process_fd_table, resolve_at_with_security,
     },
     keyring::{self, KeyTaskOwner},
     mm::{
-        ExecImageAccess, copy_from_kernel, finish_prepared_user_app, new_user_aspace_empty,
-        prepare_user_app_at,
+        Backend, ExecImageAccess, ExecLayout, copy_from_kernel, finish_prepared_user_app,
+        new_user_aspace_empty, new_user_aspace_with_page_zero, preflight_user_app_at,
     },
     readiness::block_on_poll_set,
     task::{
@@ -37,6 +39,31 @@ use crate::{
         set_current_user_address_space,
     },
 };
+
+const PER_CLEAR_ON_SETID: u32 = 0x0074_0000;
+const MMAP_PAGE_ZERO: u32 = 0x0010_0000;
+
+fn effective_exec_personality(personality: u32, secure_exec: bool) -> u32 {
+    if secure_exec {
+        personality & !PER_CLEAR_ON_SETID
+    } else {
+        personality
+    }
+}
+
+fn install_mmap_page_zero(aspace: &mut crate::mm::AddrSpace) -> AxResult {
+    let start = VirtAddr::from_usize(0);
+    aspace.map(
+        start,
+        PAGE_SIZE_4K,
+        MappingFlags::READ | MappingFlags::EXECUTE | MappingFlags::USER,
+        false,
+        Backend::new_alloc(start, PageSize::Size4K),
+    )?;
+    // Seal rejects mprotect, munmap, fixed replacement, and mremap for the
+    // lifetime of this exec image.
+    aspace.seal(start, PAGE_SIZE_4K)
+}
 
 fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
     for &tid in sibling_tids {
@@ -455,14 +482,14 @@ fn do_execve(
     // preparation step. The reservation clears them only after the new image
     // has crossed its irreversible publication boundary.
     let rseq_exec = thr.prepare_rseq_exec()?;
-    let mut new_aspace = new_user_aspace_empty()?;
-    copy_from_kernel(&mut new_aspace)?;
-    let mut prepared_app = prepare_user_app_at(
-        &mut new_aspace,
+    // Resolve the terminal interpreter and derive its privilege effects before
+    // selecting any personality-controlled address-space behavior.  The
+    // preflight holds the exact credential lease; mapping consumes its cached
+    // ELF entries later, so this does not perform a second executable load.
+    let mut prepared_app = preflight_user_app_at(
         loc.clone(),
         abs_path.as_str(),
         &args,
-        &envs,
         credentials,
         actor,
         security.filesystem_owner_user_ns(),
@@ -510,6 +537,21 @@ fn do_execve(
     let credential_lease = prepared_app.take_credential_lease()?;
     let prepared_exec_cred = thr.prepare_exec_credential(actor, input, source_security)?;
     let effects = prepared_exec_cred.effects();
+    let clear_personality_on_setid = effects.clear_personality_on_setid();
+    let effective_personality =
+        effective_exec_personality(thr.personality(), clear_personality_on_setid);
+    let mmap_page_zero = effective_personality & MMAP_PAGE_ZERO != 0;
+    let layout = if effective_personality & crate::syscall::sys::ADDR_NO_RANDOMIZE != 0 {
+        ExecLayout::fixed()
+    } else {
+        ExecLayout::randomized()
+    };
+    let mut new_aspace = if mmap_page_zero {
+        new_user_aspace_with_page_zero()?
+    } else {
+        new_user_aspace_empty()?
+    };
+    copy_from_kernel(&mut new_aspace)?;
     let mm_owner_user_ns = exec_mm_owner_user_ns(
         prepared_exec_cred.proposed_user_ns(),
         prepared_app.image_access,
@@ -527,9 +569,16 @@ fn do_execve(
         &envs,
         prepared_app,
         effects.aux_identity(),
+        layout,
     )?;
     let entry_point = loaded.entry_point;
     let user_stack_base = loaded.stack_pointer;
+    // Page zero is a personality VMA, not loader input.  Add it after the
+    // preflight-backed image mapping; secure exec selected the cleared
+    // effective personality above.
+    if mmap_page_zero {
+        install_mmap_page_zero(&mut new_aspace)?;
+    }
     fanotify::notify(
         &loc,
         &loc,
@@ -670,6 +719,9 @@ fn do_execve(
         new_aspace,
         new_access_state,
     );
+    if clear_personality_on_setid {
+        thr.clear_personality_flags(PER_CLEAR_ON_SETID);
+    }
     drop(lifecycle);
     keyring::exec_committed(KeyTaskOwner::new(thr.kernel_tid(), proc_data.proc.pid()))
         .unwrap_or_else(|error| fail_closed_exit(error));
@@ -703,7 +755,7 @@ fn do_execve(
     };
     drop(old_cmdline);
 
-    proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
+    proc_data.set_heap_layout(layout.heap_base());
 
     thr.signal.set_stack(Default::default());
 
@@ -811,12 +863,14 @@ mod tests {
     use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
-        ExecArgSizer, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,
-        exact_exec_thread_snapshot, exec_arg_limit, exec_file_capabilities, exec_mm_owner_user_ns,
-        files_preparation_covers_thread_snapshot, install_exec_user_context, load_exec_string_vec,
+        ExecArgSizer, MappingFlags, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,
+        effective_exec_personality, exact_exec_thread_snapshot, exec_arg_limit,
+        exec_file_capabilities, exec_mm_owner_user_ns, files_preparation_covers_thread_snapshot,
+        install_exec_user_context, install_mmap_page_zero, load_exec_string_vec,
     };
     use crate::{
-        mm::ExecImageAccess,
+        mm::{ExecImageAccess, new_user_aspace_with_page_zero},
+        syscall::sys::PER_CLEAR_ON_SETID,
         task::{
             Cred, CredentialSlot, ExecTraceState, Kgid, Kuid, UserNamespace,
             release_exec_action_then_complete,
@@ -844,6 +898,31 @@ mod tests {
         assert_eq!(context.arg0(), 0);
         assert_eq!(context.arg2(), 0);
         assert_eq!(context.tls(), 0);
+    }
+
+    #[test]
+    fn mmap_page_zero_is_read_execute_and_sealed() {
+        let mut aspace = new_user_aspace_with_page_zero().unwrap();
+        install_mmap_page_zero(&mut aspace).unwrap();
+
+        let area = aspace.find_area(VirtAddr::from_usize(0)).unwrap();
+        assert!(
+            area.flags()
+                .contains(MappingFlags::READ | MappingFlags::EXECUTE)
+        );
+        assert!(!area.flags().contains(MappingFlags::WRITE));
+        assert!(area.backend().is_sealed());
+        assert!(matches!(
+            aspace.unmap(VirtAddr::from_usize(0), PAGE_SIZE_4K),
+            Err(AxError::OperationNotPermitted)
+        ));
+    }
+
+    #[test]
+    fn secure_exec_uses_personality_after_all_setid_clears() {
+        let personality = PER_CLEAR_ON_SETID | 0x8000_0000;
+        assert_eq!(effective_exec_personality(personality, true), 0x8000_0000);
+        assert_eq!(effective_exec_personality(personality, false), personality);
     }
 
     #[test]

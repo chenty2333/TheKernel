@@ -28,6 +28,50 @@ use crate::{
     },
 };
 
+const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+/// Use Linux's bottom-up compatibility mmap placement rather than the normal
+/// append-biased layout.
+const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
+
+fn personality_mmap_protection(personality: u32, mut protection: MappingFlags) -> MappingFlags {
+    if personality & READ_IMPLIES_EXEC != 0 && protection.contains(MappingFlags::READ) {
+        protection |= MappingFlags::EXECUTE;
+    }
+    protection
+}
+
+/// Select an address for a non-fixed mmap.  Linux's compatibility layout is
+/// deliberately bottom-up: it must not inherit the normal layout's
+/// high-water/append bias just because the process happened to map a stack or
+/// loader segment first.
+fn find_nonfixed_mmap_area(
+    aspace: &AddrSpace,
+    personality: u32,
+    hint: VirtAddr,
+    length: usize,
+    limit: VirtAddrRange,
+    align: usize,
+) -> Option<VirtAddr> {
+    if personality & ADDR_COMPAT_LAYOUT != 0 {
+        let first = if hint > limit.start {
+            hint
+        } else {
+            limit.start
+        };
+        aspace
+            .find_free_area(first, length, limit, align)
+            // Preserve ordinary mmap hint behavior when that hinted scan is
+            // exhausted, while retaining bottom-up placement for the retry.
+            .or_else(|| {
+                (first > limit.start)
+                    .then(|| aspace.find_free_area(limit.start, length, limit, align))
+                    .flatten()
+            })
+    } else {
+        aspace.find_kernel_area(hint, length, limit, align)
+    }
+}
+
 fn lookup_mmap_fd_once<T>(fd: i32, lookup: impl FnOnce(i32) -> AxResult<T>) -> AxResult<T> {
     lookup(fd).map_err(|_| AxError::BadFileDescriptor)
 }
@@ -624,7 +668,19 @@ pub fn sys_mmap(
     if length == 0 {
         return Err(AxError::InvalidInput);
     }
-    let effective_protection = requested_protection;
+    // READ_IMPLIES_EXEC is suppressed for noexec mounts: Linux leaves such a
+    // mapping readable rather than turning the compatibility bit into an
+    // executable-map permission failure.
+    let mmap_noexec = file
+        .as_ref()
+        .map(|file| crate::mounts::is_noexec(file.inner().location()))
+        .transpose()?
+        .unwrap_or(false);
+    let read_implies_exec = thread.personality() & READ_IMPLIES_EXEC != 0 && !mmap_noexec;
+    let effective_protection = personality_mmap_protection(
+        u32::from(read_implies_exec) * READ_IMPLIES_EXEC,
+        requested_protection,
+    );
     mmap_file(
         actor,
         file.as_ref().map(|file| {
@@ -654,14 +710,15 @@ pub fn sys_mmap(
             dst_addr
         } else {
             let align = page_size as usize;
-            aspace
-                .find_kernel_area(
-                    VirtAddr::from(normalized_start),
-                    length,
-                    VirtAddrRange::new(aspace.base(), aspace.end()),
-                    align,
-                )
-                .ok_or(AxError::NoMemory)?
+            find_nonfixed_mmap_area(
+                &aspace,
+                thread.personality(),
+                VirtAddr::from(normalized_start),
+                length,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                align,
+            )
+            .ok_or(AxError::NoMemory)?
         };
         mmap_addr(
             actor,
@@ -676,12 +733,15 @@ pub fn sys_mmap(
             } else {
                 FileMappingSharing::Shared
             };
-            let may_protect = match sharing {
+            let mut may_protect = match sharing {
                 FileMappingSharing::Shared => may_protect_from_file_flags(file.inner().flags()),
                 FileMappingSharing::Private => {
                     MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
                 }
             };
+            if mmap_noexec {
+                may_protect.remove(MappingFlags::EXECUTE);
+            }
             FileMappingLease::new(
                 file,
                 filesystem_owner_user_ns.expect("file mappings freeze a filesystem owner"),
@@ -841,7 +901,6 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
     let mut aspace = aspace_handle.lock();
     let start_addr = VirtAddr::from(addr);
     let requested_protection: MappingFlags = permission_flags.into();
-    let effective_protection = requested_protection;
 
     // Match Linux's per-VMA order: a successful prefix remains protected if a
     // later VMA is unmapped, disallows the requested protection, or is sealed.
@@ -858,6 +917,15 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
             }
             let segment_end = area.end().min(end_addr);
             let segment_size = segment_end.sub_addr(cursor);
+            let may_execute = area
+                .backend()
+                .file_mapping()
+                .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
+            let effective_protection = if may_execute {
+                personality_mmap_protection(thread.personality(), requested_protection)
+            } else {
+                requested_protection
+            };
             let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
             let segment_wake = authorize_then_commit(
                 plan,
@@ -1294,9 +1362,44 @@ mod tests {
     use super::*;
     use crate::{
         file::{FileDescription, FileHandle, FileLike},
+        mm::Backend,
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn compat_layout_uses_bottom_up_mmap_placement() {
+        let base = VirtAddr::from(0x1000);
+        let mut aspace = AddrSpace::new_empty(base, 0x10_000).unwrap();
+        // Leave a low hole below this existing VMA so append-biased and
+        // compatibility placement have different observable results.
+        aspace
+            .map(
+                VirtAddr::from(0x5000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER,
+                false,
+                Backend::new_alloc(VirtAddr::from(0x5000), PageSize::Size4K),
+            )
+            .unwrap();
+        let limit = VirtAddrRange::new(aspace.base(), aspace.end());
+
+        assert_eq!(
+            find_nonfixed_mmap_area(
+                &aspace,
+                ADDR_COMPAT_LAYOUT,
+                base,
+                PAGE_SIZE_4K,
+                limit,
+                PAGE_SIZE_4K
+            ),
+            Some(base),
+        );
+        assert_eq!(
+            find_nonfixed_mmap_area(&aspace, 0, base, PAGE_SIZE_4K, limit, PAGE_SIZE_4K),
+            Some(VirtAddr::from(0x6000)),
+        );
+    }
 
     #[test]
     fn mseal_normalizes_length_and_rejects_invalid_geometry() {
@@ -1590,5 +1693,18 @@ mod tests {
         let info = classify_madvise_backend(&backend);
         assert!(!info.all_private_anonymous);
         assert!(!info.has_shared_mapping);
+    }
+
+    #[test]
+    fn read_implies_exec_promotes_only_readable_protections() {
+        let read = MappingFlags::USER | MappingFlags::READ;
+        assert!(
+            personality_mmap_protection(READ_IMPLIES_EXEC, read).contains(MappingFlags::EXECUTE)
+        );
+        assert!(
+            !personality_mmap_protection(READ_IMPLIES_EXEC, MappingFlags::USER)
+                .contains(MappingFlags::EXECUTE)
+        );
+        assert!(!personality_mmap_protection(0, read).contains(MappingFlags::EXECUTE));
     }
 }
