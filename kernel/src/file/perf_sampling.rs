@@ -100,7 +100,7 @@ pub(crate) struct PerfSamplingFile {
     state: SpinNoIrq<SamplingState>,
     waiters: PollSet<4>,
     retire_next: AtomicPtr<PerfSamplingFile>,
-    retire_queued: AtomicBool,
+    retire_raw_refs: SpinNoIrq<usize>,
 }
 
 struct SamplingRetireQueue {
@@ -155,17 +155,16 @@ static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
 fn defer_custody_retire(event: Arc<PerfSamplingFile>) {
-    if event
-        .retire_queued
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // The already-published raw Arc remains an owner until task-context
-        // drain, so this IRQ-side drop can never be the final reference.
-        drop(event);
+    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
+    let publish_node = unsafe {
+        let mut refs = (*node).retire_raw_refs.lock();
+        let first = *refs == 0;
+        *refs = refs.checked_add(1).expect("bounded perf retire references");
+        first
+    };
+    if !publish_node {
         return;
     }
-    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
     loop {
         let head = RETIRED_CUSTODY.incoming.load(Ordering::Acquire);
         // SAFETY: this raw Arc is uniquely owned by the queue publication.
@@ -225,10 +224,18 @@ pub(crate) fn drain_deferred_custody_retire_work() {
                 .retire_next
                 .store(ptr::null_mut(), Ordering::Relaxed)
         };
-        // SAFETY: `into_raw` in defer_custody_retire creates exactly this Arc.
-        let event = unsafe { Arc::from_raw(node) };
-        event.retire_queued.store(false, Ordering::Release);
-        drop(event);
+        let refs = unsafe {
+            let mut refs = (*node).retire_raw_refs.lock();
+            let count = *refs;
+            *refs = 0;
+            count
+        };
+        // Once refs is zero, a new publisher can requeue the node.  Do not
+        // touch intrusive fields after this point.
+        for _ in 0..refs {
+            // SAFETY: every count originated at Arc::into_raw above.
+            drop(unsafe { Arc::from_raw(node) });
+        }
         count += 1;
     }
     if !list.is_null() {
@@ -255,7 +262,7 @@ impl PerfSamplingFile {
             config,
             waiters: PollSet::new(),
             retire_next: AtomicPtr::new(ptr::null_mut()),
-            retire_queued: AtomicBool::new(false),
+            retire_raw_refs: SpinNoIrq::new(0),
         })
         .map_err(|_| AxError::NoMemory)
     }
