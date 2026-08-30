@@ -47,6 +47,14 @@ fn should_yield_after_clone(flags: CloneFlags) -> bool {
         )
 }
 
+const fn clone_signal_altstack(flags: CloneFlags) -> crate::task::ForkSignalAltStack {
+    if flags.contains(CloneFlags::VM) && !flags.contains(CloneFlags::VFORK) {
+        crate::task::ForkSignalAltStack::Clear
+    } else {
+        crate::task::ForkSignalAltStack::Inherit
+    }
+}
+
 fn clone_namespace_owner(
     flags: CloneFlags,
     parent_cred: &Cred,
@@ -443,6 +451,10 @@ impl CloneArgs {
 
         let curr = current();
         let calling_thread = curr.as_thread();
+        // Snapshot only thread execution state. The fresh child manager must
+        // never inherit pending records or an in-flight delivery reservation.
+        let signal_execution_state = calling_thread.fork_signal_execution_state();
+        let signal_altstack = clone_signal_altstack(flags);
         // Reserve the Linux rseq child snapshot before any fallible clone
         // construction. The guard cancels automatically on every error path
         // and is committed only with the final child publication steps.
@@ -778,6 +790,9 @@ impl CloneArgs {
                 version: 0,
             },
         )?;
+        // Apply this while the child endpoint is still unpublished, so failed
+        // clone admissions cannot expose partially initialized signal state.
+        thr.apply_fork_signal_execution_state(signal_execution_state, signal_altstack);
         #[cfg(target_arch = "x86_64")]
         if !flags.contains(CloneFlags::VM) {
             // A fork from inside a signal handler inherits the handler's
@@ -1104,8 +1119,8 @@ mod tests {
     use super::{
         CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
         clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
-        clone_process_access_state, inherited_ioprio, release_clone_lifecycle_then,
-        should_yield_after_clone,
+        clone_process_access_state, clone_signal_altstack, inherited_ioprio,
+        release_clone_lifecycle_then, should_yield_after_clone,
     };
     use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
 
@@ -1157,6 +1172,21 @@ mod tests {
             CloneFlags::VFORK | CloneFlags::VM
         ));
         assert!(should_yield_after_clone(CloneFlags::VM));
+    }
+
+    #[test]
+    fn clone_signal_altstack_follows_fork_vm_and_vfork_rules() {
+        use crate::task::ForkSignalAltStack::{Clear, Inherit};
+
+        // This includes a fork executed by an SA_ONSTACK handler: the visible
+        // stack is inherited and the saved ucontext restores AUTODISARM state.
+        assert_eq!(clone_signal_altstack(CloneFlags::empty()), Inherit);
+        assert_eq!(clone_signal_altstack(CloneFlags::VFORK), Inherit);
+        assert_eq!(clone_signal_altstack(CloneFlags::VM), Clear);
+        assert_eq!(
+            clone_signal_altstack(CloneFlags::VM | CloneFlags::VFORK),
+            Inherit
+        );
     }
 
     #[test]

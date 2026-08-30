@@ -22,8 +22,9 @@ use scope_local::{ActiveScope, Scope};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_rseq::ThreadRseq;
 use thekernel_linux_seccomp::SeccompState;
-use thekernel_linux_signal::api::{
-    ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration,
+use thekernel_linux_signal::{
+    SignalSet, SignalStack,
+    api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration},
 };
 
 use super::{
@@ -1223,7 +1224,60 @@ pub(crate) struct SchedulerSeed {
     pub(crate) version: u64,
 }
 
+/// The thread-local signal execution state which survives `fork`/`clone`.
+///
+/// This deliberately excludes every signal-delivery data-plane field: pending
+/// records, an in-flight delivery selection, bypass tokens, and wake state all
+/// remain private to the fresh child signal endpoint.
+#[derive(Clone, Copy)]
+pub(crate) struct ForkSignalExecutionState {
+    blocked: SignalSet,
+    visible_stack: SignalStack,
+}
+
+/// How clone initializes the child's alternate signal stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForkSignalAltStack {
+    Inherit,
+    Clear,
+}
+
 impl Thread {
+    /// Takes the signal state snapshot needed before an unpublished fork child
+    /// is constructed.
+    ///
+    /// Clone executes in the source thread, so its blocked mask and visible
+    /// alternate-stack state cannot be concurrently changed by another
+    /// execution context of that thread. `real_blocked` is intentionally not
+    /// read: it is private to an active `rt_sigtimedwait` guard, and that guard
+    /// keeps its owner inside the wait syscall. The guard restores it before a
+    /// handler can run, hence a clone syscall is never reachable while it is
+    /// set. `rt_sigsuspend`'s temporary mask is already the visible mask; its
+    /// original mask, and an `SS_AUTODISARM` stack's original configuration,
+    /// are retained in the inherited user signal frame and are restored by the
+    /// child's `rt_sigreturn`.
+    pub(crate) fn fork_signal_execution_state(&self) -> ForkSignalExecutionState {
+        ForkSignalExecutionState {
+            blocked: self.signal.blocked(),
+            visible_stack: self.signal.stack(),
+        }
+    }
+
+    /// Applies a source snapshot before this child is published. The fresh
+    /// manager intentionally retains its empty pending queue and all fresh
+    /// delivery reservation, selection, bypass, and wake state.
+    pub(crate) fn apply_fork_signal_execution_state(
+        &self,
+        state: ForkSignalExecutionState,
+        altstack: ForkSignalAltStack,
+    ) {
+        self.signal.set_blocked(state.blocked);
+        self.signal.set_stack(match altstack {
+            ForkSignalAltStack::Inherit => state.visible_stack,
+            ForkSignalAltStack::Clear => SignalStack::default(),
+        });
+    }
+
     /// Publishes an event into this exact task's scheduler-owned lifecycle.
     /// Reservation occurs in perf_event_open, never in a switch callback.
     pub(crate) fn attach_perf_group(&self, group: Arc<crate::file::PerfGroup>) -> AxResult<()> {

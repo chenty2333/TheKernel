@@ -69,8 +69,9 @@ pub(crate) use self::{
     seccomp::{SeccompPublicationError, init_seccomp_filter_budget, seccomp_filter_budget},
     security::{LandlockDomain, PendingCredentialPublication, SignalTargetKind},
     thread::{
-        CetPendingSignalFrame, ProcStateHint, TaskParentChoice, TaskParentCredentialPin,
-        TaskParentNode, TaskParentPublicationGuard, lock_task_parent_publication,
+        CetPendingSignalFrame, ForkSignalAltStack, ProcStateHint, TaskParentChoice,
+        TaskParentCredentialPin, TaskParentNode, TaskParentPublicationGuard,
+        lock_task_parent_publication,
     },
 };
 
