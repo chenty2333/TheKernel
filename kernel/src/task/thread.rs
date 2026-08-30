@@ -32,6 +32,7 @@ use super::{
     creds::{Cred, CredentialSlot, CredentialSnapshotGuard},
     restart::RestartTracker,
     seccomp::ThreadSeccompSlot,
+    security::LandlockDomain,
     timer::{TimeManager, request_process_cpu_evaluation},
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
@@ -917,6 +918,9 @@ pub struct Thread {
     /// until their final owner exits.
     pub(in crate::task) seccomp: ThreadSeccompSlot,
 
+    /// Immutable Landlock domains are task-local and are snapshot by clone.
+    landlock: SpinNoIrq<LandlockDomain>,
+
     /// Preallocated disabled state retained for cold snapshots and terminal
     /// teardown. An active slot is synchronously cleared at exit, so the
     /// terminal path needs neither a replacement allocation nor retire-queue
@@ -1060,6 +1064,7 @@ impl Thread {
             fs_context,
             fd_table,
             0,
+            LandlockDomain::default(),
             scheduler_seed,
         )
     }
@@ -1076,6 +1081,7 @@ impl Thread {
         fs_context: Arc<FsContextSlot>,
         fd_table: Arc<FdTableSlot>,
         personality: u32,
+        landlock: LandlockDomain,
         scheduler_seed: SchedulerSeed,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         // ProcessData is created before the child scheduler object. Seed its
@@ -1110,6 +1116,7 @@ impl Thread {
             fd_table: SpinNoIrq::new(Some(fd_table)),
             seccomp,
             seccomp_terminal_disabled,
+            landlock: SpinNoIrq::new(landlock),
             personality: AtomicU32::new(personality),
             rseq: SpinNoIrq::new(ThreadRseq::new()),
             file_operation_credential: SpinNoIrq::new(None),
@@ -1157,6 +1164,9 @@ impl Thread {
     pub(crate) fn personality(&self) -> u32 {
         self.personality.load(Ordering::Acquire)
     }
+
+    pub(crate) fn landlock_domain(&self) -> LandlockDomain { self.landlock.lock().clone() }
+    pub(crate) fn replace_landlock_domain(&self, domain: LandlockDomain) { *self.landlock.lock() = domain; }
 
     pub(crate) fn set_personality(&self, personality: u32) {
         self.personality.store(personality, Ordering::Release);

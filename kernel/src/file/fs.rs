@@ -284,6 +284,8 @@ pub fn location_to_kstat(loc: &Location) -> AxResult<Kstat> {
 pub struct File {
     inner: axfs::File,
     nonblock: AtomicBool,
+    landlock_ioctl_dev_allowed: bool,
+    landlock_truncate_allowed: bool,
 }
 
 struct ReplayableWriteSource<'a, S: ?Sized> {
@@ -395,7 +397,29 @@ impl File {
         Self {
             inner,
             nonblock: AtomicBool::new(false),
+            landlock_ioctl_dev_allowed: true,
+            landlock_truncate_allowed: true,
         }
+    }
+
+    pub(crate) fn with_landlock_permissions(
+        inner: axfs::File,
+        allowed: bool,
+        truncate_allowed: bool,
+    ) -> Self {
+        Self {
+            inner,
+            nonblock: AtomicBool::new(false),
+            landlock_ioctl_dev_allowed: allowed,
+            landlock_truncate_allowed: truncate_allowed,
+        }
+    }
+
+    pub(crate) const fn landlock_ioctl_dev_allowed(&self) -> bool {
+        self.landlock_ioctl_dev_allowed
+    }
+    pub(crate) const fn landlock_truncate_allowed(&self) -> bool {
+        self.landlock_truncate_allowed
     }
 
     pub fn inner(&self) -> &axfs::File {

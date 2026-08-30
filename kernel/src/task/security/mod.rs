@@ -15,6 +15,7 @@ mod builtin;
 mod contexts;
 mod credential;
 mod dispatch;
+mod landlock;
 mod module;
 mod registry;
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub(crate) use builtin::*;
 pub(crate) use contexts::*;
 pub(crate) use credential::*;
 pub(crate) use dispatch::*;
+pub(crate) use landlock::*;
 pub(crate) use module::*;
 pub(crate) use registry::*;
 #[cfg(test)]

@@ -516,6 +516,15 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         return Ok(0);
     }
     if let Some(file) = f.downcast_ref::<File>()
+        && matches!(
+            file.inner().location().node_type(),
+            NodeType::CharacterDevice | NodeType::BlockDevice
+        )
+        && !file.landlock_ioctl_dev_allowed()
+    {
+        return Err(AxError::PermissionDenied);
+    }
+    if let Some(file) = f.downcast_ref::<File>()
         && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
     {
         return result;

@@ -819,6 +819,13 @@ impl Drop for Location {
 
 #[inherit_methods(from = "self.entry")]
 impl Location {
+    /// Returns whether `self` names the same object as, or an ancestor of,
+    /// `descendant` in this mount.  This is an object-identity relation, not a
+    /// pathname comparison, so rename/reuse cannot retarget policy rules.
+    pub fn is_same_or_ancestor_of(&self, descendant: &Location) -> bool {
+        Arc::ptr_eq(&self.mountpoint, &descendant.mountpoint)
+            && entry_is_same_or_ancestor_by_inode(&self.entry, &descendant.entry)
+    }
     pub fn inode(&self) -> u64;
 
     pub fn filesystem(&self) -> &dyn FilesystemOps;

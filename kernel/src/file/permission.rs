@@ -29,19 +29,24 @@ use crate::{
     file::privilege_metadata::InodePrivilegeCleanup,
     pseudofs::check_proc_pid_dir_search,
     task::{
-        Cred, DacCredentialView, Kgid, Kuid, UserNamespace,
+        AsThread, Cred, DacCredentialView, Kgid, Kuid, UserNamespace,
         security::{
             ExistingInodeSecurityRef, FileOpenSecurityContext, InodeCreateSecurityContext,
             InodeLinkSecurityContext, InodeMkdirSecurityContext, InodeMknodSecurityContext,
             InodePermissionOperation, InodePermissionSecurityContext, InodeRenameSecurityContext,
             InodeRmdirSecurityContext, InodeSecurityRef, InodeSetattrCommittedSecurityRef,
             InodeSetattrSecurityAdmission, InodeSetattrSecurityContext,
-            InodeSymlinkSecurityContext, InodeUnlinkSecurityContext, PlannedInodeSecurityRef,
-            RenameDestinationSecurityRef, dispatch_file_open, dispatch_inode_create,
-            dispatch_inode_link, dispatch_inode_mkdir, dispatch_inode_mknod,
-            dispatch_inode_permission, dispatch_inode_rename, dispatch_inode_rmdir,
-            dispatch_inode_setattr, dispatch_inode_symlink, dispatch_inode_unlink,
-            initial_user_namespace,
+            InodeSymlinkSecurityContext, InodeUnlinkSecurityContext, LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV,
+            LANDLOCK_ACCESS_FS_MAKE_BLOCK, LANDLOCK_ACCESS_FS_MAKE_CHAR,
+            LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
+            LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
+            LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
+            LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE,
+            LANDLOCK_ACCESS_FS_WRITE_FILE, PlannedInodeSecurityRef, RenameDestinationSecurityRef,
+            dispatch_file_open, dispatch_inode_create, dispatch_inode_link, dispatch_inode_mkdir,
+            dispatch_inode_mknod, dispatch_inode_permission, dispatch_inode_rename,
+            dispatch_inode_rmdir, dispatch_inode_setattr, dispatch_inode_symlink,
+            dispatch_inode_unlink, initial_user_namespace,
         },
     },
     time::wall_time,
@@ -62,6 +67,62 @@ pub(crate) struct VfsSecurityContext {
     actor: Arc<Cred>,
     credentials: DacCredentialView,
     filesystem_owner_user_ns: Arc<UserNamespace>,
+}
+
+/// Landlock is task-local rather than credential-local.  Fetching its
+/// immutable domain here is safe for this syscall execution context; a task
+/// can only append a new layer by returning to userspace and issuing another
+/// syscall.  Denials deliberately use EACCES, matching Linux path rules.
+pub(crate) fn check_landlock_access(location: &Location, access: u64) -> AxResult {
+    if axtask::current()
+        .as_thread()
+        .landlock_domain()
+        .allows_path(location, access)
+    {
+        Ok(())
+    } else {
+        Err(AxError::PermissionDenied)
+    }
+}
+
+pub(crate) fn landlock_allows_access(location: &Location, access: u64) -> bool {
+    axtask::current()
+        .as_thread()
+        .landlock_domain()
+        .allows_path(location, access)
+}
+fn check_landlock_refer_transition(source: &Location, destination: &Location) -> AxResult {
+    let domain = axtask::current().as_thread().landlock_domain();
+    let compared_access = if source.is_dir() {
+        u64::MAX
+    } else {
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE | LANDLOCK_ACCESS_FS_IOCTL_DEV
+    };
+    if domain.allows_path(source, LANDLOCK_ACCESS_FS_REFER)
+        && domain.allows_path(destination, LANDLOCK_ACCESS_FS_REFER)
+        && domain.destination_is_no_less_restrictive(source, destination, compared_access)
+    {
+        Ok(())
+    } else {
+        Err(LinuxError::EXDEV.into())
+    }
+}
+
+pub(crate) fn check_landlock_truncate(location: &Location) -> AxResult {
+    check_landlock_access(location, LANDLOCK_ACCESS_FS_TRUNCATE)
+}
+
+fn landlock_make_access(node_type: NodeType) -> AxResult<u64> {
+    match node_type {
+        NodeType::RegularFile => Ok(LANDLOCK_ACCESS_FS_MAKE_REG),
+        NodeType::Directory => Ok(LANDLOCK_ACCESS_FS_MAKE_DIR),
+        NodeType::CharacterDevice => Ok(LANDLOCK_ACCESS_FS_MAKE_CHAR),
+        NodeType::BlockDevice => Ok(LANDLOCK_ACCESS_FS_MAKE_BLOCK),
+        NodeType::Fifo => Ok(LANDLOCK_ACCESS_FS_MAKE_FIFO),
+        NodeType::Socket => Ok(LANDLOCK_ACCESS_FS_MAKE_SOCK),
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 impl VfsSecurityContext {
@@ -1081,6 +1142,25 @@ fn check_inode_permissions_with_metadata(
         actor,
         credentials,
     )?;
+    let requested = requested & (R_OK | W_OK);
+    let landlock_access = match metadata.node_type {
+        NodeType::Directory if requested & R_OK != 0 => LANDLOCK_ACCESS_FS_READ_DIR,
+        NodeType::Directory => 0,
+        _ => {
+            (if requested & R_OK != 0 {
+                LANDLOCK_ACCESS_FS_READ_FILE
+            } else {
+                0
+            }) | (if requested & W_OK != 0 {
+                LANDLOCK_ACCESS_FS_WRITE_FILE
+            } else {
+                0
+            })
+        }
+    };
+    if landlock_access != 0 {
+        check_landlock_access(loc, landlock_access)?;
+    }
     let object = InodeSecurityRef::new(loc, metadata);
     dispatch_inode_permission(&InodePermissionSecurityContext::new(
         actor,
@@ -1128,6 +1208,7 @@ pub(crate) fn authorize_named_inode_create(
     rdev: Option<axfs_ng_vfs::DeviceId>,
     security: &VfsSecurityContext,
 ) -> AxResult {
+    check_landlock_access(parent, landlock_make_access(node_type)?)?;
     let mode = InodeCreateMode::try_from_bits(mode.bits()).ok_or(AxError::BadState)?;
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let planned = PlannedInodeSecurityRef::new(parent_object, name);
@@ -1184,6 +1265,7 @@ pub(crate) fn authorize_symlink_create(
     target: &str,
     security: &VfsSecurityContext,
 ) -> AxResult {
+    check_landlock_access(parent, LANDLOCK_ACCESS_FS_MAKE_SYM)?;
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let planned = PlannedInodeSecurityRef::new(parent_object, name);
     dispatch_inode_symlink(&InodeSymlinkSecurityContext::new(
@@ -1244,6 +1326,10 @@ pub(crate) fn authorize_hardlink_create(
     name: &str,
     security: &VfsSecurityContext,
 ) -> AxResult {
+    check_landlock_access(parent, LANDLOCK_ACCESS_FS_MAKE_REG)?;
+    if source.parent().as_ref().is_none_or(|source_parent| !source_parent.same_node(parent)) {
+        check_landlock_refer_transition(source, parent)?;
+    }
     let source_object = InodeSecurityRef::new(source, source_metadata);
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let planned = PlannedInodeSecurityRef::new(parent_object, name);
@@ -1271,6 +1357,7 @@ pub(crate) fn authorize_inode_unlink(
     name: &str,
     security: &VfsSecurityContext,
 ) -> AxResult {
+    check_landlock_access(parent, LANDLOCK_ACCESS_FS_REMOVE_FILE)?;
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let target_object = InodeSecurityRef::new(target, target_metadata);
     let existing = ExistingInodeSecurityRef::new(parent_object, target_object, name);
@@ -1296,6 +1383,7 @@ pub(crate) fn authorize_inode_rmdir(
     name: &str,
     security: &VfsSecurityContext,
 ) -> AxResult {
+    check_landlock_access(parent, LANDLOCK_ACCESS_FS_REMOVE_DIR)?;
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let target_object = InodeSecurityRef::new(target, target_metadata);
     let existing = ExistingInodeSecurityRef::new(parent_object, target_object, name);
@@ -1326,6 +1414,25 @@ pub(crate) fn authorize_inode_rename(
     new_name: &str,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
+    check_landlock_access(
+        old_parent,
+        if source_metadata.node_type == NodeType::Directory {
+            LANDLOCK_ACCESS_FS_REMOVE_DIR
+        } else {
+            LANDLOCK_ACCESS_FS_REMOVE_FILE
+        },
+    )?;
+    check_landlock_access(
+        new_parent,
+        match replaced {
+            Some((target, _)) if target.is_dir() => LANDLOCK_ACCESS_FS_REMOVE_DIR,
+            Some(_) => LANDLOCK_ACCESS_FS_REMOVE_FILE,
+            None => landlock_make_access(source_metadata.node_type)?,
+        },
+    )?;
+    if !old_parent.same_node(new_parent) {
+        check_landlock_refer_transition(source, new_parent)?;
+    }
     let old_parent_object = InodeSecurityRef::new(old_parent, old_parent_metadata);
     let source_object = InodeSecurityRef::new(source, source_metadata);
     let old_entry = ExistingInodeSecurityRef::new(old_parent_object, source_object, old_name);
@@ -1418,6 +1525,7 @@ pub(crate) fn check_execute_permissions_with_security(
     if metadata.node_type != NodeType::RegularFile {
         return Err(AxError::PermissionDenied);
     }
+    check_landlock_access(loc, LANDLOCK_ACCESS_FS_EXECUTE)?;
     check_inode_permissions_with_metadata(
         loc,
         &metadata,

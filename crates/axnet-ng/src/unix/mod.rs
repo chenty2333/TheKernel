@@ -146,6 +146,19 @@ pub struct BindSlot {
 }
 
 impl BindSlot {
+    fn endpoint_identity(&self) -> Option<UnixEndpointIdentity> {
+        self.stream
+            .lock()
+            .as_ref()
+            .map(|bind| UnixEndpointIdentity::from_raw(bind.identity()))
+            .or_else(|| {
+                self.dgram
+                    .lock()
+                    .as_ref()
+                    .map(|bind| UnixEndpointIdentity::from_raw(bind.identity()))
+            })
+    }
+
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
@@ -219,7 +232,12 @@ impl UnixNamespace {
         }
     }
 
-    fn insert_abstract_slot(&self, name: Arc<Vec<u8>>, slot: Arc<BindSlot>) -> AxResult {
+    fn insert_abstract_slot_with(
+        &self,
+        name: Arc<Vec<u8>>,
+        slot: Arc<BindSlot>,
+        publish: impl FnOnce(),
+    ) -> AxResult {
         let mut binds = self.abstract_binds.lock();
         let retired = match binds.get(&name) {
             Some(existing) if existing.is_active() => return Err(AxError::AddrInUse),
@@ -232,6 +250,9 @@ impl UnixNamespace {
             return Err(AxError::NoMemory);
         }
         binds.insert(name, slot);
+        // The caller's companion metadata becomes visible while the endpoint
+        // remains protected by this namespace publication lock.
+        publish();
         drop(binds);
         drop(retired);
         Ok(())
@@ -287,6 +308,11 @@ impl UnixSocketTarget {
 
     fn slot(&self) -> &BindSlot {
         &self.slot
+    }
+
+    /// Identity of the exact bound endpoint retained by this target.
+    pub fn endpoint_identity(&self) -> AxResult<UnixEndpointIdentity> {
+        self.slot.endpoint_identity().ok_or(AxError::ConnectionRefused)
     }
 }
 
@@ -708,6 +734,27 @@ impl UnixSocket {
         })
     }
 
+    /// Binds an abstract endpoint and publishes caller-owned metadata in the
+    /// same namespace critical section as the endpoint name.
+    pub fn bind_abstract_with_publish(
+        &self,
+        address: UnixSocketAddr,
+        publish: impl FnOnce(UnixEndpointIdentity),
+    ) -> AxResult {
+        let UnixSocketAddr::Abstract(name) = &address else {
+            return Err(AxError::InvalidInput);
+        };
+        let name = name.clone();
+        let slot = Arc::try_new(BindSlot::default()).map_err(|_| AxError::NoMemory)?;
+        let target = UnixSocketTarget::new(address, slot.clone())?;
+        let reservation = self.reserve_bind(target)?;
+        let endpoint = reservation.target.endpoint_identity()?;
+        self.namespace
+            .insert_abstract_slot_with(name, slot, || publish(endpoint))?;
+        reservation.commit_inner(true);
+        Ok(())
+    }
+
     fn prepare_stream_connect_target(
         &self,
         target: UnixSocketTarget,
@@ -786,7 +833,7 @@ impl UnixSocket {
         Ok(())
     }
 
-    /// Connects to a pathname target resolved and admitted by the caller.
+    /// Connects to an already resolved Unix target admitted by the caller.
     pub fn connect_resolved(&self, target: UnixSocketTarget) -> AxResult {
         self.connect_resolved_as(target, UnixCredentials::UNKNOWN)
     }
@@ -798,23 +845,23 @@ impl UnixSocket {
         target: UnixSocketTarget,
         credentials: UnixCredentials,
     ) -> AxResult {
-        if !matches!(target.address(), UnixSocketAddr::Path(_)) {
-            return Err(AxError::InvalidInput);
-        }
         self.connect_target(target, credentials)
     }
 
-    /// Prepares a pathname Unix stream connection without publishing either
+    /// Prepares an already resolved Unix stream connection without publishing either
     /// channel endpoint or consuming its listener queue permit.
     pub fn prepare_stream_connect_resolved_as(
         &self,
         target: UnixSocketTarget,
         credentials: UnixCredentials,
     ) -> AxResult<UnixStreamConnectReservation<'_>> {
-        if !matches!(target.address(), UnixSocketAddr::Path(_)) {
-            return Err(AxError::InvalidInput);
-        }
         self.prepare_stream_connect_target(target, credentials)
+    }
+
+    /// Resolves one exact live abstract endpoint for an operation that must
+    /// retain it across policy dispatch.
+    pub fn resolve_abstract_target(&self, name: &Arc<Vec<u8>>) -> AxResult<UnixSocketTarget> {
+        UnixSocketTarget::from_bound(self.namespace.abstract_slot(name)?)
     }
 
     /// Connects an abstract Unix socket using an operation-time credential
@@ -825,8 +872,7 @@ impl UnixSocket {
             UnixSocketAddr::Unnamed => Err(AxError::InvalidInput),
             UnixSocketAddr::Path(_) => Err(AxError::OperationNotSupported),
             UnixSocketAddr::Abstract(name) => {
-                let slot = self.namespace.abstract_slot(name)?;
-                self.connect_target(UnixSocketTarget::from_bound(slot)?, credentials)
+                self.connect_target(self.resolve_abstract_target(name)?, credentials)
             }
         }
     }
@@ -843,8 +889,7 @@ impl UnixSocket {
             UnixSocketAddr::Unnamed => Err(AxError::InvalidInput),
             UnixSocketAddr::Path(_) => Err(AxError::OperationNotSupported),
             UnixSocketAddr::Abstract(name) => {
-                let slot = self.namespace.abstract_slot(name)?;
-                self.prepare_stream_connect_target(UnixSocketTarget::from_bound(slot)?, credentials)
+                self.prepare_stream_connect_target(self.resolve_abstract_target(name)?, credentials)
             }
         }
     }
@@ -975,17 +1020,7 @@ impl SocketOps for UnixSocket {
         match &local_addr {
             UnixSocketAddr::Unnamed => Err(AxError::InvalidInput),
             UnixSocketAddr::Path(_) => Err(AxError::OperationNotSupported),
-            UnixSocketAddr::Abstract(name) => {
-                let name = name.clone();
-                let slot = Arc::try_new(BindSlot::default()).map_err(|_| AxError::NoMemory)?;
-                let target = UnixSocketTarget::new(local_addr, slot.clone())?;
-                let reservation = self.reserve_bind(target)?;
-                // Only transport-ready slots enter the public abstract map.
-                // From this point commit is allocation-free and infallible.
-                self.namespace.insert_abstract_slot(name, slot)?;
-                reservation.commit_inner(true);
-                Ok(())
-            }
+            UnixSocketAddr::Abstract(_) => self.bind_abstract_with_publish(local_addr, |_| {}),
         }
     }
 

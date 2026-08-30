@@ -541,12 +541,16 @@ impl CloneArgs {
             calling_thread.fs_context_for_child()
         } else {
             let cloned = calling_thread.fs_context().lock().clone();
-            FsContextSlot::new(Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?)
+            FsContextSlot::new(
+                Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?,
+            )
         };
         let child_fd_table = if flags.contains(CloneFlags::FILES) {
             calling_thread.fd_table_for_child()
         } else {
-            crate::task::FdTableSlot::new(Arc::try_new(current_fd_table().fork_copy()?).map_err(|_| AxError::NoMemory)?)
+            crate::task::FdTableSlot::new(
+                Arc::try_new(current_fd_table().fork_copy()?).map_err(|_| AxError::NoMemory)?,
+            )
         };
         let (new_proc_data, thread_publication, pid_reservation) = if flags
             .contains(CloneFlags::THREAD)
@@ -735,6 +739,7 @@ impl CloneArgs {
             child_fs_context,
             child_fd_table,
             calling_thread.personality(),
+            calling_thread.landlock_domain(),
             SchedulerSeed {
                 state: child_sched_state,
                 reset_on_fork: child_reset_on_fork,
@@ -748,7 +753,11 @@ impl CloneArgs {
         // either task's first ioperm mutation.
         thr.install_ioport_snapshot(child_ioport);
         if thread_publication.is_initial() {
-            new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
+            new_proc_data.bind_initial_group_leader_signal(
+                tid,
+                thr.signal.clone(),
+                thr.landlock_domain(),
+            )?;
         }
         let task_parent_choice = if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
             TaskParentChoice::Inherit(calling_thread.task_parent_node().clone())

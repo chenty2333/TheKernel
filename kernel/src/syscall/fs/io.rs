@@ -35,8 +35,8 @@ use crate::{
         },
         lease, memfd,
         permission::{
-            SecurityFsContextExt, VfsSecurityContext, check_open_permissions_with_security,
-            check_writable_mount,
+            SecurityFsContextExt, VfsSecurityContext, check_landlock_truncate,
+            check_open_permissions_with_security, check_writable_mount,
         },
         pipe::{NamedPipe, PipeEndpoint},
         privilege_metadata::{
@@ -2732,6 +2732,7 @@ pub fn sys_truncate(
     check_writable_mount(&loc)?;
     crate::mm::check_not_active(&loc)?;
     let _swap_mutation = crate::mm::admit_mutation(&loc)?;
+    check_landlock_truncate(&loc)?;
     check_resize_limit(length as u64)?;
     // Unlike fd-backed mutations, path truncate has no persistent open-file
     // description carrying the ETXTBSY reference. Hold a transient write
@@ -2792,6 +2793,9 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     check_writable_mount(f.inner().location())?;
     crate::mm::check_not_active(f.inner().location())?;
     let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
+    if !f.landlock_truncate_allowed() {
+        return Err(AxError::PermissionDenied);
+    }
     executable::check_not_active(f.inner().location())?;
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;

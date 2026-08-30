@@ -531,6 +531,10 @@ pub struct Bind {
     buffers: Arc<SocketBufferLimits>,
 }
 impl Bind {
+    pub(super) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.peer_closed).cast::<()>() as usize
+    }
+
     fn connect(&self) -> AxResult<Channel> {
         if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
             return Err(AxError::ConnectionRefused);

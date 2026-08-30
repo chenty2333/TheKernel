@@ -189,7 +189,7 @@ impl Bind {
             .map_err(|_| AxError::ConnectionRefused)
     }
 
-    fn identity(&self) -> usize {
+    pub(super) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0).cast::<()>() as usize
     }
 

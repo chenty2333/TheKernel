@@ -39,7 +39,8 @@ use crate::{
     },
     syscall::net::{CMsg, CMsgBuilder, SCM_MAX_FD},
     task::{
-        security::{SocketSecurityContext, dispatch_socket},
+        AsThread,
+        security::{SocketSecurityContext, abstract_unix_socket_endpoint_is_in_scope, dispatch_socket},
         send_signal_to_process,
     },
 };
@@ -793,6 +794,12 @@ fn send_impl(
         cmsg,
         nonblocking_override: Some(nonblocking),
     };
+    let abstract_name = options.to.as_ref().and_then(|address| match address {
+        SocketAddrEx::Unix(UnixSocketAddr::Abstract(name)) => Some(name.clone()),
+        _ => None,
+    });
+    let option_flags = options.flags;
+    let option_nonblocking = options.nonblocking_override;
     let sent = match &socket.inner {
         AxSocket::Unix(unix) if unix.is_datagram() => {
             let reservation = match options.to.as_ref() {
@@ -803,6 +810,35 @@ fn send_impl(
                 }
                 _ => unix.prepare_may_send(options)?,
             };
+            if let Some(name) = abstract_name.as_deref() {
+                // Compare retained transport identities, never addresses: an
+                // abstract name may have been rebound between lookup and this
+                // policy decision.  The actual send reservation is the one
+                // compared and later committed.
+                let connected = SendOptions {
+                    to: None,
+                    flags: option_flags,
+                    cmsg: Vec::new(),
+                    nonblocking_override: option_nonblocking,
+                };
+                let same_connected_peer = unix
+                    .prepare_may_send(connected)
+                    .ok()
+                    .is_some_and(|peer| peer.receiving_identity() == reservation.receiving_identity());
+                if !same_connected_peer {
+                    let current = axtask::current();
+                    let thread = current.as_thread();
+                    let net_namespace = alloc::sync::Arc::as_ptr(socket.net_namespace()) as usize;
+                    if !abstract_unix_socket_endpoint_is_in_scope(
+                        net_namespace,
+                        name,
+                        reservation.receiving_identity(),
+                        &thread.landlock_domain(),
+                    ) {
+                        return Err(AxError::OperationNotPermitted);
+                    }
+                }
+            }
             let receiving = crate::file::UnixEndpointSecurityRef::new(
                 reservation.receiving_identity(),
                 socket.net_namespace(),

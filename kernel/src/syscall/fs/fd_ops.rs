@@ -9,8 +9,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use super::admit_resize;
 use axfs::{
-    FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent,
-    PathwalkPolicy,
+    FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
 use axfs_ng_vfs::{
     DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
@@ -28,8 +27,8 @@ use thekernel_linux_signal::Signo;
 
 use crate::{
     file::{
-        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, current_fd_table,
-        FileDescription, FileLike, Pipe, ReservedFd, close_file_like, dnotify, executable,
+        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, FileDescription,
+        FileLike, Pipe, ReservedFd, close_file_like, current_fd_table, dnotify, executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file,
         inotify::{
@@ -39,13 +38,13 @@ use crate::{
         lease, memfd,
         permission::{
             VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
-            check_create_permissions_with_security, check_open_permissions_with_security,
-            check_pathwalk_search_permission_with_security, check_writable_mount,
-            initial_named_create_owner_mode_with_security,
+            check_create_permissions_with_security, check_landlock_truncate,
+            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
+            check_writable_mount, initial_named_create_owner_mode_with_security,
+            landlock_allows_access,
         },
         pipe::NamedPipe,
-        prepare_file_description_with_open_lease, reserve_fd, resolve_at,
-        with_path_fs,
+        prepare_file_description_with_open_lease, reserve_fd, resolve_at, with_path_fs,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
@@ -636,7 +635,18 @@ fn prepare_open_description(
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }
                 }
-                let file = File::new(file);
+                let ioctl_allowed = !matches!(
+                    file.location().node_type(),
+                    NodeType::CharacterDevice | NodeType::BlockDevice
+                ) || landlock_allows_access(
+                    file.location(),
+                    crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
+                );
+                let truncate_allowed = landlock_allows_access(
+                    file.location(),
+                    crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
+                );
+                let file = File::with_landlock_permissions(file, ioctl_allowed, truncate_allowed);
                 if let Some(guard) = pty_guard {
                     description_resource =
                         Some(Box::try_new(guard).map_err(|_| AxError::NoMemory)?
@@ -919,6 +929,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
+            if truncates_regular {
+                check_landlock_truncate(&loc)?;
+            }
         }
 
         let file_open_operation = file_open_operation(flags as u32, created, false)?;
@@ -1052,7 +1065,8 @@ pub(crate) fn openat_inner(
 ) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
-    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    let security =
+        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     openat_inner_with_context(dirfd, path, flags, mode, security)
 }
 
@@ -1275,7 +1289,8 @@ pub fn sys_openat2(
     }
     let curr = current();
     let thread = curr.as_thread();
-    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    let security =
+        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     // Use one guard for both scoped pathwalk and creation. Combining the
     // predicates before acquisition avoids recursively locking the non-
     // reentrant namespace mutex when openat2 requests both.
@@ -1715,10 +1730,11 @@ pub fn sys_fcntl(
             let description = get_file_description(fd)?;
             let expected = description.id();
             if dnotify::is_remove_mask(raw_mask) {
-                let detached =
-                    current_fd_table().with_same_description(fd, expected, |table, _, description| {
-                        Ok(dnotify::detach_watch(table, description.id()))
-                    })?;
+                let detached = current_fd_table().with_same_description(
+                    fd,
+                    expected,
+                    |table, _, description| Ok(dnotify::detach_watch(table, description.id())),
+                )?;
                 drop(detached);
                 return Ok(0);
             }

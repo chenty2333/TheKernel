@@ -468,7 +468,12 @@ pub fn sys_faccessat2<M: UserMemory + ?Sized>(
     if let Some(security) = security.as_ref() {
         if let Some(loc) = loc {
             let metadata = loc.metadata()?;
-            check_inode_permissions_with_security(loc, &metadata, mode, security)?;
+            // faccessat(2) checks discretionary access using real/effective
+            // IDs; it is not an operation on the object and must not consume
+            // Landlock rights.
+            check_dac_permissions_with_security(
+                perm, metadata.uid, metadata.gid, node_type, mode, security,
+            )?;
         } else {
             check_dac_permissions_with_security(
                 perm, stat.uid, stat.gid, node_type, mode, security,

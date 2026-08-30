@@ -7,6 +7,7 @@ use axnet::{
     options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
+use axsync::Mutex;
 use linux_raw_sys::{
     general::O_PATH,
     ioctl::{FIONREAD, TIOCINQ},
@@ -17,7 +18,10 @@ use super::{File, FileHandle, FileLike, IoctlContext, Kstat, PseudoInode, try_ps
 use crate::bpf::{prog::BpfProgram, vm::BpfVm};
 use crate::{
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
-    task::NetworkNamespace,
+    task::{
+        Cred, NetworkNamespace,
+        security::{AbstractUnixSocketLabelReservation, LandlockDomain},
+    },
 };
 
 #[cfg(feature = "bpf")]
@@ -43,6 +47,8 @@ pub struct Socket {
     pub inner: SocketInner,
     net_ns: Arc<NetworkNamespace>,
     inode: PseudoInode,
+    abstract_landlock_label: Mutex<Option<AbstractUnixSocketLabelReservation>>,
+    creator_security: Option<(Arc<Cred>, LandlockDomain)>,
 }
 
 impl Deref for Socket {
@@ -59,11 +65,33 @@ impl Socket {
             inner,
             net_ns,
             inode: PseudoInode::socket(),
+            abstract_landlock_label: Mutex::new(None),
+            creator_security: None,
         }
     }
 
     pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
+    }
+
+    pub(crate) fn install_abstract_landlock_label(
+        &self,
+        label: AbstractUnixSocketLabelReservation,
+    ) {
+        *self.abstract_landlock_label.lock() = Some(label);
+    }
+
+    /// Freeze the task security state at socket creation.  A later holder of
+    /// the fd must not be able to relabel an abstract endpoint on bind.
+    pub(crate) fn capture_creator_security(&mut self, cred: Arc<Cred>, domain: LandlockDomain) {
+        self.creator_security = Some((cred, domain));
+    }
+
+    pub(crate) fn creator_landlock_domain(&self) -> AxResult<LandlockDomain> {
+        self.creator_security
+            .as_ref()
+            .map(|(_, domain)| domain.clone())
+            .ok_or(AxError::BadState)
     }
 
     pub(crate) fn read_with_nonblocking(

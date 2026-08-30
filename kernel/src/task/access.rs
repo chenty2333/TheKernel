@@ -8,8 +8,8 @@ use linux_raw_sys::general::{
 use thekernel_linux_process_adapter::Pid;
 
 use super::{
-    AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, Process, ProcessData,
-    ProcessImageAccessSnapshot, Thread, UserGid, UserNamespace, UserUid,
+    AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, LandlockDomain,
+    Process, ProcessData, ProcessImageAccessSnapshot, Thread, UserGid, UserNamespace, UserUid,
     security::{
         ProcessImageSecurityRef, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
         SecuritySignalContext, SignalSecurityOperation, SignalTargetKind, SignalTargetSecurityRef,
@@ -289,6 +289,12 @@ pub(crate) fn check_current_ptrace_image_snapshot(
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
+    if !actor
+        .landlock_domain()
+        .is_ancestor_of(&target.group_leader_landlock_domain())
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     check_ptrace_access(&actor.proc_data, &actor_cred, target, snapshot, mode)
 }
 
@@ -299,6 +305,12 @@ pub(crate) fn check_current_thread_ptrace_image_access(
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
+    if !actor
+        .landlock_domain()
+        .is_ancestor_of(&target.landlock_domain())
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     check_thread_ptrace_image_access_with_actor(actor, &actor_cred, target, mode)
 }
 
@@ -312,6 +324,12 @@ pub(crate) fn check_thread_ptrace_image_access_with_actor(
     target: &Thread,
     mode: PtraceAccessMode,
 ) -> AxResult<ProcessImageAccessSnapshot> {
+    if !actor
+        .landlock_domain()
+        .is_ancestor_of(&target.landlock_domain())
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     let snapshot = target.proc_data.thread_image_access_snapshot(target)?;
     check_ptrace_access(
         &actor.proc_data,
@@ -371,8 +389,13 @@ fn check_signal_access(
     target: &Arc<Process>,
     target_cred: &Cred,
     target_object: &SignalTargetSecurityRef<'_>,
+    actor_landlock: &LandlockDomain,
+    target_landlock: &LandlockDomain,
     operation: SignalSecurityOperation,
 ) -> AxResult<()> {
+    if !actor_landlock.allows_scope_to(target_landlock, super::security::LANDLOCK_SCOPE_SIGNAL) {
+        return Err(AxError::OperationNotPermitted);
+    }
     let same_thread_group = Arc::ptr_eq(actor, target);
     let actor_group = actor.group();
     let target_group = target.group();
@@ -408,6 +431,7 @@ pub(crate) fn check_current_pinned_thread_signal_access(
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
+    let actor_landlock = actor.landlock_domain();
     let target_object = SignalTargetSecurityRef::new(
         target_owner,
         target.kernel_tid(),
@@ -420,6 +444,8 @@ pub(crate) fn check_current_pinned_thread_signal_access(
         &target.proc_data.proc,
         target_cred,
         &target_object,
+        &actor_landlock,
+        &target.landlock_domain(),
         operation,
     )
 }
@@ -435,14 +461,22 @@ pub(crate) fn check_current_pinned_process_identity_signal_access(
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
+    let actor_landlock = actor.landlock_domain();
     let pid = target.pid();
     let target_object = SignalTargetSecurityRef::new(target, pid, pid, kind);
+    let target_landlock = super::get_process_data(pid)
+        .ok()
+        .map(|process| process.group_leader_landlock_domain())
+        .or_else(|| super::process::zombie_landlock_domain(target))
+        .unwrap_or_default();
     check_signal_access(
         &actor.proc_data.proc,
         &actor_cred,
         target,
         target_cred,
         &target_object,
+        &actor_landlock,
+        &target_landlock,
         operation,
     )
 }

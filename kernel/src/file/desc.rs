@@ -40,7 +40,7 @@ use super::{
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, Cred, Kuid, ProcessData, ProcessGroup, Thread, get_process_data,
+        AsThread, Cred, Kuid, LandlockDomain, ProcessData, ProcessGroup, Thread, get_process_data,
         get_process_group, get_visible_task, process_domain, send_queued_signal_thread_inner,
         send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
     },
@@ -902,6 +902,8 @@ pub struct AsyncIoState {
     pub owner: AsyncIoOwner,
     pub signal: u8,
     credentials: Option<AsyncIoCredentials>,
+    landlock: Option<LandlockDomain>,
+    landlock_tgid: Option<Pid>,
 }
 
 impl Default for AsyncIoState {
@@ -910,6 +912,8 @@ impl Default for AsyncIoState {
             owner: AsyncIoOwner::None(AsyncIoOwnerType::Pid),
             signal: 0,
             credentials: None,
+            landlock: None,
+            landlock_tgid: None,
         }
     }
 }
@@ -979,6 +983,19 @@ fn send_sigio_to_process(process: &ProcessData, info: SignalInfo) {
     }
 }
 
+fn sigio_in_scope(
+    state: &AsyncIoState,
+    target_tgid: Pid,
+    target: &LandlockDomain,
+) -> bool {
+    state.landlock.as_ref().is_none_or(|actor| {
+        state
+            .landlock_tgid
+            .is_some_and(|owner_tgid| owner_tgid == target_tgid)
+            || actor.allows_scope_to(target, crate::task::security::LANDLOCK_SCOPE_SIGNAL)
+    })
+}
+
 /// Delivers SIGIO through the stable owner object captured by F_SETOWN.
 /// Numeric IDs are retained only for ABI readback and are never looked up
 /// again during delivery, so a recycled PID/TID/PGID cannot inherit signals.
@@ -996,7 +1013,14 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 return;
             };
             let target_cred = thread.current_cred();
-            if thread.pending_exit() || !credentials.may_signal(&target_cred) {
+            if thread.pending_exit()
+                || !credentials.may_signal(&target_cred)
+                || !sigio_in_scope(
+                    state,
+                    thread.proc_data.proc.pid(),
+                    &thread.landlock_domain(),
+                )
+            {
                 return;
             }
             let info = sigio_info(state.signal, fd, reason);
@@ -1019,7 +1043,13 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 return;
             };
             let target_cred = process.group_leader_cred();
-            if credentials.may_signal(&target_cred) {
+            if credentials.may_signal(&target_cred)
+                && sigio_in_scope(
+                    state,
+                    process.proc.pid(),
+                    &process.group_leader_landlock_domain(),
+                )
+            {
                 send_sigio_to_process(&process, sigio_info(state.signal, fd, reason));
             }
         }
@@ -1041,6 +1071,11 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 let target_cred = process_data.group_leader_cred();
                 if !Arc::ptr_eq(&process_data.proc, process)
                     || !credentials.may_signal(&target_cred)
+                    || !sigio_in_scope(
+                        state,
+                        process_data.proc.pid(),
+                        &process_data.group_leader_landlock_domain(),
+                    )
                 {
                     return;
                 }
@@ -1430,21 +1465,55 @@ impl FileDescription {
     }
 
     pub fn set_async_io_owner(&self, owner: AsyncIoOwner) {
-        let credentials = (!owner.is_none())
-            .then(AsyncIoCredentials::current)
-            .flatten();
+        let (credentials, landlock, landlock_tgid) = if owner.is_none() {
+            (None, None, None)
+        } else {
+            current_may_uninit()
+                .and_then(|task| {
+                    task.try_as_thread().map(|thread| {
+                        let cred = thread.current_cred();
+                        let ids = cred.ids();
+                        (
+                            Some(AsyncIoCredentials {
+                                uid: ids.ruid,
+                                euid: ids.euid,
+                                euid_is_global_root: ids.euid == Kuid::INITIAL_ROOT
+                                    && cred.user_ns().is_initial(),
+                            }),
+                            Some(thread.landlock_domain()),
+                            Some(thread.proc_data.proc.pid()),
+                        )
+                    })
+                })
+                .unwrap_or((None, None, None))
+        };
         let mut ofd = self.ofd.lock();
         let state = ofd.async_owner_mut();
         state.owner = owner;
         state.credentials = credentials;
+        state.landlock = landlock;
+        state.landlock_tgid = landlock_tgid;
     }
 
     pub(crate) fn ensure_async_io_owner(&self, owner: AsyncIoOwner) {
         let credentials = AsyncIoCredentials::current();
+        let (landlock, landlock_tgid) = current_may_uninit()
+            .and_then(|task| {
+                task.try_as_thread().map(|thread| {
+                    (
+                        thread.landlock_domain(),
+                        thread.proc_data.proc.pid(),
+                    )
+                })
+            })
+            .map(|(domain, tgid)| (Some(domain), Some(tgid)))
+            .unwrap_or((None, None));
         let mut ofd = self.ofd.lock();
         let state = ofd.async_owner_mut();
         if state.owner.is_none() {
             state.credentials = credentials;
+            state.landlock = landlock;
+            state.landlock_tgid = landlock_tgid;
             state.owner = owner;
         }
     }

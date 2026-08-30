@@ -1651,6 +1651,47 @@ pub(super) fn dispatch_syscall(
             uctx.arg3() as _,
             uctx.arg4() as _,
         ),
+        Sysno::landlock_create_ruleset => with_user_memory(aspace(), |memory| {
+            sys_landlock_create_ruleset(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+            )
+        }),
+        Sysno::landlock_add_rule => with_user_memory(aspace(), |memory| {
+            sys_landlock_add_rule(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
+        Sysno::landlock_restrict_self => {
+            sys_landlock_restrict_self(uctx.arg0() as _, uctx.arg1() as _)
+        }
+        Sysno::lsm_list_modules => with_user_memory(aspace(), |memory| {
+            sys_lsm_list_modules(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
+        Sysno::lsm_get_self_attr => with_user_memory(aspace(), |memory| {
+            sys_lsm_get_self_attr(
+                memory,
+                uctx.arg0(),
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
+        Sysno::lsm_set_self_attr => with_user_memory(aspace(), |memory| {
+            sys_lsm_set_self_attr(
+                memory,
+                uctx.arg0(),
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
 
         // bpf
         #[cfg(feature = "bpf")]

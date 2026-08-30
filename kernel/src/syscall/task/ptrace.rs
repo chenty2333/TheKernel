@@ -169,6 +169,12 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
     if target.exec_in_progress() {
         return Err(AxError::OperationNotPermitted);
     }
+    if !ptracer
+        .landlock_domain()
+        .is_ancestor_of(&target_thread.landlock_domain())
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     let authorized_image = check_thread_ptrace_image_access_with_actor(
         ptracer,
         ptracer_credential.credential(),
@@ -282,6 +288,13 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
         Ok::<_, AxError>(task)
     };
     let parent_task = resolve_exact_parent()?;
+    if !parent_task
+        .as_thread()
+        .landlock_domain()
+        .is_ancestor_of(&child.landlock_domain())
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     let authorized_image = proc_data.thread_image_access_snapshot(child)?;
 
     let child_image_ref =

@@ -170,6 +170,7 @@ use super::{
         StopState, VforkControlState,
     },
     resources::Rlimits,
+    security::LandlockDomain,
     signal::PtraceSignalRecord,
     thread::{AsThread, TaskParentPublicationGuard, lock_task_parent_publication},
     timer::{PosixTimer, ProcessITimerWorkNode, ProcessITimers},
@@ -263,6 +264,9 @@ pub(crate) struct GroupLeaderSignalIdentity {
     /// every exec replacement, including when per-task scheduler versions
     /// restart from zero on the executor.
     scheduler_identity_token: u64,
+    /// Shared with the durable group-leader binding so an exec replacement is
+    /// reflected in the owner retained by a zombie payload.
+    landlock: Arc<SpinNoIrq<LandlockDomain>>,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -273,20 +277,7 @@ impl GroupLeaderSignalIdentity {
             pid_ns: None,
             scheduler: None,
             scheduler_identity_token: 0,
-        }
-    }
-
-    fn with_pid_namespace(
-        registration_tid: Pid,
-        manager: Arc<ThreadSignalManager>,
-        pid_ns: Option<Arc<PidNamespace>>,
-    ) -> Self {
-        Self {
-            registration_tid,
-            manager,
-            pid_ns,
-            scheduler: None,
-            scheduler_identity_token: 0,
+            landlock: Arc::new(SpinNoIrq::new(LandlockDomain::default())),
         }
     }
 
@@ -295,6 +286,7 @@ impl GroupLeaderSignalIdentity {
         manager: Arc<ThreadSignalManager>,
         pid_ns: Option<Arc<PidNamespace>>,
         scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
+        landlock: Arc<SpinNoIrq<LandlockDomain>>,
     ) -> Self {
         Self {
             registration_tid,
@@ -302,6 +294,7 @@ impl GroupLeaderSignalIdentity {
             pid_ns,
             scheduler: Some(scheduler),
             scheduler_identity_token: 0,
+            landlock,
         }
     }
 
@@ -320,6 +313,18 @@ pub(crate) type GroupLeaderSignalOwner = Arc<SpinNoIrq<Option<GroupLeaderSignalI
 /// provenance retained in the durable zombie payload.
 pub(crate) type Process =
     thekernel_linux_process_adapter::Process<Arc<Cred>, GroupLeaderSignalOwner>;
+
+/// Gets the label retained by a durable zombie identity after its runtime
+/// ProcessData has left PROCESS_TABLE.
+pub(crate) fn zombie_landlock_domain(process: &Process) -> Option<LandlockDomain> {
+    process.zombie_payload().and_then(|snapshot| {
+        snapshot
+            .reap_owner
+            .lock()
+            .as_ref()
+            .map(|owner| owner.landlock.lock().clone())
+    })
+}
 /// Linux process-group identity in the kernel-owned process domain.
 pub(crate) type ProcessGroup =
     thekernel_linux_process_adapter::ProcessGroup<Arc<Cred>, GroupLeaderSignalOwner>;
@@ -1855,6 +1860,7 @@ impl GroupLeaderIdentitySnapshot {
 struct GroupLeaderIdentityBinding {
     current: SpinNoIrq<Arc<CredentialSlot>>,
     signal: GroupLeaderSignalOwner,
+    landlock: Arc<SpinNoIrq<LandlockDomain>>,
     /// Starts nonzero and is renewed under the current/signal publication
     /// locks by every exec handoff.  It is read only while those locks are
     /// held, so a snapshot can never pair a new token with old owners.
@@ -1882,6 +1888,8 @@ impl GroupLeaderIdentityBinding {
         Ok(Self {
             current: SpinNoIrq::new(initial),
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
+            landlock: Arc::try_new(SpinNoIrq::new(LandlockDomain::default()))
+                .map_err(|_| AxError::NoMemory)?,
             identity_token: AtomicU64::new(1),
             pid_ns,
             scheduler_identity_epoch: SpinNoIrq::new(0),
@@ -1894,6 +1902,13 @@ impl GroupLeaderIdentityBinding {
     fn current_cred(&self) -> Arc<Cred> {
         let slot = self.current.lock().clone();
         slot.current()
+    }
+
+    fn landlock_domain(&self) -> LandlockDomain {
+        self.landlock.lock().clone()
+    }
+    fn replace_landlock_domain(&self, domain: LandlockDomain) {
+        *self.landlock.lock() = domain;
     }
 
     fn bind_initial_signal(
@@ -1910,6 +1925,7 @@ impl GroupLeaderIdentityBinding {
             signal,
             self.pid_ns.clone(),
             self.scheduler.clone(),
+            self.landlock.clone(),
         ));
         Ok(())
     }
@@ -3311,6 +3327,12 @@ impl ProcessData {
     pub(crate) fn group_leader_cred(&self) -> Arc<Cred> {
         self.group_leader_identity.current_cred()
     }
+    pub(crate) fn group_leader_landlock_domain(&self) -> LandlockDomain {
+        self.group_leader_identity.landlock_domain()
+    }
+    pub(crate) fn replace_group_leader_landlock_domain(&self, domain: LandlockDomain) {
+        self.group_leader_identity.replace_landlock_domain(domain);
+    }
 
     /// Binds the initial leader's private signal queue before process
     /// publication. Later non-leader exec replaces it atomically with the
@@ -3319,7 +3341,9 @@ impl ProcessData {
         &self,
         registration_tid: Pid,
         signal: Arc<ThreadSignalManager>,
+        landlock: LandlockDomain,
     ) -> AxResult<()> {
+        self.group_leader_identity.replace_landlock_domain(landlock);
         self.group_leader_identity
             .bind_initial_signal(registration_tid, signal)
     }
@@ -3557,6 +3581,8 @@ impl ProcessData {
         // on-enter hook can observe either complete publication, but can
         // never run while this task is suspended holding either writer lock.
         let _switch_guard = kernel_guard::NoPreemptIrqSave::new();
+        self.group_leader_identity
+            .replace_landlock_domain(thread.landlock_domain());
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
             &self.group_leader_identity,

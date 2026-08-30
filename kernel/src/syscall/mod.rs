@@ -3,6 +3,7 @@ mod bpf;
 mod dispatch;
 mod fs;
 mod io_mpx;
+pub(crate) mod landlock;
 mod ipc;
 mod mm;
 mod net;
@@ -29,7 +30,7 @@ pub(crate) use thekernel_linux_usercopy::RawSigevent;
 
 pub(crate) use self::sync::init_membarrier_ipi;
 pub use self::{
-    fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, seccomp::*, signal::*, sync::*, sys::*,
+    fs::*, io_mpx::*, ipc::*, landlock::*, mm::*, net::*, resources::*, seccomp::*, signal::*, sync::*, sys::*,
     task::*, time::*,
 };
 use crate::{

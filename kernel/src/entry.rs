@@ -16,12 +16,11 @@ use crate::{
     mm::{copy_from_kernel, load_user_app_trusted, new_user_aspace_empty},
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
-        FsContextSlot, ProcessAccessState, ProcessData, SchedulerSeed, Thread, TimeNamespace,
+        CgroupNamespace, Cred, CredentialSlot, Dumpability, FsContextSlot, NetworkNamespace,
+        PidNamespace, ProcessAccessState, ProcessData, SchedulerSeed, Thread, TimeNamespace,
         UserNamespace, UtsNamespace, init_process_domain, init_seccomp_filter_budget,
-        linux_pid_from_task_id,
-        prepare_task_table_admission, set_task_user_address_space, spawn_alarm_task,
-        try_new_user_task,
+        linux_pid_from_task_id, prepare_task_table_admission, set_task_user_address_space,
+        spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -172,8 +171,7 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::try_new(FdTable::new().expect("Failed to allocate init fd-table identity"))
             .expect("Failed to allocate init fd table");
     let init_fs_context = FS_CONTEXT.clone();
-    let scope = try_new_process_scope()
-        .expect("Failed to allocate init process scope");
+    let scope = try_new_process_scope().expect("Failed to allocate init process scope");
     let exit_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
             .expect("Failed to allocate init exit fd table");
@@ -221,7 +219,7 @@ pub fn init(args: &[String], envs: &[String]) {
         },
     )
     .expect("Failed to allocate init thread state");
-    proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
+    proc.bind_initial_group_leader_signal(tid, thr.signal.clone(), thr.landlock_domain())
         .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);
