@@ -308,11 +308,45 @@ struct LinuxFileHandle {
     handle_type: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandleDecodeAuthorization {
+    Global,
+    Superblock,
+    MountNamespace,
+}
+
 const fn short_handle_probe_header(required_bytes: u32) -> LinuxFileHandle {
     LinuxFileHandle {
         handle_bytes: required_bytes,
         handle_type: FILEID_INVALID,
     }
+}
+
+fn classify_handle_decode_authorization(
+    global_dac_search: bool,
+    caller_dac_search: bool,
+    superblock_admin: bool,
+    mount_namespace_admin: bool,
+    directory_scope: bool,
+    flags: u32,
+) -> Option<HandleDecodeAuthorization> {
+    if global_dac_search {
+        return Some(HandleDecodeAuthorization::Global);
+    }
+    if !caller_dac_search {
+        return None;
+    }
+    if superblock_admin {
+        return Some(HandleDecodeAuthorization::Superblock);
+    }
+    if mount_namespace_admin && directory_scope && flags & O_DIRECTORY != 0 {
+        return Some(HandleDecodeAuthorization::MountNamespace);
+    }
+    None
+}
+
+const fn usable_export_handle_bytes(handle_bytes: u32) -> usize {
+    (handle_bytes as usize >> 2) * size_of::<u32>()
 }
 
 fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
@@ -910,31 +944,35 @@ pub fn sys_open_by_handle_at(
             return Err(AxError::InvalidInput);
         }
     };
-    // may_decode_fh() has an unscoped global-capability fast path.  The
-    // relaxed path is deliberately narrower: a real O_DIRECTORY anchor plus
-    // CAP_SYS_ADMIN in the selected superblock's governing user namespace.
-    // The current VFS model governs every superblock from the initial user
-    // namespace; resolve that target only after admitting the selected mount,
-    // rather than using the caller's current namespace as the target.
+    // Keep Linux's global, superblock, and mount-namespace decode authorities
+    // distinct. The current VFS has one mount namespace and superblock owner
+    // domain (the initial user namespace), but the enum preserves the policy
+    // boundary as namespace ownership becomes per-mount.
     let selected_superblock_user_ns =
         crate::task::security::initial_user_namespace(thread.current_cred().user_ns());
-    let globally_authorized = thread.has_effective_capability(CAP_DAC_READ_SEARCH);
-    let relaxed_directory_scope = if globally_authorized {
-        None
-    } else if directory_scope
-        && flags as u32 & O_DIRECTORY != 0
-        && thread
+    let mount_namespace_user_ns = selected_superblock_user_ns.clone();
+    let authorization = classify_handle_decode_authorization(
+        thread.has_effective_capability(CAP_DAC_READ_SEARCH),
+        thread
             .current_cred()
-            .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
-        && ns_capable(
+            .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH),
+        ns_capable(
             &thread.current_cred(),
             &selected_superblock_user_ns,
             CAP_SYS_ADMIN,
-        )
-    {
-        Some(mount.clone())
-    } else {
-        return Err(LinuxError::EPERM.into());
+        ),
+        ns_capable(
+            &thread.current_cred(),
+            &mount_namespace_user_ns,
+            CAP_SYS_ADMIN,
+        ),
+        directory_scope,
+        flags as u32,
+    )
+    .ok_or(LinuxError::EPERM)?;
+    let relaxed_directory_scope = match authorization {
+        HandleDecodeAuthorization::MountNamespace => Some(mount.clone()),
+        HandleDecodeAuthorization::Global | HandleDecodeAuthorization::Superblock => None,
     };
 
     let flags = normalize_legacy_open_flags(flags)?;
@@ -963,6 +1001,9 @@ pub fn sys_open_by_handle_at(
         .read_bytes(body_addr, &mut body)
         .map_err(map_usercopy_error)?;
     let body = unsafe { slice::from_raw_parts(body.as_ptr().cast::<u8>(), body.len()) };
+    // exportfs consumes handle words, not arbitrary bytes. Retain the full
+    // user copy for fault/bounds behavior, then ignore a 1–3 byte tail.
+    let body = &body[..usable_export_handle_bytes(header.handle_bytes)];
 
     let location = mount
         .mountpoint()
@@ -2140,6 +2181,38 @@ mod namespace_operation_tests {
         let header = short_handle_probe_header(24);
         assert_eq!(header.handle_bytes, 24);
         assert_eq!(header.handle_type, FILEID_INVALID);
+    }
+
+    #[test]
+    fn handle_decode_authorization_keeps_superblock_and_mount_paths_distinct() {
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, true, false, false, 0),
+            Some(HandleDecodeAuthorization::Superblock)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, true, O_DIRECTORY),
+            Some(HandleDecodeAuthorization::MountNamespace)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, false, O_DIRECTORY),
+            None
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, true, 0),
+            None
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(true, false, false, false, false, 0),
+            Some(HandleDecodeAuthorization::Global)
+        );
+    }
+
+    #[test]
+    fn export_handle_decode_uses_complete_dwords_only() {
+        assert_eq!(usable_export_handle_bytes(8), 8);
+        assert_eq!(usable_export_handle_bytes(9), 8);
+        assert_eq!(usable_export_handle_bytes(11), 8);
+        assert_eq!(usable_export_handle_bytes(12), 12);
     }
 
     #[test]
