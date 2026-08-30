@@ -952,10 +952,17 @@ fn ua<Mm: UserMemory + ?Sized>(
     p: *const c_char,
 ) -> AxResult<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
     let raw = if p.is_null() {
-        Vec::new()
+        None
     } else {
-        vm_load_until_nul_bounded(m, p.cast(), ARGMAX).map_err(map_usercopy_error)?
+        Some(vm_load_until_nul_bounded(m, p.cast(), ARGMAX).map_err(map_usercopy_error)?)
     };
+    parse_uargs(raw)
+}
+
+fn parse_uargs(raw: Option<Vec<u8>>) -> AxResult<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    // load_module() uses strndup_user(), so NULL is a user-copy fault rather
+    // than an empty parameter string. An empty string must be readable NUL.
+    let raw = raw.ok_or(LinuxError::EFAULT)?;
     let parsed = args(&raw)?;
     Ok((raw, parsed))
 }
@@ -1093,6 +1100,8 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     fn param_image() -> Vec<u8> {
@@ -1166,6 +1175,17 @@ mod tests {
         assert_eq!(got, vec![(b"foo-bar".to_vec(), b"quoted value".to_vec())]);
         assert!(eq(b"foo-bar", b"foo_bar"));
         assert_eq!(num(b"077", false, 32).unwrap(), 63);
+    }
+
+    #[test]
+    fn module_uargs_require_a_nonnull_nul_terminated_pointer() {
+        assert_eq!(
+            LinuxError::from(parse_uargs(None).unwrap_err()),
+            LinuxError::EFAULT
+        );
+        let (raw, parsed) = parse_uargs(Some(Vec::new())).unwrap();
+        assert!(raw.is_empty());
+        assert!(parsed.is_empty());
     }
 
     #[test]
@@ -1262,7 +1282,7 @@ mod tests {
             0x3000,
         )
         .unwrap();
-        assert_eq!(u64::from_le_bytes(text.try_into().unwrap()), 0x3008);
+        assert_eq!(u64::from_le_bytes(text[..8].try_into().unwrap()), 0x3008);
 
         // The same symbol resolved PC-relatively from RW data must use the
         // final bases, rather than a temporary combined buffer address.
