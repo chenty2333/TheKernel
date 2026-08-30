@@ -836,14 +836,24 @@ impl FilesystemOps for Ext4Filesystem {
             }
             let Ok(directory) = entry.as_dir() else { continue };
             let mut names = Vec::<String>::new();
-            directory.read_dir(0, &mut |name: &str, _: u64, _: NodeType, _: u64| {
+            let listed = directory.read_dir(0, &mut |name: &str, _: u64, _: NodeType, _: u64| {
                 if name != "." && name != ".." {
                     names.push(String::from(name));
                 }
                 true
-            })?;
+            });
+            if let Err(error) = listed {
+                return match error {
+                    VfsError::NoMemory | VfsError::StorageFull => Err(error),
+                    _ => Ok(false),
+                };
+            }
             for name in names {
-                let child = directory.lookup(&name)?;
+                let child = match directory.lookup(&name) {
+                    Ok(child) => child,
+                    Err(error @ (VfsError::NoMemory | VfsError::StorageFull)) => return Err(error),
+                    Err(_) => return Ok(false),
+                };
                 if child.is_dir() {
                     pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
                     pending.push(child);
