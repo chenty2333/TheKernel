@@ -2429,6 +2429,8 @@ pub struct ProcessData {
 
     /// CPU time accumulated from sibling threads that have already exited.
     pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
+    /// Seqcount closes the exit-thread-list to exited-usage handoff gap.
+    pub(in crate::task) usage_transition_epoch: AtomicU64,
     /// CPU time accumulated from waited-for child subtrees.
     waited_children_usage: AtomicTaskUsage,
     /// Maximum resident set size observed for this process, in kilobytes.
@@ -2903,6 +2905,7 @@ impl ProcessData {
             process_itimer_work_queued: AtomicBool::new(false),
             process_itimer_work_node: ProcessITimerWorkNode::new(),
             exited_threads_usage: AtomicTaskUsage::new(),
+            usage_transition_epoch: AtomicU64::new(0),
             waited_children_usage: AtomicTaskUsage::new(),
             maxrss_kb: AtomicU64::new(0),
             wait_lock: Mutex::new(()),
@@ -3396,6 +3399,9 @@ impl ProcessData {
     pub fn account_exited_thread(&self, usage: super::accounting::TaskUsage) {
         self.exited_threads_usage.add(usage);
     }
+
+    pub(crate) fn begin_usage_transition(&self) { self.usage_transition_epoch.fetch_add(1, Ordering::AcqRel); }
+    pub(crate) fn end_usage_transition(&self) { self.usage_transition_epoch.fetch_add(1, Ordering::Release); }
 
     /// Records a waited-for child subtree into the process's child ledger.
     pub fn account_waited_child(&self, usage: super::accounting::TaskUsage) {

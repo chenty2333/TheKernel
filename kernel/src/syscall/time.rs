@@ -23,8 +23,8 @@ use crate::{
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
-        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, nanos_to_clock_ticks,
-        poll_timer, set_process_itimer,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, poll_timer, set_process_itimer,
+        times_clock_ticks,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -1115,13 +1115,13 @@ pub fn sys_adjtimex<M: UserMemory + ?Sized>(
 #[repr(C)]
 pub struct Tms {
     /// user time
-    tms_utime: usize,
+    tms_utime: i64,
     /// system time
-    tms_stime: usize,
+    tms_stime: i64,
     /// user time of children
-    tms_cutime: usize,
+    tms_cutime: i64,
     /// system time of children
-    tms_cstime: usize,
+    tms_cstime: i64,
 }
 
 pub fn sys_times<M: UserMemory + ?Sized>(
@@ -1130,26 +1130,29 @@ pub fn sys_times<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     if let Some(tms) = VmPtr::nullable(tms) {
         let curr = current();
+        // Flush the currently executing task before taking the lock-free
+        // group snapshot; siblings are sampled from their atomic snapshots.
+        poll_timer(&curr);
         let proc_data = &curr.as_thread().proc_data;
         let self_usage = proc_data.self_usage();
         let child_usage = proc_data.children_usage();
-        // SAFETY: `Tms` is repr(C) over four initialized usize words and has
+        // SAFETY: `Tms` is repr(C) over four initialized native clock_t words and has
         // no implicit padding on the supported x86_64 ABI.
         unsafe {
             VmMutPtr::vm_write_unchecked(
                 tms,
                 memory,
                 Tms {
-                    tms_utime: self_usage.utime_ticks() as usize,
-                    tms_stime: self_usage.stime_ticks() as usize,
-                    tms_cutime: child_usage.utime_ticks() as usize,
-                    tms_cstime: child_usage.stime_ticks() as usize,
+                    tms_utime: self_usage.utime_ticks() as i64,
+                    tms_stime: self_usage.stime_ticks() as i64,
+                    tms_cutime: child_usage.utime_ticks() as i64,
+                    tms_cstime: child_usage.stime_ticks() as i64,
                 },
             )
         }
         .map_err(map_usercopy_error)?;
     }
-    Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
+    Ok(times_clock_ticks(monotonic_time_nanos()) as isize)
 }
 
 /// Implements Linux alarm(2) by replacing the process-wide ITIMER_REAL with

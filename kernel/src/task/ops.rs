@@ -1495,6 +1495,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // waits for a grace period while lifecycle serialization is held.
     let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
+    thr.proc_data.begin_usage_transition();
     let final_exit = match remove_current_thread(process, tid, exit_code) {
         Ok(ThreadExitTransition::NotFound) => {
             fail_closed_exit(AxError::BadState);
@@ -1610,6 +1611,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
 
     thr.proc_data
         .account_exited_thread(TaskUsage::from_thread(thr));
+    thr.proc_data.end_usage_transition();
     if visible_tid != tid {
         remove_task_alias(visible_tid);
     }

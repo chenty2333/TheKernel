@@ -11,11 +11,22 @@ use crate::time::TimeValueLike;
 /// timer ticks. Keep this conversion centralized so `/proc` and `times()`
 /// report the same scale.
 pub const CLOCK_TICKS_PER_SEC: u64 = 100;
+const KERNEL_HZ: u64 = 1_000;
+/// Linux stores INITIAL_JIFFIES as a 32-bit unsigned `-300 * HZ`; on native
+/// x86_64 `jiffies64_to_clock_t()` preserves that historical wrapped origin.
+pub const INITIAL_JIFFIES: u64 = (-300_i32 * KERNEL_HZ as i32) as u32 as u64;
 
 pub fn nanos_to_clock_ticks(nanos: u64) -> u64 {
-    nanos
-        .saturating_mul(CLOCK_TICKS_PER_SEC)
-        .saturating_div(NANOS_PER_SEC)
+    // Divide first: multiplying nanoseconds overflows after roughly 5.85
+    // years even though the resulting clock_t remains representable.
+    nanos.saturating_div(NANOS_PER_SEC / CLOCK_TICKS_PER_SEC)
+}
+
+/// Linux `jiffies64_to_clock_t(get_jiffies_64())` for HZ=1000 and USER_HZ=100.
+pub fn times_clock_ticks(monotonic_nanos: u64) -> i64 {
+    INITIAL_JIFFIES
+        .saturating_add(monotonic_nanos / (NANOS_PER_SEC / KERNEL_HZ))
+        .saturating_div(KERNEL_HZ / CLOCK_TICKS_PER_SEC) as i64
 }
 
 /// Durable CPU usage totals stored in nanoseconds.
@@ -175,7 +186,10 @@ impl AtomicTaskUsage {
 }
 
 pub(crate) fn live_process_usage(proc_data: &super::ProcessData) -> TaskUsage {
-    proc_data
+    loop {
+    let before = proc_data.usage_transition_epoch.load(Ordering::Acquire);
+    if before & 1 != 0 { core::hint::spin_loop(); continue; }
+    let usage = proc_data
         .proc
         .thread_ids()
         .fold(proc_data.exited_threads_usage.snapshot(), |acc, tid| {
@@ -184,5 +198,25 @@ pub(crate) fn live_process_usage(proc_data: &super::ProcessData) -> TaskUsage {
             } else {
                 acc
             }
-        })
+        });
+    let after = proc_data.usage_transition_epoch.load(Ordering::Acquire);
+    if before == after { return usage; }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_tick_conversion_divides_before_multiplying() {
+        assert_eq!(nanos_to_clock_ticks(NANOS_PER_SEC), CLOCK_TICKS_PER_SEC);
+        assert_eq!(nanos_to_clock_ticks(u64::MAX), u64::MAX / (NANOS_PER_SEC / CLOCK_TICKS_PER_SEC));
+    }
+
+    #[test]
+    fn times_preserves_linux_wrapped_initial_jiffies_offset() {
+        assert_eq!(times_clock_ticks(0), 429_466_729);
+        assert_eq!(times_clock_ticks(NANOS_PER_SEC), 429_466_829);
+    }
 }
