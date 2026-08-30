@@ -1057,7 +1057,6 @@ impl Thread {
         events.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         events.push(Arc::downgrade(event));
         drop(events);
-        event.on_enter();
         Ok(())
     }
 

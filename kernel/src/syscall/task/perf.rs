@@ -10,7 +10,9 @@ use axtask::current;
 use crate::{
     file::{PerfEventFile, PerfGroup, SoftwareEvent, add_file_like, get_typed_file},
     mm::{UserMemoryCapability, map_usercopy_error},
-    task::AsThread,
+    task::{
+        AsThread, PtraceAccessMode, check_current_thread_ptrace_image_access, get_visible_task,
+    },
 };
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
@@ -79,9 +81,20 @@ pub(crate) fn sys_perf_event_open(
     if flags & PERF_FLAG_PID_CGROUP != 0 {
         return Err(AxError::OperationNotSupported);
     }
-    if pid != 0 || cpu != -1 {
+    if cpu != -1 {
         return Err(AxError::OperationNotSupported);
     }
+    let target_is_current = pid == 0;
+    let target = if target_is_current {
+        current().clone()
+    } else {
+        if pid < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        get_visible_task(pid as u32)?
+    };
+    // perf's task attachment has ptrace-style credential access semantics.
+    check_current_thread_ptrace_image_access(target.as_thread(), PtraceAccessMode::ReadReal)?;
     let group = if group_fd == -1 {
         PerfGroup::new()
     } else {
@@ -115,7 +128,10 @@ pub(crate) fn sys_perf_event_open(
         group,
         attr.read_format & PERF_FORMAT_GROUP != 0,
     )?;
-    current().as_thread().attach_perf_event(&file)?;
+    target.as_thread().attach_perf_event(&file)?;
+    if target_is_current {
+        file.on_enter();
+    }
     add_file_like(
         file as Arc<dyn crate::file::FileLike>,
         flags & PERF_FLAG_FD_CLOEXEC != 0,
