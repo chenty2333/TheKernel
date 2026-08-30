@@ -874,7 +874,7 @@ pub fn sys_open_by_handle_at(
     capability: UserMemoryCapability,
     mount_fd: c_int,
     handle: *const u8,
-    _flags: i32,
+    flags: i32,
 ) -> AxResult<isize> {
     let handle_addr = handle as usize;
     let header = unsafe {
@@ -884,15 +884,15 @@ pub fn sys_open_by_handle_at(
             .assume_init()
     };
 
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ
-        || header.handle_bytes == 0
-        || header.handle_type < 0
+    if header.handle_bytes != EXPORTED_HANDLE_BYTES
+        || header.handle_type != EXPORTED_HANDLE_TYPE
     {
         return Err(AxError::InvalidInput);
     }
-
-    if mount_fd != AT_FDCWD {
-        get_file_like(mount_fd)?;
+    // Unlike pathname-at syscalls, this argument is a real mount selector;
+    // AT_FDCWD is not a valid substitute for a mount file descriptor.
+    if mount_fd < 0 {
+        return Err(LinuxError::EBADF.into());
     }
 
     let curr = current();
@@ -906,13 +906,27 @@ pub fn sys_open_by_handle_at(
     let body_addr = handle_addr
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
-    let mut body = [MaybeUninit::<u8>::uninit(); MAX_FILE_HANDLE_SZ as usize];
+    let mut body = [MaybeUninit::<u8>::uninit(); EXPORTED_HANDLE_BYTES as usize];
     capability
         .read_bytes(body_addr, &mut body[..header.handle_bytes as usize])
         .map_err(map_usercopy_error)?;
 
-    // A well-formed handle cannot be decoded until the VFS exports stable IDs.
-    Err(LinuxError::ESTALE.into())
+    let body = unsafe { core::mem::transmute::<_, [u8; EXPORTED_HANDLE_BYTES as usize]>(body) };
+    let inode = u64::from_ne_bytes(body[..8].try_into().unwrap());
+    let generation = u64::from_ne_bytes(body[8..].try_into().unwrap());
+    // The mount fd selects the filesystem/mount view.  Empty-path resolution
+    // also preserves Linux's EBADF/ENOTDIR distinction for invalid descriptors.
+    let mount = resolve_at(mount_fd, Some(""), AT_EMPTY_PATH)?
+        .into_file()
+        .ok_or(AxError::InvalidInput)?;
+    let location = mount
+        .mountpoint()
+        .decode_export_handle(axfs_ng_vfs::ExportHandle { inode, generation })
+        .map_err(|_| LinuxError::ESTALE)?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    open_resolved_location_with_policy("", location, false, flags, 0, &security)
 }
 
 fn open_in_fs(
@@ -941,13 +955,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     let uid = credentials.uid().into_raw();
     let gid = credentials.gid().into_raw();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
-    let masked_mode =
-        NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
     let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));
-    // Linux reserves a numeric slot before path lookup can create a name or
-    // truncate an existing inode. The reservation is invisible until the OFD
-    // is fully constructed and published below.
-    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
     let (loc, created) = resolve_options.resolve_location_with_policy(
         fs,
         path,
@@ -989,6 +997,33 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         },
         policy,
     )?;
+
+    open_resolved_location_with_policy(path, loc, created, flags, mode, security)
+}
+
+/// Complete the post-lookup open transaction for an already-resolved inode.
+///
+/// Keeping this separate from pathname resolution is required by
+/// `open_by_handle_at`: handle lookup must receive precisely the same FD
+/// reservation, LSM/fanotify/lease admission, executable-write accounting,
+/// truncate, and notification ordering as a pathname open.
+fn open_resolved_location_with_policy(
+    path: &str,
+    loc: Location,
+    created: bool,
+    flags: i32,
+    mode: __kernel_mode_t,
+    security: &OpenPathSecurityContext,
+) -> AxResult<isize> {
+    let credentials = security.credentials();
+    let uid = credentials.uid().into_raw();
+    let gid = credentials.gid().into_raw();
+    let requested_mode = NodePermission::from_bits_truncate(mode as u16);
+    let masked_mode =
+        NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
+    // Keep the FD unpublished until every admission and (when requested)
+    // destructive side effect has succeeded.
+    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
 
     if created {
         if let Some(parent) = loc.parent() {
