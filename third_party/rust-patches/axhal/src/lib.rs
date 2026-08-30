@@ -59,6 +59,15 @@ pub mod mem;
 pub mod percpu;
 pub mod time;
 
+/// x86_64 hardware performance-monitoring counters.
+///
+/// This API is deliberately local-CPU only.  A counter lease pins its caller
+/// until it is released and never performs a remote MSR access.
+#[cfg(feature = "pmu")]
+pub mod pmu {
+    pub use axplat_x86_pc::pmu::*;
+}
+
 #[cfg(feature = "tls")]
 pub mod tls;
 

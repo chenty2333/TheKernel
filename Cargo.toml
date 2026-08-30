@@ -124,6 +124,7 @@ asid-fast-switch = ["thekernel-kernel/asid-fast-switch"]
 asid-switch-diagnostics = ["thekernel-kernel/asid-switch-diagnostics"]
 mm-lock-diagnostics = ["thekernel-kernel/mm-lock-diagnostics"]
 pmu-diagnostics = ["thekernel-kernel/pmu-diagnostics"]
+pmu = ["thekernel-kernel/pmu"]
 test-io-control = ["thekernel-kernel/test-io-control"]
 qemu = [
     "axfeat/defplat",

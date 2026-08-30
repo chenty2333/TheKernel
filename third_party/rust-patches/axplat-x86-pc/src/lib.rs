@@ -20,6 +20,9 @@ mod mem;
 mod power;
 mod time;
 
+#[cfg(feature = "pmu")]
+pub mod pmu;
+
 #[cfg(feature = "smp")]
 mod mp;
 

@@ -56,6 +56,10 @@ irq = [
     "axplat-dyn?/irq",
 ]
 myplat = []
+pmu = [
+    "dep:axplat-x86-pc",
+    "axplat-x86-pc/pmu",
+]
 paging = [
     "dep:axalloc",
     "dep:page_table_multiarch",

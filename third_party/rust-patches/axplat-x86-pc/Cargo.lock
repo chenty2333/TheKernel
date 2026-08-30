@@ -148,6 +148,7 @@ dependencies = [
  "bitflags 2.13.1",
  "heapless",
  "int_ratio",
+ "kernel_guard",
  "kspin",
  "lazyinit",
  "log",

@@ -52,6 +52,7 @@ targets = ["x86_64-unknown-none"]
 [features]
 fp-simd = ["axcpu/fp-simd"]
 irq = ["axplat/irq"]
+pmu = []
 reboot-on-system-off = []
 rtc = ["x86_rtc"]
 smp = [
@@ -82,6 +83,9 @@ version = "0.9"
 version = "0.1"
 
 [dependencies.kspin]
+version = "0.1"
+
+[dependencies.kernel_guard]
 version = "0.1"
 
 [dependencies.lazyinit]

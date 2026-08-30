@@ -14,12 +14,14 @@ repository.workspace = true
 [features]
 fp-simd = ["axcpu/fp-simd"]
 irq = ["axplat/irq"]
+pmu = []
 rtc = ["x86_rtc"]
 smp = ["axplat/smp", "kspin/smp"]
 reboot-on-system-off = []
 
 [dependencies]
 kspin = "0.1"
+kernel_guard = "0.1"
 log = "0.4"
 bitflags = "2.6"
 lazyinit = "0.2"
