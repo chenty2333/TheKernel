@@ -953,35 +953,6 @@ pub fn reset_current_task_extended_state() {
     super::signal::reset_current_legacy_fp_state();
 }
 
-/// Returns the CET control state saved for the running task.
-#[cfg(target_arch = "x86_64")]
-pub fn current_user_cet_state() -> axhal::asm::UserCetState {
-    let _guard = NoPreemptIrqSave::new();
-    let curr = current();
-    // SAFETY: the running task cannot be switched while the guard is held.
-    unsafe { (*((&***curr) as *const TaskInner as *mut TaskInner)).ctx_mut().user_cet }
-}
-
-/// Replaces the CET control state of the running task and the live CPU.
-#[cfg(target_arch = "x86_64")]
-pub fn set_current_user_cet_state(state: axhal::asm::UserCetState) {
-    let _guard = NoPreemptIrqSave::new();
-    let curr = current();
-    // SAFETY: the running task cannot be switched while the guard is held.
-    unsafe {
-        (*((&***curr) as *const TaskInner as *mut TaskInner))
-            .ctx_mut()
-            .set_current_user_cet_state(state);
-    }
-}
-
-/// Clears CET state during exec, matching Linux's non-inheritance rule for a
-/// newly installed executable image.
-#[cfg(target_arch = "x86_64")]
-pub fn reset_current_user_cet_state() {
-    set_current_user_cet_state(axhal::asm::UserCetState::default());
-}
-
 struct ProcessPtraceExitRetirements {
     _traced_relationship: Option<PtraceRelationshipSnapshot>,
     _reverse_links: super::process::PtraceReverseLinkDrain,

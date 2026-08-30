@@ -65,60 +65,6 @@ pub fn init_user_shadow_stack() {
     }
 }
 
-/// Architectural user-CET state owned by one schedulable task.
-///
-/// Keep this separate from XSAVE: CET's supervisor-visible control MSRs are
-/// switched explicitly and do not require enabling AVX or any optional XCR0
-/// component.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct UserCetState {
-    /// Value programmed into IA32_U_CET.
-    pub u_cet: u64,
-    /// Privilege-level-three shadow stack pointer programmed into IA32_PL3_SSP.
-    pub pl3_ssp: u64,
-    /// Linux ABI lock state; this is software metadata, never an MSR bit.
-    pub locked: bool,
-}
-
-#[cfg(target_os = "none")]
-const IA32_U_CET: u32 = 0x6a0;
-#[cfg(target_os = "none")]
-const IA32_PL3_SSP: u32 = 0x6a7;
-
-/// Read the CET state currently installed on this CPU.  CET is deliberately
-/// unavailable to hosted builds, where touching these MSRs would address the
-/// host process rather than a kernel task.
-#[inline]
-pub fn read_user_cet_state() -> UserCetState {
-    #[cfg(target_os = "none")]
-    {
-        if user_shadow_stack_enabled() {
-            // SAFETY: CR4.CET is live and these are architectural CET MSRs.
-            return UserCetState {
-                u_cet: unsafe { msr::rdmsr(IA32_U_CET) },
-                pl3_ssp: unsafe { msr::rdmsr(IA32_PL3_SSP) },
-            };
-        }
-    }
-    UserCetState::default()
-}
-
-/// Install a task's CET state on this CPU.
-#[inline]
-pub fn write_user_cet_state(state: UserCetState) {
-    #[cfg(target_os = "none")]
-    if user_shadow_stack_enabled() {
-        // SAFETY: CR4.CET is live and the scheduler owns the current task's
-        // CET MSRs with IRQs/preemption disabled during a context switch.
-        unsafe {
-            msr::wrmsr(IA32_PL3_SSP, state.pl3_ssp);
-            msr::wrmsr(IA32_U_CET, state.u_cet);
-        }
-    }
-    #[cfg(not(target_os = "none"))]
-    let _ = state;
-}
-
 /// Per-CPU capability observations used to decide whether PCID is safe for
 /// the whole boot.
 #[cfg(feature = "asid-fast-switch")]
