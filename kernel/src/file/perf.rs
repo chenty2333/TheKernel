@@ -4,7 +4,11 @@
 //! is kept out of this object so an event FD remains an ordinary anonymous
 //! descriptor while the per-CPU backend is introduced separately.
 
-use alloc::{borrow::Cow, sync::Arc};
+use alloc::{
+    borrow::Cow,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{mem::size_of, task::Context};
 
 use axerrno::{AxError, AxResult};
@@ -23,6 +27,56 @@ const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_REFRESH: u32 = 0x2402;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
+const PERF_IOC_FLAG_GROUP: usize = 1;
+
+pub(crate) struct PerfGroup {
+    members: Mutex<Vec<Weak<PerfEventFile>>>,
+}
+
+impl PerfGroup {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            members: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn add(&self, event: &Arc<PerfEventFile>) -> AxResult<()> {
+        let mut members = self.members.lock();
+        members.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        members.push(Arc::downgrade(event));
+        Ok(())
+    }
+
+    fn with_live(&self, operation: impl Fn(&PerfEventFile)) {
+        let mut members = self.members.lock();
+        members.retain(|member| {
+            let Some(member) = member.upgrade() else {
+                return false;
+            };
+            operation(&member);
+            true
+        });
+    }
+
+    fn counts(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let members = self.members.lock();
+        let count = members
+            .iter()
+            .filter(|member| member.strong_count() != 0)
+            .count();
+        let bytes = (count + 1)
+            .checked_mul(size_of::<u64>())
+            .ok_or(AxError::InvalidInput)?;
+        if dst.remaining_mut() < bytes {
+            return Err(AxError::InvalidInput);
+        }
+        dst.write(&(count as u64).to_ne_bytes())?;
+        for member in members.iter().filter_map(Weak::upgrade) {
+            dst.write(&member.count().to_ne_bytes())?;
+        }
+        Ok(bytes)
+    }
+}
 
 /// An enabled software perf event. `accumulated` is always a complete stopped
 /// interval; the running interval is sampled atomically from the monotonic
@@ -38,6 +92,8 @@ pub(crate) enum SoftwareEvent {
 pub struct PerfEventFile {
     id: u64,
     event: SoftwareEvent,
+    group: Arc<PerfGroup>,
+    read_group: bool,
     state: Mutex<PerfEventState>,
 }
 
@@ -49,11 +105,19 @@ struct PerfEventState {
 }
 
 impl PerfEventFile {
-    pub fn new(id: u64, event: SoftwareEvent, disabled: bool) -> Arc<Self> {
+    pub fn new(
+        id: u64,
+        event: SoftwareEvent,
+        disabled: bool,
+        group: Arc<PerfGroup>,
+        read_group: bool,
+    ) -> AxResult<Arc<Self>> {
         let now = monotonic_time_nanos();
-        Arc::new(Self {
+        let file = Arc::try_new(Self {
             id,
             event,
+            group: group.clone(),
+            read_group,
             state: Mutex::new(PerfEventState {
                 enabled: !disabled,
                 running: false,
@@ -61,6 +125,13 @@ impl PerfEventFile {
                 started: now,
             }),
         })
+        .map_err(|_| AxError::NoMemory)?;
+        group.add(&file)?;
+        Ok(file)
+    }
+
+    pub(crate) fn group(&self) -> Arc<PerfGroup> {
+        self.group.clone()
     }
 
     fn count(&self) -> u64 {
@@ -141,6 +212,9 @@ impl FileLike for PerfEventFile {
     }
 
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        if self.read_group {
+            return self.group.counts(dst);
+        }
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);
         }
@@ -162,21 +236,33 @@ impl FileLike for PerfEventFile {
                 | PERF_EVENT_IOC_DISABLE
                 | PERF_EVENT_IOC_REFRESH
                 | PERF_EVENT_IOC_RESET
-        ) && arg != 0
+        ) && arg & !PERF_IOC_FLAG_GROUP != 0
         {
             return Err(AxError::InvalidInput);
         }
         match cmd {
             PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_REFRESH => {
-                self.enable();
+                if arg & PERF_IOC_FLAG_GROUP != 0 {
+                    self.group.with_live(Self::enable);
+                } else {
+                    self.enable();
+                }
                 Ok(0)
             }
             PERF_EVENT_IOC_DISABLE => {
-                self.disable();
+                if arg & PERF_IOC_FLAG_GROUP != 0 {
+                    self.group.with_live(Self::disable);
+                } else {
+                    self.disable();
+                }
                 Ok(0)
             }
             PERF_EVENT_IOC_RESET => {
-                self.reset();
+                if arg & PERF_IOC_FLAG_GROUP != 0 {
+                    self.group.with_live(Self::reset);
+                } else {
+                    self.reset();
+                }
                 Ok(0)
             }
             PERF_EVENT_IOC_ID => {

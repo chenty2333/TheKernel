@@ -8,7 +8,7 @@ use axerrno::{AxError, AxResult};
 use axtask::current;
 
 use crate::{
-    file::{PerfEventFile, SoftwareEvent, add_file_like},
+    file::{PerfEventFile, PerfGroup, SoftwareEvent, add_file_like, get_typed_file},
     mm::{UserMemoryCapability, map_usercopy_error},
     task::AsThread,
 };
@@ -23,6 +23,7 @@ const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
 const PERF_ATTR_SIZE_VER0: u32 = 64;
 const ATTR_DISABLED: u64 = 1;
+const PERF_FORMAT_GROUP: u64 = 1 << 3;
 
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -49,7 +50,7 @@ fn read_attr(
 ) -> AxResult<PerfEventAttrV0> {
     if attr.is_null() {
         return Err(AxError::BadAddress);
-    }
+    };
     memory
         .read_value_uninit(attr)
         .map_err(map_usercopy_error)
@@ -81,9 +82,14 @@ pub(crate) fn sys_perf_event_open(
     if pid != 0 || cpu != -1 {
         return Err(AxError::OperationNotSupported);
     }
-    if group_fd != -1 && flags & PERF_FLAG_FD_NO_GROUP == 0 {
-        return Err(AxError::OperationNotSupported);
-    }
+    let group = if group_fd == -1 {
+        PerfGroup::new()
+    } else {
+        if flags & PERF_FLAG_FD_NO_GROUP != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        get_typed_file::<PerfEventFile>(group_fd)?.group()
+    };
     if attr.event_type != PERF_TYPE_SOFTWARE {
         return Err(AxError::OperationNotSupported);
     }
@@ -95,11 +101,20 @@ pub(crate) fn sys_perf_event_open(
         _ => return Err(AxError::OperationNotSupported),
     };
     // Sampling, output routing and read-format extensions are not fabricated.
-    if attr.sample_period != 0 || attr.sample_type != 0 || attr.read_format != 0 {
+    if attr.sample_period != 0
+        || attr.sample_type != 0
+        || attr.read_format & !PERF_FORMAT_GROUP != 0
+    {
         return Err(AxError::OperationNotSupported);
     }
     let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    let file = PerfEventFile::new(id, event, attr.flags & ATTR_DISABLED != 0);
+    let file = PerfEventFile::new(
+        id,
+        event,
+        attr.flags & ATTR_DISABLED != 0,
+        group,
+        attr.read_format & PERF_FORMAT_GROUP != 0,
+    )?;
     current().as_thread().attach_perf_event(&file)?;
     add_file_like(
         file as Arc<dyn crate::file::FileLike>,
