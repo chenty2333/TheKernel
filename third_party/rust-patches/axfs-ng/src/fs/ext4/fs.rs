@@ -10,8 +10,9 @@ use core::{
 };
 
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, Filesystem, FilesystemOps, Metadata, NodePermission, NodeType,
-    NodeUserData, Reference, StatFs, VfsError, VfsResult, WritebackErrorState, path::MAX_NAME_LEN,
+    DeviceId, DirEntry, ExportHandle, Filesystem, FilesystemOps, Metadata, NodePermission,
+    NodeType, NodeUserData, Reference, StatFs, VfsError, VfsResult, WritebackErrorState,
+    path::MAX_NAME_LEN,
 };
 use axsync::{Mutex as SleepingMutex, MutexGuard as SleepingMutexGuard};
 use hashbrown::HashMap;
@@ -776,6 +777,37 @@ impl FilesystemOps for Ext4Filesystem {
             visitor(inode_metadata(attr, project_id))?;
         }
         Ok(())
+    fn encode_export_handle(&self, entry: &DirEntry) -> VfsResult<ExportHandle> {
+        let inode = entry.downcast::<Inode>()?;
+        if !core::ptr::eq(self, inode.filesystem().as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let token = inode.export_handle().ok_or(VfsError::NotFound)?;
+        Ok(ExportHandle {
+            inode: token.ino() as u64,
+            generation: token.generation() as u64,
+        })
+    }
+
+    fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
+        let ino = u32::try_from(handle.inode).map_err(|_| VfsError::NotFound)?;
+        let generation = u32::try_from(handle.generation).map_err(|_| VfsError::NotFound)?;
+        let fs = self.root_dir().downcast::<Inode>()?.filesystem();
+        let (token, epoch, inode_type) = {
+            let mut low = fs.lock();
+            let (token, epoch) = low.retain_inode_handle(ino).map_err(into_vfs_err)?;
+            if token.generation() != generation {
+                low.release_inode_handle(token);
+                return Err(VfsError::NotFound);
+            }
+            let mut attr = FileAttr::default();
+            if let Err(error) = low.get_attr(ino, &mut attr) {
+                low.release_inode_handle(token);
+                return Err(into_vfs_err(error));
+            }
+            (token, epoch, attr.node_type)
+        };
+        Inode::try_finish_exported_entry(fs, token, epoch, inode_type)
     }
 
     fn flush(&self) -> VfsResult<()> {

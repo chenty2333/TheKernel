@@ -181,6 +181,39 @@ pub struct Inode {
 }
 
 impl Inode {
+    pub(crate) fn export_handle(&self) -> Option<InodeToken> {
+        self.token()
+    }
+
+    pub(crate) fn filesystem(&self) -> Arc<Ext4Filesystem> {
+        self.fs.clone()
+    }
+
+    pub(crate) fn try_finish_exported_entry(
+        fs: Arc<Ext4Filesystem>,
+        token: InodeToken,
+        namespace_epoch: Arc<AtomicU64>,
+        inode_type: InodeType,
+    ) -> VfsResult<DirEntry> {
+        let writeback = fs.reserve_writeback_error_state(Some(token))?;
+        match Self::try_prepare_entry_with_writeback_error_reservation(
+            fs.clone(),
+            inode_type,
+            Reference::anonymous(),
+            writeback,
+        ) {
+            Ok(prepared) => {
+                if let Some(runtime) = fs.runtime_attachment(token) {
+                    prepared.inode.attach_runtime(runtime);
+                }
+                Ok(prepared.bind(token, namespace_epoch))
+            }
+            Err(error) => {
+                fs.lock().release_inode_handle(token);
+                Err(error)
+            }
+        }
+    }
     pub(crate) fn try_prepare_entry(
         fs: Arc<Ext4Filesystem>,
         inode_type: InodeType,

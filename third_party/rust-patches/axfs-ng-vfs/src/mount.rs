@@ -15,8 +15,8 @@ use inherit_methods_macro::inherit_methods;
 use spin::{Once, RwLock};
 
 use crate::{
-    AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, Filesystem,
-    FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
+    AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, ExportHandle,
+    Filesystem, FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
     NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission, NodeType, OpenOptions,
     ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity, XattrProvider,
     XattrSetMode,
@@ -424,6 +424,23 @@ impl Mountpoint {
 
     pub fn filesystem_handle(self: &Arc<Self>) -> Filesystem {
         self.filesystem.clone()
+    }
+
+    pub fn encode_export_handle(self: &Arc<Self>, location: &Location) -> VfsResult<ExportHandle> {
+        if !Arc::ptr_eq(self, location.mountpoint()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        self.filesystem.encode_export_handle(location.entry())
+    }
+
+    pub fn decode_export_handle(self: &Arc<Self>, handle: ExportHandle) -> VfsResult<Location> {
+        // Keep a location admission across backend lookup so a normal unmount
+        // cannot pass its no-users phase between decode and publication.
+        let anchor = self.root_location();
+        let entry = self.filesystem.decode_export_handle(handle)?;
+        let result = anchor.wrap(entry);
+        drop(anchor);
+        Ok(result)
     }
 
     pub fn filesystem_identity_weak(self: &Arc<Self>) -> WeakFilesystemIdentity {
@@ -1552,8 +1569,12 @@ impl Location {
         // nothing, so it cannot leave a partially pivoted namespace.
         let new_subtree = new_root.subtree_nodes_locked()?;
         let old_subtree = old_root.subtree_nodes_locked()?;
-        if new_subtree.iter().any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
-            || old_subtree.iter().any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
+        if new_subtree
+            .iter()
+            .any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
+            || old_subtree
+                .iter()
+                .any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
         {
             return Err(VfsError::ResourceBusy);
         }
@@ -1562,7 +1583,10 @@ impl Location {
         *new_root.location.lock() = None;
         old_root.namespace_root.store(false, Ordering::Release);
         *old_root.location.lock() = Some(MountLocation::new(put_old));
-        new_root.children.lock().insert(put_old_key, old_root.clone());
+        new_root
+            .children
+            .lock()
+            .insert(put_old_key, old_root.clone());
         new_root.namespace_root.store(true, Ordering::Release);
         Mountpoint::refresh_subtree_handles_locked(&new_subtree);
         Mountpoint::refresh_subtree_handles_locked(&old_subtree);
@@ -1967,7 +1991,12 @@ mod tests {
         assert!(new_mount.is_root());
         assert!(!old_root_mount.is_root());
         assert!(old_root_mount.location().unwrap().ptr_eq(&put_old));
-        assert!(new_root.lookup_no_follow("child").unwrap().same_mount(&old_root));
+        assert!(
+            new_root
+                .lookup_no_follow("child")
+                .unwrap()
+                .same_mount(&old_root)
+        );
     }
 
     #[test]

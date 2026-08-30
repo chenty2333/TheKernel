@@ -16,6 +16,12 @@ use crate::{
 /// must return [`VfsError::OperationNotSupported`] rather than walking their
 /// visible directory tree and claiming that it is complete.
 pub type InodeVisitor<'a> = dyn FnMut(Metadata) -> VfsResult<()> + 'a;
+/// Filesystem-owned opaque identity for one live inode generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportHandle {
+    pub inode: u64,
+    pub generation: u64,
+}
 
 pub struct StatFs {
     pub fs_type: u32,
@@ -51,6 +57,16 @@ pub trait FilesystemOps: Send + Sync {
     /// namespace walk misses unlinked-but-open files and hard-link aliases.
     fn enumerate_inodes(&self, _visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotSupported)
+    /// Exports a backend-validated inode generation.  The VFS deliberately
+    /// does not synthesize a handle from a pathname or a bare inode number.
+    fn encode_export_handle(&self, _entry: &DirEntry) -> VfsResult<ExportHandle> {
+        Err(crate::VfsError::OperationNotSupported)
+    }
+
+    /// Resolves a previously exported live inode generation.  `NotFound`
+    /// means stale; other errors preserve backend failure information.
+    fn decode_export_handle(&self, _handle: ExportHandle) -> VfsResult<DirEntry> {
+        Err(crate::VfsError::OperationNotSupported)
     }
 
     /// Returns which inode metadata fields this filesystem can persist.
@@ -179,9 +195,18 @@ impl Filesystem {
         self.inner.ops.stat()
     }
 
+<<<<<<< HEAD
     /// Enumerates every live inode supplied by the backend.
     pub fn enumerate_inodes(&self, visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         self.inner.ops.enumerate_inodes(visitor)
+=======
+    pub fn encode_export_handle(&self, entry: &DirEntry) -> VfsResult<ExportHandle> {
+        self.inner.ops.encode_export_handle(entry)
+    }
+
+    pub fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
+        self.inner.ops.decode_export_handle(handle)
+>>>>>>> 955e94c8 (feat(vfs): add generation-safe export handles)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

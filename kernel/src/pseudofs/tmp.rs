@@ -20,10 +20,10 @@ use axfs::{
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
-    DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, Reference,
-    RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider,
-    XattrSetMode, path::MAX_NAME_LEN,
+    DirNodeOps, ExportHandle, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
+    MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
+    Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
+    XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
@@ -287,6 +287,30 @@ impl FilesystemOps for MemoryFs {
             visitor(inode.snapshot_metadata())?;
         }
         Ok(())
+    fn encode_export_handle(&self, entry: &DirEntry) -> VfsResult<ExportHandle> {
+        let node = entry.downcast::<MemoryNode>()?;
+        if !core::ptr::eq(self, node.fs.as_ref()) {
+            return Err(VfsError::CrossesDevices);
+        }
+        Ok(ExportHandle {
+            inode: node.inode.ino,
+            generation: 0,
+        })
+    }
+
+    fn decode_export_handle(&self, handle: ExportHandle) -> VfsResult<DirEntry> {
+        if handle.generation != 0 {
+            return Err(VfsError::NotFound);
+        }
+        let inode = self.get(handle.inode).ok_or(VfsError::NotFound)?;
+        let node_type = inode.metadata.lock().node_type;
+        // This is an anonymous VFS alias, not a namespace link: it retains
+        // the exact live inode generation without changing nlink or inventing
+        // a pathname. Once unlink drops the final inode registry reference,
+        // future handle decoding returns ESTALE at the syscall boundary.
+        let root = self.root_dir();
+        let fs = root.downcast::<MemoryNode>()?.fs.clone();
+        MemoryNode::try_new_entry(fs, inode, node_type, Reference::anonymous())
     }
 
     fn unmount(&self) {
