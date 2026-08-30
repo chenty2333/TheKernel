@@ -98,6 +98,9 @@ vsock = [
 name = "axruntime"
 path = "src/lib.rs"
 
+[dependencies.kspin]
+version = "0.1"
+
 [dependencies.axalloc]
 version = "=0.3.0-preview.2"
 optional = true

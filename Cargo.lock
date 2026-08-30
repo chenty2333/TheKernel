@@ -762,6 +762,7 @@ dependencies = [
  "ctor_bare",
  "indoc",
  "kernel_guard",
+ "kspin",
  "percpu",
  "thekernel-axtask",
 ]

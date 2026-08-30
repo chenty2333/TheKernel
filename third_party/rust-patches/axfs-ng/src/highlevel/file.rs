@@ -529,6 +529,10 @@ const GLOBAL_FILE_CACHE_RECLAIM_SCAN_PER_FILE: usize = 128;
 /// Bound the number of pages inspected per inode while estimating
 /// MemAvailable.  Truncation only under-estimates reclaimable memory.
 const GLOBAL_FILE_CACHE_ESTIMATE_PER_FILE: usize = 128;
+/// One shared nonresident domain is used when no memcg hierarchy exists.
+/// Keeping this budget global prevents a many-inode workload from retaining an
+/// arbitrary fixed number of shadows per inode.
+const MIN_FILE_CACHE_SHADOW_PAGES: usize = 64;
 
 /// Stable identity for one cached inode generation.
 ///
@@ -579,6 +583,12 @@ static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<CachedFileRegistryKey, FileUserD
 static FILE_CACHE_ESTIMATE_CURSOR: Once<Mutex<Option<CachedFileRegistryKey>>> = Once::new();
 static FILE_CACHE_RECLAIM_CURSOR: Once<Mutex<Option<CachedFileRegistryKey>>> = Once::new();
 static FILE_CACHE_RECLAIM_SCAN_EPOCH: AtomicU64 = AtomicU64::new(1);
+static FILE_CACHE_NONRESIDENT_AGE: AtomicU64 = AtomicU64::new(0);
+static FILE_CACHE_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+static FILE_CACHE_ACTIVE_PAGES: AtomicUsize = AtomicUsize::new(0);
+static FILE_CACHE_SHADOWS: Once<Mutex<LruCache<CachedFileShadowKey, u64>>> = Once::new();
+static FILE_CACHE_MANAGED_PAGES_ONCE: Once<()> = Once::new();
+static FILE_CACHE_MANAGED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static ENABLE_CACHED_FILE_IO_COUNTERS: AtomicBool = AtomicBool::new(false);
 static READ_BYPASS_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static READ_BYPASS_HITS: AtomicU64 = AtomicU64::new(0);
@@ -847,6 +857,157 @@ fn record_cached_file_counter(counter: &AtomicU64, value: u64) {
 
 fn file_cache_registry() -> &'static Mutex<BTreeMap<CachedFileRegistryKey, FileUserData>> {
     FILE_CACHE_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CachedFileShadowKey {
+    identity: CachedFileIdentity,
+    page: u32,
+}
+
+fn file_cache_shadows() -> &'static Mutex<LruCache<CachedFileShadowKey, u64>> {
+    FILE_CACHE_SHADOWS.call_once(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(MIN_FILE_CACHE_SHADOW_PAGES)
+                .expect("nonzero global file-cache shadow budget"),
+        ))
+    })
+}
+
+fn file_cache_shadow_budget() -> NonZeroUsize {
+    // This is the one shared workingset domain in the absence of memcgs.
+    // Contract it under allocator pressure rather than giving every inode a
+    // permanent private shadow allowance.
+    FILE_CACHE_MANAGED_PAGES_ONCE.call_once(|| {
+        let allocator = axalloc::global_allocator();
+        FILE_CACHE_MANAGED_PAGES.store(
+            allocator
+                .used_pages()
+                .saturating_add(allocator.available_pages()),
+            Ordering::Release,
+        );
+    });
+    let managed = FILE_CACHE_MANAGED_PAGES.load(Ordering::Acquire);
+    NonZeroUsize::new((managed / 8).max(MIN_FILE_CACHE_SHADOW_PAGES))
+        .expect("nonzero dynamic file-cache shadow budget")
+}
+
+fn current_file_cache_nonresident_age() -> u64 {
+    FILE_CACHE_NONRESIDENT_AGE.load(Ordering::Acquire)
+}
+
+fn advance_file_cache_nonresident_age() {
+    let mut shadows = file_cache_shadows().lock();
+    advance_file_cache_nonresident_age_locked(&mut shadows);
+}
+
+fn advance_file_cache_nonresident_age_locked(shadows: &mut LruCache<CachedFileShadowKey, u64>) {
+    if FILE_CACHE_NONRESIDENT_AGE.load(Ordering::Acquire) == u64::MAX {
+        shadows.clear();
+        FILE_CACHE_NONRESIDENT_AGE.store(1, Ordering::Release);
+    } else {
+        FILE_CACHE_NONRESIDENT_AGE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[inline]
+fn file_cache_shadow_is_recent(age: u64, evicted_at: u64, recent_threshold: u64) -> bool {
+    age.wrapping_sub(evicted_at) <= recent_threshold
+}
+
+fn record_file_cache_shadow(shared: &CachedFileShared, page: u32) {
+    let mut shadows = file_cache_shadows().lock();
+    shadows.resize(file_cache_shadow_budget());
+    // Allocate age and publish the LRU entry under the same domain lock.  On
+    // wrap, old ages cannot be compared safely, so expire the domain and
+    // restart its generation instead of manufacturing recent refaults.
+    let age = current_file_cache_nonresident_age();
+    advance_file_cache_nonresident_age_locked(&mut shadows);
+    shadows.put(
+        CachedFileShadowKey {
+            identity: shared.registry_key,
+            page,
+        },
+        age,
+    );
+}
+
+fn consume_file_cache_shadow(shared: &CachedFileShared, page: u32) {
+    file_cache_shadows().lock().pop(&CachedFileShadowKey {
+        identity: shared.registry_key,
+        page,
+    });
+}
+
+fn clear_file_cache_shadows<I>(shared: &CachedFileShared, pages: I)
+where
+    I: IntoIterator<Item = u32>,
+{
+    let mut shadows = file_cache_shadows().lock();
+    for page in pages {
+        shadows.pop(&CachedFileShadowKey {
+            identity: shared.registry_key,
+            page,
+        });
+    }
+}
+
+fn clear_file_cache_shadow_domain(shared: &CachedFileShared, domain: &InvalidationShadowDomain) {
+    let mut shadows = file_cache_shadows().lock();
+    let keys = shadows
+        .iter()
+        .filter_map(|(key, _)| {
+            (key.identity == shared.registry_key && domain.contains(key.page)).then_some(*key)
+        })
+        .collect::<Vec<_>>();
+    for key in keys {
+        shadows.pop(&key);
+    }
+}
+
+fn clear_all_file_cache_shadows(shared: &CachedFileShared) {
+    clear_file_cache_shadow_domain(shared, &InvalidationShadowDomain::All);
+}
+
+fn file_cache_resident_add(pages: usize) {
+    FILE_CACHE_RESIDENT_PAGES.fetch_add(pages, Ordering::AcqRel);
+}
+
+fn file_cache_resident_sub(pages: usize) {
+    let _ = FILE_CACHE_RESIDENT_PAGES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        n.checked_sub(pages)
+    });
+}
+
+fn file_cache_active_add() {
+    FILE_CACHE_ACTIVE_PAGES.fetch_add(1, Ordering::AcqRel);
+}
+
+fn file_cache_active_sub(pages: usize) {
+    let _ = FILE_CACHE_ACTIVE_PAGES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        n.checked_sub(pages)
+    });
+}
+
+fn file_cache_remove_page(page: &PageCache) {
+    file_cache_resident_sub(1);
+    if page.is_active() {
+        file_cache_active_sub(1);
+    }
+}
+
+fn file_cache_restore_page(page: &PageCache) {
+    file_cache_resident_add(1);
+    if page.is_active() {
+        file_cache_active_add();
+    }
+}
+
+fn file_cache_record_page_reference(page: &mut PageCache) {
+    if page.record_reference() {
+        file_cache_active_add();
+        advance_file_cache_nonresident_age();
+    }
 }
 
 fn file_cache_reclaim_cursor() -> &'static Mutex<Option<CachedFileRegistryKey>> {
@@ -1424,11 +1585,12 @@ fn reclaim_clean_pages_from_shared_with_scan_budget(
                 (scan.page, cache.len())
             };
             remaining_pages_after_reclaim = Some(remaining_pages);
-            let Some((_pn, page)) = candidate else {
+            let Some((pn, page)) = candidate else {
                 break;
             };
             // The listener lock is still held and known empty, so no mapping
             // can begin observing this cache page before it is released.
+            record_file_cache_shadow(shared, pn);
             drop(page);
             reclaimed += 1;
         }
@@ -1923,7 +2085,11 @@ fn pop_unpinned_lru_page(
             skipped += 1;
             continue;
         }
-        return Ok(cache.pop_lru());
+        let popped = cache.pop_lru();
+        if let Some((_, page)) = &popped {
+            file_cache_remove_page(page);
+        }
+        return Ok(popped);
     }
     if limit == 0 {
         Ok(None)
@@ -1956,13 +2122,23 @@ fn pop_clean_unpinned_lru_page(
         let dirty = page.is_dirty();
         let pinned = page.is_pinned();
         let writeback = page.is_writeback();
+        let active = page.is_active();
         scan.scanned += 1;
         scan.dirty += usize::from(dirty);
         scan.pinned += usize::from(pinned);
         scan.writeback += usize::from(writeback);
+        if active {
+            cache.get_mut(&pn).unwrap().demote_active();
+            file_cache_active_sub(1);
+            cache.promote(&pn);
+            continue;
+        }
         if !dirty && !pinned && !writeback {
             if page.is_noreuse() {
                 scan.page = cache.pop_lru();
+                if let Some((_, page)) = &scan.page {
+                    file_cache_remove_page(page);
+                }
                 return scan;
             }
             fallback.get_or_insert(pn);
@@ -1973,6 +2149,9 @@ fn pop_clean_unpinned_lru_page(
     }
     if let Some(pn) = fallback {
         scan.page = cache.pop(&pn).map(|page| (pn, page));
+        if let Some((_, page)) = &scan.page {
+            file_cache_remove_page(page);
+        }
     }
     scan
 }
@@ -1988,7 +2167,8 @@ fn pop_unused_readahead_lru_page(cache: &mut LruCache<u32, PageCache>) -> Option
         let pn = *pn;
         if page.is_unused_prefetched() {
             let popped = cache.pop_lru();
-            if popped.is_some() {
+            if let Some((_, page)) = &popped {
+                file_cache_remove_page(page);
                 record_readahead_retired_unused_page();
             }
             return popped;
@@ -1999,11 +2179,12 @@ fn pop_unused_readahead_lru_page(cache: &mut LruCache<u32, PageCache>) -> Option
 }
 
 fn restore_popped_cache_page(cache: &mut LruCache<u32, PageCache>, pn: u32, page: PageCache) {
+    file_cache_restore_page(&page);
     assert!(
         cache.put(pn, page).is_none(),
         "restoring an evicted cache page replaced page {pn}"
     );
-    cache.demote(&pn);
+    cache.demote(&pn); // LRU recency only; preserves PageCache::active.
 }
 
 /// Moves selected keys to the LRU end while retaining their encounter order.
@@ -2362,9 +2543,21 @@ pub struct PageCache {
     dirty: bool,
     prefetched: bool,
     noreuse: bool,
+    referenced: bool,
+    active: bool,
     pins: u32,
     writeback: u32,
     shmem: bool,
+}
+
+/// Per-file page-cache counters returned to the native cachestat adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CachedFileCacheStat {
+    pub nr_cache: u64,
+    pub nr_dirty: u64,
+    pub nr_writeback: u64,
+    pub nr_evicted: u64,
+    pub nr_recently_evicted: u64,
 }
 
 static IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -2388,6 +2581,8 @@ impl PageCache {
             dirty: false,
             prefetched: false,
             noreuse: false,
+            referenced: false,
+            active: false,
             pins: 0,
             writeback: 0,
             shmem,
@@ -2403,6 +2598,7 @@ impl PageCache {
     pub fn mark_dirty(&mut self) {
         self.prefetched = false;
         self.noreuse = false;
+        self.referenced = true;
         self.dirty = true;
     }
 
@@ -2434,6 +2630,36 @@ impl PageCache {
 
     fn is_noreuse(&self) -> bool {
         self.noreuse
+    }
+
+    fn is_prefetched(&self) -> bool {
+        self.prefetched
+    }
+
+    fn record_reference(&mut self) -> bool {
+        if self.referenced {
+            let promoted = !self.active;
+            self.active = true;
+            if promoted {
+                self.referenced = false;
+            }
+            promoted
+        } else {
+            self.referenced = true;
+            false
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn demote_active(&mut self) {
+        self.active = false;
+    }
+
+    fn is_referenced(&self) -> bool {
+        self.referenced
     }
 
     fn is_unused_prefetched(&self) -> bool {
@@ -2705,6 +2931,13 @@ struct DirtyWritebackRun {
     pages: Vec<DirtyWritebackPage>,
 }
 
+enum DirtyWritebackCopy {
+    Run(DirtyWritebackRun),
+    Empty,
+    Busy,
+    Stale,
+}
+
 struct DirtySgWritebackPage {
     pn: u32,
     ptr: *const u8,
@@ -2770,9 +3003,9 @@ fn copy_dirty_writeback_run(
     guard: &mut LruCache<u32, PageCache>,
     dirty_pages: &[u32],
     file_len: u64,
-) -> VfsResult<Option<DirtyWritebackRun>> {
+) -> VfsResult<DirtyWritebackCopy> {
     let Some(first_pn) = dirty_pages.first().copied() else {
-        return Ok(None);
+        return Ok(DirtyWritebackCopy::Empty);
     };
     let page_start = first_pn as u64 * PAGE_SIZE as u64;
     let max_len = file_len
@@ -2784,10 +3017,20 @@ fn copy_dirty_writeback_run(
                 page.clear_dirty();
             }
         }
-        return Ok(None);
+        return Ok(DirtyWritebackCopy::Empty);
     }
 
     let listeners = evict_listeners_snapshot(shared)?;
+    // The dirty snapshot is advisory. Do not copy a clean/stale page into a
+    // run whose byte offsets were derived from the original list; reselect it
+    // after releasing any existing writeback instead.
+    for pn in dirty_pages {
+        match guard.get(pn) {
+            Some(page) if page.is_writeback() => return Ok(DirtyWritebackCopy::Busy),
+            Some(page) if page.is_dirty() => {}
+            _ => return Ok(DirtyWritebackCopy::Stale),
+        }
+    }
     let mut pages: Vec<DirtyWritebackPage> = Vec::with_capacity(dirty_pages.len());
     for (idx, pn) in dirty_pages.iter().enumerate() {
         let Some(page) = guard.get_mut(pn) else {
@@ -2808,11 +3051,13 @@ fn copy_dirty_writeback_run(
         pages.push(DirtyWritebackPage { pn: *pn, data });
     }
 
-    Ok((!pages.is_empty()).then_some(DirtyWritebackRun {
-        page_start,
-        bytes: max_len,
-        pages,
-    }))
+    Ok((!pages.is_empty())
+        .then_some(DirtyWritebackRun {
+            page_start,
+            bytes: max_len,
+            pages,
+        })
+        .map_or(DirtyWritebackCopy::Empty, DirtyWritebackCopy::Run))
 }
 
 fn begin_sg_dirty_writeback_run(
@@ -2915,16 +3160,55 @@ fn finish_sg_dirty_writeback_run(
     }
 }
 
-fn clear_flushed_dirty_run(shared: &CachedFileShared, run: &DirtyWritebackRun) {
+fn begin_dirty_writeback_run(shared: &CachedFileShared, run: &DirtyWritebackRun) -> VfsResult<()> {
+    let mut guard = shared.page_cache.lock();
+    let mut begun = Vec::new();
+    for written in &run.pages {
+        let Some(page) = guard.get_mut(&written.pn) else {
+            for pn in begun {
+                guard
+                    .get_mut(&pn)
+                    .expect("begun page disappeared")
+                    .end_writeback();
+            }
+            return Err(VfsError::ResourceBusy);
+        };
+        if !page.is_dirty() || page.is_writeback() {
+            for pn in begun {
+                guard
+                    .get_mut(&pn)
+                    .expect("begun page disappeared")
+                    .end_writeback();
+            }
+            return Err(VfsError::ResourceBusy);
+        }
+        if let Err(error) = page.begin_writeback() {
+            for pn in begun {
+                guard
+                    .get_mut(&pn)
+                    .expect("begun page disappeared")
+                    .end_writeback();
+            }
+            return Err(error);
+        }
+        begun.push(written.pn);
+    }
+    Ok(())
+}
+
+fn finish_dirty_writeback_run(shared: &CachedFileShared, run: &DirtyWritebackRun, success: bool) {
     let mut guard = shared.page_cache.lock();
     for written in &run.pages {
         let Some(page) = guard.get_mut(&written.pn) else {
             continue;
         };
-        if page.is_dirty() && page.data().get(..written.data.len()) == Some(written.data.as_slice())
+        if success
+            && page.is_dirty()
+            && page.data().get(..written.data.len()) == Some(written.data.as_slice())
         {
             page.clear_dirty();
         }
+        page.end_writeback();
     }
 }
 
@@ -3179,6 +3463,8 @@ fn flush_dirty_page_list_locked(
                 DirtySgWritebackBegin::Busy => {
                     record_async_dirty_flush_writeback_restart();
                     wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
+                    dirty_pages = cached_dirty_page_numbers(shared);
+                    start = 0;
                     continue;
                 }
                 DirtySgWritebackBegin::Fallback => {
@@ -3187,14 +3473,40 @@ fn flush_dirty_page_list_locked(
             }
         }
 
-        let run = {
+        let copy = {
             let mut guard = shared.page_cache.lock();
             copy_dirty_writeback_run(shared, &mut guard, &dirty_pages[start..end], file_len)
         }?;
-        let Some(run) = run else {
-            start = end;
-            continue;
+        let run = match copy {
+            DirtyWritebackCopy::Run(run) => run,
+            DirtyWritebackCopy::Empty => {
+                start = end;
+                continue;
+            }
+            DirtyWritebackCopy::Busy => {
+                record_async_dirty_flush_writeback_restart();
+                wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
+                dirty_pages = cached_dirty_page_numbers(shared);
+                start = 0;
+                continue;
+            }
+            DirtyWritebackCopy::Stale => {
+                dirty_pages = cached_dirty_page_numbers(shared);
+                start = 0;
+                continue;
+            }
         };
+
+        if let Err(error) = begin_dirty_writeback_run(shared, &run) {
+            if error == VfsError::ResourceBusy {
+                record_async_dirty_flush_writeback_restart();
+                wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
+                dirty_pages = cached_dirty_page_numbers(shared);
+                start = 0;
+                continue;
+            }
+            return Err(error.into());
+        }
 
         let segments = build_dirty_writeback_segments(&run);
         let slices = segments.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -3205,15 +3517,17 @@ fn flush_dirty_page_list_locked(
         match write_result {
             Ok(written) if written == run.bytes => {
                 record_dirty_writeback(range_flush, run.pages.len(), run.bytes, async_enabled);
-                clear_flushed_dirty_run(shared, &run);
+                finish_dirty_writeback_run(shared, &run, true);
             }
             Ok(_) => {
+                finish_dirty_writeback_run(shared, &run, false);
                 if async_enabled {
                     record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
                 }
                 return Err(DirtyWritebackError::completion(VfsError::Io, false));
             }
             Err(err) => {
+                finish_dirty_writeback_run(shared, &run, false);
                 if async_enabled {
                     record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
                 }
@@ -3588,6 +3902,42 @@ impl RangeWritebackState {
 }
 
 impl CachedFileShared {
+    fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
+        if first_page > last_page {
+            return CachedFileCacheStat::default();
+        }
+        let recent_threshold =
+            u64::try_from(FILE_CACHE_ACTIVE_PAGES.load(Ordering::Acquire)).unwrap_or(u64::MAX);
+        let cache = self.page_cache.lock();
+        let mut stat = CachedFileCacheStat::default();
+        for (page_no, page) in cache.iter() {
+            if (first_page..=last_page).contains(&u64::from(*page_no)) {
+                stat.nr_cache += 1;
+                stat.nr_dirty += u64::from(page.is_dirty());
+                stat.nr_writeback += u64::from(page.is_writeback());
+            }
+        }
+        let shadows = file_cache_shadows().lock();
+        // Sample age only after joining the shadow publication domain, so a
+        // reclaimer cannot publish A+1 between the entry observation and the
+        // age snapshot used to classify A.
+        let age = current_file_cache_nonresident_age();
+        for (key, evicted_at) in shadows.iter() {
+            if key.identity == self.registry_key
+                && (first_page..=last_page).contains(&u64::from(key.page))
+                && !cache.contains(&key.page)
+            {
+                stat.nr_evicted += 1;
+                stat.nr_recently_evicted += u64::from(file_cache_shadow_is_recent(
+                    age,
+                    *evicted_at,
+                    recent_threshold,
+                ));
+            }
+        }
+        stat
+    }
+
     #[cfg(test)]
     fn new(registry_key: CachedFileRegistryKey, in_memory: bool) -> Self {
         Self::with_identity(
@@ -3678,9 +4028,27 @@ impl CachedFileShared {
     }
 }
 
+#[derive(Clone)]
+enum InvalidationShadowDomain {
+    All,
+    Range(Range<u32>),
+    From(u64),
+}
+
+impl InvalidationShadowDomain {
+    fn contains(&self, page: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Range(range) => range.contains(&page),
+            Self::From(first) => u64::from(page) >= *first,
+        }
+    }
+}
+
 struct CachedPageInvalidationTransaction {
     shared: Arc<CachedFileShared>,
     pages: Vec<(u32, PageCache)>,
+    shadow_domain: Option<InvalidationShadowDomain>,
     committed: bool,
 }
 
@@ -3693,11 +4061,13 @@ impl CachedPageInvalidationTransaction {
         Self {
             shared,
             pages: Vec::new(),
+            shadow_domain: None,
             committed: false,
         }
     }
 
     fn stage_all(&mut self) -> VfsResult<()> {
+        self.shadow_domain = Some(InvalidationShadowDomain::All);
         let mut cache = self.shared.page_cache.lock();
         if cache.iter().any(|(_, page)| page.is_pinned()) {
             return Err(VfsError::ResourceBusy);
@@ -3707,6 +4077,7 @@ impl CachedPageInvalidationTransaction {
             .try_reserve_exact(cache.len())
             .map_err(|_| VfsError::NoMemory)?;
         while let Some((pn, page)) = cache.pop_lru() {
+            file_cache_remove_page(&page);
             self.pages.push((pn, page));
         }
         drop(cache);
@@ -3714,6 +4085,7 @@ impl CachedPageInvalidationTransaction {
     }
 
     fn stage_range(&mut self, pages: Range<u32>) -> VfsResult<usize> {
+        self.shadow_domain = Some(InvalidationShadowDomain::Range(pages.clone()));
         let mut cache = self.shared.page_cache.lock();
         let listeners = evict_listeners_snapshot(&self.shared)?;
         let mut keys = Vec::new();
@@ -3738,6 +4110,7 @@ impl CachedPageInvalidationTransaction {
             .map_err(|_| VfsError::NoMemory)?;
         for pn in keys {
             if let Some(page) = cache.pop(&pn) {
+                file_cache_remove_page(&page);
                 self.pages.push((pn, page));
             }
         }
@@ -3748,6 +4121,7 @@ impl CachedPageInvalidationTransaction {
     }
 
     fn stage_from(&mut self, first_page: u64) -> VfsResult<usize> {
+        self.shadow_domain = Some(InvalidationShadowDomain::From(first_page));
         let mut cache = self.shared.page_cache.lock();
         let listeners = evict_listeners_snapshot(&self.shared)?;
         let mut keys = Vec::new();
@@ -3769,6 +4143,7 @@ impl CachedPageInvalidationTransaction {
             .map_err(|_| VfsError::NoMemory)?;
         for pn in keys {
             if let Some(page) = cache.pop(&pn) {
+                file_cache_remove_page(&page);
                 self.pages.push((pn, page));
             }
         }
@@ -3806,15 +4181,19 @@ impl CachedPageInvalidationTransaction {
         let (staged_pn, mut page) = self.pages.swap_remove(index);
         update(&mut page);
         let mut cache = self.shared.page_cache.lock();
+        file_cache_restore_page(&page);
         assert!(
             cache.put(staged_pn, page).is_none(),
             "restoring a retained truncate page replaced page {staged_pn}"
         );
-        cache.demote(&staged_pn);
+        cache.demote(&staged_pn); // LRU recency only; preserves PageCache::active.
         true
     }
 
     fn commit_discard(mut self) {
+        if let Some(domain) = &self.shadow_domain {
+            clear_file_cache_shadow_domain(&self.shared, domain);
+        }
         for (_, page) in &mut self.pages {
             page.clear_dirty();
         }
@@ -3829,11 +4208,12 @@ impl Drop for CachedPageInvalidationTransaction {
         }
         let mut cache = self.shared.page_cache.lock();
         for (pn, page) in self.pages.drain(..).rev() {
+            file_cache_restore_page(&page);
             assert!(
                 cache.put(pn, page).is_none(),
                 "cache invalidation rollback replaced page {pn}"
             );
-            cache.demote(&pn);
+            cache.demote(&pn); // LRU recency only; preserves PageCache::active.
         }
     }
 }
@@ -4171,6 +4551,20 @@ impl Drop for PhysicalIoEffect {
 
 impl Drop for CachedFileShared {
     fn drop(&mut self) {
+        let cache = self.page_cache.lock();
+        let remaining = cache.len();
+        let active = cache.iter().filter(|(_, page)| page.is_active()).count();
+        drop(cache);
+        let observed = FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire);
+        debug_assert!(
+            observed >= remaining,
+            "file-cache resident accounting underflow on final shared drop"
+        );
+        file_cache_resident_sub(remaining);
+        file_cache_active_sub(active);
+        // Registry identities are never reused, but retaining their shadows
+        // after the final cache owner is gone only wastes the global budget.
+        clear_all_file_cache_shadows(self);
         // Final Arc release makes the registered Weak impossible to upgrade.
         // The pointer check prevents a stale release from deleting a newer
         // shared state installed for the same inode-generation identity.
@@ -4326,6 +4720,16 @@ impl Drop for FileUserData {
 }
 
 impl CachedFile {
+    /// Snapshot the cache state in the inclusive page interval used by
+    /// Linux's cachestat(2).  The snapshot is intentionally advisory: page
+    /// state may change immediately after the locks are released.
+    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
+        self.shared.cachestat(first_page, last_page)
+    }
+
+    fn record_eviction(&self, page_no: u32) {
+        record_file_cache_shadow(&self.shared, page_no);
+    }
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
         let in_memory = cached_file_is_in_memory(&location);
@@ -4741,6 +5145,14 @@ impl CachedFile {
         )?;
         let _ = writeback_cached_page_data(file, pn, page)?;
         page.clear_dirty();
+        // Retiring an untouched readahead page is not a workingset eviction:
+        // it has never been consumed by the caller.  In particular, do not
+        // let an older shadow survive this explicit retirement.
+        if page.is_unused_prefetched() {
+            clear_file_cache_shadows(&self.shared, [pn]);
+        } else {
+            self.record_eviction(pn);
+        }
         Ok(acknowledgement)
     }
 
@@ -5477,6 +5889,7 @@ impl CachedFile {
     ) -> VfsResult<Option<EvictedPage>> {
         if let Some(page) = cache.get_mut(&pn) {
             page.clear_prefetched();
+            file_cache_record_page_reference(page);
             return Ok(None);
         }
         if cache.len() < cache.cap().get() {
@@ -5510,7 +5923,10 @@ impl CachedFile {
                 }
             };
         let retained_page = acknowledgement.deferred.then_some(evicted_page);
+        consume_file_cache_shadow(&self.shared, pn);
+        replacement.record_reference();
         cache.put(pn, replacement);
+        file_cache_resident_add(1);
         Ok(Some(EvictedPage {
             pn: evicted_pn,
             deferred_owner: acknowledgement.deferred.then_some(owner),
@@ -5533,6 +5949,7 @@ impl CachedFile {
             } else if !load_from_file {
                 page.clear_prefetched();
             }
+            file_cache_record_page_reference(page);
             return Ok(None);
         }
         let readahead_enabled = load_from_file && readahead && cached_readahead_enabled();
@@ -5572,7 +5989,10 @@ impl CachedFile {
         if !load_from_file {
             let mut page = PageCache::new(self.shared.in_memory)?;
             page.data().fill(0);
+            page.record_reference();
+            consume_file_cache_shadow(&self.shared, pn);
             cache.put(pn, page);
+            file_cache_resident_add(1);
             record_cached_file_counter(&WRITE_NO_READ_INSERT_PAGES, 1);
             record_cached_file_counter(&WRITE_NO_READ_INSERT_BYTES, PAGE_SIZE as u64);
             return Ok(evicted);
@@ -5610,7 +6030,10 @@ impl CachedFile {
             data.fill(0);
             let n0 = read.min(PAGE_SIZE);
             data[..n0].copy_from_slice(&buf[..n0]);
+            page.record_reference();
+            consume_file_cache_shadow(&self.shared, pn);
             cache.put(pn, page);
+            file_cache_resident_add(1);
 
             let mut loaded_readahead_pages = 0usize;
             for i in 1..ra {
@@ -5646,7 +6069,9 @@ impl CachedFile {
                 let chunk_end = (off + PAGE_SIZE).min(read);
                 nd[..chunk_end - off].copy_from_slice(&buf[off..chunk_end]);
                 np.mark_prefetched();
+                consume_file_cache_shadow(&self.shared, next_pn);
                 cache.put(next_pn, np);
+                file_cache_resident_add(1);
                 cache.demote(&next_pn);
                 loaded_readahead_pages += 1;
             }
@@ -5707,8 +6132,12 @@ impl CachedFile {
             let mut page = page;
             if i > 0 {
                 page.mark_prefetched();
+            } else {
+                page.record_reference();
             }
+            consume_file_cache_shadow(&self.shared, target_pn);
             cache.put(target_pn, page);
+            file_cache_resident_add(1);
             if i > 0 {
                 cache.demote(&target_pn);
                 loaded_readahead_pages += 1;
@@ -5743,6 +6172,9 @@ impl CachedFile {
                 drop(guard);
                 wait_for_page_writeback_clear(&self.shared, pn);
                 continue;
+            }
+            if let Some(page) = guard.get_mut(&pn) {
+                file_cache_record_page_reference(page);
             }
             let result = f.take().unwrap()(guard.get_mut(&pn));
             let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
@@ -6552,6 +6984,17 @@ const fn fadvise_next_bits(previous: u8, set: u8, clear: u8) -> u8 {
 }
 
 impl FileBackend {
+    /// Returns the page-cache snapshot for an inclusive page interval.
+    /// Direct handles intentionally have no resident high-level cache.
+    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
+        match self {
+            Self::Cached(cached) => cached.cachestat(first_page, last_page),
+            Self::Direct(location) => cached_file_shared_for_location(location)
+                .map(|shared| shared.cachestat(first_page, last_page))
+                .unwrap_or_default(),
+        }
+    }
+
     const DIRECT_IO_CHUNK: usize = ALIGNED_BYPASS_CHUNK;
 
     pub(crate) fn new_direct(location: Location) -> Self {
@@ -7320,6 +7763,12 @@ impl File {
     pub fn backend(&self) -> VfsResult<&FileBackend> {
         self.access(FileFlags::empty())?;
         Ok(&self.inner)
+    }
+
+    /// Page-cache statistics do not require data-I/O access, so O_PATH file
+    /// descriptors may query their regular file's mapping as on Linux.
+    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
+        self.inner.cachestat(first_page, last_page)
     }
 
     /// Returns a reference to the underlying [`Location`].
@@ -8217,10 +8666,11 @@ mod tests {
         PhysicalIoEffect, fadvise_next_bits,
         PhysicalIoResetProof, PhysicalIoSegment, PinnedPhysicalSegment, RANGE_CACHE_LEASE_SLOTS,
         RangeCacheLease, RangeCacheLeaseKind, WritePlacement, acknowledge_cached_page_eviction,
-        advance_clean_cached_file_reclaim_scan_epoch, cached_file_registry_key,
-        cached_file_shared_for_location, cached_file_shared_for_location_or_create,
-        discard_cached_pages, file_cache_registry,
-        mark_cached_file_unlinked, physical_to_virtual, reclaim_clean_pages_from_shared,
+        advance_clean_cached_file_reclaim_scan_epoch, begin_dirty_writeback_run,
+        cached_file_registry_key, cached_file_shared_for_location,
+        cached_file_shared_for_location_or_create, discard_cached_pages, file_cache_registry,
+        finish_dirty_writeback_run, mark_cached_file_unlinked, physical_to_virtual,
+        reclaim_clean_pages_from_shared,
         reclaim_clean_pages_from_shared_with_scan_budget,
         release_unlinked_cached_file_registry_ownership, remove_cached_file_registry_entry,
         synchronize_retained_page_count, try_zeroed_pinned_io_bounce,
@@ -9044,6 +9494,213 @@ mod tests {
         cached.with_page(1, |page| assert!(page.is_some()));
         cached.with_page(2, |page| assert!(page.is_some()));
         drop(pin);
+    }
+
+    #[test]
+    fn pressure_reclaim_records_a_shadow_and_refault_consumes_it() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x33, false);
+
+        let mut stats = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&cached.shared, 1, &mut stats),
+            1
+        );
+        assert_eq!(cached.cachestat(0, 0).nr_evicted, 1);
+        assert_eq!(cached.cachestat(0, 0).nr_recently_evicted, 0);
+
+        seed_cached_page(&cached, 0, 0x34, false);
+        assert_eq!(cached.cachestat(0, 0).nr_evicted, 0);
+    }
+
+    #[test]
+    fn nonresident_age_is_shared_across_inode_generations() {
+        let (first, _first_location, _first_state) = cached_append_test_file(PAGE_SIZE as u64);
+        let (second, _second_location, _second_state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&first, 0, 0x35, false);
+        seed_cached_page(&second, 0, 0x36, false);
+
+        let mut first_stats = CachedFileReclaimStats::default();
+        let mut second_stats = CachedFileReclaimStats::default();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&first.shared, 1, &mut first_stats),
+            1
+        );
+        let first_age = super::current_file_cache_nonresident_age();
+        assert_eq!(
+            reclaim_clean_pages_from_shared(&second.shared, 1, &mut second_stats),
+            1
+        );
+        assert!(super::current_file_cache_nonresident_age() > first_age);
+        assert_eq!(first.cachestat(0, 0).nr_recently_evicted, 1);
+    }
+
+    #[test]
+    fn cachestat_zero_resident_window_only_marks_same_age_shadow_recent() {
+        assert!(super::file_cache_shadow_is_recent(7, 7, 0));
+        assert!(!super::file_cache_shadow_is_recent(8, 7, 0));
+    }
+
+    #[test]
+    fn cachestat_active_window_excludes_single_touch_cache_pages() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        cached
+            .with_page_or_insert(0, |_, evicted| {
+                assert!(evicted.is_none());
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut cache = cached.shared.page_cache.lock();
+            let page = cache.get(&0).unwrap();
+            assert!(page.is_referenced());
+            assert!(!page.is_active());
+        }
+
+        cached.with_page(0, |page| assert!(page.is_some()));
+        assert!(cached.shared.page_cache.lock().get(&0).unwrap().is_active());
+
+        // A just-faulted page has no active-window allowance; the second
+        // reference promotes it and allows a one-generation refault.
+        assert!(!super::file_cache_shadow_is_recent(2, 1, 0));
+        assert!(super::file_cache_shadow_is_recent(2, 1, 1));
+    }
+
+    #[test]
+    fn cachestat_first_write_marks_referenced_without_promotion() {
+        init_test_page_allocator();
+        let mut page = PageCache::new(false).unwrap();
+        page.mark_dirty();
+        assert!(page.is_referenced());
+        assert!(!page.is_active());
+
+        assert!(page.record_reference());
+        page.demote_active();
+        assert!(!page.record_reference());
+        assert!(page.record_reference());
+    }
+
+    #[test]
+    fn final_shared_drop_releases_nonempty_resident_cache() {
+        init_test_page_allocator();
+        let before = super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire);
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 91,
+                inode: 92,
+                object: 93,
+            },
+            false,
+        ));
+        let page = PageCache::new(false).unwrap();
+        assert!(shared.page_cache.lock().put(0, page).is_none());
+        super::file_cache_resident_add(1);
+
+        drop(shared);
+        assert_eq!(
+            super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire),
+            before
+        );
+    }
+
+    #[test]
+    fn invalidation_rollback_restores_resident_accounting() {
+        init_test_page_allocator();
+        let before = super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire);
+        let shared = Arc::new(CachedFileShared::new(
+            super::CachedFileIdentity {
+                device: 94,
+                inode: 95,
+                object: 96,
+            },
+            false,
+        ));
+        let page = PageCache::new(false).unwrap();
+        assert!(shared.page_cache.lock().put(0, page).is_none());
+        super::file_cache_resident_add(1);
+
+        let mut transaction = CachedPageInvalidationTransaction::new_shared(shared.clone());
+        transaction.stage_all().unwrap();
+        assert_eq!(
+            super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire),
+            before
+        );
+        drop(transaction);
+        assert_eq!(shared.page_cache.lock().len(), 1);
+        assert_eq!(
+            super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire),
+            before + 1
+        );
+
+        drop(shared);
+        assert_eq!(
+            super::FILE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire),
+            before
+        );
+    }
+
+    #[test]
+    fn managed_page_baseline_is_stable_during_concurrent_page_allocation() {
+        init_test_page_allocator();
+        let budget = super::file_cache_shadow_budget();
+        let managed = super::FILE_CACHE_MANAGED_PAGES.load(Ordering::Acquire);
+        let workers = (0..4)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..32 {
+                        drop(PageCache::new(false).unwrap());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(
+            super::FILE_CACHE_MANAGED_PAGES.load(Ordering::Acquire),
+            managed
+        );
+        assert_eq!(super::file_cache_shadow_budget(), budget);
+    }
+
+    #[test]
+    fn fallback_writeback_has_the_same_begin_end_page_state_as_sg() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x37, true);
+        let run = super::DirtyWritebackRun {
+            page_start: 0,
+            bytes: PAGE_SIZE,
+            pages: vec![super::DirtyWritebackPage {
+                pn: 0,
+                data: vec![0x37; PAGE_SIZE],
+            }],
+        };
+
+        begin_dirty_writeback_run(&cached.shared, &run).unwrap();
+        assert!(
+            cached
+                .shared
+                .page_cache
+                .lock()
+                .get(&0)
+                .unwrap()
+                .is_writeback()
+        );
+        finish_dirty_writeback_run(&cached.shared, &run, false);
+        cached.with_page(0, |page| {
+            let page = page.unwrap();
+            assert!(page.is_dirty());
+            assert!(!page.is_writeback());
+        });
+
+        begin_dirty_writeback_run(&cached.shared, &run).unwrap();
+        finish_dirty_writeback_run(&cached.shared, &run, true);
+        cached.with_page(0, |page| {
+            let page = page.unwrap();
+            assert!(!page.is_dirty());
+            assert!(!page.is_writeback());
+        });
     }
 
     #[test]

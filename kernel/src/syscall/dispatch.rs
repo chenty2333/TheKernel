@@ -510,6 +510,15 @@ pub(super) fn dispatch_syscall(
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::cachestat => with_user_memory(aspace(), |memory| {
+            sys_cachestat(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
         Sysno::pread64 => sys_pread64(
             UserMemoryCapability::new(aspace()),
             uctx.arg0() as _,
