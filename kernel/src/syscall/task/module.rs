@@ -16,6 +16,7 @@ use spin::Lazy;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
 
 use crate::{
+    file::{FileLike, get_file_description},
     jit_memory::{self, ExecutableCode, MemoryError},
     mm::map_usercopy_error,
     task::AsThread,
@@ -35,6 +36,9 @@ const SHT_RELA: u32 = 4;
 const SHF_EXECINSTR: u64 = 4;
 const SHN_UNDEF: u16 = 0;
 const STT_FUNC: u8 = 2;
+const MODULE_INIT_IGNORE_VERMAGIC: u32 = 1;
+const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 2;
+const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 
 #[derive(Clone, Copy)]
 struct Section { typ: u32, flags: u64, offset: usize, size: usize, link: u32, info: u32, entsize: usize }
@@ -71,5 +75,20 @@ fn prepare(b:&[u8])->AxResult<PreparedModule>{
 }
 
 pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;let prepared=prepare(&bytes)?;if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}MODULES.lock().push(prepared);Ok(0)}
-pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M>,_fd:i32,_args:*const c_char,_flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}Err(AxError::OperationNotSupported)}
+pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M>,fd:i32,_args:*const c_char,flags:u32)->AxResult<isize>{
+    if !has_module_capability(){return Err(AxError::OperationNotPermitted)}
+    if flags & !(MODULE_INIT_IGNORE_VERMAGIC|MODULE_INIT_IGNORE_MODVERSIONS|MODULE_INIT_COMPRESSED_FILE) != 0{return Err(AxError::InvalidInput)}
+    // The native ABI has no vermagic/modversion or compression layer.  Do
+    // not silently accept callers asking to bypass checks that do not exist.
+    if flags != 0{return Err(AxError::OperationNotSupported)}
+    let description=get_file_description(fd)?;
+    let size=usize::try_from(description.stat()?.size).map_err(|_|AxError::InvalidInput)?;
+    if size==0||size>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}
+    let mut bytes=Vec::with_capacity(size);
+    let copied=description.read(&mut bytes)?;
+    if copied!=size||bytes.len()!=size{return Err(AxError::InvalidExecutable)}
+    let prepared=prepare(&bytes)?;
+    if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}
+    MODULES.lock().push(prepared);Ok(0)
+}
 pub fn sys_delete_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,name:*const c_char,_flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}let name=vm_load_until_nul_bounded(memory,name.cast(),MODULE_NAME_MAX+1).map_err(map_usercopy_error)?;let name=core::str::from_utf8(&name).map_err(|_|AxError::IllegalBytes)?;let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(LinuxError::ENOENT)?;let module=modules.remove(index);if let Some(exit)=module.exit{let _=module.code.execute_module_entry(exit);}module.code.retire().map_err(memory_error)?;Ok(0)}
