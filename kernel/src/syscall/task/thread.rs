@@ -300,7 +300,11 @@ pub fn sys_arch_prctl(
             let curr = current();
             let thread = curr.as_thread();
             let aspace_handle = thread.proc_data.aspace();
+            let locked = state.locked;
             state = map_cet_default_shadow_stack(&mut aspace_handle.lock(), thread.kernel_tid())?;
+            // Mapping returns architectural enable/SSP state; ARCH_SHSTK_LOCK
+            // belongs to the task and survives enabling another feature.
+            state.locked = locked;
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
@@ -325,12 +329,18 @@ pub fn sys_arch_prctl(
                 crate::task::set_current_user_cet_state(state);
                 return Ok(0);
             }
+            // WRSS is dependent on SHSTK. Disabling SHSTK removes both bits,
+            // unless the separately locked WRSS feature forbids that change.
+            if state.u_cet & CET_WRSS_EN != 0 && state.locked & CET_WRSS_EN != 0 {
+                return Err(LinuxError::EPERM.into());
+            }
             let curr = current();
             let thread = curr.as_thread();
             let aspace_handle = thread.proc_data.aspace();
             unmap_cet_default_shadow_stack(&mut aspace_handle.lock(), thread.kernel_tid());
             thread.clear_cet_signal_frames();
-            state = axhal::asm::UserCetState::default();
+            state.u_cet = 0;
+            state.pl3_ssp = 0;
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
@@ -346,7 +356,10 @@ pub fn sys_arch_prctl(
         ArchPrctlCode::StatusShstk => {
             let state = crate::task::current_user_live_cet_state();
             memory
-                .write_value(addr as *mut usize, (state.u_cet & CET_SHSTK_EN) as usize)
+                .write_value(
+                    addr as *mut usize,
+                    (state.u_cet & (CET_SHSTK_EN | CET_WRSS_EN)) as usize,
+                )
                 .map_err(map_usercopy_error)?;
             Ok(0)
         }

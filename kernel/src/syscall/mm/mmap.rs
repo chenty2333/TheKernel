@@ -54,41 +54,30 @@ fn find_nonfixed_mmap_area(
     limit: VirtAddrRange,
     align: usize,
 ) -> Option<VirtAddr> {
-    let candidate = if personality & ADDR_COMPAT_LAYOUT != 0 {
+    if personality & ADDR_COMPAT_LAYOUT != 0 {
         let first = if hint > limit.start {
             hint
         } else {
             limit.start
         };
         aspace
-            .find_free_area(first, length, limit, align)
+            .find_free_area_avoiding_shadow_stack_guards(first, length, limit, align)
             // Preserve ordinary mmap hint behavior when that hinted scan is
             // exhausted, while retaining bottom-up placement for the retry.
             .or_else(|| {
                 (first > limit.start)
-                    .then(|| aspace.find_free_area(limit.start, length, limit, align))
+                    .then(|| {
+                        aspace.find_free_area_avoiding_shadow_stack_guards(
+                            limit.start,
+                            length,
+                            limit,
+                            align,
+                        )
+                    })
                     .flatten()
             })
     } else {
         aspace.find_kernel_area(hint, length, limit, align)
-    }?;
-    // Keep the page below every shadow-stack VMA permanently unavailable to
-    // automatic placement.  The VMA itself is not enlarged, so fixed mappings
-    // retain Linux's explicit-address semantics.
-    let end = candidate.checked_add(length)?;
-    let guard_end = aspace
-        .areas()
-        .filter(|area| area.flags().contains(MappingFlags::SHADOW_STACK))
-        .filter_map(|area| {
-            let guard_end = area.start();
-            let guard_start = guard_end.checked_sub(PAGE_SIZE_4K)?;
-            (candidate < guard_end && guard_start < end).then_some(guard_end)
-        })
-        .max();
-    if let Some(guard_end) = guard_end {
-        aspace.find_free_area(guard_end, length, limit, align)
-    } else {
-        Some(candidate)
     }
 }
 

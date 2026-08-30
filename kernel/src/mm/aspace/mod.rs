@@ -4179,6 +4179,42 @@ impl AddrSpace {
         self.areas.find_free_area(hint, size, limit, align)
     }
 
+    /// Finds a free interval while treating the page immediately below every
+    /// shadow-stack VMA as occupied.  Guard pages are policy, not VMAs, so
+    /// every automatic allocator must use this helper rather than a one-shot
+    /// caller-side retry.
+    pub fn find_free_area_avoiding_shadow_stack_guards(
+        &self,
+        hint: VirtAddr,
+        size: usize,
+        limit: VirtAddrRange,
+        align: usize,
+    ) -> Option<VirtAddr> {
+        let mut hint = hint;
+        loop {
+            let candidate = self.find_free_area(hint, size, limit, align)?;
+            let end = candidate.checked_add(size)?;
+            let retry = self
+                .areas()
+                .filter(|area| area.flags().contains(MappingFlags::SHADOW_STACK))
+                .filter_map(|area| {
+                    let guard_end = area.start();
+                    let guard_start = guard_end.checked_sub(PAGE_SIZE_4K)?;
+                    (candidate < guard_end && guard_start < end).then_some(guard_end)
+                })
+                .max();
+            let Some(next) = retry else {
+                return Some(candidate);
+            };
+            // All VMAs and guard boundaries are page-aligned; still defend
+            // against malformed state so the retry cannot spin forever.
+            if next <= hint || next <= candidate {
+                return None;
+            }
+            hint = next;
+        }
+    }
+
     /// Finds a free area for kernel-chosen placement.
     ///
     /// If the caller provides an explicit hint above the base, that hint is
@@ -4194,13 +4230,17 @@ impl AddrSpace {
         align: usize,
     ) -> Option<VirtAddr> {
         if hint > limit.start {
-            self.find_free_area(hint, size, limit, align)
-                .or_else(|| self.areas.find_append_area(size, limit, align))
-                .or_else(|| self.find_free_area(limit.start, size, limit, align))
+            self.find_free_area_avoiding_shadow_stack_guards(hint, size, limit, align)
+                .or_else(|| {
+                    self.find_free_area_avoiding_shadow_stack_guards(
+                        limit.start,
+                        size,
+                        limit,
+                        align,
+                    )
+                })
         } else {
-            self.areas
-                .find_append_area(size, limit, align)
-                .or_else(|| self.find_free_area(limit.start, size, limit, align))
+            self.find_free_area_avoiding_shadow_stack_guards(limit.start, size, limit, align)
         }
     }
 
