@@ -49,7 +49,8 @@ use crate::{
     mounts,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
-        namespace_target_from_proc_file, proc_namespace_location_from_object,
+        dev::tty::vhangup_controlling_session, namespace_target_from_proc_file,
+        proc_namespace_location_from_object,
     },
     task::{
         AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context,
@@ -2066,7 +2067,13 @@ pub fn sys_vhangup() -> AxResult<isize> {
     if !current_has_capability(CAP_SYS_TTY_CONFIG) {
         return Err(AxError::OperationNotPermitted);
     }
-    Err(LinuxError::EOPNOTSUPP.into())
+
+    // Linux treats the absence of a controlling terminal as a successful
+    // no-op. The terminal state machine serializes this with PTY last-close
+    // and only the winner signals the foreground process group.
+    let session = current().as_thread().proc_data.proc.group().session();
+    vhangup_controlling_session(&session);
+    Ok(0)
 }
 
 #[cfg(test)]

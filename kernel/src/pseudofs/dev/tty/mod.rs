@@ -218,10 +218,30 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
     }
 
+    /// Synchronously tears down this terminal's controlling-session state.
+    ///
+    /// The terminal job-control association is the synchronization point for
+    /// both a PTY master's final close and `vhangup(2)`: only the transition
+    /// which retires that association owns foreground signal delivery.
     fn hangup_controlling_session(&self) {
         let Some(session) = self.terminal.job_control.session() else {
             return;
         };
+        self.hangup_session(&session);
+    }
+
+    /// Hangs up this terminal only when it is still controlled by `expected`.
+    ///
+    /// A vhangup caller first snapshots its session terminal.  The identity
+    /// check prevents that stale snapshot from tearing down a later session
+    /// which claimed the same terminal after a concurrent last close.
+    fn hangup_session(&self, expected: &Arc<Session>) {
+        let Some(session) = self.terminal.job_control.session() else {
+            return;
+        };
+        if !Arc::ptr_eq(&session, expected) {
+            return;
+        }
         if let Some(tty) = session.terminal()
             && tty
                 .downcast_ref::<Self>()
@@ -235,6 +255,24 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             let _ =
                 send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGCONT)));
         }
+    }
+}
+
+/// Hangs up `session`'s controlling terminal, if it has one.
+///
+/// A session keeps its controlling terminal as an erased `Arc`, while the
+/// terminal state machine is shared by the concrete N_TTY and PTY drivers.
+/// Keep that type recovery here so syscall code neither learns driver details
+/// nor duplicates the close/hangup transition.
+pub(crate) fn vhangup_controlling_session(session: &Arc<Session>) {
+    let Some(tty) = session.terminal() else {
+        return;
+    };
+
+    if let Some(tty) = tty.downcast_ref::<NTtyDriver>() {
+        tty.hangup_session(session);
+    } else if let Some(tty) = tty.downcast_ref::<PtyDriver>() {
+        tty.hangup_session(session);
     }
 }
 
