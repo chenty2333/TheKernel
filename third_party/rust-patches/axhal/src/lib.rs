@@ -65,7 +65,85 @@ pub mod time;
 /// until it is released and never performs a remote MSR access.
 #[cfg(feature = "pmu")]
 pub mod pmu {
+    #[cfg(target_os = "none")]
     pub use axplat_x86_pc::pmu::*;
+
+    // Host builds deliberately expose the same capability-only surface without
+    // linking an implementation that could execute privileged MSR operations.
+    #[cfg(not(target_os = "none"))]
+    mod host {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum Event {
+            Cycles,
+            Instructions,
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum CounterKind {
+            Programmable,
+            Fixed,
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum Error {
+            Unsupported,
+            Hypervisor,
+            NoCounter,
+            Busy,
+            Migrated,
+            Stale,
+            Overflowed,
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct Capabilities {
+            pub version: u8,
+            pub programmable_counters: u8,
+            pub programmable_width: u8,
+            pub event_mask_length: u8,
+            pub unavailable_events: u32,
+            pub fixed_counters: u8,
+            pub fixed_width: u8,
+        }
+        impl Capabilities {
+            pub const fn programmable_mask(self) -> u64 {
+                0
+            }
+            pub const fn fixed_mask(self) -> u64 {
+                0
+            }
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct CounterLease;
+        pub fn capabilities() -> Result<Capabilities, Error> {
+            Err(Error::Unsupported)
+        }
+        pub fn drain_local() -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        impl CounterLease {
+            pub fn acquire(_: Event, _: CounterKind) -> Result<Self, Error> {
+                Err(Error::Unsupported)
+            }
+            pub fn read(&self) -> Result<u64, Error> {
+                Err(Error::Unsupported)
+            }
+            pub fn settle(&self, _: u64) -> Result<u64, Error> {
+                Err(Error::Unsupported)
+            }
+            pub fn release(self) -> Result<(), Error> {
+                Err(Error::Unsupported)
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            #[test]
+            fn host_pmu_is_an_unsupported_stub() {
+                assert_eq!(capabilities(), Err(Error::Unsupported));
+                assert_eq!(CounterLease::acquire(Event::Cycles, CounterKind::Fixed), Err(Error::Unsupported));
+            }
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    pub use host::*;
 }
 
 #[cfg(feature = "tls")]

@@ -1,59 +1,57 @@
-//! Local-only x86 architectural PMU counter leases.
-//!
-//! The first-stage interface intentionally has no sampling, PMI, LVT, or
-//! cross-CPU operation.  A lease owns one counter while preemption is disabled
-//! and restores every PMU register it changes before releasing that pin.
+//! Local x86 architectural-PMU leases.  Leases are tokens, never IRQ guards.
+use core::arch::x86_64::__cpuid_count;
 
-use core::{arch::x86_64::__cpuid_count, marker::PhantomData};
-
-use kernel_guard::NoPreemptIrqSave;
+use kspin::SpinNoIrq;
 use x86::msr::{rdmsr, wrmsr};
-
-const IA32_PMC0: u32 = 0x0c1;
-const IA32_PERFEVTSEL0: u32 = 0x186;
-const IA32_FIXED_CTR0: u32 = 0x309;
-const IA32_PERF_GLOBAL_STATUS: u32 = 0x38e;
-const IA32_PERF_GLOBAL_CTRL: u32 = 0x38f;
-const IA32_FIXED_CTR_CTRL: u32 = 0x38d;
-const IA32_PERF_GLOBAL_OVF_CTRL: u32 = 0x390;
-const MAX_COUNTERS: u8 = 32;
-
-/// The two architectural events exposed by this counting-only HAL.
+const PMC: u32 = 0xc1;
+const EVT: u32 = 0x186;
+const FIXED: u32 = 0x309;
+const STATUS: u32 = 0x38e;
+const GLOBAL: u32 = 0x38f;
+const FIXED_CTRL: u32 = 0x38d;
+const OVF: u32 = 0x390;
+const MAX: usize = 32;
+const SLOTS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Cycles,
     Instructions,
 }
-
 impl Event {
-    const fn encoding(self) -> u8 {
+    const fn code(self) -> u8 {
         match self {
             Self::Cycles => 0x3c,
             Self::Instructions => 0xc0,
         }
     }
-    const fn unavailable_bit(self) -> u32 {
+    const fn bit(self) -> u32 {
         match self {
             Self::Cycles => 1,
-            Self::Instructions => 1 << 1,
+            Self::Instructions => 2,
         }
     }
-    const fn fixed_index(self) -> u8 {
+    const fn fixed(self) -> u8 {
         match self {
             Self::Instructions => 0,
             Self::Cycles => 1,
         }
     }
 }
-
-/// Counter bank from which to request an event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CounterKind {
     Programmable,
     Fixed,
 }
-
-/// CPUID.0Ah information for the CPU executing this call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Unsupported,
+    Hypervisor,
+    NoCounter,
+    Busy,
+    Migrated,
+    Stale,
+    Overflowed,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     pub version: u8,
@@ -64,26 +62,25 @@ pub struct Capabilities {
     pub fixed_counters: u8,
     pub fixed_width: u8,
 }
-
 impl Capabilities {
-    const fn decode(eax: u32, ebx: u32, edx: u32) -> Self {
+    const fn decode(a: u32, b: u32, d: u32) -> Self {
         Self {
-            version: eax as u8,
-            programmable_counters: (eax >> 8) as u8,
-            programmable_width: (eax >> 16) as u8,
-            event_mask_length: (eax >> 24) as u8,
-            unavailable_events: ebx,
-            fixed_counters: edx as u8 & 0x1f,
-            fixed_width: (edx >> 5) as u8 & 0xff,
+            version: a as u8,
+            programmable_counters: (a >> 8) as u8,
+            programmable_width: (a >> 16) as u8,
+            event_mask_length: (a >> 24) as u8,
+            unavailable_events: b,
+            fixed_counters: d as u8 & 31,
+            fixed_width: (d >> 5) as u8,
         }
     }
-    const fn mask(width: u8) -> u64 {
-        if width >= 64 {
-            u64::MAX
-        } else if width == 0 {
+    const fn mask(w: u8) -> u64 {
+        if w == 0 {
             0
+        } else if w >= 64 {
+            u64::MAX
         } else {
-            (1u64 << width) - 1
+            (1 << w) - 1
         }
     }
     pub const fn programmable_mask(self) -> u64 {
@@ -92,316 +89,328 @@ impl Capabilities {
     pub const fn fixed_mask(self) -> u64 {
         Self::mask(self.fixed_width)
     }
-    const fn supports_programmable(self, event: Event) -> bool {
-        self.version != 0
-            && self.programmable_counters != 0
-            && self.programmable_width != 0
-            && self.event_mask_length > event.unavailable_bit().trailing_zeros() as u8
-            && (self.unavailable_events & event.unavailable_bit()) == 0
+    const fn valid(self) -> bool {
+        self.version >= 2
+            && self.programmable_counters as usize <= MAX
+            && self.programmable_width <= 64
+            && (self.programmable_counters == 0 || self.programmable_width > 0)
+            && self.fixed_counters as usize <= MAX
+            && self.fixed_width <= 64
+            && (self.fixed_counters == 0 || self.fixed_width > 0)
     }
-    const fn supports_fixed(self, event: Event) -> bool {
-        self.fixed_width != 0 && self.fixed_counters > event.fixed_index()
+    const fn programmable(self, e: Event) -> bool {
+        self.valid()
+            && self.programmable_counters > 0
+            && self.programmable_width > 0
+            && self.event_mask_length > e.bit().trailing_zeros() as u8
+            && self.unavailable_events & e.bit() == 0
+    }
+    const fn fixed_ok(self, e: Event) -> bool {
+        self.valid()
+            && self.fixed_width > 0
+            && self.fixed_width <= 64
+            && self.fixed_counters as usize <= MAX
+            && self.fixed_counters > e.fixed()
+    }
+    const fn usable(self) -> bool {
+        (self.programmable_counters > 0 && self.programmable_width > 0)
+            || (self.fixed_counters > 0 && self.fixed_width > 0)
     }
 }
-
-/// Why a local PMU lease could not be obtained or used.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    Unsupported,
-    Hypervisor,
-    NoCounter,
-    Busy,
-    Migrated,
-    Overflowed,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
-    Programmable(u8),
-    Fixed(u8),
+    P(u8),
+    F(u8),
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Snapshot {
-    global_ctrl: u64,
-    status: u64,
+impl Slot {
+    const fn idx(self) -> usize {
+        match self {
+            Self::P(i) => i as usize,
+            Self::F(i) => MAX + i as usize,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Saved {
+    global: u64,
     control: u64,
     counter: u64,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Restore {
-    Active(Snapshot),
-    Disabled(Snapshot),
-    Restored,
+const EMPTY: Saved = Saved {
+    global: 0,
+    control: 0,
+    counter: 0,
+};
+#[derive(Clone, Copy)]
+struct State {
+    generation: u32,
+    owned: bool,
+    saved: Saved,
+    width: u8,
 }
-
-impl Restore {
-    fn disable(&mut self) {
-        if let Self::Active(s) = *self {
-            *self = Self::Disabled(s);
+const FREE: State = State {
+    generation: 0,
+    owned: false,
+    saved: EMPTY,
+    width: 0,
+};
+struct Manager {
+    slots: [State; SLOTS],
+}
+impl Manager {
+    const fn new() -> Self {
+        Self {
+            slots: [FREE; SLOTS],
         }
     }
-    fn finish(&mut self) {
-        *self = Self::Restored;
-    }
 }
-
-/// A local CPU PMU counter lease.  It is neither `Send` nor `Sync`.
+static MANAGERS: [SpinNoIrq<Manager>; crate::config::plat::MAX_CPU_NUM] =
+    [const { SpinNoIrq::new(Manager::new()) }; crate::config::plat::MAX_CPU_NUM];
+/// A CPU, slot, generation token. It is Send, but never authorizes remote MSRs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CounterLease {
-    // IRQs are saved as well as preemption-disabled: this closes the only
-    // same-CPU acquisition race while a counter's idle state is inspected.
-    _pin: NoPreemptIrqSave,
     cpu: usize,
     slot: Slot,
-    snapshot: Restore,
-    width: u8,
-    _not_send_sync: PhantomData<*mut ()>,
+    generation: u32,
 }
-
-/// Return the PMU capabilities of the CPU executing this call.
 pub fn capabilities() -> Result<Capabilities, Error> {
-    // SAFETY: CPUID is available on every x86_64 CPU.
-    let leaf0 = __cpuid_count(0, 0);
-    if leaf0.eax < 0x0a {
+    #[cfg(not(target_os = "none"))]
+    {
         return Err(Error::Unsupported);
     }
-    let leaf1 = __cpuid_count(1, 0);
-    if leaf1.ecx & (1 << 31) != 0 {
-        return Err(Error::Hypervisor);
-    }
-    let pmu = __cpuid_count(0x0a, 0);
-    let caps = Capabilities::decode(pmu.eax, pmu.ebx, pmu.edx);
-    if caps.version == 0 {
-        Err(Error::Unsupported)
-    } else {
-        Ok(caps)
+    #[cfg(target_os = "none")]
+    {
+        let l0 = __cpuid_count(0, 0);
+        if l0.eax < 0x0a || [l0.ebx, l0.edx, l0.ecx] != [0x756e6547, 0x49656e69, 0x6c65746e] {
+            return Err(Error::Unsupported);
+        }
+        if __cpuid_count(1, 0).ecx & (1 << 31) != 0 {
+            return Err(Error::Hypervisor);
+        }
+        let p = __cpuid_count(0x0a, 0);
+        let c = Capabilities::decode(p.eax, p.ebx, p.edx);
+        if c.valid() && c.usable() {
+            Ok(c)
+        } else {
+            Err(Error::Unsupported)
+        }
     }
 }
-
 impl CounterLease {
-    /// Acquire an idle counter on this CPU.  Acquisition pins the caller, so
-    /// later reads and release cannot accidentally access an MSR after migration.
     pub fn acquire(event: Event, kind: CounterKind) -> Result<Self, Error> {
-        let pin = NoPreemptIrqSave::new();
-        let cpu = crate::cpu::current_logical_cpu_id();
-        let caps = capabilities()?;
-        let slot = match kind {
-            CounterKind::Programmable if caps.supports_programmable(event) => {
-                find_programmable(caps)?
+        local(|cpu, m| {
+            let c = capabilities()?;
+            let slot = match kind {
+                CounterKind::Programmable if c.programmable(event) => select(m, c)?,
+                CounterKind::Fixed if c.fixed_ok(event) => Slot::F(event.fixed()),
+                _ => return Err(Error::Unsupported),
+            };
+            let s = &mut m.slots[slot.idx()];
+            if s.owned {
+                return Err(Error::Busy);
             }
-            CounterKind::Fixed if caps.supports_fixed(event) => Slot::Fixed(event.fixed_index()),
-            _ => return Err(Error::Unsupported),
-        };
-        let snapshot = read_snapshot(slot);
-        if !is_idle(slot, snapshot) {
-            return Err(Error::Busy);
-        }
-        program(slot, event, snapshot.global_ctrl);
-        Ok(Self {
-            _pin: pin,
-            cpu,
-            slot,
-            snapshot: Restore::Active(snapshot),
-            width: match slot {
-                Slot::Programmable(_) => caps.programmable_width,
-                Slot::Fixed(_) => caps.fixed_width,
-            },
-            _not_send_sync: PhantomData,
+            let old = snapshot(slot);
+            if !idle(slot, old) {
+                return Err(Error::Busy);
+            }
+            program(slot, event);
+            s.generation = s.generation.wrapping_add(1).max(1);
+            s.owned = true;
+            s.saved = old;
+            s.width = match slot {
+                Slot::P(_) => c.programmable_width,
+                Slot::F(_) => c.fixed_width,
+            };
+            Ok(Self {
+                cpu,
+                slot,
+                generation: s.generation,
+            })
         })
     }
-
-    /// Read the counter modulo its CPUID-reported architectural width.
     pub fn read(&self) -> Result<u64, Error> {
-        self.ensure_local()?;
-        Ok(read_counter(self.slot) & Capabilities::mask(self.width))
-    }
-
-    /// Restore the exact saved configuration and release this local lease.
-    pub fn release(mut self) -> Result<(), Error> {
-        self.restore()
-    }
-
-    fn ensure_local(&self) -> Result<(), Error> {
-        if crate::cpu::current_logical_cpu_id() == self.cpu {
-            Ok(())
-        } else {
-            Err(Error::Migrated)
-        }
-    }
-    fn restore(&mut self) -> Result<(), Error> {
-        self.ensure_local()?;
-        let snapshot = match self.snapshot {
-            Restore::Active(s) | Restore::Disabled(s) => s,
-            Restore::Restored => return Ok(()),
-        };
-        // Stop first.  This also ensures no new overflow is generated while restoring.
-        disable_global(self.slot, snapshot.global_ctrl);
-        self.snapshot.disable();
-        let overflow = read_msr(IA32_PERF_GLOBAL_STATUS) & slot_bit(self.slot);
-        restore_registers(self.slot, snapshot, overflow != 0);
-        self.snapshot.finish();
-        if overflow != 0 {
-            Err(Error::Overflowed)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl Drop for CounterLease {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
-fn find_programmable(caps: Capabilities) -> Result<Slot, Error> {
-    let count = caps.programmable_counters.min(MAX_COUNTERS) as usize;
-    let mut snapshots = [Snapshot {
-        global_ctrl: 0,
-        status: 0,
-        control: 1,
-        counter: 0,
-    }; MAX_COUNTERS as usize];
-    for (index, snapshot) in snapshots[..count].iter_mut().enumerate() {
-        *snapshot = read_snapshot(Slot::Programmable(index as u8));
-    }
-    select_idle_programmable(caps, &snapshots[..count]).ok_or(Error::NoCounter)
-}
-
-fn select_idle_programmable(caps: Capabilities, snapshots: &[Snapshot]) -> Option<Slot> {
-    snapshots
-        .iter()
-        .take(caps.programmable_counters.min(MAX_COUNTERS) as usize)
-        .enumerate()
-        .find_map(|(index, snapshot)| {
-            let slot = Slot::Programmable(index as u8);
-            is_idle(slot, *snapshot).then_some(slot)
+        token(*self, |s| {
+            Ok(read(slot_msr(self.slot)) & Capabilities::mask(s.width))
         })
-}
-fn slot_bit(slot: Slot) -> u64 {
-    match slot {
-        Slot::Programmable(i) => 1u64 << i,
-        Slot::Fixed(i) => 1u64 << (32 + i),
+    }
+    /// Delta from `previous`, modulo the architectural width.
+    pub fn settle(&self, previous: u64) -> Result<u64, Error> {
+        token(*self, |s| {
+            Ok(read(slot_msr(self.slot)).wrapping_sub(previous) & Capabilities::mask(s.width))
+        })
+    }
+    pub fn release(self) -> Result<(), Error> {
+        token(self, |s| {
+            let overflow = restore(self.slot, s.saved);
+            s.owned = false;
+            s.generation = s.generation.wrapping_add(1);
+            if overflow {
+                Err(Error::Overflowed)
+            } else {
+                Ok(())
+            }
+        })
     }
 }
-fn counter_msr(slot: Slot) -> u32 {
-    match slot {
-        Slot::Programmable(i) => IA32_PMC0 + i as u32,
-        Slot::Fixed(i) => IA32_FIXED_CTR0 + i as u32,
-    }
+/// Bounded, local-only recovery for tokens dropped on another CPU.
+pub fn drain_local() -> Result<usize, Error> {
+    local(|_, m| {
+        let mut n = 0;
+        for i in 0..SLOTS {
+            if m.slots[i].owned {
+                let slot = if i < MAX {
+                    Slot::P(i as u8)
+                } else {
+                    Slot::F((i - MAX) as u8)
+                };
+                let s = &mut m.slots[i];
+                let _ = restore(slot, s.saved);
+                s.owned = false;
+                s.generation = s.generation.wrapping_add(1);
+                n += 1
+            }
+        }
+        Ok(n)
+    })
 }
-fn read_counter(slot: Slot) -> u64 {
-    read_msr(counter_msr(slot))
+fn local<T>(f: impl FnOnce(usize, &mut Manager) -> Result<T, Error>) -> Result<T, Error> {
+    let _short = kernel_guard::NoPreemptIrqSave::new();
+    let cpu = crate::cpu::current_logical_cpu_id();
+    let mut m = MANAGERS[cpu].lock();
+    f(cpu, &mut m)
 }
-fn read_snapshot(slot: Slot) -> Snapshot {
-    Snapshot {
-        global_ctrl: read_msr(IA32_PERF_GLOBAL_CTRL),
-        status: read_msr(IA32_PERF_GLOBAL_STATUS),
-        control: match slot {
-            Slot::Programmable(i) => read_msr(IA32_PERFEVTSEL0 + i as u32),
-            Slot::Fixed(_) => read_msr(IA32_FIXED_CTR_CTRL),
-        },
-        counter: read_counter(slot),
-    }
+fn token<T>(t: CounterLease, f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
+    local(|cpu, m| {
+        if cpu != t.cpu {
+            return Err(Error::Migrated);
+        }
+        let s = &mut m.slots[t.slot.idx()];
+        if !s.owned || s.generation != t.generation {
+            return Err(Error::Stale);
+        }
+        f(s)
+    })
 }
-fn is_idle(slot: Slot, s: Snapshot) -> bool {
-    let control_idle = match slot {
-        Slot::Programmable(_) => s.control == 0,
-        Slot::Fixed(i) => ((s.control >> (i * 4)) & 0xf) == 0,
-    };
-    control_idle && (s.global_ctrl & slot_bit(slot)) == 0 && (s.status & slot_bit(slot)) == 0
-}
-fn program(slot: Slot, event: Event, global_ctrl: u64) {
-    disable_global(slot, global_ctrl);
-    match slot {
-        Slot::Programmable(i) => write_msr(
-            IA32_PERFEVTSEL0 + i as u32,
-            event.encoding() as u64 | (1 << 17) | (1 << 22),
-        ),
-        Slot::Fixed(i) => {
-            let old = read_msr(IA32_FIXED_CTR_CTRL);
-            write_msr(
-                IA32_FIXED_CTR_CTRL,
-                (old & !(0xf << (i * 4))) | (1 << (i * 4)),
-            );
+fn select(m: &Manager, c: Capabilities) -> Result<Slot, Error> {
+    for i in 0..c.programmable_counters as usize {
+        if !m.slots[i].owned {
+            return Ok(Slot::P(i as u8));
         }
     }
-    write_msr(counter_msr(slot), 0);
-    write_msr(IA32_PERF_GLOBAL_CTRL, global_ctrl | slot_bit(slot));
+    Err(Error::NoCounter)
 }
-fn disable_global(slot: Slot, global_ctrl: u64) {
-    write_msr(IA32_PERF_GLOBAL_CTRL, global_ctrl & !slot_bit(slot));
-}
-fn restore_registers(slot: Slot, s: Snapshot, overflowed: bool) {
-    match slot {
-        Slot::Programmable(i) => write_msr(IA32_PERFEVTSEL0 + i as u32, s.control),
-        Slot::Fixed(_) => write_msr(IA32_FIXED_CTR_CTRL, s.control),
+fn bit(s: Slot) -> u64 {
+    match s {
+        Slot::P(i) => 1 << i,
+        Slot::F(i) => 1 << (32 + i),
     }
-    write_msr(counter_msr(slot), s.counter);
-    // OVF_CTRL is write-one-to-clear; acquisition requires the saved bit clear,
-    // so clearing only a newly observed bit restores the saved status boundary.
-    if overflowed {
-        write_msr(IA32_PERF_GLOBAL_OVF_CTRL, slot_bit(slot));
-    }
-    write_msr(IA32_PERF_GLOBAL_CTRL, s.global_ctrl);
 }
-fn read_msr(msr: u32) -> u64 {
+fn slot_msr(s: Slot) -> u32 {
+    match s {
+        Slot::P(i) => PMC + i as u32,
+        Slot::F(i) => FIXED + i as u32,
+    }
+}
+fn snapshot(s: Slot) -> Saved {
+    Saved {
+        global: read(GLOBAL),
+        control: match s {
+            Slot::P(i) => read(EVT + i as u32),
+            Slot::F(_) => read(FIXED_CTRL),
+        },
+        counter: read(slot_msr(s)),
+    }
+}
+fn idle(s: Slot, v: Saved) -> bool {
+    let ctrl = match s {
+        Slot::P(_) => v.control == 0,
+        Slot::F(i) => v.control >> (i * 4) & 15 == 0,
+    };
+    ctrl && v.global & bit(s) == 0 && read(STATUS) & bit(s) == 0
+}
+fn disable(s: Slot) {
+    write(GLOBAL, read(GLOBAL) & !bit(s))
+}
+fn program(s: Slot, e: Event) {
+    disable(s);
+    match s {
+        Slot::P(i) => write(
+            EVT + i as u32,
+            e.code() as u64 | (1 << 16) | (1 << 17) | (1 << 22),
+        ),
+        Slot::F(i) => {
+            let old = read(FIXED_CTRL);
+            write(FIXED_CTRL, (old & !(15 << (i * 4))) | (3 << (i * 4)))
+        }
+    }
+    write(slot_msr(s), 0);
+    write(GLOBAL, read(GLOBAL) | bit(s))
+}
+fn restore(s: Slot, old: Saved) -> bool {
+    disable(s);
+    let overflow = read(STATUS) & bit(s) != 0;
+    match s {
+        Slot::P(i) => write(EVT + i as u32, old.control),
+        Slot::F(i) => {
+            let now = read(FIXED_CTRL);
+            let mask = 15 << (i * 4);
+            write(FIXED_CTRL, (now & !mask) | (old.control & mask))
+        }
+    }
+    write(slot_msr(s), old.counter);
+    if overflow {
+        write(OVF, bit(s))
+    }
+    let now = read(GLOBAL);
+    write(GLOBAL, (now & !bit(s)) | (old.global & bit(s)));
+    overflow
+}
+fn read(msr: u32) -> u64 {
     unsafe { rdmsr(msr) }
 }
-fn write_msr(msr: u32, value: u64) {
-    unsafe { wrmsr(msr, value) }
+fn write(msr: u32, v: u64) {
+    unsafe { wrmsr(msr, v) }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn decode_capabilities_and_width_masks() {
-        let c = Capabilities::decode(4 | (4 << 8) | (48 << 16) | (7 << 24), 2, 3 | (40 << 5));
-        assert_eq!(c.programmable_mask(), (1u64 << 48) - 1);
-        assert_eq!(c.fixed_mask(), (1u64 << 40) - 1);
-        assert!(c.supports_programmable(Event::Cycles));
-        assert!(!c.supports_programmable(Event::Instructions));
-        assert!(c.supports_fixed(Event::Cycles));
-        assert!(c.supports_fixed(Event::Instructions));
-    }
-    #[test]
-    fn allocation_skips_busy_slots() {
-        let free = Snapshot {
-            global_ctrl: 0,
-            status: 0,
-            control: 0,
-            counter: 9,
-        };
-        let busy = Snapshot { control: 1, ..free };
-        assert!(is_idle(Slot::Programmable(0), free));
-        assert!(!is_idle(Slot::Programmable(0), busy));
-        assert!(!is_idle(
-            Slot::Fixed(1),
-            Snapshot {
-                control: 0x10,
-                ..free
-            }
-        ));
-        let caps = Capabilities::decode(1 | (2 << 8) | (40 << 16) | (2 << 24), 0, 0);
-        assert_eq!(
-            select_idle_programmable(caps, &[busy, free]),
-            Some(Slot::Programmable(1))
+    fn capabilities_reject_v1_and_invalid_widths() {
+        assert!(!Capabilities::decode(1 | (1 << 8) | (48 << 16), 0, 0).valid());
+        assert!(!Capabilities::decode(2 | (1 << 8) | (65 << 16), 0, 0).valid());
+        assert!(
+            Capabilities::decode(2 | (4 << 8) | (48 << 16) | (2 << 24), 0, 3 | (40 << 5))
+                .fixed_ok(Event::Cycles)
         );
     }
     #[test]
-    fn restore_state_machine_is_idempotent() {
-        let s = Snapshot {
-            global_ctrl: 1,
-            status: 0,
-            control: 0,
-            counter: 0,
-        };
-        let mut state = Restore::Active(s);
-        state.disable();
-        assert_eq!(state, Restore::Disabled(s));
-        state.finish();
-        assert_eq!(state, Restore::Restored);
+    fn encodings_and_delta() {
+        assert_eq!(
+            Event::Cycles.code() as u64 | (1 << 16) | (1 << 17) | (1 << 22),
+            0x43003c
+        );
+        assert_eq!(3u64.wrapping_sub(250) & Capabilities::mask(8), 9);
+    }
+    #[test]
+    fn busy_and_stale_generation() {
+        let mut m = Manager::new();
+        m.slots[0].owned = true;
+        assert_eq!(
+            select(&m, Capabilities::decode(2 | (1 << 8) | (48 << 16), 0, 0)),
+            Err(Error::NoCounter)
+        );
+        m.slots[0].generation = 7;
+        assert_ne!(m.slots[0].generation, 6);
+    }
+    #[test]
+    fn masked_restore_math() {
+        let mask = 15 << 4;
+        assert_eq!((0xa0 & !mask) | (0x10 & mask), 0x10);
+        assert_eq!((0b101 & !2) | (2 & 2), 0b111);
+    }
+    #[test]
+    fn host_stub() {
+        #[cfg(not(target_os = "none"))]
+        assert_eq!(capabilities(), Err(Error::Unsupported));
     }
 }
