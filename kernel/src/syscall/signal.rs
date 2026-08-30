@@ -11,7 +11,8 @@ use axtask::{
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK,
+    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_AUTODISARM,
+    SS_DISABLE, SS_ONSTACK,
     siginfo, timespec,
 };
 use thekernel_linux_process_adapter::Pid;
@@ -1711,14 +1712,14 @@ fn prepare_sigaltstack_update(
     current_sp: usize,
     candidate: SignalStack,
 ) -> AxResult<SignalStack> {
-    let valid_flags = SS_DISABLE;
+    let valid_flags = SS_DISABLE | SS_AUTODISARM;
     if candidate.flags & !valid_flags != 0 || candidate.flags & SS_ONSTACK != 0 {
         return Err(AxError::InvalidInput);
     }
     if current_stack.contains_sp(current_sp) {
         return Err(AxError::OperationNotPermitted);
     }
-    if candidate.flags == SS_DISABLE {
+    if candidate.flags & SS_DISABLE != 0 {
         return Ok(SignalStack::default());
     }
     if candidate.size < MINSIGSTKSZ as usize {
@@ -1783,7 +1784,7 @@ mod tests {
 
     use axerrno::AxError;
     use axtask::future::TimerRegistrationError;
-    use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_DISABLE, SS_ONSTACK};
+    use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK};
     use thekernel_linux_signal::{
         RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalSet,
         SignalStack, Signo,
@@ -2198,5 +2199,12 @@ mod tests {
                 .unwrap()
                 .disabled()
         );
+    }
+
+    #[test]
+    fn sigaltstack_accepts_autodisarm_configuration() {
+        let current = SignalStack::default();
+        let configured = SignalStack::new(0x8000, SS_AUTODISARM, MINSIGSTKSZ as usize);
+        assert_eq!(prepare_sigaltstack_update(&current, 0x4000, configured), Ok(configured));
     }
 }
