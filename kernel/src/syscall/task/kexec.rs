@@ -236,6 +236,8 @@ static STOP_ACKS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "smp-tlb-shootdown")]
 fn kexec_stop_handler() {
+    #[cfg(feature = "perf-sampling")]
+    crate::file::PerfSamplingFile::quiesce_current_cpu();
     #[cfg(feature = "hwp-uclamp")]
     // Restore this CPU's firmware-owned request before acknowledging the
     // terminal stop; the initiator may hand execution to another kernel.
@@ -1046,6 +1048,8 @@ pub(crate) fn execute_loaded() -> AxResult<isize> {
         if stop_other_cpus().is_err() {
             axhal::power::system_off();
         }
+        #[cfg(feature = "perf-sampling")]
+        crate::file::PerfSamplingFile::quiesce_current_cpu();
         #[cfg(feature = "hwp-uclamp")]
         // Remote CPUs restored before their ACK.  Restore the initiator only
         // after every ACK and immediately before the non-returning handoff.

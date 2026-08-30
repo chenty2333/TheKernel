@@ -108,7 +108,10 @@ fn open_sampling(
         file.clone() as Arc<dyn crate::file::FileLike>,
         flags & PERF_FLAG_FD_CLOEXEC != 0,
     ) {
-        Ok(fd) => Ok(fd as isize),
+        Ok(fd) => {
+            file.enter_current();
+            Ok(fd as isize)
+        }
         Err(error) => {
             current().as_thread().detach_perf_sampling(&file);
             Err(error)

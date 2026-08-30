@@ -199,6 +199,19 @@ impl PerfSamplingFile {
         }
     }
 
+    /// Terminal kexec cleanup.  The caller will never resume ordinary task
+    /// execution, so retain the Arc rather than allowing the final fixed-view
+    /// drop to run in the terminal IPI context.
+    pub(crate) fn quiesce_current_cpu() {
+        let _irq = NoPreemptIrqSave::new();
+        let cpu = axhal::percpu::this_cpu_id();
+        if let Some(custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) {
+            let _ = axhal::pmu::sampling_stop_local(custody.token);
+            core::mem::forget(custody.event);
+        }
+        let _ = axhal::pmu::sampling_quiesce_local();
+    }
+
     pub(crate) fn handle_pmi(frame: &axcpu::TrapFrame) {
         let Ok(Some((sample, generation))) = axhal::pmu::sampling_take_pmi() else {
             return;
