@@ -2101,7 +2101,7 @@ fn positioned_file_handle(
     access: FileFlags,
 ) -> AxResult<FileHandle<File>> {
     match FileLikeKind::from_file_like(file_like.as_ref()) {
-        FileLikeKind::Directory => return Err(AxError::InvalidInput),
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
         FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::from(LinuxError::ESPIPE)),
         FileLikeKind::Regular | FileLikeKind::Other => {}
     }
@@ -2773,17 +2773,11 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let file_like = get_file_like(fd)?;
-    // do_ftruncate rejects O_PATH at fd admission, before asking the target
-    // inode what type it is.  In particular, O_PATH directories are EBADF,
-    // while ordinary directories below remain EISDIR.
-    file_like.check_io_access()?;
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
-    match kind {
-        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
-        FileLikeKind::Socket | FileLikeKind::Other => return Err(AxError::InvalidInput),
-        FileLikeKind::Directory => return Err(AxError::IsADirectory),
-        FileLikeKind::Regular => {}
-    }
+    // Linux v6.12.103 fs/open.c:168 tests both S_ISREG and FMODE_WRITE in
+    // do_ftruncate, returning EINVAL for either failure. fdget's EBADF has
+    // already been returned by get_file_like above.
+    ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
         secret.check_truncate()?;
         if (length as u64) > secret.size() {
@@ -2795,7 +2789,10 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     let security = current_vfs_security();
     let f = file_like.downcast::<File>()?;
     let backend = f.inner().access(FileFlags::WRITE).map_err(|error| match error {
-        AxError::BadFileDescriptor => AxError::InvalidInput,
+        AxError::BadFileDescriptor => {
+            ftruncate_admission_errno(true, FileLikeKind::Regular, false, false)
+                .expect_err("read-only regular ftruncate must be EINVAL")
+        }
         other => other,
     })?;
     check_writable_mount(f.inner().location())?;
@@ -2827,6 +2824,21 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     notify_write(fd);
     let _ = notify_exact(f.inner().location(), IN_ATTRIB);
     Ok(0)
+}
+
+fn ftruncate_admission_errno(
+    fd_found: bool,
+    kind: FileLikeKind,
+    path_only: bool,
+    writable: bool,
+) -> AxResult {
+    if !fd_found {
+        return Err(AxError::BadFileDescriptor);
+    }
+    if kind != FileLikeKind::Regular || path_only || !writable {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
 }
 
 pub fn sys_fallocate(
@@ -6720,5 +6732,21 @@ mod tests {
             validate_sync_file_range_args(i64::MAX, 1, 0),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn ftruncate_admission_matches_linux_do_ftruncate() {
+        let cases = [
+            (false, FileLikeKind::Regular, false, true, AxError::BadFileDescriptor),
+            (true, FileLikeKind::Directory, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Regular, true, true, AxError::InvalidInput),
+            (true, FileLikeKind::Regular, false, false, AxError::InvalidInput),
+        ];
+        for (fd_found, kind, path_only, writable, expected) in cases {
+            assert_eq!(
+                ftruncate_admission_errno(fd_found, kind, path_only, writable),
+                Err(expected)
+            );
+        }
     }
 }
