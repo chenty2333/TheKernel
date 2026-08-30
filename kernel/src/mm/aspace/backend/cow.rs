@@ -1928,7 +1928,10 @@ mod tests {
             .map(|page| {
                 (
                     page.paddr,
-                    Arc::new(SpinNoIrq::new(FrameRefCnt(FrameTableRefCount::INITIAL_CNT))),
+                    Arc::new(SpinNoIrq::new(FrameRefCnt {
+                        references: FrameTableRefCount::INITIAL_CNT,
+                        backing: None,
+                    })),
                 )
             })
             .collect()
@@ -2046,7 +2049,7 @@ mod tests {
         let frame_refs = tracked_frames(&pages);
         let mut ops = mock_clone_ops(&pages, 3);
         assert_eq!(
-            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
                 frame_refs.get(&paddr).unwrap().clone()
             }),
             Err(AxError::NoMemory)
@@ -2104,7 +2107,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, 2);
 
         assert_eq!(
-            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
                 frame_refs.get(&paddr).unwrap().clone()
             }),
             Err(AxError::NoMemory)
@@ -2137,7 +2140,7 @@ mod tests {
         let frame_refs = tracked_frames(&pages);
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
-        clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+        clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
             frame_refs.get(&paddr).unwrap().clone()
         })
         .unwrap();
@@ -2169,7 +2172,7 @@ mod tests {
         let copied = PhysAddr::from(pages[0].paddr.as_usize() + 0x1000_0000);
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
-        clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+        clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
             frame_refs.get(&paddr).unwrap().clone()
         })
         .unwrap();
@@ -2199,7 +2202,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, 3);
 
         assert_eq!(
-            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
                 frame_refs.get(&paddr).unwrap().clone()
             }),
             Err(AxError::NoMemory)
@@ -2232,7 +2235,7 @@ mod tests {
         let source_snapshot = ops.parents.clone();
 
         assert_eq!(
-            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
                 frame_refs.get(&paddr).unwrap().clone()
             }),
             Err(AxError::BadAddress)
