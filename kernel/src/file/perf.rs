@@ -21,6 +21,8 @@ const PERF_EVENT_IOC_REFRESH: u32 = 0x2402;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_IOC_FLAG_GROUP: usize = 1;
+pub(crate) const MAX_GROUP_MEMBERS: usize = 64;
+pub(crate) const MAX_GROUPS_PER_THREAD: usize = 64;
 
 pub(crate) const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
 pub(crate) const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
@@ -52,7 +54,13 @@ struct GroupState { members: Vec<Member>, active: ActiveGroup }
 pub(crate) struct PerfGroup { target_task_id: u64, leader_id: u64, state: SpinNoIrq<GroupState> }
 
 impl PerfGroup {
-    pub(crate) fn new(target_task_id: u64, leader_id: u64) -> Arc<Self> { Arc::new(Self { target_task_id, leader_id, state: SpinNoIrq::new(GroupState { members: Vec::new(), active: ActiveGroup::new() }) }) }
+    pub(crate) fn new(target_task_id: u64, leader_id: u64) -> AxResult<Arc<Self>> {
+        let mut members = Vec::new();
+        members.try_reserve_exact(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?;
+        let mut active = ActiveGroup::new();
+        active.files.try_reserve_exact(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?;
+        Arc::try_new(Self { target_task_id, leader_id, state: SpinNoIrq::new(GroupState { members, active }) }).map_err(|_| AxError::NoMemory)
+    }
     pub(crate) fn accepts_target(&self, id: u64) -> bool { self.target_task_id == id }
     fn is_leader(&self, id: u64) -> bool { self.leader_id == id }
     #[cfg(test)] pub(crate) fn is_group_leader_for_test(&self, id: u64) -> bool { self.is_leader(id) }
@@ -64,8 +72,7 @@ impl PerfGroup {
         if let Some(hw) = event.event.hardware() {
             if state.members.iter().filter_map(|member| member.file.upgrade()).any(|member| member.event.hardware() == Some(hw)) { return Err(AxError::OperationNotSupported); }
         }
-        state.members.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        state.active.files.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        if state.members.len() == MAX_GROUP_MEMBERS { return Err(AxError::OperationNotSupported); }
         state.members.push(Member { file: Arc::downgrade(event), dead: false }); state.active.files.push(None); Ok(())
     }
     fn live<'a>(state: &'a mut GroupState) -> impl Iterator<Item = (usize, Arc<PerfEventFile>)> + 'a { state.members.iter_mut().enumerate().filter_map(|(slot, member)| { let file = member.file.upgrade(); member.dead = file.is_none(); file.map(|file| (slot, file)) }) }
@@ -85,12 +92,12 @@ impl PerfGroup {
                 let (id, event) = wanted[index]; let event = match event { HardwareEvent::Cycles => axhal::pmu::Event::Cycles, HardwareEvent::Instructions => axhal::pmu::Event::Instructions };
                 match axhal::pmu::CounterLease::acquire(event, axhal::pmu::CounterKind::Fixed).or_else(|_| axhal::pmu::CounterLease::acquire(event, axhal::pmu::CounterKind::Programmable)) {
                     Ok(lease) => state.active.leases[index] = Some((id, lease)),
-                    Err(_) => { for lease in &mut state.active.leases { if let Some((_, lease)) = lease.take() { let _ = lease.finish(); } } return; }
+                    Err(_) => { for lease in &mut state.active.leases { if let Some((_, lease)) = lease.take() { let _ = lease.finish(); } } for file in &mut state.active.files { *file = None; } state.active.running = false; return; }
                 }
             }
         }
         #[cfg(not(feature = "pmu"))]
-        if state.active.files.iter().filter_map(Option::as_ref).any(|file| file.enabled() && file.event.hardware().is_some()) { return; }
+        if state.active.files.iter().filter_map(Option::as_ref).any(|file| file.enabled() && file.event.hardware().is_some()) { for file in &mut state.active.files { *file = None; } return; }
         for file in state.active.files.iter().filter_map(Option::as_ref) { file.start_running(now); }
         state.active.running = true;
     }
@@ -103,10 +110,10 @@ impl PerfGroup {
             });
             if let Some((id, value)) = sample { if let Some(file) = state.active.files.iter().filter_map(Option::as_ref).find(|file| file.id == id) { file.add_count(value); } }
         }
-        for file in state.active.files.iter_mut().filter_map(Option::take) { file.stop_running(now); if file.event == PerfEvent::Software(SoftwareEvent::ContextSwitches) && file.enabled() { file.add_count(1); } }
+        for file in state.active.files.iter_mut().filter_map(Option::take) { let was_running = file.stop_running(now); if was_running && file.event == PerfEvent::Software(SoftwareEvent::ContextSwitches) && file.enabled() { file.add_count(1); } }
         state.active.running = false;
     }
-    pub(crate) fn on_fault(&self) { let state = self.state.lock(); for file in state.members.iter().filter_map(|member| member.file.upgrade()) { if file.event == PerfEvent::Software(SoftwareEvent::PageFaults) && file.enabled() { file.add_count(1); } } }
+    pub(crate) fn on_fault(&self) { let state = self.state.lock(); if !state.active.running { return; } for file in state.active.files.iter().filter_map(Option::as_ref) { if file.event == PerfEvent::Software(SoftwareEvent::PageFaults) && file.running() { file.add_count(1); } } }
     fn snapshots(&self, out: &mut Vec<Sample>) { let state = self.state.lock(); for member in &state.members { if let Some(file) = member.file.upgrade() { out.push(file.sample()); } } }
 }
 
@@ -115,27 +122,28 @@ pub struct PerfEventFile { id: u64, event: PerfEvent, group: Weak<PerfGroup>, re
 #[derive(Clone, Copy)] struct Sample { id: u64, value: u64, enabled: u64, running: u64 }
 
 impl PerfEventFile {
-    pub fn new(id: u64, event: PerfEvent, disabled: bool, group: Arc<PerfGroup>, read_format: u64) -> AxResult<Arc<Self>> {
-        let now = monotonic_time_nanos(); let file = Arc::try_new(Self { id, event, group: Arc::downgrade(&group), read_format, state: SpinNoIrq::new(PerfEventState { enabled: !disabled, running: false, count: 0, enabled_total: 0, running_total: 0, enabled_since: now, running_since: now }) }).map_err(|_| AxError::NoMemory)?; group.add(&file)?; Ok(file)
+    pub fn new(id: u64, event: PerfEvent, disabled: bool, group: &Arc<PerfGroup>, read_format: u64) -> AxResult<Arc<Self>> {
+        let now = monotonic_time_nanos(); let file = Arc::try_new(Self { id, event, group: Arc::downgrade(group), read_format, state: SpinNoIrq::new(PerfEventState { enabled: !disabled, running: false, count: 0, enabled_total: 0, running_total: 0, enabled_since: now, running_since: now }) }).map_err(|_| AxError::NoMemory)?; group.add(&file)?; Ok(file)
     }
-    pub(crate) fn group(&self) -> Arc<PerfGroup> { self.group.upgrade().expect("perf group retained by target thread") }
-    pub(crate) fn is_group_leader(&self) -> bool { self.group().is_leader(self.id) }
+    pub(crate) fn group(&self) -> Option<Arc<PerfGroup>> { self.group.upgrade() }
+    pub(crate) fn is_group_leader(&self) -> bool { self.group().is_some_and(|group| group.is_leader(self.id)) }
     fn enabled(&self) -> bool { self.state.lock().enabled }
     fn start_running(&self, now: u64) { let mut state = self.state.lock(); if state.enabled && !state.running { state.running = true; state.running_since = now; } }
-    fn stop_running(&self, now: u64) { let mut state = self.state.lock(); if state.running { let elapsed = now.saturating_sub(state.running_since); state.running_total = state.running_total.saturating_add(elapsed); state.running = false; if matches!(self.event, PerfEvent::Software(SoftwareEvent::CpuClock | SoftwareEvent::TaskClock)) { state.count = state.count.saturating_add(elapsed); } } }
+    fn stop_running(&self, now: u64) -> bool { let mut state = self.state.lock(); if state.running { let elapsed = now.saturating_sub(state.running_since); state.running_total = state.running_total.saturating_add(elapsed); state.running = false; if matches!(self.event, PerfEvent::Software(SoftwareEvent::CpuClock | SoftwareEvent::TaskClock)) { state.count = state.count.saturating_add(elapsed); } true } else { false } }
+    fn running(&self) -> bool { self.state.lock().running }
     fn add_count(&self, value: u64) { let mut state = self.state.lock(); state.count = state.count.saturating_add(value); }
     fn enable_at(&self, now: u64) { let mut state = self.state.lock(); if !state.enabled { state.enabled = true; state.enabled_since = now; } }
     fn disable_at(&self, now: u64) { let mut state = self.state.lock(); if state.running { state.running_total = state.running_total.saturating_add(now.saturating_sub(state.running_since)); state.running = false; } if state.enabled { state.enabled_total = state.enabled_total.saturating_add(now.saturating_sub(state.enabled_since)); state.enabled = false; } }
     fn reset_at(&self, _: u64) { self.state.lock().count = 0; }
     fn sample(&self) -> Sample { let now = monotonic_time_nanos(); let state = self.state.lock(); Sample { id: self.id, value: state.count, enabled: state.enabled_total.saturating_add(if state.enabled { now.saturating_sub(state.enabled_since) } else { 0 }), running: state.running_total.saturating_add(if state.running { now.saturating_sub(state.running_since) } else { 0 }) } }
-    pub(crate) fn on_enter(&self) { self.group().on_enter() } pub(crate) fn on_leave(&self) { self.group().on_leave() } pub(crate) fn on_fault(&self) { self.group().on_fault() }
-    fn check_hardware_local(&self) -> AxResult { self.group().require_local_for_hardware() }
+    pub(crate) fn on_enter(&self) { if let Some(group) = self.group() { group.on_enter(); } } pub(crate) fn on_leave(&self) { if let Some(group) = self.group() { group.on_leave(); } } pub(crate) fn on_fault(&self) { if let Some(group) = self.group() { group.on_fault(); } }
+    fn check_hardware_local(&self) -> AxResult { self.group().ok_or(AxError::BadFileDescriptor)?.require_local_for_hardware() }
     fn read_samples(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.check_hardware_local()?; let group_read = self.read_format & PERF_FORMAT_GROUP != 0; let mut samples = Vec::new();
-        if group_read { let reserve = self.group().state.lock().members.len(); samples.try_reserve(reserve).map_err(|_| AxError::NoMemory)?; self.group().snapshots(&mut samples); } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(self.sample()); }
+        if group_read { samples.try_reserve(MAX_GROUP_MEMBERS).map_err(|_| AxError::NoMemory)?; self.group().ok_or(AxError::BadFileDescriptor)?.snapshots(&mut samples); } else { samples.try_reserve(1).map_err(|_| AxError::NoMemory)?; samples.push(self.sample()); }
         let ids = self.read_format & PERF_FORMAT_ID != 0; let timing = ((self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0) as usize) + ((self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0) as usize);
         let words = if group_read { (1 + timing).checked_add(samples.len().checked_mul(1 + ids as usize).ok_or(AxError::InvalidInput)?).ok_or(AxError::InvalidInput)? } else { 1 + timing + ids as usize }; let bytes = words.checked_mul(size_of::<u64>()).ok_or(AxError::InvalidInput)?; if dst.remaining_mut() < bytes { return Err(AxError::InvalidInput); }
-        let leader = samples.first().copied().unwrap_or(Sample { id: self.id, value: 0, enabled: 0, running: 0 });
+        let leader = samples.iter().copied().find(|sample| sample.id == self.group().map_or(self.id, |group| group.leader_id)).unwrap_or(Sample { id: self.id, value: 0, enabled: 0, running: 0 });
         if group_read { dst.write(&(samples.len() as u64).to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } for sample in samples { dst.write(&sample.value.to_ne_bytes())?; if ids { dst.write(&sample.id.to_ne_bytes())?; } } } else { dst.write(&leader.value.to_ne_bytes())?; if self.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 { dst.write(&leader.enabled.to_ne_bytes())?; } if self.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 { dst.write(&leader.running.to_ne_bytes())?; } if ids { dst.write(&leader.id.to_ne_bytes())?; } }
         Ok(bytes)
     }
@@ -149,7 +157,7 @@ impl FileLike for PerfEventFile {
         if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_REFRESH | PERF_EVENT_IOC_RESET) && arg & !PERF_IOC_FLAG_GROUP != 0 { return Err(AxError::InvalidInput); }
         if cmd == PERF_EVENT_IOC_REFRESH { return Err(AxError::OperationNotSupported); }
         if matches!(cmd, PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) { self.check_hardware_local()?; }
-        let now = monotonic_time_nanos(); let perf_group = self.group();
+        let now = monotonic_time_nanos(); let perf_group = self.group().ok_or(AxError::BadFileDescriptor)?;
         // A self-target ioctl may run in the counted task. Stop it before
         // changing the member state, then acquire a fresh local lease. This
         // never attempts a remote MSR access; remote software events retain
@@ -178,16 +186,16 @@ mod tests {
 
     #[test]
     fn group_rejects_duplicate_hardware_event() {
-        let group = PerfGroup::new(1, 1);
-        let first = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Cycles), true, group.clone(), 0).unwrap();
-        assert!(PerfEventFile::new(2, PerfEvent::Hardware(HardwareEvent::Cycles), true, group, 0).is_err());
+        let group = PerfGroup::new(1, 1).unwrap();
+        let first = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Cycles), true, &group, 0).unwrap();
+        assert!(PerfEventFile::new(2, PerfEvent::Hardware(HardwareEvent::Cycles), true, &group, 0).is_err());
         drop(first);
     }
 
     #[test]
     fn file_holds_only_weak_group_reference() {
-        let group = PerfGroup::new(1, 1);
-        let file = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Instructions), true, group.clone(), 0).unwrap();
+        let group = PerfGroup::new(1, 1).unwrap();
+        let file = PerfEventFile::new(1, PerfEvent::Hardware(HardwareEvent::Instructions), true, &group, 0).unwrap();
         assert_eq!(Arc::strong_count(&group), 1);
         drop(file);
     }

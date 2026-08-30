@@ -134,18 +134,19 @@ pub(crate) fn sys_perf_event_open(
         // Reserve the ID before group construction so the group's immutable
         // leader identity and the created event cannot diverge.
         let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-        (id, PerfGroup::new(target_task_id, id))
+        (id, PerfGroup::new(target_task_id, id)?)
     } else {
         if flags & PERF_FLAG_FD_NO_GROUP != 0 {
             return Err(AxError::InvalidInput);
         }
         let leader = get_typed_file::<PerfEventFile>(group_fd)?;
-        if !leader.is_group_leader() || !leader.group().accepts_target(target_task_id) {
+        let Some(group) = leader.group() else { return Err(AxError::BadFileDescriptor); };
+        if !leader.is_group_leader() || !group.accepts_target(target_task_id) {
             return Err(AxError::InvalidInput);
         }
         (
             NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed),
-            leader.group(),
+            group,
         )
     };
     let event = match attr.event_type {
@@ -181,22 +182,27 @@ pub(crate) fn sys_perf_event_open(
     {
         return Err(AxError::OperationNotSupported);
     }
-    let file = PerfEventFile::new(
+    // The target retains the only long-lived group Arc before the file takes
+    // its weak back-reference. Every failure below removes an empty group.
+    target.as_thread().attach_perf_group(group.clone())?;
+    let file = match PerfEventFile::new(
         id,
         event,
         disabled,
-        group,
+        &group,
         attr.read_format,
-    )?;
-    target.as_thread().attach_perf_group(file.group())?;
-    if target_is_current {
-        file.on_enter();
-    }
-    add_file_like(
+    ) {
+        Ok(file) => file,
+        Err(error) => { target.as_thread().detach_empty_perf_group(&group); return Err(error); }
+    };
+    let result = add_file_like(
         file as Arc<dyn crate::file::FileLike>,
         flags & PERF_FLAG_FD_CLOEXEC != 0,
-    )
-    .map(|fd| fd as isize)
+    );
+    match result {
+        Ok(fd) => { if target_is_current { group.on_enter(); } Ok(fd as isize) }
+        Err(error) => { target.as_thread().detach_empty_perf_group(&group); Err(error) }
+    }
 }
 
 #[cfg(test)]
@@ -216,7 +222,7 @@ mod tests {
 
     #[test]
     fn perf_group_binds_leader_and_target_task() {
-        let group = PerfGroup::new(41, 7);
+        let group = PerfGroup::new(41, 7).unwrap();
         assert!(group.is_group_leader_for_test(7));
         assert!(!group.is_group_leader_for_test(8));
         assert!(group.accepts_target(41));

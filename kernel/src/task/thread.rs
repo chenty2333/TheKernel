@@ -1231,9 +1231,14 @@ impl Thread {
         if events.iter().any(|attached| Arc::ptr_eq(attached, &group)) {
             return Ok(());
         }
-        events.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        if events.len() == crate::file::MAX_GROUPS_PER_THREAD { return Err(AxError::OperationNotSupported); }
         events.push(group);
         Ok(())
+    }
+
+    pub(crate) fn detach_empty_perf_group(&self, group: &Arc<crate::file::PerfGroup>) {
+        let mut events = self.perf_events.lock();
+        events.retain(|attached| !Arc::ptr_eq(attached, group) || !attached.is_prunable());
     }
 
     fn perf_on_enter(&self) {
@@ -1343,7 +1348,7 @@ impl Thread {
             io_write_bytes: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
-            perf_events: SpinNoIrq::new(Vec::new()),
+            perf_events: SpinNoIrq::new({ let mut groups = Vec::new(); groups.try_reserve_exact(crate::file::MAX_GROUPS_PER_THREAD).map_err(|_| AxError::NoMemory)?; groups }),
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             io_context: SpinNoIrq::new(io_context),
