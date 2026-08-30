@@ -911,13 +911,17 @@ pub fn sys_remap_file_pages(
         aspace.remap_shared_span_snapshot(start_addr, size)?
     };
     let flags = flags & MAP_NONBLOCK as usize;
-    let fully_locked = {
+    // The LSM observes the source VMA's MAP_LOCKED state.  This address
+    // space records mlock state at page granularity instead of splitting the
+    // VMA, so use the first source page (the VMA selected by Linux) rather
+    // than requiring the complete remapped interval to be locked.
+    let source_starts_locked = {
         let aspace = aspace_handle.lock();
-        aspace.locked_bytes_in_range(start_addr, size) == size
+        aspace.locked_bytes_in_range(start_addr, PageSize::Size4K as usize) != 0
     };
     let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize
         | flags
-        | if fully_locked { MAP_LOCKED as usize } else { 0 };
+        | if source_starts_locked { MAP_LOCKED as usize } else { 0 };
     mmap_file(
         image.credential(),
         Some((lease.filesystem_owner_user_ns(), lease.file())),

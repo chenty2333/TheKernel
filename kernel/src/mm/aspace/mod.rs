@@ -3029,8 +3029,13 @@ impl AddrSpace {
         populate: bool,
     ) -> AxResult<DeferredUffdWake> {
         let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::InvalidInput)?;
+        // `mlock` can cover only a prefix, suffix, or interior pages of a
+        // VMA.  Keep those exact intervals before unmap clears the ledger;
+        // remap_file_pages must neither drop the charge nor expand it to the
+        // whole replacement mapping.
+        let locked_segments = self.locked_segments_in_range(start, size);
         let mut cursor = start;
-        let mut fragments: Vec<(VirtAddr, usize, MappingFlags, bool, Backend, Backend)> = Vec::new();
+        let mut fragments: Vec<(VirtAddr, usize, MappingFlags, Backend, Backend)> = Vec::new();
         for area in self.areas_overlapping(range) {
             if cursor >= range.end { break; }
             if area.start() > cursor { return Err(AxError::InvalidInput); }
@@ -3046,27 +3051,28 @@ impl AddrSpace {
                 Backend::Shared(_) => source.clone_shared_rebased(cursor, offset)?,
                 _ => return Err(AxError::InvalidInput),
             };
-            // Preserve only a fully locked fragment here; a partially locked
-            // source is rejected by the syscall planner rather than expanding
-            // its mlock accounting to the whole replacement VMA.
-            let locked_bytes = self.locked_bytes_in_range(cursor, length);
-            if locked_bytes != 0 && locked_bytes != length { return Err(AxError::InvalidInput); }
-            fragments.push((cursor, length, area.flags(), locked_bytes == length, rollback, replacement));
+            fragments.push((cursor, length, area.flags(), rollback, replacement));
             cursor = end;
         }
         if cursor != range.end { return Err(AxError::InvalidInput); }
         let wake = self.unmap(start, size)?;
         let mut committed = 0usize;
-        for (_, _, flags, locked, _, replacement) in &fragments {
-            let (address, length, _, _, _, _) = fragments[committed];
-            if let Err(error) = self.map_with_lock_state(address, length, *flags, false, replacement.clone(), *locked) {
+        for (_, _, flags, _, replacement) in &fragments {
+            let (address, length, _, _, _) = fragments[committed];
+            if let Err(error) = self.map_with_lock_state(address, length, *flags, false, replacement.clone(), false) {
                 self.unmap(start, size).ok();
-                for (address, length, flags, locked, rollback, _) in fragments.into_iter() {
-                    self.map_with_lock_state(address, length, flags, false, rollback, locked).map_err(|_| AxError::BadState)?;
+                for (address, length, flags, rollback, _) in fragments.into_iter() {
+                    self.map_with_lock_state(address, length, flags, false, rollback, false).map_err(|_| AxError::BadState)?;
+                }
+                for (locked_start, locked_size) in locked_segments {
+                    self.insert_locked_range(locked_start, locked_start + locked_size);
                 }
                 return Err(error);
             }
             committed += 1;
+        }
+        for (locked_start, locked_size) in locked_segments {
+            self.insert_locked_range(locked_start, locked_start + locked_size);
         }
         Ok(wake)
     }
