@@ -410,6 +410,31 @@ impl SharedMapId {
 }
 
 impl SharedBackend {
+    /// Clone this shared backing at a different page cursor while retaining
+    /// its physical-object identity.  `remap_file_pages` uses this only while
+    /// an AddrSpace replacement transaction owns the old VMA, so futex keys
+    /// continue to name the same `SharedPages` object at the rebased offset.
+    pub(crate) fn clone_rebased(
+        &self,
+        start: VirtAddr,
+        page_offset: usize,
+    ) -> AxResult<Self> {
+        let byte_offset = page_offset
+            .checked_mul(self.pages.size as usize)
+            .ok_or(AxError::InvalidInput)?;
+        if byte_offset >= self.pages.total_bytes() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(Self {
+            start,
+            page_offset,
+            pages: self.pages.clone(),
+            may_protect: self.may_protect,
+            map_id: self.map_id.clone(),
+            status: self.status.clone(),
+        })
+    }
+
     pub(super) const fn mapping_status(&self) -> &MappingStatus {
         &self.status
     }

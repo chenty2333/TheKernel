@@ -754,6 +754,22 @@ impl Backend {
         }
     }
 
+    /// Produce a shared-backend alias at an explicit backing page offset.
+    /// Private/COW and linear mappings deliberately reject this deprecated
+    /// Linux ABI: only a genuinely shared backing may be nonlinearly aliased.
+    pub(crate) fn clone_shared_rebased(
+        &self,
+        start: VirtAddr,
+        page_offset: usize,
+    ) -> AxResult<Self> {
+        match self {
+            Backend::Shared(backend) => backend
+                .clone_rebased(start, page_offset)
+                .map(Backend::Shared),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
     pub fn migrate_present_pages(
         &self,
         old_start: VirtAddr,
