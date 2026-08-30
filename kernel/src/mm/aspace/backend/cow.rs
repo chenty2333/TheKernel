@@ -856,17 +856,57 @@ impl CowBackend {
         self.file.is_some()
     }
 
-    /// Prepares a replacement PMD frame for a private anonymous 4 KiB COW
-    /// mapping.  Page-table replacement and retirement of `sources` stay with
-    /// the caller so both can be committed as one transaction.
+    /// Prepares a replacement PMD frame for a private 4 KiB COW mapping.
+    ///
+    /// Materialized leaves are copied verbatim. For sparse MAP_PRIVATE file
+    /// mappings, absent leaves are loaded directly into the unpublished huge
+    /// frame, avoiding transient 4 KiB mappings and anonymous COW frames.
     pub(crate) fn prepare_collapse_2m_frame(
         &self,
+        start: VirtAddr,
         sources: &[Option<PhysAddr>],
     ) -> AxResult<PreparedCowHugeFrame> {
-        if !self.is_4k_anonymous() {
+        if self.size != PageSize::Size4K {
             return Err(AxError::InvalidInput);
         }
-        PreparedCowHugeFrame::copy_from_4k_frames(sources)
+        let prepared = PreparedCowHugeFrame::copy_from_4k_frames(sources)?;
+        let Some((file, file_start, file_end, sigbus_on_eof)) = &self.file else {
+            return Ok(prepared);
+        };
+        let frame = prepared.frame()?;
+        for (index, source) in sources.iter().enumerate() {
+            if source.is_some() {
+                continue;
+            }
+            let vaddr = start + index * PAGE_SIZE_4K;
+            if self.faults_with_sigbus(vaddr) {
+                return Err(AxError::BadAddress);
+            }
+            let page_file_start = file_start
+                .checked_add(vaddr.as_usize().saturating_sub(self.start.as_usize()) as u64)
+                .ok_or(AxError::InvalidInput)?;
+            let current_end = if *sigbus_on_eof {
+                Some(file.location().len()?)
+            } else {
+                *file_end
+            };
+            let max_read = current_end
+                .map_or(u64::MAX, |end| end.saturating_sub(page_file_start))
+                .min(PAGE_SIZE_4K as u64) as usize;
+            let destination = unsafe {
+                slice::from_raw_parts_mut(
+                    phys_to_virt(frame).as_mut_ptr().add(index * PAGE_SIZE_4K),
+                    max_read,
+                )
+            };
+            let read = file.read_at_sync(&mut &mut *destination, page_file_start)?;
+            if read > max_read {
+                return Err(AxError::Io);
+            }
+            // The prepared frame is zeroed, so short reads keep the normal
+            // fault path's zero-filled tail.
+        }
+        Ok(prepared)
     }
 
     /// Returns the otherwise-identical COW backend used after a successful
@@ -874,7 +914,7 @@ impl CowBackend {
     /// transaction commits; changing the backend first would make rollback
     /// unable to interpret the old leaves.
     pub(crate) fn collapsed_2m_backend(&self) -> AxResult<Self> {
-        if !self.is_4k_anonymous() {
+        if self.size != PageSize::Size4K {
             return Err(AxError::InvalidInput);
         }
         let mut collapsed = self.clone();
@@ -887,14 +927,14 @@ impl CowBackend {
         &self,
         source: PhysAddr,
     ) -> AxResult<PreparedCowDemotionFrames> {
-        if self.size != PageSize::Size2M || self.file.is_some() {
+        if self.size != PageSize::Size2M {
             return Err(AxError::InvalidInput);
         }
         PreparedCowDemotionFrames::copy_from_2m_frame(source)
     }
 
     pub(crate) fn demoted_4k_backend(&self) -> AxResult<Self> {
-        if self.size != PageSize::Size2M || self.file.is_some() {
+        if self.size != PageSize::Size2M {
             return Err(AxError::InvalidInput);
         }
         let mut demoted = self.clone();
@@ -926,7 +966,7 @@ impl CowBackend {
         start: VirtAddr,
         leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
     ) -> AxResult<BackendRetirement> {
-        if !self.is_4k_anonymous() {
+        if self.size != PageSize::Size4K {
             return Err(AxError::InvalidInput);
         }
         let end = start + PageSize::Size2M as usize;
@@ -1657,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_promotes_only_private_anonymous_4k_cow_backend() {
+    fn collapse_promotes_private_anonymous_and_file_4k_cow_backends() {
         let Backend::Cow(anonymous) =
             Backend::new_alloc(VirtAddr::from(0x20_0000), PageSize::Size4K)
         else {
@@ -1667,6 +1707,30 @@ mod tests {
         assert_eq!(collapsed.page_size(), PageSize::Size2M);
         assert!(collapsed.is_private_anonymous());
         assert!(collapsed.is_materialized());
+
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "collapse-private-file-cow",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let Backend::Cow(file_private) = Backend::new_cow(
+            VirtAddr::from(0x40_0000),
+            PageSize::Size4K,
+            location,
+            0,
+            None,
+            false,
+        ) else {
+            unreachable!()
+        };
+        let collapsed_file = file_private.collapsed_2m_backend().unwrap();
+        assert_eq!(collapsed_file.page_size(), PageSize::Size2M);
+        assert!(collapsed_file.has_file_backing());
 
         let Backend::Cow(already_huge) =
             Backend::new_alloc(VirtAddr::from(0x20_0000), PageSize::Size2M)
