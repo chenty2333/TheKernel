@@ -301,6 +301,18 @@ impl SharedPages {
         self.len() * self.size as usize
     }
 
+    /// The range that may fault and be copied for a secret object. Like
+    /// Linux's secretmem page-cache backing, a non-page-aligned i_size owns
+    /// the complete final page; bytes in its tail begin zeroed and remain
+    /// addressable. The following page faults as SIGBUS.
+    fn secret_accessible_bytes(&self) -> Option<usize> {
+        self.secret_size.as_ref().and_then(|size| {
+            size.load(Ordering::Acquire)
+                .checked_add(PAGE_SIZE_4K - 1)
+                .map(|end| end & !(PAGE_SIZE_4K - 1))
+        })
+    }
+
     fn total_bytes_snapshot(&self) -> usize {
         self.secret_size.as_ref().map_or_else(
             || self.published_len.load(Ordering::Acquire) * self.size as usize,
@@ -309,7 +321,9 @@ impl SharedPages {
     }
 
     pub fn read_bytes(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
 
@@ -352,7 +366,9 @@ impl SharedPages {
     /// secret page remains a retry, not an implicit population.
     pub(crate) fn read_secret_bytes_resident(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
         let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
         let mut pages = frames.lock();
@@ -372,7 +388,9 @@ impl SharedPages {
     }
 
     pub fn write_bytes(&self, offset: usize, mut buf: &[u8]) -> AxResult {
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
 
@@ -413,7 +431,9 @@ impl SharedPages {
     /// frame; see [`Self::read_secret_bytes_resident`].
     pub(crate) fn write_secret_bytes_resident(&self, offset: usize, mut buf: &[u8]) -> AxResult {
         let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
         let mut pages = frames.lock();
@@ -780,7 +800,7 @@ impl SharedBackend {
         self.pages.is_secret()
             && self
                 .backing_offset(vaddr.as_usize())
-                .is_none_or(|offset| offset >= self.pages.secret_size.as_ref().expect("secret size").load(Ordering::Acquire))
+                .is_none_or(|offset| offset >= self.pages.secret_accessible_bytes().expect("secret size"))
     }
     /// Clone this shared backing at a different page cursor while retaining
     /// its physical-object identity.  `remap_file_pages` uses this only while
@@ -1311,6 +1331,28 @@ mod tests {
         };
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x4000)));
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+    }
+
+    #[test]
+    fn secret_partial_last_page_is_accessible_but_following_page_sigbuses() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K + 1).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        let mut tail = [0xff_u8; 1];
+        pages.read_bytes(PAGE_SIZE_4K + 0xffe, &mut tail).unwrap();
+        assert_eq!(tail, [0]);
+        pages.write_bytes(PAGE_SIZE_4K + 0xffe, &[0xa5]).unwrap();
+        pages.read_bytes(PAGE_SIZE_4K + 0xffe, &mut tail).unwrap();
+        assert_eq!(tail, [0xa5]);
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5ffe)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
     }
 
     #[test]
