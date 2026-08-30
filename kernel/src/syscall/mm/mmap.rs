@@ -898,7 +898,8 @@ pub fn sys_remap_file_pages(
     if size == 0 || start.checked_add(size).is_none() || pgoff.checked_add(size / PageSize::Size4K as usize).is_none() {
         return Err(AxError::InvalidInput);
     }
-    let thread = current().as_thread();
+    let curr = current();
+    let thread = curr.as_thread();
     let image = thread.proc_data.thread_image_access_snapshot(thread)?;
     let aspace_handle = image.aspace().clone();
     let start_addr = VirtAddr::from(start);
@@ -907,15 +908,7 @@ pub fn sys_remap_file_pages(
     // call, then compare it again while publishing under the write side.
     let (snapshot_flags, lease) = {
         let aspace = aspace_handle.lock();
-        let area = aspace.find_area(start_addr).ok_or(AxError::InvalidInput)?;
-        if area.start() != start_addr || area.end() < start_addr + size {
-            return Err(AxError::InvalidInput);
-        }
-        let lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
-        if lease.sharing() != FileMappingSharing::Shared {
-            return Err(AxError::InvalidInput);
-        }
-        (area.flags(), lease.clone())
+        aspace.remap_shared_span_snapshot(start_addr, size)?
     };
     let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize | (flags & MAP_NONBLOCK as usize);
     mmap_file(
@@ -927,16 +920,12 @@ pub fn sys_remap_file_pages(
     )?;
 
     let mut aspace = aspace_handle.lock();
-    let area = aspace.find_area(start_addr).ok_or(AxError::InvalidInput)?;
-    let current_lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
-    if area.flags() != snapshot_flags
-        || current_lease.ofd_key() != lease.ofd_key()
-        || current_lease.file_offset_at(start_addr) != lease.file_offset_at(start_addr)
-    {
+    let (current_flags, current_lease) = aspace.remap_shared_span_snapshot(start_addr, size)?;
+    if current_flags != snapshot_flags || current_lease.ofd_key() != lease.ofd_key() {
         return Err(AxError::InvalidInput);
     }
     let populate = flags & MAP_NONBLOCK as usize == 0;
-    let wake = aspace.replace_shared_mapping_at_offset(
+    let wake = aspace.replace_shared_mapping_span_at_offset(
         &aspace_handle,
         start_addr,
         size,

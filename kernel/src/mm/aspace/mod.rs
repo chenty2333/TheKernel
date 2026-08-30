@@ -2994,6 +2994,78 @@ impl AddrSpace {
         }
     }
 
+    /// Snapshot the complete Linux remap_file_pages VMA span.  Every fragment
+    /// must be contiguous, shared, carry the same flags and pin the same OFD.
+    pub(crate) fn remap_shared_span_snapshot(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<(MappingFlags, FileMappingLease)> {
+        let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::InvalidInput)?;
+        let mut cursor = start;
+        let mut result: Option<(MappingFlags, FileMappingLease)> = None;
+        for area in self.areas_overlapping(range) {
+            if cursor >= range.end { break; }
+            if area.start() > cursor { return Err(AxError::InvalidInput); }
+            let lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
+            if lease.sharing() != FileMappingSharing::Shared { return Err(AxError::InvalidInput); }
+            if let Some((flags, first)) = &result {
+                if *flags != area.flags() || first.ofd_key() != lease.ofd_key() { return Err(AxError::InvalidInput); }
+            } else {
+                result = Some((area.flags(), lease.clone()));
+            }
+            cursor = area.end().min(range.end);
+        }
+        if cursor != range.end { return Err(AxError::InvalidInput); }
+        result.ok_or(AxError::InvalidInput)
+    }
+
+    pub(crate) fn replace_shared_mapping_span_at_offset(
+        &mut self,
+        aspace: &Arc<Mutex<AddrSpace>>,
+        start: VirtAddr,
+        size: usize,
+        page_offset: usize,
+        populate: bool,
+    ) -> AxResult<DeferredUffdWake> {
+        let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::InvalidInput)?;
+        let mut cursor = start;
+        let mut fragments: Vec<(VirtAddr, usize, MappingFlags, bool, Backend, Backend)> = Vec::new();
+        for area in self.areas_overlapping(range) {
+            if cursor >= range.end { break; }
+            if area.start() > cursor { return Err(AxError::InvalidInput); }
+            let end = area.end().min(range.end);
+            let length = end.sub_addr(cursor);
+            let offset = page_offset.checked_add(cursor.sub_addr(start) / PAGE_SIZE_4K).ok_or(AxError::InvalidInput)?;
+            let source = area.backend();
+            let shared = source.file_mapping().is_some_and(|lease| lease.sharing() == FileMappingSharing::Shared);
+            if !shared { return Err(AxError::InvalidInput); }
+            let rollback = source.relocate(cursor, cursor, aspace)?;
+            let replacement = match source {
+                Backend::File(_) => source.clone_file_rebased(cursor, offset, aspace)?,
+                Backend::Shared(_) => source.clone_shared_rebased(cursor, offset)?,
+                _ => return Err(AxError::InvalidInput),
+            };
+            fragments.push((cursor, length, area.flags(), self.range_is_locked(cursor, length), rollback, replacement));
+            cursor = end;
+        }
+        if cursor != range.end { return Err(AxError::InvalidInput); }
+        let wake = self.unmap(start, size)?;
+        let mut committed = 0usize;
+        for (_, _, flags, locked, _, replacement) in &fragments {
+            let (address, length, _, _, _, _) = fragments[committed];
+            if let Err(error) = self.map_with_lock_state(address, length, *flags, populate, replacement.clone(), *locked) {
+                self.unmap(start, size).ok();
+                for (address, length, flags, locked, rollback, _) in fragments.into_iter().take(committed) {
+                    self.map_with_lock_state(address, length, flags, false, rollback, locked).map_err(|_| AxError::BadState)?;
+                }
+                return Err(error);
+            }
+            committed += 1;
+        }
+        Ok(wake)
+    }
+
     pub fn map_with_lock_state(
         &mut self,
         start: VirtAddr,
