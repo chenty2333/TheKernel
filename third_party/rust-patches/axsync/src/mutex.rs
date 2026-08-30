@@ -454,7 +454,7 @@ mod tests {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
-        sync::{Arc, Once},
+        sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Once},
         vec::Vec,
     };
 
@@ -511,9 +511,12 @@ mod tests {
     static GLOBAL_ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
     static INIT: Once = Once::new();
+    static TEST_SERIAL: StdMutex<()> = StdMutex::new(());
 
-    fn init_scheduler() {
+    fn init_scheduler() -> StdMutexGuard<'static, ()> {
+        let serial = TEST_SERIAL.lock().unwrap();
         INIT.call_once(|| thread::init_scheduler().unwrap());
+        serial
     }
 
     fn allocation_count(f: impl FnOnce()) -> usize {
@@ -536,7 +539,7 @@ mod tests {
 
     #[test]
     fn uncontended_unlock_does_not_notify_or_allocate() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Mutex::new(());
 
         // Warm current-task lookup before observing allocator traffic.
@@ -551,7 +554,7 @@ mod tests {
 
     #[test]
     fn registered_waiter_is_not_lost() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let acquired = Arc::new(AtomicBool::new(false));
         let guard = mutex.lock();
@@ -577,7 +580,7 @@ mod tests {
 
     #[test]
     fn interruptible_wait_ignores_nonterminal_interrupt_and_wakes_on_unlock() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let acquired = Arc::new(AtomicBool::new(false));
         let guard = mutex.lock();
@@ -602,7 +605,7 @@ mod tests {
 
     #[test]
     fn interruptible_wait_cancels_terminal_signal_without_lost_wakeup() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let waiter_cancelled_result = Arc::new(AtomicBool::new(false));
@@ -632,7 +635,7 @@ mod tests {
 
     #[test]
     fn queued_waiter_receives_handoff_before_a_barging_locker() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let order = Arc::new(AtomicUsize::new(0));
         let guard = mutex.lock();
@@ -660,7 +663,7 @@ mod tests {
 
     #[test]
     fn cancelled_other_waiter_cannot_reopen_selected_handoff() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let order = Arc::new(AtomicUsize::new(0));
         let guard = mutex.lock();
@@ -728,7 +731,7 @@ mod tests {
 
     #[test]
     fn lots_and_lots() {
-        init_scheduler();
+        let _test_serial = init_scheduler();
 
         const NUM_TASKS: u32 = 10;
         const NUM_ITERS: u32 = 10_000;
