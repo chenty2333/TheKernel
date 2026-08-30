@@ -2,7 +2,11 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use axtask::{can_block_current, current, future::{block_on, interruptible}, yield_now};
+use axtask::{
+    can_block_current, current,
+    future::{block_on, interruptible},
+    yield_now,
+};
 use event_listener::{Event, listener};
 
 /// A [`lock_api::RawMutex`] implementation.
@@ -37,6 +41,8 @@ impl RawMutex {
             waiters: AtomicUsize::new(0),
             #[cfg(test)]
             notify_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            handoff_claim_pause: AtomicUsize::new(0),
         }
     }
 
@@ -50,6 +56,36 @@ impl RawMutex {
         self.notify_calls.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    fn pause_next_handoff_claim(&self) {
+        assert_eq!(self.handoff_claim_pause.swap(1, Ordering::SeqCst), 0);
+    }
+
+    #[cfg(test)]
+    fn wait_for_handoff_claim_pause(&self) {
+        while self.handoff_claim_pause.load(Ordering::Acquire) != 2 {
+            yield_now();
+        }
+    }
+
+    #[cfg(test)]
+    fn resume_handoff_claim(&self) {
+        assert_eq!(self.handoff_claim_pause.swap(3, Ordering::Release), 2);
+    }
+
+    #[cfg(test)]
+    fn pause_before_handoff_claim(&self) {
+        if self
+            .handoff_claim_pause
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            while self.handoff_claim_pause.load(Ordering::Acquire) == 2 {
+                yield_now();
+            }
+        }
+    }
+
     /// Acquires this sleeping mutex while allowing a caller-selected terminal
     /// condition to cancel the wait.  Listener registration and the SeqCst
     /// owner recheck are identical to `RawMutex::lock`, so an unlock cannot
@@ -58,30 +94,13 @@ impl RawMutex {
         let current_id = current().id().as_u64();
         let mut spin = Spin(0);
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);
-        let mut owns_handoff = false;
 
         loop {
             if cancelled() {
-                if owns_handoff {
-                    self.pass_handoff(false);
-                }
                 return false;
             }
             if owner_id == current_id {
                 panic!("task attempted to recursively acquire an interruptible mutex");
-            }
-            if owner_id == HANDOFF_OWNER && owns_handoff {
-                match self.owner_id.compare_exchange(
-                    HANDOFF_OWNER,
-                    current_id,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return true,
-                    Err(observed) => owner_id = observed,
-                }
-                owns_handoff = false;
-                continue;
             }
             if owner_id == 0 {
                 match self.owner_id.compare_exchange_weak(
@@ -111,7 +130,31 @@ impl RawMutex {
             }
 
             match block_on(interruptible(listener)) {
-                Ok(Ok(())) => owns_handoff = true,
+                Ok(Ok(())) => {
+                    // A notification selects this listener.  Claim the
+                    // handoff while its waiter interest is still live, so a
+                    // different cancelling listener cannot mistake an empty
+                    // counter for permission to reopen this selected turn.
+                    #[cfg(test)]
+                    self.pause_before_handoff_claim();
+                    match self.owner_id.compare_exchange(
+                        HANDOFF_OWNER,
+                        current_id,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            drop(interest);
+                            if cancelled() {
+                                self.owner_id.store(HANDOFF_OWNER, Ordering::Release);
+                                self.pass_handoff(false);
+                                return false;
+                            }
+                            return true;
+                        }
+                        Err(observed) => owner_id = observed,
+                    }
+                }
                 Ok(Err(_)) if cancelled() => {
                     // Drop interest while the listener remains registered,
                     // then claim-or-pass any unlock handoff which sampled it.
@@ -251,7 +294,6 @@ unsafe impl lock_api::RawMutex for RawMutex {
         let current_id = current().id().as_u64();
         let mut spin = Spin(0);
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);
-        let mut owns_handoff = false;
 
         loop {
             if owner_id == current_id {
@@ -263,20 +305,6 @@ unsafe impl lock_api::RawMutex for RawMutex {
                          already owns."
                     ),
                 }
-            }
-
-            if owner_id == HANDOFF_OWNER && owns_handoff {
-                match self.owner_id.compare_exchange(
-                    HANDOFF_OWNER,
-                    current_id,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => owner_id = observed,
-                }
-                owns_handoff = false;
-                continue;
             }
 
             if owner_id == 0 {
@@ -334,8 +362,18 @@ unsafe impl lock_api::RawMutex for RawMutex {
                     ),
                 }
             });
-            owns_handoff = true;
-            owner_id = self.owner_id.load(Ordering::Acquire);
+            // Keep the registered interest until this notified listener has
+            // claimed the handoff.  An interruptible peer cancelling in this
+            // interval must still see a waiter and cannot reopen our turn.
+            match self.owner_id.compare_exchange(
+                HANDOFF_OWNER,
+                current_id,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => owner_id = observed,
+            }
         }
     }
 
@@ -410,7 +448,6 @@ pub fn lock_interruptible<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{RawMutex, WaiterInterest, HANDOFF_OWNER};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{
         alloc::{GlobalAlloc, Layout, System},
@@ -612,24 +649,65 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_selected_waiter_notifies_the_last_other_waiter() {
-        // Precise cancellation/unlock interleave: two listeners registered,
-        // unlock selected the first one, and that first listener withdrew its
-        // own interest before it could observe the notification.  The count
-        // of one is the *other* listener, not the cancelling caller.
-        let raw = RawMutex::new();
-        let cancelled = WaiterInterest::new(&raw.waiters);
-        let _remaining = WaiterInterest::new(&raw.waiters);
-        raw.owner_id.store(HANDOFF_OWNER, Ordering::SeqCst);
-        drop(cancelled);
+    fn cancelled_other_waiter_cannot_reopen_selected_handoff() {
+        init_scheduler();
+        let mutex = Arc::new(Mutex::new(()));
+        let order = Arc::new(AtomicUsize::new(0));
+        let guard = mutex.lock();
 
-        raw.pass_handoff(false);
+        let selected_mutex = Arc::clone(&mutex);
+        let selected_order = Arc::clone(&order);
+        let selected = thread::spawn(move || {
+            let _guard = lock_interruptible(&selected_mutex, || false).unwrap();
+            assert_eq!(selected_order.fetch_add(1, Ordering::AcqRel), 0);
+        })
+        .unwrap();
+        while unsafe { mutex.raw() }.waiter_count() != 1 {
+            thread::yield_now();
+        }
 
-        // Keep the handoff sentinel closed to bargers and wake the remaining
-        // listener.  Treating `waiters == 1` as the cancelling caller would
-        // instead open this lock without a notification.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelling_mutex = Arc::clone(&mutex);
+        let cancelling_signal = Arc::clone(&cancelled);
+        let cancelling = thread::spawn(move || {
+            lock_interruptible(&cancelling_mutex, || {
+                cancelling_signal.load(Ordering::Acquire)
+            })
+            .is_none()
+        })
+        .unwrap();
+        while unsafe { mutex.raw() }.waiter_count() != 2 {
+            thread::yield_now();
+        }
+
+        let raw = unsafe { mutex.raw() };
+        raw.pause_next_handoff_claim();
+        drop(guard);
+        raw.wait_for_handoff_claim_pause();
+
+        // The first listener has been selected by unlock but deliberately has
+        // not claimed it yet.  Cancel the other real listener in this window.
+        cancelled.store(true, Ordering::Release);
+        cancelling.interrupt();
+        assert!(cancelling.join().unwrap());
         assert_eq!(raw.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
-        assert_eq!(raw.notify_count(), 1);
+
+        let barger_mutex = Arc::clone(&mutex);
+        let barger_order = Arc::clone(&order);
+        let barger = thread::spawn(move || {
+            let _guard = barger_mutex.lock();
+            assert_eq!(barger_order.fetch_add(1, Ordering::AcqRel), 1);
+        })
+        .unwrap();
+        while raw.waiter_count() != 2 {
+            thread::yield_now();
+        }
+        assert_eq!(raw.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
+
+        raw.resume_handoff_claim();
+        selected.join().unwrap();
+        barger.join().unwrap();
+        assert_eq!(order.load(Ordering::Acquire), 2);
     }
 
     #[test]
