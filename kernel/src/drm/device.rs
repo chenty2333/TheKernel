@@ -599,7 +599,7 @@ fn decrement_pin(pins: &mut BTreeMap<FramebufferId, usize>, fb: FramebufferId) {
     }
 }
 
-struct CommitCompletion {
+pub(crate) struct CommitCompletion {
     result: Mutex<Option<DrmResult<()>>>,
     waiters: WaitQueue,
 }

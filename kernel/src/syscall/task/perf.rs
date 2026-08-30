@@ -31,7 +31,7 @@ static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PerfEventAttrV0 {
+pub(crate) struct PerfEventAttrV0 {
     event_type: u32,
     size: u32,
     config: u64,
