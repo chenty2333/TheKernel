@@ -2769,27 +2769,31 @@ pub fn sys_truncate(
 
 pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     debug!("sys_ftruncate <= {fd} {length}");
-    if length < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let security = current_vfs_security();
-    check_resize_limit(length as u64)?;
+    ftruncate_length_errno(length)?;
     let file_like = get_file_like(fd)?;
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
-    match kind {
-        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
-        FileLikeKind::Socket => return Err(AxError::InvalidInput),
-        FileLikeKind::Directory => return Err(AxError::IsADirectory),
-        FileLikeKind::Regular | FileLikeKind::Other => {}
+    // Linux v6.12.103 fs/open.c uses fdget() without FMODE_PATH: an O_PATH
+    // descriptor therefore fails the fd acquisition stage with EBADF.  The
+    // subsequent do_ftruncate() checks S_ISREG and FMODE_WRITE, returning
+    // EINVAL for either failure, all before the RLIMIT_FSIZE check below.
+    ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
+    if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
+        secret.check_truncate()?;
+        if (length as u64) > secret.size() {
+            check_resize_limit(length as u64)?;
+        }
+        secret.truncate(length as u64)?;
+        return Ok(0);
     }
+    let security = current_vfs_security();
     let f = file_like.downcast::<File>()?;
-    let backend = f
-        .inner()
-        .access(FileFlags::WRITE)
-        .map_err(|err| match err {
-            AxError::BadFileDescriptor => AxError::InvalidInput,
-            other => other,
-        })?;
+    let backend = f.inner().access(FileFlags::WRITE).map_err(|error| match error {
+        AxError::BadFileDescriptor => {
+            ftruncate_admission_errno(true, FileLikeKind::Regular, false, false)
+                .expect_err("read-only regular ftruncate must be EINVAL")
+        }
+        other => other,
+    })?;
     check_writable_mount(f.inner().location())?;
     crate::mm::check_not_active(f.inner().location())?;
     let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
@@ -2797,6 +2801,9 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::PermissionDenied);
     }
     executable::check_not_active(f.inner().location())?;
+    if (length as u64) > f.inner().location().len()? {
+        check_resize_limit(length as u64)?;
+    }
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;
     let status = f.io_status_snapshot();
@@ -2816,6 +2823,29 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     notify_write(fd);
     let _ = notify_exact(f.inner().location(), IN_ATTRIB);
     Ok(0)
+}
+
+fn ftruncate_admission_errno(
+    fd_found: bool,
+    kind: FileLikeKind,
+    path_only: bool,
+    writable: bool,
+) -> AxResult {
+    if !fd_found || path_only {
+        return Err(AxError::BadFileDescriptor);
+    }
+    if kind != FileLikeKind::Regular || !writable {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn ftruncate_length_errno(length: __kernel_off_t) -> AxResult {
+    if length < 0 {
+        Err(AxError::InvalidInput)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn sys_fallocate(
@@ -6709,5 +6739,33 @@ mod tests {
             validate_sync_file_range_args(i64::MAX, 1, 0),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn ftruncate_admission_matches_linux_fdget_and_do_ftruncate() {
+        let cases = [
+            (false, FileLikeKind::Regular, false, true, AxError::BadFileDescriptor),
+            (true, FileLikeKind::Regular, true, true, AxError::BadFileDescriptor),
+            (true, FileLikeKind::Directory, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Fifo, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Socket, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Other, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Regular, false, false, AxError::InvalidInput),
+        ];
+        for (fd_found, kind, path_only, writable, expected) in cases {
+            assert_eq!(
+                ftruncate_admission_errno(fd_found, kind, path_only, writable),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn ftruncate_negative_length_precedes_invalid_and_opath_fd_admission() {
+        for (fd_found, path_only) in [(false, false), (true, true)] {
+            let result = ftruncate_length_errno(-1)
+                .and_then(|()| ftruncate_admission_errno(fd_found, FileLikeKind::Regular, path_only, true));
+            assert_eq!(result, Err(AxError::InvalidInput));
+        }
     }
 }

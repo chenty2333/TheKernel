@@ -1731,8 +1731,7 @@ pub(super) fn dispatch_syscall(
             uctx.arg4() as _,
         ),
 
-        // Unsupported fd-producing syscalls.
-        Sysno::memfd_secret => sys_unsupported_fd(sysno),
+        Sysno::memfd_secret => sys_memfd_secret(uctx.arg0() as _),
 
         Sysno::timer_create => with_user_memory(aspace(), |memory| {
             sys_timer_create(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

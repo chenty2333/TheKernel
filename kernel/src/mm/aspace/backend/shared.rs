@@ -8,6 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
+use hashbrown::HashMap;
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
@@ -18,7 +19,7 @@ use super::{
 };
 use crate::{
     file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
-    mm::{FileLikeMappingLease, FileMappingSharing},
+    mm::{FileLikeMappingLease, FileMappingSharing, secret::SecretFrame},
 };
 
 static FIXED_SHARED_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
@@ -80,6 +81,15 @@ fn uncharge_shmem_pages(charge: &AtomicUsize, resident_frames: usize, page_size:
 pub struct SharedPages {
     backing_key: SharedBackingKey,
     phys_pages: Mutex<SharedPageStorage>,
+    // Secret objects keep their frames in a separate owner.  The ordinary
+    // `phys_pages` vector is deliberately empty for these objects so no
+    // helper can accidentally obtain a direct-map alias.
+    secret_frames: Option<Mutex<HashMap<usize, SecretFrame>>>,
+    secret_size: Option<AtomicUsize>,
+    // Growing a zero-length secret backing publishes its page count before
+    // its logical EOF. Faults therefore either see the old EOF and SIGBUS or
+    // the fully admitted new range.
+    secret_growth: Option<Mutex<()>>,
     // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
     // the published length separate from `phys_pages`: taking that mutex in
     // the gate would be a blocking operation. The backing only grows, so a
@@ -91,6 +101,28 @@ pub struct SharedPages {
     resident_charge: Option<&'static AtomicUsize>,
 }
 impl SharedPages {
+    pub(crate) const fn is_secret(&self) -> bool {
+        self.secret_frames.is_some()
+    }
+    /// Allocates a fixed, 4K secret backing.  Kernel copies use the secret
+    /// window; VMA population consumes only the physical frame number.
+    pub(crate) fn new_secret_fixed(size: usize) -> AxResult<Self> {
+        let count = size.div_ceil(PAGE_SIZE_4K);
+        Ok(Self {
+            backing_key: SharedBackingKey::allocate()?,
+            phys_pages: Mutex::new(SharedPageStorage {
+                pages: Vec::new(),
+                folios: Vec::new(),
+            }),
+            secret_frames: Some(Mutex::new(HashMap::new())),
+            secret_size: Some(AtomicUsize::new(size)),
+            secret_growth: Some(Mutex::new(())),
+            published_len: AtomicUsize::new(count),
+            size: PageSize::Size4K,
+            fixed: true,
+            resident_charge: None,
+        })
+    }
     pub fn new(size: usize, page_size: PageSize) -> AxResult<Self> {
         Self::new_with_growth(size, page_size, true)
     }
@@ -155,6 +187,9 @@ impl SharedPages {
                 pages: phys_pages,
                 folios: Vec::new(),
             }),
+            secret_frames: None,
+            secret_size: None,
+            secret_growth: None,
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
@@ -176,14 +211,38 @@ impl SharedPages {
     }
 
     pub fn len(&self) -> usize {
-        self.phys_pages.lock().pages.len()
+        self.secret_size.as_ref().map_or_else(
+            || self.phys_pages.lock().pages.len(),
+            |size| size.load(Ordering::Acquire).div_ceil(PAGE_SIZE_4K),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
         self.phys_pages.lock().pages.is_empty()
     }
 
+    /// Publishes the first nonzero logical size for a zero-length secret
+    /// backing.  Existing mappings retain this Arc and begin faulting pages
+    /// only after this publication.
+    pub(crate) fn set_secret_size_once(&self, size: usize) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        let secret_size = self.secret_size.as_ref().ok_or(AxError::InvalidInput)?;
+        let _growth = self.secret_growth.as_ref().expect("secret growth gate").lock();
+        if secret_size.load(Ordering::Acquire) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        secret_size.store(size, Ordering::Release);
+        Ok(())
+    }
+
     pub fn ensure_len(&self, len: usize) -> AxResult {
+        if self.secret_frames.is_some() {
+            return (len <= self.len())
+                .then_some(())
+                .ok_or(AxError::InvalidInput);
+        }
         let current_len = self.phys_pages.lock().pages.len();
         if current_len >= len {
             return Ok(());
@@ -242,16 +301,46 @@ impl SharedPages {
         self.len() * self.size as usize
     }
 
+    /// The range that may fault and be copied for a secret object. Like
+    /// Linux's secretmem page-cache backing, a non-page-aligned i_size owns
+    /// the complete final page; bytes in its tail begin zeroed and remain
+    /// addressable. The following page faults as SIGBUS.
+    fn secret_accessible_bytes(&self) -> Option<usize> {
+        self.secret_size.as_ref().and_then(|size| {
+            size.load(Ordering::Acquire)
+                .checked_add(PAGE_SIZE_4K - 1)
+                .map(|end| end & !(PAGE_SIZE_4K - 1))
+        })
+    }
+
     fn total_bytes_snapshot(&self) -> usize {
-        self.published_len.load(Ordering::Acquire) * self.size as usize
+        self.secret_size.as_ref().map_or_else(
+            || self.published_len.load(Ordering::Acquire) * self.size as usize,
+            |size| size.load(Ordering::Acquire),
+        )
     }
 
     pub fn read_bytes(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
 
         let page_bytes = self.size as usize;
+        if let Some(frames) = &self.secret_frames {
+            let mut pages = frames.lock();
+            let mut page_index = offset / page_bytes;
+            let mut page_offset = offset % page_bytes;
+            while !buf.is_empty() {
+                let chunk_len = (page_bytes - page_offset).min(buf.len());
+                secret_page(&mut pages, page_index)?.copy_to(&mut buf[..chunk_len], page_offset)?;
+                buf = &mut buf[chunk_len..];
+                page_index += 1;
+                page_offset = 0;
+            }
+            return Ok(());
+        }
         let pages = self.phys_pages.lock();
         let mut page_index = offset / page_bytes;
         let mut page_offset = offset % page_bytes;
@@ -272,12 +361,53 @@ impl SharedPages {
         Ok(())
     }
 
+    /// Copies from an already-materialized secret backing without allocating
+    /// a frame.  IRQ-safe nofault users need this distinction: a missing
+    /// secret page remains a retry, not an implicit population.
+    pub(crate) fn read_secret_bytes_resident(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
+        let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let mut pages = frames.lock();
+        let mut page_index = offset / PAGE_SIZE_4K;
+        let mut page_offset = offset % PAGE_SIZE_4K;
+        while !buf.is_empty() {
+            let chunk_len = (PAGE_SIZE_4K - page_offset).min(buf.len());
+            pages
+                .get(&page_index)
+                .ok_or(AxError::BadAddress)?
+                .copy_to(&mut buf[..chunk_len], page_offset)?;
+            buf = &mut buf[chunk_len..];
+            page_index += 1;
+            page_offset = 0;
+        }
+        Ok(())
+    }
+
     pub fn write_bytes(&self, offset: usize, mut buf: &[u8]) -> AxResult {
-        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
             return Err(AxError::InvalidInput);
         }
 
         let page_bytes = self.size as usize;
+        if let Some(frames) = &self.secret_frames {
+            let mut pages = frames.lock();
+            let mut page_index = offset / page_bytes;
+            let mut page_offset = offset % page_bytes;
+            while !buf.is_empty() {
+                let chunk_len = (page_bytes - page_offset).min(buf.len());
+                secret_page(&mut pages, page_index)?.copy_from(&buf[..chunk_len], page_offset)?;
+                buf = &buf[chunk_len..];
+                page_index += 1;
+                page_offset = 0;
+            }
+            return Ok(());
+        }
         let pages = self.phys_pages.lock();
         let mut page_index = offset / page_bytes;
         let mut page_offset = offset % page_bytes;
@@ -297,12 +427,52 @@ impl SharedPages {
         Ok(())
     }
 
+    /// Writes an already-materialized secret backing without allocating a
+    /// frame; see [`Self::read_secret_bytes_resident`].
+    pub(crate) fn write_secret_bytes_resident(&self, offset: usize, mut buf: &[u8]) -> AxResult {
+        let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)?
+            > self.secret_accessible_bytes().unwrap_or_else(|| self.total_bytes())
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let mut pages = frames.lock();
+        let mut page_index = offset / PAGE_SIZE_4K;
+        let mut page_offset = offset % PAGE_SIZE_4K;
+        while !buf.is_empty() {
+            let chunk_len = (PAGE_SIZE_4K - page_offset).min(buf.len());
+            pages
+                .get(&page_index)
+                .ok_or(AxError::BadAddress)?
+                .copy_from(&buf[..chunk_len], page_offset)?;
+            buf = &buf[chunk_len..];
+            page_index += 1;
+            page_offset = 0;
+        }
+        Ok(())
+    }
+
     fn with_pages_range<T>(
         &self,
         start_index: usize,
         count: usize,
         use_pages: impl FnOnce(&[PhysAddr]) -> AxResult<T>,
     ) -> AxResult<T> {
+        if let Some(frames) = &self.secret_frames {
+            let mut frames = frames.lock();
+            let end = start_index
+                .checked_add(count)
+                .ok_or(AxError::InvalidInput)?;
+            if end > self.len() {
+                return Err(AxError::NoMemory);
+            }
+            let mut pages = Vec::new();
+            pages.try_reserve_exact(count).map_err(|_| AxError::NoMemory)?;
+            for index in start_index..end {
+                pages.push(secret_page(&mut frames, index)?.physical());
+            }
+            return use_pages(&pages);
+        }
         let pages = self.phys_pages.lock();
         let end = start_index
             .checked_add(count)
@@ -318,12 +488,23 @@ impl SharedPages {
     /// A promoted folio still exposes all 512 entries through this interface,
     /// as consecutive physical addresses derived from its 2 MiB base.
     pub fn paddr_at(&self, index: usize) -> AxResult<PhysAddr> {
+        if let Some(frames) = &self.secret_frames {
+            let mut frames = frames.lock();
+            if index >= self.len() {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(secret_page(&mut frames, index)?.physical());
+        }
         self.phys_pages
             .lock()
             .pages
             .get(index)
             .copied()
             .ok_or(AxError::InvalidInput)
+    }
+
+    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+        self.paddr_at(index)
     }
 
     /// Snapshots the source 4 KiB frames retained by a promoted folio.
@@ -357,10 +538,6 @@ impl SharedPages {
                 .folios
                 .iter()
                 .any(|folio| folio.start_index == start_index)
-    }
-
-    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
-        self.paddr_at(index)
     }
 
     /// Transactionally replace 512 base-page entries with one 2 MiB folio.
@@ -473,6 +650,9 @@ impl SharedPages {
         let page_size = self.size as usize;
         let page = self.physical_page(offset / page_size)?;
         let in_page = offset % page_size;
+        if self.secret_frames.is_some() {
+            return Err(AxError::OperationNotSupported);
+        }
         let virtual_address = axhal::mem::phys_to_virt(page)
             .as_usize()
             .checked_add(in_page)
@@ -484,6 +664,18 @@ impl SharedPages {
             pages: self.clone(),
         })
     }
+}
+
+fn secret_page(
+    pages: &mut HashMap<usize, SecretFrame>,
+    index: usize,
+) -> AxResult<&SecretFrame> {
+    if !pages.contains_key(&index) {
+        let frame = SecretFrame::allocate()?;
+        pages.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        pages.insert(index, frame);
+    }
+    Ok(pages.get(&index).expect("secret frame inserted"))
 }
 
 fn validate_atomic_u32_offset(total_bytes: usize, page_size: usize, offset: usize) -> AxResult {
@@ -544,6 +736,11 @@ fn atomic_store_release(address: NonNull<AtomicU32>, value: u32) {
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
+        // Dropping SecretFrame performs window zeroing, restores the direct
+        // alias only after the wipe, and finally returns the frame.
+        if self.secret_frames.is_some() {
+            return;
+        }
         let storage = self.phys_pages.lock();
         for (index, &frame) in storage.pages.iter().enumerate() {
             if !storage.folios.iter().any(|folio| {
@@ -596,15 +793,20 @@ impl SharedMapId {
 }
 
 impl SharedBackend {
+    pub(crate) fn is_secret(&self) -> bool {
+        self.pages.is_secret()
+    }
+    pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
+        self.pages.is_secret()
+            && self
+                .backing_offset(vaddr.as_usize())
+                .is_none_or(|offset| offset >= self.pages.secret_accessible_bytes().expect("secret size"))
+    }
     /// Clone this shared backing at a different page cursor while retaining
     /// its physical-object identity.  `remap_file_pages` uses this only while
     /// an AddrSpace replacement transaction owns the old VMA, so futex keys
     /// continue to name the same `SharedPages` object at the rebased offset.
-    pub(crate) fn clone_rebased(
-        &self,
-        start: VirtAddr,
-        page_offset: usize,
-    ) -> AxResult<Self> {
+    pub(crate) fn clone_rebased(&self, start: VirtAddr, page_offset: usize) -> AxResult<Self> {
         let byte_offset = page_offset
             .checked_mul(self.pages.size as usize)
             .ok_or(AxError::InvalidInput)?;
@@ -705,7 +907,10 @@ impl SharedBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
     ) -> AxResult<Self> {
-        if self.pages.is_fixed() {
+        // mremap(old_size = 0) duplicates a MAP_SHARED secret VMA.  It must
+        // retain the same secret object but gets an independent map identity;
+        // ordinary fixed control mappings remain non-duplicable.
+        if self.pages.is_fixed() && !self.pages.is_secret() {
             return Err(AxError::OperationNotSupported);
         }
         let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
@@ -713,6 +918,12 @@ impl SharedBackend {
     }
 
     pub(crate) fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
+        // Growing a secret VMA never grows its immutable file backing.  New
+        // pages are valid mappings but fault as SIGBUS once their backing
+        // offset reaches i_size.
+        if self.pages.is_secret() {
+            return Ok(());
+        }
         let offset = start
             .as_usize()
             .checked_sub(self.start.as_usize())
@@ -796,37 +1007,36 @@ impl BackendOps for SharedBackend {
                 .ok_or(AxError::InvalidInput)?;
             let count = divide_page(range.size(), self.pages.size)?;
             let mut needs_tlb_sync = false;
-            let result = self
-                .pages
-                .with_pages_range(start_index, count, |physical_pages| {
-                    let mut populated = 0;
-                    for (vaddr, &paddr) in
-                        pages_in(range, self.pages.size)?.zip(physical_pages.iter())
-                    {
-                        match pt.query(vaddr) {
-                            Ok((mapped_paddr, page_flags, page_size)) => {
-                                if page_size != self.pages.size || mapped_paddr != paddr {
-                                    return Err(AxError::BadAddress);
-                                }
-                                if access_flags.contains(MappingFlags::WRITE)
-                                    && !page_flags.contains(MappingFlags::WRITE)
-                                {
-                                    pt.remap(vaddr, paddr, page_table_flags(flags))?;
-                                    needs_tlb_sync = true;
-                                    populated += 1;
-                                } else if page_flags.contains(access_flags) {
-                                    populated += 1;
-                                }
+            let result = {
+                let mut populated = 0;
+                for (index, vaddr) in
+                    (start_index..start_index + count).zip(pages_in(range, self.pages.size)?)
+                {
+                    let paddr = self.pages.physical_page(index)?;
+                    match pt.query(vaddr) {
+                        Ok((mapped_paddr, page_flags, page_size)) => {
+                            if page_size != self.pages.size || mapped_paddr != paddr {
+                                return Err(AxError::BadAddress);
                             }
-                            Err(PagingError::NotMapped) => {
-                                pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
+                            if access_flags.contains(MappingFlags::WRITE)
+                                && !page_flags.contains(MappingFlags::WRITE)
+                            {
+                                pt.remap(vaddr, paddr, page_table_flags(flags))?;
+                                needs_tlb_sync = true;
+                                populated += 1;
+                            } else if page_flags.contains(access_flags) {
                                 populated += 1;
                             }
-                            Err(_) => return Err(AxError::BadAddress),
                         }
+                        Err(PagingError::NotMapped) => {
+                            pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
+                            populated += 1;
+                        }
+                        Err(_) => return Err(AxError::BadAddress),
                     }
-                    Ok(populated)
-                });
+                }
+                Ok(populated)
+            };
             if needs_tlb_sync {
                 pt.flush();
                 drop(crate::mm::synchronize_tlb());
@@ -916,6 +1126,7 @@ pub(crate) struct PreparedFixedSharedMapping {
     owner: Option<DeferredFileLease>,
     ofd_key: u64,
     object_offset: u64,
+    page_offset: usize,
     initial_flags: MappingFlags,
     may_protect: MappingFlags,
     map_id: u64,
@@ -927,9 +1138,15 @@ impl PreparedFixedSharedMapping {
         plan: PreparedFileMmap,
     ) -> AxResult<Self> {
         let request = plan.request();
+        let region_offset = plan.region_offset();
         let pages = plan.pages().clone();
         if !pages.is_fixed()
-            || request.length() != pages.total_bytes()
+            || request.offset() < region_offset
+            || request.offset().checked_sub(region_offset).is_none_or(|relative| {
+                relative
+                    .checked_add(request.length() as u64)
+                    .is_none_or(|end| end > pages.total_bytes() as u64 && !pages.is_secret())
+            })
             || request.page_size() != pages.page_size() as usize
         {
             return Err(AxError::InvalidInput);
@@ -953,6 +1170,7 @@ impl PreparedFixedSharedMapping {
             owner,
             ofd_key,
             object_offset: request.offset(),
+            page_offset: ((request.offset() - region_offset) / pages.page_size() as u64) as usize,
             initial_flags: mapping_flags(request.protection()),
             may_protect,
             map_id,
@@ -965,6 +1183,7 @@ impl PreparedFixedSharedMapping {
             owner,
             ofd_key,
             object_offset,
+            page_offset,
             initial_flags,
             may_protect,
             map_id,
@@ -991,7 +1210,7 @@ impl PreparedFixedSharedMapping {
         };
         Backend::Shared(SharedBackend {
             start,
-            page_offset: 0,
+            page_offset,
             pages,
             may_protect: may_protect & access_flags(),
             map_id: SharedMapId::Fixed(map_id),
@@ -1079,6 +1298,97 @@ mod tests {
         assert_eq!(atomic_load_acquire(address), 7);
         atomic_store_release(address, 29);
         assert_eq!(atomic.load(Ordering::Acquire), 29);
+    }
+
+    #[test]
+    fn secret_backing_is_sparse_and_faults_past_logical_eof() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K + 1).unwrap());
+        assert_eq!(pages.len(), 2);
+        assert!(pages.secret_frames.as_ref().unwrap().lock().is_empty());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages,
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x4000)));
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
+    }
+
+    #[test]
+    fn zero_length_secret_backing_faults_every_mapping_access() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(0).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages,
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x4000)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+    }
+
+    #[test]
+    fn secret_partial_last_page_is_accessible_but_following_page_sigbuses() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K + 1).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        let mut tail = [0xff_u8; 1];
+        pages.read_bytes(PAGE_SIZE_4K + 0xffe, &mut tail).unwrap();
+        assert_eq!(tail, [0]);
+        pages.write_bytes(PAGE_SIZE_4K + 0xffe, &[0xa5]).unwrap();
+        pages.read_bytes(PAGE_SIZE_4K + 0xffe, &mut tail).unwrap();
+        assert_eq!(tail, [0xa5]);
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5ffe)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
+    }
+
+    #[test]
+    fn resident_secret_copy_never_populates_a_missing_frame() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = SharedPages::new_secret_fixed(PAGE_SIZE_4K).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            pages.read_secret_bytes_resident(0, &mut byte),
+            Err(AxError::BadAddress)
+        );
+        pages.write_bytes(0, &[0x5a]).unwrap();
+        pages.read_secret_bytes_resident(0, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
+    }
+
+    #[test]
+    fn secret_fixed_mapping_can_grow_and_duplicate_without_backing_growth() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        backend.ensure_range_covered(VirtAddr::from(0x4000), PAGE_SIZE_4K * 2).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+
+        let duplicate = backend
+            .duplicate_mapping(VirtAddr::from(0x4000), VirtAddr::from(0x8000))
+            .unwrap();
+        assert!(Arc::ptr_eq(backend.pages(), duplicate.pages()));
+        assert_eq!(duplicate.futex_id(0x8000), backend.futex_id(0x4000));
     }
 
     #[test]

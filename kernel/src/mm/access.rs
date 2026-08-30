@@ -31,6 +31,7 @@ use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     syscall::ensure_4k_granularity_across_aliases,
 };
+use crate::task::AsThread;
 static ENABLE_USER_IO_PIN_COUNTERS: AtomicBool = AtomicBool::new(false);
 static USER_IO_PIN_TO_USER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_TO_USER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -936,6 +937,12 @@ fn prepare_user_io_pin_with_duration(
     let admission = {
         let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinAdmission);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
+        // Secret frames have no durable direct alias and therefore cannot be
+        // exported as GUP/DMA segments, including long-term registered pins.
+        if aspace.has_secret_mapping(start_addr, len) {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+            return None;
+        }
         let request = PinRequest::new(
             UserRange::new(start, len).ok()?,
             if access_flags.contains(MappingFlags::WRITE) {
@@ -2106,12 +2113,13 @@ pub fn try_read_user_u32_nofault_locked(
     }
     validate_futex_mapping_locked(aspace, start, expected_namespace, expected)?;
     let mut bytes = [0; size_of::<u32>()];
-    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
     let page_count = prepare_user_nofault_span(
         aspace,
         start,
         size_of::<u32>(),
         MappingFlags::READ,
+        false,
         &mut pages,
     )
     .map_err(|error| match error {
@@ -2135,12 +2143,13 @@ pub fn try_validate_futex_mapping_nofault_locked(
         return Err(UserU32NofaultError::BadAddress);
     }
     validate_futex_mapping_locked(aspace, start, expected_namespace, expected)?;
-    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
     prepare_user_nofault_span(
         aspace,
         start,
         size_of::<u32>(),
         MappingFlags::READ,
+        false,
         &mut pages,
     )
     .map(|_| ())
@@ -2201,14 +2210,21 @@ pub enum UserNofaultError {
 }
 
 /// A translation captured while the selected address-space lock is held.
-#[derive(Clone, Copy)]
-struct NofaultPage {
-    start: usize,
-    paddr: memory_addr::PhysAddr,
+#[derive(Clone)]
+enum NofaultPage {
+    Direct {
+        start: usize,
+        paddr: memory_addr::PhysAddr,
+    },
+    Secret {
+        start: usize,
+        pages: Arc<super::SharedPages>,
+        offset: usize,
+    },
 }
 
 impl NofaultPage {
-    const EMPTY: Self = Self {
+    const EMPTY: Self = Self::Direct {
         start: 0,
         paddr: memory_addr::PhysAddr::from_usize(0),
     };
@@ -2261,6 +2277,7 @@ fn prepare_user_nofault_span(
     start: usize,
     len: usize,
     access_flags: MappingFlags,
+    allow_secret: bool,
     pages: &mut [NofaultPage; USER_NOFAULT_PAGE_SLOTS],
 ) -> Result<usize, UserNofaultError> {
     if !matches!(len, 4 | 8 | USER_NOFAULT_MAX_SPAN) {
@@ -2296,12 +2313,21 @@ fn prepare_user_nofault_span(
                 Err(error) => return Err(classify_nofault_query(error)),
             };
         classify_nofault_page(pte_flags, page_size, access_flags)?;
-        *page = NofaultPage {
-            start: page_start,
-            paddr,
-        };
+        let area = aspace.find_area(VirtAddr::from(page_start)).ok_or(UserNofaultError::BadAddress)?;
+        match area.backend() {
+            Backend::Shared(shared) if shared.is_secret() && allow_secret => {
+                let offset = shared.backing_offset(page_start).ok_or(UserNofaultError::BadAddress)?;
+                *page = NofaultPage::Secret { start: page_start, pages: shared.pages().clone(), offset };
+            }
+            Backend::Shared(shared) if shared.is_secret() => return Err(UserNofaultError::BadAddress),
+            _ => *page = NofaultPage::Direct { start: page_start, paddr },
+        }
     }
     Ok(page_count)
+}
+
+fn current_owns_aspace(aspace: &Arc<Mutex<AddrSpace>>) -> bool {
+    Arc::ptr_eq(aspace, &axtask::current().as_thread().proc_data.aspace())
 }
 
 /// Copies one already-resident fixed-size user span into kernel storage.
@@ -2323,9 +2349,9 @@ pub fn try_read_user_nofault(
     let Some(aspace) = aspace_handle.try_lock() else {
         return Err(UserNofaultError::Retry);
     };
-    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
     let page_count =
-        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, &mut pages)?;
+        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, current_owns_aspace(aspace_handle), &mut pages)?;
     copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
     Ok(())
 }
@@ -2349,9 +2375,9 @@ pub fn try_write_user_nofault(
     let Some(aspace) = aspace_handle.try_lock() else {
         return Err(UserNofaultError::Retry);
     };
-    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
     let page_count =
-        prepare_user_nofault_span(&aspace, start, src.len(), MappingFlags::WRITE, &mut pages)?;
+        prepare_user_nofault_span(&aspace, start, src.len(), MappingFlags::WRITE, current_owns_aspace(aspace_handle), &mut pages)?;
     copy_to_user_nofault_pages(start, src, &pages[..page_count]);
     Ok(())
 }
@@ -2367,17 +2393,19 @@ pub fn try_write_user_nofault(
 /// between its preflight and copy.
 pub struct UserNofaultTransaction<'a> {
     aspace: &'a AddrSpace,
+    allow_secret: bool,
 }
 
 impl UserNofaultTransaction<'_> {
     /// Copies one fixed-size, resident user span into kernel storage.
     pub fn read(&self, start: usize, dst: &mut [u8]) -> Result<(), UserNofaultError> {
-        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
         let page_count = prepare_user_nofault_span(
             self.aspace,
             start,
             dst.len(),
             MappingFlags::READ,
+            self.allow_secret,
             &mut pages,
         )?;
         copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
@@ -2386,12 +2414,13 @@ impl UserNofaultTransaction<'_> {
 
     /// Checks one fixed-size destination span without changing user memory.
     pub fn preflight_write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
-        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
         prepare_user_nofault_span(
             self.aspace,
             start,
             src.len(),
             MappingFlags::WRITE,
+            self.allow_secret,
             &mut pages,
         )?;
         Ok(())
@@ -2400,12 +2429,13 @@ impl UserNofaultTransaction<'_> {
     /// Copies one fixed-size kernel span into a destination previously
     /// preflighted by this transaction.
     pub fn write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
-        let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+        let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
         let page_count = prepare_user_nofault_span(
             self.aspace,
             start,
             src.len(),
             MappingFlags::WRITE,
+            self.allow_secret,
             &mut pages,
         )?;
         copy_to_user_nofault_pages(start, src, &pages[..page_count]);
@@ -2422,7 +2452,10 @@ pub fn try_user_nofault_transaction<R>(
     let Some(aspace) = aspace_handle.try_lock() else {
         return Err(UserNofaultError::Retry);
     };
-    let transaction = UserNofaultTransaction { aspace: &aspace };
+    let transaction = UserNofaultTransaction {
+        aspace: &aspace,
+        allow_secret: current_owns_aspace(aspace_handle),
+    };
     operation(&transaction)
 }
 
@@ -2479,9 +2512,9 @@ pub(crate) fn read_user_nofault_task(
         return Err(UserNofaultError::BadAddress);
     }
     let aspace = aspace_handle.lock();
-    let mut pages = [NofaultPage::EMPTY; USER_NOFAULT_PAGE_SLOTS];
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
     let page_count =
-        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, &mut pages)?;
+        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, current_owns_aspace(aspace_handle), &mut pages)?;
     copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
     Ok(())
 }
@@ -2489,13 +2522,21 @@ pub(crate) fn read_user_nofault_task(
 fn copy_from_user_nofault_pages(start: usize, dst: &mut [u8], pages: &[NofaultPage]) {
     let mut copied = 0;
     for page in pages {
-        let offset = start.saturating_sub(page.start);
+        let page_start = match page {
+            NofaultPage::Direct { start, .. } | NofaultPage::Secret { start, .. } => *start,
+        };
+        let offset = start.saturating_sub(page_start);
         let count = (PAGE_SIZE_4K - offset).min(dst.len() - copied);
-        let source = phys_to_virt(page.paddr + offset).as_ptr();
-        // SAFETY: `prepare_user_nofault_span` validated every page and the
-        // caller still holds the address-space mutex guard.
-        unsafe {
-            ptr::copy_nonoverlapping(source, dst.as_mut_ptr().add(copied), count);
+        match page {
+            NofaultPage::Direct { paddr, .. } => {
+                let source = phys_to_virt(*paddr + offset).as_ptr();
+                // SAFETY: the preflight validated this resident direct page.
+                unsafe { ptr::copy_nonoverlapping(source, dst.as_mut_ptr().add(copied), count) };
+            }
+            NofaultPage::Secret { pages, offset: backing, .. } => {
+                pages.read_secret_bytes_resident(*backing + offset, &mut dst[copied..copied + count])
+                    .expect("resident secret PTE lost its frame");
+            }
         }
         copied += count;
         if copied == dst.len() {
@@ -2508,13 +2549,21 @@ fn copy_from_user_nofault_pages(start: usize, dst: &mut [u8], pages: &[NofaultPa
 fn copy_to_user_nofault_pages(start: usize, src: &[u8], pages: &[NofaultPage]) {
     let mut copied = 0;
     for page in pages {
-        let offset = start.saturating_sub(page.start);
+        let page_start = match page {
+            NofaultPage::Direct { start, .. } | NofaultPage::Secret { start, .. } => *start,
+        };
+        let offset = start.saturating_sub(page_start);
         let count = (PAGE_SIZE_4K - offset).min(src.len() - copied);
-        let destination = phys_to_virt(page.paddr + offset).as_mut_ptr();
-        // SAFETY: `prepare_user_nofault_span` prevalidated every page's write
-        // permission before this first or subsequent destination copy.
-        unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination, count);
+        match page {
+            NofaultPage::Direct { paddr, .. } => {
+                let destination = phys_to_virt(*paddr + offset).as_mut_ptr();
+                // SAFETY: the preflight validated this resident direct page.
+                unsafe { ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination, count) };
+            }
+            NofaultPage::Secret { pages, offset: backing, .. } => {
+                pages.write_secret_bytes_resident(*backing + offset, &src[copied..copied + count])
+                    .expect("resident secret PTE lost its frame");
+            }
         }
         copied += count;
         if copied == src.len() {

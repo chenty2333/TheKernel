@@ -187,7 +187,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     // Collect user-accessible memory areas.
     let user_area_count = aspace
         .areas()
-        .filter(|a| a.flags().contains(MappingFlags::USER))
+        .filter(|a| a.flags().contains(MappingFlags::USER) && !a.backend().is_secret())
         .count();
     let mut areas = Vec::new();
     areas
@@ -195,7 +195,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         .map_err(|_| AxError::NoMemory)?;
     for area in aspace
         .areas()
-        .filter(|area| area.flags().contains(MappingFlags::USER))
+        .filter(|area| area.flags().contains(MappingFlags::USER) && !area.backend().is_secret())
     {
         areas.push((area.start(), area.size(), area.flags()));
     }

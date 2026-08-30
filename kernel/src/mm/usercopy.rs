@@ -14,12 +14,9 @@ use thekernel_linux_usercopy::{
 };
 
 use super::AddrSpace;
+use crate::task::AsThread;
 
 /// A user-memory provider bound to one explicitly selected address space.
-///
-/// The provider walks and populates the supplied address space directly. It
-/// never consults the current task or dereferences the userspace virtual
-/// address through the kernel's current page table.
 pub(crate) struct AddressSpaceUserMemory {
     address_space: Arc<Mutex<AddrSpace>>,
 }
@@ -152,6 +149,11 @@ impl AddressSpaceUserMemory {
     pub(crate) fn new(address_space: Arc<Mutex<AddrSpace>>) -> Self {
         Self { address_space }
     }
+
+    fn targets_current_address_space(&self) -> bool {
+        let current = axtask::current();
+        Arc::ptr_eq(&self.address_space, &current.as_thread().proc_data.aspace())
+    }
 }
 
 /// Runs one usercopy operation against the explicitly supplied address space.
@@ -208,22 +210,48 @@ fn prepare_range(
 // address space, and successful reads initialize every destination byte.
 unsafe impl UserMemory for AddressSpaceUserMemory {
     fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+        let current = self.targets_current_address_space();
         let mut address_space = self.address_space.lock();
         let start = prepare_range(&mut address_space, start, dst.len(), MappingFlags::READ)?;
         // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the address
         // space read initializes the complete slice before returning `Ok`.
         let dst = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
-        address_space
-            .read(start, dst)
+        if current {
+            address_space.current_uaccess_read(start, dst)
+        } else if address_space.has_secret_mapping(start, dst.len()) {
+            Err(AxError::BadAddress)
+        } else {
+            address_space.read(start, dst)
+        }
             .map_err(map_address_space_error)
     }
 
     fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+        let current = self.targets_current_address_space();
         let mut address_space = self.address_space.lock();
         let start = prepare_range(&mut address_space, start, src.len(), MappingFlags::WRITE)?;
-        address_space
-            .write(start, src)
+        if current {
+            address_space.current_uaccess_write(start, src)
+        } else if address_space.has_secret_mapping(start, src.len()) {
+            Err(AxError::BadAddress)
+        } else {
+            address_space.write(start, src)
+        }
             .map_err(map_address_space_error)
+    }
+
+    fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
+        let current = self.targets_current_address_space();
+        let address_space = self.address_space.lock();
+        let start = VirtAddr::from(start);
+        if len != 0
+            && (!address_space.contains_range(start, len)
+                || (!current && address_space.has_secret_mapping(start, len))
+                || !address_space.can_access_range(start, len, MappingFlags::WRITE))
+        {
+            return Err(UserCopyError::BadAddress);
+        }
+        Ok(())
     }
 }
 

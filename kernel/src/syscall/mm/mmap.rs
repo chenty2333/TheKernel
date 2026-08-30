@@ -656,17 +656,21 @@ pub fn sys_mmap(
 
     // Keep type errors at the historical backend-construction point, but
     // classify the exact OFD pinned above instead of looking up `fd` again.
-    let file = pinned_fd
-        .map(|handle| {
-            handle.downcast::<File>().map_err(|_| {
-                if handle.as_ref().downcast_ref::<Directory>().is_some() {
-                    AxError::IsADirectory
-                } else {
-                    AxError::BrokenPipe
-                }
+    let file = if prepared_fixed_mapping.is_some() {
+        None
+    } else {
+        pinned_fd
+            .map(|handle| {
+                handle.downcast::<File>().map_err(|_| {
+                    if handle.as_ref().downcast_ref::<Directory>().is_some() {
+                        AxError::IsADirectory
+                    } else {
+                        AxError::BrokenPipe
+                    }
             })
         })
-        .transpose()?;
+        .transpose()?
+    };
     if map_type != MmapFlags::PRIVATE && permission_flags.contains(MmapProt::WRITE) {
         if let Some(file) = file.as_ref() {
             crate::mm::check_not_active(file.inner().location())?;
@@ -842,8 +846,10 @@ pub fn sys_mmap(
         .then(|| backend.shared_file_location().cloned())
         .flatten();
 
-        let locked_mapping =
-            map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
+        let secret_mapping = backend.is_secret();
+        let locked_mapping = secret_mapping
+            || map_flags.contains(MmapFlags::LOCKED)
+            || aspace.locks_future_mappings();
         if locked_mapping {
             check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
         }
@@ -869,12 +875,19 @@ pub fn sys_mmap(
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);
             proc_data.clear_mempolicy_range(start.as_usize(), length);
         }
+        let best_effort_secret_populate = secret_mapping && populate;
         let pending_alias = backend
             .shared_backing_key()
             .map(|key| aspace.prepare_shared_alias_binding(key, &aspace_handle))
             .transpose()?
             .flatten();
-        aspace.map(start, length, effective_protection, populate, backend)?;
+        aspace.map(
+            start,
+            length,
+            effective_protection,
+            populate && !best_effort_secret_populate,
+            backend,
+        )?;
         if let Some(pending_alias) = pending_alias {
             aspace.commit_shared_alias_binding(pending_alias);
         }
@@ -886,13 +899,17 @@ pub fn sys_mmap(
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);
             return Err(error);
         }
+        if best_effort_secret_populate {
+            // EOF is a future SIGBUS fault, not an mmap failure.
+            let _ = aspace.populate_area(start, length, effective_protection);
+        }
         if let Some(admission) = mapping_admission {
             admission
                 .complete()
                 .expect("writable mapping admission vanished after mmap commit");
         }
         drop(privilege_guard);
-        if map_flags.contains(MmapFlags::LOCKED) {
+        if secret_mapping || map_flags.contains(MmapFlags::LOCKED) {
             aspace.set_locked(start, length, true)?;
         }
         if growdown_private_anon {
@@ -2014,6 +2031,9 @@ pub(super) fn check_mmap_memlock_limit(
     length: usize,
 ) -> AxResult {
     let limit_error = AxError::from(LinuxError::EAGAIN);
+    if !has_ipc_lock && proc_data.rlim.read()[RLIMIT_MEMLOCK].current == 0 {
+        return Err(limit_error);
+    }
     let locked_bytes = locked_bytes_after_range(aspace, start, length, limit_error)?;
     check_memlock_total(proc_data, has_ipc_lock, locked_bytes, limit_error)
 }

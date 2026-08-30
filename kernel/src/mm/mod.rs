@@ -11,6 +11,7 @@ pub(crate) mod ldt;
 mod loader;
 mod pressure;
 mod remap;
+pub(crate) mod secret;
 mod stats;
 mod swap;
 mod tlb;

@@ -2399,6 +2399,20 @@ impl AddrSpace {
         self.clear_locked_range(start, size);
         if enabled {
             self.insert_locked_range(start, start + size);
+        } else {
+            let range = VirtAddrRange::from_start_size(start, size);
+            let secret_ranges: Vec<_> = self
+                .areas_overlapping(range)
+                .filter(|area| area.backend().is_secret())
+                .map(|area| {
+                    let range_start = area.start().max(start);
+                    let range_end = area.end().min(start + size);
+                    (range_start, range_end)
+                })
+                .collect();
+            for (range_start, range_end) in secret_ranges {
+                self.insert_locked_range(range_start, range_end);
+            }
         }
         Ok(())
     }
@@ -4079,6 +4093,14 @@ impl AddrSpace {
 
     pub fn clear_locked_mappings(&mut self) {
         self.locked_ranges.clear();
+        let secret_ranges: Vec<_> = self
+            .areas()
+            .filter(|area| area.backend().is_secret())
+            .map(|area| (area.start(), area.end()))
+            .collect();
+        for (start, end) in secret_ranges {
+            self.insert_locked_range(start, end);
+        }
         self.lock_future_mappings = false;
         self.lock_future_on_fault = false;
     }
@@ -5741,6 +5763,109 @@ impl AddrSpace {
         result
     }
 
+    /// Copies from this address space for the task that currently owns it.
+    ///
+    /// Ordinary pages retain the direct-map fast path. Secret shared pages
+    /// have no direct alias, so each VMA/page-sized piece is populated and
+    /// copied through its backing's CPU-local secret window instead.
+    pub(crate) fn current_uaccess_read(&mut self, start: VirtAddr, buf: &mut [u8]) -> AxResult {
+        self.current_uaccess(start, buf, MappingFlags::READ)
+    }
+
+    /// See [`Self::current_uaccess_read`].
+    pub(crate) fn current_uaccess_write(&mut self, start: VirtAddr, buf: &[u8]) -> AxResult {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !self.contains_range(start, buf.len()) {
+            return Err(AxError::BadAddress);
+        }
+        let end = start.checked_add(buf.len()).ok_or(AxError::BadAddress)?;
+        let mut cursor = start;
+        let mut copied = 0;
+        while cursor < end {
+            let (area_end, area_flags, backend) = {
+                let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
+                if area.start() > cursor || !area.flags().contains(MappingFlags::WRITE) {
+                    return Err(AxError::PermissionDenied);
+                }
+                (area.end(), area.flags(), area.backend().clone())
+            };
+            let page_end = cursor + PAGE_SIZE_4K - cursor.align_offset_4k();
+            let piece_end = area_end.min(end).min(page_end);
+            self.populate_area(cursor.align_down_4k(), PAGE_SIZE_4K, MappingFlags::WRITE)?;
+            let piece_len = piece_end - cursor;
+            let piece = &buf[copied..copied + piece_len];
+            match backend {
+                Backend::Shared(shared) if shared.is_secret() => {
+                    let offset = shared.backing_offset(cursor.as_usize()).ok_or(AxError::BadAddress)?;
+                    shared.pages().write_bytes(offset, piece)?;
+                }
+                _ => self.write(cursor, piece)?,
+            }
+            if area_flags.contains(MappingFlags::EXECUTE) {
+                synchronize_executable_publication(MappingFlags::EXECUTE);
+            }
+            cursor = piece_end;
+            copied += piece_len;
+        }
+        Ok(())
+    }
+
+    fn current_uaccess(
+        &mut self,
+        start: VirtAddr,
+        buf: &mut [u8],
+        access_flags: MappingFlags,
+    ) -> AxResult {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !self.contains_range(start, buf.len()) {
+            return Err(AxError::BadAddress);
+        }
+        let end = start.checked_add(buf.len()).ok_or(AxError::BadAddress)?;
+        let mut cursor = start;
+        let mut copied = 0;
+        while cursor < end {
+            let (area_end, backend) = {
+                let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
+                if area.start() > cursor || !area.flags().contains(access_flags) {
+                    return Err(AxError::PermissionDenied);
+                }
+                (area.end(), area.backend().clone())
+            };
+            let piece_end = area_end
+                .min(end)
+                .min(cursor + PAGE_SIZE_4K - cursor.align_offset_4k());
+            let page_start = cursor.align_down_4k();
+            self.populate_area(page_start, PAGE_SIZE_4K, access_flags)?;
+            let piece_len = piece_end - cursor;
+            let piece = &mut buf[copied..copied + piece_len];
+            match backend {
+                Backend::Shared(shared) if shared.is_secret() => {
+                    let offset = shared.backing_offset(cursor.as_usize()).ok_or(AxError::BadAddress)?;
+                    shared.pages().read_bytes(offset, piece)?;
+                }
+                _ => self.read(cursor, piece)?,
+            }
+            cursor = piece_end;
+            copied += piece_len;
+        }
+        Ok(())
+    }
+
+    /// Returns whether a range overlaps a secret-memory VMA.  Such frames
+    /// must never be accessed through the generic direct-map copy helpers.
+    pub(crate) fn has_secret_mapping(&self, start: VirtAddr, len: usize) -> bool {
+        len != 0
+            && start.checked_add(len).is_some_and(|end| {
+                self.areas.iter().any(|area| {
+                    area.start() < end && start < area.end() && area.backend().is_secret()
+                })
+            })
+    }
+
     /// Updates mapping within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not
@@ -6604,6 +6729,19 @@ impl AddrSpace {
             }
             crate::mm::retain(*entry)?;
             guard.swapped.insert(*page, *entry);
+        }
+        // Secret VMAs are unconditionally mlocked.  Reconstruct this child
+        // sidecar from VMAs that were actually cloned, rather than copying
+        // the parent's ranges: MADV_DONTFORK holes have no child mapping and
+        // ordinary mlock state is not inherited by fork.
+        let child_secret_ranges: Vec<_> = guard
+            .areas
+            .iter()
+            .filter(|area| area.backend().is_secret())
+            .map(|area| (area.start(), area.end()))
+            .collect();
+        for (start, end) in child_secret_ranges {
+            guard.insert_locked_range(start, end);
         }
         guard.refresh_growdown_starts();
         for pending in fork_pending_aliases.drain(..) {

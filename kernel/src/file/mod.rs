@@ -38,6 +38,7 @@ pub mod inotify;
 pub(crate) mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
+pub(crate) mod secretmem;
 pub(crate) mod namespace_mutation;
 mod net;
 pub(crate) mod netlink;
@@ -86,6 +87,7 @@ pub(crate) use self::{
     packet_socket::PacketSocket,
     io_uring::IoUring,
     userfaultfd::UserfaultFile,
+    secretmem::SecretMemFile,
     socket::{
         AcceptedSocketSecurityRef, BareAcceptedSocketSecurityRef, PACKET_SOCKADDR_STORAGE_LEN,
         PacketSockaddrSnapshot, PendingSocketSecurityRef, PinnedSocketDescription,
