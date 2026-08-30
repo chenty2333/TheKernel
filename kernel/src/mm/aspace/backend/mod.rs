@@ -648,7 +648,8 @@ impl Backend {
         match self {
             Backend::Cow(backend) => backend.faults_with_sigbus(vaddr),
             Backend::File(backend) => backend.faults_with_sigbus(vaddr),
-            Backend::Linear(_) | Backend::Shared(_) => false,
+            Backend::Shared(backend) => backend.faults_with_sigbus(vaddr),
+            Backend::Linear(_) => false,
         }
     }
 

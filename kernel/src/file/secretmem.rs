@@ -14,7 +14,7 @@ use crate::{
         FileLike, FileMmapProtection, FileMmapRequest, FixedSharedMmapRegion, Kstat,
         PreparedFileMmap, anon_inode_stat,
     },
-    mm::{SharedPages, checked_align_up_4k},
+    mm::SharedPages,
 };
 
 /// Anonymous secret-memory descriptor. Data is reachable only through its
@@ -43,10 +43,9 @@ impl SecretMemFile {
         if size == 0 {
             return Ok(());
         }
-        // i_size is byte-granular.  The backing remains page-granular and
-        // the final page is only materialized on a permitted page fault.
-        let allocation = checked_align_up_4k(size).ok_or(AxError::NoMemory)?;
-        let pages = Arc::try_new(SharedPages::new_secret_fixed(allocation)?)
+        // i_size is byte-granular; backing metadata is sparse, so truncation
+        // only records the logical size and never reserves one entry/page.
+        let pages = Arc::try_new(SharedPages::new_secret_fixed(size)?)
             .map_err(|_| AxError::NoMemory)?;
         *current = Some(pages);
         self.size.store(size as u64, Ordering::Release);
@@ -72,7 +71,7 @@ impl FileLike for SecretMemFile {
         let mut stat = anon_inode_stat();
         stat.mode = S_IFREG | 0o600;
         stat.size = self.size.load(Ordering::Acquire);
-        stat.blocks = stat.size / 512;
+        stat.blocks = 0;
         Ok(stat)
     }
     fn path(&self) -> AxResult<Cow<'_, str>> {

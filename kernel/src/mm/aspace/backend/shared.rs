@@ -8,6 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
+use hashbrown::HashMap;
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
@@ -83,7 +84,8 @@ pub struct SharedPages {
     // Secret objects keep their frames in a separate owner.  The ordinary
     // `phys_pages` vector is deliberately empty for these objects so no
     // helper can accidentally obtain a direct-map alias.
-    secret_frames: Option<Mutex<Vec<Option<SecretFrame>>>>,
+    secret_frames: Option<Mutex<HashMap<usize, SecretFrame>>>,
+    secret_size: Option<AtomicUsize>,
     // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
     // the published length separate from `phys_pages`: taking that mutex in
     // the gate would be a blocking operation. The backing only grows, so a
@@ -101,22 +103,18 @@ impl SharedPages {
     /// Allocates a fixed, 4K secret backing.  Kernel copies use the secret
     /// window; VMA population consumes only the physical frame number.
     pub(crate) fn new_secret_fixed(size: usize) -> AxResult<Self> {
-        if size == 0 || !size.is_multiple_of(PAGE_SIZE_4K) {
+        if size == 0 {
             return Err(AxError::InvalidInput);
         }
-        let count = size / PAGE_SIZE_4K;
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(count)
-            .map_err(|_| AxError::NoMemory)?;
-        frames.resize_with(count, || None);
+        let count = size.div_ceil(PAGE_SIZE_4K);
         Ok(Self {
             backing_key: SharedBackingKey::allocate()?,
             phys_pages: Mutex::new(SharedPageStorage {
                 pages: Vec::new(),
                 folios: Vec::new(),
             }),
-            secret_frames: Some(Mutex::new(frames)),
+            secret_frames: Some(Mutex::new(HashMap::new())),
+            secret_size: Some(AtomicUsize::new(size)),
             published_len: AtomicUsize::new(count),
             size: PageSize::Size4K,
             fixed: true,
@@ -188,6 +186,7 @@ impl SharedPages {
                 folios: Vec::new(),
             }),
             secret_frames: None,
+            secret_size: None,
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
@@ -209,10 +208,9 @@ impl SharedPages {
     }
 
     pub fn len(&self) -> usize {
-        self.secret_frames.as_ref().map_or_else(
-            || self.phys_pages.lock().pages.len(),
-            |frames| frames.lock().len(),
-        )
+        self.secret_frames
+            .as_ref()
+            .map_or_else(|| self.phys_pages.lock().pages.len(), |_| self.published_len.load(Ordering::Acquire))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -299,9 +297,7 @@ impl SharedPages {
             let mut page_offset = offset % page_bytes;
             while !buf.is_empty() {
                 let chunk_len = (page_bytes - page_offset).min(buf.len());
-                pages[page_index]
-                    .get_or_insert(SecretFrame::allocate()?)
-                    .copy_to(&mut buf[..chunk_len], page_offset)?;
+                secret_page(&mut pages, page_index)?.copy_to(&mut buf[..chunk_len], page_offset)?;
                 buf = &mut buf[chunk_len..];
                 page_index += 1;
                 page_offset = 0;
@@ -340,9 +336,7 @@ impl SharedPages {
             let mut page_offset = offset % page_bytes;
             while !buf.is_empty() {
                 let chunk_len = (page_bytes - page_offset).min(buf.len());
-                pages[page_index]
-                    .get_or_insert(SecretFrame::allocate()?)
-                    .copy_from(&buf[..chunk_len], page_offset)?;
+                secret_page(&mut pages, page_index)?.copy_from(&buf[..chunk_len], page_offset)?;
                 buf = &buf[chunk_len..];
                 page_index += 1;
                 page_offset = 0;
@@ -379,11 +373,13 @@ impl SharedPages {
             let end = start_index
                 .checked_add(count)
                 .ok_or(AxError::InvalidInput)?;
-            let frames = frames.get_mut(start_index..end).ok_or(AxError::NoMemory)?;
+            if end > self.published_len.load(Ordering::Acquire) {
+                return Err(AxError::NoMemory);
+            }
             let mut pages = Vec::new();
             pages.try_reserve_exact(count).map_err(|_| AxError::NoMemory)?;
-            for frame in frames {
-                pages.push(frame.get_or_insert(SecretFrame::allocate()?).physical());
+            for index in start_index..end {
+                pages.push(secret_page(&mut frames, index)?.physical());
             }
             return use_pages(&pages);
         }
@@ -404,11 +400,10 @@ impl SharedPages {
     pub fn paddr_at(&self, index: usize) -> AxResult<PhysAddr> {
         if let Some(frames) = &self.secret_frames {
             let mut frames = frames.lock();
-            return Ok(frames
-                .get_mut(index)
-                .ok_or(AxError::InvalidInput)?
-                .get_or_insert(SecretFrame::allocate()?)
-                .physical());
+            if index >= self.published_len.load(Ordering::Acquire) {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(secret_page(&mut frames, index)?.physical());
         }
         self.phys_pages
             .lock()
@@ -453,10 +448,6 @@ impl SharedPages {
                 .folios
                 .iter()
                 .any(|folio| folio.start_index == start_index)
-    }
-
-    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
-        self.paddr_at(index)
     }
 
     /// Transactionally replace 512 base-page entries with one 2 MiB folio.
@@ -585,6 +576,18 @@ impl SharedPages {
     }
 }
 
+fn secret_page(
+    pages: &mut HashMap<usize, SecretFrame>,
+    index: usize,
+) -> AxResult<&SecretFrame> {
+    if !pages.contains_key(&index) {
+        let frame = SecretFrame::allocate()?;
+        pages.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        pages.insert(index, frame);
+    }
+    Ok(pages.get(&index).expect("secret frame inserted"))
+}
+
 fn validate_atomic_u32_offset(total_bytes: usize, page_size: usize, offset: usize) -> AxResult {
     if page_size < core::mem::size_of::<AtomicU32>()
         || !offset.is_multiple_of(core::mem::align_of::<AtomicU32>())
@@ -702,6 +705,12 @@ impl SharedMapId {
 impl SharedBackend {
     pub(crate) fn is_secret(&self) -> bool {
         self.pages.is_secret()
+    }
+    pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
+        self.pages.is_secret()
+            && self
+                .backing_offset(vaddr.as_usize())
+                .is_none_or(|offset| offset >= self.pages.secret_size.as_ref().expect("secret size").load(Ordering::Acquire))
     }
     /// Clone this shared backing at a different page cursor while retaining
     /// its physical-object identity.  `remap_file_pages` uses this only while
@@ -1190,6 +1199,24 @@ mod tests {
         assert_eq!(atomic_load_acquire(address), 7);
         atomic_store_release(address, 29);
         assert_eq!(atomic.load(Ordering::Acquire), 29);
+    }
+
+    #[test]
+    fn secret_backing_is_sparse_and_faults_past_logical_eof() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(PAGE_SIZE_4K + 1).unwrap());
+        assert_eq!(pages.len(), 2);
+        assert!(pages.secret_frames.as_ref().unwrap().lock().is_empty());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages,
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x4000)));
+        assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
     }
 
     #[test]
