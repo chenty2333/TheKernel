@@ -260,7 +260,9 @@ pub fn unregister(irq: usize) -> Option<axplat::irq::IrqHandler> {
     }
 }
 
-fn context_marker(_: usize) {}
+// `axplat::irq::IrqHandler` is a no-argument callback.  Dispatch has already
+// retained the vector for EOI before this marker is invoked.
+fn context_marker() {}
 
 /// Registers a trap-frame-aware owner for one x86 hardware IRQ vector.
 /// The matching no-op normal handler preserves platform dispatch and EOI.

@@ -316,19 +316,38 @@ const fn sampling_preload(width: u8, period: u64) -> u64 {
 const fn sampling_event(event: Event, user: bool, kernel: bool) -> u64 {
     event.code() as u64 | (user as u64) << 16 | (kernel as u64) << 17 | 1 << 20 | 1 << 22
 }
+#[cfg(feature = "pmu-sampling")]
+fn sampling_owner(m: &Manager) -> Result<Option<usize>, Error> {
+    let mut owner = None;
+    for i in 0..MAX {
+        if m.slots[i].owned && m.slots[i].sampling {
+            if owner.replace(i).is_some() { return Err(Error::Busy); }
+        }
+    }
+    Ok(owner)
+}
+#[cfg(feature = "pmu-sampling")]
+const fn lvt_is_safe_sampling_baseline(lvt: u32) -> bool {
+    // A masked LVT cannot deliver PMIs.  Its remaining bits are preserved and
+    // restored verbatim, so a firmware/platform dormant configuration is not
+    // claimed or destroyed.
+    lvt & LVT_MASKED != 0
+}
 
 /// Arms exactly one local programmable PMU counter for PMI delivery.
 #[cfg(feature = "pmu-sampling")]
 pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Error> {
     local(|cpu, m| {
         let _ = reap(m);
+        if sampling_owner(m)?.is_some() { return Err(Error::Busy); }
         let c = capabilities()?;
         if !c.programmable(program.event) || !program.count_user && !program.count_kernel
             || program.period < 4096 || program.period > c.programmable_mask() { return Err(Error::InvalidProgram); }
+        let lvt = unsafe { crate::apic::local_apic().lvt_perf() };
+        if !lvt_is_safe_sampling_baseline(lvt) { return Err(Error::Busy); }
         let (slot, saved) = select(m, c)?;
         let state = &mut m.slots[slot.idx()];
         claim_generation(state)?; // before the first register write: no ABA on exhaustion.
-        let lvt = unsafe { crate::apic::local_apic().lvt_perf() };
         unsafe { crate::apic::local_apic().write_lvt_perf(lvt | LVT_MASKED); }
         disable(slot);
         write(OVF, bit(slot)); // candidate was idle/status-clear; acknowledge only our bit.
@@ -344,7 +363,7 @@ pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Err
         state.lvt_perf = lvt;
         unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32 | LVT_MASKED); }
         write(GLOBAL, read(GLOBAL) | bit(slot));
-        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !(0xff | LVT_MASKED)) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
         Ok(SamplingToken { cpu, slot, generation: state.generation, cookie: program.cookie, active: true })
     })
 }
@@ -353,17 +372,18 @@ pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Err
 #[cfg(feature = "pmu-sampling")]
 pub fn sampling_take_pmi() -> Result<Option<(PmiSample, u64)>, Error> {
     local(|_, m| {
-        for i in 0..MAX {
-            let s = &mut m.slots[i];
-            if !s.owned || !s.sampling { continue; }
-            let slot = Slot::P(i as u8);
-            unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
-            disable(slot);
-            if read(STATUS) & bit(slot) == 0 { return Ok(None); } // stray: do not clear another owner.
-            write(OVF, bit(slot));
-            return Ok(Some((PmiSample { cookie: s.cookie, period: s.period }, s.generation)));
-        }
-        Ok(None)
+        let Some(i) = sampling_owner(m)? else { return Ok(None); };
+        let slot = Slot::P(i as u8);
+        // A stray PMI is not ours.  Do not perturb the sampler (or any other
+        // PMU owner's latch) before proving that this owned bit is asserted.
+        if read(STATUS) & bit(slot) == 0 { return Ok(None); }
+        let s = &m.slots[i];
+        let sample = PmiSample { cookie: s.cookie, period: s.period };
+        let generation = s.generation;
+        unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
+        disable(slot);
+        write(OVF, bit(slot));
+        Ok(Some((sample, generation)))
     })
 }
 
@@ -374,7 +394,7 @@ pub fn sampling_rearm_local(cookie: u64, generation: u64) -> Result<(), Error> {
         for i in 0..MAX { let s = &mut m.slots[i]; if s.owned && s.sampling && s.cookie == cookie && s.generation == generation {
             let slot = Slot::P(i as u8); write(slot_msr(slot), sampling_preload(s.width, s.period)); write(OVF, bit(slot));
             write(GLOBAL, read(GLOBAL) | bit(slot));
-            unsafe { crate::apic::local_apic().write_lvt_perf((s.lvt_perf & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+            unsafe { crate::apic::local_apic().write_lvt_perf((s.lvt_perf & !(0xff | LVT_MASKED)) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
             return Ok(());
         }} Err(Error::Stale)
     })
@@ -717,5 +737,30 @@ mod tests {
         let foreign = bit(Slot::P(2));
         assert_eq!((own | foreign) & own, own, "W1C selects only the owned latch");
         assert_eq!((0x1234u32 & !0xff) | 0xef, 0x12ef, "LVT restores non-vector bits exactly");
+    }
+
+    #[cfg(feature = "pmu-sampling")]
+    #[test]
+    fn sampling_lvt_baseline_owner_and_unmask_rules() {
+        assert!(lvt_is_safe_sampling_baseline(LVT_MASKED | 0x41));
+        assert!(!lvt_is_safe_sampling_baseline(0x41));
+        let armed = (LVT_MASKED | 0x41) & !(0xff | LVT_MASKED) | 0xef;
+        assert_eq!(armed & LVT_MASKED, 0, "activation explicitly unmasks PMI");
+        let mut manager = Manager::new();
+        manager.slots[2].owned = true;
+        manager.slots[2].sampling = true;
+        assert_eq!(sampling_owner(&manager), Ok(Some(2)));
+        manager.slots[3].owned = true;
+        manager.slots[3].sampling = true;
+        assert_eq!(sampling_owner(&manager), Err(Error::Busy));
+    }
+
+    #[cfg(feature = "pmu-sampling")]
+    #[test]
+    fn stray_pmi_predicate_keeps_sampler_armed() {
+        let own = bit(Slot::P(0));
+        let foreign = bit(Slot::P(1));
+        assert_eq!(foreign & own, 0, "stray status must not cause mask/disable/W1C");
+        assert_ne!((foreign | own) & own, 0, "only the unique owned bit authorizes disarm");
     }
 }
