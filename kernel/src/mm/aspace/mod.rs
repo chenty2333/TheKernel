@@ -39,7 +39,7 @@ use super::{
     checked_align_up_4k,
     ldt::{ENTRIES, Ldt, UserDesc},
 };
-use crate::task::{AsThread, has_pending_syscall_signal};
+use crate::task::{AsThread, has_pending_sigkill};
 
 mod backend;
 mod mapping;
@@ -1564,21 +1564,16 @@ impl AddrSpace {
     }
 
     /// The mmap-lock equivalent used by operations that Linux specifies as
-    /// killable. `axsync::Mutex` has no signal-aware waiter, so retry its
-    /// nonblocking acquisition with scheduler yields and sample deliverable
-    /// signals before each yield.
+    /// killable.  The sleeping mutex registers an event listener before its
+    /// SeqCst owner recheck, so unlock notification cannot be lost; only a
+    /// pending SIGKILL cancels the wait, matching fatal_signal_pending().
     pub(crate) fn lock_interruptibly(
         handle: &Arc<Mutex<Self>>,
     ) -> AxResult<axsync::MutexGuard<'_, Self>> {
-        loop {
-            if has_pending_syscall_signal(axtask::current().as_thread()) {
-                return Err(AxError::Interrupted);
-            }
-            if let Some(guard) = handle.try_lock() {
-                return Ok(guard);
-            }
-            axtask::yield_now();
-        }
+        axsync::lock_interruptible(handle, || {
+            has_pending_sigkill(axtask::current().as_thread())
+        })
+        .ok_or(AxError::Interrupted)
     }
 
     fn prepare_fresh_mapping_lineage(&mut self) -> AxResult<MappingLineage> {

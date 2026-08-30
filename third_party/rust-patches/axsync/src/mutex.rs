@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use axtask::{can_block_current, current, future::block_on, yield_now};
+use axtask::{can_block_current, current, future::{block_on, interruptible}, yield_now};
 use event_listener::{Event, listener};
 
 /// A [`lock_api::RawMutex`] implementation.
@@ -44,6 +44,62 @@ impl RawMutex {
     #[cfg(test)]
     fn notify_count(&self) -> usize {
         self.notify_calls.load(Ordering::Relaxed)
+    }
+
+    /// Acquires this sleeping mutex while allowing a caller-selected terminal
+    /// condition to cancel the wait.  Listener registration and the SeqCst
+    /// owner recheck are identical to `RawMutex::lock`, so an unlock cannot
+    /// be lost between observing contention and blocking.
+    fn lock_interruptible(&self, mut cancelled: impl FnMut() -> bool) -> bool {
+        let current_id = current().id().as_u64();
+        let mut spin = Spin(0);
+        let mut owner_id = self.owner_id.load(Ordering::Relaxed);
+
+        loop {
+            if cancelled() {
+                return false;
+            }
+            if owner_id == current_id {
+                panic!("task attempted to recursively acquire an interruptible mutex");
+            }
+            if owner_id == 0 {
+                match self.owner_id.compare_exchange_weak(
+                    owner_id,
+                    current_id,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => owner_id = observed,
+                }
+                continue;
+            }
+            if !can_block_current() {
+                panic!("non-blockable context attempted an interruptible mutex wait");
+            }
+            if spin.spin() {
+                owner_id = self.owner_id.load(Ordering::Relaxed);
+                continue;
+            }
+
+            listener!(self.event => listener);
+            let _interest = WaiterInterest::new(&self.waiters);
+            owner_id = self.owner_id.load(Ordering::SeqCst);
+            if owner_id == 0 {
+                continue;
+            }
+
+            match block_on(interruptible(listener)) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) if cancelled() => return false,
+                // Ordinary task interrupts do not cancel this lock. They are
+                // consumed at this wait boundary and the caller's predicate
+                // selects only its terminal signal (SIGKILL for mmap).
+                Ok(Err(_)) => {}
+                Err(error) => panic!("interruptible sleeping mutex wait failed: {error}"),
+            }
+            owner_id = self.owner_id.load(Ordering::Acquire);
+        }
     }
 }
 
@@ -232,6 +288,21 @@ pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
 /// An alias of [`lock_api::MutexGuard`].
 pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;
 
+/// Acquires a sleeping mutex with caller-defined cancellation while preserving
+/// the raw mutex's event-listener wakeup protocol.
+pub fn lock_interruptible<T>(
+    mutex: &Mutex<T>,
+    cancelled: impl FnMut() -> bool,
+) -> Option<MutexGuard<'_, T>> {
+    // SAFETY: a successful raw acquisition gives this current task sole lock
+    // ownership, which is exactly the precondition for creating its guard.
+    if unsafe { mutex.raw() }.lock_interruptible(cancelled) {
+        Some(unsafe { mutex.make_guard_unchecked() })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -356,6 +427,54 @@ mod tests {
         assert!(acquired.load(Ordering::Acquire));
         assert_eq!(unsafe { mutex.raw() }.waiter_count(), 0);
         assert!(unsafe { mutex.raw() }.notify_count() >= 1);
+    }
+
+    #[test]
+    fn interruptible_wait_ignores_nonterminal_interrupt_and_wakes_on_unlock() {
+        init_scheduler();
+        let mutex = Arc::new(Mutex::new(()));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let guard = mutex.lock();
+        let waiter_mutex = Arc::clone(&mutex);
+        let waiter_acquired = Arc::clone(&acquired);
+        let waiter = thread::spawn(move || {
+            let _guard = lock_interruptible(&waiter_mutex, || false).unwrap();
+            waiter_acquired.store(true, Ordering::Release);
+        })
+        .unwrap();
+
+        while unsafe { mutex.raw() }.waiter_count() == 0 {
+            thread::yield_now();
+        }
+        waiter.interrupt();
+        thread::yield_now();
+        assert!(!acquired.load(Ordering::Acquire));
+        drop(guard);
+        waiter.join().unwrap();
+        assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn interruptible_wait_cancels_terminal_signal_without_lost_wakeup() {
+        init_scheduler();
+        let mutex = Arc::new(Mutex::new(()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = mutex.lock();
+        let waiter_mutex = Arc::clone(&mutex);
+        let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter = thread::spawn(move || {
+            lock_interruptible(&waiter_mutex, || waiter_cancelled.load(Ordering::Acquire)).is_none()
+        })
+        .unwrap();
+
+        while unsafe { mutex.raw() }.waiter_count() == 0 {
+            thread::yield_now();
+        }
+        cancelled.store(true, Ordering::Release);
+        waiter.interrupt();
+        assert!(waiter.join().unwrap());
+        // The waiter never acquired the held mutex.
+        drop(guard);
     }
 
     #[test]
