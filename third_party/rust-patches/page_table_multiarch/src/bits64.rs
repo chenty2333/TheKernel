@@ -320,17 +320,9 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         self.root_paddr
     }
 
-    /// Borrows an already-installed page-table root.  The returned object
-    /// never frees the root (nor its existing hierarchy); callers must keep
-    /// the root active and serialize every mutation externally.
+    /// Borrows an installed root without taking deallocation ownership.
     pub unsafe fn from_existing_root(root_paddr: PhysAddr) -> Self {
-        Self {
-            root_paddr,
-            owns_root: false,
-            #[cfg(feature = "copy-from")]
-            borrowed_entries: bitmaps::Bitmap::new(),
-            _phantom: PhantomData,
-        }
+        Self { root_paddr, owns_root: false, #[cfg(feature = "copy-from")] borrowed_entries: bitmaps::Bitmap::new(), _phantom: PhantomData }
     }
 
     /// Queries the result of the mapping starting at `vaddr`.
@@ -967,9 +959,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop for PageTable64<M, PTE, H> {
     fn drop(&mut self) {
-        if !self.owns_root {
-            return;
-        }
+        if !self.owns_root { return; }
         let root = self.table_of(self.root_paddr);
         #[allow(unused_variables)]
         for (i, entry) in root.iter().enumerate() {
