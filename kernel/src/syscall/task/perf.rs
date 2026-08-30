@@ -24,9 +24,13 @@ const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
 const PERF_COUNT_SW_PAGE_FAULTS: u64 = 2;
 const PERF_COUNT_SW_CONTEXT_SWITCHES: u64 = 3;
 const PERF_FLAG_FD_NO_GROUP: u64 = 1;
+const PERF_FLAG_FD_OUTPUT: u64 = 2;
 const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
+const PERF_FLAG_KNOWN: u64 =
+    PERF_FLAG_FD_NO_GROUP | PERF_FLAG_FD_OUTPUT | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC;
 const PERF_ATTR_SIZE_VER0: u32 = 64;
+const PERF_ATTR_SIZE_OFFSET: usize = 4;
 // Linux extends perf_event_attr by appending fields.  This implementation
 // understands only v0, but it must not silently discard a requested newer
 // field.  Keep the probe bounded so a malicious size cannot make perf open
@@ -41,10 +45,23 @@ const PERF_SAMPLE_SUPPORTED: u64 = crate::file::perf_sampling::PERF_SAMPLE_SUPPO
 
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
+fn validate_perf_open_flags(flags: u64) -> AxResult<()> {
+    if flags & !PERF_FLAG_KNOWN != 0 {
+        Err(AxError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
 /// This implementation has no inheritance, filtering, pinning, sampling, or
 /// PMU scheduling. Accepting any corresponding perf attribute bit would
 /// advertise behavior the event cannot provide.
 fn supported_attr_flags(flags: u64) -> AxResult<bool> {
+    if flags & (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+        == (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+    {
+        return Err(AxError::InvalidInput);
+    }
     if flags & !ATTR_DISABLED != 0 {
         return Err(AxError::OperationNotSupported);
     }
@@ -62,17 +79,18 @@ fn open_sampling(
     if pid != 0
         || cpu != -1
         || group_fd != -1
-        || flags & !(PERF_FLAG_FD_CLOEXEC | PERF_FLAG_FD_NO_GROUP) != 0
-        || flags & PERF_FLAG_FD_NO_GROUP != 0
+        || flags & (PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_OUTPUT | PERF_FLAG_FD_NO_GROUP) != 0
     {
         return Err(AxError::OperationNotSupported);
     }
     if attr.event_type != PERF_TYPE_HARDWARE {
         return Err(AxError::OperationNotSupported);
     }
+    if attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
     if attr.sample_period < 4096
         || attr.sample_type == 0
-        || attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
         || attr.read_format & !crate::file::PERF_FORMAT_SUPPORTED != 0
         || attr.read_format & crate::file::PERF_FORMAT_GROUP != 0
         || attr.wakeup_events > 1
@@ -81,10 +99,12 @@ fn open_sampling(
     {
         return Err(AxError::InvalidInput);
     }
-    if attr.flags & !(ATTR_DISABLED | ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL) != 0
-        || attr.flags & (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
-            == (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+    if attr.flags & (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+        == (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
     {
+        return Err(AxError::InvalidInput);
+    }
+    if attr.flags & !(ATTR_DISABLED | ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL) != 0 {
         return Err(AxError::OperationNotSupported);
     }
     let caps = axhal::pmu::capabilities().map_err(|_| AxError::OperationNotSupported)?;
@@ -165,6 +185,7 @@ pub(crate) struct PerfEventAttrV0 {
 
 // All fields are integer words and Linux's original ABI is exactly 64 bytes.
 const _: () = assert!(size_of::<PerfEventAttrV0>() == PERF_ATTR_SIZE_VER0 as usize);
+const _: () = assert!(core::mem::offset_of!(PerfEventAttrV0, size) == PERF_ATTR_SIZE_OFFSET);
 
 fn read_attr(
     memory: &UserMemoryCapability,
@@ -179,11 +200,28 @@ fn read_attr(
         .map(|value| unsafe { value.assume_init() })
 }
 
-/// Returns the number of bytes following the v0 prefix that have to be
-/// verified.  An extension is compatible only when every byte is zero.
-fn attr_extension_len(size: u32) -> AxResult<usize> {
+/// Reads only the ABI's size word before deciding whether the complete v0
+/// prefix may be copied.  This lets a short, valid mapping report an invalid
+/// size instead of spuriously faulting while reading unrelated v0 fields.
+fn read_attr_size(memory: &UserMemoryCapability, attr: *const PerfEventAttrV0) -> AxResult<u32> {
+    if attr.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    let address = (attr as usize)
+        .checked_add(PERF_ATTR_SIZE_OFFSET)
+        .ok_or(AxError::BadAddress)?;
+    memory
+        .read_value_uninit(address as *const u32)
+        .map_err(map_usercopy_error)
+        .map(|value| unsafe { value.assume_init() })
+}
+
+/// Converts the first size snapshot into the exact userspace range that may
+/// be read. A zero size preserves Linux's v0 compatibility convention.
+fn attr_copy_len(size: u32) -> AxResult<usize> {
+    let size = if size == 0 { PERF_ATTR_SIZE_VER0 } else { size };
     if size < PERF_ATTR_SIZE_VER0 {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::ArgumentListTooLong);
     }
     if size > PERF_ATTR_MAX_SIZE {
         return Err(AxError::ArgumentListTooLong);
@@ -205,9 +243,9 @@ fn validate_extension_bytes(bytes: &[u8]) -> AxResult<()> {
 fn validate_attr_extensions(
     memory: &UserMemoryCapability,
     attr: *const PerfEventAttrV0,
-    size: u32,
+    copy_len: usize,
 ) -> AxResult<()> {
-    let extension_len = attr_extension_len(size)?;
+    let extension_len = copy_len - PERF_ATTR_SIZE_VER0 as usize;
     let extension_start = (attr as usize)
         .checked_add(PERF_ATTR_SIZE_VER0 as usize)
         .ok_or(AxError::BadAddress)?;
@@ -240,20 +278,20 @@ pub(crate) fn sys_perf_event_open(
     group_fd: i32,
     flags: u64,
 ) -> AxResult<isize> {
+    validate_perf_open_flags(flags)?;
+    let attr_size = read_attr_size(&memory, attr)?;
+    let copy_len = attr_copy_len(attr_size)?;
     let attr_value = read_attr(&memory, attr)?;
-    validate_attr_extensions(&memory, attr, attr_value.size)?;
+    validate_attr_extensions(&memory, attr, copy_len)?;
     let attr = attr_value;
     #[cfg(feature = "perf-sampling")]
     if attr.sample_period != 0 {
         return open_sampling(attr, pid, cpu, group_fd, flags);
     }
     let disabled = supported_attr_flags(attr.flags)?;
-    if flags & !(PERF_FLAG_FD_NO_GROUP | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC) != 0 {
-        return Err(AxError::InvalidInput);
-    }
     // A cgroup file descriptor has no meaning until cgroup perf attachment is
     // implemented; reject it before interpreting pid.
-    if flags & PERF_FLAG_PID_CGROUP != 0 {
+    if flags & (PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_OUTPUT) != 0 {
         return Err(AxError::OperationNotSupported);
     }
     if cpu != -1 {
@@ -278,7 +316,7 @@ pub(crate) fn sys_perf_event_open(
         (id, PerfGroup::new(target_task_id, id)?)
     } else {
         if flags & PERF_FLAG_FD_NO_GROUP != 0 {
-            return Err(AxError::InvalidInput);
+            return Err(AxError::OperationNotSupported);
         }
         let leader = get_typed_file::<PerfEventFile>(group_fd)?;
         let Some(group) = leader.group() else {
@@ -359,8 +397,8 @@ mod tests {
     use axerrno::AxError;
 
     use super::{
-        ATTR_DISABLED, PERF_ATTR_MAX_SIZE, PERF_ATTR_SIZE_VER0, attr_extension_len,
-        supported_attr_flags, validate_extension_bytes,
+        ATTR_DISABLED, PERF_ATTR_MAX_SIZE, PERF_ATTR_SIZE_VER0, PERF_FLAG_FD_OUTPUT, attr_copy_len,
+        supported_attr_flags, validate_extension_bytes, validate_perf_open_flags,
     };
     use crate::file::PerfGroup;
 
@@ -385,12 +423,20 @@ mod tests {
 
     #[test]
     fn perf_attr_extension_validator_accepts_only_zero_tail_with_bounded_size() {
-        assert_eq!(attr_extension_len(PERF_ATTR_SIZE_VER0).unwrap(), 0);
-        assert_eq!(attr_extension_len(PERF_ATTR_SIZE_VER0 + 1).unwrap(), 1);
-        assert_eq!(attr_extension_len(PERF_ATTR_MAX_SIZE).unwrap(), 4032);
-        assert!(attr_extension_len(PERF_ATTR_SIZE_VER0 - 1).is_err());
+        // A zero word and a full v0 word both authorize exactly the v0 copy;
+        // a short partial mapping is rejected before that copy is attempted.
+        assert_eq!(attr_copy_len(0).unwrap(), PERF_ATTR_SIZE_VER0 as usize);
         assert_eq!(
-            attr_extension_len(PERF_ATTR_MAX_SIZE + 1),
+            attr_copy_len(PERF_ATTR_SIZE_VER0),
+            Ok(PERF_ATTR_SIZE_VER0 as usize)
+        );
+        assert_eq!(
+            attr_copy_len(PERF_ATTR_SIZE_VER0 - 1),
+            Err(AxError::ArgumentListTooLong)
+        );
+        assert_eq!(attr_copy_len(PERF_ATTR_MAX_SIZE).unwrap(), 4096);
+        assert_eq!(
+            attr_copy_len(PERF_ATTR_MAX_SIZE + 1),
             Err(AxError::ArgumentListTooLong)
         );
 
@@ -398,6 +444,15 @@ mod tests {
         assert_eq!(
             validate_extension_bytes(&[0, 0, 1]),
             Err(AxError::ArgumentListTooLong)
+        );
+    }
+
+    #[test]
+    fn perf_open_flag_validator_recognizes_fd_output_but_rejects_unknown_bits() {
+        assert_eq!(validate_perf_open_flags(PERF_FLAG_FD_OUTPUT), Ok(()));
+        assert_eq!(
+            validate_perf_open_flags(1 << 63),
+            Err(AxError::InvalidInput)
         );
     }
 }
