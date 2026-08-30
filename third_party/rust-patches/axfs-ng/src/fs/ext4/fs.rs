@@ -30,6 +30,42 @@ use crate::MountedBlockDevice;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
 const PROJECT_ID_XATTR: &[u8] = b"trusted.thekernel.project_id";
+// `open_by_handle_at` may need to prove that an anonymously decoded inode is
+// below a directory file descriptor.  Keep that proof deliberately bounded:
+// failing closed preserves the directory capability boundary, while avoiding a
+// hostile or simply enormous directory tree turning the check into unbounded
+// CPU or memory consumption.
+const MAX_EXPORT_HANDLE_DESCENDANT_STEPS: usize = 4096;
+
+struct ExportHandleDescendantWalk {
+    remaining_steps: usize,
+}
+
+impl ExportHandleDescendantWalk {
+    const fn new() -> Self {
+        Self {
+            remaining_steps: MAX_EXPORT_HANDLE_DESCENDANT_STEPS,
+        }
+    }
+
+    /// Admit one lookup or directory expansion.  Exhaustion is deliberately
+    /// reported to the caller as an unproven descendant relation.
+    fn take_step(&mut self) -> bool {
+        let Some(remaining) = self.remaining_steps.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_steps = remaining;
+        true
+    }
+
+    /// Bound temporary names by both remaining work and queued directories.
+    /// The latter keeps the sum of `pending` and `names` bounded even before
+    /// their work is consumed.
+    fn directory_name_limit(&self, pending_directories: usize) -> usize {
+        self.remaining_steps
+            .min(MAX_EXPORT_HANDLE_DESCENDANT_STEPS.saturating_sub(pending_directories))
+    }
+}
 
 fn inode_metadata(attr: FileAttr, project_id: u32) -> Metadata {
     Metadata {
@@ -231,6 +267,34 @@ impl RuntimeRegistry {
 #[cfg(test)]
 mod runtime_registry_tests {
     use super::*;
+
+    #[test]
+    fn export_handle_descendant_walk_has_a_hard_work_limit() {
+        let mut walk = ExportHandleDescendantWalk::new();
+        for _ in 0..MAX_EXPORT_HANDLE_DESCENDANT_STEPS {
+            assert!(walk.take_step());
+        }
+        assert!(!walk.take_step());
+    }
+
+    #[test]
+    fn export_handle_descendant_walk_bounds_names_by_queued_directories() {
+        let mut walk = ExportHandleDescendantWalk::new();
+        assert_eq!(
+            walk.directory_name_limit(0),
+            MAX_EXPORT_HANDLE_DESCENDANT_STEPS
+        );
+        assert_eq!(
+            walk.directory_name_limit(MAX_EXPORT_HANDLE_DESCENDANT_STEPS),
+            0
+        );
+
+        assert!(walk.take_step());
+        assert_eq!(
+            walk.directory_name_limit(MAX_EXPORT_HANDLE_DESCENDANT_STEPS - 1),
+            1
+        );
+    }
 
     #[test]
     fn ext4_io_and_wrapper_state_use_their_intended_lock_domains() {
@@ -832,9 +896,17 @@ impl FilesystemOps for Ext4Filesystem {
     ) -> VfsResult<bool> {
         let target = self.encode_export_handle(descendant, ExportHandleMode::Openable)?;
         let mut pending = Vec::new();
-        pending.try_reserve(16).map_err(|_| VfsError::NoMemory)?;
+        pending
+            .try_reserve_exact(1)
+            .map_err(|_| VfsError::NoMemory)?;
         pending.push(ancestor.clone());
+        let mut walk = ExportHandleDescendantWalk::new();
         while let Some(entry) = pending.pop() {
+            if !walk.take_step() {
+                // An incomplete walk must not grant a directory-scoped
+                // open-by-handle capability.
+                return Ok(false);
+            }
             let exported = self.encode_export_handle(&entry, ExportHandleMode::Openable)?;
             if exported == target {
                 return Ok(true);
@@ -843,19 +915,50 @@ impl FilesystemOps for Ext4Filesystem {
                 continue;
             };
             let mut names = Vec::<String>::new();
+            let name_limit = walk.directory_name_limit(pending.len());
+            if name_limit == 0 {
+                return Ok(false);
+            }
+            let mut allocation_error = None;
+            let mut name_limit_reached = false;
             let listed = directory.read_dir(0, &mut |name: &str, _: u64, _: NodeType, _: u64| {
                 if name != "." && name != ".." {
-                    names.push(String::from(name));
+                    if names.len() == name_limit {
+                        name_limit_reached = true;
+                        return false;
+                    }
+                    if names.try_reserve(1).is_err() {
+                        allocation_error = Some(VfsError::NoMemory);
+                        return false;
+                    }
+                    let mut owned = String::new();
+                    if owned.try_reserve_exact(name.len()).is_err() {
+                        allocation_error = Some(VfsError::NoMemory);
+                        return false;
+                    }
+                    // The exact capacity above guarantees this append does
+                    // not allocate.
+                    owned.push_str(name);
+                    names.push(owned);
                 }
                 true
             });
+            if let Some(error) = allocation_error {
+                return Err(error);
+            }
             if let Err(error) = listed {
                 return match error {
                     VfsError::NoMemory | VfsError::StorageFull => Err(error),
                     _ => Ok(false),
                 };
             }
+            if name_limit_reached {
+                return Ok(false);
+            }
             for name in names {
+                if !walk.take_step() {
+                    return Ok(false);
+                }
                 let child = match directory.lookup(&name) {
                     Ok(child) => child,
                     Err(error @ (VfsError::NoMemory | VfsError::StorageFull)) => return Err(error),
