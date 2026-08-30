@@ -1354,6 +1354,27 @@ mod tests {
     }
 
     #[test]
+    fn set_mempolicy_home_node_syscall_validates_before_current_task_lookup() {
+        assert_eq!(
+            sys_set_mempolicy_home_node(1, 0, 0, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sys_set_mempolicy_home_node(0, 0, 0, 1),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sys_set_mempolicy_home_node(0, 0, 1, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(sys_set_mempolicy_home_node(0, 0, 0, 0), Ok(0));
+        assert_eq!(
+            sys_set_mempolicy_home_node(0, usize::MAX - PAGE_SIZE_4K + 2, 0, 0),
+            Ok(0)
+        );
+    }
+
+    #[test]
     fn process_access_prctl_dumpable_validates_value_only() {
         assert_eq!(
             parse_pr_set_dumpable_args(0, 7, 8, 9),
