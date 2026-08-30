@@ -2101,7 +2101,7 @@ fn positioned_file_handle(
     access: FileFlags,
 ) -> AxResult<FileHandle<File>> {
     match FileLikeKind::from_file_like(file_like.as_ref()) {
-        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Directory => return Err(AxError::InvalidInput),
         FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::from(LinuxError::ESPIPE)),
         FileLikeKind::Regular | FileLikeKind::Other => {}
     }
