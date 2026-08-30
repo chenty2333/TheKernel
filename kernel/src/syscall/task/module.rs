@@ -16,7 +16,7 @@ use spin::Lazy;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
 
 use crate::{
-    file::{FileLike, get_file_description},
+    file::{FileLike, get_typed_file, File},
     jit_memory::{self, ExecutableCode, MemoryError},
     mm::map_usercopy_error,
     task::AsThread,
@@ -82,11 +82,11 @@ pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M
     // The native ABI has no vermagic/modversion or compression layer.  Do
     // not silently accept callers asking to bypass checks that do not exist.
     if flags != 0{return Err(AxError::OperationNotSupported)}
-    let description=get_file_description(fd)?;
-    let size=usize::try_from(description.stat()?.size).map_err(|_|AxError::InvalidInput)?;
+    let file=get_typed_file::<File>(fd)?;
+    let size=usize::try_from(file.stat()?.size).map_err(|_|AxError::InvalidInput)?;
     if size==0||size>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}
     let mut bytes=Vec::new();bytes.try_reserve_exact(size).map_err(|_|AxError::NoMemory)?;
-    let copied=description.read(&mut bytes)?;
+    let copied=file.inner().read_at(&mut bytes,0)?;
     if copied!=size||bytes.len()!=size{return Err(AxError::InvalidExecutable)}
     let prepared=prepare(&bytes)?;
     if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}
