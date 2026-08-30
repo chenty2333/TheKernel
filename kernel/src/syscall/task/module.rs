@@ -11,7 +11,7 @@ use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
-use linux_raw_sys::general::CAP_SYS_MODULE;
+use linux_raw_sys::general::{CAP_SYS_MODULE, O_NONBLOCK, O_TRUNC};
 use spin::Lazy;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
 
@@ -44,8 +44,10 @@ const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 struct Section { name: u32, typ: u32, flags: u64, offset: usize, size: usize, link: u32, info: u32, entsize: usize }
 #[derive(Clone, Copy)]
 struct Symbol { name: u32, info: u8, section: u16, value: usize }
+enum ModuleState { Coming, Live(PreparedModule), Going }
+struct ModuleSlot { name: String, state: ModuleState, base_ref: u32, dependents: u32 }
 struct PreparedModule { name: String, code: ExecutableCode, init: usize, exit: Option<usize> }
-static MODULES: Lazy<spin::Mutex<Vec<PreparedModule>>> = Lazy::new(|| spin::Mutex::new(Vec::new()));
+static MODULES: Lazy<spin::Mutex<Vec<ModuleSlot>>> = Lazy::new(|| spin::Mutex::new(Vec::new()));
 
 fn le16(b: &[u8], o: usize) -> AxResult<u16> { b.get(o..o + 2).and_then(|v| v.try_into().ok()).map(u16::from_le_bytes).ok_or(AxError::InvalidExecutable) }
 fn le32(b: &[u8], o: usize) -> AxResult<u32> { b.get(o..o + 4).and_then(|v| v.try_into().ok()).map(u32::from_le_bytes).ok_or(AxError::InvalidExecutable) }
@@ -79,7 +81,7 @@ fn prepare(b:&[u8])->AxResult<PreparedModule>{
 /// calling init means a successful init always has a non-fallible publication
 /// path, and keeping the transaction serialized prevents same-name loaders
 /// from executing two init functions concurrently.
-fn activate(prepared:PreparedModule)->AxResult<isize>{let mut modules=MODULES.lock();if modules.iter().any(|module|module.name==prepared.name){return Err(LinuxError::EEXIST.into())}modules.try_reserve(1).map_err(|_|AxError::NoMemory)?;if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}modules.push(prepared);Ok(0)}
+fn activate(prepared:PreparedModule)->AxResult<isize>{let name=prepared.name.clone();{let mut modules=MODULES.lock();if modules.iter().any(|module|module.name==name){return Err(LinuxError::EEXIST.into())}modules.try_reserve(1).map_err(|_|AxError::NoMemory)?;modules.push(ModuleSlot{name:name.clone(),state:ModuleState::Coming,base_ref:1,dependents:0});}let ret=prepared.code.execute_module_entry(prepared.init);let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(AxError::BadState)?;if ret!=0{modules.remove(index);return Err(LinuxError::EINVAL.into())}modules[index].state=ModuleState::Live(prepared);Ok(0)}
 
 pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;activate(prepare(&bytes)?)}
 pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M>,fd:i32,_args:*const c_char,flags:u32)->AxResult<isize>{
@@ -97,4 +99,4 @@ pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M
     if copied!=size||bytes.len()!=size{return Err(AxError::InvalidExecutable)}
     activate(prepare(&bytes)?)
 }
-pub fn sys_delete_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,name:*const c_char,flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if flags!=0{return Err(AxError::OperationNotSupported)}let name=vm_load_until_nul_bounded(memory,name.cast(),MODULE_NAME_MAX+1).map_err(map_usercopy_error)?;let name=core::str::from_utf8(&name).map_err(|_|AxError::IllegalBytes)?;let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(LinuxError::ENOENT)?;let module=modules.remove(index);if let Some(exit)=module.exit{let _=module.code.execute_module_entry(exit);}module.code.retire().map_err(memory_error)?;Ok(0)}
+pub fn sys_delete_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,name:*const c_char,flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if flags&!(O_NONBLOCK|O_TRUNC)!=0{return Err(LinuxError::EINVAL.into())}let name=vm_load_until_nul_bounded(memory,name.cast(),MODULE_NAME_MAX+1).map_err(map_usercopy_error)?;let name=core::str::from_utf8(&name).map_err(|_|AxError::IllegalBytes)?;let module={let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(LinuxError::ENOENT)?;let slot=&mut modules[index];if !matches!(slot.state,ModuleState::Live(_))||slot.base_ref!=1||slot.dependents!=0{return Err(LinuxError::EBUSY.into())};match core::mem::replace(&mut slot.state,ModuleState::Going){ModuleState::Live(m)=>m,_=>unreachable!()}};if let Some(exit)=module.exit{let _=module.code.execute_module_entry(exit);}module.code.retire().map_err(memory_error)?;let mut modules=MODULES.lock();if let Some(i)=modules.iter().position(|m|m.name==name&&matches!(m.state,ModuleState::Going)){modules.remove(i);}Ok(0)}
