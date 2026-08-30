@@ -5,15 +5,12 @@
 //! descriptor while the per-CPU backend is introduced separately.
 
 use alloc::{borrow::Cow, sync::Arc};
-use core::{
-    mem::size_of,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    task::Context,
-};
+use core::{mem::size_of, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axhal::time::monotonic_time_nanos;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
+use axsync::Mutex;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat, anon_inode_stat},
@@ -32,9 +29,13 @@ const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 /// clock, avoiding a reader/ioctl lock in the common read path.
 pub struct PerfEventFile {
     id: u64,
-    enabled: AtomicBool,
-    accumulated: AtomicU64,
-    started: AtomicU64,
+    state: Mutex<PerfEventState>,
+}
+
+struct PerfEventState {
+    enabled: bool,
+    accumulated: u64,
+    started: u64,
 }
 
 impl PerfEventFile {
@@ -42,42 +43,47 @@ impl PerfEventFile {
         let now = monotonic_time_nanos();
         Arc::new(Self {
             id,
-            enabled: AtomicBool::new(!disabled),
-            accumulated: AtomicU64::new(0),
-            started: AtomicU64::new(now),
+            state: Mutex::new(PerfEventState {
+                enabled: !disabled,
+                accumulated: 0,
+                started: now,
+            }),
         })
     }
 
     fn count(&self) -> u64 {
-        let accumulated = self.accumulated.load(Ordering::Acquire);
-        if self.enabled.load(Ordering::Acquire) {
-            accumulated.saturating_add(
-                monotonic_time_nanos().saturating_sub(self.started.load(Ordering::Acquire)),
-            )
+        let state = self.state.lock();
+        if state.enabled {
+            state
+                .accumulated
+                .saturating_add(monotonic_time_nanos().saturating_sub(state.started))
         } else {
-            accumulated
+            state.accumulated
         }
     }
 
     fn disable(&self) {
-        if self.enabled.swap(false, Ordering::AcqRel) {
-            let elapsed =
-                monotonic_time_nanos().saturating_sub(self.started.load(Ordering::Acquire));
-            self.accumulated.fetch_add(elapsed, Ordering::AcqRel);
+        let mut state = self.state.lock();
+        if state.enabled {
+            state.accumulated = state
+                .accumulated
+                .saturating_add(monotonic_time_nanos().saturating_sub(state.started));
+            state.enabled = false;
         }
     }
 
     fn enable(&self) {
-        if !self.enabled.swap(true, Ordering::AcqRel) {
-            self.started
-                .store(monotonic_time_nanos(), Ordering::Release);
+        let mut state = self.state.lock();
+        if !state.enabled {
+            state.started = monotonic_time_nanos();
+            state.enabled = true;
         }
     }
 
     fn reset(&self) {
-        self.accumulated.store(0, Ordering::Release);
-        self.started
-            .store(monotonic_time_nanos(), Ordering::Release);
+        let mut state = self.state.lock();
+        state.accumulated = 0;
+        state.started = monotonic_time_nanos();
     }
 }
 
