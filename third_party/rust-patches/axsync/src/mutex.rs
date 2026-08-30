@@ -104,7 +104,7 @@ impl RawMutex {
             }
 
             listener!(self.event => listener);
-            let _interest = WaiterInterest::new(&self.waiters);
+            let interest = WaiterInterest::new(&self.waiters);
             owner_id = self.owner_id.load(Ordering::SeqCst);
             if owner_id == 0 {
                 continue;
@@ -112,7 +112,13 @@ impl RawMutex {
 
             match block_on(interruptible(listener)) {
                 Ok(Ok(())) => owns_handoff = true,
-                Ok(Err(_)) if cancelled() => return false,
+                Ok(Err(_)) if cancelled() => {
+                    // Drop interest while the listener remains registered,
+                    // then claim-or-pass any unlock handoff which sampled it.
+                    drop(interest);
+                    self.cancel_waiter_handoff(current_id);
+                    return false;
+                }
                 // Ordinary task interrupts do not cancel this lock. They are
                 // consumed at this wait boundary and the caller's predicate
                 // selects only its terminal signal (SIGKILL for mmap).
@@ -137,6 +143,31 @@ impl RawMutex {
             );
         } else {
             self.event.notify(1);
+        }
+    }
+
+    /// Finishes cancellation after waiter-interest withdrawal.  A concurrent
+    /// unlock may already have selected this listener by publishing the
+    /// handoff sentinel; claim and forward that turn so it cannot strand.
+    fn cancel_waiter_handoff(&self, current_id: u64) {
+        loop {
+            if self.owner_id.load(Ordering::SeqCst) != HANDOFF_OWNER {
+                return;
+            }
+            if self
+                .owner_id
+                .compare_exchange(
+                    HANDOFF_OWNER,
+                    current_id,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.owner_id.store(HANDOFF_OWNER, Ordering::Release);
+                self.pass_handoff();
+                return;
+            }
         }
     }
 }
