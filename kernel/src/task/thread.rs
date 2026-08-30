@@ -1179,6 +1179,8 @@ pub struct Thread {
     voluntary_switches: AtomicU64,
     involuntary_switches: AtomicU64,
     perf_events: SpinNoIrq<Vec<Arc<crate::file::PerfGroup>>>,
+    #[cfg(feature = "perf-sampling")]
+    perf_sampling: SpinNoIrq<Option<Weak<crate::file::PerfSamplingFile>>>,
     /// Scheduler-owned utilization clamps, published as a coherent pair.
     ///
     /// `sched_clamp_sequence` is a tiny seqlock: writers are serialized with
@@ -1247,7 +1249,10 @@ const fn pack_sched_clamp(min: u16, max: u16) -> u32 {
 
 #[cfg(feature = "hwp-uclamp")]
 const fn unpack_sched_clamp(packed: u32) -> (u16, u16) {
-    ((packed & SCHED_CLAMP_MASK) as u16, ((packed >> 11) & SCHED_CLAMP_MASK) as u16)
+    (
+        (packed & SCHED_CLAMP_MASK) as u16,
+        ((packed >> 11) & SCHED_CLAMP_MASK) as u16,
+    )
 }
 
 #[cfg(feature = "hwp-uclamp")]
@@ -1316,7 +1321,8 @@ impl SchedulerClampCache {
             }
             self.packed.store(packed, Ordering::Relaxed);
             self.version.store(version, Ordering::Relaxed);
-            self.sequence.store(sequence.wrapping_add(2), Ordering::Release);
+            self.sequence
+                .store(sequence.wrapping_add(2), Ordering::Release);
             return;
         }
     }
@@ -1383,7 +1389,9 @@ impl Thread {
         if events.iter().any(|attached| Arc::ptr_eq(attached, &group)) {
             return Ok(());
         }
-        if events.len() == crate::file::MAX_GROUPS_PER_THREAD { return Err(AxError::OperationNotSupported); }
+        if events.len() == crate::file::MAX_GROUPS_PER_THREAD {
+            return Err(AxError::OperationNotSupported);
+        }
         events.push(group);
         Ok(())
     }
@@ -1394,18 +1402,58 @@ impl Thread {
     }
 
     fn perf_on_enter(&self) {
+        #[cfg(feature = "perf-sampling")]
+        if let Some(event) = self.perf_sampling.lock().as_ref().and_then(Weak::upgrade) {
+            event.enter_current();
+        }
         let mut events = self.perf_events.lock();
-        events.retain(|group| { group.on_enter(); !group.is_prunable() });
+        events.retain(|group| {
+            group.on_enter();
+            !group.is_prunable()
+        });
     }
 
     fn perf_on_leave(&self) {
         let mut events = self.perf_events.lock();
-        events.retain(|group| { group.on_leave(); !group.is_prunable() });
+        events.retain(|group| {
+            group.on_leave();
+            !group.is_prunable()
+        });
+        #[cfg(feature = "perf-sampling")]
+        crate::file::PerfSamplingFile::leave_current();
+    }
+
+    #[cfg(feature = "perf-sampling")]
+    pub(crate) fn attach_perf_sampling(
+        &self,
+        event: &Arc<crate::file::PerfSamplingFile>,
+    ) -> AxResult<()> {
+        let mut sampling = self.perf_sampling.lock();
+        if sampling.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        *sampling = Some(Arc::downgrade(event));
+        Ok(())
+    }
+
+    #[cfg(feature = "perf-sampling")]
+    pub(crate) fn detach_perf_sampling(&self, event: &Arc<crate::file::PerfSamplingFile>) {
+        let mut sampling = self.perf_sampling.lock();
+        if sampling
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|attached| Arc::ptr_eq(&attached, event))
+        {
+            *sampling = None;
+        }
     }
 
     fn perf_on_fault(&self) {
         let mut events = self.perf_events.lock();
-        events.retain(|group| { group.on_fault(); !group.is_prunable() });
+        events.retain(|group| {
+            group.on_fault();
+            !group.is_prunable()
+        });
     }
 
     /// Create a new [`Thread`].
@@ -1500,7 +1548,15 @@ impl Thread {
             io_write_bytes: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
-            perf_events: SpinNoIrq::new({ let mut groups = Vec::new(); groups.try_reserve_exact(crate::file::MAX_GROUPS_PER_THREAD).map_err(|_| AxError::NoMemory)?; groups }),
+            perf_events: SpinNoIrq::new({
+                let mut groups = Vec::new();
+                groups
+                    .try_reserve_exact(crate::file::MAX_GROUPS_PER_THREAD)
+                    .map_err(|_| AxError::NoMemory)?;
+                groups
+            }),
+            #[cfg(feature = "perf-sampling")]
+            perf_sampling: SpinNoIrq::new(None),
             #[cfg(feature = "hwp-uclamp")]
             sched_clamp: SchedulerClampCache::new(
                 scheduler_seed.util_min,

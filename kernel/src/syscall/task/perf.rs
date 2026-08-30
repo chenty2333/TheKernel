@@ -28,6 +28,10 @@ const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
 const PERF_ATTR_SIZE_VER0: u32 = 64;
 const ATTR_DISABLED: u64 = 1;
+const ATTR_EXCLUDE_USER: u64 = 1 << 4;
+const ATTR_EXCLUDE_KERNEL: u64 = 1 << 5;
+#[cfg(feature = "perf-sampling")]
+const PERF_SAMPLE_SUPPORTED: u64 = crate::file::perf_sampling::PERF_SAMPLE_SUPPORTED;
 
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -41,9 +45,82 @@ fn supported_attr_flags(flags: u64) -> AxResult<bool> {
     Ok(flags & ATTR_DISABLED != 0)
 }
 
+#[cfg(feature = "perf-sampling")]
+fn open_sampling(
+    attr: PerfEventAttrV0,
+    pid: i32,
+    cpu: i32,
+    group_fd: i32,
+    flags: u64,
+) -> AxResult<isize> {
+    if pid != 0
+        || cpu != -1
+        || group_fd != -1
+        || flags & !(PERF_FLAG_FD_CLOEXEC | PERF_FLAG_FD_NO_GROUP) != 0
+        || flags & PERF_FLAG_FD_NO_GROUP != 0
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    if attr.event_type != PERF_TYPE_HARDWARE {
+        return Err(AxError::OperationNotSupported);
+    }
+    if attr.sample_period < 4096
+        || attr.sample_type == 0
+        || attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
+        || attr.read_format & !crate::file::PERF_FORMAT_SUPPORTED != 0
+        || attr.read_format & crate::file::PERF_FORMAT_GROUP != 0
+        || attr.wakeup_events > 1
+        || attr.bp_type != 0
+        || attr.config1 != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+    if attr.flags & !(ATTR_DISABLED | ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL) != 0
+        || attr.flags & (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+            == (ATTR_EXCLUDE_USER | ATTR_EXCLUDE_KERNEL)
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    let caps = axhal::pmu::capabilities().map_err(|_| AxError::OperationNotSupported)?;
+    if attr.sample_period > caps.programmable_mask() {
+        return Err(AxError::InvalidInput);
+    }
+    let event = match attr.config {
+        PERF_COUNT_HW_CPU_CYCLES => crate::file::perf_sampling::SamplingEvent::Cycles,
+        PERF_COUNT_HW_INSTRUCTIONS => crate::file::perf_sampling::SamplingEvent::Instructions,
+        _ => return Err(AxError::OperationNotSupported),
+    };
+    let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
+    let file =
+        crate::file::PerfSamplingFile::try_new(crate::file::perf_sampling::SamplingConfig {
+            id,
+            event,
+            period: attr.sample_period,
+            sample_type: attr.sample_type,
+            count_user: attr.flags & ATTR_EXCLUDE_USER == 0,
+            count_kernel: attr.flags & ATTR_EXCLUDE_KERNEL == 0,
+            disabled: attr.flags & ATTR_DISABLED != 0,
+            read_format: attr.read_format,
+        })?;
+    current().as_thread().attach_perf_sampling(&file)?;
+    match add_file_like(
+        file.clone() as Arc<dyn crate::file::FileLike>,
+        flags & PERF_FLAG_FD_CLOEXEC != 0,
+    ) {
+        Ok(fd) => Ok(fd as isize),
+        Err(error) => {
+            current().as_thread().detach_perf_sampling(&file);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod abi_tests {
-    use super::{ATTR_DISABLED, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE, supported_attr_flags};
+    use super::{
+        ATTR_DISABLED, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_TYPE_HARDWARE,
+        PERF_TYPE_SOFTWARE, supported_attr_flags,
+    };
 
     #[test]
     fn perf_attr_accepts_only_disabled_bit() {
@@ -106,6 +183,10 @@ pub(crate) fn sys_perf_event_open(
     if attr.size < PERF_ATTR_SIZE_VER0 {
         return Err(AxError::InvalidInput);
     }
+    #[cfg(feature = "perf-sampling")]
+    if attr.sample_period != 0 {
+        return open_sampling(attr, pid, cpu, group_fd, flags);
+    }
     let disabled = supported_attr_flags(attr.flags)?;
     if flags & !(PERF_FLAG_FD_NO_GROUP | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC) != 0 {
         return Err(AxError::InvalidInput);
@@ -140,14 +221,13 @@ pub(crate) fn sys_perf_event_open(
             return Err(AxError::InvalidInput);
         }
         let leader = get_typed_file::<PerfEventFile>(group_fd)?;
-        let Some(group) = leader.group() else { return Err(AxError::BadFileDescriptor); };
+        let Some(group) = leader.group() else {
+            return Err(AxError::BadFileDescriptor);
+        };
         if !leader.is_group_leader() || !group.accepts_target(target_task_id) {
             return Err(AxError::InvalidInput);
         }
-        (
-            NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed),
-            group,
-        )
+        (NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed), group)
     };
     let event = match attr.event_type {
         PERF_TYPE_SOFTWARE => PerfEvent::Software(match attr.config {
@@ -160,12 +240,16 @@ pub(crate) fn sys_perf_event_open(
         PERF_TYPE_HARDWARE => {
             // Hardware leases are strictly local: opening another task would
             // either need a remote MSR operation or expose a stale sample.
-            if !target_is_current { return Err(AxError::OperationNotSupported); }
+            if !target_is_current {
+                return Err(AxError::OperationNotSupported);
+            }
             #[cfg(not(feature = "pmu"))]
             return Err(AxError::OperationNotSupported);
             #[cfg(feature = "pmu")]
             {
-                if axhal::pmu::capabilities().is_err() { return Err(AxError::OperationNotSupported); }
+                if axhal::pmu::capabilities().is_err() {
+                    return Err(AxError::OperationNotSupported);
+                }
                 PerfEvent::Hardware(match attr.config {
                     PERF_COUNT_HW_CPU_CYCLES => crate::file::HardwareEvent::Cycles,
                     PERF_COUNT_HW_INSTRUCTIONS => crate::file::HardwareEvent::Instructions,
@@ -185,23 +269,28 @@ pub(crate) fn sys_perf_event_open(
     // The target retains the only long-lived group Arc before the file takes
     // its weak back-reference. Every failure below removes an empty group.
     target.as_thread().attach_perf_group(group.clone())?;
-    let file = match PerfEventFile::new(
-        id,
-        event,
-        disabled,
-        &group,
-        attr.read_format,
-    ) {
+    let file = match PerfEventFile::new(id, event, disabled, &group, attr.read_format) {
         Ok(file) => file,
-        Err(error) => { target.as_thread().detach_empty_perf_group(&group); return Err(error); }
+        Err(error) => {
+            target.as_thread().detach_empty_perf_group(&group);
+            return Err(error);
+        }
     };
     let result = add_file_like(
         file as Arc<dyn crate::file::FileLike>,
         flags & PERF_FLAG_FD_CLOEXEC != 0,
     );
     match result {
-        Ok(fd) => { if target_is_current { group.reconfigure_current(); } Ok(fd as isize) }
-        Err(error) => { target.as_thread().detach_empty_perf_group(&group); Err(error) }
+        Ok(fd) => {
+            if target_is_current {
+                group.reconfigure_current();
+            }
+            Ok(fd as isize)
+        }
+        Err(error) => {
+            target.as_thread().detach_empty_perf_group(&group);
+            Err(error)
+        }
     }
 }
 

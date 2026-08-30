@@ -33,6 +33,11 @@ pub fn init(args: &[String], envs: &[String]) {
 
     crate::mm::init_tlb_shootdown();
     crate::syscall::init_membarrier_ipi();
+    #[cfg(feature = "perf-sampling")]
+    assert!(
+        crate::file::PerfSamplingFile::init_irq(),
+        "failed to reserve the PMU sampling IRQ vector"
+    );
     #[cfg(all(feature = "smp-tlb-shootdown", target_os = "none"))]
     axtask::init_remote_resched_ipi()
         .expect("failed to register the EEVDF remote-reschedule IPI consumer");

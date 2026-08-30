@@ -305,6 +305,10 @@ impl FileMmapRequest {
     pub const fn protection(self) -> FileMmapProtection {
         self.protection
     }
+
+    pub const fn sharing(self) -> FileMmapSharing {
+        self.sharing
+    }
 }
 
 /// One exact fixed-size region exported by a file-like object.
@@ -401,7 +405,9 @@ fn validate_fixed_shared_request(
     may_protect: FileMmapProtection,
     request: FileMmapRequest,
 ) -> AxResult {
-    let Some(relative) = request.offset.checked_sub(expected_offset) else { return Err(AxError::InvalidInput); };
+    let Some(relative) = request.offset.checked_sub(expected_offset) else {
+        return Err(AxError::InvalidInput);
+    };
     // secretmem follows normal file mmap admission: a shared mapping may
     // extend past i_size.  Its fault handler rejects pages beyond EOF instead
     // of turning mmap itself into EINVAL.  Other fixed control mappings keep
@@ -438,7 +444,9 @@ impl PreparedFileMmap {
     pub(crate) const fn request(&self) -> FileMmapRequest {
         self.request
     }
-    pub(crate) const fn region_offset(&self) -> u64 { self.region_offset }
+    pub(crate) const fn region_offset(&self) -> u64 {
+        self.region_offset
+    }
 
     pub(crate) const fn pages(&self) -> &Arc<SharedPages> {
         &self.pages

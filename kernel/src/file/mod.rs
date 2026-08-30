@@ -27,7 +27,6 @@ pub mod bpf;
 pub(crate) mod dnotify;
 pub mod epoll;
 pub mod event;
-pub(crate) mod perf;
 pub(crate) mod executable;
 pub mod fanotify;
 mod fiemap;
@@ -38,16 +37,19 @@ pub mod inotify;
 pub(crate) mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
-pub(crate) mod secretmem;
 pub(crate) mod namespace_mutation;
 mod net;
 pub(crate) mod netlink;
 pub(crate) mod packet;
 pub(crate) mod packet_socket;
+pub(crate) mod perf;
+#[cfg(feature = "perf-sampling")]
+pub(crate) mod perf_sampling;
 pub(crate) mod permission;
 mod pidfd;
 pub(crate) mod pipe;
 pub(crate) mod privilege_metadata;
+pub(crate) mod secretmem;
 pub mod signalfd;
 pub mod timerfd;
 pub(crate) mod unix_socket;
@@ -63,6 +65,8 @@ mod stdio;
 mod types;
 
 // Re-exports from split sub-modules — keep the old `crate::file::*` paths unchanged.
+#[cfg(feature = "perf-sampling")]
+pub(crate) use self::perf_sampling::PerfSamplingFile;
 pub use self::{
     af_alg::AfAlgSocket,
     desc::*,
@@ -75,18 +79,20 @@ pub use self::{
     stdio::add_stdio,
     types::*,
 };
-pub(crate) use self::perf::{HardwareEvent, MAX_GROUPS_PER_THREAD, PERF_FORMAT_SUPPORTED, PerfEvent, PerfEventFile, PerfGroup, SoftwareEvent};
 pub(crate) use self::{
-    pipe::NamedPipe,
     fs::{
         allowed_write_len, check_resize_limit, resolve_at_with_security,
         resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,
     },
     fs_types::filesystem_type_catalog,
+    io_uring::IoUring,
     metadata::{PseudoInode, anon_inode_stat},
     packet_socket::PacketSocket,
-    io_uring::IoUring,
-    userfaultfd::UserfaultFile,
+    perf::{
+        HardwareEvent, MAX_GROUPS_PER_THREAD, PERF_FORMAT_GROUP, PERF_FORMAT_SUPPORTED, PerfEvent,
+        PerfEventFile, PerfGroup, SoftwareEvent,
+    },
+    pipe::NamedPipe,
     secretmem::SecretMemFile,
     socket::{
         AcceptedSocketSecurityRef, BareAcceptedSocketSecurityRef, PACKET_SOCKADDR_STORAGE_LEN,
@@ -94,4 +100,5 @@ pub(crate) use self::{
         PreparedSocketAddress, PreparedSocketMessage, SocketBackendKind, SocketSecurityRef,
         UnixEndpointSecurityRef,
     },
+    userfaultfd::UserfaultFile,
 };
