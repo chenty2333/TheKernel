@@ -10,11 +10,12 @@ mod kexec;
 mod keys;
 mod module;
 mod ptrace;
+mod perf;
 mod schedule;
 mod thread;
 mod wait;
 
 pub use self::{
     acct::*, clone::*, clone3::*, ctl::*, execve::*, exit::*, ioport::*, job::*, kexec::*, keys::*,
-    module::*, ptrace::*, schedule::*, thread::*, wait::*,
+    module::*, perf::*, ptrace::*, schedule::*, thread::*, wait::*,
 };

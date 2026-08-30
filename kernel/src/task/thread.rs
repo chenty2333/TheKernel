@@ -1,6 +1,7 @@
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     cell::RefCell,
@@ -999,6 +1000,7 @@ pub struct Thread {
     io_write_bytes: AtomicU64,
     voluntary_switches: AtomicU64,
     involuntary_switches: AtomicU64,
+    perf_events: SpinNoIrq<Vec<Weak<crate::file::PerfEventFile>>>,
     /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
     /// The scheduler Exit callback consumes this marker so `nvcsw` is
     /// published exactly once before the frozen usage snapshot is queued.
@@ -1045,6 +1047,52 @@ pub(crate) struct SchedulerSeed {
 }
 
 impl Thread {
+    /// Publishes an event into this exact task's scheduler-owned lifecycle.
+    /// Reservation occurs in perf_event_open, never in a switch callback.
+    pub(crate) fn attach_perf_event(
+        &self,
+        event: &Arc<crate::file::PerfEventFile>,
+    ) -> AxResult<()> {
+        let mut events = self.perf_events.lock();
+        events.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        events.push(Arc::downgrade(event));
+        drop(events);
+        Ok(())
+    }
+
+    fn perf_on_enter(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|event| {
+            let Some(event) = event.upgrade() else {
+                return false;
+            };
+            event.on_enter();
+            true
+        });
+    }
+
+    fn perf_on_leave(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|event| {
+            let Some(event) = event.upgrade() else {
+                return false;
+            };
+            event.on_leave();
+            true
+        });
+    }
+
+    fn perf_on_fault(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|event| {
+            let Some(event) = event.upgrade() else {
+                return false;
+            };
+            event.on_fault();
+            true
+        });
+    }
+
     /// Create a new [`Thread`].
     pub(crate) fn try_new(
         tid: u32,
@@ -1135,6 +1183,7 @@ impl Thread {
             io_write_bytes: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
+            perf_events: SpinNoIrq::new(Vec::new()),
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             io_context: SpinNoIrq::new(io_context),
@@ -1594,11 +1643,13 @@ impl Thread {
     /// Accounts one successfully handled minor page fault.
     pub(crate) fn account_minor_fault(&self) {
         self.minor_faults.fetch_add(1, Ordering::Relaxed);
+        self.perf_on_fault();
     }
 
     /// Accounts one successfully handled major page fault.
     pub(crate) fn account_major_fault(&self) {
         self.major_faults.fetch_add(1, Ordering::Relaxed);
+        self.perf_on_fault();
     }
 
     /// Accounts bytes transferred by a real backing read, before conversion
@@ -1768,6 +1819,7 @@ impl From<u8> for ProcStateHint {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self, _task: &TaskInner) {
+        self.perf_on_enter();
         let state = self.proc_data.aspace_tlb_state();
         state.enter_current();
         // A scheduler enter is the migration observation consumed by the
@@ -1790,6 +1842,7 @@ impl TaskExt for Box<Thread> {
         if reason.counts_as_context_switch() && !exit_was_preaccounted {
             self.account_context_switch(!reason.is_involuntary());
         }
+        self.perf_on_leave();
         self.pause_cpu_accounting_for_switch();
         ActiveScope::set_global();
         self.release_active_scope_read();
