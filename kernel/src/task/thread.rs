@@ -1448,6 +1448,13 @@ impl Thread {
         }
     }
 
+    #[cfg(feature = "perf-sampling")]
+    pub(crate) fn reconcile_perf_sampling(&self) {
+        if let Some(event) = self.perf_sampling.lock().as_ref().and_then(Weak::upgrade) {
+            event.reconcile_current();
+        }
+    }
+
     fn perf_on_fault(&self) {
         let mut events = self.perf_events.lock();
         events.retain(|group| {
@@ -2365,6 +2372,8 @@ impl TaskExt for Box<Thread> {
         #[cfg(feature = "hwp-uclamp")]
         self.apply_current_hwp_clamp();
         super::load_average_sample_now();
+        #[cfg(feature = "perf-sampling")]
+        self.reconcile_perf_sampling();
         self.poll_cpu_accounting_for_tick()
     }
 }

@@ -10,6 +10,7 @@ use core::task::Context;
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use axsync::spin::SpinNoIrq;
+use axtask::current;
 use kernel_guard::NoPreemptIrqSave;
 use memory_addr::PAGE_SIZE_4K;
 
@@ -19,6 +20,7 @@ use crate::{
         IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap, anon_inode_stat,
     },
     mm::{SharedAtomicU64, SharedFixedView, SharedPages},
+    task::AsThread,
 };
 
 pub(crate) const PERF_SAMPLE_IP: u64 = 1;
@@ -29,6 +31,7 @@ pub(crate) const PERF_SAMPLE_SUPPORTED: u64 =
     PERF_SAMPLE_IP | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD;
 const PERF_RECORD_LOST: u32 = 2;
 const PERF_RECORD_SAMPLE: u32 = 9;
+const PERF_RECORD_MISC_KERNEL: u16 = 1;
 const PERF_RECORD_MISC_USER: u16 = 2;
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -96,7 +99,9 @@ pub(crate) struct PerfSamplingFile {
 
 struct CpuCustody {
     event: Arc<PerfSamplingFile>,
-    token: axhal::pmu::SamplingToken,
+    // Keep the event alive even after an IRQ has stopped the counter.  In
+    // particular, never let an interrupt drop the final Ring/FixedView Arc.
+    token: Option<axhal::pmu::SamplingToken>,
     cookie: u64,
 }
 
@@ -137,10 +142,7 @@ impl PerfSamplingFile {
         if !self.target_current() {
             return;
         }
-        if !self.enabled() {
-            return;
-        }
-        if self.state.lock().ring.is_none() {
+        if !self.live() {
             return;
         }
         let _irq = NoPreemptIrqSave::new();
@@ -164,38 +166,108 @@ impl PerfSamplingFile {
         };
         *CUSTODY[cpu].lock() = Some(CpuCustody {
             event: self.clone(),
-            token,
+            token: Some(token),
             cookie: self.config.id,
         });
-        self.state.lock().running_since = Some(axhal::time::monotonic_time_nanos());
+        let mut state = self.state.lock();
+        if state.enabled && !state.closed && !state.failed && state.ring.is_some() {
+            state.running_since = Some(axhal::time::monotonic_time_nanos());
+            return;
+        }
+        drop(state);
+        // A remote final_close/disable can win after arm.  The custody Arc
+        // makes this stop safe here and defers its final destruction to leave.
+        Self::stop_current();
     }
 
     pub(crate) fn leave_current() {
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
-        let Some(custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) else {
+        let Some(mut custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) else {
             return;
         };
-        if let Ok(sample) = axhal::pmu::sampling_stop_local(custody.token) {
-            if let Ok(caps) = axhal::pmu::capabilities() {
-                let preload = caps
-                    .programmable_mask()
-                    .saturating_add(1)
-                    .saturating_sub(custody.event.config.period);
-                let partial = sample.residual.wrapping_sub(preload) & caps.programmable_mask();
+        Self::stop_custody(&mut custody);
+    }
+
+    fn live(&self) -> bool {
+        let state = self.state.lock();
+        state.enabled && !state.closed && !state.failed && state.ring.is_some()
+    }
+
+    fn settle_stop(event: &Self, sample: axhal::pmu::StopSample) {
+        let mut state = event.state.lock();
+        if let Ok(caps) = axhal::pmu::capabilities() {
+            let mask = caps.programmable_mask();
+            let preload = mask.wrapping_add(1).wrapping_sub(event.config.period);
+            let partial = sample.residual.wrapping_sub(preload) & mask;
+            state.value = state.value.saturating_add(partial);
+        } else {
+            state.failed = true;
+        }
+        if let Some(since) = state.running_since.take() {
+            state.running_total = state
+                .running_total
+                .saturating_add(axhal::time::monotonic_time_nanos().saturating_sub(since));
+        }
+        // An overflow merely means that one pending sample could not be
+        // delivered before stop; it is loss, not a hardware fault.
+        if sample.overflowed || sample.lost {
+            if let Some(ring) = state.ring.as_mut() {
+                ring.lost = ring.lost.saturating_add(1);
+            }
+        }
+    }
+
+    fn stop_custody(custody: &mut CpuCustody) {
+        let Some(token) = custody.token.take() else {
+            return;
+        };
+        match axhal::pmu::sampling_stop_local(token) {
+            Ok(sample) => Self::settle_stop(&custody.event, sample),
+            Err(_) => {
                 let mut state = custody.event.state.lock();
-                state.value = state.value.saturating_add(partial);
+                state.failed = true;
                 if let Some(since) = state.running_since.take() {
                     state.running_total = state
                         .running_total
                         .saturating_add(axhal::time::monotonic_time_nanos().saturating_sub(since));
                 }
-                if sample.overflowed || sample.lost {
-                    state.failed = true;
-                }
             }
-        } else {
-            custody.event.state.lock().failed = true;
+        }
+    }
+
+    /// Stop this CPU's sampler while retaining custody until scheduler leave.
+    /// This is safe from IRQ/tick/final-close contexts and never drops Arc.
+    pub(crate) fn stop_current() {
+        let _irq = NoPreemptIrqSave::new();
+        let cpu = axhal::percpu::this_cpu_id();
+        if let Some(slot) = CUSTODY.get(cpu) {
+            let mut custody = slot.lock();
+            if let Some(custody) = custody.as_mut() {
+                Self::stop_custody(custody);
+            }
+        }
+    }
+
+    /// Reconcile hardware ownership with the target event's current state.
+    /// The scheduler tick uses this to bound a remote close/disable to one tick.
+    pub(crate) fn reconcile_current(self: &Arc<Self>) {
+        if !self.target_current() {
+            return;
+        }
+        let _irq = NoPreemptIrqSave::new();
+        let cpu = axhal::percpu::this_cpu_id();
+        let owned = CUSTODY.get(cpu).is_some_and(|slot| {
+            slot.lock()
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(&c.event, self))
+        });
+        if self.live() {
+            if !owned {
+                self.enter_current();
+            }
+        } else if owned {
+            Self::stop_current();
         }
     }
 
@@ -205,65 +277,87 @@ impl PerfSamplingFile {
     pub(crate) fn quiesce_current_cpu() {
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
-        if let Some(custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) {
-            let _ = axhal::pmu::sampling_stop_local(custody.token);
+        if let Some(mut custody) = CUSTODY.get(cpu).and_then(|slot| slot.lock().take()) {
+            if let Some(token) = custody.token.take() {
+                let _ = axhal::pmu::sampling_stop_local(token);
+            }
             core::mem::forget(custody.event);
         }
         let _ = axhal::pmu::sampling_quiesce_local();
     }
 
     pub(crate) fn handle_pmi(frame: &axcpu::TrapFrame) {
-        let Ok(Some((sample, generation))) = axhal::pmu::sampling_take_pmi() else {
-            return;
+        let (sample, generation) = match axhal::pmu::sampling_take_pmi() {
+            Ok(Some(sample)) => sample,
+            Ok(None) => return,
+            Err(_) => {
+                Self::stop_current();
+                return;
+            }
         };
         let cpu = axhal::percpu::this_cpu_id();
-        let Some(event) = CUSTODY.get(cpu).and_then(|slot| {
-            let custody = slot.lock();
-            (custody.as_ref()?.cookie == sample.cookie)
-                .then(|| custody.as_ref().unwrap().event.clone())
-        }) else {
+        let Some(slot) = CUSTODY.get(cpu) else { return };
+        let event = {
+            let custody_slot = slot.lock();
+            let Some(custody) = custody_slot.as_ref() else {
+                return;
+            };
+            if custody.cookie != sample.cookie || custody.token.is_none() {
+                custody.event.state.lock().failed = true;
+                None
+            } else {
+                // A temporary clone is safe in IRQ: the static custody keeps
+                // a strong owner until scheduler leave performs the final drop.
+                Some(custody.event.clone())
+            }
+        };
+        let Some(event) = event else {
+            Self::stop_current();
             return;
         };
-        event.publish_sample(
+        let mut state = event.state.lock();
+        if !state.enabled || state.closed || state.failed || state.ring.is_none() {
+            drop(state);
+            Self::stop_current();
+            return;
+        }
+        let mut bytes = [0_u8; 40];
+        let size = encode_sample(
+            &mut bytes,
+            event.config.sample_type,
             frame.rip,
             frame.cs,
             axhal::time::monotonic_time_nanos(),
             cpu as u32,
+            event.config.period,
         );
-        if event.enabled() {
-            let _ = axhal::pmu::sampling_rearm_local(sample.cookie, generation);
+        state.value = state.value.saturating_add(event.config.period);
+        let published = publish_record(
+            state.ring.as_mut().unwrap(),
+            &bytes[..size],
+            event.config.id,
+        );
+        if published.overflow {
+            state.failed = true;
         }
+        // The state lock spans the rearm decision: close/disable can neither
+        // win after the period was accounted nor leave a live counter behind.
+        let rearm = !state.failed && state.enabled && !state.closed && state.ring.is_some();
+        if published.published {
+            event.waiters.wake();
+        }
+        drop(state);
+        if rearm {
+            if axhal::pmu::sampling_rearm_local(sample.cookie, generation).is_ok() {
+                return;
+            }
+            event.state.lock().failed = true;
+        }
+        Self::stop_current();
     }
 
     pub(crate) fn init_irq() -> bool {
         axhal::irq::register_context(axhal::pmu::SAMPLING_IRQ_VECTOR, perf_sampling_pmi)
-    }
-
-    /// The PMI path owns this lock while copying into the fixed view.  A tail
-    /// outside the producer window is treated as full, never as an address.
-    pub(crate) fn publish_sample(&self, ip: u64, cs: u64, time: u64, cpu: u32) {
-        let mut state = self.state.lock();
-        if !state.enabled || state.closed || state.failed {
-            return;
-        }
-        if state.ring.is_none() {
-            return;
-        }
-        let mut sample = [0_u8; 40];
-        let size = encode_sample(
-            &mut sample,
-            self.config.sample_type,
-            ip,
-            cs,
-            time,
-            cpu,
-            self.config.period,
-        );
-        state.value = state.value.saturating_add(self.config.period);
-        let ring = state.ring.as_mut().expect("ring checked above");
-        if publish_record(ring, &sample[..size], self.config.id) {
-            self.waiters.wake();
-        }
     }
 
     fn install_ring(&self, request: FileMmapRequest) -> AxResult {
@@ -339,8 +433,16 @@ impl PerfSamplingFile {
         if !self.target_current() {
             return Err(AxError::OperationNotSupported);
         }
+        // Reading an active event settles its residual counter before taking
+        // the snapshot.  Custody keeps the backing alive while IRQs are off.
+        let active = self.live();
+        if active {
+            Self::stop_current();
+        }
         let state = self.state.lock();
         if state.failed {
+            // stop_current above consumed the token.  Do not rearm a sticky
+            // hardware failure; leave later releases the retained custody Arc.
             return Err(AxError::Io);
         }
         let now = axhal::time::monotonic_time_nanos();
@@ -356,6 +458,9 @@ impl PerfSamplingFile {
                 .map_or(0, |since| now.saturating_sub(since)),
         );
         drop(state);
+        if active {
+            current().as_thread().reconcile_perf_sampling();
+        }
         let words = 1
             + usize::from(self.config.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0)
             + usize::from(self.config.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0)
@@ -383,7 +488,17 @@ fn perf_sampling_pmi(_: usize, frame: &axcpu::TrapFrame) {
 
 impl FileLike for PerfSamplingFile {
     fn final_close(&self) {
-        self.state.lock().closed = true;
+        let now = axhal::time::monotonic_time_nanos();
+        {
+            let mut state = self.state.lock();
+            if state.enabled {
+                state.enabled_total = state
+                    .enabled_total
+                    .saturating_add(now.saturating_sub(state.enabled_since));
+                state.enabled = false;
+            }
+            state.closed = true;
+        }
         self.waiters.wake();
     }
     fn stat(&self) -> AxResult<Kstat> {
@@ -397,6 +512,8 @@ impl FileLike for PerfSamplingFile {
     }
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
         self.install_ring(request)?;
+        // mmap is the first point at which this event has a producer backing.
+        current().as_thread().reconcile_perf_sampling();
         Ok(self
             .state
             .lock()
@@ -417,19 +534,26 @@ impl FileLike for PerfSamplingFile {
                 .map_err(crate::mm::map_usercopy_error)?;
             return Ok(0);
         }
-        if matches!(cmd, PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) {
-            Self::leave_current();
+        if !matches!(
+            cmd,
+            PERF_EVENT_IOC_ENABLE | PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET
+        ) || arg != 0
+        {
+            return Err(AxError::InvalidInput);
         }
         let now = axhal::time::monotonic_time_nanos();
+        if matches!(cmd, PERF_EVENT_IOC_DISABLE | PERF_EVENT_IOC_RESET) {
+            Self::stop_current();
+        }
         let mut state = self.state.lock();
         match cmd {
-            PERF_EVENT_IOC_ENABLE if arg == 0 => {
+            PERF_EVENT_IOC_ENABLE => {
                 if !state.enabled {
                     state.enabled = true;
                     state.enabled_since = now;
                 }
             }
-            PERF_EVENT_IOC_DISABLE if arg == 0 => {
+            PERF_EVENT_IOC_DISABLE => {
                 if state.enabled {
                     state.enabled_total = state
                         .enabled_total
@@ -437,14 +561,18 @@ impl FileLike for PerfSamplingFile {
                     state.enabled = false;
                 }
             }
-            PERF_EVENT_IOC_RESET if arg == 0 => {
+            PERF_EVENT_IOC_RESET => {
                 state.value = 0;
                 state.failed = false;
                 if let Some(ring) = state.ring.as_mut() {
                     ring.lost = 0;
                 }
             }
-            _ => return Err(AxError::InvalidInput),
+            _ => unreachable!("validated perf sampling ioctl"),
+        }
+        drop(state);
+        if cmd != PERF_EVENT_IOC_DISABLE {
+            current().as_thread().reconcile_perf_sampling();
         }
         Ok(0)
     }
@@ -469,11 +597,10 @@ impl Pollable for PerfSamplingFile {
         if state.failed {
             events |= IoEvents::ERROR;
         }
-        if state
-            .ring
-            .as_ref()
-            .is_some_and(|ring| ring.producer_head != ring.tail.load_acquire())
-        {
+        if state.ring.as_ref().is_some_and(|ring| {
+            producer_window(ring.producer_head, ring.tail.load_acquire(), ring.data_size)
+                .is_some_and(|used| used != 0)
+        }) {
             events |= IoEvents::READABLE;
         }
         events
@@ -529,55 +656,85 @@ fn encode_sample(
         if cs & 3 == 3 {
             PERF_RECORD_MISC_USER
         } else {
-            0
+            PERF_RECORD_MISC_KERNEL
         },
         cursor,
     );
     cursor
 }
 
-fn publish_record(ring: &mut Ring, sample: &[u8], id: u64) -> bool {
+#[derive(Clone, Copy, Default)]
+struct PublishResult {
+    published: bool,
+    overflow: bool,
+}
+
+fn producer_window(head: u64, tail: u64, size: usize) -> Option<u64> {
+    let used = head.checked_sub(tail)?;
+    (used <= size as u64).then_some(used)
+}
+
+fn has_space(size: usize, used: u64, record: usize) -> bool {
+    (size as u64).saturating_sub(used) >= record as u64
+}
+
+fn publish_record(ring: &mut Ring, sample: &[u8], id: u64) -> PublishResult {
     let tail = ring.tail.load_acquire();
-    let Some(used) = ring.producer_head.checked_sub(tail) else {
+    let Some(mut used) = producer_window(ring.producer_head, tail, ring.data_size) else {
         ring.lost = ring.lost.saturating_add(1);
-        return false;
+        return PublishResult::default();
     };
-    if used > ring.data_size as u64 {
-        ring.lost = ring.lost.saturating_add(1);
-        return false;
-    }
     let mut lost = [0_u8; 24];
     header(&mut lost, PERF_RECORD_LOST, 0, 24);
     lost[8..16].copy_from_slice(&id.to_ne_bytes());
     let pending = ring.lost;
+    let mut published_any = false;
     lost[16..24].copy_from_slice(&pending.to_ne_bytes());
-    let required = sample.len() + if pending != 0 { lost.len() } else { 0 };
-    if (ring.data_size as u64).saturating_sub(used) < required as u64 {
-        ring.lost = ring.lost.saturating_add(1);
-        return false;
-    }
-    // Prove the final publication point before copying either LOST or SAMPLE:
-    // a wrapped head is never allowed to expose a partial old epoch.
-    if ring.producer_head.checked_add(required as u64).is_none() {
-        return false;
-    }
     let mut head = ring.producer_head;
-    if pending != 0 {
+    // LOST is independently useful: publish it first whenever it fits, even
+    // when this SAMPLE cannot.  Each record has its own all-or-nothing head.
+    if pending != 0 && has_space(ring.data_size, used, lost.len()) {
+        let Some(next) = head.checked_add(lost.len() as u64) else {
+            return PublishResult {
+                published: false,
+                overflow: true,
+            };
+        };
         if write_record(ring, head, &lost).is_err() {
-            return false;
+            return PublishResult::default();
         }
-        head += lost.len() as u64;
+        head = next;
+        used += lost.len() as u64;
         ring.lost = 0;
+        ring.producer_head = head;
+        ring.head.store_release(head);
+        published_any = true;
     }
-    if write_record(ring, head, sample).is_err() {
-        return false;
+    if !has_space(ring.data_size, used, sample.len()) {
+        ring.lost = ring.lost.saturating_add(1);
+        return PublishResult {
+            published: published_any,
+            overflow: false,
+        };
     }
     let Some(next) = head.checked_add(sample.len() as u64) else {
-        return false;
+        return PublishResult {
+            published: published_any,
+            overflow: true,
+        };
     };
+    if write_record(ring, head, sample).is_err() {
+        return PublishResult {
+            published: published_any,
+            overflow: false,
+        };
+    }
     ring.producer_head = next;
     ring.head.store_release(next);
-    true
+    PublishResult {
+        published: true,
+        overflow: false,
+    }
 }
 fn write_record(ring: &Ring, head: u64, bytes: &[u8]) -> AxResult {
     let offset = (head as usize) & (ring.data_size - 1);
@@ -615,6 +772,37 @@ mod tests {
         assert_eq!(u64::from_ne_bytes(out[16..24].try_into().unwrap()), 2);
         assert_eq!(u32::from_ne_bytes(out[24..28].try_into().unwrap()), 4);
         assert_eq!(u64::from_ne_bytes(out[32..40].try_into().unwrap()), 5);
+    }
+    #[test]
+    fn kernel_sample_uses_kernel_misc() {
+        let mut out = [0; 40];
+        encode_sample(&mut out, PERF_SAMPLE_IP, 1, 0, 0, 0, 0);
+        assert_eq!(
+            u16::from_ne_bytes(out[4..6].try_into().unwrap()),
+            PERF_RECORD_MISC_KERNEL
+        );
+    }
+
+    #[test]
+    fn producer_window_rejects_invalid_tails_and_accepts_exact_space() {
+        assert_eq!(producer_window(80, 16, 64), Some(64));
+        assert_eq!(producer_window(80, 81, 64), None);
+        assert_eq!(producer_window(80, 0, 64), None);
+        assert!(has_space(64, 40, 24));
+        assert!(!has_space(64, 41, 24));
+    }
+
+    #[test]
+    fn lost_is_publishable_before_a_sample_that_does_not_fit() {
+        assert!(has_space(64, 24, 24));
+        assert!(!has_space(64, 24 + 24, 24));
+        assert!(!has_space(64, 41, 24));
+    }
+
+    #[test]
+    fn counter_head_overflow_is_not_a_resettable_window() {
+        assert!(u64::MAX.checked_add(1).is_none());
+        assert_eq!(producer_window(96, 64, 64), Some(32));
     }
     #[test]
     fn sample_type_sizes_cover_each_field() {
