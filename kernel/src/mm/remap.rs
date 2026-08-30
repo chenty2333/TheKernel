@@ -167,6 +167,41 @@ fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize)
     aspace.find_free_area(start, size, limit, align) == Some(start)
 }
 
+/// Chooses an automatic mremap destination.  A moved shadow stack keeps its
+/// lower guard outside the relocated VMA, so transactions continue to use the
+/// returned `start` and `new_size` unchanged.
+fn automatic_remap_destination(
+    aspace: &AddrSpace,
+    hint: VirtAddr,
+    new_size: usize,
+    page_size: usize,
+    source_segments: &[RemapSegment],
+) -> AxResult<VirtAddr> {
+    let limit = VirtAddrRange::new(aspace.base(), aspace.end());
+    if source_segments
+        .iter()
+        .any(|segment| segment.flags.contains(MappingFlags::SHADOW_STACK))
+    {
+        let total = new_size
+            .checked_add(memory_addr::PAGE_SIZE_4K)
+            .ok_or(AxError::NoMemory)?;
+        let base = aspace
+            .find_kernel_area(hint, total, limit, page_size)
+            .ok_or(AxError::NoMemory)?;
+        let start = base
+            .checked_add(memory_addr::PAGE_SIZE_4K)
+            .ok_or(AxError::NoMemory)?;
+        if !start.is_aligned(page_size) || !aspace.contains_range(start, new_size) {
+            return Err(AxError::NoMemory);
+        }
+        Ok(start)
+    } else {
+        aspace
+            .find_kernel_area(hint, new_size, limit, page_size)
+            .ok_or(AxError::NoMemory)
+    }
+}
+
 fn validate_fixed_remap_dst(
     aspace: &AddrSpace,
     src: VirtAddr,
@@ -581,14 +616,13 @@ fn build_remap_plan(
             )?;
             request.new_addr
         } else {
-            aspace
-                .find_kernel_area(
-                    request.addr,
-                    request.new_size,
-                    VirtAddrRange::new(aspace.base(), aspace.end()),
-                    page_size as usize,
-                )
-                .ok_or(AxError::NoMemory)?
+            automatic_remap_destination(
+                aspace,
+                request.addr,
+                request.new_size,
+                page_size as usize,
+                &source_segments,
+            )?
         };
 
         let duplicated_locked = aspace.locked_bytes_in_range(request.addr, request.new_size);
@@ -657,14 +691,13 @@ fn build_remap_plan(
         )?;
         request.new_addr
     } else {
-        aspace
-            .find_kernel_area(
-                request.addr,
-                request.new_size,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                page_size as usize,
-            )
-            .ok_or(AxError::NoMemory)?
+        automatic_remap_destination(
+            aspace,
+            request.addr,
+            request.new_size,
+            page_size as usize,
+            &source_segments,
+        )?
     };
     if grow_locked {
         check_mremap_locked_growth_limit(proc_data, has_ipc_lock, aspace, grow)?;
@@ -1241,7 +1274,9 @@ fn try_optimistic_mremap(
             proc_data.clear_mempolicy_range(start.as_usize(), size);
             #[cfg(target_arch = "x86_64")]
             let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
-                request.addr, request.old_size, request.addr,
+                request.addr,
+                request.old_size,
+                request.addr,
             );
             drop(aspace);
             wake.finish();
@@ -1306,7 +1341,9 @@ fn run_locked_mremap(
                 proc_data.clear_mempolicy_range(start.as_usize(), size);
                 #[cfg(target_arch = "x86_64")]
                 let invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
-                    request.addr, request.old_size, request.addr,
+                    request.addr,
+                    request.old_size,
+                    request.addr,
                 );
                 drop(aspace);
                 wake.finish();
