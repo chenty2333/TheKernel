@@ -1932,6 +1932,40 @@ mod tests {
     }
 
     #[test]
+    fn sched_get_priority_min_matches_linux_query_policy_set() {
+        for (policy, expected) in [
+            (SCHED_NORMAL as i32, 0),
+            (SCHED_FIFO as i32, RT_PRIORITY_MIN as isize),
+            (SCHED_RR as i32, RT_PRIORITY_MIN as isize),
+            (SCHED_BATCH as i32, 0),
+            (SCHED_IDLE as i32, 0),
+            (SCHED_DEADLINE as i32, 0),
+            (7, 0), // SCHED_EXT
+        ] {
+            assert_eq!(sys_sched_get_priority_min(policy), Ok(expected));
+        }
+        assert_eq!(sys_sched_get_priority_min(4), Err(AxError::InvalidInput));
+        assert_eq!(
+            sys_sched_get_priority_min(7 | SCHED_RESET_ON_FORK as i32),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sched_get_priority_min_uses_the_x86_64_low_i32_syscall_argument() {
+        let sched_ext_with_high_bits = (1usize << 32) | 7;
+        let invalid_with_high_bits = (1usize << 32) | 4;
+        assert_eq!(
+            sys_sched_get_priority_min(sched_ext_with_high_bits as i32),
+            Ok(0)
+        );
+        assert_eq!(
+            sys_sched_get_priority_min(invalid_with_high_bits as i32),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
     fn sched_get_priority_max_accepts_sched_ext_only_as_plain_i32_policy() {
         const SCHED_EXT: i32 = 7;
         assert_eq!(sys_sched_get_priority_max(SCHED_EXT), Ok(0));
