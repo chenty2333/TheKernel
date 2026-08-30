@@ -13,6 +13,8 @@ use x2apic::{
     lapic::{LocalApic, LocalApicBuilder, xapic_base},
 };
 use x86_64::instructions::port::Port;
+#[cfg(feature = "pmu-sampling")]
+use x86::msr::{rdmsr, wrmsr};
 
 use self::vectors::*;
 
@@ -25,6 +27,10 @@ pub(super) mod vectors {
 
 const IO_APIC_BASE: PhysAddr = pa!(0xFEC0_0000);
 const IO_APIC_VECTOR_BASE: usize = 0x20;
+#[cfg(feature = "pmu-sampling")]
+const XAPIC_LVT_PERF_OFFSET: usize = 0x340;
+#[cfg(feature = "pmu-sampling")]
+const X2APIC_LVT_PERF_MSR: u32 = 0x834;
 
 static mut LOCAL_APIC: MaybeUninit<LocalApic> = MaybeUninit::uninit();
 static IS_X2APIC: AtomicBool = AtomicBool::new(false);
@@ -87,6 +93,32 @@ fn io_apic_vector(pin: u8) -> Option<u8> {
 pub fn local_apic<'a>() -> &'a mut LocalApic {
     // It's safe as `LOCAL_APIC` is initialized in `init_primary`.
     unsafe { LOCAL_APIC.assume_init_mut() }
+}
+
+/// Reads this CPU's complete LVT Performance Counter register.
+///
+/// `x2apic` deliberately does not expose this LVT entry through `LocalApic`.
+/// Keep the architectural register access here so PMU code has one local-only
+/// implementation for both xAPIC MMIO and x2APIC MSR modes.
+#[cfg(feature = "pmu-sampling")]
+pub unsafe fn read_lvt_perf() -> u32 {
+    if IS_X2APIC.load(Ordering::Acquire) {
+        unsafe { rdmsr(X2APIC_LVT_PERF_MSR) as u32 }
+    } else {
+        let base = phys_to_virt(pa!(unsafe { xapic_base() } as usize));
+        unsafe { core::ptr::read_volatile((base.as_usize() + XAPIC_LVT_PERF_OFFSET) as *const u32) }
+    }
+}
+
+/// Writes this CPU's complete LVT Performance Counter register.
+#[cfg(feature = "pmu-sampling")]
+pub unsafe fn write_lvt_perf(value: u32) {
+    if IS_X2APIC.load(Ordering::Acquire) {
+        unsafe { wrmsr(X2APIC_LVT_PERF_MSR, value as u64); }
+    } else {
+        let base = phys_to_virt(pa!(unsafe { xapic_base() } as usize));
+        unsafe { core::ptr::write_volatile((base.as_usize() + XAPIC_LVT_PERF_OFFSET) as *mut u32, value); }
+    }
 }
 
 #[cfg(any(feature = "smp", feature = "irq"))]

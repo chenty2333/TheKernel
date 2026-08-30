@@ -358,12 +358,12 @@ pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Err
         let c = capabilities()?;
         if !c.programmable(program.event) || !program.count_user && !program.count_kernel
             || program.period < 4096 || program.period > c.programmable_mask() { return Err(Error::InvalidProgram); }
-        let lvt = unsafe { crate::apic::local_apic().lvt_perf() };
+        let lvt = unsafe { crate::apic::read_lvt_perf() };
         if !lvt_is_safe_sampling_baseline(lvt) { return Err(Error::Busy); }
         let (slot, saved) = select(m, c)?;
         let state = &mut m.slots[slot.idx()];
         claim_generation(state)?; // before the first register write: no ABA on exhaustion.
-        unsafe { crate::apic::local_apic().write_lvt_perf(lvt | LVT_MASKED); }
+        unsafe { crate::apic::write_lvt_perf(lvt | LVT_MASKED); }
         disable(slot);
         write(OVF, bit(slot)); // candidate was idle/status-clear; acknowledge only our bit.
         write(EVT + match slot { Slot::P(i) => i as u32, _ => unreachable!() }, sampling_event(program.event, program.count_user, program.count_kernel));
@@ -376,9 +376,9 @@ pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Err
         state.cookie = program.cookie;
         state.period = program.period;
         state.lvt_perf = lvt;
-        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32 | LVT_MASKED); }
+        unsafe { crate::apic::write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32 | LVT_MASKED); }
         write(GLOBAL, read(GLOBAL) | bit(slot));
-        unsafe { crate::apic::local_apic().write_lvt_perf(sampling_active_lvt(lvt)); }
+        unsafe { crate::apic::write_lvt_perf(sampling_active_lvt(lvt)); }
         Ok(SamplingToken { cpu, slot, generation: state.generation, cookie: program.cookie, active: true })
     })
 }
@@ -395,7 +395,7 @@ pub fn sampling_take_pmi() -> Result<Option<(PmiSample, u64)>, Error> {
         let s = &m.slots[i];
         let sample = PmiSample { cookie: s.cookie, period: s.period };
         let generation = s.generation;
-        unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
+        unsafe { crate::apic::write_lvt_perf(crate::apic::read_lvt_perf() | LVT_MASKED); }
         disable(slot);
         write(OVF, bit(slot));
         Ok(Some((sample, generation)))
@@ -409,7 +409,7 @@ pub fn sampling_rearm_local(cookie: u64, generation: u64) -> Result<(), Error> {
         for i in 0..MAX { let s = &mut m.slots[i]; if s.owned && s.sampling && s.cookie == cookie && s.generation == generation {
             let slot = Slot::P(i as u8); write(slot_msr(slot), sampling_preload(s.width, s.period)); write(OVF, bit(slot));
             write(GLOBAL, read(GLOBAL) | bit(slot));
-            unsafe { crate::apic::local_apic().write_lvt_perf(sampling_active_lvt(s.lvt_perf)); }
+            unsafe { crate::apic::write_lvt_perf(sampling_active_lvt(s.lvt_perf)); }
             return Ok(());
         }} Err(Error::Stale)
     })
@@ -417,12 +417,12 @@ pub fn sampling_rearm_local(cookie: u64, generation: u64) -> Result<(), Error> {
 
 #[cfg(feature = "pmu-sampling")]
 fn stop_sampling(slot: Slot, s: &mut State) -> StopSample {
-    unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
+    unsafe { crate::apic::write_lvt_perf(crate::apic::read_lvt_perf() | LVT_MASKED); }
     disable(slot); let residual = read(slot_msr(slot)) & Capabilities::mask(s.width); let overflowed = read(STATUS) & bit(slot) != 0;
     if overflowed { write(OVF, bit(slot)); }
     write(EVT + match slot { Slot::P(i) => i as u32, _ => unreachable!() }, s.saved.control);
     write(slot_msr(slot), s.saved.counter); let now = read(GLOBAL); write(GLOBAL, (now & !bit(slot)) | (s.saved.global & bit(slot)));
-    unsafe { crate::apic::local_apic().write_lvt_perf(s.lvt_perf); }
+    unsafe { crate::apic::write_lvt_perf(s.lvt_perf); }
     s.owned = false; s.sampling = false; s.abandoned = false;
     StopSample { residual, overflowed, lost: false }
 }
