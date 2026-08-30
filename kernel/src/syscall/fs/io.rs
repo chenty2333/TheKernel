@@ -2780,17 +2780,26 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         FileLikeKind::Directory => return Err(AxError::IsADirectory),
         FileLikeKind::Regular => {}
     }
-    file_like.check_io_access()?;
+    file_like.check_io_access().map_err(|error| match error {
+        // The descriptor exists, so do_ftruncate's invalid file mode is
+        // EINVAL; only get_file_like above is allowed to report EBADF.
+        AxError::BadFileDescriptor => AxError::InvalidInput,
+        other => other,
+    })?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
-        // All descriptor/type admission precedes RLIMIT_FSIZE, so an invalid
-        // fd never gains SIGXFSZ merely because the requested size is large.
-        check_resize_limit(length as u64)?;
+        secret.check_truncate()?;
+        if (length as u64) > secret.size() {
+            check_resize_limit(length as u64)?;
+        }
         secret.truncate(length as u64)?;
         return Ok(0);
     }
     let security = current_vfs_security();
     let f = file_like.downcast::<File>()?;
-    let backend = f.inner().access(FileFlags::WRITE)?;
+    let backend = f.inner().access(FileFlags::WRITE).map_err(|error| match error {
+        AxError::BadFileDescriptor => AxError::InvalidInput,
+        other => other,
+    })?;
     check_writable_mount(f.inner().location())?;
     crate::mm::check_not_active(f.inner().location())?;
     let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
@@ -2798,7 +2807,9 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::PermissionDenied);
     }
     executable::check_not_active(f.inner().location())?;
-    check_resize_limit(length as u64)?;
+    if (length as u64) > f.inner().location().len()? {
+        check_resize_limit(length as u64)?;
+    }
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;
     let status = f.io_status_snapshot();

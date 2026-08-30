@@ -51,6 +51,21 @@ impl SecretMemFile {
         self.size.store(size as u64, Ordering::Release);
         Ok(())
     }
+
+    /// Validates the immutable-after-first-size rule without allocating or
+    /// mutating.  ftruncate uses this before RLIMIT_FSIZE so a second secret
+    /// truncate retains Linux's EINVAL priority.
+    pub(crate) fn check_truncate(&self) -> AxResult<()> {
+        if self.pages.lock().is_some() {
+            Err(AxError::InvalidInput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size.load(Ordering::Acquire)
+    }
 }
 
 impl Pollable for SecretMemFile {
