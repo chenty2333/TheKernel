@@ -3,12 +3,14 @@ use alloc::{borrow::ToOwned, format, string::String};
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, SchedClass, TaskState, sched_state};
 use linux_raw_sys::general::{
-    RLIMIT_RSS, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+    RLIMIT_RSS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use memory_addr::PAGE_SIZE_4K;
 use thekernel_linux_signal::Signo;
 
-use crate::task::{AsThread, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks};
+use crate::task::{
+    AsThread, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks, zombie_scheduler_state,
+};
 
 pub(crate) fn task_state(task: &AxTaskRef) -> char {
     let thread = task.as_thread();
@@ -57,20 +59,26 @@ fn process_usage(task: &AxTaskRef, num_threads: u32) -> TaskUsage {
     }
 }
 
-fn task_sched_stat(task: &AxTaskRef) -> (i32, i8, u8, u32) {
-    let sched = sched_state(task);
-    let priority = match sched.class {
-        SchedClass::Fifo | SchedClass::RoundRobin => -(sched.rt_priority as i32) - 1,
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 20 + sched.nice as i32,
+fn sched_stat(class: SchedClass, nice: i8, rt_priority: u8) -> (i32, i8, u8, u32) {
+    let priority = match class {
+        SchedClass::Fifo | SchedClass::RoundRobin => -(rt_priority as i32) - 1,
+        SchedClass::Deadline => -101,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 20 + nice as i32,
     };
-    let policy = match sched.class {
+    let policy = match class {
         SchedClass::Normal => SCHED_NORMAL,
         SchedClass::Batch => SCHED_BATCH,
         SchedClass::Idle => SCHED_IDLE,
         SchedClass::Fifo => SCHED_FIFO,
         SchedClass::RoundRobin => SCHED_RR,
+        SchedClass::Deadline => SCHED_DEADLINE,
     };
-    (priority, sched.nice, sched.rt_priority, policy)
+    (priority, nice, rt_priority, policy)
+}
+
+fn task_sched_stat(task: &AxTaskRef) -> (i32, i8, u8, u32) {
+    let sched = sched_state(task);
+    sched_stat(sched.class, sched.nice, sched.rt_priority)
 }
 
 fn process_memory_stat(task: &AxTaskRef) -> (usize, isize, u64) {
@@ -138,16 +146,32 @@ pub fn render_zombie_stat(process: &Process) -> AxResult<String> {
     let num_threads = 1;
     let self_usage: TaskUsage = snapshot.self_usage.into();
     let child_usage: TaskUsage = snapshot.child_usage.into();
+    let scheduler = zombie_scheduler_state(process)?;
+    let (priority, nice, rt_priority, policy) =
+        sched_stat(scheduler.class, scheduler.nice, scheduler.rt_priority);
     let exit_signal = process.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
     let exit_code = snapshot.wait_status;
 
     Ok(format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} 20 0 \
-         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 0 0 0 0 0 0 0 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} {priority} {nice} \
+         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 {rt_priority} {policy} 0 0 0 0 0 0 0 0 0 0 \
          {exit_code}\n",
         self_usage.utime_ticks(),
         self_usage.stime_ticks(),
         child_usage.utime_ticks(),
         child_usage.stime_ticks(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_sched_stat_uses_linux_deadline_priority() {
+        assert_eq!(
+            sched_stat(SchedClass::Deadline, 0, 0),
+            (-101, 0, 0, SCHED_DEADLINE)
+        );
+    }
 }

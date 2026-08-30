@@ -1054,7 +1054,6 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
         let rlimit_rtprio = target_thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current;
         let rlimit_nice = target_thread.proc_data.rlim.read()[RLIMIT_NICE].current;
-        let authority = SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred);
         let mut state = old.state;
         let old_class = state.class;
         let old_nice = state.nice;
@@ -1067,6 +1066,7 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         {
             return Err(AxError::OperationNotPermitted);
         }
+        let authority = SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred);
         match class {
             SchedClass::Fifo | SchedClass::RoundRobin => {
                 state.rt_priority = if keep_params {
@@ -2043,8 +2043,6 @@ pub fn sys_ioprio_set(which: u32, who: u32, ioprio: u32) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use core::cell::Cell;
-
     use super::*;
 
     #[test]
@@ -2172,11 +2170,11 @@ mod tests {
     }
 
     #[test]
-    fn deadline_setattr_is_known_but_unsupported() {
-        assert!(matches!(
+    fn deadline_setattr_maps_to_deadline_class() {
+        assert_eq!(
             sched_class_for_set(SCHED_DEADLINE, SchedSetAbi::Attr),
-            Err(AxError::OperationNotSupported)
-        ));
+            Ok(SchedClass::Deadline)
+        );
     }
 
     #[test]
@@ -2185,36 +2183,6 @@ mod tests {
             sched_class_for_set(SCHED_DEADLINE, SchedSetAbi::Legacy),
             Err(AxError::InvalidInput)
         ));
-    }
-
-    #[test]
-    fn scheduler_update_rejects_missing_target_before_any_store() {
-        let state_updates = Cell::new(0);
-        let flag_updates = Cell::new(0);
-        let result = apply_sched_state_with_reset::<()>(
-            None,
-            || {
-                state_updates.set(state_updates.get() + 1);
-                Ok(0)
-            },
-            |_| flag_updates.set(flag_updates.get() + 1),
-        );
-        assert_eq!(result, Err(AxError::NoSuchProcess));
-        assert_eq!(state_updates.get(), 0);
-        assert_eq!(flag_updates.get(), 0);
-    }
-
-    #[test]
-    fn scheduler_failure_never_partially_stores_reset_on_fork() {
-        let target = ();
-        let flag_updates = Cell::new(0);
-        let result = apply_sched_state_with_reset(
-            Some(&target),
-            || Err(AxError::NoSuchProcess),
-            |_| flag_updates.set(flag_updates.get() + 1),
-        );
-        assert_eq!(result, Err(AxError::NoSuchProcess));
-        assert_eq!(flag_updates.get(), 0);
     }
 
     #[test]

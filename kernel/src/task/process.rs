@@ -4808,7 +4808,7 @@ mod tests {
 
     use axerrno::AxError;
     use axsync::spin::SpinNoIrq;
-    use axtask::{SchedClass, SchedState, TaskSchedCommit};
+    use axtask::{AxCpuMask, DeadlineConfig, SchedClass, SchedState, TaskSchedCommit};
     use linux_raw_sys::general::CAP_CHOWN;
     use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, Signo,
@@ -6148,6 +6148,10 @@ mod tests {
                 rt_priority: 1,
             },
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 5,
         };
         let new = TaskSchedCommit {
@@ -6157,6 +6161,10 @@ mod tests {
                 rt_priority: 0,
             },
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 0,
         };
         // The token changes with identity, so version streams are never
@@ -6174,6 +6182,10 @@ mod tests {
                 rt_priority: 0,
             },
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 7,
         };
         let remote = TaskSchedCommit {
@@ -6183,6 +6195,10 @@ mod tests {
                 rt_priority: 0,
             },
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 8,
         };
         assert!(!scheduler_publication_matches(
@@ -6198,6 +6214,10 @@ mod tests {
         let commit = TaskSchedCommit {
             state: SchedState::default(),
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 5,
         };
         assert!(!scheduler_publication_matches(12, 11, commit, Some(commit)));
@@ -6245,6 +6265,10 @@ mod tests {
                 rt_priority: 0,
             },
             reset_on_fork: false,
+            util_min: 0,
+            util_max: 1024,
+            fair_runtime_ns: 0,
+            deadline: DeadlineConfig::default(),
             version: 1,
         };
         let token = binding.publication_token_for(10);

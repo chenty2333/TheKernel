@@ -468,7 +468,7 @@ impl CloneArgs {
         let child_reset_on_fork = false;
         if parent_reset_on_fork {
             match child_sched_state.class {
-                SchedClass::Fifo | SchedClass::RoundRobin => {
+                SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => {
                     child_sched_state.class = SchedClass::Normal;
                     child_sched_state.nice = 0;
                     child_sched_state.rt_priority = 0;
