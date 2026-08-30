@@ -89,6 +89,7 @@ pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M
     // not silently accept callers asking to bypass checks that do not exist.
     if flags != 0{return Err(AxError::OperationNotSupported)}
     let file=get_typed_file::<File>(fd)?;
+    file.check_io_access()?;
     let size=usize::try_from(file.stat()?.size).map_err(|_|AxError::InvalidInput)?;
     if size==0||size>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}
     let mut bytes=Vec::new();bytes.try_reserve_exact(size).map_err(|_|AxError::NoMemory)?;
