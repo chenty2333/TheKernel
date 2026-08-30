@@ -1,6 +1,7 @@
 mod context;
 mod gdt;
 mod idt;
+pub mod ioport;
 
 pub mod asm;
 pub mod init;

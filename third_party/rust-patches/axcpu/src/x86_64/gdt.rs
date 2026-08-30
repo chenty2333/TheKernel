@@ -7,9 +7,40 @@ use x86_64::{
     structures::tss::TaskStateSegment,
 };
 
+/// Number of architecturally addressable I/O ports.
+pub(super) const IO_BITMAP_BYTES: usize = 65_536 / 8;
+const IO_BITMAP_TERMINATOR_BYTES: usize = 1;
+
+/// Keep the permission map contiguous with the TSS: the CPU interprets
+/// `iomap_base` as an offset from the TSS descriptor base.
+#[repr(C, align(16))]
+struct TssWithIoBitmap {
+    tss: TaskStateSegment,
+    bitmap: [u8; IO_BITMAP_BYTES + IO_BITMAP_TERMINATOR_BYTES],
+}
+
+impl TssWithIoBitmap {
+    const fn new() -> Self {
+        Self {
+            tss: TaskStateSegment::new(),
+            // A one bit denies the corresponding port. The required byte
+            // after the 65536-port map is also all ones.
+            bitmap: [0xff; IO_BITMAP_BYTES + IO_BITMAP_TERMINATOR_BYTES],
+        }
+    }
+
+    const fn invalid_iomap_base() -> u16 {
+        // The GDT limit includes `bitmap`; this is exactly one byte beyond
+        // its final terminator and makes every CPL3 port access fault.
+        (core::mem::size_of::<TaskStateSegment>()
+            + IO_BITMAP_BYTES
+            + IO_BITMAP_TERMINATOR_BYTES) as u16
+    }
+}
+
 #[percpu::def_percpu]
 #[unsafe(no_mangle)]
-static TSS: TaskStateSegment = TaskStateSegment::new();
+static TSS: TssWithIoBitmap = TssWithIoBitmap::new();
 
 #[repr(C, align(16))]
 struct CpuGdt {
@@ -96,6 +127,38 @@ unsafe fn refresh_ldt_data_segments(base: *const u8, bytes: usize) {
     refresh!("es");
 }
 
+/// Installs the current task's I/O permissions for the imminent user return.
+///
+/// The caller must have disabled preemption and interrupts. A TSS belongs to
+/// a CPU, not a task, so it must be refreshed at every final return to ring 3.
+pub(super) fn install_user_io_bitmap(
+    bitmap: Option<&[u8; IO_BITMAP_BYTES]>,
+    revoked: Option<&[u8; IO_BITMAP_BYTES]>,
+    allow_all: bool,
+) {
+    let tss = unsafe { TSS.current_ref_mut_raw() };
+    match (allow_all, bitmap) {
+        (true, _) => {
+            tss.bitmap[..IO_BITMAP_BYTES].fill(0);
+            tss.tss.iomap_base = core::mem::size_of::<TaskStateSegment>() as u16;
+        }
+        (false, Some(bitmap)) => {
+            tss.bitmap[..IO_BITMAP_BYTES].copy_from_slice(bitmap);
+            if let Some(revoked) = revoked {
+                for (entry, revoked) in tss.bitmap[..IO_BITMAP_BYTES].iter_mut().zip(revoked) {
+                    *entry |= revoked;
+                }
+            }
+            tss.tss.iomap_base = core::mem::size_of::<TaskStateSegment>() as u16;
+        }
+        (false, None) => {
+            tss.tss.iomap_base = TssWithIoBitmap::invalid_iomap_base();
+        }
+    }
+    // Never let a partial copy turn the final byte into an allowed port.
+    tss.bitmap[IO_BITMAP_BYTES] = 0xff;
+}
+
 /// Initializes the per-CPU TSS and GDT structures and loads them into the
 /// current CPU.
 pub(super) fn init() {
@@ -105,7 +168,10 @@ pub(super) fn init() {
     gdt.entries[3] = 0x00cff3000000ffff;
     gdt.entries[4] = 0x00affb000000ffff;
     let base = unsafe { TSS.current_ref_raw() } as *const _ as u64;
-    let limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;
+    let limit = (core::mem::size_of::<TaskStateSegment>()
+        + IO_BITMAP_BYTES
+        + IO_BITMAP_TERMINATOR_BYTES
+        - 1) as u64;
     gdt.entries[5] = (limit & 0xffff)
         | ((base & 0xffffff) << 16)
         | (9 << 40)
