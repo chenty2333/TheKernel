@@ -25,7 +25,9 @@ use crate::{
 };
 
 static MOUNT_TREE_LOCK: RwLock<()> = RwLock::new(());
-static MOUNT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+// Keep the mount identity in the Linux ``unique`` ID domain.  In particular,
+// do not let it be mistaken for the recyclable 32-bit mountinfo ID.
+static MOUNT_ID_COUNTER: AtomicU64 = AtomicU64::new((1u64 << 32) + 1);
 static ACTIVE_NON_ROOT_MOUNTS: AtomicUsize = AtomicUsize::new(0);
 
 /// A hard safety bound for mount-tree traversal and nesting.
