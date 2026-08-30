@@ -6,7 +6,11 @@ members = [
     "crates/readiness-adapter",
     "third_party/rust-patches/axsync",
 ]
-exclude = ["arceos"]
+exclude = [
+    "arceos",
+    "third_party/rust-patches/axalloc",
+    "third_party/rust-patches/axallocator",
+]
 
 # Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
 # directly and promotes every warning not explicitly allowed here to an error.
@@ -163,6 +167,8 @@ all-features = true
 # Force all direct and transitive users onto the vendored axnet-ng so feature
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
+axalloc = { path = "third_party/rust-patches/axalloc" }
+axallocator = { path = "third_party/rust-patches/axallocator" }
 axhal = { path = "third_party/rust-patches/axhal" }
 axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
@@ -202,6 +208,7 @@ thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
 thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
+page_table_entry = { path = "third_party/rust-patches/page_table_entry" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
 lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
 starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }
