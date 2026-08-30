@@ -4,6 +4,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::Timestamp;
 use axhal::time::TimeValue;
 use axpoll::PollSet;
 use linux_raw_sys::general::{
@@ -18,6 +19,27 @@ static WALL_TIME_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WALL_TIME_DISCONTINUITY_WAIT_CAPACITY: usize = 64;
 static WALL_TIME_DISCONTINUITY_WAITERS: PollSet<WALL_TIME_DISCONTINUITY_WAIT_CAPACITY> =
     PollSet::new();
+
+/// Converts userspace wall-clock fields into the signed VFS timestamp model.
+/// This is intentionally separate from duration-oriented timeout conversion:
+/// pre-epoch file timestamps are valid while negative timeouts are not.
+pub(crate) fn timestamp_from_seconds(seconds: i64) -> Timestamp {
+    Timestamp::new(seconds, 0)
+}
+
+pub(crate) fn timestamp_from_timeval(seconds: i64, microseconds: i64) -> AxResult<Timestamp> {
+    if !(0..1_000_000).contains(&microseconds) {
+        return Err(AxError::InvalidInput);
+    }
+    Timestamp::try_new(seconds, (microseconds as u32) * 1_000).ok_or(AxError::InvalidInput)
+}
+
+pub(crate) fn timestamp_from_timespec(seconds: i64, nanoseconds: i64) -> AxResult<Timestamp> {
+    if !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(AxError::InvalidInput);
+    }
+    Timestamp::try_new(seconds, nanoseconds as u32).ok_or(AxError::InvalidInput)
+}
 
 fn apply_wall_time_offset(base_nanos: u64, offset_nanos: i64) -> u64 {
     let adjusted = base_nanos as i128 + offset_nanos as i128;

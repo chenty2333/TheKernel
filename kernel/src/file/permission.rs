@@ -124,6 +124,20 @@ impl VfsSecurityContext {
             proposal,
         ))
     }
+
+    pub(crate) fn begin_pseudo_inode_setattr<'context>(
+        &'context self,
+        metadata: &Metadata,
+        proposal: InodeSetattrProposal,
+    ) -> AxResult<InodeSetattrSecurityAdmission<'context, 'static>> {
+        dispatch_inode_setattr(InodeSetattrSecurityContext::new(
+            self.actor(),
+            self.credentials(),
+            self.filesystem_owner_user_ns(),
+            InodeSecurityRef::new_pseudo(metadata),
+            proposal,
+        ))
+    }
 }
 
 /// Backend update and successful committed facts derived from one consumed
@@ -862,7 +876,7 @@ fn dac_access_allowed_with(
     .is_ok()
 }
 
-fn dac_access_allowed(
+pub(crate) fn dac_access_allowed(
     perm: u32,
     owner_uid: u32,
     owner_gid: u32,
@@ -1894,9 +1908,9 @@ mod tests {
             block_size: 4096,
             blocks: 0,
             rdev: axfs_ng_vfs::DeviceId(0),
-            atime: core::time::Duration::ZERO,
-            btime: core::time::Duration::ZERO,
-            mtime: core::time::Duration::ZERO,
+            atime: Timestamp::ZERO,
+            btime: Timestamp::ZERO,
+            mtime: Timestamp::ZERO,
             ctime: Timestamp::ZERO,
         }
     }

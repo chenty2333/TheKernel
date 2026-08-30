@@ -444,6 +444,21 @@ impl<'location> InodeSecurityRef<'location> {
         }
     }
 
+    /// Constructs security facts for a descriptor-only pseudo inode.  Such
+    /// objects have no mount path, so mount id zero is reserved for their
+    /// stable device/inode identity.
+    pub(crate) fn new_pseudo(metadata: &Metadata) -> InodeSecurityRef<'static> {
+        InodeSecurityRef {
+            identity: InodeIdentity::new(0, metadata.device, metadata.inode),
+            mode: metadata.mode.bits(),
+            node_kind: metadata.node_type,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            size: metadata.size,
+            _location: PhantomData,
+        }
+    }
+
     pub(crate) const fn identity(&self) -> InodeIdentity {
         self.identity
     }
@@ -494,6 +509,17 @@ impl<'location> InodeSetattrCommittedSecurityRef<'location> {
                 metadata.device,
                 metadata.inode,
             ),
+            mode: metadata.mode.bits(),
+            node_kind: metadata.node_type,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            _location: PhantomData,
+        }
+    }
+
+    pub(crate) fn new_pseudo(metadata: &Metadata) -> InodeSetattrCommittedSecurityRef<'static> {
+        InodeSetattrCommittedSecurityRef {
+            identity: InodeIdentity::new(0, metadata.device, metadata.inode),
             mode: metadata.mode.bits(),
             node_kind: metadata.node_type,
             uid: metadata.uid,

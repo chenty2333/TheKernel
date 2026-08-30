@@ -2707,7 +2707,9 @@ pub fn sys_truncate(
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let loc = current_fs_context().lock().resolve_security(path, &security)?;
+    let loc = current_fs_context()
+        .lock()
+        .resolve_security(path, &security)?;
     check_open_permissions_with_security(
         &loc,
         W_OK,
@@ -2990,8 +2992,15 @@ pub fn sys_sync_file_range(
     let node_type = file_like
         .downcast_ref::<File>()
         .map(|file| file.inner().location().node_type())
-        .or_else(|| file_like.downcast_ref::<Directory>().map(|dir| dir.inner().node_type()));
-    if !matches!(node_type, Some(NodeType::RegularFile | NodeType::Directory | NodeType::BlockDevice)) {
+        .or_else(|| {
+            file_like
+                .downcast_ref::<Directory>()
+                .map(|dir| dir.inner().node_type())
+        });
+    if !matches!(
+        node_type,
+        Some(NodeType::RegularFile | NodeType::Directory | NodeType::BlockDevice)
+    ) {
         return Err(AxError::from(LinuxError::ESPIPE));
     }
 
@@ -3010,17 +3019,27 @@ pub fn sys_sync_file_range(
         // the request just published by this syscall.
         let before = f.inner().range_writeback_snapshot()?;
         if flags & SYNC_FILE_RANGE_WAIT_BEFORE != 0 {
-            finish_wait(f.inner().wait_range_writeback_through(&before, offset as u64, len))?;
+            finish_wait(
+                f.inner()
+                    .wait_range_writeback_through(&before, offset as u64, len),
+            )?;
         }
         if flags & SYNC_FILE_RANGE_WRITE != 0 {
             let write_fence = f.inner().submit_range_writeback(offset as u64, len, true)?;
             if flags & SYNC_FILE_RANGE_WAIT_AFTER != 0 {
-                finish_wait(f.inner().wait_range_writeback_through(&write_fence, offset as u64, len))?;
+                finish_wait(f.inner().wait_range_writeback_through(
+                    &write_fence,
+                    offset as u64,
+                    len,
+                ))?;
             }
         }
         if flags & SYNC_FILE_RANGE_WAIT_AFTER != 0 && flags & SYNC_FILE_RANGE_WRITE == 0 {
             let after = f.inner().range_writeback_snapshot()?;
-            finish_wait(f.inner().wait_range_writeback_through(&after, offset as u64, len))?;
+            finish_wait(
+                f.inner()
+                    .wait_range_writeback_through(&after, offset as u64, len),
+            )?;
         }
     }
     Ok(0)
@@ -5836,10 +5855,10 @@ mod tests {
                 block_size: 4096,
                 blocks: 0,
                 rdev: Default::default(),
-                atime: Duration::ZERO,
-                btime: Duration::ZERO,
-                mtime: Duration::ZERO,
-                ctime: Duration::ZERO,
+                atime: axfs_ng_vfs::Timestamp::ZERO,
+                btime: axfs_ng_vfs::Timestamp::ZERO,
+                mtime: axfs_ng_vfs::Timestamp::ZERO,
+                ctime: axfs_ng_vfs::Timestamp::ZERO,
             })
         }
 
@@ -6590,10 +6609,7 @@ mod tests {
 
     #[test]
     fn sync_file_range_checks_signed_loff_t_overflow_but_keeps_zero_to_eof() {
-        assert_eq!(
-            sync_file_range_end(i64::MAX, 1),
-            Err(AxError::InvalidInput)
-        );
+        assert_eq!(sync_file_range_end(i64::MAX, 1), Err(AxError::InvalidInput));
         assert_eq!(sync_file_range_end(i64::MAX, 0), Ok(0));
         assert_eq!(sync_file_range_end(i64::MAX - 1, 1), Ok(i64::MAX as u64));
     }

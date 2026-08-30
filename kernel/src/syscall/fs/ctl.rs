@@ -19,7 +19,7 @@ use linux_raw_sys::{
         TIOCGWINSZ, TIOCINQ,
     },
 };
-use thekernel_linux_cred::{InodeTimestampIntent, InodeTimestampValue};
+use thekernel_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
     vm_write_slice,
@@ -40,7 +40,7 @@ use crate::{
             ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
             TimestampSetattrPolicy, VfsSecurityContext, check_fchdir_permissions_with_security,
             check_open_permissions_with_security, check_search_permissions_with_security,
-            check_writable_mount,
+            check_writable_mount, dac_access_allowed,
         },
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
         resolve_at_with_security, validate_symlink_target, with_path_fs,
@@ -53,9 +53,12 @@ use crate::{
     },
     task::{
         AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context,
-        has_pending_syscall_signal, ns_capable,
+        has_pending_syscall_signal, ns_capable, security::InodeSetattrCommittedSecurityRef,
     },
-    time::{TimeValueLike, wall_time},
+    time::{
+        TimeValueLike, timestamp_from_seconds, timestamp_from_timespec, timestamp_from_timeval,
+        wall_time,
+    },
 };
 
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
@@ -1532,8 +1535,65 @@ fn update_times<M: UserMemory + ?Sized>(
         crate::file::ResolveAtResult::Other(file) => {
             // A NULL pathname plus a descriptor denotes that exact struct
             // file; pipes and sockets have mutable pseudo-inode timestamps.
-            file.update_timestamps(atime, mtime, wall_time().into())
+            let stat = file.stat()?;
+            let metadata = pseudo_metadata(&stat);
+            let credentials = security.credentials();
+            if Kuid::from_raw(metadata.uid) != Some(credentials.uid())
+                && !security.has_capability(CAP_FOWNER)
+            {
+                if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                if !dac_access_allowed(
+                    metadata.mode.bits() as u32,
+                    metadata.uid,
+                    metadata.gid,
+                    metadata.node_type,
+                    W_OK,
+                    credentials,
+                ) {
+                    return Err(AxError::PermissionDenied);
+                }
+            }
+            let intent = InodeTimestampIntent::new(
+                timestamp_value(atime_intent),
+                timestamp_value(mtime_intent),
+            );
+            let admission = security
+                .begin_pseudo_inode_setattr(&metadata, InodeSetattrProposal::timestamps(intent))?;
+            let ctime = wall_time().into();
+            file.update_timestamps(atime, mtime, ctime)?;
+            let mut committed = metadata;
+            if let Some(atime) = atime {
+                committed.atime = atime;
+            }
+            if let Some(mtime) = mtime {
+                committed.mtime = mtime;
+            }
+            committed.ctime = ctime;
+            admission.committed(InodeSetattrCommittedSecurityRef::new_pseudo(&committed));
+            Ok(())
         }
+    }
+}
+
+fn pseudo_metadata(stat: &crate::file::Kstat) -> axfs_ng_vfs::Metadata {
+    axfs_ng_vfs::Metadata {
+        device: stat.dev,
+        inode: stat.ino,
+        nlink: stat.nlink as u64,
+        mode: NodePermission::from_bits_truncate((stat.mode & 0o7777) as u16),
+        node_type: NodeType::from((stat.mode >> 12) as u8),
+        uid: stat.uid,
+        gid: stat.gid,
+        size: stat.size,
+        block_size: stat.blksize as u64,
+        blocks: stat.blocks,
+        rdev: stat.rdev,
+        atime: stat.atime,
+        btime: stat.btime,
+        mtime: stat.mtime,
+        ctime: stat.ctime,
     }
 }
 
@@ -1566,8 +1626,8 @@ pub fn sys_utime<M: UserMemory + ?Sized>(
                 .assume_init()
         };
         (
-            Timestamp::from(Duration::from_secs(times.actime as _)),
-            Timestamp::from(Duration::from_secs(times.modtime as _)),
+            timestamp_from_seconds(times.actime),
+            timestamp_from_seconds(times.modtime),
         )
     } else {
         let time = wall_time();
@@ -1605,8 +1665,8 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
                 .assume_init()
         };
         (
-            Timestamp::from(atime.try_into_time_value()?),
-            Timestamp::from(mtime.try_into_time_value()?),
+            timestamp_from_timeval(atime.tv_sec, atime.tv_usec)?,
+            timestamp_from_timeval(mtime.tv_sec, mtime.tv_usec)?,
         )
     } else {
         let time = wall_time();
@@ -1639,10 +1699,7 @@ fn legacy_futimesat_pair(
     times: [linux_raw_sys::general::__kernel_old_timeval; 2],
 ) -> AxResult<(Timestamp, Timestamp)> {
     fn convert(time: linux_raw_sys::general::__kernel_old_timeval) -> AxResult<Timestamp> {
-        if !(0..1_000_000).contains(&time.tv_usec) {
-            return Err(AxError::InvalidInput);
-        }
-        Timestamp::try_new(time.tv_sec, (time.tv_usec as u32) * 1_000).ok_or(AxError::InvalidInput)
+        timestamp_from_timeval(time.tv_sec, time.tv_usec)
     }
     Ok((convert(times[0])?, convert(times[1])?))
 }
@@ -1708,11 +1765,14 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
         }
         flags |= AT_EMPTY_PATH;
     }
-    fn utime_to_duration(time: &timespec) -> (Option<AxResult<Duration>>, TimeUpdate) {
+    fn utime_to_timestamp(time: &timespec) -> (Option<AxResult<Timestamp>>, TimeUpdate) {
         match time.tv_nsec {
             val if val == UTIME_OMIT as _ => (None, TimeUpdate::Omit),
             val if val == UTIME_NOW as _ => (Some(Ok(wall_time())), TimeUpdate::Now),
-            _ => (Some(time.try_into_time_value()), TimeUpdate::Explicit),
+            _ => (
+                Some(timestamp_from_timespec(time.tv_sec, time.tv_nsec)),
+                TimeUpdate::Explicit,
+            ),
         }
     }
 
@@ -1724,11 +1784,11 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
                 .map_err(map_usercopy_error)?
                 .assume_init()
         };
-        let (atime, atime_intent) = utime_to_duration(&atime);
-        let (mtime, mtime_intent) = utime_to_duration(&mtime);
+        let (atime, atime_intent) = utime_to_timestamp(&atime);
+        let (mtime, mtime_intent) = utime_to_timestamp(&mtime);
         (
-            atime.transpose()?.map(Into::into),
-            mtime.transpose()?.map(Into::into),
+            atime.transpose()?,
+            mtime.transpose()?,
             atime_intent,
             mtime_intent,
         )
@@ -2951,16 +3011,14 @@ mod tests {
         credentials: &DacCredentialView,
         ctime: Duration,
     ) -> AxResult<MetadataUpdate> {
-        Ok(
-            prepare_chmod_metadata_setattr_for_test(
-                metadata,
-                requested_mode,
-                credentials,
-                ctime.into(),
-            )?
-                .into_parts()
-                .0,
-        )
+        Ok(prepare_chmod_metadata_setattr_for_test(
+            metadata,
+            requested_mode,
+            credentials,
+            ctime.into(),
+        )?
+        .into_parts()
+        .0)
     }
 
     #[test]
