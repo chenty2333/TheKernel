@@ -94,6 +94,54 @@ pub enum PageFaultFailure {
     OutOfMemory,
 }
 
+/// A retained software swap PTE captured outside swapoff's final MM lock
+/// phase. The extra slot reference keeps backing stable while page-in frames
+/// and page-table reservations are prepared.
+pub(crate) struct SwapoffPage {
+    page: VirtAddr,
+    entry: crate::mm::SwapPte,
+}
+
+pub(crate) struct PreparedSwapoffPage {
+    page: VirtAddr,
+    entry: crate::mm::SwapPte,
+    prepared: PreparedCowPage,
+}
+
+impl SwapoffPage {
+    pub(crate) fn prepare(self) -> AxResult<PreparedSwapoffPage> {
+        let mut prepared = PreparedCowPage::try_new()?;
+        prepared.reserve_max_table_frames()?;
+        unsafe {
+            prepared.prepare_uninitialized(|bytes| {
+                let page = core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), PAGE_SIZE_4K);
+                crate::mm::read(self.entry, page)
+            })?;
+        }
+        let result = PreparedSwapoffPage {
+            page: self.page,
+            entry: self.entry,
+            prepared,
+        };
+        core::mem::forget(self);
+        Ok(result)
+    }
+}
+
+impl Drop for SwapoffPage {
+    fn drop(&mut self) {
+        let _ = crate::mm::release(self.entry);
+    }
+}
+
+impl Drop for PreparedSwapoffPage {
+    fn drop(&mut self) {
+        // This is the temporary preflight pin, distinct from the software
+        // PTE reference which the commit path drops after publication.
+        let _ = crate::mm::release(self.entry);
+    }
+}
+
 fn classify_page_population(result: AxResult<usize>) -> PageFaultResult {
     match result {
         Ok(0) => PageFaultResult::Failed(PageFaultFailure::InternalInconsistency),
@@ -1140,6 +1188,11 @@ pub struct AddrSpace {
     /// VMAs, makes split/merge/unmap lifecycle handling explicit and avoids a
     /// backend-to-mm ownership cycle.
     alias_bindings: BTreeMap<SharedBackingKey, AliasLease>,
+
+    /// Non-present anonymous leaves.  The hardware table deliberately has no
+    /// encoding for them; this owner-side registry is the authoritative
+    /// software PTE and keeps swap entries out of physical-address APIs.
+    swapped: BTreeMap<VirtAddr, crate::mm::SwapPte>,
     user_io_pins: Box<UserIoPinRegistry>,
     active_long_term_cow_pins: Vec<ActiveLongTermCowPin>,
     pub(super) uffd: Option<Box<super::userfaultfd::UffdAddressSpaceState>>,
@@ -1624,6 +1677,7 @@ impl AddrSpace {
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
             alias_bindings: BTreeMap::new(),
+            swapped: BTreeMap::new(),
             user_io_pins,
             active_long_term_cow_pins,
             uffd: None,
@@ -1644,9 +1698,7 @@ impl AddrSpace {
             let current = axtask::current();
             let thread = current.as_thread();
             has_pending_sigkill(thread)
-                || thread
-                    .proc_data
-                    .should_exit_for_exec(thread.kernel_tid())
+                || thread.proc_data.should_exit_for_exec(thread.kernel_tid())
         })
         .ok_or(AxError::Interrupted)
     }
@@ -3431,6 +3483,12 @@ impl AddrSpace {
             return Ok(None);
         };
         let page = address.align_down(PAGE_SIZE_4K);
+        // A swap PTE is a recoverable resident image, not a UFFD MISSING
+        // hole.  Let normal fault handling page it in rather than allowing a
+        // resolver to overwrite it with zeroes or unrelated copied bytes.
+        if self.swapped.contains_key(&page) {
+            return Ok(None);
+        }
         match self.pt.query(page) {
             Ok(_) => Ok(None),
             Err(PagingError::NotMapped) => self.mapping_snapshot(area).map(Some),
@@ -4468,6 +4526,7 @@ impl AddrSpace {
         let retirement =
             self.areas
                 .unmap_deferred_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
+        self.release_swapped_range(start, size);
         let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
@@ -4478,6 +4537,12 @@ impl AddrSpace {
     fn clear_areas_with_tlb_grace(&mut self) -> MappingResult {
         self.publish_resident_highwater();
         let retirement = self.areas.clear_deferred(&mut self.pt)?;
+        let swapped: Vec<_> = self.swapped.keys().copied().collect();
+        for page in swapped {
+            if let Some(entry) = self.swapped.remove(&page) {
+                let _ = crate::mm::release(entry);
+            }
+        }
         let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
@@ -5115,6 +5180,7 @@ impl AddrSpace {
         // fence first, but deliberately keep per-lineage VMA generations
         // stable: residency is not a mapping-contract change.
         self.commit_topology_generation(next_generation);
+        let discard_start = start;
         let end = start + size;
 
         let retirement_capacity = self
@@ -5148,6 +5214,9 @@ impl AddrSpace {
                 Ok(())
             })()
         };
+        // A software swap PTE is already non-present, so backend `unmap`
+        // cannot see it.  Discard is nevertheless an ownership drop.
+        self.release_swapped_range(discard_start, start.sub_addr(discard_start));
         let grace = self.synchronize_tlb_after_mutation();
         drop(retired);
         drop(grace);
@@ -5726,6 +5795,166 @@ impl AddrSpace {
         false
     }
 
+    /// Reclaims one exclusively-owned 4 KiB anonymous leaf.  The present PTE
+    /// is first invalidated and globally quiesced, so a concurrent CPU cannot
+    /// modify bytes while they are copied to swap.  An I/O failure restores
+    /// the original leaf before returning.
+    pub(crate) fn reclaim_one_anonymous_page(&mut self) -> AxResult<bool> {
+        let candidate = self.areas.iter().find_map(|area| {
+            if area.backend().page_size() != PageSize::Size4K {
+                return None;
+            }
+            let mut page = area.start();
+            while page < area.end() {
+                if let Ok((paddr, _, PageSize::Size4K)) = self.pt.query(page)
+                    && area.backend().swap_reclaimable(paddr)
+                {
+                    return Some((page, paddr, area.flags(), area.backend().clone()));
+                }
+                page += PAGE_SIZE_4K;
+            }
+            None
+        });
+        let Some((page, paddr, _flags, backend)) = candidate else {
+            return Ok(false);
+        };
+        // A pinned frame may still be modified by in-flight DMA.  Deferring
+        // allocator reuse is insufficient: the persisted image would already
+        // be stale, so reclaim must reject the victim before pageout.
+        self.check_no_user_io_pin_overlap(page, PAGE_SIZE_4K, InvalidationReason::Discard)?;
+        let (_, leaf_flags, leaf_size) = self.pt.cursor().unmap(page).map_err(AxError::from)?;
+        if leaf_size != PageSize::Size4K {
+            return Err(AxError::BadState);
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        let bytes =
+            unsafe { core::slice::from_raw_parts(phys_to_virt(paddr).as_ptr(), PAGE_SIZE_4K) };
+        let entry = match crate::mm::pageout(bytes) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.pt
+                    .cursor()
+                    .map(page, paddr, PageSize::Size4K, leaf_flags)
+                    .map_err(AxError::from)?;
+                drop(self.synchronize_tlb_after_mutation());
+                return Err(error);
+            }
+        };
+        self.swapped.insert(page, entry);
+        let grace = self.synchronize_tlb_after_mutation();
+        backend.release_swapped_frame(paddr);
+        drop(grace);
+        Ok(true)
+    }
+
+    /// Captures and pins all target entries while the caller holds this mm
+    /// lock. Allocation and I/O are deliberately deferred to `prepare`.
+    pub(crate) fn snapshot_swapoff_area(&self, area: u16) -> AxResult<Vec<SwapoffPage>> {
+        let count = self.swapped.values().filter(|entry| entry.area() == area).count();
+        let mut pages = Vec::new();
+        pages.try_reserve_exact(count).map_err(|_| AxError::NoMemory)?;
+        for (page, entry) in self
+            .swapped
+            .iter()
+            .filter(|(_, entry)| entry.area() == area)
+        {
+            let mapping = self.areas.find(*page).ok_or(AxError::BadState)?;
+            if !mapping.backend().supports_uffd_missing_resolver() {
+                return Err(AxError::BadState);
+            }
+            crate::mm::retain(*entry)?;
+            pages.push(SwapoffPage {
+                page: *page,
+                entry: *entry,
+            });
+        }
+        Ok(pages)
+    }
+
+    /// Validates the complete preflight set while all live MM locks are held.
+    /// No page-table state changes here, allowing the caller to abandon every
+    /// prepared page with zero migration on any mismatch.
+    pub(crate) fn validate_swapoff_pages(&self, pages: &[PreparedSwapoffPage]) -> AxResult<()> {
+        for page in pages {
+            match self.swapped.get(&page.page) {
+                Some(entry) if *entry == page.entry => {
+                    let mapping = self.areas.find(page.page).ok_or(AxError::BadState)?;
+                    if !mapping.backend().supports_uffd_missing_resolver() {
+                        return Err(AxError::BadState);
+                    }
+                }
+                // A fault may have restored the entry after snapshot. That
+                // already satisfies swapoff and only leaves our temporary pin.
+                None => {}
+                Some(_) => return Err(AxError::BadState),
+            }
+        }
+        Ok(())
+    }
+
+    /// Infallible half of the global swapoff transaction. Validation and all
+    /// allocation precede this call while all MM locks remain held.
+    pub(crate) fn commit_swapoff_pages(&mut self, pages: &mut [PreparedSwapoffPage]) {
+        for page in pages {
+            if self.swapped.get(&page.page) != Some(&page.entry) {
+                continue;
+            }
+            let mapping = self.areas.find(page.page).expect("validated swapoff VMA vanished");
+            let backend = mapping.backend().clone();
+            let flags = mapping.flags();
+            backend
+                .publish_prepared_cow_page(page.page, flags, &mut self.pt, &mut page.prepared)
+                .expect("validated swapoff publication consumed preallocated resources");
+            self.swapped.remove(&page.page);
+            crate::mm::release(page.entry).expect("validated swapoff entry disappeared");
+            self.publish_resident_highwater();
+        }
+    }
+
+    fn release_swapped_range(&mut self, start: VirtAddr, size: usize) {
+        let end = start + size;
+        let pages: Vec<_> = self
+            .swapped
+            .range(start..end)
+            .map(|(page, entry)| (*page, *entry))
+            .collect();
+        for (page, entry) in pages {
+            self.swapped.remove(&page);
+            let _ = crate::mm::release(entry);
+        }
+    }
+
+    /// Stages non-present anonymous software PTEs at an mremap destination.
+    /// This always takes a destination reference.  A moving transaction keeps
+    /// its source reference until its normal source-unmap commit, making a
+    /// failed staged move rollback-safe without a special restore path.
+    pub(crate) fn relocate_swapped_entries(
+        &mut self,
+        source: VirtAddr,
+        destination: VirtAddr,
+        size: usize,
+    ) -> AxResult {
+        let end = source + size;
+        let entries: Vec<_> = self
+            .swapped
+            .range(source..end)
+            .map(|(page, entry)| (*page, *entry))
+            .collect();
+        for (page, entry) in entries {
+            let destination_page = destination + page.sub_addr(source);
+            crate::mm::retain(entry)?;
+            if let Some(displaced) = self.swapped.insert(destination_page, entry) {
+                // A destination is required to be empty by the remap
+                // transaction.  Treat a violation as ownership corruption
+                // rather than silently releasing an unrelated swap PTE.
+                let _ = crate::mm::release(entry);
+                self.swapped.insert(destination_page, displaced);
+                return Err(AxError::AlreadyExists);
+            }
+        }
+        Ok(())
+    }
+
     /// Checks whether this trap still names a real missing/unsatisfied leaf.
     /// The eventual minor/major classification is deliberately deferred until
     /// backend population completes, when the task's backing-read counter can
@@ -5740,6 +5969,9 @@ impl AddrSpace {
         };
         if !area.flags().contains(access_flags) {
             return false;
+        }
+        if self.swapped.contains_key(&vaddr.align_down(PAGE_SIZE_4K)) {
+            return true;
         }
         match self.pt.query(vaddr.align_down(PAGE_SIZE_4K)) {
             Ok((_paddr, page_flags, _page_size)) => {
@@ -5770,6 +6002,27 @@ impl AddrSpace {
         if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
             if flags.contains(access_flags) {
+                let page = vaddr.align_down(PAGE_SIZE_4K);
+                if let Some(entry) = self.swapped.get(&page).copied() {
+                    let backend = area.backend().clone();
+                    let restored = {
+                        let mut cursor = self.pt.cursor();
+                        backend.restore_swapped_page(page, flags, entry, &mut cursor)
+                    };
+                    match restored {
+                        Ok(()) => {
+                            self.swapped.remove(&page);
+                            self.publish_resident_highwater();
+                            return PageFaultResult::Handled;
+                        }
+                        Err(error) if error.canonicalize() == AxError::NoMemory => {
+                            return PageFaultResult::Failed(PageFaultFailure::OutOfMemory);
+                        }
+                        Err(_) => {
+                            return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
+                        }
+                    }
+                }
                 let page_size = area.backend().page_size();
                 let start = vaddr.align_down(page_size);
                 if area.backend().faults_with_sigbus(start) {
@@ -5883,6 +6136,7 @@ impl AddrSpace {
         let active_long_term_cow_frames = self.active_long_term_cow_frames()?;
 
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
+        crate::mm::register_pending_address_space(&new_aspace);
         let next_topology_generation = self.next_topology_generation()?;
         let new_aspace_clone = new_aspace.clone();
         let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
@@ -6055,6 +6309,19 @@ impl AddrSpace {
                     cursor += page_size as usize;
                 }
             }
+        }
+        // Present private leaves were handled by `clone_map`; copy software
+        // swap PTEs separately and take one slot reference for the child.
+        // DONTFORK drops the child ownership and WIPEONFORK intentionally
+        // starts absent/zero-filled.
+        for (page, entry) in &self.swapped {
+            if Self::interval_end_covering(&dontfork_ranges, *page).is_some()
+                || Self::interval_end_covering(&wipe_on_fork_ranges, *page).is_some()
+            {
+                continue;
+            }
+            crate::mm::retain(*entry)?;
+            guard.swapped.insert(*page, *entry);
         }
         guard.refresh_growdown_starts();
         for pending in fork_pending_aliases.drain(..) {

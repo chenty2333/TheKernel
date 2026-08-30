@@ -194,16 +194,20 @@ fn take_deferred_eviction_prepare_failpoint(stage: u8) -> bool {
 struct WritableMappingActivation {
     memfd: bool,
     executable: bool,
+    swap: bool,
 }
 
 fn activate_writable_mapping(
     executable_mapping: Option<&executable::WritableMappingRegistration>,
     writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
+    swap_mapping: Option<&crate::mm::WritableMappingRegistration>,
 ) -> AxResult<WritableMappingActivation> {
     let was_memfd_mapping_active =
         writable_mapping.is_some_and(|registration| registration.is_active());
     let was_executable_mapping_active =
         executable_mapping.is_some_and(executable::WritableMappingRegistration::is_active);
+    let was_swap_mapping_active = swap_mapping.is_some_and(crate::mm::WritableMappingRegistration::is_active);
+    if let Some(registration) = swap_mapping { registration.set_active(true)?; }
     if let Some(registration) = writable_mapping {
         // This is the shared linearization point with F_ADD_SEALS. Reserve it
         // before executable admission so a sealed mapping publishes nothing.
@@ -215,18 +219,21 @@ fn activate_writable_mapping(
         if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
             let _ = registration.set_active(false);
         }
+        if !was_swap_mapping_active && let Some(registration) = swap_mapping { let _ = registration.set_active(false); }
         return Err(error);
     }
 
     Ok(WritableMappingActivation {
         memfd: writable_mapping.is_some() && !was_memfd_mapping_active,
         executable: executable_mapping.is_some() && !was_executable_mapping_active,
+        swap: swap_mapping.is_some() && !was_swap_mapping_active,
     })
 }
 
 fn deactivate_writable_mapping(
     executable_mapping: Option<&executable::WritableMappingRegistration>,
     writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
+    swap_mapping: Option<&crate::mm::WritableMappingRegistration>,
 ) -> AxResult<()> {
     if let Some(registration) = executable_mapping {
         registration.set_active(false)?;
@@ -234,12 +241,14 @@ fn deactivate_writable_mapping(
     if let Some(registration) = writable_mapping {
         registration.set_active(false)?;
     }
+    if let Some(registration) = swap_mapping { registration.set_active(false)?; }
     Ok(())
 }
 
 fn rollback_writable_mapping_activation(
     executable_mapping: Option<&executable::WritableMappingRegistration>,
     writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
+    swap_mapping: Option<&crate::mm::WritableMappingRegistration>,
     activation: WritableMappingActivation,
 ) -> AxResult<()> {
     if activation.executable
@@ -252,6 +261,7 @@ fn rollback_writable_mapping_activation(
     {
         registration.set_active(false)?;
     }
+    if activation.swap && let Some(registration) = swap_mapping { registration.set_active(false)?; }
     Ok(())
 }
 
@@ -295,6 +305,7 @@ fn new_file_backend_inner(
     let writable_mapping = memfd::new_writable_mapping_registration(cache.location());
     let executable_mapping =
         executable::WritableMappingRegistration::for_location(cache.location());
+    let swap_mapping = crate::mm::WritableMappingRegistration::for_location(cache.location());
     Arc::new(FileBackendInner {
         start,
         cache,
@@ -308,6 +319,7 @@ fn new_file_backend_inner(
         writable_segments: AtomicUsize::new(0),
         writable_mapping,
         executable_mapping,
+        swap_mapping,
     })
 }
 
@@ -341,6 +353,7 @@ pub struct FileBackendInner {
     writable_segments: AtomicUsize,
     writable_mapping: Option<Arc<memfd::WritableMappingRegistration>>,
     executable_mapping: Option<executable::WritableMappingRegistration>,
+    swap_mapping: Option<crate::mm::WritableMappingRegistration>,
 }
 impl Drop for FileBackendInner {
     fn drop(&mut self) {
@@ -363,12 +376,14 @@ impl FileBackendInner {
             activate_writable_mapping(
                 self.executable_mapping.as_ref(),
                 self.writable_mapping.as_ref(),
+                self.swap_mapping.as_ref(),
             )?;
             Ok(())
         } else {
             deactivate_writable_mapping(
                 self.executable_mapping.as_ref(),
                 self.writable_mapping.as_ref(),
+                self.swap_mapping.as_ref(),
             )
         }
     }
@@ -630,6 +645,7 @@ impl WritableMappingAdmission {
         let activation = activate_writable_mapping(
             backend.0.executable_mapping.as_ref(),
             backend.0.writable_mapping.as_ref(),
+            backend.0.swap_mapping.as_ref(),
         )?;
         Ok(Self {
             inner: backend.0.clone(),
@@ -659,6 +675,7 @@ impl Drop for WritableMappingAdmission {
         if let Err(error) = rollback_writable_mapping_activation(
             self.inner.executable_mapping.as_ref(),
             self.inner.writable_mapping.as_ref(),
+            self.inner.swap_mapping.as_ref(),
             activation,
         ) {
             error!(
@@ -1815,7 +1832,7 @@ mod tests {
         let executable_mapping =
             executable::WritableMappingRegistration::for_location(&loc).unwrap();
 
-        activate_writable_mapping(Some(&executable_mapping), None).unwrap();
+        activate_writable_mapping(Some(&executable_mapping), None, None).unwrap();
         assert!(has_capability(&loc));
         assert!(matches!(
             executable::CredentialReadLease::acquire(&loc),
@@ -1826,7 +1843,7 @@ mod tests {
             Err(error) if error == axerrno::LinuxError::ETXTBSY.into()
         ));
 
-        deactivate_writable_mapping(Some(&executable_mapping), None).unwrap();
+        deactivate_writable_mapping(Some(&executable_mapping), None, None).unwrap();
         drop(executable::CredentialReadLease::acquire(&loc).unwrap());
     }
 

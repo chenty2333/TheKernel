@@ -383,6 +383,7 @@ fn generic_write_after_socket_policy<T>(
 fn check_file_write_admission(file: &File, len: usize) -> AxResult<()> {
     file.inner().access(FileFlags::WRITE)?;
     if len != 0 {
+        crate::mm::check_not_active(file.inner().location())?;
         check_writable_mount(file.inner().location())?;
     }
     Ok(())
@@ -1361,6 +1362,7 @@ fn try_regular_file_write_user_slice(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1401,6 +1403,7 @@ fn try_regular_file_write_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1441,6 +1444,7 @@ fn try_regular_file_pwrite_user_slice(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1481,6 +1485,7 @@ fn try_regular_file_pwrite_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1651,6 +1656,7 @@ fn try_regular_file_writev_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, iov.len())?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1692,6 +1698,7 @@ fn try_regular_file_pwritev_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
     let allowed = allowed_write_len(offset, iov.len())?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -2145,6 +2152,7 @@ fn positioned_read_file_handle(file_like: FileHandle<dyn FileLike>) -> AxResult<
 
 fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
     let file = write_file(fd)?;
+    crate::mm::check_not_active(file.inner().location())?;
     if !file.inner().supports_positioned_write() {
         return Err(LinuxError::ESPIPE.into());
     }
@@ -2154,6 +2162,7 @@ fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
 fn positioned_write_file_handle(file_like: FileHandle<dyn FileLike>) -> AxResult<FileHandle<File>> {
     let file = positioned_file_handle(file_like, FileFlags::WRITE)?;
     check_writable_mount(file.inner().location())?;
+    crate::mm::check_not_active(file.inner().location())?;
     executable::check_not_active(file.inner().location())?;
     if !file.inner().supports_positioned_write() {
         return Err(LinuxError::ESPIPE.into());
@@ -2182,6 +2191,7 @@ fn regular_copy_file(
         }
         file.inner().access(FileFlags::WRITE)?;
         check_writable_mount(file.inner().location())?;
+        crate::mm::check_not_active(file.inner().location())?;
         executable::check_not_active(file.inner().location())?;
     } else {
         file.inner().access(FileFlags::READ)?;
@@ -2718,6 +2728,8 @@ pub fn sys_truncate(
         security.filesystem_owner_user_ns(),
     )?;
     check_writable_mount(&loc)?;
+    crate::mm::check_not_active(&loc)?;
+    let _swap_mutation = crate::mm::admit_mutation(&loc)?;
     check_resize_limit(length as u64)?;
     // Unlike fd-backed mutations, path truncate has no persistent open-file
     // description carrying the ETXTBSY reference. Hold a transient write
@@ -2774,6 +2786,8 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
             other => other,
         })?;
     check_writable_mount(f.inner().location())?;
+    crate::mm::check_not_active(f.inner().location())?;
+    let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
     executable::check_not_active(f.inner().location())?;
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;
@@ -2822,6 +2836,8 @@ pub fn sys_fallocate(
     let file = f.inner();
     let backend = file.backend()?;
     let loc = backend.location().clone();
+    crate::mm::check_not_active(&loc)?;
+    let _swap_mutation = crate::mm::admit_mutation(&loc)?;
     executable::check_not_active(&loc)?;
     let offset = offset as u64;
     let len = len as u64;
@@ -3528,6 +3544,10 @@ fn pwrite64_file_with_context(
                 );
                 if regular_file_supports_user_slice_fast_path(f.as_ref()) {
                     executable::check_not_active(f.inner().location())?;
+                    // The fixed-buffer fallback bypasses File's ordinary
+                    // write admission, so retain the swap mutation token
+                    // until its direct pinned-segment backend effect returns.
+                    let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
                     if allowed == 0 {
                         Some(0)
                     } else {
@@ -4224,6 +4244,8 @@ impl SendFile {
                                     off,
                                     mandatory_len,
                                 )?;
+                                crate::mm::check_not_active(regular.inner().location())?;
+                                let _swap_mutation = crate::mm::admit_mutation(regular.inner().location())?;
                                 executable::check_not_active(regular.inner().location())?;
                                 let allowed = allowed_write_len(off, data.len())?;
                                 if allowed == 0 {
@@ -4255,6 +4277,8 @@ impl SendFile {
             } => {
                 let off = *offset;
                 check_writable_mount(file.inner().location())?;
+                crate::mm::check_not_active(file.inner().location())?;
+                let _swap_mutation = crate::mm::admit_mutation(file.inner().location())?;
                 executable::check_not_active(file.inner().location())?;
                 let memfd_mutation = memfd::begin_write(file.inner().location(), buf.len())?;
                 // A null pointer marks an internal positioned view whose OFD

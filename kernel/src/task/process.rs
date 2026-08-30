@@ -134,7 +134,7 @@ use crate::{
         FdTable,
         executable::{self, CredentialReadLease, ExecutableKey},
     },
-    mm::{AddrSpace, TlbState},
+    mm::{AddrSpace, TlbState, register_address_space, unregister_address_space},
     time::wall_time,
 };
 
@@ -3169,7 +3169,9 @@ impl ProcessData {
             time_ns_for_children: RwLock::new(time_ns),
         };
         executable_rollback.0 = None;
-        Arc::try_new(data).map_err(|_| AxError::NoMemory)
+        let data = Arc::try_new(data).map_err(|_| AxError::NoMemory)?;
+        register_address_space(&data.aspace());
+        Ok(data)
     }
 
     /// Reserves the fixed-cost zombie payload allocation before process
@@ -3432,11 +3434,15 @@ impl ProcessData {
         // `ru_maxrss` is a process-lifetime high-water mark.  Preserve the
         // old image's peak across exec while the new image starts publishing
         // its own resident pages into the shared mm-level counter.
-        let old_image = self.aspace();
-        let old_image = old_image.lock();
+        let old_aspace = self.aspace();
+        let old_image = old_aspace.lock();
         let old_maxrss_kb = old_image
             .merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
         drop(old_image);
+        // Publish the replacement mm to swapoff before making it reachable
+        // through the process image. The old registration remains until the
+        // image handoff completes, so neither side can escape a snapshot.
+        register_address_space(&new_aspace);
         let new_tlb_state = {
             let image = new_aspace.lock();
             image.tlb_state()
@@ -3471,6 +3477,7 @@ impl ProcessData {
                 self.mempolicy.lock().ranges.clear();
             },
         );
+        unregister_address_space(&old_aspace);
         ExecImageCommit {
             group_leader,
             image: retired_image,

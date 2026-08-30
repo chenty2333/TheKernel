@@ -148,6 +148,7 @@ fn begin_shared_writable_protection(
         let Some(location) = segment.backend().shared_file_location() else {
             continue;
         };
+        crate::mm::check_not_active(location)?;
         let Some(admission) = segment
             .backend()
             .begin_shared_writable_mapping_admission()?
@@ -649,6 +650,11 @@ pub fn sys_mmap(
             })
         })
         .transpose()?;
+    if map_type != MmapFlags::PRIVATE && permission_flags.contains(MmapProt::WRITE) {
+        if let Some(file) = file.as_ref() {
+            crate::mm::check_not_active(file.inner().location())?;
+        }
+    }
     let filesystem_owner_user_ns = file
         .as_ref()
         .map(|_| initial_user_namespace(actor.user_ns()));
@@ -837,7 +843,10 @@ pub fn sys_mmap(
         };
         let privilege_guard = shared_writable_location
             .as_ref()
-            .map(begin_shared_writable_mapping_privilege_cleanup)
+            .map(|location| {
+                crate::mm::check_not_active(location)?;
+                begin_shared_writable_mapping_privilege_cleanup(location)
+            })
             .transpose()?;
         if map_flags.contains(MmapFlags::FIXED) && !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);

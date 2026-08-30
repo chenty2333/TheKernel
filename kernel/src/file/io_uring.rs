@@ -54,7 +54,7 @@ use super::{
     anon_inode_stat, memfd::MemfdMutationGuard, privilege_metadata::ContentWritePrivilegeGuard,
 };
 use crate::mm::{
-    PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinProvenance, UserIoPinSegment,
+    MutationAdmission, PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinProvenance, UserIoPinSegment,
     UserMemoryCapability, physical_segments_are_disjoint,
     try_pin_user_segments_to_user_longterm_with,
 };
@@ -5006,6 +5006,7 @@ pub(crate) struct PreparedPhysicalIoAdmission {
     /// while the effect still owns the destination range.
     memfd: Option<MemfdMutationGuard>,
     privilege: Option<ContentWritePrivilegeGuard>,
+    mutation: Option<MutationAdmission>,
     /// Bound before lower publication so a defensive Drop can transfer the
     /// exact published owner into the ring's typed custody table.
     worker_slot: Option<usize>,
@@ -5024,6 +5025,7 @@ impl PreparedPhysicalIoAdmission {
         plan: PreparedPhysicalIoPlan,
         memfd: Option<MemfdMutationGuard>,
         privilege: Option<ContentWritePrivilegeGuard>,
+        mutation: Option<MutationAdmission>,
         effect: PreparedPhysicalIoEffect,
     ) -> AxResult<Self> {
         if plan.device_identity == 0 {
@@ -5067,7 +5069,7 @@ impl PreparedPhysicalIoAdmission {
             return Err(AxError::BadState);
         }
         if plan.operation == PreparedPhysicalIoOperation::Write
-            && (memfd.is_none() || privilege.is_none())
+            && (memfd.is_none() || privilege.is_none() || mutation.is_none())
         {
             return Err(AxError::BadState);
         }
@@ -5078,6 +5080,7 @@ impl PreparedPhysicalIoAdmission {
             plan,
             memfd,
             privilege,
+            mutation,
             worker_slot: None,
             effect: Some(effect),
         })
@@ -5219,6 +5222,7 @@ impl Drop for PreparedPhysicalIoAdmission {
             plan: self.plan,
             memfd: self.memfd.take(),
             privilege: self.privilege.take(),
+            mutation: self.mutation.take(),
             worker_slot: Some(slot),
             effect: self.effect.take(),
         };

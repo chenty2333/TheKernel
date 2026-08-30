@@ -336,6 +336,11 @@ fn map_prepared_relocated_segments(
             segment.size,
             &mut aspace.page_table_mut().cursor(),
         )?;
+        aspace.relocate_swapped_entries(
+            segment.source_start,
+            segment.destination_start,
+            segment.size,
+        )?;
     }
     Ok(())
 }
@@ -404,6 +409,7 @@ fn map_locked_relocated_segments(
             segment.size,
             &mut aspace.page_table_mut().cursor(),
         )?;
+        aspace.relocate_swapped_entries(segment.start, destination_start, segment.size)?;
     }
     Ok(())
 }

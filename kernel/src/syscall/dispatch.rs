@@ -943,8 +943,12 @@ pub(super) fn dispatch_syscall(
         Sysno::munlock => sys_munlock(uctx.arg0(), uctx.arg1() as _),
         Sysno::mlockall => sys_mlockall(uctx.arg0() as _),
         Sysno::munlockall => sys_munlockall(),
-        Sysno::swapon => sys_swapon(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::swapoff => sys_swapoff(uctx.arg0() as _),
+        Sysno::swapon => with_user_memory(aspace(), |memory| {
+            sys_swapon(memory, uctx.arg0() as _, uctx.arg1() as _)
+        }),
+        Sysno::swapoff => {
+            with_user_memory(aspace(), |memory| sys_swapoff(memory, uctx.arg0() as _))
+        }
 
         // task info
         Sysno::getpid => sys_getpid(),

@@ -12,6 +12,7 @@ mod loader;
 mod pressure;
 mod remap;
 mod stats;
+mod swap;
 mod tlb;
 mod usercopy;
 mod userfaultfd;
@@ -30,7 +31,7 @@ pub use self::diagnostics::{
     mm_lock_diagnostics_snapshot, reset_mm_lock_diagnostics, set_mm_lock_diagnostics_enabled,
 };
 pub use self::{
-    access::*, asid::AddressSpaceToken, aspace::*, io::*, loader::*, pressure::*, stats::*,
+    access::*, asid::AddressSpaceToken, aspace::*, io::*, loader::*, pressure::*, stats::*, swap::*,
 };
 pub(crate) use self::{
     asid::init as init_hardware_asids,

@@ -550,19 +550,23 @@ impl File {
         memfd_mutation: &memfd::MemfdMutationGuard,
         security: ContentWriteSecurity<'_>,
         validate_direct: &mut impl FnMut(u64, usize) -> AxResult<()>,
-    ) -> AxResult<(usize, Option<ContentWritePrivilegeGuard>)> {
+    ) -> AxResult<(usize, Option<(ContentWritePrivilegeGuard, crate::mm::MutationAdmission)>)> {
         if requested == 0 {
             return Ok((0, None));
         }
 
         let location = self.inner.location();
+        // This guard survives through the actual backend write, closing the
+        // swapon check-to-effect race for write/pwrite/vector/direct paths.
+        let swap_mutation = crate::mm::admit_mutation(location)?;
         super::executable::check_not_active(location)?;
         let allowed = allowed_write_len(offset, requested)?;
         validate_direct(offset, allowed)?;
         memfd_mutation.admit_write(location, file_len, offset, allowed)?;
         let privilege_guard = (allowed != 0)
             .then(|| security.begin(location))
-            .transpose()?;
+            .transpose()?
+            .map(|guard| (guard, swap_mutation));
         Ok((allowed, privilege_guard))
     }
 

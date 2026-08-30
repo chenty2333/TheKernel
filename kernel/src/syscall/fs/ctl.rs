@@ -1106,6 +1106,7 @@ pub fn sys_unlinkat<M: UserMemory + ?Sized>(
     let (parent, name, loc) = with_path_fs(dirfd, path_ref, |fs| {
         resolve_unlink_target_in_fs(fs, path_ref, remove_dir, &security)
     })?;
+    let _swap_mutation = crate::mm::admit_mutation(&loc)?;
     let outcome = namespace_mutation::unlink(
         &mount_operation,
         &parent,
@@ -1943,6 +1944,17 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
     // make both transaction identity checks and the eventual EBUSY wrong.
     let old_loc = old_dir.lookup_no_follow_in_mount(old_final.name)?;
     let new_existing = lookup_optional_in_mount(&new_dir, new_final.name)?;
+    // Swap backing is identified by inode, not pathname: prohibit both
+    // renaming the active backing and replacing it through the destination.
+    crate::mm::check_not_active(&old_loc)?;
+    let _old_swap_mutation = crate::mm::admit_mutation(&old_loc)?;
+    if let Some(destination) = new_existing.as_ref() {
+        crate::mm::check_not_active(destination)?;
+    }
+    let _destination_swap_mutation = new_existing
+        .as_ref()
+        .map(crate::mm::admit_mutation)
+        .transpose()?;
     if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);
     }

@@ -779,6 +779,17 @@ pub(crate) fn check_not_active(loc: &Location) -> AxResult<()> {
     }
 }
 
+/// Swap activation uses this to reject a backing inode that is already
+/// writable through a shared mapping.
+pub(crate) fn has_writable_mapping(loc: &Location) -> AxResult<bool> {
+    let Some(key) = key(loc) else { return Ok(false); };
+    Ok(executables()?
+        .lock()
+        .entries
+        .get(&key)
+        .is_some_and(|counts| counts.writable_mappings != 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

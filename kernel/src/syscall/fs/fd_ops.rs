@@ -997,6 +997,8 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         )?;
         let publication = reservation.prepare_publication(description.clone())?;
         if truncates_regular {
+            crate::mm::check_not_active(&loc)?;
+            let _swap_mutation = crate::mm::admit_mutation(&loc)?;
             let status = description.io_status_snapshot();
             check_mandatory_fd_truncate_lock(
                 &loc,

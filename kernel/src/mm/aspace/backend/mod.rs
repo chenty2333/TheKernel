@@ -546,6 +546,23 @@ impl Backend {
     ) -> AxResult<BackendRetirement> {
         match self {
             Self::Cow(cow) => cow.retire_demoted_2m_source(vaddr, frame, flags),
+            Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
+        }
+    }
+
+    pub(super) fn swap_reclaimable(&self, paddr: PhysAddr) -> bool {
+        matches!(self, Self::Cow(cow) if cow.swap_reclaimable(paddr))
+    }
+
+    pub(super) fn restore_swapped_page(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        entry: crate::mm::SwapPte,
+        pt: &mut PageTableCursor,
+    ) -> AxResult {
+        match self {
+            Self::Cow(cow) => cow.restore_swapped_page(vaddr, flags, entry, pt),
             _ => Err(AxError::InvalidInput),
         }
     }
@@ -560,6 +577,12 @@ impl Backend {
         match self {
             Self::Cow(cow) => cow.retire_collapsed_2m_sources(start, leaves),
             Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
+        }
+    }
+
+    pub(super) fn release_swapped_frame(&self, paddr: PhysAddr) {
+        if let Self::Cow(cow) = self {
+            cow.release_swapped_frame(paddr);
         }
     }
 

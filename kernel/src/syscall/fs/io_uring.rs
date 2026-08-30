@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     file::{
-        FileDescription, FileHandle, FileLike, FileLikeKind, get_file_description, get_file_like,
+        File, FileDescription, FileHandle, FileLike, FileLikeKind, get_file_description, get_file_like,
         io_uring::{
             IoUring, IoUringBufferLease, IoUringFileLease, PendingStreamAdmissionError,
             PreparedPhysicalIoAdmission, PreparedPhysicalIoOperation, SubmissionStep,
@@ -1031,6 +1031,18 @@ fn submit_entries(
                                                     &plan,
                                                 ) {
                                                     Ok(privilege) => {
+                                                        let mutation = if plan.operation()
+                                                            == PreparedPhysicalIoOperation::Write
+                                                        {
+                                                            file_lease
+                                                                .description()?
+                                                                .inner
+                                                                .downcast_ref::<File>()
+                                                                .map(|file| crate::mm::admit_mutation(file.inner().location()))
+                                                                .transpose()?
+                                                        } else {
+                                                            None
+                                                        };
                                                         let file_lease = lease
                                                             .take()
                                                             .ok_or(AxError::BadState)?;
@@ -1047,6 +1059,7 @@ fn submit_entries(
                                                                 plan,
                                                                 memfd,
                                                                 privilege,
+                                                                mutation,
                                                                 effect,
                                                             );
                                                         match prepared {

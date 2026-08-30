@@ -79,6 +79,9 @@ pub(crate) struct FileMappingLease {
     sharing: FileMappingSharing,
     mapping_start: VirtAddr,
     file_offset: u64,
+    // Keeps the inode's swap admission identity alive across every VMA split,
+    // clone and post-close mapping lifetime.
+    _swap_mutation_state: Option<Arc<axsync::Mutex<crate::mm::MutationState>>>,
 }
 
 #[allow(dead_code)]
@@ -101,6 +104,7 @@ impl FileMappingLease {
         let ofd_key = file.open_file_description_key();
         let access_flags = file.inner().flags();
         let status_flags = file.status_flags();
+        let swap_mutation_state = crate::mm::mutation_state_for_mapping(&location);
         Self {
             file,
             ofd_key,
@@ -113,6 +117,7 @@ impl FileMappingLease {
             sharing,
             mapping_start,
             file_offset,
+            _swap_mutation_state: swap_mutation_state,
         }
     }
 

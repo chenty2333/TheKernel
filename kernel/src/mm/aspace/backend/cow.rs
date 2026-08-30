@@ -24,6 +24,7 @@ use super::{
     AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, PopulateOutcome, alloc_frame,
     dealloc_frame, page_table_flags, pages_in, preflight_sparse_unmap,
 };
+use crate::mm::swap::{self, SwapPte};
 
 struct FrameRefCnt(u32);
 
@@ -815,6 +816,56 @@ impl CowBackend {
             previous = Some(*vaddr);
         }
         Ok(BackendRetirement::cow(CowUnmapRetirement { leaves }))
+    }
+
+    /// Whether a present anonymous leaf has a single MM owner and can be
+    /// replaced by a swap entry without invalidating a fork sibling.
+    pub(super) fn swap_reclaimable(&self, paddr: PhysAddr) -> bool {
+        if !self.is_4k_anonymous() {
+            return false;
+        }
+        FRAME_TABLE
+            .lock()
+            .get_frame_ref(paddr)
+            .is_none_or(|frame| frame.lock().0 == 1)
+    }
+
+    /// Installs a resident page from an already-owned software swap entry.
+    /// The entry is deliberately released only after `map` publishes the PTE.
+    pub(super) fn restore_swapped_page(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        entry: SwapPte,
+        pt: &mut PageTableCursor,
+    ) -> AxResult {
+        if !self.is_4k_anonymous() {
+            return Err(AxError::InvalidInput);
+        }
+        let frame = self.alloc_new_frame(false)?;
+        let page =
+            unsafe { slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), PAGE_SIZE_4K) };
+        if let Err(error) = swap::read(entry, page) {
+            dealloc_frame(frame, self.size);
+            return Err(error);
+        }
+        if let Err(error) = pt.map(vaddr, frame, self.size, page_table_flags(flags)) {
+            dealloc_frame(frame, self.size);
+            return Err(error.into());
+        }
+        swap::release(entry)?;
+        self.mark_materialized();
+        Ok(())
+    }
+
+    /// Drops the former resident ownership after a swap PTE has been
+    /// published and the TLB grace period has elapsed.
+    pub(super) fn release_swapped_frame(&self, paddr: PhysAddr) {
+        if let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) {
+            frame.lock().drop_frame(paddr, self.size);
+        } else {
+            dealloc_frame(paddr, self.size);
+        }
     }
 
     /// Atomically publishes one fully initialized anonymous page.

@@ -36,6 +36,7 @@ use crate::{
     keyring::{self, KeyTaskOwner},
     mm::{
         AddrSpace, AddressSpaceToken, UserMemoryCapability, map_usercopy_error,
+        unregister_address_space,
         try_read_user_u32_nofault_locked,
     },
     pseudofs::cgroup,
@@ -1708,6 +1709,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             "authoritative process reparent handoff left exact children behind"
         );
         drop(task_parent_publication.take());
+        unregister_address_space(&thr.proc_data.aspace());
         remove_process_runtime(&thr.proc_data);
 
         let parent = committed.notification_parent().cloned();
