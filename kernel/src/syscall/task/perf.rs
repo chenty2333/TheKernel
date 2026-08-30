@@ -41,6 +41,7 @@ struct PerfEventAttrV0 {
     flags: u64,
     wakeup_events: u32,
     bp_type: u32,
+    config1: u64,
 }
 
 // All fields are integer words and Linux's original ABI is exactly 64 bytes.
