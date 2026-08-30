@@ -8160,7 +8160,11 @@ impl IoUring {
                 Some(pin) => pin,
                 None => {
                     drop(pin_charge);
-                    return Err(AxError::ResourceBusy);
+                    // A rejected user pin is an invalid registered-buffer
+                    // address (not ring-table contention). In particular,
+                    // secretmem deliberately cannot supply durable DMA/GUP
+                    // segments and Linux reports EFAULT for this admission.
+                    return Err(AxError::BadAddress);
                 }
             };
             let mut segment_ends = Vec::new();

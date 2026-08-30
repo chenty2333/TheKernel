@@ -347,6 +347,30 @@ impl SharedPages {
         Ok(())
     }
 
+    /// Copies from an already-materialized secret backing without allocating
+    /// a frame.  IRQ-safe nofault users need this distinction: a missing
+    /// secret page remains a retry, not an implicit population.
+    pub(crate) fn read_secret_bytes_resident(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
+        let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+            return Err(AxError::InvalidInput);
+        }
+        let mut pages = frames.lock();
+        let mut page_index = offset / PAGE_SIZE_4K;
+        let mut page_offset = offset % PAGE_SIZE_4K;
+        while !buf.is_empty() {
+            let chunk_len = (PAGE_SIZE_4K - page_offset).min(buf.len());
+            pages
+                .get(&page_index)
+                .ok_or(AxError::BadAddress)?
+                .copy_to(&mut buf[..chunk_len], page_offset)?;
+            buf = &mut buf[chunk_len..];
+            page_index += 1;
+            page_offset = 0;
+        }
+        Ok(())
+    }
+
     pub fn write_bytes(&self, offset: usize, mut buf: &[u8]) -> AxResult {
         if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
             return Err(AxError::InvalidInput);
@@ -382,6 +406,29 @@ impl SharedPages {
             page_offset = 0;
         }
 
+        Ok(())
+    }
+
+    /// Writes an already-materialized secret backing without allocating a
+    /// frame; see [`Self::read_secret_bytes_resident`].
+    pub(crate) fn write_secret_bytes_resident(&self, offset: usize, mut buf: &[u8]) -> AxResult {
+        let frames = self.secret_frames.as_ref().ok_or(AxError::InvalidInput)?;
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+            return Err(AxError::InvalidInput);
+        }
+        let mut pages = frames.lock();
+        let mut page_index = offset / PAGE_SIZE_4K;
+        let mut page_offset = offset % PAGE_SIZE_4K;
+        while !buf.is_empty() {
+            let chunk_len = (PAGE_SIZE_4K - page_offset).min(buf.len());
+            pages
+                .get(&page_index)
+                .ok_or(AxError::BadAddress)?
+                .copy_from(&buf[..chunk_len], page_offset)?;
+            buf = &buf[chunk_len..];
+            page_index += 1;
+            page_offset = 0;
+        }
         Ok(())
     }
 
@@ -1264,6 +1311,20 @@ mod tests {
         };
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x4000)));
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
+    }
+
+    #[test]
+    fn resident_secret_copy_never_populates_a_missing_frame() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = SharedPages::new_secret_fixed(PAGE_SIZE_4K).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            pages.read_secret_bytes_resident(0, &mut byte),
+            Err(AxError::BadAddress)
+        );
+        pages.write_bytes(0, &[0x5a]).unwrap();
+        pages.read_secret_bytes_resident(0, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
     }
 
     #[test]
