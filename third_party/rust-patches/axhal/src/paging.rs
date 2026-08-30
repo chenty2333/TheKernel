@@ -11,6 +11,12 @@ pub use page_table_multiarch::{
 };
 
 use crate::mem::{phys_to_virt, virt_to_phys};
+use spin::Mutex;
+
+// The boot/runtime kernel root is shared by every address space.  Mutating it
+// therefore needs one global serialization point; callers also own the
+// architecture-wide TLB invalidation before releasing this gate.
+static KERNEL_PAGE_TABLE_GATE: Mutex<()> = Mutex::new(());
 
 /// Implementation of [`PagingHandler`], to provide physical memory manipulation to
 /// the [page_table_multiarch] crate.
@@ -51,3 +57,16 @@ pub type PageTable = page_table_multiarch::x86_64::X64PageTable<PagingHandlerImp
 /// The x86_64 page table cursor.
 pub type PageTableCursor<'a> =
     page_table_multiarch::x86_64::X64PageTableCursor<'a, PagingHandlerImpl>;
+
+/// Mutates the active kernel page table without taking ownership of its CR3
+/// root.  The closure must not retain the borrowed table or cursor.  This is
+/// the sole entry point for global direct-map lifecycle changes.
+pub fn with_active_kernel_page_table<T>(operation: impl FnOnce(&mut PageTable) -> T) -> T {
+    let _gate = KERNEL_PAGE_TABLE_GATE.lock();
+    let root = axcpu::asm::read_kernel_page_table();
+    // SAFETY: CR3 names the currently active, globally shared kernel root;
+    // the gate serializes mutations and PageTable's borrowed-root mode never
+    // deallocates this boot/runtime-owned hierarchy.
+    let mut table = unsafe { PageTable::from_existing_root(root) };
+    operation(&mut table)
+}
