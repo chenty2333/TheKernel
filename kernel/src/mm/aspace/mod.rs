@@ -2399,6 +2399,20 @@ impl AddrSpace {
         self.clear_locked_range(start, size);
         if enabled {
             self.insert_locked_range(start, start + size);
+        } else {
+            let range = VirtAddrRange::from_start_size(start, size);
+            let secret_ranges: Vec<_> = self
+                .areas_overlapping(range)
+                .filter(|area| area.backend().is_secret())
+                .map(|area| {
+                    let range_start = area.start().max(start);
+                    let range_end = area.end().min(start + size);
+                    (range_start, range_end)
+                })
+                .collect();
+            for (range_start, range_end) in secret_ranges {
+                self.insert_locked_range(range_start, range_end);
+            }
         }
         Ok(())
     }
@@ -4069,6 +4083,14 @@ impl AddrSpace {
 
     pub fn clear_locked_mappings(&mut self) {
         self.locked_ranges.clear();
+        let secret_ranges: Vec<_> = self
+            .areas()
+            .filter(|area| area.backend().is_secret())
+            .map(|area| (area.start(), area.end()))
+            .collect();
+        for (start, end) in secret_ranges {
+            self.insert_locked_range(start, end);
+        }
         self.lock_future_mappings = false;
         self.lock_future_on_fault = false;
     }

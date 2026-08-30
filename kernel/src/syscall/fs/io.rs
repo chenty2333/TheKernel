@@ -2716,7 +2716,6 @@ pub fn sys_truncate(
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
-    check_resize_limit(length as u64)?;
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());

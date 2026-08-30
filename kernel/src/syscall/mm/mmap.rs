@@ -876,12 +876,19 @@ pub fn sys_mmap(
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);
             proc_data.clear_mempolicy_range(start.as_usize(), length);
         }
+        let best_effort_secret_populate = secret_mapping && populate;
         let pending_alias = backend
             .shared_backing_key()
             .map(|key| aspace.prepare_shared_alias_binding(key, &aspace_handle))
             .transpose()?
             .flatten();
-        aspace.map(start, length, effective_protection, populate, backend)?;
+        aspace.map(
+            start,
+            length,
+            effective_protection,
+            populate && !best_effort_secret_populate,
+            backend,
+        )?;
         if let Some(pending_alias) = pending_alias {
             aspace.commit_shared_alias_binding(pending_alias);
         }
@@ -892,6 +899,10 @@ pub fn sys_mmap(
             // so rollback cannot retire an unrelated mapping.
             deferred_uffd_wake.merge(aspace.unmap(start, length)?);
             return Err(error);
+        }
+        if best_effort_secret_populate {
+            // EOF is a future SIGBUS fault, not an mmap failure.
+            let _ = aspace.populate_area(start, length, effective_protection);
         }
         if let Some(admission) = mapping_admission {
             admission
@@ -2018,6 +2029,9 @@ pub(super) fn check_mmap_memlock_limit(
     length: usize,
 ) -> AxResult {
     let limit_error = AxError::from(LinuxError::EAGAIN);
+    if !has_ipc_lock && proc_data.rlim.read()[RLIMIT_MEMLOCK].current == 0 {
+        return Err(limit_error);
+    }
     let locked_bytes = locked_bytes_after_range(aspace, start, length, limit_error)?;
     check_memlock_total(proc_data, has_ipc_lock, locked_bytes, limit_error)
 }
