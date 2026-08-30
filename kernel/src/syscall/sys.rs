@@ -728,7 +728,10 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
     }
     match kind {
         SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => Ok(0),
-        SYSLOG_ACTION_READ => Ok(syslog_copy(memory, buf, len, true)?.0),
+        SYSLOG_ACTION_READ => {
+            let _serialized = SYSLOG_READ_LOCK.lock();
+            Ok(syslog_copy(memory, buf, len, true)?.0)
+        }
         SYSLOG_ACTION_READ_ALL => Ok(syslog_copy(memory, buf, len, false)?.0),
         SYSLOG_ACTION_READ_CLEAR => {
             let (copied, end) = syslog_copy(memory, buf, len, false)?;
