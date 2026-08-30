@@ -973,10 +973,19 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     {
         check_mbind_strict_resident(start, len, policy)?;
     }
-    current()
-        .as_thread()
-        .proc_data
-        .bind_mempolicy_range(start.as_usize(), len, policy);
+
+    // Serialize policy publication with VMA inspection exactly as the
+    // home-node path below does: address-space topology first, then policy
+    // intervals.  Revalidate while holding that order so an unmap cannot
+    // leave a freshly published policy for a vanished VMA.
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    if !aspace.can_access_range(start, len, MappingFlags::USER) {
+        return Err(AxError::BadAddress);
+    }
+    proc_data.bind_mempolicy_range(start.as_usize(), len, policy);
     Ok(0)
 }
 
@@ -1003,11 +1012,13 @@ pub fn sys_set_mempolicy_home_node(
         return Err(AxError::InvalidInput);
     }
 
-    let len = len
-        .checked_add(PAGE_SIZE_4K - 1)
-        .map(|value| value & !(PAGE_SIZE_4K - 1))
-        .ok_or(AxError::InvalidInput)?;
-    let end = start.checked_add(len).ok_or(AxError::InvalidInput)?;
+    // Linux uses the unchecked PAGE_ALIGN() macro here.  Keep its unsigned
+    // wrap behavior: a near-ULONG_MAX length may become the empty interval.
+    let len = len.wrapping_add(PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Err(AxError::InvalidInput);
+    }
     if end == start {
         return Ok(0);
     }
