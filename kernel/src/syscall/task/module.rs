@@ -1,5 +1,5 @@
 //! Native x86-64 ET_REL module admission.
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -76,8 +76,13 @@ struct M {
     rodata: Option<ExecutableCode>,
     data: Option<jit_memory::WritableCode>,
     charps: Vec<Vec<u8>>,
-    init: usize,
-    exit: Option<usize>,
+    init: Entry,
+    exit: Option<Entry>,
+}
+#[derive(Clone, Copy)]
+struct Entry {
+    offset: usize,
+    size: usize,
 }
 static MODULES: Lazy<spin::Mutex<Vec<Slot>>> = Lazy::new(|| spin::Mutex::new(Vec::new()));
 struct LoadFlight {
@@ -142,6 +147,13 @@ fn await_flight(flight: Arc<LoadFlight>) -> AxResult<isize> {
 }
 fn no<T>() -> AxResult<T> {
     Err(LinuxError::ENOEXEC.into())
+}
+fn copy_vec(bytes: &[u8]) -> AxResult<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| AxError::NoMemory)?;
+    out.extend_from_slice(bytes);
+    Ok(out)
 }
 fn u16x(b: &[u8], o: usize) -> AxResult<u16> {
     b.get(o..o.checked_add(2).ok_or(AxError::InvalidExecutable)?)
@@ -208,22 +220,25 @@ fn sh(b: &[u8]) -> AxResult<Vec<S>> {
         return no();
     }
     sl(b, o, e.checked_mul(n).ok_or(AxError::InvalidExecutable)?)?;
-    (0..n)
-        .map(|j| {
-            let p = o + j * SH;
-            Ok(S {
-                n: u32x(b, p)?,
-                t: u32x(b, p + 4)?,
-                f: u64x(b, p + 8)?,
-                o: usize::try_from(u64x(b, p + 24)?).map_err(|_| AxError::InvalidExecutable)?,
-                z: usize::try_from(u64x(b, p + 32)?).map_err(|_| AxError::InvalidExecutable)?,
-                l: u32x(b, p + 40)?,
-                i: u32x(b, p + 44)?,
-                a: usize::try_from(u64x(b, p + 48)?).map_err(|_| AxError::InvalidExecutable)?,
-                e: usize::try_from(u64x(b, p + 56)?).map_err(|_| AxError::InvalidExecutable)?,
-            })
-        })
-        .collect()
+    let mut sections = Vec::new();
+    sections
+        .try_reserve_exact(n)
+        .map_err(|_| AxError::NoMemory)?;
+    for j in 0..n {
+        let p = o + j * SH;
+        sections.push(S {
+            n: u32x(b, p)?,
+            t: u32x(b, p + 4)?,
+            f: u64x(b, p + 8)?,
+            o: usize::try_from(u64x(b, p + 24)?).map_err(|_| AxError::InvalidExecutable)?,
+            z: usize::try_from(u64x(b, p + 32)?).map_err(|_| AxError::InvalidExecutable)?,
+            l: u32x(b, p + 40)?,
+            i: u32x(b, p + 44)?,
+            a: usize::try_from(u64x(b, p + 48)?).map_err(|_| AxError::InvalidExecutable)?,
+            e: usize::try_from(u64x(b, p + 56)?).map_err(|_| AxError::InvalidExecutable)?,
+        });
+    }
+    Ok(sections)
 }
 fn sy(b: &[u8], t: S, j: usize) -> AxResult<Y> {
     if t.e != SYM || j >= t.z / SYM {
@@ -246,6 +261,16 @@ fn pa(p: P, tb: usize, db: usize, rb: usize) -> AxResult<usize> {
         P::R(x) => rb.checked_add(x),
     }
     .ok_or(AxError::InvalidExecutable)
+}
+fn module_entry(y: Y, sec: S, p: Option<P>) -> AxResult<Entry> {
+    let Some(P::T(offset)) = p else { return no() };
+    if y.z == 0 || y.v >= sec.z || y.z > sec.z - y.v {
+        return no();
+    }
+    Ok(Entry {
+        offset: offset.checked_add(y.v).ok_or(AxError::InvalidExecutable)?,
+        size: y.z,
+    })
 }
 fn put(t: &mut [u8], d: &mut [u8], r: &mut [u8], p: P, v: &[u8]) -> AxResult<()> {
     match p {
@@ -316,7 +341,9 @@ fn rel(
                 P::R(x) => P::R(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
             };
             let a = u64x(b, q + 16)? as i64 as i128;
-            let s = pa(sp, tb, db, rb)? as i128;
+            let s = pa(sp, tb, db, rb)?
+                .checked_add(y.v)
+                .ok_or(AxError::InvalidExecutable)? as i128;
             let p = pa(dp, tb, db, rb)? as i128;
             match inf as u32 {
                 1 => put(
@@ -377,14 +404,17 @@ fn args(b: &[u8]) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
                 if z == q {
                     q = 0
                 } else if z == b'\\' && i < b.len() {
+                    x.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                     x.push(b[i]);
                     i += 1
                 } else {
+                    x.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                     x.push(z)
                 }
             } else if z == b'\'' || z == b'"' {
                 q = z
             } else {
+                x.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 x.push(z)
             }
         }
@@ -402,14 +432,15 @@ fn args(b: &[u8]) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
             .iter()
             .position(|x| *x == b'=')
             .ok_or(LinuxError::EINVAL)?;
-        let mut n = x[..e].to_vec();
+        let mut n = copy_vec(&x[..e])?;
         while n.first() == Some(&b'-') {
             n.remove(0);
         }
         if n.is_empty() {
             return Err(LinuxError::EINVAL.into());
         }
-        out.push((n, x[e + 1..].to_vec()))
+        out.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        out.push((n, copy_vec(&x[e + 1..])?))
     }
     Ok(out)
 }
@@ -543,7 +574,7 @@ fn params(
     let base = pa(p, 0, d_base, ro_base)?;
     // Decode the relocated records from a stable snapshot while writes go to
     // their final RW mapping.  The snapshot is not module-owned storage.
-    let old = d.to_vec();
+    let old = copy_vec(d)?;
     let view = DataView {
         ro,
         ro_base,
@@ -581,12 +612,12 @@ fn params(
                 {
                     return no();
                 }
-                let vs: Vec<&[u8]> = if fl & 1 != 0 {
-                    v.split(|x| *x == b',').collect()
+                let value_count = if fl & 1 != 0 {
+                    v.split(|x| *x == b',').count()
                 } else {
-                    vec![v]
+                    1
                 };
-                if vs.len() > cap {
+                if value_count > cap {
                     return Err(LinuxError::EINVAL.into());
                 }
                 let w = match kind {
@@ -607,11 +638,16 @@ fn params(
                 if cnt != 0 {
                     view.rw_offset(cnt, 4)?;
                 }
-                for (i, x) in vs.iter().enumerate() {
+                for i in 0..value_count {
+                    let x = if fl & 1 != 0 {
+                        v.split(|x| *x == b',').nth(i).unwrap()
+                    } else {
+                        v
+                    };
                     let z = ao + i * w;
                     match kind {
                         0 => {
-                            d[z] = match *x {
+                            d[z] = match x {
                                 b"1" | b"y" | b"Y" | b"yes" | b"true" | b"on" => 1,
                                 b"0" | b"n" | b"N" | b"no" | b"false" | b"off" => 0,
                                 _ => return Err(LinuxError::EINVAL.into()),
@@ -637,6 +673,7 @@ fn params(
                             s.extend_from_slice(x);
                             s.push(0);
                             d[z..z + 8].copy_from_slice(&(s.as_ptr() as u64).to_le_bytes());
+                            cp.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                             cp.push(s)
                         }
                         _ => unreachable!(),
@@ -644,7 +681,7 @@ fn params(
                 }
                 if cnt != 0 {
                     let x = view.rw_offset(cnt, 4)?;
-                    d[x..x + 4].copy_from_slice(&(vs.len() as u32).to_le_bytes())
+                    d[x..x + 4].copy_from_slice(&(value_count as u32).to_le_bytes())
                 }
             }
             if !seen {
@@ -682,7 +719,9 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
         return no();
     }
     let mut ps = Vec::new();
-    ps.resize(ss.len(), None);
+    ps.try_reserve_exact(ss.len())
+        .map_err(|_| AxError::NoMemory)?;
+    ps.extend(core::iter::repeat(None).take(ss.len()));
     let (mut tl, mut dl, mut rl) = (0, 0, 0);
     for (i, s) in ss.iter().enumerate() {
         if s.f & ALLOC == 0 {
@@ -754,16 +793,10 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
             return no();
         }
         if y.i & 15 == FUNC {
-            if let Some(P::T(o)) = ps[y.s as usize] {
-                match cs(sl(b, strtab.o, strtab.z)?, y.n as usize)? {
-                    b"thekernel_module_init" => {
-                        init = Some(o.checked_add(y.v).ok_or(AxError::InvalidExecutable)?)
-                    }
-                    b"thekernel_module_exit" => {
-                        exit = Some(o.checked_add(y.v).ok_or(AxError::InvalidExecutable)?)
-                    }
-                    _ => {}
-                }
+            match cs(sl(b, strtab.o, strtab.z)?, y.n as usize)? {
+                b"thekernel_module_init" => init = Some(module_entry(y, sec, ps[y.s as usize])?),
+                b"thekernel_module_exit" => exit = Some(module_entry(y, sec, ps[y.s as usize])?),
+                _ => {}
             }
         }
     }
@@ -779,9 +812,8 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
     if mn.is_empty() || mn.len() > NAMEMAX {
         return no();
     }
-    let name = core::str::from_utf8(mn)
-        .map_err(|_| AxError::IllegalBytes)?
-        .into();
+    core::str::from_utf8(mn).map_err(|_| AxError::IllegalBytes)?;
+    let name = String::from_utf8(copy_vec(mn)?).map_err(|_| AxError::IllegalBytes)?;
     let tb = text.code_address();
     let db = data
         .as_ref()
@@ -811,7 +843,7 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
             .unwrap_or(&mut []);
         params(ro, rb, d, db, &ss, &ps, param_section, av)?
     };
-    let code = text.publish(init).map_err(me)?;
+    let code = text.publish(init.offset).map_err(me)?;
     let rodata = rodata
         .map(jit_memory::WritableCode::publish_readonly)
         .transpose()
@@ -841,7 +873,10 @@ fn activate(x: M) -> AxResult<isize> {
             deps: 0,
         })
     }
-    let r = x.code.execute_module_entry(x.init);
+    let r = x
+        .code
+        .execute_module_entry(x.init.offset, x.init.size)
+        .ok_or(AxError::InvalidExecutable)?;
     let mut v = MODULES.lock();
     let i = v
         .iter()
@@ -920,7 +955,8 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     if b.try_reserve_exact(n).is_err() {
         return complete_flight(&flight, Err(AxError::NoMemory));
     }
-    b.resize(n, 0);
+    // Capacity was fallibly reserved above; extending cannot allocate.
+    b.extend(core::iter::repeat(0).take(n));
     let copied = match f.inner().read_at(&mut b, 0) {
         Ok(copied) => copied,
         Err(error) => return complete_flight(&flight, Err(error)),
@@ -980,7 +1016,7 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
         }
     };
     if let Some(e) = x.exit {
-        let _ = x.code.execute_module_entry(e);
+        let _ = x.code.execute_module_entry(e.offset, e.size);
     };
     // Retire the executable segment before releasing the RO/RW segment
     // owners.  Even a failed retirement consumes its owner exactly once and
@@ -1141,7 +1177,7 @@ mod tests {
             0x3000,
         )
         .unwrap();
-        assert_eq!(u64::from_le_bytes(text.try_into().unwrap()), 0x3000);
+        assert_eq!(u64::from_le_bytes(text.try_into().unwrap()), 0x3008);
 
         // The same symbol resolved PC-relatively from RW data must use the
         // final bases, rather than a temporary combined buffer address.
@@ -1159,7 +1195,113 @@ mod tests {
             0x3000,
         )
         .unwrap();
-        assert_eq!(i32::from_le_bytes(data[..4].try_into().unwrap()), 0x1000);
+        assert_eq!(i32::from_le_bytes(data[..4].try_into().unwrap()), 0x1008);
+    }
+
+    #[test]
+    fn relocations_add_nonzero_defined_symbol_offsets_for_all_forms() {
+        let mut image = vec![0; RELA * 5 + SYM * 2];
+        for (j, kind) in [1u32, 2, 4, 10, 11].into_iter().enumerate() {
+            let q = j * RELA;
+            image[q..q + 8].copy_from_slice(&((j * 8) as u64).to_le_bytes());
+            image[q + 8..q + 16].copy_from_slice(&((1u64 << 32) | kind as u64).to_le_bytes());
+            image[q + 16..q + 24].copy_from_slice(&7i64.to_le_bytes());
+        }
+        let sym = RELA * 5 + SYM;
+        image[sym + 6..sym + 8].copy_from_slice(&1u16.to_le_bytes());
+        image[sym + 8..sym + 16].copy_from_slice(&3u64.to_le_bytes());
+        image[sym + 16..sym + 24].copy_from_slice(&1u64.to_le_bytes());
+        let sections = [
+            S {
+                n: 0,
+                t: PROG,
+                f: ALLOC | EXEC,
+                o: 0,
+                z: 40,
+                l: 0,
+                i: 0,
+                a: 1,
+                e: 0,
+            },
+            S {
+                n: 0,
+                t: PROG,
+                f: ALLOC,
+                o: 0,
+                z: 8,
+                l: 0,
+                i: 0,
+                a: 1,
+                e: 0,
+            },
+            S {
+                n: 0,
+                t: RELOC,
+                f: 0,
+                o: 0,
+                z: RELA * 5,
+                l: 3,
+                i: 0,
+                a: 8,
+                e: RELA,
+            },
+            S {
+                n: 0,
+                t: SYMTAB,
+                f: 0,
+                o: RELA * 5,
+                z: SYM * 2,
+                l: 0,
+                i: 0,
+                a: 8,
+                e: SYM,
+            },
+        ];
+        let mut text = vec![0; 40];
+        rel(
+            &image,
+            &sections,
+            &[Some(P::T(0)), Some(P::R(0)), None, None],
+            &mut text,
+            &mut [],
+            &mut [],
+            0x1000,
+            0,
+            0x3000,
+        )
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(text[..8].try_into().unwrap()), 0x300a);
+        assert_eq!(i32::from_le_bytes(text[8..12].try_into().unwrap()), 0x2002);
+        assert_eq!(i32::from_le_bytes(text[16..20].try_into().unwrap()), 0x1ffa);
+        assert_eq!(u32::from_le_bytes(text[24..28].try_into().unwrap()), 0x300a);
+        assert_eq!(i32::from_le_bytes(text[32..36].try_into().unwrap()), 0x300a);
+    }
+
+    #[test]
+    fn module_entry_rejects_empty_and_exclusive_end_symbols() {
+        let section = S {
+            n: 0,
+            t: PROG,
+            f: ALLOC | EXEC,
+            o: 0,
+            z: 8,
+            l: 0,
+            i: 0,
+            a: 1,
+            e: 0,
+        };
+        let base = Y {
+            n: 0,
+            i: FUNC,
+            s: 0,
+            v: 7,
+            z: 1,
+        };
+        let entry = module_entry(base, section, Some(P::T(16))).unwrap();
+        assert_eq!(entry.offset, 23);
+        assert!(module_entry(Y { z: 0, ..base }, section, Some(P::T(16))).is_err());
+        assert!(module_entry(Y { v: 8, z: 0, ..base }, section, Some(P::T(16))).is_err());
+        assert!(module_entry(Y { v: 7, z: 2, ..base }, section, Some(P::T(16))).is_err());
     }
 
     #[test]

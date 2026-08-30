@@ -502,15 +502,24 @@ impl ExecutableCode {
     /// Invokes a validated SysV x86_64 module entry point.  Module code is
     /// entered only through this owner, so its RX mapping remains pinned for
     /// the whole call and teardown cannot race the instruction fetches.
-    pub(crate) fn execute_module_entry(&self, entry_offset: usize) -> i32 {
-        debug_assert!(entry_offset < self.len);
+    pub(crate) fn execute_module_entry(
+        &self,
+        entry_offset: usize,
+        entry_size: usize,
+    ) -> Option<i32> {
+        let Some(entry_end) = entry_offset.checked_add(entry_size) else {
+            return None;
+        };
+        if entry_size == 0 || entry_offset >= self.len || entry_end > self.len {
+            return None;
+        }
         type Entry = extern "C" fn() -> i32;
         let entry = self.code.as_usize() + entry_offset;
         // SAFETY: the ET_REL loader validated that this offset denotes a
         // defined executable symbol in this published allocation. `self`
         // owns the RX mapping for the complete invocation.
         let function: Entry = unsafe { core::mem::transmute(entry) };
-        function()
+        Some(function())
     }
     /// Executes the published SysV x86_64 entry while borrowing the code
     /// owner for the complete call. The only unsafe operation in this
