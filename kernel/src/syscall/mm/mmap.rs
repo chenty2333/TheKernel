@@ -911,7 +911,13 @@ pub fn sys_remap_file_pages(
         aspace.remap_shared_span_snapshot(start_addr, size)?
     };
     let flags = flags & MAP_NONBLOCK as usize;
-    let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize | flags;
+    let fully_locked = {
+        let aspace = aspace_handle.lock();
+        aspace.locked_bytes_in_range(start_addr, size) == size
+    };
+    let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize
+        | flags
+        | if fully_locked { MAP_LOCKED as usize } else { 0 };
     mmap_file(
         image.credential(),
         Some((lease.filesystem_owner_user_ns(), lease.file())),
