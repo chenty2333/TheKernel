@@ -295,7 +295,6 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
-const FILEID_INVALID: i32 = 255;
 const AT_HANDLE_FID: i32 = 0x200;
 const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
@@ -845,7 +844,7 @@ pub fn sys_name_to_handle_at(
     if header.handle_bytes < required_bytes {
         let required_header = LinuxFileHandle {
             handle_bytes: required_bytes,
-            handle_type: FILEID_INVALID,
+            handle_type: exported.handle_type,
         };
         let required_header = unsafe {
             slice::from_raw_parts(
