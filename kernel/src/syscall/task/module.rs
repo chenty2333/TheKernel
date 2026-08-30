@@ -75,7 +75,13 @@ fn prepare(b:&[u8])->AxResult<PreparedModule>{
     let mut w=jit_memory::prepare(cs.size).map_err(memory_error)?; let mut code=Vec::new();code.try_reserve_exact(cs.size).map_err(|_|AxError::NoMemory)?;code.extend_from_slice(range(b,cs.offset,cs.size)?); relocate(&mut code,w.code_address(),b,&ss,ci)?; w.write(0,&code)?; let code=w.publish(init).map_err(memory_error)?; Ok(PreparedModule{name:owned_name,code,init,exit})
 }
 
-pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;let prepared=prepare(&bytes)?;let mut modules=MODULES.lock();if modules.iter().any(|module|module.name==prepared.name){return Err(LinuxError::EEXIST.into())}if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}modules.push(prepared);Ok(0)}
+/// Serializes native module activation. Reserving the registry slot before
+/// calling init means a successful init always has a non-fallible publication
+/// path, and keeping the transaction serialized prevents same-name loaders
+/// from executing two init functions concurrently.
+fn activate(prepared:PreparedModule)->AxResult<isize>{let mut modules=MODULES.lock();if modules.iter().any(|module|module.name==prepared.name){return Err(LinuxError::EEXIST.into())}modules.try_reserve(1).map_err(|_|AxError::NoMemory)?;if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}modules.push(prepared);Ok(0)}
+
+pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;activate(prepare(&bytes)?)}
 pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M>,fd:i32,_args:*const c_char,flags:u32)->AxResult<isize>{
     if !has_module_capability(){return Err(AxError::OperationNotPermitted)}
     if flags & !(MODULE_INIT_IGNORE_VERMAGIC|MODULE_INIT_IGNORE_MODVERSIONS|MODULE_INIT_COMPRESSED_FILE) != 0{return Err(AxError::InvalidInput)}
@@ -88,8 +94,6 @@ pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M
     let mut bytes=Vec::new();bytes.try_reserve_exact(size).map_err(|_|AxError::NoMemory)?;
     let copied=file.inner().read_at(&mut bytes,0)?;
     if copied!=size||bytes.len()!=size{return Err(AxError::InvalidExecutable)}
-    let prepared=prepare(&bytes)?;
-    if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}
-    MODULES.lock().push(prepared);Ok(0)
+    activate(prepare(&bytes)?)
 }
-pub fn sys_delete_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,name:*const c_char,_flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}let name=vm_load_until_nul_bounded(memory,name.cast(),MODULE_NAME_MAX+1).map_err(map_usercopy_error)?;let name=core::str::from_utf8(&name).map_err(|_|AxError::IllegalBytes)?;let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(LinuxError::ENOENT)?;let module=modules.remove(index);if let Some(exit)=module.exit{let _=module.code.execute_module_entry(exit);}module.code.retire().map_err(memory_error)?;Ok(0)}
+pub fn sys_delete_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,name:*const c_char,flags:u32)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if flags!=0{return Err(AxError::OperationNotSupported)}let name=vm_load_until_nul_bounded(memory,name.cast(),MODULE_NAME_MAX+1).map_err(map_usercopy_error)?;let name=core::str::from_utf8(&name).map_err(|_|AxError::IllegalBytes)?;let mut modules=MODULES.lock();let index=modules.iter().position(|m|m.name==name).ok_or(LinuxError::ENOENT)?;let module=modules.remove(index);if let Some(exit)=module.exit{let _=module.code.execute_module_entry(exit);}module.code.retire().map_err(memory_error)?;Ok(0)}
