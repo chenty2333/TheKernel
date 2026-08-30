@@ -23,6 +23,7 @@ use crate::time::wall_time;
 
 pub struct MountRecord {
     pub mount_id: u64,
+    pub mount_id_old: u32,
     pub parent_id: u64,
     pub root: String,
     pub source: String,
@@ -111,6 +112,7 @@ impl<'a> MountRecordIndex<'a> {
 }
 
 static MOUNT_RECORDS: BlockingMutex<Vec<MountRecord>> = BlockingMutex::new(Vec::new());
+static MOUNTINFO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 // Detached mount FDs and lazily unmounted-but-referenced mounts remain live
 // superblocks even though they have no namespace record. Keep weak mount roots
 // so legacy device-number queries can follow Linux's user_get_super lifetime.
@@ -153,6 +155,7 @@ impl fmt::Debug for NamespaceOperationGuard {
 }
 
 struct LinuxMountState {
+    mount_id_old: u32,
     flags: AtomicU32,
     activity_epoch: AtomicU64,
     readonly_floor: bool,
@@ -222,6 +225,7 @@ impl MountRecord {
     fn try_clone(&self) -> AxResult<Self> {
         Ok(Self {
             mount_id: self.mount_id,
+            mount_id_old: self.mount_id_old,
             parent_id: self.parent_id,
             root: try_string(&self.root)?,
             source: try_string(&self.source)?,
@@ -234,6 +238,11 @@ impl MountRecord {
             mountpoint: self.mountpoint.clone(),
         })
     }
+}
+
+fn next_mountinfo_id() -> AxResult<u32> {
+    let id = MOUNTINFO_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    u32::try_from(id).map_err(|_| AxError::OutOfRange)
 }
 
 fn try_string(value: &str) -> AxResult<String> {
@@ -258,6 +267,28 @@ pub fn snapshot() -> AxResult<Vec<MountRecord>> {
         snapshot.push(record.try_clone()?);
     }
     Ok(snapshot)
+}
+
+/// Read the superblock magic for an attached mount record.  The record's weak
+/// mountpoint is deliberately revalidated here so statmount never reports a
+/// detached or stale ledger entry.
+pub fn statmount_sb_magic(record: &MountRecord) -> AxResult<u64> {
+    let mountpoint = validate_record_state(record)?;
+    Ok(mountpoint.root_location().filesystem().stat()?.fs_type as u64)
+}
+
+pub fn legacy_mount_id(mount_id: u64) -> Option<u32> {
+    if let Some(id) = MOUNT_RECORDS.lock().iter().find_map(|record| {
+        (record.mount_id == mount_id).then_some(record.mount_id_old)
+    }) {
+        return Some(id);
+    }
+    LIVE_SUPERBLOCK_MOUNTS
+        .lock()
+        .get(&mount_id)?
+        .upgrade()?
+        .extension::<LinuxMountState>()
+        .map(|state| state.mount_id_old)
 }
 
 /// Returns the root location of the first live mount with this Linux device
@@ -330,9 +361,14 @@ fn register_live_superblock_tree(records: &[MountRecord]) -> VfsResult<()> {
     Ok(())
 }
 
-fn mount_extensions(flags: u32, metadata: MountMetadata) -> VfsResult<TypeMap> {
+fn mount_extensions(
+    flags: u32,
+    metadata: MountMetadata,
+    mount_id_old: u32,
+) -> VfsResult<TypeMap> {
     let mut extensions = TypeMap::new();
     let retired = extensions.try_insert(LinuxMountState {
+        mount_id_old,
         flags: AtomicU32::new(flags),
         activity_epoch: AtomicU64::new(0),
         readonly_floor: flags & MS_RDONLY != 0,
@@ -352,6 +388,7 @@ pub(crate) fn initialize_test_mount(mountpoint: &Arc<Mountpoint>, flags: u32) ->
             root: String::new(),
             data: String::new(),
         },
+        1,
     )?)
 }
 
@@ -363,7 +400,8 @@ pub fn initialize_root_mount(
     let dev = linux_device_id(mountpoint.device()).0;
     let record_metadata = metadata.try_clone()?;
     let target = try_string("/")?;
-    let extensions = mount_extensions(flags, metadata)?;
+    let mount_id_old = next_mountinfo_id()?;
+    let extensions = mount_extensions(flags, metadata, mount_id_old)?;
     let mut records = MOUNT_RECORDS.lock();
     if records
         .iter()
@@ -378,6 +416,7 @@ pub fn initialize_root_mount(
     mountpoint.initialize_extensions(extensions)?;
     records.push(MountRecord {
         mount_id: mountpoint.mount_id(),
+        mount_id_old,
         parent_id: 0,
         root: record_metadata.root,
         source: record_metadata.source,
@@ -389,6 +428,7 @@ pub fn initialize_root_mount(
         expire_epoch: None,
         mountpoint: Arc::downgrade(mountpoint),
     });
+    register_live_superblock_mount(mountpoint)?;
     Ok(())
 }
 
@@ -398,7 +438,10 @@ pub fn mount_with_flags(
     flags: u32,
     metadata: MountMetadata,
 ) -> VfsResult<Arc<Mountpoint>> {
-    target.mount_with_extensions(filesystem, mount_extensions(flags, metadata)?)
+    target.mount_with_extensions(
+        filesystem,
+        mount_extensions(flags, metadata, next_mountinfo_id()?)?,
+    )
 }
 
 pub fn new_detached_with_flags(
@@ -406,8 +449,10 @@ pub fn new_detached_with_flags(
     flags: u32,
     metadata: MountMetadata,
 ) -> VfsResult<Arc<Mountpoint>> {
-    let mountpoint =
-        Mountpoint::new_detached_with_extensions(filesystem, mount_extensions(flags, metadata)?)?;
+    let mountpoint = Mountpoint::new_detached_with_extensions(
+        filesystem,
+        mount_extensions(flags, metadata, next_mountinfo_id()?)?,
+    )?;
     register_live_superblock_mount(&mountpoint)?;
     Ok(mountpoint)
 }
@@ -586,6 +631,7 @@ pub fn attach_tree_and_record(root: &Arc<Mountpoint>, target: &Location) -> VfsR
         };
         committed.push(MountRecord {
             mount_id: mountpoint.mount_id(),
+            mount_id_old: state.mount_id_old,
             parent_id,
             root: metadata.root,
             source: metadata.source,
@@ -1309,6 +1355,7 @@ mod tests {
     fn record(mount_id: u64, parent_id: u64, target: &str) -> MountRecord {
         MountRecord {
             mount_id,
+            mount_id_old: mount_id as u32,
             parent_id,
             root: "/".to_string(),
             source: "none".to_string(),

@@ -1,5 +1,8 @@
-use alloc::{borrow::Cow, string::String, sync::Arc};
-use core::ffi::{c_char, c_void};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
+use core::{
+    ffi::{c_char, c_void},
+    mem::{offset_of, size_of},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
@@ -17,7 +20,9 @@ use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN, O_CLOEXEC,
     mount_attr,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul};
+use thekernel_linux_usercopy::{
+    UserMemory, UserMemoryContext, VmPtr, vm_load, vm_load_until_nul, vm_write_slice,
+};
 
 use crate::{
     file::{
@@ -147,6 +152,431 @@ const MOUNT_SETATTR_FLAGS: u32 =
     AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW;
 const MOUNT_ATTR_SIZE_VER0: usize = core::mem::size_of::<mount_attr>();
 const PAGE_SIZE: usize = 4096;
+
+const MNT_ID_REQ_SIZE_VER0: usize = 24;
+const MNT_ID_REQ_SIZE_VER1: usize = 32;
+const LISTMOUNT_REVERSE: u32 = 1;
+const LSMT_ROOT: u64 = u64::MAX;
+const CURRENT_MOUNT_NS_ID: u64 = 1;
+const STATMOUNT_SB_BASIC: u64 = 0x001;
+const STATMOUNT_MNT_BASIC: u64 = 0x002;
+const STATMOUNT_PROPAGATE_FROM: u64 = 0x004;
+const STATMOUNT_MNT_ROOT: u64 = 0x008;
+const STATMOUNT_MNT_POINT: u64 = 0x010;
+const STATMOUNT_FS_TYPE: u64 = 0x020;
+const STATMOUNT_MNT_NS_ID: u64 = 0x040;
+const STATMOUNT_MNT_OPTS: u64 = 0x080;
+const STATMOUNT_SUPPORTED: u64 = STATMOUNT_SB_BASIC
+    | STATMOUNT_MNT_BASIC
+    | STATMOUNT_PROPAGATE_FROM
+    | STATMOUNT_MNT_ROOT
+    | STATMOUNT_MNT_POINT
+    | STATMOUNT_FS_TYPE
+    | STATMOUNT_MNT_NS_ID
+    | STATMOUNT_MNT_OPTS;
+
+#[repr(C)]
+struct StatmountPrefix {
+    size: u32,
+    mnt_opts: u32,
+    mask: u64,
+    sb_dev_major: u32,
+    sb_dev_minor: u32,
+    sb_magic: u64,
+    sb_flags: u32,
+    fs_type: u32,
+    mnt_id: u64,
+    mnt_parent_id: u64,
+    mnt_id_old: u32,
+    mnt_parent_id_old: u32,
+    mnt_attr: u64,
+    mnt_propagation: u64,
+    mnt_peer_group: u64,
+    mnt_master: u64,
+    propagate_from: u64,
+    mnt_root: u32,
+    mnt_point: u32,
+    mnt_ns_id: u64,
+    fs_subtype: u32,
+    sb_source: u32,
+    opt_num: u32,
+    opt_array: u32,
+    opt_sec_num: u32,
+    opt_sec_array: u32,
+    supported_mask: u64,
+    mnt_uidmap_num: u32,
+    mnt_uidmap: u32,
+    mnt_gidmap_num: u32,
+    mnt_gidmap: u32,
+    spare: [u64; 43],
+}
+
+const STATMOUNT_PREFIX_SIZE: usize = size_of::<StatmountPrefix>();
+const _: () = assert!(STATMOUNT_PREFIX_SIZE == 480);
+
+#[derive(Default)]
+struct MntIdReq {
+    spare: u32,
+    mnt_id: u64,
+    param: u64,
+    ns_id: u64,
+}
+
+fn read_mnt_id_req<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    req: *const u8,
+) -> AxResult<MntIdReq> {
+    let size = VmPtr::vm_read(req.cast::<u32>(), memory).map_err(map_usercopy_error)? as usize;
+    if size < MNT_ID_REQ_SIZE_VER0 {
+        return Err(LinuxError::EINVAL.into());
+    }
+    if size > PAGE_SIZE {
+        return Err(LinuxError::E2BIG.into());
+    }
+    let copy_size = size.min(MNT_ID_REQ_SIZE_VER1);
+    let src = vm_load(memory, req, copy_size).map_err(map_usercopy_error)?;
+    let mut bytes = [0u8; MNT_ID_REQ_SIZE_VER1];
+    bytes[..copy_size].copy_from_slice(&src);
+    if size > MNT_ID_REQ_SIZE_VER1 {
+        let extra = vm_load(
+            memory,
+            req.wrapping_add(MNT_ID_REQ_SIZE_VER1),
+            size - MNT_ID_REQ_SIZE_VER1,
+        )
+        .map_err(map_usercopy_error)?;
+        if extra.iter().any(|byte| *byte != 0) {
+            return Err(LinuxError::E2BIG.into());
+        }
+    }
+    Ok(MntIdReq {
+        spare: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+        mnt_id: u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+        param: u64::from_ne_bytes(bytes[16..24].try_into().unwrap()),
+        ns_id: u64::from_ne_bytes(bytes[24..32].try_into().unwrap()),
+    })
+}
+
+fn validate_current_mount_namespace(req: &MntIdReq) -> AxResult<()> {
+    // v0 reserves this field. v1 adds the namespace ID selector; TheKernel
+    // has a single namespace, so zero/current select it and another ID is not
+    // found.
+    if req.spare != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if req.ns_id != 0 && req.ns_id != CURRENT_MOUNT_NS_ID {
+        return Err(AxError::NotFound);
+    }
+    Ok(())
+}
+
+fn validate_unique_mount_id(mount_id: u64) -> AxResult<()> {
+    if mount_id <= (1u64 << 31) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn append_statmount_string(bytes: &mut Vec<u8>, value: &str) -> AxResult<u32> {
+    let offset = u32::try_from(bytes.len() - STATMOUNT_PREFIX_SIZE)
+        .map_err(|_| AxError::from(LinuxError::EOVERFLOW))?;
+    bytes
+        .try_reserve(value.len() + 1)
+        .map_err(|_| AxError::NoMemory)?;
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(0);
+    Ok(offset)
+}
+
+fn put_statmount<T: bytemuck::NoUninit>(bytes: &mut [u8], offset: usize, value: T) {
+    bytes[offset..offset + size_of::<T>()].copy_from_slice(bytemuck::bytes_of(&value));
+}
+
+fn mount_options(flags: u32, data: &str) -> AxResult<String> {
+    let mut options = try_string(if flags & MS_RDONLY != 0 { "ro" } else { "rw" })?;
+    for (flag, name) in [
+        (MS_NOSUID, "nosuid"),
+        (MS_NODEV, "nodev"),
+        (MS_NOEXEC, "noexec"),
+    ] {
+        if flags & flag != 0 {
+            options
+                .try_reserve(name.len() + 1)
+                .map_err(|_| AxError::NoMemory)?;
+            options.push(',');
+            options.push_str(name);
+        }
+    }
+    if !data.is_empty() {
+        options
+            .try_reserve(data.len() + 1)
+            .map_err(|_| AxError::NoMemory)?;
+        options.push(',');
+        options.push_str(data);
+    }
+    Ok(options)
+}
+
+fn statmount_attr(flags: u32) -> u64 {
+    let mut attrs = 0u64;
+    for (mount_flag, attr) in [
+        (MS_RDONLY, MOUNT_ATTR_RDONLY),
+        (MS_NOSUID, MOUNT_ATTR_NOSUID),
+        (MS_NODEV, MOUNT_ATTR_NODEV),
+        (MS_NOEXEC, MOUNT_ATTR_NOEXEC),
+        (MS_NOATIME, MOUNT_ATTR_NOATIME),
+        (MS_STRICTATIME, MOUNT_ATTR_STRICTATIME),
+        (MS_NODIRATIME, MOUNT_ATTR_NODIRATIME),
+        (MS_NOSYMFOLLOW, MOUNT_ATTR_NOSYMFOLLOW),
+    ] {
+        if flags & mount_flag != 0 {
+            attrs |= attr as u64;
+        }
+    }
+    attrs
+}
+
+pub fn sys_statmount<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    req: *const u8,
+    buf: *mut u8,
+    bufsize: usize,
+    flags: u32,
+) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let req = read_mnt_id_req(memory, req)?;
+    validate_current_mount_namespace(&req)?;
+    validate_unique_mount_id(req.mnt_id)?;
+    let records = mounts::snapshot()?;
+    let record = records
+        .iter()
+        .find(|record| record.mount_id == req.mnt_id)
+        .ok_or(AxError::NotFound)?;
+    let requested = req.param;
+    let mask = requested & STATMOUNT_SUPPORTED;
+    let mut output = Vec::new();
+    output
+        .try_reserve(STATMOUNT_PREFIX_SIZE)
+        .map_err(|_| AxError::NoMemory)?;
+    output.resize(STATMOUNT_PREFIX_SIZE, 0);
+    let dev = DeviceId(record.dev);
+    put_statmount(&mut output, offset_of!(StatmountPrefix, mask), mask);
+    if mask & STATMOUNT_SB_BASIC != 0 {
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, sb_dev_major),
+            dev.major(),
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, sb_dev_minor),
+            dev.minor(),
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, sb_magic),
+            mounts::statmount_sb_magic(record)?,
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, sb_flags),
+            record.flags & MS_RDONLY,
+        );
+    }
+    if mask & STATMOUNT_MNT_BASIC != 0 {
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_id),
+            record.mount_id,
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_parent_id),
+            if record.parent_id == 0 {
+                record.mount_id
+            } else {
+                record.parent_id
+            },
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_id_old),
+            record.mount_id_old,
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_parent_id_old),
+            if record.parent_id == 0 {
+                record.mount_id_old
+            } else {
+                records.iter().find(|parent| parent.mount_id == record.parent_id).ok_or(AxError::Io)?.mount_id_old
+            },
+        );
+    }
+    if mask & STATMOUNT_PROPAGATE_FROM != 0 {
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, propagate_from),
+            0u64,
+        );
+    }
+    if mask & STATMOUNT_MNT_NS_ID != 0 {
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_ns_id),
+            CURRENT_MOUNT_NS_ID,
+        );
+    }
+    if mask & STATMOUNT_MNT_BASIC != 0 {
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_attr),
+            statmount_attr(record.flags),
+        );
+        put_statmount(
+            &mut output,
+            offset_of!(StatmountPrefix, mnt_propagation),
+            MS_PRIVATE as u64,
+        );
+    }
+    if mask & STATMOUNT_MNT_OPTS != 0 {
+        let offset =
+            append_statmount_string(&mut output, &mount_options(record.flags, &record.data)?)?;
+        put_statmount(&mut output, offset_of!(StatmountPrefix, mnt_opts), offset);
+    }
+    for (bit, field, value) in [
+        (
+            STATMOUNT_MNT_ROOT,
+            offset_of!(StatmountPrefix, mnt_root),
+            record.root.as_str(),
+        ),
+        (
+            STATMOUNT_MNT_POINT,
+            offset_of!(StatmountPrefix, mnt_point),
+            record.target.as_str(),
+        ),
+        (
+            STATMOUNT_FS_TYPE,
+            offset_of!(StatmountPrefix, fs_type),
+            record.fs_type.as_str(),
+        ),
+    ] {
+        if mask & bit != 0 {
+            let offset = append_statmount_string(&mut output, value)?;
+            put_statmount(&mut output, field, offset);
+        }
+    }
+    let size = u32::try_from(output.len()).map_err(|_| AxError::from(LinuxError::EOVERFLOW))?;
+    put_statmount(&mut output, offset_of!(StatmountPrefix, size), size);
+    let has_strings = output.len() > STATMOUNT_PREFIX_SIZE;
+    // String offsets must never be published until their complete variable
+    // tail fits. A fixed-only response, however, follows Linux's short-prefix
+    // rule and may be copied partially.
+    if !has_strings && bufsize < STATMOUNT_PREFIX_SIZE {
+        put_statmount(&mut output, offset_of!(StatmountPrefix, size), bufsize as u32);
+        vm_write_slice(memory, buf, &output[..bufsize]).map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+    if bufsize < output.len() {
+        return Err(LinuxError::EOVERFLOW.into());
+    }
+    vm_write_slice(memory, buf, &output).map_err(map_usercopy_error)?;
+    Ok(0)
+}
+
+pub fn sys_listmount<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    req: *const u8,
+    ids: *mut u64,
+    nr_ids: usize,
+    flags: u32,
+) -> AxResult<isize> {
+    if flags & !LISTMOUNT_REVERSE != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let req = read_mnt_id_req(memory, req)?;
+    validate_current_mount_namespace(&req)?;
+    if nr_ids > 1_000_000 {
+        return Err(LinuxError::EOVERFLOW.into());
+    }
+    let bytes = nr_ids.checked_mul(size_of::<u64>()).ok_or(LinuxError::EOVERFLOW)?;
+    memory
+        .validate_write_range(ids as usize, bytes)
+        .map_err(map_usercopy_error)?;
+    if nr_ids == 0 {
+        return Ok(0);
+    }
+    let records = mounts::snapshot()?;
+    let root_id = if req.mnt_id == LSMT_ROOT {
+        records
+            .iter()
+            .find(|record| record.parent_id == 0)
+            .map(|record| record.mount_id)
+    } else {
+        Some(req.mnt_id)
+    }
+    .ok_or(AxError::NotFound)?;
+    if req.mnt_id != LSMT_ROOT {
+        validate_unique_mount_id(req.mnt_id)?;
+    }
+    if !records.iter().any(|record| record.mount_id == root_id) {
+        return Err(AxError::NotFound);
+    }
+    let mut selected = Vec::new();
+    selected
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    pending.push(root_id);
+    while let Some(parent) = pending.pop() {
+        if req.mnt_id == LSMT_ROOT || parent != root_id {
+            selected.push(parent);
+        }
+        for record in records.iter().filter(|record| record.parent_id == parent) {
+            pending.push(record.mount_id);
+        }
+    }
+    selected.sort_unstable();
+    if flags & LISTMOUNT_REVERSE != 0 {
+        selected.reverse();
+    }
+    let start = req.param;
+    selected.retain(|id| {
+        if flags & LISTMOUNT_REVERSE != 0 {
+            start == 0 || *id < start
+        } else {
+            *id > start
+        }
+    });
+    selected.truncate(nr_ids);
+    vm_write_slice(memory, ids, &selected).map_err(map_usercopy_error)?;
+    Ok(selected.len() as isize)
+}
+
+#[cfg(test)]
+mod statmount_tests {
+    use super::*;
+
+    #[test]
+    fn linux_612_mask_stops_at_mount_options() {
+        assert_eq!(STATMOUNT_SUPPORTED, 0xff);
+    }
+
+    #[test]
+    fn unique_mount_id_floor_is_not_a_lookup_miss() {
+        assert!(validate_unique_mount_id(1u64 << 31).is_err());
+        assert!(validate_unique_mount_id((1u64 << 31) + 1).is_ok());
+    }
+
+    #[test]
+    fn mount_options_preserve_mount_policy() {
+        assert_eq!(mount_options(MS_RDONLY | MS_NOSUID | MS_NODEV, "").unwrap(), "ro,nosuid,nodev");
+    }
+}
 
 fn load_user_string<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
