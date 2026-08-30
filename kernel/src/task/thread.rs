@@ -5,7 +5,9 @@ use alloc::{
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{
+        AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    },
 };
 
 use axerrno::{AxError, AxResult};
@@ -13,7 +15,7 @@ use axfs::FsContext;
 use axpoll::PollSet;
 use axsync::Mutex;
 use axsync::spin::SpinNoIrq;
-use axtask::{SchedClass, TaskExt, TaskInner, current_may_uninit, sched_state};
+use axtask::{SchedClass, SwitchReason, TaskExt, TaskInner, current_may_uninit, sched_state};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use thekernel_linux_process_adapter::Pid;
@@ -872,6 +874,19 @@ pub struct Thread {
     /// Best-effort CPU usage snapshot that can be sampled without touching
     /// the live time manager.
     live_usage: AtomicTaskUsage,
+    /// Linux task-local resource counters.  Bytes are retained for I/O so
+    /// several sub-block operations are rounded only once at snapshot time,
+    /// matching task_io_account_*'s 512-byte units.
+    minor_faults: AtomicU64,
+    major_faults: AtomicU64,
+    io_read_bytes: AtomicU64,
+    io_write_bytes: AtomicU64,
+    voluntary_switches: AtomicU64,
+    involuntary_switches: AtomicU64,
+    /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
+    /// The scheduler Exit callback consumes this marker so `nvcsw` is
+    /// published exactly once before the frozen usage snapshot is queued.
+    exit_switch_preaccounted: AtomicBool,
     /// Best-effort user-visible blocking state used by procfs.
     proc_state_hint: AtomicU8,
 
@@ -1001,6 +1016,13 @@ impl Thread {
             robust_list_head: AtomicUsize::new(0),
             time: AssumeSync(RefCell::new(time)),
             live_usage: AtomicTaskUsage::new(),
+            minor_faults: AtomicU64::new(0),
+            major_faults: AtomicU64::new(0),
+            io_read_bytes: AtomicU64::new(0),
+            io_write_bytes: AtomicU64::new(0),
+            voluntary_switches: AtomicU64::new(0),
+            involuntary_switches: AtomicU64::new(0),
+            exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             sched_reset_on_fork: AtomicBool::new(false),
             io_context: SpinNoIrq::new(io_context),
@@ -1393,12 +1415,78 @@ impl Thread {
 
     /// Returns the last published CPU usage snapshot for this thread.
     pub fn usage_snapshot(&self) -> TaskUsage {
-        self.live_usage.snapshot()
+        let mut usage = self.live_usage.snapshot();
+        usage.minflt = self.minor_faults.load(Ordering::Acquire);
+        usage.majflt = self.major_faults.load(Ordering::Acquire);
+        usage.inblock = self.io_read_bytes.load(Ordering::Acquire) >> 9;
+        usage.oublock = self.io_write_bytes.load(Ordering::Acquire) >> 9;
+        usage.nvcsw = self.voluntary_switches.load(Ordering::Acquire);
+        usage.nivcsw = self.involuntary_switches.load(Ordering::Acquire);
+        usage
     }
 
     /// Publishes a CPU usage snapshot for lock-free readers such as procfs.
     pub fn store_usage_snapshot(&self, usage: TaskUsage) {
         self.live_usage.store(usage);
+    }
+
+    /// Accounts one successfully handled minor page fault.
+    pub(crate) fn account_minor_fault(&self) {
+        self.minor_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accounts one successfully handled major page fault.
+    pub(crate) fn account_major_fault(&self) {
+        self.major_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accounts bytes transferred by a real backing read, before conversion
+    /// to Linux's 512-byte block units.
+    pub(crate) fn account_backing_read(&self, bytes: usize) {
+        self.io_read_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Returns the completed backing-read total used to classify the page
+    /// fault that just ran.  A major fault is only possible when this value
+    /// increases during the backend population transaction.
+    pub(crate) fn backing_read_bytes(&self) -> u64 {
+        self.io_read_bytes.load(Ordering::Acquire)
+    }
+
+    /// Accounts a successfully populated page after backend I/O has finished.
+    /// Cache hits, tmpfs, and anonymous/COW population therefore remain minor.
+    pub(crate) fn account_resolved_page_fault(&self, read_before: u64) {
+        if self.backing_read_bytes() > read_before {
+            self.account_major_fault();
+        } else {
+            self.account_minor_fault();
+        }
+    }
+
+    /// Accounts bytes transferred by a real backing write.
+    pub(crate) fn account_backing_write(&self, bytes: usize) {
+        self.io_write_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Accounts a context switch at the scheduler's switch-out edge.
+    pub(crate) fn account_context_switch(&self, voluntary: bool) {
+        let counter = if voluntary {
+            &self.voluntary_switches
+        } else {
+            &self.involuntary_switches
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accounts the final voluntary switch before freezing an exiting task's
+    /// usage.  `TaskExt::on_leave(SwitchReason::Exit)` consumes the marker
+    /// instead of incrementing the same counter again.
+    pub(crate) fn preaccount_exit_context_switch(&self) {
+        let was_set = self.exit_switch_preaccounted.swap(true, Ordering::AcqRel);
+        debug_assert!(!was_set, "exit context switch was pre-accounted twice");
+        self.account_context_switch(true);
     }
 
     /// Returns the current procfs state hint.
@@ -1530,12 +1618,17 @@ impl TaskExt for Box<Thread> {
         self.resume_cpu_accounting_after_switch();
     }
 
-    fn on_leave(&self, task: &TaskInner) {
+    fn on_leave(&self, task: &TaskInner, reason: SwitchReason) {
         let _ = task;
         // Every scheduler leave is a preemption observation.  The final
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
         let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::PREEMPT);
+        let exit_was_preaccounted =
+            reason == SwitchReason::Exit && self.exit_switch_preaccounted.swap(false, Ordering::AcqRel);
+        if reason.counts_as_context_switch() && !exit_was_preaccounted {
+            self.account_context_switch(!reason.is_involuntary());
+        }
         self.pause_cpu_accounting_for_switch();
         ActiveScope::set_global();
         self.release_active_scope_read();

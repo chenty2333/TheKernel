@@ -58,7 +58,7 @@ axalloc.workspace = true
 axconfig.workspace = true
 axdisplay.workspace = true
 axdriver.workspace = true
-axfs.workspace = true
+axfs = { workspace = true, features = ["task-io-accounting"] }
 axhal.workspace = true
 axinput = { workspace = true, optional = true }
 axlog.workspace = true
@@ -91,6 +91,7 @@ bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
 bytemuck = { version = "1.23", features = ["unsound_ptr_pod_impl", "derive"] }
 cfg-if = "1.0"
+crate_interface = "0.1"
 chrono = { version = "0.4", default-features = false }
 chacha20 = { version = "0.9.1", default-features = false }
 downcast-rs = { version = "2.0", default-features = false, features = ["sync"] }

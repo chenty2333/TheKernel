@@ -1,3 +1,26 @@
+use crate::task::AsThread;
+
+struct TaskIoAccountingIf;
+
+#[crate_interface::impl_interface]
+impl axfs::TaskIoAccounting for TaskIoAccountingIf {
+    fn account_read(bytes: usize) {
+        if let Some(task) = axtask::current_may_uninit()
+            && let Some(thread) = task.try_as_thread()
+        {
+            thread.account_backing_read(bytes);
+        }
+    }
+
+    fn account_write(bytes: usize) {
+        if let Some(task) = axtask::current_may_uninit()
+            && let Some(thread) = task.try_as_thread()
+        {
+            thread.account_backing_write(bytes);
+        }
+    }
+}
+
 pub(crate) mod af_alg;
 #[cfg(feature = "bpf")]
 pub mod bpf;

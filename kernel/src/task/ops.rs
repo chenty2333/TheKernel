@@ -1628,6 +1628,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         exit_robust_list(&exit_memory, head);
     }
 
+    // The axtask Exit edge is the real TASK_DEAD schedule switch.  It runs
+    // after this teardown returns, so pre-account its voluntary switch before
+    // freezing the usage ledger; the scheduler callback consumes the marker
+    // and does not double-count it.
+    thr.preaccount_exit_context_switch();
     thr.proc_data
         .account_exited_thread(TaskUsage::from_thread(thr));
     thr.proc_data.end_usage_transition();
@@ -1639,6 +1644,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         // CLONE_VM can share this mm with a different live process, so only do
         // this when the exiting process is the sole ProcessData owner. The VMA
         // metadata and file mappings are still released by AddrSpace drop.
+        // Sample first: discarding private pages below must not erase the
+        // process high-water mark that Linux retains in its signal struct.
+        let _ = thr.proc_data.sample_maxrss_kb();
         let aspace = thr.proc_data.aspace();
         if Arc::strong_count(&aspace) == 2 {
             aspace.lock().discard_private_anonymous_pages();

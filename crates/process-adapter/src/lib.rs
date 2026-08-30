@@ -18,7 +18,7 @@ extern crate std;
 use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 
-/// Durable CPU usage totals for a process subtree.
+/// Durable resource-usage totals for a process subtree.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct ProcessUsage {
     /// User CPU time in nanoseconds.
@@ -27,6 +27,18 @@ pub struct ProcessUsage {
     pub stime_ns: u64,
     /// Maximum resident set size in kilobytes.
     pub maxrss_kb: u64,
+    /// Minor page faults.
+    pub minflt: u64,
+    /// Major page faults.
+    pub majflt: u64,
+    /// 512-byte input blocks.
+    pub inblock: u64,
+    /// 512-byte output blocks.
+    pub oublock: u64,
+    /// Voluntary context switches.
+    pub nvcsw: u64,
+    /// Involuntary context switches.
+    pub nivcsw: u64,
 }
 
 impl ProcessUsage {
@@ -36,6 +48,12 @@ impl ProcessUsage {
             utime_ns,
             stime_ns,
             maxrss_kb: 0,
+            minflt: 0,
+            majflt: 0,
+            inblock: 0,
+            oublock: 0,
+            nvcsw: 0,
+            nivcsw: 0,
         }
     }
 
@@ -45,6 +63,12 @@ impl ProcessUsage {
             utime_ns,
             stime_ns,
             maxrss_kb,
+            minflt: 0,
+            majflt: 0,
+            inblock: 0,
+            oublock: 0,
+            nvcsw: 0,
+            nivcsw: 0,
         }
     }
 
@@ -55,6 +79,12 @@ impl ProcessUsage {
             utime_ns: self.utime_ns.saturating_add(other.utime_ns),
             stime_ns: self.stime_ns.saturating_add(other.stime_ns),
             maxrss_kb: self.maxrss_kb.max(other.maxrss_kb),
+            minflt: self.minflt.saturating_add(other.minflt),
+            majflt: self.majflt.saturating_add(other.majflt),
+            inblock: self.inblock.saturating_add(other.inblock),
+            oublock: self.oublock.saturating_add(other.oublock),
+            nvcsw: self.nvcsw.saturating_add(other.nvcsw),
+            nivcsw: self.nivcsw.saturating_add(other.nivcsw),
         }
     }
 }

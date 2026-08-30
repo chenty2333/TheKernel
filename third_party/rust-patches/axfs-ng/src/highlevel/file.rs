@@ -2262,6 +2262,7 @@ unsafe fn read_file_into_pinned_bounce(
             Err(_) if total != 0 => break,
             Err(error) => return Err(error),
         };
+        crate::account_backing_read(read);
         if read == 0 {
             break;
         }
@@ -2294,6 +2295,7 @@ unsafe fn write_file_from_pinned_bounce(
             Err(_) if total != 0 => break,
             Err(error) => return Err(error),
         };
+        crate::account_backing_write(written);
         if written == 0 {
             break;
         }
@@ -2622,7 +2624,9 @@ fn writeback_cached_page_data(file: &FileNode, pn: u32, page: &mut PageCache) ->
     if len == 0 {
         return Ok(0);
     }
-    match file.write_at(&page.data()[..len], page_start)? {
+    let written = file.write_at(&page.data()[..len], page_start)?;
+    crate::account_backing_write(written);
+    match written {
         written if written == len => Ok(written),
         _ => Err(VfsError::Io),
     }
@@ -3066,6 +3070,9 @@ fn flush_dirty_page_list_locked(
                             }
                             Err(error) => Err(error),
                         };
+                    if let Ok(written) = write_result.as_ref() {
+                        crate::account_backing_write(*written);
+                    }
                     match write_result {
                         Ok(written) if written == run.bytes => {
                             record_dirty_writeback(range_flush, run.pages.len(), run.bytes, true);
@@ -3129,7 +3136,11 @@ fn flush_dirty_page_list_locked(
 
         let segments = build_dirty_writeback_segments(&run);
         let slices = segments.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        match file.write_at_vectored(&slices, run.page_start) {
+        let write_result = file.write_at_vectored(&slices, run.page_start);
+        if let Ok(written) = write_result.as_ref() {
+            crate::account_backing_write(*written);
+        }
+        match write_result {
             Ok(written) if written == run.bytes => {
                 record_dirty_writeback(range_flush, run.pages.len(), run.bytes, async_enabled);
                 clear_flushed_dirty_run(shared, &run);
@@ -4780,6 +4791,7 @@ impl CachedFile {
                     Err(error) => return Err(error),
                 },
             };
+            crate::account_backing_read(read);
             if read == 0 {
                 break;
             }
@@ -4841,6 +4853,7 @@ impl CachedFile {
             Some(read) => read,
             None => file.read_at(dst, offset)?,
         };
+        crate::account_backing_read(read);
         if read > 0 {
             record_cached_file_counter(&READ_BYPASS_HITS, 1);
             record_cached_file_counter(&READ_BYPASS_BYTES, read as u64);
@@ -4884,6 +4897,7 @@ impl CachedFile {
             Some(read) => read,
             None => file.read_at_vectored(dst, offset)?,
         };
+        crate::account_backing_read(read);
         if read > 0 {
             record_cached_file_counter(&READ_BYPASS_HITS, 1);
             record_cached_file_counter(&READ_BYPASS_BYTES, read as u64);
@@ -4992,6 +5006,7 @@ impl CachedFile {
                 Err(_) if total != 0 => break,
                 Err(error) => return Err(error),
             };
+            crate::account_backing_write(written);
             if written == 0 {
                 break;
             }
@@ -5033,6 +5048,7 @@ impl CachedFile {
         self.invalidate_cached_range(file, pages.clone(), &mutation)?;
 
         let written = file.write_at(src, offset)?;
+        crate::account_backing_write(written);
 
         self.invalidate_cached_range(file, pages, &mutation)?;
         if written > 0 {
@@ -5076,6 +5092,7 @@ impl CachedFile {
             AsyncVectoredWriteOutcome::NotSubmitted => file.write_at_vectored(src, offset)?,
             AsyncVectoredWriteOutcome::CompletionError(error) => return Err(error),
         };
+        crate::account_backing_write(written);
 
         self.invalidate_cached_range(file, pages, &mutation)?;
         if written > 0 {
@@ -5169,7 +5186,10 @@ impl CachedFile {
         let mut replacement = PageCache::new(self.shared.in_memory)?;
         replacement.data().fill(0);
         let offset = u64::from(pn) * PAGE_SIZE as u64;
-        file.read_at(replacement.data(), offset)?;
+        let read = file.read_at(replacement.data(), offset)?;
+        if !self.shared.in_memory {
+            crate::account_backing_read(read);
+        }
 
         let listeners = evict_listeners_snapshot(&self.shared)?;
         let Some((evicted_pn, mut evicted_page)) = pop_unpinned_lru_page(cache)? else {
@@ -5274,6 +5294,9 @@ impl CachedFile {
         if !async_page_fill {
             let mut buf = vec![0u8; ra * PAGE_SIZE];
             let read = file.read_at(&mut buf, base)?;
+            if !self.shared.in_memory {
+                crate::account_backing_read(read);
+            }
 
             let mut page = PageCache::new(self.shared.in_memory)?;
             let data = page.data();
@@ -5340,6 +5363,9 @@ impl CachedFile {
                 None => file.read_at_vectored(&mut bufs, base)?,
             }
         };
+        if !self.shared.in_memory {
+            crate::account_backing_read(read);
+        }
 
         #[cfg(feature = "ext4")]
         let mut async_filled_pages = 0usize;
@@ -6216,6 +6242,7 @@ impl FileBackend {
                         Err(_) if total != 0 => break,
                         Err(error) => return Err(error),
                     };
+                    crate::account_backing_read(read);
                     if read == 0 {
                         break;
                     }
@@ -6247,10 +6274,12 @@ impl FileBackend {
                     let mut bufs = [&mut *dst];
                     file.try_read_at_vectored_async(&mut bufs, offset)?
                 };
-                match async_read {
-                    Some(read) => Ok(read),
-                    None => file.read_at(dst, offset),
-                }
+                let read = match async_read {
+                    Some(read) => read,
+                    None => file.read_at(dst, offset)?,
+                };
+                crate::account_backing_read(read);
+                Ok(read)
             }),
         }
     }
@@ -6258,11 +6287,13 @@ impl FileBackend {
     pub fn read_at_vectored(&self, dst: &mut [&mut [u8]], offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at_vectored(dst, offset),
-            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| match file
-                .try_read_at_vectored_async(dst, offset)?
-            {
-                Some(read) => Ok(read),
-                None => file.read_at_vectored(dst, offset),
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
+                let read = match file.try_read_at_vectored_async(dst, offset)? {
+                    Some(read) => read,
+                    None => file.read_at_vectored(dst, offset)?,
+                };
+                crate::account_backing_read(read);
+                Ok(read)
             }),
         }
     }
@@ -6379,6 +6410,7 @@ impl FileBackend {
             if bytes == 0 || bytes > total {
                 return Err(VfsError::Io);
             }
+            crate::account_backing_read(bytes);
         }
         Ok(result)
     }
@@ -6445,6 +6477,7 @@ impl FileBackend {
                         Err(_) if total != 0 => break,
                         Err(error) => return Err(error),
                     };
+                    crate::account_backing_write(written);
                     if written == 0 {
                         break;
                     }
@@ -6463,9 +6496,11 @@ impl FileBackend {
     pub fn write_at_slice(&self, src: &[u8], offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.write_at_slice(src, offset),
-            Self::Direct(loc) => {
-                with_cache_invalidating_file_operation(loc, |_, file| file.write_at(src, offset))
-            }
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
+                let written = file.write_at(src, offset)?;
+                crate::account_backing_write(written);
+                Ok(written)
+            }),
         }
     }
 
@@ -6480,6 +6515,7 @@ impl FileBackend {
                     }
                     AsyncVectoredWriteOutcome::CompletionError(error) => return Err(error),
                 };
+                crate::account_backing_write(written);
                 Ok(written)
             }),
         }
@@ -6520,6 +6556,7 @@ impl FileBackend {
             if bytes != total {
                 return Err(VfsError::Io);
             }
+            crate::account_backing_write(bytes);
         }
         Ok(result)
     }

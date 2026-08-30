@@ -31,6 +31,7 @@ fat = ["dep:fatfs"]
 std = ["lwext4_rust?/std"]
 test-io-control = []
 test-ramdisk = ["axdriver/ramdisk"]
+task-io-accounting = ["dep:crate_interface"]
 times = []
 
 [lib]
@@ -76,6 +77,10 @@ version = "2.10"
 
 [dependencies.cfg-if]
 version = "1.0"
+
+[dependencies.crate_interface]
+version = "0.1"
+optional = true
 
 [dependencies.chrono]
 version = "0.4"

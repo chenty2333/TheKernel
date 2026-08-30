@@ -38,6 +38,7 @@ use super::{
     asid::{AddressSpaceToken, HardwareAddressSpaceId, reserve_hardware_address_space_id},
     checked_align_up_4k,
 };
+use crate::task::AsThread;
 
 mod backend;
 mod mapping;
@@ -49,6 +50,15 @@ pub(crate) use self::mapping::{FileLikeMappingLease, FileMappingLease, FileMappi
 pub enum PageFaultResult {
     Handled,
     Failed(PageFaultFailure),
+}
+
+/// Linux rusage classification for one successful missing-page resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageFaultKind {
+    /// No backing-device read was needed.
+    Minor,
+    /// The backing file had to supply page contents.
+    Major,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1016,6 +1026,12 @@ pub struct AddrSpace {
     va_range: VirtAddrRange,
     address_space_id: AddressSpaceId,
     hardware_asid: HardwareAddressSpaceId,
+    /// Historical peak of resident user pages for this memory image.
+    ///
+    /// The mark belongs to the mm rather than a particular task: CLONE_VM
+    /// owners and remote memory operations all observe the same Linux
+    /// process-wide high-water mark.
+    maxrss_kb: AtomicU64,
     /// Monotonic PTE invalidation generation and bounded per-CPU residency.
     /// The state is shared with scheduler hooks so they can publish residency
     /// without taking the address-space mutex.
@@ -1466,6 +1482,7 @@ impl AddrSpace {
             va_range,
             address_space_id,
             hardware_asid,
+            maxrss_kb: AtomicU64::new(0),
             tlb: Arc::try_new(TlbState::new()).map_err(|_| AxError::NoMemory)?,
             topology_mapping_id,
             topology_generation,
@@ -2599,6 +2616,33 @@ impl AddrSpace {
             .sum()
     }
 
+    /// Merges an already-observed peak into this mm's high-water mark.
+    ///
+    /// Exec uses this to preserve the process lifetime mark while replacing
+    /// the address space; fork uses the same operation for the child's
+    /// inherited initial peak.
+    pub(crate) fn merge_resident_highwater(&self, resident_kb: u64) -> u64 {
+        let mut current = self.maxrss_kb.load(Ordering::Acquire);
+        while resident_kb > current {
+            match self.maxrss_kb.compare_exchange_weak(
+                current,
+                resident_kb,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return resident_kb,
+                Err(observed) => current = observed,
+            }
+        }
+        current
+    }
+
+    /// Publishes the current resident set before a mutation can remove PTEs.
+    /// The caller already owns the address-space lock.
+    fn publish_resident_highwater(&self) {
+        self.merge_resident_highwater(self.resident_user_bytes() as u64 / 1024);
+    }
+
     pub fn lock_current_mappings(&mut self) {
         let ranges: Vec<_> = self
             .areas
@@ -3078,20 +3122,24 @@ impl AddrSpace {
     }
 
     fn unmap_areas_with_tlb_grace(&mut self, start: VirtAddr, size: usize) -> MappingResult {
+        self.publish_resident_highwater();
         let retirement =
             self.areas
                 .unmap_deferred_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
         let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
+        self.publish_resident_highwater();
         Ok(())
     }
 
     fn clear_areas_with_tlb_grace(&mut self) -> MappingResult {
+        self.publish_resident_highwater();
         let retirement = self.areas.clear_deferred(&mut self.pt)?;
         let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
+        self.publish_resident_highwater();
         Ok(())
     }
 
@@ -3686,6 +3734,9 @@ impl AddrSpace {
             // A backend may have published a valid executable prefix before a
             // later page fails, so synchronize before propagating the error.
             synchronize_executable_publication(area_flags);
+            // Publish even on a partial-population error: the valid prefix is
+            // still a real resident peak and may be rolled back immediately.
+            self.publish_resident_highwater();
             result?;
             start = area_end;
             if !start.is_aligned_4k() {
@@ -3707,6 +3758,7 @@ impl AddrSpace {
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
+        self.publish_resident_highwater();
         let next_generation = self.next_topology_generation()?;
         // Backend discard can make partial progress before reporting a later
         // hole or backend error. Advance the legacy address-space admission
@@ -3749,6 +3801,7 @@ impl AddrSpace {
         let grace = self.synchronize_tlb_after_mutation();
         drop(retired);
         drop(grace);
+        self.publish_resident_highwater();
         result
     }
 
@@ -4224,6 +4277,33 @@ impl AddrSpace {
         false
     }
 
+    /// Checks whether this trap still names a real missing/unsatisfied leaf.
+    /// The eventual minor/major classification is deliberately deferred until
+    /// backend population completes, when the task's backing-read counter can
+    /// prove that storage I/O actually occurred.
+    pub(crate) fn fault_needs_accounting(
+        &self,
+        vaddr: VirtAddr,
+        access_flags: PageFaultFlags,
+    ) -> bool {
+        let Some(area) = self.areas.find(vaddr) else {
+            return false;
+        };
+        if !area.flags().contains(access_flags) {
+            return false;
+        }
+        match self.pt.query(vaddr.align_down(PAGE_SIZE_4K)) {
+            Ok((_paddr, page_flags, _page_size)) => {
+                if present_leaf_satisfies_fault(page_flags, access_flags) {
+                    return false;
+                }
+                true
+            }
+            Err(PagingError::NotMapped) => true,
+            Err(_) => false,
+        }
+    }
+
     /// Handles a page fault at the given address.
     ///
     /// `access_flags` indicates the access type that caused the page fault.
@@ -4294,6 +4374,7 @@ impl AddrSpace {
                 // Synchronize even on error: a multi-page populate may have
                 // installed a valid executable prefix before the failure.
                 synchronize_executable_publication(flags);
+                self.publish_resident_highwater();
                 match populate_result {
                     Ok(n) => {
                         if n == 0 {
@@ -4317,10 +4398,22 @@ impl AddrSpace {
         if self.blocks_kernel_usercopy_missing(vaddr) {
             return false;
         }
-        matches!(
+        let fault_candidate = self.fault_needs_accounting(vaddr, access_flags);
+        let read_before = axtask::current()
+            .try_as_thread()
+            .map(|thread| thread.backing_read_bytes());
+        let handled = matches!(
             self.handle_page_fault_result(vaddr, access_flags, None),
             PageFaultResult::Handled
-        )
+        );
+        if handled && fault_candidate {
+            if let (Some(thread), Some(read_before)) =
+                (axtask::current().try_as_thread(), read_before)
+            {
+                thread.account_resolved_page_fault(read_before);
+            }
+        }
+        handled
     }
 
     /// Attempts to clone the current address space into a new one.
@@ -4481,6 +4574,9 @@ impl AddrSpace {
             }
         }
         guard.refresh_growdown_starts();
+        // A forked mm starts with the child's currently resident pages as its
+        // initial peak; unlike CLONE_VM this is a distinct address space.
+        guard.publish_resident_highwater();
         debug_assert!(
             guard.areas.iter().all(|area| mapping_identity(
                 &guard.mapping_identities,
@@ -4553,6 +4649,14 @@ mod tests {
     fn address_space_keeps_the_fixed_pin_ledger_off_stack() {
         assert!(core::mem::size_of::<UserIoPinRegistry>() > PAGE_SIZE_4K);
         assert!(core::mem::size_of::<AddrSpace>() <= PAGE_SIZE_4K);
+    }
+
+    #[test]
+    fn resident_highwater_is_mm_owned_and_monotonic() {
+        let aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE).unwrap();
+        assert_eq!(aspace.merge_resident_highwater(12), 12);
+        assert_eq!(aspace.merge_resident_highwater(7), 12);
+        assert_eq!(aspace.merge_resident_highwater(19), 19);
     }
 
     #[test]

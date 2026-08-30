@@ -25,6 +25,44 @@ use axfs_ng_vfs::{Filesystem, WeakFilesystemIdentity};
 use axsync::Mutex;
 use spin::Once;
 
+/// Attributes successful transfers to the task that issued backing I/O.
+///
+/// The filesystem crate cannot depend on the kernel task layer without
+/// creating a cycle, so the native kernel supplies this narrow callback when
+/// it enables `task-io-accounting`.
+#[cfg(feature = "task-io-accounting")]
+#[crate_interface::def_interface]
+pub trait TaskIoAccounting {
+    /// Accounts bytes read from a backing device or filesystem node.
+    fn account_read(bytes: usize);
+    /// Accounts bytes written to a backing device or filesystem node.
+    fn account_write(bytes: usize);
+}
+
+#[cfg(feature = "task-io-accounting")]
+#[inline]
+pub(crate) fn account_backing_read(bytes: usize) {
+    if bytes != 0 {
+        crate_interface::call_interface!(TaskIoAccounting::account_read(bytes));
+    }
+}
+
+#[cfg(feature = "task-io-accounting")]
+#[inline]
+pub(crate) fn account_backing_write(bytes: usize) {
+    if bytes != 0 {
+        crate_interface::call_interface!(TaskIoAccounting::account_write(bytes));
+    }
+}
+
+#[cfg(not(feature = "task-io-accounting"))]
+#[inline]
+pub(crate) fn account_backing_read(_bytes: usize) {}
+
+#[cfg(not(feature = "task-io-accounting"))]
+#[inline]
+pub(crate) fn account_backing_write(_bytes: usize) {}
+
 mod fs;
 pub use fs::{
     FatMountOptions, drain_deferred_filesystem_finalizers, has_deferred_filesystem_finalizer_work,

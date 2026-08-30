@@ -2514,9 +2514,6 @@ pub struct ProcessData {
     pub(in crate::task) usage_transition_epoch: AtomicU64,
     /// CPU time accumulated from waited-for child subtrees.
     waited_children_usage: AtomicTaskUsage,
-    /// Maximum resident set size observed for this process, in kilobytes.
-    maxrss_kb: AtomicU64,
-
     /// Serializes wait* selection and consumption for this process.
     pub wait_lock: Mutex<()>,
 
@@ -2931,7 +2928,11 @@ impl ProcessData {
             group_leader_credential,
             Some(pid_ns.clone()),
         )?;
-        let image_tlb_state = aspace.lock().tlb_state();
+        let image_tlb_state = {
+            let image = aspace.lock();
+            image.merge_resident_highwater(image.resident_user_bytes() as u64 / 1024);
+            image.tlb_state()
+        };
         let data = Self {
             proc,
             process_lifecycle: Mutex::new(()),
@@ -2988,7 +2989,6 @@ impl ProcessData {
             exited_threads_usage: AtomicTaskUsage::new(),
             usage_transition_epoch: AtomicU64::new(0),
             waited_children_usage: AtomicTaskUsage::new(),
-            maxrss_kb: AtomicU64::new(0),
             wait_lock: Mutex::new(()),
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
@@ -3248,7 +3248,19 @@ impl ProcessData {
             // this credential transition, never its former siblings.
             thread.set_pdeath_signal(0);
         }
-        let new_tlb_state = new_aspace.lock().tlb_state();
+        // `ru_maxrss` is a process-lifetime high-water mark.  Preserve the
+        // old image's peak across exec while the new image starts publishing
+        // its own resident pages into the shared mm-level counter.
+        let old_image = self.aspace();
+        let old_image = old_image.lock();
+        let old_maxrss_kb = old_image
+            .merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
+        drop(old_image);
+        let new_tlb_state = {
+            let image = new_aspace.lock();
+            image.tlb_state()
+        };
+        new_aspace.lock().merge_resident_highwater(old_maxrss_kb);
         let executor = current().clone();
         let executor_scheduler = scheduler_state_snapshot(&executor).ok().map(|commit| {
             (commit.state, commit.version)
@@ -3468,6 +3480,11 @@ impl ProcessData {
 
     /// Returns waited-for child CPU usage accumulated for this process.
     pub fn children_usage(&self) -> super::accounting::TaskUsage {
+        // The wait path publishes the reaped state and charges this ledger
+        // while holding the same lock.  Keep readers on that linearization
+        // boundary so CHILDREN cannot observe the interval between those two
+        // operations.
+        let _wait_guard = self.wait_lock.lock();
         self.waited_children_usage.snapshot()
     }
 
@@ -3481,29 +3498,23 @@ impl ProcessData {
         self.exited_threads_usage.add(usage);
     }
 
-    pub(crate) fn begin_usage_transition(&self) { self.usage_transition_epoch.fetch_add(1, Ordering::AcqRel); }
-    pub(crate) fn end_usage_transition(&self) { self.usage_transition_epoch.fetch_add(1, Ordering::Release); }
+    pub(crate) fn begin_usage_transition(&self) {
+        self.usage_transition_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn end_usage_transition(&self) {
+        self.usage_transition_epoch.fetch_add(1, Ordering::Release);
+    }
 
     /// Records a waited-for child subtree into the process's child ledger.
     pub fn account_waited_child(&self, usage: super::accounting::TaskUsage) {
         self.waited_children_usage.add(usage);
     }
 
-    fn sample_maxrss_kb(&self) -> u64 {
-        let resident_kb = self.aspace().lock().resident_user_bytes() as u64 / 1024;
-        let mut current = self.maxrss_kb.load(Ordering::Acquire);
-        while resident_kb > current {
-            match self.maxrss_kb.compare_exchange_weak(
-                current,
-                resident_kb,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return resident_kb,
-                Err(observed) => current = observed,
-            }
-        }
-        current
+    pub(crate) fn sample_maxrss_kb(&self) -> u64 {
+        let image = self.aspace();
+        let image = image.lock();
+        image.merge_resident_highwater(image.resident_user_bytes() as u64 / 1024)
     }
 }
 

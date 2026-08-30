@@ -370,7 +370,14 @@ fn sys_process_vm_rw(
     let target_image =
         check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
     let target_aspace = target_image.into_aspace();
-    process_vm_copy(&caller, &target_aspace, &local, &remote, copy_len, op)
+    process_vm_copy(
+        &caller,
+        &target_aspace,
+        &local,
+        &remote,
+        copy_len,
+        op,
+    )
 }
 
 pub fn sys_process_vm_readv(

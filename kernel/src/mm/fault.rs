@@ -14,7 +14,9 @@ use axsync::Mutex;
 use memory_addr::VirtAddr;
 use thekernel_linux_mm::{FaultAccess, FaultDisposition, FaultFailure as DelegatedFaultFailure};
 
-use super::{AddrSpace, PageFaultFailure, PageFaultResult, repair_local_spurious_fault};
+use super::{
+    AddrSpace, PageFaultFailure, PageFaultKind, PageFaultResult, repair_local_spurious_fault,
+};
 use crate::{
     readiness::block_on_poll_set_interruptible_if,
     task::{AsThread, has_pending_syscall_signal, linux_pid_from_task_id},
@@ -40,12 +42,28 @@ impl FaultSession {
             user_sp,
         } = self;
 
-        let admitted = {
+        let (admitted, delegated_fault_kind) = {
             let mut locked = aspace.lock();
             match locked.admit_uffd_missing_fault(vaddr, fault_access(access_flags)) {
-                Ok(Some(admitted)) => admitted,
+                // A userfaultfd resolver supplies or zero-fills the page in
+                // task context; the kernel did not perform backing I/O for
+                // this fault, so its successful completion is minor.
+                Ok(Some(admitted)) => (admitted, Some(PageFaultKind::Minor)),
                 Ok(None) => {
-                    return locked.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
+                    let fault_candidate = locked.fault_needs_accounting(vaddr, access_flags);
+                    let read_before = axtask::current()
+                        .try_as_thread()
+                        .map(|thread| thread.backing_read_bytes());
+                    let result =
+                        locked.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
+                    if result == PageFaultResult::Handled && fault_candidate {
+                        if let (Some(thread), Some(read_before)) =
+                            (axtask::current().try_as_thread(), read_before)
+                        {
+                            thread.account_resolved_page_fault(read_before);
+                        }
+                    }
+                    return result;
                 }
                 Err(error) => return admission_failure(error),
             }
@@ -101,8 +119,27 @@ impl FaultSession {
             // current CPU before retrying the original userspace instruction;
             // each coalesced waiter owns its own local maintenance.
             repair_local_spurious_fault(vaddr);
+            // The resolver may have populated the target address space from a
+            // different task. Publish the shared mm peak at the completion
+            // edge while the waiter still owns the target image.
+            let locked = aspace.lock();
+            locked.merge_resident_highwater(locked.resident_user_bytes() as u64 / 1024);
         }
-        disposition_result(disposition)
+        let result = disposition_result(disposition);
+        if matches!(
+            disposition,
+            FaultDisposition::Supply | FaultDisposition::ZeroFill
+        ) {
+            if let Some(thread) = axtask::current().try_as_thread() {
+                if let Some(kind) = delegated_fault_kind {
+                    match kind {
+                        PageFaultKind::Minor => thread.account_minor_fault(),
+                        PageFaultKind::Major => thread.account_major_fault(),
+                    }
+                }
+            }
+        }
+        result
     }
 }
 

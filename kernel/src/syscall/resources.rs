@@ -3,18 +3,15 @@ use core::mem::{align_of, offset_of, size_of};
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{
-    CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE, rlimit, rlimit64,
-    rusage,
+    __kernel_old_timeval, CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE,
+    rlimit, rlimit64, rusage,
 };
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
-use crate::{
-    mm::map_usercopy_error,
-    task::{
-        AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
-        nr_open_limit,
-    },
+use crate::task::{
+    AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
+    nr_open_limit, poll_timer,
 };
 
 // `linux_raw_sys` does not expose bytemuck's `AnyBitPattern`/`NoUninit`
@@ -35,6 +32,23 @@ const _: () = {
     assert!(offset_of!(rusage, ru_utime) == 0);
     assert!(offset_of!(rusage, ru_stime) == 16);
     assert!(offset_of!(rusage, ru_maxrss) == 32);
+    assert!(size_of::<__kernel_old_timeval>() == 16);
+    assert!(align_of::<__kernel_old_timeval>() == 8);
+    assert!(offset_of!(__kernel_old_timeval, tv_sec) == 0);
+    assert!(offset_of!(__kernel_old_timeval, tv_usec) == 8);
+    assert!(offset_of!(rusage, ru_ixrss) == 40);
+    assert!(offset_of!(rusage, ru_idrss) == 48);
+    assert!(offset_of!(rusage, ru_isrss) == 56);
+    assert!(offset_of!(rusage, ru_minflt) == 64);
+    assert!(offset_of!(rusage, ru_majflt) == 72);
+    assert!(offset_of!(rusage, ru_nswap) == 80);
+    assert!(offset_of!(rusage, ru_inblock) == 88);
+    assert!(offset_of!(rusage, ru_oublock) == 96);
+    assert!(offset_of!(rusage, ru_msgsnd) == 104);
+    assert!(offset_of!(rusage, ru_msgrcv) == 112);
+    assert!(offset_of!(rusage, ru_nsignals) == 120);
+    assert!(offset_of!(rusage, ru_nvcsw) == 128);
+    assert!(offset_of!(rusage, ru_nivcsw) == 136);
 };
 
 fn current_can_raise_hard_limit() -> bool {
@@ -293,16 +307,28 @@ pub fn sys_getrusage<M: UserMemory + ?Sized>(
     let curr = current();
     let thr = curr.as_thread();
 
+    // Linux validates `who` before touching userspace.  Refresh only the
+    // selectors whose result includes the caller; CHILDREN is a durable
+    // parent ledger and must not gain unrelated syscall CPU time.
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return Err(AxError::InvalidInput);
+    }
+    if who != RUSAGE_CHILDREN {
+        poll_timer(&curr);
+    }
     let result = match who {
         RUSAGE_SELF => thr.proc_data.self_usage(),
         RUSAGE_CHILDREN => thr.proc_data.children_usage(),
-        RUSAGE_THREAD => TaskUsage::from_thread(thr),
-        _ => return Err(AxError::InvalidInput),
+        RUSAGE_THREAD => {
+            TaskUsage::from_thread(thr).with_maxrss_floor(thr.proc_data.sample_maxrss_kb())
+        }
+        _ => unreachable!(),
     };
     let result: rusage = result.into();
     // SAFETY: TaskUsage conversion starts from a zeroed rusage and fills the
     // integer fields, so the full object representation is initialized.
-    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }.map_err(map_usercopy_error)?;
+    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }
+        .map_err(|_| AxError::BadAddress)?;
 
     Ok(0)
 }
