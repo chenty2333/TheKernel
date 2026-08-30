@@ -5,12 +5,14 @@ use alloc::{
     vec,
     vec::Vec,
 };
+#[cfg(feature = "times")]
+use core::sync::atomic::AtomicU8;
 use core::{
     hint::spin_loop,
     mem::ManuallyDrop,
     num::NonZeroUsize,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -2311,7 +2313,6 @@ pub struct PageCache {
     addr: VirtAddr,
     dirty: bool,
     prefetched: bool,
-    noreuse: bool,
     pins: u32,
     writeback: u32,
     shmem: bool,
@@ -2337,7 +2338,6 @@ impl PageCache {
             addr: addr.into(),
             dirty: false,
             prefetched: false,
-            noreuse: false,
             pins: 0,
             writeback: 0,
             shmem,
@@ -2352,7 +2352,6 @@ impl PageCache {
     /// Marks this page as dirty so it will be flushed on eviction.
     pub fn mark_dirty(&mut self) {
         self.prefetched = false;
-        self.noreuse = false;
         self.dirty = true;
     }
 
@@ -2378,15 +2377,8 @@ impl PageCache {
         was_prefetched
     }
 
-    fn mark_noreuse(&mut self) {
-        self.noreuse = true;
-    }
-
     fn is_unused_prefetched(&self) -> bool {
-        (self.prefetched || self.noreuse)
-            && !self.dirty
-            && !self.is_pinned()
-            && !self.is_writeback()
+        self.prefetched && !self.dirty && !self.is_pinned() && !self.is_writeback()
     }
 
     fn pin(&mut self) -> VfsResult<()> {
@@ -4234,74 +4226,6 @@ impl CachedFile {
         self.shared.registry_key
     }
 
-    /// Faults the requested byte range into the coherent page cache.  This is
-    /// deliberately synchronous: POSIX_FADV_WILLNEED is a real prefetch hint,
-    /// not a request that can be silently forgotten after returning success.
-    pub fn fadvise_willneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        let file = self.inner.entry().as_file()?;
-        let end = offset.saturating_add(len).min(file.len()?);
-        if end <= offset {
-            return Ok(());
-        }
-        let first = offset / PAGE_SIZE as u64;
-        let last = end.saturating_sub(1) / PAGE_SIZE as u64;
-        let _direct_guard = self.shared.direct_io_lock.read();
-        let mut cache = self.shared.page_cache.lock();
-        for page in first..=last {
-            let pn = u32::try_from(page).map_err(|_| VfsError::InvalidInput)?;
-            self.ensure_page_cached(file, &mut cache, pn)?;
-            if let Some(page) = cache.get_mut(&pn) {
-                page.mark_prefetched();
-                cache.demote(&pn);
-            }
-        }
-        Ok(())
-    }
-
-    /// Marks already resident clean pages as low-reuse candidates.  It never
-    /// faults data in, which is the important distinction from WILLNEED.
-    pub fn fadvise_noreuse(&self, offset: u64, len: u64) -> VfsResult<()> {
-        let end = offset.saturating_add(len);
-        if end <= offset {
-            return Ok(());
-        }
-        let first = offset / PAGE_SIZE as u64;
-        let last = end.saturating_sub(1) / PAGE_SIZE as u64;
-        let mut cache = self.shared.page_cache.lock();
-        for page in first..=last {
-            let Ok(pn) = u32::try_from(page) else { break };
-            if let Some(entry) = cache.get_mut(&pn) {
-                entry.mark_noreuse();
-                cache.demote(&pn);
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes back and invalidates only whole pages fully covered by the
-    /// range.  On a writeback or eviction failure the transaction drops and
-    /// restores every staged page, retaining dirty data and its error state.
-    pub fn fadvise_dontneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        let file = self.inner.entry().as_file()?;
-        let end = offset.saturating_add(len).min(file.len()?);
-        let first = offset.saturating_add(PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
-        let last_exclusive = end / PAGE_SIZE as u64;
-        if first >= last_exclusive {
-            return Ok(());
-        }
-        let pages = u32::try_from(first).map_err(|_| VfsError::InvalidInput)?
-            ..u32::try_from(last_exclusive).map_err(|_| VfsError::InvalidInput)?;
-        let _direct_guard = self.shared.direct_io_lock.write();
-        let mutation = self.begin_cache_invalidating_mutation()?;
-        let _writeback_guard = self.shared.writeback_lock.write();
-        wait_for_all_writeback_clear(&self.shared);
-        let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
-        invalidation.stage_range(pages)?;
-        invalidation.writeback(file, true)?;
-        invalidation.commit_discard();
-        Ok(())
-    }
-
     /// Opens a short preparation window for pinning file-backed user I/O pages.
     ///
     /// While this window is active, direct cache-draining I/O and LRU evictions
@@ -5235,7 +5159,7 @@ impl CachedFile {
         cache: &mut LruCache<u32, PageCache>,
         pn: u32,
     ) -> VfsResult<Option<EvictedPage>> {
-        self.ensure_page_cached_with(file, cache, pn, true, true, true)
+        self.ensure_page_cached_with(file, cache, pn, true, true)
     }
 
     fn ensure_page_cached_for_owner(
@@ -5253,7 +5177,7 @@ impl CachedFile {
             // The owner-aware path is called while an address space owns its
             // mapping transaction. Keep population synchronous until MM can
             // drop that lock and range-revalidate after I/O.
-            return self.ensure_page_cached_with(file, cache, pn, true, false, true);
+            return self.ensure_page_cached_with(file, cache, pn, true, false);
         }
 
         // Load the replacement before touching the resident cache. Once an
@@ -5295,7 +5219,6 @@ impl CachedFile {
         pn: u32,
         load_from_file: bool,
         allow_async_page_fill: bool,
-        readahead: bool,
     ) -> VfsResult<Option<EvictedPage>> {
         if let Some(page) = cache.get_mut(&pn) {
             if load_from_file && page.clear_prefetched() {
@@ -5305,7 +5228,7 @@ impl CachedFile {
             }
             return Ok(None);
         }
-        let readahead_enabled = load_from_file && readahead && cached_readahead_enabled();
+        let readahead_enabled = load_from_file && cached_readahead_enabled();
         if readahead_enabled {
             record_readahead_miss();
         }
@@ -5613,7 +5536,6 @@ impl CachedFile {
         mut page_each: impl FnMut(T, &mut PageCache, u64, Range<usize>) -> VfsResult<T>,
         wait_writeback: bool,
         allow_async_page_fill: bool,
-        readahead: bool,
     ) -> VfsResult<T> {
         let _cache_user =
             self.begin_cache_user_range(range.clone(), RangeCacheLeaseKind::CachedWrite)?;
@@ -5635,7 +5557,6 @@ impl CachedFile {
                     pn,
                     load_from_file,
                     allow_async_page_fill,
-                    readahead,
                 )?;
                 if wait_writeback && guard.get(&pn).is_some_and(PageCache::is_writeback) {
                     drop(guard);
@@ -5668,7 +5589,6 @@ impl CachedFile {
                 pn,
                 load_from_file,
                 allow_async_page_fill,
-                true,
             )?;
             if guard.get(&pn).is_some_and(PageCache::is_writeback) {
                 drop(evicted);
@@ -5718,7 +5638,6 @@ impl CachedFile {
         mut dst: impl Write + IoBufMut,
         offset: u64,
         allow_async: bool,
-        readahead: bool,
     ) -> VfsResult<usize> {
         let len = self.inner.len()?;
         let requested = u64::try_from(dst.remaining_mut()).map_err(|_| VfsError::InvalidInput)?;
@@ -5759,7 +5678,6 @@ impl CachedFile {
                 },
                 false,
                 allow_async,
-                readahead,
             ) {
                 Ok(copied) => copied,
                 Err(_) if total != 0 => break,
@@ -5786,18 +5704,7 @@ impl CachedFile {
 
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
-        self.read_at_with_async_policy(dst, offset, true, true)
-    }
-
-    /// Reads with caller-selected automatic read-ahead.  The policy belongs
-    /// to the open file description, never to this inode-shared cache.
-    pub fn read_at_with_readahead(
-        &self,
-        dst: impl Write + IoBufMut,
-        offset: u64,
-        readahead: bool,
-    ) -> VfsResult<usize> {
-        self.read_at_with_async_policy(dst, offset, true, readahead)
+        self.read_at_with_async_policy(dst, offset, true)
     }
 
     /// Reads through the coherent page cache without invoking the lower
@@ -5809,7 +5716,7 @@ impl CachedFile {
     /// request. Ordinary reads should use [`read_at`](Self::read_at), which may
     /// use the explicit split-submit/wait path when the filesystem supports it.
     pub fn read_at_sync(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
-        self.read_at_with_async_policy(dst, offset, false, true)
+        self.read_at_with_async_policy(dst, offset, false)
     }
 
     /// Reads into caller-pinned physical memory without exposing an aliasing
@@ -5866,7 +5773,6 @@ impl CachedFile {
                 },
                 false,
                 try_async,
-                true,
             ) {
                 Ok(copied) => copied,
                 Err(_) if total != 0 => break,
@@ -6295,15 +6201,6 @@ pub enum FileBackend {
     Cached(CachedFile),
     /// File I/O bypasses the page cache and hits the VFS directly.
     Direct(Location),
-}
-
-/// Per-open-file-description read-ahead policy selected by POSIX_FADV_*.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum FadviseReadahead {
-    Normal     = 0,
-    Random     = 1,
-    Sequential = 2,
 }
 
 impl FileBackend {
@@ -6815,39 +6712,6 @@ impl FileBackend {
         }
     }
 
-    fn fadvise_cache(&self) -> CachedFile {
-        match self {
-            Self::Cached(cache) => cache.clone(),
-            // An O_DIRECT description has no private buffered cache, but the
-            // inode can still have one through another OFD/mapping.
-            Self::Direct(location) => CachedFile::get_or_create(location.clone()),
-        }
-    }
-
-    pub fn fadvise_willneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.fadvise_cache().fadvise_willneed(offset, len)
-    }
-
-    pub fn fadvise_noreuse(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.fadvise_cache().fadvise_noreuse(offset, len)
-    }
-
-    pub fn fadvise_dontneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.fadvise_cache().fadvise_dontneed(offset, len)
-    }
-
-    pub fn read_at_with_readahead(
-        &self,
-        dst: impl Write + IoBufMut,
-        offset: u64,
-        readahead: bool,
-    ) -> VfsResult<usize> {
-        match self {
-            Self::Cached(cache) => cache.read_at_with_readahead(dst, offset, readahead),
-            Self::Direct(_) => self.read_at(dst, offset),
-        }
-    }
-
     /// Flushes cached data (and optionally metadata) to disk.
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         record_file_sync_request(data_only);
@@ -6923,7 +6787,6 @@ pub struct File {
     /// an external transfer consumer runs.
     position_transaction: Mutex<()>,
     position: Option<Mutex<u64>>,
-    readahead: AtomicU8,
     #[cfg(feature = "times")]
     access_flags: AtomicU8,
 }
@@ -6972,7 +6835,6 @@ impl File {
             flags: flags & !FileFlags::APPEND,
             position_transaction: Mutex::new(()),
             position,
-            readahead: AtomicU8::new(FadviseReadahead::Normal as u8),
             #[cfg(feature = "times")]
             access_flags: AtomicU8::new(0),
         }
@@ -7071,42 +6933,11 @@ impl File {
         self.inner.location()
     }
 
-    pub fn set_fadvise_readahead(&self, policy: FadviseReadahead) {
-        self.readahead.store(policy as u8, Ordering::Release);
-    }
-
-    pub fn fadvise_readahead(&self) -> FadviseReadahead {
-        match self.readahead.load(Ordering::Acquire) {
-            1 => FadviseReadahead::Random,
-            2 => FadviseReadahead::Sequential,
-            _ => FadviseReadahead::Normal,
-        }
-    }
-
-    pub fn fadvise_willneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.access(FileFlags::empty())?
-            .fadvise_willneed(offset, len)
-    }
-
-    pub fn fadvise_noreuse(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.access(FileFlags::empty())?
-            .fadvise_noreuse(offset, len)
-    }
-
-    pub fn fadvise_dontneed(&self, offset: u64, len: u64) -> VfsResult<()> {
-        self.access(FileFlags::empty())?
-            .fadvise_dontneed(offset, len)
-    }
-
     /// Reads a number of bytes starting from a given offset.
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
         #[cfg(feature = "times")]
         let requested = dst.remaining_mut();
-        let read = self.access(FileFlags::READ)?.read_at_with_readahead(
-            dst,
-            offset,
-            self.fadvise_readahead() != FadviseReadahead::Random,
-        )?;
+        let read = self.access(FileFlags::READ)?.read_at(dst, offset)?;
         #[cfg(feature = "times")]
         if requested > 0
             && !self.flags.contains(FileFlags::NOATIME)
