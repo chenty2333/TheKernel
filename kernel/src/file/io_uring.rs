@@ -6635,6 +6635,9 @@ pub(crate) struct IoUring {
     ring_region: FixedSharedMmapRegion,
     cq_ring_region: FixedSharedMmapRegion,
     sqe_region: FixedSharedMmapRegion,
+    // These handles are created by try_new and retained only by the file
+    // object/final-close policy path. Neither ownership path runs in hard IRQ
+    // context, so their final drop may release SharedPages normally.
     sq_head: SharedAtomicU32,
     sq_tail: SharedAtomicU32,
     cq_head: SharedAtomicU32,

@@ -655,7 +655,7 @@ impl SharedPages {
 
     /// Captures a direct-map view suitable for IRQ use. Construction may
     /// allocate and take the backing mutex; the returned operations do neither.
-    pub fn fixed_view(self: &Arc<Self>) -> AxResult<SharedFixedView> {
+    pub(crate) fn fixed_view(self: &Arc<Self>) -> AxResult<SharedFixedView> {
         if !self.fixed || self.size != PageSize::Size4K || self.secret_frames.is_some() {
             return Err(AxError::OperationNotSupported);
         }
@@ -703,9 +703,10 @@ impl SharedPages {
 }
 
 /// A lifecycle-fixed direct view of a 4 KiB shared backing. Clones share one
-/// pin, released by the final drop without allocation or blocking.
+/// pin. Its final drop must run in task context: releasing the retained
+/// backing Arc may reclaim frames under its mutex.
 #[derive(Clone)]
-pub struct SharedFixedView {
+pub(crate) struct SharedFixedView {
     inner: Arc<FixedSharedViewInner>,
 }
 
@@ -725,13 +726,25 @@ unsafe impl Send for SharedFixedView {}
 unsafe impl Sync for SharedFixedView {}
 
 impl SharedFixedView {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.total_bytes
     }
 
-    /// Writes a complete ring record, wrapping at `base + size`. Every bound
-    /// is checked before copying, so an error writes no bytes.
-    pub fn write_wrapped(&self, base: usize, size: usize, offset: usize, bytes: &[u8]) -> AxResult {
+    /// Writes a complete ring record, wrapping at `base + size`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must serialize producers and prove this record does not
+    /// overlap bytes concurrently read by a consumer or written by another
+    /// producer. The ring head/tail protocol must establish that ownership.
+    /// All bounds are checked before copying, so an error writes no bytes.
+    pub(crate) unsafe fn write_wrapped(
+        &self,
+        base: usize,
+        size: usize,
+        offset: usize,
+        bytes: &[u8],
+    ) -> AxResult {
         validate_wrapped_write(self.len(), base, size, offset, bytes.len())?;
         let first = bytes.len().min(size - offset);
         self.copy_at(base + offset, &bytes[..first]);
@@ -739,14 +752,14 @@ impl SharedFixedView {
         Ok(())
     }
 
-    pub fn atomic_u32(&self, offset: usize) -> AxResult<SharedAtomicU32> {
+    pub(crate) fn atomic_u32(&self, offset: usize) -> AxResult<SharedAtomicU32> {
         Ok(SharedAtomicU32 {
             address: self.atomic_address::<AtomicU32>(offset)?,
             view: self.clone(),
         })
     }
 
-    pub fn atomic_u64(&self, offset: usize) -> AxResult<SharedAtomicU64> {
+    pub(crate) fn atomic_u64(&self, offset: usize) -> AxResult<SharedAtomicU64> {
         Ok(SharedAtomicU64 {
             address: self.atomic_address::<AtomicU64>(offset)?,
             view: self.clone(),
@@ -769,7 +782,7 @@ impl SharedFixedView {
             let in_page = offset % PAGE_SIZE_4K;
             let count = bytes.len().min(PAGE_SIZE_4K - in_page);
             // SAFETY: write_wrapped validated the full range against this
-            // pinned view; direct-map pages stay valid until final drop.
+            // pinned view, and its safety contract excludes concurrent bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -825,6 +838,9 @@ fn validate_atomic_offset<T>(total_bytes: usize, page_size: usize, offset: usize
 }
 
 /// A lifetime-pinned atomic word stored in a fixed shared-page backing.
+///
+/// This handle, and [`SharedFixedView`], must be dropped from task context:
+/// their final Arc drop can release the backing and take its frame mutex.
 pub struct SharedAtomicU32 {
     address: NonNull<AtomicU32>,
     view: SharedFixedView,
@@ -857,7 +873,8 @@ impl SharedAtomicU32 {
 }
 
 /// A lifetime-pinned 64-bit metadata word for shared producer/consumer rings.
-pub struct SharedAtomicU64 {
+/// Its final drop has the same task-context requirement as [`SharedAtomicU32`].
+pub(crate) struct SharedAtomicU64 {
     address: NonNull<AtomicU64>,
     view: SharedFixedView,
 }
@@ -1471,14 +1488,14 @@ mod tests {
         let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K * 2, PageSize::Size4K).unwrap());
         let view = pages.fixed_view().unwrap();
         let base = PAGE_SIZE_4K - 4;
-        view.write_wrapped(base, 8, 6, &[0xa1, 0xb2, 0xc3, 0xd4])
-            .unwrap();
+        // SAFETY: this test is the only producer and has no consumer.
+        unsafe { view.write_wrapped(base, 8, 6, &[0xa1, 0xb2, 0xc3, 0xd4]) }.unwrap();
         let mut bytes = [0_u8; 8];
         pages.read_bytes(base, &mut bytes).unwrap();
         assert_eq!(bytes, [0xc3, 0xd4, 0, 0, 0, 0, 0xa1, 0xb2]);
 
-        view.write_wrapped(base, 8, 0, &[1, 2, 3, 4, 5, 6, 7, 8])
-            .unwrap();
+        // SAFETY: this test is the only producer and has no consumer.
+        unsafe { view.write_wrapped(base, 8, 0, &[1, 2, 3, 4, 5, 6, 7, 8]) }.unwrap();
         pages.read_bytes(base, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -1489,19 +1506,19 @@ mod tests {
         let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K, PageSize::Size4K).unwrap());
         let view = pages.fixed_view().unwrap();
         assert_eq!(
-            view.write_wrapped(PAGE_SIZE_4K - 4, 8, 0, &[1]),
+            unsafe { view.write_wrapped(PAGE_SIZE_4K - 4, 8, 0, &[1]) },
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            view.write_wrapped(0, 3, 0, &[1]),
+            unsafe { view.write_wrapped(0, 3, 0, &[1]) },
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            view.write_wrapped(0, 8, 8, &[1]),
+            unsafe { view.write_wrapped(0, 8, 8, &[1]) },
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            view.write_wrapped(0, 8, 0, &[1; 9]),
+            unsafe { view.write_wrapped(0, 8, 0, &[1; 9]) },
             Err(AxError::InvalidInput)
         );
         let mut bytes = [0_u8; 8];
