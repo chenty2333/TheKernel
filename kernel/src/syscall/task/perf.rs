@@ -29,6 +29,16 @@ const PERF_FORMAT_GROUP: u64 = 1 << 3;
 
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// This implementation has no inheritance, filtering, pinning, sampling, or
+/// PMU scheduling. Accepting any corresponding perf attribute bit would
+/// advertise behavior the event cannot provide.
+fn supported_attr_flags(flags: u64) -> AxResult<bool> {
+    if flags & !ATTR_DISABLED != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    Ok(flags & ATTR_DISABLED != 0)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct PerfEventAttrV0 {
@@ -74,6 +84,7 @@ pub(crate) fn sys_perf_event_open(
     if attr.size < PERF_ATTR_SIZE_VER0 {
         return Err(AxError::InvalidInput);
     }
+    let disabled = supported_attr_flags(attr.flags)?;
     if flags & !(PERF_FLAG_FD_NO_GROUP | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC) != 0 {
         return Err(AxError::InvalidInput);
     }
@@ -96,13 +107,24 @@ pub(crate) fn sys_perf_event_open(
     };
     // perf's task attachment has ptrace-style credential access semantics.
     check_current_thread_ptrace_image_access(target.as_thread(), PtraceAccessMode::ReadReal)?;
-    let group = if group_fd == -1 {
-        PerfGroup::new()
+    let target_task_id = target.id().as_u64();
+    let (id, group) = if group_fd == -1 {
+        // Reserve the ID before group construction so the group's immutable
+        // leader identity and the created event cannot diverge.
+        let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
+        (id, PerfGroup::new(target_task_id, id))
     } else {
         if flags & PERF_FLAG_FD_NO_GROUP != 0 {
             return Err(AxError::InvalidInput);
         }
-        get_typed_file::<PerfEventFile>(group_fd)?.group()
+        let leader = get_typed_file::<PerfEventFile>(group_fd)?;
+        if !leader.is_group_leader() || !leader.group().accepts_target(target_task_id) {
+            return Err(AxError::InvalidInput);
+        }
+        (
+            NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed),
+            leader.group(),
+        )
     };
     if attr.event_type != PERF_TYPE_SOFTWARE {
         return Err(AxError::OperationNotSupported);
@@ -121,11 +143,10 @@ pub(crate) fn sys_perf_event_open(
     {
         return Err(AxError::OperationNotSupported);
     }
-    let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
     let file = PerfEventFile::new(
         id,
         event,
-        attr.flags & ATTR_DISABLED != 0,
+        disabled,
         group,
         attr.read_format & PERF_FORMAT_GROUP != 0,
     )?;
@@ -138,4 +159,29 @@ pub(crate) fn sys_perf_event_open(
         flags & PERF_FLAG_FD_CLOEXEC != 0,
     )
     .map(|fd| fd as isize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ATTR_DISABLED, supported_attr_flags};
+    use crate::file::PerfGroup;
+
+    #[test]
+    fn software_perf_accepts_only_disabled_attr_flag() {
+        assert!(!supported_attr_flags(0).unwrap());
+        assert!(supported_attr_flags(ATTR_DISABLED).unwrap());
+        for unsupported in [1_u64 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5] {
+            assert!(supported_attr_flags(unsupported).is_err());
+            assert!(supported_attr_flags(ATTR_DISABLED | unsupported).is_err());
+        }
+    }
+
+    #[test]
+    fn perf_group_binds_leader_and_target_task() {
+        let group = PerfGroup::new(41, 7);
+        assert!(group.is_group_leader_for_test(7));
+        assert!(!group.is_group_leader_for_test(8));
+        assert!(group.accepts_target(41));
+        assert!(!group.accepts_target(42));
+    }
 }
