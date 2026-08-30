@@ -25,6 +25,8 @@ pub struct RawMutex {
     waiters: AtomicUsize,
     #[cfg(test)]
     notify_calls: AtomicUsize,
+    #[cfg(test)]
+    handoff_claim_pause: AtomicUsize,
 }
 
 // A released lock with an already selected waiter.  Ordinary lockers must
@@ -458,6 +460,7 @@ mod tests {
 
     use axtask as thread;
 
+    use super::{HANDOFF_OWNER, lock_interruptible};
     use crate::Mutex;
 
     struct TrackingAllocator;
@@ -602,11 +605,17 @@ mod tests {
         init_scheduler();
         let mutex = Arc::new(Mutex::new(()));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled_result = Arc::new(AtomicBool::new(false));
         let guard = mutex.lock();
         let waiter_mutex = Arc::clone(&mutex);
         let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter_result = Arc::clone(&waiter_cancelled_result);
         let waiter = thread::spawn(move || {
-            lock_interruptible(&waiter_mutex, || waiter_cancelled.load(Ordering::Acquire)).is_none()
+            waiter_result.store(
+                lock_interruptible(&waiter_mutex, || waiter_cancelled.load(Ordering::Acquire))
+                    .is_none(),
+                Ordering::Release,
+            );
         })
         .unwrap();
 
@@ -615,7 +624,8 @@ mod tests {
         }
         cancelled.store(true, Ordering::Release);
         waiter.interrupt();
-        assert!(waiter.join().unwrap());
+        assert_eq!(waiter.join().unwrap(), 0);
+        assert!(waiter_cancelled_result.load(Ordering::Acquire));
         // The waiter never acquired the held mutex.
         drop(guard);
     }
@@ -667,13 +677,18 @@ mod tests {
         }
 
         let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
         let cancelling_mutex = Arc::clone(&mutex);
         let cancelling_signal = Arc::clone(&cancelled);
+        let cancelling_observed = Arc::clone(&cancellation_observed);
         let cancelling = thread::spawn(move || {
-            lock_interruptible(&cancelling_mutex, || {
-                cancelling_signal.load(Ordering::Acquire)
-            })
-            .is_none()
+            cancelling_observed.store(
+                lock_interruptible(&cancelling_mutex, || {
+                    cancelling_signal.load(Ordering::Acquire)
+                })
+                .is_none(),
+                Ordering::Release,
+            );
         })
         .unwrap();
         while unsafe { mutex.raw() }.waiter_count() != 2 {
@@ -689,7 +704,8 @@ mod tests {
         // not claimed it yet.  Cancel the other real listener in this window.
         cancelled.store(true, Ordering::Release);
         cancelling.interrupt();
-        assert!(cancelling.join().unwrap());
+        assert_eq!(cancelling.join().unwrap(), 0);
+        assert!(cancellation_observed.load(Ordering::Acquire));
         assert_eq!(raw.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
 
         let barger_mutex = Arc::clone(&mutex);

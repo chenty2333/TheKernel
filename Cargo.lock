@@ -771,6 +771,7 @@ name = "axsync"
 version = "0.3.0-preview.2"
 dependencies = [
  "event-listener",
+ "fastrand",
  "kspin",
  "lock_api",
  "thekernel-axtask",
@@ -1402,6 +1403,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fdt-edit"

@@ -4,6 +4,7 @@ members = [
     "kernel",
     "crates/process-adapter",
     "crates/readiness-adapter",
+    "third_party/rust-patches/axsync",
 ]
 exclude = ["arceos"]
 
