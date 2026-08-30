@@ -212,6 +212,7 @@ pub fn capabilities() -> Result<Capabilities, Error> {
 impl CounterLease {
     pub fn acquire(event: Event, kind: CounterKind) -> Result<Self, Error> {
         local(|cpu, m| {
+            let _ = reap(m);
             let c = capabilities()?;
             let (slot, old) = match kind {
                 CounterKind::Programmable if c.programmable(event) => select(m, c)?,
@@ -231,8 +232,9 @@ impl CounterLease {
             if s.retired {
                 return Err(Error::NoCounter);
             }
-            program(slot, event);
             claim_generation(s)?;
+            // Generation exhaustion retires before this first register write.
+            program(slot, event);
             s.owned = true;
             s.abandoned = false;
             s.saved = old;
@@ -307,34 +309,18 @@ impl Drop for CounterLease {
 }
 /// Bounded, local-only recovery for tokens dropped on another CPU.
 pub fn drain_local() -> Result<usize, Error> {
-    local(|_, m| {
-        let mut count = 0;
-        for index in 0..SLOTS {
-            let state = &mut m.slots[index];
-            if state.owned {
-                let slot = if index < MAX {
-                    Slot::P(index as u8)
-                } else {
-                    Slot::F((index - MAX) as u8)
-                };
-                let _ = terminate(slot, state.saved, state.width);
-                state.owned = false;
-                state.abandoned = false;
-                count += 1;
-            }
-        }
-        Ok(count)
-    })
+    // Recovery only: live local leases retain their exclusive ownership.
+    local(|_, m| Ok(reap(m)))
 }
 fn local<T>(f: impl FnOnce(usize, &mut Manager) -> Result<T, Error>) -> Result<T, Error> {
     let _short = kernel_guard::NoPreemptIrqSave::new();
     let cpu = crate::cpu::current_logical_cpu_id();
     let mut m = MANAGERS[cpu].lock();
-    let _ = reap(&mut m);
     f(cpu, &mut m)
 }
 fn token<T>(t: &CounterLease, f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
     local(|cpu, m| {
+        let _ = reap(m);
         if cpu != t.cpu {
             return Err(Error::Migrated);
         }
@@ -349,7 +335,7 @@ fn reap(m: &mut Manager) -> usize {
     let mut count = 0;
     for index in 0..SLOTS {
         let state = &mut m.slots[index];
-        if state.owned && state.abandoned {
+        if should_reap(state) {
             let slot = if index < MAX {
                 Slot::P(index as u8)
             } else {
@@ -362,6 +348,9 @@ fn reap(m: &mut Manager) -> usize {
         }
     }
     count
+}
+const fn should_reap(state: &State) -> bool {
+    state.owned && state.abandoned
 }
 fn claim_generation(state: &mut State) -> Result<(), Error> {
     state.generation = match state.generation.checked_add(1) {
@@ -420,21 +409,17 @@ fn idle(s: Slot, v: Saved) -> bool {
     };
     ctrl && v.global & bit(s) == 0 && read(STATUS) & bit(s) == 0
 }
-/// A stale overflow latch is safe to clear only after control and global bits
-/// prove the slot idle; re-read afterwards so a concurrent external user wins.
+/// An overflow latch on a slot not owned by this HAL is external state.  It is
+/// never W1C'd here; the candidate remains busy and selection keeps scanning.
 fn prepare_idle(s: Slot) -> Option<Saved> {
     let saved = snapshot(s);
     let control_idle = match s {
         Slot::P(_) => saved.control == 0,
         Slot::F(i) => saved.control >> (i * 4) & 15 == 0,
     };
-    if !control_idle || saved.global & bit(s) != 0 {
+    if !control_idle || saved.global & bit(s) != 0 || read(STATUS) & bit(s) != 0 {
         return None;
     }
-    if read(STATUS) & bit(s) != 0 {
-        write(OVF, bit(s));
-    }
-    let saved = snapshot(s);
     idle(s, saved).then_some(saved)
 }
 fn disable(s: Slot) {
@@ -487,6 +472,22 @@ fn write(msr: u32, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct RegisterModel {
+        status: u64,
+        programmed: usize,
+        overflow_w1c: usize,
+    }
+    impl RegisterModel {
+        fn claim_then_program(&mut self, state: &mut State) -> Result<(), Error> {
+            claim_generation(state)?;
+            self.programmed += 1;
+            Ok(())
+        }
+        fn external_overflow_is_busy(&mut self, slot: Slot) -> bool {
+            self.status & bit(slot) != 0
+        }
+    }
     #[test]
     fn capabilities_reject_v1_and_invalid_widths() {
         assert!(!Capabilities::decode(1 | (1 << 8) | (48 << 16), 0, 0).valid());
@@ -524,6 +525,35 @@ mod tests {
         assert!(state.retired);
         state.owned = false;
         assert!(!state.owned, "released state rejects every old token");
+    }
+    #[test]
+    fn drain_policy_preserves_an_effective_lease() {
+        let mut state = FREE;
+        state.owned = true;
+        assert!(!should_reap(&state));
+        state.abandoned = true;
+        assert!(should_reap(&state));
+    }
+    #[test]
+    fn external_overflow_never_causes_w1c() {
+        let mut registers = RegisterModel {
+            status: bit(Slot::P(2)),
+            ..RegisterModel::default()
+        };
+        assert!(registers.external_overflow_is_busy(Slot::P(2)));
+        assert_eq!(registers.overflow_w1c, 0);
+    }
+    #[test]
+    fn exhausted_generation_never_programs() {
+        let mut registers = RegisterModel::default();
+        let mut state = FREE;
+        state.generation = u64::MAX;
+        assert_eq!(
+            registers.claim_then_program(&mut state),
+            Err(Error::NoCounter)
+        );
+        assert!(state.retired);
+        assert_eq!(registers.programmed, 0);
     }
     #[test]
     fn masked_restore_math() {
