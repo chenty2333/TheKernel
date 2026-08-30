@@ -1,4 +1,5 @@
 //! Local x86 architectural-PMU leases.  Leases are tokens, never IRQ guards.
+#[cfg(target_os = "none")]
 use core::arch::x86_64::__cpuid_count;
 
 use kspin::SpinNoIrq;
@@ -143,14 +144,18 @@ const EMPTY: Saved = Saved {
 };
 #[derive(Clone, Copy)]
 struct State {
-    generation: u32,
+    generation: u64,
     owned: bool,
+    abandoned: bool,
+    retired: bool,
     saved: Saved,
     width: u8,
 }
 const FREE: State = State {
     generation: 0,
     owned: false,
+    abandoned: false,
+    retired: false,
     saved: EMPTY,
     width: 0,
 };
@@ -166,12 +171,20 @@ impl Manager {
 }
 static MANAGERS: [SpinNoIrq<Manager>; crate::config::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(Manager::new()) }; crate::config::plat::MAX_CPU_NUM];
-/// A CPU, slot, generation token. It is Send, but never authorizes remote MSRs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A linear CPU, slot, generation token. It is Send, but never authorizes
+/// remote MSRs.
+#[derive(Debug)]
 pub struct CounterLease {
     cpu: usize,
     slot: Slot,
-    generation: u32,
+    generation: u64,
+    active: bool,
+}
+/// The final, width-masked sample taken while atomically terminating a lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalSample {
+    pub value: u64,
+    pub overflowed: bool,
 }
 pub fn capabilities() -> Result<Capabilities, Error> {
     #[cfg(not(target_os = "none"))]
@@ -200,22 +213,28 @@ impl CounterLease {
     pub fn acquire(event: Event, kind: CounterKind) -> Result<Self, Error> {
         local(|cpu, m| {
             let c = capabilities()?;
-            let slot = match kind {
+            let (slot, old) = match kind {
                 CounterKind::Programmable if c.programmable(event) => select(m, c)?,
-                CounterKind::Fixed if c.fixed_ok(event) => Slot::F(event.fixed()),
+                CounterKind::Fixed if c.fixed_ok(event) => {
+                    let slot = Slot::F(event.fixed());
+                    if m.slots[slot.idx()].owned {
+                        return Err(Error::Busy);
+                    }
+                    (slot, prepare_idle(slot).ok_or(Error::Busy)?)
+                }
                 _ => return Err(Error::Unsupported),
             };
             let s = &mut m.slots[slot.idx()];
             if s.owned {
                 return Err(Error::Busy);
             }
-            let old = snapshot(slot);
-            if !idle(slot, old) {
-                return Err(Error::Busy);
+            if s.retired {
+                return Err(Error::NoCounter);
             }
             program(slot, event);
-            s.generation = s.generation.wrapping_add(1).max(1);
+            claim_generation(s)?;
             s.owned = true;
+            s.abandoned = false;
             s.saved = old;
             s.width = match slot {
                 Slot::P(_) => c.programmable_width,
@@ -225,61 +244,96 @@ impl CounterLease {
                 cpu,
                 slot,
                 generation: s.generation,
+                active: true,
             })
         })
     }
     pub fn read(&self) -> Result<u64, Error> {
-        token(*self, |s| {
+        token(self, |s| {
             Ok(read(slot_msr(self.slot)) & Capabilities::mask(s.width))
         })
     }
     /// Delta from `previous`, modulo the architectural width.
     pub fn settle(&self, previous: u64) -> Result<u64, Error> {
-        token(*self, |s| {
+        token(self, |s| {
             Ok(read(slot_msr(self.slot)).wrapping_sub(previous) & Capabilities::mask(s.width))
         })
     }
-    pub fn release(self) -> Result<(), Error> {
-        token(self, |s| {
-            let overflow = restore(self.slot, s.saved);
+    pub fn finish(mut self) -> Result<FinalSample, Error> {
+        let result = token(&self, |s| {
+            let sample = terminate(self.slot, s.saved, s.width);
             s.owned = false;
-            s.generation = s.generation.wrapping_add(1);
-            if overflow {
-                Err(Error::Overflowed)
-            } else {
-                Ok(())
+            s.abandoned = false;
+            Ok(sample)
+        });
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+    pub fn release(self) -> Result<(), Error> {
+        match self.finish()? {
+            FinalSample {
+                overflowed: true, ..
+            } => Err(Error::Overflowed),
+            _ => Ok(()),
+        }
+    }
+}
+impl Drop for CounterLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _short = kernel_guard::NoPreemptIrqSave::new();
+        let cpu = crate::cpu::current_logical_cpu_id();
+        if cpu != self.cpu {
+            let mut manager = MANAGERS[self.cpu].lock();
+            let state = &mut manager.slots[self.slot.idx()];
+            if state.owned && state.generation == self.generation {
+                state.abandoned = true;
             }
-        })
+            return;
+        }
+        let mut manager = MANAGERS[cpu].lock();
+        let _ = reap(&mut manager);
+        let state = &mut manager.slots[self.slot.idx()];
+        if state.owned && state.generation == self.generation {
+            let _ = terminate(self.slot, state.saved, state.width);
+            state.owned = false;
+            state.abandoned = false;
+        }
     }
 }
 /// Bounded, local-only recovery for tokens dropped on another CPU.
 pub fn drain_local() -> Result<usize, Error> {
     local(|_, m| {
-        let mut n = 0;
-        for i in 0..SLOTS {
-            if m.slots[i].owned {
-                let slot = if i < MAX {
-                    Slot::P(i as u8)
+        let mut count = 0;
+        for index in 0..SLOTS {
+            let state = &mut m.slots[index];
+            if state.owned {
+                let slot = if index < MAX {
+                    Slot::P(index as u8)
                 } else {
-                    Slot::F((i - MAX) as u8)
+                    Slot::F((index - MAX) as u8)
                 };
-                let s = &mut m.slots[i];
-                let _ = restore(slot, s.saved);
-                s.owned = false;
-                s.generation = s.generation.wrapping_add(1);
-                n += 1
+                let _ = terminate(slot, state.saved, state.width);
+                state.owned = false;
+                state.abandoned = false;
+                count += 1;
             }
         }
-        Ok(n)
+        Ok(count)
     })
 }
 fn local<T>(f: impl FnOnce(usize, &mut Manager) -> Result<T, Error>) -> Result<T, Error> {
     let _short = kernel_guard::NoPreemptIrqSave::new();
     let cpu = crate::cpu::current_logical_cpu_id();
     let mut m = MANAGERS[cpu].lock();
+    let _ = reap(&mut m);
     f(cpu, &mut m)
 }
-fn token<T>(t: CounterLease, f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
+fn token<T>(t: &CounterLease, f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
     local(|cpu, m| {
         if cpu != t.cpu {
             return Err(Error::Migrated);
@@ -291,13 +345,51 @@ fn token<T>(t: CounterLease, f: impl FnOnce(&mut State) -> Result<T, Error>) -> 
         f(s)
     })
 }
-fn select(m: &Manager, c: Capabilities) -> Result<Slot, Error> {
-    for i in 0..c.programmable_counters as usize {
-        if !m.slots[i].owned {
-            return Ok(Slot::P(i as u8));
+fn reap(m: &mut Manager) -> usize {
+    let mut count = 0;
+    for index in 0..SLOTS {
+        let state = &mut m.slots[index];
+        if state.owned && state.abandoned {
+            let slot = if index < MAX {
+                Slot::P(index as u8)
+            } else {
+                Slot::F((index - MAX) as u8)
+            };
+            let _ = terminate(slot, state.saved, state.width);
+            state.owned = false;
+            state.abandoned = false;
+            count += 1;
         }
     }
-    Err(Error::NoCounter)
+    count
+}
+fn claim_generation(state: &mut State) -> Result<(), Error> {
+    state.generation = match state.generation.checked_add(1) {
+        Some(generation) => generation,
+        None => {
+            state.retired = true;
+            return Err(Error::NoCounter);
+        }
+    };
+    Ok(())
+}
+fn select(m: &Manager, c: Capabilities) -> Result<(Slot, Saved), Error> {
+    let mut software_free = false;
+    for i in 0..c.programmable_counters as usize {
+        let state = &m.slots[i];
+        if !state.owned && !state.retired {
+            software_free = true;
+            let slot = Slot::P(i as u8);
+            if let Some(saved) = prepare_idle(slot) {
+                return Ok((slot, saved));
+            }
+        }
+    }
+    if software_free {
+        Err(Error::Busy)
+    } else {
+        Err(Error::NoCounter)
+    }
 }
 fn bit(s: Slot) -> u64 {
     match s {
@@ -328,6 +420,23 @@ fn idle(s: Slot, v: Saved) -> bool {
     };
     ctrl && v.global & bit(s) == 0 && read(STATUS) & bit(s) == 0
 }
+/// A stale overflow latch is safe to clear only after control and global bits
+/// prove the slot idle; re-read afterwards so a concurrent external user wins.
+fn prepare_idle(s: Slot) -> Option<Saved> {
+    let saved = snapshot(s);
+    let control_idle = match s {
+        Slot::P(_) => saved.control == 0,
+        Slot::F(i) => saved.control >> (i * 4) & 15 == 0,
+    };
+    if !control_idle || saved.global & bit(s) != 0 {
+        return None;
+    }
+    if read(STATUS) & bit(s) != 0 {
+        write(OVF, bit(s));
+    }
+    let saved = snapshot(s);
+    idle(s, saved).then_some(saved)
+}
 fn disable(s: Slot) {
     write(GLOBAL, read(GLOBAL) & !bit(s))
 }
@@ -346,8 +455,9 @@ fn program(s: Slot, e: Event) {
     write(slot_msr(s), 0);
     write(GLOBAL, read(GLOBAL) | bit(s))
 }
-fn restore(s: Slot, old: Saved) -> bool {
+fn terminate(s: Slot, old: Saved, width: u8) -> FinalSample {
     disable(s);
+    let value = read(slot_msr(s)) & Capabilities::mask(width);
     let overflow = read(STATUS) & bit(s) != 0;
     match s {
         Slot::P(i) => write(EVT + i as u32, old.control),
@@ -363,7 +473,10 @@ fn restore(s: Slot, old: Saved) -> bool {
     }
     let now = read(GLOBAL);
     write(GLOBAL, (now & !bit(s)) | (old.global & bit(s)));
-    overflow
+    FinalSample {
+        value,
+        overflowed: overflow,
+    }
 }
 fn read(msr: u32) -> u64 {
     unsafe { rdmsr(msr) }
@@ -395,12 +508,22 @@ mod tests {
     fn busy_and_stale_generation() {
         let mut m = Manager::new();
         m.slots[0].owned = true;
-        assert_eq!(
+        assert!(matches!(
             select(&m, Capabilities::decode(2 | (1 << 8) | (48 << 16), 0, 0)),
             Err(Error::NoCounter)
-        );
+        ));
         m.slots[0].generation = 7;
         assert_ne!(m.slots[0].generation, 6);
+    }
+    #[test]
+    fn token_is_linear_and_generation_retires_before_aba() {
+        assert!(core::mem::needs_drop::<CounterLease>());
+        let mut state = FREE;
+        state.generation = u64::MAX;
+        assert_eq!(claim_generation(&mut state), Err(Error::NoCounter));
+        assert!(state.retired);
+        state.owned = false;
+        assert!(!state.owned, "released state rejects every old token");
     }
     #[test]
     fn masked_restore_math() {

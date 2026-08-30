@@ -61,8 +61,8 @@ pub mod time;
 
 /// x86_64 hardware performance-monitoring counters.
 ///
-/// This API is deliberately local-CPU only.  A counter lease pins its caller
-/// until it is released and never performs a remote MSR access.
+/// This API is deliberately local-CPU only. A lease is a linear token; each
+/// operation validates the current CPU and never performs a remote MSR access.
 #[cfg(feature = "pmu")]
 pub mod pmu {
     #[cfg(target_os = "none")]
@@ -93,6 +93,11 @@ pub mod pmu {
             Overflowed,
         }
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct FinalSample {
+            pub value: u64,
+            pub overflowed: bool,
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub struct Capabilities {
             pub version: u8,
             pub programmable_counters: u8,
@@ -110,7 +115,7 @@ pub mod pmu {
                 0
             }
         }
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Debug)]
         pub struct CounterLease;
         pub fn capabilities() -> Result<Capabilities, Error> {
             Err(Error::Unsupported)
@@ -128,6 +133,9 @@ pub mod pmu {
             pub fn settle(&self, _: u64) -> Result<u64, Error> {
                 Err(Error::Unsupported)
             }
+            pub fn finish(self) -> Result<FinalSample, Error> {
+                Err(Error::Unsupported)
+            }
             pub fn release(self) -> Result<(), Error> {
                 Err(Error::Unsupported)
             }
@@ -138,7 +146,10 @@ pub mod pmu {
             #[test]
             fn host_pmu_is_an_unsupported_stub() {
                 assert_eq!(capabilities(), Err(Error::Unsupported));
-                assert_eq!(CounterLease::acquire(Event::Cycles, CounterKind::Fixed), Err(Error::Unsupported));
+                assert!(matches!(
+                    CounterLease::acquire(Event::Cycles, CounterKind::Fixed),
+                    Err(Error::Unsupported)
+                ));
             }
         }
     }
