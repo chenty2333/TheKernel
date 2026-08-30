@@ -445,7 +445,7 @@ fn set_task_nice(
 }
 
 pub fn sys_sched_yield() -> AxResult<isize> {
-    axtask::yield_now();
+    axtask::sched_yield();
     Ok(0)
 }
 
