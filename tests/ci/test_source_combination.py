@@ -35,10 +35,10 @@ class SourceCombinationTests(unittest.TestCase):
             values,
             {
                 "ax_repository": "chenty2333/thekernel-ax",
-                "ax_ref": "b780f528d806844ce47653cb5c7fdcb6ee5082b5",
+                "ax_ref": "962defe2790c8cee6e699e66b1b4b7f8ba97e450",
                 "ax_path": "thekernel-ax",
                 "linux_abi_repository": "chenty2333/thekernel-linux-abi",
-                "linux_abi_ref": "f0721ef792ecd0c4826a00b90b88a524f6411d47",
+                "linux_abi_ref": "f21c02a03cd2355f18efb28e911976b9750c3e0f",
                 "linux_abi_path": "thekernel-linux-abi",
             },
         )
