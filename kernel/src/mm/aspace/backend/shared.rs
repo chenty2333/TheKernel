@@ -211,9 +211,10 @@ impl SharedPages {
     }
 
     pub fn len(&self) -> usize {
-        self.secret_frames
-            .as_ref()
-            .map_or_else(|| self.phys_pages.lock().pages.len(), |_| self.published_len.load(Ordering::Acquire))
+        self.secret_size.as_ref().map_or_else(
+            || self.phys_pages.lock().pages.len(),
+            |size| size.load(Ordering::Acquire).div_ceil(PAGE_SIZE_4K),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -232,8 +233,6 @@ impl SharedPages {
         if secret_size.load(Ordering::Acquire) != 0 {
             return Err(AxError::InvalidInput);
         }
-        self.published_len
-            .store(size.div_ceil(PAGE_SIZE_4K), Ordering::Release);
         secret_size.store(size, Ordering::Release);
         Ok(())
     }
@@ -303,7 +302,10 @@ impl SharedPages {
     }
 
     fn total_bytes_snapshot(&self) -> usize {
-        self.published_len.load(Ordering::Acquire) * self.size as usize
+        self.secret_size.as_ref().map_or_else(
+            || self.published_len.load(Ordering::Acquire) * self.size as usize,
+            |size| size.load(Ordering::Acquire),
+        )
     }
 
     pub fn read_bytes(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
@@ -394,7 +396,7 @@ impl SharedPages {
             let end = start_index
                 .checked_add(count)
                 .ok_or(AxError::InvalidInput)?;
-            if end > self.published_len.load(Ordering::Acquire) {
+            if end > self.len() {
                 return Err(AxError::NoMemory);
             }
             let mut pages = Vec::new();
@@ -421,7 +423,7 @@ impl SharedPages {
     pub fn paddr_at(&self, index: usize) -> AxResult<PhysAddr> {
         if let Some(frames) = &self.secret_frames {
             let mut frames = frames.lock();
-            if index >= self.published_len.load(Ordering::Acquire) {
+            if index >= self.len() {
                 return Err(AxError::InvalidInput);
             }
             return Ok(secret_page(&mut frames, index)?.physical());

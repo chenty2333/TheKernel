@@ -6628,6 +6628,19 @@ impl AddrSpace {
             crate::mm::retain(*entry)?;
             guard.swapped.insert(*page, *entry);
         }
+        // Secret VMAs are unconditionally mlocked.  Reconstruct this child
+        // sidecar from VMAs that were actually cloned, rather than copying
+        // the parent's ranges: MADV_DONTFORK holes have no child mapping and
+        // ordinary mlock state is not inherited by fork.
+        let child_secret_ranges: Vec<_> = guard
+            .areas
+            .iter()
+            .filter(|area| area.backend().is_secret())
+            .map(|area| (area.start(), area.end()))
+            .collect();
+        for (start, end) in child_secret_ranges {
+            guard.insert_locked_range(start, end);
+        }
         guard.refresh_growdown_starts();
         for pending in fork_pending_aliases.drain(..) {
             guard.commit_shared_alias_binding(pending);
