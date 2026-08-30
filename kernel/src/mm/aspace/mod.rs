@@ -7,7 +7,7 @@ use alloc::{
 use core::{
     fmt,
     ops::DerefMut,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence},
 };
 
 use axerrno::{AxError, AxResult, ax_bail};
@@ -39,7 +39,7 @@ use super::{
     checked_align_up_4k,
     ldt::{ENTRIES, Ldt, UserDesc},
 };
-use crate::task::AsThread;
+use crate::task::{AsThread, has_pending_syscall_signal};
 
 mod backend;
 mod mapping;
@@ -1563,6 +1563,24 @@ impl AddrSpace {
         })
     }
 
+    /// The mmap-lock equivalent used by operations that Linux specifies as
+    /// killable. `axsync::Mutex` has no signal-aware waiter, so retry its
+    /// nonblocking acquisition with scheduler yields and sample deliverable
+    /// signals before each yield.
+    pub(crate) fn lock_interruptibly(
+        handle: &Arc<Mutex<Self>>,
+    ) -> AxResult<axsync::MutexGuard<'_, Self>> {
+        loop {
+            if has_pending_syscall_signal(axtask::current().as_thread()) {
+                return Err(AxError::Interrupted);
+            }
+            if let Some(guard) = handle.try_lock() {
+                return Ok(guard);
+            }
+            axtask::yield_now();
+        }
+    }
+
     fn prepare_fresh_mapping_lineage(&mut self) -> AxResult<MappingLineage> {
         reserve_mapping_identity_slot(&mut self.mapping_identities, MAX_MAPPING_LINEAGES)?;
         let (lineage, identity) = allocate_mapping_identity()?;
@@ -2678,23 +2696,22 @@ impl AddrSpace {
             .sum()
     }
 
-    /// Claims this shared mm's OOM reaper.  Completed mm teardown is a
-    /// successful no-op; a concurrent pass must be retried by its caller.
+    /// Claims this shared mm's OOM reaper for one PTE generation. Completion
+    /// returns to idle: later faults can populate new private pages which a
+    /// later process_mrelease must be able to reclaim.
     pub(crate) fn begin_oom_reap(&self) -> AxResult<bool> {
         match self
             .oom_reap_state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => Ok(true),
-            Err(2) => Ok(false),
             Err(_) => Err(AxError::ResourceBusy),
         }
     }
 
-    /// Completes (or makes retryable) the reaper ownership claimed above.
-    pub(crate) fn finish_oom_reap(&self, completed: bool) {
-        self.oom_reap_state
-            .store(if completed { 2 } else { 0 }, Ordering::Release);
+    /// Releases the reaper ownership claimed above.
+    pub(crate) fn finish_oom_reap(&self) {
+        self.oom_reap_state.store(0, Ordering::Release);
     }
 
     /// Merges an already-observed peak into this mm's high-water mark.
@@ -4796,6 +4813,19 @@ mod tests {
         assert_eq!(aspace.resident_user_bytes(), 0);
         // A completed reaper pass is idempotent at the page-table layer.
         assert!(aspace.oom_reap_private_pages());
+
+        // Completion is not a permanent OOM_SKIP: a later fault generation
+        // can populate and then be drained by another pass.
+        aspace
+            .populate_area(
+                start,
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K);
+        assert!(aspace.oom_reap_private_pages());
+        assert_eq!(aspace.resident_user_bytes(), 0);
     }
 
     #[test]
@@ -4803,10 +4833,12 @@ mod tests {
         let aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE).unwrap();
         assert_eq!(aspace.begin_oom_reap(), Ok(true));
         assert_eq!(aspace.begin_oom_reap(), Err(AxError::ResourceBusy));
-        aspace.finish_oom_reap(false);
+        aspace.finish_oom_reap();
         assert_eq!(aspace.begin_oom_reap(), Ok(true));
-        aspace.finish_oom_reap(true);
-        assert_eq!(aspace.begin_oom_reap(), Ok(false));
+        aspace.finish_oom_reap();
+        // A new fault generation may be reaped by a subsequent caller.
+        assert_eq!(aspace.begin_oom_reap(), Ok(true));
+        aspace.finish_oom_reap();
     }
 
     #[test]

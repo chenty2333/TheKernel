@@ -569,7 +569,7 @@ impl Backend {
     /// MAP_PRIVATE file mapping.  Shared/file/device mappings must retain
     /// their backing and are deliberately left alone.
     pub(crate) fn is_oom_reapable_private(&self) -> bool {
-        matches!(self, Backend::Cow(_))
+        matches!(self, Backend::Cow(_)) && self.page_size() == PageSize::Size4K
     }
 
     pub(crate) fn is_sealed(&self) -> bool {
@@ -864,6 +864,14 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(outcome)));
         assert!(panic.is_err());
         assert_eq!(drops.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn oom_reaper_rejects_huge_private_cow_mappings() {
+        let start = VirtAddr::from(0x20_0000);
+        assert!(Backend::new_alloc(start, PageSize::Size4K).is_oom_reapable_private());
+        assert!(!Backend::new_alloc(start, PageSize::Size2M).is_oom_reapable_private());
+        assert!(!Backend::new_alloc(start, PageSize::Size1G).is_oom_reapable_private());
     }
 
     #[test]

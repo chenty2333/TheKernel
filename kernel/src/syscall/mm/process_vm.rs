@@ -14,7 +14,7 @@ use crate::{
     task::{
         AsThread, PtraceAccessMode, check_current_ptrace_image_snapshot,
         check_current_thread_ptrace_image_access, get_process_data, get_visible_task,
-        has_pending_syscall_signal, process_domain, process_error,
+        process_domain, process_error,
     },
 };
 
@@ -110,6 +110,17 @@ fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
         MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => Err(AxError::OperationNotSupported),
         _ => Err(AxError::InvalidInput),
     }
+}
+
+/// `find_lock_task_mm()` does not treat a retained zombie ProcessData as an
+/// mm owner. Resolve one still-published thread in the exact process group;
+/// final exit removes every such thread before the zombie payload survives.
+fn process_mrelease_has_live_mm_thread(target: &crate::task::ProcessData) -> bool {
+    target.proc.thread_ids().any(|tid| {
+        get_visible_task(tid)
+            .ok()
+            .is_some_and(|task| core::ptr::eq(&*task.as_thread().proc_data, target))
+    })
 }
 
 fn validate_address_range(
@@ -469,12 +480,8 @@ pub fn sys_process_mrelease(pidfd: i32, flags: u32) -> AxResult<isize> {
     if !target.oom_reap_eligible() {
         return Err(AxError::InvalidInput);
     }
-
-    // `mmap_read_lock_killable()` observes an already pending deliverable
-    // signal before sleeping.  axsync exposes no interruptible mutex wait, so
-    // contention is reported as the Linux retry result below.
-    if has_pending_syscall_signal(current().as_thread()) {
-        return Err(AxError::Interrupted);
+    if !process_mrelease_has_live_mm_thread(&target) {
+        return Err(AxError::NoSuchProcess);
     }
 
     let aspace = target.aspace();
@@ -498,25 +505,16 @@ pub fn sys_process_mrelease(pidfd: i32, flags: u32) -> AxResult<isize> {
         }
     }
 
-    let claimed = aspace.lock().begin_oom_reap().map_err(|error| match error {
+    // Match mmap_read_lock_killable(): contention waits, while a deliverable
+    // signal during that wait yields EINTR rather than a spurious EAGAIN.
+    let mut aspace = AddrSpace::lock_interruptibly(&aspace)?;
+    let claimed = aspace.begin_oom_reap().map_err(|error| match error {
         AxError::ResourceBusy => LinuxError::EAGAIN.into(),
         _ => error,
     })?;
-    if !claimed {
-        return Ok(0);
-    }
-
-    let Some(mut aspace) = aspace.try_lock() else {
-        target.aspace().lock().finish_oom_reap(false);
-        return Err(LinuxError::EAGAIN.into());
-    };
-    if has_pending_syscall_signal(current().as_thread()) {
-        drop(aspace);
-        target.aspace().lock().finish_oom_reap(false);
-        return Err(AxError::Interrupted);
-    }
+    debug_assert!(claimed, "the mmap lock serializes OOM reaper ownership");
     let completed = aspace.oom_reap_private_pages();
-    aspace.finish_oom_reap(completed);
+    aspace.finish_oom_reap();
     drop(aspace);
     if completed {
         Ok(0)

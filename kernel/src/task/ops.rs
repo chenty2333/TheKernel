@@ -1666,8 +1666,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         if Arc::strong_count(&aspace) == 2 {
             let mut aspace = aspace.lock();
             if let Ok(true) = aspace.begin_oom_reap() {
-                let completed = aspace.oom_reap_private_pages();
-                aspace.finish_oom_reap(completed);
+                let _ = aspace.oom_reap_private_pages();
+                aspace.finish_oom_reap();
             }
         }
         let self_usage = thr.proc_data.self_usage();
