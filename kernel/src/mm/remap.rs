@@ -167,6 +167,40 @@ fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize)
     aspace.find_free_area(start, size, limit, align) == Some(start)
 }
 
+/// Revalidates the complete automatic destination reservation.  A shadow
+/// stack's guard is policy-only (not a VMA), so it must be checked alongside
+/// the destination again after lock-external preparation.
+fn remap_destination_is_free(
+    aspace: &AddrSpace,
+    destination: VirtAddr,
+    new_size: usize,
+    page_size: usize,
+    source_segments: &[RemapSegment],
+) -> bool {
+    let has_shadow_stack = source_segments
+        .iter()
+        .any(|segment| segment.flags.contains(MappingFlags::SHADOW_STACK));
+    if !has_shadow_stack {
+        return range_is_free(aspace, destination, new_size, page_size);
+    }
+    // A mixed source cannot have one coherent CET guard contract. The normal
+    // collector rejects it already; retain this fail-closed check for plan
+    // revalidation and future callers.
+    if source_segments
+        .iter()
+        .any(|segment| !segment.flags.contains(MappingFlags::SHADOW_STACK))
+    {
+        return false;
+    }
+    let Some(guard_start) = destination.checked_sub(memory_addr::PAGE_SIZE_4K) else {
+        return false;
+    };
+    let Some(total) = new_size.checked_add(memory_addr::PAGE_SIZE_4K) else {
+        return false;
+    };
+    range_is_free(aspace, guard_start, total, page_size)
+}
+
 /// Chooses an automatic mremap destination.  A moved shadow stack keeps its
 /// lower guard outside the relocated VMA, so transactions continue to use the
 /// returned `start` and `new_size` unchanged.
@@ -820,11 +854,12 @@ impl PreparedRemapPlan {
                 ..
             } => {
                 remap_segments_match(aspace, request.addr, request.new_size, source_segments)
-                    && range_is_free(
+                    && remap_destination_is_free(
                         aspace,
                         *destination,
                         request.new_size,
                         source_segments[0].backend.page_size() as usize,
+                        source_segments,
                     )
             }
             Self::GrowInPlace {
@@ -845,11 +880,12 @@ impl PreparedRemapPlan {
                 ..
             } => {
                 remap_segments_match(aspace, request.addr, request.old_size, source_segments)
-                    && range_is_free(
+                    && remap_destination_is_free(
                         aspace,
                         *destination,
                         request.new_size,
                         source_segments[0].backend.page_size() as usize,
+                        source_segments,
                     )
             }
         }
