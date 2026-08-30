@@ -281,6 +281,11 @@ fn unmap_pages(base: VirtAddr, pages: usize) -> AxResult<()> {
 }
 
 impl WritableCode {
+    /// Virtual base of the unpublished image, used to resolve ET_REL
+    /// section-relative relocations before W^X publication.
+    pub(crate) fn code_address(&self) -> usize {
+        self.code.as_usize()
+    }
     /// Copies bytes into the unpublished NX alias.
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> AxResult<()> {
         let end = offset
@@ -432,6 +437,19 @@ pub(crate) struct ExecutableCode {
 }
 
 impl ExecutableCode {
+    /// Invokes a validated SysV x86_64 module entry point.  Module code is
+    /// entered only through this owner, so its RX mapping remains pinned for
+    /// the whole call and teardown cannot race the instruction fetches.
+    pub(crate) fn execute_module_entry(&self, entry_offset: usize) -> i32 {
+        debug_assert!(entry_offset < self.len);
+        type Entry = extern "C" fn() -> i32;
+        let entry = self.code.as_usize() + entry_offset;
+        // SAFETY: the ET_REL loader validated that this offset denotes a
+        // defined executable symbol in this published allocation. `self`
+        // owns the RX mapping for the complete invocation.
+        let function: Entry = unsafe { core::mem::transmute(entry) };
+        function()
+    }
     /// Executes the published SysV x86_64 entry while borrowing the code
     /// owner for the complete call. The only unsafe operation in this
     /// publisher is the typed conversion of the validated, W^X-protected

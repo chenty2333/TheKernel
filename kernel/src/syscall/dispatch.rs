@@ -1048,11 +1048,15 @@ pub(super) fn dispatch_syscall(
                 )
             })
         }
-        Sysno::init_module => sys_init_module(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::finit_module => {
-            sys_finit_module(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
-        Sysno::delete_module => sys_delete_module(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::init_module => with_user_memory(aspace(), |memory| {
+            sys_init_module(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
+        Sysno::finit_module => with_user_memory(aspace(), |memory| {
+            sys_finit_module(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
+        Sysno::delete_module => with_user_memory(aspace(), |memory| {
+            sys_delete_module(memory, uctx.arg0() as _, uctx.arg1() as _)
+        }),
         Sysno::kexec_load => with_user_memory(aspace(), |memory| {
             sys_kexec_load(
                 memory,
