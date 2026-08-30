@@ -29,6 +29,7 @@ const STRTAB: u32 = 3;
 const RELOC: u32 = 4;
 const NOBITS: u32 = 8;
 const ALLOC: u64 = 2;
+const WRITE: u64 = 1;
 const EXEC: u64 = 4;
 const UNDEF: u16 = 0;
 const FUNC: u8 = 2;
@@ -54,8 +55,9 @@ struct Y {
 }
 #[derive(Clone, Copy)]
 enum P {
-    C(usize),
+    T(usize),
     D(usize),
+    R(usize),
 }
 enum State {
     Coming,
@@ -71,7 +73,8 @@ struct Slot {
 struct M {
     name: String,
     code: ExecutableCode,
-    data: Vec<u8>,
+    rodata: Option<ExecutableCode>,
+    data: Option<jit_memory::WritableCode>,
     charps: Vec<Vec<u8>>,
     init: usize,
     exit: Option<usize>,
@@ -236,17 +239,19 @@ fn sy(b: &[u8], t: S, j: usize) -> AxResult<Y> {
         z: usize::try_from(u64x(b, p + 16)?).map_err(|_| AxError::InvalidExecutable)?,
     })
 }
-fn pa(p: P, cb: usize, db: usize) -> AxResult<usize> {
+fn pa(p: P, tb: usize, db: usize, rb: usize) -> AxResult<usize> {
     match p {
-        P::C(x) => cb.checked_add(x),
+        P::T(x) => tb.checked_add(x),
         P::D(x) => db.checked_add(x),
+        P::R(x) => rb.checked_add(x),
     }
     .ok_or(AxError::InvalidExecutable)
 }
-fn put(c: &mut [u8], d: &mut [u8], p: P, v: &[u8]) -> AxResult<()> {
+fn put(t: &mut [u8], d: &mut [u8], r: &mut [u8], p: P, v: &[u8]) -> AxResult<()> {
     match p {
-        P::C(x) => c.get_mut(x..x + v.len()),
+        P::T(x) => t.get_mut(x..x + v.len()),
         P::D(x) => d.get_mut(x..x + v.len()),
+        P::R(x) => r.get_mut(x..x + v.len()),
     }
     .ok_or(AxError::InvalidExecutable)?
     .copy_from_slice(v);
@@ -256,24 +261,28 @@ fn rel(
     b: &[u8],
     ss: &[S],
     ps: &[Option<P>],
-    c: &mut [u8],
+    t: &mut [u8],
     d: &mut [u8],
-    cb: usize,
+    r: &mut [u8],
+    tb: usize,
+    db: usize,
+    rb: usize,
 ) -> AxResult<()> {
-    let db = d.as_ptr() as usize;
-    for r in ss.iter().filter(|x| x.t == RELOC) {
+    for reloc in ss.iter().filter(|x| x.t == RELOC) {
         let dst = ps
-            .get(r.i as usize)
+            .get(reloc.i as usize)
             .ok_or(AxError::InvalidExecutable)?
             .ok_or(AxError::InvalidExecutable)?;
-        let tab = *ss.get(r.l as usize).ok_or(AxError::InvalidExecutable)?;
-        if tab.t != SYMTAB || r.e != RELA || r.z % RELA != 0 {
+        let dst_section = *ss.get(reloc.i as usize).ok_or(AxError::InvalidExecutable)?;
+        let tab = *ss.get(reloc.l as usize).ok_or(AxError::InvalidExecutable)?;
+        if tab.t != SYMTAB || reloc.e != RELA || reloc.z % RELA != 0 {
             return no();
         }
-        for j in 0..r.z / RELA {
-            let q =
-                r.o.checked_add(j.checked_mul(RELA).ok_or(AxError::InvalidExecutable)?)
-                    .ok_or(AxError::InvalidExecutable)?;
+        for j in 0..reloc.z / RELA {
+            let q = reloc
+                .o
+                .checked_add(j.checked_mul(RELA).ok_or(AxError::InvalidExecutable)?)
+                .ok_or(AxError::InvalidExecutable)?;
             sl(b, q, RELA)?;
             let off = usize::try_from(u64x(b, q)?).map_err(|_| AxError::InvalidExecutable)?;
             let inf = u64x(b, q + 8)?;
@@ -298,44 +307,49 @@ fn rel(
                 2 | 4 | 10 | 11 => 4,
                 _ => return no(),
             };
-            if off.checked_add(width).ok_or(AxError::InvalidExecutable)? > ss[r.i as usize].z {
+            if off.checked_add(width).ok_or(AxError::InvalidExecutable)? > dst_section.z {
                 return no();
             }
             let dp = match dst {
-                P::C(x) => P::C(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
+                P::T(x) => P::T(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
                 P::D(x) => P::D(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
+                P::R(x) => P::R(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
             };
             let a = u64x(b, q + 16)? as i64 as i128;
-            let s = pa(sp, cb, db)? as i128;
-            let p = pa(dp, cb, db)? as i128;
+            let s = pa(sp, tb, db, rb)? as i128;
+            let p = pa(dp, tb, db, rb)? as i128;
             match inf as u32 {
                 1 => put(
-                    c,
+                    t,
                     d,
+                    r,
                     dp,
                     &u64::try_from(s + a)
                         .map_err(|_| AxError::InvalidExecutable)?
                         .to_le_bytes(),
                 )?,
                 2 | 4 => put(
-                    c,
+                    t,
                     d,
+                    r,
                     dp,
                     &i32::try_from(s + a - p)
                         .map_err(|_| AxError::InvalidExecutable)?
                         .to_le_bytes(),
                 )?,
                 10 => put(
-                    c,
+                    t,
                     d,
+                    r,
                     dp,
                     &u32::try_from(s + a)
                         .map_err(|_| AxError::InvalidExecutable)?
                         .to_le_bytes(),
                 )?,
                 11 => put(
-                    c,
+                    t,
                     d,
+                    r,
                     dp,
                     &i32::try_from(s + a)
                         .map_err(|_| AxError::InvalidExecutable)?
@@ -441,15 +455,78 @@ fn num(x: &[u8], sg: bool, bits: u32) -> AxResult<u64> {
         Ok(v as u64)
     }
 }
-fn off(d: &[u8], p: usize, n: usize) -> AxResult<usize> {
-    let b = d.as_ptr() as usize;
-    if p < b || p.checked_add(n).ok_or(AxError::InvalidExecutable)? > b + d.len() {
-        return no();
+struct DataView<'a> {
+    ro: &'a [u8],
+    ro_base: usize,
+    rw: &'a [u8],
+    rw_base: usize,
+}
+impl DataView<'_> {
+    fn get(&self, p: usize, n: usize) -> AxResult<&[u8]> {
+        let end = p.checked_add(n).ok_or(AxError::InvalidExecutable)?;
+        for (base, bytes) in [(self.ro_base, self.ro), (self.rw_base, self.rw)] {
+            if p >= base
+                && end
+                    <= base
+                        .checked_add(bytes.len())
+                        .ok_or(AxError::InvalidExecutable)?
+            {
+                return Ok(&bytes[p - base..end - base]);
+            }
+        }
+        no()
     }
-    Ok(p - b)
+    fn u16(&self, p: usize) -> AxResult<u16> {
+        Ok(u16::from_le_bytes(self.get(p, 2)?.try_into().unwrap()))
+    }
+    fn u32(&self, p: usize) -> AxResult<u32> {
+        Ok(u32::from_le_bytes(self.get(p, 4)?.try_into().unwrap()))
+    }
+    fn u64(&self, p: usize) -> AxResult<u64> {
+        Ok(u64::from_le_bytes(self.get(p, 8)?.try_into().unwrap()))
+    }
+    fn cstr(&self, p: usize) -> AxResult<&[u8]> {
+        let bytes = if p >= self.ro_base
+            && p < self
+                .ro_base
+                .checked_add(self.ro.len())
+                .ok_or(AxError::InvalidExecutable)?
+        {
+            &self.ro[p - self.ro_base..]
+        } else if p >= self.rw_base
+            && p < self
+                .rw_base
+                .checked_add(self.rw.len())
+                .ok_or(AxError::InvalidExecutable)?
+        {
+            &self.rw[p - self.rw_base..]
+        } else {
+            return no();
+        };
+        Ok(&bytes[..bytes
+            .iter()
+            .position(|x| *x == 0)
+            .ok_or(AxError::InvalidExecutable)?])
+    }
+    fn rw_offset(&self, p: usize, n: usize) -> AxResult<usize> {
+        let end = p.checked_add(n).ok_or(AxError::InvalidExecutable)?;
+        if p < self.rw_base
+            || end
+                > self
+                    .rw_base
+                    .checked_add(self.rw.len())
+                    .ok_or(AxError::InvalidExecutable)?
+        {
+            return no();
+        }
+        Ok(p - self.rw_base)
+    }
 }
 fn params(
-    d: &mut Vec<u8>,
+    ro: &[u8],
+    ro_base: usize,
+    d: &mut [u8],
+    d_base: usize,
     ss: &[S],
     ps: &[Option<P>],
     which: Option<usize>,
@@ -459,35 +536,49 @@ fn params(
         return Ok(Vec::new());
     };
     let s = ss[i];
-    let Some(P::D(o)) = ps[i] else { return no() };
-    if s.z < 16 || u32x(d, o)? != 1 || u32x(d, o + 12)? != 0 {
+    let Some(p) = ps[i] else { return no() };
+    if matches!(p, P::T(_)) {
         return no();
     }
-    let old = d.clone();
+    let base = pa(p, 0, d_base, ro_base)?;
+    // Decode the relocated records from a stable snapshot while writes go to
+    // their final RW mapping.  The snapshot is not module-owned storage.
+    let old = d.to_vec();
+    let view = DataView {
+        ro,
+        ro_base,
+        rw: &old,
+        rw_base: d_base,
+    };
+    if s.z < 16 || view.u32(base)? != 1 || view.u32(base + 12)? != 0 {
+        return no();
+    }
     let r = (|| {
-        let rs = u32x(d, o + 4)? as usize;
-        let n = u32x(d, o + 8)? as usize;
-        if rs != 40 || o + 16 + n.checked_mul(rs).ok_or(AxError::InvalidExecutable)? > o + s.z {
+        let rs = view.u32(base + 4)? as usize;
+        let n = view.u32(base + 8)? as usize;
+        if rs != 40 || base + 16 + n.checked_mul(rs).ok_or(AxError::InvalidExecutable)? > base + s.z
+        {
             return no();
         }
         let mut cp = Vec::new();
         for (k, v) in av {
             let mut seen = false;
             for j in 0..n {
-                let q = o + 16 + j * rs;
-                let np = usize::try_from(u64x(d, q)?).map_err(|_| AxError::InvalidExecutable)?;
-                if !eq(k, cs(d, off(d, np, 1)?)?) {
+                let q = base + 16 + j * rs;
+                let np = usize::try_from(view.u64(q)?).map_err(|_| AxError::InvalidExecutable)?;
+                if !eq(k, view.cstr(np)?) {
                     continue;
                 }
                 seen = true;
                 let ap =
-                    usize::try_from(u64x(d, q + 8)?).map_err(|_| AxError::InvalidExecutable)?;
+                    usize::try_from(view.u64(q + 8)?).map_err(|_| AxError::InvalidExecutable)?;
                 let cnt =
-                    usize::try_from(u64x(d, q + 16)?).map_err(|_| AxError::InvalidExecutable)?;
-                let kind = u16x(d, q + 24)?;
-                let fl = u16x(d, q + 26)?;
-                let cap = u32x(d, q + 28)? as usize;
-                if fl & !1 != 0 || u32x(d, q + 32)? != 0 || cap == 0 || (kind == 5 && fl & 1 != 0) {
+                    usize::try_from(view.u64(q + 16)?).map_err(|_| AxError::InvalidExecutable)?;
+                let kind = view.u16(q + 24)?;
+                let fl = view.u16(q + 26)?;
+                let cap = view.u32(q + 28)? as usize;
+                if fl & !1 != 0 || view.u32(q + 32)? != 0 || cap == 0 || (kind == 5 && fl & 1 != 0)
+                {
                     return no();
                 }
                 let vs: Vec<&[u8]> = if fl & 1 != 0 {
@@ -505,8 +596,7 @@ fn params(
                     5 => cap,
                     _ => return no(),
                 };
-                let ao = off(
-                    d,
+                let ao = view.rw_offset(
                     ap,
                     if kind == 5 {
                         cap
@@ -515,7 +605,7 @@ fn params(
                     },
                 )?;
                 if cnt != 0 {
-                    off(d, cnt, 4)?;
+                    view.rw_offset(cnt, 4)?;
                 }
                 for (i, x) in vs.iter().enumerate() {
                     let z = ao + i * w;
@@ -553,7 +643,7 @@ fn params(
                     }
                 }
                 if cnt != 0 {
-                    let x = off(d, cnt, 4)?;
+                    let x = view.rw_offset(cnt, 4)?;
                     d[x..x + 4].copy_from_slice(&(vs.len() as u32).to_le_bytes())
                 }
             }
@@ -593,33 +683,50 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
     }
     let mut ps = Vec::new();
     ps.resize(ss.len(), None);
-    let (mut cl, mut dl) = (0, 0);
+    let (mut tl, mut dl, mut rl) = (0, 0, 0);
     for (i, s) in ss.iter().enumerate() {
         if s.f & ALLOC == 0 {
             continue;
         }
+        if s.f & (EXEC | WRITE) == EXEC | WRITE {
+            return no();
+        }
         if s.f & EXEC != 0 {
-            cl = al(cl, s.a.max(1))?;
-            ps[i] = Some(P::C(cl));
-            cl = cl.checked_add(s.z).ok_or(AxError::InvalidExecutable)?
-        } else {
+            tl = al(tl, s.a.max(1))?;
+            ps[i] = Some(P::T(tl));
+            tl = tl.checked_add(s.z).ok_or(AxError::InvalidExecutable)?
+        } else if s.f & WRITE != 0 {
             dl = al(dl, s.a.max(1))?;
             ps[i] = Some(P::D(dl));
             dl = dl.checked_add(s.z).ok_or(AxError::InvalidExecutable)?
+        } else {
+            rl = al(rl, s.a.max(1))?;
+            ps[i] = Some(P::R(rl));
+            rl = rl.checked_add(s.z).ok_or(AxError::InvalidExecutable)?
         }
     }
-    if cl == 0 {
+    if tl == 0 {
         return no();
     }
-    if cl.checked_add(dl).ok_or(AxError::InvalidExecutable)? > MAX {
+    if tl
+        .checked_add(dl)
+        .and_then(|x| x.checked_add(rl))
+        .ok_or(AxError::InvalidExecutable)?
+        > MAX
+    {
         return Err(AxError::NoMemory);
     }
-    let mut c = Vec::new();
-    c.try_reserve_exact(cl).map_err(|_| AxError::NoMemory)?;
-    c.resize(cl, 0);
-    let mut d = Vec::new();
-    d.try_reserve_exact(dl).map_err(|_| AxError::NoMemory)?;
-    d.resize(dl, 0);
+    let mut text = jit_memory::prepare(tl).map_err(me)?;
+    let mut data = if dl == 0 {
+        None
+    } else {
+        Some(jit_memory::prepare_module_data(dl).map_err(me)?)
+    };
+    let mut rodata = if rl == 0 {
+        None
+    } else {
+        Some(jit_memory::prepare_module_data(rl).map_err(me)?)
+    };
     for (i, s) in ss.iter().enumerate() {
         let Some(p) = ps[i] else { continue };
         if s.t != PROG && s.t != NOBITS {
@@ -627,8 +734,12 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
         }
         if s.t == PROG {
             match p {
-                P::C(o) => c[o..o + s.z].copy_from_slice(sl(b, s.o, s.z)?),
-                P::D(o) => d[o..o + s.z].copy_from_slice(sl(b, s.o, s.z)?),
+                P::T(o) => text.bytes_mut()[o..o + s.z].copy_from_slice(sl(b, s.o, s.z)?),
+                P::D(o) => {
+                    data.as_mut().unwrap().bytes_mut()[o..o + s.z].copy_from_slice(sl(b, s.o, s.z)?)
+                }
+                P::R(o) => rodata.as_mut().unwrap().bytes_mut()[o..o + s.z]
+                    .copy_from_slice(sl(b, s.o, s.z)?),
             }
         }
     }
@@ -643,7 +754,7 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
             return no();
         }
         if y.i & 15 == FUNC {
-            if let Some(P::C(o)) = ps[y.s as usize] {
+            if let Some(P::T(o)) = ps[y.s as usize] {
                 match cs(sl(b, strtab.o, strtab.z)?, y.n as usize)? {
                     b"thekernel_module_init" => {
                         init = Some(o.checked_add(y.v).ok_or(AxError::InvalidExecutable)?)
@@ -671,14 +782,45 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
     let name = core::str::from_utf8(mn)
         .map_err(|_| AxError::IllegalBytes)?
         .into();
-    let mut w = jit_memory::prepare(cl).map_err(me)?;
-    rel(b, &ss, &ps, &mut c, &mut d, w.code_address())?;
-    let charps = params(&mut d, &ss, &ps, param_section, av)?;
-    w.write(0, &c)?;
+    let tb = text.code_address();
+    let db = data
+        .as_ref()
+        .map_or(0, jit_memory::WritableCode::code_address);
+    let rb = rodata
+        .as_ref()
+        .map_or(0, jit_memory::WritableCode::code_address);
+    {
+        let d = data
+            .as_mut()
+            .map(jit_memory::WritableCode::bytes_mut)
+            .unwrap_or(&mut []);
+        let r = rodata
+            .as_mut()
+            .map(jit_memory::WritableCode::bytes_mut)
+            .unwrap_or(&mut []);
+        rel(b, &ss, &ps, text.bytes_mut(), d, r, tb, db, rb)?;
+    }
+    let charps = {
+        let ro = rodata
+            .as_mut()
+            .map(jit_memory::WritableCode::bytes_mut)
+            .unwrap_or(&mut []);
+        let d = data
+            .as_mut()
+            .map(jit_memory::WritableCode::bytes_mut)
+            .unwrap_or(&mut []);
+        params(ro, rb, d, db, &ss, &ps, param_section, av)?
+    };
+    let code = text.publish(init).map_err(me)?;
+    let rodata = rodata
+        .map(jit_memory::WritableCode::publish_readonly)
+        .transpose()
+        .map_err(me)?;
     Ok(M {
         name,
-        code: w.publish(init).map_err(me)?,
-        data: d,
+        code,
+        rodata,
+        data,
         charps,
         init,
         exit,
@@ -840,7 +982,10 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     if let Some(e) = x.exit {
         let _ = x.code.execute_module_entry(e);
     };
-    x.code.retire().map_err(me)?;
+    // Retire the executable segment before releasing the RO/RW segment
+    // owners.  Even a failed retirement consumes its owner exactly once and
+    // leaves any uncertain mapping retained/quarantined.
+    let retired = x.code.retire().map_err(me);
     let mut v = MODULES.lock();
     if let Some(i) = v
         .iter()
@@ -848,6 +993,7 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     {
         v.remove(i);
     };
+    retired?;
     Ok(0)
 }
 
@@ -885,14 +1031,38 @@ mod tests {
             e: 0,
         };
         let args = vec![(b"foo".to_vec(), b"0x2a".to_vec())];
-        params(&mut data, &[section], &[Some(P::D(0))], Some(0), &args).unwrap();
+        let base = data.as_ptr() as usize;
+        params(
+            &[],
+            0,
+            &mut data,
+            base,
+            &[section],
+            &[Some(P::D(0))],
+            Some(0),
+            &args,
+        )
+        .unwrap();
         assert_eq!(&data[72..76], &42u32.to_le_bytes());
         let before = data.clone();
         let bad = vec![
             (b"foo".to_vec(), b"7".to_vec()),
             (b"unknown".to_vec(), b"1".to_vec()),
         ];
-        assert!(params(&mut data, &[section], &[Some(P::D(0))], Some(0), &bad).is_err());
+        let base = data.as_ptr() as usize;
+        assert!(
+            params(
+                &[],
+                0,
+                &mut data,
+                base,
+                &[section],
+                &[Some(P::D(0))],
+                Some(0),
+                &bad
+            )
+            .is_err()
+        );
         assert_eq!(data, before);
     }
 
@@ -902,5 +1072,128 @@ mod tests {
         assert_eq!(got, vec![(b"foo-bar".to_vec(), b"quoted value".to_vec())]);
         assert!(eq(b"foo-bar", b"foo_bar"));
         assert_eq!(num(b"077", false, 32).unwrap(), 63);
+    }
+
+    #[test]
+    fn relocations_use_final_addresses_across_text_rodata_and_data() {
+        let mut image = vec![0; 72];
+        // Rela[0]: text[0] = rodata symbol (R_X86_64_64).
+        image[8..16].copy_from_slice(&((1u64 << 32) | 1).to_le_bytes());
+        image[24 + 24 + 6..24 + 24 + 8].copy_from_slice(&1u16.to_le_bytes());
+        image[24 + 24 + 16..24 + 24 + 24].copy_from_slice(&8u64.to_le_bytes());
+        let sections = [
+            S {
+                n: 0,
+                t: PROG,
+                f: ALLOC | EXEC,
+                o: 0,
+                z: 8,
+                l: 0,
+                i: 0,
+                a: 1,
+                e: 0,
+            },
+            S {
+                n: 0,
+                t: PROG,
+                f: ALLOC,
+                o: 0,
+                z: 8,
+                l: 0,
+                i: 0,
+                a: 1,
+                e: 0,
+            },
+            S {
+                n: 0,
+                t: RELOC,
+                f: 0,
+                o: 0,
+                z: RELA,
+                l: 3,
+                i: 0,
+                a: 8,
+                e: RELA,
+            },
+            S {
+                n: 0,
+                t: SYMTAB,
+                f: 0,
+                o: 24,
+                z: 48,
+                l: 0,
+                i: 0,
+                a: 8,
+                e: SYM,
+            },
+        ];
+        let places = [Some(P::T(0)), Some(P::R(0)), None, None];
+        let (mut text, mut data, mut rodata) = (vec![0; 8], vec![0; 8], vec![0; 8]);
+        rel(
+            &image,
+            &sections,
+            &places,
+            &mut text,
+            &mut data,
+            &mut rodata,
+            0x1000,
+            0x2000,
+            0x3000,
+        )
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(text.try_into().unwrap()), 0x3000);
+
+        // The same symbol resolved PC-relatively from RW data must use the
+        // final bases, rather than a temporary combined buffer address.
+        image[8..16].copy_from_slice(&((1u64 << 32) | 2).to_le_bytes());
+        let places = [Some(P::D(0)), Some(P::R(0)), None, None];
+        rel(
+            &image,
+            &sections,
+            &places,
+            &mut text,
+            &mut data,
+            &mut rodata,
+            0x1000,
+            0x2000,
+            0x3000,
+        )
+        .unwrap();
+        assert_eq!(i32::from_le_bytes(data[..4].try_into().unwrap()), 0x1000);
+    }
+
+    #[test]
+    fn parameter_targets_must_be_in_final_rw_segment() {
+        let mut ro = param_image();
+        let mut rw = vec![0; 8];
+        let base = ro.as_ptr() as usize;
+        // `arg` points into rodata, which must be rejected even though the
+        // parameter record and name themselves may live there.
+        ro[24..32].copy_from_slice(&((base + 72) as u64).to_le_bytes());
+        let section = S {
+            n: 0,
+            t: PROG,
+            f: ALLOC,
+            o: 0,
+            z: ro.len(),
+            l: 0,
+            i: 0,
+            a: 1,
+            e: 0,
+        };
+        let rw_base = rw.as_ptr() as usize;
+        assert!(
+            params(
+                &ro,
+                base,
+                &mut rw,
+                rw_base,
+                &[section],
+                &[Some(P::R(0))],
+                Some(0),
+                &[(b"foo".to_vec(), b"1".to_vec())]
+            )
+            .is_err()
+        );
     }
 }
