@@ -6971,11 +6971,37 @@ impl AddrSpace {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn cet_shadow_stack_extent_at(&self, address: VirtAddr) -> Option<(VirtAddr, usize)> {
-        let area = self.find_area(address)?;
-        area.flags()
-            .contains(MappingFlags::SHADOW_STACK)
-            .then_some((area.start(), area.size()))
+    /// Validates one registered default CET stack as a logical extent. A
+    /// `pkey_mprotect(PROT_READ)` may split its VMA at either boundary while
+    /// retaining SHSTK on every fragment; that must not invalidate the SSP
+    /// lease merely because no single VMA still has the original size.
+    fn cet_shadow_stack_extent_covers(&self, start: VirtAddr, size: usize) -> bool {
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        if size == 0 {
+            return false;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let Some(area) = self.find_area(cursor) else {
+                return false;
+            };
+            let flags = area.flags();
+            if area.start() > cursor
+                || !flags
+                    .contains(MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK)
+                || flags.intersects(MappingFlags::WRITE | MappingFlags::EXECUTE)
+            {
+                return false;
+            }
+            let next = area.end().min(end);
+            if next <= cursor {
+                return false;
+            }
+            cursor = next;
+        }
+        true
     }
 
     /// Registers the task-owned default stack only after its VMA is live.
@@ -7024,7 +7050,7 @@ impl AddrSpace {
                 .cet_default_shadow_stacks
                 .iter()
                 .any(|owner| owner.task_id == task_id)
-            || self.cet_shadow_stack_extent_at(start) != Some((start, size))
+            || !self.cet_shadow_stack_extent_covers(start, size)
         {
             return Err(AxError::InvalidInput);
         }
@@ -7114,7 +7140,7 @@ impl AddrSpace {
         let ssp = ssp as usize;
         ssp >= owner.start.as_usize()
             && ssp <= end
-            && self.cet_shadow_stack_extent_at(owner.start) == Some((owner.start, owner.size))
+            && self.cet_shadow_stack_extent_covers(owner.start, owner.size)
     }
 
     /// A borrowed vfork stack deliberately shares its physical leaves with
@@ -7216,9 +7242,7 @@ impl AddrSpace {
         let mut index = 0;
         while index < self.cet_default_shadow_stacks.len() {
             let owner = self.cet_default_shadow_stacks[index];
-            if let Some((start, size)) = self.cet_shadow_stack_extent_at(owner.start) {
-                self.cet_default_shadow_stacks[index].start = start;
-                self.cet_default_shadow_stacks[index].size = size;
+            if self.cet_shadow_stack_extent_covers(owner.start, owner.size) {
                 index += 1;
             } else {
                 invalidated.push(owner.task_id);
@@ -8857,5 +8881,35 @@ mod tests {
         mm.unmap(owner.start, owner.size).unwrap();
         assert!(mm.take_cet_default_shadow_stack(101).is_none());
         assert!(mm.find_area(stack).is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owner_survives_partial_shadow_stack_rekey_split() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page * 2);
+        mm.register_cet_default_shadow_stack(101, stack, page * 2)
+            .unwrap();
+
+        // This is the VMA half of pkey_mprotect(PROT_READ) over one page:
+        // the logical stack now spans differently keyed adjacent fragments.
+        mm.prepare_protect(
+            stack + page,
+            page,
+            (MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK).with_pkey(3),
+        )
+        .unwrap()
+        .commit()
+        .unwrap()
+        .finish();
+
+        assert!(mm.cet_default_shadow_stack_contains(101, (stack + page * 2).as_usize() as u64));
+        assert!(mm.reconcile_cet_default_shadow_stacks().is_empty());
+        // Fork/vfork registration consumes the same logical extent rather
+        // than requiring one unsplit VMA at the recorded start.
+        mm.register_cet_default_shadow_stack(202, stack, page * 2)
+            .unwrap();
     }
 }
