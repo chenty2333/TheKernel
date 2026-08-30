@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytemuck::AnyBitPattern;
-use kspin::SpinNoPreempt;
+use kspin::{SpinNoIrq, SpinNoPreempt};
 
 pub mod job;
 pub mod ldisc;
@@ -19,6 +19,8 @@ pub struct WindowSize {
 }
 
 pub struct Terminal {
+    /// Serializes controlling-terminal ownership changes with a hangup.
+    pub lifecycle: SpinNoIrq<()>,
     pub job_control: job::JobControl,
     pub window_size: SpinNoPreempt<WindowSize>,
     pub termios: SpinNoPreempt<termios::Termios2>,
@@ -29,6 +31,7 @@ pub struct Terminal {
 impl Default for Terminal {
     fn default() -> Self {
         Self {
+            lifecycle: SpinNoIrq::new(()),
             job_control: job::JobControl::new(),
             window_size: SpinNoPreempt::new(WindowSize {
                 ws_row: 28,

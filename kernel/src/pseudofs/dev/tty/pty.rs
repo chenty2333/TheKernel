@@ -165,6 +165,10 @@ impl PtyEndpoint {
             PtySide::Slave => &self.lifecycle.slave_waiters,
         }
     }
+
+    pub(super) fn wake_waiters(&self) {
+        self.lifecycle.wake_all();
+    }
 }
 
 struct ChannelEvents {

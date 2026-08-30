@@ -883,6 +883,21 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         }
     }
 
+    /// Stops input processing and wakes all readers waiting on this discipline.
+    pub fn hangup(&mut self) {
+        match &self.processor {
+            Processor::External(processor) => {
+                processor.control.cancel();
+                processor.poll_rx.wake();
+            }
+            Processor::None(_, poll_rx) => {
+                poll_rx.wake();
+            }
+            Processor::Manual(_) => {}
+        }
+        self.poll_tx.wake();
+    }
+
     pub fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
         if buf.is_empty() {
             return Ok(0);

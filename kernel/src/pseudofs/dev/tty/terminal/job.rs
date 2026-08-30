@@ -14,6 +14,14 @@ pub struct JobControl {
     poll_fg: PollSet,
 }
 
+/// Result of attempting to retire one terminal/session association.
+pub enum SessionRelease {
+    /// Another hangup or detach had already retired the association.
+    NotReleased,
+    /// This caller performed the retirement and owns any foreground signals.
+    Released(Option<Arc<ProcessGroup>>),
+}
+
 impl Default for JobControl {
     fn default() -> Self {
         Self::new()
@@ -110,7 +118,7 @@ impl JobControl {
     }
 
     /// Removes this terminal's session and foreground process group.
-    pub fn release_session(&self, session: &Arc<Session>) -> Option<Arc<ProcessGroup>> {
+    pub fn release_session(&self, session: &Arc<Session>) -> SessionRelease {
         // Keep the lock order consistent with `set_foreground`.
         let mut foreground = self.foreground.lock();
         let mut current_session = self.session.lock();
@@ -118,13 +126,13 @@ impl JobControl {
         let Some(current) = current else {
             drop(current_session);
             drop(foreground);
-            return None;
+            return SessionRelease::NotReleased;
         };
         if !Arc::ptr_eq(&current, session) {
             drop(current_session);
             drop(foreground);
             drop(current);
-            return None;
+            return SessionRelease::NotReleased;
         }
 
         let old_foreground = foreground.upgrade();
@@ -136,7 +144,7 @@ impl JobControl {
         drop(retired_foreground);
         drop(current);
         self.poll_fg.wake();
-        old_foreground
+        SessionRelease::Released(old_foreground)
     }
 }
 

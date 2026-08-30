@@ -32,6 +32,7 @@ use self::{
     pty::PtyEndpoint,
     terminal::{
         Terminal, WindowSize,
+        job::SessionRelease,
         ldisc::{LineDiscipline, TtyConfig, TtyRead, TtyWrite},
         termios::{Termio, Termios, Termios2},
     },
@@ -95,6 +96,7 @@ pub struct Tty<R, W> {
     ldisc: Mutex<LineDiscipline<R, W>>,
     read_waiters: Option<Arc<PollSet>>,
     writer: W,
+    hung_up: core::sync::atomic::AtomicBool,
     endpoint: Option<PtyEndpoint>,
     pts_lease: SpinNoIrq<Option<PtsLease>>,
     is_ptm: bool,
@@ -117,6 +119,7 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
             ldisc,
             read_waiters,
             writer,
+            hung_up: core::sync::atomic::AtomicBool::new(false),
             endpoint,
             pts_lease: SpinNoIrq::new(None),
             is_ptm,
@@ -178,6 +181,10 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     }
 
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
+        let _lifecycle = self.terminal.lifecycle.lock();
+        if self.hung_up.load(Ordering::Acquire) {
+            return Err(AxError::Io);
+        }
         let pg = proc.group();
         let session = pg.session();
         if session.sid() != proc.pid() {
@@ -236,26 +243,57 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     /// check prevents that stale snapshot from tearing down a later session
     /// which claimed the same terminal after a concurrent last close.
     fn hangup_session(&self, expected: &Arc<Session>) {
-        let Some(session) = self.terminal.job_control.session() else {
-            return;
-        };
-        if !Arc::ptr_eq(&session, expected) {
-            return;
-        }
-        if let Some(tty) = session.terminal()
-            && tty
+        let (released, target) = {
+            let _lifecycle = self.terminal.lifecycle.lock();
+            let Some(session) = self.terminal.job_control.session() else {
+                return;
+            };
+            if !Arc::ptr_eq(&session, expected) {
+                return;
+            }
+            let Some(target) = session.terminal() else {
+                return;
+            };
+            if !target
                 .downcast_ref::<Self>()
-                .is_some_and(|other| Arc::ptr_eq(&other.terminal, &self.terminal))
-        {
-            session.unset_terminal(&tty);
-        }
-        if let Some(foreground) = self.terminal.job_control.release_session(&session) {
+                .is_some_and(|tty| Arc::ptr_eq(&tty.terminal, &self.terminal))
+            {
+                return;
+            }
+            let released = self.terminal.job_control.release_session(&session);
+            let SessionRelease::Released(foreground) = released else {
+                return;
+            };
+            session.unset_terminal(&target);
+            (foreground, target)
+        };
+        // On a PTY master close, `self` is the master but the controlling
+        // terminal is its slave.  Hang up that endpoint's operations.
+        target
+            .downcast_ref::<Self>()
+            .expect("validated controlling tty type")
+            .hangup_io();
+        if let Some(foreground) = released {
             let pgid = foreground.pgid();
             let _ = send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGHUP)));
             let _ =
                 send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGCONT)));
         }
     }
+
+    /// Makes existing terminal file operations observe a synchronous hangup.
+    fn hangup_io(&self) {
+        self.hung_up.store(true, Ordering::Release);
+        self.ldisc.lock().hangup();
+        if let Some(waiters) = &self.read_waiters {
+            waiters.wake();
+        }
+        self.writer.wake_waiters();
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.wake_waiters();
+        }
+    }
+
 }
 
 /// Hangs up `session`'s controlling terminal, if it has one.
@@ -309,6 +347,9 @@ impl Tty<pty::PtyReader, pty::PtyWriter> {
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> AxResult<usize> {
+        if self.hung_up.load(Ordering::Acquire) {
+            return Ok(0);
+        }
         let slave_hangup = self
             .endpoint
             .as_ref()
@@ -342,6 +383,9 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {
+        if self.hung_up.load(Ordering::Acquire) {
+            return Err(AxError::Io);
+        }
         self.writer.write(buf)
     }
 
@@ -498,6 +542,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 self.this_arc()?.bind_to(&context.caller_process().proc)?;
             }
             TIOCNOTTY => {
+                let _lifecycle = self.terminal.lifecycle.lock();
                 let proc = &context.caller_process().proc;
                 let session = context.caller_session().clone();
                 let tty: Arc<dyn Any + Send + Sync> = self.this_arc()?;
@@ -514,12 +559,12 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     return Err(AxError::OperationNotSupported);
                 }
 
-                let foreground = self.terminal.job_control.foreground();
                 if !session.unset_terminal(&tty) {
                     return Err(AxError::NotATty);
                 }
-                self.terminal.job_control.release_session(&session);
-                if let Some(foreground) = foreground {
+                let released = self.terminal.job_control.release_session(&session);
+                drop(_lifecycle);
+                if let SessionRelease::Released(Some(foreground)) = released {
                     let pgid = foreground.pgid();
                     let _ = send_signal_to_process_group(
                         pgid,
@@ -576,6 +621,9 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
 
 impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
     fn poll(&self) -> IoEvents {
+        if self.hung_up.load(Ordering::Acquire) {
+            return IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP;
+        }
         let hangup_events = self
             .endpoint
             .as_ref()
@@ -734,6 +782,22 @@ mod tests {
             destination[size_of::<Termios>()..]
                 .iter()
                 .all(|&byte| byte == 0xa5)
+        );
+    }
+
+    #[test]
+    fn vhangup_makes_existing_slave_operations_hung_up() {
+        let (_master, slave) = pty::create_pty_pair_for_test().unwrap();
+
+        slave.hangup_io();
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(slave.read_at(&mut byte, 0), Ok(0));
+        assert_eq!(slave.write_at(b"x", 0), Err(AxError::Io));
+        assert_eq!(
+            slave.poll().bits(),
+            (IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP)
+                .bits()
         );
     }
 
