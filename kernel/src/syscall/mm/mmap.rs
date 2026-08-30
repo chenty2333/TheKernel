@@ -1088,15 +1088,26 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
             }
             let segment_end = area.end().min(end_addr);
             let segment_size = segment_end.sub_addr(cursor);
+            let shadow_stack = area.flags().contains(MappingFlags::SHADOW_STACK);
+            // A shadow-stack VMA is not convertible into an ordinary mapping.
+            // Preserve its architectural W=0,D=1 leaf encoding across a
+            // no-op/read mprotect, and reject any attempt to add write,
+            // execute, or remove access through this generic interface.
+            if shadow_stack && requested_protection != MappingFlags::READ {
+                return Err(AxError::InvalidInput);
+            }
             let may_execute = area
                 .backend()
                 .file_mapping()
                 .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
-            let effective_protection = if may_execute {
+            let mut effective_protection = if may_execute {
                 personality_mmap_protection(thread.personality(), requested_protection)
             } else {
                 requested_protection
             };
+            if shadow_stack {
+                effective_protection |= MappingFlags::SHADOW_STACK;
+            }
             let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
             let segment_wake = authorize_then_commit(
                 plan,
