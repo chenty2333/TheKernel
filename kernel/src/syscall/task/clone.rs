@@ -730,6 +730,23 @@ impl CloneArgs {
                 Some(pid_reservation),
             )
         };
+        #[cfg(target_arch = "x86_64")]
+        if !flags.intersects(CloneFlags::THREAD | CloneFlags::VM) {
+            // A fork owns a new mm whose COW VMA is an independent default
+            // stack. CLONE_VM (including vfork) deliberately does not copy a
+            // record: a later allocation path must create a distinct VMA for
+            // each task before registering it.
+            if let Some(owner) = old_proc_data
+                .aspace()
+                .lock()
+                .cet_default_shadow_stack(calling_thread.kernel_tid())
+            {
+                new_proc_data
+                    .aspace()
+                    .lock()
+                    .register_cet_default_shadow_stack(tid, owner.start, owner.size)?;
+            }
+        }
         let (thr, signal_registration) = Thread::try_new_with_io_context(
             tid,
             new_proc_data.clone(),

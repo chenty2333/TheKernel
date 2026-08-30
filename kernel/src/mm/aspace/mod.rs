@@ -1187,6 +1187,15 @@ pub struct AddrSpace {
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// CET default shadow stacks are owned by Linux tasks, but the ownership
+    /// lives in the mm that owns the VMA.  In particular, CLONE_VM peers may
+    /// have distinct ProcessData objects, so keeping this in ProcessData (or
+    /// walking a thread group) loses owners belonging to another sharer.
+    ///
+    /// This is deliberately a fallibly-grown vector rather than a global
+    /// side table: it is protected by the same address-space mutex as the
+    /// VMAs it names, and a task id occurs at most once in one mm.
+    cet_default_shadow_stacks: Vec<CetDefaultShadowStackOwner>,
     /// One weak reverse-map lease per live shared-memory backing referenced by
     /// this mm.  Keeping leases on the address space, rather than individual
     /// VMAs, makes split/merge/unmap lifecycle handling explicit and avoids a
@@ -1203,6 +1212,16 @@ pub struct AddrSpace {
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
+}
+
+/// Kernel-only ownership for one automatically allocated CET shadow stack.
+/// Explicit `map_shadow_stack(2)` mappings never enter this registry.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CetDefaultShadowStackOwner {
+    pub task_id: u32,
+    pub start: VirtAddr,
+    pub size: usize,
 }
 
 // `AddrSpace` is constructed by value during early boot and fork preparation.
@@ -1874,6 +1893,7 @@ impl AddrSpace {
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
+            cet_default_shadow_stacks: Vec::new(),
             alias_bindings: BTreeMap::new(),
             swapped: BTreeMap::new(),
             user_io_pins,
@@ -4265,14 +4285,19 @@ impl AddrSpace {
         populate: bool,
         backend: Backend,
     ) -> AxResult {
-        self.map_with_lock_state(
+        let result = self.map_with_lock_state(
             start,
             size,
             flags,
             populate,
             backend,
             self.lock_future_mappings,
-        )
+        );
+        #[cfg(target_arch = "x86_64")]
+        if result.is_ok() {
+            let _invalidated = self.reconcile_cet_default_shadow_stacks();
+        }
+        result
     }
 
     /// Replace one complete shared VMA at the same virtual address with an
@@ -6773,6 +6798,112 @@ impl AddrSpace {
         self.areas.iter()
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn cet_shadow_stack_extent_at(&self, address: VirtAddr) -> Option<(VirtAddr, usize)> {
+        let area = self.find_area(address)?;
+        area.flags()
+            .contains(MappingFlags::SHADOW_STACK)
+            .then_some((area.start(), area.size()))
+    }
+
+    /// Registers the task-owned default stack only after its VMA is live.
+    /// The caller retains responsibility for undoing the just-created VMA if
+    /// this fallible publication cannot reserve its registry slot.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn register_cet_default_shadow_stack(
+        &mut self,
+        task_id: u32,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult {
+        if size == 0
+            || self.cet_default_shadow_stacks.iter().any(|owner| owner.task_id == task_id)
+            || self.cet_shadow_stack_extent_at(start) != Some((start, size))
+        {
+            return Err(AxError::InvalidInput);
+        }
+        self.cet_default_shadow_stacks
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        self.cet_default_shadow_stacks.push(CetDefaultShadowStackOwner {
+            task_id,
+            start,
+            size,
+        });
+        Ok(())
+    }
+
+    /// Removes one owner without touching VMAs.  Exec uses this before the
+    /// image handoff; exit uses `detach_*` below to remove its private VMA.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn take_cet_default_shadow_stack(
+        &mut self,
+        task_id: u32,
+    ) -> Option<CetDefaultShadowStackOwner> {
+        let index = self
+            .cet_default_shadow_stacks
+            .iter()
+            .position(|owner| owner.task_id == task_id)?;
+        Some(self.cet_default_shadow_stacks.swap_remove(index))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_default_shadow_stack(
+        &self,
+        task_id: u32,
+    ) -> Option<CetDefaultShadowStackOwner> {
+        self.cet_default_shadow_stacks
+            .iter()
+            .copied()
+            .find(|owner| owner.task_id == task_id)
+    }
+
+    /// Reconciles every owner in this mm after an arbitrary successful VMA
+    /// mutation.  The returned task ids are the only information callers may
+    /// use to clear task-local CET signal metadata; this avoids taking task
+    /// locks while holding the mm lock.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn reconcile_cet_default_shadow_stacks(&mut self) -> Vec<u32> {
+        let mut invalidated = Vec::new();
+        let mut index = 0;
+        while index < self.cet_default_shadow_stacks.len() {
+            let owner = self.cet_default_shadow_stacks[index];
+            if let Some((start, size)) = self.cet_shadow_stack_extent_at(owner.start) {
+                self.cet_default_shadow_stacks[index].start = start;
+                self.cet_default_shadow_stacks[index].size = size;
+                index += 1;
+            } else {
+                invalidated.push(owner.task_id);
+                self.cet_default_shadow_stacks.swap_remove(index);
+            }
+        }
+        invalidated
+    }
+
+    /// Reconciles stack records after mremap while still inside its VMA
+    /// transaction. A moved owner's start follows its source offset; all
+    /// unrelated owners are checked against the resulting live VMAs too,
+    /// which covers MREMAP_FIXED replacement in a shared mm.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn reconcile_cet_default_shadow_stacks_after_mremap(
+        &mut self,
+        source: VirtAddr,
+        old_size: usize,
+        destination: VirtAddr,
+    ) -> Vec<u32> {
+        let source_end = source.checked_add(old_size);
+        for owner in &mut self.cet_default_shadow_stacks {
+            if source_end.is_some_and(|end| source <= owner.start && owner.start < end) {
+                if let Some(offset) = owner.start.as_usize().checked_sub(source.as_usize())
+                    && let Some(start) = destination.checked_add(offset)
+                {
+                    owner.start = start;
+                }
+            }
+        }
+        self.reconcile_cet_default_shadow_stacks()
+    }
+
     pub(crate) fn shared_backing_key_at(&self, address: VirtAddr) -> Option<SharedBackingKey> {
         self.find_area(address)?.backend().shared_backing_key()
     }
@@ -8303,5 +8434,75 @@ mod tests {
             classify_page_population(Err(AxError::Io)),
             PageFaultResult::Failed(PageFaultFailure::BackingUnavailable)
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn test_cet_stack(aspace: &mut AddrSpace, start: VirtAddr, size: usize) {
+        aspace
+            .map(
+                start,
+                size,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
+                false,
+                Backend::new_alloc(start, PageSize::Size4K),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owners_are_mm_local_and_reconcile_move_shrink_and_replacement() {
+        let page = PAGE_SIZE_4K;
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap();
+        let first = VirtAddr::from(0x4000);
+        let second = VirtAddr::from(0x8000);
+        test_cet_stack(&mut mm, first, page * 2);
+        test_cet_stack(&mut mm, second, page);
+        // These model two distinct ProcessData values sharing CLONE_VM: both
+        // owners are discoverable solely through this one address space.
+        mm.register_cet_default_shadow_stack(101, first, page * 2).unwrap();
+        mm.register_cet_default_shadow_stack(202, second, page).unwrap();
+
+        let moved = VirtAddr::from(0xc000);
+        mm.unmap(first, page * 2).unwrap();
+        test_cet_stack(&mut mm, moved, page * 2);
+        assert!(mm
+            .reconcile_cet_default_shadow_stacks_after_mremap(first, page * 2, moved)
+            .is_empty());
+        assert_eq!(mm.cet_default_shadow_stack(101).unwrap().start, moved);
+        assert_eq!(mm.cet_default_shadow_stack(202).unwrap().start, second);
+
+        // Shrinking leaves the low VMA fragment live and updates its exact
+        // extent; replacing the other owner's VMA invalidates only it.
+        mm.unmap(moved + page, page).unwrap();
+        assert!(mm
+            .reconcile_cet_default_shadow_stacks_after_mremap(moved, page * 2, moved)
+            .is_empty());
+        assert_eq!(mm.cet_default_shadow_stack(101).unwrap().size, page);
+        mm.unmap(second, page).unwrap();
+        mm.map(
+            second,
+            page,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            false,
+            Backend::new_alloc(second, PageSize::Size4K),
+        )
+        .unwrap();
+        assert_eq!(mm.reconcile_cet_default_shadow_stacks(), vec![202]);
+        assert!(mm.cet_default_shadow_stack(202).is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owner_detach_is_exactly_once() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page);
+        mm.register_cet_default_shadow_stack(101, stack, page).unwrap();
+        let owner = mm.take_cet_default_shadow_stack(101).unwrap();
+        mm.unmap(owner.start, owner.size).unwrap();
+        assert!(mm.take_cet_default_shadow_stack(101).is_none());
+        assert!(mm.find_area(stack).is_none());
     }
 }

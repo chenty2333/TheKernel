@@ -926,6 +926,16 @@ fn commit_prepared_remap(
             Ok(destination.as_usize() as isize)
         }
     })();
+    #[cfg(target_arch = "x86_64")]
+    if let Ok(destination) = outcome.as_ref() {
+        // The registry belongs to this mm, not the caller's ProcessData:
+        // reconcile every CLONE_VM owner before releasing the VMA lock.
+        let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+            request.addr,
+            request.old_size,
+            VirtAddr::from(*destination as usize),
+        );
+    }
     LockExternalUffdOutcome::new(outcome, wake)
 }
 
@@ -1158,6 +1168,14 @@ fn commit_locked_remap(
             Ok(destination.as_usize() as isize)
         }
     })();
+    #[cfg(target_arch = "x86_64")]
+    if let Ok(destination) = outcome.as_ref() {
+        let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+            request.addr,
+            request.old_size,
+            VirtAddr::from(*destination as usize),
+        );
+    }
     LockExternalUffdOutcome::new(outcome, wake)
 }
 
@@ -1201,6 +1219,10 @@ fn try_optimistic_mremap(
         RemapPlan::Shrink { start, size } => {
             let wake = aspace.unmap(start, size)?;
             proc_data.clear_mempolicy_range(start.as_usize(), size);
+            #[cfg(target_arch = "x86_64")]
+            let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+                request.addr, request.old_size, request.addr,
+            );
             drop(aspace);
             wake.finish();
             return Ok(OptimisticRemapOutcome::Complete(
@@ -1258,6 +1280,10 @@ fn run_locked_mremap(
             RemapPlan::Shrink { start, size } => {
                 let wake = aspace.unmap(start, size)?;
                 proc_data.clear_mempolicy_range(start.as_usize(), size);
+                #[cfg(target_arch = "x86_64")]
+                let _invalidated = aspace.reconcile_cet_default_shadow_stacks_after_mremap(
+                    request.addr, request.old_size, request.addr,
+                );
                 drop(aspace);
                 wake.finish();
                 return Ok(request.addr.as_usize() as isize);

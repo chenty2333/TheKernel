@@ -994,6 +994,8 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
     let mut aspace = aspace_handle.lock();
     let wake = aspace.unmap(start_addr, length)?;
+    #[cfg(target_arch = "x86_64")]
+    let _invalidated_cet_owners = aspace.reconcile_cet_default_shadow_stacks();
     proc_data.clear_mempolicy_range(start_addr.as_usize(), length);
     drop(aspace);
     wake.finish();

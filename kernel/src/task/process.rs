@@ -3558,10 +3558,24 @@ impl ProcessData {
         // old image's peak across exec while the new image starts publishing
         // its own resident pages into the shared mm-level counter.
         let old_aspace = self.aspace();
-        let old_image = old_aspace.lock();
-        let old_maxrss_kb = old_image
-            .merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
-        drop(old_image);
+        let (old_maxrss_kb, cet_wake) = {
+            let mut old_image = old_aspace.lock();
+            // The record is in the old mm, which remains pinned across the
+            // handoff.  Taking it first makes exec teardown exactly-once even
+            // if a later old-image retirement path observes this task again.
+            #[cfg(target_arch = "x86_64")]
+            let cet_wake = old_image
+                .take_cet_default_shadow_stack(thread.kernel_tid())
+                .and_then(|owner| old_image.unmap(owner.start, owner.size).ok());
+            #[cfg(not(target_arch = "x86_64"))]
+            let cet_wake = None;
+            let old_maxrss_kb = old_image
+                .merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
+            (old_maxrss_kb, cet_wake)
+        };
+        if let Some(wake) = cet_wake {
+            wake.finish();
+        }
         // Publish the replacement mm to swapoff before making it reachable
         // through the process image. The old registration remains until the
         // image handoff completes, so neither side can escape a snapshot.

@@ -1555,6 +1555,23 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             fail_closed_exit(error);
         }
     };
+    // CET default stacks are task-owned VMAs in the mm, not Thread-drop
+    // state. Retire the authoritative owner at the task-unhash edge while
+    // this task still names its old image; a CLONE_VM peer has a distinct
+    // record and is therefore untouched.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let aspace = thr.proc_data.aspace();
+        let wake = {
+            let mut aspace = aspace.lock();
+            aspace
+                .take_cet_default_shadow_stack(thr.kernel_tid())
+                .and_then(|owner| aspace.unmap(owner.start, owner.size).ok())
+        };
+        if let Some(wake) = wake {
+            wake.finish();
+        }
+    }
     // The core unlink above is the sole Linux task ownership retirement edge;
     // scheduler Arc destruction is not allowed to define files_struct lifetime.
     // Keep the slot live while pivot_root walks its task snapshot. The task
