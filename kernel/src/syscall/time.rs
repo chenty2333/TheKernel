@@ -367,6 +367,15 @@ fn timex_invalid_adjadjtime_mode(modes: u32) -> bool {
     modes & ADJ_SINGLESHOT_FLAG != 0 && modes & ADJ_OFFSET == 0
 }
 
+fn clock_adjtime_is_realtime(clock_id: __kernel_clockid_t) -> AxResult<bool> {
+    match clock_domain(clock_id)? {
+        // CLOCK_REALTIME_ALARM shares the realtime domain but has no
+        // clock_adjtime operation.
+        ClockDomain::Realtime => Ok(clock_id as u32 == CLOCK_REALTIME),
+        _ => Ok(false),
+    }
+}
+
 fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
     timex.modes = state.resolution_mode();
     timex.offset = state.offset;
@@ -460,15 +469,14 @@ fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     timex_ptr: *mut KernelOldTimex,
 ) -> AxResult<isize> {
-    if clock_id as u32 != CLOCK_REALTIME {
-        return Err(AxError::InvalidInput);
-    }
-
     let mut timex = unsafe {
         VmPtr::vm_read_uninit(timex_ptr, memory)
             .map_err(map_usercopy_error)?
             .assume_init()
     };
+    if !clock_adjtime_is_realtime(clock_id)? {
+        return Err(AxError::OperationNotSupported);
+    }
     let modes = timex.modes;
     if timex_invalid_adjadjtime_mode(modes) {
         return Err(AxError::InvalidInput);
@@ -1567,6 +1575,55 @@ mod tests {
         assert!(timex_modes_supported(ADJ_OFFSET_SINGLESHOT));
         assert!(timex_modes_supported(ADJ_OFFSET_SS_READ));
         assert!(!timex_modes_supported(ADJ_SINGLESHOT_FLAG));
+    }
+
+    #[test]
+    fn clock_adjtime_copies_timex_before_classifying_clock() {
+        let timex_ptr = core::ptr::without_provenance_mut::<KernelOldTimex>(0);
+
+        let mut valid_provider = TestMemory {
+            bytes: vec![0; size_of::<KernelOldTimex>()],
+            reject_writes: false,
+        };
+        let mut valid_memory = UserMemoryContext::new(&mut valid_provider);
+        assert_eq!(
+            sys_clock_adjtime(&mut valid_memory, CLOCK_MONOTONIC as _, timex_ptr),
+            Err(AxError::OperationNotSupported)
+        );
+
+        let mut invalid_provider = TestMemory {
+            bytes: vec![],
+            reject_writes: false,
+        };
+        let mut invalid_memory = UserMemoryContext::new(&mut invalid_provider);
+        assert_eq!(
+            sys_clock_adjtime(&mut invalid_memory, CLOCK_MONOTONIC as _, timex_ptr),
+            Err(AxError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn clock_adjtime_distinguishes_realtime_supported_invalid_and_unsupported_clocks() {
+        assert_eq!(clock_adjtime_is_realtime(CLOCK_REALTIME as _), Ok(true));
+        assert_eq!(clock_adjtime_is_realtime(CLOCK_MONOTONIC as _), Ok(false));
+        assert_eq!(
+            clock_adjtime_is_realtime(0x7fff),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut provider = TestMemory {
+            bytes: vec![0; size_of::<KernelOldTimex>()],
+            reject_writes: false,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_clock_adjtime(
+                &mut memory,
+                0x7fff,
+                core::ptr::without_provenance_mut::<KernelOldTimex>(0),
+            ),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]
