@@ -6,6 +6,7 @@ use core::{
 };
 
 use axdriver::prelude::BlockPhysicalCompletionRoute;
+use axerrno::LinuxError;
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FILE_EXTENT_MAX, FILE_EXTENT_SCAN_CHUNK_BYTES, FileExtent, FileExtentMap, FileNode,
@@ -19,7 +20,7 @@ use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use lwext4_rust::{
     BlockDevice, Ext4Error, FileAttr, InodeToken, InodeType, PhysicalIoCompletion,
     PhysicalIoEffect, PhysicalIoOperation, PhysicalIoPlan, PhysicalIoPublishOutcome,
-    PhysicalIoSettlement,
+    PhysicalIoSettlement, Timestamp as Ext4Timestamp,
     ffi::{EEXIST, ENODATA, ENOENT},
 };
 use spin::Once;
@@ -358,14 +359,25 @@ impl NodeOps for Inode {
             block_size: attr.block_size,
             blocks: attr.blocks,
             rdev: DeviceId(attr.rdev),
-            atime: attr.atime,
-            btime: attr.btime,
-            mtime: attr.mtime,
-            ctime: attr.ctime,
+            atime: axfs_ng_vfs::Timestamp::new(attr.atime.seconds(), attr.atime.subsec_nanos()),
+            btime: axfs_ng_vfs::Timestamp::new(attr.btime.seconds(), attr.btime.subsec_nanos()),
+            mtime: axfs_ng_vfs::Timestamp::new(attr.mtime.seconds(), attr.mtime.subsec_nanos()),
+            ctime: axfs_ng_vfs::Timestamp::new(attr.ctime.seconds(), attr.ctime.subsec_nanos()),
         })
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
+        // Validate every requested timestamp before touching the inode: an
+        // out-of-range ext4 value must fail atomically, never publish a mode
+        // or owner change and then discover a time encoding failure.
+        for time in [update.atime, update.mtime, update.ctime]
+            .into_iter()
+            .flatten()
+        {
+            if !Ext4Timestamp::new(time.seconds(), time.subsec_nanos()).is_ext4_representable() {
+                return Err(LinuxError::EOVERFLOW.into());
+            }
+        }
         let mut fs = self.fs.lock();
         fs.with_inode_ref_mut(self.ino(), |inode| {
             let mut status_changed = false;
@@ -382,14 +394,14 @@ impl NodeOps for Inode {
                 status_changed = true;
             }
             if let Some(atime) = update.atime {
-                inode.set_atime(&atime);
+                inode.set_atime(Ext4Timestamp::new(atime.seconds(), atime.subsec_nanos()));
             }
             if let Some(mtime) = update.mtime {
-                inode.set_mtime(&mtime);
+                inode.set_mtime(Ext4Timestamp::new(mtime.seconds(), mtime.subsec_nanos()));
                 status_changed = true;
             }
             if let Some(ctime) = update.ctime {
-                inode.set_ctime(&ctime);
+                inode.set_ctime(Ext4Timestamp::new(ctime.seconds(), ctime.subsec_nanos()));
             } else if status_changed {
                 inode.update_ctime();
             }

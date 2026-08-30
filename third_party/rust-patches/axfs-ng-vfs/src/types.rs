@@ -1,5 +1,69 @@
 use core::{fmt::Debug, time::Duration};
 
+/// A filesystem timestamp with a signed Unix epoch second.
+///
+/// Unlike [`Duration`], this can represent pre-1970 inode times.  Nanoseconds
+/// are normalized to the conventional `0..1_000_000_000` range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Timestamp {
+    seconds: i64,
+    nanoseconds: u32,
+}
+
+impl Timestamp {
+    /// Unix epoch.
+    pub const ZERO: Self = Self::new(0, 0);
+
+    /// Constructs a normalized timestamp, returning `None` for invalid ns.
+    pub const fn try_new(seconds: i64, nanoseconds: u32) -> Option<Self> {
+        if nanoseconds < 1_000_000_000 {
+            Some(Self {
+                seconds,
+                nanoseconds,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Constructs a timestamp from already validated parts.
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
+        assert!(nanoseconds < 1_000_000_000);
+        Self {
+            seconds,
+            nanoseconds,
+        }
+    }
+
+    /// Returns signed seconds from the Unix epoch.
+    pub const fn seconds(self) -> i64 {
+        self.seconds
+    }
+
+    /// Returns the normalized nanosecond component.
+    pub const fn subsec_nanos(self) -> u32 {
+        self.nanoseconds
+    }
+
+    /// Converts to the legacy unsigned representation when possible.
+    pub const fn try_into_duration(self) -> Option<Duration> {
+        if self.seconds < 0 {
+            None
+        } else {
+            Some(Duration::new(self.seconds as u64, self.nanoseconds))
+        }
+    }
+}
+
+impl From<Duration> for Timestamp {
+    fn from(value: Duration) -> Self {
+        Self::new(
+            value.as_secs().min(i64::MAX as u64) as i64,
+            value.subsec_nanos(),
+        )
+    }
+}
+
 /// Filesystem node type.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -116,13 +180,13 @@ pub struct Metadata {
     pub rdev: DeviceId,
 
     /// Time of last access
-    pub atime: Duration,
+    pub atime: Timestamp,
     /// Time of creation
-    pub btime: Duration,
+    pub btime: Timestamp,
     /// Time of last modification
-    pub mtime: Duration,
+    pub mtime: Timestamp,
     /// Time of last status change
-    pub ctime: Duration,
+    pub ctime: Timestamp,
 }
 
 /// Filesystem node metadata update.
@@ -136,11 +200,11 @@ pub struct MetadataUpdate {
     pub rdev: Option<DeviceId>,
 
     /// Time of last access
-    pub atime: Option<Duration>,
+    pub atime: Option<Timestamp>,
     /// Time of last modification
-    pub mtime: Option<Duration>,
+    pub mtime: Option<Timestamp>,
     /// Time of last status change
-    pub ctime: Option<Duration>,
+    pub ctime: Option<Timestamp>,
 }
 
 impl MetadataUpdate {

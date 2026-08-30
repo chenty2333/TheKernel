@@ -206,10 +206,10 @@ impl NodeOps for FatDirNode {
             block_size,
             blocks: 1,
             rdev: DeviceId::default(),
-            atime: fs.root_atime,
-            btime: Duration::default(),
-            mtime: fs.root_mtime,
-            ctime: Duration::default(),
+            atime: fs.root_atime.into(),
+            btime: Duration::default().into(),
+            mtime: fs.root_mtime.into(),
+            ctime: Duration::default().into(),
         })
     }
 
@@ -228,10 +228,10 @@ impl NodeOps for FatDirNode {
             return super::util::update_file_metadata(file, update);
         }
         if let Some(atime) = update.atime {
-            fs.root_atime = atime;
+            fs.root_atime = atime.try_into_duration().ok_or(VfsError::InvalidInput)?;
         }
         if let Some(mtime) = update.mtime {
-            fs.root_mtime = mtime;
+            fs.root_mtime = mtime.try_into_duration().ok_or(VfsError::InvalidInput)?;
         }
         Ok(())
     }

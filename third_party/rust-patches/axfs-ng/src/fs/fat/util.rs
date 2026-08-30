@@ -95,10 +95,10 @@ pub fn file_metadata(
         atime: dos_to_unix(fatfs::DateTime::new(
             file.accessed(),
             fatfs::Time::new(0, 0, 0, 0),
-        )),
-        btime: dos_to_unix(file.created()),
-        mtime: dos_to_unix(file.modified()),
-        ctime: dos_to_unix(file.created()),
+        )).into(),
+        btime: dos_to_unix(file.created()).into(),
+        mtime: dos_to_unix(file.modified()).into(),
+        ctime: dos_to_unix(file.created()).into(),
     })
 }
 
@@ -112,11 +112,15 @@ pub fn update_file_metadata(file: &mut ff::File, update: MetadataUpdate) -> VfsR
     }
     if let Some(atime) = update.atime {
         #[allow(deprecated)]
-        file.set_accessed(unix_to_dos(atime).date);
+        file.set_accessed(
+            unix_to_dos(atime.try_into_duration().ok_or(VfsError::InvalidInput)?).date,
+        );
     }
     if let Some(mtime) = update.mtime {
         #[allow(deprecated)]
-        file.set_modified(unix_to_dos(mtime));
+        file.set_modified(unix_to_dos(
+            mtime.try_into_duration().ok_or(VfsError::InvalidInput)?,
+        ));
     }
     Ok(())
 }

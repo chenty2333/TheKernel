@@ -1774,10 +1774,10 @@ mod tests {
                 block_size: 4096,
                 blocks: 0,
                 rdev: Default::default(),
-                atime: Duration::ZERO,
-                btime: Duration::ZERO,
-                mtime: Duration::ZERO,
-                ctime: Duration::ZERO,
+                atime: crate::Timestamp::ZERO,
+                btime: crate::Timestamp::ZERO,
+                mtime: crate::Timestamp::ZERO,
+                ctime: crate::Timestamp::ZERO,
             })
         }
 
