@@ -1027,9 +1027,6 @@ pub(super) fn dispatch_syscall(
             uctx.arg0() as _,
             uctx.arg1() as _,
         ),
-        Sysno::map_shadow_stack => {
-            sys_map_shadow_stack(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
         Sysno::modify_ldt => sys_modify_ldt(
             UserMemoryCapability::new(aspace()),
             uctx.arg0() as _,
