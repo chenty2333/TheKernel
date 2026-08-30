@@ -1237,7 +1237,7 @@ const SCHED_CLAMP_MASK: u32 = 0x7ff;
 
 const fn pack_sched_clamp(min: u16, max: u16) -> u32 {
     debug_assert!(min <= max && max <= 1024);
-    u32::from(min) | (u32::from(max) << 11)
+    (min as u32) | ((max as u32) << 11)
 }
 
 const fn unpack_sched_clamp(packed: u32) -> (u16, u16) {
@@ -2269,7 +2269,7 @@ impl TaskExt for Box<Thread> {
     fn on_leave(&self, task: &TaskInner, reason: SwitchReason) {
         let _ = task;
         #[cfg(feature = "hwp-uclamp")]
-        Self::clear_current_hwp_clamp();
+        Thread::clear_current_hwp_clamp();
         // Every scheduler leave is a preemption observation.  The final
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
