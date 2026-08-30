@@ -3103,11 +3103,13 @@ impl AddrSpace {
                 )
                 .ok();
                 let restored = self.unmap_areas_with_tlb_grace(start, size).is_ok();
-                if let Some(replacement_mutations) = replacement_mutations {
+                if restored {
+                    if let Some(replacement_mutations) = replacement_mutations {
                     commit_mapping_identity_mutations(
                         &mut self.mapping_identities,
                         &replacement_mutations,
                     );
+                    }
                 }
                 for (address, length, flags, lineage, rollback, _) in fragments.into_iter() {
                     if self

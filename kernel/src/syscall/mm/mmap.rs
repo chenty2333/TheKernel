@@ -941,6 +941,15 @@ pub fn sys_remap_file_pages(
     if current_flags != snapshot_flags || current_lease.ofd_key() != lease.ofd_key() {
         return Err(AxError::InvalidInput);
     }
+    // The source lock state is part of the LSM's synthetic mmap request.  It
+    // is kept in a page-granular ledger here, so revalidate it under the same
+    // write-side lock that publishes the alias; otherwise a concurrent mlock
+    // could add MAP_LOCKED after LSM authorization.
+    if (aspace.locked_bytes_in_range(start_addr, PageSize::Size4K as usize) != 0)
+        != source_starts_locked
+    {
+        return Err(AxError::InvalidInput);
+    }
     let populate = flags & MAP_NONBLOCK as usize == 0;
     let outcome = aspace.replace_shared_mapping_span_at_offset(
         &aspace_handle,
