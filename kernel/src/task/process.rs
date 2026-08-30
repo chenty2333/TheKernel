@@ -20,7 +20,8 @@ use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::{
-    AxTaskRef, SchedClass, SchedState, TaskSchedCommit, current, scheduler_state_snapshot,
+    AxCpuMask, AxTaskRef, SchedClass, SchedState, TaskSchedCommit, current,
+    scheduler_state_snapshot,
 };
 use hashbrown::HashMap;
 use scope_local::Scope;
@@ -151,6 +152,10 @@ pub(crate) struct ZombieSchedulerSnapshot {
     /// Linux's policy query exposes this flag as part of the returned policy,
     /// including while the group leader is an unreaped zombie.
     pub(crate) reset_on_fork: bool,
+    /// Effective affinity captured while the leader was still live. A waitable
+    /// zombie has no scheduler task after exit, yet Linux exposes its last
+    /// affinity until wait/reap.
+    pub(crate) affinity: AxCpuMask,
     /// Generation of the persistent group-leader binding that owned this
     /// scheduler state. Scheduler commit versions are local to a task, so
     /// they are comparable only within one binding generation.
@@ -165,6 +170,7 @@ impl Default for ZombieSchedulerSnapshot {
             nice: 0,
             rt_priority: 0,
             reset_on_fork: false,
+            affinity: AxCpuMask::new(),
             identity_epoch: 0,
             version: 0,
         }
@@ -178,6 +184,7 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
             nice: state.nice,
             rt_priority: state.rt_priority,
             reset_on_fork: false,
+            affinity: AxCpuMask::new(),
             identity_epoch: 0,
             version: 0,
         }
@@ -1794,6 +1801,19 @@ impl GroupLeaderIdentityBinding {
         self.signal.clone()
     }
 
+    fn publish_affinity_snapshot(&self, registration_tid: Pid, token: u64, affinity: AxCpuMask) {
+        let signal = self.signal.lock();
+        let Some(identity) = signal.as_ref() else {
+            return;
+        };
+        if identity.registration_tid != registration_tid
+            || identity.scheduler_identity_token != token
+        {
+            return;
+        }
+        self.scheduler.lock().affinity = affinity;
+    }
+
     fn publication_token_for(&self, kernel_tid: Pid) -> Option<u64> {
         self.signal.lock().as_ref().and_then(|identity| {
             (identity.registration_tid == kernel_tid).then_some(identity.scheduler_identity_token)
@@ -3140,6 +3160,16 @@ impl ProcessData {
     ) {
         self.group_leader_identity
             .publish_scheduler_commit(registration_tid, token, task, commit);
+    }
+
+    pub(crate) fn publish_affinity_snapshot(
+        &self,
+        registration_tid: Pid,
+        token: u64,
+        affinity: AxCpuMask,
+    ) {
+        self.group_leader_identity
+            .publish_affinity_snapshot(registration_tid, token, affinity);
     }
 
     /// Returns the token only when `kernel_tid` is the authoritative current

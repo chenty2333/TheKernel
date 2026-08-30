@@ -13,6 +13,7 @@ use axtask::{
     future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, scheduler_state_snapshot, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
+    task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus,
     update_sched_state_versioned_with_reset,
 };
 use linux_raw_sys::general::{
@@ -825,19 +826,38 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
     cpusetsize: usize,
     user_mask: *mut u8,
 ) -> AxResult<isize> {
-    let cpu_count = axhal::cpu_num().max(1);
-    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes {
+    // The native x86_64 ABI argument is C `unsigned int`; raw callers are
+    // not required to clear the high register word.
+    let cpusetsize = syscall_c_uint(cpusetsize);
+    let nr_cpu_ids = task_affinity_nr_cpu_ids();
+    let kernel_mask_bytes = task_affinity_mask_bytes();
+    if cpusetsize < nr_cpu_ids.div_ceil(u8::BITS as usize) || cpusetsize % size_of::<usize>() != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let mask = sched_target(pid)?.cpumask();
+    let target = if pid == 0 {
+        SchedGetSchedulerTarget::Live(current().clone())
+    } else {
+        let caller_ns = current().as_thread().proc_data.pid_ns();
+        if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_ns) {
+            SchedGetSchedulerTarget::Live(task)
+        } else {
+            SchedGetSchedulerTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_ns)?)
+        }
+    };
+    let (_, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = target.credential()?;
+    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
+        &actor_cred,
+        &target_cred,
+    ))?;
+    let mask = target.affinity()?;
     let mut mask_bytes = Vec::new();
     mask_bytes
         .try_reserve_exact(kernel_mask_bytes)
         .map_err(|_| AxError::NoMemory)?;
     mask_bytes.resize(kernel_mask_bytes, 0);
-    for cpu in 0..cpu_count {
+    for cpu in 0..nr_cpu_ids {
         if mask.get(cpu) {
             mask_bytes[cpu / u8::BITS as usize] |= 1 << (cpu % u8::BITS as usize);
         }
@@ -1169,6 +1189,10 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
 /// x86_64's register width.
 fn syscall_c_int(raw: usize) -> i32 {
     raw as u32 as i32
+}
+
+fn syscall_c_uint(raw: usize) -> usize {
+    raw as u32 as usize
 }
 
 fn visible_live_task_for_getpriority(
@@ -1624,6 +1648,19 @@ impl SchedGetSchedulerTarget {
                     SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
                 })
             }
+        }
+    }
+
+    fn affinity(&self) -> AxResult<AxCpuMask> {
+        match self {
+            Self::Live(task) => task_allowed_active_cpus(task).map_err(|error| match error {
+                TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                    AxError::NoSuchProcess
+                }
+            }),
+            Self::Zombie(process) => Ok(zombie_scheduler_state(process)?.affinity),
         }
     }
 }
@@ -2277,6 +2314,12 @@ mod tests {
         assert_eq!(syscall_c_int(0x1_0000_0002), 2);
         assert_eq!(syscall_c_int(0x0000_0000_ffff_ffff), -1);
         assert_eq!(syscall_c_int(0xffff_ffff_8000_0000), i32::MIN);
+    }
+
+    #[test]
+    fn affinity_cpusetsize_decodes_the_x86_64_unsigned_int_word() {
+        assert_eq!(syscall_c_uint(0x1_0000_0000), 0);
+        assert_eq!(syscall_c_uint(0x1_0000_0008), 8);
     }
 
     #[test]

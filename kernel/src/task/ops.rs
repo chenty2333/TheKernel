@@ -1496,6 +1496,15 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
     thr.proc_data.begin_usage_transition();
+    // Preserve the leader's effective affinity while its zombie remains
+    // PID-addressable. The axtask snapshot holds the affinity lock and
+    // intersects active CPUs before the task is removed from the scheduler.
+    if let Some(token) = thr.proc_data.scheduler_publication_token(thr.kernel_tid())
+        && let Ok(mask) = axtask::task_allowed_active_cpus(&current())
+    {
+        thr.proc_data
+            .publish_affinity_snapshot(thr.kernel_tid(), token, mask);
+    }
     let final_exit = match remove_current_thread(process, tid, exit_code) {
         Ok(ThreadExitTransition::NotFound) => {
             fail_closed_exit(AxError::BadState);
