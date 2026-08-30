@@ -4,7 +4,7 @@ use alloc::{borrow::ToOwned, string::String, sync::Arc, vec, vec::Vec};
 use core::{cell::Cell, ffi::CStr};
 
 use axerrno::{AxError, AxResult};
-use axfs::{CachedFile, FS_CONTEXT};
+use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::virt_to_phys,
@@ -33,7 +33,7 @@ use crate::{
     },
     mm::aspace::{AddrSpace, Backend},
     task::{
-        AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE, Cred, DacCredentialView, ExecAuxIdentity,
+        AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE, Cred, DacCredentialView, ExecAuxIdentity, current_fs_context,
         ExecExecutableRole, ExecFileIdentity, ExecFileOwner, ExecFileSecurityObject, Kgid, Kuid,
         UserNamespace,
         security::{ExecExecutableSecurityContext, dispatch_exec_executable},
@@ -132,7 +132,8 @@ impl ExecAccess<'_> {
         {
             return resolve(path);
         }
-        let fs = FS_CONTEXT.lock();
+        let fs_context = current_fs_context();
+        let fs = fs_context.lock();
         match self {
             Self::TrustedBoot => fs.resolve(path),
             Self::User {

@@ -8,7 +8,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FsContext, WritePlacement};
+use axfs::{FsContext, WritePlacement};
 use axfs_ng_vfs::{
     DirEntrySink, Filesystem, Location, Metadata, NodeFlags, WritebackErrorState,
     path::{MAX_NAME_LEN, Path},
@@ -36,7 +36,7 @@ use crate::{
     mounts,
     pseudofs::Device,
     readiness::block_on_poll_io,
-    task::{AsThread, DacCredentialView, send_signal_to_process},
+    task::{AsThread, DacCredentialView, current_fs_context, send_signal_to_process},
 };
 
 const PATH_MAX: usize = 4096;
@@ -109,7 +109,8 @@ pub(crate) fn check_resize_limit(new_len: u64) -> AxResult<()> {
 }
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
-    let mut fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let mut fs = fs_context.lock();
     if dirfd == AT_FDCWD {
         f(&mut fs)
     } else {
@@ -123,7 +124,8 @@ pub fn with_path_fs<R>(
     path: &Path,
     f: impl FnOnce(&mut FsContext) -> AxResult<R>,
 ) -> AxResult<R> {
-    let mut fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let mut fs = fs_context.lock();
     if dirfd == AT_FDCWD || path.is_absolute() {
         f(&mut fs)
     } else {
@@ -175,7 +177,7 @@ pub(crate) fn resolve_at_with_synthetic_credentials(
             }
             if dirfd == AT_FDCWD {
                 return Ok(ResolveAtResult::File(
-                    FS_CONTEXT.lock().current_dir().clone(),
+                    current_fs_context().lock().current_dir().clone(),
                 ));
             }
             let file_like = get_file_like(dirfd)?;
@@ -219,7 +221,7 @@ pub(crate) fn resolve_at_with_security(
             }
             if dirfd == AT_FDCWD {
                 return Ok(ResolveAtResult::File(
-                    FS_CONTEXT.lock().current_dir().clone(),
+                    current_fs_context().lock().current_dir().clone(),
                 ));
             }
             let file_like = get_file_like(dirfd)?;

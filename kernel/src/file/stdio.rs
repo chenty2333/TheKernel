@@ -1,12 +1,11 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
-use axfs::{FS_CONTEXT, OpenOptions};
+use axfs::{FsContext, OpenOptions};
 
 use super::{FdTable, desc::FileDescription, fs::File};
 
-pub fn add_stdio(fd_table: &FdTable) -> AxResult<()> {
-    let cx = FS_CONTEXT.lock();
+pub fn add_stdio(fd_table: &FdTable, cx: &FsContext) -> AxResult<()> {
     let open = |options: &mut OpenOptions| {
         AxResult::Ok(Arc::new(File::new(
             options.open(&cx, "/dev/console")?.into_file()?,
@@ -18,7 +17,6 @@ pub fn add_stdio(fd_table: &FdTable) -> AxResult<()> {
     let stdin = FileDescription::new(tty_in)?;
     let stdout = FileDescription::new(tty_out.clone())?;
     let stderr = FileDescription::new(tty_out)?;
-    drop(cx);
 
     if fd_table.add_at_least(stdin, 0, 1, false)? != 0
         || fd_table.add_at_least(stdout, 1, 2, false)? != 1

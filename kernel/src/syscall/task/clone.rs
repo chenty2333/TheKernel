@@ -2,7 +2,6 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicU16;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
     AxTaskExt, SchedClass, current, prepare_task_with_sched_from, publish_prepared_task,
@@ -17,14 +16,14 @@ use thekernel_linux_signal::{
 };
 
 use crate::{
-    file::{FD_TABLE, FdTable, FileDescription, PidFd, reserve_fd, try_new_process_scope},
+    file::{FdTable, FileDescription, PidFd, current_fd_table, reserve_fd, try_new_process_scope},
     keyring::{self, KeyTaskOwner},
     mm::{UserMemoryCapability, copy_from_kernel, map_usercopy_error},
     pseudofs::cgroup,
     readiness::block_on_poll_set_uninterruptible,
     syscall::prepare_proc_shm_inheritance,
     task::{
-        AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
+        AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
         TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
@@ -318,16 +317,6 @@ impl CloneArgs {
         {
             return Err(AxError::InvalidInput);
         }
-        // `ProcessData::scope` is currently shared by every thread in a
-        // thread group, so this kernel cannot yet represent Linux threads
-        // that unshare either `files_struct` or `fs_struct`.  Reject that
-        // shape honestly until those pointers move to a task-level resource
-        // context; silently sharing them would let one thread mutate every
-        // sibling's descriptor table or cwd/root state.
-        if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::FILES | CloneFlags::FS)
-        {
-            return Err(AxError::OperationNotSupported);
-        }
         // NPTL thread creation includes CLONE_SYSVSEM. Threads already share
         // one ProcessData, and SEM_UNDO operations remain explicitly
         // unsupported, so no representable undo state can diverge. A
@@ -440,7 +429,7 @@ impl CloneArgs {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
             // can be used to escape that root in later namespace slices.
-            if !FS_CONTEXT.lock().root_dir().is_root() {
+            if !calling_thread.fs_context().lock().root_dir().is_root() {
                 return Err(AxError::OperationNotPermitted);
             }
             let ids = parent_cred.ids();
@@ -530,6 +519,17 @@ impl CloneArgs {
                 .map(|parent| parent.lock_process_lifecycle())
         };
 
+        let child_fs_context = if flags.contains(CloneFlags::FS) {
+            calling_thread.fs_context_for_child()
+        } else {
+            let cloned = calling_thread.fs_context().lock().clone();
+            FsContextSlot::new(Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?)
+        };
+        let child_fd_table = if flags.contains(CloneFlags::FILES) {
+            calling_thread.fd_table_for_child()
+        } else {
+            crate::task::FdTableSlot::new(Arc::try_new(current_fd_table().fork_copy()?).map_err(|_| AxError::NoMemory)?)
+        };
         let (new_proc_data, thread_publication, pid_reservation) = if flags
             .contains(CloneFlags::THREAD)
         {
@@ -657,18 +657,7 @@ impl CloneArgs {
             // Construct the resources that replace scope-local defaults before
             // taking the child scope lock. The lock section below performs
             // only pointer swaps; displaced defaults are dropped afterwards.
-            let child_fd_table = if flags.contains(CloneFlags::FILES) {
-                FD_TABLE.clone()
-            } else {
-                Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?
-            };
-            let child_fs_context = if flags.contains(CloneFlags::FS) {
-                FS_CONTEXT.clone()
-            } else {
-                let cloned = FS_CONTEXT.lock().clone();
-                Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?
-            };
-            let scope = try_new_process_scope(child_fd_table, child_fs_context)?;
+            let scope = try_new_process_scope()?;
             let exit_fd_table = Arc::try_new(FdTable::new()?).map_err(|_| AxError::NoMemory)?;
 
             let proc_data = ProcessData::try_new(
@@ -690,7 +679,6 @@ impl CloneArgs {
                 uts_ns,
                 time_ns,
             )?;
-            proc_data.set_umask(old_proc_data.umask());
             let inherited_rlimits = old_proc_data.rlim.read().clone();
             let inherited_cpu_limit_active = inherited_rlimits[linux_raw_sys::general::RLIMIT_CPU]
                 .current
@@ -717,6 +705,8 @@ impl CloneArgs {
             child_credential,
             inherited_seccomp,
             child_io_context,
+            child_fs_context,
+            child_fd_table,
             calling_thread.personality(),
         )?;
         if thread_publication.is_initial() {
@@ -1081,15 +1071,12 @@ mod tests {
     }
 
     #[test]
-    fn clone_validate_rejects_thread_with_process_scoped_files() {
+    fn clone_validate_allows_thread_with_private_fs_context() {
         let args = CloneArgs {
-            flags: CloneFlags::THREAD | CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::FS,
+            flags: CloneFlags::THREAD | CloneFlags::VM | CloneFlags::SIGHAND,
             ..Default::default()
         };
-        assert_eq!(
-            args.validate_for(CloneApi::Clone),
-            Err(AxError::OperationNotSupported)
-        );
+        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
     }
 
     #[test]

@@ -92,7 +92,13 @@ pub use self::{
     resources::*,
     signal::*,
     stat::*,
-    thread::{AsThread, Thread},
+    thread::{AsThread, FdTableSlot, FsContextSlot, Thread},
     timer::*,
     user::*,
 };
+
+/// Snapshot the calling task's Linux `fs_struct`.
+#[inline]
+pub(crate) fn current_fs_context() -> alloc::sync::Arc<axsync::Mutex<axfs::FsContext>> {
+    axtask::current().as_thread().fs_context()
+}

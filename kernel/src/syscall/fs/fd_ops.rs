@@ -8,7 +8,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
-    FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent,
+    FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent,
     PathwalkPolicy,
 };
 use axfs_ng_vfs::{
@@ -27,7 +27,7 @@ use thekernel_linux_signal::Signo;
 
 use crate::{
     file::{
-        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, FD_TABLE, File,
+        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, current_fd_table,
         FileDescription, FileLike, Pipe, ReservedFd, close_file_like, dnotify, executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file,
@@ -43,13 +43,13 @@ use crate::{
             initial_named_create_owner_mode_with_security,
         },
         pipe::NamedPipe,
-        prepare_file_description_with_open_lease, replace_process_fd_table, reserve_fd, resolve_at,
+        prepare_file_description_with_open_lease, reserve_fd, resolve_at,
         with_path_fs,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
     syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
-    task::{AX_FILE_LIMIT, AsThread, Cred, linux_pid_from_task_id, ns_capable},
+    task::{AX_FILE_LIMIT, AsThread, Cred, current_fs_context, ns_capable},
     time::wall_time,
 };
 
@@ -369,7 +369,8 @@ fn normalize_legacy_open_flags(flags: i32) -> AxResult<i32> {
 
 fn openat2_context(dirfd: c_int, path: &Path, resolve: u64) -> AxResult<FsContext> {
     let (root, current_dir) = {
-        let fs = FS_CONTEXT.lock();
+        let fs_context = current_fs_context();
+        let fs = fs_context.lock();
         (fs.root_dir().clone(), fs.current_dir().clone())
     };
 
@@ -1046,7 +1047,7 @@ pub(crate) fn openat_inner(
 ) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
-    let security = OpenPathSecurityContext::new(thread.current_cred(), thread.proc_data.umask());
+    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     openat_inner_with_context(dirfd, path, flags, mode, security)
 }
 
@@ -1269,7 +1270,7 @@ pub fn sys_openat2(
     }
     let curr = current();
     let thread = curr.as_thread();
-    let security = OpenPathSecurityContext::new(thread.current_cred(), thread.proc_data.umask());
+    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     // Use one guard for both scoped pathwalk and creation. Combining the
     // predicates before acquisition avoids recursively locking the non-
     // reentrant namespace mutex when openat2 requests both.
@@ -1350,29 +1351,16 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
     if flags.contains(CloseRangeFlags::UNSHARE) {
         let curr = current();
         let thread = curr.as_thread();
-        let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-        if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
-            return Err(AxError::OperationNotSupported);
+        if let Some(replacement) = thread.try_clone_fd_table_if_shared()? {
+            drop(thread.replace_fd_table(replacement));
         }
-        let result = (|| -> AxResult<()> {
-            if Arc::strong_count(&*FD_TABLE) > 1 {
-                let replacement =
-                    Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?;
-                let previous =
-                    thread.with_mut_scope(|scope| replace_process_fd_table(scope, replacement));
-                drop(previous);
-            }
-            Ok(())
-        })();
-        thread.proc_data.end_exec(curr_tid);
-        result?;
     }
 
     let cloexec = flags.contains(CloseRangeFlags::CLOEXEC);
     if cloexec {
-        FD_TABLE.mark_cloexec_range(first, last);
+        current_fd_table().mark_cloexec_range(first, last);
     } else {
-        drop(FD_TABLE.close_range(first, last)?);
+        drop(current_fd_table().close_range(first, last)?);
         wait_current_close_notifications();
     }
 
@@ -1400,7 +1388,7 @@ fn dup_fd_at_least(
     }
 
     let upper_bound = max_nofile.min(AX_FILE_LIMIT);
-    FD_TABLE
+    current_fd_table()
         .add_at_least(description, min_fd, upper_bound, cloexec)
         .map(|fd| fd as isize)
 }
@@ -1549,7 +1537,7 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
     if new_fd < 0 || new_fd as usize >= max_nofile.min(AX_FILE_LIMIT) {
         return Err(AxError::BadFileDescriptor);
     }
-    drop(FD_TABLE.dup_replace(old_fd, new_fd, flags.contains(Dup3Flags::O_CLOEXEC))?);
+    drop(current_fd_table().dup_replace(old_fd, new_fd, flags.contains(Dup3Flags::O_CLOEXEC))?);
     wait_current_close_notifications();
 
     Ok(new_fd as _)
@@ -1723,7 +1711,7 @@ pub fn sys_fcntl(
             let expected = description.id();
             if dnotify::is_remove_mask(raw_mask) {
                 let detached =
-                    FD_TABLE.with_same_description(fd, expected, |table, _, description| {
+                    current_fd_table().with_same_description(fd, expected, |table, _, description| {
                         Ok(dnotify::detach_watch(table, description.id()))
                     })?;
                 drop(detached);
@@ -1742,8 +1730,8 @@ pub fn sys_fcntl(
             }
             let watch = WatchKey::from_location(&loc)?;
             let mask = dnotify::converted_mask(raw_mask);
-            FD_TABLE.prepare_dnotify_cleanup()?;
-            FD_TABLE.with_same_description(fd, expected, |table, fd, description| {
+            current_fd_table().prepare_dnotify_cleanup()?;
+            current_fd_table().with_same_description(fd, expected, |table, fd, description| {
                 dnotify::set_watch(table, fd, description, watch, mask)
             })?;
             Ok(0)
@@ -1768,12 +1756,12 @@ pub fn sys_fcntl(
             Ok(description.io_status_snapshot().raw() as _)
         }
         F_GETFD => {
-            let cloexec = FD_TABLE.get_cloexec(fd)?;
+            let cloexec = current_fd_table().get_cloexec(fd)?;
             Ok(if cloexec { FD_CLOEXEC as _ } else { 0 })
         }
         F_SETFD => {
             let cloexec = arg & FD_CLOEXEC as usize != 0;
-            FD_TABLE.set_cloexec(fd, cloexec)?;
+            current_fd_table().set_cloexec(fd, cloexec)?;
             Ok(0)
         }
         F_GETPIPE_SZ => {

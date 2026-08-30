@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_void};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
-    FS_CONTEXT, FatMountOptions, FsContext, OpenBlockDeviceError, block_device_is_read_only,
+    FatMountOptions, FsContext, OpenBlockDeviceError, block_device_is_read_only,
     block_device_names, new_block_filesystem, new_block_filesystem_with_fat_options,
     open_block_device,
 };
@@ -28,7 +28,7 @@ use crate::{
     mm::map_usercopy_error,
     mounts,
     pseudofs::{MemoryFs, cgroup},
-    task::{AsThread, DacCredentialView},
+    task::{AsThread, DacCredentialView, current_fs_context},
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
@@ -500,7 +500,7 @@ fn do_bind_mount(
         return Err(AxError::InvalidInput);
     }
 
-    let source_loc = FS_CONTEXT.lock().resolve_security(source, security)?;
+    let source_loc = current_fs_context().lock().resolve_security(source, security)?;
     if source_loc.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
@@ -543,7 +543,7 @@ fn do_move_mount_old(
         return Err(AxError::InvalidInput);
     }
 
-    let old = FS_CONTEXT.lock().resolve_security(source, security)?;
+    let old = current_fs_context().lock().resolve_security(source, security)?;
     if !old.is_root_of_mount() || old.is_root() || old.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
@@ -977,16 +977,15 @@ pub fn sys_mount<M: UserMemory + ?Sized>(
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let credentials = security.credentials();
-    let umask = proc_data.umask() as u16;
+    let umask = current_fs_context().lock().umask() as u16;
     if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
     let flags_u32 = validate_mount_flags(flags)?;
     let _mount_operation = mounts::namespace_operation();
-    let target = FS_CONTEXT.lock().resolve_security(&target, &security)?;
+    let target = current_fs_context().lock().resolve_security(&target, &security)?;
     let normalized_fs = if fs_type.starts_with("vfat") {
         "vfat"
     } else {
@@ -1070,7 +1069,7 @@ pub fn sys_mount<M: UserMemory + ?Sized>(
     let (fs, linux_device) = if let Some(fs) = pseudo_fs_for_mount(&source, normalized_fs, &data)? {
         (fs, None)
     } else {
-        let source_loc = FS_CONTEXT.lock().resolve_security(&source, &security)?;
+        let source_loc = current_fs_context().lock().resolve_security(&source, &security)?;
         let metadata = source_loc.metadata()?;
         if metadata.node_type != NodeType::BlockDevice {
             return Err(AxError::from(LinuxError::ENOTBLK));
@@ -1162,11 +1161,11 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
 
     let _mount_operation = mounts::namespace_operation();
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
-        FS_CONTEXT
+        current_fs_context()
             .lock()
             .resolve_no_follow_security_unobserved(&target, &security)?
     } else {
-        FS_CONTEXT
+        current_fs_context()
             .lock()
             .resolve_security_unobserved(&target, &security)?
     };

@@ -5,6 +5,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use axfs_ng_vfs::{
     Location, Metadata, NodeFlags, NodePermission, NodeType, OpenOptions as VfsOpenOptions,
@@ -123,10 +124,21 @@ pub struct ReadDirEntry {
 }
 
 /// Provides `std::fs`-like interface.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FsContext {
     root_dir: Location,
     current_dir: Location,
+    umask: AtomicU32,
+}
+
+impl Clone for FsContext {
+    fn clone(&self) -> Self {
+        Self {
+            root_dir: self.root_dir.clone(),
+            current_dir: self.current_dir.clone(),
+            umask: AtomicU32::new(self.umask.load(Ordering::SeqCst)),
+        }
+    }
 }
 
 impl FsContext {
@@ -183,7 +195,18 @@ impl FsContext {
         Self {
             root_dir: root_dir.clone(),
             current_dir: root_dir,
+            umask: AtomicU32::new(0o022),
         }
+    }
+
+    /// Returns this filesystem context's file creation mask.
+    pub fn umask(&self) -> u32 {
+        self.umask.load(Ordering::SeqCst)
+    }
+
+    /// Replaces this filesystem context's file creation mask.
+    pub fn replace_umask(&self, umask: u32) -> u32 {
+        self.umask.swap(umask, Ordering::SeqCst)
     }
 
     /// Returns a reference to the root directory.
@@ -210,6 +233,7 @@ impl FsContext {
         Ok(Self {
             root_dir: self.root_dir.clone(),
             current_dir,
+            umask: AtomicU32::new(self.umask.load(Ordering::SeqCst)),
         })
     }
 

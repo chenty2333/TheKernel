@@ -2,7 +2,7 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
+use axfs::{FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
 use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, NodeType, PhysicalIoSegment};
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
@@ -56,7 +56,7 @@ use crate::{
     pseudofs::tmp,
     readiness::block_on_poll_io,
     task::{
-        AsThread,
+        AsThread, current_fs_context,
         security::{SocketSecurityContext, dispatch_socket},
     },
     time::wall_time,
@@ -2678,7 +2678,7 @@ pub fn sys_truncate(
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let loc = FS_CONTEXT.lock().resolve_security(path, &security)?;
+    let loc = current_fs_context().lock().resolve_security(path, &security)?;
     check_open_permissions_with_security(
         &loc,
         W_OK,

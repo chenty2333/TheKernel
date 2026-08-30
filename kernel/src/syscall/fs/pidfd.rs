@@ -8,7 +8,7 @@ use thekernel_linux_signal::{SignalInfo, api::ThreadSignalManager};
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
-    file::{Directory, FD_TABLE, FileHandle, FileLike, PidFd, add_file_description},
+    file::{Directory, FileHandle, FileLike, PidFd, add_file_description},
     mm::map_usercopy_error,
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::{
@@ -451,9 +451,11 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     let pidfd = PidFd::from_fd(pidfd)?;
     let proc_data = pidfd.process_data()?;
     let authorized_image = check_pidfd_getfd_permission(&pidfd, &proc_data)?.into_aspace();
-    let description = FD_TABLE
-        .scope(&proc_data.scope.read())
-        .get_description(target_fd)?;
+    let target = match pidfd.signal_thread_task()? {
+        Some(task) => task,
+        None => crate::task::get_visible_task(proc_data.proc.pid())?,
+    };
+    let description = target.as_thread().fd_table().get_description(target_fd)?;
     if proc_data.exec_in_progress() || !proc_data.image_matches(&authorized_image) {
         return Err(AxError::OperationNotPermitted);
     }

@@ -9,7 +9,9 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axfs::FsContext;
 use axpoll::PollSet;
+use axsync::Mutex;
 use axsync::spin::SpinNoIrq;
 use axtask::{SchedClass, TaskExt, TaskInner, current_may_uninit, sched_state};
 use extern_trait::extern_trait;
@@ -703,6 +705,73 @@ impl<T> Deref for AssumeSync<T> {
     }
 }
 
+/// One Linux `fs_struct` plus an explicit count of owning task slots.  This
+/// deliberately does not use `Arc::strong_count`: boot references and
+/// temporary operation snapshots are not Linux `fs_struct` users.
+pub struct FsContextSlot {
+    context: Arc<Mutex<FsContext>>,
+    task_users: AtomicUsize,
+}
+
+/// One Linux `files_struct` plus the number of task slots owning it.  This is
+/// deliberately separate from `Arc` refcounts: operation snapshots are not
+/// Linux `CLONE_FILES` users.
+pub struct FdTableSlot {
+    table: Arc<crate::file::FdTable>,
+    task_users: AtomicUsize,
+}
+
+impl FdTableSlot {
+    pub(crate) fn new(table: Arc<crate::file::FdTable>) -> Arc<Self> {
+        Arc::new(Self { table, task_users: AtomicUsize::new(0) })
+    }
+    fn share_for_task(slot: &Arc<Self>) -> Arc<Self> {
+        slot.clone()
+    }
+    fn acquire_task(&self) { self.task_users.fetch_add(1, Ordering::Relaxed); }
+    fn release_task(&self) { self.task_users.fetch_sub(1, Ordering::Relaxed); }
+    pub(crate) fn table(&self) -> Arc<crate::file::FdTable> { self.table.clone() }
+    pub(crate) fn has_task_users(&self) -> bool {
+        self.task_users.load(Ordering::Acquire) != 0
+    }
+}
+
+impl FsContextSlot {
+    pub(crate) fn new(context: Arc<Mutex<FsContext>>) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            task_users: AtomicUsize::new(0),
+        })
+    }
+
+    fn share_for_task(slot: &Arc<Self>) -> Arc<Self> {
+        slot.clone()
+    }
+
+    fn acquire_task(&self) { self.task_users.fetch_add(1, Ordering::Relaxed); }
+
+    fn release_task(&self) {
+        self.task_users.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Temporary owner claims made before `Thread` is boxed.  Every error path
+/// before commit releases both claims; after commit the Thread owns them.
+struct TaskResourceAdmission {
+    fs: Arc<FsContextSlot>,
+    fd: Arc<FdTableSlot>,
+    committed: bool,
+}
+impl TaskResourceAdmission {
+    fn new(fs: Arc<FsContextSlot>, fd: Arc<FdTableSlot>) -> Self {
+        fs.acquire_task(); fd.acquire_task(); Self { fs, fd, committed: false }
+    }
+    fn commit(mut self) { self.committed = true; }
+}
+impl Drop for TaskResourceAdmission {
+    fn drop(&mut self) { if !self.committed { self.fs.release_task(); self.fd.release_task(); } }
+}
+
 /// The inner data of a thread.
 pub struct Thread {
     /// The process data shared by all threads in the process.
@@ -717,6 +786,14 @@ pub struct Thread {
     /// after an early leader exit. There is never a second credential copy or
     /// publication point.
     pub(in crate::task) credential: Arc<CredentialSlot>,
+
+    /// Linux `fs_struct`: shared only when clone semantics request it.  The
+    /// slot itself is task-local so `unshare(CLONE_FS)` can replace just the
+    /// calling thread's reference.
+    fs_context: SpinNoIrq<Option<Arc<FsContextSlot>>>,
+
+    /// Linux `files_struct`, independently selected for every task.
+    fd_table: SpinNoIrq<Option<Arc<FdTableSlot>>>,
 
     /// One atomically consistent, task-local seccomp mode and filter ancestry
     /// published through the independent bounded seccomp RCU domain.
@@ -836,8 +913,19 @@ impl Thread {
         proc_data: Arc<ProcessData>,
         credential: Arc<CredentialSlot>,
         seccomp: Arc<SeccompState>,
+        fs_context: Arc<FsContextSlot>,
+        fd_table: Arc<FdTableSlot>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
-        Self::try_new_with_io_context(tid, proc_data, credential, seccomp, None, 0)
+        Self::try_new_with_io_context(
+            tid,
+            proc_data,
+            credential,
+            seccomp,
+            None,
+            fs_context,
+            fd_table,
+            0,
+        )
     }
 
     /// Create a task with an explicitly selected Linux I/O-priority context.
@@ -849,6 +937,8 @@ impl Thread {
         credential: Arc<CredentialSlot>,
         seccomp: Arc<SeccompState>,
         io_context: Option<Arc<AtomicU16>>,
+        fs_context: Arc<FsContextSlot>,
+        fd_table: Arc<FdTableSlot>,
         personality: u32,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         // ProcessData is created before the child scheduler object. Seed its
@@ -890,10 +980,13 @@ impl Thread {
             TaskParentNode::try_new(tid, Arc::downgrade(&proc_data), Arc::downgrade(&credential))?;
         let time = TimeManager::new(&proc_data);
         let (seccomp, seccomp_terminal_disabled) = super::seccomp::new_thread_seccomp(seccomp)?;
+        let resource_admission = TaskResourceAdmission::new(fs_context.clone(), fd_table.clone());
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
             credential,
+            fs_context: SpinNoIrq::new(Some(fs_context)),
+            fd_table: SpinNoIrq::new(Some(fd_table)),
             seccomp,
             seccomp_terminal_disabled,
             personality: AtomicU32::new(personality),
@@ -919,6 +1012,7 @@ impl Thread {
             deferred_work,
         })
         .map_err(|_| AxError::NoMemory)?;
+        resource_admission.commit();
         let registration = thread
             .signal
             .try_register(tid)
@@ -942,6 +1036,82 @@ impl Thread {
 
     pub(crate) fn clear_personality_flags(&self, flags: u32) {
         self.personality.fetch_and(!flags, Ordering::AcqRel);
+    }
+
+    /// Snapshot this task's current Linux filesystem context pointer.
+    pub(crate) fn fs_context(&self) -> Arc<Mutex<FsContext>> {
+        self.fs_context.lock().as_ref().expect("retired fs_struct").context.clone()
+    }
+
+    /// Acquires one Linux task ownership of this `fs_struct`.
+    pub(crate) fn fs_context_for_child(&self) -> Arc<FsContextSlot> {
+        FsContextSlot::share_for_task(self.fs_context.lock().as_ref().expect("retired fs_struct"))
+    }
+
+    pub(crate) fn fd_table(&self) -> Arc<crate::file::FdTable> { self.fd_table.lock().as_ref().expect("retired files_struct").table.clone() }
+    pub(crate) fn fd_table_is_shared(&self) -> bool { self.fd_table.lock().as_ref().expect("retired files_struct").task_users.load(Ordering::Relaxed) != 1 }
+    pub(crate) fn fd_table_for_child(&self) -> Arc<FdTableSlot> { FdTableSlot::share_for_task(self.fd_table.lock().as_ref().expect("retired files_struct")) }
+    pub(crate) fn try_clone_fd_table_if_shared(&self) -> AxResult<Option<Arc<FdTableSlot>>> {
+        let table = { let slot = self.fd_table.lock(); (slot.as_ref().expect("retired files_struct").task_users.load(Ordering::Relaxed) != 1).then(|| slot.as_ref().expect("retired files_struct").table.clone()) };
+        table.map(|table| Arc::try_new(FdTableSlot { table: Arc::try_new(table.fork_copy()?).map_err(|_| AxError::NoMemory)?, task_users: AtomicUsize::new(0) }).map_err(|_| AxError::NoMemory)).transpose()
+    }
+    pub(crate) fn replace_fd_table(&self, replacement: Arc<FdTableSlot>) -> Arc<FdTableSlot> {
+        replacement.acquire_task();
+        let old = core::mem::replace(&mut *self.fd_table.lock(), Some(replacement)).expect("retired files_struct");
+        old.release_task(); old
+    }
+    /// Retire the Linux task ownership at the authoritative task-unhash edge.
+    /// Takes the exact task-owned table at authoritative unlink.  Subsequent
+    /// accesses are invalid, and dropping the returned Arc performs final
+    /// descriptor/resource close when it was the last owner.
+    pub(crate) fn retire_fd_table(&self) -> Arc<FdTableSlot> {
+        let slot = self.fd_table.lock().take().expect("files_struct retired twice");
+        slot.release_task();
+        slot
+    }
+
+    /// Creates a private `fs_struct` only when this task's slot actually
+    /// shares one. The count is checked before making a local Arc clone, so
+    /// an already-private `unshare(CLONE_FS)` needs no allocation.
+    pub(crate) fn try_clone_fs_context_if_shared(
+        &self,
+    ) -> AxResult<Option<Arc<FsContextSlot>>> {
+        let cloned = {
+            let fs_context = self.fs_context.lock();
+            let fs_context = fs_context.as_ref().expect("retired fs_struct");
+            if fs_context.task_users.load(Ordering::Relaxed) == 1 {
+                None
+            } else {
+                Some(fs_context.context.lock().clone())
+            }
+        };
+        cloned
+            .map(|context| {
+                Arc::try_new(FsContextSlot {
+                    context: Arc::try_new(Mutex::new(context)).map_err(|_| AxError::NoMemory)?,
+                    task_users: AtomicUsize::new(0),
+                })
+                .map_err(|_| AxError::NoMemory)
+            })
+            .transpose()
+    }
+
+    /// Replaces this task's `fs_struct`, used by `unshare(CLONE_FS)`.
+    pub(crate) fn replace_fs_context(
+        &self,
+        replacement: Arc<FsContextSlot>,
+    ) -> Arc<FsContextSlot> {
+        replacement.acquire_task();
+        let old = core::mem::replace(&mut *self.fs_context.lock(), Some(replacement)).expect("retired fs_struct");
+        old.release_task();
+        old
+    }
+
+    /// Removes the exact task owner's fs_struct at authoritative task unlink.
+    pub(crate) fn retire_fs_context(&self) -> Arc<FsContextSlot> {
+        let slot = self.fs_context.lock().take().expect("fs_struct retired twice");
+        slot.release_task();
+        slot
     }
 
     /// Returns the shared I/O-priority context used by `CLONE_IO`, if Linux
@@ -1314,6 +1484,15 @@ impl Thread {
             // SAFETY: guarded by active_scope_read_held, which is set only
             // after acquire_active_scope_read leaks exactly one read guard.
             unsafe { self.proc_data.scope.force_read_decrement() };
+        }
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if let Some(slot) = self.fs_context.get_mut().take() { slot.release_task(); }
+        if let Some(slot) = self.fd_table.get_mut().take() {
+            slot.release_task();
         }
     }
 }

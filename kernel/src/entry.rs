@@ -12,12 +12,12 @@ use thekernel_linux_seccomp::SeccompState;
 use thekernel_linux_signal::api::{SharedSignalActions, SignalActions};
 
 use crate::{
-    file::{FD_TABLE, FdTable, executable, init_fd_scope_default, try_new_process_scope},
+    file::{FdTable, executable, try_new_process_scope},
     mm::{copy_from_kernel, load_user_app_trusted, new_user_aspace_empty},
     pseudofs::{self, dev::tty::N_TTY},
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
-        ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
+        FsContextSlot, ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
         init_process_domain, init_seccomp_filter_budget, linux_pid_from_task_id,
         prepare_task_table_admission, set_task_user_address_space, spawn_alarm_task,
         try_new_user_task,
@@ -48,7 +48,6 @@ pub fn init(args: &[String], envs: &[String]) {
         error!("failed to initialize bounded executable registry: {error}");
         system_off();
     }
-    init_fd_scope_default().expect("Failed to initialize real fd scope default");
 
     {
         let fs = FS_CONTEXT.lock();
@@ -91,8 +90,11 @@ pub fn init(args: &[String], envs: &[String]) {
     let credential =
         CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
     let init_net_stack = axnet::default_stack().clone();
-    pseudofs::mount_all(&boot_security, init_net_stack.unix_namespace())
-        .expect("Failed to mount pseudofs");
+    {
+        let fs = FS_CONTEXT.lock();
+        pseudofs::mount_all(&fs, &boot_security, init_net_stack.unix_namespace())
+            .expect("Failed to mount pseudofs");
+    }
     let init_net_ns = NetworkNamespace::try_new(init_net_stack, user_ns.clone())
         .expect("Failed to allocate init network namespace");
 
@@ -168,7 +170,8 @@ pub fn init(args: &[String], envs: &[String]) {
     let init_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init fd-table identity"))
             .expect("Failed to allocate init fd table");
-    let scope = try_new_process_scope(init_fd_table, FS_CONTEXT.clone())
+    let init_fs_context = FS_CONTEXT.clone();
+    let scope = try_new_process_scope()
         .expect("Failed to allocate init process scope");
     let exit_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
@@ -198,10 +201,7 @@ pub fn init(args: &[String], envs: &[String]) {
     .expect("Failed to allocate init process runtime state");
     init_pid_reservation.commit();
 
-    {
-        let mut scope = proc.scope.write();
-        crate::file::add_stdio(&FD_TABLE.scope_mut(&mut scope)).expect("Failed to add stdio");
-    }
+    crate::file::add_stdio(&init_fd_table, &init_fs_context.lock()).expect("Failed to add stdio");
 
     let thread_admission = proc
         .prepare_thread(tid)
@@ -211,6 +211,8 @@ pub fn init(args: &[String], envs: &[String]) {
         proc.clone(),
         credential,
         Arc::new(SeccompState::disabled()),
+        FsContextSlot::new(init_fs_context.clone()),
+        crate::task::FdTableSlot::new(init_fd_table),
     )
     .expect("Failed to allocate init thread state");
     proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
@@ -244,7 +246,7 @@ pub fn init(args: &[String], envs: &[String]) {
     let exit_code = task.join().expect("Failed to join init task");
     info!("Init process exited with code: {exit_code}");
 
-    let cx = FS_CONTEXT.lock();
+    let cx = init_fs_context.lock();
     cx.root_dir()
         .unmount_all()
         .expect("Failed to unmount all filesystems");

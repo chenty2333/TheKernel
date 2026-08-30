@@ -5,7 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileBackend, FileFlags};
+use axfs::{FileBackend, FileFlags};
 use axfs_ng_vfs::{
     DeviceId, Location, MetadataUpdate, NodePermission, NodeType,
     path::{FinalComponent, FinalComponentKind, Path},
@@ -51,7 +51,7 @@ use crate::{
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
     task::{
-        AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, has_pending_syscall_signal,
+        AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context, has_pending_syscall_signal,
         ns_capable,
     },
     time::{TimeValueLike, wall_time},
@@ -384,7 +384,7 @@ fn resolve_linkat_source(
         }
         if old_dirfd == AT_FDCWD {
             return Ok(LinkatSource::Location(
-                FS_CONTEXT.lock().current_dir().clone(),
+                current_fs_context().lock().current_dir().clone(),
             ));
         }
 
@@ -403,7 +403,7 @@ fn resolve_linkat_source(
     let path = Path::new(old_path);
     if path.is_absolute() || old_dirfd == AT_FDCWD {
         return resolve_hardlink_source_in_fs(
-            &FS_CONTEXT.lock(),
+            &current_fs_context().lock(),
             path,
             follow_final_symlink,
             security,
@@ -417,7 +417,8 @@ fn resolve_linkat_source(
     let description =
         pin_linkat_source_description(old_dirfd, security, flags & AT_EMPTY_PATH != 0)?;
     let start = hardlink_location_from_description(&description).ok_or(AxError::NotADirectory)?;
-    let fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let fs = fs_context.lock();
     let relative_fs = fs.with_current_dir(start)?;
     let result = resolve_hardlink_source_in_fs(&relative_fs, path, follow_final_symlink, security)
         .map(LinkatSource::Location);
@@ -545,7 +546,8 @@ pub fn sys_chdir<M: UserMemory + ?Sized>(
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let mut fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let mut fs = fs_context.lock();
     let entry = fs.resolve_security(path, &security)?;
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
@@ -568,7 +570,7 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     check_fchdir_permissions_with_security(entry, &security)?;
     // One FS-context critical section publishes the new pwd only after all
     // fallible fd/type/permission stages succeeded, preserving CLONE_FS.
-    FS_CONTEXT.lock().set_current_dir(entry.clone())?;
+    current_fs_context().lock().set_current_dir(entry.clone())?;
     Ok(0)
 }
 
@@ -589,7 +591,8 @@ pub fn sys_chroot<M: UserMemory + ?Sized>(
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let mut fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let mut fs = fs_context.lock();
     let loc = fs.resolve_security(path, &security)?;
     if loc.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
@@ -616,7 +619,6 @@ pub fn sys_mkdirat<M: UserMemory + ?Sized>(
     validate_pathname(Path::new(&path))?;
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let path_ref = Path::new(&path);
@@ -635,7 +637,7 @@ pub fn sys_mkdirat<M: UserMemory + ?Sized>(
         &name,
         NodeType::Directory,
         requested_mode,
-        proc_data.umask(),
+        current_fs_context().lock().umask(),
         None,
         &security,
     )?;
@@ -680,7 +682,6 @@ pub fn sys_mknodat<M: UserMemory + ?Sized>(
     let node_type = decode_mknod_node_type(mode)?;
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
 
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
@@ -702,7 +703,7 @@ pub fn sys_mknodat<M: UserMemory + ?Sized>(
         &name,
         node_type,
         requested_mode,
-        proc_data.umask(),
+        current_fs_context().lock().umask(),
         rdev,
         &security,
     )?;
@@ -1161,7 +1162,8 @@ pub fn sys_getcwd<M: UserMemory + ?Sized>(
     size: usize,
 ) -> AxResult<isize> {
     let cwd = {
-        let fs = FS_CONTEXT.lock();
+        let fs_context = current_fs_context();
+        let fs = fs_context.lock();
         path_from_root(fs.current_dir().clone(), fs.root_dir())?
     };
     debug!("sys_getcwd => cwd: {cwd}");
@@ -1890,7 +1892,7 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
-    FS_CONTEXT
+    current_fs_context()
         .lock()
         .root_dir()
         .mountpoint()

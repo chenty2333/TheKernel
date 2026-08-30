@@ -7,7 +7,7 @@
 use alloc::{format, vec, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use axfs::{FS_CONTEXT, File, OpenOptions};
+use axfs::{File, OpenOptions};
 use axhal::{paging::MappingFlags, uspace::UserContext};
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CORE};
 use memory_addr::PAGE_SIZE_4K;
@@ -271,7 +271,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         // symlinks, so a privileged dump cannot overwrite or follow an
         // attacker-prepared `/tmp/core.<pid>` path.
         .create_new(true)
-        .open(&FS_CONTEXT.lock(), &path)?
+        .open(&crate::task::current_fs_context().lock(), &path)?
         .into_file()?;
 
     let mut offset = 0u64;

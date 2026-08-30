@@ -7,7 +7,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::RLIMIT_NOFILE;
-use spin::{Mutex, Once, RwLock};
+use spin::{Mutex, RwLock};
 pub(crate) use thekernel_linux_fd::FdTableId;
 use thekernel_linux_fd::{
     CloseBatch as LinuxCloseBatch, DescriptorFlags, FdNumber, FdTable as LinuxFdTable,
@@ -27,7 +27,10 @@ use super::{
 use crate::task::{AX_FILE_LIMIT, AsThread};
 
 static NEXT_FD_TABLE_ID: AtomicU64 = AtomicU64::new(1);
-static FD_SCOPE_DEFAULT: Once<Arc<FdTable>> = Once::new();
+
+pub(crate) fn try_new_process_scope() -> AxResult<scope_local::Scope> {
+    scope_local::Scope::try_new().map_err(|_| AxError::NoMemory)
+}
 
 fn allocate_fd_table_id() -> AxResult<FdTableId> {
     let raw = NEXT_FD_TABLE_ID
@@ -681,43 +684,6 @@ impl Drop for FdTable {
     }
 }
 
-scope_local::scope_local! {
-    /// The current file descriptor table.
-    pub static FD_TABLE: Arc<FdTable> = scope_default_fd_table();
-}
-
-fn scope_default_fd_table() -> Arc<FdTable> {
-    FD_SCOPE_DEFAULT
-        .get()
-        .expect("fd scope default not initialized")
-        .clone()
-}
-
-/// Installs the real, empty table cloned by otherwise unpublished scopes.
-/// This must run before the first scope-local item is accessed.
-pub(crate) fn init_fd_scope_default() -> AxResult<()> {
-    FD_SCOPE_DEFAULT
-        .try_call_once(|| {
-            let table = FdTable::new()?;
-            Arc::try_new(table).map_err(|_| AxError::NoMemory)
-        })
-        .map(|_| ())
-}
-
-/// Fallibly builds a process scope around already-prepared resource pointers.
-/// Scope item initialization only clones boot-prepared real Arcs; displaced
-/// defaults are dropped after all fallible scope allocations have completed.
-pub(crate) fn try_new_process_scope(
-    fd_table: Arc<FdTable>,
-    fs_context: Arc<axsync::Mutex<axfs::FsContext>>,
-) -> AxResult<scope_local::Scope> {
-    init_fd_scope_default()?;
-    let mut scope = scope_local::Scope::try_new().map_err(|_| AxError::NoMemory)?;
-    let old_fd = core::mem::replace(&mut *FD_TABLE.scope_mut(&mut scope), fd_table);
-    let old_fs = core::mem::replace(&mut *axfs::FS_CONTEXT.scope_mut(&mut scope), fs_context);
-    drop((old_fd, old_fs));
-    Ok(scope)
-}
 
 /// Get a file-like object by `fd`.
 pub fn get_file_like(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
@@ -734,7 +700,7 @@ pub fn get_file_like(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
 /// this once and carry it through the operation instead of resolving the
 /// scope-local table again in a leaf object.
 pub(crate) fn current_fd_table() -> Arc<FdTable> {
-    (*FD_TABLE).clone()
+    current().as_thread().fd_table()
 }
 
 pub fn get_typed_file<T>(fd: c_int) -> AxResult<FileHandle<T>>
@@ -755,7 +721,7 @@ where
 
 /// Get an open file description by `fd`.
 pub fn get_file_description(fd: c_int) -> AxResult<Arc<FileDescription>> {
-    FD_TABLE.get_description(fd)
+    current_fd_table().get_description(fd)
 }
 
 /// Add an open file description to the file descriptor table.
@@ -763,7 +729,7 @@ pub fn add_file_description(description: Arc<FileDescription>, cloexec: bool) ->
     let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE]
         .current
         .min(AX_FILE_LIMIT as u64) as usize;
-    FD_TABLE.add_at_least(description, 0, max_nofile, cloexec)
+    current_fd_table().add_at_least(description, 0, max_nofile, cloexec)
 }
 
 /// Tries to reserve the lowest available fd number. The reservation blocks
@@ -771,7 +737,7 @@ pub fn add_file_description(description: Arc<FileDescription>, cloexec: bool) ->
 /// lookup. `None` is useful to SCM_RIGHTS, where fd exhaustion truncates the
 /// ancillary prefix instead of failing the already received payload.
 pub(crate) fn try_reserve_fd(cloexec: bool) -> AxResult<Option<ReservedFd>> {
-    let fd_table = (*FD_TABLE).clone();
+    let fd_table = current_fd_table();
     let limit = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE]
         .current
         .min(AX_FILE_LIMIT as u64) as usize;
@@ -856,7 +822,7 @@ pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
 
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
-    let f = FD_TABLE.close(fd)?;
+    let f = current_fd_table().close(fd)?;
     debug!(
         "close_file_like <= description refs: {}",
         Arc::strong_count(&f.description)
@@ -866,15 +832,6 @@ pub fn close_file_like(fd: c_int) -> AxResult {
 
 pub(crate) fn close_fd_table(table: &FdTable) -> AxResult<CloseBatch> {
     table.close_all()
-}
-
-/// Replaces the process-scope files pointer without allocating or dropping the
-/// previous table under the scope lock.
-pub(crate) fn replace_process_fd_table(
-    scope: &mut scope_local::Scope,
-    replacement: Arc<FdTable>,
-) -> Arc<FdTable> {
-    core::mem::replace(&mut *FD_TABLE.scope_mut(scope), replacement)
 }
 
 /// Releases process-owned record locks before dropping this process's

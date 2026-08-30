@@ -48,7 +48,7 @@ impl SocketSyscallSnapshot {
             actor,
             net_namespace: thread.proc_data.net_ns.clone(),
             pid,
-            umask: thread.proc_data.umask(),
+            umask: thread.fs_context().lock().umask(),
             unix_credentials: UnixCredentials::new(pid, ids.euid.into_raw(), ids.egid.into_raw()),
         }
     }

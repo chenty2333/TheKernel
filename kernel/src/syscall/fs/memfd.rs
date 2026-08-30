@@ -6,13 +6,12 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodePermission;
 use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, O_RDWR};
 
 use super::fd_ops::openat_inner;
 use crate::{
-    file::{FD_TABLE, File, get_file_description, memfd},
+    file::{File, current_fd_table, get_file_description, memfd},
     mm::{UserMemoryCapability, map_usercopy_error},
 };
 
@@ -48,7 +47,8 @@ fn validate_memfd_name(capability: &UserMemoryCapability, name: *const c_char) -
 }
 
 fn ensure_memfd_dir() -> AxResult<()> {
-    let fs = FS_CONTEXT.lock();
+    let fs_context = crate::task::current_fs_context();
+    let fs = fs_context.lock();
     match fs.resolve(MEMFD_DIR) {
         Ok(loc) if loc.is_dir() => Ok(()),
         Ok(_) => Err(AxError::NotADirectory),
@@ -93,7 +93,7 @@ pub fn sys_memfd_create(
                     });
                 if let Err(error) = install {
                     drop(description);
-                    let removed = FD_TABLE.close_if_same(fd as i32, expected);
+                    let removed = current_fd_table().close_if_same(fd as i32, expected);
                     drop(removed);
                     crate::file::inotify::wait_current_close_notifications();
                     return Err(error);

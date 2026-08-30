@@ -2461,8 +2461,8 @@ pub struct ProcessData {
     /// The futex table.
     pub(in crate::task) futex_table: Arc<FutexTable>,
 
-    /// The default mask for file permissions.
-    umask: AtomicU32,
+    /// Linux personality flags shared by all threads in the process.
+    personality: AtomicU32,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
     /// Current timer slack in nanoseconds.
@@ -2965,7 +2965,7 @@ impl ProcessData {
 
             futex_table,
 
-            umask: AtomicU32::new(0o022),
+            personality: AtomicU32::new(0),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
@@ -3504,21 +3504,6 @@ impl ProcessData {
             }
         }
         current
-    }
-
-    /// Get the umask.
-    pub fn umask(&self) -> u32 {
-        self.umask.load(Ordering::SeqCst)
-    }
-
-    /// Set the umask.
-    pub fn set_umask(&self, umask: u32) {
-        self.umask.store(umask, Ordering::SeqCst);
-    }
-
-    /// Set the umask and return the old value.
-    pub fn replace_umask(&self, umask: u32) -> u32 {
-        self.umask.swap(umask, Ordering::SeqCst)
     }
 }
 

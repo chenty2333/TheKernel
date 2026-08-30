@@ -1518,6 +1518,25 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             fail_closed_exit(error);
         }
     };
+    // The core unlink above is the sole Linux task ownership retirement edge;
+    // scheduler Arc destruction is not allowed to define files_struct lifetime.
+    let retired_fs_context = thr.retire_fs_context();
+    let mut retired_fd_table = Some(thr.retire_fd_table());
+    // Do not defer cwd/root release to scheduler Arc destruction.
+    drop(retired_fs_context);
+    if final_exit.is_none() {
+        let retired = retired_fd_table.take().expect("nonfinal exit retains files_struct");
+        // A private files_struct must take the normal close path while this
+        // exiting task still supplies the POSIX-lock owner context. Shared
+        // CLONE_FILES tables retain another task owner and are left intact.
+        if !retired.has_task_users() {
+            let table = retired.table();
+            let closed = crate::file::close_fd_table(&table).unwrap_or_else(|_| fail_closed_exit(AxError::BadState));
+            drop(closed);
+            crate::file::inotify::wait_current_close_notifications();
+        }
+        drop(retired);
+    }
 
     // A final admission owns the removed membership and restores it on Drop.
     // Bind the process-owned payload before any per-thread/process teardown.
@@ -1631,15 +1650,15 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         thr.proc_data.release_executable();
         crate::syscall::cleanup_process_aio(process.pid());
         crate::syscall::cleanup_process_mqueue_notifications(process.pid());
-        let detached_fd_table = thr.proc_data.exit_fd_table();
-        let closed_fds = thr.with_mut_scope(|scope| {
-            crate::file::replace_process_fd_table(scope, detached_fd_table)
-        });
+        let closed_fds = retired_fd_table.take().expect("final exit retains files_struct");
         // wait(2) may return as soon as the parent observes the zombie state.
         // Release process-owned POSIX locks before the old files_struct can
         // drop its descriptions. Their Drop path publishes IN_CLOSE/FAN_CLOSE
         // work, which must only become observable after those locks are gone.
-        crate::file::release_process_fd_table(process.pid(), closed_fds);
+        crate::file::release_process_fd_table(process.pid(), closed_fds.table());
+        // Retire the slot itself before close notifications or zombie
+        // publication: it is the remaining table Arc after the lock release.
+        drop(closed_fds);
         crate::file::inotify::wait_current_close_notifications();
         ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(&thr.proc_data));
         crate::syscall::clear_proc_shm(process.pid());

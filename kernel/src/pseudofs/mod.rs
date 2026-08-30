@@ -15,7 +15,7 @@ pub(crate) mod tmp;
 use alloc::sync::Arc;
 
 use axerrno::LinuxResult;
-use axfs::{FS_CONTEXT, FsContext};
+use axfs::FsContext;
 use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
 use axnet::unix::UnixNamespace;
 pub use tmp::MemoryFs;
@@ -87,6 +87,7 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
 
 /// Mount all filesystems
 pub fn mount_all(
+    fs: &FsContext,
     boot_security: &crate::file::permission::VfsSecurityContext,
     unix_namespace: Arc<UnixNamespace>,
 ) -> LinuxResult<()> {
@@ -94,7 +95,6 @@ pub fn mount_all(
     #[cfg(not(feature = "dev-log"))]
     let _ = (boot_security, unix_namespace);
 
-    let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
     let tmp_permission = NodePermission::from_bits_truncate(0o1777);
     mount_at(
@@ -119,7 +119,6 @@ pub fn mount_all(
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", sys::new_sysfs())?;
-    drop(fs);
 
     #[cfg(feature = "dev-log")]
     dev::bind_dev_log(boot_security, unix_namespace).expect("Failed to bind /dev/log");

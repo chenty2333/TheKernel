@@ -1,8 +1,7 @@
 use alloc::{string::String, sync::Arc};
-use core::mem::{self, MaybeUninit};
+use core::{mem::{self, MaybeUninit}, sync::atomic::{AtomicU64, Ordering}};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::FS_CONTEXT;
 use axhal::paging::MappingFlags;
 use axtask::{AxTaskRef, current};
 use linux_raw_sys::{
@@ -18,13 +17,12 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use thekernel_linux_cred::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, CapsetRequest,
 };
-use thekernel_linux_signal::api::SharedSignalActions;
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul, vm_write_slice,
 };
 
 use crate::{
-    file::{FD_TABLE, File, FileDescription, FileLike, replace_process_fd_table},
+    file::{File, FileDescription, FileLike},
     mm::map_usercopy_error,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
@@ -32,7 +30,7 @@ use crate::{
     },
     task::{
         AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
-        check_current_process_ptrace_access, cred_error, get_process_data, get_visible_task,
+        cred_error, get_process_data, get_visible_task,
         linux_pid_from_task_id, ns_capable,
     },
 };
@@ -50,6 +48,9 @@ const MAX_NODEMASK_BITS: usize = 4096;
 const KCMP_FILE: i32 = 0;
 const KCMP_VM: i32 = 1;
 const KCMP_FILES: i32 = 2;
+const KCMP_POINTER_TYPES: usize = 5;
+static KCMP_POINTER_COOKIES: [AtomicU64; KCMP_POINTER_TYPES] =
+    [const { AtomicU64::new(0) }; KCMP_POINTER_TYPES];
 const KCMP_FS: i32 = 3;
 const KCMP_SIGHAND: i32 = 4;
 const KCMP_IO: i32 = 5;
@@ -283,8 +284,34 @@ fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
     get_process_data(pid as u32)
 }
 
-fn kcmp_result(equal: bool) -> isize {
-    if equal { 0 } else { 1 }
+/// Linux KCMP returns an ordering over obfuscated kernel pointers, never the
+/// pointer itself. Mix before comparing so the observable direction does not
+/// encode an address ordering, while remaining stable for this boot.
+fn kcmp_cookie(type_: i32) -> AxResult<u64> {
+    let cookie = &KCMP_POINTER_COOKIES[type_ as usize];
+    let existing = cookie.load(Ordering::Acquire);
+    if existing != 0 { return Ok(existing); }
+    let mut bytes = [0u8; 8];
+    // KCMP deliberately fails rather than falling back to predictable time or
+    // address material when the boot entropy source is unavailable.
+    crate::random::fill_secure(&mut bytes)?;
+    let candidate = u64::from_ne_bytes(bytes).max(1);
+    let _ = cookie.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire);
+    Ok(cookie.load(Ordering::Acquire))
+}
+
+fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<isize> {
+    let key = kcmp_cookie(type_)?;
+    let mix = |ptr: *const T| {
+        let value = ptr as *const () as usize;
+        let mut value = (value as u64) ^ key;
+        value ^= value >> 30; value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27; value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    };
+    let left = mix(Arc::as_ptr(left));
+    let right = mix(Arc::as_ptr(right));
+    Ok(if left == right { 0 } else if left < right { 1 } else { 2 })
 }
 
 struct KcmpAuthorizedImage<T> {
@@ -313,23 +340,37 @@ fn validate_kcmp_fd_image<T>(
     }
 }
 
-fn kcmp_file_description(proc_data: &ProcessData, fd: usize) -> AxResult<Arc<FileDescription>> {
-    FD_TABLE
-        .scope(&proc_data.scope.read())
+fn kcmp_file_description(thread: &crate::task::Thread, fd: usize) -> AxResult<Arc<FileDescription>> {
+    thread.fd_table()
         .get_description_number(u32::try_from(fd).map_err(|_| AxError::BadFileDescriptor)?)
 }
 
 pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> AxResult<isize> {
     debug!("sys_kcmp <= pid1: {pid1}, pid2: {pid2}, type: {type_}, idx1: {idx1}, idx2: {idx2}");
 
-    let proc1 = kcmp_target_process(pid1)?;
-    let proc2 = kcmp_target_process(pid2)?;
-    let image1 = KcmpAuthorizedImage::new(
-        check_current_process_ptrace_access(&proc1, PtraceAccessMode::ReadReal)?.into_aspace(),
-    );
-    let image2 = KcmpAuthorizedImage::new(
-        check_current_process_ptrace_access(&proc2, PtraceAccessMode::ReadReal)?.into_aspace(),
-    );
+    if pid1 <= 0 || pid2 <= 0 { return Err(AxError::NoSuchProcess); }
+    let task1 = get_visible_task(pid1 as u32)?;
+    let task2 = get_visible_task(pid2 as u32)?;
+    let thread1 = task1.as_thread();
+    let thread2 = task2.as_thread();
+    let proc1 = thread1.proc_data.clone();
+    let proc2 = thread2.proc_data.clone();
+    let authorized1 = crate::task::check_current_thread_ptrace_image_access(thread1, PtraceAccessMode::ReadReal)?;
+    let authorized2 = crate::task::check_current_thread_ptrace_image_access(thread2, PtraceAccessMode::ReadReal)?;
+    if type_ == KCMP_FS {
+        let image1 = KcmpAuthorizedImage::new(authorized1.into_aspace());
+        let image2 = KcmpAuthorizedImage::new(authorized2.into_aspace());
+        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| proc1.image_matches(image))?;
+        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| proc2.image_matches(image))?;
+        let fs1 = thread1.fs_context();
+        let fs2 = thread2.fs_context();
+        validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| proc1.image_matches(image))?;
+        validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| proc2.image_matches(image))?;
+        return kcmp_ptr(KCMP_FS, &fs1, &fs2);
+    }
+
+    let image1 = KcmpAuthorizedImage::new(authorized1.into_aspace());
+    let image2 = KcmpAuthorizedImage::new(authorized2.into_aspace());
 
     match type_ {
         KCMP_FILE => {
@@ -339,8 +380,8 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
                 proc2.image_matches(image)
             })?;
-            let file1 = kcmp_file_description(&proc1, idx1);
-            let file2 = kcmp_file_description(&proc2, idx2);
+            let file1 = kcmp_file_description(thread1, idx1);
+            let file2 = kcmp_file_description(thread2, idx2);
             validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
                 proc1.image_matches(image)
             })?;
@@ -349,9 +390,9 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             })?;
             let file1 = file1?;
             let file2 = file2?;
-            Ok(kcmp_result(Arc::ptr_eq(&file1, &file2)))
+            kcmp_ptr(KCMP_FILE, &file1, &file2)
         }
-        KCMP_VM => Ok(kcmp_result(Arc::ptr_eq(image1.pinned(), image2.pinned()))),
+        KCMP_VM => kcmp_ptr(KCMP_VM, image1.pinned(), image2.pinned()),
         KCMP_FILES => {
             validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
                 proc1.image_matches(image)
@@ -359,28 +400,18 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
                 proc2.image_matches(image)
             })?;
-            let files1 = Arc::clone(&*FD_TABLE.scope(&proc1.scope.read()));
-            let files2 = Arc::clone(&*FD_TABLE.scope(&proc2.scope.read()));
+            let files1 = thread1.fd_table();
+            let files2 = thread2.fd_table();
             validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
                 proc1.image_matches(image)
             })?;
             validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
                 proc2.image_matches(image)
             })?;
-            Ok(kcmp_result(Arc::ptr_eq(&files1, &files2)))
+            kcmp_ptr(KCMP_FILES, &files1, &files2)
         }
-        KCMP_FS => {
-            let scope1 = proc1.scope.read();
-            let scope2 = proc2.scope.read();
-            Ok(kcmp_result(Arc::ptr_eq(
-                &*FS_CONTEXT.scope(&scope1),
-                &*FS_CONTEXT.scope(&scope2),
-            )))
-        }
-        KCMP_SIGHAND => Ok(kcmp_result(SharedSignalActions::ptr_eq(
-            proc1.signal.shared_actions(),
-            proc2.signal.shared_actions(),
-        ))),
+        KCMP_FS => unreachable!("handled before process-target resolution"),
+        KCMP_SIGHAND => kcmp_ptr(KCMP_SIGHAND, &proc1.signal.shared_actions(), &proc2.signal.shared_actions()),
         KCMP_IO | KCMP_SYSVSEM => Err(LinuxError::EOPNOTSUPP.into()),
         KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
         _ => Err(AxError::InvalidInput),
@@ -401,27 +432,21 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
     let actor_cred = thread.current_cred();
     let namespace_owner = unshare_namespace_owner(flags, &actor_cred)?;
     if flags & UNSHARE_SUPPORTED_FLAGS != 0 {
-        // Every currently supported resource still lives in ProcessData or its
-        // process-wide Scope. Replacing one while siblings exist would unshare
-        // it for the whole thread group instead of only for the caller.
-        // Atomically gate CLONE_THREAD against the single-thread test, then
-        // prepare every fallible replacement before committing any of them.
+        // Namespace changes remain group-scoped; FS and FILES are task-local.
+        // Prepare every fallible replacement before committing any of them.
         let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-        if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
+        if flags & !(CLONE_FS | CLONE_FILES) != 0 && !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
             return Err(AxError::OperationNotSupported);
         }
 
         let result = (|| -> AxResult<()> {
-            let private_fd_table = if flags & CLONE_FILES != 0 && Arc::strong_count(&*FD_TABLE) > 1
-            {
-                Some(Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?)
+            let private_fd_table = if flags & CLONE_FILES != 0 {
+                thread.try_clone_fd_table_if_shared()?
             } else {
                 None
             };
-            let private_fs_context = if flags & CLONE_FS != 0 && Arc::strong_count(&*FS_CONTEXT) > 1
-            {
-                let cloned = FS_CONTEXT.lock().clone();
-                Some(Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?)
+            let private_fs_context = if flags & CLONE_FS != 0 {
+                thread.try_clone_fs_context_if_shared()?
             } else {
                 None
             };
@@ -448,14 +473,8 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
                 None
             };
 
-            let (old_fd_table, old_fs_context) = thread.with_mut_scope(|scope| {
-                let old_fd_table = private_fd_table
-                    .map(|replacement| replace_process_fd_table(scope, replacement));
-                let old_fs_context = private_fs_context.map(|replacement| {
-                    mem::replace(&mut *FS_CONTEXT.scope_mut(scope), replacement)
-                });
-                (old_fd_table, old_fs_context)
-            });
+            let old_fd_table = private_fd_table.map(|replacement| thread.replace_fd_table(replacement));
+            let old_fs_context = private_fs_context.map(|replacement| thread.replace_fs_context(replacement));
             // Arc destructors can cascade into filesystem or file-description
             // cleanup. Keep all such work outside the IRQ/preempt-off scope gate.
             drop(old_fd_table);
@@ -468,7 +487,9 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             }
             Ok(())
         })();
-        thread.proc_data.end_exec(curr_tid);
+        if flags & !CLONE_FS != 0 {
+            thread.proc_data.end_exec(curr_tid);
+        }
         result?;
     }
 
@@ -783,8 +804,7 @@ pub fn sys_capset<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_umask(mask: u32) -> AxResult<isize> {
-    let curr = current();
-    let old = curr.as_thread().proc_data.replace_umask(mask & 0o777);
+    let old = current().as_thread().fs_context().lock().replace_umask(mask & 0o777);
     Ok(old as isize)
 }
 

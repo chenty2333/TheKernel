@@ -19,8 +19,8 @@ use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_
 
 use crate::{
     file::{
-        FD_TABLE, ResolveAtResult, fanotify, permission::VfsSecurityContext,
-        replace_process_fd_table, resolve_at_with_security,
+        ResolveAtResult, current_fd_table, fanotify, permission::VfsSecurityContext,
+        resolve_at_with_security,
     },
     keyring::{self, KeyTaskOwner},
     mm::{
@@ -612,14 +612,14 @@ fn do_execve(
     // Arc; a single-thread caller needs one only when CLONE_FILES shares the
     // table with another process.
     let has_siblings = sibling_tids.len() > 1;
-    let private_fd_table = if has_siblings || Arc::strong_count(&*FD_TABLE) > 1 {
-        Some(Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?)
+    let private_fd_table = if has_siblings || thr.fd_table_is_shared() {
+        Some(Arc::try_new(current_fd_table().fork_copy()?).map_err(|_| AxError::NoMemory)?)
     } else {
         None
     };
     let cloexec = match private_fd_table.as_ref() {
         Some(table) => table.prepare_cloexec(),
-        None => FD_TABLE.prepare_cloexec(),
+        None => current_fd_table().prepare_cloexec(),
     };
     let cloexec = cloexec?;
 
@@ -666,8 +666,7 @@ fn do_execve(
     // sighand-sharing peers on the old owner.
     prepared_signal_unshare.commit();
     if let Some(private) = private_fd_table {
-        let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
-        drop(previous);
+        drop(thr.replace_fd_table(crate::task::FdTableSlot::new(private)));
     }
     // The selected table owns full-capacity detach and cleanup storage. Commit
     // covers flags/descriptors added after preparation and has no recoverable

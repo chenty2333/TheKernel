@@ -37,7 +37,7 @@ use crate::mm::asid_switch_diagnostics_snapshot;
 use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
     file::{
-        FD_TABLE, FileDescription, PidFd, current_file_operation_security_credential,
+        FileDescription, PidFd, current_file_operation_security_credential,
         fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
     },
     keyring::{
@@ -2238,8 +2238,7 @@ impl SimpleFileOps for PreparedFdMagicLink {
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let description = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let description = task.as_thread().fd_table()
             .get_description_number(self.fd)
             .map_err(|_| VfsError::NotFound)?;
         let target = try_path_into_bytes(description.inner.path()?)?;
@@ -2258,8 +2257,7 @@ impl SimpleDirOps for ThreadFdDir {
             return try_boxed_names(iter::empty());
         };
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let ids = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let ids = task.as_thread().fd_table()
             .try_fd_numbers()?
             .into_iter()
             .map(|id| Cow::Owned(id.to_string()))
@@ -2273,13 +2271,7 @@ impl SimpleDirOps for ThreadFdDir {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        {
-            let scope = task.as_thread().proc_data.scope.read();
-            let scoped_table = FD_TABLE.scope(&scope);
-            scoped_table
-                .get_description_number(fd)
-                .map_err(|_| VfsError::NotFound)?;
-        }
+        task.as_thread().fd_table().get_description_number(fd).map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
         Ok(SimpleFile::try_new_magic_link(
             fs,
@@ -2309,8 +2301,7 @@ impl ThreadFdInfoDir {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let fd = name.parse::<usize>().map_err(|_| VfsError::NotFound)?;
-        let description = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let description = task.as_thread().fd_table()
             .get_description_number(u32::try_from(fd).map_err(|_| VfsError::NotFound)?)
             .map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
@@ -2351,8 +2342,7 @@ impl SimpleDirOps for ThreadFdInfoDir {
             return try_boxed_names(iter::empty());
         };
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let ids = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let ids = task.as_thread().fd_table()
             .try_fd_numbers()?
             .into_iter()
             .map(|id| Cow::Owned(id.to_string()))

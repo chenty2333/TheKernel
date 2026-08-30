@@ -794,7 +794,7 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             }
             let attr = read_create_attr(memory, attr)?;
             let (uid, gid) = current_ids();
-            let create_mode = (mode & !current().as_thread().proc_data.umask()) & 0o777;
+            let create_mode = (mode & !crate::task::current_fs_context().lock().umask()) & 0o777;
             let queue = Arc::try_new(Mutex::new(PosixMqueue::new(
                 name.clone(),
                 create_mode,
