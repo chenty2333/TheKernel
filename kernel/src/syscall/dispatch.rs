@@ -1718,8 +1718,17 @@ pub(super) fn dispatch_syscall(
             bpf::sys_bpf(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
 
+        Sysno::perf_event_open => sys_perf_event_open(
+            UserMemoryCapability::new(aspace()),
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+
         // Unsupported fd-producing syscalls.
-        Sysno::perf_event_open | Sysno::memfd_secret => sys_unsupported_fd(sysno),
+        Sysno::memfd_secret => sys_unsupported_fd(sysno),
 
         Sysno::timer_create => with_user_memory(aspace(), |memory| {
             sys_timer_create(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

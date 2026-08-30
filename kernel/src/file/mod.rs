@@ -27,6 +27,7 @@ pub mod bpf;
 pub(crate) mod dnotify;
 pub mod epoll;
 pub mod event;
+pub(crate) mod perf;
 pub(crate) mod executable;
 pub mod fanotify;
 mod fiemap;
@@ -73,6 +74,7 @@ pub use self::{
     stdio::add_stdio,
     types::*,
 };
+pub(crate) use self::perf::PerfEventFile;
 pub(crate) use self::{
     pipe::NamedPipe,
     fs::{
