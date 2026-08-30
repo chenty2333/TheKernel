@@ -309,6 +309,8 @@ impl CounterLease {
 #[cfg(feature = "pmu-sampling")]
 const LVT_MASKED: u32 = 1 << 16;
 #[cfg(feature = "pmu-sampling")]
+const LVT_DELIVERY_MODE: u32 = 0b111 << 8;
+#[cfg(feature = "pmu-sampling")]
 const fn sampling_preload(width: u8, period: u64) -> u64 {
     Capabilities::mask(width).wrapping_add(1).wrapping_sub(period)
 }
@@ -332,6 +334,14 @@ const fn lvt_is_safe_sampling_baseline(lvt: u32) -> bool {
     // restored verbatim, so a firmware/platform dormant configuration is not
     // claimed or destroyed.
     lvt & LVT_MASKED != 0
+}
+#[cfg(feature = "pmu-sampling")]
+const fn sampling_active_lvt(saved: u32) -> u32 {
+    // PMIs must enter the ordinary fixed-vector IRQ path.  A dormant LVT
+    // configuration may carry a different delivery mode; retain it only in
+    // the saved value and restore it on stop, never while sampling is active.
+    (saved & !(0xff | LVT_MASKED | LVT_DELIVERY_MODE))
+        | crate::apic::vectors::APIC_PMI_VECTOR as u32
 }
 
 /// Arms exactly one local programmable PMU counter for PMI delivery.
@@ -363,7 +373,7 @@ pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Err
         state.lvt_perf = lvt;
         unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32 | LVT_MASKED); }
         write(GLOBAL, read(GLOBAL) | bit(slot));
-        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !(0xff | LVT_MASKED)) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+        unsafe { crate::apic::local_apic().write_lvt_perf(sampling_active_lvt(lvt)); }
         Ok(SamplingToken { cpu, slot, generation: state.generation, cookie: program.cookie, active: true })
     })
 }
@@ -394,7 +404,7 @@ pub fn sampling_rearm_local(cookie: u64, generation: u64) -> Result<(), Error> {
         for i in 0..MAX { let s = &mut m.slots[i]; if s.owned && s.sampling && s.cookie == cookie && s.generation == generation {
             let slot = Slot::P(i as u8); write(slot_msr(slot), sampling_preload(s.width, s.period)); write(OVF, bit(slot));
             write(GLOBAL, read(GLOBAL) | bit(slot));
-            unsafe { crate::apic::local_apic().write_lvt_perf((s.lvt_perf & !(0xff | LVT_MASKED)) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+            unsafe { crate::apic::local_apic().write_lvt_perf(sampling_active_lvt(s.lvt_perf)); }
             return Ok(());
         }} Err(Error::Stale)
     })
@@ -744,8 +754,11 @@ mod tests {
     fn sampling_lvt_baseline_owner_and_unmask_rules() {
         assert!(lvt_is_safe_sampling_baseline(LVT_MASKED | 0x41));
         assert!(!lvt_is_safe_sampling_baseline(0x41));
-        let armed = (LVT_MASKED | 0x41) & !(0xff | LVT_MASKED) | 0xef;
+        let armed = sampling_active_lvt(LVT_MASKED | 0x41);
         assert_eq!(armed & LVT_MASKED, 0, "activation explicitly unmasks PMI");
+        let nmi_baseline = LVT_MASKED | LVT_DELIVERY_MODE | 0x41;
+        assert_eq!(sampling_active_lvt(nmi_baseline) & LVT_DELIVERY_MODE, 0, "activation uses fixed delivery");
+        assert_eq!(sampling_active_lvt(nmi_baseline) & 0xff, 0xef);
         let mut manager = Manager::new();
         manager.slots[2].owned = true;
         manager.slots[2].sampling = true;
