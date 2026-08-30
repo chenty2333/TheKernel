@@ -198,7 +198,14 @@ fn remap_destination_is_free(
     let Some(total) = new_size.checked_add(memory_addr::PAGE_SIZE_4K) else {
         return false;
     };
-    range_is_free(aspace, guard_start, total, page_size)
+    let Some(limit) = VirtAddrRange::try_from_start_size(guard_start, total) else {
+        return false;
+    };
+    // Reuse the logical-guard-aware allocator here.  Plain VMA first-fit
+    // would miss another SHSTK VMA whose lower guard overlaps this reservation
+    // while its VMA itself begins just outside it.
+    aspace.find_free_area_avoiding_shadow_stack_guards(guard_start, total, limit, page_size)
+        == Some(guard_start)
 }
 
 /// Chooses an automatic mremap destination.  A moved shadow stack keeps its
