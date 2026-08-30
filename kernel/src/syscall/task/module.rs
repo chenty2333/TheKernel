@@ -432,16 +432,24 @@ fn rel(
     }
     Ok(())
 }
-fn args(b: &[u8]) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
+struct ParamArg {
+    name: Vec<u8>,
+    value: Vec<u8>,
+    bare: bool,
+}
+fn args(b: &[u8]) -> AxResult<Vec<ParamArg>> {
     let (mut i, mut stop) = (0, false);
     let mut out = Vec::new();
     while i < b.len() {
         while i < b.len() && b[i].is_ascii_whitespace() {
             i += 1
         }
+        if i == b.len() {
+            break;
+        }
         let mut x = Vec::new();
         let mut q = 0;
-        while i < b.len() && !b[i].is_ascii_whitespace() {
+        while i < b.len() && (q != 0 || !b[i].is_ascii_whitespace()) {
             let z = b[i];
             i += 1;
             if q != 0 {
@@ -472,11 +480,11 @@ fn args(b: &[u8]) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
         if stop {
             continue;
         }
-        let e = x
-            .iter()
-            .position(|x| *x == b'=')
-            .ok_or(LinuxError::EINVAL)?;
-        let mut n = copy_vec(&x[..e])?;
+        let (mut n, value, bare) = if let Some(e) = x.iter().position(|x| *x == b'=') {
+            (copy_vec(&x[..e])?, copy_vec(&x[e + 1..])?, false)
+        } else {
+            (x, Vec::new(), true)
+        };
         while n.first() == Some(&b'-') {
             n.remove(0);
         }
@@ -484,7 +492,11 @@ fn args(b: &[u8]) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
             return Err(LinuxError::EINVAL.into());
         }
         out.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        out.push((n, copy_vec(&x[e + 1..])?))
+        out.push(ParamArg {
+            name: n,
+            value,
+            bare,
+        })
     }
     Ok(out)
 }
@@ -605,7 +617,7 @@ fn params(
     ss: &[S],
     ps: &[Option<P>],
     which: Option<usize>,
-    av: &[(Vec<u8>, Vec<u8>)],
+    av: &[ParamArg],
 ) -> AxResult<Vec<Vec<u8>>> {
     let Some(i) = which else {
         return Ok(Vec::new());
@@ -636,7 +648,9 @@ fn params(
             return no();
         }
         let mut cp = Vec::new();
-        for (k, v) in av {
+        for arg in av {
+            let k = &arg.name;
+            let v = &arg.value;
             let mut seen = false;
             for j in 0..n {
                 let q = base + 16 + j * rs;
@@ -656,7 +670,12 @@ fn params(
                 {
                     return no();
                 }
-                let value_count = if fl & 1 != 0 {
+                if arg.bare && kind != 0 {
+                    return Err(LinuxError::EINVAL.into());
+                }
+                let value_count = if arg.bare {
+                    1
+                } else if fl & 1 != 0 {
                     v.split(|x| *x == b',').count()
                 } else {
                     1
@@ -683,7 +702,9 @@ fn params(
                     view.rw_offset(cnt, 4)?;
                 }
                 for i in 0..value_count {
-                    let x = if fl & 1 != 0 {
+                    let x = if arg.bare {
+                        b"1".as_slice()
+                    } else if fl & 1 != 0 {
                         v.split(|x| *x == b',').nth(i).unwrap()
                     } else {
                         v
@@ -739,7 +760,7 @@ fn params(
     }
     r
 }
-fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
+fn prep(b: &[u8], av: &[ParamArg]) -> AxResult<M> {
     let ss = sh(b)?;
     let names = *ss
         .get(usize::from(u16x(b, 62)?))
@@ -950,7 +971,7 @@ fn module_init_result(result: i32) -> AxResult<()> {
 fn ua<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
     p: *const c_char,
-) -> AxResult<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+) -> AxResult<(Vec<u8>, Vec<ParamArg>)> {
     let raw = if p.is_null() {
         None
     } else {
@@ -959,7 +980,7 @@ fn ua<Mm: UserMemory + ?Sized>(
     parse_uargs(raw)
 }
 
-fn parse_uargs(raw: Option<Vec<u8>>) -> AxResult<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+fn parse_uargs(raw: Option<Vec<u8>>) -> AxResult<(Vec<u8>, Vec<ParamArg>)> {
     // load_module() uses strndup_user(), so NULL is a user-copy fault rather
     // than an empty parameter string. An empty string must be readable NUL.
     let raw = raw.ok_or(LinuxError::EFAULT)?;
@@ -1104,6 +1125,14 @@ mod tests {
 
     use super::*;
 
+    fn assigned(name: &[u8], value: &[u8]) -> ParamArg {
+        ParamArg {
+            name: name.to_vec(),
+            value: value.to_vec(),
+            bare: false,
+        }
+    }
+
     fn param_image() -> Vec<u8> {
         let mut data = vec![0; 96];
         data[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -1133,7 +1162,7 @@ mod tests {
             a: 1,
             e: 0,
         };
-        let args = vec![(b"foo".to_vec(), b"0x2a".to_vec())];
+        let args = vec![assigned(b"foo", b"0x2a")];
         let base = data.as_ptr() as usize;
         params(
             &[],
@@ -1148,10 +1177,7 @@ mod tests {
         .unwrap();
         assert_eq!(&data[72..76], &42u32.to_le_bytes());
         let before = data.clone();
-        let bad = vec![
-            (b"foo".to_vec(), b"7".to_vec()),
-            (b"unknown".to_vec(), b"1".to_vec()),
-        ];
+        let bad = vec![assigned(b"foo", b"7"), assigned(b"unknown", b"1")];
         let base = data.as_ptr() as usize;
         assert!(
             params(
@@ -1171,18 +1197,107 @@ mod tests {
 
     #[test]
     fn module_arguments_handle_quotes_dash_and_underscore() {
-        let got = args(b"--foo-bar='quoted value' -- answer=ignored").unwrap();
-        assert_eq!(got, vec![(b"foo-bar".to_vec(), b"quoted value".to_vec())]);
+        let got = args(b"--foo-bar='quoted value' answer=\"two words\" -- ignored=1").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, b"foo-bar");
+        assert_eq!(got[0].value, b"quoted value");
+        assert!(!got[0].bare);
+        assert_eq!(got[1].name, b"answer");
+        assert_eq!(got[1].value, b"two words");
+        assert!(args(b" \t").unwrap().is_empty());
+        assert!(args(b"foo='unterminated").is_err());
         assert!(eq(b"foo-bar", b"foo_bar"));
         assert_eq!(num(b"077", false, 32).unwrap(), 63);
     }
 
     #[test]
-    fn module_uargs_require_a_nonnull_nul_terminated_pointer() {
+    fn bare_arguments_only_enable_boolean_parameters() {
+        let section = |size| S {
+            n: 0,
+            t: PROG,
+            f: ALLOC,
+            o: 0,
+            z: size,
+            l: 0,
+            i: 0,
+            a: 1,
+            e: 0,
+        };
+        let mut boolean = param_image();
+        boolean[40..42].copy_from_slice(&0u16.to_le_bytes());
+        let base = boolean.as_ptr() as usize;
+        let boolean_size = boolean.len();
+        params(
+            &[],
+            0,
+            &mut boolean,
+            base,
+            &[section(boolean_size)],
+            &[Some(P::D(0))],
+            Some(0),
+            &args(b"--foo").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(boolean[72], 1);
+
+        let mut integer = param_image();
+        let base = integer.as_ptr() as usize;
+        let integer_size = integer.len();
         assert_eq!(
-            LinuxError::from(parse_uargs(None).unwrap_err()),
-            LinuxError::EFAULT
+            LinuxError::from(
+                params(
+                    &[],
+                    0,
+                    &mut integer,
+                    base,
+                    &[section(integer_size)],
+                    &[Some(P::D(0))],
+                    Some(0),
+                    &args(b"--foo").unwrap(),
+                )
+                .unwrap_err(),
+            ),
+            LinuxError::EINVAL
         );
+    }
+
+    #[test]
+    fn parameter_names_normalize_dashes_and_last_value_wins() {
+        let mut data = param_image();
+        data[64..72].copy_from_slice(b"foo_bar\0");
+        let section = S {
+            n: 0,
+            t: PROG,
+            f: ALLOC,
+            o: 0,
+            z: data.len(),
+            l: 0,
+            i: 0,
+            a: 1,
+            e: 0,
+        };
+        let base = data.as_ptr() as usize;
+        params(
+            &[],
+            0,
+            &mut data,
+            base,
+            &[section],
+            &[Some(P::D(0))],
+            Some(0),
+            &args(b"foo-bar=7 foo_bar=42").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&data[72..76], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn module_uargs_require_a_nonnull_nul_terminated_pointer() {
+        let null_error = match parse_uargs(None) {
+            Err(error) => LinuxError::from(error),
+            Ok(_) => panic!("NULL module arguments unexpectedly accepted"),
+        };
+        assert_eq!(null_error, LinuxError::EFAULT);
         let (raw, parsed) = parse_uargs(Some(Vec::new())).unwrap();
         assert!(raw.is_empty());
         assert!(parsed.is_empty());
@@ -1438,7 +1553,7 @@ mod tests {
                 &[section],
                 &[Some(P::R(0))],
                 Some(0),
-                &[(b"foo".to_vec(), b"1".to_vec())]
+                &[assigned(b"foo", b"1")]
             )
             .is_err()
         );
