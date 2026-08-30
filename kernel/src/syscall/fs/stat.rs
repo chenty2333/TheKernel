@@ -222,7 +222,7 @@ fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
         result.stx_mnt_id = if request_mask & STATX_MNT_ID_UNIQUE != 0 {
             value.mnt_id
         } else {
-            mounts::legacy_mount_id(value.mnt_id).unwrap_or(value.mnt_id as u32) as u64
+            mounts::statx_mount_id(value.mnt_id).unwrap_or(value.mnt_id as u32) as u64
         };
     }
 

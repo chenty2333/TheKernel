@@ -118,6 +118,10 @@ static MOUNTINFO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 // so legacy device-number queries can follow Linux's user_get_super lifetime.
 static LIVE_SUPERBLOCK_MOUNTS: Lazy<BlockingMutex<HashMap<u64, Weak<Mountpoint>>>> =
     Lazy::new(|| BlockingMutex::new(HashMap::new()));
+// `Mountpoint::mount_id()` is the 64-bit identity used by statmount and mount
+// topology internals.  The old name_to_handle_at ABI has a distinct, positive
+// signed mount-ID namespace.
+static NEXT_LEGACY_MOUNT_ID: AtomicU32 = AtomicU32::new(1);
 /// Linux defaults `/proc/sys/fs/mount-max` to 100,000 mounts per namespace.
 /// TheKernel currently has one global namespace, so use the same hard ceiling
 /// until mount namespace accounting is extracted into the ABI layer.
@@ -156,6 +160,7 @@ impl fmt::Debug for NamespaceOperationGuard {
 
 struct LinuxMountState {
     mount_id_old: u32,
+    legacy_mount_id: i32,
     flags: AtomicU32,
     activity_epoch: AtomicU64,
     readonly_floor: bool,
@@ -277,7 +282,7 @@ pub fn statmount_sb_magic(record: &MountRecord) -> AxResult<u64> {
     Ok(mountpoint.root_location().filesystem().stat()?.fs_type as u64)
 }
 
-pub fn legacy_mount_id(mount_id: u64) -> Option<u32> {
+pub fn statx_mount_id(mount_id: u64) -> Option<u32> {
     if let Some(id) = MOUNT_RECORDS.lock().iter().find_map(|record| {
         (record.mount_id == mount_id).then_some(record.mount_id_old)
     }) {
@@ -366,9 +371,15 @@ fn mount_extensions(
     metadata: MountMetadata,
     mount_id_old: u32,
 ) -> VfsResult<TypeMap> {
+    let legacy_mount_id = NEXT_LEGACY_MOUNT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id < i32::MAX as u32).then_some(id + 1)
+        })
+        .map_err(|_| AxError::StorageFull)? as i32;
     let mut extensions = TypeMap::new();
     let retired = extensions.try_insert(LinuxMountState {
         mount_id_old,
+        legacy_mount_id,
         flags: AtomicU32::new(flags),
         activity_epoch: AtomicU64::new(0),
         readonly_floor: flags & MS_RDONLY != 0,
@@ -461,6 +472,12 @@ fn mount_state(mountpoint: &Mountpoint) -> AxResult<Arc<LinuxMountState>> {
     mountpoint
         .extension_shared::<LinuxMountState>()
         .ok_or(AxError::Io)
+}
+
+/// Legacy, per-mount-namespace ID used by the `name_to_handle_at` ABI.
+/// This is intentionally not the mountpoint's stable 64-bit identity.
+pub fn legacy_mount_id(mountpoint: &Mountpoint) -> AxResult<i32> {
+    Ok(mount_state(mountpoint)?.legacy_mount_id)
 }
 
 fn flags_for_mountpoint(mountpoint: &Mountpoint) -> Option<u32> {
