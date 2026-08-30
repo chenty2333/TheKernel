@@ -235,6 +235,16 @@ impl FileLike for PidFd {
         Ok(self.inode.stat())
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.inode.update_timestamps(atime, mtime, ctime);
+        Ok(())
+    }
+
     fn path(&self) -> AxResult<Cow<'_, str>> {
         Ok("anon_inode:[pidfd]".into())
     }

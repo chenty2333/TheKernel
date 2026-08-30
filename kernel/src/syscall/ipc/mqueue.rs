@@ -323,6 +323,19 @@ impl FileLike for MqFd {
         Ok(stat)
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.queue
+            .lock()
+            .inode
+            .update_timestamps(atime, mtime, ctime);
+        Ok(())
+    }
+
     fn path(&self) -> AxResult<Cow<'_, str>> {
         // Reserve the protocol maximum before taking the queue lock so path
         // rendering cannot allocate while the queue's spin mutex is held.

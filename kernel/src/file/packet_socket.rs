@@ -533,6 +533,16 @@ impl FileLike for PacketSocket {
         Ok(self.inode.stat())
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.inode.update_timestamps(atime, mtime, ctime);
+        Ok(())
+    }
+
     fn path(&self) -> AxResult<Cow<'_, str>> {
         try_pseudo_inode_path("socket", self.inode.inode())
     }

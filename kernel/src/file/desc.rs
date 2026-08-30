@@ -1617,6 +1617,15 @@ impl FileLike for FileDescription {
         self.inner.stat()
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.inner.update_timestamps(atime, mtime, ctime)
+    }
+
     fn path(&self) -> AxResult<Cow<'_, str>> {
         self.inner.path()
     }

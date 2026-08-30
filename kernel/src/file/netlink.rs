@@ -477,6 +477,16 @@ impl FileLike for NetlinkSocket {
         Ok(self.inode.stat())
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.inode.update_timestamps(atime, mtime, ctime);
+        Ok(())
+    }
+
     fn nonblocking(&self) -> bool {
         self.nonblocking.load(Ordering::Acquire)
     }
