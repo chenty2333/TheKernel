@@ -5,7 +5,8 @@ use thekernel_linux_process_adapter::{Pid, ProcessError};
 
 use crate::task::{
     AsThread, Cred, PidNamespace, Process, get_process_data, get_process_group,
-    get_process_including_zombie, get_visible_task, process_domain,
+    get_process_including_zombie, get_visible_task, prepare_session_sid_binding, process_domain,
+    release_dead_session_sid_binding,
     security::{SecurityTaskGetsidContext, dispatch_task_getsid},
 };
 
@@ -90,10 +91,10 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
         let target_ns = process
             .identity::<alloc::sync::Arc<PidNamespace>>()
             .ok_or(AxError::NoSuchProcess)?;
-        return caller_ns
+        return Ok(caller_ns
             .visible_pid_for(&target_ns, process.group().session().sid())
             .map(|sid| sid as isize)
-            .ok_or(AxError::NoSuchProcess);
+            .unwrap_or(0));
     }
 
     let target = resolve_getsid_target(pid, &caller_ns)?;
@@ -103,27 +104,41 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
         .ok_or(AxError::NoSuchProcess)?;
     let credential = target.credential()?;
     dispatch_task_getsid(&SecurityTaskGetsidContext::new(&credential))?;
-    caller_ns
+    Ok(caller_ns
         .visible_pid_for(&target_ns, process.group().session().sid())
         .map(|sid| sid as isize)
-        .ok_or(AxError::NoSuchProcess)
+        .unwrap_or(0))
 }
 
 pub fn sys_setsid() -> AxResult<isize> {
     let _operation = JOB_CONTROL_OPERATION.lock();
     let curr = current();
-    let proc = &curr.as_thread().proc_data.proc;
+    let thread = curr.as_thread();
+    let proc = &thread.proc_data.proc;
+    let pid_ns = thread.proc_data.pid_ns();
     if proc.group().pgid() == proc.pid() {
         return Err(AxError::OperationNotPermitted);
     }
 
+    let old_session = proc.group().session();
+    let prepared_sid_binding = prepare_session_sid_binding()?;
     if let Some((session, _group)) = process_domain()?
         .try_create_session(proc)
         .map_err(process_error)?
     {
-        Ok(session.sid() as _)
+        if !old_session.is_live() {
+            release_dead_session_sid_binding(&old_session, &pid_ns);
+        }
+        prepared_sid_binding.commit(session.clone(), pid_ns.clone());
+        pid_ns
+            .visible_pid_for(&pid_ns, session.sid())
+            .map(|sid| sid as isize)
+            .ok_or(AxError::NoSuchProcess)
     } else {
-        Ok(proc.pid() as _)
+        pid_ns
+            .visible_pid_for(&pid_ns, proc.pid())
+            .map(|pid| pid as isize)
+            .ok_or(AxError::NoSuchProcess)
     }
 }
 

@@ -300,6 +300,78 @@ pub(crate) type ProcessReaperScope =
 type StarryThreadAdmission =
     thekernel_linux_process_adapter::ThreadAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 
+struct SessionSidBinding {
+    session: Arc<Session>,
+    pid_ns: Arc<PidNamespace>,
+}
+
+struct SessionSidBindings {
+    entries: Vec<SessionSidBinding>,
+    pending: usize,
+}
+
+static SESSION_SID_BINDINGS: Once<Mutex<SessionSidBindings>> = Once::new();
+
+fn session_sid_bindings() -> &'static Mutex<SessionSidBindings> {
+    SESSION_SID_BINDINGS.call_once(|| {
+        Mutex::new(SessionSidBindings {
+            entries: Vec::new(),
+            pending: 0,
+        })
+    })
+}
+
+pub(crate) struct PreparedSessionSidBinding {
+    armed: bool,
+}
+
+pub(crate) fn prepare_session_sid_binding() -> AxResult<PreparedSessionSidBinding> {
+    let mut bindings = session_sid_bindings().lock();
+    let needed = bindings.pending.checked_add(1).ok_or(AxError::NoMemory)?;
+    bindings
+        .entries
+        .try_reserve(needed)
+        .map_err(|_| AxError::NoMemory)?;
+    bindings.pending = needed;
+    Ok(PreparedSessionSidBinding { armed: true })
+}
+
+impl PreparedSessionSidBinding {
+    pub(crate) fn commit(mut self, session: Arc<Session>, pid_ns: Arc<PidNamespace>) {
+        let mut bindings = session_sid_bindings().lock();
+        debug_assert!(bindings.pending != 0);
+        bindings.pending -= 1;
+        bindings.entries.push(SessionSidBinding { session, pid_ns });
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedSessionSidBinding {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut bindings = session_sid_bindings().lock();
+            debug_assert!(bindings.pending != 0);
+            bindings.pending -= 1;
+        }
+    }
+}
+
+pub(crate) fn release_dead_session_sid_binding(
+    session: &Arc<Session>,
+    fallback: &Arc<PidNamespace>,
+) {
+    let pid_ns = {
+        let mut bindings = session_sid_bindings().lock();
+        bindings
+            .entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.session, session))
+            .map(|index| bindings.entries.swap_remove(index).pid_ns)
+            .unwrap_or_else(|| fallback.clone())
+    };
+    pid_ns.release_reaped_process(session.sid());
+}
+
 static PROCESS_DOMAIN: Once<ProcessDomain> = Once::new();
 
 /// Initializes the sole kernel-owned process domain before publishing init.
@@ -335,7 +407,7 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
         if !session.is_live() {
             // The last process group left this session. This may release a
             // previously reaped leader's SID binding from a different group.
-            pid_ns.release_reaped_process(session_sid);
+            release_dead_session_sid_binding(&session, &pid_ns);
         }
         if process.pid() != session_sid {
             pid_ns.release_reaped_process(process.pid());
@@ -734,10 +806,12 @@ impl PidNamespace {
         })
     }
 
-    /// Releases the namespace PID bindings after the process has been
-    /// authoritatively reaped. Exit intentionally does not call this: zombies
-    /// retain numeric identity until wait/autoreap consumes them.
-    fn release_reaped_process(&self, global_pid: Pid) {
+    /// Releases the namespace PID binding after its final identity owner has
+    /// gone. This is normally authoritative reap; `setsid` also uses it for
+    /// an already reaped session leader when the final group leaves its
+    /// session. Exit intentionally does not call this: zombies retain numeric
+    /// identity until wait/autoreap consumes them.
+    pub(crate) fn release_reaped_process(&self, global_pid: Pid) {
         self.pids.lock().release(global_pid);
         if let Some(parent) = self.parent() {
             parent.release_reaped_process(global_pid);
@@ -776,7 +850,8 @@ impl PidNamespace {
         global_pid: Pid,
     ) -> Option<Pid> {
         self.contains(target_namespace)
-            .then(|| self.visible_pid(global_pid))
+            .then(|| self.visible_pid_checked(global_pid))
+            .flatten()
     }
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
@@ -793,6 +868,12 @@ impl PidNamespace {
             .get(&global_pid)
             .copied()
             .unwrap_or(global_pid)
+    }
+
+    /// Strict syscall-visible rendering: absence of a namespace binding is
+    /// not a global PID and must be rendered as zero by pid_vnr-style users.
+    pub(crate) fn visible_pid_checked(&self, global_pid: Pid) -> Option<Pid> {
+        self.pids.lock().by_global.get(&global_pid).copied()
     }
 
     /// Resolves a positive PID visible in this namespace to its kernel-wide
