@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use axfs_ng_vfs::{MetadataUpdate, Mountpoint, NodePermission};
+use axfs_ng_vfs::{MetadataUpdate, Mountpoint, NodePermission, Timestamp};
 use axhal::paging::PageSize;
 use linux_raw_sys::general::{
     CAP_CHOWN, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE, MAP_ANONYMOUS,
@@ -4347,17 +4347,17 @@ fn unlink_registry_denial_is_once_and_preserves_exact_transaction() {
         .update_metadata(MetadataUpdate {
             mode: Some(NodePermission::from_bits_truncate(0o2640)),
             owner: Some((1200, 1300)),
-            atime: Some(core::time::Duration::from_secs(201)),
-            mtime: Some(core::time::Duration::from_secs(202)),
-            ctime: Some(core::time::Duration::from_secs(203)),
+            atime: Some(Timestamp::from(core::time::Duration::from_secs(201))),
+            mtime: Some(Timestamp::from(core::time::Duration::from_secs(202))),
+            ctime: Some(Timestamp::from(core::time::Duration::from_secs(203))),
             ..Default::default()
         })
         .unwrap();
     parent
         .update_metadata(MetadataUpdate {
-            atime: Some(core::time::Duration::from_secs(101)),
-            mtime: Some(core::time::Duration::from_secs(102)),
-            ctime: Some(core::time::Duration::from_secs(103)),
+            atime: Some(Timestamp::from(core::time::Duration::from_secs(101))),
+            mtime: Some(Timestamp::from(core::time::Duration::from_secs(102))),
+            ctime: Some(Timestamp::from(core::time::Duration::from_secs(103))),
             ..Default::default()
         })
         .unwrap();
@@ -4413,17 +4413,17 @@ fn rmdir_registry_denial_is_once_and_preserves_exact_transaction() {
         .update_metadata(MetadataUpdate {
             mode: Some(NodePermission::from_bits_truncate(0o2750)),
             owner: Some((2200, 2300)),
-            atime: Some(core::time::Duration::from_secs(401)),
-            mtime: Some(core::time::Duration::from_secs(402)),
-            ctime: Some(core::time::Duration::from_secs(403)),
+            atime: Some(Timestamp::from(core::time::Duration::from_secs(401))),
+            mtime: Some(Timestamp::from(core::time::Duration::from_secs(402))),
+            ctime: Some(Timestamp::from(core::time::Duration::from_secs(403))),
             ..Default::default()
         })
         .unwrap();
     parent
         .update_metadata(MetadataUpdate {
-            atime: Some(core::time::Duration::from_secs(301)),
-            mtime: Some(core::time::Duration::from_secs(302)),
-            ctime: Some(core::time::Duration::from_secs(303)),
+            atime: Some(Timestamp::from(core::time::Duration::from_secs(301))),
+            mtime: Some(Timestamp::from(core::time::Duration::from_secs(302))),
+            ctime: Some(Timestamp::from(core::time::Duration::from_secs(303))),
             ..Default::default()
         })
         .unwrap();

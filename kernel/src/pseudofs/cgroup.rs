@@ -1938,6 +1938,8 @@ impl CgroupDir {
 mod tests {
     extern crate std;
 
+    use axfs_ng_vfs::Timestamp;
+
     use super::*;
 
     fn test_cgroup_dir() -> Arc<CgroupDir> {
@@ -1959,15 +1961,7 @@ mod tests {
         CgroupFs::mount(CgroupVersion::V1, Vec::from(["pids".to_string()])).unwrap()
     }
 
-    fn metadata_state(
-        entry: &DirEntry,
-    ) -> (
-        u64,
-        core::time::Duration,
-        core::time::Duration,
-        core::time::Duration,
-        core::time::Duration,
-    ) {
+    fn metadata_state(entry: &DirEntry) -> (u64, Timestamp, Timestamp, Timestamp, Timestamp) {
         let metadata = entry.metadata().unwrap();
         (
             metadata.nlink,
@@ -1979,7 +1973,7 @@ mod tests {
     }
 
     fn install_rename_timestamp_sentinels(parents: &[&DirEntry], source: &DirEntry) {
-        let sentinel = core::time::Duration::MAX;
+        let sentinel = Timestamp::from(core::time::Duration::MAX);
         for parent in parents {
             parent
                 .update_metadata(MetadataUpdate {
@@ -2368,7 +2362,10 @@ mod tests {
         let source_metadata = source.metadata().unwrap();
         let old_parent_metadata = old_parent.metadata().unwrap();
         let new_parent_metadata = new_parent.metadata().unwrap();
-        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(
+            source_metadata.ctime,
+            Timestamp::from(core::time::Duration::MAX)
+        );
         assert_eq!(old_parent_metadata.mtime, source_metadata.ctime);
         assert_eq!(old_parent_metadata.ctime, source_metadata.ctime);
         assert_eq!(new_parent_metadata.mtime, source_metadata.ctime);
@@ -2395,7 +2392,10 @@ mod tests {
 
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
-        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(
+            source_metadata.ctime,
+            Timestamp::from(core::time::Duration::MAX)
+        );
         assert_eq!(parent_metadata.mtime, source_metadata.ctime);
         assert_eq!(parent_metadata.ctime, source_metadata.ctime);
     }
@@ -2415,7 +2415,7 @@ mod tests {
         install_rename_timestamp_sentinels(&[&root], &source);
         victim
             .update_metadata(MetadataUpdate {
-                ctime: Some(core::time::Duration::MAX),
+                ctime: Some(Timestamp::from(core::time::Duration::MAX)),
                 ..Default::default()
             })
             .unwrap();

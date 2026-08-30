@@ -1756,7 +1756,7 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
     fn utime_to_timestamp(time: &timespec) -> (Option<AxResult<Timestamp>>, TimeUpdate) {
         match time.tv_nsec {
             val if val == UTIME_OMIT as _ => (None, TimeUpdate::Omit),
-            val if val == UTIME_NOW as _ => (Some(Ok(wall_time())), TimeUpdate::Now),
+            val if val == UTIME_NOW as _ => (Some(Ok(wall_time().into())), TimeUpdate::Now),
             _ => (
                 Some(timestamp_from_timespec(time.tv_sec, time.tv_nsec)),
                 TimeUpdate::Explicit,
@@ -3059,7 +3059,7 @@ mod tests {
 
         assert_eq!(update.owner, None);
         assert!(update.mode.is_none());
-        assert_eq!(update.ctime, Some(Duration::from_secs(7)));
+        assert_eq!(update.ctime, Some(Duration::from_secs(7).into()));
     }
 
     #[test]
@@ -3252,18 +3252,18 @@ mod tests {
             Some(Kuid::from_raw(2000).unwrap()),
             Some(Kgid::from_raw(3000).unwrap()),
             &actor,
-            Duration::from_secs(4),
+            Duration::from_secs(4).into(),
         )
         .unwrap()
         .into_parts();
         assert_eq!(update.owner, Some((2000, 3000)));
         assert_eq!(update.mode.unwrap().bits(), 0o755);
-        assert_eq!(update.ctime, Some(Duration::from_secs(4)));
+        assert_eq!(update.ctime, Some(Duration::from_secs(4).into()));
         assert_eq!(committed.mode.bits(), 0o755);
         assert_eq!((committed.uid, committed.gid), (2000, 3000));
         assert_eq!(committed.atime, old.atime);
         assert_eq!(committed.mtime, old.mtime);
-        assert_eq!(committed.ctime, Duration::from_secs(4));
+        assert_eq!(committed.ctime, Duration::from_secs(4).into());
         assert_eq!(committed.inode, old.inode);
     }
 }

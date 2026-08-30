@@ -1644,7 +1644,7 @@ mod tests {
     use axerrno::LinuxError;
     use axfs_ng_vfs::{
         AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
-        NamedCreateOptions, NodePermission, NodeType, VfsError, XattrSetMode,
+        NamedCreateOptions, NodePermission, NodeType, Timestamp, VfsError, XattrSetMode,
     };
 
     use super::{MemoryFs, TMPFS_XATTR_SIZE_MAX};
@@ -1864,7 +1864,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let sentinel = core::time::Duration::MAX;
+        let sentinel = Timestamp::from(core::time::Duration::MAX);
         root.update_metadata(MetadataUpdate {
             mtime: Some(sentinel),
             ctime: Some(sentinel),
@@ -1891,13 +1891,7 @@ mod tests {
 
     fn metadata_state(
         location: &axfs_ng_vfs::Location,
-    ) -> (
-        u64,
-        core::time::Duration,
-        core::time::Duration,
-        core::time::Duration,
-        core::time::Duration,
-    ) {
+    ) -> (u64, Timestamp, Timestamp, Timestamp, Timestamp) {
         let metadata = location.metadata().unwrap();
         (
             metadata.nlink,
@@ -1912,7 +1906,7 @@ mod tests {
         parent: &axfs_ng_vfs::Location,
         victim: &axfs_ng_vfs::Location,
     ) {
-        let sentinel = core::time::Duration::MAX;
+        let sentinel = Timestamp::from(core::time::Duration::MAX);
         parent
             .update_metadata(MetadataUpdate {
                 mtime: Some(sentinel),
@@ -1948,7 +1942,10 @@ mod tests {
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 1);
-        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(
+            source_metadata.ctime,
+            Timestamp::from(core::time::Duration::MAX)
+        );
         assert_eq!(parent_metadata.mtime, source_metadata.ctime);
         assert_eq!(parent_metadata.ctime, source_metadata.ctime);
 
@@ -1957,7 +1954,10 @@ mod tests {
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 0);
-        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(
+            source_metadata.ctime,
+            Timestamp::from(core::time::Duration::MAX)
+        );
         assert_eq!(parent_metadata.mtime, source_metadata.ctime);
         assert_eq!(parent_metadata.ctime, source_metadata.ctime);
     }
@@ -1985,7 +1985,10 @@ mod tests {
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(victim_metadata.nlink, 0);
         assert_eq!(parent_metadata.nlink, parent_nlink - 1);
-        assert_ne!(victim_metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(
+            victim_metadata.ctime,
+            Timestamp::from(core::time::Duration::MAX)
+        );
         assert_eq!(parent_metadata.mtime, victim_metadata.ctime);
         assert_eq!(parent_metadata.ctime, victim_metadata.ctime);
     }
@@ -2468,7 +2471,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let sentinel = core::time::Duration::MAX;
+        let sentinel = Timestamp::from(core::time::Duration::MAX);
         root.update_metadata(MetadataUpdate {
             mtime: Some(sentinel),
             ctime: Some(sentinel),
@@ -2511,7 +2514,7 @@ mod tests {
         let victim = new_parent
             .create("victim", NodeType::RegularFile, mode)
             .unwrap();
-        let sentinel = core::time::Duration::MAX;
+        let sentinel = Timestamp::from(core::time::Duration::MAX);
         for parent in [&old_parent, &new_parent] {
             parent
                 .update_metadata(MetadataUpdate {
@@ -2568,7 +2571,7 @@ mod tests {
         install_removal_timestamp_sentinels(&root, &source);
         victim
             .update_metadata(MetadataUpdate {
-                ctime: Some(core::time::Duration::MAX),
+                ctime: Some(Timestamp::from(core::time::Duration::MAX)),
                 ..Default::default()
             })
             .unwrap();
@@ -2591,8 +2594,8 @@ mod tests {
         let mount = Mountpoint::new_root(&fs);
         let root = mount.root_location();
         root.update_metadata(MetadataUpdate {
-            mtime: Some(core::time::Duration::MAX),
-            ctime: Some(core::time::Duration::MAX),
+            mtime: Some(Timestamp::from(core::time::Duration::MAX)),
+            ctime: Some(Timestamp::from(core::time::Duration::MAX)),
             ..Default::default()
         })
         .unwrap();
@@ -2604,7 +2607,7 @@ mod tests {
         )
         .unwrap();
         let metadata = root.metadata().unwrap();
-        assert_ne!(metadata.mtime, core::time::Duration::MAX);
-        assert_ne!(metadata.ctime, core::time::Duration::MAX);
+        assert_ne!(metadata.mtime, Timestamp::from(core::time::Duration::MAX));
+        assert_ne!(metadata.ctime, Timestamp::from(core::time::Duration::MAX));
     }
 }
