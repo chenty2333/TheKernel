@@ -506,7 +506,7 @@ impl CloneArgs {
                 .lock()
                 .cet_default_shadow_stack(calling_thread.kernel_tid())
                 .ok_or(AxError::BadState)?;
-            Some((owner.start, owner.size))
+            Some(owner)
         } else {
             None
         };

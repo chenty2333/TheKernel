@@ -6705,7 +6705,7 @@ impl AddrSpace {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn try_clone_with_shared_shadow_stack(
         &mut self,
-        borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+        borrowed_shadow_stack: Option<CetDefaultShadowStackOwner>,
     ) -> AxResult<Arc<Mutex<Self>>> {
         self.try_clone_inner(borrowed_shadow_stack)
     }
@@ -6713,20 +6713,38 @@ impl AddrSpace {
     #[cfg(not(target_arch = "x86_64"))]
     fn try_clone_with_shared_shadow_stack(
         &mut self,
-        _borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+        _borrowed_shadow_stack: Option<CetDefaultShadowStackOwner>,
     ) -> AxResult<Arc<Mutex<Self>>> {
         self.try_clone_inner(None)
     }
 
     fn try_clone_inner(
         &mut self,
-        borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+        borrowed_shadow_stack: Option<CetDefaultShadowStackOwner>,
     ) -> AxResult<Arc<Mutex<Self>>> {
         if self.user_io_pins.has_clone_blocker() {
             return Err(AxError::ResourceBusy);
         }
         if self.fork_fragment_count()? > MAX_VMA_FRAGMENTS {
             return Err(AxError::NoMemory);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = borrowed_shadow_stack {
+            // A vfork borrow is an exact lease from this source mm.  Validate
+            // it before any COW PTE mutation: pkey_mprotect(PROT_READ) may
+            // have split the VMA, but every fragment of the logical extent
+            // must remain live SHSTK and no fork policy may punch a child
+            // hole through the borrowed stack.
+            let Some(end) = owner.start.checked_add(owner.size) else {
+                return Err(AxError::BadState);
+            };
+            if !self.cet_default_shadow_stacks.contains(&owner)
+                || !self.cet_shadow_stack_extent_covers(owner.start, owner.size)
+                || Self::interval_overlaps(&self.dontfork_ranges, owner.start, end)
+                || Self::interval_overlaps(&self.wipe_on_fork_ranges, owner.start, end)
+            {
+                return Err(AxError::BadState);
+            }
         }
         // Resolve owner-aware physical identities before any parent PTE is
         // COW-protected. Allocation failure therefore leaves fork entirely
@@ -6871,10 +6889,18 @@ impl AddrSpace {
 
                 if cursor < segment_end {
                     let segment_size = segment_end.sub_addr(cursor);
-                    let share_shadow_stack = borrowed_shadow_stack.is_some_and(|(start, size)| {
-                        start == cursor
-                            && size == segment_size
-                            && area.flags().contains(MappingFlags::SHADOW_STACK)
+                    let share_shadow_stack = borrowed_shadow_stack.is_some_and(|owner| {
+                        let Some(owner_end) = owner.start.checked_add(owner.size) else {
+                            return false;
+                        };
+                        // Each whole SHSTK fragment inside the already
+                        // validated logical lease keeps the parent's CET
+                        // leaves.  Do not share a merely overlapping VMA:
+                        // that could cover a hole, an adjacent explicit
+                        // SHSTK mapping, or another owner's extent.
+                        area.flags().contains(MappingFlags::SHADOW_STACK)
+                            && owner.start <= cursor
+                            && segment_end <= owner_end
                     });
                     let new_backend = {
                         let mut new_modify = guard.pt.cursor_no_flush();
@@ -8911,5 +8937,65 @@ mod tests {
         // than requiring one unsplit VMA at the recorded start.
         mm.register_cet_default_shadow_stack(202, stack, page * 2)
             .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn vfork_clone_shares_every_fragment_of_a_rekeyed_shadow_stack_lease() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page * 2);
+        mm.populate_area(
+            stack,
+            page * 2,
+            MappingFlags::SHADOW_STACK | MappingFlags::WRITE,
+        )
+        .unwrap();
+        mm.register_cet_default_shadow_stack(101, stack, page * 2)
+            .unwrap();
+
+        // Model pkey_mprotect(PROT_READ) on only the upper page.  The owner
+        // remains one logical two-page CET lease even though its VMA is now
+        // split at the pkey boundary.
+        mm.prepare_protect(
+            stack + page,
+            page,
+            (MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK).with_pkey(3),
+        )
+        .unwrap()
+        .commit()
+        .unwrap()
+        .finish();
+        let owner = mm.cet_default_shadow_stack(101).unwrap();
+
+        let vfork_child = mm.try_clone_with_shared_shadow_stack(Some(owner)).unwrap();
+        let mut vfork_child = vfork_child.lock();
+        vfork_child
+            .register_borrowed_cet_default_shadow_stack(202, owner.start, owner.size)
+            .unwrap();
+        for offset in [0, page] {
+            let parent_leaf = mm.page_table().query(stack + offset).unwrap();
+            let child_leaf = vfork_child.page_table().query(stack + offset).unwrap();
+            assert_eq!(child_leaf.0, parent_leaf.0);
+            assert_eq!(child_leaf.1, parent_leaf.1);
+            assert!(child_leaf.1.contains(MappingFlags::SHADOW_STACK));
+        }
+        drop(vfork_child);
+
+        // The same fragmented source still takes the ordinary fork COW
+        // path; only an authenticated vfork lease may preserve CET leaves.
+        let cow_child = mm.try_clone().unwrap();
+        let cow_child = cow_child.lock();
+        for offset in [0, page] {
+            assert!(
+                !cow_child
+                    .page_table()
+                    .query(stack + offset)
+                    .unwrap()
+                    .1
+                    .contains(MappingFlags::SHADOW_STACK)
+            );
+        }
     }
 }
