@@ -995,10 +995,16 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     let mut aspace = aspace_handle.lock();
     let wake = aspace.unmap(start_addr, length)?;
     #[cfg(target_arch = "x86_64")]
-    let _invalidated_cet_owners = aspace.reconcile_cet_default_shadow_stacks();
+    let invalidated_cet_owners = aspace.reconcile_cet_default_shadow_stacks();
     proc_data.clear_mempolicy_range(start_addr.as_usize(), length);
     drop(aspace);
     wake.finish();
+    #[cfg(target_arch = "x86_64")]
+    if invalidated_cet_owners.contains(&thread.kernel_tid()) {
+        // The current task's default VMA was removed through munmap.  Do not
+        // leave the scheduler image pointing at an invalidated PL3_SSP.
+        crate::task::reset_current_user_cet_state();
+    }
     Ok(0)
 }
 

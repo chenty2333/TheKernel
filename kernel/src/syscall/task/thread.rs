@@ -1,5 +1,7 @@
 use axerrno::{AxError, AxResult, LinuxError};
+use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
+use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use crate::{
     mm::{
@@ -8,6 +10,7 @@ use crate::{
         map_usercopy_error,
     },
     task::AsThread,
+    mm::{AddrSpace, Backend},
 };
 
 pub fn sys_modify_ldt(
@@ -137,6 +140,54 @@ enum ArchPrctlCode {
 const ARCH_SHSTK_SHSTK: usize = 1;
 #[cfg(target_arch = "x86_64")]
 const CET_SHSTK_EN: u64 = 1;
+#[cfg(target_arch = "x86_64")]
+const CET_DEFAULT_SHSTK_SIZE: usize = crate::config::USER_STACK_SIZE;
+#[cfg(target_arch = "x86_64")]
+const CET_SHSTK_MIN_ADDR: usize = 1usize << 32;
+
+/// Install the anonymous stack used by ARCH_SHSTK_ENABLE.  The lower page is
+/// intentionally left unmapped: it is the overflow guard, not a VMA whose
+/// lifetime can accidentally be detached from the task record.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn map_cet_default_shadow_stack(
+    aspace: &mut AddrSpace,
+    task_id: u32,
+) -> AxResult<axhal::asm::UserCetState> {
+    let total = CET_DEFAULT_SHSTK_SIZE.checked_add(PAGE_SIZE_4K).ok_or(AxError::NoMemory)?;
+    let base = aspace.find_kernel_area(
+        VirtAddr::from(CET_SHSTK_MIN_ADDR), total,
+        VirtAddrRange::new(aspace.base(), aspace.end()), PAGE_SIZE_4K,
+    ).ok_or(AxError::NoMemory)?;
+    let start = base + PAGE_SIZE_4K;
+    let result = (|| {
+        aspace.map(
+            start, CET_DEFAULT_SHSTK_SIZE,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
+            false, Backend::new_alloc(start, PageSize::Size4K),
+        )?;
+        // A restore token at the architectural top is required before CET is
+        // made visible; an enabled task must never enter userspace with only
+        // U_CET set and no valid PL3_SSP landing stack.
+        aspace.populate_area(start, CET_DEFAULT_SHSTK_SIZE, MappingFlags::READ)?;
+        let token = start.as_usize() + CET_DEFAULT_SHSTK_SIZE - core::mem::size_of::<u64>();
+        aspace.write(VirtAddr::from(token), &((token + 8) as u64 | 1).to_ne_bytes())?;
+        aspace.register_cet_default_shadow_stack(task_id, start, CET_DEFAULT_SHSTK_SIZE)?;
+        Ok(axhal::asm::UserCetState { u_cet: CET_SHSTK_EN, pl3_ssp: (token + 8) as u64, locked: false })
+    })();
+    if result.is_err() {
+        if let Ok(wake) = aspace.unmap(start, CET_DEFAULT_SHSTK_SIZE) { wake.finish(); }
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn unmap_cet_default_shadow_stack(aspace: &mut AddrSpace, task_id: u32) {
+    if let Some(owner) = aspace.take_cet_default_shadow_stack(task_id)
+        && let Ok(wake) = aspace.unmap(owner.start, owner.size)
+    {
+        wake.finish();
+    }
+}
 
 /// To set the clear_child_tid field in the task extended data.
 ///
@@ -214,7 +265,11 @@ pub fn sys_arch_prctl(
             if !axhal::asm::user_shadow_stack_enabled() { return Err(AxError::NoSuchDevice); }
             let mut state = crate::task::current_user_cet_state();
             if state.locked && state.u_cet & CET_SHSTK_EN == 0 { return Err(LinuxError::EPERM.into()); }
-            state.u_cet |= CET_SHSTK_EN;
+            if state.u_cet & CET_SHSTK_EN != 0 { return Ok(0); }
+            let curr = current();
+            let thread = curr.as_thread();
+            let aspace_handle = thread.proc_data.aspace();
+            state = map_cet_default_shadow_stack(&mut aspace_handle.lock(), thread.kernel_tid())?;
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }
@@ -222,7 +277,12 @@ pub fn sys_arch_prctl(
             if addr != ARCH_SHSTK_SHSTK { return Err(AxError::InvalidInput); }
             let mut state = crate::task::current_user_cet_state();
             if state.locked && state.u_cet & CET_SHSTK_EN != 0 { return Err(LinuxError::EPERM.into()); }
-            state.u_cet &= !CET_SHSTK_EN;
+            if state.u_cet & CET_SHSTK_EN == 0 { return Ok(0); }
+            let curr = current();
+            let thread = curr.as_thread();
+            let aspace_handle = thread.proc_data.aspace();
+            unmap_cet_default_shadow_stack(&mut aspace_handle.lock(), thread.kernel_tid());
+            state = axhal::asm::UserCetState::default();
             crate::task::set_current_user_cet_state(state);
             Ok(0)
         }

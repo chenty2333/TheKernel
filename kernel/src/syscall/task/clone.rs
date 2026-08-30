@@ -22,7 +22,7 @@ use crate::{
     mm::{UserMemoryCapability, copy_from_kernel, map_usercopy_error},
     pseudofs::cgroup,
     readiness::block_on_poll_set_uninterruptible,
-    syscall::prepare_proc_shm_inheritance,
+    syscall::{prepare_proc_shm_inheritance, task::thread::map_cet_default_shadow_stack},
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
@@ -95,6 +95,32 @@ impl CloneThreadPublication {
                 drop(process);
                 completion
             }
+        }
+    }
+}
+
+/// Keeps a private child's CET VMA transactional until all fallible clone
+/// admissions have completed.  This also matters for CLONE_VM: a failed child
+/// must not leave a stack record in the parent's mm.
+#[cfg(target_arch = "x86_64")]
+struct PendingCetDefaultShadowStack {
+    aspace: Arc<axsync::Mutex<crate::mm::AddrSpace>>,
+    tid: u32,
+    committed: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PendingCetDefaultShadowStack {
+    fn commit(&mut self) { self.committed = true; }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for PendingCetDefaultShadowStack {
+    fn drop(&mut self) {
+        if !self.committed {
+            crate::syscall::task::thread::unmap_cet_default_shadow_stack(
+                &mut self.aspace.lock(), self.tid,
+            );
         }
     }
 }
@@ -730,23 +756,6 @@ impl CloneArgs {
                 Some(pid_reservation),
             )
         };
-        #[cfg(target_arch = "x86_64")]
-        if !flags.intersects(CloneFlags::THREAD | CloneFlags::VM) {
-            // A fork owns a new mm whose COW VMA is an independent default
-            // stack. CLONE_VM (including vfork) deliberately does not copy a
-            // record: a later allocation path must create a distinct VMA for
-            // each task before registering it.
-            if let Some(owner) = old_proc_data
-                .aspace()
-                .lock()
-                .cet_default_shadow_stack(calling_thread.kernel_tid())
-            {
-                new_proc_data
-                    .aspace()
-                    .lock()
-                    .register_cet_default_shadow_stack(tid, owner.start, owner.size)?;
-            }
-        }
         let (thr, signal_registration) = Thread::try_new_with_io_context(
             tid,
             new_proc_data.clone(),
@@ -820,6 +829,27 @@ impl CloneArgs {
             })
             .transpose()?;
 
+        #[cfg(target_arch = "x86_64")]
+        let mut pending_cet_stack = if crate::task::current_user_cet_state().u_cet & 1 != 0 {
+            // A fork initially COW-copies the parent's default-stack VMA. It
+            // is not the child's stack: discard that private copy, then make
+            // a fresh guarded mapping. CLONE_VM/vfork instead adds a distinct
+            // record and VMA to the shared mm.
+            if !flags.contains(CloneFlags::VM)
+                && let Some(owner) = old_proc_data.aspace().lock()
+                    .cet_default_shadow_stack(calling_thread.kernel_tid())
+            {
+                let child_mm_handle = new_proc_data.aspace();
+                let mut child_mm = child_mm_handle.lock();
+                let wake = child_mm.unmap(owner.start, owner.size)?;
+                wake.finish();
+            }
+            let child_mm = new_proc_data.aspace();
+            let cet = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
+            new_task.ctx_mut().set_current_user_cet_state(cet);
+            Some(PendingCetDefaultShadowStack { aspace: child_mm, tid, committed: false })
+        } else { None };
+
         // The task extension must exist before any process identity becomes
         // visible. Every admission token below rolls itself back on failure.
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
@@ -859,6 +889,11 @@ impl CloneArgs {
         if flags.contains(CloneFlags::VFORK) {
             new_proc_data.begin_vfork(calling_tid);
         }
+
+        // All remaining clone publication is allocation-free and infallible;
+        // only now may the child retain its registered CET owner.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(stack) = pending_cet_stack.as_mut() { stack.commit(); }
 
         if let Some(publication) = credential_publication.as_ref() {
             publication.activate();
