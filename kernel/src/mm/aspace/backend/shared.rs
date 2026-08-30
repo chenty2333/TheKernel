@@ -8,7 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
-use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
     AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId, FutexBackingIdentity,
@@ -27,6 +27,30 @@ static SHMEM_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 pub fn shmem_resident_pages() -> usize {
     SHMEM_RESIDENT_PAGES.load(Ordering::Acquire)
+}
+
+/// Converts resident backing frames to Linux `NR_SHMEM` base-page units.
+///
+/// The backing can use a huge page, but sysinfo's `sharedram` is expressed in
+/// bytes from a count of 4 KiB base pages. Keeping the charge in that unit
+/// makes allocation, growth, and final drop independent of huge-page
+/// promotion or demotion.
+fn shmem_base_pages(resident_frames: usize, page_size: PageSize) -> usize {
+    resident_frames.saturating_mul(page_size as usize / PAGE_SIZE_4K)
+}
+
+fn charge_shmem_pages(charge: &AtomicUsize, resident_frames: usize, page_size: PageSize) {
+    charge.fetch_add(
+        shmem_base_pages(resident_frames, page_size),
+        Ordering::Release,
+    );
+}
+
+fn uncharge_shmem_pages(charge: &AtomicUsize, resident_frames: usize, page_size: PageSize) {
+    let pages = shmem_base_pages(resident_frames, page_size);
+    let _ = charge.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        n.checked_sub(pages)
+    });
 }
 
 pub struct SharedPages {
@@ -98,7 +122,7 @@ impl SharedPages {
             }
         }
         if let Some(charge) = resident_charge {
-            charge.fetch_add(num_pages, Ordering::Release);
+            charge_shmem_pages(charge, num_pages, page_size);
         }
         Ok(Self {
             phys_pages: Mutex::new(phys_pages),
@@ -169,7 +193,7 @@ impl SharedPages {
         let unused = new_pages.split_off(needed);
         pages.extend(new_pages);
         if let Some(charge) = self.resident_charge {
-            charge.fetch_add(needed, Ordering::Release);
+            charge_shmem_pages(charge, needed, self.size);
         }
         let published_len = pages.len();
         drop(pages);
@@ -349,8 +373,11 @@ impl Drop for SharedPages {
             dealloc_frame(*frame, self.size);
         }
         if let Some(charge) = self.resident_charge {
-            let pages = self.published_len.load(Ordering::Relaxed);
-            let _ = charge.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(pages));
+            uncharge_shmem_pages(
+                charge,
+                self.published_len.load(Ordering::Relaxed),
+                self.size,
+            );
         }
     }
 }
@@ -770,6 +797,37 @@ fn access_flags() -> MappingFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shmem_charge_is_in_base_page_equivalents_for_all_backing_sizes() {
+        assert_eq!(shmem_base_pages(1, PageSize::Size4K), 1);
+        assert_eq!(shmem_base_pages(1, PageSize::Size2M), 512);
+        assert_eq!(shmem_base_pages(1, PageSize::Size1G), 262_144);
+
+        // The same resident byte range has one NR_SHMEM charge regardless of
+        // whether its backing is represented as base pages or huge pages.
+        assert_eq!(
+            shmem_base_pages(512, PageSize::Size4K),
+            shmem_base_pages(1, PageSize::Size2M)
+        );
+        assert_eq!(
+            shmem_base_pages(512, PageSize::Size2M),
+            shmem_base_pages(1, PageSize::Size1G)
+        );
+    }
+
+    #[test]
+    fn shmem_huge_backing_growth_and_drop_are_symmetric() {
+        let _context = crate::test_support::scheduler_test_context();
+        let baseline = shmem_resident_pages();
+        let pages = SharedPages::new_shmem(PageSize::Size2M as usize, PageSize::Size2M).unwrap();
+        assert_eq!(shmem_resident_pages(), baseline + 512);
+
+        pages.ensure_len(2).unwrap();
+        assert_eq!(shmem_resident_pages(), baseline + 1024);
+        drop(pages);
+        assert_eq!(shmem_resident_pages(), baseline);
+    }
 
     #[test]
     fn shared_atomic_offsets_are_aligned_bounded_and_page_local() {
