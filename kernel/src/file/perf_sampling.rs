@@ -123,6 +123,9 @@ impl PerfSamplingFile {
         if !self.enabled() {
             return;
         }
+        if self.state.lock().ring.is_none() {
+            return;
+        }
         let _irq = NoPreemptIrqSave::new();
         let cpu = axhal::percpu::this_cpu_id();
         if cpu >= CUSTODY.len() || CUSTODY[cpu].lock().is_some() {
@@ -202,9 +205,9 @@ impl PerfSamplingFile {
         if !state.enabled || state.closed || state.failed {
             return;
         }
-        let Some(ring) = state.ring.as_mut() else {
+        if state.ring.is_none() {
             return;
-        };
+        }
         let mut sample = [0_u8; 40];
         let size = encode_sample(
             &mut sample,
@@ -215,11 +218,11 @@ impl PerfSamplingFile {
             cpu,
             self.config.period,
         );
-        if !publish_record(ring, &sample[..size], self.config.id) {
-            return;
-        }
         state.value = state.value.saturating_add(self.config.period);
-        self.waiters.wake();
+        let ring = state.ring.as_mut().expect("ring checked above");
+        if publish_record(ring, &sample[..size], self.config.id) {
+            self.waiters.wake();
+        }
     }
 
     fn install_ring(&self, request: FileMmapRequest) -> AxResult {
@@ -244,8 +247,7 @@ impl PerfSamplingFile {
         {
             return Err(AxError::InvalidInput);
         }
-        let mut state = self.state.lock();
-        if let Some(ring) = state.ring.as_ref() {
+        if let Some(ring) = self.state.lock().ring.as_ref() {
             return if ring.data_size == data_size {
                 Ok(())
             } else {
@@ -269,6 +271,14 @@ impl PerfSamplingFile {
             pages,
             FileMmapProtection::READ | FileMmapProtection::WRITE,
         )?;
+        let mut state = self.state.lock();
+        if let Some(ring) = state.ring.as_ref() {
+            return if ring.data_size == data_size {
+                Ok(())
+            } else {
+                Err(AxError::ResourceBusy)
+            };
+        }
         state.ring = Some(Ring {
             region,
             view,
@@ -286,6 +296,8 @@ impl PerfSamplingFile {
         if state.failed {
             return Err(AxError::Io);
         }
+        let value = state.value;
+        drop(state);
         let words = 1
             + usize::from(self.config.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0)
             + usize::from(self.config.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0)
@@ -293,7 +305,7 @@ impl PerfSamplingFile {
         if dst.remaining_mut() < words * 8 {
             return Err(AxError::InvalidInput);
         }
-        dst.write(&state.value.to_ne_bytes())?;
+        dst.write(&value.to_ne_bytes())?;
         if self.config.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
             dst.write(&0_u64.to_ne_bytes())?;
         }
@@ -337,6 +349,13 @@ impl FileLike for PerfSamplingFile {
             .flatten())
     }
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if cmd == PERF_EVENT_IOC_ID {
+            context
+                .user_memory()
+                .write_value(arg as *mut u64, self.config.id)
+                .map_err(crate::mm::map_usercopy_error)?;
+            return Ok(0);
+        }
         let mut state = self.state.lock();
         match cmd {
             PERF_EVENT_IOC_ENABLE if arg == 0 => state.enabled = true,
@@ -349,12 +368,6 @@ impl FileLike for PerfSamplingFile {
                     ring.lost = 0;
                     ring.head.store_release(0);
                 }
-            }
-            PERF_EVENT_IOC_ID => {
-                context
-                    .user_memory()
-                    .write_value(arg as *mut u64, self.config.id)
-                    .map_err(crate::mm::map_usercopy_error)?;
             }
             _ => return Err(AxError::InvalidInput),
         }
@@ -466,6 +479,11 @@ fn publish_record(ring: &mut Ring, sample: &[u8], id: u64) -> bool {
     let required = sample.len() + if pending != 0 { lost.len() } else { 0 };
     if (ring.data_size as u64).saturating_sub(used) < required as u64 {
         ring.lost = ring.lost.saturating_add(1);
+        return false;
+    }
+    // Prove the final publication point before copying either LOST or SAMPLE:
+    // a wrapped head is never allowed to expose a partial old epoch.
+    if ring.producer_head.checked_add(required as u64).is_none() {
         return false;
     }
     let mut head = ring.producer_head;
