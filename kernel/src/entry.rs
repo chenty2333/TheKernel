@@ -235,7 +235,7 @@ pub fn init(args: &[String], envs: &[String]) {
         },
     )
     .expect("Failed to allocate init thread state");
-    proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
+    proc.bind_initial_group_leader_signal(tid, thr.signal.clone(), thr.landlock_domain())
         .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);

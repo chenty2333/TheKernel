@@ -213,7 +213,7 @@ struct StatmountPrefix {
 }
 
 const STATMOUNT_PREFIX_SIZE: usize = size_of::<StatmountPrefix>();
-const _: () = assert!(STATMOUNT_PREFIX_SIZE == 480);
+const _: () = assert!(STATMOUNT_PREFIX_SIZE == 512);
 
 #[derive(Default)]
 struct MntIdReq {
@@ -277,7 +277,7 @@ fn validate_unique_mount_id(mount_id: u64) -> AxResult<()> {
     Ok(())
 }
 
-fn mount_point_under_root(root: &str, target: &str) -> Option<&str> {
+fn mount_point_under_root<'a>(root: &str, target: &'a str) -> Option<&'a str> {
     if root == "/" {
         return Some(target);
     }
@@ -287,12 +287,16 @@ fn mount_point_under_root(root: &str, target: &str) -> Option<&str> {
     target.strip_prefix(root).filter(|suffix| suffix.starts_with('/'))
 }
 
-fn visible_mount_point(record: &mounts::MountRecord) -> AxResult<Option<String>> {
+fn current_mount_root() -> AxResult<String> {
     let root = current_fs_context()
         .lock()
-        .root()
+        .root_dir()
         .absolute_path()
         .map_err(|_| AxError::Io)?;
+    try_string(root.as_ref())
+}
+
+fn visible_mount_point(record: &mounts::MountRecord, root: &str) -> AxResult<Option<String>> {
     mount_point_under_root(root.as_ref(), &record.target)
         .map(try_string)
         .transpose()
@@ -313,29 +317,10 @@ fn put_statmount<T: bytemuck::NoUninit>(bytes: &mut [u8], offset: usize, value: 
     bytes[offset..offset + size_of::<T>()].copy_from_slice(bytemuck::bytes_of(&value));
 }
 
-fn mount_options(flags: u32, data: &str) -> AxResult<String> {
-    let mut options = try_string(if flags & MS_RDONLY != 0 { "ro" } else { "rw" })?;
-    for (flag, name) in [
-        (MS_NOSUID, "nosuid"),
-        (MS_NODEV, "nodev"),
-        (MS_NOEXEC, "noexec"),
-    ] {
-        if flags & flag != 0 {
-            options
-                .try_reserve(name.len() + 1)
-                .map_err(|_| AxError::NoMemory)?;
-            options.push(',');
-            options.push_str(name);
-        }
-    }
-    if !data.is_empty() {
-        options
-            .try_reserve(data.len() + 1)
-            .map_err(|_| AxError::NoMemory)?;
-        options.push(',');
-        options.push_str(data);
-    }
-    Ok(options)
+fn mount_options(data: &str) -> AxResult<String> {
+    // STATMOUNT_MNT_OPTS is the filesystem's show_options output.  Per-mount
+    // policy (ro/nosuid/nodev/noexec) is reported separately in mnt_attr.
+    try_string(data)
 }
 
 fn statmount_attr(flags: u32) -> u64 {
@@ -370,12 +355,14 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
     let req = read_mnt_id_req(memory, req)?;
     validate_current_mount_namespace(&req)?;
     validate_unique_mount_id(req.mnt_id)?;
+    let _mount_operation = mounts::namespace_operation();
+    let fs_root = current_mount_root()?;
     let records = mounts::snapshot()?;
     let record = records
         .iter()
         .find(|record| record.mount_id == req.mnt_id)
         .ok_or(AxError::NotFound)?;
-    let visible_point = visible_mount_point(record)?.ok_or(LinuxError::EPERM)?;
+    let visible_point = visible_mount_point(record, &fs_root)?.ok_or(LinuxError::EPERM)?;
     let requested = req.param;
     let mask = requested & STATMOUNT_SUPPORTED;
     let mut output = Vec::new();
@@ -465,7 +452,7 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
     }
     if mask & STATMOUNT_MNT_OPTS != 0 {
         let offset =
-            append_statmount_string(&mut output, &mount_options(record.flags, &record.data)?)?;
+            append_statmount_string(&mut output, &mount_options(&record.data)?)?;
         put_statmount(&mut output, offset_of!(StatmountPrefix, mnt_opts), offset);
     }
     for (bit, field, value) in [
@@ -520,6 +507,9 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
     }
     let req = read_mnt_id_req(memory, req)?;
     validate_current_mount_namespace(&req)?;
+    if req.param != 0 {
+        validate_unique_mount_id(req.param)?;
+    }
     if nr_ids > 1_000_000 {
         return Err(LinuxError::EOVERFLOW.into());
     }
@@ -527,9 +517,8 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
     memory
         .validate_write_range(ids as usize, bytes)
         .map_err(map_usercopy_error)?;
-    if nr_ids == 0 {
-        return Ok(0);
-    }
+    let _mount_operation = mounts::namespace_operation();
+    let fs_root = current_mount_root()?;
     let records = mounts::snapshot()?;
     let root_id = if req.mnt_id == LSMT_ROOT {
         records
@@ -546,6 +535,18 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
     if !records.iter().any(|record| record.mount_id == root_id) {
         return Err(AxError::NotFound);
     }
+    if req.mnt_id != LSMT_ROOT
+        && visible_mount_point(
+            records
+                .iter()
+                .find(|record| record.mount_id == root_id)
+                .ok_or(AxError::Io)?,
+            &fs_root,
+        )?
+        .is_none()
+    {
+        return Err(LinuxError::EPERM.into());
+    }
     let mut selected = Vec::new();
     selected
         .try_reserve(records.len())
@@ -557,7 +558,9 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
     pending.push(root_id);
     while let Some(parent) = pending.pop() {
         let record = records.iter().find(|record| record.mount_id == parent).ok_or(AxError::Io)?;
-        if (req.mnt_id == LSMT_ROOT || parent != root_id) && visible_mount_point(record)?.is_some() {
+        if (req.mnt_id == LSMT_ROOT || parent != root_id)
+            && visible_mount_point(record, &fs_root)?.is_some()
+        {
             selected.push(parent);
         }
         for record in records.iter().filter(|record| record.parent_id == parent) {
@@ -598,7 +601,8 @@ mod statmount_tests {
 
     #[test]
     fn mount_options_preserve_mount_policy() {
-        assert_eq!(mount_options(MS_RDONLY | MS_NOSUID | MS_NODEV, "").unwrap(), "ro,nosuid,nodev");
+        assert_eq!(mount_options("").unwrap(), "");
+        assert_eq!(mount_options("journal_checksum").unwrap(), "journal_checksum");
     }
 
     #[test]
