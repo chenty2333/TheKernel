@@ -609,6 +609,13 @@ fn nth_numa_node(mask: usize, ordinal: usize) -> Option<i32> {
 }
 
 fn mempolicy_page_node(policy: Mempolicy, addr: usize) -> i32 {
+    if matches!(policy.mode, mode if mode == MPOL_BIND as u32 || mode == MPOL_PREFERRED_MANY as u32)
+        && let Some(home_node) = policy.home_node
+        && ALLOWED_NODEMASK & (1usize.checked_shl(home_node as u32).unwrap_or(0)) != 0
+    {
+        return home_node as i32;
+    }
+
     let mask = mempolicy_target_mask(policy) & ALLOWED_NODEMASK;
     if mask == 0 {
         return DEFAULT_NUMA_NODE;
@@ -973,6 +980,61 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
+/// Linux 6.12 `set_mempolicy_home_node(2)`.
+///
+/// The VMA walk intentionally applies each successful policy interval before
+/// looking at the next one. Holes are skipped; an unsupported later policy
+/// returns an error while retaining the already-updated prefix, as Linux does.
+pub fn sys_set_mempolicy_home_node(
+    start: usize,
+    len: usize,
+    home_node: usize,
+    flags: usize,
+) -> AxResult<isize> {
+    if start & (PAGE_SIZE_4K - 1) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if home_node >= usize::BITS as usize
+        || ALLOWED_NODEMASK & (1usize.checked_shl(home_node as u32).unwrap_or(0)) == 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    let len = len
+        .checked_add(PAGE_SIZE_4K - 1)
+        .map(|value| value & !(PAGE_SIZE_4K - 1))
+        .ok_or(AxError::InvalidInput)?;
+    let end = start.checked_add(len).ok_or(AxError::InvalidInput)?;
+    if end == start {
+        return Ok(0);
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    let mut cursor = VirtAddr::from(start);
+    let end = VirtAddr::from(end);
+    let mut updated = false;
+    while cursor < end {
+        let Some(area) = aspace.areas().find(|area| area.end() > cursor) else {
+            break;
+        };
+        let range_start = area.start().max(cursor);
+        let range_end = area.end().min(end);
+        updated |= proc_data.set_mempolicy_home_node_range(
+            range_start.as_usize(),
+            range_end.sub_addr(range_start),
+            home_node,
+        )?;
+        cursor = range_end;
+    }
+    updated.then_some(0).ok_or_else(|| LinuxError::ENOENT.into())
+}
+
 pub fn sys_move_pages<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
@@ -1268,6 +1330,17 @@ mod tests {
 
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn mempolicy_home_node_selects_bind_and_preferred_many_allocations() {
+        let bind = Mempolicy::new(MPOL_BIND as u32, 1).with_home_node(0);
+        let preferred_many = Mempolicy::new(MPOL_PREFERRED_MANY as u32, 1).with_home_node(0);
+        let interleave = Mempolicy::new(MPOL_INTERLEAVE as u32, 1).with_home_node(0);
+
+        assert_eq!(mempolicy_page_node(bind, 0x1000), 0);
+        assert_eq!(mempolicy_page_node(preferred_many, 0x1000), 0);
+        assert_eq!(mempolicy_page_node(interleave, 0x1000), 0);
+    }
 
     #[test]
     fn process_access_prctl_dumpable_validates_value_only() {

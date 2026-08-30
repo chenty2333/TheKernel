@@ -1113,6 +1113,12 @@ pub(super) fn dispatch_syscall(
         Sysno::set_mempolicy => with_user_memory(aspace(), |memory| {
             sys_set_mempolicy(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
+        Sysno::set_mempolicy_home_node => sys_set_mempolicy_home_node(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         // task management
         Sysno::clone => sys_clone(

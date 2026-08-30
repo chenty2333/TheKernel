@@ -1503,11 +1503,25 @@ fn apply_time_offset(value: Duration, offset_ns: i64) -> Duration {
 pub struct Mempolicy {
     pub mode: u32,
     pub nodemask: usize,
+    /// Preferred allocation node for `MPOL_BIND` and `MPOL_PREFERRED_MANY`.
+    ///
+    /// `None` is Linux's `NUMA_NO_NODE`: no home-node preference has been
+    /// configured for this policy.
+    pub home_node: Option<usize>,
 }
 
 impl Mempolicy {
     pub const fn new(mode: u32, nodemask: usize) -> Self {
-        Self { mode, nodemask }
+        Self {
+            mode,
+            nodemask,
+            home_node: None,
+        }
+    }
+
+    pub const fn with_home_node(mut self, home_node: usize) -> Self {
+        self.home_node = Some(home_node);
+        self
     }
 }
 
@@ -1667,6 +1681,65 @@ impl MempolicyState {
             .rev()
             .find(|range| addr >= range.start && addr < range.end)
             .map(|range| range.policy)
+    }
+
+    /// Applies a home node to policy intervals intersecting `start..end`.
+    ///
+    /// `mbind` policy intervals can be narrower than an address-space VMA, so
+    /// this operates on the interval topology rather than treating the VMA's
+    /// first policy as covering the whole VMA.  The sorted traversal provides
+    /// Linux's address-order partial-update behavior if a later policy is not
+    /// supported by `set_mempolicy_home_node`.
+    fn set_home_node_in_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        home_node: usize,
+    ) -> AxResult<bool> {
+        let mut old_ranges = core::mem::take(&mut self.ranges);
+        old_ranges.sort_unstable_by_key(|range| range.start);
+        let mut updated = false;
+
+        let mut ranges = old_ranges.into_iter();
+        while let Some(range) = ranges.next() {
+            if range.end <= start || range.start >= end {
+                self.ranges.push(range);
+                continue;
+            }
+            if range.policy.mode != linux_raw_sys::mempolicy::MPOL_BIND as u32
+                && range.policy.mode != linux_raw_sys::mempolicy::MPOL_PREFERRED_MANY as u32
+            {
+                self.ranges.push(range);
+                self.ranges.extend(ranges);
+                return Err(AxError::OperationNotSupported);
+            }
+
+            let overlap_start = range.start.max(start);
+            let overlap_end = range.end.min(end);
+            if range.start < overlap_start {
+                self.ranges.push(MempolicyRange {
+                    start: range.start,
+                    end: overlap_start,
+                    policy: range.policy,
+                });
+            }
+            let mut policy = range.policy;
+            policy.home_node = Some(home_node);
+            self.ranges.push(MempolicyRange {
+                start: overlap_start,
+                end: overlap_end,
+                policy,
+            });
+            if overlap_end < range.end {
+                self.ranges.push(MempolicyRange {
+                    start: overlap_end,
+                    end: range.end,
+                    policy: range.policy,
+                });
+            }
+            updated = true;
+        }
+        Ok(updated)
     }
 }
 
@@ -3702,6 +3775,23 @@ impl ProcessData {
     pub fn mempolicy_for_addr(&self, addr: usize) -> Option<Mempolicy> {
         self.mempolicy.lock().policy_for_addr(addr)
     }
+
+    /// Updates the home-node preference for the policy covering an existing
+    /// VMA prefix.  An absent VMA policy deliberately remains absent, matching
+    /// Linux's `set_mempolicy_home_node()` handling of default-policy VMAs.
+    pub fn set_mempolicy_home_node_range(
+        &self,
+        start: usize,
+        size: usize,
+        home_node: usize,
+    ) -> AxResult<bool> {
+        let Some(end) = start.checked_add(size) else {
+            return Err(AxError::InvalidInput);
+        };
+        self.mempolicy
+            .lock()
+            .set_home_node_in_range(start, end, home_node)
+    }
 }
 
 impl ProcessData {
@@ -5457,6 +5547,49 @@ mod tests {
         assert_eq!(snapshot.policy_for_addr(0), Mempolicy::new(0, 1));
         assert_eq!(snapshot.policy_for_addr(0x1800), Mempolicy::new(2, 2));
         assert_eq!(snapshot.policy_for_addr(0x2800), Mempolicy::new(3, 4));
+    }
+
+    #[test]
+    fn mempolicy_home_node_replaces_only_the_updated_range_prefix() {
+        let mut state = MempolicyState {
+            process_policy: Mempolicy::new(0, 0),
+            ranges: vec![MempolicyRange {
+                start: 0x1000,
+                end: 0x5000,
+                policy: Mempolicy::new(2, 1),
+            }],
+        };
+
+        assert!(state.set_home_node_in_range(0x2000, 0x3000, 0).unwrap());
+        assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, None);
+        assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, Some(0));
+        assert_eq!(state.policy_for_addr(0x3000).unwrap().home_node, None);
+    }
+
+    #[test]
+    fn mempolicy_home_node_keeps_the_updated_prefix_before_unsupported_policy() {
+        let mut state = MempolicyState {
+            process_policy: Mempolicy::new(0, 0),
+            ranges: vec![
+                MempolicyRange {
+                    start: 0x1000,
+                    end: 0x2000,
+                    policy: Mempolicy::new(2, 1),
+                },
+                MempolicyRange {
+                    start: 0x2000,
+                    end: 0x3000,
+                    policy: Mempolicy::new(3, 1),
+                },
+            ],
+        };
+
+        assert_eq!(
+            state.set_home_node_in_range(0x1000, 0x3000, 0),
+            Err(AxError::OperationNotSupported)
+        );
+        assert_eq!(state.policy_for_addr(0x1000).unwrap().home_node, Some(0));
+        assert_eq!(state.policy_for_addr(0x2000).unwrap().home_node, None);
     }
 
     #[test]
