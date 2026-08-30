@@ -24,6 +24,7 @@ use linux_vfs::{
 use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
 use thekernel_linux_signal::Signo;
 
+use super::admit_resize;
 use crate::{
     file::{
         AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, FileDescription,
@@ -37,9 +38,10 @@ use crate::{
         lease, memfd,
         permission::{
             VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
-            check_create_permissions_with_security, check_open_permissions_with_security,
-            check_pathwalk_search_permission_with_security, check_writable_mount,
-            initial_named_create_owner_mode_with_security,
+            check_create_permissions_with_security, check_landlock_truncate,
+            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
+            check_writable_mount, initial_named_create_owner_mode_with_security,
+            landlock_allows_access,
         },
         pipe::NamedPipe,
         prepare_file_description_with_open_lease, reserve_fd, resolve_at, with_path_fs,
@@ -650,7 +652,22 @@ fn prepare_open_description(
                         if let Some(file) = device_file {
                             file
                         } else {
-                            let file = File::new(file);
+                            let ioctl_allowed = !matches!(
+                                file.location().node_type(),
+                                NodeType::CharacterDevice | NodeType::BlockDevice
+                            ) || landlock_allows_access(
+                                file.location(),
+                                crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
+                            );
+                            let truncate_allowed = landlock_allows_access(
+                                file.location(),
+                                crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
+                            );
+                            let file = File::with_landlock_permissions(
+                                file,
+                                ioctl_allowed,
+                                truncate_allowed,
+                            );
                             if let Some(guard) = pty_guard {
                                 description_resource =
                                     Some(Box::try_new(guard).map_err(|_| AxError::NoMemory)?
@@ -660,7 +677,23 @@ fn prepare_open_description(
                         }
                     }
                 } else {
-                    Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
+                    let ioctl_allowed = !matches!(
+                        file.location().node_type(),
+                        NodeType::CharacterDevice | NodeType::BlockDevice
+                    ) || landlock_allows_access(
+                        file.location(),
+                        crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
+                    );
+                    let truncate_allowed = landlock_allows_access(
+                        file.location(),
+                        crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
+                    );
+                    Arc::try_new(File::with_landlock_permissions(
+                        file,
+                        ioctl_allowed,
+                        truncate_allowed,
+                    ))
+                    .map_err(|_| AxError::NoMemory)?
                 }
             }
         }
@@ -730,7 +763,9 @@ fn commit_open_truncate(
 ) -> AxResult<()> {
     let _memfd_mutation = memfd::begin_resize(loc, 0)?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
+    let quota_charge = admit_resize(loc, loc.len()?, 0)?;
     file.inner().backend()?.set_len(0)?;
+    quota_charge.commit_actual_blocks(loc)?;
     // A post-truncate metadata failure cannot be reported without lying that
     // this destructive open left the inode untouched. Filesystems should
     // update truncate timestamps as part of set_len; retain this compatibility
@@ -964,6 +999,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
+            if truncates_regular {
+                check_landlock_truncate(&loc)?;
+            }
         }
 
         let file_open_operation = file_open_operation(flags as u32, created, false)?;
@@ -1045,6 +1083,8 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         )?;
         let publication = reservation.prepare_publication(description.clone())?;
         if truncates_regular {
+            crate::mm::check_not_active(&loc)?;
+            let _swap_mutation = crate::mm::admit_mutation(&loc)?;
             let status = description.io_status_snapshot();
             check_mandatory_fd_truncate_lock(
                 &loc,
