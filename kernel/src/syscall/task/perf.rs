@@ -204,16 +204,29 @@ fn read_attr(
 /// prefix may be copied.  This lets a short, valid mapping report an invalid
 /// size instead of spuriously faulting while reading unrelated v0 fields.
 fn read_attr_size(memory: &UserMemoryCapability, attr: *const PerfEventAttrV0) -> AxResult<u32> {
-    if attr.is_null() {
-        return Err(AxError::BadAddress);
-    }
-    let address = (attr as usize)
-        .checked_add(PERF_ATTR_SIZE_OFFSET)
-        .ok_or(AxError::BadAddress)?;
+    let address = attr_size_address(attr)?;
     memory
         .read_value_uninit(address as *const u32)
         .map_err(map_usercopy_error)
         .map(|value| unsafe { value.assume_init() })
+}
+
+fn attr_size_address(attr: *const PerfEventAttrV0) -> AxResult<usize> {
+    if attr.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    (attr as usize)
+        .checked_add(PERF_ATTR_SIZE_OFFSET)
+        .ok_or(AxError::BadAddress)
+}
+
+/// Linux's E2BIG size probe best-effort reports the largest prefix this
+/// kernel understands. Failure to publish that hint does not replace E2BIG.
+fn report_supported_attr_size(memory: &UserMemoryCapability, attr: *const PerfEventAttrV0) {
+    let Ok(address) = attr_size_address(attr) else {
+        return;
+    };
+    let _ = memory.write_value(address as *mut u32, PERF_ATTR_SIZE_VER0);
 }
 
 /// Converts the first size snapshot into the exact userspace range that may
@@ -262,7 +275,10 @@ fn validate_attr_extensions(
         // SAFETY: read_bytes initialized every byte in the requested prefix.
         let bytes =
             unsafe { core::slice::from_raw_parts(extension.as_ptr().cast::<u8>(), chunk_len) };
-        validate_extension_bytes(bytes)?;
+        if let Err(error) = validate_extension_bytes(bytes) {
+            report_supported_attr_size(memory, attr);
+            return Err(error);
+        }
         offset += chunk_len;
     }
     Ok(())
@@ -280,7 +296,13 @@ pub(crate) fn sys_perf_event_open(
 ) -> AxResult<isize> {
     validate_perf_open_flags(flags)?;
     let attr_size = read_attr_size(&memory, attr)?;
-    let copy_len = attr_copy_len(attr_size)?;
+    let copy_len = match attr_copy_len(attr_size) {
+        Ok(copy_len) => copy_len,
+        Err(error) => {
+            report_supported_attr_size(&memory, attr);
+            return Err(error);
+        }
+    };
     let attr_value = read_attr(&memory, attr)?;
     validate_attr_extensions(&memory, attr, copy_len)?;
     let attr = attr_value;
