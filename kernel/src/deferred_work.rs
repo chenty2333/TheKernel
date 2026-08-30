@@ -161,13 +161,18 @@ pub(crate) fn wake_policy_worker() {
 #[cfg(feature = "perf-sampling")]
 pub(crate) fn kick_perf_retire_worker() {
     #[cfg(target_os = "none")]
-    axhal::irq::send_ipi_reason(
+    if axhal::irq::send_ipi_reason(
         axhal::irq::IpiReason::DeferredWork,
         axhal::irq::IpiTarget::Current {
             cpu_id: axhal::percpu::this_cpu_id(),
         },
     )
-    .expect("perf retirement IPI broker is unavailable");
+    .is_err()
+    {
+        // Registration and topology are immutable before user tasks start.
+        // Continuing here could strand the only final-drop owner forever.
+        axhal::power::system_off();
+    }
 }
 
 /// Wakes the single task-context owner for device-global physical

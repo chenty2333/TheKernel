@@ -81,6 +81,8 @@ pub enum IpiReason {
     /// work: its consumer never returns to ordinary execution after it has
     /// acknowledged the handoff generation.
     KexecStop      = 4,
+    /// Wake a task-context owner after work was published under scheduler
+    /// locks that make a direct task wake unsafe.
     DeferredWork   = 5,
 }
 
@@ -753,14 +755,10 @@ mod tests {
     #[test]
     fn reason_snapshot_dispatch_is_ordered_and_rejects_unknown_bits() {
         let mut visited = Vec::new();
-        super::visit_pending_reasons(
-            super::IpiReason::CallFunction.bit()
-                | super::IpiReason::CpuMaintenance.bit()
-                | super::IpiReason::Reschedule.bit()
-                | super::IpiReason::Membarrier.bit(),
-            |reason| visited.push(reason),
-        )
-        .unwrap();
+        let all = super::IpiReason::ALL
+            .iter()
+            .fold(0, |mask, reason| mask | reason.bit());
+        super::visit_pending_reasons(all, |reason| visited.push(reason)).unwrap();
         assert_eq!(visited, super::IpiReason::ALL);
         assert_eq!(super::visit_pending_reasons(1 << 7, |_| {}), Err(1 << 7));
     }

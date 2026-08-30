@@ -155,15 +155,22 @@ static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
 fn defer_custody_retire(event: Arc<PerfSamplingFile>) {
-    let mut queued = event.retire_queued.lock();
+    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
+    // SAFETY: `node` owns the strong reference just transferred from `event`.
+    // A true queued bit is protected by this same lock and guarantees that a
+    // distinct queue-owned strong reference remains live until the consumer
+    // acquires the lock to clear it.
+    let mut queued = unsafe { (*node).retire_queued.lock() };
     if *queued {
+        // Release the duplicate while the queue owner is still protected by
+        // `retire_queued`.  This decrement therefore cannot run the final
+        // destructor in the scheduler's IRQ-disabled leave path.
+        unsafe { Arc::decrement_strong_count(node) };
         drop(queued);
-        drop(event);
         return;
     }
     *queued = true;
     drop(queued);
-    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
     loop {
         let head = RETIRED_CUSTODY.incoming.load(Ordering::Acquire);
         // SAFETY: this raw Arc is uniquely owned by the queue publication.
