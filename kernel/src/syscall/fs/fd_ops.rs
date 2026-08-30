@@ -11,7 +11,7 @@ use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
 use axfs_ng_vfs::{
-    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
+    DirEntry, ExportHandleDecodeMode, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
 };
 use axio::{Seek, SeekFrom};
 use axtask::current;
@@ -315,6 +315,18 @@ enum HandleDecodeAuthorization {
     MountNamespace,
 }
 
+impl HandleDecodeAuthorization {
+    const fn decode_mode(self, flags: u32) -> ExportHandleDecodeMode {
+        match self {
+            Self::Global => ExportHandleDecodeMode::Any,
+            Self::Superblock | Self::MountNamespace if flags & O_DIRECTORY != 0 => {
+                ExportHandleDecodeMode::DirectoryOnly
+            }
+            Self::Superblock | Self::MountNamespace => ExportHandleDecodeMode::Any,
+        }
+    }
+}
+
 const fn short_handle_probe_header(required_bytes: u32) -> LinuxFileHandle {
     LinuxFileHandle {
         handle_bytes: required_bytes,
@@ -327,6 +339,7 @@ fn classify_handle_decode_authorization(
     caller_dac_search: bool,
     superblock_admin: bool,
     mount_namespace_admin: bool,
+    mount_attached: bool,
     directory_scope: bool,
     flags: u32,
 ) -> Option<HandleDecodeAuthorization> {
@@ -339,7 +352,7 @@ fn classify_handle_decode_authorization(
     if superblock_admin {
         return Some(HandleDecodeAuthorization::Superblock);
     }
-    if mount_namespace_admin && directory_scope && flags & O_DIRECTORY != 0 {
+    if mount_namespace_admin && mount_attached && directory_scope && flags & O_DIRECTORY != 0 {
         return Some(HandleDecodeAuthorization::MountNamespace);
     }
     None
@@ -966,10 +979,12 @@ pub fn sys_open_by_handle_at(
             &mount_namespace_user_ns,
             CAP_SYS_ADMIN,
         ),
+        mount.mountpoint().is_attached(),
         directory_scope,
         flags as u32,
     )
     .ok_or(LinuxError::EPERM)?;
+    let decode_mode = authorization.decode_mode(flags as u32);
     let relaxed_directory_scope = match authorization {
         HandleDecodeAuthorization::MountNamespace => Some(mount.clone()),
         HandleDecodeAuthorization::Global | HandleDecodeAuthorization::Superblock => None,
@@ -1007,7 +1022,7 @@ pub fn sys_open_by_handle_at(
 
     let location = mount
         .mountpoint()
-        .decode_export_handle(header.handle_type, &body)
+        .decode_export_handle(header.handle_type, &body, decode_mode)
         .map_err(map_decode_export_handle_error)?;
     // Anonymous decoded references have no parent chain.  Ask the filesystem
     // to verify the stable namespace ancestry from the encoded inode instead.
@@ -2186,24 +2201,44 @@ mod namespace_operation_tests {
     #[test]
     fn handle_decode_authorization_keeps_superblock_and_mount_paths_distinct() {
         assert_eq!(
-            classify_handle_decode_authorization(false, true, true, false, false, 0),
+            classify_handle_decode_authorization(false, true, true, false, false, false, 0),
             Some(HandleDecodeAuthorization::Superblock)
         );
         assert_eq!(
-            classify_handle_decode_authorization(false, true, false, true, true, O_DIRECTORY),
+            classify_handle_decode_authorization(false, true, false, true, true, true, O_DIRECTORY),
             Some(HandleDecodeAuthorization::MountNamespace)
         );
         assert_eq!(
-            classify_handle_decode_authorization(false, true, false, true, false, O_DIRECTORY),
+            classify_handle_decode_authorization(false, true, false, true, true, false, O_DIRECTORY),
             None
         );
         assert_eq!(
-            classify_handle_decode_authorization(false, true, false, true, true, 0),
+            classify_handle_decode_authorization(false, true, false, true, true, true, 0),
             None
         );
         assert_eq!(
-            classify_handle_decode_authorization(true, false, false, false, false, 0),
+            classify_handle_decode_authorization(true, false, false, false, false, false, 0),
             Some(HandleDecodeAuthorization::Global)
+        );
+        assert_eq!(
+            classify_handle_decode_authorization(false, true, false, true, false, true, O_DIRECTORY),
+            None
+        );
+    }
+
+    #[test]
+    fn relaxed_handle_decode_uses_directory_only_mode() {
+        assert_eq!(
+            HandleDecodeAuthorization::Global.decode_mode(O_DIRECTORY),
+            ExportHandleDecodeMode::Any
+        );
+        assert_eq!(
+            HandleDecodeAuthorization::Superblock.decode_mode(O_DIRECTORY),
+            ExportHandleDecodeMode::DirectoryOnly
+        );
+        assert_eq!(
+            HandleDecodeAuthorization::MountNamespace.decode_mode(O_TMPFILE),
+            ExportHandleDecodeMode::DirectoryOnly
         );
     }
 

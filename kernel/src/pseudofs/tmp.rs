@@ -347,18 +347,14 @@ impl FilesystemOps for MemoryFs {
         let _namespace = self.namespace.lock();
         let inode_count = self.inodes.lock().len();
         let mut pending = Vec::new();
-        pending
-            .try_reserve(inode_count)
-            .map_err(|_| VfsError::NoMemory)?;
         let mut visited = HashSet::new();
         visited
             .try_reserve(inode_count)
             .map_err(|_| VfsError::NoMemory)?;
+        pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        visited.insert(ancestor.inode.ino);
         pending.push(ancestor.inode.clone());
         while let Some(inode) = pending.pop() {
-            if !visited.insert(inode.ino) {
-                continue;
-            }
             if Arc::ptr_eq(&inode, &target.inode) {
                 return Ok(true);
             }
@@ -369,7 +365,11 @@ impl FilesystemOps for MemoryFs {
                 if name.0 == "." || name.0 == ".." {
                     continue;
                 }
-                pending.push(child.get().ok_or(VfsError::Io)?);
+                let child = child.get().ok_or(VfsError::Io)?;
+                if visited.insert(child.ino) {
+                    pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                    pending.push(child);
+                }
             }
         }
         Ok(false)
@@ -1765,7 +1765,7 @@ mod tests {
 
     use axerrno::LinuxError;
     use axfs_ng_vfs::{
-        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleMode, InitialNodeData,
+        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleDecodeMode, ExportHandleMode, InitialNodeData,
         MetadataUpdate, Mountpoint, NamedCreateOptions, NodePermission, NodeType, Timestamp,
         VfsError, XattrSetMode,
     };
@@ -2299,16 +2299,52 @@ mod tests {
             .encode_export_handle(&sibling, ExportHandleMode::Openable)
             .unwrap();
         let child = mount
-            .decode_export_handle(child_handle.handle_type, &child_handle.bytes)
+            .decode_export_handle(
+                child_handle.handle_type,
+                &child_handle.bytes,
+                axfs_ng_vfs::ExportHandleDecodeMode::Any,
+            )
             .unwrap();
         let sibling = mount
-            .decode_export_handle(sibling_handle.handle_type, &sibling_handle.bytes)
+            .decode_export_handle(
+                sibling_handle.handle_type,
+                &sibling_handle.bytes,
+                axfs_ng_vfs::ExportHandleDecodeMode::Any,
+            )
             .unwrap();
         assert!(mount.export_handle_is_descendant(&subtree, &child).unwrap());
         assert!(
             !mount
                 .export_handle_is_descendant(&subtree, &sibling)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn directory_only_export_decode_rejects_regular_inode_as_stale() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let file = mount
+            .root_location()
+            .create(
+                "file",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let handle = mount
+            .encode_export_handle(&file, ExportHandleMode::Openable)
+            .unwrap();
+
+        assert_eq!(
+            mount
+                .decode_export_handle(
+                    handle.handle_type,
+                    &handle.bytes,
+                    ExportHandleDecodeMode::DirectoryOnly,
+                )
+                .unwrap_err(),
+            VfsError::NotFound
         );
     }
 

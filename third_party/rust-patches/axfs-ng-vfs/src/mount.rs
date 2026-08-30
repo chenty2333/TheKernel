@@ -16,7 +16,7 @@ use spin::{Once, RwLock};
 
 use crate::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, ExportHandle,
-    ExportHandleMode, Filesystem, FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate,
+    ExportHandleDecodeMode, ExportHandleMode, Filesystem, FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate,
     Mutex, MutexGuard, NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission,
     NodeType, OpenOptions, ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity,
     XattrProvider, XattrSetMode,
@@ -441,11 +441,14 @@ impl Mountpoint {
         self: &Arc<Self>,
         handle_type: i32,
         bytes: &[u8],
+        mode: ExportHandleDecodeMode,
     ) -> VfsResult<Location> {
         // Keep a location admission across backend lookup so a normal unmount
         // cannot pass its no-users phase between decode and publication.
         let anchor = self.root_location();
-        let entry = self.filesystem.decode_export_handle(handle_type, bytes)?;
+        let entry = self
+            .filesystem
+            .decode_export_handle_with_mode(handle_type, bytes, mode)?;
         let result = anchor.wrap(entry);
         drop(anchor);
         Ok(result)

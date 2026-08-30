@@ -11,7 +11,7 @@ use axfs::{
     open_block_device,
 };
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, ExportHandle, ExportHandleMode, Filesystem, FilesystemOps, NodePermission,
+    DeviceId, DirEntry, ExportHandle, ExportHandleDecodeMode, ExportHandleMode, Filesystem, FilesystemOps, NodePermission,
     NodeType, StatFs, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
@@ -718,6 +718,16 @@ impl FilesystemOps for BindFilesystem {
 
     fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
         self.source.decode_export_handle(handle_type, bytes)
+    }
+
+    fn decode_export_handle_with_mode(
+        &self,
+        handle_type: i32,
+        bytes: &[u8],
+        mode: ExportHandleDecodeMode,
+    ) -> VfsResult<DirEntry> {
+        self.source
+            .decode_export_handle_with_mode(handle_type, bytes, mode)
     }
 
     fn export_handle_is_descendant(
@@ -1780,7 +1790,11 @@ mod tests {
         assert_eq!(bind_handle, source_handle);
 
         let decoded = bind_mount
-            .decode_export_handle(bind_handle.handle_type, &bind_handle.bytes)
+            .decode_export_handle(
+                bind_handle.handle_type,
+                &bind_handle.bytes,
+                ExportHandleDecodeMode::Any,
+            )
             .unwrap();
         assert_eq!(decoded.mountpoint().mount_id(), bind_mount.mount_id());
         assert_eq!(decoded.inode(), child.inode());
@@ -1794,7 +1808,11 @@ mod tests {
             .encode_export_handle(&outside, ExportHandleMode::Openable)
             .unwrap();
         let decoded_outside = bind_mount
-            .decode_export_handle(outside_handle.handle_type, &outside_handle.bytes)
+            .decode_export_handle(
+                outside_handle.handle_type,
+                &outside_handle.bytes,
+                ExportHandleDecodeMode::Any,
+            )
             .unwrap();
         assert!(
             !bind_mount

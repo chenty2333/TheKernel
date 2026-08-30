@@ -32,6 +32,13 @@ pub enum ExportHandleMode {
     Fid,
 }
 
+/// Restrictions supplied by handle consumers while resolving an export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportHandleDecodeMode {
+    Any,
+    DirectoryOnly,
+}
+
 pub struct StatFs {
     pub fs_type: u32,
     pub block_size: u32,
@@ -81,6 +88,21 @@ pub trait FilesystemOps: Send + Sync {
     /// means stale; other errors preserve backend failure information.
     fn decode_export_handle(&self, _handle_type: i32, _bytes: &[u8]) -> VfsResult<DirEntry> {
         Err(crate::VfsError::OperationNotSupported)
+    }
+
+    /// Resolves an export under the caller's required object kind. Backends
+    /// may override this when their native decoder can enforce it earlier.
+    fn decode_export_handle_with_mode(
+        &self,
+        handle_type: i32,
+        bytes: &[u8],
+        mode: ExportHandleDecodeMode,
+    ) -> VfsResult<DirEntry> {
+        let entry = self.decode_export_handle(handle_type, bytes)?;
+        if mode == ExportHandleDecodeMode::DirectoryOnly && !entry.is_dir() {
+            return Err(crate::VfsError::NotFound);
+        }
+        Ok(entry)
     }
 
     /// Tests whether an exported inode is reachable through `ancestor` in the
@@ -235,6 +257,17 @@ impl Filesystem {
 
     pub fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
         self.inner.ops.decode_export_handle(handle_type, bytes)
+    }
+
+    pub fn decode_export_handle_with_mode(
+        &self,
+        handle_type: i32,
+        bytes: &[u8],
+        mode: ExportHandleDecodeMode,
+    ) -> VfsResult<DirEntry> {
+        self.inner
+            .ops
+            .decode_export_handle_with_mode(handle_type, bytes, mode)
     }
 
     pub fn export_handle_is_descendant(
