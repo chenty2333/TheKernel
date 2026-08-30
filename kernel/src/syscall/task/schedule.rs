@@ -347,6 +347,7 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
 }
 
 fn publish_sched_commit(task: &AxTaskRef, commit: axtask::TaskSchedCommit) {
+    #[cfg(feature = "hwp-uclamp")]
     if let Some(thread) = task.try_as_thread() {
         // Do this before the durable leader snapshot.  The Thread cache is
         // the CPU-local HWP consumer and rejects a delayed, older commit by

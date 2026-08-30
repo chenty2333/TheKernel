@@ -231,7 +231,9 @@ pub fn init(args: &[String], envs: &[String]) {
         SchedulerSeed {
             state: SchedState::default(),
             reset_on_fork: false,
+            #[cfg(feature = "hwp-uclamp")]
             util_min: 0,
+            #[cfg(feature = "hwp-uclamp")]
             util_max: 1024,
             version: 0,
         },

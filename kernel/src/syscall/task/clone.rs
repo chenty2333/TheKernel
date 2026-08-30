@@ -6,8 +6,10 @@ use axhal::uspace::UserContext;
 use axtask::{
     AxTaskExt, SchedClass, current, prepare_task_with_sched_from, publish_prepared_task,
     reclaim_exited_tasks, reserve_prepared_task, scheduler_state_snapshot,
-    set_prepared_task_sched_reset_on_fork, set_prepared_task_sched_util_clamp, yield_now,
+    set_prepared_task_sched_reset_on_fork, yield_now,
 };
+#[cfg(feature = "hwp-uclamp")]
+use axtask::set_prepared_task_sched_util_clamp;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 use thekernel_linux_process_adapter::{Pid, ProcessError};
@@ -549,7 +551,9 @@ impl CloneArgs {
 
         let parent_sched = scheduler_state_snapshot(&curr).map_err(|_| AxError::NoSuchProcess)?;
         let mut child_sched_state = parent_sched.state;
+        #[cfg(feature = "hwp-uclamp")]
         let child_util_min = parent_sched.util_min;
+        #[cfg(feature = "hwp-uclamp")]
         let child_util_max = parent_sched.util_max;
         let parent_reset_on_fork = parent_sched.reset_on_fork;
         // sched_fork applies RESET_ON_FORK before either a process or a
@@ -835,7 +839,9 @@ impl CloneArgs {
             SchedulerSeed {
                 state: child_sched_state,
                 reset_on_fork: child_reset_on_fork,
+                #[cfg(feature = "hwp-uclamp")]
                 util_min: child_util_min as u16,
+                #[cfg(feature = "hwp-uclamp")]
                 util_max: child_util_max as u16,
                 // The child owns a fresh scheduler commit stream. Its first
                 // prepared scheduler state is version zero.
@@ -966,8 +972,10 @@ impl CloneArgs {
         // number or publishing it into a possibly shared files_struct.
         let task = prepare_task_with_sched_from(new_task, child_sched_state, &curr)?;
         set_prepared_task_sched_reset_on_fork(&task, child_reset_on_fork);
+        #[cfg(feature = "hwp-uclamp")]
         // The prepared task stays private until every admission succeeds, so
         // seed the scheduler and Thread cache from the same parent snapshot.
+        #[cfg(feature = "hwp-uclamp")]
         set_prepared_task_sched_util_clamp(&task, child_util_min, child_util_max);
         if let Some((_, Some(pidfd))) = pending_pidfd.as_ref() {
             pidfd.bind_thread_task(&task)?;

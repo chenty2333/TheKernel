@@ -1185,6 +1185,7 @@ pub struct Thread {
     /// its low bit and readers retry instead of allocating or locking in a
     /// scheduler callback.  The scheduler's own commit serial is retained
     /// separately so a delayed completion cannot replace a newer clamp.
+    #[cfg(feature = "hwp-uclamp")]
     sched_clamp: SchedulerClampCache,
     /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
     /// The scheduler Exit callback consumes this marker so `nvcsw` is
@@ -1228,33 +1229,41 @@ pub struct Thread {
 pub(crate) struct SchedulerSeed {
     pub(crate) state: SchedState,
     pub(crate) reset_on_fork: bool,
+    #[cfg(feature = "hwp-uclamp")]
     pub(crate) util_min: u16,
+    #[cfg(feature = "hwp-uclamp")]
     pub(crate) util_max: u16,
     pub(crate) version: u64,
 }
 
+#[cfg(feature = "hwp-uclamp")]
 const SCHED_CLAMP_MASK: u32 = 0x7ff;
 
+#[cfg(feature = "hwp-uclamp")]
 const fn pack_sched_clamp(min: u16, max: u16) -> u32 {
     debug_assert!(min <= max && max <= 1024);
     (min as u32) | ((max as u32) << 11)
 }
 
+#[cfg(feature = "hwp-uclamp")]
 const fn unpack_sched_clamp(packed: u32) -> (u16, u16) {
     ((packed & SCHED_CLAMP_MASK) as u16, ((packed >> 11) & SCHED_CLAMP_MASK) as u16)
 }
 
+#[cfg(feature = "hwp-uclamp")]
 /// Serial-number ordering for scheduler commit streams, including wraparound.
 const fn scheduler_commit_is_newer_or_equal(candidate: u64, published: u64) -> bool {
     candidate.wrapping_sub(published) < (1_u64 << 63)
 }
 
+#[cfg(feature = "hwp-uclamp")]
 struct SchedulerClampCache {
     packed: AtomicU32,
     version: AtomicU64,
     sequence: AtomicU64,
 }
 
+#[cfg(feature = "hwp-uclamp")]
 impl SchedulerClampCache {
     const fn new(min: u16, max: u16, version: u64) -> Self {
         Self {
@@ -1492,6 +1501,7 @@ impl Thread {
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             perf_events: SpinNoIrq::new({ let mut groups = Vec::new(); groups.try_reserve_exact(crate::file::MAX_GROUPS_PER_THREAD).map_err(|_| AxError::NoMemory)?; groups }),
+            #[cfg(feature = "hwp-uclamp")]
             sched_clamp: SchedulerClampCache::new(
                 scheduler_seed.util_min,
                 scheduler_seed.util_max,
@@ -1528,12 +1538,14 @@ impl Thread {
     }
 
     /// Reads the scheduler clamp and its commit version as one coherent tuple.
+    #[cfg(feature = "hwp-uclamp")]
     pub(crate) fn scheduler_clamp_snapshot(&self) -> (u16, u16, u64) {
         self.sched_clamp.snapshot()
     }
 
     /// Publishes a successfully committed scheduler clamp.  A delayed commit
     /// is harmlessly ignored once a newer serial has become visible.
+    #[cfg(feature = "hwp-uclamp")]
     pub(crate) fn publish_scheduler_clamp(&self, min: u32, max: u32, version: u64) {
         self.sched_clamp.publish(min, max, version);
     }
@@ -2319,7 +2331,7 @@ impl AsThread for TaskInner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hwp-uclamp"))]
 mod scheduler_clamp_tests {
     use super::{
         SchedulerClampCache, pack_sched_clamp, scheduler_commit_is_newer_or_equal,
