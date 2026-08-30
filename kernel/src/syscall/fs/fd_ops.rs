@@ -295,13 +295,25 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
-const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
+const AT_HANDLE_FID: i32 = 0x200;
+const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
+const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
+    (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32 | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE;
+const EXPORTED_HANDLE_TYPE: i32 = 1;
+const EXPORTED_HANDLE_BYTES: u32 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxFileHandle {
     handle_bytes: u32,
     handle_type: i32,
+}
+
+fn export_handle_bytes(handle: axfs_ng_vfs::ExportHandle) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&handle.inode.to_ne_bytes());
+    bytes[8..].copy_from_slice(&handle.generation.to_ne_bytes());
+    bytes
 }
 
 fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
@@ -790,8 +802,8 @@ pub fn sys_name_to_handle_at(
     capability: UserMemoryCapability,
     dirfd: c_int,
     path: *const c_char,
-    _handle: *mut u8,
-    _mount_id: *mut i32,
+    handle: *mut u8,
+    mount_id: *mut i32,
     flags: i32,
 ) -> AxResult<isize> {
     if flags & !NAME_TO_HANDLE_ALLOWED_FLAGS != 0 {
@@ -799,16 +811,63 @@ pub fn sys_name_to_handle_at(
     }
 
     let path = load_user_string(&capability, path)?;
-    if !(path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD) {
-        let _ = resolve_at(
-            dirfd,
-            Some(path.as_str()),
-            name_to_handle_resolve_flags(flags),
-        )?;
+    let location = resolve_at(
+        dirfd,
+        Some(path.as_str()),
+        name_to_handle_resolve_flags(flags),
+    )?
+    .into_file()
+    .ok_or(AxError::InvalidInput)?;
+    let exported = location.mountpoint().encode_export_handle(&location)?;
+    let header = unsafe {
+        capability
+            .read_value_uninit(handle.cast::<LinuxFileHandle>())
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    let unique = flags & AT_HANDLE_MNT_ID_UNIQUE != 0;
+    // Linux writes the mount ID before reporting a short handle buffer.
+    if unique {
+        capability
+            .write_bytes(
+                mount_id as usize,
+                &location.mountpoint().mount_id().to_ne_bytes(),
+            )
+            .map_err(map_usercopy_error)?;
+    } else {
+        let legacy =
+            u32::try_from(location.mountpoint().mount_id()).map_err(|_| LinuxError::EOVERFLOW)?;
+        capability
+            .write_bytes(mount_id as usize, &(legacy as i32).to_ne_bytes())
+            .map_err(map_usercopy_error)?;
     }
-
-    // axfs-ng has no exportable mount/inode/generation handle contract yet.
-    Err(LinuxError::EOPNOTSUPP.into())
+    if header.handle_bytes < EXPORTED_HANDLE_BYTES {
+        capability
+            .write_bytes(handle as usize, &EXPORTED_HANDLE_BYTES.to_ne_bytes())
+            .map_err(map_usercopy_error)?;
+        return Err(LinuxError::EOVERFLOW.into());
+    }
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
+        return Err(AxError::InvalidInput);
+    }
+    capability
+        .write_bytes(handle as usize, &EXPORTED_HANDLE_BYTES.to_ne_bytes())
+        .map_err(map_usercopy_error)?;
+    capability
+        .write_bytes(
+            (handle as usize).checked_add(4).ok_or(LinuxError::EFAULT)?,
+            &EXPORTED_HANDLE_TYPE.to_ne_bytes(),
+        )
+        .map_err(map_usercopy_error)?;
+    capability
+        .write_bytes(
+            (handle as usize)
+                .checked_add(size_of::<LinuxFileHandle>())
+                .ok_or(LinuxError::EFAULT)?,
+            &export_handle_bytes(exported),
+        )
+        .map_err(map_usercopy_error)?;
+    Ok(0)
 }
 
 pub fn sys_open_by_handle_at(
