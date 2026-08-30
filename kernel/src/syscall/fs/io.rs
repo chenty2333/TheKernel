@@ -2769,15 +2769,16 @@ pub fn sys_truncate(
 
 pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     debug!("sys_ftruncate <= {fd} {length}");
+    let file_like = get_file_like(fd)?;
+    let kind = FileLikeKind::from_file_like(file_like.as_ref());
+    // Linux v6.12.103 fs/open.c uses fdget() without FMODE_PATH: an O_PATH
+    // descriptor therefore fails the fd acquisition stage with EBADF.  The
+    // subsequent do_ftruncate() checks S_ISREG and FMODE_WRITE, returning
+    // EINVAL for either failure, all before the RLIMIT_FSIZE check below.
+    ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
-    let file_like = get_file_like(fd)?;
-    let kind = FileLikeKind::from_file_like(file_like.as_ref());
-    // Linux v6.12.103 fs/open.c:168 tests both S_ISREG and FMODE_WRITE in
-    // do_ftruncate, returning EINVAL for either failure. fdget's EBADF has
-    // already been returned by get_file_like above.
-    ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
         secret.check_truncate()?;
         if (length as u64) > secret.size() {
@@ -2832,10 +2833,10 @@ fn ftruncate_admission_errno(
     path_only: bool,
     writable: bool,
 ) -> AxResult {
-    if !fd_found {
+    if !fd_found || path_only {
         return Err(AxError::BadFileDescriptor);
     }
-    if kind != FileLikeKind::Regular || path_only || !writable {
+    if kind != FileLikeKind::Regular || !writable {
         return Err(AxError::InvalidInput);
     }
     Ok(())
@@ -6735,11 +6736,14 @@ mod tests {
     }
 
     #[test]
-    fn ftruncate_admission_matches_linux_do_ftruncate() {
+    fn ftruncate_admission_matches_linux_fdget_and_do_ftruncate() {
         let cases = [
             (false, FileLikeKind::Regular, false, true, AxError::BadFileDescriptor),
+            (true, FileLikeKind::Regular, true, true, AxError::BadFileDescriptor),
             (true, FileLikeKind::Directory, false, true, AxError::InvalidInput),
-            (true, FileLikeKind::Regular, true, true, AxError::InvalidInput),
+            (true, FileLikeKind::Fifo, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Socket, false, true, AxError::InvalidInput),
+            (true, FileLikeKind::Other, false, true, AxError::InvalidInput),
             (true, FileLikeKind::Regular, false, false, AxError::InvalidInput),
         ];
         for (fd_found, kind, path_only, writable, expected) in cases {
