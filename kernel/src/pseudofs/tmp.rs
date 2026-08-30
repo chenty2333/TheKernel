@@ -297,7 +297,8 @@ impl FilesystemOps for MemoryFs {
         bytes.try_reserve_exact(16).map_err(|_| VfsError::NoMemory)?;
         bytes.extend_from_slice(&node.inode.ino.to_ne_bytes());
         bytes.extend_from_slice(&0u64.to_ne_bytes());
-        Ok(ExportHandle { handle_type: if mode == ExportHandleMode::Fid { 2 } else { 1 }, bytes })
+        let _ = mode;
+        Ok(ExportHandle { handle_type: 1, bytes })
     }
 
     fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {

@@ -790,7 +790,8 @@ impl FilesystemOps for Ext4Filesystem {
         bytes.try_reserve_exact(8).map_err(|_| VfsError::NoMemory)?;
         bytes.extend_from_slice(&(token.ino() as u32).to_ne_bytes());
         bytes.extend_from_slice(&(token.generation() as u32).to_ne_bytes());
-        Ok(ExportHandle { handle_type: if mode == ExportHandleMode::Fid { 2 } else { 1 }, bytes })
+        let _ = mode;
+        Ok(ExportHandle { handle_type: 1, bytes })
     }
 
     fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
