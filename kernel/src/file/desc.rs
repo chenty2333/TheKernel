@@ -2466,7 +2466,7 @@ mod tests {
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
         let description =
-            FileDescription::new_inner(file, 0, None, None, None, Some(credential.clone()))
+            FileDescription::new_inner(file, 0, false, None, None, None, Some(credential.clone()))
                 .unwrap();
 
         let retained = description.vfs_open_credential().unwrap();
@@ -2496,7 +2496,7 @@ mod tests {
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
         let description =
-            FileDescription::new_inner(file, 0, None, None, None, Some(credential.clone()))
+            FileDescription::new_inner(file, 0, false, None, None, None, Some(credential.clone()))
                 .unwrap();
         let context = description.capture_io_operation_context(
             VfsSecurityContext::new(credential.clone()),
@@ -2544,12 +2544,26 @@ mod tests {
         )));
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
-        let first =
-            FileDescription::new_inner(file.clone(), 0, None, None, None, Some(credential.clone()))
-                .unwrap();
-        let second =
-            FileDescription::new_inner(file.clone(), 0, None, None, None, Some(credential.clone()))
-                .unwrap();
+        let first = FileDescription::new_inner(
+            file.clone(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            Some(credential.clone()),
+        )
+        .unwrap();
+        let second = FileDescription::new_inner(
+            file.clone(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            Some(credential.clone()),
+        )
+        .unwrap();
         let context = first.capture_io_operation_context(
             VfsSecurityContext::new(credential.clone()),
             FanotifyEventActor::default(),
