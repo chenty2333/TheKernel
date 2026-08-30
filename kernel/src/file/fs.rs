@@ -685,10 +685,6 @@ impl FileLike for File {
         location_to_kstat(self.inner().location())
     }
 
-    fn cachestat(&self, first_page: u64, last_page: u64) -> AxResult<axfs::CachedFileCacheStat> {
-        Ok(self.inner().cachestat(first_page, last_page))
-    }
-
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         if super::fiemap::is_fiemap_command(cmd) {
             return super::fiemap::ioctl(self.inner(), context, arg);

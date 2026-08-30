@@ -2318,16 +2318,6 @@ pub struct PageCache {
     shmem: bool,
 }
 
-/// Per-file page-cache counters returned to the native cachestat adapter.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CachedFileCacheStat {
-    pub nr_cache: u64,
-    pub nr_dirty: u64,
-    pub nr_writeback: u64,
-    pub nr_evicted: u64,
-    pub nr_recently_evicted: u64,
-}
-
 static IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 pub fn in_memory_page_cache_pages() -> usize {
@@ -3369,11 +3359,6 @@ struct CachedFileShared {
     /// pages can be faulted back, so global pressure reclaim must skip them.
     in_memory: bool,
     page_cache: Mutex<LruCache<u32, PageCache>>,
-    /// Bounded shadow entries for pages displaced from this cache.  The
-    /// generation is deliberately per-inode: cachestat only needs to tell a
-    /// current shadow from one which was evicted sufficiently recently.
-    evicted_pages: Mutex<LruCache<u32, u64>>,
-    eviction_generation: AtomicU64,
     /// Remaining entries in the current bounded pressure-scan cycle. The LRU
     /// rotation is the cursor; this counter prevents an all-ineligible inode
     /// from requesting active retries forever.
@@ -3485,30 +3470,6 @@ impl RangeWritebackState {
 }
 
 impl CachedFileShared {
-    fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
-        if first_page > last_page {
-            return CachedFileCacheStat::default();
-        }
-        let cache = self.page_cache.lock();
-        let mut stat = CachedFileCacheStat::default();
-        for (page_no, page) in cache.iter() {
-            if (first_page..=last_page).contains(&u64::from(*page_no)) {
-                stat.nr_cache += 1;
-                stat.nr_dirty += u64::from(page.is_dirty());
-                stat.nr_writeback += u64::from(page.is_writeback());
-            }
-        }
-        let generation = self.eviction_generation.load(Ordering::Acquire);
-        let shadows = self.evicted_pages.lock();
-        for (page_no, evicted_at) in shadows.iter() {
-            if (first_page..=last_page).contains(&u64::from(*page_no)) && !cache.contains(page_no) {
-                stat.nr_evicted += 1;
-                stat.nr_recently_evicted += u64::from(generation.saturating_sub(*evicted_at) < 128);
-            }
-        }
-        stat
-    }
-
     #[cfg(test)]
     fn new(registry_key: CachedFileRegistryKey, in_memory: bool) -> Self {
         Self::with_identity(
@@ -3535,8 +3496,6 @@ impl CachedFileShared {
             identity_lease,
             in_memory,
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
-            evicted_pages: Mutex::new(LruCache::new(capacity)),
-            eviction_generation: AtomicU64::new(0),
             pressure_reclaim_scan_remaining: AtomicUsize::new(0),
             pressure_reclaim_scan_epoch: AtomicU64::new(0),
             evict_listeners: Mutex::new(LinkedList::default()),
@@ -4243,24 +4202,6 @@ impl Drop for FileUserData {
 }
 
 impl CachedFile {
-    /// Snapshot the cache state in the inclusive page interval used by
-    /// Linux's cachestat(2).  The snapshot is intentionally advisory: page
-    /// state may change immediately after the locks are released.
-    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
-        self.shared.cachestat(first_page, last_page)
-    }
-
-    fn record_eviction(&self, page_no: u32) {
-        let generation = self.eviction_generation();
-        self.shared.evicted_pages.lock().put(page_no, generation);
-    }
-
-    fn eviction_generation(&self) -> u64 {
-        self.shared
-            .eviction_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1)
-    }
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
         let in_memory = cached_file_is_in_memory(&location);
@@ -4494,7 +4435,6 @@ impl CachedFile {
         )?;
         let _ = writeback_cached_page_data(file, pn, page)?;
         page.clear_dirty();
-        self.record_eviction(pn);
         Ok(acknowledgement)
     }
 
@@ -6264,17 +6204,6 @@ pub enum FileBackend {
 }
 
 impl FileBackend {
-    /// Returns the page-cache snapshot for an inclusive page interval.
-    /// Direct handles intentionally have no resident high-level cache.
-    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
-        match self {
-            Self::Cached(cached) => cached.cachestat(first_page, last_page),
-            Self::Direct(location) => cached_file_shared_for_location(location)
-                .map(|shared| shared.cachestat(first_page, last_page))
-                .unwrap_or_default(),
-        }
-    }
-
     const DIRECT_IO_CHUNK: usize = ALIGNED_BYPASS_CHUNK;
 
     pub(crate) fn new_direct(location: Location) -> Self {
@@ -6997,12 +6926,6 @@ impl File {
     pub fn backend(&self) -> VfsResult<&FileBackend> {
         self.access(FileFlags::empty())?;
         Ok(&self.inner)
-    }
-
-    /// Page-cache statistics do not require data-I/O access, so O_PATH file
-    /// descriptors may query their regular file's mapping as on Linux.
-    pub fn cachestat(&self, first_page: u64, last_page: u64) -> CachedFileCacheStat {
-        self.inner.cachestat(first_page, last_page)
     }
 
     /// Returns a reference to the underlying [`Location`].
