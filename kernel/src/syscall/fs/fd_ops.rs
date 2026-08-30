@@ -812,7 +812,11 @@ pub fn sys_name_to_handle_at(
     .ok_or(AxError::InvalidInput)?;
     let exported = location.mountpoint().encode_export_handle(
         &location,
-        if flags & AT_HANDLE_FID != 0 { axfs_ng_vfs::ExportHandleMode::Fid } else { axfs_ng_vfs::ExportHandleMode::Openable },
+        if flags & AT_HANDLE_FID != 0 {
+            axfs_ng_vfs::ExportHandleMode::Fid
+        } else {
+            axfs_ng_vfs::ExportHandleMode::Openable
+        },
     )?;
     let header = unsafe {
         capability
@@ -892,10 +896,7 @@ pub fn sys_open_by_handle_at(
     } else {
         let selected = get_file_like(mount_fd)?;
         if let Some(directory) = selected.downcast_ref::<Directory>() {
-            (
-                directory.inner().clone(),
-                true,
-            )
+            (directory.inner().clone(), true)
         } else if let Some(file) = selected.downcast_ref::<File>() {
             (file.inner().location().clone(), false)
         } else {
@@ -904,16 +905,23 @@ pub fn sys_open_by_handle_at(
     };
     // may_decode_fh() has an unscoped global-capability fast path.  The
     // relaxed path is deliberately narrower: a real O_DIRECTORY anchor plus
-    // CAP_SYS_ADMIN in the target mount's governing user namespace.
+    // CAP_SYS_ADMIN in the selected superblock's governing user namespace.
+    // The current VFS model governs every superblock from the initial user
+    // namespace; resolve that target only after admitting the selected mount,
+    // rather than using the caller's current namespace as the target.
+    let selected_superblock_user_ns =
+        crate::task::security::initial_user_namespace(thread.current_cred().user_ns());
     let globally_authorized = thread.has_effective_capability(CAP_DAC_READ_SEARCH);
     let relaxed_directory_scope = if globally_authorized {
         None
     } else if directory_scope
         && flags as u32 & O_DIRECTORY != 0
-        && thread.current_cred().has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
+        && thread
+            .current_cred()
+            .has_effective_capability_in_own_user_ns(CAP_DAC_READ_SEARCH)
         && ns_capable(
             &thread.current_cred(),
-            &crate::task::security::initial_user_namespace(thread.current_cred().user_ns()),
+            &selected_superblock_user_ns,
             CAP_SYS_ADMIN,
         )
     {
@@ -923,8 +931,8 @@ pub fn sys_open_by_handle_at(
     };
 
     let flags = normalize_legacy_open_flags(flags)?;
-    let _mount_namespace = open_requires_namespace_operation(flags as u32, 0)
-        .then(crate::mounts::namespace_operation);
+    let _mount_namespace =
+        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
 
     let handle_addr = handle as usize;
     let header = unsafe {
@@ -941,7 +949,8 @@ pub fn sys_open_by_handle_at(
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
     let mut body = Vec::<MaybeUninit<u8>>::new();
-    body.try_reserve_exact(header.handle_bytes as usize).map_err(|_| LinuxError::ENOMEM)?;
+    body.try_reserve_exact(header.handle_bytes as usize)
+        .map_err(|_| LinuxError::ENOMEM)?;
     body.resize(header.handle_bytes as usize, MaybeUninit::uninit());
     capability
         .read_bytes(body_addr, &mut body)
@@ -951,21 +960,19 @@ pub fn sys_open_by_handle_at(
     let location = mount
         .mountpoint()
         .decode_export_handle(header.handle_type, &body)
-        .map_err(|_| LinuxError::ESTALE)?;
+        .map_err(map_decode_export_handle_error)?;
     // Anonymous decoded references have no parent chain.  Ask the filesystem
     // to verify the stable namespace ancestry from the encoded inode instead.
     if let Some(directory) = relaxed_directory_scope
         && !mount
             .mountpoint()
-            .export_handle_is_descendant(
-                &directory,
-                header.handle_type,
-                &body,
-            )?
+            .export_handle_is_descendant(&directory, &location)
+            .map_err(map_decode_export_handle_error)?
     {
         return Err(LinuxError::ESTALE.into());
     }
-    let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    let security =
+        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         if !location.is_dir() {
             return Err(AxError::NotADirectory);
@@ -974,14 +981,14 @@ pub fn sys_open_by_handle_at(
         let mut policy = Openat2PathwalkPolicy::legacy()?;
         return open_tmpfile_in_fs(&mut fs, ".", flags, 0, &security, &mut policy);
     }
-    open_resolved_location_with_policy(
-        "",
-        location,
-        false,
-        flags,
-        0,
-        &security,
-    )
+    open_resolved_location_with_policy("", location, false, flags, 0, &security)
+}
+
+fn map_decode_export_handle_error(error: AxError) -> AxError {
+    match error {
+        AxError::NotFound | AxError::InvalidInput => LinuxError::ESTALE.into(),
+        error => error,
+    }
 }
 
 fn open_in_fs(
@@ -2099,6 +2106,22 @@ mod namespace_operation_tests {
         assert_eq!(flags as u32 & O_PATH, O_PATH);
         assert_eq!(flags as u32 & O_CLOEXEC, O_CLOEXEC);
         assert_eq!(flags as u32 & O_TRUNC, 0);
+    }
+
+    #[test]
+    fn handle_decode_staleness_mapping_preserves_allocation_failure() {
+        assert_eq!(
+            map_decode_export_handle_error(AxError::NotFound),
+            LinuxError::ESTALE.into()
+        );
+        assert_eq!(
+            map_decode_export_handle_error(AxError::InvalidInput),
+            LinuxError::ESTALE.into()
+        );
+        assert_eq!(
+            map_decode_export_handle_error(AxError::NoMemory),
+            AxError::NoMemory
+        );
     }
 
     #[test]

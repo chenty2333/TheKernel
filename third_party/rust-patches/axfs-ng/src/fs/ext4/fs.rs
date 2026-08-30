@@ -780,7 +780,11 @@ impl FilesystemOps for Ext4Filesystem {
         }
         Ok(())
     }
-    fn encode_export_handle(&self, entry: &DirEntry, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+    fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
         let inode = entry.downcast::<Inode>()?;
         if !core::ptr::eq(self, inode.filesystem().as_ref()) {
             return Err(VfsError::CrossesDevices);
@@ -791,11 +795,16 @@ impl FilesystemOps for Ext4Filesystem {
         bytes.extend_from_slice(&(token.ino() as u32).to_ne_bytes());
         bytes.extend_from_slice(&(token.generation() as u32).to_ne_bytes());
         let _ = mode;
-        Ok(ExportHandle { handle_type: 1, bytes })
+        Ok(ExportHandle {
+            handle_type: 1,
+            bytes,
+        })
     }
 
     fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
-        if handle_type != 1 || bytes.len() != 8 { return Err(VfsError::NotFound); }
+        if handle_type != 1 || bytes.len() != 8 {
+            return Err(VfsError::NotFound);
+        }
         let ino = u32::from_ne_bytes(bytes[..4].try_into().map_err(|_| VfsError::NotFound)?);
         let generation = u32::from_ne_bytes(bytes[4..].try_into().map_err(|_| VfsError::NotFound)?);
         let fs = self.root_dir().downcast::<Inode>()?.filesystem();
@@ -819,22 +828,20 @@ impl FilesystemOps for Ext4Filesystem {
     fn export_handle_is_descendant(
         &self,
         ancestor: &DirEntry,
-        handle_type: i32,
-        bytes: &[u8],
+        descendant: &DirEntry,
     ) -> VfsResult<bool> {
-        // Decode first: this checks the candidate's generation before the
-        // namespace walk.  Then walk from the mapped directory, preserving
-        // real ext4 parent/child topology rather than anonymous references.
-        let _ = self.decode_export_handle(handle_type, bytes)?;
+        let target = self.encode_export_handle(descendant, ExportHandleMode::Openable)?;
         let mut pending = Vec::new();
         pending.try_reserve(16).map_err(|_| VfsError::NoMemory)?;
         pending.push(ancestor.clone());
         while let Some(entry) = pending.pop() {
             let exported = self.encode_export_handle(&entry, ExportHandleMode::Openable)?;
-            if exported.handle_type == handle_type && exported.bytes == bytes {
+            if exported == target {
                 return Ok(true);
             }
-            let Ok(directory) = entry.as_dir() else { continue };
+            let Ok(directory) = entry.as_dir() else {
+                continue;
+            };
             let mut names = Vec::<String>::new();
             let listed = directory.read_dir(0, &mut |name: &str, _: u64, _: NodeType, _: u64| {
                 if name != "." && name != ".." {
@@ -859,7 +866,7 @@ impl FilesystemOps for Ext4Filesystem {
                     pending.push(child);
                 } else {
                     let exported = self.encode_export_handle(&child, ExportHandleMode::Openable)?;
-                    if exported.handle_type == handle_type && exported.bytes == bytes {
+                    if exported == target {
                         return Ok(true);
                     }
                 }

@@ -15,11 +15,11 @@ use inherit_methods_macro::inherit_methods;
 use spin::{Once, RwLock};
 
 use crate::{
-    AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, ExportHandle, ExportHandleMode,
-    Filesystem, FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
-    NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission, NodeType, OpenOptions,
-    ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity, XattrProvider,
-    XattrSetMode,
+    AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, ExportHandle,
+    ExportHandleMode, Filesystem, FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate,
+    Mutex, MutexGuard, NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission,
+    NodeType, OpenOptions, ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity,
+    XattrProvider, XattrSetMode,
     path::{DOT, DOTDOT, PathBuf, try_build_absolute_path},
     unsupported_xattr,
 };
@@ -426,14 +426,22 @@ impl Mountpoint {
         self.filesystem.clone()
     }
 
-    pub fn encode_export_handle(self: &Arc<Self>, location: &Location, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+    pub fn encode_export_handle(
+        self: &Arc<Self>,
+        location: &Location,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
         if !Arc::ptr_eq(self, location.mountpoint()) {
             return Err(VfsError::CrossesDevices);
         }
         self.filesystem.encode_export_handle(location.entry(), mode)
     }
 
-    pub fn decode_export_handle(self: &Arc<Self>, handle_type: i32, bytes: &[u8]) -> VfsResult<Location> {
+    pub fn decode_export_handle(
+        self: &Arc<Self>,
+        handle_type: i32,
+        bytes: &[u8],
+    ) -> VfsResult<Location> {
         // Keep a location admission across backend lookup so a normal unmount
         // cannot pass its no-users phase between decode and publication.
         let anchor = self.root_location();
@@ -446,14 +454,14 @@ impl Mountpoint {
     pub fn export_handle_is_descendant(
         self: &Arc<Self>,
         ancestor: &Location,
-        handle_type: i32,
-        bytes: &[u8],
+        descendant: &Location,
     ) -> VfsResult<bool> {
-        if !Arc::ptr_eq(self, ancestor.mountpoint()) {
+        if !Arc::ptr_eq(self, ancestor.mountpoint()) || !Arc::ptr_eq(self, descendant.mountpoint())
+        {
             return Err(VfsError::CrossesDevices);
         }
         self.filesystem
-            .export_handle_is_descendant(ancestor.entry(), handle_type, bytes)
+            .export_handle_is_descendant(ancestor.entry(), descendant.entry())
     }
 
     pub fn filesystem_identity_weak(self: &Arc<Self>) -> WeakFilesystemIdentity {

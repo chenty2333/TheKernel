@@ -1,4 +1,7 @@
-use alloc::{sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
@@ -66,7 +69,11 @@ pub trait FilesystemOps: Send + Sync {
     }
     /// Exports a backend-validated inode generation.  The VFS deliberately
     /// does not synthesize a handle from a pathname or a bare inode number.
-    fn encode_export_handle(&self, _entry: &DirEntry, _mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+    fn encode_export_handle(
+        &self,
+        _entry: &DirEntry,
+        _mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
         Err(crate::VfsError::OperationNotSupported)
     }
 
@@ -82,8 +89,7 @@ pub trait FilesystemOps: Send + Sync {
     fn export_handle_is_descendant(
         &self,
         _ancestor: &DirEntry,
-        _handle_type: i32,
-        _bytes: &[u8],
+        _descendant: &DirEntry,
     ) -> VfsResult<bool> {
         Ok(false)
     }
@@ -219,7 +225,11 @@ impl Filesystem {
         self.inner.ops.enumerate_inodes(visitor)
     }
 
-    pub fn encode_export_handle(&self, entry: &DirEntry, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+    pub fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
         self.inner.ops.encode_export_handle(entry, mode)
     }
 
@@ -230,10 +240,11 @@ impl Filesystem {
     pub fn export_handle_is_descendant(
         &self,
         ancestor: &DirEntry,
-        handle_type: i32,
-        bytes: &[u8],
+        descendant: &DirEntry,
     ) -> VfsResult<bool> {
-        self.inner.ops.export_handle_is_descendant(ancestor, handle_type, bytes)
+        self.inner
+            .ops
+            .export_handle_is_descendant(ancestor, descendant)
     }
 
     pub fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {

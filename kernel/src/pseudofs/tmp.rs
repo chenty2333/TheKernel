@@ -20,10 +20,10 @@ use axfs::{
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
-    DirNodeOps, ExportHandle, ExportHandleMode, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
-    MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
-    Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
-    XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
+    DirNodeOps, ExportHandle, ExportHandleMode, FileNode, FileNodeOps, Filesystem, FilesystemOps,
+    Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType,
+    NodeUserData, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
+    WeakDirEntry, XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
@@ -288,26 +288,38 @@ impl FilesystemOps for MemoryFs {
         }
         Ok(())
     }
-    fn encode_export_handle(&self, entry: &DirEntry, mode: ExportHandleMode) -> VfsResult<ExportHandle> {
+    fn encode_export_handle(
+        &self,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
+    ) -> VfsResult<ExportHandle> {
         let node = entry.downcast::<MemoryNode>()?;
         if !core::ptr::eq(self, node.fs.as_ref()) {
             return Err(VfsError::CrossesDevices);
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(16).map_err(|_| VfsError::NoMemory)?;
+        bytes
+            .try_reserve_exact(16)
+            .map_err(|_| VfsError::NoMemory)?;
         bytes.extend_from_slice(&node.inode.ino.to_ne_bytes());
         bytes.extend_from_slice(&0u64.to_ne_bytes());
         let _ = mode;
-        Ok(ExportHandle { handle_type: 1, bytes })
+        Ok(ExportHandle {
+            handle_type: 1,
+            bytes,
+        })
     }
 
     fn decode_export_handle(&self, handle_type: i32, bytes: &[u8]) -> VfsResult<DirEntry> {
         if handle_type != 1 || bytes.len() != 16 {
             return Err(VfsError::NotFound);
         }
-        let inode_number = u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
+        let inode_number =
+            u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
         let generation = u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| VfsError::NotFound)?);
-        if generation != 0 { return Err(VfsError::NotFound); }
+        if generation != 0 {
+            return Err(VfsError::NotFound);
+        }
         let inode = self.get(inode_number).ok_or(VfsError::NotFound)?;
         let node_type = inode.metadata.lock().node_type;
         // This is an anonymous VFS alias, not a namespace link: it retains
@@ -322,20 +334,11 @@ impl FilesystemOps for MemoryFs {
     fn export_handle_is_descendant(
         &self,
         ancestor: &DirEntry,
-        handle_type: i32,
-        bytes: &[u8],
+        descendant: &DirEntry,
     ) -> VfsResult<bool> {
-        if handle_type != 1 || bytes.len() != 16 {
-            return Ok(false);
-        }
-        let inode_number = u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| VfsError::NotFound)?);
-        let generation = u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| VfsError::NotFound)?);
-        if generation != 0 { return Ok(false); }
-        let Some(target) = self.get(inode_number) else {
-            return Ok(false);
-        };
+        let target = descendant.downcast::<MemoryNode>()?;
         let ancestor = ancestor.downcast::<MemoryNode>()?;
-        if !core::ptr::eq(self, ancestor.fs.as_ref()) {
+        if !core::ptr::eq(self, ancestor.fs.as_ref()) || !core::ptr::eq(self, target.fs.as_ref()) {
             return Err(VfsError::CrossesDevices);
         }
 
@@ -344,15 +347,19 @@ impl FilesystemOps for MemoryFs {
         let _namespace = self.namespace.lock();
         let inode_count = self.inodes.lock().len();
         let mut pending = Vec::new();
-        pending.try_reserve(inode_count).map_err(|_| VfsError::NoMemory)?;
+        pending
+            .try_reserve(inode_count)
+            .map_err(|_| VfsError::NoMemory)?;
         let mut visited = HashSet::new();
-        visited.try_reserve(inode_count).map_err(|_| VfsError::NoMemory)?;
+        visited
+            .try_reserve(inode_count)
+            .map_err(|_| VfsError::NoMemory)?;
         pending.push(ancestor.inode.clone());
         while let Some(inode) = pending.pop() {
             if !visited.insert(inode.ino) {
                 continue;
             }
-            if Arc::ptr_eq(&inode, &target) {
+            if Arc::ptr_eq(&inode, &target.inode) {
                 return Ok(true);
             }
             let Ok(directory) = inode.as_dir() else {
@@ -1758,8 +1765,9 @@ mod tests {
 
     use axerrno::LinuxError;
     use axfs_ng_vfs::{
-        AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
-        NamedCreateOptions, NodePermission, NodeType, Timestamp, VfsError, XattrSetMode,
+        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleMode, InitialNodeData,
+        MetadataUpdate, Mountpoint, NamedCreateOptions, NodePermission, NodeType, Timestamp,
+        VfsError, XattrSetMode,
     };
 
     use super::{MemoryFs, TMPFS_XATTR_SIZE_MAX};
@@ -2290,12 +2298,18 @@ mod tests {
         let sibling_handle = mount
             .encode_export_handle(&sibling, ExportHandleMode::Openable)
             .unwrap();
-        assert!(mount
-            .export_handle_is_descendant(&subtree, child_handle.handle_type, &child_handle.bytes)
-            .unwrap());
-        assert!(!mount
-            .export_handle_is_descendant(&subtree, sibling_handle.handle_type, &sibling_handle.bytes)
-            .unwrap());
+        let child = mount
+            .decode_export_handle(child_handle.handle_type, &child_handle.bytes)
+            .unwrap();
+        let sibling = mount
+            .decode_export_handle(sibling_handle.handle_type, &sibling_handle.bytes)
+            .unwrap();
+        assert!(mount.export_handle_is_descendant(&subtree, &child).unwrap());
+        assert!(
+            !mount
+                .export_handle_is_descendant(&subtree, &sibling)
+                .unwrap()
+        );
     }
 
     #[test]
