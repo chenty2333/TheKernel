@@ -9,7 +9,6 @@ use core::{
 
 use axerrno::AxResult;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet};
-use axtask::WaitQueue;
 use spin::Mutex;
 
 use super::{
@@ -61,7 +60,6 @@ pub(crate) struct EventQueue {
     waiters: PollSet,
     closing: AtomicBool,
     in_flight: AtomicUsize,
-    close_waiters: WaitQueue,
 }
 
 struct EventState {
@@ -83,12 +81,14 @@ impl EventQueue {
             waiters: PollSet::new(),
             closing: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
-            close_waiters: WaitQueue::new(),
         })
     }
     pub(crate) fn reserve(&self, user_data: u64) -> DrmResult<u64> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(DrmError::NotFound);
+        }
         let mut state = self.state.lock();
-        if state.closed {
+        if state.closed || self.closing.load(Ordering::Acquire) {
             return Err(DrmError::NotFound);
         }
         if state
@@ -108,7 +108,7 @@ impl EventQueue {
     pub(crate) fn complete(&self, token: u64, sequence: u64, timestamp_us: u64) {
         let mut state = self.state.lock();
         let user_data = state.reserved.remove(&token);
-        if !state.closed {
+        if !state.closed && !self.closing.load(Ordering::Acquire) {
             if let Some(user_data) = user_data {
                 state.events.push_back(DrmEvent::FlipComplete {
                     sequence,
@@ -122,7 +122,7 @@ impl EventQueue {
     pub(crate) fn complete_vblank(&self, token: u64, sequence: u64, timestamp_us: u64) {
         let mut state = self.state.lock();
         let user_data = state.reserved.remove(&token);
-        if !state.closed {
+        if !state.closed && !self.closing.load(Ordering::Acquire) {
             if let Some(user_data) = user_data {
                 state.events.push_back(DrmEvent::VBlank {
                     sequence,
@@ -152,21 +152,26 @@ impl EventQueue {
     }
     pub(crate) fn end_delivery(&self) {
         if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.close_waiters.notify_all(true);
+            self.finish_close();
         }
     }
     fn close(&self) {
         self.begin_close();
-        self.finish_close();
     }
     pub(crate) fn begin_close(&self) {
         self.closing.store(true, Ordering::Release);
+        self.finish_close();
     }
     pub(crate) fn finish_close(&self) {
-        self.close_waiters
-            .wait_until(|| self.in_flight.load(Ordering::Acquire) == 0)
-            .expect("DRM event queue close wait failed");
+        if !self.closing.load(Ordering::Acquire)
+            || self.in_flight.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
         let mut state = self.state.lock();
+        if state.closed {
+            return;
+        }
         state.closed = true;
         state.events.clear();
         state.reserved.clear();
@@ -768,7 +773,13 @@ impl DrmFile {
     }
 
     fn push_event(&self, event: DrmEvent) -> DrmResult<()> {
+        if self.events.is_closed() {
+            return Err(DrmError::NotFound);
+        }
         let mut state = self.events.state.lock();
+        if state.closed || self.events.is_closed() {
+            return Err(DrmError::NotFound);
+        }
         if state
             .events
             .len()
@@ -960,6 +971,27 @@ mod tests {
         events.complete(token, 5, 2);
         assert!(events.state.lock().events.is_empty());
         assert!(events.is_closed());
+    }
+
+    #[test]
+    fn close_defers_cleanup_to_the_last_delivery_without_blocking() {
+        let events = EventQueue::new();
+        let token = events.reserve(9).unwrap();
+        assert!(events.try_begin_delivery());
+
+        // `close` is also used from `DrmFile::drop`, so it must not wait for
+        // this in-flight delivery.  The delivery owns final cleanup instead.
+        events.close();
+        assert!(events.is_closed());
+        assert!(!events.state.lock().closed);
+        assert_eq!(events.reserve(10), Err(DrmError::NotFound));
+
+        events.complete(token, 4, 1);
+        events.end_delivery();
+        let state = events.state.lock();
+        assert!(state.closed);
+        assert!(state.events.is_empty());
+        assert!(state.reserved.is_empty());
     }
 
     #[test]
