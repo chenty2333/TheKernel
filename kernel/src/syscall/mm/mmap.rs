@@ -667,7 +667,6 @@ pub fn sys_mmap(
                     } else {
                         AxError::BrokenPipe
                     }
-                })
             })
         })
         .transpose()?
