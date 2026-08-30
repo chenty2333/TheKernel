@@ -11,6 +11,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axcpu::ioport::{self, IO_BITMAP_BYTES};
 use axfs::FsContext;
 use axpoll::PollSet;
 use axsync::Mutex;
@@ -39,6 +40,67 @@ const TASK_PARENT_RELATION_HARD_LIMIT: usize =
     thekernel_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
+
+/// Linux x86 I/O-port state.  It is deliberately task-local: threads in one
+/// process may grant different port ranges.  The bitmap is shared after fork
+/// and copied only when either task subsequently mutates it.
+#[derive(Clone, Default)]
+pub(crate) struct IoPortState {
+    bitmap: Option<Arc<[u8; IO_BITMAP_BYTES]>>,
+    iopl: u8,
+}
+
+impl IoPortState {
+    fn update_range(bitmap: &mut [u8; IO_BITMAP_BYTES], from: usize, num: usize, turn_on: bool) {
+        let end = from + num;
+        let first = from / 8;
+        let last = (end - 1) / 8;
+        let first_mask = 0xffu8 << (from % 8);
+        let last_mask = ((1u16 << ((end - 1) % 8 + 1)) - 1) as u8;
+        let update = |byte: &mut u8, mask: u8| {
+            if turn_on {
+                *byte &= !mask;
+            } else {
+                *byte |= mask;
+            }
+        };
+        if first == last {
+            update(&mut bitmap[first], first_mask & last_mask);
+            return;
+        }
+        update(&mut bitmap[first], first_mask);
+        bitmap[first + 1..last].fill(if turn_on { 0 } else { 0xff });
+        update(&mut bitmap[last], last_mask);
+    }
+
+    fn try_update_ioperm(&mut self, from: usize, num: usize, turn_on: bool) -> AxResult<()> {
+        if self.bitmap.is_none() && !turn_on {
+            return Ok(());
+        }
+
+        if let Some(shared) = self.bitmap.as_mut()
+            && let Some(bitmap) = Arc::get_mut(shared)
+        {
+            Self::update_range(bitmap, from, num, turn_on);
+            if bitmap.iter().all(|&byte| byte == 0xff) {
+                self.bitmap = None;
+            }
+            return Ok(());
+        }
+
+        let mut bitmap = match self.bitmap.as_ref() {
+            Some(bitmap) => **bitmap,
+            None => [0xff; IO_BITMAP_BYTES],
+        };
+        Self::update_range(&mut bitmap, from, num, turn_on);
+        if bitmap.iter().all(|&byte| byte == 0xff) {
+            self.bitmap = None;
+            return Ok(());
+        }
+        self.bitmap = Some(Arc::try_new(bitmap).map_err(|_| AxError::NoMemory)?);
+        Ok(())
+    }
+}
 
 #[cfg(not(test))]
 type TaskParentPublicationMutex<T> = axsync::Mutex<T>;
@@ -897,6 +959,9 @@ pub struct Thread {
     /// fork/clone children.
     io_context: SpinNoIrq<Option<Arc<AtomicU16>>>,
 
+    /// x86 `ioperm(2)` bitmap and `iopl(2)` emulation state.
+    ioport: SpinNoIrq<IoPortState>,
+
     /// The OOM score adjustment value.
     oom_score_adj: AtomicI32,
 
@@ -1016,6 +1081,7 @@ impl Thread {
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             io_context: SpinNoIrq::new(io_context),
+            ioport: SpinNoIrq::new(IoPortState::default()),
             exit,
             oom_score_adj: AtomicI32::new(200),
             active_scope_read_held: AtomicBool::new(false),
@@ -1153,6 +1219,38 @@ impl Thread {
             *io_context = Some(new_context);
         }
         Ok(())
+    }
+
+    /// Takes the fork-visible x86 I/O-port snapshot. The bitmap Arc is COW.
+    pub(crate) fn ioport_snapshot(&self) -> IoPortState {
+        self.ioport.lock().clone()
+    }
+
+    /// Installs an inherited x86 I/O-port snapshot before the child is
+    /// runnable. This preserves Linux's fork semantics without sharing later
+    /// mutations between parent and child.
+    pub(crate) fn install_ioport_snapshot(&self, state: IoPortState) {
+        *self.ioport.lock() = state;
+    }
+
+    /// Applies one already-validated `ioperm(2)` request to this task.
+    pub(crate) fn update_ioperm(&self, from: usize, num: usize, turn_on: bool) -> AxResult<()> {
+        self.ioport.lock().try_update_ioperm(from, num, turn_on)
+    }
+
+    pub(crate) fn iopl_level(&self) -> u8 {
+        self.ioport.lock().iopl
+    }
+
+    pub(crate) fn set_iopl_level(&self, level: u8) {
+        self.ioport.lock().iopl = level;
+    }
+
+    /// Refreshes the current CPU's TSS immediately before returning to ring 3.
+    /// The caller holds the final user-return IRQ/preemption exclusion.
+    pub(crate) fn install_user_io_permissions(&self) {
+        let state = self.ioport.lock();
+        ioport::install_user_io_bitmap(state.bitmap.as_deref(), state.iopl == 3);
     }
 
     pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
@@ -1645,6 +1743,28 @@ impl AsThread for TaskInner {
     fn try_as_thread(&self) -> Option<&Thread> {
         self.task_ext()
             .map(|ext| ext.downcast_ref::<Box<Thread>>().as_ref())
+    }
+}
+
+#[cfg(test)]
+mod ioport_tests {
+    use super::IoPortState;
+
+    #[test]
+    fn ioperm_bitmap_is_copy_on_write_and_is_reclaimed_when_empty() {
+        let mut parent = IoPortState::default();
+        parent.try_update_ioperm(7, 2, true).unwrap();
+        let mut child = parent.clone();
+
+        assert!(parent.bitmap.is_some());
+        assert!(child.bitmap.is_some());
+        assert!(parent.bitmap.as_ref().unwrap()[0] & 0x80 == 0);
+        assert!(parent.bitmap.as_ref().unwrap()[1] & 0x01 == 0);
+
+        child.try_update_ioperm(7, 2, false).unwrap();
+        assert!(child.bitmap.is_none());
+        assert!(parent.bitmap.as_ref().unwrap()[0] & 0x80 == 0);
+        assert!(parent.bitmap.as_ref().unwrap()[1] & 0x01 == 0);
     }
 }
 

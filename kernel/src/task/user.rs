@@ -75,7 +75,17 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 // before the next attempt.
                 let reason = loop {
                     let aspace = thr.proc_data.aspace();
-                    match uctx.run_with_return_hook(|uctx| thr.rseq_return_gate(uctx, &aspace)) {
+                    match uctx.run_with_return_hook(|uctx| {
+                        let action = thr.rseq_return_gate(uctx, &aspace);
+                        if matches!(action, axhal::uspace::UserReturnHookAction::EnterUser) {
+                            // The TSS map is CPU-local, while ioperm/iopl is
+                            // task-local. Refresh or invalidate it only at
+                            // this IRQ-disabled final return edge so a
+                            // migration cannot expose a prior task's ports.
+                            thr.install_user_io_permissions();
+                        }
+                        action
+                    }) {
                         UserReturnHookResult::Returned(reason) => break reason,
                         UserReturnHookResult::Retry => {
                             set_timer_state(&curr, TimerState::Kernel);

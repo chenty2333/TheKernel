@@ -146,6 +146,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 thekernel-linux-signal = { workspace = true, features = ["multitask"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+axcpu = "=0.3.0-preview.8"
 x86 = "0.52"
 page_table_multiarch = { version = "0.6", features = ["copy-from"] }
 

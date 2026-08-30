@@ -343,6 +343,12 @@ impl Thread {
             .with_current(|credential| credential.has_effective_capability(cap))
     }
 
+    /// Whether the task's frozen LSM stack denies raw I/O-port access.
+    pub(crate) fn ioport_locked_down(&self) -> bool {
+        self.credential
+            .with_current(super::security::locked_down_ioport)
+    }
+
     pub fn bounding_capability_enabled(&self, cap: u32) -> AxResult<bool> {
         if CapabilityState::cap_mask(cap).is_none() {
             return Err(AxError::InvalidInput);

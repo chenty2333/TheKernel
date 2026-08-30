@@ -450,6 +450,7 @@ impl CloneArgs {
             return Err(AxError::Interrupted);
         }
         let child_io_context = clone_io_context(flags, calling_thread)?;
+        let child_ioport = calling_thread.ioport_snapshot();
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
         // this CPU. Nudge its pinned recycler before allocating another child
@@ -720,6 +721,10 @@ impl CloneArgs {
                 version: 0,
             },
         )?;
+        // Linux inherits ioperm/iopl state for every fork/clone child. The
+        // state stays private after this point: the bitmap Arc is copied on
+        // either task's first ioperm mutation.
+        thr.install_ioport_snapshot(child_ioport);
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
         }

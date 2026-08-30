@@ -275,6 +275,20 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    /// Dispatches Linux's global I/O-port lockdown hook through the current
+    /// actor's frozen security stack. Lockdown is deny-first and does not
+    /// allocate or block.
+    pub(super) fn dispatch_locked_down_ioport(&self, actor: &Cred) -> AxResult<()> {
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            debug_assert_eq!(registered.id, actor_state.module_id);
+            registered
+                .module
+                .locked_down_ioport(actor.core(), actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_prepared_credential_capable(
         &self,
         source: &Cred,

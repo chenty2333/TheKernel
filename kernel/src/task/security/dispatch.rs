@@ -600,6 +600,19 @@ pub(in crate::task) fn capable_for_setid(
     .is_ok()
 }
 
+/// Returns whether an LSM lockdown policy denies raw x86 I/O-port access.
+///
+/// This is deliberately called after the caller's CAP_SYS_RAWIO check, just
+/// like Linux's `security_locked_down(LOCKDOWN_IOPORT)` path.
+pub(in crate::task) fn locked_down_ioport(actor: &Cred) -> bool {
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_locked_down_ioport(actor)
+        .is_err()
+}
+
 /// Checks namespace-creation authority carried by one exact prepared child.
 /// Commoncap evaluates the proposed credential, while stacked modules receive
 /// both the live source state and the still-private proposed state.

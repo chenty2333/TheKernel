@@ -967,6 +967,8 @@ pub(super) fn dispatch_syscall(
         Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::ioprio_get => sys_ioprio_get(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::ioprio_set => sys_ioprio_set(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::iopl => sys_iopl(uctx.arg0() as u32),
+        Sysno::ioperm => sys_ioperm(uctx.arg0(), uctx.arg1(), uctx.arg2() as i32),
 
         // task ops
         Sysno::execve => {

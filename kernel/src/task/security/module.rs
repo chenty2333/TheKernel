@@ -90,6 +90,23 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
         self.capable(context)
     }
 
+    /// Linux `security_locked_down(LOCKDOWN_IOPORT)` authorization.
+    ///
+    /// The hook is intentionally independent of capability authorization:
+    /// lockdown may deny an operation even after commoncap accepted
+    /// CAP_SYS_RAWIO.
+    fn locked_down_ioport(&self, _actor: &CoreCred) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn locked_down_ioport_with_credential_state(
+        &self,
+        actor: &CoreCred,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.locked_down_ioport(actor)
+    }
+
     /// Narrows commoncap authority derived from a fully prepared credential
     /// without treating that credential as an already-live actor.
     fn prepared_credential_capable(
@@ -620,6 +637,11 @@ pub(super) trait ErasedSecurityModule: Send + Sync {
         context: &CoreCapabilitySecurityContext<'_>,
         actor_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
+    fn locked_down_ioport(
+        &self,
+        actor: &CoreCred,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn prepared_credential_capable(
         &self,
         context: &CorePreparedCredentialCapabilityContext<'_>,
@@ -969,6 +991,18 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         SecurityModule::capable_with_credential_state(
             self,
             context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn locked_down_ioport(
+        &self,
+        actor: &CoreCred,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::locked_down_ioport_with_credential_state(
+            self,
+            actor,
             owned_credential_state(self, actor_state)?,
         )
     }

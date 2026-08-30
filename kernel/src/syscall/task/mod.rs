@@ -6,6 +6,7 @@ mod execve;
 mod exit;
 mod job;
 mod keys;
+mod ioport;
 mod module;
 mod ptrace;
 mod schedule;
@@ -13,6 +14,6 @@ mod thread;
 mod wait;
 
 pub use self::{
-    acct::*, clone::*, clone3::*, ctl::*, execve::*, exit::*, job::*, keys::*, module::*,
+    acct::*, clone::*, clone3::*, ctl::*, execve::*, exit::*, ioport::*, job::*, keys::*, module::*,
     ptrace::*, schedule::*, thread::*, wait::*,
 };
