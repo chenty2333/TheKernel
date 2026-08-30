@@ -26,7 +26,10 @@ pub(crate) use self::{
     cow::{PreparedCowHugeFrame, PreparedCowPage},
     cow::register_demoted_huge_backing,
     file::WritableMappingAdmission,
-    phys_pin::{PhysicalFramePins, PreparedPhysicalFramePins, prepare_physical_pin_registry},
+    phys_pin::{
+        PhysicalFramePins, PreparedPhysicalFramePins, any_frame_pinned,
+        prepare_physical_pin_registry,
+    },
     shared::PreparedFixedSharedMapping,
 };
 use super::{
@@ -509,15 +512,16 @@ impl DeferredUnmapBackend for Backend {
 }
 
 impl Backend {
-    /// Prepares the privately owned PMD frame used to collapse one anonymous
+    /// Prepares the privately owned PMD frame used to collapse one private
     /// 4 KiB COW run.  Translation and VMA publication deliberately remain
     /// the address-space transaction's responsibility.
     pub(crate) fn prepare_collapse_2m_frame(
         &self,
+        start: VirtAddr,
         sources: &[Option<PhysAddr>],
     ) -> AxResult<PreparedCowHugeFrame> {
         match self {
-            Self::Cow(cow) => cow.prepare_collapse_2m_frame(sources),
+            Self::Cow(cow) => cow.prepare_collapse_2m_frame(start, sources),
             Self::Linear(_) | Self::Shared(_) | Self::File(_) => Err(AxError::InvalidInput),
         }
     }
@@ -660,6 +664,11 @@ impl Backend {
     pub fn is_private_anonymous(&self) -> bool {
         !self.mapping_status().has_mapping_owner()
             && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
+    }
+
+    /// A MAP_PRIVATE anonymous or file-backed COW mapping.
+    pub(crate) fn is_private_cow(&self) -> bool {
+        matches!(self, Backend::Cow(_))
     }
 
     /// Linux's OOM reaper drops every private COW mapping, including a

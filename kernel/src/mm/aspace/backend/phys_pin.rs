@@ -317,6 +317,10 @@ impl PinnedFrameTable {
         }
         true
     }
+
+    fn is_pinned(&self, paddr: PhysAddr) -> bool {
+        self.find_node(paddr).is_some()
+    }
 }
 
 /// Installs one fully allocated shard table with only the pointer/owner move
@@ -617,6 +621,20 @@ pub(crate) fn defer_frame_dealloc_if_pinned(paddr: PhysAddr, page_size: PageSize
     .is_some_and(|table| table.defer_deallocation(paddr, page_size))
 }
 
+/// Returns whether any exact frame has an active physical pin. Collapse
+/// replaces source translations, so every pin duration—including AsyncIo
+/// DMA—must block it rather than merely delaying allocator reuse.
+pub(crate) fn any_frame_pinned(paddrs: impl IntoIterator<Item = PhysAddr>) -> bool {
+    paddrs.into_iter().any(|paddr| {
+        crate::mm::lock_mm_diagnosed!(
+            PINNED_FRAME_SHARDS[pin_shard_index(paddr)],
+            PhysPinDeallocProbeShard
+        )
+        .as_ref()
+        .is_some_and(|table| table.is_pinned(paddr))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -638,6 +656,20 @@ mod tests {
             // the table's large vectors are released after the shard unlocks.
             drop(table);
         }
+    }
+
+    #[test]
+    fn active_physical_pin_probe_tracks_async_owner_lifetime() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL.lock().unwrap();
+        reset_pin_registry();
+        let pinned = PhysAddr::from(0x50_0000);
+        let other = PhysAddr::from(0x51_0000);
+        let pins = pin_frames_admitted(alloc::vec![pinned]).unwrap();
+        assert!(any_frame_pinned([pinned]));
+        assert!(!any_frame_pinned([other]));
+        drop(pins);
+        assert!(!any_frame_pinned([pinned]));
+        reset_pin_registry();
     }
 
     fn paddrs_for_shard(shard_index: usize, count: usize, first_page: usize) -> Vec<PhysAddr> {

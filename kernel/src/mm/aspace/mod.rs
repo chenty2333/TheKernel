@@ -237,7 +237,7 @@ pub(crate) struct Collapse2MCandidateFacts {
     pub(crate) start: usize,
     pub(crate) length: usize,
     pub(crate) vma_covers_range: bool,
-    pub(crate) private_anonymous_cow: bool,
+    pub(crate) private_cow: bool,
     /// A write-protect registration changes the permission contract of a
     /// present leaf.  MISSING-only registrations do not: once every source
     /// PTE is resident, promotion can retain their fault-free semantics.
@@ -260,7 +260,7 @@ pub(crate) const fn collapse_2m_candidate_eligible(facts: Collapse2MCandidateFac
     facts.start & (COLLAPSE_2M_SIZE - 1) == 0
         && facts.length == COLLAPSE_2M_SIZE
         && facts.vma_covers_range
-        && facts.private_anonymous_cow
+        && facts.private_cow
         && !facts.has_uffd_write_protect
         && !facts.has_locked_pages
         && !facts.has_exact_long_term_cow_pin
@@ -2427,7 +2427,7 @@ impl AddrSpace {
         let end = VirtAddr::from(end_raw);
         let area = self.find_area(start);
         let vma_covers_range = area.is_some_and(|area| area.start() <= start && area.end() >= end);
-        let private_anonymous_cow = area.is_some_and(|area| area.backend().is_private_anonymous());
+        let private_cow = area.is_some_and(|area| area.backend().is_private_cow());
         let range = PageRange::new(start.as_usize(), length, PAGE_SIZE_4K).ok();
         let has_uffd_write_protect = range.is_some_and(|range| {
             self.uffd.as_ref().is_some_and(|state| {
@@ -2445,7 +2445,7 @@ impl AddrSpace {
             start: start.as_usize(),
             length,
             vma_covers_range,
-            private_anonymous_cow,
+            private_cow,
             has_uffd_write_protect,
             has_locked_pages: self.range_is_locked(start, length),
             // Exact pin ownership is established from the PTE source frames
@@ -2455,9 +2455,23 @@ impl AddrSpace {
         })
     }
 
-    /// Collapses one private anonymous COW PMD into a privately owned 2 MiB
-    /// leaf, materializing absent demand-zero leaves directly in the prepared
-    /// frame.
+    fn uffd_missing_registered_at(&self, vaddr: VirtAddr) -> bool {
+        let Ok(page) = PageRange::new(vaddr.as_usize(), PAGE_SIZE_4K, PAGE_SIZE_4K) else {
+            return false;
+        };
+        self.uffd.as_ref().is_some_and(|state| {
+            state
+                .registrations
+                .intersecting(self.address_space_id, page)
+                .any(|registration| {
+                    registration.mode().bits() & UffdRegisterMode::MISSING.bits() != 0
+                })
+        })
+    }
+
+    /// Collapses one private COW PMD into a privately owned 2 MiB leaf,
+    /// materializing absent anonymous or file-backed leaves directly in the
+    /// prepared frame.
     ///
     /// The source leaves are first made read-only and observed through a TLB
     /// grace period, so copying cannot race a stale writable translation.  A
@@ -2469,6 +2483,7 @@ impl AddrSpace {
         if !self.collapse_2m_candidate_eligible(start, COLLAPSE_2M_SIZE) {
             return Err(AxError::InvalidInput);
         }
+        self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
         // This is the only fallible bookkeeping step after PDE publication;
         // admit it before changing either metadata or translations.
         let next_topology_generation = self.next_topology_generation()?;
@@ -2505,18 +2520,8 @@ impl AddrSpace {
                     leaves.push((vaddr, paddr, flags, page_size));
                 }
                 Err(PagingError::NotMapped) => {
-                    let page = PageRange::new(vaddr.as_usize(), PAGE_SIZE_4K, PAGE_SIZE_4K)
-                        .map_err(mm_error)?;
-                    let uffd_missing = self.uffd.as_ref().is_some_and(|state| {
-                        state
-                            .registrations
-                            .intersecting(self.address_space_id, page)
-                            .any(|registration| {
-                                registration.mode().bits() & UffdRegisterMode::MISSING.bits() != 0
-                            })
-                    });
-                    if uffd_missing {
-                        return Err(AxError::InvalidInput);
+                    if self.uffd_missing_registered_at(vaddr) {
+                        return Err(AxError::ResourceBusy);
                     }
                     source_slots.push(None);
                 }
@@ -2545,6 +2550,7 @@ impl AddrSpace {
         if leaves
             .iter()
             .any(|(_, frame, ..)| pinned_frames.binary_search(frame).is_ok())
+            || any_frame_pinned(leaves.iter().map(|(_, frame, ..)| *frame))
         {
             return Err(AxError::ResourceBusy);
         }
@@ -2572,7 +2578,7 @@ impl AddrSpace {
         }
         drop(self.synchronize_tlb_after_mutation());
 
-        let mut prepared = match source_backend.prepare_collapse_2m_frame(&source_slots) {
+        let mut prepared = match source_backend.prepare_collapse_2m_frame(start, &source_slots) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.restore_collapse_2m_source_permissions(&leaves)?;
@@ -2974,6 +2980,7 @@ impl AddrSpace {
         if !PageSize::Size2M.is_aligned(start.as_usize()) {
             return Err(AxError::InvalidInput);
         }
+        self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
         let end = start + COLLAPSE_2M_SIZE;
         let source_backend = self
             .find_area(start)
@@ -2981,12 +2988,15 @@ impl AddrSpace {
             .ok_or(AxError::NoMemory)?
             .backend()
             .clone();
-        if !source_backend.is_private_anonymous() || source_backend.page_size() != PageSize::Size2M
+        if !source_backend.is_private_cow() || source_backend.page_size() != PageSize::Size2M
         {
             return Err(AxError::InvalidInput);
         }
         let (source_frame, source_flags, source_size) =
             self.pt.query(start).map_err(|error| match error {
+                PagingError::NotMapped if self.uffd_missing_registered_at(start) => {
+                    AxError::ResourceBusy
+                }
                 PagingError::NotMapped => AxError::NoMemory,
                 _ => AxError::BadAddress,
             })?;
@@ -3249,7 +3259,7 @@ impl AddrSpace {
             let demote_private = self.areas.find(candidate).is_some_and(|area| {
                 area.start() == candidate
                     && area.size() == COLLAPSE_2M_SIZE
-                    && area.backend().is_private_anonymous()
+                    && area.backend().is_private_cow()
                     && area.backend().page_size() == PageSize::Size2M
             });
             if demote_private {
@@ -6725,7 +6735,7 @@ mod tests {
             start: COLLAPSE_2M_SIZE,
             length: COLLAPSE_2M_SIZE,
             vma_covers_range: true,
-            private_anonymous_cow: true,
+            private_cow: true,
             has_uffd_write_protect: false,
             has_locked_pages: false,
             has_exact_long_term_cow_pin: false,
@@ -6751,7 +6761,7 @@ mod tests {
         assert!(!collapse_2m_candidate_eligible(crosses_vma));
 
         let mut non_private = facts;
-        non_private.private_anonymous_cow = false;
+        non_private.private_cow = false;
         assert!(!collapse_2m_candidate_eligible(non_private));
     }
 

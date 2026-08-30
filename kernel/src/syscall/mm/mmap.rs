@@ -1688,7 +1688,7 @@ fn process_madvise_collapse_shared_locked(
         let Some(pages) = guards[target_index].shared_pages_at(start) else {
             let result = if guards[target_index]
                 .find_area(start)
-                .is_some_and(|area| area.backend().is_private_anonymous())
+                .is_some_and(|area| area.backend().is_private_cow())
             {
                 guards[target_index].collapse_private_cow_2m(start)
             } else {
@@ -1788,20 +1788,23 @@ fn process_madvise_collapse_locked(
         return Ok(());
     };
     let unit = PageSize::Size2M as usize;
+    let mut first_error = None;
     while cursor < end {
         let start = VirtAddr::from(cursor);
         let result = if aspace
             .find_area(start)
-            .is_some_and(|area| area.backend().is_private_anonymous())
+            .is_some_and(|area| area.backend().is_private_cow())
         {
             aspace.collapse_private_cow_2m(start)
         } else {
             aspace.collapse_alias_preserving_2m(start)
         };
-        result?;
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
         cursor = cursor.checked_add(unit).ok_or(AxError::InvalidInput)?;
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
