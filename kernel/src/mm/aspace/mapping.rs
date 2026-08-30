@@ -171,6 +171,13 @@ impl FileMappingLease {
         Ok(relocated)
     }
 
+    pub(super) fn rebased(&self, mapping_start: VirtAddr, file_offset: u64) -> Self {
+        let mut rebased = self.clone();
+        rebased.mapping_start = mapping_start;
+        rebased.file_offset = file_offset;
+        rebased
+    }
+
     fn compatible_with(&self, other: &Self) -> bool {
         self.ofd_key == other.ofd_key
             && Arc::ptr_eq(
@@ -352,6 +359,19 @@ impl MappingStatus {
                 .as_ref()
                 .map(|file| file.relocated(old_start, new_start))
                 .transpose()?,
+            sealed: self.sealed,
+        })
+    }
+
+    pub(super) fn rebased_file_mapping(
+        &self,
+        mapping_start: VirtAddr,
+        file_offset: u64,
+    ) -> AxResult<Self> {
+        let file = self.file.as_ref().ok_or(AxError::InvalidInput)?;
+        Ok(Self {
+            file: Some(file.rebased(mapping_start, file_offset)),
+            file_like: self.file_like.clone(),
             sealed: self.sealed,
         })
     }

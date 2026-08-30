@@ -1071,6 +1071,37 @@ impl FileBackend {
         self.clone_for_range_with_id(old_start, new_start, aspace, self.0.map_id.clone())
     }
 
+    /// Clone the same cached file object at an explicit file-page cursor for
+    /// `remap_file_pages`.  The new listener is registered before publication;
+    /// mapping status is rebased so VMA ownership and futex/file offsets agree.
+    pub(crate) fn clone_rebased(
+        &self,
+        start: VirtAddr,
+        offset_page: u32,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Self> {
+        let inner = new_file_backend_inner(
+            start,
+            self.0.cache.clone(),
+            eviction_owner(aspace),
+            self.0.flags,
+            offset_page,
+            self.0.file_end,
+            self.0.map_id.clone(),
+            self.0.futex_handle.clone(),
+        );
+        inner.register_listener(aspace)?;
+        let byte_offset = u64::from(offset_page)
+            .checked_mul(PAGE_SIZE_4K as u64)
+            .ok_or(AxError::InvalidInput)?;
+        let status = self.2.rebased_file_mapping(start, byte_offset)?;
+        let backend = Self::inactive_with_status(inner, status);
+        if self.writable_segment_active() {
+            backend.activate_writable_segment()?;
+        }
+        Ok(backend)
+    }
+
     pub(crate) fn duplicate_mapping(
         &self,
         old_start: VirtAddr,

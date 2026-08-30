@@ -770,6 +770,24 @@ impl Backend {
         }
     }
 
+    pub(crate) fn clone_file_rebased(
+        &self,
+        start: VirtAddr,
+        page_offset: usize,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Self> {
+        match self {
+            Backend::File(backend) => backend
+                .clone_rebased(
+                    start,
+                    u32::try_from(page_offset).map_err(|_| AxError::InvalidInput)?,
+                    aspace,
+                )
+                .map(Backend::File),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
     pub fn migrate_present_pages(
         &self,
         old_start: VirtAddr,
