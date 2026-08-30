@@ -2769,6 +2769,7 @@ pub fn sys_truncate(
 
 pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     debug!("sys_ftruncate <= {fd} {length}");
+    ftruncate_length_errno(length)?;
     let file_like = get_file_like(fd)?;
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
     // Linux v6.12.103 fs/open.c uses fdget() without FMODE_PATH: an O_PATH
@@ -2776,9 +2777,6 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     // subsequent do_ftruncate() checks S_ISREG and FMODE_WRITE, returning
     // EINVAL for either failure, all before the RLIMIT_FSIZE check below.
     ftruncate_admission_errno(true, kind, file_like.is_path_only(), true)?;
-    if length < 0 {
-        return Err(AxError::InvalidInput);
-    }
     if let Ok(secret) = file_like.downcast::<crate::file::SecretMemFile>() {
         secret.check_truncate()?;
         if (length as u64) > secret.size() {
@@ -2840,6 +2838,14 @@ fn ftruncate_admission_errno(
         return Err(AxError::InvalidInput);
     }
     Ok(())
+}
+
+fn ftruncate_length_errno(length: __kernel_off_t) -> AxResult {
+    if length < 0 {
+        Err(AxError::InvalidInput)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn sys_fallocate(
@@ -6751,6 +6757,15 @@ mod tests {
                 ftruncate_admission_errno(fd_found, kind, path_only, writable),
                 Err(expected)
             );
+        }
+    }
+
+    #[test]
+    fn ftruncate_negative_length_precedes_invalid_and_opath_fd_admission() {
+        for (fd_found, path_only) in [(false, false), (true, true)] {
+            let result = ftruncate_length_errno(-1)
+                .and_then(|()| ftruncate_admission_errno(fd_found, FileLikeKind::Regular, path_only, true));
+            assert_eq!(result, Err(AxError::InvalidInput));
         }
     }
 }

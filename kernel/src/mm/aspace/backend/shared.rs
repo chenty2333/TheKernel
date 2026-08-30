@@ -86,6 +86,10 @@ pub struct SharedPages {
     // helper can accidentally obtain a direct-map alias.
     secret_frames: Option<Mutex<HashMap<usize, SecretFrame>>>,
     secret_size: Option<AtomicUsize>,
+    // Growing a zero-length secret backing publishes its page count before
+    // its logical EOF. Faults therefore either see the old EOF and SIGBUS or
+    // the fully admitted new range.
+    secret_growth: Option<Mutex<()>>,
     // `futex_id` is queried while an IRQ-safe futex queue gate is held. Keep
     // the published length separate from `phys_pages`: taking that mutex in
     // the gate would be a blocking operation. The backing only grows, so a
@@ -103,9 +107,6 @@ impl SharedPages {
     /// Allocates a fixed, 4K secret backing.  Kernel copies use the secret
     /// window; VMA population consumes only the physical frame number.
     pub(crate) fn new_secret_fixed(size: usize) -> AxResult<Self> {
-        if size == 0 {
-            return Err(AxError::InvalidInput);
-        }
         let count = size.div_ceil(PAGE_SIZE_4K);
         Ok(Self {
             backing_key: SharedBackingKey::allocate()?,
@@ -115,6 +116,7 @@ impl SharedPages {
             }),
             secret_frames: Some(Mutex::new(HashMap::new())),
             secret_size: Some(AtomicUsize::new(size)),
+            secret_growth: Some(Mutex::new(())),
             published_len: AtomicUsize::new(count),
             size: PageSize::Size4K,
             fixed: true,
@@ -187,6 +189,7 @@ impl SharedPages {
             }),
             secret_frames: None,
             secret_size: None,
+            secret_growth: None,
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
@@ -215,6 +218,24 @@ impl SharedPages {
 
     pub fn is_empty(&self) -> bool {
         self.phys_pages.lock().pages.is_empty()
+    }
+
+    /// Publishes the first nonzero logical size for a zero-length secret
+    /// backing.  Existing mappings retain this Arc and begin faulting pages
+    /// only after this publication.
+    pub(crate) fn set_secret_size_once(&self, size: usize) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        let secret_size = self.secret_size.as_ref().ok_or(AxError::InvalidInput)?;
+        let _growth = self.secret_growth.as_ref().expect("secret growth gate").lock();
+        if secret_size.load(Ordering::Acquire) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        self.published_len
+            .store(size.div_ceil(PAGE_SIZE_4K), Ordering::Release);
+        secret_size.store(size, Ordering::Release);
+        Ok(())
     }
 
     pub fn ensure_len(&self, len: usize) -> AxResult {
@@ -1226,6 +1247,21 @@ mod tests {
         assert!(!backend.faults_with_sigbus(VirtAddr::from(0x4000)));
         assert!(!backend.faults_with_sigbus(VirtAddr::from(0x5000)));
         assert!(backend.faults_with_sigbus(VirtAddr::from(0x6000)));
+    }
+
+    #[test]
+    fn zero_length_secret_backing_faults_every_mapping_access() {
+        let pages = Arc::new(SharedPages::new_secret_fixed(0).unwrap());
+        let backend = SharedBackend {
+            start: VirtAddr::from(0x4000),
+            page_offset: 0,
+            pages,
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(1),
+            status: MappingStatus::default(),
+        };
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x4000)));
+        assert!(backend.faults_with_sigbus(VirtAddr::from(0x5000)));
     }
 
     #[test]

@@ -351,7 +351,7 @@ impl FixedSharedMmapRegion {
         let length = pages.total_bytes();
         let page_size = pages.page_size() as usize;
         if !pages.is_fixed()
-            || length == 0
+            || (length == 0 && !pages.is_secret())
             || !file_offset.is_multiple_of(page_size as u64)
             || may_protect.contains(FileMmapProtection::EXECUTE)
         {
