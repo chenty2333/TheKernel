@@ -3037,17 +3037,6 @@ impl AddrSpace {
             prepare_unmap_mapping_mutations(&self.areas, &self.mapping_identities, start, size)?;
         let next_topology_generation = self.next_topology_generation()?;
         let policy = self.prepare_remap_policy(start, size, size)?;
-        // Do not use `unmap()` below: that helper commits its UFFD plan
-        // immediately.  A nonlinear replacement must retain both outcomes
-        // until the replacement has either fully published or been restored.
-        let uffd_plan = self.preflight_remap_uffd(
-            UffdRemapKind::Move,
-            true,
-            start,
-            size,
-            start,
-            size,
-        )?;
         // `mlock` can cover only a prefix, suffix, or interior pages of a
         // VMA.  `prepare_remap_policy` snapshots those exact intervals before
         // unmap clears the ledger, so the replacement neither drops the
@@ -3081,6 +3070,19 @@ impl AddrSpace {
             cursor = end;
         }
         if cursor != range.end { return Err(AxError::InvalidInput); }
+        // Arm UFFD only after every backend and rollback candidate has been
+        // built.  From here, every failure consumes this plan exactly once.
+        // Do not use `unmap()` below: that helper commits its UFFD plan
+        // immediately.  A nonlinear replacement must retain both outcomes
+        // until the replacement has either fully published or been restored.
+        let uffd_plan = self.preflight_remap_uffd(
+            UffdRemapKind::Move,
+            true,
+            start,
+            size,
+            start,
+            size,
+        )?;
         if let Err(error) = self.unmap_areas_with_tlb_grace(start, size) {
             deferred_wake.merge(self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Preserved));
             return Err(error.into());
