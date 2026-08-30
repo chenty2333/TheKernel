@@ -29,8 +29,8 @@ use crate::{
     mm::map_usercopy_error,
     task::{
         AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
-        get_process_including_zombie, get_task, get_visible_task,
-        has_pending_syscall_signal, prepare_clock_sleep, process_domain,
+        get_process_including_zombie, get_task, get_visible_task, has_pending_syscall_signal,
+        prepare_clock_sleep, process_domain,
         security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
         try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
@@ -374,9 +374,12 @@ fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
 }
 
 fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
+    // SCHED_EXT is a queryable Linux policy even though this kernel has no
+    // sched_ext execution class.
+    const SCHED_EXT: u32 = 7;
     match policy as u32 {
         SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN as isize, RT_PRIORITY_MAX as isize)),
-        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Ok((0, 0)),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -1314,7 +1317,8 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                         continue;
                     };
                     let thread = task.as_thread();
-                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.proc_data.pid_ns())
+                    {
                         continue;
                     }
                     if thread.current_cred().ids().ruid == uid {
@@ -1924,6 +1928,16 @@ mod tests {
         assert_eq!(
             linux_priority_bounds(SCHED_DEADLINE as i32).unwrap(),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn sched_get_priority_max_accepts_sched_ext_only_as_plain_i32_policy() {
+        const SCHED_EXT: i32 = 7;
+        assert_eq!(sys_sched_get_priority_max(SCHED_EXT), Ok(0));
+        assert_eq!(
+            sys_sched_get_priority_max(SCHED_EXT | SCHED_RESET_ON_FORK as i32),
+            Err(AxError::InvalidInput)
         );
     }
 
