@@ -295,6 +295,7 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
+const FILEID_INVALID: i32 = 255;
 const AT_HANDLE_FID: i32 = 0x200;
 const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
@@ -820,6 +821,9 @@ pub fn sys_name_to_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
+        return Err(AxError::InvalidInput);
+    }
     let unique = flags & AT_HANDLE_MNT_ID_UNIQUE != 0;
     // Linux writes the mount ID before reporting a short handle buffer.
     if unique {
@@ -841,7 +845,7 @@ pub fn sys_name_to_handle_at(
     if header.handle_bytes < required_bytes {
         let required_header = LinuxFileHandle {
             handle_bytes: required_bytes,
-            handle_type: exported.handle_type,
+            handle_type: FILEID_INVALID,
         };
         let required_header = unsafe {
             slice::from_raw_parts(
@@ -853,9 +857,6 @@ pub fn sys_name_to_handle_at(
             .write_bytes(handle as usize, required_header)
             .map_err(map_usercopy_error)?;
         return Err(LinuxError::EOVERFLOW.into());
-    }
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
-        return Err(AxError::InvalidInput);
     }
     capability
         .write_bytes(handle as usize, &required_bytes.to_ne_bytes())
@@ -933,7 +934,7 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
+    if header.handle_bytes == 0 || header.handle_bytes > MAX_FILE_HANDLE_SZ {
         return Err(AxError::InvalidInput);
     }
 
@@ -966,6 +967,14 @@ pub fn sys_open_by_handle_at(
         return Err(LinuxError::ESTALE.into());
     }
     let security = OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    if (flags as u32 & O_TMPFILE) == O_TMPFILE {
+        if !location.is_dir() {
+            return Err(AxError::NotADirectory);
+        }
+        let mut fs = FsContext::new(location);
+        let mut policy = Openat2PathwalkPolicy::legacy()?;
+        return open_tmpfile_in_fs(&mut fs, ".", flags, 0, &security, &mut policy);
+    }
     open_resolved_location_with_policy(
         "",
         location,
@@ -1089,6 +1098,9 @@ fn open_resolved_location_with_policy(
         && (flags as u32) & O_TRUNC != 0
         && loc.node_type() == NodeType::RegularFile;
     let open_result = (|| {
+        if opened_existing && (flags as u32 & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
+            return Err(AxError::AlreadyExists);
+        }
         enforce_trailing_slash_directory(path, &loc)?;
         enforce_special_open_rules(&loc, flags, security)?;
         if loc.is_dir() && invalid_directory_open(flags) {
