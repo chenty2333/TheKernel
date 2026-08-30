@@ -2,7 +2,7 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
+use axfs::{FadviseReadahead, FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
 use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, NodeType, PhysicalIoSegment};
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
@@ -3052,22 +3052,47 @@ pub fn sys_fadvise64(
     advice: u32,
 ) -> AxResult<isize> {
     debug!("sys_fadvise64 <= fd: {fd}, offset: {offset}, len: {len}, advice: {advice}");
+    // fdget comes first in Linux too: a bad descriptor wins over malformed
+    // range/advice arguments. Keep this exact retained OFD for every later
+    // check so close-and-reuse cannot change the target half way through.
+    let file_like = get_file_like(fd)?;
+    file_like.check_io_access()?;
     if offset < 0 || len < 0 {
         return Err(AxError::InvalidInput);
     }
     if advice > 5 {
         return Err(AxError::InvalidInput);
     }
-    let file_like = get_file_like(fd)?;
-    file_like.check_io_access()?;
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Fifo | FileLikeKind::Socket => {
             return Err(AxError::from(LinuxError::ESPIPE));
         }
         FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
     }
-    if let Some(file) = file_like.downcast_ref::<File>() {
-        file.inner().access(FileFlags::empty())?;
+    let Some(file) = file_like.downcast_ref::<File>() else {
+        return Ok(0);
+    };
+    file.inner().access(FileFlags::empty())?;
+
+    let offset = offset as u64;
+    let len = len as u64;
+    let end = if len == 0 {
+        // A zero length extends through the EOF sampled for this operation.
+        file.inner().location().metadata()?.size
+    } else {
+        offset.checked_add(len).ok_or(AxError::InvalidInput)?
+    };
+    let effective_len = end.saturating_sub(offset);
+    match advice {
+        0 => file.inner().set_fadvise_readahead(FadviseReadahead::Normal),
+        1 => file.inner().set_fadvise_readahead(FadviseReadahead::Random),
+        2 => file
+            .inner()
+            .set_fadvise_readahead(FadviseReadahead::Sequential),
+        3 => file.inner().fadvise_willneed(offset, effective_len)?,
+        4 => file.inner().fadvise_dontneed(offset, effective_len)?,
+        5 => file.inner().fadvise_noreuse(offset, effective_len)?,
+        _ => unreachable!("advice validated above"),
     }
     Ok(0)
 }
