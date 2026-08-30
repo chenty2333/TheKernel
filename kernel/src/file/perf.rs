@@ -27,24 +27,36 @@ const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 /// An enabled software perf event. `accumulated` is always a complete stopped
 /// interval; the running interval is sampled atomically from the monotonic
 /// clock, avoiding a reader/ioctl lock in the common read path.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SoftwareEvent {
+    CpuClock,
+    TaskClock,
+    PageFaults,
+    ContextSwitches,
+}
+
 pub struct PerfEventFile {
     id: u64,
+    event: SoftwareEvent,
     state: Mutex<PerfEventState>,
 }
 
 struct PerfEventState {
     enabled: bool,
+    running: bool,
     accumulated: u64,
     started: u64,
 }
 
 impl PerfEventFile {
-    pub fn new(id: u64, disabled: bool) -> Arc<Self> {
+    pub fn new(id: u64, event: SoftwareEvent, disabled: bool) -> Arc<Self> {
         let now = monotonic_time_nanos();
         Arc::new(Self {
             id,
+            event,
             state: Mutex::new(PerfEventState {
                 enabled: !disabled,
+                running: false,
                 accumulated: 0,
                 started: now,
             }),
@@ -53,7 +65,7 @@ impl PerfEventFile {
 
     fn count(&self) -> u64 {
         let state = self.state.lock();
-        if state.enabled {
+        if state.running {
             state
                 .accumulated
                 .saturating_add(monotonic_time_nanos().saturating_sub(state.started))
@@ -64,18 +76,18 @@ impl PerfEventFile {
 
     fn disable(&self) {
         let mut state = self.state.lock();
-        if state.enabled {
+        if state.running {
             state.accumulated = state
                 .accumulated
                 .saturating_add(monotonic_time_nanos().saturating_sub(state.started));
-            state.enabled = false;
+            state.running = false;
         }
+        state.enabled = false;
     }
 
     fn enable(&self) {
         let mut state = self.state.lock();
         if !state.enabled {
-            state.started = monotonic_time_nanos();
             state.enabled = true;
         }
     }
@@ -84,6 +96,42 @@ impl PerfEventFile {
         let mut state = self.state.lock();
         state.accumulated = 0;
         state.started = monotonic_time_nanos();
+    }
+
+    pub(crate) fn on_enter(&self) {
+        if !matches!(
+            self.event,
+            SoftwareEvent::CpuClock | SoftwareEvent::TaskClock
+        ) {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.enabled && !state.running {
+            state.started = monotonic_time_nanos();
+            state.running = true;
+        }
+    }
+
+    pub(crate) fn on_leave(&self) {
+        let mut state = self.state.lock();
+        if state.running {
+            state.accumulated = state
+                .accumulated
+                .saturating_add(monotonic_time_nanos().saturating_sub(state.started));
+            state.running = false;
+        }
+        if state.enabled && self.event == SoftwareEvent::ContextSwitches {
+            state.accumulated = state.accumulated.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn on_fault(&self) {
+        if self.event == SoftwareEvent::PageFaults {
+            let mut state = self.state.lock();
+            if state.enabled {
+                state.accumulated = state.accumulated.saturating_add(1);
+            }
+        }
     }
 }
 

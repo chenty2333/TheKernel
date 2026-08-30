@@ -5,15 +5,19 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axtask::current;
 
 use crate::{
-    file::{PerfEventFile, add_file_like},
+    file::{PerfEventFile, SoftwareEvent, add_file_like},
     mm::{UserMemoryCapability, map_usercopy_error},
+    task::AsThread,
 };
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
+const PERF_COUNT_SW_PAGE_FAULTS: u64 = 2;
+const PERF_COUNT_SW_CONTEXT_SWITCHES: u64 = 3;
 const PERF_FLAG_FD_NO_GROUP: u64 = 1;
 const PERF_FLAG_PID_CGROUP: u64 = 4;
 const PERF_FLAG_FD_CLOEXEC: u64 = 8;
@@ -80,20 +84,23 @@ pub(crate) fn sys_perf_event_open(
     if group_fd != -1 && flags & PERF_FLAG_FD_NO_GROUP == 0 {
         return Err(AxError::OperationNotSupported);
     }
-    if attr.event_type != PERF_TYPE_SOFTWARE
-        || !matches!(
-            attr.config,
-            PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
-        )
-    {
+    if attr.event_type != PERF_TYPE_SOFTWARE {
         return Err(AxError::OperationNotSupported);
     }
+    let event = match attr.config {
+        PERF_COUNT_SW_CPU_CLOCK => SoftwareEvent::CpuClock,
+        PERF_COUNT_SW_TASK_CLOCK => SoftwareEvent::TaskClock,
+        PERF_COUNT_SW_PAGE_FAULTS => SoftwareEvent::PageFaults,
+        PERF_COUNT_SW_CONTEXT_SWITCHES => SoftwareEvent::ContextSwitches,
+        _ => return Err(AxError::OperationNotSupported),
+    };
     // Sampling, output routing and read-format extensions are not fabricated.
     if attr.sample_period != 0 || attr.sample_type != 0 || attr.read_format != 0 {
         return Err(AxError::OperationNotSupported);
     }
     let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    let file = PerfEventFile::new(id, attr.flags & ATTR_DISABLED != 0);
+    let file = PerfEventFile::new(id, event, attr.flags & ATTR_DISABLED != 0);
+    current().as_thread().attach_perf_event(&file)?;
     add_file_like(
         file as Arc<dyn crate::file::FileLike>,
         flags & PERF_FLAG_FD_CLOEXEC != 0,
