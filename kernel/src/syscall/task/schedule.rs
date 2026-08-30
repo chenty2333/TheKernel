@@ -411,20 +411,55 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
-    let mut state = sched_state(task);
-    let realtime = matches!(state.class, SchedClass::Fifo | SchedClass::RoundRobin);
-    scheduler_authority_snapshot(task)?
-        .authorize(SchedulerSecurityOperation::SetParam { realtime })?;
-    match state.class {
-        SchedClass::Fifo | SchedClass::RoundRobin => {
-            state.rt_priority = validate_rt_priority(priority)?;
-        }
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+    let (actor_task, actor_cred) = scheduler_actor_snapshot();
+    let result = update_sched_state_versioned_with_reset(task, |commit| {
+        let realtime = matches!(
+            commit.state.class,
+            SchedClass::Fifo | SchedClass::RoundRobin
+        );
+        let new_rt_priority = if realtime {
+            validate_rt_priority(priority)?
+        } else {
             validate_static_priority(priority)?;
-            state.rt_priority = 0;
+            0
+        };
+        let target_cred = scheduler_target_credential(&actor_task, &actor_cred, task)?;
+        let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+        let rlimit_rtprio = target_thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current;
+        SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred).authorize(
+            SchedulerSecurityOperation::SetParam {
+                realtime,
+                old_rt_priority: commit.state.rt_priority,
+                new_rt_priority,
+                rlimit_rtprio,
+            },
+        )?;
+        let mut state = commit.state;
+        state.rt_priority = new_rt_priority;
+        Ok((state, commit.reset_on_fork))
+    });
+    match result {
+        Ok(Ok(commit)) => {
+            publish_sched_commit(task, commit);
+            Ok(0)
         }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(match error {
+            TaskSchedError::Unsupported => AxError::OperationNotSupported,
+            TaskSchedError::TaskExited => AxError::NoSuchProcess,
+            TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+            TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+        }),
     }
-    apply_sched_state(task, state)
+}
+
+fn validate_sched_setparam_arguments(pid: i32, param: *const SchedParam) -> AxResult {
+    // Linux rejects an invalid pid before touching the user pointer.  Keeping
+    // this separate makes that errno ordering explicit and testable.
+    if pid < 0 || param.is_null() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
@@ -901,9 +936,7 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
     pid: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    if param.is_null() {
-        return Err(AxError::InvalidInput);
-    }
+    validate_sched_setparam_arguments(pid, param)?;
     let priority = unsafe {
         param
             .vm_read_uninit(memory)
@@ -911,7 +944,13 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .sched_priority;
-    let task = sched_target(pid)?;
+    let task = if pid == 0 {
+        current().clone()
+    } else {
+        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns)
+            .ok_or(AxError::NoSuchProcess)?
+    };
     update_sched_param(&task, priority)
 }
 
@@ -2059,6 +2098,18 @@ mod tests {
         assert_eq!(
             linux_policy_from_class(SchedClass::Normal, false),
             SCHED_NORMAL as i32
+        );
+    }
+
+    #[test]
+    fn sched_setparam_rejects_negative_pid_before_user_pointer() {
+        assert_eq!(
+            validate_sched_setparam_arguments(-1, core::ptr::null()),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_sched_setparam_arguments(0, core::ptr::null()),
+            Err(AxError::InvalidInput)
         );
     }
 

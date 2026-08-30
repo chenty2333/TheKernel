@@ -4913,7 +4913,12 @@ fn credential_caller_scheduler_child_cannot_administer_ancestor() {
 
     for operation in [
         SchedulerSecurityOperation::SetAffinity,
-        SchedulerSecurityOperation::SetParam { realtime: false },
+        SchedulerSecurityOperation::SetParam {
+            realtime: false,
+            old_rt_priority: 0,
+            new_rt_priority: 0,
+            rlimit_rtprio: 0,
+        },
     ] {
         assert_eq!(
             dispatch_scheduler(&scheduler_context(&actor, &root, operation)),
@@ -4935,7 +4940,12 @@ fn credential_caller_scheduler_capable_ancestor_administers_child() {
     dispatch_scheduler(&scheduler_context(
         &actor,
         &target,
-        SchedulerSecurityOperation::SetParam { realtime: true },
+        SchedulerSecurityOperation::SetParam {
+            realtime: true,
+            old_rt_priority: 1,
+            new_rt_priority: 2,
+            rlimit_rtprio: 0,
+        },
     ))
     .unwrap();
 }
