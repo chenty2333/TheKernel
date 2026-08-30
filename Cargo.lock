@@ -508,6 +508,7 @@ dependencies = [
  "scope-local",
  "spin 0.10.0",
  "starry-fatfs",
+ "thekernel-axtask",
  "thekernel-readiness-adapter",
 ]
 

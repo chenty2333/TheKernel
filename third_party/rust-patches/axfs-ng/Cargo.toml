@@ -67,6 +67,10 @@ version = "=0.1.0"
 [dependencies.axsync]
 version = "=0.3.0-preview.2"
 
+[dependencies.axtask]
+package = "thekernel-axtask"
+version = "=0.1.0"
+
 [dependencies.bitflags]
 version = "2.10"
 

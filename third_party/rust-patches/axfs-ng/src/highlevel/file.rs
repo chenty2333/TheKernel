@@ -1,6 +1,6 @@
 use alloc::{
     boxed::Box,
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -39,6 +39,7 @@ use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 #[cfg(target_os = "none")]
 use axsync::Mutex;
+use axtask::WaitQueue;
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
 #[cfg(feature = "ext4")]
@@ -2967,12 +2968,51 @@ pub(crate) fn record_file_sync_data_only_metadata_fallback() {
     record_cached_file_counter(&SYNC_DATA_ONLY_METADATA_FALLBACKS, 1);
 }
 
+struct DirtyWritebackError {
+    error: VfsError,
+    errseq_published: bool,
+    worker_must_publish: bool,
+}
+
+impl From<VfsError> for DirtyWritebackError {
+    fn from(error: VfsError) -> Self {
+        Self {
+            error,
+            errseq_published: false,
+            worker_must_publish: false,
+        }
+    }
+}
+
+impl DirtyWritebackError {
+    /// Converts the lower-level result returned by a real page writeback.
+    /// This is the only error class a queued range-writeback worker may turn
+    /// into an asynchronous errseq event.  SG completion failures are already
+    /// published by the submit/completion path; the synchronous fallback is
+    /// deliberately deferred until the range worker owns its completion.
+    fn completion(error: VfsError, errseq_published: bool) -> Self {
+        Self {
+            error,
+            errseq_published,
+            worker_must_publish: true,
+        }
+    }
+}
+
+/// A range-writeback error that has reached the page writeback layer.  Setup
+/// failures (range leases, node lookup, and argument validation) remain plain
+/// VFS errors and must not be published as asynchronous completion failures.
+enum RangeSyncError {
+    Immediate(VfsError),
+    Writeback(DirtyWritebackError),
+}
+
 fn flush_dirty_page_list_locked(
     shared: &CachedFileShared,
     file: &FileNode,
     mut dirty_pages: Vec<u32>,
     range_flush: bool,
-) -> VfsResult<()> {
+) -> Result<(), DirtyWritebackError> {
     let file_len = file.len()?;
     dirty_pages.sort_unstable();
 
@@ -3041,7 +3081,11 @@ fn flush_dirty_page_list_locked(
                                 publish_async_dirty_writeback_completion_error(file, VfsError::Io);
                             }
                             finish_sg_dirty_writeback_run(shared, &run, false);
-                            return Err(VfsError::Io);
+                            return Err(DirtyWritebackError {
+                                error: VfsError::Io,
+                                errseq_published: accepted_async_submit,
+                                worker_must_publish: false,
+                            });
                         }
                         Err(err) => {
                             record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
@@ -3049,7 +3093,11 @@ fn flush_dirty_page_list_locked(
                                 publish_async_dirty_writeback_completion_error(file, err);
                             }
                             finish_sg_dirty_writeback_run(shared, &run, false);
-                            return Err(err);
+                            return Err(DirtyWritebackError {
+                                error: err,
+                                errseq_published: accepted_async_submit,
+                                worker_must_publish: false,
+                            });
                         }
                     }
                     start = end;
@@ -3090,13 +3138,13 @@ fn flush_dirty_page_list_locked(
                 if async_enabled {
                     record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
                 }
-                return Err(VfsError::Io);
+                return Err(DirtyWritebackError::completion(VfsError::Io, false));
             }
             Err(err) => {
                 if async_enabled {
                     record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
                 }
-                return Err(err);
+                return Err(DirtyWritebackError::completion(err, false));
             }
         }
         start = end;
@@ -3118,6 +3166,7 @@ fn flush_dirty_page_list(
     )?;
     let _writeback_guard = shared.writeback_lock.read();
     flush_dirty_page_list_locked(shared, file, dirty_pages, range_flush)
+        .map_err(|error| error.error)
 }
 
 fn flush_dirty_cache_shared_locked(shared: &CachedFileShared, file: &FileNode) -> VfsResult<()> {
@@ -3128,7 +3177,7 @@ fn flush_dirty_cache_shared_locked(shared: &CachedFileShared, file: &FileNode) -
             .filter_map(|(pn, page)| page.is_dirty().then_some(*pn))
             .collect::<Vec<_>>()
     };
-    flush_dirty_page_list_locked(shared, file, dirty_pages, false)
+    flush_dirty_page_list_locked(shared, file, dirty_pages, false).map_err(|error| error.error)
 }
 
 fn flush_dirty_cache_shared(shared: &Arc<CachedFileShared>, file: &FileNode) -> VfsResult<()> {
@@ -3324,6 +3373,89 @@ struct CachedFileShared {
     /// Fixed-capacity range ownership used to arbitrate cache aliases and
     /// direct I/O without holding a lock across device completion.
     range_cache_leases: Mutex<RangeCacheLeaseTable>,
+    /// Per-inode async range-writeback admission and completion state.  This
+    /// is deliberately shared by every CachedFile opened on the inode.
+    range_writeback: RangeWritebackState,
+}
+
+struct RangeWritebackRequest {
+    generation: u64,
+    offset: u64,
+    len: u64,
+    data_only: bool,
+}
+
+struct RangeWritebackCompletion {
+    generation: u64,
+    offset: u64,
+    len: u64,
+    result: VfsResult<()>,
+}
+
+#[derive(Default)]
+struct RangeWritebackQueue {
+    next_generation: u64,
+    worker_running: bool,
+    active: Option<(u64, u64, u64)>,
+    pending: VecDeque<RangeWritebackRequest>,
+    completed: Vec<RangeWritebackCompletion>,
+    interests: BTreeMap<u64, usize>,
+}
+
+struct RangeWritebackState {
+    queue: Mutex<RangeWritebackQueue>,
+    completed: WaitQueue,
+}
+
+fn gc_range_writeback_completions(queue: &mut RangeWritebackQueue) {
+    if let Some((&last, _)) = queue.interests.last_key_value() {
+        queue
+            .completed
+            .retain(|completion| completion.generation <= last);
+    } else {
+        queue.completed.clear();
+    }
+}
+
+/// A generation interest acquired atomically with a range snapshot or write
+/// submission.  Its Drop is the sole completion-retention release point.
+pub struct RangeWritebackFence {
+    shared: Option<Arc<CachedFileShared>>,
+    generation: u64,
+}
+
+impl RangeWritebackFence {
+    fn none() -> Self {
+        Self {
+            shared: None,
+            generation: 0,
+        }
+    }
+}
+
+impl Drop for RangeWritebackFence {
+    fn drop(&mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        let mut queue = shared.range_writeback.queue.lock();
+        if let Some(count) = queue.interests.get_mut(&self.generation) {
+            *count -= 1;
+            if *count == 0 {
+                queue.interests.remove(&self.generation);
+            }
+        }
+        gc_range_writeback_completions(&mut queue);
+    }
+}
+
+impl RangeWritebackState {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(RangeWritebackQueue::default()),
+            completed: WaitQueue::new(),
+        }
+    }
 }
 
 impl CachedFileShared {
@@ -3365,6 +3497,7 @@ impl CachedFileShared {
             writeback_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
             range_cache_leases: Mutex::new(RangeCacheLeaseTable::new()),
+            range_writeback: RangeWritebackState::new(),
         }
     }
 
@@ -4316,6 +4449,258 @@ impl CachedFile {
 
     fn flush_dirty_cache(&self, file: &FileNode) -> VfsResult<()> {
         flush_dirty_cache_shared(&self.shared, file)
+    }
+
+    /// Writes dirty cached pages intersecting one byte range. `len == 0`
+    /// means through EOF. The shared cache/writeback locks serialize this
+    /// selection with concurrent writers and make completion observable to a
+    /// later range wait.
+    fn sync_range_marked(
+        &self,
+        offset: u64,
+        len: u64,
+        data_only: bool,
+    ) -> Result<(), RangeSyncError> {
+        let _direct_guard = self.shared.direct_io_lock.read();
+        // In-memory nodes have no backing device; range writeback is a no-op.
+        if self.in_memory {
+            return Ok(());
+        }
+        let file = self
+            .inner
+            .entry()
+            .as_file()
+            .map_err(RangeSyncError::Immediate)?;
+        let end = if len == 0 {
+            u64::MAX
+        } else {
+            offset
+                .checked_add(len)
+                .ok_or(RangeSyncError::Immediate(VfsError::InvalidInput))?
+        };
+        let first = offset / PAGE_SIZE as u64;
+        let last = if end == u64::MAX {
+            u64::MAX
+        } else {
+            end.saturating_sub(1) / PAGE_SIZE as u64
+        };
+        let dirty_pages = {
+            let guard = self.shared.page_cache.lock();
+            guard
+                .iter()
+                .filter_map(|(pn, page)| {
+                    (page.is_dirty() && (*pn as u64 >= first) && (*pn as u64 <= last))
+                        .then_some(*pn)
+                })
+                .collect::<Vec<_>>()
+        };
+        let _range_lease = CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            offset..end,
+            RangeCacheLeaseKind::CachedWrite,
+        )
+        .map_err(RangeSyncError::Immediate)?;
+        let _writeback_guard = self.shared.writeback_lock.read();
+        flush_dirty_page_list_locked(&self.shared, file, dirty_pages, true)
+            .map_err(RangeSyncError::Writeback)?;
+        // sync_file_range writes selected dirty cache pages only.  In
+        // particular it must not turn range writeback into fsync-like
+        // metadata or device-cache persistence.
+        let _ = data_only;
+        Ok(())
+    }
+
+    pub fn sync_range(&self, offset: u64, len: u64, data_only: bool) -> VfsResult<()> {
+        self.sync_range_marked(offset, len, data_only)
+            .map_err(|error| match error {
+                RangeSyncError::Immediate(error)
+                | RangeSyncError::Writeback(DirtyWritebackError { error, .. }) => error,
+            })
+    }
+
+    fn complete_range_writeback(&self, result: Result<(), RangeSyncError>) -> VfsResult<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(RangeSyncError::Immediate(error)) => Err(error),
+            Err(RangeSyncError::Writeback(error)) => {
+                if error.worker_must_publish && !error.errseq_published {
+                    publish_async_dirty_writeback_completion_error(
+                        self.inner
+                            .entry()
+                            .as_file()
+                            .expect("range writeback file changed type"),
+                        error.error,
+                    );
+                }
+                Err(error.error)
+            }
+        }
+    }
+
+    fn range_writeback_snapshot(&self) -> RangeWritebackFence {
+        let generation = {
+            let mut queue = self.shared.range_writeback.queue.lock();
+            let generation = queue.next_generation;
+            *queue.interests.entry(generation).or_default() += 1;
+            generation
+        };
+        RangeWritebackFence {
+            shared: Some(self.shared.clone()),
+            generation,
+        }
+    }
+
+    fn submit_range_writeback(
+        &self,
+        offset: u64,
+        len: u64,
+        data_only: bool,
+    ) -> VfsResult<RangeWritebackFence> {
+        let (generation, start_worker) = {
+            let mut queue = self.shared.range_writeback.queue.lock();
+            queue.next_generation = queue
+                .next_generation
+                .checked_add(1)
+                .ok_or(VfsError::NoMemory)?;
+            let generation = queue.next_generation;
+            queue.pending.push_back(RangeWritebackRequest {
+                generation,
+                offset,
+                len,
+                data_only,
+            });
+            *queue.interests.entry(generation).or_default() += 1;
+            let start = !queue.worker_running;
+            if start {
+                queue.worker_running = true;
+            }
+            (generation, start)
+        };
+        if start_worker {
+            let worker = self.clone();
+            if axtask::try_spawn_with_name(
+                move || worker.range_writeback_worker(),
+                alloc::string::String::from("range-writeback"),
+            )
+            .is_err()
+            {
+                let mut queue = self.shared.range_writeback.queue.lock();
+                // Other submitters may have observed worker_running while the
+                // task allocation was in progress. Complete every request in
+                // that admission epoch with a definite error rather than
+                // leaving their WAIT_* callers behind an orphaned FIFO.
+                while let Some(request) = queue.pending.pop_front() {
+                    queue.completed.push(RangeWritebackCompletion {
+                        generation: request.generation,
+                        offset: request.offset,
+                        len: request.len,
+                        result: Err(VfsError::NoMemory),
+                    });
+                }
+                if let Some(count) = queue.interests.get_mut(&generation) {
+                    *count -= 1;
+                    if *count == 0 {
+                        queue.interests.remove(&generation);
+                    }
+                }
+                gc_range_writeback_completions(&mut queue);
+                queue.worker_running = false;
+                drop(queue);
+                self.shared.range_writeback.completed.notify_all(false);
+                return Err(VfsError::NoMemory);
+            }
+        }
+        Ok(RangeWritebackFence {
+            shared: Some(self.shared.clone()),
+            generation,
+        })
+    }
+
+    fn range_writeback_worker(&self) {
+        loop {
+            let request = {
+                let mut queue = self.shared.range_writeback.queue.lock();
+                match queue.pending.pop_front() {
+                    Some(request) => {
+                        queue.active = Some((request.generation, request.offset, request.len));
+                        request
+                    }
+                    None => {
+                        queue.worker_running = false;
+                        return;
+                    }
+                }
+            };
+            // The worker, rather than submitter, owns the synchronous lower
+            // writeback.  The range/direct-I/O locks are taken inside this
+            // call and are never held while the request waits in the FIFO.
+            let result = self.complete_range_writeback(self.sync_range_marked(
+                request.offset,
+                request.len,
+                request.data_only,
+            ));
+            let mut queue = self.shared.range_writeback.queue.lock();
+            queue.active = None;
+            queue.completed.push(RangeWritebackCompletion {
+                generation: request.generation,
+                offset: request.offset,
+                len: request.len,
+                result,
+            });
+            gc_range_writeback_completions(&mut queue);
+            drop(queue);
+            self.shared.range_writeback.completed.notify_all(false);
+        }
+    }
+
+    fn wait_range_writeback_through(
+        &self,
+        fence: &RangeWritebackFence,
+        offset: u64,
+        len: u64,
+    ) -> VfsResult<()> {
+        let generation = fence.generation;
+        let overlaps = |start: u64, length: u64| {
+            let end = if len == 0 {
+                u64::MAX
+            } else {
+                offset.saturating_add(len)
+            };
+            let other_end = if length == 0 {
+                u64::MAX
+            } else {
+                start.saturating_add(length)
+            };
+            start < end && offset < other_end
+        };
+        self.shared
+            .range_writeback
+            .completed
+            .wait_until_interruptible(|| {
+                let queue = self.shared.range_writeback.queue.lock();
+                let active = queue.active.is_some_and(
+                    |(request_generation, request_offset, request_len)| {
+                        request_generation <= generation && overlaps(request_offset, request_len)
+                    },
+                );
+                !active
+                    && !queue.pending.iter().any(|request| {
+                        request.generation <= generation && overlaps(request.offset, request.len)
+                    })
+            })
+            .map_err(|_| VfsError::Interrupted)?;
+        let queue = self.shared.range_writeback.queue.lock();
+        let mut result = Ok(());
+        for completion in &queue.completed {
+            if completion.generation <= generation && overlaps(completion.offset, completion.len) {
+                if let Err(error) = completion.result {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        drop(queue);
+        result
     }
 
     fn aligned_page_range(offset: u64, len: usize) -> Option<Range<u32>> {
@@ -6301,6 +6686,49 @@ impl FileBackend {
         }
     }
 
+    pub fn sync_range(&self, offset: u64, len: u64, data_only: bool) -> VfsResult<()> {
+        match self {
+            Self::Cached(cached) => cached.sync_range(offset, len, data_only),
+            Self::Direct(loc) => {
+                with_cache_invalidating_file_operation(loc, |_, file| file.sync(data_only))
+            }
+        }
+    }
+
+    pub fn range_writeback_snapshot(&self) -> RangeWritebackFence {
+        match self {
+            Self::Cached(cached) => cached.range_writeback_snapshot(),
+            Self::Direct(_) => RangeWritebackFence::none(),
+        }
+    }
+
+    pub fn submit_range_writeback(
+        &self,
+        offset: u64,
+        len: u64,
+        data_only: bool,
+    ) -> VfsResult<RangeWritebackFence> {
+        match self {
+            Self::Cached(cached) => cached.submit_range_writeback(offset, len, data_only),
+            // There is no page-cache writeback domain for direct handles.
+            // Do not substitute a whole-file sync; Linux treats this as an
+            // implementation-supported no-op when there is nothing queued.
+            Self::Direct(_) => Ok(RangeWritebackFence::none()),
+        }
+    }
+
+    pub fn wait_range_writeback_through(
+        &self,
+        fence: &RangeWritebackFence,
+        offset: u64,
+        len: u64,
+    ) -> VfsResult<()> {
+        match self {
+            Self::Cached(cached) => cached.wait_range_writeback_through(fence, offset, len),
+            Self::Direct(_) => Ok(()),
+        }
+    }
+
     /// Truncates or extends the file to `len` bytes.
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         match self {
@@ -6778,6 +7206,35 @@ impl File {
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         self.access(FileFlags::empty())?;
         self.inner.sync(data_only)
+    }
+
+    pub fn sync_range(&self, offset: u64, len: u64, data_only: bool) -> VfsResult<()> {
+        self.access(FileFlags::empty())?;
+        self.inner.sync_range(offset, len, data_only)
+    }
+
+    pub fn range_writeback_snapshot(&self) -> VfsResult<RangeWritebackFence> {
+        Ok(self.access(FileFlags::empty())?.range_writeback_snapshot())
+    }
+
+    pub fn submit_range_writeback(
+        &self,
+        offset: u64,
+        len: u64,
+        data_only: bool,
+    ) -> VfsResult<RangeWritebackFence> {
+        self.access(FileFlags::empty())?
+            .submit_range_writeback(offset, len, data_only)
+    }
+
+    pub fn wait_range_writeback_through(
+        &self,
+        fence: &RangeWritebackFence,
+        offset: u64,
+        len: u64,
+    ) -> VfsResult<()> {
+        self.access(FileFlags::empty())?
+            .wait_range_writeback_through(fence, offset, len)
     }
 
     /// Returns a typed map of allocated extents for this open file.  Access is
@@ -7907,6 +8364,73 @@ mod tests {
         axdriver::set_virtio_async_block_enabled(false);
 
         assert_eq!(result, Err(VfsError::Io));
+        assert_eq!(writeback_errors.check_and_advance(&mut cursor), None);
+    }
+
+    #[test]
+    fn range_sg_completion_error_arrives_with_its_errseq_already_published() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x5a, true);
+        let writeback_errors = location.writeback_error_state().unwrap();
+        let mut cursor = writeback_errors.sample();
+
+        state.async_write_mode.store(2, Ordering::Release);
+        axdriver::set_virtio_async_block_enabled(true);
+        super::set_async_dirty_flush_sg_enabled(true);
+        let result = cached.sync_range_marked(0, PAGE_SIZE as u64, true);
+        super::set_async_dirty_flush_sg_enabled(false);
+        axdriver::set_virtio_async_block_enabled(false);
+
+        assert!(matches!(
+            &result,
+            Err(super::RangeSyncError::Writeback(
+                super::DirtyWritebackError {
+                    error: VfsError::Io,
+                    errseq_published: true,
+                    worker_must_publish: false,
+                }
+            ))
+        ));
+        assert_eq!(
+            writeback_errors.check_and_advance(&mut cursor),
+            Some(VfsError::Io)
+        );
+        assert_eq!(writeback_errors.check_and_advance(&mut cursor), None);
+    }
+
+    #[test]
+    fn range_fallback_write_error_is_deferred_to_its_worker_completion() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x5a, true);
+        let writeback_errors = location.writeback_error_state().unwrap();
+        let mut cursor = writeback_errors.sample();
+
+        // No SG submission is accepted; the ordinary vectored write is a
+        // real range-worker completion and must be published by that worker.
+        state.async_write_mode.store(0, Ordering::Release);
+        axdriver::set_virtio_async_block_enabled(true);
+        super::set_async_dirty_flush_sg_enabled(true);
+        let result = cached.sync_range_marked(0, PAGE_SIZE as u64, true);
+        super::set_async_dirty_flush_sg_enabled(false);
+        axdriver::set_virtio_async_block_enabled(false);
+
+        assert!(matches!(
+            &result,
+            Err(super::RangeSyncError::Writeback(
+                super::DirtyWritebackError {
+                    error: VfsError::Io,
+                    errseq_published: false,
+                    worker_must_publish: true,
+                }
+            ))
+        ));
+        assert_eq!(writeback_errors.check_and_advance(&mut cursor), None);
+
+        assert_eq!(cached.complete_range_writeback(result), Err(VfsError::Io));
+        assert_eq!(
+            writeback_errors.check_and_advance(&mut cursor),
+            Some(VfsError::Io)
+        );
         assert_eq!(writeback_errors.check_and_advance(&mut cursor), None);
     }
 
