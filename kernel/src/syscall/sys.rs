@@ -80,7 +80,7 @@ fn write_sysinfo<M: UserMemory + ?Sized>(
 ) -> AxResult {
     // SAFETY: `kinfo` starts zeroed and every exported field is initialized;
     // the checked x86_64 layout includes the ABI padding and tail exactly.
-    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(map_usercopy_error)
+    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(|_| AxError::BadAddress)
 }
 
 fn setfsid_abi<Id>(
@@ -845,23 +845,29 @@ mod tests {
     }
 
     #[test]
-    fn sysinfo_copyout_fault_is_efault() {
-        let mut provider = GroupMemory {
-            bytes: vec![0; core::mem::size_of::<sysinfo>()],
-            reads: Vec::new(),
-            writes: Vec::new(),
-            read_error: None,
-            fail_write_at: Some(0),
-            write_error: None,
-        };
-        let mut memory = UserMemoryContext::new(&mut provider);
-        let info: sysinfo = unsafe { core::mem::zeroed() };
+    fn sysinfo_copyout_errors_are_efault() {
+        for error in [
+            UserCopyError::BadAddress,
+            UserCopyError::AccessDenied,
+            UserCopyError::NoMemory,
+        ] {
+            let mut provider = GroupMemory {
+                bytes: vec![0; core::mem::size_of::<sysinfo>()],
+                reads: Vec::new(),
+                writes: Vec::new(),
+                read_error: None,
+                fail_write_at: None,
+                write_error: Some(error),
+            };
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let info: sysinfo = unsafe { core::mem::zeroed() };
 
-        assert_eq!(
-            write_sysinfo(&mut memory, core::ptr::null_mut(), info),
-            Err(AxError::BadAddress)
-        );
-        assert_eq!(memory.memory_mut().writes, &[0]);
+            assert_eq!(
+                write_sysinfo(&mut memory, core::ptr::null_mut(), info),
+                Err(AxError::BadAddress)
+            );
+            assert_eq!(memory.memory_mut().writes, &[0]);
+        }
     }
 
     fn mapped_child_namespace() -> alloc::sync::Arc<UserNamespace> {
