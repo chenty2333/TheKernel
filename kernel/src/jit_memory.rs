@@ -249,6 +249,13 @@ pub(crate) fn prepare(size: usize) -> Result<WritableCode, MemoryError> {
     })
 }
 
+/// Reserves a non-executable module data segment at its final virtual address.
+/// The caller may relocate through its writable alias, then either retain it
+/// RW/NX or consume it with [`WritableCode::publish_readonly`] as RO/NX.
+pub(crate) fn prepare_module_data(size: usize) -> Result<WritableCode, MemoryError> {
+    prepare(size)
+}
+
 /// Changes permissions one page at a time and reports how many pages were
 /// changed before the first failure. `AddrSpace::protect` accepts a range but
 /// is allowed to stop after a partial page-table walk; keeping the cursor
@@ -281,6 +288,22 @@ fn unmap_pages(base: VirtAddr, pages: usize) -> AxResult<()> {
 }
 
 impl WritableCode {
+    /// Virtual base of the unpublished image, used to resolve ET_REL
+    /// section-relative relocations before W^X publication.
+    pub(crate) fn code_address(&self) -> usize {
+        self.code.as_usize()
+    }
+
+    /// Views the unpublished final mapping through its writable, NX alias.
+    /// This is deliberately restricted to the builder lifetime: callers must
+    /// finish all relocation and initialization before publishing or dropping
+    /// the allocation.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `WritableCode` exclusively owns this RW/NX mapping while it
+        // is armed. Publication consumes `self`, so the returned borrow cannot
+        // survive a permission transition.
+        unsafe { core::slice::from_raw_parts_mut(self.code.as_mut_ptr(), self.len) }
+    }
     /// Copies bytes into the unpublished NX alias.
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> AxResult<()> {
         let end = offset
@@ -410,6 +433,50 @@ impl WritableCode {
             armed: true,
         })
     }
+
+    /// Publishes module rodata as read-only and non-executable.  This is the
+    /// same alias discipline as code publication, except execute is never
+    /// granted to the final kernel mapping.
+    pub(crate) fn publish_readonly(mut self) -> Result<ExecutableCode, MemoryError> {
+        if let Err((error, changed)) =
+            protect_pages_partial(self.direct, self.pages, MappingFlags::READ)
+        {
+            if protect_pages(
+                self.direct,
+                changed,
+                MappingFlags::READ | MappingFlags::WRITE,
+            )
+            .is_err()
+            {
+                return Err(self.quarantine(MemoryError::Quarantined(error)));
+            }
+            drop(crate::mm::synchronize_tlb_and_icache());
+            return Err(self.abort(MemoryError::Unavailable(error)));
+        }
+        drop(crate::mm::synchronize_tlb_and_icache());
+        if let Err((error, changed)) =
+            protect_pages_partial(self.code, self.pages, MappingFlags::READ)
+        {
+            if protect_pages(self.code, changed, MappingFlags::READ | MappingFlags::WRITE).is_err()
+            {
+                return Err(self.quarantine(MemoryError::Quarantined(error)));
+            }
+            drop(crate::mm::synchronize_tlb_and_icache());
+            return Err(self.abort(MemoryError::Unavailable(error)));
+        }
+        drop(crate::mm::synchronize_tlb_and_icache());
+        self.armed = false;
+        Ok(ExecutableCode {
+            arena: self.arena,
+            first: self.first,
+            pages: self.pages,
+            code: self.code,
+            direct: self.direct,
+            len: self.len,
+            entry_offset: 0,
+            armed: true,
+        })
+    }
 }
 
 impl Drop for WritableCode {
@@ -432,6 +499,28 @@ pub(crate) struct ExecutableCode {
 }
 
 impl ExecutableCode {
+    /// Invokes a validated SysV x86_64 module entry point.  Module code is
+    /// entered only through this owner, so its RX mapping remains pinned for
+    /// the whole call and teardown cannot race the instruction fetches.
+    pub(crate) fn execute_module_entry(
+        &self,
+        entry_offset: usize,
+        entry_size: usize,
+    ) -> Option<i32> {
+        let Some(entry_end) = entry_offset.checked_add(entry_size) else {
+            return None;
+        };
+        if entry_size == 0 || entry_offset >= self.len || entry_end > self.len {
+            return None;
+        }
+        type Entry = extern "C" fn() -> i32;
+        let entry = self.code.as_usize() + entry_offset;
+        // SAFETY: the ET_REL loader validated that this offset denotes a
+        // defined executable symbol in this published allocation. `self`
+        // owns the RX mapping for the complete invocation.
+        let function: Entry = unsafe { core::mem::transmute(entry) };
+        Some(function())
+    }
     /// Executes the published SysV x86_64 entry while borrowing the code
     /// owner for the complete call. The only unsafe operation in this
     /// publisher is the typed conversion of the validated, W^X-protected
