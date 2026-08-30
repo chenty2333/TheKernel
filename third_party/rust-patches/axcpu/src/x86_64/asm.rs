@@ -15,7 +15,7 @@ use x86::tlb;
 use x86_64::instructions::interrupts;
 #[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
 use x86_64::instructions::tlb as x86_64_tlb;
-#[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
+#[cfg(target_os = "none")]
 use x86_64::registers::control::{Cr4, Cr4Flags};
 #[cfg(target_os = "none")]
 use x86_64::{
@@ -27,6 +27,43 @@ use x86_64::{
 static PCID_CPUS_ENABLED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "asid-fast-switch")]
 static PCID_CPUS_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether this CPU advertises user-mode CET shadow stacks and CR4.CET is
+/// live.  The hosted build deliberately reports false: it must never infer a
+/// privileged control-register state from host CPUID alone.
+#[inline]
+pub fn user_shadow_stack_enabled() -> bool {
+    let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
+    let advertised = cpuid.ecx & (1 << 7) != 0; // CPUID.7.0:ECX.CET_SS
+    #[cfg(target_os = "none")]
+    {
+        advertised && Cr4::read().contains(Cr4Flags::CONTROL_FLOW_ENFORCEMENT)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = advertised;
+        false
+    }
+}
+
+/// Enables CR4.CET only after CPUID has advertised CET shadow stacks.
+///
+/// This is called on every CPU during trap bootstrap. It does not enable CET
+/// for any task; IA32_U_CET remains task-owned and clear until arch_prctl.
+pub fn init_user_shadow_stack() {
+    #[cfg(target_os = "none")]
+    {
+        let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
+        if cpuid.ecx & (1 << 7) != 0 {
+            let mut cr4 = Cr4::read();
+            cr4.insert(Cr4Flags::CONTROL_FLOW_ENFORCEMENT);
+            // SAFETY: CPUID has advertised CET shadow-stack capability; this
+            // only toggles CR4.CET and leaves U_CET disabled until a task
+            // explicitly opts in.
+            unsafe { Cr4::write(cr4) };
+        }
+    }
+}
 
 /// Per-CPU capability observations used to decide whether PCID is safe for
 /// the whole boot.

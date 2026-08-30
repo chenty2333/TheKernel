@@ -26,6 +26,7 @@ pub fn init_percpu(cpu_id: usize) {
 pub fn init_trap() {
     #[cfg(feature = "asid-fast-switch")]
     crate::asm::init_pcid();
+    crate::asm::init_user_shadow_stack();
     #[cfg(feature = "uspace")]
     crate::uspace_common::init_exception_table();
     super::gdt::init();

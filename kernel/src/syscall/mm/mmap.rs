@@ -20,6 +20,7 @@ use crate::{
         AddrSpace, Backend, DeferredUffdWake, FileMappingLease, FileMappingSharing,
         PreparedFixedSharedMapping, PreparedProtect, SharedPages, WritableMappingAdmission,
         check_memory_overcommit, checked_align_up, checked_align_up_4k, remap_user_mapping,
+        UserMemoryCapability,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -32,6 +33,8 @@ const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 /// Use Linux's bottom-up compatibility mmap placement rather than the normal
 /// append-biased layout.
 const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
+const SHADOW_STACK_SET_TOKEN: usize = 1;
+const SHADOW_STACK_MIN_ADDR: usize = 1usize << 32;
 
 fn personality_mmap_protection(personality: u32, mut protection: MappingFlags) -> MappingFlags {
     if personality & READ_IMPLIES_EXEC != 0 && protection.contains(MappingFlags::READ) {
@@ -852,6 +855,83 @@ pub fn sys_mmap(
     drop(aspace);
     deferred_uffd_wake.finish();
     outcome
+}
+
+/// Linux x86-64 `map_shadow_stack(2)`.  CET shadow-stack PTEs are not normal
+/// read-only pages: hardware requires W=0,D=1, represented by
+/// `MappingFlags::SHADOW_STACK` all the way to the leaf PTE.
+pub fn sys_map_shadow_stack(
+    addr: usize,
+    size: usize,
+    flags: usize,
+) -> AxResult<isize> {
+    if !axhal::asm::user_shadow_stack_enabled() {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & !SHADOW_STACK_SET_TOKEN != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & SHADOW_STACK_SET_TOKEN != 0 && size < core::mem::size_of::<u64>() {
+        return Err(LinuxError::ENOSPC.into());
+    }
+    if addr != 0 && addr < SHADOW_STACK_MIN_ADDR {
+        return Err(AxError::OutOfRange);
+    }
+    let size = checked_align_up_4k(size).ok_or(LinuxError::EOVERFLOW)?;
+    if size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if addr != 0 && !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let current_task = current();
+    let thread = current_task.as_thread();
+    let aspace_handle = thread.proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+    let start = if addr == 0 {
+        aspace
+            .find_kernel_area(
+                VirtAddr::from(SHADOW_STACK_MIN_ADDR),
+                size,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                PageSize::Size4K as usize,
+            )
+            .ok_or(AxError::NoMemory)?
+    } else {
+        let start = VirtAddr::from(addr);
+        aspace.contains_range(start, size).then_some(start).ok_or(AxError::NoMemory)?
+    };
+    let mapping_flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK;
+    aspace.map(
+        start,
+        size,
+        mapping_flags,
+        flags & SHADOW_STACK_SET_TOKEN != 0,
+        Backend::new_alloc(start, PageSize::Size4K),
+    )?;
+    drop(aspace);
+
+    if flags & SHADOW_STACK_SET_TOKEN != 0 {
+        let token_addr = start
+            .as_usize()
+            .checked_add(size)
+            .and_then(|end| end.checked_sub(core::mem::size_of::<u64>()))
+            .ok_or(LinuxError::EOVERFLOW)?;
+        // A restore token is the aligned SSP with bit zero marking 64-bit
+        // mode. Populate above made this CET leaf resident before copyout.
+        let aspace = aspace_handle.lock();
+        let (frame, _, _) = aspace.page_table().query(VirtAddr::from(token_addr))?;
+        let offset = token_addr & (PageSize::Size4K as usize - 1);
+        // Kernel-originated token construction is the only ordinary store
+        // allowed here. Userspace must use CET instructions/WRSS; copying
+        // through the usercopy path would incorrectly require VMA WRITE.
+        unsafe {
+            (axhal::mem::phys_to_virt(frame).as_mut_ptr().add(offset) as *mut u64)
+                .write((token_addr + 8) as u64 | 1);
+        }
+    }
+    Ok(start.as_usize() as isize)
 }
 
 pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
