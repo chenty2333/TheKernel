@@ -60,10 +60,11 @@ impl PerfGroup {
 
     fn counts(&self, dst: &mut IoDst) -> AxResult<usize> {
         let members = self.members.lock();
-        let count = members
-            .iter()
-            .filter(|member| member.strong_count() != 0)
-            .count();
+        let mut live = Vec::new();
+        live.try_reserve(members.len())
+            .map_err(|_| AxError::NoMemory)?;
+        live.extend(members.iter().filter_map(Weak::upgrade));
+        let count = live.len();
         let bytes = (count + 1)
             .checked_mul(size_of::<u64>())
             .ok_or(AxError::InvalidInput)?;
@@ -71,7 +72,7 @@ impl PerfGroup {
             return Err(AxError::InvalidInput);
         }
         dst.write(&(count as u64).to_ne_bytes())?;
-        for member in members.iter().filter_map(Weak::upgrade) {
+        for member in &live {
             dst.write(&member.count().to_ne_bytes())?;
         }
         Ok(bytes)
