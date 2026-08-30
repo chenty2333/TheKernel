@@ -98,6 +98,9 @@ pub struct SharedPages {
     published_len: AtomicUsize,
     pub size: PageSize,
     fixed: bool,
+    // A fixed direct view snapshots direct-map pointers for IRQ use. Holding
+    // this count prevents 4 KiB <-> 2 MiB backing replacement.
+    direct_view_pins: AtomicUsize,
     resident_charge: Option<&'static AtomicUsize>,
 }
 impl SharedPages {
@@ -120,6 +123,7 @@ impl SharedPages {
             published_len: AtomicUsize::new(count),
             size: PageSize::Size4K,
             fixed: true,
+            direct_view_pins: AtomicUsize::new(0),
             resident_charge: None,
         })
     }
@@ -193,6 +197,7 @@ impl SharedPages {
             published_len: AtomicUsize::new(num_pages),
             size: page_size,
             fixed: !growable,
+            direct_view_pins: AtomicUsize::new(0),
             resident_charge,
         })
     }
@@ -517,6 +522,9 @@ impl SharedPages {
             return Err(AxError::InvalidInput);
         }
         let storage = self.phys_pages.lock();
+        if self.direct_view_pins.load(Ordering::Acquire) != 0 {
+            return Err(AxError::ResourceBusy);
+        }
         let folio = storage
             .folios
             .iter()
@@ -553,6 +561,9 @@ impl SharedPages {
             .checked_add(FOLIO_4K_PAGES)
             .ok_or(AxError::InvalidInput)?;
         let mut storage = self.phys_pages.lock();
+        if self.direct_view_pins.load(Ordering::Acquire) != 0 {
+            return Err(AxError::ResourceBusy);
+        }
         if end > storage.pages.len()
             || storage.folios.iter().any(|folio| {
                 let folio_end = folio.start_index + FOLIO_4K_PAGES;
@@ -609,6 +620,9 @@ impl SharedPages {
             .checked_add(FOLIO_4K_PAGES)
             .ok_or(AxError::InvalidInput)?;
         let mut storage = self.phys_pages.lock();
+        if self.direct_view_pins.load(Ordering::Acquire) != 0 {
+            return Err(AxError::ResourceBusy);
+        }
         let folio_index = storage
             .folios
             .iter()
@@ -639,37 +653,137 @@ impl SharedPages {
         Ok(())
     }
 
-    /// Returns an aligned, bounds-checked atomic view into a fixed backing.
-    /// The handle exposes only the memory order required by shared producer /
-    /// consumer rings; callers cannot accidentally perform relaxed accesses.
-    pub fn atomic_u32(self: &Arc<Self>, offset: usize) -> AxResult<SharedAtomicU32> {
-        validate_atomic_u32_offset(self.total_bytes(), self.size as usize, offset)?;
-        if !self.fixed {
-            return Err(AxError::InvalidInput);
-        }
-        let page_size = self.size as usize;
-        let page = self.physical_page(offset / page_size)?;
-        let in_page = offset % page_size;
-        if self.secret_frames.is_some() {
+    /// Captures a direct-map view suitable for IRQ use. Construction may
+    /// allocate and take the backing mutex; the returned operations do neither.
+    pub fn fixed_view(self: &Arc<Self>) -> AxResult<SharedFixedView> {
+        if !self.fixed || self.size != PageSize::Size4K || self.secret_frames.is_some() {
             return Err(AxError::OperationNotSupported);
         }
-        let virtual_address = axhal::mem::phys_to_virt(page)
-            .as_usize()
-            .checked_add(in_page)
+        let storage = self.phys_pages.lock();
+        let total_bytes = storage
+            .pages
+            .len()
+            .checked_mul(PAGE_SIZE_4K)
             .ok_or(AxError::InvalidInput)?;
-        let address =
-            NonNull::new(virtual_address as *mut AtomicU32).ok_or(AxError::InvalidInput)?;
-        Ok(SharedAtomicU32 {
-            address,
+        let mut page_bases = Vec::new();
+        page_bases
+            .try_reserve_exact(storage.pages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for &page in &storage.pages {
+            page_bases.push(
+                NonNull::new(axhal::mem::phys_to_virt(page).as_usize() as *mut u8)
+                    .ok_or(AxError::BadState)?,
+            );
+        }
+        self.direct_view_pins
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| AxError::ResourceBusy)?;
+        let inner = match Arc::try_new(FixedSharedViewInner {
             pages: self.clone(),
-        })
+            page_bases,
+            total_bytes,
+        }) {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.direct_view_pins.fetch_sub(1, Ordering::Release);
+                return Err(AxError::NoMemory);
+            }
+        };
+        drop(storage);
+        Ok(SharedFixedView { inner })
+    }
+
+    /// Returns an aligned, bounds-checked atomic view into a fixed backing.
+    /// The handle exposes only Acquire loads and Release stores.
+    pub fn atomic_u32(self: &Arc<Self>, offset: usize) -> AxResult<SharedAtomicU32> {
+        self.fixed_view()?.atomic_u32(offset)
     }
 }
 
-fn secret_page(
-    pages: &mut HashMap<usize, SecretFrame>,
-    index: usize,
-) -> AxResult<&SecretFrame> {
+/// A lifecycle-fixed direct view of a 4 KiB shared backing. Clones share one
+/// pin, released by the final drop without allocation or blocking.
+#[derive(Clone)]
+pub struct SharedFixedView {
+    inner: Arc<FixedSharedViewInner>,
+}
+
+struct FixedSharedViewInner {
+    pages: Arc<SharedPages>,
+    page_bases: Vec<NonNull<u8>>,
+    total_bytes: usize,
+}
+
+impl Drop for FixedSharedViewInner {
+    fn drop(&mut self) {
+        self.pages.direct_view_pins.fetch_sub(1, Ordering::Release);
+    }
+}
+
+unsafe impl Send for SharedFixedView {}
+unsafe impl Sync for SharedFixedView {}
+
+impl SharedFixedView {
+    pub fn len(&self) -> usize {
+        self.inner.total_bytes
+    }
+
+    /// Writes a complete ring record, wrapping at `base + size`. Every bound
+    /// is checked before copying, so an error writes no bytes.
+    pub fn write_wrapped(&self, base: usize, size: usize, offset: usize, bytes: &[u8]) -> AxResult {
+        validate_wrapped_write(self.len(), base, size, offset, bytes.len())?;
+        let first = bytes.len().min(size - offset);
+        self.copy_at(base + offset, &bytes[..first]);
+        self.copy_at(base, &bytes[first..]);
+        Ok(())
+    }
+
+    pub fn atomic_u32(&self, offset: usize) -> AxResult<SharedAtomicU32> {
+        Ok(SharedAtomicU32 {
+            address: self.atomic_address::<AtomicU32>(offset)?,
+            view: self.clone(),
+        })
+    }
+
+    pub fn atomic_u64(&self, offset: usize) -> AxResult<SharedAtomicU64> {
+        Ok(SharedAtomicU64 {
+            address: self.atomic_address::<AtomicU64>(offset)?,
+            view: self.clone(),
+        })
+    }
+
+    fn atomic_address<T>(&self, offset: usize) -> AxResult<NonNull<T>> {
+        validate_atomic_offset::<T>(self.len(), PAGE_SIZE_4K, offset)?;
+        let page = offset / PAGE_SIZE_4K;
+        let in_page = offset % PAGE_SIZE_4K;
+        let address = (self.inner.page_bases[page].as_ptr() as usize)
+            .checked_add(in_page)
+            .ok_or(AxError::InvalidInput)?;
+        NonNull::new(address as *mut T).ok_or(AxError::BadState)
+    }
+
+    fn copy_at(&self, mut offset: usize, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let page = offset / PAGE_SIZE_4K;
+            let in_page = offset % PAGE_SIZE_4K;
+            let count = bytes.len().min(PAGE_SIZE_4K - in_page);
+            // SAFETY: write_wrapped validated the full range against this
+            // pinned view; direct-map pages stay valid until final drop.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.inner.page_bases[page].as_ptr().add(in_page),
+                    count,
+                );
+            }
+            offset += count;
+            bytes = &bytes[count..];
+        }
+    }
+}
+
+fn secret_page(pages: &mut HashMap<usize, SecretFrame>, index: usize) -> AxResult<&SecretFrame> {
     if !pages.contains_key(&index) {
         let frame = SecretFrame::allocate()?;
         pages.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -678,13 +792,32 @@ fn secret_page(
     Ok(pages.get(&index).expect("secret frame inserted"))
 }
 
-fn validate_atomic_u32_offset(total_bytes: usize, page_size: usize, offset: usize) -> AxResult {
-    if page_size < core::mem::size_of::<AtomicU32>()
-        || !offset.is_multiple_of(core::mem::align_of::<AtomicU32>())
+fn validate_wrapped_write(
+    total_bytes: usize,
+    base: usize,
+    size: usize,
+    offset: usize,
+    bytes_len: usize,
+) -> AxResult {
+    if size == 0
+        || !size.is_power_of_two()
+        || offset >= size
+        || bytes_len > size
+        || base.checked_add(size).is_none_or(|end| end > total_bytes)
+        || base.checked_add(offset).is_none()
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_atomic_offset<T>(total_bytes: usize, page_size: usize, offset: usize) -> AxResult {
+    if page_size < core::mem::size_of::<T>()
+        || !offset.is_multiple_of(core::mem::align_of::<T>())
         || offset
-            .checked_add(core::mem::size_of::<AtomicU32>())
+            .checked_add(core::mem::size_of::<T>())
             .is_none_or(|end| end > total_bytes)
-        || offset % page_size > page_size - core::mem::size_of::<AtomicU32>()
+        || offset % page_size > page_size - core::mem::size_of::<T>()
     {
         return Err(AxError::InvalidInput);
     }
@@ -694,7 +827,7 @@ fn validate_atomic_u32_offset(total_bytes: usize, page_size: usize, offset: usiz
 /// A lifetime-pinned atomic word stored in a fixed shared-page backing.
 pub struct SharedAtomicU32 {
     address: NonNull<AtomicU32>,
-    pages: Arc<SharedPages>,
+    view: SharedFixedView,
 }
 
 // The target is naturally aligned, points into immutable backing storage, and
@@ -706,21 +839,48 @@ impl Clone for SharedAtomicU32 {
     fn clone(&self) -> Self {
         Self {
             address: self.address,
-            pages: self.pages.clone(),
+            view: self.view.clone(),
         }
     }
 }
 
 impl SharedAtomicU32 {
     pub fn load_acquire(&self) -> u32 {
-        // SAFETY: construction validated alignment and bounds, while `pages`
-        // pins the physical frame for the complete handle lifetime.
+        // SAFETY: construction validated alignment and the view pins frames.
         atomic_load_acquire(self.address)
     }
 
     pub fn store_release(&self, value: u32) {
         // SAFETY: see load_acquire; AtomicU32 supplies the shared mutation law.
         atomic_store_release(self.address, value);
+    }
+}
+
+/// A lifetime-pinned 64-bit metadata word for shared producer/consumer rings.
+pub struct SharedAtomicU64 {
+    address: NonNull<AtomicU64>,
+    view: SharedFixedView,
+}
+
+unsafe impl Send for SharedAtomicU64 {}
+unsafe impl Sync for SharedAtomicU64 {}
+
+impl Clone for SharedAtomicU64 {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address,
+            view: self.view.clone(),
+        }
+    }
+}
+
+impl SharedAtomicU64 {
+    pub fn load_acquire(&self) -> u64 {
+        unsafe { self.address.as_ref() }.load(Ordering::Acquire)
+    }
+
+    pub fn store_release(&self, value: u64) {
+        unsafe { self.address.as_ref() }.store(value, Ordering::Release);
     }
 }
 
@@ -1276,18 +1436,22 @@ mod tests {
 
     #[test]
     fn shared_atomic_offsets_are_aligned_bounded_and_page_local() {
-        assert!(validate_atomic_u32_offset(0x2000, 0x1000, 0).is_ok());
-        assert!(validate_atomic_u32_offset(0x2000, 0x1000, 0xffc).is_ok());
+        assert!(validate_atomic_offset::<AtomicU32>(0x2000, 0x1000, 0).is_ok());
+        assert!(validate_atomic_offset::<AtomicU32>(0x2000, 0x1000, 0xffc).is_ok());
         assert_eq!(
-            validate_atomic_u32_offset(0x2000, 0x1000, 1),
+            validate_atomic_offset::<AtomicU32>(0x2000, 0x1000, 1),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            validate_atomic_u32_offset(0x2000, 0x1000, 0x2000),
+            validate_atomic_offset::<AtomicU32>(0x2000, 0x1000, 0x2000),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            validate_atomic_u32_offset(3, 3, 0),
+            validate_atomic_offset::<AtomicU32>(3, 3, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_atomic_offset::<AtomicU64>(0x2000, 0x1000, 0xffc),
             Err(AxError::InvalidInput)
         );
     }
@@ -1299,6 +1463,77 @@ mod tests {
         assert_eq!(atomic_load_acquire(address), 7);
         atomic_store_release(address, 29);
         assert_eq!(atomic.load(Ordering::Acquire), 29);
+    }
+
+    #[test]
+    fn fixed_view_wraps_across_page_and_ring_end() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K * 2, PageSize::Size4K).unwrap());
+        let view = pages.fixed_view().unwrap();
+        let base = PAGE_SIZE_4K - 4;
+        view.write_wrapped(base, 8, 6, &[0xa1, 0xb2, 0xc3, 0xd4])
+            .unwrap();
+        let mut bytes = [0_u8; 8];
+        pages.read_bytes(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xc3, 0xd4, 0, 0, 0, 0, 0xa1, 0xb2]);
+
+        view.write_wrapped(base, 8, 0, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        pages.read_bytes(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn fixed_view_rejects_invalid_write_before_copying() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K, PageSize::Size4K).unwrap());
+        let view = pages.fixed_view().unwrap();
+        assert_eq!(
+            view.write_wrapped(PAGE_SIZE_4K - 4, 8, 0, &[1]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            view.write_wrapped(0, 3, 0, &[1]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            view.write_wrapped(0, 8, 8, &[1]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            view.write_wrapped(0, 8, 0, &[1; 9]),
+            Err(AxError::InvalidInput)
+        );
+        let mut bytes = [0_u8; 8];
+        pages.read_bytes(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 8]);
+    }
+
+    #[test]
+    fn fixed_view_atomics_pin_until_all_clones_drop() {
+        let _context = crate::test_support::scheduler_test_context();
+        let pages = Arc::new(
+            SharedPages::new_fixed(PAGE_SIZE_4K * FOLIO_4K_PAGES, PageSize::Size4K).unwrap(),
+        );
+        let view = pages.fixed_view().unwrap();
+        let clone = view.clone();
+        let word = view.atomic_u64(8).unwrap();
+        word.store_release(0x0123_4567_89ab_cdef);
+        assert_eq!(word.load_acquire(), 0x0123_4567_89ab_cdef);
+        assert!(matches!(
+            view.atomic_u64(PAGE_SIZE_4K - 4),
+            Err(AxError::InvalidInput)
+        ));
+        assert_eq!(pages.promote_4k_folio(0), Err(AxError::ResourceBusy));
+        drop(word);
+        drop(view);
+        assert_eq!(pages.promote_4k_folio(0), Err(AxError::ResourceBusy));
+        drop(clone);
+        pages.promote_4k_folio(0).unwrap();
+        let demote_view = pages.fixed_view().unwrap();
+        assert_eq!(pages.demote_4k_folio(0), Err(AxError::ResourceBusy));
+        drop(demote_view);
+        pages.demote_4k_folio(0).unwrap();
     }
 
     #[test]

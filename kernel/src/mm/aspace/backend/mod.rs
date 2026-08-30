@@ -21,7 +21,9 @@ mod linear;
 mod phys_pin;
 mod shared;
 
-pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
+pub use self::shared::{
+    SharedAtomicU32, SharedAtomicU64, SharedFixedView, SharedPages, shmem_resident_pages,
+};
 pub(crate) use self::{
     cow::{PreparedCowHugeFrame, PreparedCowPage, register_demoted_huge_backing},
     file::WritableMappingAdmission,
