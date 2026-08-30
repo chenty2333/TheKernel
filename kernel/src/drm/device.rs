@@ -368,7 +368,11 @@ impl DrmDevice {
         if job.next.active && !self.state.lock().framebuffers.contains_key(&job.next.fb) {
             job.discard_event();
             job.cancellation.end_delivery();
-            return Err(DrmError::NotFound);
+            return if job.cancellation.is_closed() {
+                Ok(())
+            } else {
+                Err(DrmError::NotFound)
+            };
         }
         let scanout = match job.scanout() {
             Ok(scanout) => scanout,
@@ -383,12 +387,12 @@ impl DrmDevice {
             job.cancellation.end_delivery();
             return Err(error);
         }
-        {
-            let mut state = self.state.lock();
-            state.atomic = job.next;
-            state.rebuild_atomic_tail();
-            state.resources.crtc.mode = job.next.mode;
-            state.resources.crtc.framebuffer = job.next.active.then_some(job.next.fb);
+        if !self.publish_atomic(&job) {
+            // A file can close while the adapter presents an already-validated
+            // scanout.  Do not revive its framebuffer after Drop removes it.
+            job.discard_event();
+            job.cancellation.end_delivery();
+            return Ok(());
         }
         if let Some(token) = job.event {
             job.cancellation
@@ -396,6 +400,24 @@ impl DrmDevice {
         }
         job.cancellation.end_delivery();
         Ok(())
+    }
+
+    /// Publishes a completed atomic job only while its file and framebuffer
+    /// still exist.  This is deliberately checked under the device lock: file
+    /// teardown removes framebuffers under the same lock.
+    fn publish_atomic(&self, job: &AtomicCommit) -> bool {
+        let mut state = self.state.lock();
+        if job.cancellation.is_closed()
+            || (job.next.active && !state.framebuffers.contains_key(&job.next.fb))
+        {
+            state.rebuild_atomic_tail();
+            return false;
+        }
+        state.atomic = job.next;
+        state.rebuild_atomic_tail();
+        state.resources.crtc.mode = job.next.mode;
+        state.resources.crtc.framebuffer = job.next.active.then_some(job.next.fb);
+        true
     }
 
     pub(crate) fn wait_for_vblank(self: &Arc<Self>) -> DrmResult<u64> {
@@ -719,6 +741,8 @@ impl DeviceState {
 mod tests {
     use alloc::sync::Arc;
 
+    use crate::drm::gem::GemObject;
+
     use super::*;
 
     struct Adapter;
@@ -728,6 +752,13 @@ mod tests {
         }
         fn present(&self, _: Scanout) -> DrmResult<()> {
             Ok(())
+        }
+    }
+
+    struct Backing;
+    impl GemBacking for Backing {
+        fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
+            Err(DrmError::Unsupported)
         }
     }
 
@@ -765,6 +796,48 @@ mod tests {
         assert_eq!(state.pending_commits.len(), 1);
         assert!(!state.pending_fb_pins.contains_key(&7));
         assert_eq!(state.atomic_tail.fb, state.atomic.fb);
+    }
+
+    #[test]
+    fn closed_in_flight_job_does_not_republish_removed_framebuffer() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let queue = super::super::file::EventQueue::new();
+        let mut next = super::super::atomic::initial(&device.state.lock().resources);
+        next.active = true;
+        next.fb = 7;
+        {
+            let mut state = device.state.lock();
+            state.framebuffers.insert(
+                next.fb,
+                Framebuffer {
+                    owner: 1,
+                    handle: 1,
+                    object: Arc::new(GemObject::new(Arc::new(Backing), 1, 0)),
+                    width: 1,
+                    height: 1,
+                    pitch: 64,
+                    bpp: 32,
+                },
+            );
+        }
+        let job = AtomicCommit {
+            next,
+            fb: None,
+            cancellation: Arc::clone(&queue),
+            event: None,
+            completion: None,
+        };
+
+        assert!(queue.try_begin_delivery());
+        queue.begin_close();
+        remove_owned_framebuffers(&mut device.state.lock(), 1);
+        assert!(!device.publish_atomic(&job));
+        queue.end_delivery();
+
+        let state = device.state.lock();
+        assert!(!state.atomic.active);
+        assert_eq!(state.resources.crtc.framebuffer, None);
+        assert_eq!(state.resources.crtc.mode, None);
     }
 
     #[test]
