@@ -41,7 +41,7 @@ const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 2;
 const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 
 #[derive(Clone, Copy)]
-struct Section { typ: u32, flags: u64, offset: usize, size: usize, link: u32, info: u32, entsize: usize }
+struct Section { name: u32, typ: u32, flags: u64, offset: usize, size: usize, link: u32, info: u32, entsize: usize }
 #[derive(Clone, Copy)]
 struct Symbol { name: u32, info: u8, section: u16, value: usize }
 struct PreparedModule { name: String, code: ExecutableCode, init: usize, exit: Option<usize> }
@@ -59,7 +59,7 @@ fn sections(b: &[u8]) -> AxResult<Vec<Section>> {
     if b.len()<ELF64_EHDR || &b[..4]!=b"\x7fELF" || b[4]!=2 || b[5]!=1 || b[6]!=1 || le16(b,16)?!=ET_REL || le16(b,18)?!=EM_X86_64 { return Err(AxError::InvalidExecutable); }
     let off=usize::try_from(le64(b,40)?).map_err(|_|AxError::InvalidExecutable)?; let ent=usize::from(le16(b,58)?); let count=usize::from(le16(b,60)?);
     if ent!=ELF64_SHDR || count==0 { return Err(AxError::InvalidExecutable); } range(b,off,ent.checked_mul(count).ok_or(AxError::InvalidExecutable)?)?;
-    (0..count).map(|i| { let p=off+i*ELF64_SHDR; Ok(Section { typ:le32(b,p+4)?, flags:le64(b,p+8)?, offset:usize::try_from(le64(b,p+24)?).map_err(|_|AxError::InvalidExecutable)?, size:usize::try_from(le64(b,p+32)?).map_err(|_|AxError::InvalidExecutable)?, link:le32(b,p+40)?, info:le32(b,p+44)?, entsize:usize::try_from(le64(b,p+56)?).map_err(|_|AxError::InvalidExecutable)? }) }).collect()
+    (0..count).map(|i| { let p=off+i*ELF64_SHDR; Ok(Section { name:le32(b,p)?, typ:le32(b,p+4)?, flags:le64(b,p+8)?, offset:usize::try_from(le64(b,p+24)?).map_err(|_|AxError::InvalidExecutable)?, size:usize::try_from(le64(b,p+32)?).map_err(|_|AxError::InvalidExecutable)?, link:le32(b,p+40)?, info:le32(b,p+44)?, entsize:usize::try_from(le64(b,p+56)?).map_err(|_|AxError::InvalidExecutable)? }) }).collect()
 }
 fn symbol(b:&[u8], tab:Section, i:usize)->AxResult<Symbol>{ if tab.entsize!=ELF64_SYM{return Err(AxError::InvalidExecutable)} let p=tab.offset.checked_add(i.checked_mul(ELF64_SYM).ok_or(AxError::InvalidExecutable)?).ok_or(AxError::InvalidExecutable)?; range(b,p,ELF64_SYM)?; Ok(Symbol{name:le32(b,p)?,info:b[p+4],section:le16(b,p+6)?,value:usize::try_from(le64(b,p+8)?).map_err(|_|AxError::InvalidExecutable)?}) }
 fn name<'a>(b:&'a[u8],strs:Section,s:Symbol)->AxResult<&'a[u8]>{cstr(range(b,strs.offset,strs.size)?,s.name as usize)}
@@ -71,10 +71,11 @@ fn relocate(code:&mut[u8],base:usize,b:&[u8],ss:&[Section],code_index:usize)->Ax
 fn prepare(b:&[u8])->AxResult<PreparedModule>{
     let ss=sections(b)?; let ci=ss.iter().position(|s|s.typ==SHT_PROGBITS&&s.flags&SHF_EXECINSTR!=0).ok_or(AxError::InvalidExecutable)?; let cs=ss[ci]; if cs.size==0{return Err(AxError::InvalidExecutable)}; let tab=*ss.iter().find(|s|s.typ==SHT_SYMTAB).ok_or(AxError::InvalidExecutable)?; let strs=*ss.get(tab.link as usize).ok_or(AxError::InvalidExecutable)?; if tab.entsize!=ELF64_SYM||tab.size%ELF64_SYM!=0{return Err(AxError::InvalidExecutable)};
     let(mut init,mut exit)=(None,None); for i in 0..tab.size/ELF64_SYM {let s=symbol(b,tab,i)?;if s.section as usize!=ci||s.info&15!=STT_FUNC{continue}match name(b,strs,s)?{b"thekernel_module_init"=>init=Some(s.value),b"thekernel_module_exit"=>exit=Some(s.value),_=>{}}} let init=init.ok_or(AxError::InvalidExecutable)?;if init>=cs.size||exit.is_some_and(|x|x>=cs.size){return Err(AxError::InvalidExecutable)};
-    let mut w=jit_memory::prepare(cs.size).map_err(memory_error)?; let mut code=range(b,cs.offset,cs.size)?.to_vec(); relocate(&mut code,w.code_address(),b,&ss,ci)?; w.write(0,&code)?; let code=w.publish(init).map_err(memory_error)?; Ok(PreparedModule{name:String::from("module"),code,init,exit})
+    let section_strings=*ss.get(usize::from(le16(b,62)?)).ok_or(AxError::InvalidExecutable)?; let section_string_bytes=range(b,section_strings.offset,section_strings.size)?; let modinfo=ss.iter().find(|s|cstr(section_string_bytes,s.name as usize).is_ok_and(|n|n==b".modinfo")).ok_or(AxError::InvalidExecutable)?; let module_name=range(b,modinfo.offset,modinfo.size)?.split(|b|*b==0).find_map(|item|item.strip_prefix(b"name=")).ok_or(AxError::InvalidExecutable)?; if module_name.is_empty()||module_name.len()>MODULE_NAME_MAX{return Err(AxError::InvalidExecutable)} let name=core::str::from_utf8(module_name).map_err(|_|AxError::IllegalBytes)?; let mut owned_name=String::new();owned_name.try_reserve_exact(name.len()).map_err(|_|AxError::NoMemory)?;owned_name.push_str(name);
+    let mut w=jit_memory::prepare(cs.size).map_err(memory_error)?; let mut code=Vec::new();code.try_reserve_exact(cs.size).map_err(|_|AxError::NoMemory)?;code.extend_from_slice(range(b,cs.offset,cs.size)?); relocate(&mut code,w.code_address(),b,&ss,ci)?; w.write(0,&code)?; let code=w.publish(init).map_err(memory_error)?; Ok(PreparedModule{name:owned_name,code,init,exit})
 }
 
-pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;let prepared=prepare(&bytes)?;if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}MODULES.lock().push(prepared);Ok(0)}
+pub fn sys_init_module<M:UserMemory+?Sized>(memory:&mut UserMemoryContext<'_,M>,image:*const u8,len:usize,_args:*const c_char)->AxResult<isize>{if !has_module_capability(){return Err(AxError::OperationNotPermitted)}if len==0||len>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}let bytes=vm_load(memory,image,len).map_err(map_usercopy_error)?;let prepared=prepare(&bytes)?;let mut modules=MODULES.lock();if modules.iter().any(|module|module.name==prepared.name){return Err(LinuxError::EEXIST.into())}if prepared.code.execute_module_entry(prepared.init)!=0{return Err(AxError::InvalidInput)}modules.push(prepared);Ok(0)}
 pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M>,fd:i32,_args:*const c_char,flags:u32)->AxResult<isize>{
     if !has_module_capability(){return Err(AxError::OperationNotPermitted)}
     if flags & !(MODULE_INIT_IGNORE_VERMAGIC|MODULE_INIT_IGNORE_MODVERSIONS|MODULE_INIT_COMPRESSED_FILE) != 0{return Err(AxError::InvalidInput)}
@@ -84,7 +85,7 @@ pub fn sys_finit_module<M:UserMemory+?Sized>(_memory:&mut UserMemoryContext<'_,M
     let description=get_file_description(fd)?;
     let size=usize::try_from(description.stat()?.size).map_err(|_|AxError::InvalidInput)?;
     if size==0||size>MAX_MODULE_BYTES{return Err(AxError::InvalidInput)}
-    let mut bytes=Vec::with_capacity(size);
+    let mut bytes=Vec::new();bytes.try_reserve_exact(size).map_err(|_|AxError::NoMemory)?;
     let copied=description.read(&mut bytes)?;
     if copied!=size||bytes.len()!=size{return Err(AxError::InvalidExecutable)}
     let prepared=prepare(&bytes)?;
