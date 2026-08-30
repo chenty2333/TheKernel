@@ -5,9 +5,12 @@ use thekernel_linux_process_adapter::{Pid, ProcessError};
 
 use crate::task::{
     AsThread, Cred, PidNamespace, Process, get_process_data, get_process_group,
-    get_process_including_zombie, get_visible_task, prepare_session_sid_binding, process_domain,
-    release_dead_session_sid_binding,
-    security::{SecurityTaskGetsidContext, dispatch_task_getsid},
+    get_process_including_zombie, get_visible_task_including_exiting, prepare_session_sid_binding,
+    process_domain, release_dead_session_sid_binding,
+    security::{
+        SecurityTaskGetpgidContext, SecurityTaskGetsidContext, dispatch_task_getpgid,
+        dispatch_task_getsid,
+    },
 };
 
 /// Serializes process-group/session identity admission with the corresponding
@@ -63,7 +66,7 @@ fn resolve_getsid_target(pid: Pid, caller_ns: &PidNamespace) -> AxResult<GetsidT
     // process PID to the executor while the retired leader's immutable kernel
     // TID may still be present in TASK_TABLE.  Looking up the visible task
     // first therefore cannot let that old leader steal getsid(getpid()).
-    if let Ok(task) = get_visible_task(global_pid)
+    if let Ok(task) = get_visible_task_including_exiting(global_pid)
         && caller_ns.contains(&task.as_thread().proc_data.pid_ns())
     {
         return Ok(GetsidTarget::Live(task));
@@ -143,12 +146,33 @@ pub fn sys_setsid() -> AxResult<isize> {
 }
 
 pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
-    let pid = if pid == 0 {
-        current().as_thread().proc_data.proc.pid()
-    } else {
-        pid
-    };
-    Ok(get_process_including_zombie(pid)?.group().pgid() as _)
+    let caller = current();
+    let caller_thread = caller.as_thread();
+    let caller_ns = caller_thread.proc_data.pid_ns();
+    if pid == 0 {
+        let process = &caller_thread.proc_data.proc;
+        let target_ns = process
+            .identity::<alloc::sync::Arc<PidNamespace>>()
+            .ok_or(AxError::NoSuchProcess)?;
+        return Ok(caller_ns
+            .visible_pid_for(&target_ns, process.group().pgid())
+            .map(|pgid| pgid as isize)
+            .unwrap_or(0));
+    }
+
+    // getpgid shares getsid's PIDTYPE_PID lookup: a visible live TID wins;
+    // a zombie is addressable only while its leader is unreaped.
+    let target = resolve_getsid_target(pid, &caller_ns)?;
+    let process = target.process();
+    let target_ns = process
+        .identity::<alloc::sync::Arc<PidNamespace>>()
+        .ok_or(AxError::NoSuchProcess)?;
+    let credential = target.credential()?;
+    dispatch_task_getpgid(&SecurityTaskGetpgidContext::new(&credential))?;
+    Ok(caller_ns
+        .visible_pid_for(&target_ns, process.group().pgid())
+        .map(|pgid| pgid as isize)
+        .unwrap_or(0))
 }
 
 pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {

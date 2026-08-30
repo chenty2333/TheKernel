@@ -401,6 +401,8 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     // leader while another process group still belongs to it. Keep the
     // namespace binding through that lifetime so getsid can render its SID.
     let session = process.group().session();
+    let group = process.group();
+    let group_pgid = group.pgid();
     let session_sid = session.sid();
     let pid_ns = process.identity::<Arc<PidNamespace>>();
     let reaped = process_domain()?.reap(process).map_err(process_error)?;
@@ -409,12 +411,20 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     }
 
     if let Some(pid_ns) = pid_ns {
+        let group_live = group.is_live();
         if !session.is_live() {
             // The last process group left this session. This may release a
             // previously reaped leader's SID binding from a different group.
             release_dead_session_sid_binding(&session, &pid_ns);
         }
-        if process.pid() != session_sid {
+        if !group_live {
+            // PIDTYPE_PGID survives a reaped group leader while another
+            // member remains in the group.  The final membership retirement
+            // is the single edge that returns that namespace PID to the
+            // allocator, including when the last member is not the leader.
+            pid_ns.release_reaped_process(group_pgid);
+        }
+        if process.pid() != session_sid && (process.pid() != group_pgid || !group_live) {
             pid_ns.release_reaped_process(process.pid());
         } else if !session.is_live() {
             // The leader was also the last group member; the SID release

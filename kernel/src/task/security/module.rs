@@ -556,6 +556,19 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
         self.task_getscheduler(context)
     }
 
+    /// Linux `security_task_getpgid` authorization for one resolved task.
+    fn task_getpgid(&self, _context: &SecurityTaskGetpgidContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn task_getpgid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetpgidContext<'_>,
+        _target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.task_getpgid(context)
+    }
+
     fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -779,6 +792,13 @@ pub(super) trait ErasedSecurityModule: Send + Sync {
         &self,
         context: &SecurityTaskGetSchedulerContext<'_>,
         actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+
+    fn task_getpgid(&self, context: &SecurityTaskGetpgidContext<'_>) -> AxResult<()>;
+    fn task_getpgid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetpgidContext<'_>,
         target_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
     fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()>;
@@ -1394,6 +1414,22 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
             self,
             context,
             owned_credential_state(self, actor_state)?,
+            owned_credential_state(self, target_state)?,
+        )
+    }
+
+    fn task_getpgid(&self, context: &SecurityTaskGetpgidContext<'_>) -> AxResult<()> {
+        SecurityModule::task_getpgid(self, context)
+    }
+
+    fn task_getpgid_with_credential_state(
+        &self,
+        context: &SecurityTaskGetpgidContext<'_>,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::task_getpgid_with_credential_state(
+            self,
+            context,
             owned_credential_state(self, target_state)?,
         )
     }

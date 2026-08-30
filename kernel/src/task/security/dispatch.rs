@@ -721,6 +721,16 @@ pub(crate) fn dispatch_task_getscheduler(
         .dispatch_task_getscheduler_with_credential_state(context)
 }
 
+/// Runs Linux `security_task_getpgid` hooks for one already-resolved target.
+pub(crate) fn dispatch_task_getpgid(context: &SecurityTaskGetpgidContext<'_>) -> AxResult<()> {
+    context
+        .target()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_task_getpgid_with_credential_state(context)
+}
+
 /// Runs the frozen signal policy hooks after Linux core signal permission has
 /// admitted the exact actor/target pair. The first denial is returned without
 /// invoking later modules.

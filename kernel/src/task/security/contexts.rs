@@ -319,6 +319,23 @@ impl<'a> SecurityTaskGetSchedulerContext<'a> {
     }
 }
 
+/// Frozen target credential for Linux's `security_task_getpgid` hook.
+/// This is deliberately a distinct hook type: policies may distinguish the
+/// two task identity queries even though both carry only the target.
+pub(crate) struct SecurityTaskGetpgidContext<'a> {
+    target: &'a Cred,
+}
+
+impl<'a> SecurityTaskGetpgidContext<'a> {
+    pub(crate) const fn new(target: &'a Cred) -> Self {
+        Self { target }
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
+}
+
 impl<'a> SecurityTaskGetsidContext<'a> {
     pub(crate) const fn new(target: &'a Cred) -> Self {
         Self { target }
