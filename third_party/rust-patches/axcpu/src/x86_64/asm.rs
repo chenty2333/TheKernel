@@ -15,10 +15,7 @@ use x86::tlb;
 use x86_64::instructions::interrupts;
 #[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
 use x86_64::instructions::tlb as x86_64_tlb;
-#[cfg(all(
-    target_os = "none",
-    any(feature = "asid-fast-switch", feature = "pkeys")
-))]
+#[cfg(target_os = "none")]
 use x86_64::registers::control::{Cr4, Cr4Flags};
 #[cfg(target_os = "none")]
 use x86_64::{
@@ -55,7 +52,8 @@ pub fn user_shadow_stack_enabled() -> bool {
     #[cfg(target_os = "none")]
     {
         let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
-        return cpuid.ecx & (1 << 7) != 0 && x86::controlregs::cr4() & (1 << 23) != 0;
+        return cpuid.ecx & (1 << 7) != 0
+            && Cr4::read().contains(Cr4Flags::CONTROL_FLOW_ENFORCEMENT);
     }
     #[cfg(not(target_os = "none"))]
     false
@@ -67,7 +65,10 @@ pub fn init_user_shadow_stack() {
     {
         let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
         if cpuid.ecx & (1 << 7) != 0 {
-            unsafe { x86::controlregs::cr4_write(x86::controlregs::cr4() | (1 << 23)) };
+            let mut cr4 = Cr4::read();
+            cr4.insert(Cr4Flags::CONTROL_FLOW_ENFORCEMENT);
+            // SAFETY: CPUID has advertised CET and only CR4.CET is changed.
+            unsafe { Cr4::write(cr4) };
         }
     }
 }
