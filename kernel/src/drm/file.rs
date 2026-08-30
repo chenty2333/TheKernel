@@ -164,7 +164,8 @@ impl EventQueue {
     }
     pub(crate) fn finish_close(&self) {
         self.close_waiters
-            .wait_until(|| self.in_flight.load(Ordering::Acquire) == 0);
+            .wait_until(|| self.in_flight.load(Ordering::Acquire) == 0)
+            .expect("DRM event queue close wait failed");
         let mut state = self.state.lock();
         state.closed = true;
         state.events.clear();

@@ -402,9 +402,12 @@ impl DrmDevice {
         let epoch = self.worker_epoch.load(Ordering::Acquire);
         self.ensure_vblank_worker()?;
         let seen = self.state.lock().vblank;
-        self.vblank_waiters.wait_until(|| {
-            self.state.lock().vblank != seen || self.worker_epoch.load(Ordering::Acquire) != epoch
-        });
+        self.vblank_waiters
+            .wait_until(|| {
+                self.state.lock().vblank != seen
+                    || self.worker_epoch.load(Ordering::Acquire) != epoch
+            })
+            .map_err(|_| DrmError::Busy)?;
         if self.worker_epoch.load(Ordering::Acquire) != epoch {
             return Err(DrmError::Busy);
         }
@@ -416,9 +419,12 @@ impl DrmDevice {
     pub(crate) fn wait_for_vblank_at_least(self: &Arc<Self>, target: u64) -> DrmResult<u64> {
         let epoch = self.worker_epoch.load(Ordering::Acquire);
         self.ensure_vblank_worker()?;
-        self.vblank_waiters.wait_until(|| {
-            self.state.lock().vblank >= target || self.worker_epoch.load(Ordering::Acquire) != epoch
-        });
+        self.vblank_waiters
+            .wait_until(|| {
+                self.state.lock().vblank >= target
+                    || self.worker_epoch.load(Ordering::Acquire) != epoch
+            })
+            .map_err(|_| DrmError::Busy)?;
         if self.worker_epoch.load(Ordering::Acquire) != epoch {
             return Err(DrmError::Busy);
         }
@@ -615,7 +621,9 @@ impl CommitCompletion {
         self.waiters.notify_all(true);
     }
     fn wait(&self) -> DrmResult<()> {
-        self.waiters.wait_until(|| self.result.lock().is_some());
+        self.waiters
+            .wait_until(|| self.result.lock().is_some())
+            .map_err(|_| DrmError::Busy)?;
         self.result.lock().unwrap()
     }
 }

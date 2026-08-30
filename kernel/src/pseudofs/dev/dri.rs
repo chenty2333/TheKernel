@@ -14,7 +14,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
-use linux_raw_sys::general::S_IFCHR;
+use linux_raw_sys::general::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
 
 use crate::{
     drm::{DrmDevice, DrmFile},
@@ -163,23 +163,36 @@ struct DrmFileAdapter {
     file: DrmFile,
     nonblocking: AtomicBool,
     render: bool,
+    access_mode: u32,
 }
 
 impl DrmFileAdapter {
-    fn new(file: DrmFile, render: bool) -> Self {
+    fn new(file: DrmFile, render: bool, flags: u32) -> Self {
         Self {
             file,
             nonblocking: AtomicBool::new(false),
             render,
+            access_mode: flags & O_ACCMODE,
         }
+    }
+
+    fn allows_read(&self) -> bool {
+        matches!(self.access_mode, O_RDONLY | O_RDWR)
+    }
+
+    fn allows_write(&self) -> bool {
+        matches!(self.access_mode, O_WRONLY | O_RDWR)
     }
 }
 
 impl DeviceOps for DrmPrimary {
-    fn open_description(&self, _location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
-        let file: Arc<dyn FileLike> =
-            Arc::try_new(DrmFileAdapter::new(self.device.open_primary(), false))
-                .map_err(|_| AxError::NoMemory)?;
+    fn open_description(&self, _location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        let file: Arc<dyn FileLike> = Arc::try_new(DrmFileAdapter::new(
+            self.device.open_primary(),
+            false,
+            flags,
+        ))
+        .map_err(|_| AxError::NoMemory)?;
         Ok(Some(DeviceOpen::new(file, None)))
     }
 
@@ -203,10 +216,11 @@ impl DeviceOps for DrmPrimary {
 }
 
 impl DeviceOps for DrmRender {
-    fn open_description(&self, _: &Location, _: u32) -> VfsResult<Option<DeviceOpen>> {
+    fn open_description(&self, _: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
         let file: Arc<dyn FileLike> = Arc::try_new(DrmFileAdapter::new(
             self.device.open_render().map_err(AxError::from)?,
             true,
+            flags,
         ))
         .map_err(|_| AxError::NoMemory)?;
         Ok(Some(DeviceOpen::new(file, None)))
@@ -227,6 +241,9 @@ impl DeviceOps for DrmRender {
 
 impl FileLike for DrmFileAdapter {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        if !self.allows_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
         block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             let result = self.file.read_events(dst);
             match result {
@@ -237,6 +254,9 @@ impl FileLike for DrmFileAdapter {
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
+        if !self.allows_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
         Err(AxError::InvalidInput)
     }
 
@@ -346,8 +366,34 @@ mod tests {
         assert_eq!(metadata.mode.bits(), 0o600);
         drop(filesystem);
 
-        let first = DrmFileAdapter::new(primary.device.open_primary(), false);
-        let second = DrmFileAdapter::new(primary.device.open_primary(), false);
+        let first = DrmFileAdapter::new(primary.device.open_primary(), false, O_RDONLY);
+        let second = DrmFileAdapter::new(primary.device.open_primary(), false, O_RDONLY);
         assert_ne!(first.file.id(), second.file.id());
+    }
+
+    #[test]
+    fn drm_ofd_retains_open_access_mode() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let read_only = DrmFileAdapter::new(device.open_primary(), false, O_RDONLY);
+        let write_only = DrmFileAdapter::new(device.open_primary(), false, O_WRONLY);
+        let read_write = DrmFileAdapter::new(device.open_primary(), false, O_RDWR);
+        let mut destination_storage = [0; 1];
+        let mut destination = &mut destination_storage[..];
+        let mut source = &b"x"[..];
+
+        assert!(read_only.allows_read());
+        assert!(!read_only.allows_write());
+        assert!(!write_only.allows_read());
+        assert!(write_only.allows_write());
+        assert!(read_write.allows_read());
+        assert!(read_write.allows_write());
+        assert_eq!(
+            write_only.read(&mut destination),
+            Err(AxError::BadFileDescriptor)
+        );
+        assert_eq!(
+            read_only.write(&mut source),
+            Err(AxError::BadFileDescriptor)
+        );
     }
 }
