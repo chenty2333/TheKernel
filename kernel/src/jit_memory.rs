@@ -249,6 +249,13 @@ pub(crate) fn prepare(size: usize) -> Result<WritableCode, MemoryError> {
     })
 }
 
+/// Reserves a non-executable module data segment at its final virtual address.
+/// The caller may relocate through its writable alias, then either retain it
+/// RW/NX or consume it with [`WritableCode::publish_readonly`] as RO/NX.
+pub(crate) fn prepare_module_data(size: usize) -> Result<WritableCode, MemoryError> {
+    prepare(size)
+}
+
 /// Changes permissions one page at a time and reports how many pages were
 /// changed before the first failure. `AddrSpace::protect` accepts a range but
 /// is allowed to stop after a partial page-table walk; keeping the cursor
@@ -412,6 +419,50 @@ impl WritableCode {
             direct: self.direct,
             len: self.len,
             entry_offset,
+            armed: true,
+        })
+    }
+
+    /// Publishes module rodata as read-only and non-executable.  This is the
+    /// same alias discipline as code publication, except execute is never
+    /// granted to the final kernel mapping.
+    pub(crate) fn publish_readonly(mut self) -> Result<ExecutableCode, MemoryError> {
+        if let Err((error, changed)) =
+            protect_pages_partial(self.direct, self.pages, MappingFlags::READ)
+        {
+            if protect_pages(
+                self.direct,
+                changed,
+                MappingFlags::READ | MappingFlags::WRITE,
+            )
+            .is_err()
+            {
+                return Err(self.quarantine(MemoryError::Quarantined(error)));
+            }
+            drop(crate::mm::synchronize_tlb_and_icache());
+            return Err(self.abort(MemoryError::Unavailable(error)));
+        }
+        drop(crate::mm::synchronize_tlb_and_icache());
+        if let Err((error, changed)) =
+            protect_pages_partial(self.code, self.pages, MappingFlags::READ)
+        {
+            if protect_pages(self.code, changed, MappingFlags::READ | MappingFlags::WRITE).is_err()
+            {
+                return Err(self.quarantine(MemoryError::Quarantined(error)));
+            }
+            drop(crate::mm::synchronize_tlb_and_icache());
+            return Err(self.abort(MemoryError::Unavailable(error)));
+        }
+        drop(crate::mm::synchronize_tlb_and_icache());
+        self.armed = false;
+        Ok(ExecutableCode {
+            arena: self.arena,
+            first: self.first,
+            pages: self.pages,
+            code: self.code,
+            direct: self.direct,
+            len: self.len,
+            entry_offset: 0,
             armed: true,
         })
     }
