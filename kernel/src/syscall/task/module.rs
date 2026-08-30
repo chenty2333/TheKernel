@@ -233,6 +233,14 @@ fn rel(
             if y.v > sec.z || y.z > sec.z - y.v {
                 return no();
             }
+            let width = match inf as u32 {
+                1 => 8,
+                2 | 4 | 10 | 11 => 4,
+                _ => return no(),
+            };
+            if off.checked_add(width).ok_or(AxError::InvalidExecutable)? > ss[r.i as usize].z {
+                return no();
+            }
             let dp = match dst {
                 P::C(x) => P::C(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
                 P::D(x) => P::D(x.checked_add(off).ok_or(AxError::InvalidExecutable)?),
@@ -273,7 +281,7 @@ fn rel(
                         .map_err(|_| AxError::InvalidExecutable)?
                         .to_le_bytes(),
                 )?,
-                _ => return no(),
+                _ => unreachable!(),
             }
         }
     }
@@ -419,7 +427,7 @@ fn params(
                 let kind = u16x(d, q + 24)?;
                 let fl = u16x(d, q + 26)?;
                 let cap = u32x(d, q + 28)? as usize;
-                if fl & !1 != 0 || u32x(d, q + 32)? != 0 || cap == 0 {
+                if fl & !1 != 0 || u32x(d, q + 32)? != 0 || cap == 0 || (kind == 5 && fl & 1 != 0) {
                     return no();
                 }
                 let vs: Vec<&[u8]> = if fl & 1 != 0 {
@@ -543,6 +551,9 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
     if cl == 0 {
         return no();
     }
+    if cl.checked_add(dl).ok_or(AxError::InvalidExecutable)? > MAX {
+        return Err(AxError::NoMemory);
+    }
     let mut c = Vec::new();
     c.try_reserve_exact(cl).map_err(|_| AxError::NoMemory)?;
     c.resize(cl, 0);
@@ -634,14 +645,11 @@ fn activate(x: M) -> AxResult<isize> {
         .iter()
         .position(|x| x.name == n)
         .ok_or(AxError::BadState)?;
-    if r != 0 {
+    if r < 0 {
         v.remove(i);
-        return Err(if r < 0 {
-            LinuxError::try_from(-r).unwrap_or(LinuxError::EINVAL)
-        } else {
-            LinuxError::EINVAL
-        }
-        .into());
+        return Err(LinuxError::try_from(-r)
+            .unwrap_or(LinuxError::EINVAL)
+            .into());
     }
     v[i].state = State::Live(x);
     Ok(0)
@@ -717,13 +725,35 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     }
     let raw = vm_load_until_nul_bounded(m, p.cast(), NAMEMAX + 1).map_err(map_usercopy_error)?;
     let n = core::str::from_utf8(&raw).map_err(|_| AxError::IllegalBytes)?;
+    let force = fl & O_TRUNC != 0;
     let x = {
         let mut v = MODULES.lock();
         let i = v
             .iter()
             .position(|x| x.name == n)
             .ok_or(LinuxError::ENOENT)?;
-        if !matches!(v[i].state, State::Live(_)) || v[i].refs != 1 || v[i].deps != 0 {
+        let live = match &v[i].state {
+            State::Live(x) => x,
+            _ => {
+                return Err(if fl & O_NONBLOCK != 0 {
+                    LinuxError::EAGAIN
+                } else {
+                    LinuxError::EBUSY
+                }
+                .into());
+            }
+        };
+        if v[i].refs != 1 || v[i].deps != 0 {
+            return Err(if fl & O_NONBLOCK != 0 {
+                LinuxError::EAGAIN
+            } else if force {
+                LinuxError::EOPNOTSUPP
+            } else {
+                LinuxError::EBUSY
+            }
+            .into());
+        }
+        if live.exit.is_none() && !force {
             return Err(LinuxError::EBUSY.into());
         }
         match core::mem::replace(&mut v[i].state, State::Going) {
