@@ -16,6 +16,10 @@ phys-virt-offset = "0xffff_8000_0000_0000"
 phys-bus-offset = 0
 kernel-aspace-base = "0xffff_8000_0000_0000"
 kernel-aspace-size = "0x0000_7fff_ffff_f000"
+# Four 4 KiB per-CPU secret mapping slots, immediately below the exclusive
+# kernel-aspace end.  The direct map occupies only phys-memory-size at its base.
+secret-window-base = "0xffff_ffff_ffff_b000"
+secret-window-size = 0x4000
 boot-stack-size = 0x0004_0000
 
 [devices]
