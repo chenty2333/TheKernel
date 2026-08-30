@@ -295,6 +295,7 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
+const FILEID_INVALID: i32 = 255;
 const AT_HANDLE_FID: i32 = 0x200;
 const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
@@ -305,6 +306,13 @@ const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
 struct LinuxFileHandle {
     handle_bytes: u32,
     handle_type: i32,
+}
+
+const fn short_handle_probe_header(required_bytes: u32) -> LinuxFileHandle {
+    LinuxFileHandle {
+        handle_bytes: required_bytes,
+        handle_type: FILEID_INVALID,
+    }
 }
 
 fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
@@ -846,10 +854,9 @@ pub fn sys_name_to_handle_at(
     }
     let required_bytes = u32::try_from(exported.bytes.len()).map_err(|_| LinuxError::EOVERFLOW)?;
     if header.handle_bytes < required_bytes {
-        let required_header = LinuxFileHandle {
-            handle_bytes: required_bytes,
-            handle_type: exported.handle_type,
-        };
+        // Linux stores exportfs_encode_fh()'s FILEID_INVALID result in the
+        // fixed header while reporting the required variable payload size.
+        let required_header = short_handle_probe_header(required_bytes);
         let required_header = unsafe {
             slice::from_raw_parts(
                 (&required_header as *const LinuxFileHandle).cast::<u8>(),
@@ -985,9 +992,10 @@ pub fn sys_open_by_handle_at(
 }
 
 fn map_decode_export_handle_error(error: AxError) -> AxError {
-    match error {
-        AxError::NotFound | AxError::InvalidInput => LinuxError::ESTALE.into(),
-        error => error,
+    if error == AxError::NoMemory {
+        error
+    } else {
+        LinuxError::ESTALE.into()
     }
 }
 
@@ -2110,18 +2118,28 @@ mod namespace_operation_tests {
 
     #[test]
     fn handle_decode_staleness_mapping_preserves_allocation_failure() {
-        assert_eq!(
-            map_decode_export_handle_error(AxError::NotFound),
-            LinuxError::ESTALE.into()
-        );
-        assert_eq!(
-            map_decode_export_handle_error(AxError::InvalidInput),
-            LinuxError::ESTALE.into()
-        );
+        for error in [
+            AxError::NotFound,
+            AxError::InvalidInput,
+            AxError::OperationNotSupported,
+            AxError::Io,
+        ] {
+            assert_eq!(
+                map_decode_export_handle_error(error),
+                LinuxError::ESTALE.into()
+            );
+        }
         assert_eq!(
             map_decode_export_handle_error(AxError::NoMemory),
             AxError::NoMemory
         );
+    }
+
+    #[test]
+    fn short_handle_probe_reports_fileid_invalid() {
+        let header = short_handle_probe_header(24);
+        assert_eq!(header.handle_bytes, 24);
+        assert_eq!(header.handle_type, FILEID_INVALID);
     }
 
     #[test]
