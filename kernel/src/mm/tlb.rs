@@ -9,6 +9,13 @@ pub(crate) fn repair_local_spurious_fault(vaddr: VirtAddr) {
     axhal::asm::flush_tlb(Some(vaddr.align_down(PAGE_SIZE_4K)));
 }
 
+/// Acknowledged global invalidation for a mutation of the shared kernel page
+/// table (direct-map removal and per-CPU temporary windows).  Call only after
+/// publishing the PTE mutation and before exposing its protected frame.
+pub(crate) fn synchronize_kernel_map_tlb() -> imp::GlobalGrace {
+    imp::synchronize_tlb()
+}
+
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
