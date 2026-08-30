@@ -55,6 +55,33 @@ const fn clone_signal_altstack(flags: CloneFlags) -> crate::task::ForkSignalAltS
     }
 }
 
+/// CET stack handling is intentionally distinct from ordinary address-space
+/// clone handling. A vfork child borrows the parent's active stack lease even
+/// when the raw clone flags do not also request `CLONE_VM`.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CetShadowStackCloneMode {
+    ForkCow,
+    BorrowVfork,
+    NewSharedMmThread,
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn cet_shadow_stack_clone_mode(flags: CloneFlags) -> CetShadowStackCloneMode {
+    if flags.contains(CloneFlags::VFORK) {
+        CetShadowStackCloneMode::BorrowVfork
+    } else if flags.contains(CloneFlags::VM) {
+        CetShadowStackCloneMode::NewSharedMmThread
+    } else {
+        CetShadowStackCloneMode::ForkCow
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn clone_inherits_cet_handler_state(flags: CloneFlags) -> bool {
+    !flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK)
+}
+
 fn clone_namespace_owner(
     flags: CloneFlags,
     parent_cred: &Cred,
@@ -794,9 +821,11 @@ impl CloneArgs {
         // clone admissions cannot expose partially initialized signal state.
         thr.apply_fork_signal_execution_state(signal_execution_state, signal_altstack);
         #[cfg(target_arch = "x86_64")]
-        if !flags.contains(CloneFlags::VM) {
-            // A fork from inside a signal handler inherits the handler's
-            // authenticated CET nesting, but not pending signal queues.
+        if clone_inherits_cet_handler_state(flags) {
+            // A fork or vfork from inside a signal handler inherits the
+            // handler's authenticated CET nesting and restart state, but not
+            // pending signal queues. In particular, a CLONE_VM|CLONE_VFORK
+            // child must be able to complete the inherited rt_sigreturn.
             thr.clone_cet_signal_frames_from(calling_thread);
         }
         // Linux inherits ioperm/iopl state for every fork/clone child. The
@@ -862,27 +891,35 @@ impl CloneArgs {
                 .lock()
                 .cet_default_shadow_stack(calling_thread.kernel_tid());
             let child_mm = new_proc_data.aspace();
-            let cet = if !flags.contains(CloneFlags::VM) {
-                // fork COW-copies the parent's VMA and inherits its live SSP.
-                let owner = parent_owner.ok_or(AxError::BadState)?;
-                child_mm
-                    .lock()
-                    .register_cet_default_shadow_stack(tid, owner.start, owner.size)?;
-                parent_cet
-            } else if flags.contains(CloneFlags::VFORK) {
-                // vfork borrows the parent's VMA and must never unmap it.
-                let owner = parent_owner.ok_or(AxError::BadState)?;
-                child_mm.lock().register_borrowed_cet_default_shadow_stack(
-                    tid,
-                    owner.start,
-                    owner.size,
-                )?;
-                parent_cet
-            } else {
-                let mut cet = parent_cet;
-                let fresh = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
-                cet.pl3_ssp = fresh.pl3_ssp;
-                cet
+            let cet = match cet_shadow_stack_clone_mode(flags) {
+                CetShadowStackCloneMode::BorrowVfork => {
+                    // This must precede the !CLONE_VM fork-COW case: a vfork
+                    // child borrows the parent's live stack/SSP and its alias
+                    // must never unmap the parent's VMA on exit or exec.
+                    let owner = parent_owner.ok_or(AxError::BadState)?;
+                    child_mm.lock().register_borrowed_cet_default_shadow_stack(
+                        tid,
+                        owner.start,
+                        owner.size,
+                    )?;
+                    parent_cet
+                }
+                CetShadowStackCloneMode::ForkCow => {
+                    // fork COW-copies the parent's VMA and inherits its live SSP.
+                    let owner = parent_owner.ok_or(AxError::BadState)?;
+                    child_mm.lock().register_cet_default_shadow_stack(
+                        tid,
+                        owner.start,
+                        owner.size,
+                    )?;
+                    parent_cet
+                }
+                CetShadowStackCloneMode::NewSharedMmThread => {
+                    let mut cet = parent_cet;
+                    let fresh = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
+                    cet.pl3_ssp = fresh.pl3_ssp;
+                    cet
+                }
             };
             // The child has not been published: do not write the live MSRs.
             new_task.ctx_mut().set_saved_user_cet_state(cet);
@@ -1116,6 +1153,10 @@ mod tests {
     use axerrno::AxError;
     use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
 
+    #[cfg(target_arch = "x86_64")]
+    use super::{
+        CetShadowStackCloneMode, cet_shadow_stack_clone_mode, clone_inherits_cet_handler_state,
+    };
     use super::{
         CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
         clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
@@ -1187,6 +1228,29 @@ mod tests {
             clone_signal_altstack(CloneFlags::VM | CloneFlags::VFORK),
             Inherit
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vfork_prioritizes_borrowed_cet_stack_and_handler_state() {
+        use CetShadowStackCloneMode::{BorrowVfork, ForkCow, NewSharedMmThread};
+
+        assert_eq!(cet_shadow_stack_clone_mode(CloneFlags::empty()), ForkCow);
+        assert_eq!(
+            cet_shadow_stack_clone_mode(CloneFlags::VM),
+            NewSharedMmThread
+        );
+        assert_eq!(cet_shadow_stack_clone_mode(CloneFlags::VFORK), BorrowVfork);
+        assert_eq!(
+            cet_shadow_stack_clone_mode(CloneFlags::VM | CloneFlags::VFORK),
+            BorrowVfork
+        );
+
+        assert!(clone_inherits_cet_handler_state(CloneFlags::empty()));
+        assert!(!clone_inherits_cet_handler_state(CloneFlags::VM));
+        assert!(clone_inherits_cet_handler_state(
+            CloneFlags::VM | CloneFlags::VFORK
+        ));
     }
 
     #[test]
