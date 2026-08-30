@@ -54,7 +54,8 @@ use crate::{
     },
     task::{
         AsThread, Cred, Kgid, Kuid, PidNamespace, UserGid, UserUid, current_fs_context,
-        has_pending_syscall_signal, ns_capable, security::InodeSetattrCommittedSecurityRef,
+        fs_context_publication, has_pending_syscall_signal, ns_capable,
+        security::InodeSetattrCommittedSecurityRef,
     },
     time::{timestamp_from_seconds, timestamp_from_timespec, timestamp_from_timeval, wall_time},
 };
@@ -548,6 +549,7 @@ pub fn sys_chdir<M: UserMemory + ?Sized>(
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let _fs_context_publication = fs_context_publication();
     let fs_context = current_fs_context();
     let mut fs = fs_context.lock();
     let entry = fs.resolve_security(path, &security)?;
@@ -561,6 +563,8 @@ pub fn sys_chdir<M: UserMemory + ?Sized>(
 
 pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     debug!("sys_fchdir <= dirfd: {dirfd}");
+
+    let _fs_context_publication = fs_context_publication();
 
     // fdget_raw-equivalent: retain this exact open file description once and
     // keep it live through the permission decision and cwd publication.
@@ -593,6 +597,7 @@ pub fn sys_chroot<M: UserMemory + ?Sized>(
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let _fs_context_publication = fs_context_publication();
     let fs_context = current_fs_context();
     let mut fs = fs_context.lock();
     let loc = fs.resolve_security(path, &security)?;

@@ -975,6 +975,87 @@ pub fn move_tree_and_records(old: &Location, target: &Location) -> AxResult<()> 
     Ok(())
 }
 
+/// Performs the mount-tree and mount-record half of `pivot_root(2)` as one
+/// namespace operation. Callers must hold [`namespace_operation`].
+pub fn pivot_root_and_records(
+    old_root: &Location,
+    new_root: &Location,
+    put_old: &Location,
+) -> AxResult<()> {
+    let new_mount = new_root.mountpoint();
+    if new_mount.is_root() {
+        return Err(AxError::ResourceBusy);
+    }
+    if !old_root.is_root_of_mount()
+        || !new_root.is_root_of_mount()
+        || !put_old.is_dir()
+        || !Arc::ptr_eq(put_old.mountpoint(), new_mount)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    let new_root_path = new_root.absolute_path().map_err(|_| AxError::Io)?;
+    let put_old_path = put_old.absolute_path().map_err(|_| AxError::Io)?;
+    let put_old_new_path = path_suffix(new_root_path.as_ref(), put_old_path.as_ref())
+        .filter(|path| !path.is_empty())
+        .ok_or(AxError::InvalidInput)
+        .and_then(try_string)?;
+
+    let mut records = MOUNT_RECORDS.lock();
+    let index = MountRecordIndex::new(&records)?;
+    validate_registered_mount_chain(&index, new_mount)?;
+    let new_subtree = validate_registered_subtree(&index, new_mount)?;
+    let old_root_index = records
+        .iter()
+        .position(|record| record.parent_id == 0)
+        .ok_or(AxError::Io)?;
+    let namespace_root = validate_record_state(&records[old_root_index])?;
+    if !namespace_root.is_root() {
+        return Err(AxError::Io);
+    }
+    if !Arc::ptr_eq(old_root.mountpoint(), &namespace_root) {
+        return Err(AxError::InvalidInput);
+    }
+
+    // All allocations and string construction happen before the VFS tree is
+    // touched. Once `pivot_root_to` succeeds, publishing this prepared ledger
+    // is infallible and preserves a single atomic namespace view.
+    let mut updates = Vec::new();
+    updates
+        .try_reserve_exact(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (record_index, record) in records.iter().enumerate() {
+        let (target, parent_id) = if new_subtree.contains(&record.mount_id) {
+            let suffix = path_suffix(new_root_path.as_ref(), &record.target).ok_or(AxError::Io)?;
+            let target = if suffix.is_empty() {
+                try_string("/")?
+            } else {
+                try_string(suffix)?
+            };
+            (
+                target,
+                (record.mount_id == new_mount.mount_id()).then_some(0),
+            )
+        } else {
+            (
+                joined_path(&put_old_new_path, &record.target)?,
+                (record_index == old_root_index).then_some(new_mount.mount_id()),
+            )
+        };
+        updates.push((record_index, target, parent_id));
+    }
+
+    new_root.pivot_root_to(put_old)?;
+    for (record_index, target, parent_id) in updates {
+        let record = &mut records[record_index];
+        record.target = target;
+        if let Some(parent_id) = parent_id {
+            record.parent_id = parent_id;
+        }
+        record.expire_epoch = None;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn move_tree_records(
     records: &mut [MountRecord],

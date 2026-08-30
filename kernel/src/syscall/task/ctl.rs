@@ -30,7 +30,7 @@ use crate::{
     },
     task::{
         AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
-        cred_error, get_process_data, get_visible_task,
+        cred_error, fs_context_publication, get_process_data, get_visible_task,
         linux_pid_from_task_id, ns_capable,
     },
 };
@@ -445,6 +445,10 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             } else {
                 None
             };
+            // Serialize the COW snapshot and replacement with pivot_root's
+            // all-task fs-context update.
+            let _fs_context_publication = (flags & CLONE_FS != 0)
+                .then(fs_context_publication);
             let private_fs_context = if flags & CLONE_FS != 0 {
                 thread.try_clone_fs_context_if_shared()?
             } else {

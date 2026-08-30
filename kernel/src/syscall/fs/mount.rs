@@ -28,7 +28,7 @@ use crate::{
     mm::map_usercopy_error,
     mounts,
     pseudofs::{MemoryFs, cgroup},
-    task::{AsThread, DacCredentialView, current_fs_context},
+    task::{AsThread, DacCredentialView, current_fs_context, fs_context_publication, try_tasks},
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
@@ -1134,6 +1134,68 @@ pub fn sys_mount<M: UserMemory + ?Sized>(
     }
     mounts::attach_tree_and_record(&mountpoint, &target)?;
 
+    Ok(0)
+}
+
+pub fn sys_pivot_root<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    new_root: *const c_char,
+    put_old: *const c_char,
+) -> AxResult<isize> {
+    // Linux checks namespace authority before either pathname copy.  Besides
+    // matching the observable EPERM/EFAULT order, this avoids user-memory
+    // access for callers that cannot mount in the first place.
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
+    }
+    let new_root = load_user_string(memory, new_root)?;
+    if new_root.is_empty() {
+        return Err(AxError::NotFound);
+    }
+
+    let curr = current();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let _mount_operation = mounts::namespace_operation();
+    // Freeze fs_struct cloning/replacement before resolving the transaction
+    // and retain it until every live old-root reference has moved.
+    let _fs_context_publication = fs_context_publication();
+    // Resolve in Linux order while the namespace topology is frozen.  The
+    // security-aware walk applies DAC and registered inode security hooks to
+    // both paths before the topology commit.
+    let fs_context = current_fs_context();
+    let fs = fs_context.lock();
+    let old_root = fs.root_dir().clone();
+    let new_root_loc = fs.resolve_security(&new_root, &security)?;
+    // LOOKUP_DIRECTORY belongs to the new-root walk. Linux returns ENOTDIR
+    // here before it reads or resolves put_old.
+    new_root_loc.check_is_dir()?;
+    drop(fs);
+
+    let put_old = load_user_string(memory, put_old)?;
+    if put_old.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    debug!("sys_pivot_root <= new_root: {new_root:?}, put_old: {put_old:?}");
+    let put_old_loc = fs_context.lock().resolve_security(&put_old, &security)?;
+    put_old_loc.check_is_dir()?;
+    // Keep every live task pinned before the irreversible topology commit.
+    // The subsequent per-context updates are allocation-free, matching
+    // chroot_fs_refs(): only root/cwd references exactly at the old root move.
+    let tasks = try_tasks()?;
+    mounts::pivot_root_and_records(&old_root, &new_root_loc, &put_old_loc)?;
+    for task in tasks {
+        if let Some(thread) = task.try_as_thread() {
+            // A task may have completed exit after its weak registry entry was
+            // snapshotted. The publication gate prevents retirement after a
+            // successful acquisition; an already-retired exiting task has no
+            // user-visible fs references left to update.
+            if let Some(fs_context) = thread.try_fs_context() {
+                fs_context
+                    .lock()
+                    .pivot_root_refs(&old_root, &new_root_loc);
+            }
+        }
+    }
     Ok(0)
 }
 

@@ -107,7 +107,7 @@ pub struct Mountpoint {
     /// Unique identity of this mount instance.
     mount_id: u64,
     /// Whether this is the root mount of its namespace.
-    namespace_root: bool,
+    namespace_root: AtomicBool,
     /// Preallocated shared location lease. Keeping one baseline reference in
     /// the mount avoids allocating from pathname traversal or under the mount
     /// tree lock; `MountHandle` itself owns no reference back to this mount.
@@ -269,7 +269,7 @@ impl Mountpoint {
             filesystem: fs.clone(),
             device: fs.device(),
             mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            namespace_root,
+            namespace_root: AtomicBool::new(namespace_root),
             handle,
             unmounting: AtomicBool::new(false),
             extensions: MountExtensions::new(extensions),
@@ -305,7 +305,7 @@ impl Mountpoint {
             filesystem: fs.clone(),
             device: fs.device(),
             mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            namespace_root,
+            namespace_root: AtomicBool::new(namespace_root),
             handle,
             unmounting: AtomicBool::new(false),
             extensions: MountExtensions::new(extensions),
@@ -374,12 +374,12 @@ impl Mountpoint {
     }
 
     pub fn is_root(&self) -> bool {
-        self.namespace_root
+        self.namespace_root.load(Ordering::Acquire)
     }
 
     pub fn is_attached(&self) -> bool {
         let _tree = MOUNT_TREE_LOCK.read();
-        self.namespace_root || self.location.lock().is_some()
+        self.namespace_root.load(Ordering::Acquire) || self.location.lock().is_some()
     }
 
     /// Returns the effective mountpoint.
@@ -589,7 +589,7 @@ impl Mountpoint {
             if current.unmounting.load(Ordering::Acquire) {
                 return Err(VfsError::ResourceBusy);
             }
-            if current.namespace_root {
+            if current.namespace_root.load(Ordering::Acquire) {
                 return Ok(depth);
             }
             let Some(parent) = current.parent_mountpoint_locked() else {
@@ -608,7 +608,7 @@ impl Mountpoint {
     }
 
     fn validate_detach_locked(self: &Arc<Self>, require_unused: bool) -> VfsResult<()> {
-        if self.namespace_root {
+        if self.namespace_root.load(Ordering::Acquire) {
             return Err(VfsError::ResourceBusy);
         }
 
@@ -1397,7 +1397,7 @@ impl Location {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
-        if self.mountpoint().namespace_root {
+        if self.mountpoint().namespace_root.load(Ordering::Acquire) {
             return Err(VfsError::ResourceBusy);
         }
         target.check_is_dir()?;
@@ -1477,11 +1477,94 @@ impl Location {
         Ok(())
     }
 
+    /// Atomically promotes this mounted tree to namespace root and mounts the
+    /// former root at `put_old`. Both locations must already be stable.
+    pub fn pivot_root_to(&self, put_old: &Self) -> VfsResult<()> {
+        if !self.is_root_of_mount() || !put_old.is_dir() {
+            return Err(VfsError::InvalidInput);
+        }
+        let new_root = self.mountpoint();
+        if new_root.namespace_root.load(Ordering::Acquire)
+            || !Arc::ptr_eq(put_old.mountpoint(), new_root)
+        {
+            return Err(VfsError::InvalidInput);
+        }
+
+        let _tree = mount_tree_write();
+        if new_root.unmounting.load(Ordering::Acquire) {
+            return Err(VfsError::ResourceBusy);
+        }
+        if !entry_is_same_or_ancestor_by_inode(&new_root.root, put_old.entry()) {
+            return Err(VfsError::InvalidInput);
+        }
+        let mut old_root = new_root.clone();
+        for _ in 0..=MAX_MOUNT_TREE_DEPTH {
+            if old_root.namespace_root.load(Ordering::Acquire) {
+                break;
+            }
+            old_root = old_root
+                .parent_mountpoint_locked()
+                .ok_or(VfsError::InvalidInput)?;
+        }
+        if !old_root.namespace_root.load(Ordering::Acquire)
+            || old_root.unmounting.load(Ordering::Acquire)
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+
+        let new_location = new_root.location.lock();
+        let old_parent = new_location
+            .as_ref()
+            .and_then(|location| location.mountpoint.upgrade())
+            .ok_or(VfsError::InvalidInput)?;
+        let new_key = new_location.as_ref().unwrap().entry.try_key()?;
+        let put_old_key = put_old.entry.try_key()?;
+        if !old_parent
+            .children
+            .lock()
+            .get(&new_key)
+            .is_some_and(|mount| Arc::ptr_eq(mount, new_root))
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        {
+            let mut children = new_root.children.lock();
+            if children.contains_key(&put_old_key) {
+                return Err(VfsError::ResourceBusy);
+            }
+            // `insert` is part of the irreversible edge swap below. Reserve
+            // its bucket before the first topology mutation so ENOMEM leaves
+            // the tree completely untouched.
+            children.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        }
+        drop(new_location);
+
+        // Validate before either edge is changed. The commit below allocates
+        // nothing, so it cannot leave a partially pivoted namespace.
+        let new_subtree = new_root.subtree_nodes_locked()?;
+        let old_subtree = old_root.subtree_nodes_locked()?;
+        if new_subtree.iter().any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
+            || old_subtree.iter().any(|(mount, _)| mount.unmounting.load(Ordering::Acquire))
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+
+        old_parent.children.lock().remove(&new_key);
+        *new_root.location.lock() = None;
+        old_root.namespace_root.store(false, Ordering::Release);
+        *old_root.location.lock() = Some(MountLocation::new(put_old));
+        new_root.children.lock().insert(put_old_key, old_root.clone());
+        new_root.namespace_root.store(true, Ordering::Release);
+        Mountpoint::refresh_subtree_handles_locked(&new_subtree);
+        Mountpoint::refresh_subtree_handles_locked(&old_subtree);
+        Ok(())
+    }
+
     pub fn check_unmountable(&self) -> VfsResult<()> {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
-        if self.mountpoint().namespace_root {
+        if self.mountpoint().namespace_root.load(Ordering::Acquire) {
             return Err(VfsError::ResourceBusy);
         }
 
@@ -1497,7 +1580,7 @@ impl Location {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
-        if self.mountpoint().namespace_root {
+        if self.mountpoint().namespace_root.load(Ordering::Acquire) {
             return Err(VfsError::ResourceBusy);
         }
 
@@ -1580,7 +1663,7 @@ impl Location {
                 return Err(VfsError::ResourceBusy);
             }
             for (mountpoint, _) in &mounts {
-                if !mountpoint.namespace_root {
+                if !mountpoint.namespace_root.load(Ordering::Acquire) {
                     mountpoint.validate_detach_locked(false)?;
                 }
             }
@@ -1612,7 +1695,7 @@ impl Location {
         // so resource pressure after a successful flush cannot leave a partial
         // detach.
         for (mountpoint, _) in &mounts {
-            if !mountpoint.namespace_root {
+            if !mountpoint.namespace_root.load(Ordering::Acquire) {
                 if let Err(err) = mountpoint.validate_detach_locked(false) {
                     for (mountpoint, _) in &mounts {
                         mountpoint.unmounting.store(false, Ordering::Release);
@@ -1623,7 +1706,7 @@ impl Location {
         }
         let mut detach_error = None;
         for (mountpoint, _) in &mounts {
-            if !mountpoint.namespace_root {
+            if !mountpoint.namespace_root.load(Ordering::Acquire) {
                 if let Err(err) = mountpoint.detach_prevalidated_from_parent_locked() {
                     detach_error = Some(err);
                     break;
@@ -1857,6 +1940,25 @@ mod tests {
         let in_mount_other = parent.lookup_no_follow_in_mount("other").unwrap();
         assert!(ordinary_other.ptr_eq(&in_mount_other));
         assert!(!in_mount_other.is_mountpoint());
+    }
+
+    #[test]
+    fn pivot_root_replaces_the_namespace_root_without_a_transient_detach() {
+        let parent_filesystem = Filesystem::new(LookupTestFs::new(100));
+        let old_root_mount = Mountpoint::new_root(&parent_filesystem);
+        let old_root = old_root_mount.root_location();
+        let mountpoint = old_root.lookup_no_follow_in_mount("child").unwrap();
+        let new_filesystem = Filesystem::new(LookupTestFs::new(200));
+        let new_mount = mountpoint.mount(&new_filesystem).unwrap();
+        let new_root = new_mount.root_location();
+        let put_old = new_root.lookup_no_follow_in_mount("child").unwrap();
+
+        new_root.pivot_root_to(&put_old).unwrap();
+
+        assert!(new_mount.is_root());
+        assert!(!old_root_mount.is_root());
+        assert!(old_root_mount.location().unwrap().ptr_eq(&put_old));
+        assert!(new_root.lookup_no_follow("child").unwrap().same_mount(&old_root));
     }
 
     #[test]

@@ -1171,6 +1171,12 @@ impl Thread {
         self.fs_context.lock().as_ref().expect("retired fs_struct").context.clone()
     }
 
+    /// Takes a live fs_struct reference without treating an exiting task's
+    /// already-retired slot as a kernel invariant violation.
+    pub(crate) fn try_fs_context(&self) -> Option<Arc<Mutex<FsContext>>> {
+        self.fs_context.lock().as_ref().map(|slot| slot.context.clone())
+    }
+
     /// Acquires one Linux task ownership of this `fs_struct`.
     pub(crate) fn fs_context_for_child(&self) -> Arc<FsContextSlot> {
         FsContextSlot::share_for_task(self.fs_context.lock().as_ref().expect("retired fs_struct"))

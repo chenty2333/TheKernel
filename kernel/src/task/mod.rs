@@ -99,6 +99,16 @@ pub use self::{
 
 pub(crate) use self::thread::SchedulerSeed;
 
+/// Linearizes creation/replacement of a task's `fs_struct` with namespace-root
+/// replacement. The required lock order is this gate, then an individual
+/// `FsContext` mutex; pivot_root takes the gate before snapshotting tasks.
+pub(crate) static FS_CONTEXT_PUBLICATION: axsync::Mutex<()> = axsync::Mutex::new(());
+
+#[inline]
+pub(crate) fn fs_context_publication() -> axsync::MutexGuard<'static, ()> {
+    FS_CONTEXT_PUBLICATION.lock()
+}
+
 /// Snapshot the calling task's Linux `fs_struct`.
 #[inline]
 pub(crate) fn current_fs_context() -> alloc::sync::Arc<axsync::Mutex<axfs::FsContext>> {

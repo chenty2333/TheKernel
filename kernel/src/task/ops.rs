@@ -28,7 +28,7 @@ use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
     ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
     PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
-    TimerState, futex_table_for, lock_task_parent_publication, process_domain, reap_process,
+    TimerState, fs_context_publication, futex_table_for, lock_task_parent_publication, process_domain, reap_process,
     request_process_cpu_evaluation, send_signal_to_process, send_signal_to_process_data,
     send_signal_to_thread, user::linux_pid_from_task_id,
 };
@@ -1529,7 +1529,13 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     };
     // The core unlink above is the sole Linux task ownership retirement edge;
     // scheduler Arc destruction is not allowed to define files_struct lifetime.
-    let retired_fs_context = thr.retire_fs_context();
+    // Keep the slot live while pivot_root walks its task snapshot. The task
+    // table unlink above intentionally precedes this gate, avoiding a
+    // task-table -> fs-publication lock inversion.
+    let retired_fs_context = {
+        let _fs_context_publication = fs_context_publication();
+        thr.retire_fs_context()
+    };
     let mut retired_fd_table = Some(thr.retire_fd_table());
     // Do not defer cwd/root release to scheduler Arc destruction.
     drop(retired_fs_context);

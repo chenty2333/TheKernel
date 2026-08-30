@@ -755,6 +755,9 @@ pub(super) fn dispatch_syscall(
         Sysno::umount2 => with_user_memory(aspace(), |memory| {
             sys_umount2(memory, uctx.arg0() as _, uctx.arg1() as _)
         }),
+        Sysno::pivot_root => with_user_memory(aspace(), |memory| {
+            sys_pivot_root(memory, uctx.arg0() as _, uctx.arg1() as _)
+        }),
 
         // pipe
         Sysno::pipe2 => with_user_memory(aspace(), |memory| {

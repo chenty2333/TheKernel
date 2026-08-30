@@ -245,6 +245,20 @@ impl FsContext {
         Ok(())
     }
 
+    /// Applies Linux `pivot_root(2)`'s fs-structure reference update.
+    /// Existing private chroots and working directories remain untouched;
+    /// only references exactly at the former namespace root move to `new`.
+    /// The caller has already validated both directories, so publication is
+    /// allocation-free and cannot fail after mount topology has changed.
+    pub fn pivot_root_refs(&mut self, old: &Location, new: &Location) {
+        if self.root_dir.ptr_eq(old) {
+            self.root_dir = new.clone();
+        }
+        if self.current_dir.ptr_eq(old) {
+            self.current_dir = new.clone();
+        }
+    }
+
     /// Attempts to resolve a possible symlink, at the current location (this
     /// assumes that `loc` is a child of current directory).
     pub fn try_resolve_symlink(

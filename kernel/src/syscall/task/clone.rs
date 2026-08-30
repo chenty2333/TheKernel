@@ -27,7 +27,7 @@ use crate::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        SchedulerSeed, TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
+        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data, linux_pid_from_task_id,
         lock_task_parent_publication, prepare_task_table_admission, process_domain,
         send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
     },
@@ -524,6 +524,10 @@ impl CloneArgs {
                 .map(|parent| parent.lock_process_lifecycle())
         };
 
+        // Hold this through task publication: pivot_root snapshots task
+        // fs_structs under the same gate, so a private child cannot publish
+        // an old-root clone after that snapshot.
+        let _fs_context_publication = fs_context_publication();
         let child_fs_context = if flags.contains(CloneFlags::FS) {
             calling_thread.fs_context_for_child()
         } else {
@@ -840,6 +844,10 @@ impl CloneArgs {
             pending_key_fork.commit();
             completion
         });
+        // The child fs_struct is now visible through TASK_TABLE, so a pivot
+        // can include it. Do not hold the publication gate across later user
+        // copies, scheduler handoff, or vfork waiting.
+        drop(_fs_context_publication);
         if let Some(pid_reservation) = pid_reservation {
             pid_reservation.commit();
         }
