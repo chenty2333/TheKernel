@@ -172,19 +172,12 @@ pub(crate) fn map_cet_default_shadow_stack(
             false,
             Backend::new_alloc(start, PageSize::Size4K),
         )?;
-        // A restore token at the architectural top is required before CET is
-        // made visible; an enabled task must never enter userspace with only
-        // U_CET set and no valid PL3_SSP landing stack.
-        aspace.populate_area(start, CET_DEFAULT_SHSTK_SIZE, MappingFlags::READ)?;
-        let token = start.as_usize() + CET_DEFAULT_SHSTK_SIZE - core::mem::size_of::<u64>();
-        aspace.write(
-            VirtAddr::from(token),
-            &((token + 8) as u64 | 1).to_ne_bytes(),
-        )?;
         aspace.register_cet_default_shadow_stack(task_id, start, CET_DEFAULT_SHSTK_SIZE)?;
         Ok(axhal::asm::UserCetState {
             u_cet: CET_SHSTK_EN,
-            pl3_ssp: (token + 8) as u64,
+            // ARCH_SHSTK_ENABLE's default stack does not install a restore
+            // token (Linux set_res_tok=false); the top itself is the SSP.
+            pl3_ssp: (start.as_usize() + CET_DEFAULT_SHSTK_SIZE) as u64,
             locked: false,
         })
     })();
@@ -198,11 +191,7 @@ pub(crate) fn map_cet_default_shadow_stack(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn unmap_cet_default_shadow_stack(aspace: &mut AddrSpace, task_id: u32) {
-    if let Some(owner) = aspace.take_cet_default_shadow_stack(task_id)
-        && let Ok(wake) = aspace.unmap(owner.start, owner.size)
-    {
-        wake.finish();
-    }
+    aspace.retire_cet_default_shadow_stack(task_id);
 }
 
 /// To set the clear_child_tid field in the task extended data.

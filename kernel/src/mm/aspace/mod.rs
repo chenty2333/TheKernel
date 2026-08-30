@@ -1222,6 +1222,14 @@ pub(crate) struct CetDefaultShadowStackOwner {
     pub task_id: u32,
     pub start: VirtAddr,
     pub size: usize,
+    pub ownership: CetDefaultShadowStackOwnership,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CetDefaultShadowStackOwnership {
+    Owned,
+    Borrowed,
 }
 
 // `AddrSpace` is constructed by value during early boot and fork preparation.
@@ -5986,6 +5994,14 @@ impl AddrSpace {
                 .file_mapping()
                 .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
             let mut flags = requested;
+            if area.flags().contains(MappingFlags::SHADOW_STACK) {
+                // pkey_mprotect may rekey a shadow stack, but never turns it
+                // into a conventional writable/executable mapping.
+                if requested != MappingFlags::READ {
+                    return Err(AxError::InvalidInput);
+                }
+                flags |= MappingFlags::SHADOW_STACK;
+            }
             if read_implies_exec && may_execute && flags.contains(MappingFlags::READ) {
                 flags |= MappingFlags::EXECUTE;
             }
@@ -6875,6 +6891,37 @@ impl AddrSpace {
         start: VirtAddr,
         size: usize,
     ) -> AxResult {
+        self.register_cet_default_shadow_stack_with_ownership(
+            task_id,
+            start,
+            size,
+            CetDefaultShadowStackOwnership::Owned,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn register_borrowed_cet_default_shadow_stack(
+        &mut self,
+        task_id: u32,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult {
+        self.register_cet_default_shadow_stack_with_ownership(
+            task_id,
+            start,
+            size,
+            CetDefaultShadowStackOwnership::Borrowed,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn register_cet_default_shadow_stack_with_ownership(
+        &mut self,
+        task_id: u32,
+        start: VirtAddr,
+        size: usize,
+        ownership: CetDefaultShadowStackOwnership,
+    ) -> AxResult {
         if size == 0
             || self
                 .cet_default_shadow_stacks
@@ -6892,6 +6939,7 @@ impl AddrSpace {
                 task_id,
                 start,
                 size,
+                ownership,
             });
         Ok(())
     }
@@ -6919,6 +6967,40 @@ impl AddrSpace {
             .iter()
             .copied()
             .find(|owner| owner.task_id == task_id)
+    }
+
+    /// Default CET stacks are task SSP leases.  Moving, resizing, or fixed
+    /// replacement cannot safely update every CLONE_VM peer atomically, so
+    /// callers reject any overlap before altering VMAs.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_default_shadow_stack_intersects(&self, start: VirtAddr, size: usize) -> bool {
+        let Some(end) = start.checked_add(size) else {
+            return true;
+        };
+        self.cet_default_shadow_stacks.iter().any(|owner| {
+            owner
+                .start
+                .checked_add(owner.size)
+                .is_none_or(|owner_end| start < owner_end && owner.start < end)
+        })
+    }
+
+    /// Retires an owner only after its VMA transaction succeeds. Borrowed
+    /// vfork aliases name the parent's VMA and therefore only lose the alias.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn retire_cet_default_shadow_stack(&mut self, task_id: u32) {
+        let Some(owner) = self.cet_default_shadow_stack(task_id) else {
+            return;
+        };
+        if owner.ownership == CetDefaultShadowStackOwnership::Owned {
+            let Ok(wake) = self.unmap(owner.start, owner.size) else {
+                return;
+            };
+            let _ = self.take_cet_default_shadow_stack(task_id);
+            wake.finish();
+        } else {
+            let _ = self.take_cet_default_shadow_stack(task_id);
+        }
     }
 
     /// Tests the current PL3_SSP against this task's still-live default CET

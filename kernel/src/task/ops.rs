@@ -1592,15 +1592,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     {
         thr.clear_cet_signal_frames();
         let aspace = thr.proc_data.aspace();
-        let wake = {
-            let mut aspace = aspace.lock();
-            aspace
-                .take_cet_default_shadow_stack(thr.kernel_tid())
-                .and_then(|owner| aspace.unmap(owner.start, owner.size).ok())
-        };
-        if let Some(wake) = wake {
-            wake.finish();
-        }
+        aspace
+            .lock()
+            .retire_cet_default_shadow_stack(thr.kernel_tid());
     }
     // The core unlink above is the sole Linux task ownership retirement edge;
     // scheduler Arc destruction is not allowed to define files_struct lifetime.

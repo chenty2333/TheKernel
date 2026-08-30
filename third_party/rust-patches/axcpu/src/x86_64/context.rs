@@ -452,6 +452,13 @@ impl TaskContext {
         crate::asm::write_user_cet_state(state);
     }
 
+    /// Updates an unpublished task's scheduler image without touching the
+    /// CET MSRs owned by the task currently running on this CPU.
+    #[inline]
+    pub fn set_saved_user_cet_state(&mut self, state: crate::asm::UserCetState) {
+        self.user_cet = state;
+    }
+
     /// Changes the page table root in this context.
     ///
     /// The hardware register for page table root (`CR3` for x86) will be

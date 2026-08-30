@@ -92,8 +92,12 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     {
         return Err(LinuxError::ENOSPC.into());
     }
+    let requested_size = size;
     let size = checked_align_up_4k(size).ok_or(LinuxError::EOVERFLOW)?;
-    if addr != 0 && (!addr.is_multiple_of(PAGE_SIZE_4K) || addr < SHADOW_STACK_MIN_ADDR) {
+    if addr != 0 && addr < SHADOW_STACK_MIN_ADDR {
+        return Err(LinuxError::ERANGE.into());
+    }
+    if addr != 0 && !addr.is_multiple_of(PAGE_SIZE_4K) {
         return Err(AxError::InvalidInput);
     }
     let aspace_handle = current().as_thread().proc_data.aspace();
@@ -101,29 +105,54 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     let start = if addr == 0 {
         aspace
             .find_kernel_area(
-                VirtAddr::from(SHADOW_STACK_MIN_ADDR), size,
-                VirtAddrRange::new(aspace.base(), aspace.end()), PAGE_SIZE_4K,
+                VirtAddr::from(SHADOW_STACK_MIN_ADDR),
+                size,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                PAGE_SIZE_4K,
             )
             .ok_or(AxError::NoMemory)?
     } else {
         let start = VirtAddr::from(addr);
-        if !aspace.contains_range(start, size) { return Err(AxError::NoMemory); }
+        if !aspace.contains_range(start, size) {
+            return Err(AxError::NoMemory);
+        }
         start
     };
     aspace.map(
-        start, size,
+        start,
+        size,
         MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
-        false, Backend::new_alloc(start, PageSize::Size4K),
+        false,
+        Backend::new_alloc(start, PageSize::Size4K),
     )?;
-    if flags & SHADOW_STACK_SET_TOKEN != 0 {
-        let token = start.as_usize() + size - core::mem::size_of::<u64>();
-        aspace.populate_area(VirtAddr::from(token & !(PAGE_SIZE_4K - 1)), PAGE_SIZE_4K, MappingFlags::READ)?;
-        let (frame, leaf, _) = aspace.page_table().query(VirtAddr::from(token))?;
-        if !leaf.contains(MappingFlags::SHADOW_STACK) { return Err(AxError::BadState); }
-        let offset = token & (PAGE_SIZE_4K - 1);
-        unsafe { (axhal::mem::phys_to_virt(frame).as_mut_ptr().add(offset) as *mut u64).write((token + 8) as u64 | 1) };
+    let result = (|| {
+        if flags & SHADOW_STACK_SET_TOKEN != 0 {
+            // Linux records the token at requested-size offset, not at the end of
+            // the page-rounded VMA.
+            let token = start.as_usize() + requested_size - core::mem::size_of::<u64>();
+            aspace.populate_area(
+                VirtAddr::from(token & !(PAGE_SIZE_4K - 1)),
+                PAGE_SIZE_4K,
+                MappingFlags::READ,
+            )?;
+            let (frame, leaf, _) = aspace.page_table().query(VirtAddr::from(token))?;
+            if !leaf.contains(MappingFlags::SHADOW_STACK) {
+                return Err(AxError::BadState);
+            }
+            let offset = token & (PAGE_SIZE_4K - 1);
+            unsafe {
+                (axhal::mem::phys_to_virt(frame).as_mut_ptr().add(offset) as *mut u64)
+                    .write((token + 8) as u64 | 1)
+            };
+        }
+        Ok(start.as_usize() as isize)
+    })();
+    if result.is_err() {
+        if let Ok(wake) = aspace.unmap(start, size) {
+            wake.finish();
+        }
     }
-    Ok(start.as_usize() as isize)
+    result
 }
 
 #[cfg(test)]
@@ -717,9 +746,9 @@ pub fn sys_mmap(
                     } else {
                         AxError::BrokenPipe
                     }
+                })
             })
-        })
-        .transpose()?
+            .transpose()?
     };
     if map_type != MmapFlags::PRIVATE && permission_flags.contains(MmapProt::WRITE) {
         if let Some(file) = file.as_ref() {
@@ -1023,7 +1052,12 @@ pub fn sys_remap_file_pages(
     }
     let start = start & !(PageSize::Size4K as usize - 1);
     let size = size & !(PageSize::Size4K as usize - 1);
-    if size == 0 || start.checked_add(size).is_none() || pgoff.checked_add(size / PageSize::Size4K as usize).is_none() {
+    if size == 0
+        || start.checked_add(size).is_none()
+        || pgoff
+            .checked_add(size / PageSize::Size4K as usize)
+            .is_none()
+    {
         return Err(AxError::InvalidInput);
     }
     let curr = current();
@@ -1049,7 +1083,11 @@ pub fn sys_remap_file_pages(
     };
     let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize
         | flags
-        | if source_starts_locked { MAP_LOCKED as usize } else { 0 };
+        | if source_starts_locked {
+            MAP_LOCKED as usize
+        } else {
+            0
+        };
     mmap_file(
         image.credential(),
         Some((lease.filesystem_owner_user_ns(), lease.file())),
@@ -1352,6 +1390,19 @@ pub fn sys_mremap(
     let curr = current();
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let old_len = checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?;
+        let new_len = checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?;
+        let aspace = proc_data.aspace();
+        let aspace = aspace.lock();
+        if aspace.cet_default_shadow_stack_intersects(VirtAddr::from(addr), old_len)
+            || (fixed
+                && aspace.cet_default_shadow_stack_intersects(VirtAddr::from(new_addr), new_len))
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+    }
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     remap_user_mapping(
         proc_data,
@@ -1581,10 +1632,17 @@ fn demote_shared_folio_across_aliases(
     let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key());
     let mut participants = aliases
         .into_iter()
-        .filter_map(|alias| alias.revalidate().map(|aspace| (alias.address_space_id(), aspace)))
+        .filter_map(|alias| {
+            alias
+                .revalidate()
+                .map(|aspace| (alias.address_space_id(), aspace))
+        })
         .collect::<Vec<_>>();
     let target_id = target.lock().address_space_id();
-    if !participants.iter().any(|(_, aspace)| Arc::ptr_eq(aspace, target)) {
+    if !participants
+        .iter()
+        .any(|(_, aspace)| Arc::ptr_eq(aspace, target))
+    {
         participants.push((target_id, target.clone()));
     }
     participants.sort_unstable_by_key(|(id, _)| *id);
@@ -1604,7 +1662,8 @@ fn demote_shared_folio_across_aliases(
     let mut plans = Vec::new();
     for (guard_index, guard) in guards.iter().enumerate() {
         for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
-            let flags = guard.preflight_shared_folio_demotion_2m(alias_start, &pages, start_index)?;
+            let flags =
+                guard.preflight_shared_folio_demotion_2m(alias_start, &pages, start_index)?;
             plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             plans.push((guard_index, alias_start, flags));
         }
@@ -1622,12 +1681,15 @@ fn demote_shared_folio_across_aliases(
 
     let mut protected = 0usize;
     for &(guard_index, alias_start, flags) in &plans {
-        if let Err(error) = guards[guard_index]
-            .write_protect_shared_folio_demotion_2m(alias_start, flags)
+        if let Err(error) =
+            guards[guard_index].write_protect_shared_folio_demotion_2m(alias_start, flags)
         {
-            for &(rollback_guard, rollback_start, rollback_flags) in plans[..protected].iter().rev() {
-                guards[rollback_guard]
-                    .restore_shared_folio_demotion_pmd_permissions(rollback_start, rollback_flags)?;
+            for &(rollback_guard, rollback_start, rollback_flags) in plans[..protected].iter().rev()
+            {
+                guards[rollback_guard].restore_shared_folio_demotion_pmd_permissions(
+                    rollback_start,
+                    rollback_flags,
+                )?;
             }
             return Err(error);
         }
@@ -1651,8 +1713,10 @@ fn demote_shared_folio_across_aliases(
                     guards[rollback_guard].rollback_shared_folio_demotion_2m(replacement)?;
                 }
                 for &(rollback_guard, rollback_start, rollback_flags) in plans.iter().rev() {
-                    guards[rollback_guard]
-                        .restore_shared_folio_demotion_pmd_permissions(rollback_start, rollback_flags)?;
+                    guards[rollback_guard].restore_shared_folio_demotion_pmd_permissions(
+                        rollback_start,
+                        rollback_flags,
+                    )?;
                 }
                 return Err(error);
             }
@@ -1733,10 +1797,17 @@ pub(crate) fn process_madvise_collapse(
         let (_mutation, aliases) = crate::mm::reserve_alias_mutation(key);
         let mut participants = aliases
             .into_iter()
-            .filter_map(|alias| alias.revalidate().map(|aspace| (alias.address_space_id(), aspace)))
+            .filter_map(|alias| {
+                alias
+                    .revalidate()
+                    .map(|aspace| (alias.address_space_id(), aspace))
+            })
             .collect::<Vec<_>>();
         let target_id = aspace_handle.lock().address_space_id();
-        if !participants.iter().any(|(_, alias)| Arc::ptr_eq(alias, aspace_handle)) {
+        if !participants
+            .iter()
+            .any(|(_, alias)| Arc::ptr_eq(alias, aspace_handle))
+        {
             participants.push((target_id, aspace_handle.clone()));
         }
         participants.sort_unstable_by_key(|(id, _)| *id);
@@ -1779,7 +1850,9 @@ fn process_madvise_collapse_shared_locked(
                 guards[target_index].collapse_alias_preserving_2m(start)
             };
             result?;
-            cursor = cursor.checked_add(PageSize::Size2M as usize).ok_or(AxError::InvalidInput)?;
+            cursor = cursor
+                .checked_add(PageSize::Size2M as usize)
+                .ok_or(AxError::InvalidInput)?;
             continue;
         };
         let backing_offset = guards[target_index]
@@ -1798,7 +1871,8 @@ fn process_madvise_collapse_shared_locked(
         let mut plans = Vec::new();
         for (guard_index, guard) in guards.iter().enumerate() {
             for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
-                let flags = guard.preflight_shared_folio_collapse_2m(alias_start, &pages, start_index)?;
+                let flags =
+                    guard.preflight_shared_folio_collapse_2m(alias_start, &pages, start_index)?;
                 plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 plans.push((guard_index, alias_start, flags));
             }
@@ -1813,8 +1887,8 @@ fn process_madvise_collapse_shared_locked(
             .try_reserve_exact(plans.len())
             .map_err(|_| AxError::NoMemory)?;
         for &(guard_index, alias_start, flags) in &plans {
-            if let Err(error) = guards[guard_index]
-                .write_protect_shared_folio_collapse_2m(alias_start, flags)
+            if let Err(error) =
+                guards[guard_index].write_protect_shared_folio_collapse_2m(alias_start, flags)
             {
                 for &(restore_guard, restore_start, restore_flags) in &plans {
                     if restore_guard == guard_index && restore_start == alias_start {
@@ -1854,16 +1928,14 @@ fn process_madvise_collapse_shared_locked(
         for (commit_guard, replacement) in published {
             guards[commit_guard].commit_shared_folio_collapse_2m(replacement);
         }
-        cursor = cursor.checked_add(PageSize::Size2M as usize).ok_or(AxError::InvalidInput)?;
+        cursor = cursor
+            .checked_add(PageSize::Size2M as usize)
+            .ok_or(AxError::InvalidInput)?;
     }
     Ok(())
 }
 
-fn process_madvise_collapse_locked(
-    aspace: &mut AddrSpace,
-    addr: usize,
-    length: usize,
-) -> AxResult {
+fn process_madvise_collapse_locked(aspace: &mut AddrSpace, addr: usize, length: usize) -> AxResult {
     // MADV_COLLAPSE takes ordinary page-granular user ranges. Only PMD units
     // wholly enclosed by the page-rounded range are candidates; a partial
     // leading or trailing PMD retains its 4 KiB representation. This is

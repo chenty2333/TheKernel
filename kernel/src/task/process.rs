@@ -1755,10 +1755,7 @@ impl MempolicyState {
         end: usize,
         home_node: usize,
     ) -> AxResult<(Vec<MempolicyRange>, bool, Option<axerrno::LinuxError>)> {
-        let capacity = old_ranges
-            .len()
-            .checked_mul(3)
-            .ok_or(AxError::NoMemory)?;
+        let capacity = old_ranges.len().checked_mul(3).ok_or(AxError::NoMemory)?;
         let mut new_ranges = Vec::new();
         new_ranges
             .try_reserve_exact(capacity)
@@ -1783,11 +1780,7 @@ impl MempolicyState {
             {
                 new_ranges.push(range);
                 new_ranges.extend(ranges);
-                return Ok((
-                    new_ranges,
-                    updated,
-                    Some(axerrno::LinuxError::EOPNOTSUPP),
-                ));
+                return Ok((new_ranges, updated, Some(axerrno::LinuxError::EOPNOTSUPP)));
             }
 
             let overlap_start = range.start.max(start);
@@ -3564,13 +3557,14 @@ impl ProcessData {
             // handoff.  Taking it first makes exec teardown exactly-once even
             // if a later old-image retirement path observes this task again.
             #[cfg(target_arch = "x86_64")]
-            let cet_wake = old_image
-                .take_cet_default_shadow_stack(thread.kernel_tid())
-                .and_then(|owner| old_image.unmap(owner.start, owner.size).ok());
+            // Keep the lease registered until its VMA transaction succeeds;
+            // a vfork alias only retires the alias and leaves the parent VMA.
+            old_image.retire_cet_default_shadow_stack(thread.kernel_tid());
+            let cet_wake: Option<crate::mm::DeferredUffdWake> = None;
             #[cfg(not(target_arch = "x86_64"))]
             let cet_wake = None;
-            let old_maxrss_kb = old_image
-                .merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
+            let old_maxrss_kb =
+                old_image.merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
             (old_maxrss_kb, cet_wake)
         };
         if let Some(wake) = cet_wake {
@@ -5753,8 +5747,7 @@ mod tests {
         };
 
         let (ranges, updated, error) =
-            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x2000, 0x3000, 0)
-                .unwrap();
+            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x2000, 0x3000, 0).unwrap();
         state.ranges = ranges;
         assert!(updated);
         assert_eq!(error, None);
@@ -5782,8 +5775,7 @@ mod tests {
         };
 
         let (ranges, updated, error) =
-            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x1000, 0x3000, 0)
-                .unwrap();
+            MempolicyState::try_set_home_node_in_range(&state.ranges, 0x1000, 0x3000, 0).unwrap();
         state.ranges = ranges;
         assert!(updated);
         assert_eq!(error, Some(axerrno::LinuxError::EOPNOTSUPP));

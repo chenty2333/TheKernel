@@ -82,6 +82,7 @@ pub(super) fn err_code_to_flags(err_code: u64) -> Result<PageFaultFlags, u64> {
     let reserved_bits = (PageFaultErrorCode::CAUSED_BY_WRITE
         | PageFaultErrorCode::USER_MODE
         | PageFaultErrorCode::INSTRUCTION_FETCH
+        | PageFaultErrorCode::SHADOW_STACK
         | PageFaultErrorCode::PROTECTION_VIOLATION)
         .complement();
     if code.intersects(reserved_bits) {
@@ -98,6 +99,10 @@ pub(super) fn err_code_to_flags(err_code: u64) -> Result<PageFaultFlags, u64> {
         }
         if code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
             flags |= PageFaultFlags::EXECUTE;
+        }
+        if code.contains(PageFaultErrorCode::SHADOW_STACK) {
+            // PFEC.SS is an architecturally distinct write-class access.
+            flags |= PageFaultFlags::SHADOW_STACK | PageFaultFlags::WRITE;
         }
         Ok(flags)
     }

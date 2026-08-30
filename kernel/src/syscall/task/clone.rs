@@ -27,9 +27,10 @@ use crate::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data, linux_pid_from_task_id,
-        lock_task_parent_publication, prepare_task_table_admission, process_domain,
-        send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
+        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data,
+        linux_pid_from_task_id, lock_task_parent_publication, prepare_task_table_admission,
+        process_domain, send_signal_thread_inner, set_task_user_address_space, try_new_user_task,
+        try_tasks,
     },
 };
 
@@ -111,7 +112,9 @@ struct PendingCetDefaultShadowStack {
 
 #[cfg(target_arch = "x86_64")]
 impl PendingCetDefaultShadowStack {
-    fn commit(&mut self) { self.committed = true; }
+    fn commit(&mut self) {
+        self.committed = true;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -119,7 +122,8 @@ impl Drop for PendingCetDefaultShadowStack {
     fn drop(&mut self) {
         if !self.committed {
             crate::syscall::task::thread::unmap_cet_default_shadow_stack(
-                &mut self.aspace.lock(), self.tid,
+                &mut self.aspace.lock(),
+                self.tid,
             );
         }
     }
@@ -480,8 +484,8 @@ impl CloneArgs {
         // Protection-key allocation is mm state.  Threads share it through
         // `ProcessData`; an ordinary fork gets an exact bitmap copy while
         // retaining the copied PTE key fields in its cloned address space.
-        let child_pkeys = (!flags.contains(CloneFlags::THREAD))
-            .then(|| old_proc_data.pkey_snapshot());
+        let child_pkeys =
+            (!flags.contains(CloneFlags::THREAD)).then(|| old_proc_data.pkey_snapshot());
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
         // this CPU. Nudge its pinned recycler before allocating another child
@@ -830,25 +834,45 @@ impl CloneArgs {
             .transpose()?;
 
         #[cfg(target_arch = "x86_64")]
-        let mut pending_cet_stack = if crate::task::current_user_cet_state().u_cet & 1 != 0 {
-            // A fork initially COW-copies the parent's default-stack VMA. It
-            // is not the child's stack: discard that private copy, then make
-            // a fresh guarded mapping. CLONE_VM/vfork instead adds a distinct
-            // record and VMA to the shared mm.
-            if !flags.contains(CloneFlags::VM)
-                && let Some(owner) = old_proc_data.aspace().lock()
-                    .cet_default_shadow_stack(calling_thread.kernel_tid())
-            {
-                let child_mm_handle = new_proc_data.aspace();
-                let mut child_mm = child_mm_handle.lock();
-                let wake = child_mm.unmap(owner.start, owner.size)?;
-                wake.finish();
-            }
+        let mut pending_cet_stack = if crate::task::current_user_live_cet_state().u_cet & 1 != 0 {
+            let parent_cet = crate::task::current_user_live_cet_state();
+            let parent_owner = old_proc_data
+                .aspace()
+                .lock()
+                .cet_default_shadow_stack(calling_thread.kernel_tid());
             let child_mm = new_proc_data.aspace();
-            let cet = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
-            new_task.ctx_mut().set_current_user_cet_state(cet);
-            Some(PendingCetDefaultShadowStack { aspace: child_mm, tid, committed: false })
-        } else { None };
+            let cet = if !flags.contains(CloneFlags::VM) {
+                // fork COW-copies the parent's VMA and inherits its live SSP.
+                let owner = parent_owner.ok_or(AxError::BadState)?;
+                child_mm
+                    .lock()
+                    .register_cet_default_shadow_stack(tid, owner.start, owner.size)?;
+                parent_cet
+            } else if flags.contains(CloneFlags::VFORK) {
+                // vfork borrows the parent's VMA and must never unmap it.
+                let owner = parent_owner.ok_or(AxError::BadState)?;
+                child_mm.lock().register_borrowed_cet_default_shadow_stack(
+                    tid,
+                    owner.start,
+                    owner.size,
+                )?;
+                parent_cet
+            } else {
+                let mut cet = parent_cet;
+                let fresh = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
+                cet.pl3_ssp = fresh.pl3_ssp;
+                cet
+            };
+            // The child has not been published: do not write the live MSRs.
+            new_task.ctx_mut().set_saved_user_cet_state(cet);
+            Some(PendingCetDefaultShadowStack {
+                aspace: child_mm,
+                tid,
+                committed: false,
+            })
+        } else {
+            None
+        };
 
         // The task extension must exist before any process identity becomes
         // visible. Every admission token below rolls itself back on failure.
@@ -893,7 +917,9 @@ impl CloneArgs {
         // All remaining clone publication is allocation-free and infallible;
         // only now may the child retain its registered CET owner.
         #[cfg(target_arch = "x86_64")]
-        if let Some(stack) = pending_cet_stack.as_mut() { stack.commit(); }
+        if let Some(stack) = pending_cet_stack.as_mut() {
+            stack.commit();
+        }
 
         if let Some(publication) = credential_publication.as_ref() {
             publication.activate();
