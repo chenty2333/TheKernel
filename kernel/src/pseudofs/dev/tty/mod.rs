@@ -182,9 +182,7 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
 
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
         let _lifecycle = self.terminal.lifecycle.lock();
-        if self.hung_up.load(Ordering::Acquire) {
-            return Err(AxError::Io);
-        }
+        self.ensure_bindable()?;
         let pg = proc.group();
         let session = pg.session();
         if session.sid() != proc.pid() {
@@ -215,6 +213,15 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Rejects a new controlling-session claim after a synchronous hangup.
+    fn ensure_bindable(&self) -> AxResult<()> {
+        if self.hung_up.load(Ordering::Acquire) {
+            Err(AxError::Io)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn pty_number(&self) -> u32 {
@@ -260,6 +267,15 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             {
                 return;
             }
+            // Publish the one-way admission barrier before retiring the
+            // association. A waiter which reaches bind_to after this lock is
+            // released must reject instead of claiming a tty whose ldisc is
+            // about to be cancelled outside this critical section.
+            target
+                .downcast_ref::<Self>()
+                .expect("validated controlling tty type")
+                .hung_up
+                .store(true, Ordering::Release);
             let released = self.terminal.job_control.release_session(&session);
             let SessionRelease::Released(foreground) = released else {
                 return;
@@ -721,8 +737,11 @@ impl DeviceOps for CurrentTty {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use alloc::{borrow::Cow, boxed::Box, sync::Arc};
     use core::task::Context;
+    use std::{sync::mpsc, thread};
 
     use axpoll::{IoEvents, Pollable};
 
@@ -799,6 +818,31 @@ mod tests {
             (IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP)
                 .bits()
         );
+    }
+
+    #[test]
+    fn release_to_bind_interleave_rejects_the_hangup_marker() {
+        let (_master, slave) = pty::create_pty_pair_for_test().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let lifecycle = slave.terminal.lifecycle.lock();
+        let concurrent_slave = slave.clone();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            // This is bind_to's admission prefix; exercising it directly
+            // keeps the controlled interleave process-free.
+            let _lifecycle = concurrent_slave.terminal.lifecycle.lock();
+            result_tx.send(concurrent_slave.ensure_bindable()).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        // This is the publish step performed before release_session/unset.
+        slave.hung_up.store(true, Ordering::Release);
+        drop(lifecycle);
+
+        assert_eq!(result_rx.recv().unwrap(), Err(AxError::Io));
+        waiter.join().unwrap();
     }
 
     #[test]
