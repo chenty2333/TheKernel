@@ -13,6 +13,11 @@ const FIXED_CTRL: u32 = 0x38d;
 const OVF: u32 = 0x390;
 const MAX: usize = 32;
 const SLOTS: usize = 64;
+/// The local-APIC vector reserved for architectural PMIs.
+///
+/// Consumers register their contextual IRQ handler through the HAL constant
+/// instead of duplicating the x86 vector allocation.
+pub const SAMPLING_IRQ_VECTOR: usize = crate::apic::vectors::APIC_PMI_VECTOR as usize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Cycles,
@@ -341,7 +346,7 @@ const fn sampling_active_lvt(saved: u32) -> u32 {
     // configuration may carry a different delivery mode; retain it only in
     // the saved value and restore it on stop, never while sampling is active.
     (saved & !(0xff | LVT_MASKED | LVT_DELIVERY_MODE))
-        | crate::apic::vectors::APIC_PMI_VECTOR as u32
+        | SAMPLING_IRQ_VECTOR as u32
 }
 
 /// Arms exactly one local programmable PMU counter for PMI delivery.
@@ -740,6 +745,7 @@ mod tests {
     #[cfg(feature = "pmu-sampling")]
     #[test]
     fn sampling_encoding_preload_and_owned_ack_are_precise() {
+        assert_eq!(SAMPLING_IRQ_VECTOR, 0xef);
         assert_eq!(sampling_preload(8, 16), 240);
         assert_eq!(sampling_event(Event::Cycles, true, false), 0x51003c);
         assert_eq!(sampling_event(Event::Instructions, false, true), 0x5200c0);

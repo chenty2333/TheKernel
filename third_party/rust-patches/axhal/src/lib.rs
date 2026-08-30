@@ -126,6 +126,8 @@ pub mod pmu {
     // linking an implementation that could execute privileged MSR operations.
     #[cfg(not(target_os = "none"))]
     mod host {
+        /// Stable architectural PMI vector, matching the x86 platform HAL.
+        pub const SAMPLING_IRQ_VECTOR: usize = 0xef;
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum Event {
             Cycles,
@@ -212,6 +214,7 @@ pub mod pmu {
             use super::*;
             #[test]
             fn host_pmu_is_an_unsupported_stub() {
+                assert_eq!(SAMPLING_IRQ_VECTOR, 0xef);
                 assert_eq!(capabilities(), Err(Error::Unsupported));
                 assert!(matches!(
                     CounterLease::acquire(Event::Cycles, CounterKind::Fixed),
