@@ -1,19 +1,16 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{
-    mem::size_of,
-    sync::atomic::{AtomicU32, Ordering},
-    time::Duration,
-};
+use core::{mem::size_of, time::Duration};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::TimeValue;
 use axtask::{
-    AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
-    SchedState, TaskSchedError, current,
+    AxCpuMask, AxTaskRef, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass, SchedState, TaskSchedError,
+    current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    sched_state, scheduler_attr_snapshot, scheduler_state_snapshot, set_sched_state_versioned,
+    rr_timeslice_ms, sched_state, scheduler_attr_snapshot, scheduler_state_snapshot,
+    set_rr_timeslice_ms as set_scheduler_rr_timeslice_ms, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
-    task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus,
+    task_affinity_mask_bytes, task_affinity_nr_cpu_ids, task_allowed_active_cpus, task_timeslice,
     update_sched_state_versioned_with_reset, validate_affinity_mask,
 };
 use linux_raw_sys::general::{
@@ -48,11 +45,6 @@ use crate::{
 const SUPPORTED_SCHED_ATTR_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK as u64;
 const SCHED_ATTR_SIZE_VER0: usize = 48;
 const SCHED_ATTR_MAX_SIZE: usize = 4096;
-const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
-    let ms = (RR_TIMESLICE_TICKS * 1000) / axconfig::TICKS_PER_SEC;
-    if ms == 0 { 1 } else { ms as u32 }
-};
-static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub(crate) struct SchedParam {
@@ -86,6 +78,32 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
         let caller_ns = current().as_thread().proc_data.pid_ns();
         visible_task_for_ioprio(pid as Pid, &caller_ns)
     }
+}
+
+/// Resolves the `sched_rr_get_interval(2)` target in the calling task's PID
+/// namespace. Unlike scheduler setters, this ABI names an exact live TID:
+/// resolve the vpid through the caller namespace before reading scheduler
+/// state.
+fn sched_rr_interval_target(pid: i32) -> AxResult<AxTaskRef> {
+    if pid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let caller = current();
+    if pid == 0 {
+        return Ok(caller.clone());
+    }
+
+    let caller_ns = caller.as_thread().proc_data.pid_ns();
+    let global_tid = caller_ns
+        .resolve_visible_pid(pid as Pid)
+        .ok_or(AxError::NoSuchProcess)?;
+    let task = get_visible_task(global_tid)?;
+    let target_ns = task.as_thread().proc_data.pid_ns();
+    if !caller_ns.contains(&target_ns) {
+        return Err(AxError::NoSuchProcess);
+    }
+    Ok(task)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -272,11 +290,30 @@ fn raw_priority_from_nice(nice: i8) -> isize {
     20 - nice as isize
 }
 
-fn rr_interval_for_state(state: SchedState) -> Duration {
-    if matches!(state.class, SchedClass::RoundRobin) {
-        Duration::from_millis(sched_rr_timeslice_ms() as u64)
-    } else {
-        Duration::ZERO
+fn interval_from_scheduler_ticks(ticks: usize) -> Duration {
+    let ticks = ticks as u128;
+    let hz = axconfig::TICKS_PER_SEC as u128;
+    let milliseconds = ticks.saturating_mul(1_000).div_ceil(hz);
+    Duration::from_millis(milliseconds.min(u64::MAX as u128) as u64)
+}
+
+fn sched_query_error(error: TaskSchedError) -> AxError {
+    match error {
+        TaskSchedError::Unsupported => AxError::OperationNotSupported,
+        TaskSchedError::TaskExited => AxError::NoSuchProcess,
+        TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+            AxError::WouldBlock
+        }
+    }
+}
+
+fn rr_interval_for_task(task: &AxTaskRef) -> AxResult<Duration> {
+    let snapshot = task_timeslice(task).map_err(sched_query_error)?;
+    match snapshot.class {
+        SchedClass::RoundRobin | SchedClass::Normal | SchedClass::Batch => {
+            Ok(interval_from_scheduler_ticks(snapshot.interval_ticks))
+        }
+        SchedClass::Idle | SchedClass::Fifo => Ok(Duration::ZERO),
     }
 }
 
@@ -295,16 +332,11 @@ fn fair_runtime_ns(class: SchedClass) -> u64 {
 }
 
 pub fn sched_rr_timeslice_ms() -> u32 {
-    SCHED_RR_TIMESLICE_MS.load(Ordering::Relaxed)
+    rr_timeslice_ms()
 }
 
 pub fn set_sched_rr_timeslice_ms(value: i32) {
-    let value = if value <= 0 {
-        SCHED_RR_TIMESLICE_MS_DEFAULT
-    } else {
-        value as u32
-    };
-    SCHED_RR_TIMESLICE_MS.store(value, Ordering::Relaxed);
+    set_scheduler_rr_timeslice_ms(value);
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
@@ -1086,12 +1118,23 @@ pub fn sys_sched_rr_get_interval<M: UserMemory + ?Sized>(
     pid: i32,
     interval: *mut timespec,
 ) -> AxResult<isize> {
-    let task = sched_target(pid)?;
+    let task = sched_rr_interval_target(pid)?;
+    // Authorize this exact live TID after PID-namespace resolution, before
+    // sampling scheduler state or touching user memory.
+    let (_, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = task
+        .try_as_thread()
+        .ok_or(AxError::NoSuchProcess)?
+        .current_cred();
+    dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
+        &actor_cred,
+        &target_cred,
+    ))?;
     unsafe {
         VmMutPtr::vm_write_unchecked(
             interval,
             memory,
-            timespec::from_time_value(rr_interval_for_state(sched_state(&task))),
+            timespec::from_time_value(rr_interval_for_task(&task)?),
         )
         .map_err(map_usercopy_error)?;
     }
@@ -2490,5 +2533,45 @@ mod tests {
         }
         assert_eq!(best, Some(-4));
         assert_eq!(raw_priority_from_nice(best.unwrap()), 24);
+    }
+
+    #[test]
+    fn sched_rr_interval_rounds_scheduler_ticks_up_to_milliseconds() {
+        assert_eq!(interval_from_scheduler_ticks(0), Duration::ZERO);
+        assert_eq!(
+            interval_from_scheduler_ticks(1),
+            Duration::from_millis(
+                (1_000u128).div_ceil(axconfig::TICKS_PER_SEC as u128) as u64
+            )
+        );
+    }
+
+    #[test]
+    fn sched_rr_interval_rejects_negative_pid_before_current_task_lookup() {
+        assert_eq!(sched_rr_interval_target(-1), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn sched_rr_timeslice_proc_value_roundtrips_requested_milliseconds() {
+        let previous = sched_rr_timeslice_ms();
+        set_sched_rr_timeslice_ms(1);
+        assert_eq!(sched_rr_timeslice_ms(), 1);
+        set_sched_rr_timeslice_ms(previous as i32);
+    }
+
+    #[test]
+    fn sched_rr_interval_query_maps_exited_task_to_esrch() {
+        assert_eq!(
+            sched_query_error(TaskSchedError::TaskExited),
+            AxError::NoSuchProcess
+        );
+    }
+
+    #[test]
+    fn sched_rr_interval_query_maps_bounded_scheduler_retry_to_eagain() {
+        assert_eq!(
+            LinuxError::from(sched_query_error(TaskSchedError::RunQueueUnavailable(0))),
+            LinuxError::EAGAIN
+        );
     }
 }
