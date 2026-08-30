@@ -933,7 +933,7 @@ pub fn sys_open_by_handle_at(
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ || header.handle_type == 2 {
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ {
         return Err(AxError::InvalidInput);
     }
 
