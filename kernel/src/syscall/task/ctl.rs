@@ -1031,7 +1031,10 @@ pub fn sys_set_mempolicy_home_node(
     let end = VirtAddr::from(end);
     let mut updated = false;
     while cursor < end {
-        let Some(area) = aspace.areas().find(|area| area.end() > cursor) else {
+        let Some(area) = aspace
+            .areas()
+            .find(|area| area.end() > cursor && area.start() < end)
+        else {
             break;
         };
         let range_start = area.start().max(cursor);
