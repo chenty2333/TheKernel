@@ -1471,6 +1471,7 @@ impl BackendOps for FileBackend {
         _new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
         _active_long_term_cow_frames: &[PhysAddr],
+        _share_shadow_stack: bool,
     ) -> AxResult<Backend> {
         self.clone_map_with_registration(flags, eviction_owner(new_aspace), |inner| {
             inner.register_listener(new_aspace)

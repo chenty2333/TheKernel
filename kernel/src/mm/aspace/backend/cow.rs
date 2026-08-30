@@ -1562,13 +1562,17 @@ impl BackendOps for CowBackend {
         new_pt: &mut PageTableCursor,
         _new_aspace: &Arc<Mutex<AddrSpace>>,
         active_long_term_cow_frames: &[PhysAddr],
+        share_shadow_stack: bool,
     ) -> AxResult<Backend> {
         // A resident shadow-stack leaf is W=0,D=1.  Fork must not retain that
         // CET encoding in either sharing PTE: both sides first become ordinary
         // read-only COW leaves (W=0,D=0), then a PFEC.SS write fault copies and
         // restores the target leaf's W=0,D=1 encoding.
         let shadow_stack = flags.contains(MappingFlags::SHADOW_STACK);
-        let cow_flags = if shadow_stack {
+        let share_shadow_stack = shadow_stack && share_shadow_stack;
+        let cow_flags = if share_shadow_stack {
+            page_table_flags(flags)
+        } else if shadow_stack {
             page_table_flags(flags - MappingFlags::SHADOW_STACK) - MappingFlags::WRITE
         } else {
             page_table_flags(flags) - MappingFlags::WRITE
@@ -1609,7 +1613,8 @@ impl BackendOps for CowBackend {
                     // the VMA's current permissions. The parent and its
                     // escaped I/O owner keep the original physical identity,
                     // even if mprotect has since reduced the parent PTE.
-                    protect_source: !eager_copy
+                    protect_source: !share_shadow_stack
+                        && !eager_copy
                         && (source_flags.contains(MappingFlags::WRITE) || shadow_stack),
                     eager_copy,
                 }
@@ -2166,6 +2171,37 @@ mod tests {
         );
         assert_eq!(frame_refs[&pages[0].paddr].lock().references, 2);
         assert!(ops.copied.is_empty());
+    }
+
+    #[test]
+    fn vfork_shadow_stack_clone_keeps_shared_cet_leaf() {
+        let page_size = PageSize::Size4K;
+        let shstk = MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK;
+        let pages = [CowClonePage {
+            source_vaddr: VirtAddr::from(0x7000),
+            destination_vaddr: VirtAddr::from(0x7000),
+            paddr: PhysAddr::from(0x2400_0000),
+            source_flags: shstk,
+            destination_flags: shstk,
+            page_size,
+            protect_source: false,
+            eager_copy: false,
+        }];
+        let frame_refs = tracked_frames(&pages);
+        let mut ops = mock_clone_ops(&pages, usize::MAX);
+
+        clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
+            frame_refs.get(&paddr).unwrap().clone()
+        })
+        .unwrap();
+
+        assert_eq!(ops.parents[&pages[0].source_vaddr], (shstk, page_size));
+        assert_eq!(
+            ops.children[&pages[0].destination_vaddr],
+            (pages[0].paddr, shstk, page_size)
+        );
+        assert!(ops.copied.is_empty());
+        assert_eq!(frame_refs[&pages[0].paddr].lock().references, 2);
     }
 
     #[test]

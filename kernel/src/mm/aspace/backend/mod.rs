@@ -23,8 +23,7 @@ mod shared;
 
 pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
 pub(crate) use self::{
-    cow::{PreparedCowHugeFrame, PreparedCowPage},
-    cow::register_demoted_huge_backing,
+    cow::{PreparedCowHugeFrame, PreparedCowPage, register_demoted_huge_backing},
     file::WritableMappingAdmission,
     phys_pin::{
         PhysicalFramePins, PreparedPhysicalFramePins, any_frame_pinned,
@@ -363,6 +362,7 @@ pub trait BackendOps {
         new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
         active_long_term_cow_frames: &[PhysAddr],
+        share_shadow_stack: bool,
     ) -> AxResult<Backend>;
 }
 

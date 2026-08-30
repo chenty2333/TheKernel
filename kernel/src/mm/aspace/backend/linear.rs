@@ -148,6 +148,7 @@ impl BackendOps for LinearBackend {
         _new_pt: &mut PageTableCursor,
         _new_aspace: &Arc<Mutex<AddrSpace>>,
         _active_long_term_cow_frames: &[PhysAddr],
+        _share_shadow_stack: bool,
     ) -> AxResult<Backend> {
         Ok(Backend::Linear(self.clone()))
     }

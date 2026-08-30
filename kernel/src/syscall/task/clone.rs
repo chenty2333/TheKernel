@@ -495,6 +495,19 @@ impl CloneArgs {
         // separately prepared module-state clone in its own outer credential.
         let (parent_cred, parent_dumpability, parent_aspace, parent_access_state) =
             old_proc_data.fork_image_credential_snapshot(calling_thread);
+        #[cfg(target_arch = "x86_64")]
+        let vfork_borrowed_shadow_stack = if flags.contains(CloneFlags::VFORK)
+            && !flags.contains(CloneFlags::VM)
+            && crate::task::current_user_live_cet_state().u_cet & 1 != 0
+        {
+            let owner = parent_aspace
+                .lock()
+                .cet_default_shadow_stack(calling_thread.kernel_tid())
+                .ok_or(AxError::BadState)?;
+            Some((owner.start, owner.size))
+        } else {
+            None
+        };
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
@@ -650,7 +663,15 @@ impl CloneArgs {
                 let aspace = loop {
                     let cloned = {
                         let mut parent_guard = parent_aspace.lock();
-                        parent_guard.try_clone()
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            parent_guard
+                                .try_clone_with_shared_shadow_stack(vfork_borrowed_shadow_stack)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            parent_guard.try_clone()
+                        }
                     };
                     match cloned {
                         Err(AxError::WouldBlock) => core::hint::spin_loop(),

@@ -6567,7 +6567,9 @@ impl AddrSpace {
             if flags.contains(access_flags) {
                 // A CET access is permissioned by SHADOW_STACK, but still
                 // has write semantics for private-COW allocation/copy.
-                let populate_access = if access_flags.contains(MappingFlags::SHADOW_STACK) {
+                let populate_access = if access_flags.contains(MappingFlags::SHADOW_STACK)
+                    && !self.borrowed_cet_shadow_stack_contains(vaddr)
+                {
                     access_flags | MappingFlags::WRITE
                 } else {
                     access_flags
@@ -6694,6 +6696,32 @@ impl AddrSpace {
     /// size, then iterates over all memory areas in the original address
     /// space to copy or share their mappings into the new one.
     pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
+        self.try_clone_with_shared_shadow_stack(None)
+    }
+
+    /// Clones an mm while preserving one vfork-borrowed shadow stack as a
+    /// shared CET mapping. Ordinary fork callers must use [`Self::try_clone`]
+    /// and retain its COW isolation.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn try_clone_with_shared_shadow_stack(
+        &mut self,
+        borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+    ) -> AxResult<Arc<Mutex<Self>>> {
+        self.try_clone_inner(borrowed_shadow_stack)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_clone_with_shared_shadow_stack(
+        &mut self,
+        _borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+    ) -> AxResult<Arc<Mutex<Self>>> {
+        self.try_clone_inner(None)
+    }
+
+    fn try_clone_inner(
+        &mut self,
+        borrowed_shadow_stack: Option<(VirtAddr, usize)>,
+    ) -> AxResult<Arc<Mutex<Self>>> {
         if self.user_io_pins.has_clone_blocker() {
             return Err(AxError::ResourceBusy);
         }
@@ -6843,6 +6871,11 @@ impl AddrSpace {
 
                 if cursor < segment_end {
                     let segment_size = segment_end.sub_addr(cursor);
+                    let share_shadow_stack = borrowed_shadow_stack.is_some_and(|(start, size)| {
+                        start == cursor
+                            && size == segment_size
+                            && area.flags().contains(MappingFlags::SHADOW_STACK)
+                    });
                     let new_backend = {
                         let mut new_modify = guard.pt.cursor_no_flush();
                         area.backend().clone_map(
@@ -6852,6 +6885,7 @@ impl AddrSpace {
                             &mut new_modify,
                             &new_aspace_clone,
                             &active_long_term_cow_frames,
+                            share_shadow_stack,
                         )?
                     };
                     // Fork keeps the segment at the same virtual address. In
@@ -7083,6 +7117,21 @@ impl AddrSpace {
             && self.cet_shadow_stack_extent_at(owner.start) == Some((owner.start, owner.size))
     }
 
+    /// A borrowed vfork stack deliberately shares its physical leaves with
+    /// the suspended parent. Its CET writes must therefore retain the SHSTK
+    /// PTE rather than taking the ordinary fork-COW write path.
+    #[cfg(target_arch = "x86_64")]
+    fn borrowed_cet_shadow_stack_contains(&self, address: VirtAddr) -> bool {
+        self.cet_default_shadow_stacks.iter().any(|owner| {
+            owner.ownership == CetDefaultShadowStackOwnership::Borrowed
+                && owner.start <= address
+                && owner
+                    .start
+                    .checked_add(owner.size)
+                    .is_some_and(|end| address < end)
+        })
+    }
+
     /// Performs the all-or-nothing kernel side of a CET signal push.  The
     /// VMA and every touched leaf are validated before any word is written;
     /// SHADOW_STACK mappings are intentionally written through this narrow
@@ -7113,11 +7162,12 @@ impl AddrSpace {
         // This is the kernel-authorized equivalent of a CET write: it must
         // fault a fork-demoted RO COW leaf privately and restore its SHSTK
         // PTE encoding, without granting ordinary user WRITE permission.
-        self.populate_area(
-            VirtAddr::from(first_page),
-            population,
-            MappingFlags::SHADOW_STACK | MappingFlags::WRITE,
-        )?;
+        let populate_flags = if self.borrowed_cet_shadow_stack_contains(VirtAddr::from(start)) {
+            MappingFlags::SHADOW_STACK
+        } else {
+            MappingFlags::SHADOW_STACK | MappingFlags::WRITE
+        };
+        self.populate_area(VirtAddr::from(first_page), population, populate_flags)?;
         for address in [start, saved_ssp as usize - core::mem::size_of::<u64>()] {
             let (_, flags, _) = self.page_table().query(VirtAddr::from(address))?;
             if !flags.contains(MappingFlags::USER) || !flags.contains(MappingFlags::SHADOW_STACK) {
