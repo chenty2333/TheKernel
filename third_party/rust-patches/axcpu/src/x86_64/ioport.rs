@@ -12,6 +12,10 @@ pub const IO_BITMAP_BYTES: usize = gdt::IO_BITMAP_BYTES;
 /// would also allow user mode to execute CLI and STI.
 ///
 /// Call only from the final IRQ-disabled user-return path.
-pub fn install_user_io_bitmap(bitmap: Option<&[u8; IO_BITMAP_BYTES]>, allow_all: bool) {
-    gdt::install_user_io_bitmap(bitmap, allow_all)
+pub fn install_user_io_bitmap(
+    bitmap: Option<&[u8; IO_BITMAP_BYTES]>,
+    revoked: Option<&[u8; IO_BITMAP_BYTES]>,
+    allow_all: bool,
+) {
+    gdt::install_user_io_bitmap(bitmap, revoked, allow_all)
 }

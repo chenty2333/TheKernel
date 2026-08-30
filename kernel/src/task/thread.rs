@@ -41,13 +41,28 @@ const TASK_PARENT_RELATION_HARD_LIMIT: usize =
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
 
-/// Linux x86 I/O-port state.  It is deliberately task-local: threads in one
-/// process may grant different port ranges.  The bitmap is shared after fork
-/// and copied only when either task subsequently mutates it.
-#[derive(Clone, Default)]
+/// Linux x86 I/O-port state. It is deliberately task-local: threads in one
+/// process may grant different port ranges. The grant bitmap is shared after
+/// fork, while the inline revoke overlay guarantees that removing a permission
+/// can never need an allocation.
+#[derive(Clone)]
 pub(crate) struct IoPortState {
     bitmap: Option<Arc<[u8; IO_BITMAP_BYTES]>>,
+    /// Bits explicitly revoked from a shared inherited grant bitmap. This is
+    /// embedded in the thread state so ioperm(..., 0) remains infallible under
+    /// memory pressure.
+    revoked: [u8; IO_BITMAP_BYTES],
     iopl: u8,
+}
+
+impl Default for IoPortState {
+    fn default() -> Self {
+        Self {
+            bitmap: None,
+            revoked: [0; IO_BITMAP_BYTES],
+            iopl: 0,
+        }
+    }
 }
 
 impl IoPortState {
@@ -74,17 +89,41 @@ impl IoPortState {
     }
 
     fn try_update_ioperm(&mut self, from: usize, num: usize, turn_on: bool) -> AxResult<()> {
-        if self.bitmap.is_none() && !turn_on {
+        self.try_update_ioperm_with(from, num, turn_on, |bitmap| {
+            Arc::try_new(bitmap).map_err(|_| AxError::NoMemory)
+        })
+    }
+
+    fn try_update_ioperm_with<F>(
+        &mut self,
+        from: usize,
+        num: usize,
+        turn_on: bool,
+        allocate: F,
+    ) -> AxResult<()>
+    where
+        F: FnOnce([u8; IO_BITMAP_BYTES]) -> AxResult<Arc<[u8; IO_BITMAP_BYTES]>>,
+    {
+        if !turn_on {
+            if self.bitmap.is_none() {
+                return Ok(());
+            }
+            // Do not COW a shared inherited bitmap to revoke access. The
+            // preallocated overlay is private to this thread and takes
+            // precedence when the TSS image is installed.
+            Self::update_range(&mut self.revoked, from, num, false);
+            if self.revoked.iter().all(|&byte| byte == 0xff) {
+                self.bitmap = None;
+                self.revoked.fill(0);
+            }
             return Ok(());
         }
 
         if let Some(shared) = self.bitmap.as_mut()
             && let Some(bitmap) = Arc::get_mut(shared)
         {
-            Self::update_range(bitmap, from, num, turn_on);
-            if bitmap.iter().all(|&byte| byte == 0xff) {
-                self.bitmap = None;
-            }
+            Self::update_range(bitmap, from, num, true);
+            Self::update_range(&mut self.revoked, from, num, true);
             return Ok(());
         }
 
@@ -92,13 +131,24 @@ impl IoPortState {
             Some(bitmap) => **bitmap,
             None => [0xff; IO_BITMAP_BYTES],
         };
-        Self::update_range(&mut bitmap, from, num, turn_on);
-        if bitmap.iter().all(|&byte| byte == 0xff) {
-            self.bitmap = None;
-            return Ok(());
+        // A grant must observe prior local revocations before it replaces the
+        // shared base, then clear precisely the requested range.
+        for (byte, revoked) in bitmap.iter_mut().zip(self.revoked.iter()) {
+            *byte |= *revoked;
         }
-        self.bitmap = Some(Arc::try_new(bitmap).map_err(|_| AxError::NoMemory)?);
+        Self::update_range(&mut bitmap, from, num, true);
+        let bitmap = allocate(bitmap)?;
+        self.bitmap = Some(bitmap);
+        self.revoked.fill(0);
         Ok(())
+    }
+
+    fn bitmap_and_revocations(
+        &self,
+    ) -> (Option<&[u8; IO_BITMAP_BYTES]>, Option<&[u8; IO_BITMAP_BYTES]>) {
+        let bitmap = self.bitmap.as_deref();
+        let revoked = (!self.revoked.iter().all(|&byte| byte == 0)).then_some(&self.revoked);
+        (bitmap, revoked)
     }
 }
 
@@ -1250,7 +1300,8 @@ impl Thread {
     /// The caller holds the final user-return IRQ/preemption exclusion.
     pub(crate) fn install_user_io_permissions(&self) {
         let state = self.ioport.lock();
-        ioport::install_user_io_bitmap(state.bitmap.as_deref(), state.iopl == 3);
+        let (bitmap, revoked) = state.bitmap_and_revocations();
+        ioport::install_user_io_bitmap(bitmap, revoked, state.iopl == 3);
     }
 
     pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
@@ -1748,10 +1799,12 @@ impl AsThread for TaskInner {
 
 #[cfg(test)]
 mod ioport_tests {
+    use axerrno::AxError;
+
     use super::IoPortState;
 
     #[test]
-    fn ioperm_bitmap_is_copy_on_write_and_is_reclaimed_when_empty() {
+    fn shared_ioperm_revoke_needs_no_allocation() {
         let mut parent = IoPortState::default();
         parent.try_update_ioperm(7, 2, true).unwrap();
         let mut child = parent.clone();
@@ -1761,8 +1814,17 @@ mod ioport_tests {
         assert!(parent.bitmap.as_ref().unwrap()[0] & 0x80 == 0);
         assert!(parent.bitmap.as_ref().unwrap()[1] & 0x01 == 0);
 
-        child.try_update_ioperm(7, 2, false).unwrap();
-        assert!(child.bitmap.is_none());
+        // A fork-shared map previously forced an Arc allocation to revoke a
+        // permission. This injected allocator always fails; revoke must not
+        // invoke it and must leave the parent's permissions untouched.
+        child
+            .try_update_ioperm_with(7, 2, false, |_| Err(AxError::NoMemory))
+            .unwrap();
+        assert!(child.bitmap.is_some());
+        assert!(child.revoked[0] & 0x80 != 0);
+        assert!(child.revoked[1] & 0x01 != 0);
+        assert!((child.bitmap.as_ref().unwrap()[0] | child.revoked[0]) & 0x80 != 0);
+        assert!((child.bitmap.as_ref().unwrap()[1] | child.revoked[1]) & 0x01 != 0);
         assert!(parent.bitmap.as_ref().unwrap()[0] & 0x80 == 0);
         assert!(parent.bitmap.as_ref().unwrap()[1] & 0x01 == 0);
     }
