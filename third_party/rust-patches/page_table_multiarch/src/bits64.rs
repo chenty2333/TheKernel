@@ -254,6 +254,7 @@ const fn p1_index(vaddr: usize) -> usize {
 /// When the [`PageTable64`] itself is dropped.
 pub struct PageTable64<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> {
     root_paddr: PhysAddr,
+    owns_root: bool,
     #[cfg(feature = "copy-from")]
     borrowed_entries: bitmaps::Bitmap<ENTRY_COUNT>,
     _phantom: PhantomData<(M, PTE, H)>,
@@ -307,6 +308,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let root_paddr = Self::alloc_table()?;
         Ok(Self {
             root_paddr,
+            owns_root: true,
             #[cfg(feature = "copy-from")]
             borrowed_entries: bitmaps::Bitmap::new(),
             _phantom: PhantomData,
@@ -316,6 +318,19 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
     /// Returns the physical address of the root page table.
     pub const fn root_paddr(&self) -> PhysAddr {
         self.root_paddr
+    }
+
+    /// Borrows an already-installed page-table root.  The returned object
+    /// never frees the root (nor its existing hierarchy); callers must keep
+    /// the root active and serialize every mutation externally.
+    pub unsafe fn from_existing_root(root_paddr: PhysAddr) -> Self {
+        Self {
+            root_paddr,
+            owns_root: false,
+            #[cfg(feature = "copy-from")]
+            borrowed_entries: bitmaps::Bitmap::new(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Queries the result of the mapping starting at `vaddr`.
@@ -952,6 +967,9 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop for PageTable64<M, PTE, H> {
     fn drop(&mut self) {
+        if !self.owns_root {
+            return;
+        }
         let root = self.table_of(self.root_paddr);
         #[allow(unused_variables)]
         for (i, entry) in root.iter().enumerate() {
