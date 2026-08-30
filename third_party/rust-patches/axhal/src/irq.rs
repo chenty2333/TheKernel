@@ -4,13 +4,15 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(feature = "ipi")]
 use axconfig::devices::IPI_IRQ;
-use axcpu::trap::{IRQ, IrqBoundary, register_trap_handler};
+use axcpu::{TrapFrame, trap::{IRQ, IrqBoundary, register_trap_handler}};
 #[cfg(feature = "ipi")]
 pub use axplat::irq::IpiTarget;
 use axplat::irq::handle;
 use percpu::def_percpu;
 
 static IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+const CONTEXT_INSTALLING: usize = 1;
+static IRQ_CONTEXT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
 const IRQ_BOUNDARY_UNINITIALIZED: u8 = 0;
 const IRQ_BOUNDARY_INSTALLED: u8 = 1;
@@ -237,7 +239,9 @@ pub fn register(irq: usize, handler: axplat::irq::IrqHandler) -> bool {
     if irq == IPI_IRQ {
         return false;
     }
-    axplat::irq::register(irq, handler)
+    if irq >= IRQ_CONTEXT.len() || IRQ_CONTEXT[irq].load(Ordering::Acquire) == 0 {
+        axplat::irq::register(irq, handler)
+    } else { false }
 }
 
 /// Unregisters a device interrupt handler.
@@ -249,7 +253,44 @@ pub fn unregister(irq: usize) -> Option<axplat::irq::IrqHandler> {
     if irq == IPI_IRQ {
         return None;
     }
-    axplat::irq::unregister(irq)
+    if irq < IRQ_CONTEXT.len() && IRQ_CONTEXT[irq].load(Ordering::Acquire) != 0 {
+        None
+    } else {
+        axplat::irq::unregister(irq)
+    }
+}
+
+fn context_marker(_: usize) {}
+
+/// Registers a trap-frame-aware owner for one x86 hardware IRQ vector.
+/// The matching no-op normal handler preserves platform dispatch and EOI.
+#[must_use]
+pub fn register_context(vector: usize, handler: fn(usize, &TrapFrame)) -> bool {
+    if !ensure_irq_boundary_hook() { return false; }
+    if vector >= IRQ_CONTEXT.len() || handler as usize == CONTEXT_INSTALLING { return false; }
+    let slot = &IRQ_CONTEXT[vector];
+    if slot.compare_exchange(0, CONTEXT_INSTALLING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return slot.load(Ordering::Acquire) == handler as usize;
+    }
+    if !axplat::irq::register(vector, context_marker) {
+        slot.store(0, Ordering::Release);
+        return false;
+    }
+    slot.store(handler as usize, Ordering::Release);
+    true
+}
+
+/// Removes the context owner and its EOI-preserving normal marker.
+pub fn unregister_context(vector: usize) -> Option<fn(usize, &TrapFrame)> {
+    let slot = IRQ_CONTEXT.get(vector)?;
+    let address = slot.load(Ordering::Acquire);
+    if address == 0 || address == CONTEXT_INSTALLING { return None; }
+    // Keep the slot occupied until the marker is gone: ordinary registration
+    // observes it and cannot race into a later unregister.
+    if axplat::irq::unregister(vector).is_none() { return None; }
+    slot.store(0, Ordering::Release);
+    // SAFETY: an installed slot contains only an accepted function pointer.
+    Some(unsafe { core::mem::transmute::<usize, fn(usize, &TrapFrame)>(address) })
 }
 
 #[cfg(feature = "ipi")]
@@ -463,12 +504,23 @@ fn irq_boundary(boundary: IrqBoundary) {
     }
 }
 
+fn irq_context(boundary: IrqBoundary, vector: usize, frame: &TrapFrame) {
+    if boundary != IrqBoundary::Enter { return; }
+    let address = IRQ_CONTEXT[vector & 0xff].load(Ordering::Acquire);
+    if address != 0 && address != CONTEXT_INSTALLING {
+        // SAFETY: registration publishes an immutable function pointer.
+        let handler = unsafe { core::mem::transmute::<usize, fn(usize, &TrapFrame)>(address) };
+        handler(vector, frame);
+    }
+}
+
 fn ensure_irq_boundary_hook() -> bool {
     match IRQ_BOUNDARY_STATE.load(Ordering::Acquire) {
         IRQ_BOUNDARY_INSTALLED => true,
         IRQ_BOUNDARY_CONFLICT => false,
         _ => {
-            let installed = axcpu::trap::register_irq_boundary_hook(irq_boundary);
+            let installed = axcpu::trap::register_irq_boundary_hook(irq_boundary)
+                && axcpu::trap::register_irq_context_hook(irq_context);
             let state = if installed {
                 IRQ_BOUNDARY_INSTALLED
             } else {

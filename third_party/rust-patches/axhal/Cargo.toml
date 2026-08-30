@@ -64,6 +64,7 @@ pmu = [
     "dep:axplat-x86-pc",
     "axplat-x86-pc/pmu",
 ]
+pmu-sampling = ["pmu", "irq", "axplat-x86-pc/pmu-sampling"]
 paging = [
     "dep:axalloc",
     "dep:page_table_multiarch",

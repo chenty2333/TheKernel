@@ -145,12 +145,20 @@ pub mod pmu {
             Migrated,
             Stale,
             Overflowed,
+            InvalidProgram,
         }
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub struct FinalSample {
             pub value: u64,
             pub overflowed: bool,
         }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct SamplingProgram { pub event: Event, pub period: u64, pub count_user: bool, pub count_kernel: bool, pub cookie: u64 }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct PmiSample { pub cookie: u64, pub period: u64 }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct StopSample { pub residual: u64, pub overflowed: bool, pub lost: bool }
+        #[derive(Debug)] pub struct SamplingToken;
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub struct Capabilities {
             pub version: u8,
@@ -177,6 +185,11 @@ pub mod pmu {
         pub fn drain_local() -> Result<usize, Error> {
             Err(Error::Unsupported)
         }
+        pub fn sampling_arm_local(_: SamplingProgram) -> Result<SamplingToken, Error> { Err(Error::Unsupported) }
+        pub fn sampling_take_pmi() -> Result<Option<(PmiSample, u64)>, Error> { Err(Error::Unsupported) }
+        pub fn sampling_rearm_local(_: u64, _: u64) -> Result<(), Error> { Err(Error::Unsupported) }
+        pub fn sampling_stop_local(_: SamplingToken) -> Result<StopSample, Error> { Err(Error::Unsupported) }
+        pub fn sampling_quiesce_local() -> Result<usize, Error> { Err(Error::Unsupported) }
         impl CounterLease {
             pub fn acquire(_: Event, _: CounterKind) -> Result<Self, Error> {
                 Err(Error::Unsupported)

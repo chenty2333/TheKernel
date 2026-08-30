@@ -32,6 +32,7 @@ pub enum IrqBoundary {
 }
 
 static IRQ_BOUNDARY_HOOK: AtomicUsize = AtomicUsize::new(0);
+static IRQ_CONTEXT_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Registers the single IRQ-boundary callback.
 ///
@@ -42,6 +43,16 @@ static IRQ_BOUNDARY_HOOK: AtomicUsize = AtomicUsize::new(0);
 pub fn register_irq_boundary_hook(hook: fn(IrqBoundary)) -> bool {
     let address = hook as usize;
     match IRQ_BOUNDARY_HOOK.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(existing) => existing == address,
+    }
+}
+
+/// Registers the single context-aware hardware-IRQ callback.
+#[must_use]
+pub fn register_irq_context_hook(hook: fn(IrqBoundary, usize, &TrapFrame)) -> bool {
+    let address = hook as usize;
+    match IRQ_CONTEXT_HOOK.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => true,
         Err(existing) => existing == address,
     }
@@ -61,22 +72,34 @@ pub(crate) fn notify_irq_boundary(boundary: IrqBoundary) {
     hook(boundary);
 }
 
+#[inline]
+pub(crate) fn notify_irq_context(boundary: IrqBoundary, vector: usize, frame: &TrapFrame) {
+    let address = IRQ_CONTEXT_HOOK.load(Ordering::Acquire);
+    if address == 0 { return; }
+    // SAFETY: the slot only publishes a function pointer accepted above and
+    // is never cleared after registration.
+    let hook = unsafe { core::mem::transmute::<usize, fn(IrqBoundary, usize, &TrapFrame)>(address) };
+    hook(boundary, vector, frame);
+}
+
 #[allow(unused_macros)]
 macro_rules! handle_trap {
-    (IRQ, $($args:tt)*) => {{
+    (IRQ, $vector:expr, $frame:expr) => {{
         $crate::trap::notify_irq_boundary($crate::trap::IrqBoundary::Enter);
+        $crate::trap::notify_irq_context($crate::trap::IrqBoundary::Enter, $vector, $frame);
         let result = {
             let mut iter = $crate::trap::IRQ.iter();
             if let Some(func) = iter.next() {
                 if iter.next().is_some() {
                     warn!("Multiple handlers for trap IRQ are not currently supported");
                 }
-                func($($args)*)
+                func($vector)
             } else {
                 warn!("No registered handler for trap IRQ");
                 false
             }
         };
+        $crate::trap::notify_irq_context($crate::trap::IrqBoundary::Exit, $vector, $frame);
         $crate::trap::notify_irq_boundary($crate::trap::IrqBoundary::Exit);
         result
     }};

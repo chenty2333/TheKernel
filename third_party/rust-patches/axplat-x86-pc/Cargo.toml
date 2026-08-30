@@ -55,6 +55,7 @@ irq = ["axplat/irq"]
 ## Intel Hardware P-states for the current CPU only.
 hwp = []
 pmu = []
+pmu-sampling = ["pmu", "irq"]
 reboot-on-system-off = []
 rtc = ["x86_rtc"]
 smp = [

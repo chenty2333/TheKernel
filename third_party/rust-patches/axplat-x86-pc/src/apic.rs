@@ -17,6 +17,7 @@ use x86_64::instructions::port::Port;
 use self::vectors::*;
 
 pub(super) mod vectors {
+    pub const APIC_PMI_VECTOR: u8 = 0xef;
     pub const APIC_TIMER_VECTOR: u8 = 0xf0;
     pub const APIC_SPURIOUS_VECTOR: u8 = 0xf1;
     pub const APIC_ERROR_VECTOR: u8 = 0xf2;
@@ -78,7 +79,7 @@ fn io_apic_pin(vector: usize) -> Option<u8> {
 /// the LAPIC-reserved vector range or overflowing the u8 vector field.
 fn io_apic_vector(pin: u8) -> Option<u8> {
     let vector = IO_APIC_VECTOR_BASE.checked_add(pin as usize)?;
-    (vector < APIC_TIMER_VECTOR as usize && vector <= u8::MAX as usize).then_some(vector as u8)
+    (vector < APIC_PMI_VECTOR as usize && vector <= u8::MAX as usize).then_some(vector as u8)
 }
 
 #[cfg(any(feature = "smp", feature = "irq"))]
@@ -235,8 +236,8 @@ mod tests {
     #[test]
     fn ioapic_vector_mapping_is_bounded() {
         assert_eq!(io_apic_vector(0), Some(0x20));
-        assert_eq!(io_apic_vector(0xcf), Some(0xef));
-        assert_eq!(io_apic_vector(0xd0), None);
+        assert_eq!(io_apic_vector(0xce), Some(0xee));
+        assert_eq!(io_apic_vector(0xcf), None);
         assert_eq!(io_apic_vector(u8::MAX), None);
     }
 

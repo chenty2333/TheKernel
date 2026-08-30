@@ -52,6 +52,7 @@ pub enum Error {
     Migrated,
     Stale,
     Overflowed,
+    InvalidProgram,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
@@ -150,6 +151,10 @@ struct State {
     retired: bool,
     saved: Saved,
     width: u8,
+    sampling: bool,
+    cookie: u64,
+    period: u64,
+    lvt_perf: u32,
 }
 const FREE: State = State {
     generation: 0,
@@ -158,6 +163,10 @@ const FREE: State = State {
     retired: false,
     saved: EMPTY,
     width: 0,
+    sampling: false,
+    cookie: 0,
+    period: 0,
+    lvt_perf: 0,
 };
 struct Manager {
     slots: [State; SLOTS],
@@ -186,6 +195,20 @@ pub struct FinalSample {
     pub value: u64,
     pub overflowed: bool,
 }
+#[cfg(feature = "pmu-sampling")]
+/// A programmable-counter overflow sampling configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplingProgram { pub event: Event, pub period: u64, pub count_user: bool, pub count_kernel: bool, pub cookie: u64 }
+#[cfg(feature = "pmu-sampling")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PmiSample { pub cookie: u64, pub period: u64 }
+#[cfg(feature = "pmu-sampling")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StopSample { pub residual: u64, pub overflowed: bool, pub lost: bool }
+#[cfg(feature = "pmu-sampling")]
+/// A linear local-CPU sampling owner; it is deliberately not `Copy`.
+#[derive(Debug)]
+pub struct SamplingToken { cpu: usize, slot: Slot, generation: u64, cookie: u64, active: bool }
 pub fn capabilities() -> Result<Capabilities, Error> {
     #[cfg(not(target_os = "none"))]
     {
@@ -282,6 +305,116 @@ impl CounterLease {
         }
     }
 }
+
+#[cfg(feature = "pmu-sampling")]
+const LVT_MASKED: u32 = 1 << 16;
+#[cfg(feature = "pmu-sampling")]
+const fn sampling_preload(width: u8, period: u64) -> u64 {
+    Capabilities::mask(width).wrapping_add(1).wrapping_sub(period)
+}
+#[cfg(feature = "pmu-sampling")]
+const fn sampling_event(event: Event, user: bool, kernel: bool) -> u64 {
+    event.code() as u64 | (user as u64) << 16 | (kernel as u64) << 17 | 1 << 20 | 1 << 22
+}
+
+/// Arms exactly one local programmable PMU counter for PMI delivery.
+#[cfg(feature = "pmu-sampling")]
+pub fn sampling_arm_local(program: SamplingProgram) -> Result<SamplingToken, Error> {
+    local(|cpu, m| {
+        let _ = reap(m);
+        let c = capabilities()?;
+        if !c.programmable(program.event) || !program.count_user && !program.count_kernel
+            || program.period < 4096 || program.period > c.programmable_mask() { return Err(Error::InvalidProgram); }
+        let (slot, saved) = select(m, c)?;
+        let state = &mut m.slots[slot.idx()];
+        claim_generation(state)?; // before the first register write: no ABA on exhaustion.
+        let lvt = unsafe { crate::apic::local_apic().lvt_perf() };
+        unsafe { crate::apic::local_apic().write_lvt_perf(lvt | LVT_MASKED); }
+        disable(slot);
+        write(OVF, bit(slot)); // candidate was idle/status-clear; acknowledge only our bit.
+        write(EVT + match slot { Slot::P(i) => i as u32, _ => unreachable!() }, sampling_event(program.event, program.count_user, program.count_kernel));
+        write(slot_msr(slot), sampling_preload(c.programmable_width, program.period));
+        state.owned = true;
+        state.sampling = true;
+        state.abandoned = false;
+        state.saved = saved;
+        state.width = c.programmable_width;
+        state.cookie = program.cookie;
+        state.period = program.period;
+        state.lvt_perf = lvt;
+        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32 | LVT_MASKED); }
+        write(GLOBAL, read(GLOBAL) | bit(slot));
+        unsafe { crate::apic::local_apic().write_lvt_perf((lvt & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+        Ok(SamplingToken { cpu, slot, generation: state.generation, cookie: program.cookie, active: true })
+    })
+}
+
+/// Consumes this CPU's owned PMI latch and leaves the sample disarmed.
+#[cfg(feature = "pmu-sampling")]
+pub fn sampling_take_pmi() -> Result<Option<(PmiSample, u64)>, Error> {
+    local(|_, m| {
+        for i in 0..MAX {
+            let s = &mut m.slots[i];
+            if !s.owned || !s.sampling { continue; }
+            let slot = Slot::P(i as u8);
+            unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
+            disable(slot);
+            if read(STATUS) & bit(slot) == 0 { return Ok(None); } // stray: do not clear another owner.
+            write(OVF, bit(slot));
+            return Ok(Some((PmiSample { cookie: s.cookie, period: s.period }, s.generation)));
+        }
+        Ok(None)
+    })
+}
+
+/// Rearms a disarmed local sample only when its cookie and generation still match.
+#[cfg(feature = "pmu-sampling")]
+pub fn sampling_rearm_local(cookie: u64, generation: u64) -> Result<(), Error> {
+    local(|_, m| {
+        for i in 0..MAX { let s = &mut m.slots[i]; if s.owned && s.sampling && s.cookie == cookie && s.generation == generation {
+            let slot = Slot::P(i as u8); write(slot_msr(slot), sampling_preload(s.width, s.period)); write(OVF, bit(slot));
+            write(GLOBAL, read(GLOBAL) | bit(slot));
+            unsafe { crate::apic::local_apic().write_lvt_perf((s.lvt_perf & !0xff) | crate::apic::vectors::APIC_PMI_VECTOR as u32); }
+            return Ok(());
+        }} Err(Error::Stale)
+    })
+}
+
+#[cfg(feature = "pmu-sampling")]
+fn stop_sampling(slot: Slot, s: &mut State) -> StopSample {
+    unsafe { crate::apic::local_apic().write_lvt_perf(crate::apic::local_apic().lvt_perf() | LVT_MASKED); }
+    disable(slot); let residual = read(slot_msr(slot)) & Capabilities::mask(s.width); let overflowed = read(STATUS) & bit(slot) != 0;
+    if overflowed { write(OVF, bit(slot)); }
+    write(EVT + match slot { Slot::P(i) => i as u32, _ => unreachable!() }, s.saved.control);
+    write(slot_msr(slot), s.saved.counter); let now = read(GLOBAL); write(GLOBAL, (now & !bit(slot)) | (s.saved.global & bit(slot)));
+    unsafe { crate::apic::local_apic().write_lvt_perf(s.lvt_perf); }
+    s.owned = false; s.sampling = false; s.abandoned = false;
+    StopSample { residual, overflowed, lost: false }
+}
+
+/// Stops a local sampling token and restores exactly its saved PMU/LVT state.
+#[cfg(feature = "pmu-sampling")]
+pub fn sampling_stop_local(mut token: SamplingToken) -> Result<StopSample, Error> {
+    let result = local(|cpu, m| { if cpu != token.cpu { return Err(Error::Migrated); } let s = &mut m.slots[token.slot.idx()]; if !s.owned || !s.sampling || s.generation != token.generation || s.cookie != token.cookie { return Err(Error::Stale); } Ok(stop_sampling(token.slot, s)) });
+    if result.is_ok() { token.active = false; } result
+}
+
+/// Bounded, idempotent local cleanup for a locally abandoned sampling token.
+#[cfg(feature = "pmu-sampling")]
+pub fn sampling_quiesce_local() -> Result<usize, Error> {
+    local(|_, m| { let mut count = 0; for i in 0..MAX { let s = &mut m.slots[i]; if s.owned && s.sampling && s.abandoned { let _ = stop_sampling(Slot::P(i as u8), s); count += 1; } } Ok(count) })
+}
+
+#[cfg(feature = "pmu-sampling")]
+impl Drop for SamplingToken {
+    fn drop(&mut self) {
+        if !self.active { return; }
+        let _guard = kernel_guard::NoPreemptIrqSave::new(); let cpu = crate::cpu::current_logical_cpu_id();
+        let mut m = MANAGERS[self.cpu].lock(); let s = &mut m.slots[self.slot.idx()];
+        if !s.owned || !s.sampling || s.generation != self.generation { return; }
+        if cpu == self.cpu { let _ = stop_sampling(self.slot, s); } else { s.abandoned = true; }
+    }
+}
 impl Drop for CounterLease {
     fn drop(&mut self) {
         if !self.active {
@@ -341,9 +474,16 @@ fn reap(m: &mut Manager) -> usize {
             } else {
                 Slot::F((index - MAX) as u8)
             };
+            #[cfg(feature = "pmu-sampling")]
+            if state.sampling {
+                let _ = stop_sampling(slot, state);
+                count += 1;
+                continue;
+            }
             let _ = terminate(slot, state.saved, state.width);
             state.owned = false;
             state.abandoned = false;
+            state.sampling = false;
             count += 1;
         }
     }
@@ -565,5 +705,17 @@ mod tests {
     fn host_stub() {
         #[cfg(not(target_os = "none"))]
         assert_eq!(capabilities(), Err(Error::Unsupported));
+    }
+
+    #[cfg(feature = "pmu-sampling")]
+    #[test]
+    fn sampling_encoding_preload_and_owned_ack_are_precise() {
+        assert_eq!(sampling_preload(8, 16), 240);
+        assert_eq!(sampling_event(Event::Cycles, true, false), 0x51003c);
+        assert_eq!(sampling_event(Event::Instructions, false, true), 0x5200c0);
+        let own = bit(Slot::P(1));
+        let foreign = bit(Slot::P(2));
+        assert_eq!((own | foreign) & own, own, "W1C selects only the owned latch");
+        assert_eq!((0x1234u32 & !0xff) | 0xef, 0x12ef, "LVT restores non-vector bits exactly");
     }
 }

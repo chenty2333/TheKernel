@@ -53,7 +53,7 @@ fn x86_trap_handler(tf: &mut TrapFrame) {
             );
         }
         IRQ_VECTOR_START..=IRQ_VECTOR_END => {
-            handle_trap!(IRQ, tf.vector as _);
+            handle_trap!(IRQ, tf.vector as _, tf);
         }
         _ => {
             panic!(
