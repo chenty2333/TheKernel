@@ -1253,9 +1253,7 @@ fn validate_cet_sigreturn<M: UserMemory + ?Sized>(
         };
     }
     let pending = pending.ok_or("missing CET signal-frame record")?;
-    let frame = syscall_sp
-        .checked_add(core::mem::size_of::<usize>())
-        .ok_or("CET frame overflow")?;
+    let frame = syscall_sp;
     if frame != pending.frame || current.pl3_ssp != pending.handler_ssp {
         return Err("CET signal-frame sequence mismatch");
     }
@@ -1289,17 +1287,12 @@ fn validate_cet_sigreturn<M: UserMemory + ?Sized>(
         .proc_data
         .aspace()
         .lock()
-        .read_cet_signal_frame(thr.kernel_tid(), pending.handler_ssp)
+        .read_cet_signal_frame(thr.kernel_tid(), pending.shadow_start)
         .map_err(|_| "stale CET shadow-stack mapping")?;
     // The first word is the generic frame's restorer.  It is protected by the
     // shadow-stack copy, while the remaining words bind this exact nesting
     // layer to the opaque kernel record.
-    let mut restorer = [MaybeUninit::<u8>::uninit(); 8];
-    memory
-        .read_bytes(syscall_sp, &mut restorer)
-        .map_err(|_| "unreadable signal restorer")?;
-    let restorer = u64::from_ne_bytes(restorer.map(|byte| unsafe { byte.assume_init() }));
-    if words != [restorer, pending.nonce, pending.token] {
+    if words != [pending.restorer, pending.nonce, pending.token] {
         return Err("modified CET shadow-stack record");
     }
     Ok(Some((

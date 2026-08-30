@@ -439,8 +439,9 @@ fn publish_cet_signal_frame(
     let restorer = u64::from_ne_bytes(restorer.map(|byte| unsafe { byte.assume_init() }));
     let (epoch, nonce) = thr.cet_signal_reserve().ok_or(AxError::StorageFull)?;
     let saved_ssp = state.pl3_ssp;
-    let handler_ssp = saved_ssp.checked_sub(24).ok_or(AxError::BadAddress)?;
-    let token = cet_signal_token(epoch, nonce, frame, saved_ssp, handler_ssp);
+    let shadow_start = saved_ssp.checked_sub(24).ok_or(AxError::BadAddress)?;
+    let handler_ssp = shadow_start.checked_add(8).ok_or(AxError::BadAddress)?;
+    let token = cet_signal_token(epoch, nonce, frame, saved_ssp, shadow_start);
     {
         let aspace = thr.proc_data.aspace();
         aspace.lock().write_cet_signal_frame(
@@ -471,7 +472,9 @@ fn publish_cet_signal_frame(
     let pending = CetPendingSignalFrame {
         frame,
         saved_ssp,
+        shadow_start,
         handler_ssp,
+        restorer,
         epoch,
         nonce,
         token,
@@ -481,7 +484,7 @@ fn publish_cet_signal_frame(
     }
     super::set_current_user_cet_state(axhal::asm::UserCetState {
         u_cet: state.u_cet,
-        pl3_ssp: handler_ssp,
+        pl3_ssp: shadow_start,
         locked: state.locked,
     });
     Ok(())

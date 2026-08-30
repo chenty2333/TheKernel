@@ -6984,19 +6984,19 @@ impl AddrSpace {
     pub(crate) fn read_cet_signal_frame(
         &self,
         task_id: u32,
-        handler_ssp: u64,
+        shadow_start: u64,
     ) -> AxResult<[u64; 3]> {
-        let start = handler_ssp
-            .checked_sub(core::mem::size_of::<[u64; 3]>() as u64)
-            .ok_or(AxError::BadAddress)? as usize;
-        if !handler_ssp.is_multiple_of(core::mem::size_of::<u64>() as u64)
-            || !self.cet_default_shadow_stack_contains(task_id, handler_ssp)
-            || !self.cet_default_shadow_stack_contains(task_id, start as u64)
+        let end = shadow_start
+            .checked_add(core::mem::size_of::<[u64; 3]>() as u64)
+            .ok_or(AxError::BadAddress)?;
+        if !shadow_start.is_multiple_of(core::mem::size_of::<u64>() as u64)
+            || !self.cet_default_shadow_stack_contains(task_id, shadow_start)
+            || !self.cet_default_shadow_stack_contains(task_id, end)
         {
             return Err(AxError::BadAddress);
         }
         let mut bytes = [0u8; core::mem::size_of::<[u64; 3]>()];
-        self.read(VirtAddr::from(start), &mut bytes)?;
+        self.read(VirtAddr::from(shadow_start as usize), &mut bytes)?;
         let mut words = [0u64; 3];
         for (index, word) in words.iter_mut().enumerate() {
             *word = u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap());

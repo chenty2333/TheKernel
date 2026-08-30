@@ -52,7 +52,9 @@ const CET_SIGNAL_FRAME_LIMIT: usize = 64;
 pub(crate) struct CetPendingSignalFrame {
     pub(crate) frame: usize,
     pub(crate) saved_ssp: u64,
+    pub(crate) shadow_start: u64,
     pub(crate) handler_ssp: u64,
+    pub(crate) restorer: u64,
     pub(crate) epoch: u64,
     pub(crate) nonce: u64,
     pub(crate) token: u64,
@@ -135,7 +137,9 @@ mod cet_signal_frame_tests {
         CetPendingSignalFrame {
             frame: nonce as usize,
             saved_ssp: 0x8000,
-            handler_ssp: 0x7fe8,
+            shadow_start: 0x7fe8,
+            handler_ssp: 0x7ff0,
+            restorer: 0x1000,
             epoch,
             nonce,
             token: nonce ^ 0x55,
@@ -167,6 +171,18 @@ mod cet_signal_frame_tests {
         }
         assert!(frames.reserve().is_none());
         assert!(!frames.push(frame(epoch, 99)));
+    }
+
+    #[test]
+    fn cet_signal_frame_tracks_entry_ret_and_sigreturn_positions() {
+        let saved_ssp = 0x8000;
+        let shadow_start = saved_ssp - 24;
+        let handler_ssp_after_ret = shadow_start + 8;
+        let signal_frame = 0x4000;
+        let handler_rsp = signal_frame - 8;
+        assert_eq!(handler_rsp + 8, signal_frame);
+        assert_eq!(shadow_start + 24, saved_ssp);
+        assert_eq!(handler_ssp_after_ret, shadow_start + 8);
     }
 }
 
