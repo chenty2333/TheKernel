@@ -755,6 +755,9 @@ fn do_execve(
     drop(old_cmdline);
 
     proc_data.set_heap_layout(layout.heap_base());
+    // A successful exec installs a fresh mm, so no nonzero key allocation or
+    // stale mapping key can survive into the new image.
+    proc_data.reset_pkeys_for_exec();
 
     thr.signal.set_stack(Default::default());
 
@@ -764,6 +767,7 @@ fn do_execve(
 
     install_exec_user_context(uctx, entry_point.as_usize(), user_stack_base);
     reset_current_task_extended_state();
+    axtask::reset_current_task_pkru();
     let _ = rseq_exec.commit();
     if let Some(session) = exec_ptrace_session
         && proc_data.ptrace_stop(session, Signo::SIGTRAP as u8)

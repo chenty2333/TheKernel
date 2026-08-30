@@ -4,6 +4,8 @@ use axalloc::{UsageKind, global_allocator};
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use page_table_multiarch::PagingHandler;
 #[doc(no_inline)]
+pub use page_table_multiarch::x86_64::Pkey;
+#[doc(no_inline)]
 pub use page_table_multiarch::{
     MappingFlags, PageSize, PagingError, PagingResult, PrepareTableFramesError, PreparedMapError,
 };

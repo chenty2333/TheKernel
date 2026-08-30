@@ -15,7 +15,7 @@ use x86::tlb;
 use x86_64::instructions::interrupts;
 #[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
 use x86_64::instructions::tlb as x86_64_tlb;
-#[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
+#[cfg(all(target_os = "none", any(feature = "asid-fast-switch", feature = "pkeys")))]
 use x86_64::registers::control::{Cr4, Cr4Flags};
 #[cfg(target_os = "none")]
 use x86_64::{
@@ -27,6 +27,132 @@ use x86_64::{
 static PCID_CPUS_ENABLED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "asid-fast-switch")]
 static PCID_CPUS_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+/// The architectural PKRU value that permits access through every user key.
+#[cfg(feature = "pkeys")]
+pub const PKRU_DEFAULT: u32 = 0;
+
+/// Per-CPU observations used to decide whether protection keys are usable.
+#[cfg(feature = "pkeys")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkeyCapabilityMatrix {
+    /// CPUID.7.0:ECX.PKU was advertised.
+    pub cpuid_pku: bool,
+    /// CR4.PKE is set and the PKRU instructions are therefore enabled.
+    pub pke_enabled: bool,
+}
+
+#[cfg(feature = "pkeys")]
+impl PkeyCapabilityMatrix {
+    /// Returns whether this CPU can use PKRU and protection-key PTE bits.
+    pub const fn usable(self) -> bool {
+        self.cpuid_pku && self.pke_enabled
+    }
+}
+
+/// Returns the local CPU's protection-key capability observations.
+///
+/// Host tests cannot inspect CR4 and therefore always report PKE disabled.
+#[cfg(feature = "pkeys")]
+pub fn probe_pkey_capabilities() -> PkeyCapabilityMatrix {
+    let cpuid_pku = x86::cpuid::CpuId::new()
+        .get_extended_feature_info()
+        .is_some_and(|features| features.has_pku());
+
+    #[cfg(target_os = "none")]
+    {
+        PkeyCapabilityMatrix {
+            cpuid_pku,
+            pke_enabled: Cr4::read().contains(Cr4Flags::PROTECTION_KEY_USER),
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        PkeyCapabilityMatrix {
+            cpuid_pku,
+            pke_enabled: false,
+        }
+    }
+}
+
+/// Enables CR4.PKE on this CPU when the processor advertises protection keys.
+///
+/// PKRU is switched explicitly with RDPKRU/WRPKRU; this deliberately does not
+/// enable XSAVE, XCR0 PKRU state, AVX, or any wider vector state.
+#[cfg(feature = "pkeys")]
+pub fn init_pkeys() {
+    #[cfg(target_os = "none")]
+    {
+        let capabilities = probe_pkey_capabilities();
+        if capabilities.cpuid_pku && !capabilities.pke_enabled {
+            let mut cr4 = Cr4::read();
+            cr4.insert(Cr4Flags::PROTECTION_KEY_USER);
+            // SAFETY: CPUID has advertised PKU and only CR4.PKE is changed.
+            unsafe { Cr4::write(cr4) };
+        }
+        // A bootloader-provided PKRU must not become the initial task state.
+        if probe_pkey_capabilities().usable() {
+            let _ = write_pkru(PKRU_DEFAULT);
+        }
+    }
+}
+
+/// Returns whether protection keys are enabled on this CPU.
+#[cfg(feature = "pkeys")]
+#[inline]
+pub fn pkeys_enabled() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        return probe_pkey_capabilities().usable();
+    }
+    #[cfg(not(target_os = "none"))]
+    false
+}
+
+/// Reads PKRU if protection keys are enabled on this CPU.
+#[cfg(feature = "pkeys")]
+#[inline]
+pub fn read_pkru() -> Option<u32> {
+    if !pkeys_enabled() {
+        return None;
+    }
+    let pkru: u32;
+    // SAFETY: CR4.PKE was checked above; ECX must be zero for RDPKRU.
+    unsafe {
+        asm!(
+            "rdpkru",
+            in("ecx") 0_u32,
+            lateout("eax") pkru,
+            lateout("edx") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    Some(pkru)
+}
+
+/// Writes PKRU if protection keys are enabled on this CPU.
+///
+/// The trailing LFENCE prevents later loads from being speculated with the
+/// permissions that preceded this update.
+#[cfg(feature = "pkeys")]
+#[inline]
+pub fn write_pkru(pkru: u32) -> bool {
+    if !pkeys_enabled() {
+        return false;
+    }
+    // SAFETY: CR4.PKE was checked above; WRPKRU requires ECX and EDX zero.
+    unsafe {
+        asm!(
+            "wrpkru",
+            "lfence",
+            in("eax") pkru,
+            in("ecx") 0_u32,
+            in("edx") 0_u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
 
 /// Per-CPU capability observations used to decide whether PCID is safe for
 /// the whole boot.

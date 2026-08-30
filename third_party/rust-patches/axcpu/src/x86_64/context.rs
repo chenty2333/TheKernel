@@ -317,6 +317,9 @@ pub struct TaskContext {
     /// Extended states, i.e., FP/SIMD states.
     #[cfg(feature = "fp-simd")]
     pub ext_state: ExtendedState,
+    /// The task's user protection-key permissions.
+    #[cfg(feature = "pkeys")]
+    pkru: u32,
     /// The `CR3` register value, i.e., the page table root.
     #[cfg(feature = "uspace")]
     pub cr3: memory_addr::PhysAddr,
@@ -354,6 +357,8 @@ impl TaskContext {
             cr3_fallback_reason: crate::AddressSpaceFallbackReason::AsidZero,
             #[cfg(feature = "fp-simd")]
             ext_state: ExtendedState::default(),
+            #[cfg(feature = "pkeys")]
+            pkru: crate::asm::PKRU_DEFAULT,
         }
     }
 
@@ -387,6 +392,54 @@ impl TaskContext {
     #[cfg(feature = "fp-simd")]
     pub fn reset_extended_state(&mut self) {
         self.ext_state.reset();
+    }
+
+    /// Returns this task's scheduler-saved PKRU value.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub const fn saved_pkru(&self) -> u32 {
+        self.pkru
+    }
+
+    /// Replaces this task's scheduler-saved PKRU value.
+    ///
+    /// This only updates the saved context. Call [`Self::set_current_pkru`]
+    /// when this is the task currently executing on this CPU.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub fn set_saved_pkru(&mut self, pkru: u32) {
+        self.pkru = pkru;
+    }
+
+    /// Copies the PKRU state inherited by a newly created task.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub fn inherit_pkru_from(&mut self, parent: &Self) {
+        self.pkru = parent.pkru;
+    }
+
+    /// Snapshots live PKRU into this context when it is current.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub fn save_current_pkru(&mut self) {
+        if let Some(pkru) = crate::asm::read_pkru() {
+            self.pkru = pkru;
+        }
+    }
+
+    /// Changes both the saved and live PKRU state of the current task.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub fn set_current_pkru(&mut self, pkru: u32) {
+        self.pkru = pkru;
+        let _ = crate::asm::write_pkru(pkru);
+    }
+
+    /// Restores the default permissions for the current task.
+    #[cfg(feature = "pkeys")]
+    #[inline]
+    pub fn reset_current_pkru(&mut self) {
+        self.set_current_pkru(crate::asm::PKRU_DEFAULT);
     }
 
     /// Changes the page table root in this context.
@@ -429,6 +482,11 @@ impl TaskContext {
     /// It first saves the current task's context from CPU to this place, and then
     /// restores the next task's context from `next_ctx` to CPU.
     pub fn switch_to(&mut self, next_ctx: &Self) {
+        #[cfg(feature = "pkeys")]
+        {
+            self.save_current_pkru();
+            let _ = crate::asm::write_pkru(next_ctx.pkru);
+        }
         #[cfg(feature = "fp-simd")]
         {
             self.ext_state.save();
@@ -577,6 +635,28 @@ mod tests {
         assert_eq!(state.fxsave_area.ftw, 0);
         assert_eq!(state.fxsave_area.mxcsr, 0x1f80);
         assert_eq!(state.fxsave_area.xmm[0], 0);
+    }
+}
+
+#[cfg(all(test, feature = "pkeys"))]
+mod pkey_tests {
+    use super::TaskContext;
+    use crate::asm::PKRU_DEFAULT;
+
+    #[test]
+    fn new_context_starts_with_default_pkru() {
+        assert_eq!(TaskContext::new().saved_pkru(), PKRU_DEFAULT);
+    }
+
+    #[test]
+    fn inherited_pkru_is_a_snapshot() {
+        let mut parent = TaskContext::new();
+        parent.set_saved_pkru(0xa5a5_5a5a);
+        let mut child = TaskContext::new();
+        child.inherit_pkru_from(&parent);
+        parent.set_saved_pkru(0);
+
+        assert_eq!(child.saved_pkru(), 0xa5a5_5a5a);
     }
 }
 

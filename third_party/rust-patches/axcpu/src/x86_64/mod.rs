@@ -12,3 +12,5 @@ mod trap;
 pub mod uspace;
 
 pub use self::context::{ExtendedState, FxsaveArea, TaskContext, TrapFrame};
+#[cfg(feature = "pkeys")]
+pub use self::asm::PKRU_DEFAULT;

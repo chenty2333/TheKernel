@@ -1,6 +1,7 @@
 //! x86 specific page table structures.
 
 use memory_addr::VirtAddr;
+pub use page_table_entry::x86_64::Pkey;
 pub use page_table_entry::x86_64::X64PTE;
 #[cfg(all(feature = "asid-fast-switch", target_os = "none"))]
 use x86_64::{

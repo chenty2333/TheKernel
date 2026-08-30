@@ -63,6 +63,7 @@ asid-switch-diagnostics = ["asid-fast-switch", "dep:axpmu"]
 default = []
 fp-simd = []
 host-test-context = []
+pkeys = []
 tls = []
 uspace = []
 

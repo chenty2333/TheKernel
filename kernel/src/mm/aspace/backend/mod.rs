@@ -24,6 +24,7 @@ mod shared;
 pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
 pub(crate) use self::{
     cow::{PreparedCowHugeFrame, PreparedCowPage},
+    cow::register_demoted_huge_backing,
     file::WritableMappingAdmission,
     phys_pin::{PhysicalFramePins, PreparedPhysicalFramePins, prepare_physical_pin_registry},
     shared::PreparedFixedSharedMapping,
@@ -224,6 +225,15 @@ fn preflight_sparse_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTa
             return Err(AxError::BadAddress);
         }
     }
+    Ok(())
+}
+
+/// Validates a sparse range without imposing the backend's preferred leaf
+/// size.  A pkey operation can split a resident huge leaf into P1 entries;
+/// later VMA teardown must accept those entries while still rejecting a range
+/// which cuts through a (not-yet-demoted) huge mapping.
+fn preflight_sparse_leaves(range: VirtAddrRange, pt: &PageTable) -> AxResult {
+    pt.collect_present_leaves(range.start, range.size())?;
     Ok(())
 }
 

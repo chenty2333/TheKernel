@@ -1310,6 +1310,20 @@ impl Thread {
         ioport::install_user_io_bitmap(bitmap, revoked, state.iopl == 3);
     }
 
+    /// Updates the current thread's two PKRU access bits for one allocated
+    /// x86 protection key.  PKRU is per-thread (unlike the mm allocation
+    /// bitmap), so this deliberately does not change sibling threads.
+    pub(crate) fn set_pkey_access_rights(&self, key: u8, rights: u32) -> AxResult<()> {
+        if key == 0 || key >= 16 || rights & !0x3 != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let shift = u32::from(key) * 2;
+        let old = axtask::current_task_pkru();
+        let new = (old & !(0x3 << shift)) | (rights << shift);
+        axtask::set_current_task_pkru(new);
+        Ok(())
+    }
+
     pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
         self.deferred_work.clone()
     }

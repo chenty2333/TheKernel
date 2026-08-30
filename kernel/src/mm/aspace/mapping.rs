@@ -413,7 +413,10 @@ mod tests {
     use memory_addr::{MemoryAddr, VirtAddr};
     use memory_set::{MappingBackend, MappingLineage, MemoryArea, MemorySet};
 
-    use super::{super::PreparedAreaProtect, *};
+    use super::{
+        super::{PreparedAreaProtect, PreparedProtectRange},
+        *,
+    };
     use crate::{
         file::{
             FileDescription, FileLike, drain_deferred_description_resource_only_for_test,
@@ -643,7 +646,11 @@ mod tests {
             page_table: &mut page_table,
             start: base + 0x1000,
             end: base + 0x2000,
-            flags: 3,
+            ranges: vec![PreparedProtectRange {
+                start: base + 0x1000,
+                end: base + 0x2000,
+                flags: 3,
+            }],
             max_areas: usize::MAX,
         }
         .commit()
@@ -664,7 +671,11 @@ mod tests {
             page_table: &mut page_table,
             start: base + 0x1000,
             end: base + 0x2000,
-            flags: 1,
+            ranges: vec![PreparedProtectRange {
+                start: base + 0x1000,
+                end: base + 0x2000,
+                flags: 1,
+            }],
             max_areas: usize::MAX,
         }
         .commit()

@@ -14,6 +14,7 @@ use super::{
     super::SharedBackingKey, AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId,
     FutexBackingIdentity, FutexWordOffset, MappingStatus, PopulateOutcome, SharedFutexKey,
     alloc_frame, dealloc_frame, divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
+    preflight_sparse_leaves,
 };
 use crate::{
     file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
@@ -766,17 +767,14 @@ impl BackendOps for SharedBackend {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         debug!("Shared::unmap: {range:?}");
-        for vaddr in pages_in(range, self.pages.size)? {
-            match pt.unmap(vaddr) {
-                Ok(_) | Err(PagingError::NotMapped) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
+        // `drain_present_leaves` handles both original folio-sized leaves and
+        // the P1 children published by a prepared pkey demotion.
+        let _ = pt.drain_present_leaves(range.start, range.size())?;
         Ok(BackendRetirement::empty())
     }
 
     fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
-        preflight_sparse_unmap(range, self.pages.size, pt)
+        preflight_sparse_leaves(range, pt)
     }
 
     fn populate(

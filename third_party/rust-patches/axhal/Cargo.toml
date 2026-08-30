@@ -43,6 +43,7 @@ fp-simd = [
     "axcpu/fp-simd",
     "axplat-x86-pc?/fp-simd",
 ]
+pkeys = ["axcpu/pkeys"]
 hv = [
     "paging",
     "axplat-dyn?/hv",

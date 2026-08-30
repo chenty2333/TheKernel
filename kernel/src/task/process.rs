@@ -35,6 +35,51 @@ use thekernel_linux_signal::{
     api::{ProcessSignalManager, SharedSignalActions, ThreadSignalManager},
 };
 
+/// x86 protection-key allocation belongs to an mm, not to an individual
+/// thread. Key zero is permanently reserved. `pkey_free` deliberately only
+/// changes this bitmap: Linux leaves existing PTE key fields intact.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProtectionKeyState {
+    allocated: u16,
+}
+
+impl Default for ProtectionKeyState {
+    fn default() -> Self {
+        Self { allocated: 1 }
+    }
+}
+
+impl ProtectionKeyState {
+    pub(crate) const KEYS: usize = 16;
+
+    pub(crate) fn allocate(&mut self) -> AxResult<u8> {
+        for key in 1..Self::KEYS {
+            let bit = 1u16 << key;
+            if self.allocated & bit == 0 {
+                self.allocated |= bit;
+                return Ok(key as u8);
+            }
+        }
+        Err(AxError::StorageFull)
+    }
+
+    pub(crate) fn free(&mut self, key: i32) -> AxResult<()> {
+        if !(1..Self::KEYS as i32).contains(&key) {
+            return Err(AxError::InvalidInput);
+        }
+        let bit = 1u16 << key;
+        if self.allocated & bit == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        self.allocated &= !bit;
+        Ok(())
+    }
+
+    pub(crate) fn is_allocated(&self, key: i32) -> bool {
+        (0..Self::KEYS as i32).contains(&key) && self.allocated & (1u16 << key) != 0
+    }
+}
+
 // Host unit tests do not initialize the kernel scheduler/current task. Keep
 // the production registry sleepable, but let ownership/admission tests execute
 // the same critical sections without entering `axsync::Mutex`'s task wait path.
@@ -2623,6 +2668,8 @@ pub struct ProcessData {
 
     /// Linux personality flags shared by all threads in the process.
     personality: AtomicU32,
+    /// x86 PKU allocation map, shared by every thread using this mm.
+    pkeys: SpinNoIrq<ProtectionKeyState>,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
     /// Current timer slack in nanoseconds.
@@ -2747,6 +2794,33 @@ fn ptrace_lifecycle_first(left: &ProcessData, right: &ProcessData) -> bool {
 
 fn ptrace_lifecycle_first_key(left: usize, right: usize) -> bool {
     left < right
+}
+
+#[cfg(test)]
+mod pkey_tests {
+    use super::ProtectionKeyState;
+
+    #[test]
+    fn pkey_zero_is_reserved_and_free_reuses_without_touching_other_keys() {
+        let mut state = ProtectionKeyState::default();
+        assert!(state.is_allocated(0));
+        assert_eq!(state.free(0).unwrap_err(), axerrno::AxError::InvalidInput);
+        assert_eq!(state.allocate().unwrap(), 1);
+        assert_eq!(state.allocate().unwrap(), 2);
+        state.free(1).unwrap();
+        assert!(state.is_allocated(2));
+        assert_eq!(state.allocate().unwrap(), 1);
+    }
+
+    #[test]
+    fn pkey_allocation_is_bounded_to_the_x86_sixteen_key_domain() {
+        let mut state = ProtectionKeyState::default();
+        for expected in 1..ProtectionKeyState::KEYS as u8 {
+            assert_eq!(state.allocate().unwrap(), expected);
+        }
+        assert_eq!(state.allocate().unwrap_err(), axerrno::AxError::StorageFull);
+        assert_eq!(state.free(16).unwrap_err(), axerrno::AxError::InvalidInput);
+    }
 }
 
 /// An exec group-leader handoff whose pointer publication is complete but
@@ -3127,6 +3201,7 @@ impl ProcessData {
             futex_table,
 
             personality: AtomicU32::new(0),
+            pkeys: SpinNoIrq::new(ProtectionKeyState::default()),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
@@ -3190,6 +3265,30 @@ impl ProcessData {
     /// is rejected by the syscall before this state transition is attempted.
     pub(crate) fn oom_reap_eligible(&self) -> bool {
         self.group_exit_in_progress() || self.proc.is_zombie()
+    }
+
+    pub(crate) fn allocate_pkey(&self) -> AxResult<u8> {
+        self.pkeys.lock().allocate()
+    }
+
+    pub(crate) fn free_pkey(&self, key: i32) -> AxResult<()> {
+        self.pkeys.lock().free(key)
+    }
+
+    pub(crate) fn pkey_is_allocated(&self, key: i32) -> bool {
+        self.pkeys.lock().is_allocated(key)
+    }
+
+    pub(crate) fn pkey_snapshot(&self) -> ProtectionKeyState {
+        *self.pkeys.lock()
+    }
+
+    pub(crate) fn install_pkey_snapshot(&self, state: ProtectionKeyState) {
+        *self.pkeys.lock() = state;
+    }
+
+    pub(crate) fn reset_pkeys_for_exec(&self) {
+        *self.pkeys.lock() = ProtectionKeyState::default();
     }
 
     /// Binds this process's sole payload reservation only after the process

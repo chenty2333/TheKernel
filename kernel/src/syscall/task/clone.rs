@@ -451,6 +451,11 @@ impl CloneArgs {
         }
         let child_io_context = clone_io_context(flags, calling_thread)?;
         let child_ioport = calling_thread.ioport_snapshot();
+        // Protection-key allocation is mm state.  Threads share it through
+        // `ProcessData`; an ordinary fork gets an exact bitmap copy while
+        // retaining the copied PTE key fields in its cloned address space.
+        let child_pkeys = (!flags.contains(CloneFlags::THREAD))
+            .then(|| old_proc_data.pkey_snapshot());
 
         // Long fork/exit workloads can leave already-reaped tasks queued on
         // this CPU. Nudge its pinned recycler before allocating another child
@@ -484,6 +489,10 @@ impl CloneArgs {
 
         let task_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
         let mut new_task = try_new_user_task(task_name, new_uctx)?;
+        // PKRU is a per-thread architectural register.  It is inherited by
+        // both CLONE_THREAD and fork children, independently of the mm-wide
+        // allocation bitmap captured below.
+        new_task.inherit_current_pkru();
 
         let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
         let child_credential = CredentialSlot::try_new(child_cred.clone())?;
@@ -694,6 +703,9 @@ impl CloneArgs {
                 uts_ns,
                 time_ns,
             )?;
+            proc_data.install_pkey_snapshot(
+                child_pkeys.expect("new process must carry a pkey bitmap snapshot"),
+            );
             let inherited_rlimits = old_proc_data.rlim.read().clone();
             let inherited_cpu_limit_active = inherited_rlimits[linux_raw_sys::general::RLIMIT_CPU]
                 .current

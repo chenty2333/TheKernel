@@ -1163,7 +1163,7 @@ fn bounded_protect_rejects_all_required_splits_before_pte_mutation() {
     let pt_before = pt;
 
     assert_err!(
-        set.protect_with_limit(0x2000.into(), 0x1000, |_| Some(3), &mut pt, 2),
+        set.protect_with_limit(0x2000.into(), 0x1000, |_, _| Some(3), &mut pt, 2),
         NoMemory
     );
 
@@ -1174,7 +1174,7 @@ fn bounded_protect_rejects_all_required_splits_before_pte_mutation() {
     assert_eq!(area.flags(), 1);
     assert_eq!(pt, pt_before);
 
-    assert_ok!(set.protect_with_limit(0x2000.into(), 0x1000, |_| Some(3), &mut pt, 3,));
+    assert_ok!(set.protect_with_limit(0x2000.into(), 0x1000, |_, _| Some(3), &mut pt, 3,));
     assert_eq!(set.len(), 3);
 }
 

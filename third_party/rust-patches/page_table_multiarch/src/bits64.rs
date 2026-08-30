@@ -8,6 +8,7 @@ use core::{
 
 use arrayvec::ArrayVec;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr};
+use page_table_entry::x86_64::{Pkey, PkeyPTE};
 
 use crate::{
     GenericPTE, MappingFlags, PageSize, PagingError, PagingHandler, PagingMetaData, PagingResult,
@@ -529,6 +530,91 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let p1 = self.next_table_mut(p2e)?;
         let p1e = &mut p1[p1_index(vaddr)];
         Ok((p1e, PageSize::Size4K))
+    }
+
+    /// Replaces the huge leaf covering `vaddr` with lower-level leaves, using
+    /// only frames already owned by `prepared`. A 2 MiB leaf consumes one P1
+    /// frame; a 1 GiB leaf consumes a P2 frame and then one P1 frame for the
+    /// selected 2 MiB child. All child entries are initialized before their
+    /// parent is published, so no fallible operation follows publication.
+    fn demote_leaf_to_4k_prepared(
+        &mut self,
+        vaddr: M::VirtAddr,
+        prepared: &mut PreparedPageTableFrames<H>,
+    ) -> PagingResult<PageSize> {
+        let vaddr_usize: usize = vaddr.into();
+        let p3_paddr = if M::LEVELS == 3 {
+            self.root_paddr()
+        } else if M::LEVELS == 4 {
+            let p4 = self.table_of(self.root_paddr());
+            let p4e = &p4[p4_index(vaddr_usize)];
+            if p4e.is_unused() || p4e.is_huge() {
+                return Err(PagingError::NotMapped);
+            }
+            p4e.paddr()
+        } else {
+            unreachable!("PageTable64 only supports three or four levels")
+        };
+
+        let p3_index = p3_index(vaddr_usize);
+        let (p3_paddr_leaf, p3_flags, is_1g) = {
+            let p3 = self.table_of(p3_paddr);
+            let entry = &p3[p3_index];
+            if entry.is_unused() || !entry.is_present() {
+                return Err(PagingError::NotMapped);
+            }
+            (entry.paddr(), entry.flags(), entry.is_huge())
+        };
+        let required_frames = if is_1g { 2 } else { 1 };
+        if prepared.frames.len() < required_frames {
+            return Err(PagingError::NoMemory);
+        }
+        if is_1g {
+            let p2_frame = prepared.frames.pop().ok_or(PagingError::NoMemory)?;
+            let p2 = self.table_of_mut(p2_frame);
+            for (index, entry) in p2.iter_mut().enumerate() {
+                *entry = PTE::new_page(
+                    p3_paddr_leaf.add(index * PageSize::Size2M as usize),
+                    p3_flags,
+                    true,
+                );
+            }
+            // The fully initialized child is now reachable. No operation
+            // below this point can fail except an internal invariant break.
+            self.table_of_mut(p3_paddr)[p3_index] = PTE::new_table(p2_frame);
+        }
+
+        let p2_paddr = {
+            let p3 = self.table_of(p3_paddr);
+            let p3e = &p3[p3_index];
+            if p3e.is_huge() || p3e.is_unused() {
+                return Err(PagingError::NotMapped);
+            }
+            p3e.paddr()
+        };
+        let p2_index = p2_index(vaddr_usize);
+        let (p2_paddr_leaf, p2_flags, is_2m) = {
+            let p2 = self.table_of(p2_paddr);
+            let entry = &p2[p2_index];
+            if entry.is_unused() || !entry.is_present() {
+                return Err(PagingError::NotMapped);
+            }
+            (entry.paddr(), entry.flags(), entry.is_huge())
+        };
+        if !is_2m {
+            return Ok(PageSize::Size4K);
+        }
+        let p1_frame = prepared.frames.pop().ok_or(PagingError::NoMemory)?;
+        let p1 = self.table_of_mut(p1_frame);
+        for (index, entry) in p1.iter_mut().enumerate() {
+            *entry = PTE::new_page(
+                p2_paddr_leaf.add(index * PageSize::Size4K as usize),
+                p2_flags,
+                false,
+            );
+        }
+        self.table_of_mut(p2_paddr)[p2_index] = PTE::new_table(p1_frame);
+        Ok(if is_1g { PageSize::Size1G } else { PageSize::Size2M })
     }
 
     fn get_entry_mut_or_create(
@@ -1265,6 +1351,74 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         entry.set_flags(flags, size.is_huge());
         self.push(vaddr);
         Ok(size)
+    }
+
+    /// Returns the protection key of the present leaf mapping at `vaddr`.
+    ///
+    /// Only x86 PTE implementations provide [`PkeyPTE`].
+    pub fn pkey(&self, vaddr: M::VirtAddr) -> PagingResult<(Pkey, PageSize)>
+    where
+        PTE: PkeyPTE,
+    {
+        let (entry, size) = self.inner.get_entry(vaddr)?;
+        if !entry.is_present() {
+            return Err(PagingError::NotMapped);
+        }
+        Ok((entry.pkey(), size))
+    }
+
+    /// Changes the protection key of the present leaf mapping at `vaddr`.
+    ///
+    /// This retains the address and ordinary mapping flags, then records the
+    /// leaf for the same TLB invalidation performed by permission changes.
+    pub fn set_pkey(&mut self, vaddr: M::VirtAddr, pkey: Pkey) -> PagingResult<PageSize>
+    where
+        PTE: PkeyPTE,
+    {
+        let (entry, size) = self.inner.get_entry_mut(vaddr)?;
+        if !entry.is_present() {
+            return Err(PagingError::NotMapped);
+        }
+        entry.set_pkey(pkey);
+        self.push(vaddr);
+        Ok(size)
+    }
+
+    /// Demotes the huge leaf covering `vaddr` to 4 KiB leaves using the
+    /// caller's preallocated page-table reservation. See
+    /// [`PreparedPageTableFrames::try_new`] for lock-external preparation.
+    pub fn demote_leaf_to_4k_prepared(
+        &mut self,
+        vaddr: M::VirtAddr,
+        prepared: &mut PreparedPageTableFrames<H>,
+    ) -> PagingResult<PageSize> {
+        self.inner.demote_leaf_to_4k_prepared(vaddr, prepared)
+    }
+
+    /// Changes the protection key of every present leaf fully covered by the
+    /// 4 KiB-aligned range.
+    ///
+    /// A range that would partially update a huge-page leaf is rejected. The
+    /// caller must split that leaf first or update its complete extent.
+    pub fn set_pkey_region(&mut self, vaddr: M::VirtAddr, size: usize, pkey: Pkey) -> PagingResult
+    where
+        PTE: PkeyPTE,
+    {
+        let mut current: usize = vaddr.into();
+        if !PageSize::Size4K.is_aligned(current) || !PageSize::Size4K.is_aligned(size) {
+            return Err(PagingError::NotAligned);
+        }
+        let end = current.checked_add(size).ok_or(PagingError::NotAligned)?;
+        while current < end {
+            let leaf_vaddr = current.into();
+            let (_, page_size) = self.pkey(leaf_vaddr)?;
+            if !page_size.is_aligned(current) || current + page_size as usize > end {
+                return Err(PagingError::NotAligned);
+            }
+            self.set_pkey(leaf_vaddr, pkey)?;
+            current += page_size as usize;
+        }
+        Ok(())
     }
 
     /// Unmaps the mapping starting at `vaddr`.

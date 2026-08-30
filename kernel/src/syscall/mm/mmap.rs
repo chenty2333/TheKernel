@@ -181,6 +181,23 @@ fn commit_shared_writable_protection(
     Ok(wake)
 }
 
+fn commit_shared_writable_pkey_protection(
+    plan: PreparedProtect<'_>,
+    effective_protection: MappingFlags,
+    demotion: &mut crate::mm::PreparedPkeyDemotion,
+    key: axhal::paging::Pkey,
+) -> AxResult<DeferredUffdWake> {
+    let (admissions, guards) = begin_shared_writable_protection(&plan, effective_protection)?;
+    let wake = plan.commit_with_pkey_demotion(demotion, key)?;
+    for admission in admissions {
+        admission
+            .complete()
+            .expect("writable mapping admission vanished after pkey commit");
+    }
+    drop(guards);
+    Ok(wake)
+}
+
 enum PreparedFileMmapBackend {
     SharedFile {
         cache: CachedFile,
@@ -1008,6 +1025,18 @@ pub fn sys_remap_file_pages(
 }
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> {
+    sys_mprotect_inner(addr, length, prot, None)
+}
+
+/// Performs the mprotect VMA walk while holding the address-space lock.  A
+/// pkey request is carried in the same replacement flags, so its VMA metadata
+/// cannot race a fault between ordinary permission and key publication.
+fn sys_mprotect_inner(
+    addr: usize,
+    length: usize,
+    prot: usize,
+    requested_pkey: Option<u8>,
+) -> AxResult<isize> {
     // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
     let Some((length, end_addr)) = preflight_mprotect_geometry(addr, length, prot)? else {
         return Ok(0);
@@ -1029,6 +1058,9 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
     ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
     let mut aspace = aspace_handle.lock();
     let requested_protection: MappingFlags = permission_flags.into();
+    let pkey_leaves = requested_pkey
+        .map(|_| aspace.preflight_set_pkey(start_addr, length))
+        .transpose()?;
 
     // Match Linux's per-VMA order: a successful prefix remains protected if a
     // later VMA is unmapped, disallows the requested protection, or is sealed.
@@ -1053,7 +1085,11 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
                 personality_mmap_protection(thread.personality(), requested_protection)
             } else {
                 requested_protection
-            };
+            }
+            // mprotect changes ordinary permissions but must retain the VMA's
+            // protection-key attribute so a later demand fault or COW leaf
+            // is coloured exactly like the resident mapping.
+            .with_pkey(requested_pkey.unwrap_or_else(|| area.flags().pkey()));
             let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
             let segment_wake = authorize_then_commit(
                 plan,
@@ -1081,9 +1117,126 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
         }
         Ok(0)
     })();
+    if outcome.is_ok() {
+        if let (Some(key), Some(leaves)) = (requested_pkey, pkey_leaves) {
+            let pkey = axhal::paging::Pkey::new(key).expect("validated pkey");
+            let mut pt = aspace.page_table_mut().cursor();
+            for (vaddr, ..) in leaves {
+                pt.set_pkey(vaddr, pkey)
+                    .expect("preflighted pkey leaf must remain mapped");
+            }
+            drop(pt);
+            aspace.synchronize_pte_mutation();
+        }
+    }
     drop(aspace);
     wake.finish();
     outcome
+}
+
+/// Linux x86 `pkey_mprotect(2)`.  Key validation happens before the ordinary
+/// mprotect transaction so an invalid/free key never changes VMA permissions.
+/// Key zero remains valid without allocation; all nonzero keys must be owned
+/// by this mm at the instant the page-table transaction starts.
+pub fn sys_pkey_mprotect(addr: usize, length: usize, prot: usize, pkey: i32) -> AxResult<isize> {
+    // Keep mprotect's ABI validation/range ordering, including a zero-length
+    // request's no-op behavior, before inspecting the key allocation map.
+    let Some((length, _)) = preflight_mprotect_geometry(addr, length, prot)? else {
+        return Ok(0);
+    };
+    let curr = current();
+    let thread = curr.as_thread();
+    if !axhal::asm::pkeys_enabled() {
+        return Err(AxError::StorageFull);
+    }
+    if !(0..16).contains(&pkey) || (pkey != 0 && !thread.proc_data.pkey_is_allocated(pkey)) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let Some(permission_flags) = MmapProt::from_bits(prot) else {
+        return Err(AxError::InvalidInput);
+    };
+    if permission_flags.intersects(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
+        return Err(AxError::InvalidInput);
+    }
+
+    // Unlike ordinary mprotect's Linux prefix semantics, pkey_mprotect must
+    // never publish a new VMA key without changing every corresponding leaf.
+    // Preflight all fallible VMA/PTE resources and authorize the complete
+    // range before the one prepared commit.
+    let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
+    let aspace_handle = authorized_image.aspace().clone();
+    let mut aspace = aspace_handle.lock();
+    let start = VirtAddr::from(addr);
+    let leaves = aspace.preflight_set_pkey(start, length)?;
+    let mut demotion = aspace.prepare_pkey_demotion(start, length)?;
+    let requested: MappingFlags = permission_flags.into();
+    let plan = aspace.prepare_pkey_protect(
+        start,
+        length,
+        requested,
+        pkey as u8,
+        thread.personality() & READ_IMPLIES_EXEC != 0,
+    )?;
+    for segment in plan.segments() {
+        file_mprotect(
+            authorized_image.credential(),
+            authorized_image.owner_user_ns(),
+            segment,
+            requested,
+            segment.new_flags(),
+        )?;
+        if segment.backend().is_sealed() {
+            return Err(AxError::OperationNotPermitted);
+        }
+    }
+    let key = axhal::paging::Pkey::new(pkey as u8).expect("validated pkey");
+    let wake = commit_shared_writable_pkey_protection(plan, requested, &mut demotion, key)?;
+    let mut pt = aspace.page_table_mut().cursor();
+    for (vaddr, ..) in leaves {
+        pt.set_pkey(vaddr, key)
+            .expect("preflighted pkey leaf must remain mapped");
+    }
+    drop(pt);
+    // `leaves` contains each original huge leaf once. The prepared demotion
+    // has already set all P1 children above; repeating its first child here
+    // is harmless and keeps fully covered huge leaves on the same path.
+    aspace.synchronize_pte_mutation();
+    drop(aspace);
+    wake.finish();
+    Ok(0)
+}
+
+/// Linux x86 `pkey_alloc(2)`.  Only the two PKRU access-disable bits are
+/// accepted, and allocation always chooses the lowest free nonzero key.
+pub fn sys_pkey_alloc(flags: u32, access_rights: u32) -> AxResult<isize> {
+    const PKEY_ACCESS_MASK: u32 = 0x3;
+    if flags != 0 || access_rights & !PKEY_ACCESS_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if !axhal::asm::pkeys_enabled() {
+        return Err(AxError::StorageFull);
+    }
+    let curr = current();
+    let thread = curr.as_thread();
+    let key = thread.proc_data.allocate_pkey()?;
+    if let Err(error) = thread.set_pkey_access_rights(key, access_rights) {
+        // Allocation and PKRU initialization are one syscall transaction.
+        thread
+            .proc_data
+            .free_pkey(key as i32)
+            .expect("new pkey must be allocated");
+        return Err(error);
+    }
+    Ok(key as isize)
+}
+
+/// Linux x86 `pkey_free(2)`.  Deliberately does not modify PTEs or PKRU; a
+/// reallocated key makes any old mappings visible again, just as on Linux.
+pub fn sys_pkey_free(pkey: i32) -> AxResult<isize> {
+    let curr = current();
+    curr.as_thread().proc_data.free_pkey(pkey)?;
+    Ok(0)
 }
 
 pub fn sys_mremap(

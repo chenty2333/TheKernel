@@ -49,6 +49,7 @@ preempt = [
     "percpu?/preempt",
     "kernel_guard/preempt",
 ]
+pkeys = ["axhal/pkeys"]
 sched-cfs = [
     "multitask",
     "preempt",

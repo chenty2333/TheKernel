@@ -2,6 +2,7 @@ use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    vec,
     vec::Vec,
 };
 use core::{
@@ -13,7 +14,10 @@ use core::{
 use axerrno::{AxError, AxResult, ax_bail};
 use axhal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageSize, PageTable, PagingError, PreparedPageTableFrames, PagingHandlerImpl},
+    paging::{
+        MappingFlags, PageSize, PageTable, PagingError, Pkey, PrepareTableFramesError,
+        PreparedPageTableFrames, PagingHandlerImpl,
+    },
     trap::PageFaultFlags,
 };
 use page_table_multiarch::{ReplacedPteRun, x86_64::X64PTE};
@@ -1215,18 +1219,40 @@ struct PreparedAreaProtect<'a, B: memory_set::MappingBackend> {
     page_table: &'a mut B::PageTable,
     start: B::Addr,
     end: B::Addr,
-    flags: B::Flags,
+    ranges: Vec<PreparedProtectRange<B::Addr, B::Flags>>,
     max_areas: usize,
 }
 
+/// One already-admitted portion of a protection transaction. Ranges are
+/// disjoint and cover the complete transaction interval.
+#[derive(Clone, Copy)]
+struct PreparedProtectRange<A, F> {
+    start: A,
+    end: A,
+    flags: F,
+}
+
 impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
-    fn segments(&self) -> impl Iterator<Item = (&MemoryArea<B>, B::Addr, B::Addr)> + '_ {
+    fn flags_at(&self, address: B::Addr) -> B::Flags {
+        self.ranges
+            .iter()
+            .find(|range| range.start <= address && address < range.end)
+            .expect("prepared protection ranges cover every affected VMA")
+            .flags
+    }
+
+    fn segments(&self) -> impl Iterator<Item = (&MemoryArea<B>, B::Addr, B::Addr, B::Flags)> + '_ {
         let start = self.start;
         let end = self.end;
         self.areas.iter().filter_map(move |area| {
             let affected_start = area.start().max(start);
             let affected_end = area.end().min(end);
-            (affected_start < affected_end).then_some((area, affected_start, affected_end))
+            (affected_start < affected_end).then_some((
+                area,
+                affected_start,
+                affected_end,
+                self.flags_at(affected_start),
+            ))
         })
     }
 
@@ -1236,13 +1262,21 @@ impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
             page_table,
             start,
             end,
-            flags,
+            ranges,
             max_areas,
         } = self;
         areas.protect_with_limit(
             start,
             end.sub_addr(start),
-            |_| Some(flags),
+            |affected_start, _| {
+                Some(
+                    ranges
+                        .iter()
+                        .find(|range| range.start <= affected_start && affected_start < range.end)
+                        .expect("prepared protection ranges cover every affected VMA")
+                        .flags,
+                )
+            },
             page_table,
             max_areas,
         )?;
@@ -1315,13 +1349,18 @@ fn projected_protect_pieces_merge<B: memory_set::MappingBackend>(
 pub(crate) struct PreparedProtectSegment<'a> {
     area: &'a MemoryArea<Backend>,
     affected: VirtAddrRange,
+    new_flags: MappingFlags,
 }
 
 #[allow(dead_code)]
 impl<'a> PreparedProtectSegment<'a> {
     #[cfg(test)]
     pub(crate) const fn for_test(area: &'a MemoryArea<Backend>, affected: VirtAddrRange) -> Self {
-        Self { area, affected }
+        Self {
+            area,
+            affected,
+            new_flags: area.flags(),
+        }
     }
 
     pub(crate) const fn area_start(self) -> VirtAddr {
@@ -1338,6 +1377,10 @@ impl<'a> PreparedProtectSegment<'a> {
 
     pub(crate) const fn flags(self) -> MappingFlags {
         self.area.flags()
+    }
+
+    pub(crate) const fn new_flags(self) -> MappingFlags {
+        self.new_flags
     }
 
     pub(crate) const fn backend(self) -> &'a Backend {
@@ -1374,6 +1417,55 @@ pub(crate) struct PreparedProtect<'a> {
     mapping_mutations: Vec<MappingIdentityMutation>,
     uffd_mutation: Option<PreparedUffdMutation<'a>>,
     synchronize_instruction_stream: bool,
+}
+
+/// Resources reserved before pkey protection splits a resident huge leaf.
+/// Keeping these tables outside the VMA transaction means allocation failure
+/// leaves both the PTEs and mapping metadata untouched.
+pub(crate) struct PreparedPkeyDemotion {
+    leaves: Vec<PreparedPkeyLeaf>,
+}
+
+struct PreparedPkeyLeaf {
+    vaddr: VirtAddr,
+    paddr: PhysAddr,
+    size: PageSize,
+    cow_backing: bool,
+    tables: PreparedPageTableFrames,
+}
+
+impl PreparedPkeyDemotion {
+    fn prepare_table_error(error: PrepareTableFramesError) -> AxError {
+        match error {
+            PrepareTableFramesError::NoMemory => AxError::NoMemory,
+            PrepareTableFramesError::TooMany { .. } => AxError::BadState,
+        }
+    }
+
+    pub(crate) fn commit(&mut self, pt: &mut PageTable) -> AxResult {
+        let mut cursor = pt.cursor();
+        for leaf in &mut self.leaves {
+            if leaf.cow_backing {
+                backend::register_demoted_huge_backing(leaf.paddr, leaf.size)?;
+            }
+            cursor
+                .demote_leaf_to_4k_prepared(leaf.vaddr, &mut leaf.tables)
+                .map_err(AxError::from)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_key(&self, pt: &mut PageTable, key: Pkey) -> AxResult {
+        let mut cursor = pt.cursor();
+        for leaf in &self.leaves {
+            for index in 0..(leaf.size as usize / PAGE_SIZE_4K) {
+                cursor
+                    .set_pkey(leaf.vaddr + index * PAGE_SIZE_4K, key)
+                    .map_err(AxError::from)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 enum RemapDestination {
@@ -1492,9 +1584,10 @@ impl PreparedProtect<'_> {
         self.transaction
             .segments()
             .map(
-                |(area, affected_start, affected_end)| PreparedProtectSegment {
+                |(area, affected_start, affected_end, flags)| PreparedProtectSegment {
                     area,
                     affected: VirtAddrRange::new(affected_start, affected_end),
+                    new_flags: flags,
                 },
             )
     }
@@ -1528,6 +1621,20 @@ impl PreparedProtect<'_> {
         Ok(wake)
     }
 
+    /// Commits pkey protection after prepared huge-leaf tables have been
+    /// published. The reservation is consumed before MemorySet performs its
+    /// now-preflighted PTE protection pass, and no allocation occurs in the
+    /// interval.
+    pub(crate) fn commit_with_pkey_demotion(
+        self,
+        demotion: &mut PreparedPkeyDemotion,
+        key: Pkey,
+    ) -> AxResult<DeferredUffdWake> {
+        demotion.commit(self.transaction.page_table)?;
+        demotion.apply_key(self.transaction.page_table, key)?;
+        self.commit()
+    }
+
     fn refresh_growdown_starts(
         areas: &MemorySet<Backend>,
         growdown_starts: &mut BTreeSet<VirtAddr>,
@@ -1555,6 +1662,91 @@ impl AddrSpace {
         self.va_range.end
     }
 
+    /// Assigns an x86 protection key to resident PTE leaves in a fully
+    /// validated VMA range. Missing pages deliberately need no PTE update;
+    /// their key is installed by the mapping metadata on first population.
+    pub(crate) fn set_pkey(&mut self, start: VirtAddr, size: usize, key: u8) -> AxResult {
+        let pkey = Pkey::new(key).ok_or(AxError::InvalidInput)?;
+        let leaves = self.preflight_set_pkey(start, size)?;
+        // The key is VMA state, not merely a currently-resident PTE bit.
+        // MemorySet's protected-range transaction splits boundary VMAs before
+        // publishing the replacement flags, so later demand faults, COW and
+        // fork cloning receive the same key through `MappingFlags`.
+        self.areas
+            .protect_with_limit(
+                start,
+                size,
+                |_, flags| Some(flags.with_pkey(key)),
+                &mut self.pt,
+                MAX_VMA_FRAGMENTS,
+            )
+            .map_err(AxError::from)?;
+        let mut cursor = self.pt.cursor();
+        for (vaddr, ..) in leaves {
+            cursor
+                .set_pkey(vaddr, pkey)
+                .expect("preflighted pkey leaf must remain mapped");
+        }
+        drop(cursor);
+        let _ = self.tlb.synchronize_after_mutation();
+        Ok(())
+    }
+
+    /// Validates that changing a key cannot require an unsupported huge-leaf
+    /// demotion.  It allocates every resident-leaf record before any VMA or
+    /// PTE mutation, allowing callers to reject a pkey_mprotect request
+    /// before beginning its ordinary protection transaction.
+    pub(crate) fn preflight_set_pkey(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>> {
+        self.validate_region(start, size)?;
+        // Validate every resident leaf before publishing VMA metadata. A
+        // partial huge leaf is handled by `prepare_pkey_demotion`.
+        let leaves = self.pt.collect_present_leaves(start, size)?;
+        Ok(leaves)
+    }
+
+    /// Reserves lower-level page tables for huge leaves touched partially by
+    /// a pkey range. Fully covered huge leaves retain their original size.
+    pub(crate) fn prepare_pkey_demotion(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<PreparedPkeyDemotion> {
+        self.validate_region(start, size)?;
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let present = self.pt.collect_present_leaves(start, size)?;
+        let mut leaves = Vec::new();
+        leaves.try_reserve(present.len()).map_err(|_| AxError::NoMemory)?;
+        for (vaddr, paddr, _, page_size) in present {
+            if page_size == PageSize::Size4K {
+                continue;
+            }
+            let leaf_end = vaddr
+                .checked_add(page_size as usize)
+                .ok_or(AxError::InvalidInput)?;
+            if vaddr >= start && leaf_end <= end {
+                continue;
+            }
+            let frames = match page_size {
+                PageSize::Size2M => 1,
+                PageSize::Size1G => 2,
+                PageSize::Size4K | PageSize::Size1M => return Err(AxError::InvalidInput),
+            };
+            leaves.push(PreparedPkeyLeaf {
+                vaddr,
+                paddr,
+                size: page_size,
+                cow_backing: matches!(self.areas.find(vaddr).map(|area| area.backend()), Some(Backend::Cow(_))),
+                tables: PreparedPageTableFrames::try_new(frames)
+                    .map_err(PreparedPkeyDemotion::prepare_table_error)?,
+            });
+        }
+        Ok(PreparedPkeyDemotion { leaves })
+    }
+
     /// Returns the stable policy identity of this address space.
     pub(crate) const fn address_space_id(&self) -> AddressSpaceId {
         self.address_space_id
@@ -1573,6 +1765,12 @@ impl AddrSpace {
     /// Returns a mutable reference to the inner page table.
     pub const fn page_table_mut(&mut self) -> &mut PageTable {
         &mut self.pt
+    }
+
+    /// Completes a direct leaf-PTE mutation that happened outside a backend
+    /// operation.  The caller holds this address space's write lock.
+    pub(crate) fn synchronize_pte_mutation(&self) {
+        let _ = self.tlb.synchronize_after_mutation();
     }
 
     /// Returns the root physical address of the inner page table.
@@ -3526,7 +3724,7 @@ impl AddrSpace {
     fn projected_protect_piece_at<'a, B: memory_set::MappingBackend>(
         areas: &'a MemorySet<B>,
         protect: memory_addr::AddrRange<B::Addr>,
-        new_flags: B::Flags,
+        ranges: &[PreparedProtectRange<B::Addr, B::Flags>],
         address: B::Addr,
     ) -> Option<ProjectedProtectPiece<'a, B>> {
         let area = areas.find(address)?;
@@ -3536,7 +3734,11 @@ impl AddrSpace {
             (
                 area.start().max(protect.start),
                 area.end().min(protect.end),
-                new_flags,
+                ranges
+                    .iter()
+                    .find(|range| range.start <= address && address < range.end)
+                    .expect("prepared protection ranges cover projected UFFD fragment")
+                    .flags,
             )
         } else {
             (area.start().max(protect.end), area.end(), area.flags())
@@ -3552,13 +3754,13 @@ impl AddrSpace {
     /// Projects MemorySet's exact post-mprotect merge law without mutating the
     /// area tree or allocating. The scan replays the retained-left merge law
     /// for the final structurally compatible run containing `address`.
-    fn projected_protect_run_at<'a, B: memory_set::MappingBackend>(
+    fn projected_protect_run_at_ranges<'a, B: memory_set::MappingBackend>(
         areas: &'a MemorySet<B>,
         protect: memory_addr::AddrRange<B::Addr>,
-        new_flags: B::Flags,
+        ranges: &[PreparedProtectRange<B::Addr, B::Flags>],
         address: B::Addr,
     ) -> Option<ProjectedProtectRun<'a, B>> {
-        let mut anchor = Self::projected_protect_piece_at(areas, protect, new_flags, address)?;
+        let mut anchor = Self::projected_protect_piece_at(areas, protect, ranges, address)?;
 
         // Backend compatibility is deliberately not a left-scan barrier.
         // MemorySet processes protection actions in ascending address order,
@@ -3569,7 +3771,7 @@ impl AddrSpace {
         while Into::<usize>::into(anchor.start) != 0 {
             let previous_address = B::Addr::from(Into::<usize>::into(anchor.start) - 1);
             let Some(previous) =
-                Self::projected_protect_piece_at(areas, protect, new_flags, previous_address)
+                Self::projected_protect_piece_at(areas, protect, ranges, previous_address)
             else {
                 break;
             };
@@ -3586,7 +3788,7 @@ impl AddrSpace {
             flags: anchor.flags,
         };
         loop {
-            let Some(next) = Self::projected_protect_piece_at(areas, protect, new_flags, run.end)
+            let Some(next) = Self::projected_protect_piece_at(areas, protect, ranges, run.end)
             else {
                 return (run.start <= address && address < run.end).then_some(run);
             };
@@ -3618,12 +3820,26 @@ impl AddrSpace {
         }
     }
 
+    fn projected_protect_run_at<'a, B: memory_set::MappingBackend>(
+        areas: &'a MemorySet<B>,
+        protect: memory_addr::AddrRange<B::Addr>,
+        new_flags: B::Flags,
+        address: B::Addr,
+    ) -> Option<ProjectedProtectRun<'a, B>> {
+        let ranges = [PreparedProtectRange {
+            start: protect.start,
+            end: protect.end,
+            flags: new_flags,
+        }];
+        Self::projected_protect_run_at_ranges(areas, protect, &ranges, address)
+    }
+
     fn projected_uffd_protect_snapshot(
         address_space_id: AddressSpaceId,
         areas: &MemorySet<Backend>,
         mapping_identities: &MappingIdentityIndex,
         protect: VirtAddrRange,
-        new_flags: MappingFlags,
+        ranges: &[PreparedProtectRange<VirtAddr, MappingFlags>],
         registration: UffdRegistration,
         fragment: PageRange,
     ) -> AxResult<Option<MappingSnapshot>> {
@@ -3633,10 +3849,10 @@ impl AddrSpace {
             mapping_identities,
             registration,
         )?;
-        let run = Self::projected_protect_run_at(
+        let run = Self::projected_protect_run_at_ranges(
             areas,
             protect,
-            new_flags,
+            ranges,
             VirtAddr::from(fragment.start()),
         )
         .ok_or(AxError::BadState)?;
@@ -5525,13 +5741,69 @@ impl AddrSpace {
         size: usize,
         flags: MappingFlags,
     ) -> AxResult<PreparedProtect<'_>> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        self.prepare_protect_ranges(
+            start,
+            size,
+            vec![PreparedProtectRange { start, end, flags }],
+        )
+    }
+
+    /// Prepares one atomic pkey_mprotect transaction.  READ_IMPLIES_EXEC is
+    /// evaluated against each source VMA because an executable personality is
+    /// suppressed for file mappings on noexec mounts.
+    pub(crate) fn prepare_pkey_protect(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        requested: MappingFlags,
+        key: u8,
+        read_implies_exec: bool,
+    ) -> AxResult<PreparedProtect<'_>> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut ranges = Vec::new();
+        let mut cursor = start;
+        while cursor < end {
+            let Some(area) = self.areas.find(cursor) else {
+                return Err(AxError::NoMemory);
+            };
+            if area.start() > cursor {
+                return Err(AxError::NoMemory);
+            }
+            ranges.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            let may_execute = area
+                .backend()
+                .file_mapping()
+                .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
+            let mut flags = requested;
+            if read_implies_exec && may_execute && flags.contains(MappingFlags::READ) {
+                flags |= MappingFlags::EXECUTE;
+            }
+            let segment_end = area.end().min(end);
+            ranges.push(PreparedProtectRange {
+                start: cursor,
+                end: segment_end,
+                flags: flags.with_pkey(key),
+            });
+            cursor = segment_end;
+        }
+        self.prepare_protect_ranges(start, size, ranges)
+    }
+
+    fn prepare_protect_ranges(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        ranges: Vec<PreparedProtectRange<VirtAddr, MappingFlags>>,
+    ) -> AxResult<PreparedProtect<'_>> {
         self.validate_region(start, size)?;
         if size == 0 {
             return Err(AxError::InvalidInput);
         }
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Protect)?;
-        self.check_protect_range(start, size, flags)?;
-        self.ensure_4k_granularity(start, size)?;
+        for range in &ranges {
+            self.check_protect_range(range.start, range.end.sub_addr(range.start), range.flags)?;
+        }
         let next_topology_generation = self.next_topology_generation()?;
         let mapping_mutations = prepare_mapping_generation_advances_for_range(
             &self.areas,
@@ -5564,7 +5836,7 @@ impl AddrSpace {
                     areas,
                     mapping_identities,
                     protect,
-                    flags,
+                    ranges.as_slice(),
                     registration,
                     fragment,
                 )
@@ -5582,12 +5854,12 @@ impl AddrSpace {
             page_table: pt,
             start,
             end,
-            flags,
+            ranges,
             max_areas: MAX_VMA_FRAGMENTS,
         };
         let synchronize_instruction_stream = transaction
             .segments()
-            .any(|(area, ..)| adds_execute_permission(area.flags(), flags));
+            .any(|(area, _, _, flags)| adds_execute_permission(area.flags(), flags));
 
         Ok(PreparedProtect {
             transaction,
@@ -7379,7 +7651,11 @@ mod tests {
                 page_table: &mut page_table,
                 start: VirtAddr::from(0x2000),
                 end: VirtAddr::from(0x3000),
-                flags: 3,
+                ranges: vec![PreparedProtectRange {
+                    start: VirtAddr::from(0x2000),
+                    end: VirtAddr::from(0x3000),
+                    flags: 3,
+                }],
                 max_areas: 1,
             },
             PreparedUffdMutation::new(&mut uffd, plan),
@@ -7414,7 +7690,11 @@ mod tests {
                 page_table: &mut page_table,
                 start: VirtAddr::from(0x2000),
                 end: VirtAddr::from(0x3000),
-                flags: 3,
+                ranges: vec![PreparedProtectRange {
+                    start: VirtAddr::from(0x2000),
+                    end: VirtAddr::from(0x3000),
+                    flags: 3,
+                }],
                 max_areas: usize::MAX,
             },
             PreparedUffdMutation::new(&mut uffd, plan),
@@ -7492,12 +7772,23 @@ mod tests {
             page_table: &mut page_table,
             start: VirtAddr::from(0x1800),
             end: VirtAddr::from(0x2800),
-            flags: 5,
+            ranges: vec![
+                PreparedProtectRange {
+                    start: VirtAddr::from(0x1800),
+                    end: VirtAddr::from(0x2000),
+                    flags: 5,
+                },
+                PreparedProtectRange {
+                    start: VirtAddr::from(0x2000),
+                    end: VirtAddr::from(0x2800),
+                    flags: 7,
+                },
+            ],
             max_areas: usize::MAX,
         };
         let segments: Vec<_> = plan
             .segments()
-            .map(|(area, affected_start, affected_end)| {
+            .map(|(area, affected_start, affected_end, flags)| {
                 (
                     area.start().as_usize(),
                     area.end().as_usize(),
@@ -7505,14 +7796,15 @@ mod tests {
                     affected_end.as_usize(),
                     area.flags(),
                     area.backend().0,
+                    flags,
                 )
             })
             .collect();
         assert_eq!(
             segments,
             vec![
-                (0x1000, 0x2000, 0x1800, 0x2000, 1, 1),
-                (0x2000, 0x3000, 0x2000, 0x2800, 3, 2),
+                (0x1000, 0x2000, 0x1800, 0x2000, 1, 1, 5),
+                (0x2000, 0x3000, 0x2000, 0x2800, 3, 2, 7),
             ]
         );
 
@@ -7559,7 +7851,11 @@ mod tests {
             page_table: &mut page_table,
             start: VirtAddr::from(0x2000),
             end: VirtAddr::from(0x3000),
-            flags: 3,
+            ranges: vec![PreparedProtectRange {
+                start: VirtAddr::from(0x2000),
+                end: VirtAddr::from(0x3000),
+                flags: 3,
+            }],
             max_areas: usize::MAX,
         }
         .commit()
@@ -7590,7 +7886,11 @@ mod tests {
             page_table: &mut page_table,
             start: VirtAddr::from(0x2000),
             end: VirtAddr::from(0x3000),
-            flags: 1,
+            ranges: vec![PreparedProtectRange {
+                start: VirtAddr::from(0x2000),
+                end: VirtAddr::from(0x3000),
+                flags: 1,
+            }],
             max_areas: usize::MAX,
         }
         .commit()
@@ -7707,7 +8007,11 @@ mod tests {
             page_table: &mut page_table,
             start: VirtAddr::from(0x1000),
             end: VirtAddr::from(0x4000),
-            flags: 9,
+            ranges: vec![PreparedProtectRange {
+                start: VirtAddr::from(0x1000),
+                end: VirtAddr::from(0x4000),
+                flags: 9,
+            }],
             max_areas: usize::MAX,
         }
         .commit()
@@ -7770,7 +8074,11 @@ mod tests {
                                     page_table: &mut page_table,
                                     start: protect.start,
                                     end: protect.end,
-                                    flags: new_flags,
+                                    ranges: vec![PreparedProtectRange {
+                                        start: protect.start,
+                                        end: protect.end,
+                                        flags: new_flags,
+                                    }],
                                     max_areas: usize::MAX,
                                 }
                                 .commit()

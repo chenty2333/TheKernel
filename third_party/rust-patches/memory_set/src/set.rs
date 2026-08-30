@@ -796,7 +796,13 @@ impl<B: MappingBackend> MemorySet<B> {
         update_flags: impl Fn(B::Flags) -> Option<B::Flags>,
         page_table: &mut B::PageTable,
     ) -> MappingResult {
-        self.protect_with_limit(start, size, update_flags, page_table, usize::MAX)
+        self.protect_with_limit(
+            start,
+            size,
+            |_, flags| update_flags(flags),
+            page_table,
+            usize::MAX,
+        )
     }
 
     /// Changes mapping flags while bounding the peak number of live VMA
@@ -808,7 +814,7 @@ impl<B: MappingBackend> MemorySet<B> {
         &mut self,
         start: B::Addr,
         size: usize,
-        update_flags: impl Fn(B::Flags) -> Option<B::Flags>,
+        update_flags: impl Fn(B::Addr, B::Flags) -> Option<B::Flags>,
         page_table: &mut B::PageTable,
         max_areas: usize,
     ) -> MappingResult {
@@ -830,7 +836,7 @@ impl<B: MappingBackend> MemorySet<B> {
         for (&area_start, area) in self.areas.range(first_start..end) {
             let area_end = area.end();
             if area_end > start {
-                let Some(new_flags) = update_flags(area.flags()) else {
+                let Some(new_flags) = update_flags(area_start.max(start), area.flags()) else {
                     continue;
                 };
                 actions.try_reserve(1).map_err(|_| MappingError::NoMemory)?;
@@ -969,7 +975,12 @@ impl<B: MappingBackend> MemorySet<B> {
                 .next_back()
                 .filter(|(_, area)| area.end() > cursor)
                 .map(|(&area_start, _)| area_start)
-                .or_else(|| self.areas.range(cursor..).next().map(|(&area_start, _)| area_start));
+                .or_else(|| {
+                    self.areas
+                        .range(cursor..)
+                        .next()
+                        .map(|(&area_start, _)| area_start)
+                });
             let Some(area_start) = candidate else {
                 break;
             };

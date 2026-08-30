@@ -883,6 +883,14 @@ pub(super) fn dispatch_syscall(
         ),
         Sysno::munmap => sys_munmap(uctx.arg0(), uctx.arg1() as _),
         Sysno::mprotect => sys_mprotect(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::pkey_mprotect => sys_pkey_mprotect(
+            uctx.arg0(),
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as i32,
+        ),
+        Sysno::pkey_alloc => sys_pkey_alloc(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::pkey_free => sys_pkey_free(uctx.arg0() as i32),
         Sysno::mseal => sys_mseal(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mincore => {
             let aspace = aspace();

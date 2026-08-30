@@ -198,6 +198,7 @@ thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
 thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
+page_table_entry = { path = "third_party/rust-patches/page_table_entry" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
 lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
 starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }
