@@ -20,7 +20,7 @@ use axdriver::{
     virtio_async_block_wait_policy,
 };
 #[cfg(feature = "times")]
-use axfs_ng_vfs::MetadataUpdate;
+use axfs_ng_vfs::{MetadataUpdate, Timestamp};
 #[cfg(not(feature = "ext4"))]
 pub use axfs_ng_vfs::PhysicalIoNotSubmittedReason;
 use axfs_ng_vfs::{
@@ -7714,7 +7714,9 @@ impl File {
             return;
         }
 
-        let now = axhal::time::wall_time();
+        // `wall_time` is the Unix-epoch wall clock used for inode metadata;
+        // convert its unsigned legacy representation into a VFS timestamp.
+        let now: Timestamp = axhal::time::wall_time().into();
         let mut update = MetadataUpdate::default();
         if flags & 1 != 0 {
             update.atime = Some(now);
