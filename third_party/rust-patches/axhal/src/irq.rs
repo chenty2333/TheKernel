@@ -4,7 +4,10 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(feature = "ipi")]
 use axconfig::devices::IPI_IRQ;
-use axcpu::{TrapFrame, trap::{IRQ, IrqBoundary, register_trap_handler}};
+use axcpu::{
+    TrapFrame,
+    trap::{IRQ, IrqBoundary, register_trap_handler},
+};
 #[cfg(feature = "ipi")]
 pub use axplat::irq::IpiTarget;
 use axplat::irq::handle;
@@ -78,16 +81,18 @@ pub enum IpiReason {
     /// work: its consumer never returns to ordinary execution after it has
     /// acknowledged the handoff generation.
     KexecStop      = 4,
+    DeferredWork   = 5,
 }
 
 #[cfg(feature = "ipi")]
 impl IpiReason {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::CpuMaintenance,
         Self::Reschedule,
         Self::CallFunction,
         Self::Membarrier,
         Self::KexecStop,
+        Self::DeferredWork,
     ];
 
     #[inline]
@@ -241,7 +246,9 @@ pub fn register(irq: usize, handler: axplat::irq::IrqHandler) -> bool {
     }
     if irq >= IRQ_CONTEXT.len() || IRQ_CONTEXT[irq].load(Ordering::Acquire) == 0 {
         axplat::irq::register(irq, handler)
-    } else { false }
+    } else {
+        false
+    }
 }
 
 /// Unregisters a device interrupt handler.
@@ -268,10 +275,17 @@ fn context_marker() {}
 /// The matching no-op normal handler preserves platform dispatch and EOI.
 #[must_use]
 pub fn register_context(vector: usize, handler: fn(usize, &TrapFrame)) -> bool {
-    if !ensure_irq_boundary_hook() { return false; }
-    if vector >= IRQ_CONTEXT.len() || handler as usize == CONTEXT_INSTALLING { return false; }
+    if !ensure_irq_boundary_hook() {
+        return false;
+    }
+    if vector >= IRQ_CONTEXT.len() || handler as usize == CONTEXT_INSTALLING {
+        return false;
+    }
     let slot = &IRQ_CONTEXT[vector];
-    if slot.compare_exchange(0, CONTEXT_INSTALLING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if slot
+        .compare_exchange(0, CONTEXT_INSTALLING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return slot.load(Ordering::Acquire) == handler as usize;
     }
     if !axplat::irq::register(vector, context_marker) {
@@ -286,10 +300,14 @@ pub fn register_context(vector: usize, handler: fn(usize, &TrapFrame)) -> bool {
 pub fn unregister_context(vector: usize) -> Option<fn(usize, &TrapFrame)> {
     let slot = IRQ_CONTEXT.get(vector)?;
     let address = slot.load(Ordering::Acquire);
-    if address == 0 || address == CONTEXT_INSTALLING { return None; }
+    if address == 0 || address == CONTEXT_INSTALLING {
+        return None;
+    }
     // Keep the slot occupied until the marker is gone: ordinary registration
     // observes it and cannot race into a later unregister.
-    if axplat::irq::unregister(vector).is_none() { return None; }
+    if axplat::irq::unregister(vector).is_none() {
+        return None;
+    }
     slot.store(0, Ordering::Release);
     // SAFETY: an installed slot contains only an accepted function pointer.
     Some(unsafe { core::mem::transmute::<usize, fn(usize, &TrapFrame)>(address) })
@@ -507,7 +525,9 @@ fn irq_boundary(boundary: IrqBoundary) {
 }
 
 fn irq_context(boundary: IrqBoundary, vector: usize, frame: &TrapFrame) {
-    if boundary != IrqBoundary::Enter { return; }
+    if boundary != IrqBoundary::Enter {
+        return;
+    }
     let address = IRQ_CONTEXT[vector & 0xff].load(Ordering::Acquire);
     if address != 0 && address != CONTEXT_INSTALLING {
         // SAFETY: registration publishes an immutable function pointer.

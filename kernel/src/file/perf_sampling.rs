@@ -100,7 +100,7 @@ pub(crate) struct PerfSamplingFile {
     state: SpinNoIrq<SamplingState>,
     waiters: PollSet<4>,
     retire_next: AtomicPtr<PerfSamplingFile>,
-    retire_raw_refs: SpinNoIrq<usize>,
+    retire_queued: SpinNoIrq<bool>,
 }
 
 struct SamplingRetireQueue {
@@ -155,16 +155,15 @@ static CUSTODY: [SpinNoIrq<Option<CpuCustody>>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
 fn defer_custody_retire(event: Arc<PerfSamplingFile>) {
-    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
-    let publish_node = unsafe {
-        let mut refs = (*node).retire_raw_refs.lock();
-        let first = *refs == 0;
-        *refs = refs.checked_add(1).expect("bounded perf retire references");
-        first
-    };
-    if !publish_node {
+    let mut queued = event.retire_queued.lock();
+    if *queued {
+        drop(queued);
+        drop(event);
         return;
     }
+    *queued = true;
+    drop(queued);
+    let node = Arc::into_raw(event) as *mut PerfSamplingFile;
     loop {
         let head = RETIRED_CUSTODY.incoming.load(Ordering::Acquire);
         // SAFETY: this raw Arc is uniquely owned by the queue publication.
@@ -174,6 +173,7 @@ fn defer_custody_retire(event: Arc<PerfSamplingFile>) {
             .compare_exchange_weak(head, node, Ordering::Release, Ordering::Acquire)
             .is_ok()
         {
+            crate::deferred_work::kick_perf_retire_worker();
             return;
         }
     }
@@ -224,18 +224,12 @@ pub(crate) fn drain_deferred_custody_retire_work() {
                 .retire_next
                 .store(ptr::null_mut(), Ordering::Relaxed)
         };
-        let refs = unsafe {
-            let mut refs = (*node).retire_raw_refs.lock();
-            let count = *refs;
-            *refs = 0;
-            count
-        };
-        // Once refs is zero, a new publisher can requeue the node.  Do not
-        // touch intrusive fields after this point.
-        for _ in 0..refs {
-            // SAFETY: every count originated at Arc::into_raw above.
-            drop(unsafe { Arc::from_raw(node) });
+        let event = unsafe { Arc::from_raw(node) };
+        {
+            let mut queued = event.retire_queued.lock();
+            *queued = false;
         }
+        drop(event);
         count += 1;
     }
     if !list.is_null() {
@@ -262,7 +256,7 @@ impl PerfSamplingFile {
             config,
             waiters: PollSet::new(),
             retire_next: AtomicPtr::new(ptr::null_mut()),
-            retire_raw_refs: SpinNoIrq::new(0),
+            retire_queued: SpinNoIrq::new(false),
         })
         .map_err(|_| AxError::NoMemory)
     }

@@ -6,6 +6,11 @@ use axpoll::PollSet;
 
 use crate::readiness::block_on_poll_set_uninterruptible;
 
+#[cfg(feature = "perf-sampling")]
+fn perf_retire_ipi_handler() {
+    wake_policy_worker();
+}
+
 /// Per-actor completion accounting for policy work published from an
 /// allocation-free Drop path.  The account is allocated with the user thread,
 /// not while the final open-file-description reference is being released.
@@ -151,6 +156,18 @@ pub(crate) fn wake_process_timer_worker(cpu: usize) {
 /// wake is allocation-free and harmless before deferred-work initialization.
 pub(crate) fn wake_policy_worker() {
     POLICY_WORKER_WAKE.wake();
+}
+
+#[cfg(feature = "perf-sampling")]
+pub(crate) fn kick_perf_retire_worker() {
+    #[cfg(target_os = "none")]
+    axhal::irq::send_ipi_reason(
+        axhal::irq::IpiReason::DeferredWork,
+        axhal::irq::IpiTarget::Current {
+            cpu_id: axhal::percpu::this_cpu_id(),
+        },
+    )
+    .expect("perf retirement IPI broker is unavailable");
 }
 
 /// Wakes the single task-context owner for device-global physical
@@ -377,6 +394,11 @@ fn note_filesystem_finalizer_work() {
 /// workers that own subsystem policy, process-timer signals, and blocking
 /// filesystem teardown.
 pub(crate) fn init() {
+    #[cfg(feature = "perf-sampling")]
+    assert!(axhal::irq::register_ipi_reason(
+        axhal::irq::IpiReason::DeferredWork,
+        perf_retire_ipi_handler,
+    ));
     assert!(
         axtask::set_deferred_work_dispatcher(dispatch),
         "a different deferred-work dispatcher is already installed"
