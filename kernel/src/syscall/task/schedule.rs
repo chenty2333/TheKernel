@@ -13,12 +13,14 @@ use axtask::{
     future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, scheduler_state_snapshot, set_sched_state_versioned,
     set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
+    update_sched_state_versioned_with_reset,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, RLIMIT_NICE, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK,
-    SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
+    SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR,
+    TIMER_ABSTIME, timespec,
 };
 use thekernel_linux_process_adapter::{Pid, ProcessError};
 use thekernel_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
@@ -77,7 +79,10 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid == 0 {
         Ok(current().clone())
     } else {
-        get_task(pid as Pid)
+        // sched_setscheduler resolves PIDTYPE_PID in the caller's active
+        // namespace.  Setters never operate on an exiting task or a zombie.
+        let caller_ns = current().as_thread().proc_data.pid_ns();
+        visible_task_for_ioprio(pid as Pid, &caller_ns)
     }
 }
 
@@ -342,31 +347,67 @@ fn process_error(error: ProcessError) -> AxError {
     }
 }
 
+fn map_sched_error(error: TaskSchedError) -> AxError {
+    match error {
+        TaskSchedError::Unsupported => AxError::OperationNotSupported,
+        TaskSchedError::TaskExited => AxError::NoSuchProcess,
+        TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+        TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+    }
+}
+
 fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult<isize> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK as i32 != 0;
     let class = sched_class_for_set(
         (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
         SchedSetAbi::Legacy,
     )?;
-    let authority = scheduler_authority_snapshot(task)?;
-    authority.authorize(SchedulerSecurityOperation::SetPolicy {
-        realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
-    })?;
-    let mut state = sched_state(task);
-    state.class = class;
-    match class {
-        SchedClass::Fifo | SchedClass::RoundRobin => {
-            state.rt_priority = validate_rt_priority(priority)?;
-            state.nice = 0;
-        }
+    // Linux rejects malformed policy/priority tuples before DAC/capability or
+    // LSM policy checks, so an invalid request cannot be turned into EPERM.
+    let requested_rt_priority = match class {
+        SchedClass::Fifo | SchedClass::RoundRobin => validate_rt_priority(priority)?,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-            state.rt_priority = validate_static_priority(priority)?;
-            if matches!(class, SchedClass::Idle) {
-                state.nice = 19;
-            }
+            validate_static_priority(priority)?;
+            // SCHED_IDLE is a scheduling class, not an implicit nice(19).
+            // Keep the current nice value exactly as Linux does.
+            0
         }
-    }
-    apply_sched_state_with_reset(task, state, reset_on_fork)
+    };
+    let authority = scheduler_authority_snapshot(task)?;
+    let rlimit_rtprio = task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current;
+    let rlimit_nice = task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
+    // Decide authority and commit class, priority, reset bit, and version in
+    // one run-queue transaction.  A failed policy check cannot roll back a
+    // concurrent scheduler update through a stale whole-state snapshot.
+    let commit = update_sched_state_versioned_with_reset(task, |old| {
+        let current_realtime = matches!(old.state.class, SchedClass::Fifo | SchedClass::RoundRobin);
+        let requested_realtime = matches!(class, SchedClass::Fifo | SchedClass::RoundRobin);
+        authority.authorize(SchedulerSecurityOperation::SetPolicy {
+            policy_changed: old.state.class != class,
+            current_realtime,
+            current_rt_priority: old.state.rt_priority,
+            requested_realtime,
+            requested_rt_priority,
+            rlimit_rtprio,
+            current_idle: matches!(old.state.class, SchedClass::Idle),
+            requested_idle: matches!(class, SchedClass::Idle),
+            current_nice: old.state.nice,
+            requested_nice: old.state.nice,
+            rlimit_nice,
+            current_reset_on_fork: old.reset_on_fork,
+            reset_on_fork,
+        })?;
+        let mut state = old.state;
+        state.class = class;
+        state.rt_priority = requested_rt_priority;
+        // RT scheduling does not erase the task's saved nice value. Linux
+        // restores that value when a later policy change returns to a fair
+        // class, so it must travel through this transaction untouched.
+        Ok::<_, AxError>((state, reset_on_fork))
+    })
+    .map_err(map_sched_error)??;
+    publish_sched_commit(task, commit);
+    Ok(0)
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
@@ -880,7 +921,9 @@ pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
     policy: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    if param.is_null() {
+    // Linux validates these scalar ABI arguments before attempting usercopy.
+    // Keep the ordering observable for invalid pointers and hidden PIDs.
+    if policy < 0 || pid < 0 || param.is_null() {
         return Err(AxError::InvalidInput);
     }
     let priority = unsafe {
@@ -986,11 +1029,13 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
     let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
     let task = sched_target(pid)?;
     let authority = scheduler_authority_snapshot(&task)?;
-    authority.authorize(SchedulerSecurityOperation::SetPolicy {
-        realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
-    })?;
     let mut state = sched_state(&task);
     let old_nice = state.nice;
+    let old_class = state.class;
+    let old_rt_priority = state.rt_priority;
+    let old_reset_on_fork = scheduler_state_snapshot(&task)
+        .map_err(|_| AxError::NoSuchProcess)?
+        .reset_on_fork;
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
@@ -998,7 +1043,6 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
                 return Err(AxError::InvalidInput);
             }
             state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
-            state.nice = 0;
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
@@ -1015,6 +1059,21 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
             state.nice = requested_nice;
         }
     }
+    authority.authorize(SchedulerSecurityOperation::SetPolicy {
+        policy_changed: old_class != class,
+        current_realtime: matches!(old_class, SchedClass::Fifo | SchedClass::RoundRobin),
+        current_rt_priority: old_rt_priority,
+        requested_realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
+        requested_rt_priority: state.rt_priority,
+        rlimit_rtprio: task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current,
+        current_idle: matches!(old_class, SchedClass::Idle),
+        requested_idle: matches!(class, SchedClass::Idle),
+        current_nice: old_nice,
+        requested_nice: state.nice,
+        rlimit_nice: task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current,
+        current_reset_on_fork: old_reset_on_fork,
+        reset_on_fork: attr.sched_flags & SCHED_FLAG_RESET_ON_FORK as u64 != 0,
+    })?;
     let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
     apply_sched_state_with_reset(&task, state, reset_on_fork)
 }

@@ -4950,7 +4950,21 @@ fn credential_caller_scheduler_uid_zero_with_dropped_cap_cannot_enter_rt() {
         dispatch_scheduler(&scheduler_context(
             &dropped,
             &root,
-            SchedulerSecurityOperation::SetPolicy { realtime: true },
+            SchedulerSecurityOperation::SetPolicy {
+                policy_changed: true,
+                current_realtime: false,
+                current_rt_priority: 0,
+                requested_realtime: true,
+                requested_rt_priority: 1,
+                rlimit_rtprio: 0,
+                current_idle: false,
+                requested_idle: false,
+                current_nice: 0,
+                requested_nice: 0,
+                rlimit_nice: 0,
+                current_reset_on_fork: false,
+                reset_on_fork: false,
+            },
         )),
         Err(AxError::OperationNotPermitted)
     );

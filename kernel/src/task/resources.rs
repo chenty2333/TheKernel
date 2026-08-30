@@ -6,8 +6,8 @@ use core::{
 };
 
 use linux_raw_sys::general::{
-    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_SIGPENDING,
-    RLIMIT_STACK,
+    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_RTPRIO,
+    RLIMIT_SIGPENDING, RLIMIT_STACK,
 };
 
 /// The maximum number of open files
@@ -76,6 +76,9 @@ impl Default for Rlimits {
         // Keeping the generic infinity default here would make RLIMIT_NICE an
         // implicit CAP_SYS_NICE bypass for every process.
         result[RLIMIT_NICE] = 0.into();
+        // Linux grants no unprivileged real-time priority increase by
+        // default.  This must not inherit the generic infinity default.
+        result[RLIMIT_RTPRIO] = 0.into();
         result[RLIMIT_NOFILE] = (AX_FILE_LIMIT as u64).into();
         // Explicit bounded default for per-(user namespace, real UID) queued
         // real-time signals. The global implementation ceiling is enforced by
@@ -101,7 +104,9 @@ impl IndexMut<u32> for Rlimits {
 
 #[cfg(test)]
 mod tests {
-    use linux_raw_sys::general::{RLIMIT_CORE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_SIGPENDING};
+    use linux_raw_sys::general::{
+        RLIMIT_CORE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_RTPRIO, RLIMIT_SIGPENDING,
+    };
 
     use super::{Rlimit, Rlimits};
 
@@ -131,5 +136,12 @@ mod tests {
         let limits = Rlimits::default();
         assert_eq!(limits[RLIMIT_NICE].current, 0);
         assert_eq!(limits[RLIMIT_NICE].max, 0);
+    }
+
+    #[test]
+    fn rtprio_default_grants_no_unprivileged_rt_raise() {
+        let limits = Rlimits::default();
+        assert_eq!(limits[RLIMIT_RTPRIO].current, 0);
+        assert_eq!(limits[RLIMIT_RTPRIO].max, 0);
     }
 }
