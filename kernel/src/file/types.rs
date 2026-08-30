@@ -463,13 +463,13 @@ pub trait FileLike: Pollable + DowncastSync {
     /// releases it, while this object is still alive.
     ///
     /// This is not an fd-close hook: duplicated descriptors, forked fd
-    /// tables, and transferred descriptor owners share one invocation. File
-    /// mappings retain their backing object independently and therefore do
-    /// not postpone this notification. Implementations run in the context
-    /// which drops the final OFD and must neither allocate nor block, sleep,
-    /// acquire a sleeping lock, submit I/O, or otherwise depend on task
-    /// context; in particular, they must remain safe if that context is an
-    /// interrupt path.
+    /// tables, transferred descriptor owners, and VMA `vm_file` leases share
+    /// one invocation. A mapping may therefore defer this notification until
+    /// its final split/fork fragment is released. Implementations run in the
+    /// context which drops the final OFD and must neither allocate nor block,
+    /// sleep, acquire a sleeping lock, submit I/O, or otherwise depend on
+    /// task context; in particular, they must remain safe if that context is
+    /// an interrupt path.
     fn final_close(&self) {}
 
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {

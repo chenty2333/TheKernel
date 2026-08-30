@@ -752,8 +752,8 @@ mod tests {
         let ofd_key = description.id().get();
         let handle = FileHandle::<dyn FileLike>::from_description_for_test(description.clone());
         let retained: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
-        let owner = DeferredFileLease::try_new(handle.mapping_backing(), retained).unwrap();
-        assert_eq!(owner.retained_reference_counts(), (4, 1));
+        let owner = DeferredFileLease::try_new(handle, retained).unwrap();
+        assert_eq!(owner.retained_reference_counts(), (2, 1));
         let mapping = FileLikeMappingLease::new(
             owner,
             ofd_key,
@@ -767,10 +767,8 @@ mod tests {
 
         drop(inner);
         drop(description);
-        drop(handle);
-        // The mapping retains only the backing object. It cannot extend the
-        // OFD lifetime or postpone the final-close notification.
-        assert_eq!(final_closes.load(Ordering::Acquire), 1);
+        // The VMA keeps its exact OFD alive after descriptor close.
+        assert_eq!(final_closes.load(Ordering::Acquire), 0);
         drop(mapping);
         assert_eq!(drops.load(Ordering::Acquire), 0);
 
@@ -779,6 +777,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::Acquire), 0);
 
         assert!(drain_deferred_file_lease_for_test());
+        assert_eq!(final_closes.load(Ordering::Acquire), 1);
         assert_eq!(drops.load(Ordering::Acquire), 1);
         drain_deferred_description_resource_only_for_test();
     }

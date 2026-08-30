@@ -76,14 +76,14 @@ pub(crate) type DescriptionResource = Box<dyn Any + Send + Sync>;
 /// Preallocated ownership retained by a mapping after fd close or reuse.
 ///
 /// VMA split/fork operations clone this intrusive reference without allocating.
-/// The final release only publishes the node; the retained backing and node
-/// allocation are destroyed by the policy worker. It deliberately retains the
-/// backing object rather than its `FileDescription`: a mapping must not become
-/// an extra open-file-description owner or postpone `FileLike::final_close`.
+/// The final release only publishes the node; the exact FileHandle, retained
+/// backing, and node allocation are destroyed by the policy worker. The
+/// handle is the VMA's `vm_file` equivalent: it deliberately keeps the OFD
+/// alive across fd close, VMA split, and fork.
 struct DeferredFileLeaseInner {
     next: AtomicPtr<Self>,
     references: AtomicUsize,
-    file: Arc<dyn FileLike>,
+    handle: FileHandle<dyn FileLike>,
     retained: Arc<dyn Any + Send + Sync>,
     _credit: DeferredFileLeaseCredit,
 }
@@ -107,7 +107,7 @@ unsafe impl Sync for DeferredFileLease {}
 
 impl DeferredFileLease {
     pub(crate) fn try_new(
-        file: Arc<dyn FileLike>,
+        handle: FileHandle<dyn FileLike>,
         retained: Arc<dyn Any + Send + Sync>,
     ) -> AxResult<Self> {
         DEFERRED_FILE_LEASE_CREDITS
@@ -118,7 +118,7 @@ impl DeferredFileLease {
         let inner = Box::try_new(DeferredFileLeaseInner {
             next: AtomicPtr::new(ptr::null_mut()),
             references: AtomicUsize::new(1),
-            file,
+            handle,
             retained,
             _credit: DeferredFileLeaseCredit,
         })
@@ -137,7 +137,7 @@ impl DeferredFileLease {
         // SAFETY: a live lease owns one reference to this immutable node.
         let inner = unsafe { self.inner.as_ref() };
         (
-            Arc::strong_count(&inner.file),
+            Arc::strong_count(&inner.handle.description),
             Arc::strong_count(&inner.retained),
         )
     }
@@ -2020,14 +2020,6 @@ impl<T: FileLike + ?Sized> FileHandle<T> {
     }
 }
 
-impl FileHandle<dyn FileLike> {
-    /// Clones only the object backing a file mapping, never the OFD which
-    /// supplied it. VMA ownership must not extend final-OFD lifetime.
-    pub(crate) fn mapping_backing(&self) -> Arc<dyn FileLike> {
-        self.file.clone()
-    }
-}
-
 #[derive(Clone)]
 pub struct FileDescriptor {
     pub description: Arc<FileDescription>,
@@ -2169,8 +2161,18 @@ mod tests {
         first.mark_open_committed();
         independent.mark_open_committed();
 
+        let first_publication = first.begin_descriptor_publication().unwrap();
+        first_publication.commit();
+        let duplicated_publication = first.begin_descriptor_publication().unwrap();
+        duplicated_publication.commit();
+        // An abandoned fd reservation must not create another close or keep
+        // the committed duplicate alive.
+        drop(first.begin_descriptor_publication().unwrap());
+
+        first.descriptor_closed();
         drop(first);
         assert_eq!(closes.load(Ordering::Acquire), 0);
+        duplicated.descriptor_closed();
         drop(duplicated);
         assert_eq!(closes.load(Ordering::Acquire), 1);
         assert!(observed_live.load(Ordering::Acquire));
@@ -2181,6 +2183,28 @@ mod tests {
         assert!(observed_live.load(Ordering::Acquire));
         drop(inner);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn nested_file_descriptions_do_not_forward_final_close() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed_live = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(FinalCloseProbe {
+            closes: closes.clone(),
+            dropped,
+            observed_live,
+        });
+        let nested = FileDescription::new(inner).unwrap();
+        nested.mark_open_committed();
+        let wrapper_inner: Arc<dyn FileLike> = nested.clone();
+        let wrapper = FileDescription::new(wrapper_inner).unwrap();
+        wrapper.mark_open_committed();
+
+        drop(wrapper);
+        assert_eq!(closes.load(Ordering::Acquire), 0);
+        drop(nested);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
     }
 
     #[test]
