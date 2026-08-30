@@ -139,6 +139,32 @@ struct InodeBinding {
     namespace_epoch: Arc<AtomicU64>,
 }
 
+struct RetainedInodeHandle {
+    fs: Arc<Ext4Filesystem>,
+    token: Option<InodeToken>,
+}
+
+impl RetainedInodeHandle {
+    fn new(fs: Arc<Ext4Filesystem>, token: InodeToken) -> Self {
+        Self {
+            fs,
+            token: Some(token),
+        }
+    }
+
+    fn release_on_success(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for RetainedInodeHandle {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.fs.lock().release_inode_handle(token);
+        }
+    }
+}
+
 pub(crate) struct PreparedInodeEntry {
     inode: Arc<Inode>,
     entry: DirEntry,
@@ -195,6 +221,7 @@ impl Inode {
         namespace_epoch: Arc<AtomicU64>,
         inode_type: InodeType,
     ) -> VfsResult<DirEntry> {
+        let mut retained = RetainedInodeHandle::new(fs.clone(), token);
         let writeback = fs.reserve_writeback_error_state(Some(token))?;
         match Self::try_prepare_entry_with_writeback_error_reservation(
             fs.clone(),
@@ -206,12 +233,11 @@ impl Inode {
                 if let Some(runtime) = fs.runtime_attachment(token) {
                     prepared.inode.attach_runtime(runtime);
                 }
-                Ok(prepared.bind(token, namespace_epoch))
+                let entry = prepared.bind(token, namespace_epoch);
+                retained.release_on_success();
+                Ok(entry)
             }
-            Err(error) => {
-                fs.lock().release_inode_handle(token);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
     pub(crate) fn try_prepare_entry(
