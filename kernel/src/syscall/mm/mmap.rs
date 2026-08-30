@@ -880,6 +880,74 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     Ok(0)
 }
 
+/// Linux's deprecated nonlinear shared mapping ABI.  This intentionally does
+/// not delegate to `mmap`: the file is selected from the existing VMA (not an
+/// fd), and the AddrSpace transaction replaces that VMA at the same address.
+pub fn sys_remap_file_pages(
+    start: usize,
+    size: usize,
+    prot: usize,
+    pgoff: usize,
+    flags: usize,
+) -> AxResult<isize> {
+    if prot != 0 || flags & !(MAP_NONBLOCK as usize) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let start = start & !(PageSize::Size4K as usize - 1);
+    let size = size & !(PageSize::Size4K as usize - 1);
+    if size == 0 || start.checked_add(size).is_none() || pgoff.checked_add(size / PageSize::Size4K as usize).is_none() {
+        return Err(AxError::InvalidInput);
+    }
+    let thread = current().as_thread();
+    let image = thread.proc_data.thread_image_access_snapshot(thread)?;
+    let aspace_handle = image.aspace().clone();
+    let start_addr = VirtAddr::from(start);
+
+    // Read-side snapshot: retain the exact vm_file-like lease across the LSM
+    // call, then compare it again while publishing under the write side.
+    let (snapshot_flags, lease) = {
+        let aspace = aspace_handle.lock();
+        let area = aspace.find_area(start_addr).ok_or(AxError::InvalidInput)?;
+        if area.start() != start_addr || area.end() < start_addr + size {
+            return Err(AxError::InvalidInput);
+        }
+        let lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
+        if lease.sharing() != FileMappingSharing::Shared {
+            return Err(AxError::InvalidInput);
+        }
+        (area.flags(), lease.clone())
+    };
+    let raw_flags = (MAP_SHARED | MAP_FIXED | MAP_POPULATE) as usize | (flags & MAP_NONBLOCK as usize);
+    mmap_file(
+        image.credential(),
+        Some((lease.filesystem_owner_user_ns(), lease.file())),
+        snapshot_flags,
+        snapshot_flags,
+        raw_flags,
+    )?;
+
+    let mut aspace = aspace_handle.lock();
+    let area = aspace.find_area(start_addr).ok_or(AxError::InvalidInput)?;
+    let current_lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
+    if area.flags() != snapshot_flags
+        || current_lease.ofd_key() != lease.ofd_key()
+        || current_lease.file_offset_at(start_addr) != lease.file_offset_at(start_addr)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    let populate = flags & MAP_NONBLOCK as usize == 0;
+    let wake = aspace.replace_shared_mapping_at_offset(
+        &aspace_handle,
+        start_addr,
+        size,
+        pgoff,
+        populate,
+    )?;
+    drop(aspace);
+    wake.finish();
+    Ok(0)
+}
+
 pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> {
     // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
     let Some((length, end_addr)) = preflight_mprotect_geometry(addr, length, prot)? else {

@@ -2941,6 +2941,59 @@ impl AddrSpace {
         )
     }
 
+    /// Replace one complete shared VMA at the same virtual address with an
+    /// alias of its backing at `page_offset`.  The caller holds the address
+    /// space mutex for the entire prepared replacement; both the replacement
+    /// and rollback backends are fully constructed before the old PTE/VMA is
+    /// retired.  Deferred UFFD wakeup is deliberately returned to the caller
+    /// and must be finished only after dropping that mutex.
+    pub(crate) fn replace_shared_mapping_at_offset(
+        &mut self,
+        aspace: &Arc<Mutex<AddrSpace>>,
+        start: VirtAddr,
+        size: usize,
+        page_offset: usize,
+        populate: bool,
+    ) -> AxResult<DeferredUffdWake> {
+        self.validate_region(start, size)?;
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let area = self.find_area(start).ok_or(AxError::InvalidInput)?;
+        if area.start() != start || area.end() < end {
+            return Err(AxError::InvalidInput);
+        }
+        let flags = area.flags();
+        let locked = self.range_is_locked(start, size);
+        let source = area.backend();
+        let shared = source
+            .file_mapping()
+            .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared)
+            || matches!(source, Backend::Shared(_));
+        if !shared {
+            return Err(AxError::InvalidInput);
+        }
+        // Build both candidates before retiring the old VMA.  Recreating the
+        // original through relocate(start,start) retains every cache/lease
+        // registration should publication of the replacement fail.
+        let rollback = source.relocate(start, start, aspace)?;
+        let replacement = match source {
+            Backend::File(_) => source.clone_file_rebased(start, page_offset, aspace)?,
+            Backend::Shared(_) => source.clone_shared_rebased(start, page_offset)?,
+            Backend::Linear(_) | Backend::Cow(_) => return Err(AxError::InvalidInput),
+        };
+        let wake = self.unmap(start, size)?;
+        match self.map_with_lock_state(start, size, flags, populate, replacement, locked) {
+            Ok(()) => Ok(wake),
+            Err(error) => {
+                // The old mapping was retained as a prepared backend, so a
+                // failed fixed replacement cannot leave a hole visible after
+                // the address-space lock is released.
+                self.map_with_lock_state(start, size, flags, false, rollback, locked)
+                    .map_err(|_| AxError::BadState)?;
+                Err(error)
+            }
+        }
+    }
+
     pub fn map_with_lock_state(
         &mut self,
         start: VirtAddr,

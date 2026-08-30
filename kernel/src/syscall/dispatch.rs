@@ -853,6 +853,13 @@ pub(super) fn dispatch_syscall(
             uctx.arg4() as _,
             uctx.arg5() as _,
         ),
+        Sysno::remap_file_pages => sys_remap_file_pages(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
         Sysno::munmap => sys_munmap(uctx.arg0(), uctx.arg1() as _),
         Sysno::mprotect => sys_mprotect(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mseal => sys_mseal(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
