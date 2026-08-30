@@ -1283,6 +1283,16 @@ impl FileLike for Pipe {
         Ok(self.shared.inode.stat())
     }
 
+    fn update_timestamps(
+        &self,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        ctime: core::time::Duration,
+    ) -> AxResult<()> {
+        self.shared.inode.update_timestamps(atime, mtime, ctime);
+        Ok(())
+    }
+
     fn path(&self) -> AxResult<Cow<'_, str>> {
         try_pseudo_inode_path("pipe", self.shared.inode.inode())
     }

@@ -22,6 +22,7 @@ use linux_vfs::{
 use thekernel_linux_cred::{
     FileOpenOperation, InodeChmodIntent, InodeChownIntent, InodeCreateMode, InodeMknodKind,
     InodeMknodOperation, InodePermissionAccess, InodeSetattrMode, InodeSetattrProposal,
+    InodeTimestampIntent,
 };
 
 use crate::{
@@ -108,7 +109,7 @@ impl VfsSecurityContext {
     /// inode metadata writer gate held through backend publication and either
     /// drop the admission on failure or carry it into the sealed published
     /// state after successful backend mutation.
-    fn begin_inode_setattr<'context, 'location>(
+    pub(crate) fn begin_inode_setattr<'context, 'location>(
         &'context self,
         location: &'location Location,
         fresh_metadata: &Metadata,
@@ -169,6 +170,86 @@ impl<'context, 'location> PreparedInodeSetattr<'context, 'location> {
             admission: Some(admission),
             location,
             committed: prepared.committed,
+        })
+    }
+}
+
+/// Timestamp setattr policy bound to one old-inode snapshot and one security
+/// admission.  The caller keeps the metadata writer transaction across this
+/// complete sequence so owner checks, the pre-hook, publication, and post-hook
+/// cannot observe a concurrent chown in between.
+pub(crate) struct TimestampSetattrPolicy<'a> {
+    location: &'a Location,
+    metadata: Metadata,
+    atime: Option<core::time::Duration>,
+    mtime: Option<core::time::Duration>,
+    ctime: core::time::Duration,
+    intent: InodeTimestampIntent,
+}
+
+impl<'a> TimestampSetattrPolicy<'a> {
+    pub(crate) fn new(
+        location: &'a Location,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+        intent: InodeTimestampIntent,
+    ) -> AxResult<Self> {
+        Ok(Self {
+            location,
+            metadata: location.metadata()?,
+            atime,
+            mtime,
+            ctime: wall_time(),
+            intent,
+        })
+    }
+
+    pub(crate) fn admit<'context>(
+        self,
+        security: &'context VfsSecurityContext,
+    ) -> AxResult<PreparedInodeSetattr<'context, 'a>> {
+        let credentials = security.credentials();
+        if Kuid::from_raw(self.metadata.uid) != Some(credentials.uid())
+            && !security.has_capability(CAP_FOWNER)
+        {
+            use thekernel_linux_cred::InodeTimestampValue;
+            if (self.intent.atime(), self.intent.mtime())
+                != (InodeTimestampValue::Now, InodeTimestampValue::Now)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+            check_open_permissions_with_security(
+                self.location,
+                W_OK,
+                security.actor(),
+                credentials,
+                security.filesystem_owner_user_ns(),
+            )?;
+        }
+        let admission = security.begin_inode_setattr(
+            self.location,
+            &self.metadata,
+            InodeSetattrProposal::timestamps(self.intent),
+        )?;
+        let update = MetadataUpdate {
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: Some(self.ctime),
+            ..Default::default()
+        };
+        let mut committed = self.metadata;
+        if let Some(atime) = self.atime {
+            committed.atime = atime;
+        }
+        if let Some(mtime) = self.mtime {
+            committed.mtime = mtime;
+        }
+        committed.ctime = self.ctime;
+        Ok(PreparedInodeSetattr {
+            admission,
+            location: self.location,
+            prepared: PreparedMetadataSetattr { update, committed },
+            privilege_cleanup: None,
         })
     }
 }

@@ -19,6 +19,7 @@ use linux_raw_sys::{
         TIOCGWINSZ, TIOCINQ,
     },
 };
+use thekernel_linux_cred::{InodeTimestampIntent, InodeTimestampValue};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
     vm_write_slice,
@@ -37,7 +38,7 @@ use crate::{
         namespace_mutation,
         permission::{
             ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
-            VfsSecurityContext, check_fchdir_permissions_with_security,
+            TimestampSetattrPolicy, VfsSecurityContext, check_fchdir_permissions_with_security,
             check_open_permissions_with_security, check_search_permissions_with_security,
             check_writable_mount,
         },
@@ -1503,40 +1504,45 @@ fn update_times<M: UserMemory + ?Sized>(
         .nullable()
         .map(|path| load_user_path(memory, path))
         .transpose()?;
-    let curr = current();
-    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let credentials = security.credentials();
-    let loc = resolve_at_with_security(dirfd, path.as_deref(), flags, &security)?
-        .into_file()
-        .ok_or(AxError::BadFileDescriptor)?;
     if atime_intent == TimeUpdate::Omit && mtime_intent == TimeUpdate::Omit {
         return Ok(());
     }
-
-    let meta = loc.metadata()?;
-    if Kuid::from_raw(meta.uid) != Some(credentials.uid()) && !security.has_capability(CAP_FOWNER) {
-        if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
-            return Err(AxError::OperationNotPermitted);
+    let curr = current();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    // Keep resolution, mount admission, DAC, security hooks, and publication
+    // in one metadata-writer transaction.  In particular, a concurrent chown
+    // cannot change the owner between the timestamp permission check and the
+    // metadata update.
+    let _metadata_writer = mounts::namespace_operation();
+    match resolve_at_with_security(dirfd, path.as_deref(), flags, &security)? {
+        crate::file::fs::ResolveAtResult::File(loc) => {
+            // Linux's mount-write admission precedes notify_change's DAC and
+            // setattr path, so a read-only mount wins over EPERM/EACCES.
+            check_writable_mount(&loc)?;
+            let intent = InodeTimestampIntent::new(
+                timestamp_value(atime_intent),
+                timestamp_value(mtime_intent),
+            );
+            let published = TimestampSetattrPolicy::new(&loc, atime, mtime, intent)?
+                .admit(&security)?
+                .publish()?;
+            published.commit();
+            Ok(())
         }
-        check_open_permissions_with_security(
-            &loc,
-            W_OK,
-            security.actor(),
-            credentials,
-            security.filesystem_owner_user_ns(),
-        )?;
+        crate::file::fs::ResolveAtResult::Other(file) => {
+            // A NULL pathname plus a descriptor denotes that exact struct
+            // file; pipes and sockets have mutable pseudo-inode timestamps.
+            file.update_timestamps(atime, mtime, wall_time())
+        }
     }
-    check_writable_mount(&loc)?;
-    loc.update_metadata(MetadataUpdate {
-        atime,
-        mtime,
-        ..Default::default()
-    })?;
-    loc.update_supported_metadata(MetadataUpdate {
-        ctime: Some(wall_time()),
-        ..Default::default()
-    })?;
-    Ok(())
+}
+
+const fn timestamp_value(update: TimeUpdate) -> InodeTimestampValue {
+    match update {
+        TimeUpdate::Omit => InodeTimestampValue::Omit,
+        TimeUpdate::Now => InodeTimestampValue::Now,
+        TimeUpdate::Explicit => InodeTimestampValue::Explicit,
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -1629,10 +1635,19 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
 fn legacy_futimesat_pair(
     times: [linux_raw_sys::general::__kernel_old_timeval; 2],
 ) -> AxResult<(Duration, Duration)> {
-    Ok((
-        times[0].try_into_time_value()?,
-        times[1].try_into_time_value()?,
-    ))
+    fn convert(time: linux_raw_sys::general::__kernel_old_timeval) -> AxResult<Duration> {
+        if !(0..1_000_000).contains(&time.tv_usec) {
+            return Err(AxError::InvalidInput);
+        }
+        // timeval's seconds field deliberately has no ABI-level validity
+        // restriction.  The VFS time representation/backend performs the
+        // eventual representability check, just as do_utimes does.
+        Ok(Duration::new(
+            time.tv_sec as u64,
+            (time.tv_usec as u32) * 1_000,
+        ))
+    }
+    Ok((convert(times[0])?, convert(times[1])?))
 }
 
 /// Linux's legacy `do_futimesat` wrapper: copy and validate the old timeval
@@ -2043,6 +2058,15 @@ mod tests {
             ];
             assert_eq!(legacy_futimesat_pair(invalid), Err(AxError::InvalidInput));
         }
+
+        let negative_seconds = [
+            __kernel_old_timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+            valid[1],
+        ];
+        assert!(legacy_futimesat_pair(negative_seconds).is_ok());
     }
 
     #[test]

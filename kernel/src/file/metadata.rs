@@ -1,6 +1,10 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use axfs_ng_vfs::DeviceId;
+use axsync::Mutex;
 use axtask::current_may_uninit;
 use linux_raw_sys::general::{S_IFIFO, S_IFREG, S_IFSOCK};
 
@@ -17,13 +21,21 @@ const MQUEUE_DEVICE: DeviceId = DeviceId::new(0, 0x00ff_f005);
 
 static NEXT_PSEUDO_INODE: AtomicU64 = AtomicU64::new(2);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct PseudoInode {
     device: DeviceId,
     inode: u64,
     mode: u32,
     uid: u32,
     gid: u32,
+    times: Mutex<PseudoTimes>,
+}
+
+#[derive(Debug)]
+struct PseudoTimes {
+    atime: Duration,
+    mtime: Duration,
+    ctime: Duration,
 }
 
 impl PseudoInode {
@@ -34,6 +46,11 @@ impl PseudoInode {
             mode,
             uid,
             gid,
+            times: Mutex::new(PseudoTimes {
+                atime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            }),
         }
     }
 
@@ -58,11 +75,12 @@ impl PseudoInode {
         Self::new(MQUEUE_DEVICE, S_IFREG | (mode & 0o777), uid, gid)
     }
 
-    pub(crate) const fn inode(self) -> u64 {
+    pub(crate) const fn inode(&self) -> u64 {
         self.inode
     }
 
-    pub(crate) fn stat(self) -> Kstat {
+    pub(crate) fn stat(&self) -> Kstat {
+        let times = self.times.lock();
         Kstat {
             dev: self.device.0,
             ino: self.inode,
@@ -71,8 +89,27 @@ impl PseudoInode {
             uid: self.uid,
             gid: self.gid,
             blksize: 4096,
+            atime: times.atime,
+            mtime: times.mtime,
+            ctime: times.ctime,
             ..Kstat::default()
         }
+    }
+
+    pub(crate) fn update_timestamps(
+        &self,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Duration,
+    ) {
+        let mut times = self.times.lock();
+        if let Some(atime) = atime {
+            times.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            times.mtime = mtime;
+        }
+        times.ctime = ctime;
     }
 }
 
@@ -97,4 +134,25 @@ fn current_fs_owner() -> (u32, u32) {
         return (0, 0);
     };
     (thread.fsuid().into_raw(), thread.fsgid().into_raw())
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use super::PseudoInode;
+
+    #[test]
+    fn pseudo_inode_timestamp_publication_is_single_snapshot() {
+        let inode = PseudoInode::pipe();
+        inode.update_timestamps(
+            Some(Duration::from_secs(11)),
+            Some(Duration::from_secs(12)),
+            Duration::from_secs(13),
+        );
+        let stat = inode.stat();
+        assert_eq!(stat.atime, Duration::from_secs(11));
+        assert_eq!(stat.mtime, Duration::from_secs(12));
+        assert_eq!(stat.ctime, Duration::from_secs(13));
+    }
 }

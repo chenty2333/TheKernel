@@ -458,6 +458,18 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn stat(&self) -> AxResult<Kstat>;
 
+    /// Updates descriptor-owned timestamps for objects which do not have a VFS
+    /// location (for example pipes and sockets).  VFS-backed files are updated
+    /// through their inode setattr transaction instead.
+    fn update_timestamps(
+        &self,
+        _atime: Option<Duration>,
+        _mtime: Option<Duration>,
+        _ctime: Duration,
+    ) -> AxResult<()> {
+        Err(AxError::OperationNotSupported)
+    }
+
     /// Produces a stable display path for procfs and other kernel adapters.
     ///
     /// Dynamic paths must reserve their storage fallibly and report
