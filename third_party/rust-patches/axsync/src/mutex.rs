@@ -23,6 +23,10 @@ pub struct RawMutex {
     notify_calls: AtomicUsize,
 }
 
+// A released lock with an already selected waiter.  Ordinary lockers must
+// queue behind it; only the listener woken by unlock may claim this turn.
+const HANDOFF_OWNER: u64 = u64::MAX;
+
 impl RawMutex {
     /// Creates a [`RawMutex`].
     #[inline(always)]
@@ -54,13 +58,30 @@ impl RawMutex {
         let current_id = current().id().as_u64();
         let mut spin = Spin(0);
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);
+        let mut owns_handoff = false;
 
         loop {
             if cancelled() {
+                if owns_handoff {
+                    self.pass_handoff();
+                }
                 return false;
             }
             if owner_id == current_id {
                 panic!("task attempted to recursively acquire an interruptible mutex");
+            }
+            if owner_id == HANDOFF_OWNER && owns_handoff {
+                match self.owner_id.compare_exchange(
+                    HANDOFF_OWNER,
+                    current_id,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => owner_id = observed,
+                }
+                owns_handoff = false;
+                continue;
             }
             if owner_id == 0 {
                 match self.owner_id.compare_exchange_weak(
@@ -90,7 +111,7 @@ impl RawMutex {
             }
 
             match block_on(interruptible(listener)) {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => owns_handoff = true,
                 Ok(Err(_)) if cancelled() => return false,
                 // Ordinary task interrupts do not cancel this lock. They are
                 // consumed at this wait boundary and the caller's predicate
@@ -99,6 +120,23 @@ impl RawMutex {
                 Err(error) => panic!("interruptible sleeping mutex wait failed: {error}"),
             }
             owner_id = self.owner_id.load(Ordering::Acquire);
+        }
+    }
+
+    fn pass_handoff(&self) {
+        debug_assert_eq!(self.owner_id.load(Ordering::Acquire), HANDOFF_OWNER);
+        // This waiter is still counted. If it is the last one, opening the
+        // lock is safe: a concurrently registering waiter rechecks owner
+        // after listener publication and therefore cannot sleep past it.
+        if self.waiters.load(Ordering::SeqCst) <= 1 {
+            let _ = self.owner_id.compare_exchange(
+                HANDOFF_OWNER,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+        } else {
+            self.event.notify(1);
         }
     }
 }
@@ -170,6 +208,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
         let current_id = current().id().as_u64();
         let mut spin = Spin(0);
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);
+        let mut owns_handoff = false;
 
         loop {
             if owner_id == current_id {
@@ -181,6 +220,20 @@ unsafe impl lock_api::RawMutex for RawMutex {
                          already owns."
                     ),
                 }
+            }
+
+            if owner_id == HANDOFF_OWNER && owns_handoff {
+                match self.owner_id.compare_exchange(
+                    HANDOFF_OWNER,
+                    current_id,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => owner_id = observed,
+                }
+                owns_handoff = false;
+                continue;
             }
 
             if owner_id == 0 {
@@ -238,6 +291,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
                     ),
                 }
             });
+            owns_handoff = true;
             owner_id = self.owner_id.load(Ordering::Acquire);
         }
     }
@@ -254,10 +308,18 @@ unsafe impl lock_api::RawMutex for RawMutex {
 
     #[inline(always)]
     unsafe fn unlock(&self) {
-        let owner_id = self.owner_id.swap(0, Ordering::SeqCst);
         let task = current();
         let current_id = task.id().as_u64();
-        if owner_id != current_id {
+        let next_owner = if self.waiters.load(Ordering::SeqCst) != 0 {
+            HANDOFF_OWNER
+        } else {
+            0
+        };
+        if self
+            .owner_id
+            .compare_exchange(current_id, next_owner, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
             match task.id_name() {
                 Ok(name) => panic!("{name} tried to release mutex it doesn't own"),
                 Err(error) => panic!(
@@ -270,7 +332,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
         // A waiter publishes this count only after Event initialization and
         // listener registration. The SeqCst ordering with the slow-path owner
         // recheck prevents both sides from missing each other.
-        if self.waiters.load(Ordering::SeqCst) != 0 {
+        if next_owner == HANDOFF_OWNER {
             #[cfg(test)]
             self.notify_calls.fetch_add(1, Ordering::Relaxed);
             self.event.notify(1);
@@ -475,6 +537,34 @@ mod tests {
         assert!(waiter.join().unwrap());
         // The waiter never acquired the held mutex.
         drop(guard);
+    }
+
+    #[test]
+    fn queued_waiter_receives_handoff_before_a_barging_locker() {
+        init_scheduler();
+        let mutex = Arc::new(Mutex::new(()));
+        let order = Arc::new(AtomicUsize::new(0));
+        let guard = mutex.lock();
+        let queued_mutex = Arc::clone(&mutex);
+        let queued_order = Arc::clone(&order);
+        let queued = thread::spawn(move || {
+            let _guard = queued_mutex.lock();
+            assert_eq!(queued_order.fetch_add(1, Ordering::AcqRel), 0);
+        })
+        .unwrap();
+        while unsafe { mutex.raw() }.waiter_count() == 0 {
+            thread::yield_now();
+        }
+        let barger_mutex = Arc::clone(&mutex);
+        let barger_order = Arc::clone(&order);
+        let barger = thread::spawn(move || {
+            let _guard = barger_mutex.lock();
+            assert_eq!(barger_order.fetch_add(1, Ordering::AcqRel), 1);
+        })
+        .unwrap();
+        drop(guard);
+        queued.join().unwrap();
+        barger.join().unwrap();
     }
 
     #[test]
