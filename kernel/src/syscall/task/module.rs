@@ -86,16 +86,52 @@ struct Entry {
 }
 static MODULES: Lazy<spin::Mutex<Vec<Slot>>> = Lazy::new(|| spin::Mutex::new(Vec::new()));
 struct LoadFlight {
-    key: u64,
+    key: LoadKey,
     state: spin::Mutex<Option<i32>>,
     done: WaitQueue,
+}
+struct LoadKey {
+    ofd: u64,
+    uargs_hash: u64,
+    uargs: Vec<u8>,
+    flags: u32,
+}
+impl LoadKey {
+    fn new(ofd: u64, uargs: Vec<u8>, flags: u32) -> Self {
+        Self {
+            ofd,
+            uargs_hash: uargs_hash(&uargs),
+            uargs,
+            flags,
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.ofd == other.ofd
+            && self.flags == other.flags
+            && self.uargs_hash == other.uargs_hash
+            // The hash only avoids most byte comparisons; exact bytes make
+            // equal hashes collision-safe.
+            && self.uargs == other.uargs
+    }
 }
 static LOAD_FLIGHTS: Lazy<spin::Mutex<Vec<Arc<LoadFlight>>>> =
     Lazy::new(|| spin::Mutex::new(Vec::new()));
 
-fn load_flight(key: u64) -> AxResult<(Arc<LoadFlight>, bool)> {
+fn uargs_hash(bytes: &[u8]) -> u64 {
+    // This is an index, not an identity: LoadKey::matches always verifies
+    // complete bytes before sharing a flight.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^ (bytes.len() as u64)
+}
+
+fn load_flight(key: LoadKey) -> AxResult<(Arc<LoadFlight>, bool)> {
     let mut flights = LOAD_FLIGHTS.lock();
-    if let Some(flight) = flights.iter().find(|flight| flight.key == key) {
+    if let Some(flight) = flights.iter().find(|flight| flight.key.matches(&key)) {
         return Ok((flight.clone(), false));
     }
     flights.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -153,6 +189,14 @@ fn copy_vec(bytes: &[u8]) -> AxResult<Vec<u8>> {
     out.try_reserve_exact(bytes.len())
         .map_err(|_| AxError::NoMemory)?;
     out.extend_from_slice(bytes);
+    Ok(out)
+}
+fn copy_name(name: &str) -> AxResult<String> {
+    let mut out = String::new();
+    out.try_reserve_exact(name.len())
+        .map_err(|_| AxError::NoMemory)?;
+    // Capacity was fallibly reserved above; copying cannot allocate.
+    out.push_str(name);
     Ok(out)
 }
 fn u16x(b: &[u8], o: usize) -> AxResult<u16> {
@@ -859,7 +903,8 @@ fn prep(b: &[u8], av: &[(Vec<u8>, Vec<u8>)]) -> AxResult<M> {
     })
 }
 fn activate(x: M) -> AxResult<isize> {
-    let n = x.name.clone();
+    let n = copy_name(&x.name)?;
+    let slot_name = copy_name(&n)?;
     {
         let mut v = MODULES.lock();
         if v.iter().any(|x| x.name == n) {
@@ -867,7 +912,7 @@ fn activate(x: M) -> AxResult<isize> {
         }
         v.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         v.push(Slot {
-            name: n.clone(),
+            name: slot_name,
             state: State::Coming,
             refs: 1,
             deps: 0,
@@ -882,24 +927,37 @@ fn activate(x: M) -> AxResult<isize> {
         .iter()
         .position(|x| x.name == n)
         .ok_or(AxError::BadState)?;
-    if r < 0 {
+    if let Err(error) = module_init_result(r) {
         v.remove(i);
-        return Err(LinuxError::try_from(-r)
-            .unwrap_or(LinuxError::EINVAL)
-            .into());
+        return Err(error);
     }
     v[i].state = State::Live(x);
     Ok(0)
 }
+fn module_init_result(result: i32) -> AxResult<()> {
+    if result < 0 {
+        Err(result
+            .checked_neg()
+            .and_then(|code| LinuxError::try_from(code).ok())
+            .unwrap_or(LinuxError::EINVAL)
+            .into())
+    } else {
+        // Linux do_init_module() warns but makes the module live for a
+        // positive init return; only negative values fail the load.
+        Ok(())
+    }
+}
 fn ua<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
     p: *const c_char,
-) -> AxResult<Vec<(Vec<u8>, Vec<u8>)>> {
-    if p.is_null() {
-        Ok(Vec::new())
+) -> AxResult<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let raw = if p.is_null() {
+        Vec::new()
     } else {
-        args(&vm_load_until_nul_bounded(m, p.cast(), ARGMAX).map_err(map_usercopy_error)?)
-    }
+        vm_load_until_nul_bounded(m, p.cast(), ARGMAX).map_err(map_usercopy_error)?
+    };
+    let parsed = args(&raw)?;
+    Ok((raw, parsed))
 }
 pub fn sys_init_module<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
@@ -913,7 +971,7 @@ pub fn sys_init_module<Mm: UserMemory + ?Sized>(
     if n == 0 || n > MAX {
         return Err(AxError::InvalidInput);
     }
-    let a = ua(m, a)?;
+    let (_, a) = ua(m, a)?;
     activate(prep(&vm_load(m, p, n).map_err(map_usercopy_error)?, &a)?)
 }
 pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
@@ -931,13 +989,13 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     if fl != 0 {
         return Err(AxError::OperationNotSupported);
     }
-    let a = ua(m, a)?;
+    let (raw_args, a) = ua(m, a)?;
     let f = get_typed_file::<File>(fd)?;
     f.check_io_access()?;
     if f.status_flags() & O_ACCMODE == O_WRONLY {
         return Err(AxError::BadFileDescriptor);
     }
-    let (flight, owner) = load_flight(f.open_file_description_key())?;
+    let (flight, owner) = load_flight(LoadKey::new(f.open_file_description_key(), raw_args, fl))?;
     if !owner {
         return await_flight(flight);
     }
@@ -1108,6 +1166,33 @@ mod tests {
         assert_eq!(got, vec![(b"foo-bar".to_vec(), b"quoted value".to_vec())]);
         assert!(eq(b"foo-bar", b"foo_bar"));
         assert_eq!(num(b"077", false, 32).unwrap(), 63);
+    }
+
+    #[test]
+    fn load_flights_require_matching_ofd_args_and_flags() {
+        let key = LoadKey::new(7, b"answer=42".to_vec(), 0);
+        assert!(key.matches(&LoadKey::new(7, b"answer=42".to_vec(), 0)));
+        assert!(!key.matches(&LoadKey::new(8, b"answer=42".to_vec(), 0)));
+        assert!(!key.matches(&LoadKey::new(7, b"answer=43".to_vec(), 0)));
+        assert!(!key.matches(&LoadKey::new(7, b"answer=42".to_vec(), 1)));
+
+        let colliding_hash = LoadKey {
+            ofd: 7,
+            uargs_hash: key.uargs_hash,
+            uargs: b"different".to_vec(),
+            flags: 0,
+        };
+        assert!(!key.matches(&colliding_hash));
+    }
+
+    #[test]
+    fn module_init_return_matches_linux_zero_negative_and_positive_rules() {
+        assert!(module_init_result(0).is_ok());
+        assert!(module_init_result(1).is_ok());
+        assert_eq!(
+            LinuxError::from(module_init_result(-LinuxError::ENOMEM.code()).unwrap_err()),
+            LinuxError::ENOMEM
+        );
     }
 
     #[test]
