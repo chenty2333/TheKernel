@@ -76,12 +76,14 @@ pub(crate) type DescriptionResource = Box<dyn Any + Send + Sync>;
 /// Preallocated ownership retained by a mapping after fd close or reuse.
 ///
 /// VMA split/fork operations clone this intrusive reference without allocating.
-/// The final release only publishes the node; the exact FileHandle, retained
-/// backing, and node allocation are destroyed by the policy worker.
+/// The final release only publishes the node; the retained backing and node
+/// allocation are destroyed by the policy worker. It deliberately retains the
+/// backing object rather than its `FileDescription`: a mapping must not become
+/// an extra open-file-description owner or postpone `FileLike::final_close`.
 struct DeferredFileLeaseInner {
     next: AtomicPtr<Self>,
     references: AtomicUsize,
-    handle: FileHandle<dyn FileLike>,
+    file: Arc<dyn FileLike>,
     retained: Arc<dyn Any + Send + Sync>,
     _credit: DeferredFileLeaseCredit,
 }
@@ -105,7 +107,7 @@ unsafe impl Sync for DeferredFileLease {}
 
 impl DeferredFileLease {
     pub(crate) fn try_new(
-        handle: FileHandle<dyn FileLike>,
+        file: Arc<dyn FileLike>,
         retained: Arc<dyn Any + Send + Sync>,
     ) -> AxResult<Self> {
         DEFERRED_FILE_LEASE_CREDITS
@@ -116,7 +118,7 @@ impl DeferredFileLease {
         let inner = Box::try_new(DeferredFileLeaseInner {
             next: AtomicPtr::new(ptr::null_mut()),
             references: AtomicUsize::new(1),
-            handle,
+            file,
             retained,
             _credit: DeferredFileLeaseCredit,
         })
@@ -135,7 +137,7 @@ impl DeferredFileLease {
         // SAFETY: a live lease owns one reference to this immutable node.
         let inner = unsafe { self.inner.as_ref() };
         (
-            Arc::strong_count(&inner.handle.description),
+            Arc::strong_count(&inner.file),
             Arc::strong_count(&inner.retained),
         )
     }
@@ -1668,6 +1670,15 @@ impl FileDescription {
 
 impl Drop for FileDescription {
     fn drop(&mut self) {
+        // This is the one true final-OFD boundary. It runs before this
+        // structure releases `inner`; mappings retain the inner object, not
+        // this description, so they cannot delay the notification. Do not
+        // report a prepared but never-published description as an open-file
+        // close. The FileLike contract makes this direct final-drop path
+        // IRQ-safe.
+        if self.open_committed.load(Ordering::Acquire) {
+            self.inner.final_close();
+        }
         let close_source = {
             let mut lifetime = self.descriptor_lifetime.lock();
             if lifetime.references != 0 || lifetime.pending_publications != 0 {
@@ -2009,6 +2020,14 @@ impl<T: FileLike + ?Sized> FileHandle<T> {
     }
 }
 
+impl FileHandle<dyn FileLike> {
+    /// Clones only the object backing a file mapping, never the OFD which
+    /// supplied it. VMA ownership must not extend final-OFD lifetime.
+    pub(crate) fn mapping_backing(&self) -> Arc<dyn FileLike> {
+        self.file.clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct FileDescriptor {
     pub description: Arc<FileDescription>,
@@ -2085,6 +2104,83 @@ mod tests {
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
             Ok(())
         }
+    }
+
+    struct FinalCloseProbe {
+        closes: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        observed_live: Arc<AtomicBool>,
+    }
+
+    impl Drop for FinalCloseProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl Pollable for FinalCloseProbe {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+
+    impl FileLike for FinalCloseProbe {
+        fn final_close(&self) {
+            self.observed_live
+                .store(!self.dropped.load(Ordering::Acquire), Ordering::Release);
+            self.closes.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn stat(&self) -> AxResult<Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("final-close-probe"))
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn final_close_is_once_per_ofd_and_precedes_inner_drop() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed_live = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(FinalCloseProbe {
+            closes: closes.clone(),
+            dropped: dropped.clone(),
+            observed_live: observed_live.clone(),
+        });
+
+        let first = FileDescription::new(inner.clone()).unwrap();
+        let duplicated = first.clone();
+        let independent = FileDescription::new(inner.clone()).unwrap();
+        first.mark_open_committed();
+        independent.mark_open_committed();
+
+        drop(first);
+        assert_eq!(closes.load(Ordering::Acquire), 0);
+        drop(duplicated);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(observed_live.load(Ordering::Acquire));
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(independent);
+        assert_eq!(closes.load(Ordering::Acquire), 2);
+        assert!(observed_live.load(Ordering::Acquire));
+        drop(inner);
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

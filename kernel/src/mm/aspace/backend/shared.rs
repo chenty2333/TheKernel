@@ -1161,7 +1161,7 @@ impl PreparedFixedSharedMapping {
         let ofd_key = handle.open_file_description_key();
         let owner = if plan.retains_description() {
             let retained: Arc<dyn Any + Send + Sync> = pages.clone();
-            Some(DeferredFileLease::try_new(handle, retained)?)
+            Some(DeferredFileLease::try_new(handle.mapping_backing(), retained)?)
         } else {
             None
         };

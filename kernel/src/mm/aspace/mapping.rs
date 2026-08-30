@@ -427,6 +427,7 @@ mod tests {
 
     struct DropCountingMappingOwner {
         drops: Arc<AtomicUsize>,
+        final_closes: Arc<AtomicUsize>,
     }
 
     impl Drop for DropCountingMappingOwner {
@@ -450,6 +451,10 @@ mod tests {
     }
 
     impl FileLike for DropCountingMappingOwner {
+        fn final_close(&self) {
+            self.final_closes.fetch_add(1, Ordering::AcqRel);
+        }
+
         fn stat(&self) -> AxResult<crate::file::Kstat> {
             Err(AxError::InvalidInput)
         }
@@ -737,15 +742,18 @@ mod tests {
     #[test]
     fn final_file_like_mapping_release_defers_owner_destruction() {
         let drops = Arc::new(AtomicUsize::new(0));
+        let final_closes = Arc::new(AtomicUsize::new(0));
         let inner = Arc::new(DropCountingMappingOwner {
             drops: drops.clone(),
+            final_closes: final_closes.clone(),
         });
         let description = FileDescription::new(inner.clone()).unwrap();
+        description.mark_open_committed();
         let ofd_key = description.id().get();
         let handle = FileHandle::<dyn FileLike>::from_description_for_test(description.clone());
         let retained: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
-        let owner = DeferredFileLease::try_new(handle, retained).unwrap();
-        assert_eq!(owner.retained_reference_counts(), (2, 1));
+        let owner = DeferredFileLease::try_new(handle.mapping_backing(), retained).unwrap();
+        assert_eq!(owner.retained_reference_counts(), (4, 1));
         let mapping = FileLikeMappingLease::new(
             owner,
             ofd_key,
@@ -759,6 +767,10 @@ mod tests {
 
         drop(inner);
         drop(description);
+        drop(handle);
+        // The mapping retains only the backing object. It cannot extend the
+        // OFD lifetime or postpone the final-close notification.
+        assert_eq!(final_closes.load(Ordering::Acquire), 1);
         drop(mapping);
         assert_eq!(drops.load(Ordering::Acquire), 0);
 
