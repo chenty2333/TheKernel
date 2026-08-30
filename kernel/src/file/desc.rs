@@ -1617,6 +1617,10 @@ impl FileLike for FileDescription {
         self.inner.stat()
     }
 
+    fn cachestat(&self, first_page: u64, last_page: u64) -> AxResult<axfs::CachedFileCacheStat> {
+        self.inner.cachestat(first_page, last_page)
+    }
+
     fn update_timestamps(
         &self,
         atime: Option<axfs_ng_vfs::Timestamp>,

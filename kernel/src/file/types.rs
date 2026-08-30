@@ -458,6 +458,12 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn stat(&self) -> AxResult<Kstat>;
 
+    /// Linux cachestat(2) observes an object's page-cache mapping.  Objects
+    /// without one behave like an empty mapping.
+    fn cachestat(&self, _first_page: u64, _last_page: u64) -> AxResult<axfs::CachedFileCacheStat> {
+        Ok(axfs::CachedFileCacheStat::default())
+    }
+
     /// Updates descriptor-owned timestamps for objects which do not have a VFS
     /// location (for example pipes and sockets).  VFS-backed files are updated
     /// through their inode setattr transaction instead.
