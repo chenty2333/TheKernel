@@ -30,14 +30,35 @@ const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_IOC_FLAG_GROUP: usize = 1;
 
 pub(crate) struct PerfGroup {
+    /// A perf group is scoped to one exact task context. Task IDs are never
+    /// reused by a live `AxTask`, so this remains stable even if the Linux TID
+    /// namespace later recycles its visible number.
+    target_task_id: u64,
+    /// The only descriptor accepted as `group_fd`.
+    leader_id: u64,
     members: Mutex<Vec<Weak<PerfEventFile>>>,
 }
 
 impl PerfGroup {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(target_task_id: u64, leader_id: u64) -> Arc<Self> {
         Arc::new(Self {
+            target_task_id,
+            leader_id,
             members: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn accepts_target(&self, target_task_id: u64) -> bool {
+        self.target_task_id == target_task_id
+    }
+
+    fn is_leader(&self, id: u64) -> bool {
+        self.leader_id == id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_group_leader_for_test(&self, id: u64) -> bool {
+        self.is_leader(id)
     }
 
     fn add(&self, event: &Arc<PerfEventFile>) -> AxResult<()> {
@@ -133,6 +154,10 @@ impl PerfEventFile {
 
     pub(crate) fn group(&self) -> Arc<PerfGroup> {
         self.group.clone()
+    }
+
+    pub(crate) fn is_group_leader(&self) -> bool {
+        self.group.is_leader(self.id)
     }
 
     fn count(&self) -> u64 {
