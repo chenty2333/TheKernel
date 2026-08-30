@@ -670,12 +670,6 @@ pub(crate) struct FsMountFd {
     root: axfs_ng_vfs::Location,
 }
 
-impl FsMountFd {
-    pub(crate) fn root(&self) -> &axfs_ng_vfs::Location {
-        &self.root
-    }
-}
-
 struct BindFilesystem {
     root: DirEntry,
     name: String,
