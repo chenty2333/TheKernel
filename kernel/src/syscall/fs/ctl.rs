@@ -1621,6 +1621,68 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
+/// Legacy timeval front-end shared by `futimesat(2)`.
+///
+/// Unlike `utimensat`, this ABI never accepts special nanosecond values: the
+/// microseconds must be checked before conversion so invalid values cannot be
+/// hidden by the `* 1000` conversion.
+fn legacy_futimesat_pair(
+    times: [linux_raw_sys::general::__kernel_old_timeval; 2],
+) -> AxResult<(Duration, Duration)> {
+    Ok((
+        times[0].try_into_time_value()?,
+        times[1].try_into_time_value()?,
+    ))
+}
+
+/// Linux's legacy `do_futimesat` wrapper: copy and validate the old timeval
+/// pair first, then delegate pathname/dirfd resolution and setattr policy to
+/// the common utimensat path with no flags.
+pub fn sys_futimesat<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    dirfd: i32,
+    path: *const c_char,
+    times: *const [linux_raw_sys::general::__kernel_old_timeval; 2],
+) -> AxResult<isize> {
+    let (atime, mtime, intent) = if let Some(times) = times.nullable() {
+        // SAFETY: the x86_64 legacy ABI has two initialized integer words per
+        // timeval; usercopy establishes the complete pair before conversion.
+        let times = unsafe {
+            times
+                .vm_read_uninit(memory)
+                .map_err(map_usercopy_error)?
+                .assume_init()
+        };
+        let (atime, mtime) = legacy_futimesat_pair(times)?;
+        (Some(atime), Some(mtime), TimeUpdate::Explicit)
+    } else {
+        let now = wall_time();
+        (Some(now), Some(now), TimeUpdate::Now)
+    };
+
+    // `do_utimes` treats a null pathname as an fd target only when dfd is a
+    // real descriptor. A null pathname with AT_FDCWD is still a bad user
+    // pathname, not an empty-path request.
+    if path.is_null() {
+        if dirfd == AT_FDCWD {
+            return Err(AxError::BadAddress);
+        }
+        update_times(
+            memory,
+            dirfd,
+            path,
+            atime,
+            mtime,
+            intent,
+            intent,
+            AT_EMPTY_PATH,
+        )?;
+    } else {
+        update_times(memory, dirfd, path, atime, mtime, intent, intent, 0)?;
+    }
+    Ok(0)
+}
+
 pub fn sys_utimensat<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
@@ -1953,6 +2015,35 @@ mod tests {
 
     use super::*;
     use crate::task::DacCredentialView;
+
+    #[test]
+    fn legacy_futimesat_rejects_invalid_microseconds_before_conversion() {
+        let valid = [
+            __kernel_old_timeval {
+                tv_sec: 7,
+                tv_usec: 999_999,
+            },
+            __kernel_old_timeval {
+                tv_sec: 9,
+                tv_usec: 0,
+            },
+        ];
+        assert_eq!(
+            legacy_futimesat_pair(valid),
+            Ok((Duration::new(7, 999_999_000), Duration::new(9, 0)))
+        );
+
+        for usec in [-1, 1_000_000] {
+            let invalid = [
+                __kernel_old_timeval {
+                    tv_sec: 0,
+                    tv_usec: usec,
+                },
+                valid[1],
+            ];
+            assert_eq!(legacy_futimesat_pair(invalid), Err(AxError::InvalidInput));
+        }
+    }
 
     #[test]
     fn getdents_records_match_native_x86_64_layouts() {

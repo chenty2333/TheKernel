@@ -386,6 +386,9 @@ pub(super) fn dispatch_syscall(
         Sysno::utimes => with_user_memory(aspace(), |memory| {
             sys_utimes(memory, uctx.arg0() as _, uctx.arg1() as _)
         }),
+        Sysno::futimesat => with_user_memory(aspace(), |memory| {
+            sys_futimesat(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
         Sysno::utimensat => with_user_memory(aspace(), |memory| {
             sys_utimensat(
                 memory,
