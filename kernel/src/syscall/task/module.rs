@@ -1,9 +1,9 @@
 //! Native x86-64 ET_REL module admission.
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axtask::current;
+use axtask::{WaitQueue, current};
 use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_NONBLOCK, O_TRUNC, O_WRONLY};
 use spin::Lazy;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
@@ -77,6 +77,66 @@ struct M {
     exit: Option<usize>,
 }
 static MODULES: Lazy<spin::Mutex<Vec<Slot>>> = Lazy::new(|| spin::Mutex::new(Vec::new()));
+struct LoadFlight {
+    key: u64,
+    state: spin::Mutex<Option<i32>>,
+    done: WaitQueue,
+}
+static LOAD_FLIGHTS: Lazy<spin::Mutex<Vec<Arc<LoadFlight>>>> =
+    Lazy::new(|| spin::Mutex::new(Vec::new()));
+
+fn load_flight(key: u64) -> AxResult<(Arc<LoadFlight>, bool)> {
+    let mut flights = LOAD_FLIGHTS.lock();
+    if let Some(flight) = flights.iter().find(|flight| flight.key == key) {
+        return Ok((flight.clone(), false));
+    }
+    flights.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    let flight = Arc::try_new(LoadFlight {
+        key,
+        state: spin::Mutex::new(None),
+        done: WaitQueue::new(),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    flights.push(flight.clone());
+    Ok((flight, true))
+}
+
+fn complete_flight(flight: &Arc<LoadFlight>, result: AxResult<isize>) -> AxResult<isize> {
+    let code = match result {
+        Ok(_) => 0,
+        Err(error) => LinuxError::from(error).code(),
+    };
+    *flight.state.lock() = Some(code);
+    LOAD_FLIGHTS
+        .lock()
+        .retain(|candidate| !Arc::ptr_eq(candidate, flight));
+    flight.done.notify_all(false);
+    if code == 0 {
+        Ok(0)
+    } else {
+        Err(LinuxError::try_from(code)
+            .unwrap_or(LinuxError::EINVAL)
+            .into())
+    }
+}
+
+fn await_flight(flight: Arc<LoadFlight>) -> AxResult<isize> {
+    flight
+        .done
+        .wait_until(|| flight.state.lock().is_some())
+        .map_err(AxError::from)?;
+    let code = flight
+        .state
+        .lock()
+        .expect("load flight completed without result");
+    if code == 0 {
+        Ok(0)
+    } else {
+        Err(LinuxError::try_from(code)
+            .unwrap_or(LinuxError::EINVAL)
+            .into())
+    }
+}
 fn no<T>() -> AxResult<T> {
     Err(LinuxError::ENOEXEC.into())
 }
@@ -700,17 +760,33 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     if f.status_flags() & O_ACCMODE == O_WRONLY {
         return Err(AxError::BadFileDescriptor);
     }
-    let n = usize::try_from(f.stat()?.size).map_err(|_| AxError::InvalidInput)?;
+    let (flight, owner) = load_flight(f.open_file_description_key())?;
+    if !owner {
+        return await_flight(flight);
+    }
+    let n = match f
+        .stat()
+        .and_then(|stat| usize::try_from(stat.size).map_err(|_| AxError::InvalidInput))
+    {
+        Ok(n) => n,
+        Err(error) => return complete_flight(&flight, Err(error)),
+    };
     if n == 0 || n > MAX {
-        return Err(AxError::InvalidInput);
+        return complete_flight(&flight, Err(AxError::InvalidInput));
     }
     let mut b = Vec::new();
-    b.try_reserve_exact(n).map_err(|_| AxError::NoMemory)?;
-    b.resize(n, 0);
-    if f.inner().read_at(&mut b, 0)? != n {
-        return no();
+    if b.try_reserve_exact(n).is_err() {
+        return complete_flight(&flight, Err(AxError::NoMemory));
     }
-    activate(prep(&b, &a)?)
+    b.resize(n, 0);
+    let copied = match f.inner().read_at(&mut b, 0) {
+        Ok(copied) => copied,
+        Err(error) => return complete_flight(&flight, Err(error)),
+    };
+    if copied != n {
+        return complete_flight(&flight, no());
+    }
+    complete_flight(&flight, prep(&b, &a).and_then(activate))
 }
 pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
