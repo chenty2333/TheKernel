@@ -10,16 +10,21 @@ use crate::{
     bpf::{
         alloc_prog_id,
         defs::*,
+        helpers::BpfExecution,
         prog::{BpfProgram, uses_raw_ctx_prog_type},
-        read_bpf_attr, read_user_slice, require_bpf_attr_range, verifier,
-        vm::BpfVm,
+        read_bpf_attr, read_user_slice, register_prog_id, require_bpf_attr_range, verifier,
         write_bpf_attr_value, write_user_bytes,
     },
-    file::{FileLike, bpf::BpfProgFd},
+    bpf_security::{authorize_program_load, authorize_token_program_load, reserve_memory},
+    file::{
+        FileLike,
+        bpf::{BpfProgFd, BpfTokenFd},
+        get_typed_file,
+    },
 };
 
 const BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES: u64 = 4 * 1024 * 1024;
-const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = BPF_MAX_EXEC_INSNS as u64;
+const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = axbpf::DEFAULT_MAX_EXECUTION_STEPS as u64;
 const BPF_PROG_TEST_RUN_MAX_TOTAL_AUX_BYTES: u64 = 64 * 1024 * 1024;
 const BPF_PROG_LICENSE_MAX_LEN: usize = 128;
 
@@ -39,9 +44,18 @@ pub fn bpf_prog_load<M: UserMemory + ?Sized>(
     );
 
     validate_prog_load_attr(&attr)?;
+    if attr.prog_token_fd == 0 {
+        authorize_program_load(attr.prog_type)?;
+    } else {
+        if attr.prog_token_fd < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let token = get_typed_file::<BpfTokenFd>(attr.prog_token_fd)?;
+        authorize_token_program_load(&token.grant, attr.prog_type)?;
+    }
 
     // Validate basic parameters
-    if attr.insn_cnt == 0 || attr.insn_cnt > BPF_MAX_INSNS as u32 {
+    if attr.insn_cnt == 0 || attr.insn_cnt > axbpf::DEFAULT_MAX_INSTRUCTIONS as u32 {
         return Err(AxError::InvalidInput);
     }
 
@@ -66,16 +80,41 @@ pub fn bpf_prog_load<M: UserMemory + ?Sized>(
 
     // Create program object
     let prog_id = alloc_prog_id();
+    // Account for the verified instruction image and retained map bindings;
+    // the verifier's bounded instruction count makes this exact and keeps the
+    // charge alive with the resulting program FD.
+    let instruction_bytes = (attr.insn_cnt as usize)
+        .checked_mul(size_of::<BpfInsn>())
+        .ok_or(AxError::NoMemory)?;
+    let binding_bytes = verified
+        .maps
+        .len()
+        .checked_mul(size_of::<crate::bpf::prog::BpfMapBinding>())
+        .ok_or(AxError::NoMemory)?;
+    let memory_charge = reserve_memory(
+        instruction_bytes
+            .checked_add(binding_bytes)
+            .ok_or(AxError::NoMemory)?,
+    )?;
     let program = Arc::new(BpfProgram {
+        mechanism: verified.portable,
         prog_type: attr.prog_type,
-        insns: verified.insns,
-        decoded_insns: verified.decoded_insns,
         name: attr.prog_name,
         prog_id,
         expected_attach_type: attr.expected_attach_type,
+        attach_btf_id: attr.attach_btf_id,
         maps: verified.maps,
+        bound_maps: axsync::spin::SpinNoIrq::new(Vec::new()),
+        streams: [
+            axsync::Mutex::new(crate::bpf::prog::BpfStreamState::new()),
+            axsync::Mutex::new(crate::bpf::prog::BpfStreamState::new()),
+        ],
         gpl_compatible,
+        memory_charge,
+        run_time_ns: core::sync::atomic::AtomicU64::new(0),
+        run_cnt: core::sync::atomic::AtomicU64::new(0),
     });
+    register_prog_id(prog_id, &program)?;
 
     // Create fd
     BpfProgFd::new(program)
@@ -102,11 +141,7 @@ pub fn bpf_prog_test_run<M: UserMemory + ?Sized>(
     let prog_fd = BpfProgFd::from_fd(attr.prog_fd as _)?;
     let prog = &prog_fd.prog;
 
-    let exec_insn_cnt = prog
-        .decoded_insns
-        .iter()
-        .filter(|aux| !aux.is_continuation())
-        .count();
+    let exec_insn_cnt = prog.mechanism.instructions().len();
     let repeat = validate_prog_test_run_attr(&attr, prog, exec_insn_cnt)?;
 
     // Read context from user space (if provided)
@@ -127,14 +162,12 @@ pub fn bpf_prog_test_run<M: UserMemory + ?Sized>(
         if iter != 0 && !ctx.is_empty() {
             ctx.copy_from_slice(&ctx_template);
         }
-        let mut vm = BpfVm::with_aux_budget(
-            &prog.insns,
-            &prog.decoded_insns,
-            &prog.maps,
-            aux_budget_remaining,
-        );
-        retval = vm.execute(&mut ctx)?;
-        aux_budget_remaining = vm.remaining_aux_budget();
+        let stats = crate::bpf::prog::BpfStatsRunGuard::begin();
+        let execution = BpfExecution::new(&mut ctx, &prog.maps, aux_budget_remaining)
+            .with_streams(&prog.streams);
+        let result = execution.execute(&prog.mechanism);
+        prog.account_run(&stats);
+        (retval, aux_budget_remaining) = result?;
     }
 
     let duration = axhal::time::monotonic_time_nanos()
@@ -190,13 +223,20 @@ pub fn bpf_prog_test_run<M: UserMemory + ?Sized>(
 }
 
 fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
-    if !uses_raw_ctx_prog_type(attr.prog_type) {
+    if !uses_raw_ctx_prog_type(attr.prog_type)
+        && attr.prog_type != crate::bpf::prog::BPF_PROG_TYPE_LSM
+    {
         return Err(AxError::InvalidInput);
     }
 
     if attr.kern_version != 0
         || attr.prog_flags != 0
-        || attr.expected_attach_type != 0
+        || (attr.expected_attach_type != 0
+            && !valid_trace_expected_attach_type(attr.prog_type, attr.expected_attach_type)
+            && !((attr.prog_type == crate::bpf::defs::BPF_PROG_TYPE_CGROUP_SKB
+                || attr.prog_type == crate::bpf::defs::BPF_PROG_TYPE_NETFILTER
+                || attr.prog_type == crate::bpf::defs::BPF_PROG_TYPE_XDP)
+                && crate::bpf::prog::is_network_attach_type(attr.expected_attach_type)))
         || attr.prog_ifindex != 0
         || attr.prog_btf_fd != 0
         || attr.func_info_rec_size != 0
@@ -205,13 +245,16 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
         || attr.line_info_rec_size != 0
         || attr.line_info != 0
         || attr.line_info_cnt != 0
-        || attr.attach_btf_id != 0
+        || (attr.attach_btf_id != 0
+            && !matches!(
+                attr.prog_type,
+                crate::bpf::prog::BPF_PROG_TYPE_TRACING | crate::bpf::prog::BPF_PROG_TYPE_LSM
+            ))
         || attr.attach_prog_fd_or_btf_obj_fd != 0
         || attr.core_relo_cnt != 0
         || attr.fd_array != 0
         || attr.core_relos != 0
         || attr.core_relo_rec_size != 0
-        || attr.prog_token_fd != 0
         || attr.fd_array_cnt != 0
         || attr.signature != 0
         || attr.signature_size != 0
@@ -229,6 +272,28 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
     }
 
     Ok(())
+}
+
+fn valid_trace_expected_attach_type(prog_type: u32, attach_type: u32) -> bool {
+    use crate::bpf::prog::*;
+    match prog_type {
+        BPF_PROG_TYPE_TRACING => matches!(
+            attach_type,
+            BPF_TRACE_RAW_TP
+                | BPF_TRACE_FENTRY
+                | BPF_TRACE_FEXIT
+                | BPF_MODIFY_RETURN
+                | BPF_TRACE_ITER
+        ),
+        BPF_PROG_TYPE_LSM => attach_type == BPF_LSM_MAC,
+        crate::bpf::defs::BPF_PROG_TYPE_TRACEPOINT
+        | crate::bpf::defs::BPF_PROG_TYPE_RAW_TRACEPOINT
+        | crate::bpf::defs::BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE
+        | crate::bpf::defs::BPF_PROG_TYPE_KPROBE => {
+            attach_type == thekernel_linux_bpf::BPF_PERF_EVENT
+        }
+        _ => false,
+    }
 }
 
 fn validate_prog_test_run_attr(
@@ -260,7 +325,11 @@ fn validate_prog_test_run_attr(
         return Err(AxError::InvalidInput);
     }
 
-    if prog_type == BPF_PROG_TYPE_RAW_TRACEPOINT && (attr.ctx_out != 0 || attr.repeat != 0) {
+    if matches!(
+        prog_type,
+        BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE
+    ) && (attr.ctx_out != 0 || attr.repeat != 0)
+    {
         return Err(AxError::InvalidInput);
     }
 
