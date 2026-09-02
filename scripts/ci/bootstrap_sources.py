@@ -113,6 +113,11 @@ def verify_existing(
             f"existing checkout is {head}, expected {source.ref}: {destination}; "
             "remove or update it yourself, then rerun"
         )
+    branch = git(destination, "branch", "--show-current")
+    if branch:
+        raise BootstrapError(
+            f"existing checkout is not detached at {source.ref}: {destination}"
+        )
 
 
 def create_checkout(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,14 @@ def run_git(directory: Path, *arguments: str) -> str:
 
 class BootstrapSourcesTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        temporary_root = Path(
+            os.environ.get(
+                "THEKERNEL_TEST_TMPDIR",
+                Path.home() / ".cache" / "thekernel-test-tmp",
+            )
+        )
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=temporary_root)
         self.root = Path(self.temporary.name)
         self.parent = self.root / "parent"
         self.parent.mkdir()
@@ -47,7 +55,10 @@ class BootstrapSourcesTests(unittest.TestCase):
         worktree = self.root / f"{name}-worktree"
         remote = self.remotes / "example" / f"{name}.git"
         remote.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", "--quiet", str(worktree)], check=True)
+        subprocess.run(
+            ["git", "init", "--quiet", "--initial-branch=main", str(worktree)],
+            check=True,
+        )
         run_git(worktree, "config", "user.email", "tests@example.invalid")
         run_git(worktree, "config", "user.name", "TheKernel tests")
         (worktree / "source.txt").write_text(f"{name}\n", encoding="utf-8")
@@ -63,6 +74,11 @@ class BootstrapSourcesTests(unittest.TestCase):
         for name, source in self.sources.items():
             destination = self.parent / source.path
             self.assertEqual(run_git(destination, "rev-parse", "HEAD"), source.ref)
+            self.assertEqual(run_git(destination, "branch", "--show-current"), "")
+            self.assertEqual(
+                (destination / "source.txt").read_text(encoding="utf-8"),
+                f"{name}\n",
+            )
             self.assertEqual(run_git(destination, "status", "--porcelain"), "")
 
         bootstrap_sources.bootstrap(self.parent, self.sources, str(self.remotes))
@@ -79,12 +95,24 @@ class BootstrapSourcesTests(unittest.TestCase):
         (destination / "second.txt").write_text("second\n", encoding="utf-8")
         run_git(destination, "add", "second.txt")
         run_git(destination, "commit", "--quiet", "-m", "second")
+        run_git(destination, "checkout", "--quiet", "--detach")
         original_head = run_git(destination, "rev-parse", "HEAD")
 
         with self.assertRaisesRegex(bootstrap_sources.BootstrapError, "expected"):
             bootstrap_sources.bootstrap(self.parent, {"ax": source}, str(self.remotes))
 
         self.assertEqual(run_git(destination, "rev-parse", "HEAD"), original_head)
+
+    def test_refuses_an_attached_branch_at_the_exact_commit(self) -> None:
+        source = self.sources["ax"]
+        destination = self.parent / source.path
+        subprocess.run(
+            ["git", "clone", "--quiet", str(self.remotes / "example" / "ax.git"), str(destination)],
+            check=True,
+        )
+        self.assertEqual(run_git(destination, "rev-parse", "HEAD"), source.ref)
+        with self.assertRaisesRegex(bootstrap_sources.BootstrapError, "not detached"):
+            bootstrap_sources.bootstrap(self.parent, {"ax": source}, str(self.remotes))
 
     def test_refuses_dirty_existing_checkout(self) -> None:
         bootstrap_sources.bootstrap(self.parent, {"ax": self.sources["ax"]}, str(self.remotes))
