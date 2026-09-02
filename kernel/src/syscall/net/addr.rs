@@ -1,7 +1,7 @@
 //! Wrapper for [`sockaddr`]. Using trait to convert between [`SocketAddr`] and
 //! [`sockaddr`] types.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     mem::size_of,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -12,6 +12,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axnet::vsock::VsockAddr;
 use axnet::{SocketAddrEx, unix::UnixSocketAddr};
 use linux_raw_sys::net::*;
+use thekernel_linux_net::{UnixName as AbiUnixName, UnixSockAddr as AbiUnixSockAddr};
 
 use crate::mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error};
 
@@ -80,40 +81,23 @@ fn try_arc_bytes(value: &[u8]) -> AxResult<Arc<Vec<u8>>> {
     Arc::try_new(owned).map_err(|_| AxError::NoMemory)
 }
 
-fn try_arc_string(value: &str) -> AxResult<Arc<String>> {
-    let mut owned = String::new();
-    owned
-        .try_reserve_exact(value.len())
-        .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(value);
-    Arc::try_new(owned).map_err(|_| AxError::NoMemory)
-}
-
 fn parse_unix_socket_addr(snapshot: &[u8]) -> AxResult<UnixSocketAddr> {
     if !(size_of::<__kernel_sa_family_t>()..=UNIX_SOCKADDR_CAPACITY).contains(&snapshot.len()) {
         return Err(AxError::InvalidInput);
     }
-    let family = __kernel_sa_family_t::from_ne_bytes([snapshot[0], snapshot[1]]);
-    if family as u32 != AF_UNIX {
-        // Keep the networking syscall layer's existing family-mismatch errno;
-        // unlike malformed AF_UNIX lengths, this is an unsupported family.
-        return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+    // The ABI crate owns sockaddr_un family/name framing. Socket ownership and
+    // byte-exact pathname storage remain in the kernel layer.
+    match AbiUnixSockAddr::decode(snapshot)
+        .map_err(|error| match error {
+            thekernel_linux_net::NetError::InvalidFamily => AxError::from(LinuxError::EAFNOSUPPORT),
+            _ => AxError::InvalidInput,
+        })?
+        .name
+    {
+        AbiUnixName::Unnamed => Ok(UnixSocketAddr::Unnamed),
+        AbiUnixName::Abstract(name) => try_arc_bytes(name).map(UnixSocketAddr::Abstract),
+        AbiUnixName::Pathname(path) => try_arc_bytes(path).map(UnixSocketAddr::Path),
     }
-
-    let data = &snapshot[size_of::<__kernel_sa_family_t>()..];
-    if data.is_empty() {
-        return Ok(UnixSocketAddr::Unnamed);
-    }
-    if data[0] == 0 {
-        return try_arc_bytes(&data[1..]).map(UnixSocketAddr::Abstract);
-    }
-
-    let end = data
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(data.len());
-    let path = str::from_utf8(&data[..end]).map_err(|_| AxError::InvalidInput)?;
-    try_arc_string(path).map(UnixSocketAddr::Path)
 }
 unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
@@ -160,7 +144,7 @@ fn serialize_unix_socket_addr(
                 return Err(AxError::InvalidInput);
             }
             let end = family_len + path.len();
-            buf[family_len..end].copy_from_slice(path.as_bytes());
+            buf[family_len..end].copy_from_slice(path);
             buf[end] = 0;
             end + 1
         }

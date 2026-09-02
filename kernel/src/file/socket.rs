@@ -8,6 +8,7 @@ use axnet::{
 
 use super::{
     af_alg::AfAlgSocket,
+    af_xdp::XdpSocket,
     desc::{FileDescription, FileHandle, OfdIoStatus},
     fd_table::get_file_description,
     fs::File,
@@ -60,6 +61,7 @@ pub(crate) enum SocketBackendKind {
     Netlink,
     Packet,
     AfAlg,
+    Xdp,
 }
 
 /// Validated, kernel-owned socket address passed to policy. The original byte
@@ -354,6 +356,9 @@ impl PinnedSocketDescription {
         if description.inner.downcast_ref::<AfAlgSocket>().is_some() {
             return Ok(SocketBackendKind::AfAlg);
         }
+        if description.inner.downcast_ref::<XdpSocket>().is_some() {
+            return Ok(SocketBackendKind::Xdp);
+        }
         if description
             .inner
             .downcast_ref::<File>()
@@ -412,6 +417,16 @@ impl PinnedSocketDescription {
             .ok_or(AxError::BadState)
     }
 
+    pub(crate) fn xdp(&self) -> AxResult<&XdpSocket> {
+        if self.backend()? != SocketBackendKind::Xdp {
+            return Err(AxError::NotASocket);
+        }
+        self.description
+            .inner
+            .downcast_ref::<XdpSocket>()
+            .ok_or(AxError::BadState)
+    }
+
     pub(crate) fn security_ref(&self) -> AxResult<SocketSecurityRef<'_>> {
         let backend = self.backend()?;
         let net_namespace = match backend {
@@ -419,6 +434,7 @@ impl PinnedSocketDescription {
             SocketBackendKind::Netlink => Some(self.netlink()?.net_namespace()),
             SocketBackendKind::Packet => Some(self.packet()?.net_namespace()),
             SocketBackendKind::AfAlg => None,
+            SocketBackendKind::Xdp => Some(self.xdp()?.net_namespace()),
         };
         Ok(SocketSecurityRef {
             description: &self.description,
@@ -429,6 +445,10 @@ impl PinnedSocketDescription {
 
     pub(crate) fn into_description(self) -> Arc<FileDescription> {
         self.description
+    }
+
+    pub(crate) fn description(&self) -> &Arc<FileDescription> {
+        &self.description
     }
 }
 
@@ -474,8 +494,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("non-socket"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"non-socket")))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult<()> {

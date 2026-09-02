@@ -9,17 +9,20 @@ use axio::prelude::*;
 use axnet::{
     CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Socket as AxSocket, SocketAddrEx,
     SocketOps,
-    options::{Configurable, GetSocketOption},
+    options::{Configurable, GetSocketOption, SocketFault},
+    sctp::{SctpRecvMetadata, SctpSendMetadata},
     unix::UnixSocketAddr,
 };
 use linux_raw_sys::{
     general::timespec,
     net::{
-        AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_NOSIGNAL,
-        MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE,
+        MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr,
+        sockaddr, socklen_t,
     },
 };
 use memory_addr::PAGE_SIZE_4K;
+use thekernel_linux_net::{PendingErrorPolicy, SocketWaitKind, plan_pending_error};
 use thekernel_linux_packet::ReceiveFlags as PacketReceiveFlags;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
@@ -27,10 +30,11 @@ use super::{
     SocketSyscallSnapshot,
     addr::SocketAddrExt,
     packet::{decode_send_address, snapshot_address, write_received_address},
+    socket::{map_socket_send_error, socket_failure, validate_network_address},
 };
 use crate::{
     file::{
-        PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind,
+        PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind, WriteBuf,
         af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
     },
     mm::{
@@ -51,6 +55,14 @@ const MSG_WAITFORONE: u32 = 0x1_0000;
 // supports SCM_RIGHTS here, so 64 KiB leaves ample room for fragmented headers
 // while imposing a hard parsing/work bound.
 const MAX_SENDMSG_CONTROL_LEN: usize = 64 * 1024;
+const SOL_SCTP: u32 = 132;
+const SOL_DCCP: u32 = 269;
+const DCCP_SCM_PRIORITY: u32 = 1;
+const SCTP_SNDRCV: u32 = 1;
+const SCTP_SNDINFO: u32 = 2;
+const SCTP_RCVINFO: u32 = 3;
+const SCTP_NXTINFO: u32 = 4;
+const SCTP_PRINFO: u32 = 5;
 const SUPPORTED_RECVMSG_FLAGS: u32 =
     MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB;
 const SUPPORTED_SENDMSG_FLAGS: u32 = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB;
@@ -59,7 +71,7 @@ fn remember_socket_error(socket: &PinnedSocketDescription, error: AxError) {
     if socket.backend() == Ok(SocketBackendKind::Network)
         && let Ok(socket) = socket.network()
     {
-        socket.set_pending_error(LinuxError::from(error));
+        socket.set_pending_error(SocketFault::from_ax_error(error));
     }
 }
 
@@ -67,16 +79,20 @@ fn take_pending_socket_error(socket: &PinnedSocketDescription) -> AxResult {
     if socket.backend()? != SocketBackendKind::Network {
         return Ok(());
     }
-    let mut error = 0;
+    let mut error = None;
     socket
         .network()?
         .get_option(GetSocketOption::Error(&mut error))?;
-    if error == 0 {
+    let Some(error) = error else {
         return Ok(());
-    }
-    Err(LinuxError::try_from(error)
-        .map_err(|_| AxError::BadState)?
-        .into())
+    };
+    let failure = match error {
+        SocketFault::ConnectionRefused => thekernel_linux_net::SocketFailure::ConnectionRefused,
+        SocketFault::ConnectionReset => thekernel_linux_net::SocketFailure::ConnectionReset,
+        SocketFault::TimedOut => thekernel_linux_net::SocketFailure::TimedOut,
+        SocketFault::Other => thekernel_linux_net::SocketFailure::Io,
+    };
+    Err(socket_failure(failure))
 }
 
 fn admitted_sendmmsg_vlen(vlen: u32) -> Option<usize> {
@@ -98,7 +114,10 @@ fn admitted_recvmmsg_vlen(vlen: u32) -> Option<usize> {
 }
 
 const fn recvmmsg_consumes_pending_error(flags: u32) -> bool {
-    flags & MSG_ERRQUEUE == 0
+    matches!(
+        plan_pending_error(SocketWaitKind::Receive),
+        PendingErrorPolicy::ConsumeBeforeAttempt
+    ) && flags & MSG_ERRQUEUE == 0
 }
 
 fn read_user_copy<T: Copy>(capability: &UserMemoryCapability, ptr: UserConstPtr<T>) -> AxResult<T> {
@@ -321,6 +340,15 @@ impl IoBufMut for ProgressiveVmBytesMut {
     }
 }
 
+// Receive backends that consume a datagram need the destination capacity as
+// well as its writable cursor.  This writer has no readable side, but its
+// remaining capacity is exactly the `IoBuf` fact required by `WriteBuf`.
+impl IoBuf for ProgressiveVmBytesMut {
+    fn remaining(&self) -> usize {
+        self.remaining_mut()
+    }
+}
+
 /// Adds page-sized read/write requests around the capability-backed iovec
 /// cursor. `IoVectorBufIo` already preserves progress at iovec boundaries;
 /// this adapter extends the same rule to a fault in the middle of one iovec.
@@ -467,6 +495,12 @@ impl<T: Write + IoBufMut> IoBufMut for StrictDatagramWrite<T> {
     }
 }
 
+impl<T: Write + IoBufMut> IoBuf for StrictDatagramWrite<T> {
+    fn remaining(&self) -> usize {
+        self.remaining_mut()
+    }
+}
+
 fn recv_copyout_requires_error(socket: &PinnedSocketDescription) -> AxResult<bool> {
     // axnet's UDP receive dequeues before invoking `dst.write`, while MSG_PEEK
     // takes the non-consuming peek path. Unix datagrams follow the same
@@ -478,8 +512,8 @@ fn recv_copyout_requires_error(socket: &PinnedSocketDescription) -> AxResult<boo
         SocketBackendKind::Network => {
             let socket = socket.network()?;
             Ok(match &socket.inner {
-                AxSocket::Udp(_) => true,
-                AxSocket::Unix(unix) => unix.is_datagram(),
+                AxSocket::Raw(_) | AxSocket::Udp(_) | AxSocket::Sctp(_) => true,
+                AxSocket::Unix(unix) => unix.is_record_oriented(),
                 _ => false,
             })
         }
@@ -593,7 +627,124 @@ fn cmsg_align(len: usize) -> Option<usize> {
         .map(|len| len & !(size_of::<usize>() - 1))
 }
 
-fn parse_send_control(capability: &UserMemoryCapability, msg: &msghdr) -> AxResult<Vec<CMsgData>> {
+fn native_u16(bytes: &[u8], offset: usize) -> AxResult<u16> {
+    Ok(u16::from_ne_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .ok_or(AxError::InvalidInput)?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+fn native_u32(bytes: &[u8], offset: usize) -> AxResult<u32> {
+    Ok(u32::from_ne_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or(AxError::InvalidInput)?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+fn read_cmsg_body(
+    capability: &UserMemoryCapability,
+    header_address: usize,
+    header: &cmsghdr,
+    exact_len: usize,
+) -> AxResult<Vec<u8>> {
+    let body_len = header
+        .cmsg_len
+        .checked_sub(size_of::<cmsghdr>())
+        .ok_or(AxError::InvalidInput)?;
+    if body_len != exact_len {
+        return Err(AxError::InvalidInput);
+    }
+    let data_address = header_address
+        .checked_add(size_of::<cmsghdr>())
+        .ok_or(AxError::BadAddress)?;
+    snapshot_user_bytes(capability, data_address as *const u8, body_len, exact_len)
+}
+
+/// Decodes Linux's three send-side SCTP cmsghdr formats.  The `sndrcv` and
+/// `sndinfo` alternatives are mutually exclusive; PRINFO may refine either.
+fn parse_sctp_send_cmsg(
+    capability: &UserMemoryCapability,
+    header_address: usize,
+    header: &cmsghdr,
+    metadata: &mut Option<SctpSendMetadata>,
+    send_info_seen: &mut bool,
+    pr_info_seen: &mut bool,
+) -> AxResult<()> {
+    let replace = |mut value: SctpSendMetadata,
+                   metadata: &mut Option<SctpSendMetadata>,
+                   send_info_seen: &mut bool|
+     -> AxResult<()> {
+        if *send_info_seen {
+            Err(AxError::InvalidInput)
+        } else {
+            if let Some(pr) = metadata.take() {
+                value.pr_policy = pr.pr_policy;
+                value.pr_value = pr.pr_value;
+            }
+            *metadata = Some(value);
+            *send_info_seen = true;
+            Ok(())
+        }
+    };
+    match header.cmsg_type as u32 {
+        SCTP_SNDRCV => {
+            let body = read_cmsg_body(capability, header_address, header, 32)?;
+            let flags = native_u16(&body, 4)?;
+            replace(
+                SctpSendMetadata {
+                    stream: native_u16(&body, 0)?,
+                    flags,
+                    ppid: native_u32(&body, 8)?,
+                    context: native_u32(&body, 12)?,
+                    pr_policy: flags & 0x0030,
+                    pr_value: native_u32(&body, 16)?,
+                    ..Default::default()
+                },
+                metadata,
+                send_info_seen,
+            )
+        }
+        SCTP_SNDINFO => {
+            let body = read_cmsg_body(capability, header_address, header, 16)?;
+            replace(
+                SctpSendMetadata {
+                    stream: native_u16(&body, 0)?,
+                    flags: native_u16(&body, 2)?,
+                    ppid: native_u32(&body, 4)?,
+                    context: native_u32(&body, 8)?,
+                    ..Default::default()
+                },
+                metadata,
+                send_info_seen,
+            )
+        }
+        SCTP_PRINFO => {
+            if *pr_info_seen {
+                return Err(AxError::InvalidInput);
+            }
+            let body = read_cmsg_body(capability, header_address, header, 8)?;
+            let value = metadata.get_or_insert_with(Default::default);
+            value.pr_policy = native_u16(&body, 0)?;
+            value.pr_value = native_u32(&body, 4)?;
+            *pr_info_seen = true;
+            Ok(())
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn parse_send_control(
+    capability: &UserMemoryCapability,
+    msg: &msghdr,
+    sctp: bool,
+    dccp: bool,
+) -> AxResult<Vec<CMsgData>> {
     if msg.msg_controllen == 0 {
         return Ok(Vec::new());
     }
@@ -609,6 +760,10 @@ fn parse_send_control(capability: &UserMemoryCapability, msg: &msghdr) -> AxResu
         .ok_or(AxError::BadAddress)?;
 
     let mut rights = Vec::new();
+    let mut sctp_metadata = None;
+    let mut dccp_priority = None;
+    let mut sctp_send_info_seen = false;
+    let mut sctp_pr_info_seen = false;
     rights
         .try_reserve_exact(SCM_MAX_FD)
         .map_err(|_| AxError::NoMemory)?;
@@ -621,7 +776,32 @@ fn parse_send_control(capability: &UserMemoryCapability, msg: &msghdr) -> AxResu
         if hdr.cmsg_len < size_of::<cmsghdr>() || hdr.cmsg_len > remaining {
             return Err(AxError::InvalidInput);
         }
-        CMsg::append_rights(capability, hdr_addr, &hdr, &mut rights)?;
+        if (hdr.cmsg_level as u32) == SOL_SCTP {
+            if !sctp {
+                return Err(AxError::InvalidInput);
+            }
+            parse_sctp_send_cmsg(
+                capability,
+                hdr_addr,
+                &hdr,
+                &mut sctp_metadata,
+                &mut sctp_send_info_seen,
+                &mut sctp_pr_info_seen,
+            )?;
+        } else if (hdr.cmsg_level as u32) == SOL_DCCP {
+            if !dccp || (hdr.cmsg_type as u32) != DCCP_SCM_PRIORITY {
+                return Err(AxError::InvalidInput);
+            }
+            if dccp_priority.is_some() {
+                return Err(AxError::InvalidInput);
+            }
+            let body = read_cmsg_body(capability, hdr_addr, &hdr, size_of::<u32>())?;
+            dccp_priority = Some(u32::from_ne_bytes(
+                body.try_into().expect("exact cmsg body"),
+            ));
+        } else {
+            CMsg::append_rights(capability, hdr_addr, &hdr, &mut rights)?;
+        }
 
         let aligned = cmsg_align(hdr.cmsg_len).ok_or(AxError::InvalidInput)?;
         if aligned > remaining {
@@ -637,6 +817,29 @@ fn parse_send_control(capability: &UserMemoryCapability, msg: &msghdr) -> AxResu
         cmsg.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
         cmsg.push(rights);
     }
+    if let Some(metadata) = sctp_metadata {
+        if !cmsg.is_empty() || dccp_priority.is_some() {
+            // SCTP ancillary data is protocol metadata, not Unix descriptor
+            // passing; reject a mixed control buffer before payload transfer.
+            return Err(AxError::InvalidInput);
+        }
+        cmsg.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+        cmsg.push(CMsg::sctp_send(
+            metadata.stream,
+            metadata.flags,
+            metadata.ppid,
+            metadata.context,
+            metadata.pr_policy,
+            metadata.pr_value,
+        )?);
+    }
+    if let Some(priority) = dccp_priority {
+        if !cmsg.is_empty() {
+            return Err(AxError::InvalidInput);
+        }
+        cmsg.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+        cmsg.push(CMsg::dccp_priority(priority)?);
+    }
     Ok(cmsg)
 }
 
@@ -647,16 +850,17 @@ fn mmsg_address(base: usize, index: usize) -> AxResult<usize> {
     base.checked_add(offset).ok_or(AxError::BadAddress)
 }
 
-fn recvmmsg_defers_error(error: AxError) -> bool {
-    // Linux leaves EAGAIN as the ordinary short-batch terminator. Deferring it
-    // through SO_ERROR would make a successful partial receive spuriously fail
-    // the next recv call. This also covers SO_RCVTIMEO expiry, which axnet-ng
-    // deliberately maps to WouldBlock.
-    error != AxError::WouldBlock
+const fn recvmmsg_transport_fault(error: AxError) -> bool {
+    // A partial recvmmsg return suppresses the immediate error, but only a
+    // fault reported by the transport belongs to the socket's SO_ERROR state.
+    // Importing a later mmsghdr or publishing its result can fail locally
+    // (EFAULT, EINVAL, address arithmetic, etc.); turning those into
+    // SocketFault::Other would leak a spurious EIO into the next operation.
+    matches!(error, AxError::ConnectionRefused | AxError::ConnectionReset)
 }
 
 fn remember_recvmmsg_error(socket: &PinnedSocketDescription, error: AxError) {
-    if !recvmmsg_defers_error(error) {
+    if !recvmmsg_transport_fault(error) {
         return;
     }
     remember_socket_error(socket, error);
@@ -689,6 +893,12 @@ fn send_packet_after_security(
     destination: Option<thekernel_linux_packet::PacketSendAddress>,
     ancillary_items: usize,
 ) -> AxResult<usize> {
+    // A TPACKET_TX_RING is producer-owned by userspace and has no separate
+    // submission syscall.  Linux observes SEND_REQUEST frames at the next
+    // packet send boundary, before admitting this ordinary sendmsg payload.
+    // Keep that ordering so an invalid explicit destination still leaves a
+    // subsequently submitted ring frame visible to the packet device.
+    socket.flush_tx_ring()?;
     let len = src.remaining();
     let plan = socket.prepare_send(len, destination)?;
     if ancillary_items != 0 {
@@ -701,6 +911,76 @@ fn send_packet_after_security(
     payload.resize(len, 0);
     src.read_exact(&mut payload)?;
     socket.send_prepared(plan, &payload)
+}
+
+fn take_sctp_send_metadata(cmsg: Vec<CMsgData>) -> AxResult<SctpSendMetadata> {
+    let mut metadata = SctpSendMetadata::default();
+    let mut found = false;
+    for cmsg in cmsg {
+        let cmsg = cmsg.downcast::<CMsg>().map_err(|_| AxError::InvalidInput)?;
+        match *cmsg {
+            CMsg::SctpSend {
+                stream,
+                flags,
+                ppid,
+                context,
+                pr_policy,
+                pr_value,
+            } if !found => {
+                metadata = SctpSendMetadata {
+                    stream,
+                    flags,
+                    ppid,
+                    context,
+                    pr_policy,
+                    pr_value,
+                };
+                found = true;
+            }
+            _ => return Err(AxError::InvalidInput),
+        }
+    }
+    Ok(metadata)
+}
+
+/// Consumes the one DCCP per-record priority ancillary value.  Parsing has
+/// already rejected mixed/duplicate control messages; keep this second check
+/// so internal callers cannot bypass the ABI boundary and silently lose one.
+fn take_dccp_send_priority(cmsg: Vec<CMsgData>) -> AxResult<Option<u32>> {
+    let mut priority = None;
+    for cmsg in cmsg {
+        let cmsg = cmsg.downcast::<CMsg>().map_err(|_| AxError::InvalidInput)?;
+        let CMsg::DccpPriority(value) = *cmsg else {
+            return Err(AxError::InvalidInput);
+        };
+        if priority.replace(value).is_some() {
+            return Err(AxError::InvalidInput);
+        }
+    }
+    Ok(priority)
+}
+
+fn sctp_rcvinfo_bytes(metadata: SctpRecvMetadata) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[0..2].copy_from_slice(&metadata.stream.to_ne_bytes());
+    bytes[2..4].copy_from_slice(&metadata.ssn.to_ne_bytes());
+    bytes[4..6].copy_from_slice(&metadata.flags.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&metadata.ppid.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&metadata.tsn.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&metadata.cumtsn.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&metadata.context.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&metadata.assoc_id.to_ne_bytes());
+    bytes
+}
+
+fn sctp_nxtinfo_bytes(metadata: axnet::sctp::SctpNextMetadata) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[0..2].copy_from_slice(&metadata.stream.to_ne_bytes());
+    bytes[2..4].copy_from_slice(&metadata.flags.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&metadata.ppid.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&metadata.length.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&metadata.assoc_id.to_ne_bytes());
+    bytes
 }
 
 fn send_impl(
@@ -717,26 +997,35 @@ fn send_impl(
     iov_count: usize,
     control_length: usize,
 ) -> AxResult<isize> {
+    let owner_description = socket.description().clone();
     let backend = socket.backend()?;
     let send_flags = if backend == SocketBackendKind::Packet {
         None
     } else {
         Some(validate_sendmsg_flags(flags)?)
     };
-    let (network_addr, packet_address) = match backend {
+    let (network_addr, packet_address, netlink_address) = match backend {
         SocketBackendKind::Network if !addr.is_null() && addrlen != 0 => (
             Some(SocketAddrEx::read_from_user(capability, addr, addrlen)?),
             None,
+            None,
         ),
-        SocketBackendKind::Packet if !addr.is_null() => {
-            (None, Some(snapshot_address(capability, addr, addrlen)?))
-        }
-        _ => (None, None),
+        SocketBackendKind::Packet if !addr.is_null() => (
+            None,
+            Some(snapshot_address(capability, addr, addrlen)?),
+            None,
+        ),
+        SocketBackendKind::Netlink if !addr.is_null() || addrlen != 0 => (
+            None,
+            None,
+            Some(read_netlink_send_address(capability, addr, addrlen)?),
+        ),
+        _ => (None, None, None),
     };
     let mut message = PreparedSocketMessage::new(
         flags,
         iov_count,
-        if network_addr.is_some() || packet_address.is_some() {
+        if network_addr.is_some() || packet_address.is_some() || netlink_address.is_some() {
             addrlen as usize
         } else {
             0
@@ -762,7 +1051,13 @@ fn send_impl(
             return Err(AxError::OperationNotSupported);
         }
         return socket
-            .write_with_actor(&mut src, snapshot.actor(), snapshot.pid())
+            .write_to_with_actor(
+                &mut src,
+                snapshot.actor(),
+                snapshot.pid(),
+                netlink_address,
+                flags & MSG_DONTWAIT != 0,
+            )
             .map(|sent| sent as isize);
     }
 
@@ -784,26 +1079,55 @@ fn send_impl(
 
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {network_addr:?}");
 
+    if backend == SocketBackendKind::Xdp {
+        // AF_XDP transmit data lives exclusively in the UMEM TX ring.  A
+        // sendmsg/sendto is its doorbell, not a byte-stream write; consuming
+        // iovecs here would create a second, incompatible data path.
+        socket.xdp()?.endpoint().kick_tx()?;
+        return Ok(0);
+    }
     if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
     let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
-    let options = SendOptions {
+    if let Some(address) = network_addr.as_ref() {
+        validate_network_address(&socket.inner, address)?;
+    }
+    if matches!(&socket.inner, AxSocket::Udp(_)) && src.remaining() > axnet::udp::MAX_UDP_SEND_LEN {
+        return Err(socket_failure(
+            thekernel_linux_net::SocketFailure::MessageTooLarge,
+        ));
+    }
+    // Socket transports hand payload to axnet after this boundary, where the
+    // IP header is constructed.  Run the namespace OUTPUT policy here so
+    // TCP/UDP/raw traffic cannot bypass the same nft/iptables graph that
+    // AF_PACKET uses; raw and TUN packet paths additionally provide headers
+    // to the conntrack/NAT traversal entry.
+    crate::syscall::iptables_output_verdict(socket.net_namespace())?;
+    crate::file::netlink::nft_output_verdict(socket.net_namespace())?;
+    let mut options = SendOptions {
         to: network_addr,
         flags: send_flags.ok_or(AxError::BadState)?,
         cmsg,
+        credentials: Some(snapshot.unix_credentials()),
         nonblocking_override: Some(nonblocking),
     };
+    if matches!(&socket.inner, AxSocket::Unix(_)) {
+        super::cmsg::set_scm_rights_owner(&mut options.cmsg, &owner_description);
+    }
     let sent = match &socket.inner {
         AxSocket::Unix(unix) if unix.is_datagram() => {
-            let reservation = match options.to.as_ref() {
+            let mut reservation = match options.to.as_ref() {
                 Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
                     let security = VfsSecurityContext::new(snapshot.actor().clone());
                     let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
-                    unix.prepare_send_to_resolved(options, target)?
+                    unix.prepare_send_to_resolved(options, target)
+                        .map_err(|error| map_socket_send_error(&socket.inner, error))?
                 }
-                _ => unix.prepare_may_send(options)?,
+                _ => unix
+                    .prepare_may_send(options)
+                    .map_err(|error| map_socket_send_error(&socket.inner, error))?,
             };
             let receiving = crate::file::UnixEndpointSecurityRef::new(
                 reservation.receiving_identity(),
@@ -815,7 +1139,20 @@ fn send_impl(
                 &socket_ref,
                 &receiving,
             ))?;
+            let receiving_endpoint = reservation.receiving_identity().raw();
+            super::cmsg::set_scm_rights_endpoint_owner(reservation.cmsg_mut(), receiving_endpoint);
             reservation.commit(&mut src)
+        }
+        AxSocket::Sctp(sctp) => {
+            let metadata = take_sctp_send_metadata(core::mem::take(&mut options.cmsg))?;
+            // SCTP consumes its cmsg as record metadata.  Pass a fresh empty
+            // list to the transport so kernel-only ancillary state can never
+            // leak through the generic axnet interface.
+            sctp.send_with_metadata(&mut src, options, metadata)
+        }
+        AxSocket::Dccp(dccp) => {
+            let priority = take_dccp_send_priority(core::mem::take(&mut options.cmsg))?;
+            dccp.send_with_priority(&mut src, options, priority)
         }
         _ => socket.send(&mut src, options),
     };
@@ -824,12 +1161,37 @@ fn send_impl(
             if should_raise_sigpipe(error, flags) {
                 raise_sigpipe(snapshot.pid());
             }
-            return Err(error);
+            return Err(map_socket_send_error(&socket.inner, error));
         }
         Ok(sent) => sent,
     };
 
     Ok(sent as isize)
+}
+
+/// `sendto`/`sendmsg` use the same fixed-size AF_NETLINK address layout as
+/// bind.  In particular, do not silently discard `sockaddr_nl`: udevd uses a
+/// port-ID-only destination to hand an event from its main process to a worker.
+fn read_netlink_send_address(
+    capability: &UserMemoryCapability,
+    addr: UserConstPtr<sockaddr>,
+    addrlen: socklen_t,
+) -> AxResult<SockaddrNl> {
+    // sockaddr APIs accept a larger caller buffer and consume only the
+    // address's defined prefix.  Reject truncation, not harmless extension.
+    if addr.is_null() || (addrlen as usize) < size_of::<SockaddrNl>() {
+        return Err(AxError::InvalidInput);
+    }
+    let address = unsafe {
+        capability
+            .read_value_uninit(addr.address().as_usize() as *const SockaddrNl)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    if address.nl_family as u32 != AF_NETLINK {
+        return Err(LinuxError::EINVAL.into());
+    }
+    Ok(address)
 }
 
 pub fn sys_sendto(
@@ -968,7 +1330,12 @@ fn sendmsg_with_socket(
         )?;
         (Vec::new(), control.len())
     } else {
-        (parse_send_control(capability, &msg)?, 0)
+        let is_sctp = socket.backend()? == SocketBackendKind::Network
+            && matches!(&socket.network()?.inner, AxSocket::Sctp(_));
+        let is_dccp = socket.backend()? == SocketBackendKind::Network
+            && matches!(&socket.network()?.inner, AxSocket::Dccp(_));
+        let cmsg = parse_send_control(capability, &msg, is_sctp, is_dccp)?;
+        (cmsg, 0)
     };
 
     send_impl(
@@ -1001,7 +1368,7 @@ pub fn sys_sendmsg(
 
 enum ReceivedSocketAddress {
     Network(SocketAddrEx),
-    NetlinkKernel { groups: u32 },
+    Netlink { pid: u32, groups: u32 },
     Packet(thekernel_linux_packet::SockAddrLl),
 }
 
@@ -1014,11 +1381,11 @@ impl ReceivedSocketAddress {
     ) -> AxResult<()> {
         match self {
             Self::Network(addr_value) => addr_value.write_to_user(capability, addr, addrlen),
-            Self::NetlinkKernel { groups } => {
+            Self::Netlink { pid, groups } => {
                 let addr_value = SockaddrNl {
                     nl_family: AF_NETLINK as _,
                     nl_pad: 0,
-                    nl_pid: 0,
+                    nl_pid: pid,
                     nl_groups: groups,
                 };
                 let bytes = unsafe {
@@ -1044,15 +1411,92 @@ impl ReceivedSocketAddress {
 struct ReceiveOutcome {
     returned_len: isize,
     message_truncated: bool,
+    message_eor: bool,
     control_truncated: bool,
     address: Option<ReceivedSocketAddress>,
+}
+
+/// Retained io_uring socket-receive result.  It deliberately carries record
+/// termination/truncation separately from CQE buffer selection so the ring
+/// executor never has to reinterpret a generic file read as a socket event.
+pub(crate) struct IoUringSocketReceive {
+    pub(crate) bytes: i32,
+    pub(crate) eof: bool,
+    pub(crate) message_flags: u32,
+}
+
+impl IoUringSocketReceive {
+    /// io_uring exposes post-receive queue state through the standard
+    /// `IORING_CQE_F_SOCK_NONEMPTY` bit. `MSG_TRUNC`, `MSG_EOR`, and
+    /// `MSG_CTRUNC` have no invented CQE bit: truncation has shaped `bytes`,
+    /// while record/control state remains retained for completion policy.
+    pub(crate) const fn cqe_flags(self, socket_nonempty: bool) -> u32 {
+        const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
+        if socket_nonempty && !self.eof {
+            IORING_CQE_F_SOCK_NONEMPTY
+        } else {
+            0
+        }
+    }
+
+    pub(crate) const fn record_boundary(self) -> bool {
+        self.message_flags & MSG_EOR != 0
+    }
+    pub(crate) const fn truncated(self) -> bool {
+        self.message_flags & (MSG_TRUNC | MSG_CTRUNC) != 0
+    }
+}
+
+/// Performs one nonblocking receive against the already retained socket OFD.
+/// No numeric fd lookup, current task file status, or generic pread path is
+/// involved.  io_uring has no recvmsg control/name storage, therefore only
+/// payload flags admitted by its SQE parser reach this primitive.
+pub(crate) fn io_uring_recv_pinned(
+    capability: &UserMemoryCapability,
+    socket: &PinnedSocketDescription,
+    buffer: *mut u8,
+    length: usize,
+    flags: u32,
+) -> AxResult<IoUringSocketReceive> {
+    let strict_copyout = recv_copyout_requires_error(socket)?;
+    let mut flags = validate_recvmsg_flags(
+        effective_message_flags(flags | MSG_DONTWAIT, socket.nonblocking()),
+        socket.backend()? == SocketBackendKind::Packet,
+    )?;
+    flags.insert_dont_wait();
+    let outcome = recv_impl(
+        capability,
+        socket,
+        -1,
+        ProgressiveVmBytesMut::new(capability.clone(), buffer, length, strict_copyout),
+        flags,
+        false,
+        None,
+        false,
+    )?;
+    let bytes = i32::try_from(outcome.returned_len).map_err(|_| AxError::OutOfRange)?;
+    let mut message_flags = 0;
+    if outcome.message_truncated {
+        message_flags |= MSG_TRUNC;
+    }
+    if outcome.message_eor {
+        message_flags |= MSG_EOR;
+    }
+    if outcome.control_truncated {
+        message_flags |= MSG_CTRUNC;
+    }
+    Ok(IoUringSocketReceive {
+        bytes,
+        eof: bytes == 0,
+        message_flags,
+    })
 }
 
 fn recv_impl(
     _capability: &UserMemoryCapability,
     socket: &PinnedSocketDescription,
     fd: i32,
-    mut dst: impl Write + IoBufMut,
+    mut dst: impl WriteBuf,
     recv_flags: ValidatedRecvFlags,
     want_address: bool,
     cmsg_builder: Option<CMsgBuilder>,
@@ -1079,8 +1523,10 @@ fn recv_impl(
         return Ok(ReceiveOutcome {
             returned_len: recv.len as isize,
             message_truncated: false,
+            message_eor: false,
             control_truncated,
-            address: want_address.then_some(ReceivedSocketAddress::NetlinkKernel {
+            address: want_address.then_some(ReceivedSocketAddress::Netlink {
+                pid: recv.source_port_id,
                 groups: recv.source_groups,
             }),
         });
@@ -1096,45 +1542,113 @@ fn recv_impl(
         return Ok(ReceiveOutcome {
             returned_len: result.returned_len() as isize,
             message_truncated: result.message_truncated(),
+            message_eor: false,
             control_truncated: false,
             address: want_address.then_some(ReceivedSocketAddress::Packet(result.address())),
         });
     }
 
+    if socket.backend()? == SocketBackendKind::Xdp {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
     if socket.backend()? != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
     let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
+    let sctp = matches!(&socket.inner, axnet::Socket::Sctp(_));
+    // DCCP retains application datagram boundaries even though Linux assigns
+    // it its own SOCK_DCCP type rather than SOCK_SEQPACKET.  Expose the
+    // record/truncation/EOR rules through recvmsg just as SCTP does.
+    let dccp = matches!(&socket.inner, axnet::Socket::Dccp(_));
+    let seqpacket =
+        matches!(&socket.inner, axnet::Socket::Unix(unix) if unix.is_seqpacket()) || sctp || dccp;
+    let record_len = if seqpacket {
+        socket.inner.recv_pending_len()?
+    } else {
+        0
+    };
+    let record_capacity = dst.remaining_mut();
     let mut cmsg = Vec::new();
 
     let mut remote_addr = want_address.then(|| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
-    let recv = socket.recv(
-        &mut dst,
-        RecvOptions {
-            from: remote_addr.as_mut(),
-            flags: recv_flags.generic,
-            cmsg: Some(&mut cmsg),
-            nonblocking_override: Some(nonblocking),
-        },
-    )?;
+    let options = RecvOptions {
+        from: remote_addr.as_mut(),
+        flags: recv_flags.generic,
+        cmsg: Some(&mut cmsg),
+        nonblocking_override: Some(nonblocking),
+    };
+    let mut sctp_metadata = None;
+    let recv = match &socket.inner {
+        AxSocket::Sctp(sctp_socket) => {
+            sctp_socket.recv_with_metadata(&mut dst, options, &mut sctp_metadata)?
+        }
+        _ => socket.recv(&mut dst, options)?,
+    };
 
-    let mut control_truncated = cmsg_builder.is_none() && !cmsg.is_empty();
+    let sctp_requested_control = matches!(&socket.inner, AxSocket::Sctp(sctp_socket)
+        if sctp_metadata.is_some()
+            && (sctp_socket.events()[0] != 0 || sctp_socket.recv_rcvinfo()
+                || (sctp_socket.recv_nxtinfo() && sctp_metadata.and_then(|metadata| metadata.next).is_some())));
+    let mut control_truncated =
+        cmsg_builder.is_none() && (!cmsg.is_empty() || sctp_requested_control);
     if let Some(mut builder) = cmsg_builder {
+        if let (AxSocket::Sctp(sctp_socket), Some(metadata)) = (&socket.inner, sctp_metadata) {
+            let legacy_data_io = sctp_socket.events()[0] != 0;
+            if legacy_data_io || sctp_socket.recv_rcvinfo() {
+                if !builder.push_fixed(SOL_SCTP, SCTP_RCVINFO, &sctp_rcvinfo_bytes(metadata)) {
+                    control_truncated = true;
+                }
+            }
+            if sctp_socket.recv_nxtinfo() {
+                if let Some(next) = metadata.next {
+                    if !builder.push_fixed(SOL_SCTP, SCTP_NXTINFO, &sctp_nxtinfo_bytes(next)) {
+                        control_truncated = true;
+                    }
+                }
+            }
+        }
         for cmsg in cmsg {
-            let Ok(cmsg) = cmsg.downcast::<CMsg>() else {
-                warn!("received unexpected cmsg");
-                control_truncated = true;
-                continue;
+            let cmsg = match cmsg.downcast::<CMsg>() {
+                Ok(cmsg) => cmsg,
+                Err(cmsg) => match cmsg.downcast::<axnet::options::SocketCredentials>() {
+                    Ok(credentials) => {
+                        if !builder.push_credentials(
+                            credentials.pid,
+                            credentials.uid,
+                            credentials.gid,
+                        ) {
+                            control_truncated = true;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!("received unexpected cmsg");
+                        control_truncated = true;
+                        continue;
+                    }
+                },
             };
 
             match &*cmsg {
-                CMsg::Rights { fds, .. } => {
+                CMsg::Rights { graph, .. } => {
+                    let fds = graph.fds.lock();
                     let expected = fds.len();
-                    let result = builder.push_rights(fds, cloexec_rights);
+                    let result = builder.push_rights(&fds, cloexec_rights);
                     if rights_push_was_truncated(expected, result) {
                         control_truncated = true;
                     }
+                }
+                CMsg::Credentials { pid, uid, gid } => {
+                    if !builder.push_credentials(*pid, *uid, *gid) {
+                        control_truncated = true;
+                    }
+                }
+                CMsg::SctpSend { .. } => {
+                    control_truncated = true;
+                }
+                CMsg::DccpPriority(_) => {
+                    control_truncated = true;
                 }
             }
         }
@@ -1143,7 +1657,8 @@ fn recv_impl(
     debug!("sys_recv => fd: {fd}, recv: {recv}");
     Ok(ReceiveOutcome {
         returned_len: recv as isize,
-        message_truncated: false,
+        message_truncated: seqpacket && record_len > record_capacity,
+        message_eor: seqpacket && recv != 0,
         control_truncated,
         address: remote_addr.map(ReceivedSocketAddress::Network),
     })
@@ -1362,6 +1877,9 @@ fn recvmsg_imported(
     if recv.message_truncated {
         msg_hdr.msg_flags |= MSG_TRUNC;
     }
+    if recv.message_eor {
+        msg_hdr.msg_flags |= MSG_EOR;
+    }
     let msg_addr = msg.address().as_usize();
     // Match Linux's ordered field copyout instead of rewriting the input half
     // of msghdr after the message has already been consumed.
@@ -1547,8 +2065,7 @@ pub fn sys_recvmmsg(
     for idx in 0..vlen {
         let ptr = match mmsg_address(base, idx) {
             Ok(ptr) => ptr,
-            Err(err) if received != 0 => {
-                remember_recvmmsg_error(&socket, err);
+            Err(_err) if received != 0 => {
                 return Ok(received as isize);
             }
             Err(err) => return Err(err),
@@ -1561,8 +2078,7 @@ pub fn sys_recvmmsg(
             let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
             match ImportedRecvMessage::import(&capability, msg, defer_payload_fault) {
                 Ok(imported) => imported,
-                Err(err) if received != 0 => {
-                    remember_recvmmsg_error(&socket, err);
+                Err(_err) if received != 0 => {
                     return Ok(received as isize);
                 }
                 Err(err) => return Err(err),
@@ -1613,7 +2129,6 @@ pub fn sys_recvmmsg(
                     len as u32,
                 ) {
                     if received != 0 {
-                        remember_recvmmsg_error(&socket, err);
                         return Ok(received as isize);
                     }
                     return Err(err);
@@ -1721,7 +2236,7 @@ mod tests {
     fn progressive_iovec_copy_returns_a_prefix_before_a_middle_page_fault() {
         let capability = mapped_io_capability();
         let descriptor = IoVec {
-            iov_base: 0x1ff0 as *mut u8,
+            iov_base: 0x1ff0,
             iov_len: 32,
         };
         unsafe {
@@ -1925,10 +2440,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_recvmmsg_does_not_defer_eagain() {
-        assert!(!recvmmsg_defers_error(AxError::WouldBlock));
-        assert!(recvmmsg_defers_error(AxError::TimedOut));
-        assert!(recvmmsg_defers_error(AxError::ConnectionReset));
+    fn partial_recvmmsg_only_defers_transport_socket_faults() {
+        assert!(!recvmmsg_transport_fault(AxError::WouldBlock));
+        assert!(!recvmmsg_transport_fault(AxError::BadAddress));
+        assert!(!recvmmsg_transport_fault(AxError::InvalidInput));
+        assert!(!recvmmsg_transport_fault(AxError::Io));
+        assert!(recvmmsg_transport_fault(AxError::ConnectionRefused));
+        assert!(recvmmsg_transport_fault(AxError::ConnectionReset));
     }
 
     #[test]

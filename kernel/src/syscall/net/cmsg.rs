@@ -1,7 +1,7 @@
 use alloc::{
     alloc::{Layout, alloc},
     boxed::Box,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{
@@ -12,9 +12,10 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::CMsgData;
 use linux_raw_sys::net::{SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, ucred};
+use spin::{Lazy, Mutex};
 
 use crate::{
-    file::{FileDescription, Socket, epoll::Epoll, get_file_description, try_reserve_fd},
+    file::{FileDescription, ScmDescriptorCustody, get_file_description_for_scm, try_reserve_fd},
     mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
 };
 
@@ -32,6 +33,166 @@ const SCM_RIGHTS_FD_QUEUE_CHARGE: usize = 64;
 // owned SCM_RIGHTS snapshot while waiting to obtain that socket admission.
 const SCM_RIGHTS_INFLIGHT_LIMIT: usize = 16_384;
 static SCM_RIGHTS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SCM_RIGHTS_GRAPH: Lazy<Mutex<Vec<Weak<RightsGraphNode>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+static UNIX_ENDPOINT_OWNERS: Lazy<Mutex<Vec<(usize, Weak<FileDescription>)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// One queued SCM_RIGHTS edge set. The retained Arc values are deliberately
+/// behind a short mutex so the collector can sever only unreachable SCCs;
+/// ordinary receive/queue-drop keeps the same exact object and cannot race a
+/// partially copied user control message.
+pub(crate) struct RightsGraphNode {
+    pub(crate) fds: Mutex<Vec<ScmDescriptorCustody>>,
+    owner: Mutex<Weak<FileDescription>>,
+}
+
+fn register_rights_graph(fds: Vec<ScmDescriptorCustody>) -> AxResult<Arc<RightsGraphNode>> {
+    let node = Arc::try_new(RightsGraphNode {
+        fds: Mutex::new(fds),
+        owner: Mutex::new(Weak::new()),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    let mut graph = SCM_RIGHTS_GRAPH.lock();
+    graph.retain(|entry| entry.strong_count() != 0);
+    graph.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    graph.push(Arc::downgrade(&node));
+    Ok(node)
+}
+
+/// Mark/sweep the SCM_RIGHTS ownership graph. A FileDescription whose strong
+/// count exceeds the number of queued SCM edges entering it is rooted by an
+/// fd table, VMA, asynchronous operation, or another non-SCM owner. Marking
+/// then follows every queued edge. Unmarked edge sets are precisely the
+/// unreachable Unix socket/epoll cycles and are severed together.
+pub(crate) fn collect_scm_rights_cycles() {
+    let mut graph = SCM_RIGHTS_GRAPH.lock();
+    graph.retain(|entry| entry.strong_count() != 0);
+    let mut incoming: Vec<(u64, usize)> = Vec::new();
+    let mut marked: Vec<u64> = Vec::new();
+    for weak in graph.iter() {
+        let Some(node) = weak.upgrade() else {
+            continue;
+        };
+        for fd in node.fds.lock().iter() {
+            let id = fd.description().id().get();
+            if let Some((_, count)) = incoming.iter_mut().find(|(known, _)| *known == id) {
+                *count += 1;
+            } else if incoming.try_reserve(1).is_err() {
+                return;
+            } else {
+                incoming.push((id, 1));
+            }
+        }
+    }
+    for weak in graph.iter() {
+        let Some(node) = weak.upgrade() else {
+            continue;
+        };
+        for fd in node.fds.lock().iter() {
+            let description = fd.description();
+            let id = description.id().get();
+            let edges = incoming
+                .iter()
+                .find(|(known, _)| *known == id)
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            // The borrowed value below does not clone the Arc. Therefore an
+            // incoming SCM edge accounts for exactly one strong reference and
+            // any surplus is a real fd-table/VMA/in-flight-operation root.
+            if description.has_live_descriptor_references()
+                || Arc::strong_count(description) > edges
+            {
+                if marked.try_reserve(1).is_err() {
+                    return;
+                }
+                marked.push(id);
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for weak in graph.iter() {
+            let Some(node) = weak.upgrade() else {
+                continue;
+            };
+            if let Some(owner) = node.owner.lock().upgrade()
+                && marked.contains(&owner.id().get())
+            {
+                for fd in node.fds.lock().iter() {
+                    let id = fd.description().id().get();
+                    if !marked.contains(&id) {
+                        if marked.try_reserve(1).is_err() {
+                            return;
+                        }
+                        marked.push(id);
+                        changed = true;
+                    }
+                }
+            }
+            // Do not follow a target back through its message to sibling
+            // targets. A rooted transferred fd does not make a dead receiver
+            // or its other queued rights reachable; the only graph edge is
+            // live owner -> message -> each target.
+        }
+    }
+    for weak in graph.iter() {
+        let Some(node) = weak.upgrade() else {
+            continue;
+        };
+        let should_sweep = {
+            let fds = node.fds.lock();
+            let owner_reachable = node
+                .owner
+                .lock()
+                .upgrade()
+                .is_some_and(|owner| marked.contains(&owner.id().get()));
+            !owner_reachable
+                && !fds.is_empty()
+                && !fds
+                    .iter()
+                    .any(|fd| marked.contains(&fd.description().id().get()))
+        };
+        if should_sweep {
+            node.fds.lock().clear();
+        }
+    }
+}
+
+pub(crate) fn set_scm_rights_owner(cmsgs: &mut [CMsgData], owner: &Arc<FileDescription>) {
+    for cmsg in cmsgs {
+        if let Some(CMsg::Rights { graph, .. }) = cmsg.downcast_mut::<CMsg>() {
+            *graph.owner.lock() = Arc::downgrade(owner);
+        }
+    }
+}
+
+pub(crate) fn register_unix_endpoint_owner(
+    endpoint: usize,
+    owner: &Arc<FileDescription>,
+) -> AxResult<()> {
+    let mut owners = UNIX_ENDPOINT_OWNERS.lock();
+    owners.retain(|(_, weak)| weak.strong_count() != 0);
+    if let Some((_, known)) = owners.iter_mut().find(|(known, _)| *known == endpoint) {
+        *known = Arc::downgrade(owner);
+        return Ok(());
+    }
+    owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    owners.push((endpoint, Arc::downgrade(owner)));
+    Ok(())
+}
+
+pub(crate) fn set_scm_rights_endpoint_owner(cmsgs: &mut [CMsgData], endpoint: usize) {
+    let owner = UNIX_ENDPOINT_OWNERS
+        .lock()
+        .iter()
+        .find(|(known, _)| *known == endpoint)
+        .and_then(|(_, owner)| owner.upgrade());
+    if let Some(owner) = owner {
+        set_scm_rights_owner(cmsgs, &owner);
+    }
+}
 
 fn try_acquire_scm_rights(count: usize) -> AxResult<()> {
     SCM_RIGHTS_INFLIGHT
@@ -42,6 +203,26 @@ fn try_acquire_scm_rights(count: usize) -> AxResult<()> {
         })
         .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
     Ok(())
+}
+
+/// RAII ownership of the global inflight charge. Every fallible construction
+/// path retains this guard until the final CMsg value owns it, so graph-node,
+/// clone callback, and type-erasure allocation failures cannot leak quota.
+pub struct ScmRightsReservation {
+    count: usize,
+}
+
+impl ScmRightsReservation {
+    fn acquire(count: usize) -> AxResult<Self> {
+        try_acquire_scm_rights(count)?;
+        Ok(Self { count })
+    }
+}
+
+impl Drop for ScmRightsReservation {
+    fn drop(&mut self) {
+        SCM_RIGHTS_INFLIGHT.fetch_sub(self.count, Ordering::AcqRel);
+    }
 }
 
 const fn cmsg_align(len: usize) -> Option<usize> {
@@ -98,19 +279,64 @@ fn try_box<T>(value: T) -> AxResult<Box<T>> {
 
 pub enum CMsg {
     Rights {
-        fds: Vec<Arc<FileDescription>>,
-        inflight_count: usize,
+        graph: Arc<RightsGraphNode>,
+        inflight: ScmRightsReservation,
     },
+    /// Kernel-generated `SCM_CREDENTIALS`; this owns no inflight resource.
+    Credentials { pid: u32, uid: u32, gid: u32 },
+    /// Per-message SCTP send metadata.  It deliberately has no resource
+    /// ownership, unlike SCM_RIGHTS, and is consumed exactly once by the
+    /// sequenced-record transport.
+    SctpSend {
+        stream: u16,
+        flags: u16,
+        ppid: u32,
+        context: u32,
+        pr_policy: u16,
+        pr_value: u32,
+    },
+    /// Linux `SOL_DCCP`/`DCCP_SCM_PRIORITY` metadata.  It is consumed by one
+    /// DCCP record and must never be queued as generic ancillary data.
+    DccpPriority(u32),
 }
 
 impl Drop for CMsg {
     fn drop(&mut self) {
-        let Self::Rights { inflight_count, .. } = self;
-        SCM_RIGHTS_INFLIGHT.fetch_sub(*inflight_count, Ordering::AcqRel);
+        if let Self::Rights { .. } = self {
+            collect_scm_rights_cycles();
+        }
     }
 }
 
 impl CMsg {
+    pub fn sctp_send(
+        stream: u16,
+        flags: u16,
+        ppid: u32,
+        context: u32,
+        pr_policy: u16,
+        pr_value: u32,
+    ) -> AxResult<CMsgData> {
+        CMsgData::new_peekable(
+            try_box(Self::SctpSend {
+                stream,
+                flags,
+                ppid,
+                context,
+                pr_policy,
+                pr_value,
+            })?,
+            size_of::<Self>(),
+            Self::clone_for_peek,
+        )
+    }
+    pub fn dccp_priority(priority: u32) -> AxResult<CMsgData> {
+        CMsgData::new_peekable(
+            try_box(Self::DccpPriority(priority))?,
+            size_of::<Self>(),
+            Self::clone_for_peek,
+        )
+    }
     /// Appends one SCM_RIGHTS header to a pre-reserved aggregate list.
     /// Multiple user headers are coalesced into one queued object, matching
     /// Linux's single `scm_fp_list` and keeping metadata bounded by
@@ -119,7 +345,7 @@ impl CMsg {
         capability: &UserMemoryCapability,
         hdr_addr: usize,
         hdr: &cmsghdr,
-        fds: &mut Vec<Arc<FileDescription>>,
+        fds: &mut Vec<ScmDescriptorCustody>,
     ) -> AxResult<()> {
         let header_len = cmsg_header_len();
         if hdr.cmsg_len < header_len {
@@ -170,23 +396,14 @@ impl CMsg {
             if fd < 0 {
                 return Err(AxError::BadFileDescriptor);
             }
-            let description = get_file_description(fd)?;
+            let description = get_file_description_for_scm(fd)?;
 
-            // Queued SCM_RIGHTS references require Linux's Unix-socket cycle
-            // collector. Until that collector exists, reject the two object
-            // kinds that can retain Unix sockets instead of leaking an
-            // unreachable OFD cycle forever.
-            if description.inner.downcast_ref::<Socket>().is_some()
-                || description.inner.downcast_ref::<Epoll>().is_some()
-            {
-                return Err(AxError::OperationNotSupported);
-            }
             fds.push(description);
         }
         Ok(())
     }
 
-    pub fn from_rights(fds: Vec<Arc<FileDescription>>) -> AxResult<Option<CMsgData>> {
+    pub fn from_rights(fds: Vec<ScmDescriptorCustody>) -> AxResult<Option<CMsgData>> {
         if fds.is_empty() {
             return Ok(None);
         }
@@ -198,19 +415,67 @@ impl CMsg {
             )
             .and_then(|charge| {
                 fds.capacity()
-                    .checked_mul(size_of::<Arc<FileDescription>>())
+                    .checked_mul(size_of::<ScmDescriptorCustody>())
                     .and_then(|storage| charge.checked_add(storage))
             })
             .ok_or(AxError::NoMemory)?;
-        try_acquire_scm_rights(fds.len())?;
-        let inflight_count = fds.len();
-        Ok(Some(CMsgData::new(
-            try_box(Self::Rights {
-                fds,
-                inflight_count,
-            })?,
+        let inflight = ScmRightsReservation::acquire(fds.len())?;
+        let graph = register_rights_graph(fds)?;
+        collect_scm_rights_cycles();
+        Ok(Some(CMsgData::new_peekable(
+            try_box(Self::Rights { graph, inflight })?,
             charge,
-        )))
+            Self::clone_for_peek,
+        )?))
+    }
+
+    fn clone_for_peek(value: &Self) -> AxResult<Self> {
+        match value {
+            Self::Rights { graph, .. } => {
+                let source = graph.fds.lock();
+                let mut fds = Vec::new();
+                fds.try_reserve_exact(source.len())
+                    .map_err(|_| AxError::NoMemory)?;
+                for fd in source.iter() {
+                    fds.push(fd.description().acquire_scm_custody());
+                }
+                let inflight = ScmRightsReservation::acquire(fds.len())?;
+                Ok(Self::Rights {
+                    graph: register_rights_graph(fds)?,
+                    inflight,
+                })
+            }
+            Self::Credentials { pid, uid, gid } => Ok(Self::Credentials {
+                pid: *pid,
+                uid: *uid,
+                gid: *gid,
+            }),
+            Self::SctpSend {
+                stream,
+                flags,
+                ppid,
+                context,
+                pr_policy,
+                pr_value,
+            } => Ok(Self::SctpSend {
+                stream: *stream,
+                flags: *flags,
+                ppid: *ppid,
+                context: *context,
+                pr_policy: *pr_policy,
+                pr_value: *pr_value,
+            }),
+            Self::DccpPriority(priority) => Ok(Self::DccpPriority(*priority)),
+        }
+    }
+
+    /// Builds an automatic `SCM_CREDENTIALS` control message for SO_PASSCRED.
+    pub fn credentials(pid: u32, uid: u32, gid: u32) -> AxResult<CMsgData> {
+        CMsgData::new_peekable(
+            try_box(Self::Credentials { pid, uid, gid })?,
+            size_of::<Self>(),
+            Self::clone_for_peek,
+        )
     }
 }
 
@@ -251,7 +516,7 @@ impl<'a> CMsgBuilder<'a> {
     /// truncation. Accordingly this method never propagates those failures;
     /// it either publishes a fully described non-empty cmsg or publishes
     /// nothing. The returned count tells the caller when to set MSG_CTRUNC.
-    pub fn push_rights(&mut self, fds: &[Arc<FileDescription>], cloexec: bool) -> RightsPushResult {
+    pub fn push_rights(&mut self, fds: &[ScmDescriptorCustody], cloexec: bool) -> RightsPushResult {
         let Some(remaining) = self.capacity.checked_sub(*self.len) else {
             return RightsPushResult::default();
         };
@@ -287,7 +552,9 @@ impl<'a> CMsgBuilder<'a> {
                 break;
             };
             if self.capability.write_value(dst as *mut i32, fd).is_err()
-                || reservation.publish(description.clone()).is_err()
+                || reservation
+                    .publish(description.description().clone())
+                    .is_err()
             {
                 break;
             }
@@ -402,6 +669,53 @@ impl<'a> CMsgBuilder<'a> {
         *self.len += used;
         true
     }
+
+    /// Publish an already initialized fixed-size ancillary payload.  SCTP
+    /// receive metadata has no resource-transfer side effect, so it follows
+    /// the same post-payload truncation contract as SCM_CREDENTIALS.
+    pub fn push_fixed(&mut self, level: u32, kind: u32, payload: &[u8]) -> bool {
+        let Some(remaining) = self.capacity.checked_sub(*self.len) else {
+            return false;
+        };
+        let Some(message_len) = cmsg_len(payload.len()) else {
+            return false;
+        };
+        let Some(message_space) = cmsg_space(payload.len()) else {
+            return false;
+        };
+        if remaining < message_len {
+            return false;
+        }
+        let base = self.hdr.address().as_usize();
+        let Some(header_len) = cmsg_align(cmsg_header_len()) else {
+            return false;
+        };
+        let Some(data_addr) = base.checked_add(header_len) else {
+            return false;
+        };
+        if self.capability.write_bytes(data_addr, payload).is_err()
+            || unsafe {
+                self.capability.write_value_unchecked(
+                    base as *mut cmsghdr,
+                    cmsghdr {
+                        cmsg_len: message_len,
+                        cmsg_level: level as _,
+                        cmsg_type: kind as _,
+                    },
+                )
+            }
+            .is_err()
+        {
+            return false;
+        }
+        let used = message_space.min(remaining);
+        let Some(next) = base.checked_add(used) else {
+            return false;
+        };
+        self.hdr = UserPtr::from(next);
+        *self.len += used;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -444,8 +758,8 @@ mod tests {
         assert!(available > 0);
         try_acquire_scm_rights(available).unwrap();
         let admitted = CMsg::Rights {
-            fds: Vec::new(),
-            inflight_count: available,
+            graph: register_rights_graph(Vec::new()).unwrap(),
+            inflight: ScmRightsReservation { count: available },
         };
         assert_eq!(
             try_acquire_scm_rights(1),

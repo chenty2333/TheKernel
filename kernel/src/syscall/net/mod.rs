@@ -9,11 +9,11 @@ mod socket;
 use alloc::sync::Arc;
 
 use axerrno::AxResult;
-use axnet::options::UnixCredentials;
+use axnet::options::SocketCredentials;
 use axtask::current;
 
 pub use self::{cmsg::*, io::*, name::*, opt::*, socket::*};
-use crate::task::{AsThread, Cred, NetworkNamespace};
+use crate::task::{AsThread, Cred, NetworkNamespace, security::LandlockDomain};
 
 /// Keeps pure socket-output syscalls at the Linux hook boundary: policy sees
 /// the exact pinned socket before the adapter reads any userspace output
@@ -31,10 +31,11 @@ fn import_socket_output_after_policy<T>(
 /// has been created.
 pub(super) struct SocketSyscallSnapshot {
     actor: Arc<Cred>,
+    landlock_domain: LandlockDomain,
     net_namespace: Arc<NetworkNamespace>,
     pid: u32,
     umask: u32,
-    unix_credentials: UnixCredentials,
+    unix_credentials: SocketCredentials,
 }
 
 impl SocketSyscallSnapshot {
@@ -42,19 +43,27 @@ impl SocketSyscallSnapshot {
         let current = current();
         let thread = current.as_thread();
         let actor = thread.current_cred();
+        let landlock_domain = thread.landlock_domain();
         let pid = thread.proc_data.proc.pid() as u32;
         let ids = actor.ids();
         Self {
             actor,
-            net_namespace: thread.proc_data.net_ns.clone(),
+            landlock_domain,
+            net_namespace: thread.net_ns(),
             pid,
             umask: thread.fs_context().lock().umask(),
-            unix_credentials: UnixCredentials::new(pid, ids.euid.into_raw(), ids.egid.into_raw()),
+            unix_credentials: SocketCredentials::new(pid, ids.euid.into_raw(), ids.egid.into_raw()),
         }
     }
 
     pub(super) fn actor(&self) -> &Arc<Cred> {
         &self.actor
+    }
+
+    /// The task-local Landlock state belongs to the syscall-entry snapshot,
+    /// not to a credential lookup performed after an operation has started.
+    pub(super) fn landlock_domain(&self) -> &LandlockDomain {
+        &self.landlock_domain
     }
 
     pub(super) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
@@ -69,7 +78,7 @@ impl SocketSyscallSnapshot {
         self.umask
     }
 
-    pub(super) const fn unix_credentials(&self) -> UnixCredentials {
+    pub(super) const fn unix_credentials(&self) -> SocketCredentials {
         self.unix_credentials
     }
 }

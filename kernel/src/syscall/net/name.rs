@@ -1,3 +1,5 @@
+use core::mem::size_of;
+
 use axerrno::{AxResult, LinuxError};
 use axnet::SocketOps;
 use linux_raw_sys::net::{sockaddr, socklen_t};
@@ -35,6 +37,16 @@ fn write_socklen(
         .map_err(map_usercopy_error)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrXdpName {
+    family: u16,
+    flags: u16,
+    ifindex: u32,
+    queue_id: u32,
+    shared_umem_fd: u32,
+}
+
 pub fn sys_getsockname(
     capability: UserMemoryCapability,
     fd: i32,
@@ -44,6 +56,39 @@ pub fn sys_getsockname(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
+    if pinned.backend()? == SocketBackendKind::Xdp {
+        dispatch_socket(&SocketSecurityContext::get_sock_name(
+            snapshot.actor(),
+            &socket_ref,
+        ))?;
+        let (flags, ifindex, queue_id) = pinned
+            .xdp()?
+            .endpoint()
+            .binding()
+            .ok_or(LinuxError::EINVAL)?;
+        let mut length = read_socklen(&capability, addrlen)?;
+        let value = SockaddrXdpName {
+            family: crate::file::af_xdp::AF_XDP as u16,
+            flags,
+            ifindex,
+            queue_id,
+            shared_umem_fd: 0,
+        };
+        if length != 0 {
+            let copied = (length as usize).min(size_of::<SockaddrXdpName>());
+            capability
+                .write_bytes(addr.address().as_usize(), unsafe {
+                    core::slice::from_raw_parts(
+                        (&value as *const SockaddrXdpName).cast::<u8>(),
+                        copied,
+                    )
+                })
+                .map_err(map_usercopy_error)?;
+        }
+        length = size_of::<SockaddrXdpName>() as socklen_t;
+        write_socklen(&capability, addrlen, length)?;
+        return Ok(0);
+    }
     if pinned.backend()? == SocketBackendKind::Packet {
         dispatch_socket(&SocketSecurityContext::get_sock_name(
             snapshot.actor(),
@@ -92,6 +137,13 @@ pub fn sys_getpeername(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
+    if pinned.backend()? == SocketBackendKind::Xdp {
+        dispatch_socket(&SocketSecurityContext::get_peer_name(
+            snapshot.actor(),
+            &socket_ref,
+        ))?;
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
     if pinned.backend()? == SocketBackendKind::Packet {
         // `packet_getname(peer=true)` rejects before Linux imports either
         // output pointer. Keep the security hook in front of that rejection.

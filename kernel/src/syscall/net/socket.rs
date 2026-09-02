@@ -7,10 +7,14 @@ use axfs_ng_vfs::NodePermission;
 use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
     MAX_LISTEN_BACKLOG, Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
+    dccp::DccpSocket,
+    raw::{RawSocket, RawSocketFamily},
+    sctp::SctpSocket,
     tcp::TcpSocket,
     udp::{UdpSocket, UdpSocketFamily},
-    unix::{DgramTransport, StreamTransport, UnixSocket, UnixSocketAddr},
+    unix::{DgramTransport, SeqPacketTransport, StreamTransport, UnixSocket, UnixSocketAddr},
 };
+use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     general::{CAP_NET_BIND_SERVICE, CAP_NET_RAW, O_CLOEXEC, O_NONBLOCK, O_RDWR},
     net::{
@@ -19,6 +23,7 @@ use linux_raw_sys::{
         SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
+use thekernel_linux_net::{SocketFailure, socket_failure_errno};
 
 use super::{
     SocketSyscallSnapshot,
@@ -28,21 +33,183 @@ use super::{
 use crate::{
     file::{
         AcceptedSocketSecurityRef, AfAlgSocket, BareAcceptedSocketSecurityRef, FileDescription,
-        FileLike, NetlinkSocket, PacketSocket, PendingSocketSecurityRef, PinnedSocketDescription,
-        PreparedSocketAddress, Socket, SocketBackendKind, af_alg, close_file_like,
-        packet_socket::packet_error, permission::VfsSecurityContext, reserve_fd,
+        FileHandle, FileLike, NetlinkSocket, PacketSocket, PendingSocketSecurityRef,
+        PinnedSocketDescription, PreparedSocketAddress, Socket, SocketBackendKind, XdpSocket,
+        af_alg, af_xdp, close_file_like, packet_socket::packet_error,
+        permission::VfsSecurityContext, reserve_fd,
     },
     mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
         NetworkNamespace, ns_capable,
-        security::{SocketCreateSpec, SocketListenBacklog, SocketSecurityContext, dispatch_socket},
+        security::{
+            LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP, SocketCreateSpec,
+            SocketListenBacklog, SocketSecurityContext, check_current_landlock_net_port,
+            dispatch_socket,
+        },
     },
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const SOCK_DCCP: u32 = 6;
+const IPPROTO_DCCP: u32 = 33;
+const IPPROTO_SCTP: u32 = 132;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+
+/// Creates a fresh kernel-owned TCP OFD in `net_ns` for a transport that must
+/// reconnect without reusing a userspace FD or its retired socket state.
+pub(crate) fn reconnect_tcp_socket(
+    net_ns: Arc<NetworkNamespace>,
+    peer: SocketAddrEx,
+    creator: (
+        Arc<crate::task::Cred>,
+        crate::task::security::LandlockDomain,
+    ),
+) -> AxResult<FileHandle<Socket>> {
+    let SocketAddrEx::Ip(ip_peer) = peer else {
+        return Err(AxError::InvalidInput);
+    };
+    let peer = SocketAddrEx::Ip(ip_peer);
+    let domain = if ip_peer.is_ipv6() { AF_INET6 } else { AF_INET };
+    let spec =
+        SocketCreateSpec::try_new(domain as i32, SOCK_STREAM as i32, IPPROTO_TCP as i32, false)
+            .expect("fixed reconnect TCP socket spec must be valid");
+    dispatch_socket(&SocketSecurityContext::create(&creator.0, spec))?;
+    let socket = Socket::new(
+        SocketInner::Tcp(TcpSocket::new(net_ns.stack().clone())?),
+        net_ns,
+    );
+    socket.capture_creator_security(creator.0.clone(), creator.1.clone());
+    let pinned = prepare_new_socket_like(socket, false)?;
+    dispatch_socket_post_create(&creator.0, &pinned, spec)?;
+    let socket_ref = pinned.security_ref()?;
+    let prepared = PreparedSocketAddress::Network(peer.clone());
+    dispatch_socket(&SocketSecurityContext::connect(
+        &creator.0,
+        &socket_ref,
+        &prepared,
+        0,
+    ))?;
+    if ip_peer.port() != 0 {
+        creator
+            .1
+            .check_net_port(ip_peer.port(), LANDLOCK_ACCESS_NET_CONNECT_TCP)?;
+    }
+    let handle = pinned
+        .into_description()
+        .file_handle()
+        .downcast::<Socket>()?;
+    handle.connect(peer)?;
+    Ok(handle)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern)]
+struct SockaddrXdp {
+    family: u16,
+    flags: u16,
+    ifindex: u32,
+    queue_id: u32,
+    shared_umem_fd: u32,
+}
+
+pub(crate) fn socket_failure(failure: SocketFailure) -> AxError {
+    LinuxError::try_from(socket_failure_errno(failure))
+        .expect("linux ABI socket failure errno must be valid")
+        .into()
+}
+
+pub(crate) fn map_socket_send_error(socket: &SocketInner, error: AxError) -> AxError {
+    match socket {
+        SocketInner::Raw(_)
+        | SocketInner::Tcp(_)
+        | SocketInner::Udp(_)
+        | SocketInner::Dccp(_)
+        | SocketInner::Sctp(_)
+            if error == AxError::NoSuchDevice =>
+        {
+            socket_failure(SocketFailure::NetworkUnreachable)
+        }
+        SocketInner::Raw(_)
+        | SocketInner::Tcp(_)
+        | SocketInner::Udp(_)
+        | SocketInner::Dccp(_)
+        | SocketInner::Sctp(_)
+            if error == AxError::NotFound =>
+        {
+            socket_failure(SocketFailure::AddressUnavailable)
+        }
+        SocketInner::Unix(_) if error == AxError::OperationNotSupported => {
+            socket_failure(SocketFailure::PeerTypeMismatch)
+        }
+        _ if error == AxError::OutOfRange => socket_failure(SocketFailure::MessageTooLarge),
+        _ => error,
+    }
+}
+
+fn map_bind_error(socket: &SocketInner, error: AxError) -> AxError {
+    if matches!(
+        socket,
+        SocketInner::Raw(_)
+            | SocketInner::Tcp(_)
+            | SocketInner::Udp(_)
+            | SocketInner::Dccp(_)
+            | SocketInner::Sctp(_)
+    ) && error == AxError::NotFound
+    {
+        socket_failure(SocketFailure::AddressUnavailable)
+    } else {
+        error
+    }
+}
+
+fn map_connect_error(socket: &SocketInner, error: AxError) -> AxError {
+    match socket {
+        SocketInner::Raw(_)
+        | SocketInner::Tcp(_)
+        | SocketInner::Udp(_)
+        | SocketInner::Dccp(_)
+        | SocketInner::Sctp(_)
+            if error == AxError::NoSuchDevice =>
+        {
+            socket_failure(SocketFailure::NetworkUnreachable)
+        }
+        SocketInner::Raw(_)
+        | SocketInner::Tcp(_)
+        | SocketInner::Udp(_)
+        | SocketInner::Dccp(_)
+        | SocketInner::Sctp(_)
+            if error == AxError::NotFound =>
+        {
+            socket_failure(SocketFailure::AddressUnavailable)
+        }
+        SocketInner::Unix(_) if error == AxError::OperationNotSupported => {
+            socket_failure(SocketFailure::PeerTypeMismatch)
+        }
+        _ => error,
+    }
+}
+
+/// Validates a transport-neutral address/socket pairing at the Linux ABI
+/// boundary. AX intentionally does not assign an errno to this fact.
+pub(super) fn validate_network_address(socket: &SocketInner, address: &SocketAddrEx) -> AxResult {
+    let supported = match (socket, address) {
+        (SocketInner::Raw(_), SocketAddrEx::Ip(_)) => true,
+        (SocketInner::Tcp(_), SocketAddrEx::Ip(_)) => true,
+        (SocketInner::Dccp(_), SocketAddrEx::Ip(_)) => true,
+        (SocketInner::Sctp(_), SocketAddrEx::Ip(_)) => true,
+        (SocketInner::Udp(udp), SocketAddrEx::Ip(address)) => {
+            udp.family().accepts_socket_addr(*address)
+        }
+        (SocketInner::Unix(_), SocketAddrEx::Unix(_)) => true,
+        #[cfg(feature = "vsock")]
+        (SocketInner::Vsock(_), SocketAddrEx::Vsock(_)) => true,
+        _ => false,
+    };
+    supported
+        .then_some(())
+        .ok_or_else(|| socket_failure(SocketFailure::AddressFamilyUnsupported))
+}
 
 const fn socket_status_flags(nonblocking: bool) -> u32 {
     O_RDWR | if nonblocking { O_NONBLOCK } else { 0 }
@@ -105,7 +272,15 @@ fn require_bind_permissions(
     {
         return Err(AxError::from(LinuxError::EACCES));
     }
+    Ok(())
+}
 
+fn check_landlock_tcp_port(socket: &SocketInner, addr: &SocketAddrEx, access: u64) -> AxResult<()> {
+    if let (SocketInner::Tcp(_), SocketAddrEx::Ip(ip_addr)) = (socket, addr)
+        && ip_addr.port() != 0
+    {
+        check_current_landlock_net_port(ip_addr.port(), access)?;
+    }
     Ok(())
 }
 
@@ -132,6 +307,41 @@ fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
     }
 
     Ok((flags & O_NONBLOCK != 0, flags & O_CLOEXEC != 0))
+}
+
+/// Accept through an already retained listener description.  io_uring uses
+/// this entry point so fd close/reuse cannot redirect a queued accept.
+pub(crate) fn accept_pinned(
+    pinned: &PinnedSocketDescription,
+    actor: &Arc<crate::task::Cred>,
+    flags: u32,
+) -> AxResult<isize> {
+    let (nonblocking, cloexec) = parse_accept4_flags(flags)?;
+    let listening_ref = pinned.security_ref()?;
+    if pinned.backend()? != SocketBackendKind::Network {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let listener = pinned.network()?;
+    let net_ns = listener.net_namespace().clone();
+    let reservation = listener.prepare_accept()?;
+    let unix_endpoint = match reservation.identity() {
+        axnet::SocketAcceptIdentity::Unix(endpoint) => Some(endpoint),
+        _ => None,
+    };
+    let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
+    dispatch_socket(&SocketSecurityContext::accept(
+        actor,
+        &listening_ref,
+        &AcceptedSocketSecurityRef::Pending(pending_ref),
+    ))?;
+    let mut accepted = Socket::new(reservation.commit()?, net_ns);
+    accepted.inherit_creator_security_from(listener);
+    accepted.inherit_inet_identity_from(listener)?;
+    let accepted = prepare_new_socket_like(accepted, nonblocking)?;
+    if let Some(endpoint) = unix_endpoint {
+        super::cmsg::register_unix_endpoint_owner(endpoint.raw(), accepted.description())?;
+    }
+    publish_new_socket_like(accepted, cloexec).map(|fd| fd as isize)
 }
 
 fn validate_pre_create_domain(domain: u32) -> AxResult<()> {
@@ -272,6 +482,19 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
+    if domain == af_xdp::AF_XDP {
+        // AF_XDP is SOCK_RAW/protocol 0 only.  It is a dedicated FileLike
+        // backend because its ABI is setsockopt/bind/mmap rings, not axnet
+        // byte-stream socket operations.
+        if ty != SOCK_RAW || proto != 0 {
+            return Err(LinuxError::EPROTONOSUPPORT.into());
+        }
+        let socket = XdpSocket::try_new(snapshot.net_namespace().clone())?;
+        let socket = prepare_new_socket_arc(socket, nonblocking)?;
+        dispatch_socket_post_create(actor, &socket, spec)?;
+        return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
+    }
+
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
         let socket = prepare_new_socket_like(AfAlgSocket::new_listener(), nonblocking)?;
@@ -283,6 +506,15 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
 
     if domain == AF_NETLINK {
         NetlinkSocket::validate_socket_type(ty, proto)?;
+        if proto == crate::file::netlink::NETLINK_AUDIT {
+            // Audit records contain cross-process security decisions.  Linux
+            // keeps creation in initial-user-namespace CAP_AUDIT_READ
+            // authority.  Bind and membership make the separate init-net
+            // listener check at their state-mutation points.
+            if !NetlinkSocket::audit_socket_creation_authorized(actor) {
+                return Err(LinuxError::EPERM.into());
+            }
+        }
         let socket = NetlinkSocket::try_new(proto, net_ns)?;
         let socket = prepare_new_socket_arc(socket, nonblocking)?;
         dispatch_socket_post_create(actor, &socket, spec)?;
@@ -310,10 +542,43 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             SocketInner::Udp(UdpSocket::new_with_family(net_stack.clone(), family)?)
         }
         (AF_INET | AF_INET6, SOCK_DCCP) => {
-            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            if proto != 0 && proto != IPPROTO_DCCP {
+                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            }
+            let family = if domain == AF_INET6 {
+                RawSocketFamily::Ipv6
+            } else {
+                RawSocketFamily::Ipv4
+            };
+            SocketInner::Dccp(DccpSocket::new(net_stack.clone(), family)?)
+        }
+        // Linux exposes SCTP as a sequenced-packet transport.  Protocol zero
+        // selects SCTP for this socket type just as it selects TCP/UDP for the
+        // stream/datagram cases.
+        (AF_INET | AF_INET6, SOCK_SEQPACKET) => {
+            if proto != 0 && proto != IPPROTO_SCTP {
+                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            }
+            let family = if domain == AF_INET6 {
+                RawSocketFamily::Ipv6
+            } else {
+                RawSocketFamily::Ipv4
+            };
+            SocketInner::Sctp(SctpSocket::new(net_stack.clone(), family)?)
         }
         (AF_INET | AF_INET6, SOCK_RAW) => {
-            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            if !ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_RAW) {
+                return Err(AxError::from(LinuxError::EPERM));
+            }
+            if proto == 0 || proto > u8::MAX as u32 {
+                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            }
+            let family = if domain == AF_INET6 {
+                RawSocketFamily::Ipv6
+            } else {
+                RawSocketFamily::Ipv4
+            };
+            SocketInner::Raw(RawSocket::new(net_stack.clone(), family, proto as u8)?)
         }
         (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(
             StreamTransport::new()?,
@@ -321,6 +586,10 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         )),
         (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(
             DgramTransport::new()?,
+            net_stack.unix_namespace(),
+        )),
+        (AF_UNIX, SOCK_SEQPACKET) => SocketInner::Unix(UnixSocket::new(
+            SeqPacketTransport::new()?,
             net_stack.unix_namespace(),
         )),
         #[cfg(feature = "vsock")]
@@ -335,7 +604,18 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
     };
-    let socket = Socket::new(socket, net_ns);
+    let mut socket = Socket::new(socket, net_ns);
+    socket.capture_creator_security(Arc::clone(actor), snapshot.landlock_domain().clone());
+    if matches!(domain, AF_INET | AF_INET6) {
+        let effective_protocol = match ty {
+            SOCK_STREAM if proto == 0 => IPPROTO_TCP as u32,
+            SOCK_DGRAM if proto == 0 => IPPROTO_UDP as u32,
+            SOCK_DCCP if proto == 0 => IPPROTO_DCCP,
+            SOCK_SEQPACKET if proto == 0 => IPPROTO_SCTP,
+            _ => proto,
+        };
+        socket.register_sock_diag(domain as u16, ty as u8, effective_protocol as u8)?;
+    }
     let socket = prepare_new_socket_like(socket, nonblocking)?;
     dispatch_socket_post_create(actor, &socket, spec)?;
     publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)
@@ -415,6 +695,34 @@ pub fn sys_bind(
             let request = decode_bind_address(address)?;
             pinned.packet()?.bind(request)?;
         }
+        SocketBackendKind::Xdp => {
+            if addrlen as usize != size_of::<SockaddrXdp>() {
+                return Err(AxError::InvalidInput);
+            }
+            let address = capability
+                .read_value(addr.address().as_usize() as *const SockaddrXdp)
+                .map_err(map_usercopy_error)?;
+            if address.family as u32 != af_xdp::AF_XDP {
+                return Err(LinuxError::EAFNOSUPPORT.into());
+            }
+            // Sharing an existing socket's UMEM needs a second retained MM
+            // pin owner and is not yet admitted; the ordinary bind form
+            // ignores this padding field exactly as Linux does.
+            if address.flags & af_xdp::XDP_SHARED_UMEM != 0 {
+                return Err(LinuxError::EOPNOTSUPP.into());
+            }
+            let prepared = PreparedSocketAddress::Unspecified;
+            dispatch_socket(&SocketSecurityContext::bind(
+                actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
+            pinned
+                .xdp()?
+                .endpoint()
+                .bind(address.ifindex, address.queue_id, address.flags)?;
+        }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
             let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
@@ -440,10 +748,34 @@ pub fn sys_bind(
                     &security,
                     NodePermission::from_bits_truncate(0o777),
                     snapshot.umask(),
+                    |endpoint| {
+                        let _ = super::cmsg::register_unix_endpoint_owner(
+                            endpoint.raw(),
+                            pinned.description(),
+                        );
+                    },
+                )?;
+            } else if let (
+                SocketInner::Unix(unix),
+                SocketAddrEx::Unix(UnixSocketAddr::Abstract(_)),
+            ) = (&socket.inner, &addr)
+            {
+                let owner = pinned.description().clone();
+                unix.bind_abstract_with_publish(
+                    addr.clone()
+                        .into_unix()
+                        .map_err(|_| AxError::InvalidInput)?,
+                    |endpoint| {
+                        let _ = super::cmsg::register_unix_endpoint_owner(endpoint.raw(), &owner);
+                    },
                 )?;
             } else {
                 require_bind_permissions(&addr, socket.net_namespace(), actor)?;
-                socket.bind(addr)?;
+                validate_network_address(&socket.inner, &addr)?;
+                check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_BIND_TCP)?;
+                socket
+                    .bind(addr)
+                    .map_err(|error| map_bind_error(&socket.inner, error))?;
             }
         }
     }
@@ -515,12 +847,34 @@ pub fn sys_connect(
     let PreparedSocketAddress::Network(addr) = prepared else {
         unreachable!();
     };
+    validate_network_address(&socket.inner, &addr)?;
+    check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_CONNECT_TCP)?;
     let result = match (&socket.inner, &addr) {
         (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
             let security = VfsSecurityContext::new(actor.clone());
             let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
             if unix.is_datagram() {
                 unix.connect_resolved_as(target, snapshot.unix_credentials())
+            } else if unix.is_seqpacket() {
+                let reservation = unix
+                    .prepare_seqpacket_connect_resolved_as(target, snapshot.unix_credentials())?;
+                let listening = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.listening_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                let accepted = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.accepted_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                dispatch_socket(&SocketSecurityContext::unix_stream_connect(
+                    actor,
+                    &socket_ref,
+                    &listening,
+                    &accepted,
+                ))?;
+                reservation.commit()
             } else {
                 let reservation =
                     unix.prepare_stream_connect_resolved_as(target, snapshot.unix_credentials())?;
@@ -546,6 +900,26 @@ pub fn sys_connect(
         (SocketInner::Unix(unix), SocketAddrEx::Unix(_)) => {
             if unix.is_datagram() {
                 unix.connect_as(addr.clone(), snapshot.unix_credentials())
+            } else if unix.is_seqpacket() {
+                let reservation =
+                    unix.prepare_seqpacket_connect_as(addr.clone(), snapshot.unix_credentials())?;
+                let listening = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.listening_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                let accepted = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.accepted_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                dispatch_socket(&SocketSecurityContext::unix_stream_connect(
+                    actor,
+                    &socket_ref,
+                    &listening,
+                    &accepted,
+                ))?;
+                reservation.commit()
             } else {
                 let reservation =
                     unix.prepare_stream_connect_as(addr.clone(), snapshot.unix_credentials())?;
@@ -570,11 +944,11 @@ pub fn sys_connect(
         }
         _ => socket.connect(addr.clone()),
     };
-    result.map_err(|e| {
-        if e == AxError::WouldBlock {
+    result.map_err(|error| {
+        if error == AxError::WouldBlock {
             AxError::InProgress
         } else {
-            e
+            map_connect_error(&socket.inner, error)
         }
     })?;
 
@@ -670,9 +1044,13 @@ pub fn sys_accept4(
         return publish_new_socket_like(request, cloexec).map(|fd| fd as isize);
     }
 
-    let socket = pinned.network()?;
-    let net_ns = socket.net_namespace().clone();
-    let reservation = socket.prepare_accept()?;
+    let listener = pinned.network()?;
+    let net_ns = listener.net_namespace().clone();
+    let reservation = listener.prepare_accept()?;
+    let unix_endpoint = match reservation.identity() {
+        axnet::SocketAcceptIdentity::Unix(endpoint) => Some(endpoint),
+        _ => None,
+    };
     let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
     let accepted_ref = AcceptedSocketSecurityRef::Pending(pending_ref);
     dispatch_socket(&SocketSecurityContext::accept(
@@ -680,7 +1058,9 @@ pub fn sys_accept4(
         &listening_ref,
         &accepted_ref,
     ))?;
-    let socket = Socket::new(reservation.commit()?, net_ns);
+    let mut socket = Socket::new(reservation.commit()?, net_ns);
+    socket.inherit_creator_security_from(listener);
+    socket.inherit_inet_identity_from(listener)?;
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
@@ -694,6 +1074,9 @@ pub fn sys_accept4(
     }
 
     let socket = prepare_new_socket_like(socket, nonblocking)?;
+    if let Some(endpoint) = unix_endpoint {
+        super::cmsg::register_unix_endpoint_owner(endpoint.raw(), socket.description())?;
+    }
     let fd = publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)?;
     debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
@@ -705,7 +1088,18 @@ pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
 
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
-    let actor = snapshot.actor();
+    shutdown_pinned_socket(&pinned, snapshot.actor(), how)
+}
+
+/// Shuts down one already pinned socket using the actor captured when the
+/// operation was admitted.  This is shared by io_uring so neither an fd-table
+/// reuse nor a later credential replacement can change its target or LSM
+/// subject after SQE acceptance.
+pub(crate) fn shutdown_pinned_socket(
+    pinned: &PinnedSocketDescription,
+    actor: &Arc<crate::task::Cred>,
+    how: u32,
+) -> AxResult<isize> {
     let socket_ref = pinned.security_ref()?;
     dispatch_socket(&SocketSecurityContext::shutdown(
         actor,
@@ -783,7 +1177,11 @@ pub fn sys_socketpair(
             )
         }
         SOCK_SEQPACKET => {
-            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
+            let (sock1, sock2) = SeqPacketTransport::new_pair(credentials)?;
+            (
+                UnixSocket::new(sock1, unix_namespace.clone()),
+                UnixSocket::new(sock2, unix_namespace),
+            )
         }
         SOCK_RAW => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
@@ -852,6 +1250,22 @@ mod tests {
     fn socket_creation_flags_keep_read_write_and_nonblocking_on_the_ofd() {
         assert_eq!(socket_status_flags(false), O_RDWR);
         assert_eq!(socket_status_flags(true), O_RDWR | O_NONBLOCK);
+    }
+
+    #[test]
+    fn linux_abi_socket_failures_are_mapped_only_at_the_syscall_boundary() {
+        assert_eq!(
+            socket_failure(SocketFailure::AddressFamilyUnsupported),
+            LinuxError::EAFNOSUPPORT.into()
+        );
+        assert_eq!(
+            socket_failure(SocketFailure::ProtocolOptionUnsupported),
+            LinuxError::ENOPROTOOPT.into()
+        );
+        assert_eq!(
+            socket_failure(SocketFailure::MessageTooLarge),
+            LinuxError::EMSGSIZE.into()
+        );
     }
 
     #[test]

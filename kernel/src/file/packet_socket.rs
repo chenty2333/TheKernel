@@ -4,41 +4,48 @@
 //! publication, errno conversion, ordinary queue copies, and file readiness.
 //! Linux value/state rules remain in `thekernel-linux-packet`; packet capture,
 //! injection, queue budgets, and wake registration remain in `axnet-ng`.
-//! TPACKET rings, fanout, and mmap are deliberately rejected instead of being
-//! exposed as placeholder success. Ordinary endpoint statistics retain their
-//! single destructive owner in Layer 1.
+//! TPACKET frame and block rings are backed by AX-owned shared pages and fanout selection
+//! occurs in the broker before endpoint enqueue. Ordinary endpoint statistics
+//! retain their single destructive owner in Layer 1.
 
-use alloc::{borrow::Cow, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
 use core::{
-    sync::atomic::{AtomicBool, Ordering},
-    task::Context,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    task::{Context, Poll},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axhal::{paging::PageSize, time::TimeValue};
 use axio::prelude::*;
 use axnet::{
     InterfaceKind,
     packet::{
         LinkHardwareType, LinkPacketType, MAX_PACKET_FRAME_BYTES, PacketAncillaryCapabilities,
         PacketDeviceCapabilities, PacketEndpoint, PacketError as PacketMechanismError,
-        PacketMetadata, PacketProtocol, PacketSelector, PacketSendRequest,
-        PacketView as EndpointPacketView,
+        PacketFanout, PacketFanoutMode, PacketMetadata, PacketProtocol, PacketRingSink,
+        PacketSelector, PacketSendRequest, PacketView as EndpointPacketView,
     },
 };
 use axpoll::{IoEvents, Pollable};
-use axsync::Mutex;
+use axsync::{Mutex, MutexGuard};
+use axtask::future::{TimerRegistrationError, sleep_until};
 use thekernel_linux_packet::{
     FrameLayout, GetPacketOption, InterfaceIndex, LinkLayerAddress, LinkLayerInfo,
     PacketBindRequest, PacketBinding, PacketError, PacketOptionValue, PacketSendAddress,
     PacketSocketState, PacketSocketType, PacketStatistics, PacketType, ProtocolSelector,
     ReceiveFlags, SetPacketOption, SockAddrLl,
 };
+#[cfg(test)]
+use thekernel_linux_packet::{SocketFilterAncillary, encoded_socket_filter_ancillary};
 
 use super::{
-    FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap, PseudoInode,
-    packet::socket_ifreq_ioctl, try_pseudo_inode_path,
+    FileLike, FileMmapProtection, FileMmapRequest, FixedSharedMmapRegion, IoDst, IoSrc,
+    IoctlContext, Kstat, PreparedFileMmap, PseudoInode, packet::socket_ifreq_ioctl,
+    try_pseudo_inode_path,
 };
-use crate::{readiness::block_on_poll_io, task::NetworkNamespace};
+use crate::{mm::SharedPages, readiness::block_on_poll_io, task::NetworkNamespace};
 
 #[cfg(test)]
 extern crate std;
@@ -90,6 +97,53 @@ pub(crate) struct PacketSendPlan {
     payload_len: usize,
 }
 
+/// One complete AF_PACKET transmit admission.  The legacy OUTPUT and lower
+/// service locks are acquired once, before a TX-ring frame is cleared or a
+/// userspace source is consumed, and are retained until submission.  This is
+/// deliberately not a probe: a RWF_NOWAIT caller either owns both domains or
+/// returns EAGAIN without changing socket/ring state.
+struct PacketSendPermit<'a> {
+    iptables: crate::syscall::IptablesOutputPermit<'a>,
+    service: axnet::NetStackServicePermit<'a>,
+    state: MutexGuard<'a, PacketSocketState>,
+    ring_config: MutexGuard<'a, ()>,
+    tx_ring: MutexGuard<'a, Option<Arc<PacketTxRing>>>,
+}
+
+impl PacketSendPermit<'_> {
+    fn interfaces(&self) -> Vec<axnet::InterfaceInfo> {
+        self.service.interfaces()
+    }
+
+    fn packet_device_capabilities(&self, interface_index: u32) -> Option<PacketDeviceCapabilities> {
+        self.service.packet_device_capabilities(interface_index)
+    }
+
+    fn submit(
+        &mut self,
+        plan: &PacketSendPlan,
+        origin: &PacketEndpoint,
+        payload: &[u8],
+    ) -> AxResult<()> {
+        // `iptables` remains borrowed for the complete payload transaction.
+        // Recheck from the retained table rather than taking a deep lock.
+        self.iptables.verify()?;
+        let request = match plan.socket_type {
+            PacketSocketType::Raw => PacketSendRequest::Raw {
+                protocol: plan.protocol,
+                frame: payload,
+            },
+            PacketSocketType::Datagram => PacketSendRequest::Cooked {
+                protocol: plan.protocol,
+                destination: &plan.destination[..plan.destination_len],
+                payload,
+            },
+        };
+        self.service
+            .send_packet(plan.interface_index, origin, request)
+    }
+}
+
 /// One AF_PACKET open-file backend.
 ///
 /// `state` is the authoritative Linux bind/option state. `endpoint` owns the
@@ -102,7 +156,589 @@ pub(crate) struct PacketSocket {
     state: Mutex<PacketSocketState>,
     filter_control: Mutex<PacketFilterControl>,
     nonblocking: AtomicBool,
+    ring_config: Mutex<()>,
+    version: Mutex<PacketVersion>,
+    ring: Mutex<Option<Arc<PacketRxRing>>>,
+    tx_ring: Mutex<Option<Arc<PacketTxRing>>>,
+    mmap: Mutex<Option<Arc<PacketRingMmap>>>,
+    mmap_published: AtomicBool,
+    v3_timer: Mutex<Option<PacketV3Timer>>,
     inode: PseudoInode,
+}
+
+struct PacketV3Timer {
+    deadline: TimeValue,
+    future: Pin<Box<dyn Future<Output = Result<(), TimerRegistrationError>> + Send>>,
+}
+
+const TP_STATUS_KERNEL: u32 = 0;
+const TP_STATUS_USER: u32 = 1;
+const TP_STATUS_BLK_TMO: u32 = 1 << 5;
+const TPACKET1_HEADER: usize = 32;
+const TPACKET2_HEADER: usize = 32;
+const TPACKET1_HDRLEN: usize = 52;
+const TPACKET2_HDRLEN: usize = 52;
+const TPACKET3_HEADER: usize = 48;
+const TPACKET3_HDRLEN: usize = 68;
+const TPACKET3_MAC_OFFSET: usize = 80;
+const TPACKET_BLOCK_DESC: usize = 48;
+const TPACKET_ALIGNMENT: usize = 16;
+
+/// Native-endian, x86_64 UAPI layouts written directly into the shared map.
+/// V3 transfers ownership through `block_status`, never through a per-frame
+/// status word.
+#[repr(C)]
+struct TpacketBlockDesc {
+    version: u32,
+    offset_to_priv: u32,
+    block_status: u32,
+    num_pkts: u32,
+    offset_to_first_pkt: u32,
+    blk_len: u32,
+    seq_num: u64,
+    ts_first_pkt: [u8; 8],
+    ts_last_pkt: [u8; 8],
+}
+
+#[repr(C)]
+struct Tpacket3Hdr {
+    next_offset: u32,
+    sec: u32,
+    nsec: u32,
+    snaplen: u32,
+    len: u32,
+    status: u32,
+    mac: u16,
+    net: u16,
+    hv1: [u8; 12],
+    padding: [u8; 8],
+}
+
+const _: [(); TPACKET_BLOCK_DESC] = [(); core::mem::size_of::<TpacketBlockDesc>()];
+const _: [(); TPACKET3_HEADER] = [(); core::mem::size_of::<Tpacket3Hdr>()];
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PacketVersion {
+    V1,
+    V2,
+    V3,
+}
+
+impl PacketVersion {
+    pub(crate) const fn raw(self) -> i32 {
+        match self {
+            Self::V1 => 0,
+            Self::V2 => 1,
+            Self::V3 => 2,
+        }
+    }
+    pub(crate) const fn header_len(self) -> usize {
+        match self {
+            Self::V1 => TPACKET1_HDRLEN,
+            Self::V2 => TPACKET2_HDRLEN,
+            Self::V3 => TPACKET3_HDRLEN,
+        }
+    }
+    pub(crate) const fn decode(raw: i32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::V1),
+            1 => Some(Self::V2),
+            2 => Some(Self::V3),
+            _ => None,
+        }
+    }
+}
+
+/// Kernel mapping backing an endpoint-owned AX ring sink.  Frame ownership is
+/// transferred by the first status word: userspace returns it to zero, and
+/// ingress publishes `TP_STATUS_USER` only after every header/payload byte is
+/// visible in the mapped shared pages.
+struct PacketRingMmap {
+    pages: Arc<SharedPages>,
+    region: FixedSharedMmapRegion,
+}
+impl PacketRingMmap {
+    fn try_new(bytes: usize) -> AxResult<Arc<Self>> {
+        let pages = Arc::try_new(SharedPages::new_fixed(bytes, PageSize::Size4K)?)
+            .map_err(|_| AxError::NoMemory)?;
+        let region = FixedSharedMmapRegion::try_new(
+            0,
+            pages.clone(),
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+        )?;
+        Arc::try_new(Self { pages, region }).map_err(|_| AxError::NoMemory)
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) struct PacketV3Request {
+    pub(crate) block_size: usize,
+    pub(crate) block_nr: u32,
+    pub(crate) frame_size: usize,
+    pub(crate) frame_nr: u32,
+    pub(crate) retire_blk_tov_ms: u32,
+    pub(crate) private_size: usize,
+    pub(crate) fill_rxhash: bool,
+    pub(crate) socket_type: PacketSocketType,
+}
+
+enum PacketRxRingKind {
+    Frames {
+        frame_size: usize,
+        frame_nr: u32,
+        version: PacketVersion,
+        next: AtomicU32,
+    },
+    V3 {
+        request: PacketV3Request,
+        state: Mutex<PacketV3ProducerState>,
+        sequence: AtomicU64,
+        freeze_q_cnt: AtomicU32,
+    },
+}
+
+struct PacketV3ProducerState {
+    block: u32,
+    packets: u32,
+    next_offset: usize,
+    last_packet: usize,
+    opened_at_nanos: u64,
+}
+
+struct PacketRxRing {
+    pages: Mutex<Arc<SharedPages>>,
+    base: AtomicU32,
+    kind: PacketRxRingKind,
+}
+impl PacketRxRing {
+    fn try_new(frame_size: usize, frame_nr: u32, version: PacketVersion) -> AxResult<Arc<Self>> {
+        let bytes = frame_size
+            .checked_mul(frame_nr as usize)
+            .ok_or(AxError::NoMemory)?;
+        let pages = Arc::try_new(SharedPages::new_fixed(bytes, PageSize::Size4K)?)
+            .map_err(|_| AxError::NoMemory)?;
+        Arc::try_new(Self {
+            pages: Mutex::new(pages),
+            base: AtomicU32::new(0),
+            kind: PacketRxRingKind::Frames {
+                frame_size,
+                frame_nr,
+                version,
+                next: AtomicU32::new(0),
+            },
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+    fn try_new_v3(request: PacketV3Request) -> AxResult<Arc<Self>> {
+        let bytes = request
+            .block_size
+            .checked_mul(request.block_nr as usize)
+            .ok_or(AxError::NoMemory)?;
+        let pages = Arc::try_new(SharedPages::new_fixed(bytes, PageSize::Size4K)?)
+            .map_err(|_| AxError::NoMemory)?;
+        Arc::try_new(Self {
+            pages: Mutex::new(pages),
+            base: AtomicU32::new(0),
+            kind: PacketRxRingKind::V3 {
+                request,
+                state: Mutex::new(PacketV3ProducerState {
+                    block: 0,
+                    packets: 0,
+                    next_offset: 0,
+                    last_packet: 0,
+                    opened_at_nanos: 0,
+                }),
+                sequence: AtomicU64::new(1),
+                freeze_q_cnt: AtomicU32::new(0),
+            },
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+    fn replace_backing(&self, pages: Arc<SharedPages>, base: usize) {
+        *self.pages.lock() = pages;
+        self.base.store(base as u32, Ordering::Release)
+    }
+    fn mapping_len(&self) -> AxResult<usize> {
+        match &self.kind {
+            PacketRxRingKind::Frames {
+                frame_size,
+                frame_nr,
+                ..
+            } => frame_size
+                .checked_mul(*frame_nr as usize)
+                .ok_or(AxError::NoMemory),
+            PacketRxRingKind::V3 { request, .. } => request
+                .block_size
+                .checked_mul(request.block_nr as usize)
+                .ok_or(AxError::NoMemory),
+        }
+    }
+    fn take_freeze_q_cnt(&self) -> u32 {
+        match &self.kind {
+            PacketRxRingKind::V3 { freeze_q_cnt, .. } => freeze_q_cnt.swap(0, Ordering::AcqRel),
+            PacketRxRingKind::Frames { .. } => 0,
+        }
+    }
+    fn v3_deadline(&self) -> Option<u64> {
+        match &self.kind {
+            PacketRxRingKind::V3 { request, state, .. } if request.retire_blk_tov_ms != 0 => {
+                let state = state.lock();
+                (state.packets != 0).then_some(
+                    state
+                        .opened_at_nanos
+                        .saturating_add(u64::from(request.retire_blk_tov_ms) * 1_000_000),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+struct PacketTxRing {
+    pages: Mutex<Arc<SharedPages>>,
+    base: AtomicU32,
+    frame_size: usize,
+    frame_nr: u32,
+    version: PacketVersion,
+    next: AtomicU32,
+}
+impl PacketTxRing {
+    fn try_new(frame_size: usize, frame_nr: u32, version: PacketVersion) -> AxResult<Arc<Self>> {
+        let bytes = frame_size
+            .checked_mul(frame_nr as usize)
+            .ok_or(AxError::NoMemory)?;
+        let pages = Arc::try_new(SharedPages::new_fixed(bytes, PageSize::Size4K)?)
+            .map_err(|_| AxError::NoMemory)?;
+        Arc::try_new(Self {
+            pages: Mutex::new(pages),
+            base: AtomicU32::new(0),
+            frame_size,
+            frame_nr,
+            version,
+            next: AtomicU32::new(0),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+    fn replace_backing(&self, pages: Arc<SharedPages>, base: usize) {
+        *self.pages.lock() = pages;
+        self.base.store(base as u32, Ordering::Release)
+    }
+}
+impl PacketRingSink for PacketRxRing {
+    fn publish(&self, metadata: PacketMetadata, bytes: &[u8]) -> AxResult<bool> {
+        match &self.kind {
+            PacketRxRingKind::Frames {
+                frame_size,
+                frame_nr,
+                version,
+                next,
+            } => {
+                let header_len = version.header_len();
+                if bytes.len() > frame_size.saturating_sub(header_len) {
+                    return Ok(false);
+                }
+                let slot = next.load(Ordering::Acquire) % frame_nr;
+                let offset =
+                    self.base.load(Ordering::Acquire) as usize + slot as usize * frame_size;
+                let pages = self.pages.lock().clone();
+                let free = match version {
+                    PacketVersion::V1 => {
+                        let mut status = [0; 8];
+                        pages.read_bytes(offset, &mut status)?;
+                        u64::from_ne_bytes(status) == TP_STATUS_KERNEL as u64
+                    }
+                    PacketVersion::V2 => {
+                        let mut status = [0; 4];
+                        pages.read_bytes(offset, &mut status)?;
+                        u32::from_ne_bytes(status) == TP_STATUS_KERNEL
+                    }
+                    PacketVersion::V3 => unreachable!(),
+                };
+                if !free {
+                    return Ok(false);
+                }
+                let mut header = [0u8; TPACKET2_HEADER];
+                match version {
+                    PacketVersion::V1 => {
+                        header[8..12].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+                        header[12..16].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+                        header[16..18].copy_from_slice(&(header_len as u16).to_ne_bytes());
+                        header[18..20].copy_from_slice(
+                            &((header_len + usize::from(metadata.link_header_len)) as u16)
+                                .to_ne_bytes(),
+                        )
+                    }
+                    PacketVersion::V2 => {
+                        header[4..8].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+                        header[8..12].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+                        header[12..14].copy_from_slice(&(header_len as u16).to_ne_bytes());
+                        header[14..16].copy_from_slice(
+                            &((header_len + usize::from(metadata.link_header_len)) as u16)
+                                .to_ne_bytes(),
+                        )
+                    }
+                    PacketVersion::V3 => unreachable!(),
+                };
+                let mut address = [0u8; 20];
+                address[..2].copy_from_slice(&(linux_raw_sys::net::AF_PACKET as u16).to_ne_bytes());
+                address[2..4].copy_from_slice(&metadata.protocol.to_be_bytes());
+                address[4..8].copy_from_slice(&(metadata.interface_index as i32).to_ne_bytes());
+                address[8..10].copy_from_slice(&hardware_type(metadata).to_ne_bytes());
+                address[10] = packet_type_raw(metadata.packet_type);
+                address[11] = metadata.address_len;
+                address[12..20].copy_from_slice(&metadata.address);
+                pages.write_bytes(offset, &header)?;
+                pages.write_bytes(offset + TPACKET1_HEADER, &address)?;
+                pages.write_bytes(offset + header_len, bytes)?;
+                core::sync::atomic::fence(Ordering::Release);
+                match version {
+                    PacketVersion::V1 => {
+                        pages.write_bytes(offset, &(TP_STATUS_USER as u64).to_ne_bytes())?
+                    }
+                    PacketVersion::V2 => {
+                        pages.write_bytes(offset, &TP_STATUS_USER.to_ne_bytes())?
+                    }
+                    PacketVersion::V3 => unreachable!(),
+                };
+                next.store(slot.wrapping_add(1), Ordering::Release);
+                Ok(true)
+            }
+            PacketRxRingKind::V3 {
+                request,
+                state,
+                sequence,
+                freeze_q_cnt,
+            } => self.publish_v3(*request, state, sequence, freeze_q_cnt, metadata, bytes),
+        }
+    }
+    fn readable(&self) -> bool {
+        match &self.kind {
+            PacketRxRingKind::Frames {
+                frame_size,
+                frame_nr,
+                version,
+                ..
+            } => {
+                for slot in 0..*frame_nr {
+                    let offset =
+                        self.base.load(Ordering::Acquire) as usize + slot as usize * frame_size;
+                    let readable = match version {
+                        PacketVersion::V1 => {
+                            let mut status = [0; 8];
+                            self.pages.lock().read_bytes(offset, &mut status).is_ok()
+                                && u64::from_ne_bytes(status) & TP_STATUS_USER as u64 != 0
+                        }
+                        PacketVersion::V2 => {
+                            let mut status = [0; 4];
+                            self.pages.lock().read_bytes(offset, &mut status).is_ok()
+                                && u32::from_ne_bytes(status) & TP_STATUS_USER != 0
+                        }
+                        PacketVersion::V3 => unreachable!(),
+                    };
+                    if readable {
+                        return true;
+                    }
+                }
+            }
+            PacketRxRingKind::V3 { request, state, .. } => {
+                if self.retire_v3_if_due(*request, state).is_err() {
+                    return false;
+                }
+                for block in 0..request.block_nr {
+                    let offset = self.base.load(Ordering::Acquire) as usize
+                        + block as usize * request.block_size
+                        + 8;
+                    let mut status = [0; 4];
+                    if self.pages.lock().read_bytes(offset, &mut status).is_ok()
+                        && u32::from_ne_bytes(status) & TP_STATUS_USER != 0
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl PacketRxRing {
+    fn publish_v3(
+        &self,
+        request: PacketV3Request,
+        state: &Mutex<PacketV3ProducerState>,
+        sequence: &AtomicU64,
+        freeze_q_cnt: &AtomicU32,
+        metadata: PacketMetadata,
+        bytes: &[u8],
+    ) -> AxResult<bool> {
+        let mac_len = usize::from(metadata.link_header_len);
+        let net_offset = align_tpacket(TPACKET3_HDRLEN + mac_len.max(16));
+        let mac_offset = match request.socket_type {
+            PacketSocketType::Raw => net_offset - mac_len,
+            PacketSocketType::Datagram => net_offset,
+        };
+        let record_len = align_v3(
+            mac_offset
+                .checked_add(bytes.len())
+                .ok_or(AxError::NoMemory)?,
+        );
+        if record_len
+            > request.block_size.saturating_sub(
+                align_v3(TPACKET_BLOCK_DESC)
+                    .checked_add(align_v3(request.private_size))
+                    .ok_or(AxError::NoMemory)?,
+            )
+        {
+            return Ok(false);
+        }
+        let pages = self.pages.lock().clone();
+        let base = self.base.load(Ordering::Acquire) as usize;
+        let mut producer = state.lock();
+        self.retire_v3_locked(request, &pages, base, &mut producer, true)?;
+        for _ in 0..request.block_nr {
+            let block_offset = base + producer.block as usize * request.block_size;
+            let mut status = [0; 4];
+            pages.read_bytes(block_offset + 8, &mut status)?;
+            core::sync::atomic::fence(Ordering::Acquire);
+            if u32::from_ne_bytes(status) == TP_STATUS_KERNEL {
+                break;
+            }
+            producer.block = (producer.block + 1) % request.block_nr;
+            producer.packets = 0;
+            producer.next_offset = 0;
+            producer.last_packet = 0;
+            producer.opened_at_nanos = 0;
+        }
+        let block_offset = base + producer.block as usize * request.block_size;
+        let mut status = [0; 4];
+        pages.read_bytes(block_offset + 8, &mut status)?;
+        if u32::from_ne_bytes(status) != TP_STATUS_KERNEL {
+            freeze_q_cnt.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        if producer.packets == 0 {
+            let first = align_v3(TPACKET_BLOCK_DESC)
+                .checked_add(align_v3(request.private_size))
+                .ok_or(AxError::NoMemory)?;
+            let now = crate::time::wall_time_nanos();
+            let mut descriptor = [0u8; TPACKET_BLOCK_DESC];
+            descriptor[..4].copy_from_slice(&1u32.to_ne_bytes());
+            descriptor[4..8].copy_from_slice(&(TPACKET_BLOCK_DESC as u32).to_ne_bytes());
+            descriptor[16..20].copy_from_slice(&(first as u32).to_ne_bytes());
+            descriptor[20..24].copy_from_slice(&(first as u32).to_ne_bytes());
+            descriptor[24..32]
+                .copy_from_slice(&sequence.fetch_add(1, Ordering::Relaxed).to_ne_bytes());
+            descriptor[32..36].copy_from_slice(&((now / 1_000_000_000) as u32).to_ne_bytes());
+            descriptor[36..40].copy_from_slice(&((now % 1_000_000_000) as u32).to_ne_bytes());
+            pages.write_bytes(block_offset, &descriptor)?;
+            producer.next_offset = first;
+            producer.opened_at_nanos = axhal::time::monotonic_time_nanos();
+        }
+        if producer
+            .next_offset
+            .checked_add(record_len)
+            .is_none_or(|end| end > request.block_size)
+        {
+            self.retire_v3_locked(request, &pages, base, &mut producer, false)?;
+            drop(producer);
+            return self.publish_v3(request, state, sequence, freeze_q_cnt, metadata, bytes);
+        }
+        let packet_offset = block_offset + producer.next_offset;
+        let mut header = [0u8; TPACKET3_HEADER];
+        let now = crate::time::wall_time_nanos();
+        header[..4].copy_from_slice(&(record_len as u32).to_ne_bytes());
+        header[4..8].copy_from_slice(&((now / 1_000_000_000) as u32).to_ne_bytes());
+        header[8..12].copy_from_slice(&((now % 1_000_000_000) as u32).to_ne_bytes());
+        header[12..16].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+        header[16..20].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+        header[20..24].copy_from_slice(&TP_STATUS_USER.to_ne_bytes());
+        header[24..26].copy_from_slice(&(mac_offset as u16).to_ne_bytes());
+        header[26..28].copy_from_slice(&(net_offset as u16).to_ne_bytes());
+        if request.fill_rxhash {
+            header[28..32].copy_from_slice(&packet_rxhash(metadata, bytes).to_ne_bytes())
+        }
+        let mut address = [0u8; 20];
+        address[..2].copy_from_slice(&(linux_raw_sys::net::AF_PACKET as u16).to_ne_bytes());
+        address[2..4].copy_from_slice(&metadata.protocol.to_be_bytes());
+        address[4..8].copy_from_slice(&(metadata.interface_index as i32).to_ne_bytes());
+        address[8..10].copy_from_slice(&hardware_type(metadata).to_ne_bytes());
+        address[10] = packet_type_raw(metadata.packet_type);
+        address[11] = metadata.address_len;
+        address[12..20].copy_from_slice(&metadata.address);
+        pages.write_bytes(packet_offset, &header)?;
+        pages.write_bytes(packet_offset + TPACKET3_HEADER, &address)?;
+        pages.write_bytes(packet_offset + mac_offset, bytes)?;
+        producer.last_packet = producer.next_offset;
+        producer.next_offset += record_len;
+        producer.packets += 1;
+        pages.write_bytes(block_offset + 12, &producer.packets.to_ne_bytes())?;
+        pages.write_bytes(
+            block_offset + 20,
+            &(producer.next_offset as u32).to_ne_bytes(),
+        )?;
+        if producer
+            .next_offset
+            .checked_add(mac_offset)
+            .is_none_or(|end| end > request.block_size)
+        {
+            self.retire_v3_locked(request, &pages, base, &mut producer, false)?
+        }
+        Ok(true)
+    }
+    fn retire_v3_if_due(
+        &self,
+        request: PacketV3Request,
+        state: &Mutex<PacketV3ProducerState>,
+    ) -> AxResult<()> {
+        let pages = self.pages.lock().clone();
+        let base = self.base.load(Ordering::Acquire) as usize;
+        let mut state = state.lock();
+        self.retire_v3_locked(request, &pages, base, &mut state, true)
+    }
+    fn retire_v3_locked(
+        &self,
+        request: PacketV3Request,
+        pages: &Arc<SharedPages>,
+        base: usize,
+        state: &mut PacketV3ProducerState,
+        timed: bool,
+    ) -> AxResult<()> {
+        if state.packets == 0 {
+            return Ok(());
+        }
+        let due = timed
+            && request.retire_blk_tov_ms != 0
+            && axhal::time::monotonic_time_nanos().saturating_sub(state.opened_at_nanos)
+                >= u64::from(request.retire_blk_tov_ms) * 1_000_000;
+        if !timed || due {
+            let offset = base + state.block as usize * request.block_size;
+            let now = crate::time::wall_time_nanos();
+            let status = TP_STATUS_USER | if due { TP_STATUS_BLK_TMO } else { 0 };
+            pages.write_bytes(offset + state.last_packet, &0u32.to_ne_bytes())?;
+            pages.write_bytes(offset + 40, &((now / 1_000_000_000) as u32).to_ne_bytes())?;
+            pages.write_bytes(offset + 44, &((now % 1_000_000_000) as u32).to_ne_bytes())?;
+            core::sync::atomic::fence(Ordering::Release);
+            pages.write_bytes(offset + 8, &status.to_ne_bytes())?;
+            state.block = (state.block + 1) % request.block_nr;
+            state.packets = 0;
+            state.next_offset = 0;
+            state.last_packet = 0;
+            state.opened_at_nanos = 0;
+        }
+        Ok(())
+    }
+}
+
+const fn align_tpacket(value: usize) -> usize {
+    (value + TPACKET_ALIGNMENT - 1) & !(TPACKET_ALIGNMENT - 1)
+}
+const fn align_v3(value: usize) -> usize {
+    (value + 7) & !7
+}
+fn packet_rxhash(metadata: PacketMetadata, bytes: &[u8]) -> u32 {
+    let mut hash = 2166136261u32 ^ (metadata.interface_index as u32);
+    for byte in bytes {
+        hash = (hash ^ u32::from(*byte)).wrapping_mul(16777619)
+    }
+    hash
 }
 
 #[derive(Default)]
@@ -147,6 +783,13 @@ impl PacketSocket {
             state: Mutex::new(state),
             filter_control: Mutex::new(PacketFilterControl::default()),
             nonblocking: AtomicBool::new(false),
+            ring_config: Mutex::new(()),
+            version: Mutex::new(PacketVersion::V1),
+            ring: Mutex::new(None),
+            tx_ring: Mutex::new(None),
+            mmap: Mutex::new(None),
+            mmap_published: AtomicBool::new(false),
+            v3_timer: Mutex::new(None),
             inode: PseudoInode::socket(),
         })
         .map_err(|_| AxError::NoMemory)
@@ -316,6 +959,358 @@ impl PacketSocket {
         Ok(())
     }
 
+    fn prepare_ring_mapping(
+        rx: Option<&Arc<PacketRxRing>>,
+        tx: Option<&Arc<PacketTxRing>>,
+    ) -> AxResult<Option<Arc<PacketRingMmap>>> {
+        let rx_len = match rx {
+            Some(ring) => ring.mapping_len()?,
+            None => 0,
+        };
+        let tx_len = match tx {
+            Some(ring) => ring
+                .frame_size
+                .checked_mul(ring.frame_nr as usize)
+                .ok_or(AxError::NoMemory)?,
+            None => 0,
+        };
+        let total = rx_len.checked_add(tx_len).ok_or(AxError::NoMemory)?;
+        if total == 0 {
+            return Ok(None);
+        }
+        PacketRingMmap::try_new(total).map(Some)
+    }
+
+    fn ring_header_len(&self) -> usize {
+        self.version.lock().header_len()
+    }
+
+    /// Setting PACKET_VERSION is an OFD transition. Linux forbids changing
+    /// layout after either ring exists, so a failed transition leaves the
+    /// default V1 state untouched.
+    pub(crate) fn set_packet_version(&self, raw: i32) -> AxResult<()> {
+        let version = PacketVersion::decode(raw).ok_or(AxError::InvalidInput)?;
+        let _serial = self.ring_config.lock();
+        if self.ring.lock().is_some() || self.tx_ring.lock().is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        *self.version.lock() = version;
+        Ok(())
+    }
+
+    pub(crate) fn packet_version(&self) -> PacketVersion {
+        *self.version.lock()
+    }
+
+    pub(crate) fn take_v3_freeze_q_cnt(&self) -> u32 {
+        self.ring
+            .lock()
+            .as_ref()
+            .map_or(0, |ring| ring.take_freeze_q_cnt())
+    }
+
+    fn arm_v3_timer(&self, context: &mut Context<'_>) -> Result<(), axpoll::PollRegistrationError> {
+        let deadline = self
+            .ring
+            .lock()
+            .as_ref()
+            .and_then(|ring| ring.v3_deadline());
+        let Some(deadline) = deadline else {
+            *self.v3_timer.lock() = None;
+            return Ok(());
+        };
+        let deadline = TimeValue::from_nanos(deadline);
+        let mut timer = self.v3_timer.lock();
+        if timer
+            .as_ref()
+            .is_none_or(|timer| timer.deadline != deadline)
+        {
+            let future = Box::try_new(sleep_until(deadline))
+                .map_err(|_| axpoll::PollRegistrationError::NoMemory)?;
+            *timer = Some(PacketV3Timer {
+                deadline,
+                future: Box::into_pin(future),
+            });
+        }
+        let expired = timer
+            .as_mut()
+            .is_some_and(|timer| matches!(timer.future.as_mut().poll(context), Poll::Ready(_)));
+        if expired {
+            *timer = None;
+            context.waker().wake_by_ref();
+        }
+        Ok(())
+    }
+
+    /// Prepare pages and a complete mmap object before publishing either the
+    /// endpoint sink or Linux-visible ring state. All-zero tpacket_req is the
+    /// Linux teardown operation; it atomically removes the requested half
+    /// before any later configuration can observe it.
+    pub(crate) fn configure_rx_ring(&self, frame_size: usize, frame_nr: u32) -> AxResult<()> {
+        let _serial = self.ring_config.lock();
+        if self.mmap_published.load(Ordering::Acquire) {
+            return Err(AxError::ResourceBusy);
+        }
+        if frame_size == 0 && frame_nr == 0 {
+            *self.v3_timer.lock() = None;
+            let tx = self.tx_ring.lock().as_ref().cloned();
+            let mapping = Self::prepare_ring_mapping(None, tx.as_ref())?;
+            self.endpoint
+                .set_ring_sink(None)
+                .map_err(packet_mechanism_error)?;
+            *self.ring.lock() = None;
+            *self.mmap.lock() = mapping;
+            return Ok(());
+        }
+        if self.packet_version() == PacketVersion::V3 {
+            return Err(AxError::InvalidInput);
+        }
+        let header_len = self.ring_header_len();
+        if frame_size < header_len
+            || !frame_size.is_multiple_of(16)
+            || frame_nr == 0
+            || self.ring.lock().is_some()
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let ring = PacketRxRing::try_new(frame_size, frame_nr, *self.version.lock())?;
+        let tx = self.tx_ring.lock().as_ref().cloned();
+        let mapping = Self::prepare_ring_mapping(Some(&ring), tx.as_ref())?;
+        if let Some(mapping) = mapping.as_ref() {
+            ring.replace_backing(mapping.pages.clone(), 0);
+            if let Some(tx) = tx.as_ref() {
+                tx.replace_backing(mapping.pages.clone(), ring.mapping_len()?);
+            }
+        }
+        self.endpoint
+            .set_ring_sink(Some(ring.clone()))
+            .map_err(packet_mechanism_error)?;
+        *self.ring.lock() = Some(ring);
+        *self.mmap.lock() = mapping;
+        Ok(())
+    }
+
+    pub(crate) fn configure_rx_ring_v3(&self, request: PacketV3Request) -> AxResult<()> {
+        let _serial = self.ring_config.lock();
+        if self.mmap_published.load(Ordering::Acquire)
+            || self.packet_version() != PacketVersion::V3
+            || self.ring.lock().is_some()
+        {
+            return Err(AxError::ResourceBusy);
+        }
+        let ring = PacketRxRing::try_new_v3(request)?;
+        *self.v3_timer.lock() = None;
+        let tx = self.tx_ring.lock().as_ref().cloned();
+        let mapping = Self::prepare_ring_mapping(Some(&ring), tx.as_ref())?;
+        if let Some(mapping) = mapping.as_ref() {
+            ring.replace_backing(mapping.pages.clone(), 0);
+            if let Some(tx) = tx.as_ref() {
+                tx.replace_backing(mapping.pages.clone(), ring.mapping_len()?);
+            }
+        }
+        self.endpoint
+            .set_ring_sink(Some(ring.clone()))
+            .map_err(packet_mechanism_error)?;
+        *self.ring.lock() = Some(ring);
+        *self.mmap.lock() = mapping;
+        Ok(())
+    }
+
+    pub(crate) fn configure_tx_ring(&self, frame_size: usize, frame_nr: u32) -> AxResult<()> {
+        let _serial = self.ring_config.lock();
+        if self.mmap_published.load(Ordering::Acquire) {
+            return Err(AxError::ResourceBusy);
+        }
+        if frame_size == 0 && frame_nr == 0 {
+            let rx = self.ring.lock().as_ref().cloned();
+            let mapping = Self::prepare_ring_mapping(rx.as_ref(), None)?;
+            *self.tx_ring.lock() = None;
+            *self.mmap.lock() = mapping;
+            return Ok(());
+        }
+        if self.packet_version() == PacketVersion::V3 {
+            return Err(AxError::InvalidInput);
+        }
+        let header_len = self.ring_header_len();
+        if frame_size < header_len
+            || !frame_size.is_multiple_of(16)
+            || frame_nr == 0
+            || self.tx_ring.lock().is_some()
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let ring = PacketTxRing::try_new(frame_size, frame_nr, *self.version.lock())?;
+        let rx = self.ring.lock().as_ref().cloned();
+        let mapping = Self::prepare_ring_mapping(rx.as_ref(), Some(&ring))?;
+        if let Some(mapping) = mapping.as_ref() {
+            if let Some(rx) = rx.as_ref() {
+                self.endpoint
+                    .set_ring_sink(None)
+                    .map_err(packet_mechanism_error)?;
+                rx.replace_backing(mapping.pages.clone(), 0);
+            }
+            let rx_len = match rx.as_ref() {
+                Some(rx) => rx.mapping_len()?,
+                None => 0,
+            };
+            ring.replace_backing(mapping.pages.clone(), rx_len);
+            if let Some(rx) = rx.as_ref() {
+                self.endpoint
+                    .set_ring_sink(Some(rx.clone()))
+                    .map_err(packet_mechanism_error)?;
+            }
+        }
+        *self.tx_ring.lock() = Some(ring);
+        *self.mmap.lock() = mapping;
+        Ok(())
+    }
+
+    /// Associates this endpoint with an AF_PACKET fanout group.  The lower
+    /// broker chooses only among members whose current selector matched the
+    /// capture, preserving one-copy semantics without a packet-side clone.
+    pub(crate) fn configure_fanout(&self, group: u16, kind: u16) -> AxResult<()> {
+        let raw_mode = kind & 0xff;
+        let flags = kind & !0xff;
+        // DEFRAG is meaningful at the lower IP reassembly layer; the packet
+        // broker receives completed link frames, so retaining it is a real
+        // no-op rather than silently reclassifying group membership.
+        if flags & !0x8000 != 0 {
+            return Err(LinuxError::EINVAL.into());
+        }
+        let mode = match raw_mode {
+            0 => PacketFanoutMode::Hash,
+            1 => PacketFanoutMode::LoadBalance,
+            2 => PacketFanoutMode::Cpu,
+            3 => PacketFanoutMode::Rollover,
+            4 => PacketFanoutMode::Random,
+            _ => return Err(LinuxError::EINVAL.into()),
+        };
+        self.endpoint
+            .set_fanout(Some(PacketFanout { group, mode, flags }))
+            .map_err(packet_mechanism_error)
+    }
+
+    pub(crate) fn flush_tx_ring(&self) -> AxResult<()> {
+        self.flush_tx_ring_with_nonblocking(false)
+    }
+    fn flush_tx_ring_with_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
+        let ring = if nonblocking {
+            self.tx_ring.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.tx_ring.lock()
+        }
+        .as_ref()
+        .cloned();
+        let Some(ring) = ring else { return Ok(()) };
+        let pages = if nonblocking {
+            ring.pages.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            ring.pages.lock()
+        }
+        .clone();
+        let base = ring.base.load(Ordering::Acquire) as usize;
+        for _ in 0..ring.frame_nr {
+            let slot = ring.next.load(Ordering::Acquire) % ring.frame_nr;
+            let offset = base + slot as usize * ring.frame_size;
+            let mut header = [0u8; TPACKET2_HEADER];
+            pages.read_bytes(offset, &mut header)?;
+            let (status, len, mac) = match ring.version {
+                PacketVersion::V1 => (
+                    u64::from_ne_bytes(header[..8].try_into().unwrap()),
+                    u32::from_ne_bytes(header[8..12].try_into().unwrap()) as usize,
+                    u16::from_ne_bytes(header[16..18].try_into().unwrap()) as usize,
+                ),
+                PacketVersion::V2 => (
+                    u32::from_ne_bytes(header[..4].try_into().unwrap()) as u64,
+                    u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize,
+                    u16::from_ne_bytes(header[12..14].try_into().unwrap()) as usize,
+                ),
+                PacketVersion::V3 => unreachable!(),
+            };
+            if status != 1 {
+                break;
+            }
+            let clear = || match ring.version {
+                PacketVersion::V1 => pages.write_bytes(offset, &0u64.to_ne_bytes()),
+                PacketVersion::V2 => pages.write_bytes(offset, &0u32.to_ne_bytes()),
+                PacketVersion::V3 => unreachable!(),
+            };
+            if mac > ring.frame_size || len > ring.frame_size.saturating_sub(mac) {
+                clear()?;
+                ring.next.store(slot.wrapping_add(1), Ordering::Release);
+                continue;
+            }
+            let mut frame = Vec::new();
+            frame
+                .try_reserve_exact(len)
+                .map_err(|_| AxError::NoMemory)?;
+            frame.resize(len, 0);
+            pages.read_bytes(offset + mac, &mut frame)?;
+            let plan = self.prepare_send_with_nonblocking(frame.len(), None, nonblocking)?;
+            self.send_prepared_with_nonblocking(plan, &frame, nonblocking)?;
+            clear()?;
+            ring.next.store(slot.wrapping_add(1), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Flushes producer-owned TX_RING frames through a previously retained
+    /// transmit permit.  No policy or network-service lock is reacquired in
+    /// this path, so a NOWAIT EAGAIN always happens before ownership changes.
+    fn flush_tx_ring_with_permit(&self, permit: &mut PacketSendPermit<'_>) -> AxResult<()> {
+        // Keep configuration serialization live for the entire flush.
+        let _config = &permit.ring_config;
+        let ring = permit.tx_ring.as_ref().cloned();
+        let Some(ring) = ring else {
+            return Ok(());
+        };
+        let pages = ring.pages.try_lock().ok_or(AxError::WouldBlock)?.clone();
+        let base = ring.base.load(Ordering::Acquire) as usize;
+        for _ in 0..ring.frame_nr {
+            let slot = ring.next.load(Ordering::Acquire) % ring.frame_nr;
+            let offset = base + slot as usize * ring.frame_size;
+            let mut header = [0u8; TPACKET2_HEADER];
+            pages.read_bytes(offset, &mut header)?;
+            let (status, len, mac) = match ring.version {
+                PacketVersion::V1 => (
+                    u64::from_ne_bytes(header[..8].try_into().unwrap()),
+                    u32::from_ne_bytes(header[8..12].try_into().unwrap()) as usize,
+                    u16::from_ne_bytes(header[16..18].try_into().unwrap()) as usize,
+                ),
+                PacketVersion::V2 => (
+                    u32::from_ne_bytes(header[..4].try_into().unwrap()) as u64,
+                    u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize,
+                    u16::from_ne_bytes(header[12..14].try_into().unwrap()) as usize,
+                ),
+                PacketVersion::V3 => unreachable!(),
+            };
+            if status != 1 {
+                break;
+            }
+            let clear = || match ring.version {
+                PacketVersion::V1 => pages.write_bytes(offset, &0u64.to_ne_bytes()),
+                PacketVersion::V2 => pages.write_bytes(offset, &0u32.to_ne_bytes()),
+                PacketVersion::V3 => unreachable!(),
+            };
+            if mac > ring.frame_size || len > ring.frame_size.saturating_sub(mac) {
+                clear()?;
+                ring.next.store(slot.wrapping_add(1), Ordering::Release);
+                continue;
+            }
+            let plan = self.prepare_send_with_permit(len, None, permit)?;
+            let mut frame = Vec::new();
+            frame
+                .try_reserve_exact(len)
+                .map_err(|_| AxError::NoMemory)?;
+            frame.resize(len, 0);
+            pages.read_bytes(offset + mac, &mut frame)?;
+            permit.submit(&plan, self.endpoint.as_ref(), &frame)?;
+            clear()?;
+            ring.next.store(slot.wrapping_add(1), Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Reads one decoded option. Statistics are taken and reset exactly once
     /// by the endpoint; neither this adapter nor Layer 2 owns a second reset.
     pub(crate) fn get_packet_option(&self, option: GetPacketOption) -> PacketOptionValue {
@@ -344,17 +1339,37 @@ impl PacketSocket {
         flags: ReceiveFlags,
         nonblocking: bool,
     ) -> AxResult<PacketReceiveResult> {
+        self.recv_with_operation_nonblocking(dst, flags, nonblocking, false)
+    }
+
+    pub(crate) fn recv_with_operation_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        flags: ReceiveFlags,
+        nonblocking: bool,
+        nowait: bool,
+    ) -> AxResult<PacketReceiveResult> {
         block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let peek = flags.contains(ReceiveFlags::PEEK);
+            let state = if nowait {
+                self.state.try_lock().ok_or(AxError::WouldBlock)?
+            } else {
+                self.state.lock()
+            };
+            let socket_type = state.socket_type();
+            drop(state);
             // Linux ordinary packet receive dequeues before usercopy: EFAULT
             // consumes the record. MSG_PEEK clones the head and therefore
             // retains it across the same fault.
-            let record = self
-                .net_ns
-                .stack()
-                .try_receive_packet(self.endpoint.as_ref(), peek)?;
+            let record = if nowait {
+                let mut permit = self.net_ns.stack().try_acquire_packet_service()?;
+                permit.receive_no_poll(self.endpoint.as_ref(), peek)?
+            } else {
+                self.net_ns
+                    .stack()
+                    .try_receive_packet(self.endpoint.as_ref(), peek)?
+            };
             let metadata = record.metadata();
-            let socket_type = self.state.lock().socket_type();
             let header_len = usize::from(metadata.link_header_len);
             let frame_len = match socket_type {
                 PacketSocketType::Raw => record.wire_len(),
@@ -396,6 +1411,74 @@ impl PacketSocket {
             .map(PacketReceiveResult::returned_len)
     }
 
+    pub(crate) fn read_with_operation_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+        nowait: bool,
+    ) -> AxResult<usize> {
+        self.recv_with_operation_nonblocking(dst, ReceiveFlags::EMPTY, nonblocking, nowait)
+            .map(PacketReceiveResult::returned_len)
+    }
+
+    /// Packet transmit has no blocking admission path today. Keep the
+    /// operation-local nonblocking decision explicit so RWF_NOWAIT never
+    /// needs to alter the OFD's O_NONBLOCK state.
+    pub(crate) fn write_with_nonblocking(
+        &self,
+        src: &mut IoSrc,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
+        self.write_with_operation_nonblocking(src, nonblocking, false)
+    }
+
+    pub(crate) fn write_with_operation_nonblocking(
+        &self,
+        src: &mut IoSrc,
+        _nonblocking: bool,
+        nowait: bool,
+    ) -> AxResult<usize> {
+        if nowait {
+            // Every shared admission precedes source import.  In particular,
+            // a source EFAULT cannot flush an earlier TX_RING record.
+            let mut permit = self.try_acquire_send_permit()?;
+            // Shared-page ring access can fault/materialize backing pages and
+            // therefore has no non-sleeping reservation yet.  Refuse NOWAIT
+            // while a TX ring is installed before touching the source; the
+            // ordinary send boundary remains responsible for its flush.
+            if permit.tx_ring.is_some() {
+                return Err(AxError::WouldBlock);
+            }
+            let len = src.remaining();
+            let plan = self.prepare_send_with_permit(len, None, &permit)?;
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(len)
+                .map_err(|_| AxError::NoMemory)?;
+            payload.resize(len, 0);
+            src.read_exact(&mut payload)?;
+            self.flush_tx_ring_with_permit(&mut permit)?;
+            let result = permit
+                .submit(&plan, self.endpoint.as_ref(), &payload)
+                .map(|_| len);
+            drop(permit);
+            self.net_ns.stack().finish_packet_submission(false);
+            return result;
+        }
+        self.flush_tx_ring_with_nonblocking(nowait)?;
+        let len = src.remaining();
+        let plan = self.prepare_send_with_nonblocking(len, None, nowait)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(len)
+            .map_err(|_| AxError::NoMemory)?;
+        payload.resize(len, 0);
+        // One file write is one packet. A source that violates its advertised
+        // remaining length must fail instead of publishing a truncated frame.
+        src.read_exact(&mut payload)?;
+        self.send_prepared_with_nonblocking(plan, &payload, nowait)
+    }
+
     /// Prepares one ordinary send without touching the payload or submitting
     /// any lower-layer work.
     ///
@@ -408,7 +1491,20 @@ impl PacketSocket {
         payload_len: usize,
         destination: Option<PacketSendAddress>,
     ) -> AxResult<PacketSendPlan> {
-        let state = self.state.lock();
+        self.prepare_send_with_nonblocking(payload_len, destination, false)
+    }
+
+    fn prepare_send_with_nonblocking(
+        &self,
+        payload_len: usize,
+        destination: Option<PacketSendAddress>,
+        nowait: bool,
+    ) -> AxResult<PacketSendPlan> {
+        let state = if nowait {
+            self.state.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.state.lock()
+        };
         let socket_type = state.socket_type();
         let binding = state.binding();
         drop(state);
@@ -480,6 +1576,95 @@ impl PacketSocket {
         })
     }
 
+    fn prepare_send_with_permit(
+        &self,
+        payload_len: usize,
+        destination: Option<PacketSendAddress>,
+        permit: &PacketSendPermit<'_>,
+    ) -> AxResult<PacketSendPlan> {
+        let socket_type = permit.state.socket_type();
+        let binding = permit.state.binding();
+        let selected_interface = destination
+            .map(PacketSendAddress::interface)
+            .unwrap_or(binding.interface());
+        let interface_index =
+            exact_interface(selected_interface).map_err(|_| AxError::from(LinuxError::ENXIO))?;
+        let info = permit
+            .interfaces()
+            .into_iter()
+            .find(|candidate| candidate.index == interface_index)
+            .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;
+        let capabilities = permit
+            .packet_device_capabilities(interface_index)
+            .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;
+        match socket_type {
+            PacketSocketType::Raw if !capabilities.raw_send => {
+                return Err(LinuxError::EOPNOTSUPP.into());
+            }
+            PacketSocketType::Datagram if !capabilities.cooked_send => {
+                return Err(LinuxError::EOPNOTSUPP.into());
+            }
+            _ => {}
+        }
+        let max_len = match socket_type {
+            PacketSocketType::Raw => info
+                .mtu
+                .checked_add(usize::from(capabilities.link_header_len))
+                .ok_or(AxError::InvalidInput)?,
+            PacketSocketType::Datagram => info.mtu,
+        };
+        if payload_len > max_len || payload_len > MAX_PACKET_FRAME_BYTES {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+        let protocol = destination
+            .map(PacketSendAddress::protocol)
+            .unwrap_or(binding.protocol())
+            .host_order();
+        let mut address = [0_u8; 8];
+        let destination_len = match (socket_type, destination) {
+            (PacketSocketType::Raw, _) => 0,
+            (PacketSocketType::Datagram, Some(destination)) => {
+                let link = destination
+                    .address_for_device(capabilities.address_len)
+                    .map_err(packet_error)?;
+                address = link.padded_bytes();
+                usize::from(link.len())
+            }
+            (PacketSocketType::Datagram, None) => {
+                default_cooked_destination(&mut address, info.kind, capabilities)?
+            }
+        };
+        Ok(PacketSendPlan {
+            interface_index,
+            socket_type,
+            protocol,
+            destination: address,
+            destination_len,
+            payload_len,
+        })
+    }
+
+    fn try_acquire_send_permit(&self) -> AxResult<PacketSendPermit<'_>> {
+        // All fallible NOWAIT admissions complete before a TX ring frame or
+        // caller source is touched.  The held state guard also prevents a
+        // later `prepare_send` from reporting EAGAIN after ring ownership
+        // has advanced.
+        let iptables = crate::syscall::try_acquire_iptables_output_permit(&self.net_ns)?;
+        let service = self.net_ns.stack().try_acquire_packet_service()?;
+        let state = self.state.try_lock().ok_or(AxError::WouldBlock)?;
+        // `configure_tx_ring` holds this same serialization guard.  Keeping
+        // it until submit closes the absent-ring preflight gap.
+        let ring_config = self.ring_config.try_lock().ok_or(AxError::WouldBlock)?;
+        let tx_ring = self.tx_ring.try_lock().ok_or(AxError::WouldBlock)?;
+        Ok(PacketSendPermit {
+            iptables,
+            service,
+            state,
+            ring_config,
+            tx_ring,
+        })
+    }
+
     /// Submits one already-copied ordinary RAW frame or cooked DGRAM payload
     /// using a matching side-effect-free admission.
     ///
@@ -489,9 +1674,24 @@ impl PacketSocket {
     /// ring transmission, retry, and deferred completion are outside this
     /// baseline.
     pub(crate) fn send_prepared(&self, plan: PacketSendPlan, payload: &[u8]) -> AxResult<usize> {
+        self.send_prepared_with_nonblocking(plan, payload, false)
+    }
+
+    fn send_prepared_with_nonblocking(
+        &self,
+        plan: PacketSendPlan,
+        payload: &[u8],
+        nowait: bool,
+    ) -> AxResult<usize> {
         if payload.len() != plan.payload_len {
             return Err(AxError::BadState);
         }
+        if nowait {
+            crate::syscall::iptables_output_verdict_nowait(&self.net_ns)?;
+        } else {
+            crate::syscall::iptables_output_verdict(&self.net_ns)?;
+        }
+        super::netlink::nft_output_verdict(&self.net_ns)?;
         let request = match plan.socket_type {
             PacketSocketType::Raw => PacketSendRequest::Raw {
                 protocol: plan.protocol,
@@ -503,9 +1703,19 @@ impl PacketSocket {
                 payload,
             },
         };
-        self.net_ns
-            .stack()
-            .send_packet(plan.interface_index, self.endpoint.as_ref(), request)?;
+        if nowait {
+            self.net_ns.stack().send_packet_nowait(
+                plan.interface_index,
+                self.endpoint.as_ref(),
+                request,
+            )?;
+        } else {
+            self.net_ns.stack().send_packet(
+                plan.interface_index,
+                self.endpoint.as_ref(),
+                request,
+            )?;
+        }
         Ok(payload.len())
     }
 }
@@ -516,17 +1726,7 @@ impl FileLike for PacketSocket {
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        let len = src.remaining();
-        let plan = self.prepare_send(len, None)?;
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(len)
-            .map_err(|_| AxError::NoMemory)?;
-        payload.resize(len, 0);
-        // One file write is one packet. A source that violates its advertised
-        // remaining length must fail instead of publishing a truncated frame.
-        src.read_exact(&mut payload)?;
-        self.send_prepared(plan, &payload)
+        self.write_with_nonblocking(src, self.nonblocking())
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -543,7 +1743,7 @@ impl FileLike for PacketSocket {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         try_pseudo_inode_path("socket", self.inode.inode())
     }
 
@@ -551,9 +1751,18 @@ impl FileLike for PacketSocket {
         socket_ifreq_ioctl(context, self.net_ns.stack(), cmd, arg)
     }
 
-    fn prepare_mmap(&self, _request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
-        // Ordinary queues do not imply a TPACKET ring. Reject before the
-        // generic mmap adapter can misclassify this socket as a regular file.
+    fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        // Serialize VMA publication with ring replacement/teardown. Without
+        // this, mmap could retain the old shared-page object between prepare
+        // and the endpoint's ring publication.
+        let _serial = self.ring_config.lock();
+        if let Some(mapping) = self.mmap.lock().as_ref().cloned() {
+            let plan = mapping.region.prepare(request)?;
+            if plan.is_some() {
+                self.mmap_published.store(true, Ordering::Release);
+            }
+            return Ok(plan);
+        }
         Err(LinuxError::EOPNOTSUPP.into())
     }
 
@@ -581,6 +1790,7 @@ impl Pollable for PacketSocket {
         context: &mut Context<'_>,
         events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        self.arm_v3_timer(context)?;
         self.net_ns
             .stack()
             .register_packet_endpoint(self.endpoint.as_ref(), context, events)
@@ -737,6 +1947,16 @@ const fn packet_type(packet_type: LinkPacketType) -> PacketType {
         LinkPacketType::Multicast => PacketType::MULTICAST,
         LinkPacketType::OtherHost => PacketType::OTHER_HOST,
         LinkPacketType::Outgoing => PacketType::OUTGOING,
+    }
+}
+
+const fn packet_type_raw(packet_type: LinkPacketType) -> u8 {
+    match packet_type {
+        LinkPacketType::Host => 0,
+        LinkPacketType::Broadcast => 1,
+        LinkPacketType::Multicast => 2,
+        LinkPacketType::OtherHost => 3,
+        LinkPacketType::Outgoing => 4,
     }
 }
 
@@ -1076,7 +2296,7 @@ mod tests {
         let filter = crate::packet_cbpf::PacketCbpfFilter::try_new(alloc::vec![
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::Protocol.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::Protocol),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0x0800, 0, 1),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, u32::MAX),
@@ -1146,31 +2366,31 @@ mod tests {
         let filter = crate::packet_cbpf::PacketCbpfFilter::try_new(alloc::vec![
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::Mark.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::Mark),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::Queue.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::Queue),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::VlanTag.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::VlanTag),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::VlanTagPresent.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::VlanTagPresent),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
             axcbpf::Instruction::statement(
                 axcbpf::opcode::LD_W_ABS,
-                axcbpf::Ancillary::VlanTpid.encoded_offset(),
+                encoded_socket_filter_ancillary(SocketFilterAncillary::VlanTpid),
             ),
             axcbpf::Instruction::jump(axcbpf::opcode::JMP_JEQ_K, 0, 1, 0),
             axcbpf::Instruction::statement(axcbpf::opcode::RET_K, 0),
