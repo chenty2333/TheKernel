@@ -1,6 +1,5 @@
 use alloc::{
     boxed::Box,
-    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -20,12 +19,13 @@ use axfs::{
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
-    DirNodeOps, ExportHandle, ExportHandleMode, FileNode, FileNodeOps, Filesystem, FilesystemOps,
-    Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType,
-    NodeUserData, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
-    WeakDirEntry, XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
+    DirNodeOps, ExportHandle, ExportHandleMode, FileAttr, FileAttrProvider, FileNode, FileNodeOps,
+    FileRangeOperation, FileRangeRequest, Filesystem, FilesystemOps, FsName, FsNameBuf, FsPath,
+    FsPathBuf, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission,
+    NodeType, NodeUserData, Reference, RenameExchangeRequest, RenameRequest, StatFs, UnlinkRequest,
+    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
 };
-use axhal::{mem::total_ram_size, time::wall_time};
+use axhal::{mem::total_ram_size, paging::PageSize, time::wall_time};
 use axpoll::{IoEvents, Pollable};
 #[cfg(not(test))]
 use axsync::Mutex;
@@ -34,6 +34,11 @@ use kspin::SpinNoIrq;
 use memory_addr::PAGE_SIZE_4K;
 #[cfg(test)]
 use spin::Mutex;
+
+use crate::{
+    file::{FileMmapProtection, FileMmapRequest, FixedSharedMmapRegion, PreparedFileMmap},
+    mm::{SharedPages, revoke_shared_pages},
+};
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
 const STAT_BLOCK_UNIT: u64 = 512;
@@ -54,15 +59,24 @@ fn default_tmpfs_capacity_bytes() -> u64 {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
-struct FileName(String);
+struct FileName(FsNameBuf);
 
-fn try_owned(value: &str) -> VfsResult<String> {
-    let mut result = String::new();
+fn try_owned_name(value: &FsName) -> VfsResult<FsNameBuf> {
+    let mut result = Vec::new();
     result
-        .try_reserve_exact(value.len())
+        .try_reserve_exact(value.as_bytes().len())
         .map_err(|_| VfsError::NoMemory)?;
-    result.push_str(value);
-    Ok(result)
+    result.extend_from_slice(value.as_bytes());
+    FsNameBuf::from_vec(result)
+}
+
+fn try_owned_path(value: &FsPath) -> VfsResult<FsPathBuf> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(value.as_bytes().len())
+        .map_err(|_| VfsError::NoMemory)?;
+    result.extend_from_slice(value.as_bytes());
+    Ok(FsPathBuf::from_vec(result))
 }
 
 fn try_owned_bytes(value: &[u8]) -> VfsResult<Vec<u8>> {
@@ -82,10 +96,10 @@ impl PartialOrd for FileName {
 
 impl Ord for FileName {
     fn cmp(&self, other: &Self) -> Ordering {
-        fn index(s: &str) -> u8 {
-            match s {
-                "." => 0,
-                ".." => 1,
+        fn index(s: &FsName) -> u8 {
+            match s.as_bytes() {
+                b"." => 0,
+                b".." => 1,
                 _ => 2,
             }
         }
@@ -93,23 +107,25 @@ impl Ord for FileName {
     }
 }
 
-impl<T> From<T> for FileName
-where
-    T: Into<String>,
-{
-    fn from(name: T) -> Self {
-        Self(name.into())
-    }
-}
-
-impl Borrow<str> for FileName {
-    fn borrow(&self) -> &str {
+impl Borrow<FsName> for FileName {
+    fn borrow(&self) -> &FsName {
         &self.0
     }
 }
 
 /// A simple in-memory filesystem that supports basic file operations.
 pub struct MemoryFs {
+    /// The superblock identity is a property of the instance, rather than of
+    /// the in-memory inode implementation.  hugetlbfs deliberately has a
+    /// separate superblock provider even though, until file mmap grows a
+    /// hugetlb backing, it reuses the sparse namespace machinery below.
+    name: &'static str,
+    fs_type: u32,
+    stat_block_size: u64,
+    huge_page_size: Option<PageSize>,
+    max_inodes: usize,
+    root_uid: u32,
+    root_gid: u32,
     namespace: Mutex<()>,
     inodes: Mutex<HashMap<u64, Arc<Inode>>>,
     next_inode: AtomicU64,
@@ -119,6 +135,8 @@ pub struct MemoryFs {
     root: SpinNoIrq<Option<DirEntry>>,
     capacity_pages: Option<u64>,
     allocated_pages: Mutex<u64>,
+    min_reservation_pages: u64,
+    reserved_min_pages: Mutex<u64>,
 }
 
 impl MemoryFs {
@@ -146,14 +164,80 @@ impl MemoryFs {
         permission: NodePermission,
         capacity_bytes: Option<u64>,
     ) -> VfsResult<Filesystem> {
+        Self::new_with_identity(
+            permission,
+            capacity_bytes,
+            "tmpfs",
+            0x0102_1994,
+            TMPFS_BLOCK_SIZE,
+            None,
+            MAX_TMPFS_INODES,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Constructs the hugetlbfs namespace/data provider.  Its superblock is
+    /// intentionally not tmpfs: mount identity, statfs and cache admission
+    /// must all retain the hugetlbfs distinction while mmap wiring is added
+    /// independently.
+    pub(crate) fn new_hugetlbfs_with_capacity(
+        permission: NodePermission,
+        capacity_bytes: u64,
+        page_size: PageSize,
+        max_inodes: usize,
+        root_uid: u32,
+        root_gid: u32,
+        min_size: u64,
+    ) -> VfsResult<Filesystem> {
+        Self::new_with_identity(
+            permission,
+            Some(capacity_bytes),
+            "hugetlbfs",
+            0x9584_58f6,
+            page_size as u64,
+            Some(page_size),
+            max_inodes,
+            root_uid,
+            root_gid,
+            min_size,
+        )
+    }
+
+    fn new_with_identity(
+        permission: NodePermission,
+        capacity_bytes: Option<u64>,
+        name: &'static str,
+        fs_type: u32,
+        stat_block_size: u64,
+        huge_page_size: Option<PageSize>,
+        max_inodes: usize,
+        root_uid: u32,
+        root_gid: u32,
+        min_size: u64,
+    ) -> VfsResult<Filesystem> {
         let capacity_bytes = capacity_bytes.unwrap_or_else(default_tmpfs_capacity_bytes);
+        let min_reservation_pages = min_size.div_ceil(TMPFS_BLOCK_SIZE);
+        if min_reservation_pages > capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE) {
+            return Err(VfsError::StorageFull);
+        }
         let fs = Arc::try_new(Self {
+            name,
+            fs_type,
+            stat_block_size,
+            huge_page_size,
+            max_inodes,
+            root_uid,
+            root_gid,
             namespace: Mutex::new(()),
             inodes: Mutex::new(HashMap::new()),
             next_inode: AtomicU64::new(1),
             root: SpinNoIrq::new(None),
             capacity_pages: Some(capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE)),
-            allocated_pages: Mutex::new(0),
+            allocated_pages: Mutex::new(min_reservation_pages),
+            min_reservation_pages,
+            reserved_min_pages: Mutex::new(min_reservation_pages),
         })
         .map_err(|_| VfsError::NoMemory)?;
         // Allocate the generic wrapper before installing the backend's root
@@ -183,7 +267,7 @@ impl MemoryFs {
     /// `publish_inode`, so no other creator can consume the reserved capacity.
     fn try_reserve_inode_number(&self) -> VfsResult<u64> {
         let mut inodes = self.inodes.lock();
-        if inodes.len() >= MAX_TMPFS_INODES {
+        if inodes.len() >= self.max_inodes {
             return Err(VfsError::NoMemory);
         }
         inodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
@@ -205,14 +289,17 @@ impl MemoryFs {
         Ok(())
     }
 
-    fn reserve_pages(&self, pages: u64) -> AxResult<()> {
+    fn reserve_pages(&self, pages: u64) -> AxResult<u64> {
         if pages == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
+        let mut reserved = self.reserved_min_pages.lock();
+        let consumed_reservation = pages.min(*reserved);
+        let additional = pages - consumed_reservation;
         let mut allocated = self.allocated_pages.lock();
         if let Some(capacity) = self.capacity_pages {
-            let Some(next) = allocated.checked_add(pages) else {
+            let Some(next) = allocated.checked_add(additional) else {
                 return Err(AxError::StorageFull);
             };
             if next > capacity {
@@ -220,30 +307,34 @@ impl MemoryFs {
             }
             *allocated = next;
         } else {
-            *allocated = allocated.saturating_add(pages);
+            *allocated = allocated.saturating_add(additional);
         }
-        Ok(())
+        *reserved -= consumed_reservation;
+        Ok(consumed_reservation)
     }
 
-    fn reserve_pages_vfs(&self, pages: u64) -> VfsResult<()> {
+    fn reserve_pages_vfs(&self, pages: u64) -> VfsResult<u64> {
         self.reserve_pages(pages).map_err(|err| match err {
             AxError::StorageFull => VfsError::StorageFull,
             _ => VfsError::InvalidInput,
         })
     }
 
-    fn release_pages(&self, pages: u64) {
+    fn release_pages(&self, pages: u64, reservation_credits: u64) {
         if pages == 0 {
             return;
         }
+        let mut reserved = self.reserved_min_pages.lock();
+        let restore = reservation_credits.min(self.min_reservation_pages.saturating_sub(*reserved));
+        *reserved += restore;
         let mut allocated = self.allocated_pages.lock();
-        *allocated = allocated.saturating_sub(pages);
+        *allocated = allocated.saturating_sub(pages - restore);
     }
 }
 
 impl FilesystemOps for MemoryFs {
     fn name(&self) -> &str {
-        "tmpfs"
+        self.name
     }
 
     fn root_dir(&self) -> DirEntry {
@@ -252,21 +343,27 @@ impl FilesystemOps for MemoryFs {
 
     fn stat(&self) -> VfsResult<StatFs> {
         let allocated = *self.allocated_pages.lock();
-        let total = self
+        let total_base_pages = self
             .capacity_pages
             .unwrap_or_else(|| default_tmpfs_capacity_bytes() / TMPFS_BLOCK_SIZE)
             .max(allocated);
-        let free = total.saturating_sub(allocated);
+        let total = total_base_pages
+            .saturating_mul(TMPFS_BLOCK_SIZE)
+            .div_ceil(self.stat_block_size);
+        let used = allocated
+            .saturating_mul(TMPFS_BLOCK_SIZE)
+            .div_ceil(self.stat_block_size);
+        let free = total.saturating_sub(used);
         Ok(StatFs {
-            fs_type: 0x01021994,
-            block_size: TMPFS_BLOCK_SIZE as u32,
+            fs_type: self.fs_type,
+            block_size: self.stat_block_size as u32,
             blocks: total,
             blocks_free: free,
             blocks_available: free,
             file_count: 0,
             free_file_count: 0,
             name_length: MAX_NAME_LEN as _,
-            fragment_size: TMPFS_BLOCK_SIZE as u32,
+            fragment_size: self.stat_block_size as u32,
             mount_flags: 0,
         })
     }
@@ -279,7 +376,9 @@ impl FilesystemOps for MemoryFs {
         let inodes = {
             let registry = self.inodes.lock();
             let mut inodes = Vec::new();
-            inodes.try_reserve_exact(registry.len()).map_err(|_| VfsError::NoMemory)?;
+            inodes
+                .try_reserve_exact(registry.len())
+                .map_err(|_| VfsError::NoMemory)?;
             inodes.extend(registry.values().cloned());
             inodes
         };
@@ -362,7 +461,7 @@ impl FilesystemOps for MemoryFs {
                 continue;
             };
             for (name, child) in directory.entries.lock().iter() {
-                if name.0 == "." || name.0 == ".." {
+                if name.0.as_bytes() == b"." || name.0.as_bytes() == b".." {
                     continue;
                 }
                 let child = child.get().ok_or(VfsError::Io)?;
@@ -418,15 +517,176 @@ struct FileContent {
     /// We only need to store the length here because we delegate the actual
     /// content management to page cache.
     length: Mutex<u64>,
-    symlink: Mutex<Option<String>>,
+    symlink: Mutex<Option<FsPathBuf>>,
     pages: Mutex<HashMap<u64, Box<[u8; PAGE_SIZE_4K]>>>,
     allocated_pages: Mutex<HashSet<u64>>,
+    /// Pages whose allocation consumed one `min_size` reservation credit.
+    /// Credit provenance must follow the page, not whichever inode happens
+    /// to free pages next.
+    reserved_credit_pages: Mutex<HashSet<u64>>,
+    /// hugetlbfs owns page-size selected frame-backed storage per inode. Keeping
+    /// it in the inode (rather than in an open file or mount-id registry)
+    /// preserves backing identity across duplicated descriptors and bind
+    /// aliases.
+    huge_pages: Mutex<Option<Arc<SharedPages>>>,
+    huge_reserved_pages: Mutex<u64>,
+    huge_reserved_credits: Mutex<u64>,
+    /// Serializes hugetlb backing identity, i_size and the fault-visible EOF.
+    /// These three publications must never be observed from different sides
+    /// of a concurrent truncate/write/mmap transition.
+    huge_mutation: Mutex<()>,
 }
 
 impl FileContent {
+    fn prepare_hugetlb_mmap(
+        &self,
+        fs: &MemoryFs,
+        request: FileMmapRequest,
+    ) -> AxResult<PreparedFileMmap> {
+        let _mutation = self.huge_mutation.lock();
+        let page_size = fs.huge_page_size.ok_or(AxError::InvalidInput)?;
+        if request.page_size() != page_size as usize {
+            return Err(AxError::InvalidInput);
+        }
+        let required = request
+            .offset()
+            .checked_add(u64::try_from(request.length()).map_err(|_| AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
+        // Existing buffered bytes are part of this inode even if a caller
+        // maps only its prefix.  Size the first huge backing for both inputs
+        // so conversion cannot fail half-way through copying sparse pages.
+        let reserved_end = self
+            .allocated_pages
+            .lock()
+            .iter()
+            .copied()
+            .max()
+            .and_then(|page| page.checked_add(1))
+            .and_then(|pages| pages.checked_mul(TMPFS_BLOCK_SIZE))
+            .unwrap_or(0);
+        let required = required.max(*self.length.lock()).max(reserved_end);
+        let required = usize::try_from(required).map_err(|_| AxError::InvalidInput)?;
+        let allocation = required
+            .checked_add(page_size as usize - 1)
+            .ok_or(AxError::NoMemory)?
+            & !(page_size as usize - 1);
+        let pages = {
+            let mut pages = self.huge_pages.lock();
+            if pages
+                .as_ref()
+                .is_none_or(|pages| pages.total_bytes() < allocation)
+            {
+                // A live VMA may not be silently switched to a different
+                // physical backing.  The future resize/mmap path must retain
+                // the old Arc until its final mapping lease is gone.
+                if pages
+                    .as_ref()
+                    .is_some_and(|pages| Arc::strong_count(pages) != 1)
+                {
+                    return Err(AxError::ResourceBusy);
+                }
+                let charge =
+                    u64::try_from(allocation / PAGE_SIZE_4K).map_err(|_| AxError::NoMemory)?;
+                let previous_charge = if pages.is_some() {
+                    *self.huge_reserved_pages.lock()
+                } else {
+                    self.allocated_pages.lock().len() as u64
+                };
+                let mut new_credits = 0;
+                if charge > previous_charge {
+                    let credits = fs.reserve_pages(charge - previous_charge)?;
+                    new_credits = credits;
+                    *self.huge_reserved_credits.lock() += credits;
+                } else {
+                    let released = previous_charge - charge;
+                    let mut credits = self.huge_reserved_credits.lock();
+                    let released_credits = released.min(*credits);
+                    *credits -= released_credits;
+                    fs.release_pages(released, released_credits);
+                }
+                let fresh = match SharedPages::new_fixed(allocation, page_size)
+                    .and_then(|pages| Arc::try_new(pages).map_err(|_| AxError::NoMemory))
+                {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        if charge > previous_charge {
+                            *self.huge_reserved_credits.lock() -= new_credits;
+                            fs.release_pages(charge - previous_charge, new_credits);
+                        } else {
+                            let _ = fs.reserve_pages(previous_charge - charge);
+                        }
+                        return Err(error);
+                    }
+                };
+                // Preserve bytes written before the first mmap.  Once this
+                // inode is exported, ordinary read/write and the VMA use the
+                // same physical `SharedPages` object.
+                for (index, data) in self.pages.lock().iter() {
+                    let offset = usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| index.checked_mul(PAGE_SIZE_4K))
+                        .ok_or(AxError::InvalidInput)?;
+                    fresh.write_bytes(offset, data.as_ref())?;
+                }
+                self.pages.lock().clear();
+                self.allocated_pages.lock().clear();
+                // Buffered 4 KiB pages may already have consumed min_size
+                // credits.  Their physical ownership is transferred into the
+                // huge backing, so transfer provenance at the same point.
+                let buffered_credits = self.reserved_credit_pages.lock().len() as u64;
+                self.reserved_credit_pages.lock().clear();
+                *self.huge_reserved_credits.lock() += buffered_credits;
+                *self.huge_reserved_pages.lock() = charge;
+                *pages = Some(fresh);
+            }
+            pages.as_ref().expect("hugetlb backing installed").clone()
+        };
+        pages.set_logical_eof(
+            usize::try_from(*self.length.lock()).map_err(|_| AxError::InvalidInput)?,
+        )?;
+        FixedSharedMmapRegion::try_new(
+            0,
+            pages,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+        )?
+        .prepare(request)?
+        .ok_or(AxError::InvalidInput)
+    }
     fn set_len(&self, fs: &MemoryFs, len: u64) {
+        let _mutation = self.huge_mutation.lock();
+        self.set_len_locked(fs, len);
+    }
+
+    fn set_len_locked(&self, fs: &MemoryFs, len: u64) {
         let old_len = *self.length.lock();
         *self.length.lock() = len;
+        if len < old_len
+            && let Some(huge) = self.huge_pages.lock().clone()
+        {
+            // A later extension after truncate must not reveal bytes retained
+            // solely by a still-live huge VMA.  The fixed backing cannot be
+            // replaced while mapped, so zero its discarded tail in place.
+            let mut position = usize::try_from(len).unwrap_or(huge.total_bytes());
+            let end = usize::try_from(old_len)
+                .unwrap_or(huge.total_bytes())
+                .min(huge.total_bytes());
+            let zero = [0u8; PAGE_SIZE_4K];
+            while position < end {
+                let count = (end - position).min(zero.len());
+                let _ = huge.write_bytes(position, &zero[..count]);
+                position += count;
+            }
+        }
+        if let Some(huge) = self.huge_pages.lock().clone() {
+            let _ = huge.set_logical_eof(usize::try_from(len).unwrap_or(huge.total_bytes()));
+            if len < old_len {
+                // A fault check alone is insufficient: a huge PTE may have
+                // been populated before truncate.  Drop aliases and flush
+                // their TLB entries so the next access re-evaluates EOF and
+                // becomes SIGBUS beyond the shrunken file.
+                revoke_shared_pages(&huge);
+            }
+        }
         let last_page = len.div_ceil(TMPFS_BLOCK_SIZE);
         let old_last_page = old_len.div_ceil(TMPFS_BLOCK_SIZE);
         let mut pages = self.pages.lock();
@@ -443,12 +703,16 @@ impl FileContent {
             let mut allocated = self.allocated_pages.lock();
             let released = allocated.iter().filter(|page| **page >= last_page).count() as u64;
             allocated.retain(|page| *page < last_page);
+            let mut credits = self.reserved_credit_pages.lock();
+            let released_credits = credits.iter().filter(|page| **page >= last_page).count() as u64;
+            credits.retain(|page| *page < last_page);
             drop(allocated);
-            fs.release_pages(released);
+            fs.release_pages(released, released_credits);
         }
     }
 
     fn clear_storage(&self, fs: &MemoryFs) {
+        let _mutation = self.huge_mutation.lock();
         *self.length.lock() = 0;
         *self.symlink.lock() = None;
         self.pages.lock().clear();
@@ -456,15 +720,38 @@ impl FileContent {
         let released = allocated.len() as u64;
         allocated.clear();
         drop(allocated);
-        fs.release_pages(released);
+        let released_credits = self.reserved_credit_pages.lock().len() as u64;
+        self.reserved_credit_pages.lock().clear();
+        fs.release_pages(released, released_credits);
+        let huge = self.huge_pages.lock().take();
+        if huge.is_some() {
+            fs.release_pages(
+                core::mem::take(&mut *self.huge_reserved_pages.lock()),
+                core::mem::take(&mut *self.huge_reserved_credits.lock()),
+            );
+        }
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        // Keep the direct I/O view in the same epoch as truncation/backing
+        // replacement.  SharedPages enforces logical EOF at VMA fault time,
+        // but buffered reads copy bytes directly and must not snapshot the
+        // former i_size before a concurrent shrink has revoked that tail.
+        let _mutation = self.huge_mutation.lock();
         let len = *self.length.lock();
         if offset >= len {
             return Ok(0);
         }
         let total = buf.len().min((len - offset) as usize);
+        if let Some(pages) = self.huge_pages.lock().clone() {
+            pages
+                .read_bytes(
+                    usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?,
+                    &mut buf[..total],
+                )
+                .map_err(VfsError::from)?;
+            return Ok(total);
+        }
         let pages = self.pages.lock();
         let mut done = 0;
         while done < total {
@@ -484,12 +771,40 @@ impl FileContent {
     }
 
     fn write_at(&self, fs: &MemoryFs, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        let _mutation = self.huge_mutation.lock();
         if buf.is_empty() {
             return Ok(0);
         }
         let end = offset
             .checked_add(buf.len() as u64)
             .ok_or(VfsError::InvalidInput)?;
+        if let Some(pages) = self.huge_pages.lock().clone() {
+            let page_size =
+                fs.huge_page_size
+                    .expect("hugetlb backing only belongs to hugetlbfs") as u64;
+            if !offset.is_multiple_of(page_size) || !(buf.len() as u64).is_multiple_of(page_size) {
+                return Err(VfsError::InvalidInput);
+            }
+            let end = usize::try_from(end).map_err(|_| VfsError::InvalidInput)?;
+            if end > pages.total_bytes() {
+                // Replacing a backing with live VMA aliases would violate
+                // shared mapping identity.  A later truncate/growth path can
+                // install a larger backing only before it is exported.
+                return Err(VfsError::StorageFull);
+            }
+            pages
+                .write_bytes(
+                    usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?,
+                    buf,
+                )
+                .map_err(VfsError::from)?;
+            let mut length = self.length.lock();
+            *length = (*length).max(u64::try_from(end).map_err(|_| VfsError::InvalidInput)?);
+            pages
+                .set_logical_eof(*length as usize)
+                .map_err(VfsError::from)?;
+            return Ok(buf.len());
+        }
         let mut pages = self.pages.lock();
         let mut allocated = self.allocated_pages.lock();
         let Some((start, end_page)) = page_range(offset, buf.len() as u64) else {
@@ -501,7 +816,17 @@ impl FileContent {
         let missing_data_pages = (start..end_page)
             .filter(|page| !pages.contains_key(page))
             .count();
-        fs.reserve_pages_vfs(new_pages)?;
+        let reservation_credits = fs.reserve_pages_vfs(new_pages)?;
+        if reservation_credits != 0
+            && self
+                .reserved_credit_pages
+                .lock()
+                .try_reserve(reservation_credits as usize)
+                .is_err()
+        {
+            fs.release_pages(new_pages, reservation_credits);
+            return Err(VfsError::NoMemory);
+        }
         let preparation = (|| {
             let mut prepared = Vec::new();
             prepared
@@ -524,12 +849,22 @@ impl FileContent {
         let prepared = match preparation {
             Ok(prepared) => prepared,
             Err(err) => {
-                fs.release_pages(new_pages);
+                fs.release_pages(new_pages, reservation_credits);
                 return Err(err);
             }
         };
         for (page, data) in prepared {
             pages.insert(page, data);
+        }
+        if reservation_credits != 0 {
+            let mut credits = self.reserved_credit_pages.lock();
+            let mut remaining_credits = reservation_credits;
+            for page in start..end_page {
+                if remaining_credits != 0 && !allocated.contains(&page) {
+                    credits.insert(page);
+                    remaining_credits -= 1;
+                }
+            }
         }
         let current_len = *self.length.lock();
         if end > current_len {
@@ -566,15 +901,31 @@ impl FileContent {
         let new_pages = (start..end)
             .filter(|page| !allocated.contains(page))
             .count() as u64;
-        fs.reserve_pages(new_pages)?;
+        let reservation_credits = fs.reserve_pages(new_pages)?;
+        if reservation_credits != 0
+            && self
+                .reserved_credit_pages
+                .lock()
+                .try_reserve(reservation_credits as usize)
+                .is_err()
+        {
+            fs.release_pages(new_pages, reservation_credits);
+            return Err(AxError::NoMemory);
+        }
         if allocated
             .try_reserve(usize::try_from(new_pages).map_err(|_| AxError::NoMemory)?)
             .is_err()
         {
-            fs.release_pages(new_pages);
+            fs.release_pages(new_pages, reservation_credits);
             return Err(AxError::NoMemory);
         }
+        let mut credits = self.reserved_credit_pages.lock();
+        let mut remaining_credits = reservation_credits;
         for page in start..end {
+            if !allocated.contains(&page) && remaining_credits != 0 {
+                credits.insert(page);
+                remaining_credits -= 1;
+            }
             allocated.insert(page);
         }
         Ok(())
@@ -597,8 +948,219 @@ impl FileContent {
             }
             keep
         });
+        let mut credits = self.reserved_credit_pages.lock();
+        let released_credits = credits
+            .iter()
+            .filter(|page| **page >= start && **page < end)
+            .count() as u64;
+        credits.retain(|page| *page < start || *page >= end);
         drop(allocated);
-        fs.release_pages(released);
+        fs.release_pages(released, released_credits);
+    }
+
+    /// Clears only materialized bytes.  A hole already reads as zero, so
+    /// allocating one here would make PUNCH_HOLE consume tmpfs capacity.
+    fn zero_materialized_range(&self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::InvalidInput)?;
+        let mut pages = self.pages.lock();
+        for (page, data) in pages.iter_mut() {
+            let page_start = page.saturating_mul(TMPFS_BLOCK_SIZE);
+            let page_end = page_start.saturating_add(TMPFS_BLOCK_SIZE);
+            let clear_start = offset.max(page_start);
+            let clear_end = end.min(page_end);
+            if clear_start < clear_end {
+                let start = usize::try_from(clear_start - page_start)
+                    .map_err(|_| VfsError::InvalidInput)?;
+                let end =
+                    usize::try_from(clear_end - page_start).map_err(|_| VfsError::InvalidInput)?;
+                data[start..end].fill(0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Performs a typed native range mutation while retaining tmpfs's sparse
+    /// backing and exact page-capacity accounting.
+    fn mutate_range(&self, fs: &MemoryFs, request: FileRangeRequest) -> VfsResult<()> {
+        let _mutation = self.huge_mutation.lock();
+        let size = *self.length.lock();
+        let end = request.end();
+        if self.huge_pages.lock().is_some() {
+            let huge = self
+                .huge_pages
+                .lock()
+                .clone()
+                .expect("hugetlb backing remains installed while mutation gate is held");
+            let size = *self.length.lock();
+            let page_size =
+                fs.huge_page_size
+                    .expect("huge backing only belongs to hugetlbfs") as u64;
+            if !request.offset.is_multiple_of(page_size)
+                || !request.length.is_multiple_of(page_size)
+            {
+                return Err(VfsError::InvalidInput);
+            }
+            if end > u64::try_from(huge.total_bytes()).map_err(|_| VfsError::InvalidInput)? {
+                return Err(VfsError::StorageFull);
+            }
+            let zero = [0u8; PAGE_SIZE_4K];
+            let zero_range = |offset: u64, length: u64| -> VfsResult<()> {
+                let mut at = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
+                let end =
+                    usize::try_from(offset.checked_add(length).ok_or(VfsError::InvalidInput)?)
+                        .map_err(|_| VfsError::InvalidInput)?;
+                while at < end {
+                    let count = (end - at).min(zero.len());
+                    huge.write_bytes(at, &zero[..count])
+                        .map_err(VfsError::from)?;
+                    at += count;
+                }
+                Ok(())
+            };
+            let move_range =
+                |source: u64, destination: u64, length: u64, backwards: bool| -> VfsResult<()> {
+                    let mut scratch = [0u8; PAGE_SIZE_4K];
+                    let mut done = 0u64;
+                    while done < length {
+                        let remaining = length - done;
+                        let chunk = remaining.min(scratch.len() as u64) as usize;
+                        let delta = if backwards {
+                            remaining - chunk as u64
+                        } else {
+                            done
+                        };
+                        let from =
+                            usize::try_from(source + delta).map_err(|_| VfsError::InvalidInput)?;
+                        let to = usize::try_from(destination + delta)
+                            .map_err(|_| VfsError::InvalidInput)?;
+                        huge.read_bytes(from, &mut scratch[..chunk])
+                            .map_err(VfsError::from)?;
+                        huge.write_bytes(to, &scratch[..chunk])
+                            .map_err(VfsError::from)?;
+                        done += chunk as u64;
+                    }
+                    Ok(())
+                };
+            match request.operation {
+                FileRangeOperation::Allocate { keep_size } => {
+                    if !keep_size && end > size {
+                        self.set_len_locked(fs, end);
+                    }
+                }
+                FileRangeOperation::PunchHole => {
+                    if request.offset < size {
+                        zero_range(request.offset, end.min(size) - request.offset)?;
+                    }
+                }
+                FileRangeOperation::ZeroRange { keep_size } => {
+                    let zero_end = if keep_size { end.min(size) } else { end };
+                    if zero_end > request.offset {
+                        zero_range(request.offset, zero_end - request.offset)?;
+                    }
+                    if !keep_size && end > size {
+                        self.set_len_locked(fs, end);
+                    }
+                }
+                FileRangeOperation::CollapseRange => {
+                    if end > size {
+                        return Err(VfsError::InvalidInput);
+                    }
+                    move_range(end, request.offset, size - end, false)?;
+                    zero_range(size - request.length, request.length)?;
+                    self.set_len_locked(fs, size - request.length);
+                }
+                FileRangeOperation::InsertRange => {
+                    if request.offset >= size {
+                        return Err(VfsError::InvalidInput);
+                    }
+                    let new_size = size
+                        .checked_add(request.length)
+                        .ok_or(VfsError::InvalidInput)?;
+                    if new_size
+                        > u64::try_from(huge.total_bytes()).map_err(|_| VfsError::InvalidInput)?
+                    {
+                        return Err(VfsError::StorageFull);
+                    }
+                    move_range(
+                        request.offset,
+                        request.offset + request.length,
+                        size - request.offset,
+                        true,
+                    )?;
+                    zero_range(request.offset, request.length)?;
+                    self.set_len_locked(fs, new_size);
+                }
+                FileRangeOperation::UnshareRange => {
+                    if end > size {
+                        return Err(VfsError::InvalidInput);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        match request.operation {
+            FileRangeOperation::Allocate { keep_size } => {
+                self.reserve_range(fs, request.offset, request.length)
+                    .map_err(VfsError::from)?;
+                if !keep_size && end > size {
+                    self.set_len_locked(fs, end);
+                }
+            }
+            FileRangeOperation::PunchHole => {
+                if request.offset < size {
+                    let clipped = end.min(size) - request.offset;
+                    self.zero_materialized_range(request.offset, clipped)?;
+                    self.punch_hole(fs, request.offset, clipped);
+                }
+            }
+            FileRangeOperation::ZeroRange { keep_size } => {
+                let zero_end = if keep_size { end.min(size) } else { end };
+                if zero_end > request.offset {
+                    let zero_len = zero_end - request.offset;
+                    self.reserve_range(fs, request.offset, zero_len)
+                        .map_err(VfsError::from)?;
+                    self.zero_materialized_range(request.offset, zero_len)?;
+                }
+                if !keep_size && end > size {
+                    self.set_len_locked(fs, end);
+                }
+            }
+            FileRangeOperation::CollapseRange => {
+                if !request.offset.is_multiple_of(TMPFS_BLOCK_SIZE)
+                    || !request.length.is_multiple_of(TMPFS_BLOCK_SIZE)
+                    || end > size
+                {
+                    return Err(VfsError::InvalidInput);
+                }
+                self.collapse_range(fs, request.offset, request.length)
+                    .map_err(VfsError::from)?;
+                self.set_len_locked(fs, size - request.length);
+            }
+            FileRangeOperation::InsertRange => {
+                if !request.offset.is_multiple_of(TMPFS_BLOCK_SIZE)
+                    || !request.length.is_multiple_of(TMPFS_BLOCK_SIZE)
+                    || request.offset >= size
+                {
+                    return Err(VfsError::InvalidInput);
+                }
+                let new_size = size
+                    .checked_add(request.length)
+                    .ok_or(VfsError::InvalidInput)?;
+                self.insert_range(request.offset, request.length)
+                    .map_err(VfsError::from)?;
+                self.set_len_locked(fs, new_size);
+            }
+            FileRangeOperation::UnshareRange => {
+                if end > size {
+                    return Err(VfsError::InvalidInput);
+                }
+                // tmpfs never shares writable data extents across inodes.  A
+                // sparse span still needs private backing after UNHARE_RANGE.
+                self.reserve_range(fs, request.offset, request.length)
+                    .map_err(VfsError::from)?;
+            }
+        }
+        Ok(())
     }
 
     fn collapse_range(&self, fs: &MemoryFs, offset: u64, len: u64) -> AxResult<()> {
@@ -616,6 +1178,22 @@ impl FileContent {
         remapped_allocated
             .try_reserve(allocated.len())
             .map_err(|_| AxError::NoMemory)?;
+        let mut credits = self.reserved_credit_pages.lock();
+        let released_credits = credits
+            .iter()
+            .filter(|page| **page >= start && **page < end)
+            .count() as u64;
+        let mut remapped_credits = HashSet::new();
+        remapped_credits
+            .try_reserve(credits.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for page in credits.iter().copied() {
+            if page < start {
+                remapped_credits.insert(page);
+            } else if page >= end {
+                remapped_credits.insert(page - delta);
+            }
+        }
         let current = mem::take(&mut *data_pages);
         for (page, data) in current {
             if page < start {
@@ -636,9 +1214,11 @@ impl FileContent {
             }
         }
         *allocated = remapped_allocated;
+        *credits = remapped_credits;
+        drop(credits);
         drop(allocated);
         drop(data_pages);
-        fs.release_pages(released);
+        fs.release_pages(released, released_credits);
         Ok(())
     }
 
@@ -649,9 +1229,11 @@ impl FileContent {
         let delta = end - start;
         let mut data_pages = self.pages.lock();
         let mut allocated = self.allocated_pages.lock();
+        let mut credits = self.reserved_credit_pages.lock();
         if data_pages
             .keys()
             .chain(allocated.iter())
+            .chain(credits.iter())
             .any(|page| *page >= start && page.checked_add(delta).is_none())
         {
             return Err(AxError::InvalidInput);
@@ -664,6 +1246,13 @@ impl FileContent {
         remapped_allocated
             .try_reserve(allocated.len())
             .map_err(|_| AxError::NoMemory)?;
+        let mut remapped_credits = HashSet::new();
+        remapped_credits
+            .try_reserve(credits.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for page in credits.iter().copied() {
+            remapped_credits.insert(if page < start { page } else { page + delta });
+        }
         let current = mem::take(&mut *data_pages);
         for (page, data) in current {
             if page < start {
@@ -677,6 +1266,8 @@ impl FileContent {
             remapped_allocated.insert(if page < start { page } else { page + delta });
         }
         *allocated = remapped_allocated;
+        *credits = remapped_credits;
+        drop(credits);
         drop(allocated);
         drop(data_pages);
         Ok(())
@@ -684,11 +1275,21 @@ impl FileContent {
 
     fn blocks(&self) -> u64 {
         self.allocated_pages.lock().len() as u64 * (TMPFS_BLOCK_SIZE / STAT_BLOCK_UNIT)
+            + *self.huge_reserved_pages.lock() * (TMPFS_BLOCK_SIZE / STAT_BLOCK_UNIT)
     }
 
     fn seek_data_or_hole(&self, size: u64, offset: u64, seek_hole: bool) -> AxResult<u64> {
         if offset >= size {
             return Err(AxError::from(LinuxError::ENXIO));
+        }
+
+        // A hugetlb-backed inode has a physically reserved folio for every
+        // byte of its fixed backing.  Its former 4 KiB sparse accounting is
+        // intentionally discarded during mmap export, so do not report the
+        // entire live huge file as a hole merely because that old map is now
+        // empty.
+        if self.huge_pages.lock().is_some() {
+            return if seek_hole { Ok(size) } else { Ok(offset) };
         }
 
         let allocated = self.allocated_pages.lock();
@@ -743,6 +1344,18 @@ fn file_content_for(loc: &axfs_ng_vfs::Location) -> Option<(Arc<MemoryFs>, Arc<I
     let node = loc.entry().downcast::<MemoryNode>().ok()?;
     node.inode.as_file().ok()?;
     Some((node.fs.clone(), node.inode.clone()))
+}
+
+pub(crate) fn prepare_hugetlbfs_mmap(
+    loc: &axfs_ng_vfs::Location,
+    request: FileMmapRequest,
+) -> AxResult<Option<PreparedFileMmap>> {
+    let node = match loc.entry().downcast::<MemoryNode>() {
+        Ok(node) if node.fs.name == "hugetlbfs" => node,
+        _ => return Ok(None),
+    };
+    let file = node.inode.as_file().map_err(AxError::from)?;
+    file.prepare_hugetlb_mmap(&node.fs, request).map(Some)
 }
 
 /// Reports whether this location exposes tmpfs range-mutation primitives.
@@ -848,7 +1461,9 @@ enum NodeContent {
 
 struct Inode {
     ino: u64,
+    block_size: u64,
     metadata: Mutex<Metadata>,
+    file_attr: Mutex<FileAttr>,
     anonymous_linkable: Mutex<bool>,
     content: NodeContent,
     xattrs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -861,7 +1476,7 @@ impl Inode {
         match &self.content {
             NodeContent::File(content) => {
                 metadata.size = *content.length.lock();
-                metadata.block_size = TMPFS_BLOCK_SIZE;
+                metadata.block_size = self.block_size;
                 metadata.blocks = content.blocks();
             }
             NodeContent::Dir(dir) => metadata.size = dir.entries.lock().len() as u64,
@@ -886,11 +1501,11 @@ impl Inode {
             nlink: 0,
             mode: permission,
             node_type,
-            uid: 0,
-            gid: 0,
+            uid: parent.is_none().then_some(fs.root_uid).unwrap_or(0),
+            gid: parent.is_none().then_some(fs.root_gid).unwrap_or(0),
             project_id: 0,
             size: 0,
-            block_size: TMPFS_BLOCK_SIZE,
+            block_size: fs.stat_block_size,
             blocks: 0,
             rdev: DeviceId::default(),
             atime: now.into(),
@@ -903,14 +1518,25 @@ impl Inode {
             _ => NodeContent::File(FileContent::default()),
         };
         let dot_names = if node_type == NodeType::Directory {
-            Some((FileName(try_owned(".")?), FileName(try_owned("..")?)))
+            Some((
+                FileName(FsNameBuf::from_readdir_pseudo_vec(try_owned_bytes(b".")?)?),
+                FileName(FsNameBuf::from_readdir_pseudo_vec(try_owned_bytes(b"..")?)?),
+            ))
         } else {
             None
         };
         let xattrs = Arc::try_new(Mutex::new(HashMap::new())).map_err(|_| VfsError::NoMemory)?;
         let result = Arc::try_new(Self {
             ino,
+            block_size: fs.stat_block_size,
             metadata: Mutex::new(metadata),
+            file_attr: Mutex::new(FileAttr {
+                xflags: 0,
+                extsize: 0,
+                nextents: 0,
+                project_id: 0,
+                cowextsize: 0,
+            }),
             anonymous_linkable: Mutex::new(false),
             content,
             xattrs,
@@ -1038,10 +1664,15 @@ impl MemoryNode {
         }
     }
 
-    fn new_entry(&self, name: &str, node_type: NodeType, inode: Arc<Inode>) -> VfsResult<DirEntry> {
+    fn new_entry(
+        &self,
+        name: &FsName,
+        node_type: NodeType,
+        inode: Arc<Inode>,
+    ) -> VfsResult<DirEntry> {
         let reference = Reference::new(
             self.this.lock().as_ref().and_then(WeakDirEntry::upgrade),
-            try_owned(name)?,
+            try_owned_name(name)?,
         );
         Self::try_new_entry(self.fs.clone(), inode, node_type, reference)
     }
@@ -1142,7 +1773,7 @@ impl NodeOps for MemoryNode {
         match &self.inode.content {
             NodeContent::File(content) => {
                 metadata.size = *content.length.lock();
-                metadata.block_size = TMPFS_BLOCK_SIZE;
+                metadata.block_size = self.inode.block_size;
                 metadata.blocks = content.blocks();
             }
             NodeContent::Dir(dir) => {
@@ -1166,6 +1797,7 @@ impl NodeOps for MemoryNode {
         }
         if let Some(project_id) = update.project_id {
             metadata.project_id = project_id;
+            self.inode.file_attr.lock().project_id = project_id;
             status_changed = true;
         }
         if let Some(rdev) = update.rdev {
@@ -1209,6 +1841,28 @@ impl NodeOps for MemoryNode {
 
     fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
         Some(self)
+    }
+
+    fn file_attr_provider(&self) -> Option<&dyn FileAttrProvider> {
+        Some(self)
+    }
+}
+
+impl FileAttrProvider for MemoryNode {
+    fn get_file_attr(&self) -> VfsResult<FileAttr> {
+        let project_id = self.inode.metadata.lock().project_id;
+        let mut attr = self.inode.file_attr.lock().clone();
+        attr.project_id = project_id;
+        Ok(attr)
+    }
+
+    fn set_file_attr(&self, attr: FileAttr) -> VfsResult<()> {
+        let mut metadata = self.inode.metadata.lock();
+        metadata.project_id = attr.project_id;
+        metadata.ctime = wall_time().into();
+        drop(metadata);
+        *self.inode.file_attr.lock() = attr;
+        Ok(())
     }
 }
 
@@ -1302,6 +1956,11 @@ impl XattrProvider for MemoryNode {
 }
 
 impl FileNodeOps for MemoryNode {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+        let file = self.inode.as_file()?;
+        file.mutate_range(&self.fs, request)
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let file = self.inode.as_file()?;
         if let Some(symlink) = file.symlink.lock().as_ref() {
@@ -1335,6 +1994,17 @@ impl FileNodeOps for MemoryNode {
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
         let file = self.inode.as_file()?;
+        if let Some(page_size) = self.fs.huge_page_size
+            && len != 0
+            && !len.is_multiple_of(page_size as u64)
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        if let Some(huge) = file.huge_pages.lock().clone()
+            && len > u64::try_from(huge.total_bytes()).map_err(|_| VfsError::InvalidInput)?
+        {
+            return Err(VfsError::StorageFull);
+        }
         file.set_len(&self.fs, len);
         Ok(())
     }
@@ -1344,10 +2014,10 @@ impl FileNodeOps for MemoryNode {
         true
     }
 
-    fn set_symlink(&self, target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, target: &FsPath) -> VfsResult<()> {
         let file = self.inode.as_file()?;
-        let target = try_owned(target)?;
-        *file.length.lock() = target.len() as u64;
+        let target = try_owned_path(target)?;
+        *file.length.lock() = target.as_bytes().len() as u64;
         *file.symlink.lock() = Some(target);
         Ok(())
     }
@@ -1430,7 +2100,7 @@ impl DirNodeOps for MemoryNode {
         Ok(count)
     }
 
-    fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
+    fn lookup(&self, name: &FsName) -> VfsResult<DirEntry> {
         let dir = self.inode.as_dir()?;
         let entries = dir.entries.lock();
 
@@ -1442,7 +2112,7 @@ impl DirNodeOps for MemoryNode {
 
     fn create_named(
         &self,
-        name: &str,
+        name: &FsName,
         options: &NamedCreateOptions,
         disposition: CreateDisposition,
     ) -> VfsResult<CreateOutcome<DirEntry>> {
@@ -1477,7 +2147,7 @@ impl DirNodeOps for MemoryNode {
             return Err(VfsError::InvalidInput);
         }
         entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
-        let cache_name = FileName(try_owned(name)?);
+        let cache_name = FileName(try_owned_name(name)?);
         let ino = self.fs.try_reserve_inode_number()?;
         let inode = Inode::try_new_unpublished(
             &self.fs,
@@ -1494,6 +2164,36 @@ impl DirNodeOps for MemoryNode {
             }
             if let Some(rdev) = options.rdev {
                 metadata.rdev = rdev;
+            }
+            if let Some(project_id) = options.initial_attributes.project_id {
+                metadata.project_id = project_id;
+            }
+        }
+        // The inode is still unpublished: install ACL payloads before the
+        // directory map receives the name, so allocation/validation failure
+        // cannot expose a partially initialized child.
+        if options.initial_attributes.project_inherit
+            || options.initial_attributes.default_acl.is_some()
+                && options.node_type != NodeType::Directory
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        {
+            let mut xattrs = inode.xattrs.lock();
+            let needed = usize::from(options.initial_attributes.access_acl.is_some())
+                + usize::from(options.initial_attributes.default_acl.is_some());
+            xattrs.try_reserve(needed).map_err(|_| VfsError::NoMemory)?;
+            if let Some(access) = options.initial_attributes.access_acl.as_ref() {
+                xattrs.insert(
+                    Vec::from(b"system.posix_acl_access".as_slice()),
+                    access.as_bytes().to_vec(),
+                );
+            }
+            if let Some(default) = options.initial_attributes.default_acl.as_ref() {
+                xattrs.insert(
+                    Vec::from(b"system.posix_acl_default".as_slice()),
+                    default.as_bytes().to_vec(),
+                );
             }
         }
         let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
@@ -1513,13 +2213,13 @@ impl DirNodeOps for MemoryNode {
 
     fn create_symlink(
         &self,
-        name: &str,
-        target: &str,
+        name: &FsName,
+        target: &FsPath,
         permission: NodePermission,
         user: Option<(u32, u32)>,
     ) -> VfsResult<DirEntry> {
-        let target = try_owned(target)?;
-        let cache_name = FileName(try_owned(name)?);
+        let target = try_owned_path(target)?;
+        let cache_name = FileName(try_owned_name(name)?);
         let _namespace = self.fs.namespace.lock();
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
@@ -1537,12 +2237,71 @@ impl DirNodeOps for MemoryNode {
             permission,
         )?;
         let file = inode.as_file()?;
-        *file.length.lock() = target.len() as u64;
+        *file.length.lock() = target.as_bytes().len() as u64;
         *file.symlink.lock() = Some(target);
         if let Some((uid, gid)) = user {
             let mut metadata = inode.metadata.lock();
             metadata.uid = uid;
             metadata.gid = gid;
+        }
+        let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
+        let entry = self.new_entry(name, NodeType::Symlink, inode.clone())?;
+        self.fs.publish_inode(inode)?;
+        dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        entries.insert(cache_name, inode_ref);
+        let now = wall_time();
+        drop(entries);
+        Self::touch_directory(&self.inode, now);
+        Ok(entry)
+    }
+
+    fn create_symlink_prepared(
+        &self,
+        name: &FsName,
+        target: &FsPath,
+        options: &NamedCreateOptions,
+    ) -> VfsResult<DirEntry> {
+        if options.node_type != NodeType::Symlink
+            || options.initial_attributes.project_inherit
+            || options.initial_attributes.default_acl.is_some()
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        let target = try_owned_path(target)?;
+        let cache_name = FileName(try_owned_name(name)?);
+        let _namespace = self.fs.namespace.lock();
+        let dir = self.inode.as_dir()?;
+        let mut entries = dir.entries.lock();
+        if entries.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        let ino = self.fs.try_reserve_inode_number()?;
+        let inode = Inode::try_new_unpublished(
+            &self.fs,
+            ino,
+            Some(&self.inode),
+            NodeType::Symlink,
+            options.permission,
+        )?;
+        let file = inode.as_file()?;
+        *file.length.lock() = target.as_bytes().len() as u64;
+        *file.symlink.lock() = Some(target);
+        {
+            let mut metadata = inode.metadata.lock();
+            if let Some((uid, gid)) = options.owner {
+                metadata.uid = uid;
+                metadata.gid = gid;
+            }
+            if let Some(project_id) = options.initial_attributes.project_id {
+                metadata.project_id = project_id;
+            }
+        }
+        if let Some(access) = options.initial_attributes.access_acl.as_ref() {
+            inode.xattrs.lock().insert(
+                Vec::from(b"system.posix_acl_access".as_slice()),
+                access.as_bytes().to_vec(),
+            );
         }
         let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
         let entry = self.new_entry(name, NodeType::Symlink, inode.clone())?;
@@ -1580,8 +2339,8 @@ impl DirNodeOps for MemoryNode {
         Ok(entry)
     }
 
-    fn link(&self, name: &str, target: &DirEntry) -> VfsResult<DirEntry> {
-        let cache_name = FileName(try_owned(name)?);
+    fn link(&self, name: &FsName, target: &DirEntry) -> VfsResult<DirEntry> {
+        let cache_name = FileName(try_owned_name(name)?);
         let _namespace = self.fs.namespace.lock();
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
@@ -1661,7 +2420,7 @@ impl DirNodeOps for MemoryNode {
         if !Arc::ptr_eq(&self.fs, &dst_node.fs) {
             return Err(VfsError::CrossesDevices);
         }
-        let dst_key = FileName(try_owned(request.dst_name)?);
+        let dst_key = FileName(try_owned_name(request.dst_name)?);
         let _namespace = self.fs.namespace.lock();
         let src_dir = self.inode.as_dir()?;
         let dst_dir = dst_node.inode.as_dir()?;
@@ -1709,7 +2468,7 @@ impl DirNodeOps for MemoryNode {
             None
         };
         let mut parent_slot = match child_entries.as_mut() {
-            Some(entries) => Some(entries.get_mut("..").ok_or(VfsError::Io)?),
+            Some(entries) => Some(entries.get_mut(FsName::new(b"..")).ok_or(VfsError::Io)?),
             None => None,
         };
 
@@ -1735,6 +2494,129 @@ impl DirNodeOps for MemoryNode {
         drop(dst_entries);
         let now = wall_time();
         Self::touch_renamed_inodes(&src_inode, dst_inode.as_deref(), now);
+        Self::touch_directory(&self.inode, now);
+        Self::touch_directory(&dst_node.inode, now);
+        Ok(())
+    }
+
+    fn supports_rename_exchange(&self) -> bool {
+        true
+    }
+
+    fn rename_exchange(&self, request: RenameExchangeRequest<'_>) -> VfsResult<()> {
+        let dst_node = request.dst_dir.downcast::<Self>()?;
+        if !Arc::ptr_eq(&self.fs, &dst_node.fs) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let src_key = FileName(try_owned_name(request.src_name)?);
+        let dst_key = FileName(try_owned_name(request.dst_name)?);
+        let _namespace = self.fs.namespace.lock();
+        let src_dir = self.inode.as_dir()?;
+        let dst_dir = dst_node.inode.as_dir()?;
+        let same_parent = Arc::ptr_eq(&self.inode, &dst_node.inode);
+
+        // `RENAME_EXCHANGE` is a no-op for two aliases of one inode, but it
+        // still requires both names to have survived to this serialized point.
+        if same_parent {
+            let mut entries = src_dir.entries.lock();
+            let src_inode = entries
+                .get(request.src_name)
+                .and_then(InodeRef::get)
+                .ok_or(VfsError::NotFound)?;
+            let dst_inode = entries
+                .get(request.dst_name)
+                .and_then(InodeRef::get)
+                .ok_or(VfsError::NotFound)?;
+            if !self.matches_expected(request.src, &src_inode)
+                || !self.matches_expected(request.dst, &dst_inode)
+            {
+                return Err(VfsError::NotFound);
+            }
+            if Arc::ptr_eq(&src_inode, &dst_inode) {
+                return Ok(());
+            }
+            src_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            let src_ref = entries.remove(request.src_name).ok_or(VfsError::NotFound)?;
+            let dst_ref = entries.remove(request.dst_name).ok_or(VfsError::NotFound)?;
+            entries.insert(src_key, dst_ref);
+            entries.insert(dst_key, src_ref);
+            let now = wall_time();
+            Self::touch_renamed_inodes(&src_inode, Some(&dst_inode), now);
+            drop(entries);
+            Self::touch_directory(&self.inode, now);
+            return Ok(());
+        }
+
+        let mut src_entries = src_dir.entries.lock();
+        let mut dst_entries = dst_dir.entries.lock();
+        let src_inode = src_entries
+            .get(request.src_name)
+            .and_then(InodeRef::get)
+            .ok_or(VfsError::NotFound)?;
+        let dst_inode = dst_entries
+            .get(request.dst_name)
+            .and_then(InodeRef::get)
+            .ok_or(VfsError::NotFound)?;
+        if !self.matches_expected(request.src, &src_inode)
+            || !dst_node.matches_expected(request.dst, &dst_inode)
+        {
+            return Err(VfsError::NotFound);
+        }
+        if Arc::ptr_eq(&src_inode, &dst_inode) {
+            return Ok(());
+        }
+
+        // Prepare both moved-directory `..` replacements before detaching a
+        // name; all subsequent HashMap replacements are allocation-free.
+        let src_parent = if src_inode.metadata.lock().node_type == NodeType::Directory {
+            Some(InodeRef::try_new_named(&self.fs, &dst_node.inode)?)
+        } else {
+            None
+        };
+        let dst_parent = if dst_inode.metadata.lock().node_type == NodeType::Directory {
+            Some(InodeRef::try_new_named(&self.fs, &self.inode)?)
+        } else {
+            None
+        };
+        let mut src_child = match &src_inode.content {
+            NodeContent::Dir(dir) => Some(dir.entries.lock()),
+            _ => None,
+        };
+        let mut dst_child = match &dst_inode.content {
+            NodeContent::Dir(dir) => Some(dir.entries.lock()),
+            _ => None,
+        };
+        let src_dotdot = src_child
+            .as_mut()
+            .map(|entries| entries.get_mut(FsName::new(b"..")).ok_or(VfsError::Io))
+            .transpose()?;
+        let dst_dotdot = dst_child
+            .as_mut()
+            .map(|entries| entries.get_mut(FsName::new(b"..")).ok_or(VfsError::Io))
+            .transpose()?;
+
+        src_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        dst_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        let src_ref = src_entries
+            .remove(request.src_name)
+            .ok_or(VfsError::NotFound)?;
+        let dst_ref = dst_entries
+            .remove(request.dst_name)
+            .ok_or(VfsError::NotFound)?;
+        dst_entries.insert(dst_key, src_ref);
+        src_entries.insert(src_key, dst_ref);
+        if let (Some(slot), Some(parent)) = (src_dotdot, src_parent) {
+            drop(mem::replace(slot, parent));
+        }
+        if let (Some(slot), Some(parent)) = (dst_dotdot, dst_parent) {
+            drop(mem::replace(slot, parent));
+        }
+        let now = wall_time();
+        Self::touch_renamed_inodes(&src_inode, Some(&dst_inode), now);
+        drop(src_entries);
+        drop(dst_entries);
+        drop(src_child);
+        drop(dst_child);
         Self::touch_directory(&self.inode, now);
         Self::touch_directory(&dst_node.inode, now);
         Ok(())
@@ -1765,9 +2647,9 @@ mod tests {
 
     use axerrno::LinuxError;
     use axfs_ng_vfs::{
-        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleDecodeMode, ExportHandleMode, InitialNodeData,
-        MetadataUpdate, Mountpoint, NamedCreateOptions, NodePermission, NodeType, Timestamp,
-        VfsError, XattrSetMode,
+        AnonymousOptions, CreateDisposition, DeviceId, ExportHandleDecodeMode, ExportHandleMode,
+        FsName, InitialNodeData, MetadataUpdate, Mountpoint, NamedCreateOptions, NodePermission,
+        NodeType, Timestamp, VfsError, XattrSetMode,
     };
 
     use super::{MemoryFs, TMPFS_XATTR_SIZE_MAX};
@@ -1778,7 +2660,7 @@ mod tests {
         mount
             .root_location()
             .create(
-                name,
+                FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -1792,7 +2674,7 @@ mod tests {
         let root = mount.root_location();
         let file = root
             .create(
-                "xattr-source",
+                FsName::new(b"xattr-source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1877,7 +2759,7 @@ mod tests {
         let root = mount.root_location();
         let file = root
             .create(
-                "xattr-create-source",
+                FsName::new(b"xattr-create-source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1946,7 +2828,7 @@ mod tests {
         let second_root = second_mount.root_location();
         let file = first_root
             .create(
-                "file",
+                FsName::new(b"file"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1982,7 +2864,7 @@ mod tests {
         let root = mount.root_location();
         let source = root
             .create(
-                "timestamp-source",
+                FsName::new(b"timestamp-source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2052,7 +2934,7 @@ mod tests {
         let root = mount.root_location();
         let source = root
             .create(
-                "unlink-first",
+                FsName::new(b"unlink-first"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2092,7 +2974,7 @@ mod tests {
         let root = mount.root_location();
         let directory = root
             .create(
-                "empty-directory",
+                FsName::new(b"empty-directory"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
@@ -2123,14 +3005,14 @@ mod tests {
         let root = mount.root_location();
         let victim = root
             .create(
-                "victim",
+                FsName::new(b"victim"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
         let wrong_identity = root
             .create(
-                "wrong-identity",
+                FsName::new(b"wrong-identity"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2156,14 +3038,14 @@ mod tests {
 
         let directory = root
             .create(
-                "nonempty-directory",
+                FsName::new(b"nonempty-directory"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
             .unwrap();
         directory
             .create(
-                "child",
+                FsName::new(b"child"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2272,21 +3154,21 @@ mod tests {
         let root = mount.root_location();
         let subtree = root
             .create(
-                "subtree",
+                FsName::new(b"subtree"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
             .unwrap();
         let child = subtree
             .create(
-                "child",
+                FsName::new(b"child"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
         let sibling = root
             .create(
-                "sibling",
+                FsName::new(b"sibling"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2327,7 +3209,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "file",
+                FsName::new(b"file"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2356,7 +3238,7 @@ mod tests {
 
         assert_eq!(
             root.create(
-                "empty-link",
+                FsName::new(b"empty-link"),
                 NodeType::Symlink,
                 NodePermission::from_bits_truncate(0o777),
             )
@@ -2394,6 +3276,7 @@ mod tests {
             owner: Some((1000, 1001)),
             rdev: Some(DeviceId(0x1234)),
             initial_data: None,
+            initial_attributes: Default::default(),
         };
 
         let created = root
@@ -2455,6 +3338,7 @@ mod tests {
                     owner: Some((1000, 1001)),
                     rdev: None,
                     initial_data: Some(InitialNodeData::from_shared(marker.clone())),
+                    initial_attributes: Default::default(),
                 },
                 CreateDisposition::Exclusive,
             )
@@ -2466,7 +3350,7 @@ mod tests {
         let _alias = root.link("socket-alias", &created.entry).unwrap();
         let unrelated = root
             .create(
-                "unrelated",
+                FsName::new(b"unrelated"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2490,7 +3374,7 @@ mod tests {
         let root = mount.root_location();
         let created = root
             .create(
-                "existing",
+                FsName::new(b"existing"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2505,6 +3389,7 @@ mod tests {
                     owner: Some((123, 456)),
                     rdev: Some(DeviceId(7)),
                     initial_data: Some(InitialNodeData::from_shared(Arc::new(Marker))),
+                    initial_attributes: Default::default(),
                 },
                 CreateDisposition::OpenOrCreate,
             )
@@ -2521,14 +3406,14 @@ mod tests {
         let root = mount.root_location();
         let parent = root
             .create(
-                "parent",
+                FsName::new(b"parent"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o755),
             )
             .unwrap();
         parent
             .create(
-                "victim",
+                FsName::new(b"victim"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2539,13 +3424,16 @@ mod tests {
             .as_dir()
             .unwrap()
             .inner()
-            .lookup("parent")
+            .lookup(FsName::new(b"parent"))
             .unwrap();
         let alias_dir = alias.as_dir().unwrap();
-        alias_dir.lookup("victim").unwrap();
+        alias_dir.lookup(FsName::new(b"victim")).unwrap();
 
         parent.unlink("victim", false).unwrap();
-        assert_eq!(alias_dir.lookup("victim").unwrap_err(), VfsError::NotFound);
+        assert_eq!(
+            alias_dir.lookup(FsName::new(b"victim")).unwrap_err(),
+            VfsError::NotFound
+        );
     }
 
     #[test]
@@ -2555,14 +3443,14 @@ mod tests {
         let root = mount.root_location();
         let parent = root
             .create(
-                "parent",
+                FsName::new(b"parent"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o755),
             )
             .unwrap();
         parent
             .create(
-                "victim",
+                FsName::new(b"victim"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2573,10 +3461,10 @@ mod tests {
             .as_dir()
             .unwrap()
             .inner()
-            .lookup("parent")
+            .lookup(FsName::new(b"parent"))
             .unwrap();
         let alias_dir = alias.as_dir().unwrap();
-        let expected = alias_dir.inner().lookup("victim").unwrap();
+        let expected = alias_dir.inner().lookup(FsName::new(b"victim")).unwrap();
         alias_dir
             .unlink_checked("victim", false, &expected)
             .unwrap();
@@ -2593,7 +3481,7 @@ mod tests {
         let root = mount.root_location();
         let old = root
             .create(
-                "slot",
+                FsName::new(b"slot"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2601,7 +3489,7 @@ mod tests {
         root.unlink("slot", false).unwrap();
         let replacement = root
             .create(
-                "slot",
+                FsName::new(b"slot"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2628,32 +3516,35 @@ mod tests {
         let root = mount.root_location();
         let dir = root
             .create(
-                "dir",
+                FsName::new(b"dir"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o755),
             )
             .unwrap();
         dir.create(
-            "child",
+            FsName::new(b"child"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
         .unwrap();
         root.create(
-            "file",
+            FsName::new(b"file"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
         .unwrap();
 
-        root.rename("dir", &root, "dir").unwrap();
+        root.rename(FsName::new(b"dir"), &root, FsName::new(b"dir"))
+            .unwrap();
         assert!(root.lookup_no_follow("dir").unwrap().is_dir());
         assert_eq!(
-            root.rename("file", &root, "dir").unwrap_err(),
+            root.rename(FsName::new(b"file"), &root, FsName::new(b"dir"))
+                .unwrap_err(),
             VfsError::IsADirectory
         );
         assert_eq!(
-            root.rename("dir", &root, "file").unwrap_err(),
+            root.rename(FsName::new(b"dir"), &root, FsName::new(b"file"))
+                .unwrap_err(),
             VfsError::NotADirectory
         );
     }
@@ -2665,14 +3556,14 @@ mod tests {
         let root = mount.root_location();
         let source = root
             .create(
-                "source",
+                FsName::new(b"source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
         let victim = root
             .create(
-                "victim",
+                FsName::new(b"victim"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2693,7 +3584,8 @@ mod tests {
                 .unwrap();
         }
 
-        root.rename("source", &root, "victim").unwrap();
+        root.rename(FsName::new(b"source"), &root, FsName::new(b"victim"))
+            .unwrap();
 
         let source_metadata = source.metadata().unwrap();
         let victim_metadata = victim.metadata().unwrap();
@@ -2712,13 +3604,17 @@ mod tests {
         let mount = Mountpoint::new_root(&fs);
         let root = mount.root_location();
         let mode = NodePermission::from_bits_truncate(0o700);
-        let old_parent = root.create("old", NodeType::Directory, mode).unwrap();
-        let new_parent = root.create("new", NodeType::Directory, mode).unwrap();
+        let old_parent = root
+            .create(FsName::new(b"old"), NodeType::Directory, mode)
+            .unwrap();
+        let new_parent = root
+            .create(FsName::new(b"new"), NodeType::Directory, mode)
+            .unwrap();
         let source = old_parent
-            .create("source", NodeType::RegularFile, mode)
+            .create(FsName::new(b"source"), NodeType::RegularFile, mode)
             .unwrap();
         let victim = new_parent
-            .create("victim", NodeType::RegularFile, mode)
+            .create(FsName::new(b"victim"), NodeType::RegularFile, mode)
             .unwrap();
         let sentinel = Timestamp::from(core::time::Duration::MAX);
         for parent in [&old_parent, &new_parent] {
@@ -2739,7 +3635,9 @@ mod tests {
                 .unwrap();
         }
 
-        old_parent.rename("source", &new_parent, "victim").unwrap();
+        old_parent
+            .rename(FsName::new(b"source"), &new_parent, FsName::new(b"victim"))
+            .unwrap();
 
         let source_metadata = source.metadata().unwrap();
         let victim_metadata = victim.metadata().unwrap();
@@ -2762,14 +3660,14 @@ mod tests {
         let root = mount.root_location();
         let source = root
             .create(
-                "source",
+                FsName::new(b"source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
         let victim = root
             .create(
-                "victim",
+                FsName::new(b"victim"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
@@ -2786,7 +3684,8 @@ mod tests {
         let victim_before = metadata_state(&victim);
 
         assert_eq!(
-            root.rename("source", &root, "victim").unwrap_err(),
+            root.rename(FsName::new(b"source"), &root, FsName::new(b"victim"))
+                .unwrap_err(),
             VfsError::IsADirectory
         );
         assert_eq!(metadata_state(&root), parent_before);
@@ -2807,7 +3706,7 @@ mod tests {
         .unwrap();
 
         root.create(
-            "child",
+            FsName::new(b"child"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
