@@ -8,10 +8,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use axcbpf::{
-    Ancillary, InputProfile, Instruction, PacketInput, PacketInputContext,
-    PacketMetadata as CbpfPacketMetadata, Program,
-};
+use axcbpf::{Input, InputProfile, Instruction, LoadWidth, Program};
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::packet::{
     LinkPacketType, PacketAncillaryCapabilities, PacketFilter, PacketFilterContext,
@@ -20,6 +17,10 @@ use axnet::packet::{
 use axnet::packet::{PacketAncillaryMetadata, PacketMetadata as LinkPacketMetadata};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::net::socklen_t;
+use thekernel_linux_packet::{
+    SocketFilterAncillary, SocketFilterSnapshot, classify_socket_filter_ancillary,
+    is_socket_filter_ancillary_offset,
+};
 
 use crate::{
     mm::{UserConstPtr, UserMemoryCapability, map_usercopy_error},
@@ -304,6 +305,7 @@ impl PacketCbpfFilter {
         instructions: alloc::vec::Vec<Instruction>,
         policy: ExecutorPolicy,
     ) -> AxResult<Arc<Self>> {
+        validate_socket_filter_profile(&instructions)?;
         let program = Program::try_from_vec(instructions).map_err(map_verify_error)?;
         let ancillary_requirements = ancillary_requirements(&program);
         let metadata_required = ancillary_requirements != 0;
@@ -335,6 +337,37 @@ impl PacketCbpfFilter {
     }
 }
 
+struct SocketFilterInput<'a> {
+    packet: &'a [u8],
+    metadata: SocketFilterSnapshot,
+}
+
+impl Input for SocketFilterInput<'_> {
+    fn len(&self) -> u32 {
+        u32::try_from(self.packet.len()).unwrap_or(u32::MAX)
+    }
+
+    fn load(&self, offset: u32, width: LoadWidth) -> Option<u32> {
+        classify_socket_filter_ancillary(offset)
+            .map(|field| self.metadata.value(field))
+            .or_else(|| self.packet.load(offset, width))
+    }
+}
+
+fn validate_socket_filter_profile(instructions: &[Instruction]) -> AxResult<()> {
+    for instruction in instructions {
+        if is_socket_filter_ancillary_offset(instruction.k)
+            && (!matches!(
+                instruction.code,
+                axcbpf::opcode::LD_W_ABS | axcbpf::opcode::LD_H_ABS | axcbpf::opcode::LD_B_ABS
+            ) || classify_socket_filter_ancillary(instruction.k).is_none())
+        {
+            return Err(AxError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
 impl PacketFilter for PacketCbpfFilter {
     fn filter(&self, packet: &[u8], context: PacketFilterContext<'_>) -> AxResult<usize> {
         if !self.metadata_required {
@@ -363,7 +396,7 @@ impl PacketCbpfFilter {
         self.filter_bytes(packet)
     }
 
-    fn cbpf_metadata(&self, context: PacketFilterContext<'_>) -> CbpfPacketMetadata {
+    fn cbpf_metadata(&self, context: PacketFilterContext<'_>) -> SocketFilterSnapshot {
         let hot = context.metadata();
         let ancillary = context.ancillary();
         let mark = ancillary.mark();
@@ -377,16 +410,16 @@ impl PacketCbpfFilter {
             LinkPacketType::OtherHost => 3,
             LinkPacketType::Outgoing => 4,
         };
-        CbpfPacketMetadata::new(
-            hot.protocol,
-            hot.interface_index,
+        SocketFilterSnapshot {
+            protocol: u32::from(hot.protocol),
+            ifindex: hot.interface_index,
             pkttype,
             mark,
-            queue,
-            vlan_tag,
-            vlan_present,
-            vlan_tpid,
-        )
+            queue: u32::from(queue),
+            vlan_tag: u32::from(vlan_tag),
+            vlan_tag_present: u32::from(vlan_present),
+            vlan_tpid: u32::from(vlan_tpid),
+        }
     }
     fn filter_bytes(&self, packet: &[u8]) -> AxResult<usize> {
         #[cfg(feature = "bpf")]
@@ -410,7 +443,7 @@ impl PacketCbpfFilter {
     pub(crate) fn filter_with_metadata(
         &self,
         packet: &[u8],
-        metadata: CbpfPacketMetadata,
+        metadata: SocketFilterSnapshot,
     ) -> AxResult<usize> {
         if !self.metadata_required {
             return self.filter_bytes(packet);
@@ -418,24 +451,14 @@ impl PacketCbpfFilter {
         #[cfg(feature = "bpf")]
         let result = self.native.as_ref().map(|native| {
             record_native_executed();
-            let context = PacketInputContext::new(packet, metadata);
-            // The packet-aware image keeps the existing two-argument JIT ABI,
-            // but receives a pointer to this typed context. The borrow and
-            // synchronous call keep both the context and packet live for the
-            // entire native execution.
-            let context_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&context as *const PacketInputContext).cast::<u8>(),
-                    core::mem::size_of::<PacketInputContext>(),
-                )
-            };
-            native.execute(context_bytes)
+            native.execute(packet)
         });
         #[cfg(not(feature = "bpf"))]
         let result = None;
         let result = result.unwrap_or_else(|| {
             record_interpreter_executed();
-            self.program.evaluate(&PacketInput::new(packet, metadata))
+            self.program
+                .evaluate(&SocketFilterInput { packet, metadata })
         });
         Ok(usize::try_from(result)
             .unwrap_or(usize::MAX)
@@ -443,14 +466,14 @@ impl PacketCbpfFilter {
     }
 }
 
-fn ancillary_for_instruction(instruction: Instruction) -> Option<Ancillary> {
+fn ancillary_for_instruction(instruction: Instruction) -> Option<SocketFilterAncillary> {
     if !matches!(
         instruction.code,
         axcbpf::opcode::LD_W_ABS | axcbpf::opcode::LD_H_ABS | axcbpf::opcode::LD_B_ABS
     ) {
         return None;
     }
-    axcbpf::ancillary_from_offset(instruction.k)
+    classify_socket_filter_ancillary(instruction.k)
 }
 
 fn ancillary_requirements(program: &Program) -> u8 {
@@ -460,13 +483,14 @@ fn ancillary_requirements(program: &Program) -> u8 {
             continue;
         };
         requirements |= match field {
-            Ancillary::Protocol => ANC_PROTOCOL,
-            Ancillary::Pkttype => ANC_PKTTYPE,
-            Ancillary::Ifindex => ANC_IFINDEX,
-            Ancillary::Mark => ANC_MARK,
-            Ancillary::Queue => ANC_QUEUE,
-            Ancillary::VlanTag | Ancillary::VlanTagPresent | Ancillary::VlanTpid => ANC_VLAN,
-            _ => 0,
+            SocketFilterAncillary::Protocol => ANC_PROTOCOL,
+            SocketFilterAncillary::PacketType => ANC_PKTTYPE,
+            SocketFilterAncillary::InterfaceIndex => ANC_IFINDEX,
+            SocketFilterAncillary::Mark => ANC_MARK,
+            SocketFilterAncillary::Queue => ANC_QUEUE,
+            SocketFilterAncillary::VlanTag
+            | SocketFilterAncillary::VlanTagPresent
+            | SocketFilterAncillary::VlanTpid => ANC_VLAN,
         };
     }
     requirements
@@ -528,7 +552,18 @@ fn select_native(
         record_fallback(FallbackReason::PolicyInterpreter);
         return Ok(None);
     }
-    let native = match try_compile(program, metadata_required) {
+    // Linux ancillary offsets are resolved by the Linux ABI input adapter,
+    // not by AX's generic native input ABI. Keep those programs on the
+    // verified interpreter path until a neutral extension ABI exists.
+    if metadata_required {
+        if policy == ExecutorPolicy::Jit {
+            increment(&JIT_REJECTED);
+            return Err(LinuxError::EOPNOTSUPP.into());
+        }
+        record_fallback(FallbackReason::Translation);
+        return Ok(None);
+    }
+    let native = match try_compile(program) {
         Ok(native) => native,
         Err(error) => {
             if policy == ExecutorPolicy::Jit {
@@ -562,15 +597,8 @@ fn select_native(
 }
 
 #[cfg(feature = "bpf")]
-fn try_compile(
-    program: &Program,
-    metadata_required: bool,
-) -> Result<crate::jit_memory::ExecutableCode, NativeError> {
-    let profile = if metadata_required {
-        InputProfile::PacketContextBigEndian
-    } else {
-        InputProfile::PacketBytesBigEndian
-    };
+fn try_compile(program: &Program) -> Result<crate::jit_memory::ExecutableCode, NativeError> {
+    let profile = InputProfile::BigEndianBytes;
     let image = program
         .translate_with_profile(profile)
         .map_err(|_| NativeError::Translation)?;
@@ -588,6 +616,33 @@ fn try_compile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Ancillary {
+        Protocol,
+        Pkttype,
+        Ifindex,
+        Mark,
+        Queue,
+        VlanTag,
+        VlanTagPresent,
+        VlanTpid,
+    }
+    impl Ancillary {
+        const fn encoded_offset(self) -> u32 {
+            let field = match self {
+                Self::Protocol => SocketFilterAncillary::Protocol,
+                Self::Pkttype => SocketFilterAncillary::PacketType,
+                Self::Ifindex => SocketFilterAncillary::InterfaceIndex,
+                Self::Mark => SocketFilterAncillary::Mark,
+                Self::Queue => SocketFilterAncillary::Queue,
+                Self::VlanTag => SocketFilterAncillary::VlanTag,
+                Self::VlanTagPresent => SocketFilterAncillary::VlanTagPresent,
+                Self::VlanTpid => SocketFilterAncillary::VlanTpid,
+            };
+            thekernel_linux_packet::encoded_socket_filter_ancillary(field)
+        }
+    }
 
     #[test]
     fn packet_filter_accept_drop_and_snaplen_follow_classic_semantics() {
@@ -630,7 +685,7 @@ mod tests {
             alloc::vec![
                 Instruction::statement(
                     axcbpf::opcode::LD_W_ABS,
-                    axcbpf::Ancillary::Protocol.encoded_offset(),
+                    Ancillary::Protocol.encoded_offset(),
                 ),
                 Instruction::statement(axcbpf::opcode::RET_A, 0),
             ],
@@ -641,7 +696,11 @@ mod tests {
             filter.filter(&[0x08, 0x00]).unwrap_err(),
             LinuxError::EOPNOTSUPP.into()
         );
-        let metadata = CbpfPacketMetadata::new(0x0800, 3, 0, 0, 0, 0, false, 0);
+        let metadata = SocketFilterSnapshot {
+            protocol: 0x0800,
+            ifindex: 3,
+            ..SocketFilterSnapshot::default()
+        };
         let packet = alloc::vec![0_u8; 2048];
         assert_eq!(
             filter.filter_with_metadata(&packet, metadata).unwrap(),
@@ -650,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_filter_trait_maps_real_link_context_for_interpreter_and_jit() {
+    fn packet_filter_trait_maps_real_link_context_and_rejects_ancillary_jit() {
         let hot = LinkPacketMetadata {
             interface_index: 7,
             protocol: 0x0800,
@@ -703,16 +762,12 @@ mod tests {
                     ExecutorPolicy::Jit,
                 );
                 match result {
-                    Ok(filter) => assert_eq!(
-                        PacketFilter::filter(filter.as_ref(), &packet, context).unwrap(),
-                        expected as usize,
-                        "{field:?} jit"
+                    Err(error) => assert_eq!(
+                        error,
+                        LinuxError::EOPNOTSUPP.into(),
+                        "{field:?} ancillary JIT admission"
                     ),
-                    // Host tests do not construct axmm's kernel address space,
-                    // so a ForceJit admission correctly reports an unavailable
-                    // executable arena rather than falling back silently.
-                    Err(AxError::BadState) => {}
-                    Err(error) => panic!("{field:?} JIT admission failed unexpectedly: {error:?}"),
+                    Ok(_) => panic!("{field:?} ancillary program entered the generic AX JIT"),
                 }
             }
         }

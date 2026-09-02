@@ -8,6 +8,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
+use axcbpf::{Instruction, NativeWordInput, Program};
 use axerrno::{AxError, LinuxError};
 use thekernel_linux_seccomp::{SeccompExecutor, VerifiedProgram};
 
@@ -61,6 +62,10 @@ pub(crate) enum FallbackReason {
 /// Explicit rejection of a force-JIT admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JitError {
+    /// The Linux profile passed an instruction stream rejected by AX's
+    /// generic cBPF verifier. This is malformed userspace input, not a JIT
+    /// availability failure.
+    InvalidProgram,
     Translation,
     Publication(AxError),
     Quarantined(AxError),
@@ -72,6 +77,7 @@ pub(crate) enum JitError {
 impl JitError {
     pub(crate) fn into_ax_error(self) -> AxError {
         match self {
+            Self::InvalidProgram => AxError::InvalidInput,
             Self::Translation => LinuxError::EOPNOTSUPP.into(),
             Self::Publication(error) => error,
             Self::Quarantined(_) | Self::Retained(_) => LinuxError::EOPNOTSUPP.into(),
@@ -298,35 +304,43 @@ fn record_fallback(reason: FallbackReason) {
 /// `None` is returned only for `Auto` fallback or an explicit interpreter
 /// policy. `Jit` never silently falls back: every translation, W^X, or owner
 /// failure is returned to the syscall adapter for an explicit rejection.
-pub(crate) fn try_compile(
-    program: &VerifiedProgram,
-) -> Result<Option<Arc<dyn SeccompExecutor>>, JitError> {
+pub(crate) fn try_compile(program: &VerifiedProgram) -> Result<Arc<dyn SeccompExecutor>, JitError> {
     try_compile_with_policy(program, executor_policy())
 }
 
 pub(crate) fn try_compile_with_policy(
     program: &VerifiedProgram,
     policy: ExecutorPolicy,
-) -> Result<Option<Arc<dyn SeccompExecutor>>, JitError> {
+) -> Result<Arc<dyn SeccompExecutor>, JitError> {
+    let mechanism = mechanism_program(program)?;
     if policy == ExecutorPolicy::Interpreter {
         record_fallback(FallbackReason::PolicyInterpreter);
-        return Ok(None);
+        return Arc::try_new(MechanismExecutor {
+            program: mechanism,
+            code: None,
+        })
+        .map(|executor| executor as Arc<dyn SeccompExecutor>)
+        .map_err(|_| JitError::Owner);
     }
 
     #[cfg(not(feature = "bpf"))]
     {
-        let _ = program;
         if policy == ExecutorPolicy::Jit {
             increment(&JIT_REJECTED);
             return Err(JitError::Unavailable(LinuxError::EOPNOTSUPP.into()));
         }
         record_fallback(FallbackReason::Unavailable);
-        return Ok(None);
+        return Arc::try_new(MechanismExecutor {
+            program: mechanism,
+            code: None,
+        })
+        .map(|executor| executor as Arc<dyn SeccompExecutor>)
+        .map_err(|_| JitError::Owner);
     }
 
     #[cfg(feature = "bpf")]
     {
-        let native = match compile_native(program) {
+        let native = match compile_native(&mechanism) {
             Ok(native) => native,
             Err(error) => {
                 if policy == ExecutorPolicy::Jit {
@@ -334,10 +348,18 @@ pub(crate) fn try_compile_with_policy(
                     return Err(error);
                 }
                 record_fallback(error.fallback_reason());
-                return Ok(None);
+                return Arc::try_new(MechanismExecutor {
+                    program: mechanism,
+                    code: None,
+                })
+                .map(|executor| executor as Arc<dyn SeccompExecutor>)
+                .map_err(|_| JitError::Owner);
             }
         };
-        let owner: Arc<dyn SeccompExecutor> = match Arc::try_new(NativeExecutor { code: native }) {
+        let owner: Arc<dyn SeccompExecutor> = match Arc::try_new(MechanismExecutor {
+            program: mechanism,
+            code: Some(native),
+        }) {
             Ok(owner) => owner,
             Err(_) => {
                 if policy == ExecutorPolicy::Jit {
@@ -345,18 +367,21 @@ pub(crate) fn try_compile_with_policy(
                     return Err(JitError::Owner);
                 }
                 record_fallback(FallbackReason::Owner);
-                return Ok(None);
+                return Arc::try_new(MechanismExecutor {
+                    program: mechanism_program(program)?,
+                    code: None,
+                })
+                .map(|executor| executor as Arc<dyn SeccompExecutor>)
+                .map_err(|_| JitError::Owner);
             }
         };
-        Ok(Some(owner))
+        Ok(owner)
     }
 }
 
 #[cfg(feature = "bpf")]
-fn compile_native(
-    program: &VerifiedProgram,
-) -> Result<crate::jit_memory::ExecutableCode, JitError> {
-    let image = match program.translate_native() {
+fn compile_native(program: &Program) -> Result<crate::jit_memory::ExecutableCode, JitError> {
+    let image = match program.translate_with_profile(axcbpf::InputProfile::NativeAlignedWords) {
         Ok(image) => image,
         Err(_) => return Err(JitError::Translation),
     };
@@ -388,6 +413,7 @@ impl JitError {
 
     fn fallback_reason(self) -> FallbackReason {
         match self {
+            Self::InvalidProgram => FallbackReason::Translation,
             Self::Translation => FallbackReason::Translation,
             Self::Publication(_) => FallbackReason::Publication,
             Self::Quarantined(_) | Self::Retained(_) | Self::Unavailable(_) => {
@@ -399,16 +425,55 @@ impl JitError {
 }
 
 #[cfg(feature = "bpf")]
-struct NativeExecutor {
-    code: crate::jit_memory::ExecutableCode,
+struct MechanismExecutor {
+    program: Program,
+    code: Option<crate::jit_memory::ExecutableCode>,
 }
 
 #[cfg(feature = "bpf")]
-impl SeccompExecutor for NativeExecutor {
+impl SeccompExecutor for MechanismExecutor {
     fn execute(&self, data: &[u8]) -> u32 {
-        record_native_executed();
-        self.code.execute(data)
+        if let Some(code) = self.code.as_ref() {
+            record_native_executed();
+            return code.execute(data);
+        }
+        record_interpreter_executed();
+        NativeWordInput::new_aligned(data).map_or(0, |input| self.program.evaluate(&input))
     }
+}
+
+#[cfg(not(feature = "bpf"))]
+struct MechanismExecutor {
+    program: Program,
+    code: Option<()>,
+}
+
+#[cfg(not(feature = "bpf"))]
+impl SeccompExecutor for MechanismExecutor {
+    fn execute(&self, data: &[u8]) -> u32 {
+        let _ = self.code;
+        record_interpreter_executed();
+        NativeWordInput::new_aligned(data).map_or(0, |input| self.program.evaluate(&input))
+    }
+}
+
+fn mechanism_program(program: &VerifiedProgram) -> Result<Program, JitError> {
+    let mut instructions = alloc::vec::Vec::new();
+    instructions
+        .try_reserve_exact(program.instructions().len())
+        .map_err(|_| JitError::Owner)?;
+    instructions.extend(program.instructions().iter().map(|instruction| {
+        Instruction::new(
+            instruction.code,
+            instruction.jt,
+            instruction.jf,
+            instruction.k,
+        )
+    }));
+    Program::try_from_vec(instructions).map_err(|error| match error {
+        axcbpf::VerifyError::NoMemory => JitError::Owner,
+        _ => JitError::InvalidProgram,
+    })
 }
 
 #[cfg(test)]
@@ -457,10 +522,34 @@ mod tests {
         .unwrap()
     }
 
+    fn malformed_program(instructions: Vec<ClassicBpfInstruction>) -> VerifiedProgram {
+        VerifiedProgram::try_from_vec(instructions).unwrap()
+    }
+
+    #[test]
+    fn malformed_linux_profile_is_not_reported_as_jit_translation_failure() {
+        let missing_return = malformed_program(alloc::vec![ClassicBpfInstruction::new(
+            opcode::LD_IMM,
+            0,
+            0,
+            0,
+        )]);
+        let out_of_range_jump = malformed_program(alloc::vec![
+            ClassicBpfInstruction::new(opcode::JMP_JA, 0, 0, 1),
+            ClassicBpfInstruction::new(opcode::RET_K, 0, 0, SECCOMP_RET_ALLOW),
+        ]);
+        for program in [&missing_return, &out_of_range_jump] {
+            assert!(matches!(
+                try_compile_with_policy(program, ExecutorPolicy::Jit),
+                Err(JitError::InvalidProgram)
+            ));
+        }
+    }
+
     #[test]
     fn interpreter_policy_is_captured_at_admission() {
         let result = try_compile_with_policy(&allow_program(), ExecutorPolicy::Interpreter);
-        assert!(matches!(result, Ok(None)));
+        assert!(result.is_ok());
     }
 
     #[cfg(feature = "test-io-control")]
@@ -472,8 +561,8 @@ mod tests {
         set_executor_policies_for_control(Some(ExecutorPolicy::Jit), None);
         let new_program_executor = try_compile(&allow_program());
 
-        assert!(old_program_executor.is_none());
-        assert!(!matches!(new_program_executor, Ok(None)));
+        assert_eq!(old_program_executor.execute(&[0; 64]), SECCOMP_RET_ALLOW);
+        assert!(new_program_executor.is_err());
 
         set_executor_policies_for_control(Some(old.0), Some(old.1));
     }
@@ -503,8 +592,21 @@ mod tests {
     #[cfg(feature = "bpf")]
     #[test]
     fn force_jit_never_returns_an_interpreter_fallback() {
+        let before = counters();
         let result = try_compile_with_policy(&allow_program(), ExecutorPolicy::Jit);
-        assert!(!matches!(result, Ok(None)));
+        match result {
+            Ok(executor) => {
+                assert_eq!(executor.execute(&[0; 64]), SECCOMP_RET_ALLOW);
+                let after = counters();
+                assert_eq!(after.native_executed, before.native_executed + 1);
+                assert_eq!(after.interpreter_executed, before.interpreter_executed);
+            }
+            Err(_) => {
+                let after = counters();
+                assert_eq!(after.jit_rejected, before.jit_rejected + 1);
+                assert_eq!(after.interpreter_executed, before.interpreter_executed);
+            }
+        }
     }
 
     #[test]

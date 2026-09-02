@@ -10,6 +10,7 @@ use core::ptr;
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
+use axexec::{self, Alias, ExecBackend, Permissions};
 use axhal::{mem::virt_to_phys, paging::MappingFlags};
 use axsync::spin::SpinNoIrq;
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
@@ -197,86 +198,12 @@ impl ExecutableArena {
     }
 }
 
-/// An unpublished, writable and non-executable code allocation.
-#[must_use = "dropping an unpublished code allocation rolls it back"]
-pub(crate) struct WritableCode {
-    arena: &'static ExecutableArena,
-    first: usize,
-    pages: usize,
-    code: VirtAddr,
-    direct: VirtAddr,
-    len: usize,
-    armed: bool,
-}
-
-/// Reserves and maps an unpublished NX code allocation.
-pub(crate) fn prepare(size: usize) -> Result<WritableCode, MemoryError> {
-    let arena = ARENA
-        .get()
-        .ok_or(MemoryError::Unavailable(AxError::BadState))?;
-    let (first, pages, code) = arena.reserve(size).map_err(MemoryError::Unavailable)?;
-    let direct = match global_allocator().alloc_pages(pages, PAGE_SIZE_4K, UsageKind::Global) {
-        Ok(address) => VirtAddr::from_usize(address),
-        Err(_) => {
-            if !arena.release(first, pages) {
-                return Err(MemoryError::Retained(AxError::BadState));
-            }
-            return Err(MemoryError::Unavailable(AxError::NoMemory));
-        }
-    };
-    let mapped = pages * PAGE_SIZE_4K;
-    unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, mapped) };
-    if let Err(error) = axmm::kernel_aspace().lock().map_linear(
-        code,
-        virt_to_phys(direct),
-        mapped,
-        MappingFlags::READ | MappingFlags::WRITE,
-    ) {
-        // Mapping backends may have changed a page-table prefix before
-        // reporting failure. Do not release either alias or physical pages
-        // on that uncertainty: an NX retained allocation is safer than
-        // reusing a page behind a stale partial mapping.
-        return Err(MemoryError::Retained(error));
-    }
-    Ok(WritableCode {
-        arena,
-        first,
-        pages,
-        code,
-        direct,
-        len: size,
-        armed: true,
-    })
-}
-
-/// Reserves a non-executable module data segment at its final virtual address.
-/// The caller may relocate through its writable alias, then either retain it
-/// RW/NX or consume it with [`WritableCode::publish_readonly`] as RO/NX.
-pub(crate) fn prepare_module_data(size: usize) -> Result<WritableCode, MemoryError> {
-    prepare(size)
-}
-
-/// Changes permissions one page at a time and reports how many pages were
-/// changed before the first failure. `AddrSpace::protect` accepts a range but
-/// is allowed to stop after a partial page-table walk; keeping the cursor
-/// explicit lets callers roll back exactly the pages already transitioned.
-fn protect_pages_partial(
-    base: VirtAddr,
-    pages: usize,
-    flags: MappingFlags,
-) -> Result<(), (AxError, usize)> {
+fn protect_pages(base: VirtAddr, pages: usize, flags: MappingFlags) -> AxResult<()> {
     let mut aspace = axmm::kernel_aspace().lock();
     for page in 0..pages {
-        let address = base + page * PAGE_SIZE_4K;
-        if let Err(error) = aspace.protect(address, PAGE_SIZE_4K, flags) {
-            return Err((error, page));
-        }
+        aspace.protect(base + page * PAGE_SIZE_4K, PAGE_SIZE_4K, flags)?;
     }
     Ok(())
-}
-
-fn protect_pages(base: VirtAddr, pages: usize, flags: MappingFlags) -> AxResult<()> {
-    protect_pages_partial(base, pages, flags).map_err(|(error, _)| error)
 }
 
 fn unmap_pages(base: VirtAddr, pages: usize) -> AxResult<()> {
@@ -287,24 +214,171 @@ fn unmap_pages(base: VirtAddr, pages: usize) -> AxResult<()> {
     Ok(())
 }
 
+/// Kernel page-table implementation of the generic dual-alias lifecycle.
+/// The allocation owns the direct-map backing while `Mapping` identifies
+/// either that alias or its final arena address.
+#[derive(Clone, Copy)]
+struct Backend {
+    arena: &'static ExecutableArena,
+}
+
+struct Allocation {
+    first: usize,
+    pages: usize,
+    code: VirtAddr,
+    direct: VirtAddr,
+}
+
+#[derive(Clone, Copy)]
+struct Mapping {
+    address: VirtAddr,
+    pages: usize,
+    final_alias: bool,
+}
+
+impl ExecBackend for Backend {
+    type Allocation = Allocation;
+    type Mapping = Mapping;
+    type Error = AxError;
+
+    fn allocate(&self, len: usize) -> AxResult<Allocation> {
+        let (first, pages, code) = self.arena.reserve(len)?;
+        let direct = match global_allocator().alloc_pages(pages, PAGE_SIZE_4K, UsageKind::Global) {
+            Ok(address) => VirtAddr::from_usize(address),
+            Err(_) => {
+                if !self.arena.release(first, pages) {
+                    return Err(AxError::BadState);
+                }
+                return Err(AxError::NoMemory);
+            }
+        };
+        unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, pages * PAGE_SIZE_4K) };
+        Ok(Allocation {
+            first,
+            pages,
+            code,
+            direct,
+        })
+    }
+
+    fn map(&self, allocation: &Allocation, alias: Alias, _: Permissions) -> AxResult<Mapping> {
+        match alias {
+            Alias::Direct => Ok(Mapping {
+                address: allocation.direct,
+                pages: allocation.pages,
+                final_alias: false,
+            }),
+            Alias::Final => {
+                axmm::kernel_aspace().lock().map_linear(
+                    allocation.code,
+                    virt_to_phys(allocation.direct),
+                    allocation.pages * PAGE_SIZE_4K,
+                    MappingFlags::READ | MappingFlags::WRITE,
+                )?;
+                Ok(Mapping {
+                    address: allocation.code,
+                    pages: allocation.pages,
+                    final_alias: true,
+                })
+            }
+        }
+    }
+
+    fn protect(&self, mapping: &mut Mapping, permissions: Permissions) -> AxResult<()> {
+        let flags = match (permissions.write, permissions.execute) {
+            (true, false) => MappingFlags::READ | MappingFlags::WRITE,
+            (false, true) => MappingFlags::READ | MappingFlags::EXECUTE,
+            (false, false) => MappingFlags::READ,
+            (true, true) => return Err(AxError::BadState),
+        };
+        // The backend is deliberately page granular. A failure after a
+        // prefix is reported as an error; axexec quarantines the complete
+        // owner rather than making an unsafe best-effort reuse decision.
+        protect_pages(mapping.address, mapping.pages, flags)
+    }
+
+    fn writable_bytes<'a>(&self, mapping: &'a mut Mapping, len: usize) -> AxResult<&'a mut [u8]> {
+        if mapping.final_alias {
+            return Err(AxError::BadState);
+        }
+        Ok(unsafe { core::slice::from_raw_parts_mut(mapping.address.as_mut_ptr(), len) })
+    }
+
+    fn unmap(&self, mapping: Mapping) -> AxResult<()> {
+        if mapping.final_alias {
+            unmap_pages(mapping.address, mapping.pages)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn deallocate(&self, allocation: Allocation) {
+        unsafe {
+            ptr::write_bytes(
+                allocation.direct.as_mut_ptr(),
+                0,
+                allocation.pages * PAGE_SIZE_4K,
+            )
+        };
+        global_allocator().dealloc_pages(
+            allocation.direct.as_usize(),
+            allocation.pages,
+            UsageKind::Global,
+        );
+        let _ = self.arena.release(allocation.first, allocation.pages);
+    }
+
+    fn synchronize_tlb(&self) -> AxResult<()> {
+        drop(crate::mm::synchronize_tlb());
+        Ok(())
+    }
+    fn synchronize_icache(&self) -> AxResult<()> {
+        drop(crate::mm::synchronize_icache());
+        Ok(())
+    }
+}
+
+type RawWritable = axexec::Writable<Backend>;
+enum RawPublished {
+    Executable(axexec::PublishedExecutable<Backend>),
+    Readonly(axexec::PublishedReadonly<Backend>),
+}
+
+pub(crate) struct WritableCode {
+    raw: RawWritable,
+    code: VirtAddr,
+    len: usize,
+}
+pub(crate) struct ExecutableCode {
+    raw: RawPublished,
+    code: VirtAddr,
+    len: usize,
+    entry_offset: usize,
+}
+
+pub(crate) fn prepare(size: usize) -> Result<WritableCode, MemoryError> {
+    let arena = ARENA
+        .get()
+        .ok_or(MemoryError::Unavailable(AxError::BadState))?;
+    let raw = axexec::allocate(Backend { arena }, size).map_err(MemoryError::Unavailable)?;
+    let code = raw.final_mapping().address;
+    Ok(WritableCode {
+        raw,
+        code,
+        len: size,
+    })
+}
+pub(crate) fn prepare_module_data(size: usize) -> Result<WritableCode, MemoryError> {
+    prepare(size)
+}
+
 impl WritableCode {
-    /// Virtual base of the unpublished image, used to resolve ET_REL
-    /// section-relative relocations before W^X publication.
     pub(crate) fn code_address(&self) -> usize {
         self.code.as_usize()
     }
-
-    /// Views the unpublished final mapping through its writable, NX alias.
-    /// This is deliberately restricted to the builder lifetime: callers must
-    /// finish all relocation and initialization before publishing or dropping
-    /// the allocation.
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `WritableCode` exclusively owns this RW/NX mapping while it
-        // is armed. Publication consumes `self`, so the returned borrow cannot
-        // survive a permission transition.
-        unsafe { core::slice::from_raw_parts_mut(self.code.as_mut_ptr(), self.len) }
+        self.raw.bytes_mut().expect("writable direct alias")
     }
-    /// Copies bytes into the unpublished NX alias.
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> AxResult<()> {
         let end = offset
             .checked_add(bytes.len())
@@ -312,292 +386,106 @@ impl WritableCode {
         if end > self.len {
             return Err(AxError::InvalidInput);
         }
-        unsafe {
-            ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.code.as_mut_ptr().add(offset),
-                bytes.len(),
-            )
-        };
+        self.bytes_mut()[offset..end].copy_from_slice(bytes);
         Ok(())
     }
-
-    /// Retains this allocation in place after a lifecycle failure.
-    ///
-    /// The code alias remains NX and the arena slot remains occupied. This is
-    /// deliberately a leak/quarantine: a failed permission transition is not
-    /// evidence that the mapping can be safely unmapped or reused.
-    fn quarantine(&mut self, error: MemoryError) -> MemoryError {
-        // The direct alias is never made writable by this helper. Make a
-        // best-effort attempt to revoke execute from every code page before
-        // retaining the owner. If that attempt also fails, retaining the
-        // complete allocation still prevents premature reuse.
-        let _ = protect_pages(self.code, self.pages, MappingFlags::READ);
-        drop(crate::mm::synchronize_tlb_and_icache());
-        self.armed = false;
-        error
-    }
-
-    /// Best-effort rollback of an unpublished allocation.
-    ///
-    /// On unmap or release failure the allocation is retained and its slot is
-    /// never returned to the bitmap. The method consumes the owner so the
-    /// `Drop` implementation cannot retry a partially completed teardown.
-    pub(crate) fn abort(mut self, error: MemoryError) -> MemoryError {
-        match self.cleanup_unpublished() {
+    pub(crate) fn abort(self, error: MemoryError) -> MemoryError {
+        match self.raw.abort() {
             Ok(()) => error,
-            Err(cleanup_error) => cleanup_error,
+            Err(failure) => {
+                drop(failure.allocation);
+                MemoryError::Retained(failure.error)
+            }
         }
     }
-
-    fn cleanup_unpublished(&mut self) -> Result<(), MemoryError> {
-        if !self.armed {
-            return Ok(());
-        }
-        if let Err(error) = unmap_pages(self.code, self.pages) {
-            // `unmap_pages` may have removed a prefix. The code alias was
-            // never executable, so retaining all ownership is safe even when
-            // the mapping topology is now partial.
-            self.armed = false;
-            return Err(MemoryError::Retained(error));
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-        unsafe { ptr::write_bytes(self.direct.as_mut_ptr(), 0, self.pages * PAGE_SIZE_4K) };
-        global_allocator().dealloc_pages(self.direct.as_usize(), self.pages, UsageKind::Global);
-        self.armed = false;
-        if !self.arena.release(self.first, self.pages) {
-            return Err(MemoryError::Retained(AxError::BadState));
-        }
-        Ok(())
-    }
-
-    /// Publishes the complete allocation under strict alias-aware W^X.
-    pub(crate) fn publish(mut self, entry_offset: usize) -> Result<ExecutableCode, MemoryError> {
+    pub(crate) fn publish(self, entry_offset: usize) -> Result<ExecutableCode, MemoryError> {
         if entry_offset >= self.len {
             return Err(self.abort(MemoryError::Unavailable(AxError::InvalidInput)));
         }
-        if let Err((error, changed)) =
-            protect_pages_partial(self.direct, self.pages, MappingFlags::READ)
-        {
-            if protect_pages(
-                self.direct,
-                changed,
-                MappingFlags::READ | MappingFlags::WRITE,
-            )
-            .is_err()
-            {
-                return Err(self.quarantine(MemoryError::Quarantined(error)));
+        let code = self.code;
+        let len = self.len;
+        match self.raw.publish() {
+            Ok(raw) => Ok(ExecutableCode {
+                raw: RawPublished::Executable(raw),
+                code,
+                len,
+                entry_offset,
+            }),
+            Err(failure) => {
+                drop(failure.allocation);
+                Err(MemoryError::Quarantined(failure.error))
             }
-            drop(crate::mm::synchronize_tlb_and_icache());
-            return Err(self.abort(MemoryError::Unavailable(error)));
         }
-        // No CPU may retain a writable direct-map translation before the code
-        // alias becomes executable.
-        drop(crate::mm::synchronize_tlb_and_icache());
-
-        if let Err((error, changed)) = protect_pages_partial(
-            self.code,
-            self.pages,
-            MappingFlags::READ | MappingFlags::EXECUTE,
-        ) {
-            // Do not make any direct-map page writable until every code page
-            // that became executable has been revoked and the revocation is
-            // globally visible.
-            if protect_pages(self.code, changed, MappingFlags::READ).is_err() {
-                return Err(self.quarantine(MemoryError::Quarantined(error)));
-            }
-            drop(crate::mm::synchronize_tlb_and_icache());
-            if protect_pages(
-                self.direct,
-                self.pages,
-                MappingFlags::READ | MappingFlags::WRITE,
-            )
-            .is_err()
-            {
-                return Err(self.quarantine(MemoryError::Quarantined(error)));
-            }
-            drop(crate::mm::synchronize_tlb_and_icache());
-            return Err(self.abort(MemoryError::Unavailable(error)));
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-
-        self.armed = false;
-        Ok(ExecutableCode {
-            arena: self.arena,
-            first: self.first,
-            pages: self.pages,
-            code: self.code,
-            direct: self.direct,
-            len: self.len,
-            entry_offset,
-            armed: true,
-        })
     }
-
-    /// Publishes module rodata as read-only and non-executable.  This is the
-    /// same alias discipline as code publication, except execute is never
-    /// granted to the final kernel mapping.
-    pub(crate) fn publish_readonly(mut self) -> Result<ExecutableCode, MemoryError> {
-        if let Err((error, changed)) =
-            protect_pages_partial(self.direct, self.pages, MappingFlags::READ)
-        {
-            if protect_pages(
-                self.direct,
-                changed,
-                MappingFlags::READ | MappingFlags::WRITE,
-            )
-            .is_err()
-            {
-                return Err(self.quarantine(MemoryError::Quarantined(error)));
+    pub(crate) fn publish_readonly(self) -> Result<ExecutableCode, MemoryError> {
+        let code = self.code;
+        let len = self.len;
+        match self.raw.publish_readonly() {
+            Ok(raw) => Ok(ExecutableCode {
+                raw: RawPublished::Readonly(raw),
+                code,
+                len,
+                entry_offset: 0,
+            }),
+            Err(failure) => {
+                drop(failure.allocation);
+                Err(MemoryError::Quarantined(failure.error))
             }
-            drop(crate::mm::synchronize_tlb_and_icache());
-            return Err(self.abort(MemoryError::Unavailable(error)));
         }
-        drop(crate::mm::synchronize_tlb_and_icache());
-        if let Err((error, changed)) =
-            protect_pages_partial(self.code, self.pages, MappingFlags::READ)
-        {
-            if protect_pages(self.code, changed, MappingFlags::READ | MappingFlags::WRITE).is_err()
-            {
-                return Err(self.quarantine(MemoryError::Quarantined(error)));
-            }
-            drop(crate::mm::synchronize_tlb_and_icache());
-            return Err(self.abort(MemoryError::Unavailable(error)));
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-        self.armed = false;
-        Ok(ExecutableCode {
-            arena: self.arena,
-            first: self.first,
-            pages: self.pages,
-            code: self.code,
-            direct: self.direct,
-            len: self.len,
-            entry_offset: 0,
-            armed: true,
-        })
     }
-}
-
-impl Drop for WritableCode {
-    fn drop(&mut self) {
-        let _ = self.cleanup_unpublished();
-    }
-}
-
-/// Published executable bytes whose borrow is the execution lifetime proof.
-#[must_use = "dropping executable code retires and releases its pages"]
-pub(crate) struct ExecutableCode {
-    arena: &'static ExecutableArena,
-    first: usize,
-    pages: usize,
-    code: VirtAddr,
-    direct: VirtAddr,
-    len: usize,
-    entry_offset: usize,
-    armed: bool,
 }
 
 impl ExecutableCode {
-    /// Invokes a validated SysV x86_64 module entry point.  Module code is
-    /// entered only through this owner, so its RX mapping remains pinned for
-    /// the whole call and teardown cannot race the instruction fetches.
+    /// Whether an address belongs to this published executable allocation.
+    ///
+    /// Module symbol tables can contain data and rodata exports as well as
+    /// code.  Consumers which intend to patch an instruction must use this
+    /// ownership check instead of accepting an arbitrary exported address.
+    pub(crate) fn contains_executable_address(&self, address: usize) -> bool {
+        matches!(&self.raw, RawPublished::Executable(_))
+            && address >= self.code.as_usize()
+            && address
+                .checked_sub(self.code.as_usize())
+                .is_some_and(|offset| offset < self.len)
+    }
+
     pub(crate) fn execute_module_entry(
         &self,
         entry_offset: usize,
         entry_size: usize,
     ) -> Option<i32> {
-        let Some(entry_end) = entry_offset.checked_add(entry_size) else {
-            return None;
-        };
+        let entry_end = entry_offset.checked_add(entry_size)?;
         if entry_size == 0 || entry_offset >= self.len || entry_end > self.len {
             return None;
         }
-        type Entry = extern "C" fn() -> i32;
-        let entry = self.code.as_usize() + entry_offset;
-        // SAFETY: the ET_REL loader validated that this offset denotes a
-        // defined executable symbol in this published allocation. `self`
-        // owns the RX mapping for the complete invocation.
-        let function: Entry = unsafe { core::mem::transmute(entry) };
+        let RawPublished::Executable(_) = self.raw else {
+            return None;
+        };
+        let function: extern "C" fn() -> i32 =
+            unsafe { core::mem::transmute(self.code.as_usize() + entry_offset) };
         Some(function())
     }
-    /// Executes the published SysV x86_64 entry while borrowing the code
-    /// owner for the complete call. The only unsafe operation in this
-    /// publisher is the typed conversion of the validated, W^X-protected
-    /// entry address; callers cannot retain or invoke a raw address.
     pub(crate) fn execute(&self, data: &[u8]) -> u32 {
-        debug_assert!(self.entry_offset < self.len);
+        if !matches!(self.raw, RawPublished::Executable(_)) || self.entry_offset >= self.len {
+            return 0;
+        }
         let Ok(length) = u32::try_from(data.len()) else {
             return 0;
         };
-        type Entry = extern "C" fn(*const u8, u32) -> u32;
-        let entry = self.code.as_usize() + self.entry_offset;
-        // SAFETY: `publish` validates the entry offset and changes the
-        // complete code alias to RX only after a global TLB/icache grace
-        // period. `self` keeps the mapping live for this borrow and Drop
-        // performs the inverse grace protocol after the call returns.
-        let function: Entry = unsafe { core::mem::transmute(entry) };
+        let function: extern "C" fn(*const u8, u32) -> u32 =
+            unsafe { core::mem::transmute(self.code.as_usize() + self.entry_offset) };
         function(data.as_ptr(), length)
     }
-
-    /// Retires an executable owner and reports any quarantine/retention state.
-    ///
-    /// The owner is marked disarmed before the first mutation. If retirement
-    /// fails, `Drop` therefore cannot attempt a second, contradictory
-    /// transition; the virtual slot and physical pages remain occupied.
-    pub(crate) fn retire(mut self) -> Result<(), MemoryError> {
-        self.retire_in_place()
-    }
-
-    fn retire_in_place(&mut self) -> Result<(), MemoryError> {
-        if !self.armed {
-            return Ok(());
-        }
-        self.armed = false;
-
-        if let Err((error, _changed)) =
-            protect_pages_partial(self.code, self.pages, MappingFlags::READ)
-        {
-            // Never restore execute after a failed revoke. Retry the full
-            // range and, if that still fails, retain/quarantine the owner.
-            if protect_pages(self.code, self.pages, MappingFlags::READ).is_err() {
-                drop(crate::mm::synchronize_tlb_and_icache());
-                let _ = unmap_pages(self.code, self.pages);
-                drop(crate::mm::synchronize_tlb_and_icache());
-                return Err(MemoryError::Quarantined(error));
-            }
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-
-        // Execute has now been revoked globally. A partial direct-map
-        // transition is safe to retain because no code alias is executable.
-        if let Err(error) = protect_pages(
-            self.direct,
-            self.pages,
-            MappingFlags::READ | MappingFlags::WRITE,
-        ) {
-            return Err(MemoryError::Retained(error));
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-
-        if let Err(error) = unmap_pages(self.code, self.pages) {
-            return Err(MemoryError::Retained(error));
-        }
-        drop(crate::mm::synchronize_tlb_and_icache());
-
-        let mapped = self.pages * PAGE_SIZE_4K;
-        unsafe { ptr::write_bytes(self.direct.as_mut_ptr(), 0, mapped) };
-        global_allocator().dealloc_pages(self.direct.as_usize(), self.pages, UsageKind::Global);
-        if !self.arena.release(self.first, self.pages) {
-            return Err(MemoryError::Retained(AxError::BadState));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ExecutableCode {
-    fn drop(&mut self) {
-        let _ = self.retire_in_place();
+    pub(crate) fn retire(self) -> Result<(), MemoryError> {
+        let result = match self.raw {
+            RawPublished::Executable(raw) => raw.retire(),
+            RawPublished::Readonly(raw) => raw.retire(),
+        };
+        result.map_err(|failure| {
+            let error = failure.error;
+            drop(failure.allocation);
+            MemoryError::Retained(error)
+        })
     }
 }
 
