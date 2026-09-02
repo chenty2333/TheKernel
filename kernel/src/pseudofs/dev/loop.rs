@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::vec::Vec;
 use core::{
     any::Any,
     cmp::min,
@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
-use axfs_ng_vfs::{DeviceId, NodeFlags, VfsResult};
+use axfs_ng_vfs::{DeviceId, FsPathBuf, NodeFlags, VfsResult};
 use axsync::Mutex;
 use lazy_static::lazy_static;
 use linux_raw_sys::{
@@ -43,16 +43,15 @@ lazy_static! {
         core::array::from_fn(|_| Mutex::new(LoopState::default()));
 }
 
-#[derive(Clone)]
 struct LoopBacking {
     file: FileBackend,
-    path: String,
+    path: FsPathBuf,
     writable: bool,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct LoopSnapshot {
-    pub backing_file: String,
+    pub backing_file: Vec<u8>,
     pub size_sectors: u64,
     pub read_only: bool,
     pub direct_io: bool,
@@ -433,7 +432,7 @@ impl LoopState {
             backing_file: self
                 .backing
                 .as_ref()
-                .map_or_else(String::new, |backing| backing.path.clone()),
+                .map_or_else(Vec::new, |backing| backing.path.as_bytes().to_vec()),
             size_sectors: self.size_sectors,
             read_only: self.read_only(),
             direct_io: self.flags & FLAG_DIRECT_IO != 0,
@@ -575,7 +574,7 @@ impl LoopState {
         res.lo_offset = self.offset.min(i32::MAX as u64) as _;
         res.lo_flags = self.flags as _;
         if let Some(backing) = self.backing.as_ref() {
-            copy_cstr_to_c_char(&backing.path, &mut res.lo_name);
+            copy_cstr_to_c_char(backing.path.as_bytes(), &mut res.lo_name);
         }
         Ok(res)
     }
@@ -594,7 +593,7 @@ impl LoopState {
         res.lo_sizelimit = self.sizelimit;
         res.lo_flags = self.flags;
         if let Some(backing) = self.backing.as_ref() {
-            copy_cstr_to_u8(&backing.path, &mut res.lo_file_name);
+            copy_cstr_to_u8(backing.path.as_bytes(), &mut res.lo_file_name);
         }
         Ok(res)
     }
@@ -818,7 +817,10 @@ impl DeviceOps for LoopDevice {
         let limit = min(buf.len() as u64, state.size_bytes() - offset) as usize;
         backing
             .file
-            .write_at_slice(&buf[..limit], state.offset + offset)
+            .location()
+            .entry()
+            .as_file()?
+            .write_at(&buf[..limit], state.offset + offset)
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
@@ -980,13 +982,12 @@ fn validate_flags(flags: u32, allowed: u32) -> VfsResult<()> {
     Ok(())
 }
 
-fn copy_cstr_to_u8(src: &str, dst: &mut [u8]) {
+fn copy_cstr_to_u8(src: &[u8], dst: &mut [u8]) {
     if dst.is_empty() {
         return;
     }
-    let bytes = src.as_bytes();
-    let len = bytes.len().min(dst.len() - 1);
-    dst[..len].copy_from_slice(&bytes[..len]);
+    let len = src.len().min(dst.len() - 1);
+    dst[..len].copy_from_slice(&src[..len]);
     dst[len] = 0;
 }
 
@@ -1006,13 +1007,12 @@ impl LoopChar for i8 {
     }
 }
 
-fn copy_cstr_to_c_char<T: LoopChar>(src: &str, dst: &mut [T]) {
+fn copy_cstr_to_c_char<T: LoopChar>(src: &[u8], dst: &mut [T]) {
     if dst.is_empty() {
         return;
     }
-    let bytes = src.as_bytes();
-    let len = bytes.len().min(dst.len() - 1);
-    for (target, byte) in dst[..len].iter_mut().zip(bytes.iter().copied()) {
+    let len = src.len().min(dst.len() - 1);
+    for (target, byte) in dst[..len].iter_mut().zip(src.iter().copied()) {
         *target = T::from_byte(byte);
     }
     dst[len] = T::from_byte(0);

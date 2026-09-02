@@ -367,17 +367,17 @@ lazy_static! {
 }
 
 pub(crate) fn is_remove_mask(mask: u32) -> bool {
-    mask & !DN_MULTISHOT == 0
+    thekernel_linux_fsnotify::dnotify_is_remove(mask, DN_MULTISHOT)
 }
 
 pub(crate) fn converted_mask(mask: u32) -> u32 {
-    mask & DNOTIFY_ALLOWED_MASK
+    thekernel_linux_fsnotify::dnotify_mask(mask as usize, DNOTIFY_ALLOWED_MASK)
 }
 
 pub(crate) const fn mask_from_fcntl_arg(arg: usize) -> u32 {
     // Linux fcntl_dirnotify takes unsigned int: the syscall's unsigned long
     // argument is truncated before convert_arg filters unknown low bits.
-    arg as u32
+    thekernel_linux_fsnotify::dnotify_mask(arg, u32::MAX)
 }
 
 /// Registers or augments a dnotify mark for one Linux fd table and open file
@@ -627,8 +627,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("dnotify-test"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"dnotify-test")))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

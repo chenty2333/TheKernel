@@ -10,14 +10,16 @@ use axnet::{
 use crate::file::permission::VfsSecurityContext;
 
 pub fn bind_dev_log(
+    fs: &axfs::FsContext,
     security: &VfsSecurityContext,
     unix_namespace: Arc<UnixNamespace>,
 ) -> LinuxResult<()> {
     let server = UnixSocket::new(DgramTransport::new()?, unix_namespace);
     crate::file::unix_socket::bind_precreated_path(
         &server,
-        crate::file::unix_socket::try_path("/dev/log")?,
+        crate::file::unix_socket::try_path(axfs_ng_vfs::FsPath::new(b"/dev/log"))?,
         security,
+        fs,
     )?;
     // The socket is already bound at this point, so a discarded spawn failure
     // would leave `/dev/log` present with nothing draining it while this
@@ -46,3 +48,7 @@ pub fn bind_dev_log(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+const _: fn(&axfs::FsContext, &VfsSecurityContext, Arc<UnixNamespace>) -> LinuxResult<()> =
+    bind_dev_log;

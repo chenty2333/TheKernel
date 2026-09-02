@@ -8,10 +8,8 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
-use linux_raw_sys::general::{SI_MESGQ, SI_QUEUE, SI_SIGIO, SI_TIMER};
 use spin::RwLock;
-use thekernel_linux_signal::{SignalInfo, SignalSet, Signo};
-use zerocopy::{Immutable, IntoBytes};
+use thekernel_linux_signal::{SignalInfo, SignalSet, SignalfdMask, SignalfdSiginfo};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
@@ -23,89 +21,7 @@ use crate::{
 /// specification)
 const SIGNALFD_SIGINFO_SIZE: usize = 128;
 
-/// signalfd_siginfo structure layout
-/// This matches the Linux signalfd_siginfo structure (128 bytes)
-#[repr(C)]
-#[derive(Immutable, IntoBytes)]
-struct SignalfdSiginfo {
-    ssi_signo: u32,    // Signal number
-    ssi_errno: i32,    // Error number (unused)
-    ssi_code: i32,     // Signal code
-    ssi_pid: u32,      // PID of sender
-    ssi_uid: u32,      // Real UID of sender
-    ssi_fd: i32,       // File descriptor (SIGIO)
-    ssi_tid: u32,      // Kernel timer ID (POSIX timers)
-    ssi_band: u32,     // Band event (SIGIO)
-    ssi_overrun: u32,  // POSIX timer overrun count
-    ssi_trapno: u32,   // Trap number that caused signal
-    ssi_status: i32,   // Exit status or signal (SIGCHLD)
-    ssi_int: i32,      // Integer sent by sigqueue(2)
-    ssi_ptr: u64,      // Pointer sent by sigqueue(2)
-    ssi_utime: u64,    // User CPU time consumed (SIGCHLD)
-    ssi_stime: u64,    // System CPU time consumed (SIGCHLD)
-    ssi_addr: u64,     // Address that generated signal
-    ssi_addr_lsb: u16, // Least significant bit of address
-    _pad: [u8; 46],    // Padding to make it 128 bytes
-}
-
 const _: [(); SIGNALFD_SIGINFO_SIZE] = [(); mem::size_of::<SignalfdSiginfo>()];
-
-fn sanitize_mask(mut mask: SignalSet) -> SignalSet {
-    mask.remove(Signo::SIGKILL);
-    mask.remove(Signo::SIGSTOP);
-    mask
-}
-
-impl SignalfdSiginfo {
-    /// Convert from SignalInfo to signalfd_siginfo
-    fn from_signal_info(sig_info: &SignalInfo) -> Self {
-        let errno = sig_info.errno();
-        let mut result = SignalfdSiginfo {
-            ssi_signo: sig_info.try_signo().map_or(0, |signo| signo as u32),
-            ssi_errno: errno,
-            ssi_code: sig_info.code(),
-            ssi_pid: 0,
-            ssi_uid: 0,
-            ssi_fd: -1,
-            ssi_tid: 0,
-            ssi_band: 0,
-            ssi_overrun: 0,
-            ssi_trapno: 0,
-            ssi_status: 0,
-            ssi_int: 0,
-            ssi_ptr: 0,
-            ssi_utime: 0,
-            ssi_stime: 0,
-            ssi_addr: 0,
-            ssi_addr_lsb: 0,
-            _pad: [0u8; 46],
-        };
-
-        match sig_info.code() {
-            SI_TIMER => {
-                let timer = sig_info.timer_payload();
-                result.ssi_tid = timer.tid as u32;
-                result.ssi_overrun = timer.overrun.max(0) as u32;
-                result.ssi_int = timer.value as i32;
-                result.ssi_ptr = timer.value as u64;
-            }
-            SI_MESGQ | SI_QUEUE => {
-                let rt = sig_info.rt_payload();
-                result.ssi_pid = rt.pid as u32;
-                result.ssi_uid = rt.uid;
-                result.ssi_int = rt.value as i32;
-                result.ssi_ptr = rt.value as u64;
-            }
-            SI_SIGIO => {
-                let poll = sig_info.poll_payload();
-                result.ssi_fd = poll.fd;
-                result.ssi_band = poll.band as u32;
-            }
-            _ => {}
-        }
-        result
-    }
-}
 
 pub struct Signalfd {
     mask: RwLock<SignalSet>,
@@ -116,14 +32,14 @@ pub struct Signalfd {
 impl Signalfd {
     pub fn new(mask: SignalSet) -> Arc<Self> {
         Arc::new(Self {
-            mask: RwLock::new(sanitize_mask(mask)),
+            mask: RwLock::new(SignalfdMask::new(mask).signals()),
             non_blocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
         })
     }
 
     pub fn update_mask(&self, mask: SignalSet) {
-        *self.mask.write() = sanitize_mask(mask);
+        *self.mask.write() = SignalfdMask::new(mask).signals();
         self.poll_rx.wake();
     }
 
@@ -149,6 +65,38 @@ impl Signalfd {
         let signal = &curr.as_thread().signal;
         signal.dequeue_signal_for_signalfd(&mask)
     }
+
+    /// Reads one signalfd record without changing the OFD's O_NONBLOCK bit.
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
+        if dst.remaining_mut() < SIGNALFD_SIGINFO_SIZE {
+            return Err(AxError::InvalidInput);
+        }
+        let proc_data = current().as_thread().proc_data.clone();
+
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+            if let Some(sig_info) = self.dequeue_signal() {
+                acknowledge_posix_timer_signal(&proc_data, &sig_info);
+                let sfd_info = SignalfdSiginfo::encode(&sig_info);
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        core::ptr::from_ref(&sfd_info).cast::<u8>(),
+                        SIGNALFD_SIGINFO_SIZE,
+                    )
+                };
+                dst.write(bytes)?;
+                if self.has_pending_signals() {
+                    self.poll_rx.wake();
+                }
+                Ok(SIGNALFD_SIGINFO_SIZE)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        })
+    }
 }
 
 impl FileLike for Signalfd {
@@ -157,31 +105,7 @@ impl FileLike for Signalfd {
     }
 
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        if dst.remaining_mut() < SIGNALFD_SIGINFO_SIZE {
-            return Err(AxError::InvalidInput);
-        }
-        let proc_data = current().as_thread().proc_data.clone();
-
-        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
-            if let Some(sig_info) = self.dequeue_signal() {
-                acknowledge_posix_timer_signal(&proc_data, &sig_info);
-                // Convert SignalInfo to SignalfdSiginfo
-                let sfd_info = SignalfdSiginfo::from_signal_info(&sig_info);
-
-                // Write the structure to the destination buffer
-                let bytes = sfd_info.as_bytes();
-                dst.write(bytes)?;
-
-                // Wake up other waiters if there are more signals pending
-                if self.has_pending_signals() {
-                    self.poll_rx.wake();
-                }
-
-                Ok(SIGNALFD_SIGINFO_SIZE)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+        self.read_with_nonblocking(dst, self.nonblocking())
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
@@ -198,8 +122,10 @@ impl FileLike for Signalfd {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[signalfd]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[signalfd]",
+        )))
     }
 }
 
@@ -225,6 +151,7 @@ impl Pollable for Signalfd {
 
 #[cfg(test)]
 mod tests {
+    use linux_raw_sys::general::SI_MESGQ;
     use thekernel_linux_signal::{SignalPollPayload, SignalRtPayload, SignalTimerPayload, Signo};
 
     use super::*;
@@ -234,11 +161,10 @@ mod tests {
         let value = 0x1234_5678_abcd_ef01usize;
         let info = SignalInfo::new_timer(Signo::SIGRTMIN, SignalTimerPayload::new(17, 9, value, 0));
 
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_tid, 17);
-        assert_eq!(projected.ssi_overrun, 9);
-        assert_eq!(projected.ssi_int as u32, value as u32);
-        assert_eq!(projected.ssi_ptr, value as u64);
+        let projected = SignalfdSiginfo::encode(&info);
+        assert_eq!(projected.tid, 17);
+        assert_eq!(projected.overrun, 9);
+        assert_eq!(projected.ptr, value as u64);
     }
 
     #[test]
@@ -250,20 +176,20 @@ mod tests {
             SignalRtPayload::new(42, 1000, value),
         );
 
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_pid, 42);
-        assert_eq!(projected.ssi_uid, 1000);
-        assert_eq!(projected.ssi_int as u32, value as u32);
-        assert_eq!(projected.ssi_ptr, value as u64);
+        let projected = SignalfdSiginfo::encode(&info);
+        assert_eq!(projected.pid, 42);
+        assert_eq!(projected.uid, 1000);
+        assert_eq!(projected.int as u32, value as u32);
+        assert_eq!(projected.ptr, value as u64);
     }
 
     #[test]
     fn sigio_siginfo_projects_fd_and_band() {
         let info = SignalInfo::new_poll(Signo::SIGIO, SignalPollPayload::new(0x1234, 37));
 
-        let projected = SignalfdSiginfo::from_signal_info(&info);
-        assert_eq!(projected.ssi_fd, 37);
-        assert_eq!(projected.ssi_band, 0x1234);
+        let projected = SignalfdSiginfo::encode(&info);
+        assert_eq!(projected.fd, 37);
+        assert_eq!(projected.band, 0x1234);
     }
 
     #[test]

@@ -11,8 +11,9 @@ use axdriver::virtio_io_counters_snapshot;
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::render_io_stats_counters;
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
-    MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
+    DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, FsName, FsNameBuf,
+    FsPath, FsPathBuf, Location, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
+    NodeType, Reference, VfsError, VfsResult,
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
@@ -29,6 +30,8 @@ use linux_raw_sys::{
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 
+#[cfg(feature = "bpf")]
+use crate::bpf_security::{set_unprivileged_bpf_disabled, unprivileged_bpf_disabled};
 #[cfg(feature = "test-io-control")]
 use crate::file::io_uring::io_uring_dma_direct_stats_snapshot;
 #[cfg(feature = "asid-switch-diagnostics")]
@@ -37,8 +40,8 @@ use crate::mm::asid_switch_diagnostics_snapshot;
 use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
     file::{
-        FileDescription, PidFd, current_file_operation_security_credential,
-        fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
+        FileDescription, PidFd, current_file_operation_security_credential, fanotify::FanotifyFile,
+        inotify::InotifyFile, lease, pipe, try_path_into_owned,
     },
     keyring::{
         KeyUserRecord, key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys,
@@ -52,38 +55,47 @@ use crate::{
         system_memory_stats_with_reclaimable_file_cache, user_io_pin_counters_snapshot,
     },
     mounts,
+    perf_security::{
+        perf_event_max_sample_rate, perf_event_mlock_kb, perf_event_paranoid,
+        set_perf_event_max_sample_rate, set_perf_event_mlock_kb, set_perf_event_paranoid,
+    },
     pseudofs::{
         ChildNames, DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFileOps, SimpleFs, SimpleFsNode,
-        cgroup::{proc_cgroup_membership, proc_cgroups_snapshot, proc_cpuset_membership},
+        cgroup::{
+            proc_cgroup_membership, proc_cgroups_snapshot, proc_cpuset_membership,
+            sched_util_clamp_max, sched_util_clamp_min, sched_util_clamp_min_rt_default,
+            set_sched_util_clamp_max, set_sched_util_clamp_min,
+            set_sched_util_clamp_min_rt_default,
+        },
         try_boxed_names,
     },
     syscall::{
         aio_max_nr, aio_nr, current_can_administer_uts, current_domainname_bytes,
         current_hostname_bytes, current_machine_string, current_release_string,
-        current_sysname_string, current_version_string, mq_msg_max, mq_msgsize_max, mq_queues_max,
-        msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string, sched_rr_timeslice_ms,
-        sem_limits_string, sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes,
-        set_mq_msg_max, set_mq_msgsize_max, set_mq_queues_max, set_msg_next_id, set_msgmni_limit,
+        current_sysname_string, current_version_string, disable_kexec_load, ipc::IpcNamespace,
+        kexec_load_disabled, mq_msg_max, mq_msgsize_max, mq_queues_max, msg_next_id, msgmni_limit,
+        parse_sem_limits, proc_version_string, sched_rr_timeslice_ms, sem_limits_string,
+        sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes, set_mq_msg_max,
+        set_mq_msgsize_max, set_mq_queues_max, set_msg_next_id, set_msgmni_limit,
         set_sched_rr_timeslice_ms, set_sem_limits, set_sem_next_id, set_shm_next_id,
         set_shmall_limit, set_shmmax_limit, set_shmmni_limit, shm_next_id, shmall_limit,
         shmmax_limit, shmmni_limit, sysvipc_msg_snapshot, sysvipc_sem_snapshot,
         sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy,
-        MempolicySnapshot, PidNamespace, Process, ProcessData, ProcessImageAccessSnapshot,
-        PtraceAccessMode, TimeNamespace, UserNamespace, UtsNamespace,
-        check_current_ptrace_image_snapshot, check_current_thread_ptrace_image_access,
-        get_process_data, get_process_including_zombie, get_task, get_visible_task,
-        get_visible_task_including_exiting, may_begin_gid_map_write, may_begin_uid_map_write,
-        may_update_setgroups_policy, may_write_gid_map, may_write_uid_map, nr_open_limit,
-        ns_capable, process_domain, process_error, render_task_stat, render_zombie_stat,
-        set_nr_open_limit, task_state, validate_id_map_input,
+        AsThread, CgroupNamespace, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid,
+        Mempolicy, MempolicySnapshot, MountNamespace, NetworkNamespace, PidNamespace, Process,
+        ProcessData, ProcessImageAccessSnapshot, PtraceAccessMode, TimeNamespace, UserNamespace,
+        UtsNamespace, check_current_ptrace_image_snapshot,
+        check_current_thread_ptrace_image_access, get_process_data, get_process_including_zombie,
+        get_task, get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
+        may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
+        nr_open_limit, ns_capable, process_domain, process_error, render_task_stat,
+        render_zombie_stat, set_nr_open_limit, task_state, validate_id_map_input,
     },
 };
 
-const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
 fn validate_oom_score_adj_value(next_value: i32) -> VfsResult<()> {
@@ -961,7 +973,7 @@ impl FileNodeOps for ProcBpfStatsFile {
         Err(VfsError::BadFileDescriptor)
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
     }
 }
@@ -1243,8 +1255,8 @@ fn record_mount_options(record: &mounts::MountRecord) -> String {
     let mut options = mounts::mount_options(record.flags);
     let data = match record.fs_type.as_str() {
         "cgroup" if !record.data.is_empty() => Some(record.data.as_str()),
-        "cgroup" if !matches!(record.source.as_str(), "none" | "cgroup") => {
-            Some(record.source.as_str())
+        "cgroup" if !matches!(record.source.as_bytes(), b"none" | b"cgroup") => {
+            core::str::from_utf8(record.source.as_bytes()).ok()
         }
         "cgroup2" if !record.data.is_empty() => Some(record.data.as_str()),
         _ => None,
@@ -1255,55 +1267,55 @@ fn record_mount_options(record: &mounts::MountRecord) -> String {
     options
 }
 
-fn escape_mount_field(field: &str) -> String {
-    let mut escaped = String::with_capacity(field.len());
-    for ch in field.chars() {
-        match ch {
-            ' ' => escaped.push_str("\\040"),
-            '\t' => escaped.push_str("\\011"),
-            '\n' => escaped.push_str("\\012"),
-            '\\' => escaped.push_str("\\134"),
-            _ => escaped.push(ch),
+fn escape_mount_field(field: &[u8], escaped: &mut Vec<u8>) -> VfsResult<()> {
+    escaped
+        .try_reserve(field.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    for byte in field {
+        match byte {
+            b' ' => escaped.extend_from_slice(b"\\040"),
+            b'\t' => escaped.extend_from_slice(b"\\011"),
+            b'\n' => escaped.extend_from_slice(b"\\012"),
+            b'\\' => escaped.extend_from_slice(b"\\134"),
+            byte => escaped.push(*byte),
         }
     }
-    escaped
+    Ok(())
 }
 
-fn render_mounts() -> VfsResult<String> {
-    let mut out = String::new();
+fn render_mounts() -> VfsResult<Vec<u8>> {
+    let mut out = Vec::new();
     for record in mounts::snapshot()? {
         let options = record_mount_options(&record);
-        let _ = writeln!(
-            out,
-            "{} {} {} {} 0 0",
-            escape_mount_field(&record.source),
-            escape_mount_field(&record.target),
-            record.fs_type,
-            options
-        );
+        escape_mount_field(record.source.as_bytes(), &mut out)?;
+        out.push(b' ');
+        escape_mount_field(record.target.as_bytes(), &mut out)?;
+        out.extend_from_slice(alloc::format!(" {} {} 0 0\n", record.fs_type, options).as_bytes());
     }
     Ok(out)
 }
 
-fn render_mountinfo() -> VfsResult<String> {
-    let mut out = String::new();
+fn render_mountinfo() -> VfsResult<Vec<u8>> {
+    let mut out = Vec::new();
     for record in mounts::snapshot()? {
         let dev = DeviceId(record.dev);
         let options = record_mount_options(&record);
-        let _ = writeln!(
-            out,
-            "{} {} {}:{} {} {} {} - {} {} {}",
-            record.mount_id,
-            record.parent_id,
-            dev.major(),
-            dev.minor(),
-            escape_mount_field(&record.root),
-            escape_mount_field(&record.target),
-            options,
-            record.fs_type,
-            escape_mount_field(&record.source),
-            options
+        out.extend_from_slice(
+            alloc::format!(
+                "{} {} {}:{} ",
+                record.mount_id,
+                record.parent_id,
+                dev.major(),
+                dev.minor()
+            )
+            .as_bytes(),
         );
+        escape_mount_field(record.root.as_bytes(), &mut out)?;
+        out.push(b' ');
+        escape_mount_field(record.target.as_bytes(), &mut out)?;
+        out.extend_from_slice(alloc::format!(" {} - {} ", options, record.fs_type).as_bytes());
+        escape_mount_field(record.source.as_bytes(), &mut out)?;
+        out.extend_from_slice(alloc::format!(" {options}\n").as_bytes());
     }
     Ok(out)
 }
@@ -1662,7 +1674,7 @@ impl FileNodeOps for ProcUserNamespaceFile {
         Ok(())
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
     }
 }
@@ -1771,8 +1783,7 @@ fn real_memory_pressure() -> String {
 fn current_net_ipv4_conf_tag(iface: &str) -> VfsResult<i32> {
     current()
         .as_thread()
-        .proc_data
-        .net_ns
+        .net_ns()
         .stack()
         .ipv4_conf_tag(iface)
         .ok_or(VfsError::NotFound)
@@ -1781,8 +1792,7 @@ fn current_net_ipv4_conf_tag(iface: &str) -> VfsResult<i32> {
 fn set_current_net_ipv4_conf_tag(iface: &str, value: i32) -> VfsResult<()> {
     current()
         .as_thread()
-        .proc_data
-        .net_ns
+        .net_ns()
         .stack()
         .set_ipv4_conf_tag(iface, value)
         .map_err(|_| VfsError::NotFound)
@@ -1800,7 +1810,7 @@ fn proc_ipv4_conf_tag_file(iface: &'static str) -> impl crate::pseudofs::SimpleF
             let current = current();
             let thread = current.as_thread();
             let cred = thread.current_cred();
-            let net_ns = thread.proc_data.net_ns.clone();
+            let net_ns = thread.net_ns();
             if !ns_capable(
                 &cred,
                 net_ns.owner_user_ns(),
@@ -1851,14 +1861,19 @@ impl SimpleDirOps for ProcessTaskDir {
             if task.as_thread().pending_exit() {
                 continue;
             }
-            names.push(Cow::Owned(try_pid_name(task.as_thread().tid())?));
+            names.push(Cow::Owned(FsNameBuf::from_vec(
+                try_pid_name(task.as_thread().tid())?.into_bytes(),
+            )?));
         }
         try_boxed_names(names.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
-        let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        let tid = str::from_utf8(name.as_bytes())
+            .map_err(|_| VfsError::NotFound)?
+            .parse::<u32>()
+            .map_err(|_| VfsError::NotFound)?;
         let task = get_visible_task(tid).map_err(|_| VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
@@ -1970,6 +1985,27 @@ fn task_status(
     let cpu_allowed_list = format_mask_list(cpu_mask, cpu_width);
     let mem_allowed_list = format_mask_list(mem_mask, mem_width);
     let task_name = task.try_name().map_err(|_| VfsError::NoMemory)?;
+    #[cfg(target_arch = "x86_64")]
+    let (cet_features_bits, cet_locked_bits) = if Arc::ptr_eq(task, &current()) {
+        let state = crate::task::current_user_live_cet_state();
+        (state.u_cet, state.locked)
+    } else {
+        // This is a task-published policy snapshot, never a foreign CPU's
+        // MSR image. It remains available while the target is running, ready,
+        // blocked, or exiting, unlike ptrace's stopped-context interface.
+        axtask::snapshot_task_user_cet_status(task)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let cet_names = |bits: u64| {
+        let mut names = Vec::new();
+        if bits & 1 != 0 { names.push("shstk"); }
+        if bits & 2 != 0 { names.push("wrss"); }
+        names.join(" ")
+    };
+    #[cfg(target_arch = "x86_64")]
+    let cet_features = cet_names(cet_features_bits);
+    #[cfg(target_arch = "x86_64")]
+    let cet_locked = cet_names(cet_locked_bits);
     Ok(format!(
         "Name:\t{}\n\
         State:\t{} ({})\n\
@@ -1993,6 +2029,8 @@ fn task_status(
         CapAmb:\t{}\n\
         Cpus_allowed:\t{:x}\n\
         Cpus_allowed_list:\t{}\n\
+        x86_Thread_features:\t{}\n\
+        x86_Thread_features_locked:\t{}\n\
         Mems_allowed:\t{:x}\n\
         Mems_allowed_list:\t{}",
         task_name,
@@ -2023,6 +2061,8 @@ fn task_status(
         format_cap_set(caps.ambient()),
         cpu_mask,
         cpu_allowed_list,
+        cet_features,
+        cet_locked,
         mem_mask,
         mem_allowed_list
     ))
@@ -2238,12 +2278,14 @@ impl SimpleFileOps for PreparedFdMagicLink {
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let description = task.as_thread().fd_table()
+        let description = task
+            .as_thread()
+            .fd_table()
             .get_description_number(self.fd)
             .map_err(|_| VfsError::NotFound)?;
-        let target = try_path_into_bytes(description.inner.path()?)?;
+        let target: FsPathBuf = try_path_into_owned(description.inner.path()?)?;
         validate_proc_fd_image(&task, &authorized_image)?;
-        Ok(Cow::Owned(target))
+        Ok(Cow::Owned(target.as_bytes().to_vec()))
     }
 
     fn write_all(&self, _data: &[u8]) -> VfsResult<()> {
@@ -2257,21 +2299,29 @@ impl SimpleDirOps for ThreadFdDir {
             return try_boxed_names(iter::empty());
         };
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let ids = task.as_thread().fd_table()
+        let ids = task
+            .as_thread()
+            .fd_table()
             .try_fd_numbers()?
             .into_iter()
-            .map(|id| Cow::Owned(id.to_string()))
-            .collect::<Vec<_>>();
+            .map(|id| FsNameBuf::from_vec(id.to_string().into_bytes()).map(Cow::Owned))
+            .collect::<VfsResult<Vec<_>>>()?;
         validate_proc_fd_image(&task, &authorized_image)?;
         try_boxed_names(ids.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        task.as_thread().fd_table().get_description_number(fd).map_err(|_| VfsError::NotFound)?;
+        let fd = str::from_utf8(name.as_bytes())
+            .map_err(|_| VfsError::NotFound)?
+            .parse::<u32>()
+            .map_err(|_| VfsError::NotFound)?;
+        task.as_thread()
+            .fd_table()
+            .get_description_number(fd)
+            .map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
         Ok(SimpleFile::try_new_magic_link(
             fs,
@@ -2297,11 +2347,16 @@ struct ThreadFdInfoDir {
 }
 
 impl ThreadFdInfoDir {
-    fn description_for(&self, name: &str) -> VfsResult<Arc<FileDescription>> {
+    fn description_for(&self, name: &FsName) -> VfsResult<Arc<FileDescription>> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let fd = name.parse::<usize>().map_err(|_| VfsError::NotFound)?;
-        let description = task.as_thread().fd_table()
+        let fd = str::from_utf8(name.as_bytes())
+            .map_err(|_| VfsError::NotFound)?
+            .parse::<usize>()
+            .map_err(|_| VfsError::NotFound)?;
+        let description = task
+            .as_thread()
+            .fd_table()
             .get_description_number(u32::try_from(fd).map_err(|_| VfsError::NotFound)?)
             .map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
@@ -2342,16 +2397,18 @@ impl SimpleDirOps for ThreadFdInfoDir {
             return try_boxed_names(iter::empty());
         };
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
-        let ids = task.as_thread().fd_table()
+        let ids = task
+            .as_thread()
+            .fd_table()
             .try_fd_numbers()?
             .into_iter()
-            .map(|id| Cow::Owned(id.to_string()))
-            .collect::<Vec<_>>();
+            .map(|id| FsNameBuf::from_vec(id.to_string().into_bytes()).map(Cow::Owned))
+            .collect::<VfsResult<Vec<_>>>()?;
         validate_proc_fd_image(&task, &authorized_image)?;
         try_boxed_names(ids.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let description = self.description_for(name)?;
         Ok(SimpleFile::new_regular(fs, move || Ok(Self::render_fdinfo(&description))).into())
@@ -2364,6 +2421,10 @@ impl SimpleDirOps for ThreadFdInfoDir {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProcNamespaceKind {
+    Cgroup,
+    Ipc,
+    Mount,
+    Net,
     Pid,
     Time,
     TimeForChildren,
@@ -2372,6 +2433,10 @@ pub(crate) enum ProcNamespaceKind {
 }
 
 pub(crate) enum ProcNamespaceObject {
+    Cgroup(Arc<CgroupNamespace>),
+    Ipc(Arc<IpcNamespace>),
+    Mount(Arc<MountNamespace>),
+    Net(Arc<NetworkNamespace>),
     Pid(Arc<PidNamespace>),
     Time(Arc<TimeNamespace>),
     User(Arc<UserNamespace>),
@@ -2385,6 +2450,10 @@ impl ProcNamespaceObject {
     /// user namespace has no owning namespace and no `NS_GET_USERNS` result.
     pub(crate) fn owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
         match self {
+            Self::Cgroup(ns) => Some(ns.owner_user_ns().clone()),
+            Self::Ipc(ns) => Some(ns.owner_user_ns().clone()),
+            Self::Mount(ns) => Some(ns.owner_user_ns().clone()),
+            Self::Net(ns) => Some(ns.owner_user_ns().clone()),
             Self::Pid(ns) => Some(ns.owner_user_ns().clone()),
             Self::Time(ns) => Some(ns.owner_user_ns().clone()),
             Self::User(ns) => ns.parent(),
@@ -2405,21 +2474,21 @@ impl ProcNamespaceFile {
         fs: Arc<SimpleFs>,
         kind: ProcNamespaceKind,
         task: &AxTaskRef,
-        process_view: bool,
+        _process_view: bool,
     ) -> Arc<Self> {
         let thread = task.as_thread();
-        let proc_data = &thread.proc_data;
         let object = match kind {
-            ProcNamespaceKind::Pid => ProcNamespaceObject::Pid(proc_data.pid_ns()),
-            ProcNamespaceKind::Time => ProcNamespaceObject::Time(proc_data.time_ns()),
+            ProcNamespaceKind::Cgroup => ProcNamespaceObject::Cgroup(thread.cgroup_ns()),
+            ProcNamespaceKind::Ipc => ProcNamespaceObject::Ipc(thread.ipc_ns()),
+            ProcNamespaceKind::Mount => ProcNamespaceObject::Mount(thread.mount_ns()),
+            ProcNamespaceKind::Net => ProcNamespaceObject::Net(thread.net_ns()),
+            ProcNamespaceKind::Pid => ProcNamespaceObject::Pid(thread.pid_ns()),
+            ProcNamespaceKind::Time => ProcNamespaceObject::Time(thread.time_ns()),
             ProcNamespaceKind::TimeForChildren => {
-                ProcNamespaceObject::Time(proc_data.time_ns_for_children())
+                ProcNamespaceObject::Time(thread.time_ns_for_children())
             }
-            ProcNamespaceKind::User => {
-                let cred = proc_subject_cred(task, process_view);
-                ProcNamespaceObject::User(cred.user_ns().clone())
-            }
-            ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(proc_data.uts_ns()),
+            ProcNamespaceKind::User => ProcNamespaceObject::User(thread.user_ns()),
+            ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(thread.uts_ns()),
         };
         Self::from_object(fs, kind, object)
     }
@@ -2443,9 +2512,17 @@ impl ProcNamespaceFile {
 
     fn namespace_inode(&self) -> Option<u64> {
         match &self.object {
+            ProcNamespaceObject::Cgroup(ns) => Some(ns.proc_inode()),
+            // IPC owns an independent allocator; reserve the low bits for
+            // its typed procfs identity rather than aliasing global process
+            // namespace IDs.
+            ProcNamespaceObject::Ipc(ns) => Some(0x9_0000_0000 + ns.id().saturating_mul(8) + 1),
+            ProcNamespaceObject::Mount(ns) => Some(ns.proc_inode()),
+            ProcNamespaceObject::Net(ns) => Some(ns.proc_inode()),
             ProcNamespaceObject::Pid(ns) => Some(ns.proc_inode()),
             ProcNamespaceObject::User(ns) => Some(ns.proc_inode()),
-            ProcNamespaceObject::Time(_) | ProcNamespaceObject::Uts(_) => None,
+            ProcNamespaceObject::Time(ns) => Some(ns.proc_inode()),
+            ProcNamespaceObject::Uts(ns) => Some(ns.proc_inode()),
         }
     }
 }
@@ -2502,7 +2579,7 @@ impl FileNodeOps for ProcNamespaceFile {
         Err(VfsError::BadFileDescriptor)
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
     }
 }
@@ -2534,21 +2611,35 @@ impl SimpleDirOps for ThreadNamespaceDir {
         };
         drop(proc_image_access(&task, self.process_view)?);
         try_boxed_names(
-            ["pid", "time", "time_for_children", "user", "uts"]
-                .into_iter()
-                .map(Cow::Borrowed),
+            [
+                b"cgroup".as_slice(),
+                b"ipc".as_slice(),
+                b"mnt".as_slice(),
+                b"net".as_slice(),
+                b"pid".as_slice(),
+                b"time".as_slice(),
+                b"time_for_children".as_slice(),
+                b"user".as_slice(),
+                b"uts".as_slice(),
+            ]
+            .into_iter()
+            .map(|name| Cow::Borrowed(FsName::new(name))),
         )
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         drop(proc_image_access(&task, self.process_view)?);
-        let kind = match name {
-            "pid" => ProcNamespaceKind::Pid,
-            "time" => ProcNamespaceKind::Time,
-            "time_for_children" => ProcNamespaceKind::TimeForChildren,
-            "user" => ProcNamespaceKind::User,
-            "uts" => ProcNamespaceKind::Uts,
+        let kind = match name.as_bytes() {
+            b"cgroup" => ProcNamespaceKind::Cgroup,
+            b"ipc" => ProcNamespaceKind::Ipc,
+            b"mnt" => ProcNamespaceKind::Mount,
+            b"net" => ProcNamespaceKind::Net,
+            b"pid" => ProcNamespaceKind::Pid,
+            b"time" => ProcNamespaceKind::Time,
+            b"time_for_children" => ProcNamespaceKind::TimeForChildren,
+            b"user" => ProcNamespaceKind::User,
+            b"uts" => ProcNamespaceKind::Uts,
             _ => return Err(VfsError::NotFound),
         };
         Ok(ProcNamespaceFile::new(self.fs.clone(), kind, &task, self.process_view).into())
@@ -2683,12 +2774,29 @@ pub(crate) fn namespace_target_from_proc_file(loc: &axfs_ng_vfs::Location) -> Pr
         return ProcNamespaceTarget::NotNamespace;
     };
     let object = match &file.object {
+        ProcNamespaceObject::Cgroup(ns) => ProcNamespaceObject::Cgroup(ns.clone()),
+        ProcNamespaceObject::Ipc(ns) => ProcNamespaceObject::Ipc(ns.clone()),
+        ProcNamespaceObject::Mount(ns) => ProcNamespaceObject::Mount(ns.clone()),
+        ProcNamespaceObject::Net(ns) => ProcNamespaceObject::Net(ns.clone()),
         ProcNamespaceObject::Pid(ns) => ProcNamespaceObject::Pid(ns.clone()),
         ProcNamespaceObject::Time(ns) => ProcNamespaceObject::Time(ns.clone()),
         ProcNamespaceObject::User(ns) => ProcNamespaceObject::User(ns.clone()),
         ProcNamespaceObject::Uts(ns) => ProcNamespaceObject::Uts(ns.clone()),
     };
     ProcNamespaceTarget::Live(file.kind, object)
+}
+
+/// Returns the namespace object retained by an opened `/proc/*/ns/net` file.
+/// BPF link creation resolves this once and retains the resulting namespace;
+/// it never reuses the caller's numeric descriptor from packet context.
+pub(crate) fn bpf_network_namespace_from_fd(fd: i32) -> AxResult<Arc<NetworkNamespace>> {
+    let file = crate::file::get_typed_file::<crate::file::File>(fd)?;
+    let ProcNamespaceTarget::Live(ProcNamespaceKind::Net, ProcNamespaceObject::Net(namespace)) =
+        namespace_target_from_proc_file(file.inner().location())
+    else {
+        return Err(AxError::InvalidInput);
+    };
+    Ok(namespace)
 }
 
 pub(crate) fn proc_namespace_location_from_object(
@@ -2698,6 +2806,10 @@ pub(crate) fn proc_namespace_location_from_object(
 ) -> VfsResult<Location> {
     let parent = template.entry().parent();
     let name = match kind {
+        ProcNamespaceKind::Cgroup => "cgroup",
+        ProcNamespaceKind::Ipc => "ipc",
+        ProcNamespaceKind::Mount => "mnt",
+        ProcNamespaceKind::Net => "net",
         ProcNamespaceKind::Pid => "pid",
         ProcNamespaceKind::Time => "time",
         ProcNamespaceKind::TimeForChildren => "time_for_children",
@@ -2709,7 +2821,7 @@ pub(crate) fn proc_namespace_location_from_object(
     let entry = DirEntry::new_file(
         FileNode::new(file),
         NodeType::RegularFile,
-        Reference::new(parent, name.into()),
+        Reference::try_new(parent, FsName::new(name.as_bytes()))?,
     );
     Ok(Location::new(template.mountpoint().clone(), entry))
 }
@@ -2748,10 +2860,7 @@ fn parse_timens_offset_line(line: &str) -> VfsResult<Option<(u32, i64, u32)>> {
 }
 
 fn render_timens_offsets(task: &AxTaskRef) -> Vec<u8> {
-    task.as_thread()
-        .proc_data
-        .time_ns_for_children()
-        .render_offsets()
+    task.as_thread().time_ns_for_children().render_offsets()
 }
 
 fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
@@ -2759,9 +2868,8 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
         return Err(VfsError::InvalidInput);
     }
     let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-    let proc_data = &task.as_thread().proc_data;
     let actor_cred = current_file_operation_security_credential().ok_or(VfsError::Io)?;
-    let time_ns = proc_data.time_ns_for_children();
+    let time_ns = task.as_thread().time_ns_for_children();
     if !ns_capable(
         actor_cred.as_ref(),
         time_ns.owner_user_ns(),
@@ -2891,7 +2999,7 @@ impl FileNodeOps for ProcPagemapFile {
         Err(VfsError::BadFileDescriptor)
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
     }
 }
@@ -2914,7 +3022,7 @@ impl SimpleDirOps for ZombieProcessDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         match self.process.upgrade() {
             Some(process) => match authoritative_zombie(&process) {
-                Ok(_) => try_boxed_names(iter::once(Cow::Borrowed("stat"))),
+                Ok(_) => try_boxed_names(iter::once(Cow::Borrowed(FsName::new(b"stat")))),
                 Err(VfsError::NotFound) => Err(VfsError::NotFound),
                 Err(error) => Err(error),
             },
@@ -2922,8 +3030,8 @@ impl SimpleDirOps for ZombieProcessDir {
         }
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        if name != "stat" {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        if name.as_bytes() != b"stat" {
             return Err(VfsError::NotFound);
         }
         let fs = self.fs.clone();
@@ -2947,52 +3055,52 @@ impl SimpleDirOps for ThreadDir {
         })?;
         try_boxed_names(
             [
-                Some("stat"),
-                Some("status"),
-                Some("uid_map"),
-                Some("gid_map"),
-                Some("setgroups"),
-                Some("limits"),
-                Some("oom_score_adj"),
-                Some("cgroup"),
-                Some("cpuset"),
-                self.show_task_dir.then_some("task"),
-                Some("maps"),
-                Some("smaps"),
-                Some("numa_maps"),
-                Some("pagemap"),
-                Some("mounts"),
-                Some("mountinfo"),
-                Some("cmdline"),
-                Some("timerslack_ns"),
-                Some("timens_offsets"),
-                Some("comm"),
-                Some("exe"),
-                Some("fd"),
-                Some("fdinfo"),
-                Some("ns"),
+                Some(b"stat".as_slice()),
+                Some(b"status".as_slice()),
+                Some(b"uid_map".as_slice()),
+                Some(b"gid_map".as_slice()),
+                Some(b"setgroups".as_slice()),
+                Some(b"limits".as_slice()),
+                Some(b"oom_score_adj".as_slice()),
+                Some(b"cgroup".as_slice()),
+                Some(b"cpuset".as_slice()),
+                self.show_task_dir.then_some(b"task".as_slice()),
+                Some(b"maps".as_slice()),
+                Some(b"smaps".as_slice()),
+                Some(b"numa_maps".as_slice()),
+                Some(b"pagemap".as_slice()),
+                Some(b"mounts".as_slice()),
+                Some(b"mountinfo".as_slice()),
+                Some(b"cmdline".as_slice()),
+                Some(b"timerslack_ns".as_slice()),
+                Some(b"timens_offsets".as_slice()),
+                Some(b"comm".as_slice()),
+                Some(b"exe".as_slice()),
+                Some(b"fd".as_slice()),
+                Some(b"fdinfo".as_slice()),
+                Some(b"ns".as_slice()),
             ]
             .into_iter()
             .flatten()
-            .map(Cow::Borrowed),
+            .map(|name| Cow::Borrowed(FsName::new(name))),
         )
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let process_view = self.show_task_dir;
-        Ok(match name {
-            "stat" => {
+        Ok(match name.as_bytes() {
+            b"stat" => {
                 SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
                     .into()
             }
-            "status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {
+            b"status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {
                 let viewer = current_file_operation_security_credential().ok_or(VfsError::Io)?;
                 task_status(&task, process_view, viewer.user_ns())
             })?
             .into(),
-            "uid_map" => {
+            b"uid_map" => {
                 let subject = proc_subject_cred(&task, process_view);
                 let ids = subject.ids();
                 ProcUserNamespaceFile::try_new(
@@ -3004,7 +3112,7 @@ impl SimpleDirOps for ThreadDir {
                 )?
                 .into()
             }
-            "gid_map" => {
+            b"gid_map" => {
                 let subject = proc_subject_cred(&task, process_view);
                 let ids = subject.ids();
                 ProcUserNamespaceFile::try_new(
@@ -3016,7 +3124,7 @@ impl SimpleDirOps for ThreadDir {
                 )?
                 .into()
             }
-            "setgroups" => {
+            b"setgroups" => {
                 let subject = proc_subject_cred(&task, process_view);
                 let ids = subject.ids();
                 ProcUserNamespaceFile::try_new(
@@ -3028,8 +3136,8 @@ impl SimpleDirOps for ThreadDir {
                 )?
                 .into()
             }
-            "limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
-            "oom_score_adj" => SimpleFile::new_regular(
+            b"limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
+            b"oom_score_adj" => SimpleFile::new_regular(
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(
@@ -3046,15 +3154,25 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "cgroup" => {
+            b"cgroup" => {
                 let pid = task.as_thread().proc_data.proc.pid();
-                SimpleFile::new_regular(fs, move || Ok(proc_cgroup_membership(pid))).into()
+                let process = task.as_thread().proc_data.proc.clone();
+                SimpleFile::new_regular(fs, move || {
+                    let roots = current().as_thread().cgroup_ns().roots().clone();
+                    Ok(proc_cgroup_membership(pid, &process, &roots))
+                })
+                .into()
             }
-            "cpuset" => {
+            b"cpuset" => {
                 let pid = task.as_thread().proc_data.proc.pid();
-                SimpleFile::new_regular(fs, move || Ok(proc_cpuset_membership(pid))).into()
+                let process = task.as_thread().proc_data.proc.clone();
+                SimpleFile::new_regular(fs, move || {
+                    let roots = current().as_thread().cgroup_ns().roots().clone();
+                    Ok(proc_cpuset_membership(pid, &process, &roots))
+                })
+                .into()
             }
-            "task" if self.show_task_dir => SimpleDir::new_maker(
+            b"task" if self.show_task_dir => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ProcessTaskDir {
                     fs,
@@ -3062,15 +3180,15 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "maps" => {
+            b"maps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, false))).into()
             }
-            "smaps" => {
+            b"smaps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, true))).into()
             }
-            "numa_maps" => {
+            b"numa_maps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 let proc_data = task.as_thread().proc_data.clone();
                 let policy = proc_data
@@ -3082,26 +3200,26 @@ impl SimpleDirOps for ThreadDir {
                 SimpleFile::new_regular(fs, move || Ok(render_task_numa_maps(&policy, &aspace)))
                     .into()
             }
-            "pagemap" => {
+            b"pagemap" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 let show_pfn = current()
                     .as_thread()
                     .has_effective_capability(CAP_SYS_ADMIN);
                 ProcPagemapFile::new(fs, aspace, show_pfn).into()
             }
-            "mounts" => SimpleFile::new_regular(fs, render_mounts).into(),
-            "mountinfo" => SimpleFile::new_regular(fs, render_mountinfo).into(),
-            "cmdline" => SimpleFile::new_regular(fs, move || {
+            b"mounts" => SimpleFile::new_regular(fs, render_mounts).into(),
+            b"mountinfo" => SimpleFile::new_regular(fs, render_mountinfo).into(),
+            b"cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();
                 for arg in cmdline.iter() {
-                    buf.extend_from_slice(arg.as_bytes());
+                    buf.extend_from_slice(arg);
                     buf.push(0);
                 }
                 Ok(buf)
             })
             .into(),
-            "timerslack_ns" => SimpleFile::try_new_regular_with_open_credential(
+            b"timerslack_ns" => SimpleFile::try_new_regular_with_open_credential(
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => {
@@ -3130,7 +3248,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )?
             .into(),
-            "timens_offsets" => SimpleFile::try_new_regular_with_open_credential(
+            b"timens_offsets" => SimpleFile::try_new_regular_with_open_credential(
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(render_timens_offsets(&task))),
@@ -3141,7 +3259,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )?
             .into(),
-            "comm" => SimpleFile::new_regular(
+            b"comm" => SimpleFile::new_regular(
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => {
@@ -3177,7 +3295,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "exe" => {
+            b"exe" => {
                 drop(proc_image_access(&task, process_view)?);
                 SimpleFile::new_magic_link(fs, move || {
                     let image = proc_image_access(&task, process_view)?.into_aspace();
@@ -3185,7 +3303,7 @@ impl SimpleDirOps for ThreadDir {
                     if proc_data.exec_in_progress() {
                         return Err(VfsError::PermissionDenied);
                     }
-                    let path = proc_data.exe_path.read().clone();
+                    let path = proc_data.exe_path.read().as_bytes().to_vec();
                     if proc_data.exec_in_progress() || !proc_data.image_matches(&image) {
                         return Err(VfsError::PermissionDenied);
                     }
@@ -3193,7 +3311,7 @@ impl SimpleDirOps for ThreadDir {
                 })
                 .into()
             }
-            "fd" => SimpleDir::new_maker(fs.clone(), {
+            b"fd" => SimpleDir::new_maker(fs.clone(), {
                 drop(proc_fd_image_access(&task, process_view)?);
                 Arc::new(ThreadFdDir {
                     fs,
@@ -3202,7 +3320,7 @@ impl SimpleDirOps for ThreadDir {
                 })
             })
             .into(),
-            "fdinfo" => SimpleDir::new_maker(fs.clone(), {
+            b"fdinfo" => SimpleDir::new_maker(fs.clone(), {
                 drop(proc_fd_image_access(&task, process_view)?);
                 Arc::new(ThreadFdInfoDir {
                     fs,
@@ -3211,7 +3329,7 @@ impl SimpleDirOps for ThreadDir {
                 })
             })
             .into(),
-            "ns" => SimpleDir::new_maker(fs.clone(), {
+            b"ns" => SimpleDir::new_maker(fs.clone(), {
                 drop(proc_image_access(&task, process_view)?);
                 Arc::new(ThreadNamespaceDir {
                     fs,
@@ -3247,25 +3365,30 @@ impl SimpleDirOps for ProcFsHandler {
             if process.is_zombie() && process.zombie_payload().is_none() {
                 continue;
             }
-            names.push(Cow::Owned(try_pid_name(process.pid())?));
+            names.push(Cow::Owned(FsNameBuf::from_vec(
+                try_pid_name(process.pid())?.into_bytes(),
+            )?));
         }
-        names.push(Cow::Borrowed("self"));
-        names.push(Cow::Borrowed("bpf_stats"));
+        names.push(Cow::Borrowed(FsName::new(b"self")));
+        names.push(Cow::Borrowed(FsName::new(b"bpf_stats")));
         try_boxed_names(names.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        if name == "bpf_stats" {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        if name.as_bytes() == b"bpf_stats" {
             return ProcBpfStatsFile::try_new(self.0.clone()).map(Into::into);
         }
-        if name == "self" {
+        if name.as_bytes() == b"self" {
             return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, || {
                 Ok(current().as_thread().proc_data.proc.pid().to_string())
             })
             .into());
         }
 
-        let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        let pid = str::from_utf8(name.as_bytes())
+            .map_err(|_| VfsError::NotFound)?
+            .parse::<u32>()
+            .map_err(|_| VfsError::NotFound)?;
         if let Ok(task) = proc_task_for_pid(pid) {
             return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
                 self.0.clone(),
@@ -3331,7 +3454,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             "bytes    packets errs drop fifo colls carrier compressed\n",
         )
         .to_string();
-        let net_ns = current().as_thread().proc_data.net_ns.clone();
+        let net_ns = current().as_thread().net_ns();
         for (name, stats) in net_ns.stack().device_stats() {
             let _ = writeln!(
                 output,
@@ -3473,6 +3596,12 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     out.push('\n');
                 }
                 let _ = writeln!(out, "processor\t: {i}");
+                #[cfg(target_arch = "x86_64")]
+                if axhal::asm::user_shadow_stack_enabled() {
+                    // CET is committed only after every online CPU accepted
+                    // it, so this flag is never a per-reader capability lie.
+                    let _ = writeln!(out, "flags\t\t: user_shstk");
+                }
             }
             Ok(out)
         }),
@@ -3490,7 +3619,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleFile::new_regular(fs.clone(), || {
             let uptime = current()
                 .as_thread()
-                .proc_data
                 .time_ns()
                 .apply_boottime_offset(axhal::time::monotonic_time());
             let secs = uptime.as_secs();
@@ -3786,6 +3914,30 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 ),
             );
             kernel.add(
+                "pid_max",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new_root_writable(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", current().as_thread().pid_ns().pid_max())
+                                .into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let task = current();
+                            let thread = task.as_thread();
+                            let pid_ns = thread.pid_ns();
+                            pid_ns
+                                .try_set_pid_max(write_proc_u32(data)?)
+                                .map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
                 "domainname",
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
@@ -3845,6 +3997,144 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                             }
                             let value = write_proc_i32(data)?;
                             set_sched_rr_timeslice_ms(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "kexec_load_disabled",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", u8::from(kexec_load_disabled())).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            match write_proc_i32(data)? {
+                                0 if !kexec_load_disabled() => Ok(None),
+                                1 => disable_kexec_load().map(|()| None).map_err(VfsError::from),
+                                _ => Err(VfsError::InvalidInput),
+                            }
+                        }
+                    }),
+                ),
+            );
+            for (name, read, write) in [
+                (
+                    "sched_util_clamp_min",
+                    sched_util_clamp_min as fn() -> u16,
+                    set_sched_util_clamp_min as fn(u16) -> VfsResult<()>,
+                ),
+                (
+                    "sched_util_clamp_max",
+                    sched_util_clamp_max as fn() -> u16,
+                    set_sched_util_clamp_max as fn(u16) -> VfsResult<()>,
+                ),
+                (
+                    "sched_util_clamp_min_rt_default",
+                    sched_util_clamp_min_rt_default as fn() -> u16,
+                    set_sched_util_clamp_min_rt_default as fn(u16) -> VfsResult<()>,
+                ),
+            ] {
+                kernel.add(
+                    name,
+                    SimpleFile::new_regular(
+                        fs.clone(),
+                        RwFile::new(move |req| match req {
+                            SimpleFileOperation::Read => {
+                                Ok(Some(alloc::format!("{}\n", read()).into_bytes()))
+                            }
+                            SimpleFileOperation::Write(data) => {
+                                if is_proc_truncate_write(data) {
+                                    return Ok(None);
+                                }
+                                let value = write_proc_i32(data)?;
+                                if !(0..=1024).contains(&value) {
+                                    return Err(VfsError::InvalidInput);
+                                }
+                                write(value as u16)?;
+                                Ok(None)
+                            }
+                        }),
+                    ),
+                );
+            }
+            kernel.add(
+                "perf_event_paranoid",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", perf_event_paranoid()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_perf_event_paranoid(write_proc_i32(data)?)
+                                .map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "perf_event_mlock_kb",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", perf_event_mlock_kb()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_perf_event_mlock_kb(write_proc_u32(data)?)
+                                .map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "perf_event_max_sample_rate",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", perf_event_max_sample_rate()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_perf_event_max_sample_rate(write_proc_u32(data)?)
+                                .map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            #[cfg(feature = "bpf")]
+            kernel.add(
+                "unprivileged_bpf_disabled",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", unprivileged_bpf_disabled()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_unprivileged_bpf_disabled(write_proc_u32(data)?)
+                                .map_err(LinuxError::from)?;
                             Ok(None)
                         }
                     }),

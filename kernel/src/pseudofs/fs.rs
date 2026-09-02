@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
@@ -6,10 +6,12 @@ use core::{
 
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirNode, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeOps,
-    NodePermission, NodeType, NodeUserData, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
+    NodePermission, NodeType, NodeUserData, Reference, StatFs, VfsError, VfsResult, XattrProvider,
+    XattrSetMode, path::MAX_NAME_LEN,
 };
 use axhal::time::wall_time;
 use axsync::Mutex;
+use hashbrown::HashMap;
 use slab::Slab;
 
 use super::DirMaker;
@@ -111,6 +113,10 @@ pub struct SimpleFsNode {
     tracked_inode: bool,
     pub(crate) metadata: Mutex<Metadata>,
     pub(crate) user_data: NodeUserData,
+    // This is inode state, not driver state. An unlinked device Arc retains
+    // its xattrs for old descriptors while a re-published generation gets a
+    // fresh SimpleFsNode and therefore fresh ACL/xattr storage.
+    xattrs: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl SimpleFsNode {
@@ -142,6 +148,7 @@ impl SimpleFsNode {
             tracked_inode: true,
             metadata: Mutex::new(metadata),
             user_data: NodeUserData::new(),
+            xattrs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -180,7 +187,74 @@ impl SimpleFsNode {
             tracked_inode: false,
             metadata: Mutex::new(metadata),
             user_data: NodeUserData::new(),
+            xattrs: Mutex::new(HashMap::new()),
         })
+    }
+}
+
+impl XattrProvider for SimpleFsNode {
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
+        let xattrs = self.xattrs.lock();
+        let value = xattrs
+            .get(name)
+            .ok_or_else(|| VfsError::from(axerrno::LinuxError::ENODATA))?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(value.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        copy.extend_from_slice(value);
+        Ok(copy)
+    }
+
+    fn list_xattrs(&self) -> VfsResult<Vec<u8>> {
+        let xattrs = self.xattrs.lock();
+        let size = xattrs.keys().try_fold(0usize, |size, name| {
+            size.checked_add(name.len())
+                .and_then(|size| size.checked_add(1))
+                .ok_or(VfsError::NoMemory)
+        })?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(size)
+            .map_err(|_| VfsError::NoMemory)?;
+        for name in xattrs.keys() {
+            result.extend_from_slice(name);
+            result.push(0);
+        }
+        Ok(result)
+    }
+
+    fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+        let mut owned_name = Vec::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        owned_name.extend_from_slice(name);
+        let mut owned_value = Vec::new();
+        owned_value
+            .try_reserve_exact(value.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        owned_value.extend_from_slice(value);
+        let mut xattrs = self.xattrs.lock();
+        match (mode, xattrs.contains_key(name)) {
+            (XattrSetMode::Create, true) => return Err(axerrno::LinuxError::EEXIST.into()),
+            (XattrSetMode::Replace, false) => return Err(axerrno::LinuxError::ENODATA.into()),
+            _ => {}
+        }
+        if let Some(previous) = xattrs.get_mut(name) {
+            *previous = owned_value;
+        } else {
+            xattrs.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            xattrs.insert(owned_name, owned_value);
+        }
+        Ok(())
+    }
+
+    fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
+        self.xattrs
+            .lock()
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| axerrno::LinuxError::ENODATA.into())
     }
 }
 

@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
+use linux_raw_sys::general::{O_CLOEXEC, O_LARGEFILE, O_RDWR};
 
 use crate::file::{SecretMemFile, add_file_like_with_flags};
-use linux_raw_sys::general::{O_CLOEXEC, O_LARGEFILE, O_RDWR};
 
 const SECRETMEM_ALLOWED_FLAGS: u32 = O_CLOEXEC;
 
@@ -20,8 +20,9 @@ pub(crate) fn sys_memfd_secret(flags: u32) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use linux_raw_sys::general::MFD_CLOEXEC;
+
+    use super::*;
 
     #[test]
     fn secretmem_uses_open_cloexec_not_memfd_cloexec() {

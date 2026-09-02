@@ -1,12 +1,11 @@
-use alloc::string::String;
+use alloc::vec::Vec;
 use core::{
     ffi::c_char,
-    fmt::Write as _,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::NodePermission;
+use axfs_ng_vfs::{FsPath, FsPathBuf, NodePermission};
 use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, O_RDWR};
 
 use super::fd_ops::openat_inner;
@@ -16,20 +15,30 @@ use crate::{
 };
 
 const MEMFD_NAME_MAX: usize = 249;
-const MEMFD_DIR: &str = "/tmp/memfd";
+const MEMFD_DIR: &FsPath = FsPath::new(b"/tmp/memfd");
 
 static MEMFD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn memfd_path(id: u64) -> AxResult<String> {
+fn memfd_path(id: u64) -> AxResult<FsPathBuf> {
     let capacity = MEMFD_DIR
+        .as_bytes()
         .len()
         .checked_add(1 + ".memfd-".len() + 16)
         .ok_or(AxError::NoMemory)?;
-    let mut path = String::new();
+    let mut path = Vec::new();
     path.try_reserve_exact(capacity)
         .map_err(|_| AxError::NoMemory)?;
-    write!(&mut path, "{MEMFD_DIR}/.memfd-{id:016x}").map_err(|_| AxError::Io)?;
-    Ok(path)
+    path.extend_from_slice(MEMFD_DIR.as_bytes());
+    path.extend_from_slice(b"/.memfd-");
+    for shift in (0..16).rev().map(|n| n * 4) {
+        let nibble = ((id >> shift) & 0xf) as u8;
+        path.push(if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        });
+    }
+    Ok(FsPathBuf::from_vec(path))
 }
 
 fn validate_memfd_name(capability: &UserMemoryCapability, name: *const c_char) -> AxResult<()> {

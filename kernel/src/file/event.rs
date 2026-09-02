@@ -6,6 +6,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
+use thekernel_linux_fd::{EVENTFD_COUNTER_MAX, EventFdPlan, EventFdSnapshot};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
@@ -34,43 +35,62 @@ impl EventFd {
     }
 
     pub fn signal(&self, value: u64) -> AxResult {
+        self.plan_write(value)?;
+        self.poll_rx.wake();
+        Ok(())
+    }
+
+    fn snapshot(&self, count: u64) -> EventFdSnapshot {
+        // All mutations go through the ABI plans, so the atomic value always
+        // remains a representable eventfd counter.
+        EventFdSnapshot::new(count, self.semaphore).expect("eventfd counter invariant")
+    }
+
+    fn plan_write(&self, value: u64) -> AxResult {
         if value == u64::MAX {
             return Err(AxError::InvalidInput);
         }
         self.count
             .try_update(Ordering::Release, Ordering::Acquire, |count| {
-                Some(count.saturating_add(value))
+                match self.snapshot(count).plan_write(value) {
+                    Ok(EventFdPlan::Write { after, .. }) => Some(after.counter()),
+                    Ok(_) | Err(_) => None,
+                }
             })
             .map_err(|_| AxError::WouldBlock)?;
-        self.poll_rx.wake();
         Ok(())
     }
-}
 
-impl FileLike for EventFd {
-    fn stat(&self) -> AxResult<Kstat> {
-        Ok(anon_inode_stat())
-    }
-
-    fn read(&self, dst: &mut IoDst) -> axio::Result<usize> {
+    /// Performs one eventfd read with a request-local nonblocking override.
+    ///
+    /// `RWF_NOWAIT` must not change the open-file description's O_NONBLOCK
+    /// state: only this attempt observes `nonblocking`.
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> axio::Result<usize> {
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);
         }
 
-        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+            let mut value = 0;
             let result = self
                 .count
                 .try_update(Ordering::Release, Ordering::Acquire, |count| {
-                    if count > 0 {
-                        let dec = if self.semaphore { 1 } else { count };
-                        Some(count - dec)
-                    } else {
-                        None
+                    match self.snapshot(count).plan_read() {
+                        Ok(EventFdPlan::Read {
+                            value: next, after, ..
+                        }) => {
+                            value = next;
+                            Some(after.counter())
+                        }
+                        Ok(_) | Err(_) => None,
                     }
                 });
             match result {
-                Ok(count) => {
-                    let value = if self.semaphore { 1 } else { count };
+                Ok(_) => {
                     dst.write(&value.to_ne_bytes())?;
                     self.poll_tx.wake();
                     Ok(size_of::<u64>())
@@ -80,10 +100,13 @@ impl FileLike for EventFd {
         })
     }
 
-    fn write(&self, src: &mut IoSrc) -> axio::Result<usize> {
+    /// Performs one eventfd write with a request-local nonblocking override.
+    pub(crate) fn write_with_nonblocking(
+        &self,
+        src: &mut IoSrc,
+        nonblocking: bool,
+    ) -> axio::Result<usize> {
         // Linux eventfd_write accepts exactly one 64-bit counter value.
-        // Unlike read (which may be given a larger destination), a larger
-        // write must fail rather than silently consume its first eight bytes.
         if src.remaining() != size_of::<u64>() {
             return Err(AxError::InvalidInput);
         }
@@ -91,28 +114,29 @@ impl FileLike for EventFd {
         let mut value = [0; size_of::<u64>()];
         src.read(&mut value)?;
         let value = u64::from_ne_bytes(value);
-        if value == u64::MAX {
-            return Err(AxError::InvalidInput);
-        }
-
-        block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
-            let result = self
-                .count
-                .try_update(Ordering::Release, Ordering::Acquire, |count| {
-                    if u64::MAX - count > value {
-                        Some(count + value)
-                    } else {
-                        None
-                    }
-                });
-            match result {
-                Ok(_) => {
+        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+            match self.plan_write(value) {
+                Ok(()) => {
                     self.poll_rx.wake();
                     Ok(size_of::<u64>())
                 }
-                Err(_) => Err(AxError::WouldBlock),
+                Err(error) => Err(error),
             }
         })
+    }
+}
+
+impl FileLike for EventFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
+    fn read(&self, dst: &mut IoDst) -> axio::Result<usize> {
+        self.read_with_nonblocking(dst, self.nonblocking())
+    }
+
+    fn write(&self, src: &mut IoSrc) -> axio::Result<usize> {
+        self.write_with_nonblocking(src, self.nonblocking())
     }
 
     fn nonblocking(&self) -> bool {
@@ -124,8 +148,10 @@ impl FileLike for EventFd {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[eventfd]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[eventfd]",
+        )))
     }
 }
 
@@ -134,8 +160,8 @@ impl Pollable for EventFd {
         let mut events = IoEvents::empty();
         let count = self.count.load(Ordering::Acquire);
         events.set(IoEvents::READABLE, count > 0);
-        events.set(IoEvents::ERROR, count == u64::MAX);
-        events.set(IoEvents::WRITABLE, u64::MAX - 1 > count);
+        events.set(IoEvents::ERROR, false);
+        events.set(IoEvents::WRITABLE, count < EVENTFD_COUNTER_MAX);
         events
     }
 

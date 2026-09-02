@@ -26,8 +26,10 @@ impl FileLike for DmaBufFile {
     fn stat(&self) -> AxResult<Kstat> {
         Ok(crate::file::anon_inode_stat())
     }
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[dmabuf]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[dmabuf]",
+        )))
     }
     fn set_nonblocking(&self, _: bool) -> AxResult<()> {
         Ok(())

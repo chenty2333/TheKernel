@@ -2,8 +2,8 @@ use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, current};
-use bitflags::bitflags;
 use linux_raw_sys::general::SI_TKILL;
+use thekernel_linux_process::PidfdPlan;
 use thekernel_linux_signal::{SignalInfo, api::ThreadSignalManager};
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
@@ -412,30 +412,21 @@ fn check_pidfd_getfd_permission(
     Ok(target_image)
 }
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct PidFdFlags: u32 {
-        const NONBLOCK = 2048;
-        const THREAD = 128;
-    }
-}
-
 pub fn sys_pidfd_open(pid: i32, flags: u32) -> AxResult<isize> {
     debug!("sys_pidfd_open <= pid: {pid}, flags: {flags}");
 
-    let flags = PidFdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     if pid <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let pid = pid as u32;
+    let plan = PidfdPlan::open(pid as u32, flags).map_err(|_| AxError::InvalidInput)?;
 
-    let fd = if flags.contains(PidFdFlags::THREAD) {
-        let task = get_visible_task(pid)?;
+    let fd = if plan.thread {
+        let task = get_visible_task(plan.target)?;
         PidFd::new_thread(&task)?
     } else {
-        PidFd::new_process(&get_process_data(pid)?)
+        PidFd::new_process(&get_process_data(plan.target)?)
     };
-    if flags.contains(PidFdFlags::NONBLOCK) {
+    if plan.nonblocking {
         fd.set_nonblocking(true)?;
     }
 

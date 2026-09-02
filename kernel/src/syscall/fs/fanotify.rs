@@ -1,7 +1,7 @@
-use alloc::string::String;
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::FsPathBuf;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 
 use crate::{
@@ -41,17 +41,16 @@ pub fn sys_fanotify_mark(
         file.stat()?;
         Some(location_for_fd(dirfd).ok_or(AxError::InvalidInput)?)
     } else {
-        let pathname = String::from_utf8(
+        let pathname = FsPathBuf::from_vec(
             memory
                 .load_until_nul(pathname.cast::<u8>())
                 .map_err(map_usercopy_error)?,
-        )
-        .map_err(|_| AxError::IllegalBytes)?;
+        );
         let mut resolve_flags = 0;
         if flags & FAN_MARK_DONT_FOLLOW != 0 {
             resolve_flags |= AT_SYMLINK_NOFOLLOW;
         }
-        if pathname.is_empty() {
+        if pathname.as_bytes().is_empty() {
             resolve_flags |= AT_EMPTY_PATH;
         }
         let ResolveAtResult::File(loc) = resolve_at(dirfd, Some(&pathname), resolve_flags)? else {

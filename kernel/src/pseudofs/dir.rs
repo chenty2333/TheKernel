@@ -1,10 +1,11 @@
-use alloc::{borrow::Cow, boxed::Box, collections::btree_map::BTreeMap, string::String, sync::Arc};
+use alloc::{borrow::Cow, boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode,
-    FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeOps, NodePermission, NodeType,
-    Reference, RenameRequest, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
+    FilesystemOps, FsName, FsNameBuf, Metadata, MetadataUpdate, NamedCreateOptions, NodeOps,
+    NodePermission, NodeType, NodeUserData, Reference, RenameRequest, UnlinkRequest, VfsError,
+    VfsResult, WeakDirEntry,
     path::{DOT, DOTDOT},
 };
 use inherit_methods_macro::inherit_methods;
@@ -12,12 +13,12 @@ use inherit_methods_macro::inherit_methods;
 use super::{DirMaker, NodeOpsMux, SimpleFs, SimpleFsNode};
 
 /// Fallible owned iterator returned by simple pseudo-directory enumerators.
-pub type ChildNames<'a> = Box<dyn Iterator<Item = Cow<'a, str>> + 'a>;
+pub type ChildNames<'a> = Box<dyn Iterator<Item = Cow<'a, FsName>> + 'a>;
 
 /// Boxes a directory-name iterator without invoking the infallible allocation
 /// path from a user-triggered `getdents` operation.
 pub fn try_boxed_names<'a>(
-    names: impl Iterator<Item = Cow<'a, str>> + 'a,
+    names: impl Iterator<Item = Cow<'a, FsName>> + 'a,
 ) -> VfsResult<ChildNames<'a>> {
     Box::try_new(names)
         .map(|names| names as ChildNames<'a>)
@@ -29,7 +30,7 @@ pub trait SimpleDirOps: Send + Sync + 'static {
     /// Get the names of all children in the directory.
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>>;
     /// Look up a child directory or file by name.
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux>;
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux>;
 
     /// Check if the directory is cacheable.
     ///
@@ -49,16 +50,16 @@ pub trait SimpleDirOps: Send + Sync + 'static {
 
 impl SimpleDirOps for DirMapping {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        try_boxed_names(self.0.keys().map(|s| s.as_str().into()))
+        try_boxed_names(self.0.keys().map(|name| Cow::Borrowed(name.as_name())))
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         self.0.get(name).cloned().ok_or(VfsError::NotFound)
     }
 }
 
 /// A mapping of directory names to entries.
-pub struct DirMapping(BTreeMap<String, NodeOpsMux>);
+pub struct DirMapping(BTreeMap<FsNameBuf, NodeOpsMux>);
 
 impl DirMapping {
     /// Create a new empty directory mapping.
@@ -67,8 +68,10 @@ impl DirMapping {
     }
 
     /// Add a new entry to the directory mapping.
-    pub fn add(&mut self, name: impl Into<String>, ops: impl Into<NodeOpsMux>) {
-        self.0.insert(name.into(), ops.into());
+    pub fn add(&mut self, name: impl AsRef<[u8]>, ops: impl Into<NodeOpsMux>) {
+        let name = FsNameBuf::from_vec(Vec::from(name.as_ref()))
+            .expect("simple pseudo-filesystem entry names must be valid");
+        self.0.insert(name, ops.into());
     }
 }
 
@@ -86,7 +89,7 @@ impl<A: SimpleDirOps, B: SimpleDirOps> SimpleDirOps for ChainedDirOps<A, B> {
         try_boxed_names(self.0.child_names()?.chain(self.1.child_names()?))
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         match self.0.lookup_child(name) {
             Ok(ops) => Ok(ops),
             Err(VfsError::NotFound) => self.1.lookup_child(name),
@@ -148,6 +151,10 @@ impl<O: SimpleDirOps> NodeOps for SimpleDir<O> {
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
 }
 
 impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
@@ -163,8 +170,8 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         let mut count = 0;
         for (i, name) in children.enumerate().skip(offset as usize) {
             let metadata = match name.as_ref() {
-                DOT => this_entry.metadata(),
-                DOTDOT => this_entry
+                name if name == DOT => this_entry.metadata(),
+                name if name == DOTDOT => this_entry
                     .parent()
                     .map_or_else(|| this_entry.metadata(), |parent| parent.metadata()),
                 other => {
@@ -181,7 +188,7 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         Ok(count)
     }
 
-    fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
+    fn lookup(&self, name: &FsName) -> VfsResult<DirEntry> {
         let ops = self.ops.lookup_child(name)?;
         let reference = Reference::try_new(self.this.upgrade(), name)?;
         let entry = match ops {
@@ -202,14 +209,14 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 
     fn create_named(
         &self,
-        _name: &str,
+        _name: &FsName,
         _options: &NamedCreateOptions,
         _disposition: CreateDisposition,
     ) -> VfsResult<CreateOutcome<DirEntry>> {
         Err(VfsError::OperationNotPermitted)
     }
 
-    fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
+    fn link(&self, _name: &FsName, _node: &DirEntry) -> VfsResult<DirEntry> {
         Err(VfsError::OperationNotPermitted)
     }
 
@@ -219,5 +226,34 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 
     fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotPermitted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_dir_exposes_a_stable_writeback_error_source() {
+        let _test_context = crate::test_support::scheduler_test_context();
+        let filesystem = SimpleFs::new_with("simple-dir-test".into(), 0, |fs| {
+            SimpleDir::new_maker(fs, Arc::new(DirMapping::new()))
+        });
+        let dir = filesystem
+            .root_dir()
+            .as_dir()
+            .unwrap()
+            .downcast::<SimpleDir<DirMapping>>()
+            .unwrap();
+
+        let persistent = dir.persistent_user_data().unwrap();
+        let expected = persistent.writeback_error_state().unwrap();
+        let actual = dir.writeback_error_state().unwrap();
+
+        assert!(Arc::ptr_eq(&actual, &expected));
+        assert!(Arc::ptr_eq(
+            &actual,
+            &dir.writeback_error_state().unwrap()
+        ));
     }
 }

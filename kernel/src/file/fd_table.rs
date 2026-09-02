@@ -19,6 +19,7 @@ use thekernel_linux_process_adapter::Pid;
 use super::{
     desc::{
         DescriptionResource, DescriptorPublication, FileDescription, FileDescriptor, FileHandle,
+        ScmDescriptorCustody,
     },
     executable::ExecutableKey,
     flock,
@@ -386,6 +387,19 @@ impl FdTable {
             .map_err(map_fd_table_error)
     }
 
+    /// Takes queued-SCM custody while the source fd-table read lock still
+    /// proves a live descriptor root. A concurrent close therefore cannot run
+    /// `pre_close` in the gap between SCM fd lookup and queue publication.
+    pub(crate) fn get_description_for_scm(&self, fd: c_int) -> AxResult<ScmDescriptorCustody> {
+        let fd = fd_number(fd)?;
+        let entries = self.entries.read();
+        let description = entries
+            .get(fd)
+            .map(|entry| Arc::clone(entry.description()))
+            .map_err(map_fd_table_error)?;
+        Ok(description.acquire_scm_custody())
+    }
+
     /// Publishes one file-like object into this exact files table.
     ///
     /// This is the table-bound counterpart of the scope-local convenience
@@ -454,9 +468,17 @@ impl FdTable {
             .mark_close_on_exec_range(FdNumber::new(first), FdNumber::new(last));
     }
 
-    fn finish_close(&self, removed: &FileDescriptor) {
-        release_posix_locks_on_close(&removed.description);
+    fn finish_close_for_process(&self, removed: &FileDescriptor, pid: Pid) {
+        release_posix_locks_on_close_for_process(&removed.description, pid);
         removed.description.descriptor_closed();
+        // A close, exec-close, and table teardown all converge here. Run the
+        // Unix SCM mark/sweep after removing the descriptor root so queued
+        // Socket/Epoll SCCs cannot survive solely by their ancillary edges.
+        crate::syscall::collect_scm_rights_cycles();
+    }
+
+    fn finish_close(&self, removed: &FileDescriptor) {
+        self.finish_close_for_process(removed, current().as_thread().proc_data.proc.pid());
     }
 
     pub(crate) fn close(&self, fd: c_int) -> AxResult<FileDescriptor> {
@@ -471,6 +493,24 @@ impl FdTable {
         let (description, _) = entry.into_parts();
         let removed = FileDescriptor { description };
         self.finish_close(&removed);
+        Ok(removed)
+    }
+
+    /// Table-bound close for a retained asynchronous actor.  Unlike
+    /// `close_file_like`, this never samples the worker task's files table or
+    /// POSIX-lock owner.
+    pub(crate) fn close_for_process(&self, fd: c_int, pid: Pid) -> AxResult<FileDescriptor> {
+        let fd = fd_number(fd)?;
+        let (entry, dnotify) = {
+            let mut entries = self.entries.write();
+            let entry = entries.close(fd).map_err(map_fd_table_error)?;
+            let dnotify = crate::file::dnotify::detach_watch(self.id, entry.description().id());
+            (entry, dnotify)
+        };
+        drop(dnotify);
+        let (description, _) = entry.into_parts();
+        let removed = FileDescriptor { description };
+        self.finish_close_for_process(&removed, pid);
         Ok(removed)
     }
 
@@ -639,6 +679,48 @@ impl FdTable {
         }
         Ok(removed)
     }
+
+    /// Installs an externally retained OFD at one exact descriptor number.
+    /// Seccomp ADDFD uses this to inject a supervisor-owned description into
+    /// a stopped task without resolving a numeric source in the target table.
+    pub(crate) fn replace_description_at(
+        &self,
+        description: Arc<FileDescription>,
+        new_fd: c_int,
+        cloexec: bool,
+    ) -> AxResult<Option<FileDescriptor>> {
+        let new_fd = fd_number(new_fd)?;
+        if new_fd.index() >= AX_FILE_LIMIT {
+            return Err(AxError::BadFileDescriptor);
+        }
+        let (entry, dnotify) = {
+            let publication = description.begin_descriptor_publication()?;
+            let mut entries = self.entries.write();
+            let (_, removed) = match entries.replace(new_fd, description, descriptor_flags(cloexec))
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(entries);
+                    drop(publication);
+                    return Err(map_fd_table_error(error));
+                }
+            };
+            publication.commit();
+            let dnotify = removed.as_ref().and_then(|removed| {
+                crate::file::dnotify::detach_watch(self.id, removed.description().id())
+            });
+            (removed, dnotify)
+        };
+        drop(dnotify);
+        let removed = entry.map(|entry| {
+            let (description, _) = entry.into_parts();
+            FileDescriptor { description }
+        });
+        if let Some(descriptor) = removed.as_ref() {
+            self.finish_close(descriptor);
+        }
+        Ok(removed)
+    }
 }
 
 impl PreparedCloexec {
@@ -684,7 +766,6 @@ impl Drop for FdTable {
     }
 }
 
-
 /// Get a file-like object by `fd`.
 pub fn get_file_like(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
     let description = get_file_description(fd)?;
@@ -722,6 +803,11 @@ where
 /// Get an open file description by `fd`.
 pub fn get_file_description(fd: c_int) -> AxResult<Arc<FileDescription>> {
     current_fd_table().get_description(fd)
+}
+
+/// Capture an fd as a republishable SCM_RIGHTS queue right.
+pub(crate) fn get_file_description_for_scm(fd: c_int) -> AxResult<ScmDescriptorCustody> {
+    current_fd_table().get_description_for_scm(fd)
 }
 
 /// Add an open file description to the file descriptor table.
@@ -766,6 +852,26 @@ pub(crate) fn reserve_fd(cloexec: bool) -> AxResult<ReservedFd> {
     try_reserve_fd(cloexec)?.ok_or(AxError::TooManyOpenFiles)
 }
 
+/// Reserves an fd in an explicitly retained files table. Async submitters
+/// capture both table and RLIMIT at issue time, so a kernel worker never
+/// resolves its own process state while publishing an open result.
+pub(crate) fn reserve_fd_in(
+    table: Arc<FdTable>,
+    limit: usize,
+    cloexec: bool,
+) -> AxResult<ReservedFd> {
+    let reservation = table
+        .entries
+        .write()
+        .reserve(0, limit.min(AX_FILE_LIMIT), descriptor_flags(cloexec))
+        .map_err(map_fd_table_error)?;
+    Ok(ReservedFd {
+        fd: reservation.fd().get() as c_int,
+        table,
+        reservation: Some(reservation),
+    })
+}
+
 /// Add a file to the file descriptor table.
 pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
     add_file_description(FileDescription::new(f)?, cloexec)
@@ -803,6 +909,8 @@ pub(crate) fn prepare_file_description_with_open_lease(
     resource: Option<DescriptionResource>,
     open_lease_admission: super::lease::OpenLeaseAdmission,
     vfs_open_credential: Arc<crate::task::Cred>,
+    vfs_mount_topology: Option<Arc<crate::mounts::MountTopology>>,
+    created_by_open: bool,
 ) -> AxResult<Arc<FileDescription>> {
     FileDescription::new_with_open_lease_admission_and_resource(
         f,
@@ -812,12 +920,20 @@ pub(crate) fn prepare_file_description_with_open_lease(
         resource,
         open_lease_admission,
         vfs_open_credential,
+        vfs_mount_topology,
+        created_by_open,
     )
 }
 
 pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
+    release_posix_locks_on_close_for_process(
+        description,
+        current().as_thread().proc_data.proc.pid(),
+    );
+}
+
+pub(crate) fn release_posix_locks_on_close_for_process(description: &FileDescription, pid: Pid) {
     if let Ok(stat) = description.inner.stat() {
-        let pid = current().as_thread().proc_data.proc.pid();
         flock::release_posix_owner_on_inode(pid, (stat.dev, stat.ino));
     }
 }
@@ -925,8 +1041,10 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("drop-counting-file"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"drop-counting-file",
+            )))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -953,8 +1071,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("lock-order-file"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"lock-order-file")))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -1155,12 +1273,12 @@ mod tests {
             &separate_open.get_description(3).unwrap(),
             &first_open
         ));
-        assert_eq!(first_open.descriptor_reference_count(), 4);
+        assert_eq!(first_open.descriptor_reference_count(), 5);
         assert_eq!(second_open.descriptor_reference_count(), 1);
 
         drop(source.close(3).unwrap());
         drop(source.close(7).unwrap());
-        assert_eq!(first_open.descriptor_reference_count(), 2);
+        assert_eq!(first_open.descriptor_reference_count(), 3);
         drop(forked);
         assert_eq!(first_open.descriptor_reference_count(), 1);
         drop(receiver.close(9).unwrap());
@@ -1226,12 +1344,14 @@ mod tests {
         let first_wake = Arc::new(CountingWake(AtomicUsize::new(0)));
         let first_waker = Waker::from(first_wake.clone());
         let _first_registration = description.register_descriptor_close(&first_waker).unwrap();
+        // A queued SCM_RIGHTS transfer is the only non-fd ownership that can
+        // republish this OFD. Capture that authority before the source close.
+        let custody = table.get_description_for_scm(3).unwrap();
         drop(table.close(3).unwrap());
-        assert_eq!(first_wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(first_wake.0.load(Ordering::SeqCst), 0);
 
-        // Models a retained SCM_RIGHTS OFD being installed after the sender
-        // closed its final descriptor. The old close source stays terminal;
-        // no stale epoll generation is revived in the new descriptor epoch.
+        // Models delivery of the queued SCM_RIGHTS OFD after the sender
+        // closed its descriptor. The transfer custody kept the OFD live.
         table
             .add_at_least(description.clone(), 3, 4, false)
             .unwrap();
@@ -1240,6 +1360,7 @@ mod tests {
         let _second_registration = description
             .register_descriptor_close(&second_waker)
             .unwrap();
+        drop(custody);
         drop(table.close(3).unwrap());
 
         assert_eq!(first_wake.0.load(Ordering::SeqCst), 1);

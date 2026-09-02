@@ -4,10 +4,11 @@ use alloc::{
     sync::Arc,
 };
 
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeType};
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeType, VfsResult};
 
 use crate::{
     mounts,
+    pmu_registry::{PMU_EVENTS, PmuEvents, registered_pmus},
     pseudofs::{
         DirMapping, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, dev::r#loop as loopdev,
         device_registry,
@@ -24,13 +25,164 @@ pub fn new_sysfs() -> Filesystem {
 
 fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut root = DirMapping::new();
+    let mut fs_dir = DirMapping::new();
+    let mut fuse_dir = DirMapping::new();
+    fuse_dir.add("connections", empty_dir(fs.clone()));
+    fs_dir.add("fuse", SimpleDir::new_maker(fs.clone(), Arc::new(fuse_dir)));
 
     root.add("class", class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));
+    root.add("bus", bus_dir(fs.clone()));
+    root.add("kernel", kernel_dir(fs.clone()));
+    root.add("fs", SimpleDir::new_maker(fs.clone(), Arc::new(fs_dir)));
 
     SimpleDir::new_maker(fs, Arc::new(root))
+}
+
+fn empty_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    SimpleDir::new_maker(fs, Arc::new(DirMapping::new()))
+}
+
+fn kernel_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    let mut kernel = DirMapping::new();
+    let mut debug = DirMapping::new();
+    let mut dri = DirMapping::new();
+    dri.add("0", empty_dir(fs.clone()));
+    debug.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
+    debug.add("tracing", empty_dir(fs.clone()));
+    kernel.add("debug", SimpleDir::new_maker(fs.clone(), Arc::new(debug)));
+    kernel.add("tracing", empty_dir(fs.clone()));
+    kernel.add(
+        "kexec_loaded",
+        SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> {
+            Ok(format!(
+                "{}\n",
+                u8::from(crate::syscall::normal_image_loaded())
+            ))
+        }),
+    );
+    kernel.add(
+        "kexec_crash_loaded",
+        SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> {
+            Ok(format!(
+                "{}\n",
+                u8::from(crate::syscall::crash_image_loaded())
+            ))
+        }),
+    );
+    SimpleDir::new_maker(fs, Arc::new(kernel))
+}
+
+fn bus_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    let mut bus = DirMapping::new();
+    let mut event_source = DirMapping::new();
+    let mut devices = DirMapping::new();
+    for pmu in registered_pmus() {
+        let mut pmu_dir = DirMapping::new();
+        let type_file = pmu.type_file();
+        pmu_dir.add(
+            "type",
+            SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                Ok(type_file.clone())
+            }),
+        );
+        let cpus = pmu.cpus.clone();
+        pmu_dir.add(
+            "cpus",
+            SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                Ok(cpus.clone())
+            }),
+        );
+        let identifier = format!("{}\n", &pmu.identifier);
+        pmu_dir.add(
+            "identifier",
+            SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                Ok(identifier.clone())
+            }),
+        );
+        let max_precise = format!("{}\n", pmu.max_precise);
+        pmu_dir.add(
+            "max_precise",
+            SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                Ok(max_precise.clone())
+            }),
+        );
+        let mut format_dir = DirMapping::new();
+        for (name, value) in pmu.format.iter() {
+            format_dir.add(
+                name,
+                SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                    Ok(String::from(*value))
+                }),
+            );
+        }
+        pmu_dir.add(
+            "format",
+            SimpleDir::new_maker(fs.clone(), Arc::new(format_dir)),
+        );
+        let mut events_dir = DirMapping::new();
+        let events: &[(&str, &str)] = match &pmu.events {
+            PmuEvents::Architectural => &PMU_EVENTS,
+            PmuEvents::Fixed(events) => events,
+            PmuEvents::None => &[],
+        };
+        for (name, value) in events {
+            events_dir.add(
+                name,
+                SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                    Ok(String::from(*value))
+                }),
+            );
+            if let Some((scale, unit)) = pmu.event_metadata_for(name) {
+                let scale_name = format!("{name}.scale");
+                events_dir.add(
+                    &scale_name,
+                    SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                        Ok(scale.clone())
+                    }),
+                );
+                let unit_name = format!("{name}.unit");
+                events_dir.add(
+                    &unit_name,
+                    SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                        Ok(unit.clone())
+                    }),
+                );
+            }
+        }
+        pmu_dir.add(
+            "events",
+            SimpleDir::new_maker(fs.clone(), Arc::new(events_dir)),
+        );
+        let mut caps_dir = DirMapping::new();
+        for (name, value) in pmu.caps.iter() {
+            caps_dir.add(
+                name,
+                SimpleFile::new_regular(fs.clone(), move || -> VfsResult<String> {
+                    Ok(String::from(*value))
+                }),
+            );
+        }
+        pmu_dir.add("caps", SimpleDir::new_maker(fs.clone(), Arc::new(caps_dir)));
+        devices.add(
+            pmu.kind.name(),
+            SimpleDir::new_maker(fs.clone(), Arc::new(pmu_dir)),
+        );
+    }
+    event_source.add(
+        "devices",
+        SimpleDir::new_maker(fs.clone(), Arc::new(devices)),
+    );
+    bus.add(
+        "event_source",
+        SimpleDir::new_maker(fs.clone(), Arc::new(event_source)),
+    );
+    SimpleDir::new_maker(
+        fs.clone(),
+        Arc::new(bus.chain(device_registry::bus_root(fs))),
+    )
 }
 
 fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -306,11 +458,9 @@ fn loop_block_device_dir(
         "backing_file",
         SimpleFile::new_regular(fs.clone(), move || {
             let backing_file = loopdev::snapshot(number).backing_file;
-            Ok(if backing_file.is_empty() {
-                "\n".into()
-            } else {
-                format!("{backing_file}\n")
-            })
+            let mut bytes = backing_file;
+            bytes.push(b'\n');
+            Ok(bytes)
         }),
     );
     loop_dir.add(
@@ -356,7 +506,10 @@ fn uevent_file(fs: Arc<SimpleFs>, dev_name: String, dev_id: DeviceId) -> Arc<Sim
 
 #[cfg(test)]
 mod tests {
-    use super::contiguous_index_list;
+    use axfs::FsContext;
+    use axfs_ng_vfs::{FsPath, Mountpoint};
+
+    use super::{contiguous_index_list, new_sysfs};
 
     #[test]
     fn cpu_topology_list_is_nonempty_and_tracks_all_configured_cpus() {
@@ -364,5 +517,22 @@ mod tests {
         assert_eq!(contiguous_index_list(1), "0\n");
         assert_eq!(contiguous_index_list(4), "0-3\n");
         assert_eq!(contiguous_index_list(8), "0-7\n");
+    }
+
+    #[test]
+    fn sysfs_declares_pseudofs_mountpoints() {
+        let _context = crate::test_support::scheduler_test_context();
+        let filesystem = new_sysfs();
+        let root = Mountpoint::new_root(&filesystem);
+        let context = FsContext::new(root.root_location());
+
+        for path in [
+            b"/fs/fuse/connections".as_slice(),
+            b"/kernel/tracing",
+            b"/kernel/debug/tracing",
+            b"/kernel/debug/dri/0",
+        ] {
+            assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
+        }
     }
 }

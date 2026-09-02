@@ -17,15 +17,15 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{Location, WeakFilesystemIdentity, path::MAX_NAME_LEN};
+use axfs_ng_vfs::{FsName, Location, WeakFilesystemIdentity, path::MAX_NAME_LEN};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
 use axtask::current_may_uninit;
 use linux_raw_sys::{
     general::{
-        IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_DELETE_SELF,
-        IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MASK_ADD, IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF,
-        IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, inotify_event,
+        IN_ACCESS, IN_ALL_EVENTS, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK,
+        IN_IGNORED, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF, IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT,
+        inotify_event,
     },
     ioctl::FIONREAD,
 };
@@ -34,8 +34,8 @@ use spin::Mutex;
 use crate::{
     deferred_work::DeferredWorkAccount,
     file::{
-        Directory, File, FileLike, IoDst, IoctlContext, Kstat, fanotify::FanotifyEventActor,
-        get_file_like,
+        Directory, File, FileLike, IoDst, IoctlContext, Kstat, OfdIoStatus,
+        fanotify::FanotifyEventActor, get_file_like,
     },
     readiness::block_on_poll_io,
     task::AsThread,
@@ -87,12 +87,7 @@ impl QueuedEvent {
     }
 
     fn encoded_name_len(&self) -> usize {
-        if self.name.is_empty() {
-            0
-        } else {
-            let name_len = self.name.len() + 1;
-            (name_len + size_of::<inotify_event>() - 1) & !(size_of::<inotify_event>() - 1)
-        }
+        thekernel_linux_fsnotify::inotify_name_wire_len(self.name.len(), size_of::<inotify_event>())
     }
 }
 
@@ -494,26 +489,29 @@ impl InotifyFile {
     }
 
     pub fn add_watch(&self, loc: &Location, mask: u32) -> AxResult<i32> {
-        if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
-            return Err(AxError::InvalidInput);
-        }
-
         let key = WatchKey::from_location(loc)?;
         let filesystem = loc.mountpoint().filesystem_identity_weak();
         let is_dir = loc.is_dir();
         let persistent_mask = mask & (IN_ALL_EVENTS | INOTIFY_PERSISTENT_FLAGS);
         let mut state = self.state.lock();
 
-        if let Some(watch) = state
+        let existing = state
             .watches
             .iter_mut()
             .flatten()
-            .find(|watch| watch.key == key)
-        {
-            if mask & IN_MASK_CREATE != 0 {
-                return Err(AxError::AlreadyExists);
-            }
-            if mask & IN_MASK_ADD != 0 {
+            .find(|watch| watch.key == key);
+        let plan = thekernel_linux_fsnotify::plan_inotify_watch(mask, existing.is_some()).map_err(
+            |error| match error {
+                thekernel_linux_fsnotify::InotifyWatchReject::ConflictingUpdateFlags => {
+                    AxError::InvalidInput
+                }
+                thekernel_linux_fsnotify::InotifyWatchReject::ExistingWatch => {
+                    AxError::AlreadyExists
+                }
+            },
+        )?;
+        if let Some(watch) = existing {
+            if plan == thekernel_linux_fsnotify::InotifyWatchPlan::Add {
                 watch.mask |= persistent_mask;
             } else {
                 watch.mask = persistent_mask;
@@ -624,7 +622,15 @@ impl InotifyFile {
         {
             return false;
         }
-        if event.mask == IN_Q_OVERFLOW || state.queue.len() >= MAX_QUEUED_EVENTS {
+        if matches!(
+            thekernel_linux_fsnotify::plan_queue_admission(
+                state.queue.len(),
+                MAX_QUEUED_EVENTS,
+                false,
+                event.mask == IN_Q_OVERFLOW,
+            ),
+            thekernel_linux_fsnotify::QueueAdmission::Overflow
+        ) {
             return Self::enqueue_overflow_locked(state);
         }
         if state.queue.try_reserve(1).is_err() {
@@ -768,6 +774,22 @@ impl FileLike for InotifyFile {
         })
     }
 
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        axtask::run_deferred_work();
+        // Never queue behind another consuming reader for RWF_NOWAIT.
+        let _reader = if status.rwf_nowait() {
+            self.read_gate.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.read_gate.lock()
+        };
+        block_on_poll_io(
+            self,
+            IoEvents::READABLE,
+            self.nonblocking() || status.rwf_nowait(),
+            || self.read_ready(dst),
+        )
+    }
+
     fn nonblocking(&self) -> bool {
         self.non_blocking.load(Ordering::Acquire)
     }
@@ -777,8 +799,10 @@ impl FileLike for InotifyFile {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[inotify]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[inotify]",
+        )))
     }
 
     fn ioctl(&self, _context: &IoctlContext, cmd: u32, _arg: usize) -> AxResult<usize> {
@@ -1070,11 +1094,13 @@ fn emit_to_matching_watches(
 }
 
 fn exact_dir_mask(mask: u32, is_dir: bool) -> u32 {
-    if is_dir && mask != IN_MOVE_SELF && mask != IN_DELETE_SELF {
-        mask | IN_ISDIR
-    } else {
-        mask
-    }
+    thekernel_linux_fsnotify::inotify_exact_mask(
+        mask,
+        is_dir,
+        IN_MOVE_SELF,
+        IN_DELETE_SELF,
+        IN_ISDIR,
+    )
 }
 
 pub(crate) fn next_rename_cookie() -> u32 {
@@ -1190,7 +1216,7 @@ fn notify_parent_prepared(
 pub(crate) fn notify_parent_with_name(
     parent: &Location,
     child: Option<&Location>,
-    child_name: &str,
+    child_name: &FsName,
     mut mask: u32,
     is_dir: bool,
     cookie: u32,
@@ -1212,47 +1238,7 @@ pub(crate) fn notify_parent_with_name(
 }
 
 fn inotify_to_fanotify(mask: u32) -> u64 {
-    let mut out = 0;
-    if mask & IN_ACCESS != 0 {
-        out |= crate::file::fanotify::FAN_ACCESS;
-    }
-    if mask & IN_MODIFY != 0 {
-        out |= crate::file::fanotify::FAN_MODIFY;
-    }
-    if mask & IN_ATTRIB != 0 {
-        out |= crate::file::fanotify::FAN_ATTRIB;
-    }
-    if mask & IN_CLOSE_WRITE != 0 {
-        out |= crate::file::fanotify::FAN_CLOSE_WRITE;
-    }
-    if mask & IN_CLOSE_NOWRITE != 0 {
-        out |= crate::file::fanotify::FAN_CLOSE_NOWRITE;
-    }
-    if mask & linux_raw_sys::general::IN_OPEN != 0 {
-        out |= crate::file::fanotify::FAN_OPEN;
-    }
-    if mask & linux_raw_sys::general::IN_MOVED_FROM != 0 {
-        out |= crate::file::fanotify::FAN_MOVED_FROM;
-    }
-    if mask & linux_raw_sys::general::IN_MOVED_TO != 0 {
-        out |= crate::file::fanotify::FAN_MOVED_TO;
-    }
-    if mask & linux_raw_sys::general::IN_CREATE != 0 {
-        out |= crate::file::fanotify::FAN_CREATE;
-    }
-    if mask & linux_raw_sys::general::IN_DELETE != 0 {
-        out |= crate::file::fanotify::FAN_DELETE;
-    }
-    if mask & IN_DELETE_SELF != 0 {
-        out |= crate::file::fanotify::FAN_DELETE_SELF;
-    }
-    if mask & IN_MOVE_SELF != 0 {
-        out |= crate::file::fanotify::FAN_MOVE_SELF;
-    }
-    if mask & IN_ISDIR != 0 {
-        out |= crate::file::fanotify::FAN_ONDIR;
-    }
-    out
+    thekernel_linux_fsnotify::inotify_to_fanotify(mask)
 }
 
 pub(crate) fn notify_dnotify_rename(old_parent: &Location, new_parent: &Location) -> AxResult<()> {

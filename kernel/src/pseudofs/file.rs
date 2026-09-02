@@ -2,8 +2,8 @@ use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{any::Any, task::Context};
 
 use axfs_ng_vfs::{
-    FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
-    NodeType, NodeUserData, VfsError, VfsResult,
+    FileNodeOps, FilesystemOps, FsPath, Metadata, MetadataUpdate, NodeFlags, NodeOps,
+    NodePermission, NodeType, NodeUserData, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
@@ -314,7 +314,7 @@ impl FileNodeOps for SimpleFile {
         Ok(())
     }
 
-    fn set_symlink(&self, target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, target: &FsPath) -> VfsResult<()> {
         self.ops.write_all(target.as_bytes())
     }
 }

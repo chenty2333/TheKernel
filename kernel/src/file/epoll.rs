@@ -1292,6 +1292,31 @@ impl Epoll {
     pub fn prepare_events(&self, maximum: usize) -> AxResult<EpollBatch> {
         self.inner.prepare_deliveries(maximum)
     }
+
+    /// Returns the open-file-description retained by the `offset`th interest
+    /// whose descriptor number is `fd`.
+    ///
+    /// This is the kernel-side lookup used by `KCMP_EPOLL_TFD`.  The returned
+    /// description is pinned independently of the interest-table lock, just as
+    /// Linux returns the raw target file after walking the eventpoll tree.
+    pub(crate) fn target_description(
+        &self,
+        fd: u32,
+        mut offset: u32,
+    ) -> AxResult<Arc<FileDescription>> {
+        self.inner.check_fault()?;
+        let state = self.inner.state.lock();
+        for record in state.by_slot.iter().flatten() {
+            if record.key.fd.get() != fd {
+                continue;
+            }
+            if offset == 0 {
+                return Ok(Arc::clone(&record.control.file));
+            }
+            offset -= 1;
+        }
+        Err(AxError::NotFound)
+    }
 }
 
 impl FileLike for Epoll {
@@ -1299,8 +1324,10 @@ impl FileLike for Epoll {
         Ok(super::anon_inode_stat())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[eventpoll]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[eventpoll]",
+        )))
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -1379,8 +1406,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("epoll-close-test"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"epoll-close-test")))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

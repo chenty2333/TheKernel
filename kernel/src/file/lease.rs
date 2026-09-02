@@ -13,6 +13,7 @@ use lazy_static::lazy_static;
 use linux_raw_sys::general::{
     CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
+use thekernel_linux_fd::{LeaseId, LeaseSnapshot, LeaseType as AbiLeaseType};
 use thekernel_linux_signal::{SignalInfo, Signo};
 
 use super::File;
@@ -189,6 +190,24 @@ fn lease_from_cmd(arg: i32) -> AxResult<LeaseType> {
         F_WRLCK => Ok(LeaseType::Write),
         _ => Err(AxError::InvalidInput),
     }
+}
+
+fn abi_lease_id(owner: LeaseOwner) -> AxResult<LeaseId> {
+    LeaseId::new(owner).ok_or(AxError::BadState)
+}
+
+fn abi_lease_type(kind: LeaseType) -> AbiLeaseType {
+    match kind {
+        LeaseType::Read => AbiLeaseType::Read,
+        LeaseType::Write => AbiLeaseType::Write,
+    }
+}
+
+fn abi_lease_snapshot(state: &LeaseState) -> AxResult<LeaseSnapshot> {
+    Ok(LeaseSnapshot {
+        lease: Some((abi_lease_id(state.owner)?, abi_lease_type(state.lease_type))),
+        breaking: state.breaking.is_some(),
+    })
 }
 
 fn current_pid() -> u32 {
@@ -528,11 +547,10 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
     if arg as u32 == F_UNLCK {
         let removed = {
             let mut table = LEASE_TABLE.lock();
-            if table
-                .leases
-                .get(&id)
-                .is_some_and(|state| state.owner == owner)
-            {
+            if let Some(state) = table.leases.get(&id).filter(|state| state.owner == owner) {
+                abi_lease_snapshot(state)?
+                    .plan_release(abi_lease_id(owner)?)
+                    .map_err(|_| AxError::BadState)?;
                 table.owners.remove(&owner);
                 table.leases.remove(&id)
             } else {
@@ -573,6 +591,22 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
         {
             return Err(AxError::WouldBlock);
         }
+        // A same-owner lease replacement is an explicit release/admit plan;
+        // the surrounding table lock performs its atomic realization.
+        let after_release = match abi_lease_snapshot(existing)?
+            .plan_release(abi_lease_id(owner)?)
+            .map_err(|_| AxError::BadState)?
+        {
+            thekernel_linux_fd::LeasePlan::Release { after, .. } => after,
+            _ => return Err(AxError::BadState),
+        };
+        after_release
+            .plan_admit(abi_lease_id(owner)?, abi_lease_type(lease_type))
+            .map_err(|_| AxError::ResourceBusy)?;
+    } else {
+        LeaseSnapshot::empty()
+            .plan_admit(abi_lease_id(owner)?, abi_lease_type(lease_type))
+            .map_err(|_| AxError::ResourceBusy)?;
     }
 
     if !table.leases.contains_key(&id) {

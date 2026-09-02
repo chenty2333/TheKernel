@@ -1,7 +1,7 @@
-use alloc::string::String;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::FsPathBuf;
 use linux_raw_sys::general::{
     AT_FDCWD, AT_SYMLINK_NOFOLLOW, IN_ACCESS, IN_ATTRIB, IN_CLOEXEC, IN_CLOSE_NOWRITE,
     IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_DONT_FOLLOW, IN_EXCL_UNLINK,
@@ -64,12 +64,11 @@ pub fn sys_inotify_add_watch(
     }
 
     let inotify = crate::file::inotify::InotifyFile::from_fd(fd)?;
-    let pathname = String::from_utf8(
+    let pathname = FsPathBuf::from_vec(
         memory
             .load_until_nul(pathname.cast::<u8>())
             .map_err(map_usercopy_error)?,
-    )
-    .map_err(|_| AxError::IllegalBytes)?;
+    );
     let resolve_flags = if mask & IN_DONT_FOLLOW != 0 {
         AT_SYMLINK_NOFOLLOW
     } else {

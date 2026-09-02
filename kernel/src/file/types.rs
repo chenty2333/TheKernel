@@ -1,8 +1,10 @@
-use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::ffi::c_int;
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, Filesystem, Timestamp, WritebackErrorState};
+use axfs_ng_vfs::{
+    DeviceId, Filesystem, FsPath, FsPathBuf, Location, Timestamp, WritebackErrorState,
+};
 use axio::prelude::*;
 use axpoll::Pollable;
 use axsync::Mutex;
@@ -12,10 +14,14 @@ use linux_raw_sys::general::{
     RLIMIT_NOFILE, S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
     STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
 };
+use thekernel_linux_io_uring::{IssuedRequest, RequestId, TerminalCause};
 
-use super::{FileHandle, add_file_like, current_fd_table, fd_table::FdTable, get_typed_file};
+use super::{
+    FileHandle, OfdIoStatus, add_file_like, current_fd_table, fd_table::FdTable, get_typed_file,
+};
 pub use crate::mm::SharedPages;
 use crate::{
+    async_operation::AsyncOperation,
     mm::{AddrSpace, UserMemoryCapability},
     task::{AX_FILE_LIMIT, AsThread, Cred, ProcessData, Session},
 };
@@ -43,6 +49,128 @@ pub struct Kstat {
     pub btime: Timestamp,
     pub mtime: Timestamp,
     pub ctime: Timestamp,
+}
+
+/// One provider-declared `IORING_OP_URING_CMD` command ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UringCmdManifest {
+    command: u32,
+    allowed_flags: u32,
+    iopoll: bool,
+    cancellable: bool,
+}
+
+impl UringCmdManifest {
+    pub const fn new(command: u32, allowed_flags: u32, iopoll: bool, cancellable: bool) -> Self {
+        Self {
+            command,
+            allowed_flags,
+            iopoll,
+            cancellable,
+        }
+    }
+
+    pub const fn command(self) -> u32 {
+        self.command
+    }
+    pub const fn accepts_flags(self, flags: u32) -> bool {
+        flags & !self.allowed_flags == 0
+    }
+    pub const fn iopoll(self) -> bool {
+        self.iopoll
+    }
+    pub const fn cancellable(self) -> bool {
+        self.cancellable
+    }
+}
+
+/// Typed, copied `IORING_OP_URING_CMD` input delivered to an opt-in provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UringCmd {
+    command: u32,
+    flags: u32,
+    payload: [u8; 16],
+}
+
+/// Single-use provider completion capability for an asynchronous URING_CMD.
+/// The provider owns this value after successful submission; dropping it
+/// without a completion fails the exact issued request instead of leaking a
+/// terminal credit.
+#[must_use]
+pub struct UringCmdCompletion {
+    ring: Arc<super::io_uring::IoUring>,
+    issued: Option<IssuedRequest>,
+    /// Retains the submission's exact OFD through provider completion.
+    _file: Option<super::io_uring::IoUringFileLease>,
+    iopoll: bool,
+}
+
+impl UringCmdCompletion {
+    pub(crate) fn new(
+        ring: Arc<super::io_uring::IoUring>,
+        issued: IssuedRequest,
+        file: Option<super::io_uring::IoUringFileLease>,
+        iopoll: bool,
+    ) -> Self {
+        Self {
+            ring,
+            issued: Some(issued),
+            _file: file,
+            iopoll,
+        }
+    }
+
+    pub fn complete(mut self, result: i32, flags: u32) -> AxResult<()> {
+        let issued = self.issued.take().ok_or(AxError::BadState)?;
+        self.ring
+            .complete_uring_cmd(issued, TerminalCause::Completed, result, flags, self.iopoll)
+    }
+
+    pub fn fail(mut self, error: AxError) -> AxResult<()> {
+        let issued = self.issued.take().ok_or(AxError::BadState)?;
+        self.ring.complete_uring_cmd(
+            issued,
+            TerminalCause::PreparationFailed,
+            -axerrno::LinuxError::from(error).code(),
+            0,
+            self.iopoll,
+        )
+    }
+}
+
+impl Drop for UringCmdCompletion {
+    fn drop(&mut self) {
+        let Some(issued) = self.issued.take() else {
+            return;
+        };
+        let _ = self.ring.complete_uring_cmd(
+            issued,
+            TerminalCause::PreparationFailed,
+            -axerrno::LinuxError::EIO.code(),
+            0,
+            self.iopoll,
+        );
+    }
+}
+
+impl UringCmd {
+    pub const fn new(command: u32, flags: u32, payload: [u8; 16]) -> Self {
+        Self {
+            command,
+            flags,
+            payload,
+        }
+    }
+
+    pub const fn command(self) -> u32 {
+        self.command
+    }
+    pub const fn flags(self) -> u32 {
+        self.flags
+    }
+    pub const fn payload(self) -> [u8; 16] {
+        self.payload
+    }
 }
 
 impl Default for Kstat {
@@ -147,8 +275,8 @@ impl From<Kstat> for statx {
     }
 }
 
-pub trait WriteBuf: Write + IoBufMut {}
-impl<T: Write + IoBufMut> WriteBuf for T {}
+pub trait WriteBuf: Write + IoBuf + IoBufMut {}
+impl<T: Write + IoBuf + IoBufMut> WriteBuf for T {}
 pub type IoDst<'a> = dyn WriteBuf + 'a;
 
 pub trait ReadBuf: Read + IoBuf {}
@@ -467,6 +595,13 @@ impl PreparedFileMmap {
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Runs at the task-context last-descriptor boundary, before the final
+    /// descriptor reference is retired.  Unlike [`Self::final_close`], this
+    /// hook may synchronously quiesce hardware owned by another CPU.  It is
+    /// deliberately advisory: callers which cannot provide task context skip
+    /// it and `final_close` remains the IRQ-safe fail-closed backstop.
+    fn pre_close(&self) {}
+
     /// Runs exactly once when the final owner of an open file description
     /// releases it, while this object is still alive.
     ///
@@ -488,12 +623,51 @@ pub trait FileLike: Pollable + DowncastSync {
         Err(AxError::InvalidInput)
     }
 
+    /// Executes one read using a frozen, operation-local OFD status.
+    ///
+    /// `RWF_NOWAIT` is not an O_NONBLOCK mutation. Providers which can honor
+    /// it override this hook with one genuinely nonblocking attempt; the
+    /// default must not poll and then call legacy `read`, because readiness
+    /// can disappear before that call and re-enter a blocking path.
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        if status.rwf_nowait() {
+            return Err(AxError::OperationNotSupported);
+        }
+        self.read(dst)
+    }
+
+    /// Write-side counterpart of [`Self::read_with_operation_status`].
+    fn write_with_operation_status(&self, status: OfdIoStatus, src: &mut IoSrc) -> AxResult<usize> {
+        if status.rwf_nowait() {
+            return Err(AxError::OperationNotSupported);
+        }
+        self.write(src)
+    }
+
     fn stat(&self) -> AxResult<Kstat>;
+
+    /// Returns the concrete VFS object retained by this open file
+    /// description.  This is deliberately separate from
+    /// [`Self::cachestat_location`]: objects such as named FIFOs have stable
+    /// mount/idmap provenance but no page-cache mapping for `cachestat(2)`.
+    fn vfs_location(&self) -> Option<&Location> {
+        None
+    }
 
     /// Linux cachestat(2) observes an object's page-cache mapping.  Objects
     /// without one behave like an empty mapping.
     fn cachestat(&self, _first_page: u64, _last_page: u64) -> AxResult<axfs::CachedFileCacheStat> {
         Ok(axfs::CachedFileCacheStat::default())
+    }
+
+    /// Returns the VFS inode checked by `cachestat(2)`.
+    fn cachestat_location(&self) -> Option<&Location> {
+        None
+    }
+
+    /// Classifies a cachestat mapping without filesystem-name matching.
+    fn cachestat_is_hugetlbfs(&self) -> bool {
+        false
     }
 
     /// Updates descriptor-owned timestamps for objects which do not have a VFS
@@ -508,16 +682,46 @@ pub trait FileLike: Pollable + DowncastSync {
         Err(AxError::OperationNotSupported)
     }
 
-    /// Produces a stable display path for procfs and other kernel adapters.
+    /// Produces a stable byte pathname for procfs and other kernel adapters.
     ///
     /// Dynamic paths must reserve their storage fallibly and report
     /// `NoMemory`; user-triggered path rendering must never rely on
     /// `format!`, `to_string`, or another abort-on-OOM allocation.
-    fn path(&self) -> AxResult<Cow<'_, str>>;
+    fn path(&self) -> AxResult<Cow<'_, FsPath>>;
 
     fn ioctl(&self, _context: &IoctlContext, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
     }
+
+    /// Explicit typed contract for `IORING_OP_URING_CMD`.  The empty default
+    /// prevents generic file descriptors from accidentally treating a command
+    /// SQE as an ioctl.
+    fn uring_cmd_manifest(&self) -> &'static [UringCmdManifest] {
+        &[]
+    }
+
+    /// Queues a manifest-validated command.  Successful submission transfers
+    /// the sole issued completion token to the provider; it must later call
+    /// `complete` or `fail` exactly once.
+    fn submit_uring_cmd(
+        &self,
+        _command: UringCmd,
+        completion: UringCmdCompletion,
+    ) -> Result<(), (AxError, UringCmdCompletion)> {
+        Err((AxError::OperationNotSupported, completion))
+    }
+
+    /// Non-blocking IOPOLL harvest hook. Providers queue completion tokens in
+    /// `submit_uring_cmd`; this hook retires any completed commands without
+    /// requiring an interrupt edge.
+    fn harvest_uring_cmd(&self) -> AxResult<()> {
+        Ok(())
+    }
+
+    /// Requests provider-side cancellation after io_uring has won the
+    /// terminal credit. Providers must stop queue ownership and drop their
+    /// completion token; a late `complete` then cannot publish a second CQE.
+    fn cancel_uring_cmd(&self, _request: RequestId) {}
 
     /// Synchronizes the object's durable state.  This is a capability, rather
     /// than a classification by object kind: regular files, directories, and
@@ -525,6 +729,22 @@ pub trait FileLike: Pollable + DowncastSync {
     /// retain Linux's `EINVAL` result.
     fn sync(&self, _data_only: bool) -> AxResult<()> {
         Err(AxError::InvalidInput)
+    }
+
+    /// Cooperative cancellation boundary for asynchronous sync providers.
+    /// Backends that own a deeper request queue may override this to abort an
+    /// in-flight flush; the default still makes cancellation visible before
+    /// and after the provider boundary without invalidating its resources.
+    fn sync_cancellable(&self, data_only: bool, operation: &AsyncOperation) -> AxResult<()> {
+        if operation.cancellation_requested() {
+            return Err(axerrno::LinuxError::ECANCELED.into());
+        }
+        self.sync(data_only)?;
+        if operation.cancellation_requested() {
+            Err(axerrno::LinuxError::ECANCELED.into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Non-VFS objects receive a private sequence.  Sync-capable VFS objects
@@ -574,29 +794,29 @@ pub trait FileLike: Pollable + DowncastSync {
 }
 impl_downcast!(sync FileLike);
 
-pub(crate) fn try_owned_path(value: &str) -> AxResult<String> {
-    let mut owned = String::new();
+pub(crate) fn try_owned_path(value: &FsPath) -> AxResult<FsPathBuf> {
+    let mut owned = Vec::new();
     owned
-        .try_reserve_exact(value.len())
+        .try_reserve_exact(value.as_bytes().len())
         .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(value);
-    Ok(owned)
+    owned.extend_from_slice(value.as_bytes());
+    Ok(FsPathBuf::from_vec(owned))
 }
 
-pub(crate) fn try_path_into_owned(path: Cow<'_, str>) -> AxResult<String> {
+pub(crate) fn try_path_into_owned(path: Cow<'_, FsPath>) -> AxResult<FsPathBuf> {
     match path {
         Cow::Owned(path) => Ok(path),
         Cow::Borrowed(path) => try_owned_path(path),
     }
 }
 
-pub(crate) fn try_path_into_bytes(path: Cow<'_, str>) -> AxResult<Vec<u8>> {
+pub(crate) fn try_path_into_bytes(path: Cow<'_, FsPath>) -> AxResult<Vec<u8>> {
     match path {
-        Cow::Owned(path) => Ok(path.into_bytes()),
+        Cow::Owned(path) => Ok(path.into_vec()),
         Cow::Borrowed(path) => {
             let mut bytes = Vec::new();
             bytes
-                .try_reserve_exact(path.len())
+                .try_reserve_exact(path.as_bytes().len())
                 .map_err(|_| AxError::NoMemory)?;
             bytes.extend_from_slice(path.as_bytes());
             Ok(bytes)
@@ -606,12 +826,12 @@ pub(crate) fn try_path_into_bytes(path: Cow<'_, str>) -> AxResult<Vec<u8>> {
 
 /// Builds Linux's anonymous inode display form without an infallible format
 /// allocation. Twenty decimal digits cover every `u64` inode value.
-pub(crate) fn try_pseudo_inode_path(kind: &str, inode: u64) -> AxResult<Cow<'static, str>> {
-    let mut path = String::new();
+pub(crate) fn try_pseudo_inode_path(kind: &str, inode: u64) -> AxResult<Cow<'static, FsPath>> {
+    let mut path = Vec::new();
     path.try_reserve_exact(kind.len().saturating_add(23))
         .map_err(|_| AxError::NoMemory)?;
-    path.push_str(kind);
-    path.push_str(":[");
+    path.extend_from_slice(kind.as_bytes());
+    path.extend_from_slice(b":[");
 
     let mut digits = [0u8; 20];
     let mut start = digits.len();
@@ -625,10 +845,10 @@ pub(crate) fn try_pseudo_inode_path(kind: &str, inode: u64) -> AxResult<Cow<'sta
         }
     }
     for digit in &digits[start..] {
-        path.push(*digit as char);
+        path.push(*digit);
     }
-    path.push(']');
-    Ok(Cow::Owned(path))
+    path.push(b']');
+    Ok(Cow::Owned(FsPathBuf::from_vec(path)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

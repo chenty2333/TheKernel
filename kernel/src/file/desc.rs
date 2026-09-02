@@ -19,9 +19,9 @@ use axsync::Mutex as StatusTransitionMutex;
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    O_APPEND, O_DIRECTORY, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI,
-    POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND,
-    POLLWRNORM, SI_SIGIO,
+    O_APPEND, O_DIRECTORY, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT,
+    POLL_PRI, POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM,
+    POLLWRBAND, POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
 use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
@@ -511,12 +511,23 @@ impl FileDescriptionId {
 struct DescriptorLifetimeState {
     references: usize,
     pending_publications: usize,
+    /// SCM_RIGHTS queue custody is descriptor-publication authority: it keeps
+    /// an OFD eligible for later fd installation, unlike epoll/VMA/worker Arc
+    /// retention which merely keeps the object alive.
+    scm_custodies: usize,
     ever_published: bool,
     terminal: bool,
     close_source: Option<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>>,
 }
 
 impl DescriptorLifetimeState {
+    fn is_quiescent(&self) -> bool {
+        self.ever_published
+            && self.references == 0
+            && self.pending_publications == 0
+            && self.scm_custodies == 0
+    }
+
     fn admit_publication(&mut self) -> AxResult<()> {
         self.references
             .checked_add(self.pending_publications)
@@ -543,15 +554,42 @@ impl DescriptorLifetimeState {
     fn terminal_source_if_quiescent(
         &mut self,
     ) -> Option<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>> {
-        if self.ever_published
-            && self.references == 0
-            && self.pending_publications == 0
-            && !self.terminal
-        {
+        if self.is_quiescent() && !self.terminal {
             self.terminal = true;
             self.close_source.clone()
         } else {
             None
+        }
+    }
+}
+
+/// One queued SCM_RIGHTS authority for an OFD. Unlike an arbitrary retained
+/// `Arc<FileDescription>` (epoll, VMA, async work), this promises that a new
+/// descriptor may be installed later and therefore postpones `pre_close`.
+pub(crate) struct ScmDescriptorCustody {
+    description: Arc<FileDescription>,
+}
+
+impl ScmDescriptorCustody {
+    pub(crate) fn description(&self) -> &Arc<FileDescription> {
+        &self.description
+    }
+}
+
+impl Drop for ScmDescriptorCustody {
+    fn drop(&mut self) {
+        let (close_source, should_pre_close) = {
+            let mut lifetime = self.description.descriptor_lifetime.lock();
+            debug_assert!(lifetime.scm_custodies != 0);
+            lifetime.scm_custodies = lifetime.scm_custodies.saturating_sub(1);
+            let should_pre_close = lifetime.is_quiescent();
+            (lifetime.terminal_source_if_quiescent(), should_pre_close)
+        };
+        if should_pre_close && axtask::can_block_current() {
+            self.description.inner.pre_close();
+        }
+        if let Some(source) = close_source {
+            source.close();
         }
     }
 }
@@ -651,6 +689,10 @@ pub(crate) struct IoOperationContext {
     vfs_open_credential: Option<Arc<Cred>>,
     open_security_credential: Option<Arc<Cred>>,
     fanotify_actor: FanotifyEventActor,
+    /// Per-request RWF bits which are not representable as an OFD status
+    /// flag (currently DONTCACHE and NOSIGNAL).  This is captured with an
+    /// asynchronous operation and never read from a worker's current task.
+    rwf_flags: u32,
 }
 
 impl IoOperationContext {
@@ -672,11 +714,31 @@ impl IoOperationContext {
             vfs_open_credential,
             open_security_credential,
             fanotify_actor,
+            rwf_flags: 0,
         }
     }
 
     pub(crate) const fn status(&self) -> OfdIoStatus {
         self.status
+    }
+
+    /// Derives an operation-local status snapshot.  Per-request RWF flags
+    /// must affect only the captured asynchronous operation, never the shared
+    /// open-file-description status observed by other syscalls.
+    pub(crate) fn with_status(&self, status: OfdIoStatus) -> Self {
+        let mut context = self.clone();
+        context.status = status;
+        context
+    }
+
+    pub(crate) fn with_rwf_flags(&self, rwf_flags: u32) -> Self {
+        let mut context = self.clone();
+        context.rwf_flags = rwf_flags;
+        context
+    }
+
+    pub(crate) const fn rwf_flags(&self) -> u32 {
+        self.rwf_flags
     }
 
     pub(crate) const fn security(&self) -> &VfsSecurityContext {
@@ -722,7 +784,6 @@ impl OpenCredentials {
         let Some(thread) = task.try_as_thread() else {
             return Self::root();
         };
-        let proc_data = &thread.proc_data;
         let cred = thread.current_cred();
         let ids = cred.ids();
         Self {
@@ -730,7 +791,11 @@ impl OpenCredentials {
             euid: ids.euid,
             suid: ids.suid,
             fsuid: ids.fsuid,
-            cgroup_ns_id: proc_data.cgroup_ns_id(),
+            // Cgroup namespaces are task-local.  ProcessData retains only a
+            // creation snapshot, so consulting it after setns/unshare would
+            // authorize a cgroup control write against the namespace this
+            // thread has already left.
+            cgroup_ns_id: thread.cgroup_ns().id(),
         }
     }
 
@@ -803,6 +868,14 @@ impl AsyncIoOwner {
         if id == 0 {
             return Ok(Self::None(AsyncIoOwnerType::Pgrp));
         }
+        // The pgid arrives in the caller's pid namespace; the group registry
+        // is keyed by kernel-global leader identity (the same translation
+        // setpgid(2) performs).
+        let id = current()
+            .as_thread()
+            .pid_ns()
+            .resolve_visible_pid(id)
+            .ok_or(AxError::NoSuchProcess)?;
         let group = get_process_group(id)?;
         Ok(Self::Pgrp {
             id,
@@ -985,11 +1058,7 @@ fn send_sigio_to_process(process: &ProcessData, info: SignalInfo) {
     }
 }
 
-fn sigio_in_scope(
-    state: &AsyncIoState,
-    target_tgid: Pid,
-    target: &LandlockDomain,
-) -> bool {
+fn sigio_in_scope(state: &AsyncIoState, target_tgid: Pid, target: &LandlockDomain) -> bool {
     state.landlock.as_ref().is_none_or(|actor| {
         state
             .landlock_tgid
@@ -1101,11 +1170,15 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OfdIoStatus {
     raw: u32,
+    rwf_nowait: bool,
 }
 
 impl OfdIoStatus {
     pub(crate) const fn new(raw: u32) -> Self {
-        Self { raw }
+        Self {
+            raw,
+            rwf_nowait: false,
+        }
     }
 
     pub(crate) const fn raw(self) -> u32 {
@@ -1120,6 +1193,15 @@ impl OfdIoStatus {
         self.raw & O_NONBLOCK != 0
     }
 
+    pub(crate) const fn rwf_nowait(self) -> bool {
+        self.rwf_nowait
+    }
+
+    pub(crate) const fn with_rwf_nowait(mut self, rwf_nowait: bool) -> Self {
+        self.rwf_nowait = rwf_nowait;
+        self
+    }
+
     pub(crate) const fn path_only(self) -> bool {
         self.raw & O_PATH != 0
     }
@@ -1127,6 +1209,16 @@ impl OfdIoStatus {
 
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
+    /// Mount identity and namespace topology through which this OFD was
+    /// opened.  Relative pathwalk may cross a nested mount after setns(), so
+    /// pinning only the starting mount's idmap is insufficient.
+    vfs_mount_id: Option<u64>,
+    vfs_mount_topology: Option<Arc<crate::mounts::MountTopology>>,
+    /// Immutable mount-idmap selected by the mount instance through which
+    /// this OFD was opened.  An fd can outlive `setns(CLONE_NEWNS)`, so
+    /// descriptor-based policy must never rediscover this through the
+    /// caller's current mount namespace.
+    vfs_mount_idmap: Option<Arc<crate::mounts::MountIdmap>>,
     /// Immutable `O_DIRECTORY` admission fact.  It is not an F_GETFL status
     /// bit, but may_decode_fh's relaxed path needs the original open intent.
     directory_capability: bool,
@@ -1141,6 +1233,10 @@ pub struct FileDescription {
     /// flock lock domains; it can never diverge because identities do not
     /// mutate after construction.
     id: FileDescriptionId,
+    created_by_open: bool,
+    /// Per-open-file-description write-lifetime hint (`F_{GET,SET}_RW_HINT`).
+    /// It is explicitly shared by dup/fork just like Linux's `struct file`.
+    rw_hint: AtomicU64,
     ofd: Mutex<OpenFileDescriptionState<AsyncIoState, ExternalOffset>>,
     /// Source is shared by independent opens of one VFS entry; the cursor is
     /// per OFD, and is consequently shared by dup.
@@ -1201,6 +1297,7 @@ impl FileDescription {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -1218,6 +1315,7 @@ impl FileDescription {
             resource,
             None,
             None,
+            false,
         )
     }
 
@@ -1229,8 +1327,10 @@ impl FileDescription {
         resource: Option<DescriptionResource>,
         open_lease_admission: lease::OpenLeaseAdmission,
         vfs_open_credential: Arc<Cred>,
+        vfs_mount_topology: Option<Arc<crate::mounts::MountTopology>>,
+        created_by_open: bool,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(
+        Self::new_inner_with_mount_topology(
             inner,
             status_flags,
             directory_capability,
@@ -1238,6 +1338,8 @@ impl FileDescription {
             resource,
             Some(open_lease_admission),
             Some(vfs_open_credential),
+            vfs_mount_topology,
+            created_by_open,
         )
     }
 
@@ -1249,6 +1351,31 @@ impl FileDescription {
         resource: Option<DescriptionResource>,
         open_lease_admission: Option<lease::OpenLeaseAdmission>,
         vfs_open_credential: Option<Arc<Cred>>,
+        created_by_open: bool,
+    ) -> AxResult<Arc<Self>> {
+        Self::new_inner_with_mount_topology(
+            inner,
+            status_flags,
+            directory_capability,
+            write_open_key,
+            resource,
+            open_lease_admission,
+            vfs_open_credential,
+            None,
+            created_by_open,
+        )
+    }
+
+    fn new_inner_with_mount_topology(
+        inner: Arc<dyn FileLike>,
+        status_flags: u32,
+        directory_capability: bool,
+        write_open_key: Option<ExecutableKey>,
+        resource: Option<DescriptionResource>,
+        open_lease_admission: Option<lease::OpenLeaseAdmission>,
+        vfs_open_credential: Option<Arc<Cred>>,
+        opening_mount_topology: Option<Arc<crate::mounts::MountTopology>>,
+        created_by_open: bool,
     ) -> AxResult<Arc<Self>> {
         // Before a complete FileDescription exists, this guard owns rollback.
         // Once transferred into the value, ordinary FileDescription::drop owns
@@ -1298,13 +1425,66 @@ impl FileDescription {
         // belong to already-open descriptions; dup retains that description's
         // existing cursor instead of constructing a new one.
         let observed = sync_error_source.sample();
+        let (vfs_mount_id, vfs_mount_topology, vfs_mount_idmap) =
+            if let Some(location) = inner.vfs_location() {
+                let mount_id = location.mountpoint().mount_id();
+                let has_opening_topology = opening_mount_topology.is_some();
+                let mut selected = None;
+                if let Some(topology) = opening_mount_topology {
+                    match topology.idmap_for_mount(mount_id) {
+                        Ok(idmap) => selected = Some((topology, idmap)),
+                        // Retain an explicit opening topology even when this
+                        // location has no ledger record in it.  Dropping it here
+                        // would let a later relative open rebind to `current()`.
+                        Err(AxError::NotFound) => selected = Some((topology, None)),
+                        Err(error) => return Err(error),
+                    }
+                }
+                // An explicit opening topology is execution authority.  In
+                // particular, io_uring workers must never replace it with their
+                // own current namespace after a successful submitter-side open.
+                if !has_opening_topology && selected.is_none() {
+                    if let Some(task) = current_may_uninit()
+                        && let Some(thread) = task.try_as_thread()
+                    {
+                        let topology = thread.mount_ns().topology();
+                        match topology.idmap_for_mount(mount_id) {
+                            Ok(idmap) => selected = Some((topology, idmap)),
+                            Err(AxError::NotFound) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                if !has_opening_topology && selected.is_none() {
+                    for namespace in crate::task::MountNamespace::live()? {
+                        let topology = namespace.topology();
+                        match topology.idmap_for_mount(mount_id) {
+                            Ok(idmap) => {
+                                selected = Some((topology, idmap));
+                                break;
+                            }
+                            Err(AxError::NotFound) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                let (topology, idmap) = selected.unzip();
+                (Some(mount_id), topology, idmap.flatten())
+            } else {
+                (None, None, None)
+            };
         Arc::try_new(Self {
             inner,
+            vfs_mount_id,
+            vfs_mount_topology,
+            vfs_mount_idmap,
             directory_capability,
             open_credentials: OpenCredentials::current(),
             vfs_open_credential,
             open_security_credential,
             id,
+            created_by_open,
+            rw_hint: AtomicU64::new(0),
             ofd: Mutex::new(OpenFileDescriptionState::new_external(
                 id.linux_id(),
                 status_flags,
@@ -1331,6 +1511,18 @@ impl FileDescription {
         self.id
     }
 
+    pub(crate) const fn created_by_open(&self) -> bool {
+        self.created_by_open
+    }
+
+    pub(crate) fn rw_hint(&self) -> u64 {
+        self.rw_hint.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_rw_hint(&self, hint: u64) {
+        self.rw_hint.store(hint, Ordering::Release);
+    }
+
     pub(crate) fn open_credentials(&self) -> OpenCredentials {
         self.open_credentials
     }
@@ -1341,6 +1533,18 @@ impl FileDescription {
 
     pub(crate) fn vfs_open_credential(&self) -> Option<Arc<Cred>> {
         self.vfs_open_credential.clone()
+    }
+
+    pub(crate) fn vfs_mount_idmap(&self) -> Option<Arc<crate::mounts::MountIdmap>> {
+        self.vfs_mount_idmap.clone()
+    }
+
+    pub(crate) const fn vfs_mount_id(&self) -> Option<u64> {
+        self.vfs_mount_id
+    }
+
+    pub(crate) fn vfs_mount_topology(&self) -> Option<Arc<crate::mounts::MountTopology>> {
+        self.vfs_mount_topology.clone()
     }
 
     /// Captures all immutable state needed by a positioned file operation.
@@ -1438,12 +1642,22 @@ impl FileDescription {
             return Err(AxError::InvalidInput);
         }
 
-        if let Err(error) = self.inner.sync(data_only) {
-            // A direct fsync/device-flush failure is not a page-writeback
-            // errseq event.  Only asynchronous writeback completion invokes
-            // `publish_sync_error`; preserve this errno for this caller.
-            return Err(error);
+        self.inner.sync(data_only)?;
+        self.take_unseen_sync_error().map_or(Ok(()), Err)
+    }
+
+    /// Retained-description variant used by cancellable async submission.
+    /// The FileLike provider receives the shared operation token so a device
+    /// or remote filesystem can wake/abort its own flush waiter.
+    pub(crate) fn sync_cancellable(
+        &self,
+        data_only: bool,
+        operation: &crate::async_operation::AsyncOperation,
+    ) -> AxResult<()> {
+        if self.io_status_snapshot().path_only() {
+            return Err(AxError::InvalidInput);
         }
+        self.inner.sync_cancellable(data_only, operation)?;
         self.take_unseen_sync_error().map_or(Ok(()), Err)
     }
 
@@ -1455,12 +1669,11 @@ impl FileDescription {
         let Some(filesystem) = self.inner.syncfs_filesystem() else {
             return Err(AxError::InvalidInput);
         };
-        let result = filesystem.flush().map_err(Into::into);
-        let async_error = self.syncfs_error.as_ref().and_then(|(source, cursor)| {
-            source
-                .check_and_advance(&mut cursor.lock().observed)
-                .map(Into::into)
-        });
+        let result = filesystem.flush();
+        let async_error = self
+            .syncfs_error
+            .as_ref()
+            .and_then(|(source, cursor)| source.check_and_advance(&mut cursor.lock().observed));
         result.and_then(|()| async_error.map_or(Ok(()), Err))
     }
 
@@ -1528,12 +1741,8 @@ impl FileDescription {
         let credentials = AsyncIoCredentials::current();
         let (landlock, landlock_tgid) = current_may_uninit()
             .and_then(|task| {
-                task.try_as_thread().map(|thread| {
-                    (
-                        thread.landlock_domain(),
-                        thread.proc_data.proc.pid(),
-                    )
-                })
+                task.try_as_thread()
+                    .map(|thread| (thread.landlock_domain(), thread.proc_data.proc.pid()))
             })
             .map(|(domain, tgid)| (Some(domain), Some(tgid)))
             .unwrap_or((None, None));
@@ -1564,26 +1773,17 @@ impl FileDescription {
     pub(crate) fn begin_descriptor_publication(
         self: &Arc<Self>,
     ) -> AxResult<DescriptorPublication> {
-        let retired_source = {
+        {
             let mut lifetime = self.descriptor_lifetime.lock();
-            let retired_source = if lifetime.terminal {
-                if lifetime.references != 0 || lifetime.pending_publications != 0 {
-                    return Err(AxError::BadState);
-                }
-                // SCM_RIGHTS and other explicitly retained OFD owners may
-                // publish a descriptor after the preceding descriptor epoch
-                // reached zero. Old epoll watches stay terminal; the new epoch
-                // receives a fresh close source and cannot revive stale
-                // generation tokens.
-                lifetime.terminal = false;
-                lifetime.close_source.take()
-            } else {
-                None
-            };
+            // A bare Arc (epoll/VMA/worker retention) is not descriptor
+            // publication authority. Queued SCM_RIGHTS obtains custody before
+            // the source table can lose its final descriptor, so it keeps this
+            // state non-terminal and reaches this path normally.
+            if lifetime.terminal {
+                return Err(AxError::BadState);
+            }
             lifetime.admit_publication()?;
-            retired_source
-        };
-        drop(retired_source);
+        }
         Ok(DescriptorPublication {
             description: Arc::clone(self),
             active: true,
@@ -1591,7 +1791,7 @@ impl FileDescription {
     }
 
     pub(crate) fn descriptor_closed(&self) {
-        let close_source = {
+        let (close_source, last_descriptor) = {
             let mut lifetime = self.descriptor_lifetime.lock();
             let Some(references) = lifetime.references.checked_sub(1) else {
                 error!("descriptor close observed an unaccounted OFD reference");
@@ -1599,10 +1799,39 @@ impl FileDescription {
                 return;
             };
             lifetime.references = references;
-            lifetime.terminal_source_if_quiescent()
+            let last_descriptor = lifetime.is_quiescent();
+            (lifetime.terminal_source_if_quiescent(), last_descriptor)
         };
+        // The descriptor is still retained by the caller at this point.  A
+        // perf event can therefore synchronously settle remote PMU custody
+        // before its last FileLike reference becomes eligible for final_drop.
+        // `final_close` remains the mandatory IRQ-safe fallback for paths
+        // (such as table destruction) which cannot wait here.
+        if last_descriptor && axtask::can_block_current() {
+            self.inner.pre_close();
+        }
         if let Some(source) = close_source {
             source.close();
+        }
+    }
+
+    /// Whether an fd table still roots this exact OFD. SCM_RIGHTS cycle
+    /// collection uses this explicit count rather than mistaking a transient
+    /// close-path Arc for a userspace-visible descriptor root.
+    pub(crate) fn has_live_descriptor_references(&self) -> bool {
+        self.descriptor_lifetime.lock().references != 0
+    }
+
+    /// Captures republishable SCM_RIGHTS custody while the caller still holds
+    /// an fd-table reference. The returned guard owns the exact OFD and keeps
+    /// last-descriptor close from running `pre_close` until the queued right
+    /// is delivered, discarded, or swept.
+    pub(crate) fn acquire_scm_custody(self: &Arc<Self>) -> ScmDescriptorCustody {
+        let mut lifetime = self.descriptor_lifetime.lock();
+        debug_assert!(lifetime.references != 0 || lifetime.scm_custodies != 0);
+        lifetime.scm_custodies = lifetime.scm_custodies.saturating_add(1);
+        ScmDescriptorCustody {
+            description: Arc::clone(self),
         }
     }
 
@@ -1721,6 +1950,12 @@ impl FileLike for FileDescription {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
+        if let Some(location) = self.inner.vfs_location() {
+            return super::fs::location_to_kstat_with_idmap(
+                location,
+                self.vfs_mount_idmap.as_deref(),
+            );
+        }
         self.inner.stat()
     }
 
@@ -1737,7 +1972,7 @@ impl FileLike for FileDescription {
         self.inner.update_timestamps(atime, mtime, ctime)
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         self.inner.path()
     }
 
@@ -1828,6 +2063,13 @@ impl<T, F: FnMut(T)> Drop for RestoreOnDrop<T, F> {
 }
 
 impl<T: ?Sized> FileHandle<T> {
+    /// Retains the typed object independently of this descriptor handle.
+    /// Subsystems that store an object reference (rather than an FD number)
+    /// use this to make descriptor replacement/close race-free.
+    pub(crate) fn clone_object(&self) -> Arc<T> {
+        self.file.clone()
+    }
+
     /// Returns the stable key shared by handles for the same Linux open file
     /// description, including handles reached through `dup` or table cloning.
     pub(crate) fn open_file_description_key(&self) -> u64 {
@@ -1840,6 +2082,23 @@ impl<T: ?Sized> FileHandle<T> {
 
     pub(crate) fn directory_capability(&self) -> bool {
         self.description.directory_capability()
+    }
+
+    /// Returns the mount idmap pinned when this exact OFD was created.
+    pub(crate) fn vfs_mount_idmap(&self) -> Option<Arc<crate::mounts::MountIdmap>> {
+        self.description.vfs_mount_idmap()
+    }
+
+    pub(crate) fn vfs_mount_id(&self) -> Option<u64> {
+        self.description.vfs_mount_id()
+    }
+
+    pub(crate) fn vfs_mount_topology(&self) -> Option<Arc<crate::mounts::MountTopology>> {
+        self.description.vfs_mount_topology()
+    }
+
+    pub(crate) fn stat_with_open_mount(&self) -> AxResult<Kstat> {
+        self.description.stat()
     }
 
     pub(crate) fn capture_io_operation_context(
@@ -1963,6 +2222,17 @@ impl FileHandle<dyn FileLike> {
 }
 
 impl<T: FileLike + ?Sized> FileHandle<T> {
+    /// Cancellable synchronization through the retained open description.
+    /// This preserves O_PATH and writeback-errseq behavior while passing the
+    /// shared async token to the provider.
+    pub(crate) fn sync_cancellable(
+        &self,
+        data_only: bool,
+        operation: &crate::async_operation::AsyncOperation,
+    ) -> AxResult<()> {
+        self.description.sync_cancellable(data_only, operation)
+    }
+
     /// Runs mmap preparation against this exact OFD and inner object. This is
     /// intentionally an inherent method so deref dispatch cannot bypass O_PATH
     /// admission on the retained description.
@@ -2076,8 +2346,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("sync-probe"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"sync-probe")))
         }
 
         fn sync(&self, _data_only: bool) -> AxResult<()> {
@@ -2135,8 +2405,10 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("final-close-probe"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"final-close-probe",
+            )))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -2505,8 +2777,10 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("rejecting-nonblocking"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"rejecting-nonblocking",
+            )))
         }
 
         fn nonblocking(&self) -> bool {
@@ -2585,9 +2859,17 @@ mod tests {
         )));
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
-        let description =
-            FileDescription::new_inner(file, 0, false, None, None, None, Some(credential.clone()))
-                .unwrap();
+        let description = FileDescription::new_inner(
+            file,
+            0,
+            false,
+            None,
+            None,
+            None,
+            Some(credential.clone()),
+            false,
+        )
+        .unwrap();
 
         let retained = description.vfs_open_credential().unwrap();
         assert!(Arc::ptr_eq(&retained, &credential));
@@ -2615,9 +2897,17 @@ mod tests {
         )));
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
-        let description =
-            FileDescription::new_inner(file, 0, false, None, None, None, Some(credential.clone()))
-                .unwrap();
+        let description = FileDescription::new_inner(
+            file,
+            0,
+            false,
+            None,
+            None,
+            None,
+            Some(credential.clone()),
+            false,
+        )
+        .unwrap();
         let context = description.capture_io_operation_context(
             VfsSecurityContext::new(credential.clone()),
             FanotifyEventActor::default(),
@@ -2672,6 +2962,7 @@ mod tests {
             None,
             None,
             Some(credential.clone()),
+            false,
         )
         .unwrap();
         let second = FileDescription::new_inner(
@@ -2682,6 +2973,7 @@ mod tests {
             None,
             None,
             Some(credential.clone()),
+            false,
         )
         .unwrap();
         let context = first.capture_io_operation_context(

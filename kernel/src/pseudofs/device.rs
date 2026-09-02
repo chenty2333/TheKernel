@@ -3,15 +3,18 @@ use core::{any::Any, task::Context};
 
 use axfs::CachedFile;
 use axfs_ng_vfs::{
-    DeviceId, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
-    NodePermission, NodeType, VfsError, VfsResult,
+    DeviceId, FileNodeOps, FilesystemOps, FsPath, Metadata, MetadataUpdate, NodeFlags, NodeOps,
+    NodePermission, NodeType, VfsError, VfsResult, XattrProvider, XattrSetMode,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 use memory_addr::PhysAddrRange;
 
 use super::{SimpleFs, SimpleFsNode};
-use crate::file::{DescriptionResource, FileLike, IoctlContext};
+use crate::{
+    file::{DescriptionResource, FileLike, IoctlContext},
+    mm::SharedPages,
+};
 
 /// A device-specific open file description payload.
 ///
@@ -43,6 +46,9 @@ pub enum DeviceMmap {
     Anonymous,
     /// Maps to a physical address range.
     Physical(PhysAddrRange),
+    /// Maps fixed pages owned by a DRM/GEM object.  Unlike `Physical`, this
+    /// preserves scatter-gather backing rather than pretending it is linear.
+    SharedPages(Arc<SharedPages>),
     /// The device is read-only and will be mapped as CoW.
     ReadOnly,
     /// Maps to a cached file.
@@ -206,6 +212,25 @@ impl NodeOps for Device {
     fn persistent_user_data(&self) -> Option<&axfs_ng_vfs::NodeUserData> {
         Some(&self.node.user_data)
     }
+
+    fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+        Some(self)
+    }
+}
+
+impl XattrProvider for Device {
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<alloc::vec::Vec<u8>> {
+        self.node.get_xattr(name)
+    }
+    fn list_xattrs(&self) -> VfsResult<alloc::vec::Vec<u8>> {
+        self.node.list_xattrs()
+    }
+    fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+        self.node.set_xattr(name, value, mode)
+    }
+    fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
+        self.node.remove_xattr(name)
+    }
 }
 
 impl FileNodeOps for Device {
@@ -230,7 +255,7 @@ impl FileNodeOps for Device {
         }
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+    fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
         Err(VfsError::BadFileDescriptor)
     }
 }

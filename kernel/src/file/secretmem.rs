@@ -112,8 +112,8 @@ impl FileLike for SecretMemFile {
         stat.blocks = 0;
         Ok(stat)
     }
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok(Cow::Borrowed("/secretmem"))
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"/secretmem")))
     }
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
         let pages = {
@@ -142,9 +142,10 @@ impl FileLike for SecretMemFile {
 
 #[cfg(test)]
 mod tests {
+    use memory_addr::PAGE_SIZE_4K;
+
     use super::*;
     use crate::file::FileMmapSharing;
-    use memory_addr::PAGE_SIZE_4K;
 
     fn shared_request() -> FileMmapRequest {
         FileMmapRequest::try_new(
@@ -159,8 +160,13 @@ mod tests {
 
     #[test]
     fn zero_length_secret_mmap_reuses_backing_for_first_truncate() {
+        let _context = crate::test_support::scheduler_test_context();
         let secret = SecretMemFile::new();
-        let mapped = secret.prepare_mmap(shared_request()).unwrap().unwrap().into_pages();
+        let mapped = secret
+            .prepare_mmap(shared_request())
+            .unwrap()
+            .unwrap()
+            .into_pages();
         assert!(mapped.is_secret());
         assert_eq!(mapped.total_bytes(), 0);
 
@@ -169,7 +175,11 @@ mod tests {
             .unwrap()
             .truncate(PAGE_SIZE_4K as u64)
             .unwrap();
-        let remapped = secret.prepare_mmap(shared_request()).unwrap().unwrap().into_pages();
+        let remapped = secret
+            .prepare_mmap(shared_request())
+            .unwrap()
+            .unwrap()
+            .into_pages();
         assert!(Arc::ptr_eq(&mapped, &remapped));
         assert_eq!(mapped.total_bytes(), PAGE_SIZE_4K);
 
@@ -178,6 +188,7 @@ mod tests {
 
     #[test]
     fn first_nonzero_size_freezes_later_zero_resize() {
+        let _context = crate::test_support::scheduler_test_context();
         let secret = SecretMemFile::new();
         secret
             .begin_truncate()

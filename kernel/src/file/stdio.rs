@@ -1,11 +1,17 @@
 use axerrno::{AxError, AxResult};
 use axfs::{FsContext, OpenOptions};
+use axfs_ng_vfs::FsPath;
 
 use super::FdTable;
 
 pub fn add_stdio(fd_table: &FdTable, cx: &FsContext) -> AxResult<()> {
     let open = |options: &mut OpenOptions, status_flags| {
-        crate::syscall::open_init_description(cx, options, "/dev/console", status_flags)
+        crate::syscall::open_init_description(
+            cx,
+            options,
+            FsPath::new(b"/dev/console"),
+            status_flags,
+        )
     };
 
     let stdin = open(OpenOptions::new().read(true).write(false), 0)?;

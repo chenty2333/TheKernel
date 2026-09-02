@@ -245,8 +245,10 @@ impl FileLike for PidFd {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[pidfd]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[pidfd]",
+        )))
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
