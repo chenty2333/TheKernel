@@ -1,5 +1,8 @@
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::{
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
@@ -71,6 +74,10 @@ static FINALIZER_WORKER_WAKE: PollSet = PollSet::new();
 // device. Keep its sole owner off the policy worker so fanotify/inotify/RCU
 // and final-close cleanup cannot be starved by an idle device queue.
 static PHYSICAL_COMPLETION_WORKER_WAKE: PollSet = PollSet::new();
+// Restoring a private executable COW byte may need to fault a reclaimed page
+// back in.  It therefore has a dedicated sleeping task-context owner rather
+// than stalling RCU/security policy retirement under memory pressure.
+static UPROBE_RESTORE_WORKER_WAKE: PollSet = PollSet::new();
 // Each permanently online CPU owns one task-context consumer for its queue.
 static PROCESS_TIMER_WORKER_WAKE: [PollSet<1>; axconfig::plat::MAX_CPU_NUM] =
     [const { PollSet::new() }; axconfig::plat::MAX_CPU_NUM];
@@ -102,7 +109,8 @@ fn policy_work_pending() -> bool {
         || crate::file::dnotify::has_deferred_table_cleanup_work()
         || crate::file::fanotify::has_deferred_cleanup_work()
         || crate::file::inotify::has_deferred_notification_work()
-        || crate::file::io_uring::has_deferred_io_uring_work();
+        || crate::file::io_uring::has_deferred_io_uring_work()
+        || crate::mm::has_deferred_mapping_finalizer_work();
     #[cfg(feature = "perf-sampling")]
     {
         pending || crate::file::perf_sampling::has_deferred_custody_retire_work()
@@ -181,6 +189,10 @@ pub(crate) fn wake_physical_completion_worker() {
     PHYSICAL_COMPLETION_WORKER_WAKE.wake();
 }
 
+pub(crate) fn wake_uprobe_restore_worker() {
+    UPROBE_RESTORE_WORKER_WAKE.wake();
+}
+
 fn wait_for_worker<const CAPACITY: usize>(
     wake: &PollSet<CAPACITY>,
     mut pending: impl FnMut() -> bool,
@@ -214,10 +226,23 @@ fn wait_with_bounded_retry(
     unreachable!("bounded policy wait retry loop must return");
 }
 
+const UCLAMP_RETRY_INITIAL_MS: u64 = 1;
+const UCLAMP_RETRY_MAX_MS: u64 = 100;
+
+fn next_uclamp_retry_delay_ms(current: u64) -> u64 {
+    current.saturating_mul(2).min(UCLAMP_RETRY_MAX_MS)
+}
+
 fn policy_worker() {
+    let mut uclamp_retry_delay_ms = UCLAMP_RETRY_INITIAL_MS;
+    let mut last_uclamp_failure = None;
     loop {
         if let Err(error) = wait_with_bounded_retry(
-            || wait_for_worker(&POLICY_WORKER_WAKE, policy_work_pending),
+            || {
+                wait_for_worker(&POLICY_WORKER_WAKE, || {
+                    policy_work_pending() || crate::pseudofs::cgroup::uclamp_reconcile_pending()
+                })
+            },
             axtask::yield_now,
         ) {
             error!("policy deferred-work worker wait failed persistently: {error}");
@@ -238,10 +263,56 @@ fn policy_worker() {
             crate::file::inotify::drain_close_notifications();
             crate::file::inotify::drain_filesystem_release_notifications();
             crate::file::io_uring::drain_deferred_io_uring_work();
+            crate::mm::drain_deferred_mapping_finalizers(16);
             #[cfg(feature = "perf-sampling")]
             crate::file::perf_sampling::drain_deferred_custody_retire_work();
             if policy_work_pending() {
                 axtask::yield_now();
+            }
+        }
+
+        // One complete cgroup snapshot/recompute pass per wake. A persistent
+        // owner failure is retried by this already-existing worker, but the
+        // exponential sleep prevents whole-task-vector allocation and log
+        // storms while retaining a prompt, scheduler-independent retry path.
+        match crate::pseudofs::cgroup::drain_pending_uclamp_reconcile() {
+            crate::pseudofs::cgroup::UclampReconcileDrain::Idle
+            | crate::pseudofs::cgroup::UclampReconcileDrain::Converged => {
+                uclamp_retry_delay_ms = UCLAMP_RETRY_INITIAL_MS;
+                last_uclamp_failure = None;
+            }
+            crate::pseudofs::cgroup::UclampReconcileDrain::Retry(failure) => {
+                if last_uclamp_failure != Some(failure) {
+                    error!("uclamp policy reconcile deferred after {failure:?}");
+                    last_uclamp_failure = Some(failure);
+                }
+                if matches!(
+                    failure,
+                    crate::pseudofs::cgroup::UclampReconcileFailure::Unsupported
+                ) {
+                    // cpu.uclamp is exposed only with the EEVDF-capable
+                    // product scheduler. Continuing after this invariant
+                    // failure would leave a successfully committed policy
+                    // permanently stale, so fail closed rather than retrying
+                    // it forever.
+                    axhal::power::system_off();
+                }
+                // Timer registration can fail (for example when its bounded
+                // queue is full).  The retry ticket was republished before
+                // this branch, so retry the delay without taking another
+                // whole-task snapshot.  A persistent failure cannot be
+                // allowed to devolve into an unbounded yield/snapshot loop.
+                if let Err(error) = wait_with_bounded_retry(
+                    || axtask::sleep(Duration::from_millis(uclamp_retry_delay_ms)),
+                    axtask::yield_now,
+                ) {
+                    error!(
+                        "uclamp policy reconcile retry delay failed persistently: {error}; \
+                         fail-stopping with pending reconciliation retained"
+                    );
+                    axhal::power::system_off();
+                }
+                uclamp_retry_delay_ms = next_uclamp_retry_delay_ms(uclamp_retry_delay_ms);
             }
         }
     }
@@ -283,6 +354,35 @@ fn physical_completion_worker() {
         // may sleep until an IRQ generation. No policy work runs on this
         // stack while that wait is in progress.
         crate::file::io_uring::drain_physical_completion_work();
+    }
+}
+
+fn uprobe_restore_worker() {
+    loop {
+        if let Err(error) = wait_with_bounded_retry(
+            || {
+                wait_for_worker(
+                    &UPROBE_RESTORE_WORKER_WAKE,
+                    crate::uprobe::has_deferred_restore_work,
+                )
+            },
+            axtask::yield_now,
+        ) {
+            error!("uprobe restore worker wait failed persistently: {error}");
+            axhal::power::system_off();
+        }
+        let mut retry_delay_ms = 1u64;
+        while crate::uprobe::has_deferred_restore_work() {
+            if crate::uprobe::drain_one_deferred_restore() {
+                retry_delay_ms = 1;
+                continue;
+            }
+            // A reclaimed private COW page can require memory before its
+            // authoritative byte is writable again.  Keep custody and retry
+            // with bounded backoff instead of spinning or forgetting INT3.
+            let _ = axtask::sleep(Duration::from_millis(retry_delay_ms));
+            retry_delay_ms = retry_delay_ms.saturating_mul(2).min(100);
+        }
     }
 }
 
@@ -436,6 +536,13 @@ pub(crate) fn init() {
     physical_name.push_str("physical-completion-worker");
     axtask::try_spawn_with_name(physical_completion_worker, physical_name)
         .expect("failed to start physical completion worker");
+    let mut uprobe_restore_name = String::new();
+    uprobe_restore_name
+        .try_reserve_exact("uprobe-restore-worker".len())
+        .expect("failed to allocate uprobe restore worker name");
+    uprobe_restore_name.push_str("uprobe-restore-worker");
+    axtask::try_spawn_with_name(uprobe_restore_worker, uprobe_restore_name)
+        .expect("failed to start uprobe restore worker");
     for cpu in 0..axhal::cpu_num() {
         let mut process_timer_name = String::new();
         process_timer_name
@@ -462,6 +569,12 @@ fn dispatch() {
     // execute only in their dedicated task contexts.
     if policy_work_pending() {
         POLICY_WORKER_WAKE.wake();
+    }
+    // A PerfReconcile IPI transfers raw Arc custody here because interrupt
+    // context must never perform the final drop. This safe point is outside
+    // IRQ/runqueue locks and drains only an already-preallocated list.
+    if crate::file::PerfGroup::has_deferred_reconcile_custody() {
+        crate::file::PerfGroup::drain_reconciled_custody();
     }
     if finalizer_work_pending() {
         FINALIZER_WORKER_WAKE.wake();
@@ -522,5 +635,40 @@ mod tests {
         assert_eq!(result, Err(AxError::BadState));
         assert_eq!(attempts.get(), POLICY_WAIT_RETRY_LIMIT + 1);
         assert_eq!(retries.get(), POLICY_WAIT_RETRY_LIMIT);
+    }
+
+    #[test]
+    fn uclamp_retry_backoff_is_bounded_and_resets_after_convergence() {
+        let mut delay = UCLAMP_RETRY_INITIAL_MS;
+        for _ in 0..16 {
+            delay = next_uclamp_retry_delay_ms(delay);
+        }
+        assert_eq!(delay, UCLAMP_RETRY_MAX_MS);
+
+        // A successful/new-generation pass starts the next failure promptly
+        // instead of inheriting a stale long delay.
+        delay = UCLAMP_RETRY_INITIAL_MS;
+        assert_eq!(next_uclamp_retry_delay_ms(delay), 2);
+    }
+
+    #[test]
+    fn uclamp_retry_sleep_failure_is_bounded_before_fail_stop() {
+        let sleeps = Cell::new(0);
+        let yields = Cell::new(0);
+        let result = wait_with_bounded_retry(
+            || {
+                sleeps.set(sleeps.get() + 1);
+                Err(AxError::OutOfRange)
+            },
+            || yields.set(yields.get() + 1),
+        );
+
+        // The worker has already republished its ticket before it asks for a
+        // delay. A persistent timer error gets this bounded progression and
+        // then reaches its fail-stop branch, rather than starting a new full
+        // uclamp snapshot pass.
+        assert_eq!(result, Err(AxError::OutOfRange));
+        assert_eq!(sleeps.get(), POLICY_WAIT_RETRY_LIMIT + 1);
+        assert_eq!(yields.get(), POLICY_WAIT_RETRY_LIMIT);
     }
 }
