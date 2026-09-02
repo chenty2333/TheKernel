@@ -973,10 +973,12 @@ fn namespace_prune_leaves_foreign_gc_scratch_untouched() {
         )
         .unwrap();
     let foreign_scratch = GcPlanScratch {
-        epoch: u64::MAX,
-        root_drops: 7,
-        link_drops: 3,
-        state: Some(GcPlanState::Touched),
+        policy: thekernel_linux_keyring::GcScratch {
+            epoch: u64::MAX,
+            root_drops: 7,
+            link_drops: 3,
+            state: thekernel_linux_keyring::GcScratchState::Touched,
+        },
         touched_next: Some(1234),
         work_next: None,
     };
@@ -1179,7 +1181,7 @@ fn public_operations_validate_and_prune_the_actor_namespace_once() {
                 &owner,
                 KeyTypeKind::User,
                 "single-ensure",
-                false,
+                None,
                 KEY_SPEC_PROCESS_KEYRING,
             )
             .unwrap(),

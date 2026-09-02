@@ -19,7 +19,7 @@ mod syscall;
 mod tests;
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -46,8 +46,8 @@ use super::{
     },
     contract::{KeyActor, KeyTaskOwner, KeyUserRecord, KeyctlCommand, KeyctlOutput, ReqKeyDefault},
     object::{
-        BIG_KEY_ABI_PAYLOAD_CHARGE, GcPlanScratch, GcPlanState, KEY_LINK_CHARGE, Key, KeyState,
-        KeyTypeKind, PublishedKeyringName, anonymous_session_keyring_permissions,
+        BIG_KEY_ABI_PAYLOAD_CHARGE, GcPlanScratch, KEY_LINK_CHARGE, Key, KeyState, KeyTypeKind,
+        PublishedKeyringName, anonymous_session_keyring_permissions,
         named_session_keyring_permissions, persistent_keyring_permissions,
         thread_process_keyring_permissions, uid_keyring_permissions, wipe_key_bytes,
     },
@@ -120,11 +120,59 @@ pub(super) struct KeyManager {
     process_keyrings: BTreeMap<u32, i32>,
     session_keyrings: BTreeMap<u32, i32>,
     reqkey_defaults: BTreeMap<u32, i32>,
+    /// Per-thread, one-shot construction authority installed by request_key.
+    /// The serial is also recorded in the key, so task teardown can revoke an
+    /// abandoned construction without granting it to a reused visible TID.
+    construction_authorities: BTreeMap<u32, i32>,
+    /// In-flight request_key constructions, scoped exactly as Linux key
+    /// lookup is scoped.  Pending keys are intentionally not linked into a
+    /// requester's keyrings, so ordinary lookup cannot be used to coalesce a
+    /// second request for the same object.
+    pending_constructions: BTreeMap<PendingConstructionKey, i32>,
     namespaces: BTreeMap<UserNamespaceId, NamespaceRegistry>,
     #[cfg(test)]
     namespace_ensure_calls: usize,
     #[cfg(test)]
     namespace_prune_candidates: usize,
+}
+
+/// A construction which has been made visible only to the key service.  The
+/// requester never receives construction authority: that one-shot authority
+/// is transferred to the dedicated request-key helper after its process has
+/// been published.
+pub(crate) struct RequestKeyConstruction {
+    pub(crate) serial: i32,
+    pub(crate) kind: KeyTypeKind,
+    pub(crate) description: String,
+    pub(crate) callout: String,
+}
+
+/// Identity of one in-flight construction.  The type name is stable and
+/// avoids making the manager's internal index depend on a formatting or ABI
+/// representation of `KeyTypeKind`.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PendingConstructionKey {
+    namespace: UserNamespaceId,
+    kind: &'static str,
+    description: String,
+}
+
+impl PendingConstructionKey {
+    fn new(namespace: UserNamespaceId, kind: KeyTypeKind, description: &str) -> Self {
+        Self {
+            namespace,
+            kind: kind.name(),
+            description: description.to_string(),
+        }
+    }
+}
+
+pub(crate) enum RequestKeyBegin {
+    Resolved(isize),
+    /// Another requester already owns helper creation.  The service waits on
+    /// this serial and rechecks the terminal state in its own namespace.
+    Pending(i32),
+    Construction(RequestKeyConstruction),
 }
 
 /// Keyring state whose lifetime and lookup domain are one user namespace.
@@ -235,6 +283,8 @@ impl KeyManager {
             process_keyrings: BTreeMap::new(),
             session_keyrings: BTreeMap::new(),
             reqkey_defaults: BTreeMap::new(),
+            construction_authorities: BTreeMap::new(),
+            pending_constructions: BTreeMap::new(),
             namespaces: BTreeMap::new(),
             #[cfg(test)]
             namespace_ensure_calls: 0,

@@ -3,6 +3,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult};
 use thekernel_linux_cred::KeyPermissionMask;
 
+use super::KeyTypeKind;
 use crate::task::{Credentials, DacCredentialView, Kgid, Kuid, UserGid, UserNamespace, UserUid};
 
 const KEY_REQKEY_DEFL_DEFAULT: i32 = 0;
@@ -226,12 +227,32 @@ pub(crate) enum KeyctlCommand {
     Invalidate {
         key: i32,
     },
+    Instantiate {
+        key: i32,
+        payload: Vec<u8>,
+        destination: i32,
+    },
+    Negate {
+        key: i32,
+        timeout: u64,
+        destination: i32,
+    },
+    Reject {
+        key: i32,
+        timeout: u64,
+        error: i32,
+        destination: i32,
+    },
+    AssumeAuthority {
+        key: i32,
+    },
     GetPersistent {
         uid: Option<u32>,
         destination: i32,
     },
     Restrict {
         keyring: i32,
+        kind: Option<KeyTypeKind>,
     },
     Move {
         key: i32,

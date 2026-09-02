@@ -1,8 +1,44 @@
 //! Special-keyring resolution, possession, and permission checks.
 
-use super::*;
+use thekernel_linux_keyring::{
+    KeyAvailability as LinuxKeyAvailability, KeyError as LinuxKeyError, KeyId as LinuxKeyId,
+    KeyPermissions as LinuxKeyPermissions, MissingSessionPlan as LinuxMissingSessionPlan,
+    PermissionInput as LinuxPermissionInput, PermissionLanes as LinuxPermissionLanes,
+    SpecialKeyring as LinuxSpecialKeyring, TraversalNode as LinuxTraversalNode,
+    availability as linux_availability, is_possessed as linux_is_possessed,
+    permits as linux_permits, plan_missing_session as linux_plan_missing_session,
+    resolve_special_keyring as linux_resolve_special_keyring,
+};
+
+use super::{links::KeyGraphView, *};
 
 impl KeyManager {
+    /// Bridges kernel-owned credentials and a validated UAPI permission mask
+    /// into the ABI planner.  The manager retains object ownership only.
+    pub(super) fn key_permission_allows(
+        key: &Key,
+        actor: &KeyActor,
+        possessed: bool,
+        permission: KeyPermission,
+    ) -> bool {
+        let raw = key.perm.into_raw();
+        let lane = |shift: u32| LinuxKeyPermissions((raw >> shift) & 0x3f);
+        linux_permits(
+            LinuxPermissionLanes {
+                possessor: Some(lane(24)),
+                owner: Some(lane(16)),
+                group: Some(lane(8)),
+                other: Some(lane(0)),
+            },
+            LinuxPermissionInput {
+                possessed,
+                owner: actor.dac.uid() == key.uid,
+                group: key.owner_gid.is_some_and(|gid| actor.in_group(gid)),
+            },
+            LinuxKeyPermissions(permission.bits() as u32),
+        )
+    }
+
     pub(super) fn special_keyring_in_namespace(
         &mut self,
         spec: i32,
@@ -10,8 +46,8 @@ impl KeyManager {
         namespace: UserNamespaceId,
         create: bool,
     ) -> AxResult<i32> {
-        match spec {
-            KEY_SPEC_THREAD_KEYRING => {
+        match linux_resolve_special_keyring(spec).map_err(|_| AxError::from(LinuxError::ENOKEY))? {
+            LinuxSpecialKeyring::Thread => {
                 if let Some(id) = self.thread_keyrings.get(&actor.thread_owner) {
                     return Ok(*id);
                 }
@@ -28,7 +64,7 @@ impl KeyManager {
                 )?;
                 Ok(id)
             }
-            KEY_SPEC_PROCESS_KEYRING => {
+            LinuxSpecialKeyring::Process => {
                 if let Some(id) = self.process_keyrings.get(&actor.process_owner) {
                     return Ok(*id);
                 }
@@ -45,11 +81,12 @@ impl KeyManager {
                 )?;
                 Ok(id)
             }
-            KEY_SPEC_SESSION_KEYRING => {
+            LinuxSpecialKeyring::Session => {
                 if let Some(id) = self.session_keyrings.get(&actor.thread_owner) {
                     return Ok(*id);
                 }
-                if !create {
+                if linux_plan_missing_session(create) == LinuxMissingSessionPlan::InstallUserSession
+                {
                     let id = self.special_keyring_in_namespace(
                         KEY_SPEC_USER_SESSION_KEYRING,
                         actor,
@@ -69,7 +106,7 @@ impl KeyManager {
                 )?;
                 Ok(id)
             }
-            KEY_SPEC_USER_KEYRING => {
+            LinuxSpecialKeyring::User => {
                 let uid = actor.real_uid();
                 if let Some(id) = self
                     .namespaces
@@ -87,7 +124,7 @@ impl KeyManager {
                 )?;
                 Ok(id)
             }
-            KEY_SPEC_USER_SESSION_KEYRING => {
+            LinuxSpecialKeyring::UserSession => {
                 let uid = actor.real_uid();
                 if let Some(id) = self
                     .namespaces
@@ -118,7 +155,6 @@ impl KeyManager {
                 }
                 Ok(id)
             }
-            _ => Err(LinuxError::ENOKEY.into()),
         }
     }
 
@@ -190,19 +226,35 @@ impl KeyManager {
 
     pub(super) fn check_key_available(&self, key: &Key, allow_keyring: bool) -> AxResult<()> {
         match key.state {
-            KeyState::Revoked => return Err(LinuxError::EKEYREVOKED.into()),
-            KeyState::Positive => {}
+            KeyState::Pending => return Err(LinuxError::EINPROGRESS.into()),
+            KeyState::Negative(error) => {
+                return Err(match error {
+                    error if error == LinuxError::EACCES as i32 => LinuxError::EACCES.into(),
+                    error if error == LinuxError::EKEYREVOKED as i32 => {
+                        LinuxError::EKEYREVOKED.into()
+                    }
+                    error if error == LinuxError::EKEYEXPIRED as i32 => {
+                        LinuxError::EKEYEXPIRED.into()
+                    }
+                    _ => LinuxError::ENOKEY.into(),
+                });
+            }
+            KeyState::Positive | KeyState::Revoked => {}
         }
-        if key
+        let expired = key
             .expires_at
-            .is_some_and(|expires_at| wall_time().as_secs() >= expires_at)
-        {
-            return Err(LinuxError::EKEYEXPIRED.into());
+            .is_some_and(|expires_at| wall_time().as_secs() >= expires_at);
+        match linux_availability(
+            key.state == KeyState::Revoked,
+            expired,
+            key.is_keyring(),
+            allow_keyring,
+        ) {
+            LinuxKeyAvailability::Available => Ok(()),
+            LinuxKeyAvailability::Revoked => Err(LinuxError::EKEYREVOKED.into()),
+            LinuxKeyAvailability::Expired => Err(LinuxError::EKEYEXPIRED.into()),
+            LinuxKeyAvailability::WrongKind => Err(AxError::InvalidInput),
         }
-        if !allow_keyring && key.is_keyring() {
-            return Err(AxError::InvalidInput);
-        }
-        Ok(())
     }
 
     pub(super) fn possession_roots(&self, actor: &KeyActor) -> Vec<i32> {
@@ -226,49 +278,41 @@ impl KeyManager {
     }
 
     pub(super) fn is_possessed(&self, target: i32, actor: &KeyActor) -> bool {
-        let mut pending = self
+        let roots = self
             .possession_roots(actor)
             .into_iter()
-            .map(|serial| (serial, 0))
-            .collect::<Vec<_>>();
-        let mut visited = BTreeSet::new();
-        while let Some((serial, depth)) = pending.pop() {
-            if !visited.insert(serial) {
-                continue;
-            }
-
-            let Some(key) = self.keys.get(&serial) else {
-                continue;
-            };
-            if serial == target {
-                return self.check_key_available(key, true).is_ok()
-                    && key.perm.allows(
-                        key.uid,
-                        key.owner_gid,
-                        &actor.dac,
+            .map(|serial| LinuxKeyId::new(serial as u32))
+            .collect::<Option<Vec<_>>>();
+        let Some(roots) = roots else {
+            return false;
+        };
+        let Some(target) = LinuxKeyId::new(target as u32) else {
+            return false;
+        };
+        linux_is_possessed(
+            &KeyGraphView::new(&self.keys),
+            &roots,
+            target,
+            self.keys.len().saturating_add(1),
+            KEYRING_SEARCH_MAX_DEPTH,
+            |id| {
+                let key = self
+                    .keys
+                    .get(&(id.get() as i32))
+                    .ok_or(LinuxKeyError::NotFound)?;
+                Ok(LinuxTraversalNode {
+                    available: self.check_key_available(key, true).is_ok(),
+                    searchable: Self::key_permission_allows(
+                        key,
+                        actor,
                         true,
                         KeyPermission::SEARCH,
-                    );
-            }
-            if depth > KEYRING_SEARCH_MAX_DEPTH {
-                continue;
-            }
-            if self.check_key_available(key, true).is_err()
-                || !key.perm.allows(
-                    key.uid,
-                    key.owner_gid,
-                    &actor.dac,
-                    true,
-                    KeyPermission::SEARCH,
-                )
-            {
-                continue;
-            }
-            if key.is_keyring() {
-                pending.extend(key.links.iter().copied().map(|serial| (serial, depth + 1)));
-            }
-        }
-        false
+                    ),
+                    keyring: key.is_keyring(),
+                })
+            },
+        )
+        .unwrap_or(false)
     }
 
     pub(super) fn key_has_perm(
@@ -287,9 +331,9 @@ impl KeyManager {
             PossessionContext::Recompute => self.is_possessed(resolved.serial, actor),
             PossessionContext::Fixed(possessed) => possessed,
         };
-        Ok(key
-            .perm
-            .allows(key.uid, key.owner_gid, &actor.dac, possessed, permission))
+        Ok(Self::key_permission_allows(
+            key, actor, possessed, permission,
+        ))
     }
 
     pub(super) fn keyring_has_write(

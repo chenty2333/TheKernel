@@ -4,8 +4,11 @@ use core::{ffi::c_char, mem::size_of};
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{CAP_SETUID, CAP_SYS_ADMIN};
-use memory_addr::PAGE_SIZE_4K;
 use thekernel_linux_cred::KeyPermissionMask;
+use thekernel_linux_keyring::uapi::{
+    KEY_CALLOUT_STRING_MAX, KEY_DESCRIPTION_STRING_MAX, KEY_TYPE_STRING_MAX, KeyctlPlan,
+    KeyctlUapiError, RawKeyctlArgs, UserBuffer, UserString, capabilities_bytes, decode_keyctl,
+};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded, vm_write_slice,
 };
@@ -15,51 +18,6 @@ use crate::{
     mm::map_usercopy_error,
     task::{AsThread, Cred},
 };
-
-const KEYCTL_GET_KEYRING_ID: i32 = 0;
-const KEYCTL_JOIN_SESSION_KEYRING: i32 = 1;
-const KEYCTL_UPDATE: i32 = 2;
-const KEYCTL_REVOKE: i32 = 3;
-const KEYCTL_CHOWN: i32 = 4;
-const KEYCTL_SETPERM: i32 = 5;
-const KEYCTL_DESCRIBE: i32 = 6;
-const KEYCTL_CLEAR: i32 = 7;
-const KEYCTL_LINK: i32 = 8;
-const KEYCTL_UNLINK: i32 = 9;
-const KEYCTL_SEARCH: i32 = 10;
-const KEYCTL_READ: i32 = 11;
-const KEYCTL_INSTANTIATE: i32 = 12;
-const KEYCTL_NEGATE: i32 = 13;
-const KEYCTL_SET_REQKEY_KEYRING: i32 = 14;
-const KEYCTL_SET_TIMEOUT: i32 = 15;
-const KEYCTL_GET_SECURITY: i32 = 17;
-const KEYCTL_REJECT: i32 = 19;
-const KEYCTL_INVALIDATE: i32 = 21;
-const KEYCTL_GET_PERSISTENT: i32 = 22;
-const KEYCTL_RESTRICT_KEYRING: i32 = 29;
-const KEYCTL_MOVE: i32 = 30;
-const KEYCTL_CAPABILITIES: i32 = 31;
-
-const KEYCTL_MOVE_EXCL: u32 = 0x0000_0001;
-const KEYCTL_CAPS0_CAPABILITIES: u8 = 0x01;
-const KEYCTL_CAPS0_PERSISTENT_KEYRINGS: u8 = 0x02;
-const KEYCTL_CAPS0_BIG_KEY: u8 = 0x10;
-const KEYCTL_CAPS0_INVALIDATE: u8 = 0x20;
-const KEYCTL_CAPS0_RESTRICT_KEYRING: u8 = 0x40;
-const KEYCTL_CAPS0_MOVE: u8 = 0x80;
-const KEYCTL_CAPABILITIES_BYTES: [u8; 2] = [
-    KEYCTL_CAPS0_CAPABILITIES
-        | KEYCTL_CAPS0_PERSISTENT_KEYRINGS
-        | KEYCTL_CAPS0_BIG_KEY
-        | KEYCTL_CAPS0_INVALIDATE
-        | KEYCTL_CAPS0_RESTRICT_KEYRING
-        | KEYCTL_CAPS0_MOVE,
-    0,
-];
-
-const KEY_TYPE_STRING_MAX: usize = 32;
-const KEY_DESCRIPTION_STRING_MAX: usize = 4096;
-const KEY_CALLOUT_STRING_MAX: usize = 4096;
 
 fn load_user_string<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
@@ -71,6 +29,61 @@ fn load_user_string<M: UserMemory + ?Sized>(
             .map_err(map_usercopy_error)?,
     )
     .map_err(|_| AxError::IllegalBytes)
+}
+
+fn load_planned_string<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    plan: UserString,
+) -> AxResult<String> {
+    load_user_string(memory, plan.address as *const c_char, plan.max_bytes)
+}
+
+fn load_planned_buffer<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    plan: UserBuffer,
+) -> AxResult<Vec<u8>> {
+    load_payload(memory, plan.address as *const u8, plan.len)
+}
+
+fn load_keyctl_iov_payload<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    plan: UserBuffer,
+) -> AxResult<Vec<u8>> {
+    use crate::mm::IoVec;
+
+    let iovs =
+        vm_load(memory, plan.address as *const IoVec, plan.len).map_err(map_usercopy_error)?;
+    let total = iovs.iter().try_fold(0usize, |total, iov| {
+        if iov.iov_len < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        total
+            .checked_add(iov.iov_len as usize)
+            .ok_or(AxError::InvalidInput)
+    })?;
+    if total > thekernel_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(total)
+        .map_err(|_| AxError::NoMemory)?;
+    for iov in iovs {
+        let len = iov.iov_len as usize;
+        if len == 0 {
+            continue;
+        }
+        let bytes = vm_load(memory, iov.iov_base as *const u8, len).map_err(map_usercopy_error)?;
+        payload.extend_from_slice(&bytes);
+    }
+    Ok(payload)
+}
+
+fn map_keyctl_uapi_error(error: KeyctlUapiError) -> AxError {
+    match error {
+        KeyctlUapiError::Invalid => AxError::InvalidInput,
+        KeyctlUapiError::Unsupported => LinuxError::EOPNOTSUPP.into(),
+    }
 }
 
 fn key_actor_capabilities(credential: &Cred) -> (bool, bool) {
@@ -187,15 +200,14 @@ fn write_keyctl_capabilities<M: UserMemory + ?Sized>(
     size: usize,
 ) -> AxResult<isize> {
     if size == 0 {
-        return Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize);
+        return Ok(capabilities_bytes().len() as isize);
     }
     if buf.is_null() {
         return Err(AxError::BadAddress);
     }
 
-    let copy_len = KEYCTL_CAPABILITIES_BYTES.len().min(size);
-    vm_write_slice(memory, buf, &KEYCTL_CAPABILITIES_BYTES[..copy_len])
-        .map_err(map_usercopy_error)?;
+    let copy_len = capabilities_bytes().len().min(size);
+    vm_write_slice(memory, buf, &capabilities_bytes()[..copy_len]).map_err(map_usercopy_error)?;
 
     const ZERO_CHUNK: [u8; 64] = [0; 64];
     let mut zeroed = copy_len;
@@ -205,7 +217,7 @@ fn write_keyctl_capabilities<M: UserMemory + ?Sized>(
             .map_err(map_usercopy_error)?;
         zeroed += chunk_len;
     }
-    Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
+    Ok(capabilities_bytes().len() as isize)
 }
 
 pub fn sys_add_key<M: UserMemory + ?Sized>(
@@ -246,7 +258,7 @@ pub fn sys_request_key<M: UserMemory + ?Sized>(
         &current_key_actor(),
         kind,
         &description,
-        callout.is_some(),
+        callout.as_deref(),
         dest_keyring,
     )
 }
@@ -259,128 +271,160 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
     arg4: usize,
     arg5: usize,
 ) -> AxResult<isize> {
-    if option == KEYCTL_CAPABILITIES {
-        return write_keyctl_capabilities(memory, arg2 as *mut u8, arg3);
-    }
-    if matches!(option, KEYCTL_INSTANTIATE | KEYCTL_NEGATE | KEYCTL_REJECT)
-        || option == KEYCTL_GET_SECURITY
-    {
-        return Err(LinuxError::EOPNOTSUPP.into());
-    }
-
-    let command = match option {
-        KEYCTL_GET_KEYRING_ID => KeyctlCommand::GetKeyringId {
-            keyring: arg2 as i32,
-            create: arg3 != 0,
-        },
-        KEYCTL_JOIN_SESSION_KEYRING => KeyctlCommand::JoinSession {
-            name: if arg2 == 0 {
-                None
-            } else {
-                Some(load_user_string(
-                    memory,
-                    arg2 as *const c_char,
-                    KEY_DESCRIPTION_STRING_MAX,
-                )?)
-            },
-        },
-        KEYCTL_UPDATE => {
-            if arg4 > PAGE_SIZE_4K {
-                return Err(AxError::InvalidInput);
-            }
-            let payload = load_payload(memory, arg3 as *const u8, arg4)?;
-            KeyctlCommand::Update {
-                key: arg2 as i32,
-                payload,
-            }
+    let plan = decode_keyctl(RawKeyctlArgs {
+        option,
+        arg2,
+        arg3,
+        arg4,
+        arg5,
+    })
+    .map_err(map_keyctl_uapi_error)?;
+    let command = match plan {
+        KeyctlPlan::Capabilities { output } => {
+            return write_keyctl_capabilities(memory, output.address as *mut u8, output.len);
         }
-        KEYCTL_REVOKE => KeyctlCommand::Revoke { key: arg2 as i32 },
-        KEYCTL_CHOWN => KeyctlCommand::Chown {
-            key: arg2 as i32,
-            uid: (arg3 as u32 != u32::MAX).then_some(arg3 as u32),
-            gid: (arg4 as u32 != u32::MAX).then_some(arg4 as u32),
+        KeyctlPlan::GetKeyringId { keyring, create } => {
+            KeyctlCommand::GetKeyringId { keyring, create }
+        }
+        KeyctlPlan::JoinSession { name } => KeyctlCommand::JoinSession {
+            name: name
+                .map(|plan| load_planned_string(memory, plan))
+                .transpose()?,
         },
-        KEYCTL_SETPERM => KeyctlCommand::SetPerm {
-            key: arg2 as i32,
-            permissions: KeyPermissionMask::try_from_raw(arg3 as u32)
+        KeyctlPlan::Update { key, payload } => KeyctlCommand::Update {
+            key,
+            payload: load_planned_buffer(memory, payload)?,
+        },
+        KeyctlPlan::Revoke { key } => KeyctlCommand::Revoke { key },
+        KeyctlPlan::Chown { key, uid, gid } => KeyctlCommand::Chown { key, uid, gid },
+        KeyctlPlan::SetPerm { key, permissions } => KeyctlCommand::SetPerm {
+            key,
+            permissions: KeyPermissionMask::try_from_raw(permissions)
                 .ok_or(AxError::InvalidInput)?,
         },
-        KEYCTL_DESCRIBE => KeyctlCommand::Describe { key: arg2 as i32 },
-        KEYCTL_CLEAR => KeyctlCommand::Clear {
-            keyring: arg2 as i32,
+        KeyctlPlan::Describe { key, .. } => KeyctlCommand::Describe { key },
+        KeyctlPlan::Clear { keyring } => KeyctlCommand::Clear { keyring },
+        KeyctlPlan::Link { key, keyring } => KeyctlCommand::Link { key, keyring },
+        KeyctlPlan::Unlink { serial, keyring } => KeyctlCommand::Unlink { serial, keyring },
+        KeyctlPlan::Search {
+            keyring,
+            type_name,
+            description,
+            destination,
+        } => KeyctlCommand::Search {
+            keyring,
+            type_name: load_planned_string(memory, type_name)?,
+            description: load_planned_string(memory, description)?,
+            destination,
         },
-        KEYCTL_LINK => KeyctlCommand::Link {
-            key: arg2 as i32,
-            keyring: arg3 as i32,
+        KeyctlPlan::Read { key, output } => KeyctlCommand::Read {
+            key,
+            copy_limit: (output.address != 0 && output.len != 0).then_some(output.len),
         },
-        KEYCTL_UNLINK => KeyctlCommand::Unlink {
-            serial: arg2 as i32,
-            keyring: arg3 as i32,
+        KeyctlPlan::SetReqKeyring { setting } => KeyctlCommand::SetReqKeyring {
+            setting: ReqKeyDefault::from_raw(setting).ok_or(AxError::InvalidInput)?,
         },
-        KEYCTL_SEARCH => KeyctlCommand::Search {
-            keyring: arg2 as i32,
-            type_name: load_user_string(memory, arg3 as *const c_char, KEY_TYPE_STRING_MAX)?,
-            description: load_user_string(
-                memory,
-                arg4 as *const c_char,
-                KEY_DESCRIPTION_STRING_MAX,
-            )?,
-            destination: (arg5 != 0).then_some(arg5 as i32),
+        KeyctlPlan::SetTimeout { key, seconds } => KeyctlCommand::SetTimeout { key, seconds },
+        KeyctlPlan::Invalidate { key } => KeyctlCommand::Invalidate { key },
+        KeyctlPlan::Instantiate {
+            key,
+            payload,
+            destination,
+        } => KeyctlCommand::Instantiate {
+            key,
+            payload: load_planned_buffer(memory, payload)?,
+            destination,
         },
-        KEYCTL_READ => KeyctlCommand::Read {
-            key: arg2 as i32,
-            copy_limit: (arg3 != 0 && arg4 != 0).then_some(arg4),
+        KeyctlPlan::InstantiateIov {
+            key,
+            iov,
+            destination,
+        } => KeyctlCommand::Instantiate {
+            key,
+            payload: load_keyctl_iov_payload(memory, iov)?,
+            destination,
         },
-        KEYCTL_SET_REQKEY_KEYRING => KeyctlCommand::SetReqKeyring {
-            setting: ReqKeyDefault::from_raw(arg2 as i32).ok_or(AxError::InvalidInput)?,
+        KeyctlPlan::Negate {
+            key,
+            timeout,
+            destination,
+        } => KeyctlCommand::Negate {
+            key,
+            timeout,
+            destination,
         },
-        KEYCTL_SET_TIMEOUT => KeyctlCommand::SetTimeout {
-            key: arg2 as i32,
-            seconds: arg3 as u64,
+        KeyctlPlan::AssumeAuthority { key } => KeyctlCommand::AssumeAuthority { key },
+        KeyctlPlan::Reject {
+            key,
+            timeout,
+            error,
+            destination,
+        } => KeyctlCommand::Reject {
+            key,
+            timeout,
+            error,
+            destination,
         },
-        KEYCTL_INVALIDATE => KeyctlCommand::Invalidate { key: arg2 as i32 },
-        KEYCTL_GET_PERSISTENT => KeyctlCommand::GetPersistent {
-            uid: (arg2 != u32::MAX as usize).then_some(arg2 as u32),
-            destination: arg3 as i32,
-        },
-        KEYCTL_RESTRICT_KEYRING => {
-            if arg3 == 0 && arg4 != 0 || arg3 != 0 && arg4 == 0 {
-                return Err(AxError::InvalidInput);
-            }
-            if arg3 != 0 {
-                let _ = load_user_string(memory, arg3 as *const c_char, KEY_TYPE_STRING_MAX)?;
-                let _ =
-                    load_user_string(memory, arg4 as *const c_char, KEY_DESCRIPTION_STRING_MAX)?;
-                return Err(LinuxError::EOPNOTSUPP.into());
-            }
-            KeyctlCommand::Restrict {
-                keyring: arg2 as i32,
-            }
+        KeyctlPlan::GetPersistent { uid, destination } => {
+            KeyctlCommand::GetPersistent { uid, destination }
         }
-        KEYCTL_MOVE => {
-            let flags = arg5 as u32;
-            if flags & !KEYCTL_MOVE_EXCL != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            KeyctlCommand::Move {
-                key: arg2 as i32,
-                from: arg3 as i32,
-                to: arg4 as i32,
-                exclusive: flags & KEYCTL_MOVE_EXCL != 0,
-            }
+        KeyctlPlan::Restrict {
+            keyring,
+            type_name,
+            restriction,
+        } => {
+            let kind = match (type_name, restriction) {
+                (None, None) => None,
+                (Some(type_name), Some(restriction)) => {
+                    let type_name = load_planned_string(memory, type_name)?;
+                    let restriction = load_planned_string(memory, restriction)?;
+                    // This kernel's supported restriction is deliberately
+                    // typed and exact: `keyring:<key-type>`. Unknown Linux
+                    // restriction backends are rejected, never recorded as a
+                    // generic “restricted” bit that accepts the wrong keys.
+                    if restriction != "type" {
+                        return Err(LinuxError::EOPNOTSUPP.into());
+                    }
+                    Some(KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?)
+                }
+                _ => return Err(AxError::InvalidInput),
+            };
+            KeyctlCommand::Restrict { keyring, kind }
         }
-        _ => return Err(LinuxError::EOPNOTSUPP.into()),
+        KeyctlPlan::Move {
+            key,
+            from,
+            to,
+            exclusive,
+        } => KeyctlCommand::Move {
+            key,
+            from,
+            to,
+            exclusive,
+        },
     };
 
     match keyring::keyctl(&current_key_actor(), command)? {
         KeyctlOutput::Value(value) => Ok(value),
         KeyctlOutput::CountedBytes(bytes) => {
-            write_counted_bytes_if_fits(memory, arg3 as *mut u8, arg4, &bytes)
+            let KeyctlPlan::Describe { output, .. } = plan else {
+                unreachable!()
+            };
+            write_counted_bytes_if_fits(memory, output.address as *mut u8, output.len, &bytes)
         }
-        KeyctlOutput::KeyringIds(ids) => write_keyring_ids(memory, arg3 as *mut u8, arg4, &ids),
+        KeyctlOutput::KeyringIds(ids) => {
+            let KeyctlPlan::Read { output, .. } = plan else {
+                unreachable!()
+            };
+            write_keyring_ids(memory, output.address as *mut u8, output.len, &ids)
+        }
         KeyctlOutput::Payload { full_len, bytes } => {
-            if arg3 != 0 && arg4 != 0 {
-                vm_write_slice(memory, arg3 as *mut u8, &bytes).map_err(map_usercopy_error)?;
+            let KeyctlPlan::Read { output, .. } = plan else {
+                unreachable!()
+            };
+            if output.address != 0 && output.len != 0 {
+                vm_write_slice(memory, output.address as *mut u8, &bytes)
+                    .map_err(map_usercopy_error)?;
             }
             Ok(full_len as isize)
         }
@@ -467,7 +511,7 @@ mod tests {
         );
         assert_eq!(
             write_keyctl_capabilities(&mut memory, ptr::null_mut(), 0),
-            Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
+            Ok(capabilities_bytes().len() as isize)
         );
     }
 
@@ -516,10 +560,10 @@ mod tests {
         assert_eq!(
             sys_keyctl(
                 &mut memory,
-                KEYCTL_UPDATE,
+                2,
                 1,
                 ptr::null::<u8>() as usize,
-                PAGE_SIZE_4K + 1,
+                thekernel_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX + 1,
                 0,
             ),
             Err(AxError::InvalidInput)

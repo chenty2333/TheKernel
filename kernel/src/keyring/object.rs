@@ -3,12 +3,11 @@ use core::{mem::size_of, sync::atomic::Ordering};
 
 use axerrno::{AxError, AxResult};
 use thekernel_linux_cred::{KeyPermission, KeyPermissionMask};
+use thekernel_linux_keyring::{GcScratch, KeyKind as LinuxKeyKind};
 
 use super::accounting::{AbiQuotaCharge, QuotaAdmission, ResidentCharge};
 use crate::task::{Kgid, Kuid, UserNamespaceId};
 
-const USER_KEY_PAYLOAD_MAX: usize = 32_767;
-const BIG_KEY_PAYLOAD_MAX: usize = 1 << 20;
 pub(super) const BIG_KEY_ABI_PAYLOAD_CHARGE: usize = 16;
 pub(super) const KEY_RESIDENT_NODE_OVERHEAD: usize = 64;
 pub(super) const KEY_LINK_CHARGE: usize = size_of::<i32>();
@@ -16,6 +15,8 @@ pub(super) const KEY_LINK_CHARGE: usize = size_of::<i32>();
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum KeyState {
     Positive,
+    Pending,
+    Negative(i32),
     Revoked,
 }
 
@@ -26,37 +27,27 @@ pub(super) struct PublishedKeyringName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum GcPlanState {
-    Touched,
-    Queued,
-    Retire,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct GcPlanScratch {
-    pub(super) epoch: u64,
-    pub(super) root_drops: usize,
-    pub(super) link_drops: usize,
-    pub(super) state: Option<GcPlanState>,
+    pub(super) policy: GcScratch,
     pub(super) touched_next: Option<i32>,
     pub(super) work_next: Option<i32>,
 }
 
 impl GcPlanScratch {
     pub(super) const IDLE: Self = Self {
-        epoch: 0,
-        root_drops: 0,
-        link_drops: 0,
-        state: None,
+        policy: GcScratch::IDLE,
         touched_next: None,
         work_next: None,
     };
 
     pub(super) const fn is_idle(self) -> bool {
-        self.epoch == 0
-            && self.root_drops == 0
-            && self.link_drops == 0
-            && self.state.is_none()
+        self.policy.epoch == 0
+            && self.policy.root_drops == 0
+            && self.policy.link_drops == 0
+            && matches!(
+                self.policy.state,
+                thekernel_linux_keyring::GcScratchState::Idle
+            )
             && self.touched_next.is_none()
             && self.work_next.is_none()
     }
@@ -71,6 +62,15 @@ pub(crate) enum KeyTypeKind {
 }
 
 impl KeyTypeKind {
+    const fn linux_kind(self) -> LinuxKeyKind {
+        match self {
+            Self::Keyring => LinuxKeyKind::Keyring,
+            Self::User => LinuxKeyKind::User,
+            Self::Logon => LinuxKeyKind::Logon,
+            Self::BigKey => LinuxKeyKind::BigKey,
+        }
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "keyring" => Some(Self::Keyring),
@@ -81,7 +81,7 @@ impl KeyTypeKind {
         }
     }
 
-    pub(super) const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Keyring => "keyring",
             Self::User => "user",
@@ -91,19 +91,15 @@ impl KeyTypeKind {
     }
 
     pub(super) const fn userspace_readable(self) -> bool {
-        !matches!(self, Self::Logon)
+        self.linux_kind().readable()
     }
 
     pub(super) const fn supports_payload_update(self) -> bool {
-        matches!(self, Self::User | Self::Logon | Self::BigKey)
+        self.linux_kind().supports_payload_update()
     }
 
     pub(crate) const fn payload_limit(self) -> usize {
-        match self {
-            Self::User | Self::Logon => USER_KEY_PAYLOAD_MAX,
-            Self::BigKey => BIG_KEY_PAYLOAD_MAX,
-            Self::Keyring => 0,
-        }
+        self.linux_kind().payload_limit()
     }
 
     pub(super) const fn abi_payload_charge(self, payload_len: usize) -> usize {
@@ -193,6 +189,13 @@ pub(super) struct Key {
     pub(super) state: KeyState,
     pub(super) expires_at: Option<u64>,
     pub(super) restricted: bool,
+    /// A restricted keyring may admit only this concrete key type. `None`
+    /// means the restriction is a deny-all policy, never a fake acceptance.
+    pub(super) restriction_kind: Option<KeyTypeKind>,
+    /// The request-key construction thread that may instantiate/negate/reject
+    /// this key. It is consumed exactly once by a terminal transition.
+    pub(super) construction_owner: Option<u32>,
+    pub(super) construction_callout: Option<String>,
     /// Namespace and stable publication order of this public keyring name.
     /// This is non-owning and allocation-free; duplicate names remain legal.
     pub(super) published_name: Option<PublishedKeyringName>,
@@ -272,6 +275,38 @@ impl Key {
         )
     }
 
+    pub(super) fn pending(
+        kind: KeyTypeKind,
+        description: String,
+        uid: Kuid,
+        owner_gid: Kgid,
+    ) -> AxResult<Self> {
+        // Reuse the normal constructor's type/description/quota validation;
+        // a construction key carries no visible payload until instantiate.
+        let seed = if kind == KeyTypeKind::Keyring {
+            Vec::new()
+        } else {
+            alloc::vec![0]
+        };
+        let mut key = Self::new(
+            kind,
+            description,
+            seed,
+            uid,
+            owner_gid,
+            kind.default_permissions(),
+        )?;
+        wipe_key_bytes(&mut key.payload);
+        key.payload.clear();
+        key.abi_charge.bytes = key
+            .abi_charge
+            .bytes
+            .checked_sub(kind.abi_payload_charge(1))
+            .ok_or(AxError::BadState)?;
+        key.state = KeyState::Pending;
+        Ok(key)
+    }
+
     pub(super) fn new(
         kind: KeyTypeKind,
         description: String,
@@ -323,6 +358,9 @@ impl Key {
             state: KeyState::Positive,
             expires_at: None,
             restricted: false,
+            restriction_kind: None,
+            construction_owner: None,
+            construction_callout: None,
             published_name: None,
             in_owner_quota: true,
             abi_charge: AbiQuotaCharge {

@@ -131,6 +131,7 @@ impl KeyManager {
     }
 
     pub(in crate::keyring) fn exec_committed(&mut self, owner: KeyTaskOwner) -> AxResult<()> {
+        self.abandon_construction(owner.thread_owner())?;
         let roots = [
             self.current_task_root(RootSource::Thread(owner.thread_owner()))?,
             self.current_task_root(RootSource::Process(owner.process_owner()))?,
@@ -144,6 +145,7 @@ impl KeyManager {
         owner: KeyTaskOwner,
         final_thread: bool,
     ) -> AxResult<()> {
+        self.abandon_construction(owner.thread_owner())?;
         let roots = [
             self.current_task_root(RootSource::Thread(owner.thread_owner()))?,
             self.current_task_root(RootSource::Session(owner.thread_owner()))?,
@@ -156,6 +158,22 @@ impl KeyManager {
         self.detach_expected_task_roots(roots, false)?;
         self.reqkey_defaults.remove(&owner.thread_owner());
         Ok(())
+    }
+
+    fn abandon_construction(&mut self, thread_owner: u32) -> AxResult<()> {
+        let Some(serial) = self.construction_authorities.remove(&thread_owner) else {
+            return Ok(());
+        };
+        let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
+        if key.state != KeyState::Pending || key.construction_owner != Some(thread_owner) {
+            return Err(AxError::BadState);
+        }
+        let result = self.remove_key_everywhere(serial);
+        if result.is_ok() {
+            self.remove_pending_construction(serial);
+        }
+        crate::keyring::service::notify_request_key_waiters();
+        result
     }
 
     pub(in crate::keyring) fn credential_fsids_precommit(

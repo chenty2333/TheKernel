@@ -4,6 +4,8 @@
 //! closure, accounting — before anything is mutated, so a planning failure
 //! aborts with the manager untouched.
 
+use thekernel_linux_keyring::GcScratchState as LinuxGcScratchState;
+
 use super::*;
 
 impl KeyManager {
@@ -21,7 +23,7 @@ impl KeyManager {
         serial: i32,
     ) -> AxResult<()> {
         let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
-        if key.gc_plan.epoch == build.epoch {
+        if key.gc_plan.policy.epoch == build.epoch {
             return Ok(());
         }
         if !key.gc_plan.is_idle() || key.gc_next.is_some() {
@@ -32,10 +34,8 @@ impl KeyManager {
             .checked_add(1)
             .ok_or(AxError::BadState)?;
         key.gc_plan = GcPlanScratch {
-            epoch: build.epoch,
-            root_drops: 0,
-            link_drops: 0,
-            state: Some(GcPlanState::Touched),
+            policy: thekernel_linux_keyring::GcScratch::touch(build.epoch)
+                .map_err(|_| AxError::BadState)?,
             touched_next: build.touched_head,
             work_next: None,
         };
@@ -54,15 +54,10 @@ impl KeyManager {
         if !key.is_keyring() {
             return Err(AxError::BadState);
         }
-        key.gc_plan.root_drops = key
-            .gc_plan
-            .root_drops
-            .checked_add(1)
-            .ok_or(AxError::BadState)?;
-        if key.gc_plan.root_drops > key.root_refs {
-            return Err(AxError::BadState);
-        }
-        Ok(())
+        key.gc_plan
+            .policy
+            .add_root_drop(key.root_refs)
+            .map_err(|_| AxError::BadState)
     }
 
     pub(super) fn gc_add_link_drop(
@@ -72,15 +67,10 @@ impl KeyManager {
     ) -> AxResult<()> {
         Self::gc_touch_key(keys, build, serial)?;
         let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
-        key.gc_plan.link_drops = key
-            .gc_plan
-            .link_drops
-            .checked_add(1)
-            .ok_or(AxError::BadState)?;
-        if key.gc_plan.link_drops > key.link_refs {
-            return Err(AxError::BadState);
-        }
-        Ok(())
+        key.gc_plan
+            .policy
+            .add_link_drop(key.link_refs)
+            .map_err(|_| AxError::BadState)
     }
 
     pub(super) fn gc_maybe_queue(
@@ -89,30 +79,19 @@ impl KeyManager {
         serial: i32,
     ) -> AxResult<()> {
         let key = keys.get_mut(&serial).ok_or(AxError::BadState)?;
-        if key.gc_plan.epoch != build.epoch {
+        if key.gc_plan.policy.epoch != build.epoch {
             return Err(AxError::BadState);
         }
-        let roots_left = key
-            .root_refs
-            .checked_sub(key.gc_plan.root_drops)
-            .ok_or(AxError::BadState)?;
-        let links_left = key
-            .link_refs
-            .checked_sub(key.gc_plan.link_drops)
-            .ok_or(AxError::BadState)?;
-        if roots_left != 0 || links_left != 0 {
-            return Ok(());
+        if key
+            .gc_plan
+            .policy
+            .queue_if_unreferenced(key.root_refs, key.link_refs)
+            .map_err(|_| AxError::BadState)?
+        {
+            key.gc_plan.work_next = build.work_head;
+            build.work_head = Some(serial);
         }
-        match key.gc_plan.state {
-            Some(GcPlanState::Touched) => {
-                key.gc_plan.state = Some(GcPlanState::Queued);
-                key.gc_plan.work_next = build.work_head;
-                build.work_head = Some(serial);
-                Ok(())
-            }
-            Some(GcPlanState::Queued) | Some(GcPlanState::Retire) => Ok(()),
-            None => Err(AxError::BadState),
-        }
+        Ok(())
     }
 
     pub(super) fn gc_plan_roots(&mut self, build: &mut GcTxnBuild) -> AxResult<()> {
@@ -146,17 +125,17 @@ impl KeyManager {
         while let Some(serial) = build.work_head {
             let link_count = {
                 let key = self.keys.get_mut(&serial).ok_or(AxError::BadState)?;
-                if key.gc_plan.epoch != build.epoch
-                    || key.gc_plan.state != Some(GcPlanState::Queued)
+                if key.gc_plan.policy.epoch != build.epoch
+                    || key.gc_plan.policy.state != LinuxGcScratchState::Queued
                 {
                     return Err(AxError::BadState);
                 }
                 build.work_head = key.gc_plan.work_next.take();
-                key.gc_plan.state = Some(GcPlanState::Retire);
-                if key.root_refs != key.gc_plan.root_drops
-                    || key.link_refs != key.gc_plan.link_drops
-                    || !key.is_keyring() && !key.links.is_empty()
-                {
+                key.gc_plan
+                    .policy
+                    .retire(key.root_refs, key.link_refs)
+                    .map_err(|_| AxError::BadState)?;
+                if !key.is_keyring() && !key.links.is_empty() {
                     return Err(AxError::BadState);
                 }
                 key.links.len()
@@ -184,16 +163,16 @@ impl KeyManager {
             let serial = current.ok_or(AxError::BadState)?;
             let (next, state, root_refs, link_refs, root_drops, link_drops, resident, owner) = {
                 let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
-                if key.gc_plan.epoch != build.epoch || key.gc_plan.work_next.is_some() {
+                if key.gc_plan.policy.epoch != build.epoch || key.gc_plan.work_next.is_some() {
                     return Err(AxError::BadState);
                 }
                 (
                     key.gc_plan.touched_next,
-                    key.gc_plan.state,
+                    key.gc_plan.policy.state,
                     key.root_refs,
                     key.link_refs,
-                    key.gc_plan.root_drops,
-                    key.gc_plan.link_drops,
+                    key.gc_plan.policy.root_drops,
+                    key.gc_plan.policy.link_drops,
                     key.resident_charge,
                     key.in_owner_quota
                         .then_some((key.quota_uid, key.abi_charge)),
@@ -202,7 +181,7 @@ impl KeyManager {
             let roots_left = root_refs.checked_sub(root_drops).ok_or(AxError::BadState)?;
             let links_left = link_refs.checked_sub(link_drops).ok_or(AxError::BadState)?;
             match state {
-                Some(GcPlanState::Retire) => {
+                LinuxGcScratchState::Retire => {
                     if roots_left != 0 || links_left != 0 {
                         return Err(AxError::BadState);
                     }
@@ -237,12 +216,14 @@ impl KeyManager {
                             .expect("GC owner chain cannot exceed the owner ledger");
                     }
                 }
-                Some(GcPlanState::Touched) => {
+                LinuxGcScratchState::Touched => {
                     if roots_left == 0 && links_left == 0 {
                         return Err(AxError::BadState);
                     }
                 }
-                Some(GcPlanState::Queued) | None => return Err(AxError::BadState),
+                LinuxGcScratchState::Queued | LinuxGcScratchState::Idle => {
+                    return Err(AxError::BadState);
+                }
             }
             current = next;
         }
@@ -263,7 +244,10 @@ impl KeyManager {
                 .keys
                 .get_mut(&serial)
                 .expect("prepared key disappeared before abort");
-            assert_eq!(key.gc_plan.epoch, build.epoch, "foreign key GC scratch");
+            assert_eq!(
+                key.gc_plan.policy.epoch, build.epoch,
+                "foreign key GC scratch"
+            );
             current = key.gc_plan.touched_next;
             key.gc_plan = GcPlanScratch::IDLE;
         }
@@ -346,10 +330,13 @@ impl KeyManager {
                     .keys
                     .get(&serial)
                     .expect("prepared key disappeared before GC commit");
-                assert_eq!(key.gc_plan.epoch, plan.epoch, "foreign key GC scratch");
+                assert_eq!(
+                    key.gc_plan.policy.epoch, plan.epoch,
+                    "foreign key GC scratch"
+                );
                 (key.gc_plan.touched_next, key.gc_plan)
             };
-            if scratch.state == Some(GcPlanState::Retire) {
+            if scratch.policy.state == LinuxGcScratchState::Retire {
                 self.keys
                     .remove(&serial)
                     .expect("prepared key disappeared during GC commit");
@@ -360,11 +347,11 @@ impl KeyManager {
                     .expect("prepared survivor disappeared during GC commit");
                 key.root_refs = key
                     .root_refs
-                    .checked_sub(scratch.root_drops)
+                    .checked_sub(scratch.policy.root_drops)
                     .expect("prepared root decrement became invalid");
                 key.link_refs = key
                     .link_refs
-                    .checked_sub(scratch.link_drops)
+                    .checked_sub(scratch.policy.link_drops)
                     .expect("prepared link decrement became invalid");
                 key.gc_plan = GcPlanScratch::IDLE;
             }

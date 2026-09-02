@@ -2,6 +2,11 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
+use thekernel_linux_keyring::{
+    GcQuotaScratch as LinuxGcQuotaScratch, KeyError as LinuxKeyError,
+    QuotaAdmission as LinuxQuotaAdmission, QuotaCharge as LinuxQuotaCharge,
+    QuotaLimit as LinuxQuotaLimit, QuotaPlan as LinuxQuotaPlan, QuotaUsage as LinuxQuotaUsage,
+};
 
 use crate::task::Kuid;
 
@@ -61,6 +66,48 @@ pub(super) struct OwnerUsage {
     pub(super) bytes: usize,
 }
 
+fn linux_usage(usage: OwnerUsage) -> LinuxQuotaUsage {
+    LinuxQuotaUsage {
+        keys: usage.keys,
+        bytes: usage.bytes,
+    }
+}
+
+fn owner_usage(usage: LinuxQuotaUsage) -> OwnerUsage {
+    OwnerUsage {
+        keys: usage.keys,
+        bytes: usage.bytes,
+    }
+}
+
+fn linux_charge(charge: AbiQuotaCharge) -> LinuxQuotaCharge {
+    LinuxQuotaCharge {
+        keys: charge.keys,
+        bytes: charge.bytes,
+    }
+}
+
+const fn linux_admission(admission: QuotaAdmission) -> LinuxQuotaAdmission {
+    match admission {
+        QuotaAdmission::Enforced => LinuxQuotaAdmission::Enforced,
+        QuotaAdmission::AllowOverrun => LinuxQuotaAdmission::AllowOverrun,
+        QuotaAdmission::Exempt => LinuxQuotaAdmission::Exempt,
+    }
+}
+
+fn map_linux_key_error(error: LinuxKeyError) -> AxError {
+    match error {
+        LinuxKeyError::Quota => LinuxError::EDQUOT.into(),
+        LinuxKeyError::Overflow | LinuxKeyError::Limit => AxError::NoMemory,
+        LinuxKeyError::State => AxError::BadState,
+        LinuxKeyError::Invalid
+        | LinuxKeyError::NotFound
+        | LinuxKeyError::Exists
+        | LinuxKeyError::Permission
+        | LinuxKeyError::Cycle => AxError::InvalidInput,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OwnerGcScratch {
     epoch: u64,
@@ -115,36 +162,22 @@ impl OwnerLedger {
         old: AbiQuotaCharge,
         new: AbiQuotaCharge,
     ) -> AxResult<Option<OwnerLedgerUpdate>> {
-        if admission == QuotaAdmission::Exempt {
-            return Ok(None);
-        }
-
         let current = self.usage(uid);
-        let base_keys = current
-            .keys
-            .checked_sub(old.keys)
-            .ok_or(AxError::BadState)?;
-        let base_bytes = current
-            .bytes
-            .checked_sub(old.bytes)
-            .ok_or(AxError::BadState)?;
-        let after = OwnerUsage {
-            keys: base_keys
-                .checked_add(new.keys)
-                .ok_or(AxError::from(LinuxError::EDQUOT))?,
-            bytes: base_bytes
-                .checked_add(new.bytes)
-                .ok_or(AxError::from(LinuxError::EDQUOT))?,
-        };
-        let grows_keys = new.keys > old.keys;
-        let grows_bytes = new.bytes > old.bytes;
-        if admission == QuotaAdmission::Enforced
-            && (grows_keys && after.keys > user_maxkeys(uid)
-                || grows_bytes && after.bytes > user_maxbytes(uid))
-        {
-            return Err(LinuxError::EDQUOT.into());
-        }
-        Ok(Some(OwnerLedgerUpdate { uid, after }))
+        let plan = LinuxQuotaPlan::admit_replace(
+            linux_usage(current),
+            linux_charge(old),
+            linux_charge(new),
+            LinuxQuotaLimit {
+                keys: user_maxkeys(uid),
+                bytes: user_maxbytes(uid),
+            },
+            linux_admission(admission),
+        )
+        .map_err(map_linux_key_error)?;
+        Ok(plan.map(|plan| OwnerLedgerUpdate {
+            uid,
+            after: owner_usage(plan.after),
+        }))
     }
 
     pub(super) fn plan_transfer(
@@ -154,47 +187,32 @@ impl OwnerLedger {
         admission: QuotaAdmission,
         charge: AbiQuotaCharge,
     ) -> AxResult<[Option<OwnerLedgerUpdate>; 2]> {
-        if admission == QuotaAdmission::Exempt || old_uid == new_uid {
-            return Ok([None, None]);
-        }
-
-        let old_usage = self.usage(old_uid);
-        let new_usage = self.usage(new_uid);
-        let old_after = OwnerUsage {
-            keys: old_usage
-                .keys
-                .checked_sub(charge.keys)
-                .ok_or(AxError::BadState)?,
-            bytes: old_usage
-                .bytes
-                .checked_sub(charge.bytes)
-                .ok_or(AxError::BadState)?,
-        };
-        let new_after = OwnerUsage {
-            keys: new_usage
-                .keys
-                .checked_add(charge.keys)
-                .ok_or(AxError::from(LinuxError::EDQUOT))?,
-            bytes: new_usage
-                .bytes
-                .checked_add(charge.bytes)
-                .ok_or(AxError::from(LinuxError::EDQUOT))?,
-        };
-        if admission == QuotaAdmission::Enforced
-            && (new_after.keys > user_maxkeys(new_uid) || new_after.bytes > user_maxbytes(new_uid))
-        {
-            return Err(LinuxError::EDQUOT.into());
-        }
-        Ok([
-            Some(OwnerLedgerUpdate {
-                uid: old_uid,
-                after: old_after,
-            }),
-            Some(OwnerLedgerUpdate {
-                uid: new_uid,
-                after: new_after,
-            }),
-        ])
+        let transfer = LinuxQuotaPlan::transfer_for(
+            old_uid,
+            new_uid,
+            linux_usage(self.usage(old_uid)),
+            linux_usage(self.usage(new_uid)),
+            linux_charge(charge),
+            LinuxQuotaLimit {
+                keys: user_maxkeys(new_uid),
+                bytes: user_maxbytes(new_uid),
+            },
+            linux_admission(admission),
+        )
+        .map_err(map_linux_key_error)?;
+        Ok(match transfer {
+            Some((old, new)) => [
+                Some(OwnerLedgerUpdate {
+                    uid: old_uid,
+                    after: owner_usage(old.after),
+                }),
+                Some(OwnerLedgerUpdate {
+                    uid: new_uid,
+                    after: owner_usage(new.after),
+                }),
+            ],
+            None => [None, None],
+        })
     }
 
     pub(super) fn apply(&mut self, update: Option<OwnerLedgerUpdate>) {
@@ -234,39 +252,24 @@ impl OwnerLedger {
         } else {
             return Err(AxError::BadState);
         };
-        let retire = AbiQuotaCharge {
-            keys: entry
-                .gc
-                .retire
-                .keys
-                .checked_add(charge.keys)
-                .ok_or(AxError::BadState)?,
-            bytes: entry
-                .gc
-                .retire
-                .bytes
-                .checked_add(charge.bytes)
-                .ok_or(AxError::BadState)?,
+        let mut policy_scratch = LinuxGcQuotaScratch {
+            epoch: entry.gc.epoch,
+            retire: linux_charge(entry.gc.retire),
+            after: linux_usage(entry.gc.after),
         };
-        let after = OwnerUsage {
-            keys: entry
-                .usage
-                .keys
-                .checked_sub(retire.keys)
-                .ok_or(AxError::BadState)?,
-            bytes: entry
-                .usage
-                .bytes
-                .checked_sub(retire.bytes)
-                .ok_or(AxError::BadState)?,
-        };
+        policy_scratch
+            .add_retire(epoch, linux_usage(entry.usage), linux_charge(charge))
+            .map_err(map_linux_key_error)?;
         if newly_touched {
             entry.gc.epoch = epoch;
             entry.gc.next = *owner_head;
             *owner_head = Some(uid);
         }
-        entry.gc.retire = retire;
-        entry.gc.after = after;
+        entry.gc.retire = AbiQuotaCharge {
+            keys: policy_scratch.retire.keys,
+            bytes: policy_scratch.retire.bytes,
+        };
+        entry.gc.after = owner_usage(policy_scratch.after);
         Ok(newly_touched)
     }
 

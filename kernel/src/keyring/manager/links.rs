@@ -1,6 +1,75 @@
 //! Link, unlink, move, revoke, and clear operations over keyrings.
 
+use thekernel_linux_keyring::{
+    KeyError as LinuxKeyError, KeyGraph as LinuxKeyGraph, KeyId as LinuxKeyId,
+    KeyKind as LinuxKeyKind, KeyMeta as LinuxKeyMeta, KeyPermissions as LinuxKeyPermissions,
+    plan_link,
+};
+
 use super::*;
+
+/// Read-only projection used by the policy crate while the manager retains
+/// object ownership, reference counts and transactional mutation.
+pub(super) struct KeyGraphView<'a> {
+    keys: &'a BTreeMap<i32, Key>,
+}
+
+impl<'a> KeyGraphView<'a> {
+    pub(super) const fn new(keys: &'a BTreeMap<i32, Key>) -> Self {
+        Self { keys }
+    }
+}
+
+impl LinuxKeyGraph for KeyGraphView<'_> {
+    type Owner = u32;
+
+    fn meta(&self, key: LinuxKeyId) -> Option<LinuxKeyMeta<Self::Owner>> {
+        let key = self.keys.get(&(key.get() as i32))?;
+        Some(LinuxKeyMeta {
+            kind: match key.kind {
+                KeyTypeKind::Keyring => LinuxKeyKind::Keyring,
+                KeyTypeKind::User => LinuxKeyKind::User,
+                KeyTypeKind::Logon => LinuxKeyKind::Logon,
+                KeyTypeKind::BigKey => LinuxKeyKind::BigKey,
+            },
+            // Permission is enforced by the kernel's credential-aware gate;
+            // policy graph planning only needs immutable object metadata.
+            owner: 0,
+            permissions: LinuxKeyPermissions(0),
+            payload_len: key.payload.len(),
+            revoked: key.state == KeyState::Revoked,
+        })
+    }
+
+    fn links(&self, key: LinuxKeyId, out: &mut Vec<LinuxKeyId>) -> Result<(), LinuxKeyError> {
+        let key = self
+            .keys
+            .get(&(key.get() as i32))
+            .ok_or(LinuxKeyError::NotFound)?;
+        for &serial in &key.links {
+            out.push(LinuxKeyId::new(serial as u32).ok_or(LinuxKeyError::State)?);
+        }
+        Ok(())
+    }
+}
+
+fn plan_linux_link(keys: &BTreeMap<i32, Key>, from: i32, to: i32) -> AxResult<()> {
+    let from = LinuxKeyId::new(from as u32).ok_or(AxError::BadState)?;
+    let to = LinuxKeyId::new(to as u32).ok_or(AxError::BadState)?;
+    plan_link(&KeyGraphView::new(keys), from, to, KEYRING_SEARCH_MAX_DEPTH).map_err(|error| {
+        match error {
+            LinuxKeyError::NotFound => AxError::from(LinuxError::ENOKEY),
+            LinuxKeyError::Cycle => AxError::from(LinuxError::EDEADLK),
+            LinuxKeyError::Limit => AxError::from(LinuxError::ELOOP),
+            LinuxKeyError::Overflow | LinuxKeyError::State => AxError::BadState,
+            LinuxKeyError::Invalid
+            | LinuxKeyError::Exists
+            | LinuxKeyError::Permission
+            | LinuxKeyError::Quota => AxError::InvalidInput,
+        }
+    })?;
+    Ok(())
+}
 
 impl KeyManager {
     pub(super) fn remove_key_everywhere(&mut self, serial: i32) -> AxResult<()> {
@@ -339,46 +408,16 @@ impl KeyManager {
 
     pub(super) fn validate_keyring_link(&self, destination: i32, serial: i32) -> AxResult<()> {
         self.check_link_destination(destination)?;
-
-        let Some(key) = self.keys.get(&serial) else {
-            return Err(LinuxError::ENOKEY.into());
-        };
-        if !key.is_keyring() {
-            return Ok(());
+        let destination_key = self.keys.get(&destination).ok_or(AxError::BadState)?;
+        if destination_key.restricted
+            && destination_key.restriction_kind != self.keys.get(&serial).map(|key| key.kind)
+        {
+            return Err(AxError::OperationNotPermitted);
         }
 
-        let mut pending = Vec::from([(serial, 0)]);
-        let mut visited = BTreeSet::new();
-        while let Some((candidate, depth)) = pending.pop() {
-            if candidate == destination {
-                return Err(LinuxError::EDEADLK.into());
-            }
-            if !visited.insert(candidate) {
-                continue;
-            }
-            let Some(candidate_key) = self.keys.get(&candidate) else {
-                continue;
-            };
-            if !candidate_key.is_keyring() {
-                continue;
-            }
-            if depth >= KEYRING_SEARCH_MAX_DEPTH
-                && candidate_key
-                    .links
-                    .iter()
-                    .any(|linked| self.keys.get(linked).is_some_and(Key::is_keyring))
-            {
-                return Err(LinuxError::ELOOP.into());
-            }
-            pending.extend(
-                candidate_key
-                    .links
-                    .iter()
-                    .copied()
-                    .filter(|linked| self.keys.get(linked).is_some_and(Key::is_keyring))
-                    .map(|linked| (linked, depth + 1)),
-            );
-        }
+        // The pure graph planner establishes the cycle/visit bound before the
+        // manager starts its allocation and quota transaction.
+        plan_linux_link(&self.keys, destination, serial)?;
         Ok(())
     }
 
@@ -389,9 +428,6 @@ impl KeyManager {
             .ok_or(AxError::from(LinuxError::ENOKEY))?;
         if !destination_key.is_keyring() {
             return Err(AxError::InvalidInput);
-        }
-        if destination_key.restricted {
-            return Err(AxError::OperationNotPermitted);
         }
         Ok(())
     }

@@ -1,7 +1,27 @@
 //! Keyring search, persistent keyrings, payload replacement, and
 //! per-user accounting records.
 
-use super::*;
+use core::cell::Cell;
+
+use thekernel_linux_keyring::{
+    BfsRequest as LinuxBfsRequest, KeyError as LinuxKeyError, KeyId as LinuxKeyId,
+    TraversalNode as LinuxTraversalNode, bfs as linux_bfs,
+};
+
+use super::{links::KeyGraphView, *};
+
+fn map_linux_search_error(error: LinuxKeyError) -> AxError {
+    match error {
+        LinuxKeyError::NotFound => LinuxError::ENOKEY.into(),
+        LinuxKeyError::Limit => LinuxError::ELOOP.into(),
+        LinuxKeyError::Permission => LinuxError::EACCES.into(),
+        LinuxKeyError::Invalid => AxError::InvalidInput,
+        LinuxKeyError::Overflow | LinuxKeyError::State => AxError::BadState,
+        LinuxKeyError::Exists | LinuxKeyError::Quota | LinuxKeyError::Cycle => {
+            AxError::InvalidInput
+        }
+    }
+}
 
 impl KeyManager {
     pub(super) fn search_keyring(
@@ -10,95 +30,101 @@ impl KeyManager {
         actor: &KeyActor,
         kind: KeyTypeKind,
         description: &str,
-        visited: &mut BTreeSet<i32>,
+        _visited: &mut BTreeSet<i32>,
     ) -> AxResult<Option<ResolvedKey>> {
         let keyring = keyring.into();
         let search_possessed = match keyring.possession {
             PossessionContext::Recompute => self.is_possessed(keyring.serial, actor),
             PossessionContext::Fixed(possessed) => possessed,
         };
-        let mut pending = VecDeque::from([(keyring.serial, 0)]);
-        let mut first_error = None;
-
-        while let Some((ring_serial, depth)) = pending.pop_front() {
-            if !visited.insert(ring_serial) {
-                continue;
-            }
-            let Some(ring) = self.keys.get(&ring_serial) else {
-                if depth == 0 {
-                    return Err(LinuxError::ENOKEY.into());
-                }
-                continue;
-            };
-            if let Err(error) = self.check_key_available(ring, true) {
-                if depth == 0 {
-                    return Err(error);
-                }
-                continue;
-            }
-            if !ring.is_keyring() {
-                if depth == 0 {
-                    return Err(AxError::InvalidInput);
-                }
-                continue;
-            }
-            let ring_ref = ResolvedKey::with_possession(ring_serial, search_possessed);
-            if !self.key_has_perm(ring_ref, actor, KeyPermission::SEARCH)? {
-                if depth == 0 {
-                    return Err(LinuxError::EACCES.into());
-                }
-                continue;
-            }
-            if depth == 0 && ring.kind == kind && ring.description == description {
-                return Ok(Some(ResolvedKey::with_possession(
-                    ring_serial,
-                    search_possessed,
-                )));
-            }
-
-            for serial in &ring.links {
-                let Some(key) = self.keys.get(serial) else {
-                    continue;
-                };
-                if key.kind != kind || key.description != description {
-                    continue;
-                }
-                if let Err(error) = self.check_key_available(key, true) {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-                match self.key_has_perm(
-                    ResolvedKey::with_possession(*serial, search_possessed),
-                    actor,
-                    KeyPermission::SEARCH,
-                ) {
-                    Ok(true) => {
-                        return Ok(Some(ResolvedKey::with_possession(
-                            *serial,
-                            search_possessed,
-                        )));
-                    }
-                    Ok(false) => {
-                        first_error.get_or_insert(AxError::from(LinuxError::EACCES));
-                    }
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-
-            for serial in &ring.links {
-                if !self.keys.get(serial).is_some_and(Key::is_keyring) {
-                    continue;
-                }
-                if depth >= KEYRING_SEARCH_MAX_DEPTH {
-                    continue;
-                }
-                pending.push_back((*serial, depth + 1));
-            }
+        let root = self
+            .keys
+            .get(&keyring.serial)
+            .ok_or(AxError::from(LinuxError::ENOKEY))?;
+        self.check_key_available(root, true)?;
+        if !root.is_keyring() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.key_has_perm(keyring, actor, KeyPermission::SEARCH)? {
+            return Err(LinuxError::EACCES.into());
         }
 
-        if let Some(error) = first_error {
+        let root = LinuxKeyId::new(keyring.serial as u32).ok_or(AxError::BadState)?;
+        let first_error = Cell::new(None);
+        let found = linux_bfs(
+            &KeyGraphView::new(&self.keys),
+            LinuxBfsRequest {
+                roots: &[root],
+                max_visits: self.keys.len().saturating_add(1),
+                max_depth: KEYRING_SEARCH_MAX_DEPTH,
+            },
+            |id| {
+                let serial = id.get() as i32;
+                let key = self.keys.get(&serial).ok_or(LinuxKeyError::NotFound)?;
+                let available = match self.check_key_available(key, true) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        if key.kind == kind
+                            && key.description == description
+                            && first_error.get().is_none()
+                        {
+                            first_error.set(Some(error));
+                        }
+                        false
+                    }
+                };
+                let searchable = available
+                    && Self::key_permission_allows(
+                        key,
+                        actor,
+                        search_possessed,
+                        KeyPermission::SEARCH,
+                    );
+                // The generic BFS planner only calls its match callback for
+                // searchable nodes.  Linux key searches must still remember a
+                // matching key that was reached but denied, so a later
+                // accessible match wins while an otherwise empty search
+                // reports EACCES rather than ENOKEY.
+                if available
+                    && !searchable
+                    && key.kind == kind
+                    && key.description == description
+                    && first_error.get().is_none()
+                {
+                    first_error.set(Some(AxError::from(LinuxError::EACCES)));
+                }
+                Ok(LinuxTraversalNode {
+                    available,
+                    searchable,
+                    keyring: key.is_keyring(),
+                })
+            },
+            |id, _depth| {
+                let key = self
+                    .keys
+                    .get(&(id.get() as i32))
+                    .expect("planner key vanished");
+                if key.kind != kind || key.description != description {
+                    return false;
+                }
+                if Self::key_permission_allows(key, actor, search_possessed, KeyPermission::SEARCH)
+                {
+                    true
+                } else {
+                    if first_error.get().is_none() {
+                        first_error.set(Some(AxError::from(LinuxError::EACCES)));
+                    }
+                    false
+                }
+            },
+        )
+        .map_err(map_linux_search_error)?;
+        if let Some(found) = found {
+            Ok(Some(ResolvedKey::with_possession(
+                found.get() as i32,
+                search_possessed,
+            )))
+        } else if let Some(error) = first_error.get() {
             Err(error)
         } else {
             Ok(None)
