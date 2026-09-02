@@ -16,6 +16,17 @@ pub const PLANE_CRTC_Y: u32 = 11;
 pub const PLANE_CRTC_W: u32 = 12;
 pub const PLANE_CRTC_H: u32 = 13;
 pub const PLANE_TYPE: u32 = 14;
+pub const CONNECTOR_EDID: u32 = 15;
+pub const CONNECTOR_DPMS: u32 = 16;
+pub const CRTC_GAMMA_LUT: u32 = 17;
+pub const PLANE_FB_DAMAGE_CLIPS: u32 = 18;
+/// A transient sync_file input for the primary plane.  It deliberately is
+/// not retained in atomic state: every atomic request must reset it to -1.
+pub const PLANE_IN_FENCE_FD: u32 = 19;
+/// Userspace pointer to the transient sync_file fd produced by this CRTC
+/// commit.  Like Linux, the property reads back as zero rather than retaining
+/// a userspace address from an earlier request.
+pub const CRTC_OUT_FENCE_PTR: u32 = 20;
 
 #[derive(Clone, Copy)]
 pub struct Property {
@@ -28,7 +39,7 @@ pub struct Property {
 
 const ATOMIC_RANGE: u32 = uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_ATOMIC;
 const ATOMIC_OBJECT: u32 = uapi::DRM_MODE_PROP_OBJECT | uapi::DRM_MODE_PROP_ATOMIC;
-pub const PROPERTIES: [Property; 14] = [
+pub const PROPERTIES: [Property; 20] = [
     Property {
         id: CONNECTOR_CRTC_ID,
         name: "CRTC_ID",
@@ -129,6 +140,48 @@ pub const PROPERTIES: [Property; 14] = [
         min: 1,
         max: 1,
     },
+    Property {
+        id: CONNECTOR_EDID,
+        name: "EDID",
+        flags: uapi::DRM_MODE_PROP_BLOB | uapi::DRM_MODE_PROP_IMMUTABLE,
+        min: 0,
+        max: u32::MAX as u64,
+    },
+    Property {
+        id: CONNECTOR_DPMS,
+        name: "DPMS",
+        flags: uapi::DRM_MODE_PROP_ENUM | uapi::DRM_MODE_PROP_ATOMIC,
+        min: 0,
+        max: 3,
+    },
+    Property {
+        id: CRTC_GAMMA_LUT,
+        name: "GAMMA_LUT",
+        flags: uapi::DRM_MODE_PROP_BLOB | uapi::DRM_MODE_PROP_ATOMIC,
+        min: 0,
+        max: u32::MAX as u64,
+    },
+    Property {
+        id: PLANE_FB_DAMAGE_CLIPS,
+        name: "FB_DAMAGE_CLIPS",
+        flags: uapi::DRM_MODE_PROP_BLOB | uapi::DRM_MODE_PROP_ATOMIC,
+        min: 0,
+        max: u32::MAX as u64,
+    },
+    Property {
+        id: PLANE_IN_FENCE_FD,
+        name: "IN_FENCE_FD",
+        flags: uapi::DRM_MODE_PROP_SIGNED_RANGE | uapi::DRM_MODE_PROP_ATOMIC,
+        min: (-1i64) as u64,
+        max: i32::MAX as u64,
+    },
+    Property {
+        id: CRTC_OUT_FENCE_PTR,
+        name: "OUT_FENCE_PTR",
+        flags: ATOMIC_RANGE,
+        min: 0,
+        max: u64::MAX,
+    },
 ];
 
 pub fn get(id: u32) -> Option<&'static Property> {
@@ -136,8 +189,13 @@ pub fn get(id: u32) -> Option<&'static Property> {
 }
 pub fn object_properties(object_type: u32) -> &'static [u32] {
     match object_type {
-        uapi::DRM_MODE_OBJECT_CONNECTOR => &[CONNECTOR_CRTC_ID],
-        uapi::DRM_MODE_OBJECT_CRTC => &[CRTC_ACTIVE, CRTC_MODE_ID],
+        uapi::DRM_MODE_OBJECT_CONNECTOR => &[CONNECTOR_CRTC_ID, CONNECTOR_EDID, CONNECTOR_DPMS],
+        uapi::DRM_MODE_OBJECT_CRTC => &[
+            CRTC_ACTIVE,
+            CRTC_MODE_ID,
+            CRTC_GAMMA_LUT,
+            CRTC_OUT_FENCE_PTR,
+        ],
         uapi::DRM_MODE_OBJECT_PLANE => &[
             PLANE_FB_ID,
             PLANE_CRTC_ID,
@@ -150,6 +208,8 @@ pub fn object_properties(object_type: u32) -> &'static [u32] {
             PLANE_CRTC_W,
             PLANE_CRTC_H,
             PLANE_TYPE,
+            PLANE_FB_DAMAGE_CLIPS,
+            PLANE_IN_FENCE_FD,
         ],
         _ => &[],
     }

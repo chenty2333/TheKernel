@@ -7,11 +7,12 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use thekernel_linux_drm as abi;
 
-use super::{DrmFile, DumbRequest, Mode, PageFlip, dmabuf, property, syncobj, uapi};
+use super::{DrmFile, DumbRequest, Mode, dmabuf, property, syncobj, uapi};
 
 const MAX_ATOMIC_OBJECTS: usize = 3;
-const MAX_ATOMIC_PROPERTIES: usize = 16;
+const MAX_ATOMIC_PROPERTIES: usize = 32;
 const MAX_BLOB_BYTES: usize = 4096;
 const MAX_SYNCOBJ_HANDLES: usize = 1024;
 const XRGB8888: u32 = 0x3432_5258;
@@ -70,6 +71,10 @@ fn write_u64(copy: &impl UserCopy, address: u64, value: u64) -> AxResult<()> {
     copy.write(address, &value.to_ne_bytes())
 }
 fn write_u16(copy: &impl UserCopy, address: u64, value: u16) -> AxResult<()> {
+    let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
+    copy.write(address, &value.to_ne_bytes())
+}
+fn write_i32(copy: &impl UserCopy, address: u64, value: i32) -> AxResult<()> {
     let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
     copy.write(address, &value.to_ne_bytes())
 }
@@ -134,6 +139,11 @@ pub(super) fn dispatch(
 ) -> AxResult<usize> {
     let copy = context;
     let command = cmd as u64;
+    // Keep ioctl framing policy in linux-drm.  The individual arms below
+    // retain device-specific usercopy and resource operations.
+    if !abi::DecodedIoctl::decode(cmd).is_drm() {
+        return Err(AxError::InvalidInput);
+    }
     match command {
         uapi::DRM_IOCTL_VERSION => version(copy, arg)?,
         uapi::DRM_IOCTL_GET_MAGIC => get_magic(file, copy, arg)?,
@@ -150,7 +160,8 @@ pub(super) fn dispatch(
             request.value = match request.capability {
                 uapi::DRM_CAP_DUMB_BUFFER
                 | uapi::DRM_CAP_TIMESTAMP_MONOTONIC
-                | uapi::DRM_CAP_SYNCOBJ => 1,
+                | uapi::DRM_CAP_SYNCOBJ
+                | uapi::DRM_CAP_SYNCOBJ_TIMELINE => 1,
                 uapi::DRM_CAP_PRIME => uapi::DRM_PRIME_CAP_IMPORT | uapi::DRM_PRIME_CAP_EXPORT,
                 uapi::DRM_CAP_DUMB_PREFERRED_DEPTH => 24,
                 uapi::DRM_CAP_DUMB_PREFER_SHADOW => 0,
@@ -167,6 +178,10 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_SYNCOBJ_WAIT => syncobj_wait(file, copy, arg)?,
         uapi::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => syncobj_handle_to_fd(file, context, arg)?,
         uapi::DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => syncobj_fd_to_handle(file, context, arg)?,
+        uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT => syncobj_timeline_wait(file, copy, arg)?,
+        uapi::DRM_IOCTL_SYNCOBJ_QUERY => syncobj_query(file, copy, arg)?,
+        uapi::DRM_IOCTL_SYNCOBJ_TRANSFER => syncobj_transfer(file, copy, arg)?,
+        uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => syncobj_timeline_signal(file, copy, arg)?,
         uapi::DRM_IOCTL_SET_CLIENT_CAP => {
             let request: uapi::DrmSetClientCap = read_pod(copy, arg)?;
             match request.capability {
@@ -207,7 +222,7 @@ pub(super) fn dispatch(
             if request.flags & !uapi::DRM_MODE_FB_MODIFIERS != 0
                 || request.handles[1..].iter().any(|&id| id != 0)
                 || request.pitches[1..].iter().any(|&pitch| pitch != 0)
-                || request.offsets.iter().any(|&offset| offset != 0)
+                || request.offsets[1..].iter().any(|&offset| offset != 0)
                 || request.modifier[1..].iter().any(|&modifier| modifier != 0)
                 || request.modifier[0] != 0
                 || request.pixel_format != XRGB8888 && request.pixel_format != ARGB8888
@@ -218,12 +233,14 @@ pub(super) fn dispatch(
             // Keeping this explicit makes a missing MODIFIERS flag harmless
             // and rejects every layout the backing cannot faithfully scan out.
             request.fb_id = file
-                .add_framebuffer(
+                .add_framebuffer_format_offset(
                     request.handles[0],
                     request.width,
                     request.height,
                     request.pitches[0],
                     32,
+                    request.pixel_format,
+                    u64::from(request.offsets[0]),
                 )
                 .map_err(AxError::from)?;
             write_pod(copy, arg, &request)?;
@@ -235,9 +252,8 @@ pub(super) fn dispatch(
             file.rm_framebuffer(id).map_err(AxError::from)?;
         }
         uapi::DRM_IOCTL_MODE_SETCRTC => set_crtc(file, copy, arg)?,
-        uapi::DRM_IOCTL_MODE_CURSOR | uapi::DRM_IOCTL_MODE_CURSOR2 => {
-            return Err(AxError::OperationNotSupported);
-        }
+        uapi::DRM_IOCTL_MODE_CURSOR => cursor(file, copy, arg, false)?,
+        uapi::DRM_IOCTL_MODE_CURSOR2 => cursor(file, copy, arg, true)?,
         uapi::DRM_IOCTL_MODE_GETGAMMA => get_gamma(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_SETGAMMA => set_gamma(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_GETCRTC => get_crtc(file, copy, arg)?,
@@ -247,14 +263,24 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_MODE_SETPLANE => set_plane(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_PAGE_FLIP => {
             let request: uapi::DrmModeCrtcPageFlip = read_pod(copy, arg)?;
-            if request.flags & !uapi::DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            let resources = file.resources();
+            if request.crtc_id != resources.crtc.id
+                || request.reserved != 0
+                || request.flags & !uapi::DRM_MODE_PAGE_FLIP_EVENT != 0
+            {
                 return Err(AxError::InvalidInput);
             }
-            file.page_flip(PageFlip {
-                framebuffer: request.fb_id,
-                event: request.flags & uapi::DRM_MODE_PAGE_FLIP_EVENT != 0,
-                user_data: request.user_data,
-            })
+            let changes = [change(
+                resources.primary_plane_id,
+                property::PLANE_FB_ID,
+                request.fb_id as u64,
+            )];
+            file.submit_legacy_atomic(
+                &changes,
+                None,
+                (request.flags & uapi::DRM_MODE_PAGE_FLIP_EVENT != 0).then_some(request.user_data),
+                true,
+            )
             .map_err(AxError::from)?;
         }
         uapi::DRM_IOCTL_WAIT_VBLANK => wait_vblank(file, copy, arg)?,
@@ -263,11 +289,12 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_MODE_GETPLANE => get_plane(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_OBJ_GETPROPERTIES => object_properties(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_OBJ_SETPROPERTY => object_set_property(file, copy, arg)?,
+        uapi::DRM_IOCTL_MODE_SETPROPERTY => connector_set_property(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_GETPROPERTY => get_property(copy, arg)?,
         uapi::DRM_IOCTL_MODE_CREATEPROPBLOB => create_blob(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_GETPROPBLOB => get_blob(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_DESTROYPROPBLOB => destroy_blob(file, copy, arg)?,
-        uapi::DRM_IOCTL_MODE_ATOMIC => atomic(file, copy, arg)?,
+        uapi::DRM_IOCTL_MODE_ATOMIC => atomic(file, context, arg)?,
         uapi::DRM_IOCTL_MODE_GETFB2 => getfb2(file, copy, arg)?,
         _ => return Err(AxError::NotATty),
     }
@@ -308,6 +335,10 @@ const fn render_allows_core_ioctl(command: u64) -> bool {
             | uapi::DRM_IOCTL_SYNCOBJ_WAIT
             | uapi::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD
             | uapi::DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE
+            | uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            | uapi::DRM_IOCTL_SYNCOBJ_QUERY
+            | uapi::DRM_IOCTL_SYNCOBJ_TRANSFER
+            | uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL
     )
 }
 
@@ -332,7 +363,15 @@ fn addfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
         return Err(AxError::InvalidInput);
     }
     r.fb_id = file
-        .add_framebuffer(r.handle, r.width, r.height, r.pitch, r.bpp)
+        .add_framebuffer_format_offset(
+            r.handle,
+            r.width,
+            r.height,
+            r.pitch,
+            r.bpp,
+            if r.depth == 24 { XRGB8888 } else { ARGB8888 },
+            0,
+        )
         .map_err(AxError::from)?;
     write_pod(copy, arg, &r)
 }
@@ -442,12 +481,8 @@ fn prime_fd_to_handle(
 
 fn syncobj_create(file: &DrmFile, context: &crate::file::IoctlContext, arg: usize) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjCreate = read_pod(context, arg)?;
-    if request.flags & !uapi::DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    request.handle = file
-        .create_syncobj(request.flags & uapi::DRM_SYNCOBJ_CREATE_SIGNALED != 0)
-        .map_err(AxError::from)?;
+    let signaled = request.validate().map_err(|_| AxError::InvalidInput)?;
+    request.handle = file.create_syncobj(signaled).map_err(AxError::from)?;
     write_pod(context, arg, &request)
 }
 
@@ -456,7 +491,8 @@ fn syncobj_destroy(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult
     if request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
-    file.destroy_syncobj(request.handle).map_err(AxError::from)
+    let handle = request.validate().map_err(|_| AxError::InvalidInput)?;
+    file.destroy_syncobj(handle).map_err(AxError::from)
 }
 
 fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool) -> AxResult<()> {
@@ -489,30 +525,33 @@ fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool)
 
 fn syncobj_wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjWait = read_pod(copy, arg)?;
-    if request.count_handles == 0
-        || request.flags & !uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0
-        || request.pad != 0
-        || request.deadline_nsec != 0
-    {
+    let allowed = uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+        | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+    if request.count_handles == 0 || request.flags & !allowed != 0 || request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
+    let deadline_hint = syncobj_deadline_hint(request.flags, request.deadline_nsec)?;
     let handles = read_array::<u32>(
         copy,
         request.handles,
         request.count_handles as usize,
         MAX_SYNCOBJ_HANDLES,
     )?;
-    let mut fences = Vec::new();
-    fences
+    let mut objects = Vec::new();
+    objects
         .try_reserve_exact(handles.len())
         .map_err(|_| AxError::NoMemory)?;
     for handle in handles {
-        fences.push(file.syncobj(handle).map_err(AxError::from)?.fence());
+        objects.push((file.syncobj(handle).map_err(AxError::from)?, 0));
     }
-    request.first_signaled = syncobj::wait(
-        fences,
+    request.first_signaled = syncobj::timeline_wait(
+        &objects,
         request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0,
+        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
+        false,
         request.timeout_nsec,
+        deadline_hint,
     )? as u32;
     write_pod(copy, arg, &request)
 }
@@ -523,17 +562,17 @@ fn syncobj_handle_to_fd(
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    if request.flags != uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE
-        || request.pad != 0
-        || request.point != 0
-    {
+    if request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
-    request.fd = syncobj::export(
-        file.syncobj(request.handle).map_err(AxError::from)?.fence(),
-        context,
-        false,
-    )?;
+    let object = file.syncobj(request.handle).map_err(AxError::from)?;
+    request.fd = match request.flags {
+        0 => syncobj::export_syncobj(object, context, false)?,
+        uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE => {
+            syncobj::export(object.fence()?, context, false)?
+        }
+        _ => return Err(AxError::InvalidInput),
+    };
     write_pod(context, arg, &request)
 }
 
@@ -543,49 +582,206 @@ fn syncobj_fd_to_handle(
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    if request.flags != uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE
-        || request.pad != 0
-        || request.point != 0
+    if request.pad != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    match request.flags {
+        0 => {
+            request.handle = file
+                .import_syncobj(syncobj::import_syncobj(context, request.fd)?)
+                .map_err(AxError::from)?;
+        }
+        uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE => {
+            file.syncobj(request.handle)
+                .map_err(AxError::from)?
+                .import_fence(syncobj::import(context, request.fd)?);
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+    write_pod(context, arg, &request)
+}
+
+fn syncobj_timeline_wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let mut request: uapi::DrmSyncobjTimelineWait = read_pod(copy, arg)?;
+    let allowed = uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+        | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+        | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+    if request.count_handles == 0 || request.flags & !allowed != 0 || request.pad != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let deadline_hint = syncobj_deadline_hint(request.flags, request.deadline_nsec)?;
+    let handles = read_array::<u32>(
+        copy,
+        request.handles,
+        request.count_handles as usize,
+        MAX_SYNCOBJ_HANDLES,
+    )?;
+    let points = read_array::<u64>(
+        copy,
+        request.points,
+        request.count_handles as usize,
+        MAX_SYNCOBJ_HANDLES,
+    )?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(handles.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (handle, point) in handles.into_iter().zip(points) {
+        objects.push((file.syncobj(handle).map_err(AxError::from)?, point));
+    }
+    request.first_signaled = syncobj::timeline_wait(
+        &objects,
+        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0,
+        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
+        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0,
+        request.timeout_nsec,
+        deadline_hint,
+    )? as u32;
+    write_pod(copy, arg, &request)
+}
+
+fn syncobj_query(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let request: uapi::DrmSyncobjTimelineArray = read_pod(copy, arg)?;
+    if request.count_handles == 0
+        || request.flags & !uapi::DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0
     {
         return Err(AxError::InvalidInput);
     }
-    let fence = syncobj::import(context, request.fd)?;
-    request.handle = file.create_syncobj(false).map_err(AxError::from)?;
-    let object = file.syncobj(request.handle).map_err(AxError::from)?;
-    object.import_fence(fence);
-    write_pod(context, arg, &request)
+    let handles = read_array::<u32>(
+        copy,
+        request.handles,
+        request.count_handles as usize,
+        MAX_SYNCOBJ_HANDLES,
+    )?;
+    for (index, handle) in handles.into_iter().enumerate() {
+        let point = file
+            .syncobj(handle)
+            .map_err(AxError::from)?
+            .query_point(request.flags & uapi::DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0);
+        write_u64(
+            copy,
+            array_at(request.points, index, size_of::<u64>() as u64)?,
+            point,
+        )?;
+    }
+    Ok(())
+}
+
+fn syncobj_transfer(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let request: uapi::DrmSyncobjTransfer = read_pod(copy, arg)?;
+    if request.flags & !uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0 || request.pad != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let source = file.syncobj(request.src_handle).map_err(AxError::from)?;
+    let destination = file.syncobj(request.dst_handle).map_err(AxError::from)?;
+    let fence = source.wait_fence_for_submit(
+        request.src_point,
+        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
+        None,
+    )?;
+    destination.submit_point(request.dst_point, fence)
+}
+
+fn syncobj_deadline_hint(
+    flags: u32,
+    deadline_nsec: u64,
+) -> AxResult<Option<axhal::time::TimeValue>> {
+    if flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE == 0 {
+        if deadline_nsec != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        return Ok(None);
+    }
+    if deadline_nsec == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(Some(core::time::Duration::from_nanos(deadline_nsec)))
+}
+
+fn syncobj_timeline_signal(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let request: uapi::DrmSyncobjTimelineArray = read_pod(copy, arg)?;
+    if request.count_handles == 0 || request.flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let handles = read_array::<u32>(
+        copy,
+        request.handles,
+        request.count_handles as usize,
+        MAX_SYNCOBJ_HANDLES,
+    )?;
+    let points = read_array::<u64>(
+        copy,
+        request.points,
+        request.count_handles as usize,
+        MAX_SYNCOBJ_HANDLES,
+    )?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(handles.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (handle, point) in handles.into_iter().zip(points) {
+        objects.push((file.syncobj(handle).map_err(AxError::from)?, point));
+    }
+    for (object, point) in objects {
+        object.signal_point(point)?;
+    }
+    Ok(())
 }
 
 fn plane_resources(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeGetPlaneRes = read_pod(copy, arg)?;
-    r.count_planes = 1;
-    if r.plane_id_ptr != 0 {
+    let capacity = r.count_planes;
+    r.count_planes = 2;
+    if r.plane_id_ptr != 0 && capacity != 0 {
         write_u32(copy, r.plane_id_ptr, file.resources().primary_plane_id)?;
+        if capacity > 1 {
+            write_u32(
+                copy,
+                r.plane_id_ptr.checked_add(4).ok_or(AxError::BadAddress)?,
+                file.resources().cursor_plane_id,
+            )?;
+        }
     }
     write_pod(copy, arg, &r)
 }
 fn get_plane(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeGetPlane = read_pod(copy, arg)?;
     let x = file.resources();
-    if r.plane_id != x.primary_plane_id {
+    if r.plane_id != x.primary_plane_id && r.plane_id != x.cursor_plane_id {
         return Err(AxError::InvalidInput);
     }
     let s = file.device_state();
-    r.crtc_id = s.atomic.plane_crtc;
-    r.fb_id = s.atomic.fb;
+    let cursor = r.plane_id == x.cursor_plane_id;
+    r.crtc_id = if cursor {
+        s.atomic.cursor_crtc
+    } else {
+        s.atomic.plane_crtc
+    };
+    r.fb_id = if cursor {
+        s.atomic.cursor_fb
+    } else {
+        s.atomic.fb
+    };
     r.possible_crtcs = 1;
     r.gamma_size = 0;
-    r.count_format_types = 2;
+    r.count_format_types = if cursor { 1 } else { 2 };
     drop(s);
     if r.format_type_ptr != 0 {
-        write_u32(copy, r.format_type_ptr, 0x3432_5258)?;
         write_u32(
             copy,
-            r.format_type_ptr
-                .checked_add(4)
-                .ok_or(AxError::BadAddress)?,
-            0x3432_5241,
+            r.format_type_ptr,
+            if cursor { 0x3432_5241 } else { 0x3432_5258 },
         )?;
+        if !cursor {
+            write_u32(
+                copy,
+                r.format_type_ptr
+                    .checked_add(4)
+                    .ok_or(AxError::BadAddress)?,
+                0x3432_5241,
+            )?;
+        }
     }
     write_pod(copy, arg, &r)
 }
@@ -607,15 +803,63 @@ fn set_plane(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     {
         return Err(AxError::InvalidInput);
     }
-    file.set_crtc(
-        r.fb_id,
-        Mode {
-            width: r.crtc_w,
-            height: r.crtc_h,
-            refresh_millihz: advertised_mode(file).refresh_millihz,
-        },
-    )
-    .map_err(AxError::from)
+    // SETPLANE changes plane geometry only.  In particular it never invents
+    // a CRTC mode from the destination dimensions; the shared atomic proposal
+    // below validates this full-frame linear geometry against the active mode.
+    let changes = [
+        change(
+            resources.primary_plane_id,
+            property::PLANE_FB_ID,
+            r.fb_id as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_CRTC_ID,
+            r.crtc_id as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_SRC_X,
+            r.src_x as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_SRC_Y,
+            r.src_y as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_SRC_W,
+            r.src_w as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_SRC_H,
+            r.src_h as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_CRTC_X,
+            r.crtc_x as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_CRTC_Y,
+            r.crtc_y as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_CRTC_W,
+            r.crtc_w as u64,
+        ),
+        change(
+            resources.primary_plane_id,
+            property::PLANE_CRTC_H,
+            r.crtc_h as u64,
+        ),
+    ];
+    file.submit_legacy_atomic(&changes, None, None, false)
+        .map_err(AxError::from)
 }
 
 fn getfb2(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
@@ -626,13 +870,14 @@ fn getfb2(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     }
     r.width = fb.width;
     r.height = fb.height;
-    r.pixel_format = XRGB8888;
+    r.pixel_format = fb.format;
     r.flags = 0;
     r.handles = [0; 4];
     r.handles[0] = fb.handle;
     r.pitches = [0; 4];
     r.pitches[0] = fb.pitch;
     r.offsets = [0; 4];
+    r.offsets[0] = u32::try_from(fb.offset).map_err(|_| AxError::InvalidInput)?;
     r.modifier = [0; 4];
     write_pod(copy, arg, &r)
 }
@@ -642,19 +887,38 @@ fn object_set_property(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxRe
     file.set_legacy_property(r.obj_id, r.obj_type, r.prop_id, r.value)
         .map_err(AxError::from)
 }
+fn connector_set_property(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let r: uapi::DrmModeConnectorSetProperty = read_pod(copy, arg)?;
+    file.set_legacy_property(
+        r.connector_id,
+        uapi::DRM_MODE_OBJECT_CONNECTOR,
+        r.prop_id,
+        r.value,
+    )
+    .map_err(AxError::from)
+}
 fn object_properties(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeObjGetProperties = read_pod(copy, arg)?;
-    let ids = property::object_properties(r.obj_type);
     let resources = file.resources();
     let valid = match r.obj_type {
         uapi::DRM_MODE_OBJECT_CONNECTOR => r.obj_id == resources.connector.id,
         uapi::DRM_MODE_OBJECT_CRTC => r.obj_id == resources.crtc.id,
-        uapi::DRM_MODE_OBJECT_PLANE => r.obj_id == resources.primary_plane_id,
+        uapi::DRM_MODE_OBJECT_PLANE => {
+            r.obj_id == resources.primary_plane_id || r.obj_id == resources.cursor_plane_id
+        }
         _ => false,
     };
     if !valid {
         return Err(AxError::InvalidInput);
     };
+    // IN_FENCE_FD is implemented by the scanout plane only.  The cursorq
+    // completion is internal to a single transaction and has no user-facing
+    // plane-fence ABI.
+    let ids: Vec<u32> = property::object_properties(r.obj_type)
+        .iter()
+        .copied()
+        .filter(|id| r.obj_id != resources.cursor_plane_id || *id != property::PLANE_IN_FENCE_FD)
+        .collect();
     r.count_props = ids.len() as u32;
     let state = file.device_state().atomic;
     if r.props_ptr != 0 {
@@ -667,7 +931,8 @@ fn object_properties(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResu
             write_u64(
                 copy,
                 array_at(r.prop_values_ptr, i, 8)?,
-                super::atomic::value(&state, *id).ok_or(AxError::InvalidInput)?,
+                super::atomic::value_for_object(&resources, &state, r.obj_id, *id)
+                    .ok_or(AxError::InvalidInput)?,
             )?;
         }
     }
@@ -680,30 +945,46 @@ fn get_property(copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     r.name = [0; uapi::DRM_PROP_NAME_LEN];
     let n = p.name.as_bytes();
     r.name[..n.len()].copy_from_slice(n);
-    r.count_values = if p.flags & uapi::DRM_MODE_PROP_RANGE != 0 {
-        2
-    } else {
-        0
+    r.count_values =
+        if p.flags & (uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_SIGNED_RANGE) != 0 {
+            2
+        } else {
+            0
+        };
+    r.count_enum_blobs = match p.id {
+        property::PLANE_TYPE => 2,
+        property::CONNECTOR_DPMS => 4,
+        _ => 0,
     };
-    r.count_enum_blobs = if p.id == property::PLANE_TYPE { 1 } else { 0 };
     if r.values_ptr != 0 && r.count_values != 0 {
         write_u64(copy, r.values_ptr, p.min)?;
         write_u64(copy, r.values_ptr + 8, p.max)?;
     }
-    if r.enum_blob_ptr != 0 && r.count_enum_blobs != 0 {
-        let e = uapi::DrmModePropertyEnum {
-            value: 1,
-            name: {
-                let mut x = [0; uapi::DRM_PROP_NAME_LEN];
-                x[..7].copy_from_slice(b"Primary");
-                x
-            },
+    if r.enum_blob_ptr != 0 {
+        let enums: &[(u64, &[u8])] = match p.id {
+            property::PLANE_TYPE => &[(1, b"Primary"), (2, b"Cursor")],
+            property::CONNECTOR_DPMS => {
+                &[(0, b"On"), (1, b"Standby"), (2, b"Suspend"), (3, b"Off")]
+            }
+            _ => &[],
         };
-        write_pod(
-            copy,
-            usize::try_from(r.enum_blob_ptr).map_err(|_| AxError::BadAddress)?,
-            &e,
-        )?;
+        for (index, (value, name)) in enums.iter().enumerate() {
+            let mut entry = uapi::DrmModePropertyEnum {
+                value: *value,
+                name: [0; uapi::DRM_PROP_NAME_LEN],
+            };
+            entry.name[..name.len()].copy_from_slice(name);
+            write_pod(
+                copy,
+                usize::try_from(array_at(
+                    r.enum_blob_ptr,
+                    index,
+                    size_of::<uapi::DrmModePropertyEnum>() as u64,
+                )?)
+                .map_err(|_| AxError::BadAddress)?,
+                &entry,
+            )?;
+        }
     }
     write_pod(copy, arg, &r)
 }
@@ -729,7 +1010,8 @@ fn destroy_blob(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()
     let r: uapi::DrmModeDestroyBlob = read_pod(copy, arg)?;
     file.destroy_blob(r.blob_id).map_err(AxError::from)
 }
-fn atomic(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+fn atomic(file: &DrmFile, context: &crate::file::IoctlContext, arg: usize) -> AxResult<()> {
+    let copy = context;
     let r: uapi::DrmModeAtomic = read_pod(copy, arg)?;
     if !file.atomic_enabled()
         || r.reserved != 0
@@ -742,6 +1024,8 @@ fn atomic(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     {
         return Err(AxError::InvalidInput);
     };
+    r.validate(MAX_ATOMIC_OBJECTS as u32)
+        .map_err(|_| AxError::InvalidInput)?;
     file.require_master().map_err(AxError::from)?;
     let objects = read_array::<u32>(copy, r.objs_ptr, r.count_objs as usize, MAX_ATOMIC_OBJECTS)?;
     let counts = read_array::<u32>(
@@ -775,13 +1059,14 @@ fn atomic(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     }
     let mode_id = changes
         .iter()
+        .rev()
         .find(|x| x.property == property::CRTC_MODE_ID)
         .map(|x| x.value as u32);
     let mode_blob = match mode_id {
         Some(0) | None => None,
         Some(id) => Some((
             id,
-            mode_from_blob(&file.blob(id).ok_or(AxError::NotFound)?)?,
+            mode_from_blob(&file.live_blob(id).ok_or(AxError::NotFound)?)?,
         )),
     };
     let (generation, current, next, fb) =
@@ -793,17 +1078,65 @@ fn atomic(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     {
         return Err(AxError::InvalidInput);
     }
+    // These two standard atomic properties are request-local and never
+    // become part of `State`.  Importing first validates a sync_file without
+    // publishing a dependency or touching the framebuffer reservation.
+    let in_fence = changes
+        .iter()
+        .rev()
+        .find(|change| change.property == property::PLANE_IN_FENCE_FD)
+        .map(|change| change.value);
+    let mut inputs = Vec::new();
+    if let Some(value) = in_fence {
+        if value != u64::MAX {
+            let fd = i32::try_from(value).map_err(|_| AxError::InvalidInput)?;
+            inputs.push(syncobj::import(context, fd)?);
+        }
+    }
+    // Atomic check has no reservation side effects. submit_atomic performs
+    // the exact predecessor replacement at commit admission, after all
+    // request validation and user copies have completed.
+    let predecessors = Vec::new();
+    let out_fence_ptr = changes
+        .iter()
+        .rev()
+        .find(|change| change.property == property::CRTC_OUT_FENCE_PTR)
+        .map(|change| change.value)
+        .unwrap_or(0);
     if r.flags & uapi::DRM_MODE_ATOMIC_TEST_ONLY != 0 {
         return Ok(());
     }
-    file.submit_atomic(
+    let completion = super::fence::Fence::new(false);
+    let exported_fd = if out_fence_ptr != 0 {
+        let fd = syncobj::export(completion.clone(), context, false)?;
+        if let Err(error) = write_i32(copy, out_fence_ptr, fd) {
+            completion.signal_error();
+            let _ = crate::file::close_file_like(fd);
+            return Err(error);
+        }
+        Some(fd)
+    } else {
+        None
+    };
+    let result = file.submit_atomic(
         generation,
         next,
         fb,
         (r.flags & uapi::DRM_MODE_PAGE_FLIP_EVENT != 0).then_some(r.user_data),
         r.flags & uapi::DRM_MODE_ATOMIC_NONBLOCK != 0,
-    )
-    .map_err(AxError::from)
+        super::file::AtomicSync {
+            inputs,
+            predecessors,
+            completion: Some(completion),
+        },
+    );
+    if let Err(error) = result {
+        if let Some(fd) = exported_fd {
+            let _ = crate::file::close_file_like(fd);
+        }
+        return Err(AxError::from(error));
+    }
+    Ok(())
 }
 
 fn mode_from_blob(b: &[u8]) -> AxResult<Mode> {
@@ -955,7 +1288,11 @@ fn get_crtc(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     r.fb_id = resources.crtc.framebuffer.unwrap_or(0);
     r.x = 0;
     r.y = 0;
-    r.gamma_size = 0;
+    r.gamma_size = file
+        .gamma_lut(resources.crtc.id)
+        .map_err(AxError::from)?
+        .len() as u32
+        / 3;
     r.mode_valid = active as u32;
     r.mode = resources.crtc.mode.map(mode_info).unwrap_or_default();
     write_pod(copy, arg, &r)
@@ -987,12 +1324,19 @@ fn get_connector(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<(
     if r.encoders_ptr != 0 && encoders_capacity != 0 {
         write_u32(copy, r.encoders_ptr, resources.encoder_id)?;
     }
-    if r.modes_ptr != 0 && modes_capacity != 0 {
-        write_pod(
-            copy,
-            usize::try_from(r.modes_ptr).map_err(|_| AxError::BadAddress)?,
-            &mode_info(advertised_mode(file)),
-        )?;
+    if resources.connector.connected && r.modes_ptr != 0 {
+        for (index, mode) in resources.modes.iter().take(modes_capacity).enumerate() {
+            write_pod(
+                copy,
+                usize::try_from(array_at(
+                    r.modes_ptr,
+                    index,
+                    size_of::<uapi::DrmModeModeInfo>() as u64,
+                )?)
+                .map_err(|_| AxError::BadAddress)?,
+                &mode_info(*mode),
+            )?;
+        }
     }
     let atomic = file.device_state().atomic;
     if r.props_ptr != 0 {
@@ -1005,12 +1349,13 @@ fn get_connector(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<(
             write_u64(
                 copy,
                 array_at(r.prop_values_ptr, index, 8)?,
-                super::atomic::value(&atomic, *id).ok_or(AxError::InvalidInput)?,
+                super::atomic::value_with_resources(&resources, &atomic, *id)
+                    .ok_or(AxError::InvalidInput)?,
             )?;
         }
     }
     r.count_encoders = 1;
-    r.count_modes = 1;
+    r.count_modes = resources.connector.connected as u32 * resources.modes.len() as u32;
     r.count_props = properties.len() as u32;
     r.encoder_id = resources.encoder_id;
     r.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
@@ -1025,6 +1370,89 @@ fn get_connector(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<(
     r.subpixel = 0;
     r.pad = 0;
     write_pod(copy, arg, &r)
+}
+
+/// Legacy cursor ioctls are translated directly to the dedicated cursor
+/// transport.  The primary plane remains the only atomic plane: VirtIO's
+/// cursorq has no atomic plane state and must never be exposed as one.
+fn cursor(file: &DrmFile, copy: &impl UserCopy, arg: usize, cursor2: bool) -> AxResult<()> {
+    let (flags, crtc_id, x, y, width, height, handle, hot_x, hot_y) = if cursor2 {
+        let request: uapi::DrmModeCursor2 = read_pod(copy, arg)?;
+        if request.hot_x < 0 || request.hot_y < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        (
+            request.flags,
+            request.crtc_id,
+            request.x,
+            request.y,
+            request.width,
+            request.height,
+            request.handle,
+            request.hot_x as u32,
+            request.hot_y as u32,
+        )
+    } else {
+        let request: uapi::DrmModeCursor = read_pod(copy, arg)?;
+        (
+            request.flags,
+            request.crtc_id,
+            request.x,
+            request.y,
+            request.width,
+            request.height,
+            request.handle,
+            0,
+            0,
+        )
+    };
+    let resources = file.resources();
+    if crtc_id != resources.crtc.id || flags == 0 || flags & !uapi::DRM_MODE_CURSOR_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let plane = resources.cursor_plane_id;
+    let changes = if flags & uapi::DRM_MODE_CURSOR_BO != 0 {
+        if handle == 0 || width != 64 || height != 64 || hot_x >= 64 || hot_y >= 64 {
+            return Err(AxError::InvalidInput);
+        }
+        [
+            change(
+                plane,
+                property::PLANE_FB_ID,
+                file.cursor_framebuffer(handle).map_err(AxError::from)? as u64,
+            ),
+            change(plane, property::PLANE_CRTC_ID, resources.crtc.id as u64),
+            change(plane, property::PLANE_SRC_X, 0),
+            change(plane, property::PLANE_SRC_Y, 0),
+            change(plane, property::PLANE_SRC_W, 64 << 16),
+            change(plane, property::PLANE_SRC_H, 64 << 16),
+            change(plane, property::PLANE_CRTC_X, x as u32 as u64),
+            change(plane, property::PLANE_CRTC_Y, y as u32 as u64),
+            change(plane, property::PLANE_CRTC_W, 64),
+            change(plane, property::PLANE_CRTC_H, 64),
+        ]
+    } else if flags & uapi::DRM_MODE_CURSOR_MOVE != 0 {
+        let state = file.device_state().atomic;
+        if state.cursor_fb == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        [
+            change(plane, property::PLANE_FB_ID, state.cursor_fb as u64),
+            change(plane, property::PLANE_CRTC_ID, resources.crtc.id as u64),
+            change(plane, property::PLANE_SRC_X, 0),
+            change(plane, property::PLANE_SRC_Y, 0),
+            change(plane, property::PLANE_SRC_W, 64 << 16),
+            change(plane, property::PLANE_SRC_H, 64 << 16),
+            change(plane, property::PLANE_CRTC_X, x as u32 as u64),
+            change(plane, property::PLANE_CRTC_Y, y as u32 as u64),
+            change(plane, property::PLANE_CRTC_W, 64),
+            change(plane, property::PLANE_CRTC_H, 64),
+        ]
+    } else {
+        return Err(AxError::InvalidInput);
+    };
+    file.submit_legacy_cursor_atomic(&changes, hot_x, hot_y)
+        .map_err(AxError::from)
 }
 
 fn dirtyfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
@@ -1081,25 +1509,109 @@ fn set_gamma(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
 fn set_crtc(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let request: uapi::DrmModeCrtc = read_pod(copy, arg)?;
     let resources = file.resources();
-    if request.crtc_id != resources.crtc.id || request.count_connectors != 1 {
+    if request.crtc_id != resources.crtc.id || request.x != 0 || request.y != 0 {
         return Err(AxError::InvalidInput);
     }
-    let connector: u32 = read_pod(
-        copy,
-        usize::try_from(request.set_connectors_ptr).map_err(|_| AxError::BadAddress)?,
-    )?;
-    if connector != resources.connector.id || request.mode_valid == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    file.set_crtc(
-        request.fb_id,
-        Mode {
+    let (changes, mode) = if request.fb_id == 0 {
+        if request.count_connectors != 0 || request.mode_valid != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        (
+            [
+                change(resources.connector.id, property::CONNECTOR_CRTC_ID, 0),
+                change(resources.crtc.id, property::CRTC_ACTIVE, 0),
+                change(resources.crtc.id, property::CRTC_MODE_ID, 0),
+                change(resources.primary_plane_id, property::PLANE_FB_ID, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_ID, 0),
+                change(resources.primary_plane_id, property::PLANE_SRC_X, 0),
+                change(resources.primary_plane_id, property::PLANE_SRC_Y, 0),
+                change(resources.primary_plane_id, property::PLANE_SRC_W, 0),
+                change(resources.primary_plane_id, property::PLANE_SRC_H, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_X, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_Y, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_W, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_H, 0),
+            ],
+            None,
+        )
+    } else {
+        if request.count_connectors != 1 || request.mode_valid == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let connector: u32 = read_pod(
+            copy,
+            usize::try_from(request.set_connectors_ptr).map_err(|_| AxError::BadAddress)?,
+        )?;
+        if connector != resources.connector.id
+            || request.mode.hdisplay == 0
+            || request.mode.vdisplay == 0
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let mode = Mode {
             width: request.mode.hdisplay as u32,
             height: request.mode.vdisplay as u32,
             refresh_millihz: request.mode.vrefresh.saturating_mul(1000),
-        },
-    )
-    .map_err(AxError::from)
+        };
+        let source_width = mode.width.checked_shl(16).ok_or(AxError::InvalidInput)?;
+        let source_height = mode.height.checked_shl(16).ok_or(AxError::InvalidInput)?;
+        (
+            [
+                change(
+                    resources.connector.id,
+                    property::CONNECTOR_CRTC_ID,
+                    resources.crtc.id as u64,
+                ),
+                change(resources.crtc.id, property::CRTC_ACTIVE, 1),
+                change(resources.crtc.id, property::CRTC_MODE_ID, 0),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_FB_ID,
+                    request.fb_id as u64,
+                ),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_CRTC_ID,
+                    resources.crtc.id as u64,
+                ),
+                change(resources.primary_plane_id, property::PLANE_SRC_X, 0),
+                change(resources.primary_plane_id, property::PLANE_SRC_Y, 0),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_SRC_W,
+                    source_width as u64,
+                ),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_SRC_H,
+                    source_height as u64,
+                ),
+                change(resources.primary_plane_id, property::PLANE_CRTC_X, 0),
+                change(resources.primary_plane_id, property::PLANE_CRTC_Y, 0),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_CRTC_W,
+                    mode.width as u64,
+                ),
+                change(
+                    resources.primary_plane_id,
+                    property::PLANE_CRTC_H,
+                    mode.height as u64,
+                ),
+            ],
+            Some(mode),
+        )
+    };
+    file.submit_legacy_atomic(&changes, mode, None, false)
+        .map_err(AxError::from)
+}
+
+const fn change(object: u32, property: u32, value: u64) -> super::atomic::Change {
+    super::atomic::Change {
+        object,
+        property,
+        value,
+    }
 }
 
 fn wait_vblank(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
@@ -1273,6 +1785,10 @@ mod tests {
             uapi::DRM_IOCTL_SYNCOBJ_WAIT,
             uapi::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
             uapi::DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+            uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+            uapi::DRM_IOCTL_SYNCOBJ_QUERY,
+            uapi::DRM_IOCTL_SYNCOBJ_TRANSFER,
+            uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
         ] {
             assert!(render_allows_core_ioctl(command));
         }
@@ -1308,8 +1824,11 @@ mod tests {
             Ok(Arc::new(Backing))
         }
 
-        fn present(&self, _: crate::drm::Scanout) -> crate::drm::DrmResult<()> {
-            Ok(())
+        fn present(
+            &self,
+            _: crate::drm::Scanout,
+        ) -> crate::drm::DrmResult<alloc::sync::Arc<crate::drm::fence::Fence>> {
+            Ok(crate::drm::fence::Fence::new(true))
         }
     }
 
