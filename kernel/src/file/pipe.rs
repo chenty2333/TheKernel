@@ -951,12 +951,16 @@ pub(crate) fn set_pipe_max_size(size: usize) -> AxResult<()> {
     Ok(())
 }
 
-fn raise_pipe() {
+pub(crate) fn raise_sigpipe_for_current() {
     let curr = current();
     let _ = send_signal_to_process(
         curr.as_thread().proc_data.proc.pid(),
         Some(SignalInfo::new_kernel(Signo::SIGPIPE)),
     );
+}
+
+fn raise_pipe() {
+    raise_sigpipe_for_current();
 }
 
 fn notify_async_readable(async_io: &Mutex<PipeAsyncIo>) {
@@ -1022,9 +1026,9 @@ impl NamedPipe {
         })
     }
 
-    fn fifo_path(&self) -> AxResult<Cow<'_, str>> {
+    fn fifo_path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         let path = self.location.absolute_path()?;
-        Ok(Cow::Owned(try_owned_path(path.as_str())?))
+        Ok(Cow::Owned(try_owned_path(&path)?))
     }
 
     pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState, fd: i32) {
@@ -1084,6 +1088,7 @@ impl NamedPipe {
         &self,
         src: &mut IoSrc,
         nonblocking: bool,
+        suppress_sigpipe: bool,
     ) -> AxResult<usize> {
         if !self.is_write() {
             return Err(AxError::BadFileDescriptor);
@@ -1097,7 +1102,9 @@ impl NamedPipe {
         let mut total_written = 0;
         block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.state.reader_count() == 0 {
-                raise_pipe();
+                if !suppress_sigpipe {
+                    raise_pipe();
+                }
                 return Err(AxError::BrokenPipe);
             }
 
@@ -1189,6 +1196,7 @@ impl Pipe {
         &self,
         src: &mut IoSrc,
         nonblocking: bool,
+        suppress_sigpipe: bool,
     ) -> AxResult<usize> {
         if !self.is_write() {
             return Err(AxError::BadFileDescriptor);
@@ -1202,7 +1210,9 @@ impl Pipe {
         let mut total_written = 0;
         block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.closed() {
-                raise_pipe();
+                if !suppress_sigpipe {
+                    raise_pipe();
+                }
                 return Err(AxError::BrokenPipe);
             }
 
@@ -1276,7 +1286,7 @@ impl FileLike for Pipe {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let nonblocking = self.nonblocking();
-        self.write_with_nonblocking(src, nonblocking)
+        self.write_with_nonblocking(src, nonblocking, false)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -1293,7 +1303,7 @@ impl FileLike for Pipe {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         try_pseudo_inode_path("pipe", self.shared.inode.inode())
     }
 
@@ -1356,14 +1366,26 @@ impl FileLike for NamedPipe {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let nonblocking = self.nonblocking();
-        self.write_with_nonblocking(src, nonblocking)
+        self.write_with_nonblocking(src, nonblocking, false)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
         location_to_kstat(&self.location)
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn vfs_location(&self) -> Option<&axfs_ng_vfs::Location> {
+        Some(&self.location)
+    }
+
+    // A FIFO has no file page-cache data of its own, but Linux cachestat(2)
+    // still authorizes the query against the backing inode.  Returning this
+    // location preserves its exact mount-idmap and LSM/DAC provenance while
+    // the default FileLike cachestat snapshot remains empty.
+    fn cachestat_location(&self) -> Option<&axfs_ng_vfs::Location> {
+        Some(&self.location)
+    }
+
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         self.fifo_path()
     }
 

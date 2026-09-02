@@ -974,31 +974,38 @@ impl UserfaultFile {
             Ok(written)
         }
     }
-}
 
-impl FileLike for UserfaultFile {
-    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+    /// Drains fault events with a request-local nonblocking decision.
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
         if dst.remaining_mut() < UFFD_MSG_SIZE {
             return Err(AxError::InvalidInput);
         }
         if !self.initialized() {
             return Err(AxError::InvalidInput);
         }
-        let nonblocking = self.nonblocking();
-        // The shared readiness helper owns the check -> arm -> check contract;
-        // each broker claim is already serialized by the address-space lock,
-        // so concurrent readers need no OFD-wide mutex held across sleep.
         block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             self.read_ready(dst)
         })
+    }
+}
+
+impl FileLike for UserfaultFile {
+    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.read_with_nonblocking(dst, self.nonblocking())
     }
 
     fn stat(&self) -> AxResult<Kstat> {
         Ok(anon_inode_stat())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[userfaultfd]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[userfaultfd]",
+        )))
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {

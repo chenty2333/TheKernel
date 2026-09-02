@@ -15,7 +15,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, sockaddr, socklen_t};
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 
 use super::{FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
@@ -183,7 +183,62 @@ pub struct AfAlgSocket {
     nonblocking: AtomicBool,
 }
 
+/// Retained AF_ALG request admission for one RWF_NOWAIT operation.
+///
+/// The request-state guard is acquired before usercopy and consumed directly
+/// by the operation.  There is consequently no second lock acquisition
+/// between a successful NOWAIT admission and the request-state update.
+pub(crate) struct AfAlgNowaitPermit<'a> {
+    state: MutexGuard<'a, RequestState>,
+}
+
+impl AfAlgNowaitPermit<'_> {
+    fn read_into(mut self, dst: &mut super::IoDst) -> AxResult<usize> {
+        AfAlgSocket::prepare_output(&mut self.state)?;
+        let output_len = self.state.output.as_ref().map_or(0, Vec::len);
+        if self.state.output_offset >= output_len {
+            self.state.output = None;
+            self.state.output_offset = 0;
+            self.state.output_finalized = true;
+            self.state.buffer.clear();
+            return Ok(0);
+        }
+        let written = {
+            let output = self.state.output.as_deref().unwrap_or(&[]);
+            dst.write(&output[self.state.output_offset..])?
+        };
+        self.state.output_offset += written;
+        if self.state.output_offset >= output_len {
+            self.state.output = None;
+            self.state.output_offset = 0;
+            self.state.output_finalized = true;
+            self.state.buffer.clear();
+        }
+        Ok(written)
+    }
+
+    fn write_from(mut self, src: &mut super::IoSrc, mut bounce: Vec<u8>) -> AxResult<usize> {
+        let read = src.read(&mut bounce)?;
+        bounce.truncate(read);
+        self.state.output = None;
+        self.state.output_offset = 0;
+        self.state.output_finalized = false;
+        if self.state.binding.family != AlgFamily::Hash && !bounce.is_empty() {
+            self.state.buffer.extend_from_slice(&bounce);
+        }
+        Ok(read)
+    }
+}
+
 impl AfAlgSocket {
+    pub(crate) fn try_acquire_nowait(&self) -> AxResult<AfAlgNowaitPermit<'_>> {
+        let SocketKind::Request(state) = &self.kind else {
+            return Err(AxError::InvalidInput);
+        };
+        Ok(AfAlgNowaitPermit {
+            state: state.try_lock().ok_or(AxError::WouldBlock)?,
+        })
+    }
     pub fn new_listener() -> Self {
         Self {
             kind: SocketKind::Listener(Mutex::new(ListenerState::default())),
@@ -322,6 +377,20 @@ impl AfAlgSocket {
         state.output = Some(output);
         Ok(())
     }
+
+    pub(crate) fn read_with_nowait(&self, dst: &mut super::IoDst) -> AxResult<usize> {
+        self.try_acquire_nowait()?.read_into(dst)
+    }
+
+    pub(crate) fn write_with_nowait(&self, src: &mut super::IoSrc) -> AxResult<usize> {
+        let len = src.remaining();
+        let mut bounce = Vec::new();
+        bounce
+            .try_reserve_exact(len)
+            .map_err(|_| AxError::NoMemory)?;
+        bounce.resize(len, 0);
+        self.try_acquire_nowait()?.write_from(src, bounce)
+    }
 }
 
 impl FileLike for AfAlgSocket {
@@ -386,7 +455,7 @@ impl FileLike for AfAlgSocket {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         try_pseudo_inode_path("socket", self.inode.inode())
     }
 }

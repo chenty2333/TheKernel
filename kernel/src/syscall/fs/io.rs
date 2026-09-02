@@ -1,9 +1,16 @@
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
-use core::ffi::{c_char, c_int};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::{
+    cell::Cell,
+    ffi::{c_char, c_int},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FadviseReadahead, FileFlags, OpenOptions, PhysicalIoOperation, PinnedPhysicalSegment};
-use axfs_ng_vfs::{Location, MetadataUpdate, NodeFlags, NodeType, PhysicalIoSegment};
+use axfs_ng_vfs::{
+    FileIoOpcode, FileIoPolicy, FileIoPrepareError, FileIoRequest, FileIoSyncMode,
+    FileIoWritePlacement, FileRangeOperation, FileRangeRequest, FsPathBuf, Location,
+    MetadataUpdate, NodeFlags, NodeType, OwnedFileIoCompletion, PhysicalIoSegment, VfsError,
+};
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
 use axpoll::{IoEvents, Pollable};
@@ -12,18 +19,22 @@ use linux_raw_sys::{
     general::{__kernel_off_t, IN_ACCESS, IN_ATTRIB, IN_MODIFY, O_APPEND, O_DSYNC, O_SYNC, W_OK},
     net::MSG_DONTWAIT,
 };
+use linux_vfs::{Fadvise, FadvisePlan, LinuxVfsError};
 use spin::Lazy;
 use syscalls::Sysno;
 
 use super::admit_resize;
-
 use crate::{
+    async_operation::AsyncOperation,
     file::{
-        Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst,
-        IoOperationContext, IoSrc, OfdIoStatus, PacketSocket, PidFd, PinnedSocketDescription, Pipe,
-        PreparedSocketMessage, Socket, allowed_write_len, check_resize_limit, executable,
+        AfAlgSocket, Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst,
+        IoOperationContext, IoSrc, NetlinkSocket, OfdIoStatus, OwnedPinnedFileIoBuffer,
+        PacketSocket, PidFd, PinnedSocketDescription, Pipe, PreparedSocketMessage, Socket,
+        allowed_write_len, check_resize_limit,
+        event::EventFd,
+        executable,
         fanotify::{FanotifyEventActor, permission_check_file_like_with_actor_and_status},
-        flock, get_file_like, get_typed_file, inode_flags,
+        flock, get_file_like, inode_flags,
         inotify::{
             notify_exact, notify_parent, notify_read, notify_read_file,
             notify_read_file_with_actor, notify_write, notify_write_file,
@@ -43,6 +54,9 @@ use crate::{
             ContentWriteCredentialView, ContentWritePrivilegeGuard,
             begin_content_write_privilege_cleanup,
         },
+        signalfd::Signalfd,
+        timerfd::TimerFd,
+        userfaultfd::UserfaultFile,
     },
     mm::{
         IoVec, IoVectorBuf, PinnedPhysicalReader, PinnedPhysicalWriter, PinnedUserSegments,
@@ -55,7 +69,7 @@ use crate::{
         try_pin_user_slice_to_user_with,
     },
     mounts,
-    pseudofs::tmp,
+    pseudofs::{dev::tun::TunFile, tmp},
     readiness::block_on_poll_io,
     task::{
         AsThread, current_fs_context,
@@ -64,6 +78,21 @@ use crate::{
     time::wall_time,
 };
 
+// Both user-memory writers are write-only cursors.  The common file I/O
+// boundary also needs their remaining length, so expose that identical
+// capacity through `IoBuf` as well as `IoBufMut`.
+impl axio::IoBuf for crate::mm::PinnedPhysicalWriter<'_> {
+    fn remaining(&self) -> usize {
+        axio::IoBufMut::remaining_mut(self)
+    }
+}
+
+impl axio::IoBuf for crate::mm::VmBytesMut {
+    fn remaining(&self) -> usize {
+        axio::IoBufMut::remaining_mut(self)
+    }
+}
+
 const SEEK_DATA: c_int = 3;
 const SEEK_HOLE: c_int = 4;
 const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
@@ -71,6 +100,9 @@ const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+// Linux's range-COW break operation.  It deliberately has no KEEP_SIZE
+// companion: the range must already exist and the file length is unchanged.
+const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
@@ -82,6 +114,33 @@ const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SP
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+const RWF_HIPRI: u32 = 0x0000_0001;
+const RWF_DSYNC: u32 = 0x0000_0002;
+const RWF_SYNC: u32 = 0x0000_0004;
+const RWF_NOWAIT: u32 = 0x0000_0008;
+const RWF_APPEND: u32 = 0x0000_0010;
+const RWF_NOAPPEND: u32 = 0x0000_0020;
+const RWF_ATOMIC: u32 = 0x0000_0040;
+const RWF_DONTCACHE: u32 = 0x0000_0080;
+const RWF_NOSIGNAL: u32 = 0x0000_0100;
+const RWF_SUPPORTED: u32 = RWF_HIPRI
+    | RWF_DSYNC
+    | RWF_SYNC
+    | RWF_NOWAIT
+    | RWF_APPEND
+    | RWF_NOAPPEND
+    | RWF_ATOMIC
+    | RWF_DONTCACHE
+    | RWF_NOSIGNAL;
+const CLASSIC_AIO_READ_RWF: u32 = RWF_SUPPORTED;
+const CLASSIC_AIO_WRITE_RWF: u32 = RWF_SUPPORTED;
+
+fn map_linux_vfs_error(error: LinuxVfsError) -> AxError {
+    match error {
+        LinuxVfsError::InvalidFlags | LinuxVfsError::InvalidRange => AxError::InvalidInput,
+        _ => AxError::InvalidInput,
+    }
+}
 
 fn sync_file_range_end(offset: __kernel_off_t, nbytes: __kernel_off_t) -> AxResult<u64> {
     debug_assert!(offset >= 0 && nbytes >= 0);
@@ -281,12 +340,27 @@ fn current_io_operation_context<T: ?Sized>(f: &FileHandle<T>) -> IoOperationCont
 pub(crate) fn capture_io_operation_context(
     description: &Arc<FileDescription>,
 ) -> IoOperationContext {
+    capture_io_operation_context_for_actor(
+        description,
+        current_vfs_security(),
+        FanotifyEventActor::current(),
+    )
+}
+
+/// Captures an asynchronous I/O context for an explicitly retained actor.
+/// SQPOLL must never re-sample the kernel worker's credentials: all DAC/LSM
+/// and fanotify identity is the ring creator/submission actor's snapshot.
+pub(crate) fn capture_io_operation_context_for_actor(
+    description: &Arc<FileDescription>,
+    security: VfsSecurityContext,
+    fanotify_actor: FanotifyEventActor,
+) -> IoOperationContext {
     let file_handle = description.file_handle();
-    current_io_operation_context(&file_handle)
+    file_handle.capture_io_operation_context(security, fanotify_actor)
 }
 
 const fn generic_socket_message_flags(status: OfdIoStatus) -> u32 {
-    if status.nonblocking() {
+    if status.nonblocking() || status.rwf_nowait() {
         MSG_DONTWAIT
     } else {
         0
@@ -491,13 +565,14 @@ fn io_uring_stream_write_with_context(
             if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
                 let mut source =
                     PinnedPhysicalReader::from_validated_range(segments, offset, fixed_len);
-                write_file_like_with_status(file_handle, status, &mut source, security)
+                write_file_like_with_status(file_handle, status, &mut source, security, false)
             } else {
                 write_file_like_with_status(
                     file_handle,
                     status,
                     &mut VmBytes::new(capability.clone(), buf, len),
                     security,
+                    false,
                 )
             }
         },
@@ -552,6 +627,14 @@ fn begin_inode_content_write(
         location,
         ContentWriteCredentialView::new(security.actor(), security.filesystem_owner_user_ns()),
     )
+}
+
+/// The direct/pinned writers intentionally bypass `File`'s buffered write
+/// wrapper.  Keep their inode-flag check in one explicit gate so no physical
+/// fast path can treat an append-only inode as writable merely because the
+/// caller happened to supply the current EOF as a positioned offset.
+fn admit_positioned_inode_write(file: &File, offset: u64) -> AxResult<()> {
+    inode_flags::check_data_write(file.inner().location(), offset, false)
 }
 
 fn validate_splice_flags(flags: u32) -> AxResult<()> {
@@ -631,12 +714,11 @@ fn write_zero_range(file: &axfs::File, offset: u64, len: u64) -> AxResult<()> {
         return Ok(());
     }
 
-    let backend = file.backend()?;
     let zero = vec![0u8; FALLOC_IO_CHUNK];
     let mut written = 0u64;
     while written < len {
         let chunk = (len - written).min(zero.len() as u64) as usize;
-        backend.write_at(&zero[..chunk], offset + written)?;
+        file.write_at(&zero[..chunk], offset + written)?;
         written += chunk as u64;
     }
     Ok(())
@@ -656,7 +738,7 @@ fn copy_within_file(file: &axfs::File, src: u64, dst: u64, len: u64) -> AxResult
         if read == 0 {
             break;
         }
-        backend.write_at(&buf[..read], dst + done)?;
+        file.write_at(&buf[..read], dst + done)?;
         done += read as u64;
     }
     Ok(())
@@ -677,11 +759,43 @@ fn copy_within_file_reverse(file: &axfs::File, src: u64, dst: u64, len: u64) -> 
         if read != chunk {
             return Err(AxError::InvalidInput);
         }
-        let written = backend.write_at(&buf[..read], dst + pos)?;
+        let written = file.write_at(&buf[..read], dst + pos)?;
         if written != read {
             return Err(AxError::InvalidInput);
         }
         remaining = pos;
+    }
+    Ok(())
+}
+
+/// Materialize a file range through the file's own positioned backend.
+///
+/// This is the generic VFS implementation of FALLOC_FL_UNSHARE_RANGE.  On a
+/// reflink backend each positioned write breaks sharing and allocates private
+/// extents; on a non-reflink backend it is still a real range rewrite, so the
+/// operation never degenerates into a successful no-op.  Reading each chunk
+/// completely before writing it also makes the operation safe for a backend
+/// that aliases its COW source and destination pages.
+fn materialize_unshared_range(file: &axfs::File, offset: u64, len: u64) -> AxResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let backend = file.backend()?;
+    let mut buf = vec![0u8; FALLOC_IO_CHUNK];
+    let mut done = 0u64;
+    while done < len {
+        let chunk = (len - done).min(buf.len() as u64) as usize;
+        let read = backend.read_at(&mut buf[..chunk], offset + done)?;
+        // The caller has checked EOF, so a short read is a provider race or
+        // I/O failure, never permission to silently leave shared bytes.
+        if read != chunk {
+            return Err(AxError::Io);
+        }
+        let written = file.write_at(&buf[..read], offset + done)?;
+        if written != read {
+            return Err(AxError::Io);
+        }
+        done += read as u64;
     }
     Ok(())
 }
@@ -703,8 +817,35 @@ fn validate_direct_io(file: &File, addr: usize, len: usize, offset: u64) -> AxRe
     Ok(())
 }
 
+/// Submission-time half of an O_DIRECT append check.  The append offset is
+/// intentionally unavailable here: validating `aio_offset` would reject a
+/// valid request (or admit one that later appends at an unaligned EOF).  The
+/// provider receives the required offset alignment in `FileIoPolicy` and
+/// checks it under its append serialization lock before copying source bytes.
+fn validate_direct_append_buffer(file: &File, addr: usize, len: usize) -> AxResult<()> {
+    if !file_uses_direct_io(file) || len == 0 {
+        return Ok(());
+    }
+    if !addr.is_multiple_of(DIRECT_IO_ALIGNMENT) || !len.is_multiple_of(DIRECT_IO_ALIGNMENT) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn validate_direct_iov(file: &File, iov: &IoVectorBuf, offset: u64) -> AxResult<()> {
     validate_direct_iov_prefix(file, iov, offset, iov.len())
+}
+
+fn validate_direct_append_iov(file: &File, iov: &IoVectorBuf) -> AxResult<()> {
+    if !file_uses_direct_io(file) || iov.len() == 0 {
+        return Ok(());
+    }
+    if !iov.len().is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || iov.aligned_prefix_len(DIRECT_IO_ALIGNMENT)? != iov.len()
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn validate_direct_iov_prefix(
@@ -744,7 +885,7 @@ fn validate_direct_iov_prefix_limit(
 }
 
 fn sync_regular_file_after_status_write(status: OfdIoStatus, file: &File) -> AxResult<()> {
-    if status.raw() & O_SYNC != 0 {
+    if status.raw() & O_SYNC != 0 || inode_flags::sync_on_content_write(file.inner().location())? {
         file.inner().sync(false)?;
     } else if status.raw() & O_DSYNC != 0 {
         file.inner().sync(true)?;
@@ -786,7 +927,8 @@ fn read_file_like_with_status_and_nonblocking(
     dst: &mut IoDst,
     force_nonblocking: bool,
 ) -> AxResult<usize> {
-    let nonblocking = status.nonblocking() || force_nonblocking;
+    let nonblocking = status.nonblocking() || status.rwf_nowait() || force_nonblocking;
+    admit_rwf_nowait_file_like(file_like, status, false)?;
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.read_with_status(status, dst)
     } else if let Some(pipe) = file_like.downcast_ref::<Pipe>() {
@@ -796,9 +938,37 @@ fn read_file_like_with_status_and_nonblocking(
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
         socket.read_with_nonblocking(dst, nonblocking)
     } else if let Some(socket) = file_like.downcast_ref::<PacketSocket>() {
-        socket.read_with_nonblocking(dst, nonblocking)
+        socket.read_with_operation_nonblocking(dst, nonblocking, status.rwf_nowait())
+    } else if let Some(socket) = file_like.downcast_ref::<NetlinkSocket>() {
+        socket
+            .recv_with_operation_nonblocking(
+                dst,
+                axnet::RecvFlags::empty(),
+                nonblocking,
+                status.rwf_nowait(),
+            )
+            .map(|received| received.len)
+    } else if file_like.downcast_ref::<AfAlgSocket>().is_some() {
+        if status.rwf_nowait() {
+            file_like
+                .downcast_ref::<AfAlgSocket>()
+                .expect("AF_ALG downcast changed")
+                .read_with_nowait(dst)
+        } else {
+            file_like.read_with_operation_status(status, dst)
+        }
+    } else if let Some(eventfd) = file_like.downcast_ref::<EventFd>() {
+        eventfd.read_with_nonblocking(dst, nonblocking)
+    } else if let Some(signalfd) = file_like.downcast_ref::<Signalfd>() {
+        signalfd.read_with_nonblocking(dst, nonblocking)
+    } else if let Some(timerfd) = file_like.downcast_ref::<TimerFd>() {
+        timerfd.read_with_nonblocking(dst, nonblocking)
+    } else if let Some(userfaultfd) = file_like.downcast_ref::<UserfaultFile>() {
+        userfaultfd.read_with_nonblocking(dst, nonblocking)
+    } else if let Some(tun) = file_like.downcast_ref::<TunFile>() {
+        tun.read_with_nonblocking(dst, nonblocking)
     } else {
-        file_like.read(dst)
+        file_like.read_with_operation_status(status, dst)
     }
 }
 
@@ -807,16 +977,122 @@ fn write_file_like_with_status(
     status: OfdIoStatus,
     src: &mut IoSrc,
     security: &VfsSecurityContext,
+    suppress_sigpipe: bool,
 ) -> AxResult<usize> {
+    admit_rwf_nowait_file_like(file_like, status, true)?;
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.write_with_status(status, src, security)
     } else if let Some(pipe) = file_like.downcast_ref::<NamedPipe>() {
-        pipe.write_with_nonblocking(src, status.nonblocking())
+        pipe.write_with_nonblocking(
+            src,
+            status.nonblocking() || status.rwf_nowait(),
+            suppress_sigpipe,
+        )
+    } else if let Some(pipe) = file_like.downcast_ref::<Pipe>() {
+        pipe.write_with_nonblocking(
+            src,
+            status.nonblocking() || status.rwf_nowait(),
+            suppress_sigpipe,
+        )
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
-        socket.write_with_nonblocking(src, status.nonblocking())
+        let result =
+            socket.write_with_nonblocking(src, status.nonblocking() || status.rwf_nowait());
+        if result == Err(AxError::BrokenPipe) && !suppress_sigpipe {
+            crate::file::pipe::raise_sigpipe_for_current();
+        }
+        result
+    } else if let Some(socket) = file_like.downcast_ref::<PacketSocket>() {
+        if status.rwf_nowait() {
+            socket.write_with_operation_nonblocking(src, true, true)
+        } else {
+            socket.write_with_nonblocking(src, status.nonblocking())
+        }
+    } else if let Some(socket) = file_like.downcast_ref::<NetlinkSocket>() {
+        if status.rwf_nowait() {
+            socket.write_with_operation_nonblocking(src, true, true)
+        } else {
+            socket.write_with_nonblocking(src, status.nonblocking())
+        }
+    } else if let Some(socket) = file_like.downcast_ref::<AfAlgSocket>() {
+        if status.rwf_nowait() {
+            socket.write_with_nowait(src)
+        } else {
+            file_like.write_with_operation_status(status, src)
+        }
+    } else if let Some(eventfd) = file_like.downcast_ref::<EventFd>() {
+        eventfd.write_with_nonblocking(src, status.nonblocking() || status.rwf_nowait())
     } else {
-        file_like.write(src)
+        file_like.write_with_operation_status(status, src)
     }
+}
+
+/// Linux exposes RWF_NOWAIT only from file operations which explicitly set
+/// `FMODE_NOWAIT`.  Keep that provider contract centralized: an arbitrary
+/// pollable anon inode must not acquire NOWAIT semantics merely because its
+/// ordinary FileLike implementation happens to block on readiness.
+///
+/// Provider manifest lookup for File-backed operations.  The default is
+/// unsupported; no node type, cacheability, or poll implementation implies
+/// Linux FMODE_NOWAIT.
+fn file_supports_rwf_nowait(file: &File, write: bool) -> AxResult<bool> {
+    if write {
+        file.supports_rwf_nowait_write()
+    } else {
+        file.supports_rwf_nowait_read()
+    }
+}
+
+fn admit_rwf_nowait_file(file: &File, status: OfdIoStatus, write: bool) -> AxResult<()> {
+    // rpc_pipefs has an open-handle adapter whose read_user/write_user entry
+    // points take the request-local nonblocking decision below.  It is an
+    // explicit provider admission, not a STREAM/NO_SEEK inference.
+    let rpc_pipe = file.inner().open_handle().is_some_and(|handle| {
+        handle
+            .clone()
+            .into_any()
+            .downcast::<crate::pseudofs::rpc_pipefs::RpcPipeOpenHandle>()
+            .is_ok()
+    });
+    if !status.rwf_nowait() || rpc_pipe || file_supports_rwf_nowait(file, write)? {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotSupported)
+    }
+}
+
+fn admit_rwf_nowait_file_like(
+    file_like: &FileHandle<dyn FileLike>,
+    status: OfdIoStatus,
+    write: bool,
+) -> AxResult<()> {
+    if !status.rwf_nowait() {
+        return Ok(());
+    }
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        return admit_rwf_nowait_file(file, status, write);
+    }
+    // Like FMODE_NOWAIT, this is a declaration by the concrete provider, not
+    // an inference from FileLike or Pollable.  In particular, a ready anon
+    // inode/device endpoint must still reject RWF_NOWAIT when it did not opt
+    // in before its provider method is entered.
+    let supported = file_like_supports_rwf_nowait(file_like, write);
+    supported
+        .then_some(())
+        .ok_or(AxError::OperationNotSupported)
+}
+
+fn file_like_supports_rwf_nowait(file_like: &FileHandle<dyn FileLike>, write: bool) -> bool {
+    file_like.downcast_ref::<Pipe>().is_some()
+        || file_like.downcast_ref::<NamedPipe>().is_some()
+        || file_like.downcast_ref::<Socket>().is_some()
+        || file_like.downcast_ref::<PacketSocket>().is_some()
+        || file_like.downcast_ref::<NetlinkSocket>().is_some()
+        || file_like.downcast_ref::<AfAlgSocket>().is_some()
+        || file_like.downcast_ref::<EventFd>().is_some()
+        || (!write && file_like.downcast_ref::<Signalfd>().is_some())
+        || (!write && file_like.downcast_ref::<TimerFd>().is_some())
+        || (!write && file_like.downcast_ref::<UserfaultFile>().is_some())
+        || file_like.downcast_ref::<TunFile>().is_some()
 }
 
 fn regular_file_supports_user_slice_fast_path(file: &File) -> bool {
@@ -1025,6 +1301,10 @@ pub(crate) fn prepare_physical_io_write_privilege_guard(
         .file_handle()
         .downcast::<File>()
         .map_err(|_| AxError::BadFileDescriptor)?;
+    // Physical io_uring writes do not pass through the buffered `File`
+    // wrapper. Admit the exact planned positioned range before any DMA effect
+    // or killpriv preparation can be published.
+    inode_flags::check_data_write(file.inner().location(), plan.offset(), false)?;
     Ok(Some(begin_inode_content_write(
         file.inner().location(),
         context.security(),
@@ -1050,7 +1330,6 @@ pub(crate) fn prepare_physical_io_effect(
     };
     let physical = plan.physical_segments()?;
     file.inner()
-        .backend()?
         .prepare_physical_io_effect(operation, physical, plan.offset())
 }
 
@@ -1188,6 +1467,9 @@ fn write_at_pinned_user_segments(
     segments: &[PinnedPhysicalSegment],
     offset: u64,
 ) -> AxResult<usize> {
+    if !segments.is_empty() {
+        admit_positioned_inode_write(file, offset)?;
+    }
     unsafe {
         // Pinned source ownership is held by the caller; cache alias policy
         // remains entirely inside axfs-ng.
@@ -1228,6 +1510,9 @@ fn write_at_fixed_user_segments(
     len: usize,
     offset: u64,
 ) -> AxResult<usize> {
+    if len != 0 {
+        admit_positioned_inode_write(file, offset)?;
+    }
     let written =
         if let Ok(physical) = axfs_pinned_segments_subrange(segments, offset_in_segments, len) {
             write_at_pinned_user_segments(file, physical.as_slice(), offset)?
@@ -1369,6 +1654,7 @@ fn try_regular_file_write_user_slice(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1410,6 +1696,7 @@ fn try_regular_file_write_user_segments(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1451,6 +1738,7 @@ fn try_regular_file_pwrite_user_slice(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1492,6 +1780,7 @@ fn try_regular_file_pwrite_user_segments(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1532,8 +1821,11 @@ fn try_pin_iov_to_user(
             continue;
         }
         let chunk = iov_len.min(remaining);
-        let Some(pin) = try_pin_user_segments_to_user_with(capability, entry.iov_base, chunk)
-        else {
+        let Some(pin) = try_pin_user_segments_to_user_with(
+            capability,
+            entry.iov_base as usize as *mut u8,
+            chunk,
+        ) else {
             return Ok(None);
         };
         segments += pin.segments().len();
@@ -1663,6 +1955,7 @@ fn try_regular_file_writev_user_segments(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1705,6 +1998,7 @@ fn try_regular_file_pwritev_user_segments(
     if allowed == 0 {
         return Ok(Some(0));
     }
+    admit_positioned_inode_write(file, offset)?;
     if allowed < USER_SLICE_FAST_MIN {
         return Ok(None);
     }
@@ -1963,6 +2257,7 @@ pub fn sys_write(
                     status,
                     &mut VmBytes::new(capability.clone(), buf, len),
                     &security,
+                    false,
                 )
                 .map(|written| (written, status))
             })
@@ -2053,7 +2348,7 @@ pub fn sys_writev(
                 Ok(written)
             } else {
                 let (written, status) = f.with_write_credentials_for_status(status, || {
-                    write_file_like_with_status(&f, status, &mut iov.into_io(), &security)
+                    write_file_like_with_status(&f, status, &mut iov.into_io(), &security, false)
                         .map(|written| (written, status))
                 })?;
                 if written > 0 {
@@ -2208,6 +2503,25 @@ fn with_current_position_io<T>(
 ) -> AxResult<T> {
     file.inner()
         .with_current_position_transaction(max_advance, operation)
+}
+
+/// Runs a current-position operation without ever waiting for the shared OFD
+/// cursor when this syscall carries RWF_NOWAIT.  The lower helper returns
+/// `None` before provider admission or I/O if another operation owns either
+/// cursor lock, which is Linux's EAGAIN outcome for this attempt.
+fn with_current_position_io_with_status<T>(
+    file: &File,
+    status: OfdIoStatus,
+    max_advance: usize,
+    operation: impl FnOnce(u64) -> AxResult<(T, usize)>,
+) -> AxResult<T> {
+    if status.rwf_nowait() {
+        return file
+            .inner()
+            .try_with_current_position_transaction(max_advance, operation)?
+            .ok_or(AxError::WouldBlock);
+    }
+    with_current_position_io(file, max_advance, operation)
 }
 
 fn file_has_current_position(file: &axfs::File) -> bool {
@@ -2392,6 +2706,131 @@ fn copy_file_range_effective_count(
     Ok(count)
 }
 
+/// Runs FUSE's server-side range copy while owning every implicit OFD cursor
+/// for the complete daemon request.  Returning `None` means at least one
+/// endpoint is not a FUSE per-open handle and the caller may use the generic
+/// byte-copy path; once both handles are FUSE, all daemon errors are terminal.
+fn fuse_copy_file_range_with_positions(
+    source: &FileHandle<File>,
+    destination: &FileHandle<File>,
+    source_offset: Option<u64>,
+    destination_offset: Option<u64>,
+    requested: usize,
+    source_size: u64,
+    same_inode: bool,
+) -> Option<AxResult<(usize, Option<axfs_ng_vfs::FileAttrMutationGuard>)>> {
+    let source_fuse = source
+        .inner()
+        .open_handle()?
+        .clone()
+        .into_any()
+        .downcast::<crate::pseudofs::dev::fuse::FuseOpenFile>()
+        .ok()?;
+    let destination_fuse = destination
+        .inner()
+        .open_handle()?
+        .clone()
+        .into_any()
+        .downcast::<crate::pseudofs::dev::fuse::FuseOpenFile>()
+        .ok()?;
+    // Retain this through the caller's timestamp and FS_SYNC publication;
+    // cursor transactions below only choose offsets, never own this gate.
+    let destination_mutation = match destination.inner().begin_native_mutation(false) {
+        Ok(guard) => guard,
+        Err(error) => return Some(Err(error)),
+    };
+    let copy = |source_at: u64, destination_at: u64| -> AxResult<usize> {
+        let source_count = copy_file_range_source_count(source_at, requested, source_size)?;
+        let destination_allowed = allowed_write_len(destination_at, source_count)?;
+        let effective = copy_file_range_effective_count(
+            source_at,
+            destination_at,
+            source_count,
+            destination_allowed,
+            same_inode,
+        )?;
+        inode_flags::check_data_write(destination.inner().location(), destination_at, false)?;
+        let copied = usize::try_from(source_fuse.copy_file_range_to(
+            destination_fuse.as_ref(),
+            source_at,
+            destination_at,
+            effective as u64,
+            0,
+        )?)
+        .map_err(|_| AxError::Io)?;
+        if copied > effective {
+            return Err(AxError::Io);
+        }
+        Ok(copied)
+    };
+    match (source_offset, destination_offset) {
+        (Some(_), Some(_)) => None,
+        (None, Some(destination_at)) => Some(
+            source
+                .inner()
+                .with_current_position_transaction(requested, |source_at| {
+                    let copied = copy(source_at, destination_at)?;
+                    Ok((copied, copied))
+                })
+                .map(|copied| (copied, destination_mutation)),
+        ),
+        (Some(source_at), None) => Some(
+            destination
+                .inner()
+                .with_current_position_transaction(requested, |destination_at| {
+                    let copied = copy(source_at, destination_at)?;
+                    Ok((copied, copied))
+                })
+                .map(|copied| (copied, destination_mutation)),
+        ),
+        (None, None)
+            if source.open_file_description_key() == destination.open_file_description_key() =>
+        {
+            Some(
+                source
+                    .inner()
+                    .with_current_position_transaction(requested, |at| {
+                        let copied = copy(at, at)?;
+                        Ok((copied, copied))
+                    })
+                    .map(|copied| (copied, destination_mutation)),
+            )
+        }
+        (None, None)
+            if source.open_file_description_key() < destination.open_file_description_key() =>
+        {
+            Some(
+                source
+                    .inner()
+                    .with_current_position_transaction(requested, |source_at| {
+                        destination
+                            .inner()
+                            .with_current_position_transaction(requested, |destination_at| {
+                                let copied = copy(source_at, destination_at)?;
+                                Ok((copied, copied))
+                            })
+                            .map(|copied| (copied, copied))
+                    })
+                    .map(|copied| (copied, destination_mutation)),
+            )
+        }
+        (None, None) => Some(
+            destination
+                .inner()
+                .with_current_position_transaction(requested, |destination_at| {
+                    source
+                        .inner()
+                        .with_current_position_transaction(requested, |source_at| {
+                            let copied = copy(source_at, destination_at)?;
+                            Ok((copied, copied))
+                        })
+                        .map(|copied| (copied, copied))
+                })
+                .map(|copied| (copied, destination_mutation)),
+        ),
+    }
+}
+
 fn seekable_fd(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
     let file_like = get_file_like(fd)?;
     file_like.check_io_access()?;
@@ -2458,11 +2897,44 @@ fn do_preadv(
     flags: u32,
     allow_current_offset: bool,
 ) -> AxResult<isize> {
-    if flags != 0 {
-        return Err(AxError::OperationNotSupported);
-    }
     if offset < 0 && !(allow_current_offset && offset == -1) {
         return Err(AxError::InvalidInput);
+    }
+
+    // The -1 extension is readv's current-position form, including streams;
+    // it must not first demand a seekable File adapter.
+    if offset == -1 {
+        let raw = get_file_like(fd)?;
+        if raw.downcast_ref::<File>().is_none() {
+            let base_status = raw.io_status_snapshot();
+            raw.check_io_status(base_status)?;
+            let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
+            // vfs_{read,write}v completes an empty iterator before it asks a
+            // provider for `read_iter`/`write_iter`.  In particular, a
+            // legacy anon inode must not turn a zero-byte RWF_NOWAIT request
+            // into EOPNOTSUPP merely because it has no FMODE_NOWAIT method.
+            if iov.len() == 0 {
+                return Ok(0);
+            }
+            let status = rwf_status(base_status, flags, false)?;
+            if flags & RWF_DONTCACHE != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let socket = PinnedSocketDescription::from_file_handle(&raw, status)?;
+            let iov_len = iov.len();
+            let iovcnt = iov.iovcnt();
+            let read = generic_read_after_socket_policy(
+                socket.as_ref(),
+                iov_len,
+                |socket| dispatch_generic_socket_receive(socket, status, iovcnt, iov_len),
+                || {
+                    raw.with_read_credentials(|| {
+                        read_file_like_with_status(&raw, status, &mut iov.into_io())
+                    })
+                },
+            )?;
+            return Ok(read.unwrap_or(0) as isize);
+        }
     }
 
     let file = positioned_file(fd, FileFlags::READ)?;
@@ -2472,16 +2944,35 @@ fn do_preadv(
     let status = file.io_status_snapshot();
     file.check_io_status(status)?;
     let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
+    if iov.len() == 0 {
+        return Ok(0);
+    }
+    let status = rwf_status(status, flags, false)?;
+    admit_rwf_nowait_file(file.as_ref(), status, false)?;
+    if flags & RWF_DONTCACHE != 0
+        && file.inner().location().metadata()?.node_type != NodeType::RegularFile
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & RWF_DONTCACHE != 0 && offset == -1 && !file_has_current_position(file.inner()) {
+        return Err(AxError::OperationNotSupported);
+    }
     if iov.len() != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
     file.with_read_credentials(|| {
+        let cursor_start = Cell::new(None);
         let read = if offset == -1 && file_has_current_position(file.inner()) {
-            with_current_position_io(file.as_ref(), iov.len(), |offset| {
+            with_current_position_io_with_status(file.as_ref(), status, iov.len(), |offset| {
+                cursor_start.set(Some(offset));
                 validate_direct_iov(file.as_ref(), &iov, offset)?;
-                let read = if let Some(read) =
-                    try_regular_file_readv_user_segments(capability, file.as_ref(), &iov, offset)?
-                {
+                let read = if !status.rwf_nowait()
+                    && let Some(read) = try_regular_file_readv_user_segments(
+                        capability,
+                        file.as_ref(),
+                        &iov,
+                        offset,
+                    )? {
                     read
                 } else {
                     file.read_at_with_status(status, &mut iov.into_io(), offset)?
@@ -2492,22 +2983,34 @@ fn do_preadv(
             file.read_with_status(status, &mut iov.into_io())?
         } else {
             validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
-            if let Some(read) = try_regular_file_preadv_user_segments(
-                capability,
-                file.as_ref(),
-                &iov,
-                offset as u64,
-            )? {
+            if !status.rwf_nowait()
+                && let Some(read) = try_regular_file_preadv_user_segments(
+                    capability,
+                    file.as_ref(),
+                    &iov,
+                    offset as u64,
+                )?
+            {
                 if read > 0 {
                     notify_read(fd);
+                    if flags & RWF_DONTCACHE != 0 {
+                        let _ = file.inner().fadvise_dontneed(offset as u64, read as u64);
+                    }
                 }
                 return Ok(read as _);
             }
-            let io = iov.into_io();
-            file.inner().read_at(io, offset as u64)?
+            let mut io = iov.into_io();
+            file.read_at_with_status(status, &mut io, offset as u64)?
         } as isize;
         if read > 0 {
             notify_read(fd);
+        }
+        if read > 0 && flags & RWF_DONTCACHE != 0 {
+            let cache_offset = cursor_start
+                .get()
+                .or_else(|| (offset >= 0).then_some(offset as u64))
+                .ok_or(AxError::OperationNotSupported)?;
+            let _ = file.inner().fadvise_dontneed(cache_offset, read as u64);
         }
         Ok(read)
     })
@@ -2522,13 +3025,48 @@ fn do_pwritev(
     flags: u32,
     allow_current_offset: bool,
 ) -> AxResult<isize> {
-    if flags != 0 {
-        return Err(AxError::OperationNotSupported);
-    }
     if offset < 0 && !(allow_current_offset && offset == -1) {
         return Err(AxError::InvalidInput);
     }
     let security = current_vfs_security();
+
+    // Linux reserves offset -1 in pwritev2 for the ordinary writev cursor
+    // path.  Do this before requiring a positioned regular-file adapter so
+    // pipes, sockets and other non-seekable descriptors retain writev's ABI.
+    if offset == -1 {
+        let raw = get_file_like(fd)?;
+        if raw.downcast_ref::<File>().is_none() {
+            let base_status = raw.io_status_snapshot();
+            raw.check_io_status(base_status)?;
+            let io = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
+            if io.len() == 0 {
+                return Ok(0);
+            }
+            let io_iovcnt = io.iovcnt();
+            let io_len = io.len();
+            let status = rwf_status(base_status, flags, true)?;
+            if flags & RWF_DONTCACHE != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let socket = PinnedSocketDescription::from_file_handle(&raw, status)?;
+            let written = generic_write_after_socket_policy(
+                socket.as_ref(),
+                |socket| dispatch_generic_socket_send(&security, socket, status, io_iovcnt, io_len),
+                || {
+                    raw.with_write_credentials_for_status(status, || {
+                        write_file_like_with_status(
+                            &raw,
+                            status,
+                            &mut io.into_io(),
+                            &security,
+                            flags & RWF_NOSIGNAL != 0,
+                        )
+                    })
+                },
+            )?;
+            return Ok(written as isize);
+        }
+    }
 
     // pwritev2(offset = -1) is an ordinary current-position write. Only an
     // explicit offset requires positioned-write support.
@@ -2538,37 +3076,79 @@ fn do_pwritev(
         positioned_write_file(fd)?
     };
     let io = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
-    let (written, status) = file.with_write_credentials(|status| {
+    if io.len() == 0 {
+        return Ok(0);
+    }
+    let initial_status = file.io_status_snapshot();
+    let status = rwf_status(initial_status, flags, true)?;
+    admit_rwf_nowait_file(file.as_ref(), status, true)?;
+    if flags & RWF_DONTCACHE != 0
+        && file.inner().location().metadata()?.node_type != NodeType::RegularFile
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & RWF_DONTCACHE != 0 && offset == -1 && !file_has_current_position(file.inner()) {
+        return Err(AxError::OperationNotSupported);
+    }
+    let cursor_start = Cell::new(None);
+    let append_start = Cell::new(None);
+    let (written, status) = file.with_write_credentials_for_status(status, || {
         let direct_alignment_limit = direct_iov_alignment_limit(file.as_ref(), &io)?;
         if offset == -1 {
-            if write_uses_current_position(file.inner(), status) {
-                return with_current_position_io(file.as_ref(), io.len(), |write_offset| {
-                    if let Some(written) = try_regular_file_writev_user_segments(
-                        capability,
-                        file.as_ref(),
-                        status,
-                        &security,
-                        &io,
-                        write_offset,
-                    )? {
-                        return Ok(((written, status), written));
-                    }
-                    let written = file.write_at_with_status_and_direct_validation(
+            if write_uses_inode_append(file.inner(), status) {
+                let (written, start) = file
+                    .write_at_current_append_with_status_and_direct_validation_and_start(
                         status,
                         &mut io.into_io(),
-                        write_offset,
                         &security,
-                        |offset, len| {
+                        |append_offset, len| {
                             validate_direct_iov_prefix_limit(
                                 file.as_ref(),
-                                offset,
+                                append_offset,
                                 len,
                                 direct_alignment_limit,
                             )
                         },
                     )?;
-                    Ok(((written, status), written))
-                });
+                append_start.set(Some(start));
+                return Ok((written, status));
+            }
+            if write_uses_current_position(file.inner(), status) {
+                return with_current_position_io_with_status(
+                    file.as_ref(),
+                    status,
+                    io.len(),
+                    |write_offset| {
+                        cursor_start.set(Some(write_offset));
+                        if !status.rwf_nowait()
+                            && let Some(written) = try_regular_file_writev_user_segments(
+                                capability,
+                                file.as_ref(),
+                                status,
+                                &security,
+                                &io,
+                                write_offset,
+                            )?
+                        {
+                            return Ok(((written, status), written));
+                        }
+                        let written = file.write_at_with_status_and_direct_validation(
+                            status,
+                            &mut io.into_io(),
+                            write_offset,
+                            &security,
+                            |offset, len| {
+                                validate_direct_iov_prefix_limit(
+                                    file.as_ref(),
+                                    offset,
+                                    len,
+                                    direct_alignment_limit,
+                                )
+                            },
+                        )?;
+                        Ok(((written, status), written))
+                    },
+                );
             }
 
             file.write_with_status_and_direct_validation(
@@ -2585,28 +3165,49 @@ fn do_pwritev(
                 },
             )
         } else if write_uses_inode_append(file.inner(), status) {
-            file.write_at_end_with_status_and_direct_validation(
-                status,
-                &mut io.into_io(),
-                &security,
-                |append_offset, len| {
-                    validate_direct_iov_prefix_limit(
-                        file.as_ref(),
-                        append_offset,
-                        len,
-                        direct_alignment_limit,
-                    )
-                },
-            )
+            if flags & RWF_DONTCACHE != 0 {
+                let (written, start) = file
+                    .write_at_end_with_status_and_direct_validation_and_start(
+                        status,
+                        &mut io.into_io(),
+                        &security,
+                        |append_offset, len| {
+                            validate_direct_iov_prefix_limit(
+                                file.as_ref(),
+                                append_offset,
+                                len,
+                                direct_alignment_limit,
+                            )
+                        },
+                    )?;
+                append_start.set(Some(start));
+                Ok(written)
+            } else {
+                file.write_at_end_with_status_and_direct_validation(
+                    status,
+                    &mut io.into_io(),
+                    &security,
+                    |append_offset, len| {
+                        validate_direct_iov_prefix_limit(
+                            file.as_ref(),
+                            append_offset,
+                            len,
+                            direct_alignment_limit,
+                        )
+                    },
+                )
+            }
         } else {
-            if let Some(written) = try_regular_file_pwritev_user_segments(
-                capability,
-                file.as_ref(),
-                status,
-                &security,
-                &io,
-                offset as u64,
-            )? {
+            if !status.rwf_nowait()
+                && let Some(written) = try_regular_file_pwritev_user_segments(
+                    capability,
+                    file.as_ref(),
+                    status,
+                    &security,
+                    &io,
+                    offset as u64,
+                )?
+            {
                 return Ok((written, status));
             }
             file.write_at_with_status_and_direct_validation(
@@ -2629,9 +3230,751 @@ fn do_pwritev(
     let written = written as isize;
     if written > 0 {
         sync_file_after_status_write(status, &file)?;
+        if flags & RWF_DONTCACHE != 0 {
+            // The cache implementation writes back and evicts only the supplied
+            // byte range.  For append placement the backend serializes EOF;
+            // sample the resulting tail after that serialized write.
+            let cache_offset = if let Some(start) = cursor_start.get() {
+                start
+            } else if let Some(start) = append_start.get() {
+                start
+            } else if offset >= 0 {
+                offset as u64
+            } else {
+                return Err(AxError::OperationNotSupported);
+            };
+            let _ = file.inner().fadvise_dontneed(cache_offset, written as u64);
+        }
         notify_write(fd);
     }
     Ok(written)
+}
+
+/// Validates and derives a request-local RWF status.  The returned status is
+/// never installed in the open-file description.
+pub(crate) fn rwf_status(base: OfdIoStatus, flags: u32, write: bool) -> AxResult<OfdIoStatus> {
+    if flags & !RWF_SUPPORTED != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    // ATOMIC reads are not a defined operation, and this kernel has neither a
+    // polled direct-I/O provider nor atomic-write provider admission yet.
+    if flags & (RWF_HIPRI | RWF_ATOMIC) != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    let mut status = base.raw();
+    if write {
+        if flags & RWF_DSYNC != 0 {
+            status |= O_DSYNC;
+        }
+        if flags & RWF_SYNC != 0 {
+            status |= O_SYNC;
+        }
+        if flags & RWF_APPEND != 0 {
+            status |= O_APPEND;
+        }
+        if flags & RWF_NOAPPEND != 0 {
+            status &= !O_APPEND;
+        }
+    }
+    Ok(OfdIoStatus::new(status).with_rwf_nowait(flags & RWF_NOWAIT != 0))
+}
+
+/// Classic AIO's captured, worker-owned operation.  Construction is confined
+/// to the submitting thread: descriptor lookup, user iovec import, fanotify
+/// admission, OFD status, credentials and VFS security are all frozen before
+/// this value can cross into a kernel worker.
+pub(crate) enum ClassicAioOperation {
+    Read {
+        capability: UserMemoryCapability,
+        file: FileHandle<File>,
+        context: IoOperationContext,
+        buf: usize,
+        len: usize,
+        offset: u64,
+        ioprio: u16,
+    },
+    Write {
+        capability: UserMemoryCapability,
+        file: FileHandle<File>,
+        context: IoOperationContext,
+        buf: usize,
+        len: usize,
+        offset: u64,
+        ioprio: u16,
+    },
+    Readv {
+        capability: UserMemoryCapability,
+        file: FileHandle<File>,
+        context: IoOperationContext,
+        iov: IoVectorBuf,
+        offset: u64,
+        ioprio: u16,
+    },
+    Writev {
+        capability: UserMemoryCapability,
+        file: FileHandle<File>,
+        context: IoOperationContext,
+        iov: IoVectorBuf,
+        offset: u64,
+        ioprio: u16,
+    },
+    Sync {
+        file: FileHandle<dyn FileLike>,
+        data_only: bool,
+        ioprio: u16,
+    },
+    Noop {
+        ioprio: u16,
+    },
+}
+
+/// The result of trying to move a classic-AIO read/write into the owned I/O
+/// domain.  `Unsupported` deliberately retains the original operation: only
+/// a provider which explicitly declined *before publication* may use the
+/// legacy worker route.  Pinning and preparation failures are not silently
+/// converted into a borrowed-buffer retry.
+pub(crate) enum ClassicAioOwnedPreparation {
+    Zero,
+    Prepared(axfs::PreparedOwnedFileIo),
+    Unsupported,
+}
+
+// The operation never dereferences its stored userspace addresses directly:
+// all access goes through the captured address-space capability.  Imported
+// iovec addresses therefore travel with that capability into the worker.
+unsafe impl Send for ClassicAioOperation {}
+
+impl ClassicAioOperation {
+    pub(crate) fn ioprio(&self) -> u16 {
+        match self {
+            Self::Read { ioprio, .. }
+            | Self::Write { ioprio, .. }
+            | Self::Readv { ioprio, .. }
+            | Self::Writev { ioprio, .. }
+            | Self::Sync { ioprio, .. }
+            | Self::Noop { ioprio } => *ioprio,
+        }
+    }
+
+    /// `RWF_NOWAIT` is request-local and must never be converted into a
+    /// queued legacy operation after the owned provider declines admission.
+    pub(crate) fn nowait(&self) -> bool {
+        match self {
+            Self::Read { context, .. }
+            | Self::Write { context, .. }
+            | Self::Readv { context, .. }
+            | Self::Writev { context, .. } => context.status().rwf_nowait(),
+            Self::Sync { .. } | Self::Noop { .. } => false,
+        }
+    }
+}
+
+/// Pins the exact buffers imported at `io_submit` and asks the open file
+/// description selected at submission to reserve a provider-owned operation.
+///
+/// This is intentionally a borrow of `operation`: a provider's explicit
+/// `OperationNotSupported` response leaves the immutable legacy operation
+/// intact for the sole permitted fallback.  Every other error is returned to
+/// `io_submit` with the long-term pins already released by the returned
+/// `FileIoPrepareError` ownership pair.
+pub(crate) fn prepare_classic_aio_owned_operation(
+    operation: &ClassicAioOperation,
+    completion: Box<dyn OwnedFileIoCompletion>,
+) -> Result<ClassicAioOwnedPreparation, (AxError, Box<dyn OwnedFileIoCompletion>)> {
+    // Owned providers may use bounce/cache machinery internally, but that is
+    // never permission to relax the syscall-facing O_DIRECT geometry.  Keep
+    // this beside the pin hand-off so every caller (classic AIO and io_uring)
+    // reaches the same scalar/iovec and append/positioned contract.
+    let direct_validation = match operation {
+        ClassicAioOperation::Read {
+            file,
+            buf,
+            len,
+            offset,
+            ..
+        } => validate_direct_io(file.as_ref(), *buf, *len, *offset),
+        ClassicAioOperation::Write {
+            file,
+            context,
+            buf,
+            len,
+            offset,
+            ..
+        } => {
+            if write_uses_inode_append(file.inner(), context.status()) {
+                validate_direct_append_buffer(file.as_ref(), *buf, *len)
+            } else {
+                validate_direct_io(file.as_ref(), *buf, *len, *offset)
+            }
+        }
+        ClassicAioOperation::Readv {
+            file, iov, offset, ..
+        } => validate_direct_iov(file.as_ref(), iov, *offset),
+        ClassicAioOperation::Writev {
+            file,
+            context,
+            iov,
+            offset,
+            ..
+        } => {
+            if write_uses_inode_append(file.inner(), context.status()) {
+                validate_direct_append_iov(file.as_ref(), iov)
+            } else {
+                validate_direct_iov(file.as_ref(), iov, *offset)
+            }
+        }
+        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => Ok(()),
+    };
+    if let Err(error) = direct_validation {
+        return Err((error, completion));
+    }
+    let (file, context, opcode, buffer): (
+        &FileHandle<File>,
+        &IoOperationContext,
+        FileIoOpcode,
+        Box<dyn axfs_ng_vfs::OwnedFileIoBuffer>,
+    ) = match operation {
+        ClassicAioOperation::Read {
+            capability,
+            file,
+            context,
+            buf,
+            len,
+            ..
+        } => {
+            if *len == 0 {
+                return Ok(ClassicAioOwnedPreparation::Zero);
+            }
+            let buffer =
+                match OwnedPinnedFileIoBuffer::pin_destination(capability, *buf as *mut u8, *len) {
+                    Ok(buffer) => buffer,
+                    Err(error) => return Err((error, completion)),
+                };
+            (file, context, FileIoOpcode::Read, Box::new(buffer))
+        }
+        ClassicAioOperation::Write {
+            capability,
+            file,
+            context,
+            buf,
+            len,
+            ..
+        } => {
+            if *len == 0 {
+                return Ok(ClassicAioOwnedPreparation::Zero);
+            }
+            let buffer =
+                match OwnedPinnedFileIoBuffer::pin_source(capability, *buf as *const u8, *len) {
+                    Ok(buffer) => buffer,
+                    Err(error) => return Err((error, completion)),
+                };
+            (file, context, FileIoOpcode::Write, Box::new(buffer))
+        }
+        ClassicAioOperation::Readv {
+            file, context, iov, ..
+        } => {
+            if iov.len() == 0 {
+                return Ok(ClassicAioOwnedPreparation::Zero);
+            }
+            let buffer = match OwnedPinnedFileIoBuffer::pin_iov_destination(iov, iov.len()) {
+                Ok(buffer) => buffer,
+                Err(error) => return Err((error, completion)),
+            };
+            (file, context, FileIoOpcode::Read, Box::new(buffer))
+        }
+        ClassicAioOperation::Writev {
+            file, context, iov, ..
+        } => {
+            if iov.len() == 0 {
+                return Ok(ClassicAioOwnedPreparation::Zero);
+            }
+            let buffer = match OwnedPinnedFileIoBuffer::pin_iov_source(iov, iov.len()) {
+                Ok(buffer) => buffer,
+                Err(error) => return Err((error, completion)),
+            };
+            (file, context, FileIoOpcode::Write, Box::new(buffer))
+        }
+        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => {
+            return Ok(ClassicAioOwnedPreparation::Unsupported);
+        }
+    };
+
+    // `ClassicAioOperation` is constructed only after all descriptor,
+    // RWF/direct-alignment, fanotify, and task security snapshots have been
+    // admitted on the submitting thread.  Recheck the immutable OFD status
+    // before pinning becomes provider-visible; this closes close/status
+    // mutations without consulting a worker's `current()` credentials.
+    if let Err(error) = file.check_io_status(context.status()) {
+        drop(buffer);
+        return Err((error, completion));
+    }
+    if opcode == FileIoOpcode::Write {
+        if let Err(error) = check_file_write_admission(file, buffer.len()) {
+            drop(buffer);
+            return Err((error, completion));
+        }
+    }
+    let offset = match operation {
+        ClassicAioOperation::Read { offset, .. }
+        | ClassicAioOperation::Write { offset, .. }
+        | ClassicAioOperation::Readv { offset, .. }
+        | ClassicAioOperation::Writev { offset, .. } => *offset,
+        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => unreachable!(),
+    };
+    // Freeze append intent at submit time.  The provider/cache must acquire
+    // its append domain later; it must never treat this saved `offset` as an
+    // EOF snapshot for O_APPEND/RWF_APPEND.
+    let placement = if opcode == FileIoOpcode::Write
+        && write_uses_inode_append(file.inner(), context.status())
+    {
+        FileIoWritePlacement::Append
+    } else {
+        FileIoWritePlacement::Positioned
+    };
+    let status_bits = context.status().raw();
+    let sync = if status_bits & O_SYNC == O_SYNC || context.rwf_flags() & RWF_SYNC != 0 {
+        FileIoSyncMode::Full
+    } else if status_bits & O_DSYNC != 0 || context.rwf_flags() & RWF_DSYNC != 0 {
+        FileIoSyncMode::Data
+    } else {
+        FileIoSyncMode::None
+    };
+    let policy = FileIoPolicy {
+        nowait: context.status().rwf_nowait(),
+        sync,
+        dontcache: context.rwf_flags() & RWF_DONTCACHE != 0,
+        direct_offset_alignment: file_uses_direct_io(file.as_ref()).then_some(DIRECT_IO_ALIGNMENT),
+    };
+    let request = match FileIoRequest::try_new_with_policy_and_placement(
+        opcode, policy, placement, offset, buffer,
+    ) {
+        Ok(request) => request,
+        Err(error) => return Err((error, completion)),
+    };
+    match file.inner().prepare_owned_file_io(request, completion) {
+        Ok(prepared) => Ok(ClassicAioOwnedPreparation::Prepared(prepared)),
+        Err(error) if error.error == AxError::OperationNotSupported => {
+            let (_request, _completion) = (error.request, error.completion);
+            Ok(ClassicAioOwnedPreparation::Unsupported)
+        }
+        Err(error) => {
+            let FileIoPrepareError {
+                error,
+                request,
+                completion,
+            } = error;
+            drop(request);
+            Err((error, completion))
+        }
+    }
+}
+
+fn classic_aio_context_with_rwf(
+    context: IoOperationContext,
+    flags: u32,
+    write: bool,
+) -> AxResult<IoOperationContext> {
+    Ok(context
+        .with_status(rwf_status(context.status(), flags, write)?)
+        .with_rwf_flags(flags))
+}
+
+fn admit_rwf_dontcache_file(file: &FileHandle<File>, flags: u32) -> AxResult<()> {
+    if flags & RWF_DONTCACHE != 0
+        && file.inner().location().metadata()?.node_type != NodeType::RegularFile
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_classic_aio_operation(
+    capability: UserMemoryCapability,
+    opcode: u16,
+    fd: c_int,
+    buf: u64,
+    nbytes: u64,
+    offset: i64,
+    flags: u32,
+    ioprio: u16,
+) -> AxResult<ClassicAioOperation> {
+    if nbytes > isize::MAX as u64 || offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let len = nbytes as usize;
+    match opcode {
+        0 => {
+            if flags & !CLASSIC_AIO_READ_RWF != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let file = positioned_read_file(fd)?;
+            admit_rwf_dontcache_file(&file, flags)?;
+            let context =
+                classic_aio_context_with_rwf(current_io_operation_context(&file), flags, false)?;
+            validate_direct_io(&file, buf as usize, len, offset as u64)?;
+            if len != 0 {
+                permission_check_file_like_with_actor_and_status(
+                    &file.clone().into_file_like(),
+                    crate::file::fanotify::FAN_ACCESS_PERM,
+                    context.fanotify_actor(),
+                    context.status(),
+                )?;
+            }
+            Ok(ClassicAioOperation::Read {
+                capability,
+                file,
+                context,
+                buf: buf as usize,
+                len,
+                offset: offset as u64,
+                ioprio,
+            })
+        }
+        1 => {
+            if flags & !CLASSIC_AIO_WRITE_RWF != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let file = positioned_write_file(fd)?;
+            admit_rwf_dontcache_file(&file, flags)?;
+            let context =
+                classic_aio_context_with_rwf(current_io_operation_context(&file), flags, true)?;
+            if write_uses_inode_append(file.inner(), context.status()) {
+                validate_direct_append_buffer(&file, buf as usize, len)?;
+            } else {
+                validate_direct_io(&file, buf as usize, len, offset as u64)?;
+            }
+            Ok(ClassicAioOperation::Write {
+                capability,
+                file,
+                context,
+                buf: buf as usize,
+                len,
+                offset: offset as u64,
+                ioprio,
+            })
+        }
+        2 | 3 => {
+            if buf != 0 || offset != 0 || nbytes != 0 || flags != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let file = get_file_like(fd)?;
+            file.check_io_access()?;
+            Ok(ClassicAioOperation::Sync {
+                file,
+                data_only: opcode == 3,
+                ioprio,
+            })
+        }
+        6 => Ok(ClassicAioOperation::Noop { ioprio }),
+        7 => {
+            if flags & !CLASSIC_AIO_READ_RWF != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let file = positioned_read_file(fd)?;
+            admit_rwf_dontcache_file(&file, flags)?;
+            let context =
+                classic_aio_context_with_rwf(current_io_operation_context(&file), flags, false)?;
+            let iov = IoVectorBuf::new(capability.clone(), buf as *const IoVec, len)?;
+            validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
+            if iov.len() != 0 {
+                permission_check_file_like_with_actor_and_status(
+                    &file.clone().into_file_like(),
+                    crate::file::fanotify::FAN_ACCESS_PERM,
+                    context.fanotify_actor(),
+                    context.status(),
+                )?;
+            }
+            Ok(ClassicAioOperation::Readv {
+                capability,
+                file,
+                context,
+                iov,
+                offset: offset as u64,
+                ioprio,
+            })
+        }
+        8 => {
+            if flags & !CLASSIC_AIO_WRITE_RWF != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let file = positioned_write_file(fd)?;
+            admit_rwf_dontcache_file(&file, flags)?;
+            let context =
+                classic_aio_context_with_rwf(current_io_operation_context(&file), flags, true)?;
+            let iov = IoVectorBuf::new(capability.clone(), buf as *const IoVec, len)?;
+            if write_uses_inode_append(file.inner(), context.status()) {
+                validate_direct_append_iov(file.as_ref(), &iov)?;
+            } else {
+                validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
+            }
+            Ok(ClassicAioOperation::Writev {
+                capability,
+                file,
+                context,
+                iov,
+                offset: offset as u64,
+                ioprio,
+            })
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+/// Executes a captured classic-AIO operation without resolving `current()` or
+/// a numeric fd.  Worker paths use the immutable context taken at submission.
+/// Captures a vectored io_uring operation against the OFD retained at SQE
+/// admission.  It intentionally never looks up a numeric descriptor.
+pub(crate) fn prepare_io_uring_vectored_operation(
+    capability: UserMemoryCapability,
+    description: &Arc<FileDescription>,
+    context: IoOperationContext,
+    write: bool,
+    iov_address: usize,
+    iov_count: usize,
+    offset: u64,
+) -> AxResult<ClassicAioOperation> {
+    let file = description.file_handle().downcast::<File>()?;
+    let iov = IoVectorBuf::new(capability.clone(), iov_address as *const IoVec, iov_count)?;
+    if write {
+        if write_uses_inode_append(file.inner(), context.status()) {
+            validate_direct_append_iov(file.as_ref(), &iov)?;
+        } else {
+            validate_direct_iov(file.as_ref(), &iov, offset)?;
+        }
+        Ok(ClassicAioOperation::Writev {
+            capability,
+            file,
+            context,
+            iov,
+            offset,
+            ioprio: axtask::current().as_thread().io_priority_raw(),
+        })
+    } else {
+        validate_direct_iov(file.as_ref(), &iov, offset)?;
+        if iov.len() != 0 {
+            permission_check_file_like_with_actor_and_status(
+                &file.clone().into_file_like(),
+                crate::file::fanotify::FAN_ACCESS_PERM,
+                context.fanotify_actor(),
+                context.status(),
+            )?;
+        }
+        Ok(ClassicAioOperation::Readv {
+            capability,
+            file,
+            context,
+            iov,
+            offset,
+            ioprio: axtask::current().as_thread().io_priority_raw(),
+        })
+    }
+}
+
+pub(crate) fn execute_classic_aio_operation(operation: ClassicAioOperation) -> AxResult<isize> {
+    execute_classic_aio_operation_with_cancellation(operation, None)
+}
+
+fn execute_classic_aio_operation_with_cancellation(
+    operation: ClassicAioOperation,
+    cancellation: Option<&AsyncOperation>,
+) -> AxResult<isize> {
+    match operation {
+        ClassicAioOperation::Read {
+            capability,
+            file,
+            context,
+            buf,
+            len,
+            offset,
+            ..
+        } => pread64_file_with_context(
+            &capability,
+            &file,
+            &context,
+            buf as *mut u8,
+            len,
+            offset,
+            None,
+            cancellation,
+        ),
+        ClassicAioOperation::Write {
+            capability,
+            file,
+            context,
+            buf,
+            len,
+            offset,
+            ..
+        } => pwrite64_file_with_context(
+            &capability,
+            &file,
+            &context,
+            buf as *const u8,
+            len,
+            offset,
+            None,
+            cancellation,
+        ),
+        ClassicAioOperation::Readv {
+            capability: _,
+            file,
+            context,
+            iov,
+            offset,
+            ..
+        } => {
+            let mut io = iov.into_io();
+            let read = if let Some(operation) = cancellation {
+                file.read_at_with_status_cancellable(context.status(), &mut io, offset, operation)?
+            } else {
+                file.read_at_with_status(context.status(), &mut io, offset)?
+            };
+            if read > 0 {
+                notify_read_file_with_actor(file.as_ref(), context.fanotify_actor());
+            }
+            if read > 0 && context.rwf_flags() & RWF_DONTCACHE != 0 {
+                let _ = file.inner().fadvise_dontneed(offset, read as u64);
+            }
+            Ok(read as isize)
+        }
+        ClassicAioOperation::Writev {
+            capability: _,
+            file,
+            context,
+            iov,
+            offset,
+            ..
+        } => {
+            let status = context.status();
+            let dontcache = context.rwf_flags() & RWF_DONTCACHE != 0;
+            let alignment = direct_iov_alignment_limit(file.as_ref(), &iov)?;
+            let mut io = iov.into_io();
+            let append_start = Cell::new(None);
+            let written = if write_uses_inode_append(file.inner(), status)
+                && dontcache
+                && cancellation.is_some()
+            {
+                let operation = cancellation.expect("checked above");
+                file.write_at_end_with_status_and_direct_validation_cancellable(
+                    status,
+                    &mut io,
+                    context.security(),
+                    operation,
+                    |at, count| {
+                        append_start.set(Some(at));
+                        validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                    },
+                )?
+            } else if write_uses_inode_append(file.inner(), status) && dontcache {
+                let (written, start) = file
+                    .write_at_end_with_status_and_direct_validation_and_start(
+                        status,
+                        &mut io,
+                        context.security(),
+                        |at, count| {
+                            validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                        },
+                    )?;
+                append_start.set(Some(start));
+                written
+            } else if write_uses_inode_append(file.inner(), status) {
+                if let Some(operation) = cancellation {
+                    file.write_at_end_with_status_and_direct_validation_cancellable(
+                        status,
+                        &mut io,
+                        context.security(),
+                        operation,
+                        |at, count| {
+                            validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                        },
+                    )?
+                } else {
+                    file.write_at_end_with_status_and_direct_validation(
+                        status,
+                        &mut io,
+                        context.security(),
+                        |at, count| {
+                            validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                        },
+                    )?
+                }
+            } else if let Some(operation) = cancellation {
+                file.write_at_with_status_and_direct_validation_cancellable(
+                    status,
+                    &mut io,
+                    offset,
+                    context.security(),
+                    operation,
+                    |at, count| {
+                        validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                    },
+                )?
+            } else {
+                file.write_at_with_status_and_direct_validation(
+                    status,
+                    &mut io,
+                    offset,
+                    context.security(),
+                    |at, count| {
+                        validate_direct_iov_prefix_limit(file.as_ref(), at, count, alignment)
+                    },
+                )?
+            };
+            if written > 0 {
+                sync_file_after_status_write(status, &file)?;
+                if dontcache {
+                    let cache_offset = append_start.get().unwrap_or(offset);
+                    let _ = file.inner().fadvise_dontneed(cache_offset, written as u64);
+                }
+                notify_write_file_with_actor(file.as_ref(), context.fanotify_actor());
+            }
+            Ok(written as isize)
+        }
+        ClassicAioOperation::Sync {
+            file, data_only, ..
+        } => match cancellation {
+            Some(operation) => file.sync_cancellable(data_only, operation).map(|()| 0),
+            None => file.sync(data_only).map(|()| 0),
+        },
+        ClassicAioOperation::Noop { .. } => Ok(0),
+    }
+}
+
+/// Runs classic AIO under the submitter's captured I/O priority and observes
+/// cancellation at both provider boundaries.  The provider retains its own
+/// resources while executing; a teardown can therefore detach immediately
+/// even when a legacy backend cannot abort an already-issued transfer.
+pub(crate) fn execute_classic_aio_operation_cancellable(
+    operation: ClassicAioOperation,
+    cancellation: &AsyncOperation,
+) -> AxResult<isize> {
+    if cancellation.cancellation_requested() {
+        return Err(LinuxError::ECANCELED.into());
+    }
+    let ioprio = operation.ioprio();
+    let result = if let Some(thread) = axtask::current().try_as_thread() {
+        let previous = thread.io_priority_raw();
+        thread.set_io_priority_raw(ioprio)?;
+        let result = execute_classic_aio_operation_with_cancellation(operation, Some(cancellation));
+        // A user-task executor is reusable too.  Never leak a request-local
+        // ioprio into the next unrelated operation it executes.
+        thread.set_io_priority_raw(previous)?;
+        result
+    } else {
+        // Classic AIO workers are currently kernel tasks.  The operation
+        // still retains ioprio for provider/operation-engine selection; do
+        // not manufacture a Linux Thread extension merely to store it.
+        let _ = ioprio;
+        execute_classic_aio_operation_with_cancellation(operation, Some(cancellation))
+    };
+    if cancellation.cancellation_requested() {
+        Err(LinuxError::ECANCELED.into())
+    } else {
+        result
+    }
 }
 
 pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<isize> {
@@ -2653,7 +3996,20 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<i
                 seek_file_like(&seekable_fd(fd)?, off as __kernel_off_t, 0)?;
                 return Ok(off as isize);
             }
-            let off = generic_seek_data_or_hole(file.inner(), offset as u64, whence == SEEK_HOLE)?;
+            // Remote sparse layout is authoritative at the FUSE daemon.  A
+            // local byte scan would turn an all-zero allocated extent into a
+            // hole, so ask the OFD-private FUSE handle before using the
+            // generic fallback.
+            let off = if let Some(handle) = file.inner().open_handle()
+                && let Ok(fuse) = handle
+                    .clone()
+                    .into_any()
+                    .downcast::<crate::pseudofs::dev::fuse::FuseOpenFile>()
+            {
+                fuse.lseek(offset as u64, whence as u32)?
+            } else {
+                generic_seek_data_or_hole(file.inner(), offset as u64, whence == SEEK_HOLE)?
+            };
             seek_file_like(&seekable_fd(fd)?, off as __kernel_off_t, 0)?;
             Ok(off as isize)
         }
@@ -2703,14 +4059,13 @@ pub fn sys_truncate(
     path: *const c_char,
     length: __kernel_off_t,
 ) -> AxResult<isize> {
-    let path = String::from_utf8(
+    let path = FsPathBuf::from_vec(
         memory
             .load_until_nul(path.cast::<u8>())
             .map_err(map_usercopy_error)?,
-    )
-    .map_err(|_| AxError::IllegalBytes)?;
+    );
     debug!("sys_truncate <= {path:?} {length}");
-    if path.is_empty() {
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
     if length < 0 {
@@ -2740,6 +4095,7 @@ pub fn sys_truncate(
     // credential sampling cannot start in the old check-then-truncate gap.
     let write_open_key = executable::retain_write_open(&loc)?;
     let truncate: AxResult<()> = (|| {
+        inode_flags::check_size_change(&loc, loc.len()?, length as u64)?;
         let _memfd_mutation = memfd::begin_resize(&loc, length as u64)?;
         let _lease_admission = lease::admit_truncate(&loc)?;
         check_mandatory_truncate_lock(
@@ -2751,11 +4107,14 @@ pub fn sys_truncate(
             .write(true)
             .open_loc(loc.clone())?
             .into_file()?;
-        let backend = file.access(FileFlags::WRITE)?;
+        file.access(FileFlags::WRITE)?;
         let _privilege_guard = begin_inode_content_write(&loc, &security)?;
         let quota_charge = admit_resize(&loc, loc.len()?, length as u64)?;
-        backend.set_len(length as _)?;
+        file.set_len(length as _)?;
         quota_charge.commit_actual_blocks(&loc)?;
+        if inode_flags::sync_on_content_write(&loc)? {
+            file.sync(false)?;
+        }
         if let Err(error) = touch_modified_metadata(&loc) {
             warn!("truncate metadata update failed after size mutation: {error}");
         }
@@ -2790,23 +4149,34 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     }
     let security = current_vfs_security();
     let f = file_like.downcast::<File>()?;
-    let backend = f.inner().access(FileFlags::WRITE).map_err(|error| match error {
-        AxError::BadFileDescriptor => {
-            ftruncate_admission_errno(true, FileLikeKind::Regular, false, false)
-                .expect_err("read-only regular ftruncate must be EINVAL")
-        }
-        other => other,
-    })?;
+    f.inner()
+        .access(FileFlags::WRITE)
+        .map_err(|error| match error {
+            AxError::BadFileDescriptor => {
+                ftruncate_admission_errno(true, FileLikeKind::Regular, false, false)
+                    .expect_err("read-only regular ftruncate must be EINVAL")
+            }
+            other => other,
+        })?;
     check_writable_mount(f.inner().location())?;
     crate::mm::check_not_active(f.inner().location())?;
     let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
     if !f.landlock_truncate_allowed() {
+        crate::file::permission::report_cached_landlock_denial(
+            f.inner().location(),
+            crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
+        );
         return Err(AxError::PermissionDenied);
     }
     executable::check_not_active(f.inner().location())?;
     if (length as u64) > f.inner().location().len()? {
         check_resize_limit(length as u64)?;
     }
+    inode_flags::check_size_change(
+        f.inner().location(),
+        f.inner().location().len()?,
+        length as u64,
+    )?;
     let _memfd_mutation = memfd::begin_resize(f.inner().location(), length as u64)?;
     let _lease_admission = lease::admit_truncate(f.inner().location())?;
     let status = f.io_status_snapshot();
@@ -2817,9 +4187,16 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         status.nonblocking(),
     )?;
     let _privilege_guard = begin_inode_content_write(f.inner().location(), &security)?;
-    let quota_charge = admit_resize(f.inner().location(), f.inner().location().len()?, length as u64)?;
-    backend.set_len(length as _)?;
+    let quota_charge = admit_resize(
+        f.inner().location(),
+        f.inner().location().len()?,
+        length as u64,
+    )?;
+    f.inner().set_len(length as _)?;
     quota_charge.commit_actual_blocks(f.inner().location())?;
+    if inode_flags::sync_on_content_write(f.inner().location())? {
+        f.inner().sync(false)?;
+    }
     if let Err(error) = touch_modified_metadata(f.inner().location()) {
         warn!("ftruncate metadata update failed after size mutation: {error}");
     }
@@ -2858,12 +4235,25 @@ pub fn sys_fallocate(
     len: __kernel_off_t,
 ) -> AxResult<isize> {
     debug!("sys_fallocate <= fd: {fd}, mode: {mode}, offset: {offset}, len: {len}");
+    let security = current_vfs_security();
+    let file_like = get_file_like(fd)?;
+    fallocate_file_like(&file_like, &security, mode, offset, len)
+}
+
+/// Executes fallocate using a retained file handle and the security snapshot
+/// captured at operation admission.  Keeping both inputs explicit prevents an
+/// io_uring submission from being redirected by fd reuse or from observing a
+/// later credential transition midway through its mutation protocol.
+pub(crate) fn fallocate_file_like(
+    file_like: &FileHandle<dyn FileLike>,
+    security: &VfsSecurityContext,
+    mode: u32,
+    offset: __kernel_off_t,
+    len: __kernel_off_t,
+) -> AxResult<isize> {
     if offset < 0 || len <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let security = current_vfs_security();
-
-    let file_like = get_file_like(fd)?;
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Regular => {}
         FileLikeKind::Directory => return Err(AxError::IsADirectory),
@@ -2896,17 +4286,85 @@ pub fn sys_fallocate(
         | FALLOC_FL_PUNCH_HOLE
         | FALLOC_FL_COLLAPSE_RANGE
         | FALLOC_FL_ZERO_RANGE
-        | FALLOC_FL_INSERT_RANGE;
+        | FALLOC_FL_INSERT_RANGE
+        | FALLOC_FL_UNSHARE_RANGE;
 
     if mode & !supported_modes != 0 {
         return Err(AxError::OperationNotSupported);
     }
 
+    // Append-only and immutable inodes reject every fallocate mode that can
+    // alter data or allocation.  KEEP_SIZE/UNSHARE retain the logical size
+    // but still alter content/extents, so they remain mutations here.
+    inode_flags::check_size_change(
+        &loc,
+        size,
+        match mode {
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_UNSHARE_RANGE => size,
+            FALLOC_FL_COLLAPSE_RANGE => size.saturating_sub(len),
+            FALLOC_FL_INSERT_RANGE => size.saturating_add(len),
+            _ => size.max(end),
+        },
+    )?;
+    inode_flags::check_nonappend_content_mutable(&loc)?;
+
+    // Providers with native allocation transactions (FUSE uses the exact
+    // daemon-issued fh) receive one typed request.  The default VFS answer is
+    // deliberately distinguished from a real provider error so local legacy
+    // backends retain the implementations below without a kernel-side FUSE
+    // downcast or a second ABI decoder.
+    let native_operation = match mode {
+        0 => Some(FileRangeOperation::Allocate { keep_size: false }),
+        FALLOC_FL_KEEP_SIZE => Some(FileRangeOperation::Allocate { keep_size: true }),
+        mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
+            Some(FileRangeOperation::PunchHole)
+        }
+        FALLOC_FL_ZERO_RANGE => Some(FileRangeOperation::ZeroRange { keep_size: false }),
+        mode if mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) => {
+            Some(FileRangeOperation::ZeroRange { keep_size: true })
+        }
+        FALLOC_FL_COLLAPSE_RANGE => Some(FileRangeOperation::CollapseRange),
+        FALLOC_FL_INSERT_RANGE => Some(FileRangeOperation::InsertRange),
+        FALLOC_FL_UNSHARE_RANGE => Some(FileRangeOperation::UnshareRange),
+        _ => None,
+    };
+    if let Some(operation) = native_operation {
+        let request = FileRangeRequest::try_new(operation, offset, len).map_err(AxError::from)?;
+        // Retain the destination inode gate past provider commit through the
+        // mandatory sync and timestamp completion below. The held-admission
+        // variant avoids recursively taking the same non-reentrant token.
+        let native_mutation = file.begin_native_mutation(false)?;
+        match file.mutate_range_with_held_native_mutation(request, &native_mutation) {
+            Ok(()) => {
+                // Native range providers have already committed their extent
+                // transaction.  FS_SYNC is nevertheless an inode attribute,
+                // so success is not reportable until the provider's normal
+                // durability boundary has completed.
+                if inode_flags::sync_on_content_write(&loc)? {
+                    file.sync(false)?;
+                }
+                if let Err(error) = touch_modified_metadata(&loc) {
+                    warn!(
+                        "native fallocate metadata update failed after provider mutation: {error}"
+                    );
+                }
+                let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
+                drop(native_mutation);
+                return Ok(0);
+            }
+            Err(VfsError::OperationNotSupported) => {
+                drop(native_mutation);
+            }
+            Err(error) => return Err(AxError::from(error)),
+        }
+    }
+
+    // The native `File::mutate_range` route above owns this admission itself.
     match mode {
         0 => {
             check_resize_limit(size.max(end))?;
             let _memfd_mutation = memfd::begin_resize(&loc, size.max(end))?;
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             if tmp::supports_fallocate_range(&loc) {
                 let quota_charge = admit_resize(&loc, size, size.max(end))?;
                 tmp::reserve_fallocate_range(&loc, offset, len, true)
@@ -2914,13 +4372,13 @@ pub fn sys_fallocate(
                 quota_charge.commit_actual_blocks(&loc)?;
             } else {
                 let quota_charge = admit_resize(&loc, size, size.max(end))?;
-                backend.set_len(size.max(end))?;
+                file.set_len(size.max(end))?;
                 quota_charge.commit_actual_blocks(&loc)?;
             }
         }
         FALLOC_FL_KEEP_SIZE => {
             let _memfd_mutation = memfd::begin_resize(&loc, size)?;
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             if tmp::supports_fallocate_range(&loc) {
                 // KEEP_SIZE may still allocate blocks beyond EOF. Reserve the
                 // full possible extent, then settle against Metadata.blocks.
@@ -2942,7 +4400,7 @@ pub fn sys_fallocate(
                 offset,
                 usize::try_from(hole_len).map_err(|_| AxError::from(LinuxError::EFBIG))?,
             )?;
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             let quota_charge = admit_resize(&loc, size, size)?;
             write_zero_range(file, offset, hole_len)?;
             tmp::punch_hole_fallocate_range(&loc, offset, len).ok_or(AxError::BadState)??;
@@ -2967,10 +4425,10 @@ pub fn sys_fallocate(
             } else {
                 memfd::begin_write_resize(&loc, offset, zero_len_usize, size.max(end))?
             };
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             if mode & FALLOC_FL_KEEP_SIZE == 0 {
                 let quota_charge = admit_resize(&loc, size, size.max(end))?;
-                backend.set_len(size.max(end))?;
+                file.set_len(size.max(end))?;
                 quota_charge.commit_actual_blocks(&loc)?;
             }
             write_zero_range(file, offset, zero_len)?;
@@ -2987,14 +4445,14 @@ pub fn sys_fallocate(
                 return Err(AxError::InvalidInput);
             }
             let _memfd_mutation = memfd::begin_write_resize(&loc, offset, len_usize, size - len)?;
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             if let Some(result) = tmp::collapse_fallocate_range(&loc, offset, len) {
                 result?;
             } else {
                 copy_within_file(file, end, offset, size - end)?;
             }
             let quota_charge = admit_resize(&loc, size, size - len)?;
-            backend.set_len(size - len)?;
+            file.set_len(size - len)?;
             quota_charge.commit_actual_blocks(&loc)?;
         }
         FALLOC_FL_INSERT_RANGE => {
@@ -3011,9 +4469,9 @@ pub fn sys_fallocate(
                 .ok_or_else(|| AxError::from(LinuxError::EFBIG))?;
             check_resize_limit(new_size)?;
             let _memfd_mutation = memfd::begin_write_resize(&loc, offset, len_usize, new_size)?;
-            let _privilege_guard = begin_inode_content_write(&loc, &security)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
             let quota_charge = admit_resize(&loc, size, new_size)?;
-            backend.set_len(new_size)?;
+            file.set_len(new_size)?;
             quota_charge.commit_actual_blocks(&loc)?;
             if let Some(result) = tmp::insert_fallocate_range(&loc, offset, len) {
                 result?;
@@ -3022,14 +4480,51 @@ pub fn sys_fallocate(
                 write_zero_range(file, offset, len)?;
             }
         }
+        FALLOC_FL_UNSHARE_RANGE => {
+            // Linux requires an existing interval.  In particular, this is
+            // not an allocation request beyond EOF and must not grow a file.
+            if end > size {
+                return Err(AxError::InvalidInput);
+            }
+            let memfd_mutation = memfd::begin_write(&loc, len_usize)?;
+            memfd_mutation.admit_write(&loc, size, offset, len_usize)?;
+            let _privilege_guard = begin_inode_content_write(&loc, security)?;
+            materialize_unshared_range(file, offset, len)?;
+        }
         _ => return Err(AxError::InvalidInput),
     }
 
     if let Err(error) = touch_modified_metadata(&loc) {
         warn!("fallocate metadata update failed after file mutation: {error}");
     }
+    if inode_flags::sync_on_content_write(&loc)? {
+        file.sync(false)?;
+    }
     let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
     Ok(0)
+}
+
+/// Applies `PUNCH_HOLE|KEEP_SIZE` to the exact open file description retained
+/// by a shared VMA.  `MADV_REMOVE` uses this after dropping the address-space
+/// mutex, preserving the same permission, LSM, quota, cache-invalidation and
+/// provider transaction path as `fallocate(2)` without another fd lookup.
+pub(crate) fn punch_hole_file_mapping(
+    file: &FileHandle<File>,
+    security: &VfsSecurityContext,
+    offset: u64,
+    length: u64,
+) -> AxResult<()> {
+    let offset = __kernel_off_t::try_from(offset).map_err(|_| LinuxError::EFBIG)?;
+    let length = __kernel_off_t::try_from(length).map_err(|_| LinuxError::EFBIG)?;
+    let file_like = file.clone().into_file_like();
+    fallocate_file_like(
+        &file_like,
+        security,
+        FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+        offset,
+        length,
+    )?;
+    Ok(())
 }
 
 pub fn sys_fsync(fd: c_int) -> AxResult<isize> {
@@ -3058,9 +4553,21 @@ pub fn sys_sync_file_range(
         "sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags:#x}"
     );
 
-    // Linux resolves and checks the descriptor before inspecting the range,
-    // so a bad descriptor wins over EINVAL from malformed arguments.
     let description = crate::file::get_file_description(fd)?;
+    sync_file_range_description(&description, offset, nbytes, flags)
+}
+
+/// Executes `sync_file_range` against a retained open-file description.
+///
+/// io_uring uses this instead of a late descriptor lookup: the writeback
+/// fence, errseq cursor, and file object must remain those selected during
+/// SQE admission even when another thread closes and reuses the fd number.
+pub(crate) fn sync_file_range_description(
+    description: &Arc<FileDescription>,
+    offset: __kernel_off_t,
+    nbytes: __kernel_off_t,
+    flags: u32,
+) -> AxResult<isize> {
     description.check_io_access()?;
     let file_like = &description.inner;
     // Range/flag validation follows the retained-fd lookup but precedes the
@@ -3082,7 +4589,10 @@ pub fn sys_sync_file_range(
     }
 
     if flags != 0 && !matches!(node_type, Some(NodeType::Directory)) {
-        let f = get_typed_file::<File>(fd)?;
+        let f = description
+            .file_handle()
+            .downcast::<File>()
+            .map_err(|_| AxError::BadFileDescriptor)?;
         let len = if end == 0 { 0 } else { end - offset as u64 };
         let finish_wait = |wait: AxResult<()>| {
             // file_fdatawait_range advances the OFD errseq even when its
@@ -3129,10 +4639,21 @@ pub fn sys_fadvise64(
     advice: u32,
 ) -> AxResult<isize> {
     debug!("sys_fadvise64 <= fd: {fd}, offset: {offset}, len: {len}, advice: {advice}");
-    // fdget comes first in Linux too: a bad descriptor wins over malformed
-    // range/advice arguments. Keep this exact retained OFD for every later
-    // check so close-and-reuse cannot change the target half way through.
     let file_like = get_file_like(fd)?;
+    fadvise_file_like(&file_like, offset, len, advice)
+}
+
+/// Executes `fadvise64` on an already retained open-file description.
+///
+/// This is deliberately separate from descriptor lookup so io_uring can
+/// preserve the SQE-selected OFD across a concurrent close/reuse.  The
+/// operation itself is a cache policy hint and samples no task credentials.
+pub(crate) fn fadvise_file_like(
+    file_like: &FileHandle<dyn FileLike>,
+    offset: __kernel_off_t,
+    len: __kernel_off_t,
+    advice: u32,
+) -> AxResult<isize> {
     file_like.check_io_access()?;
     // Pipes have no seekable mapping.  Linux reports this before considering
     // the hint payload; sockets, on the other hand, are accepted as a
@@ -3140,19 +4661,14 @@ pub fn sys_fadvise64(
     if FileLikeKind::from_file_like(file_like.as_ref()) == FileLikeKind::Fifo {
         return Err(AxError::from(LinuxError::ESPIPE));
     }
-    if offset < 0 || len < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if advice > 5 {
-        return Err(AxError::InvalidInput);
-    }
+    let plan = FadvisePlan::new(offset, len, advice as i32).map_err(map_linux_vfs_error)?;
     let Some(file) = file_like.downcast_ref::<File>() else {
         return Ok(0);
     };
     file.inner().access(FileFlags::empty())?;
 
-    let offset = offset as u64;
-    let len = len as u64;
+    let offset = plan.range.offset;
+    let len = plan.range.length;
     let end = if len == 0 {
         // A zero length extends through the EOF sampled for this operation.
         file.inner().location().metadata()?.size
@@ -3160,25 +4676,24 @@ pub fn sys_fadvise64(
         offset.checked_add(len).ok_or(AxError::InvalidInput)?
     };
     let effective_len = end.saturating_sub(offset);
-    match advice {
-        0 => file.inner().set_fadvise_readahead(FadviseReadahead::Normal),
-        1 => file.inner().set_fadvise_readahead(FadviseReadahead::Random),
-        2 => file
+    match plan.advice {
+        Fadvise::Normal => file.inner().set_fadvise_readahead(FadviseReadahead::Normal),
+        Fadvise::Random => file.inner().set_fadvise_readahead(FadviseReadahead::Random),
+        Fadvise::Sequential => file
             .inner()
             .set_fadvise_readahead(FadviseReadahead::Sequential),
-        3 => file.inner().fadvise_willneed(offset, effective_len)?,
+        Fadvise::WillNeed => file.inner().fadvise_willneed(offset, effective_len)?,
         // DONTNEED is an eviction hint.  Pins, aliases and a concurrent
         // writeback can make a particular range ineligible; that must retain
         // the data rather than turn a successful hint into a syscall error.
-        4 => {
+        Fadvise::DontNeed => {
             let _ = file.inner().fadvise_dontneed(offset, effective_len);
         }
-        5 => {
+        Fadvise::NoReuse => {
             file.inner()
                 .set_fadvise_readahead(FadviseReadahead::NoReuse);
             file.inner().fadvise_noreuse(offset, effective_len)?;
         }
-        _ => unreachable!("advice validated above"),
     }
     Ok(0)
 }
@@ -3205,7 +4720,16 @@ pub fn sys_pread64(
         )?;
     }
     f.with_read_credentials(|| {
-        pread64_file_with_context(&capability, &f, &context, buf, len, offset as u64, None)
+        pread64_file_with_context(
+            &capability,
+            &f,
+            &context,
+            buf,
+            len,
+            offset as u64,
+            None,
+            None,
+        )
     })
 }
 
@@ -3346,11 +4870,33 @@ fn pread64_file_with_context(
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+    cancellation: Option<&AsyncOperation>,
 ) -> AxResult<isize> {
+    if cancellation.is_some_and(AsyncOperation::cancellation_requested) {
+        return Err(LinuxError::ECANCELED.into());
+    }
     let status = context.status();
     validate_direct_io(f.as_ref(), buf as usize, len, offset)?;
     f.check_io_status(status)?;
-    let fast_read = if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+    // RWF_NOWAIT is operation-local.  Route it through the provider's
+    // nonblocking readiness path before any regular-file fast path can enter
+    // a blocking cache or backend operation.
+    if status.rwf_nowait() {
+        let mut dst = VmBytesMut::new(capability.clone(), buf, len);
+        let read = if let Some(operation) = cancellation {
+            f.read_at_with_status_cancellable(status, &mut dst, offset, operation)?
+        } else {
+            f.read_at_with_status(status, &mut dst, offset)?
+        };
+        if read > 0 {
+            notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+            rwf_dontcache_range(context, f, offset, read)?;
+        }
+        return Ok(read as isize);
+    }
+    let fast_read = if cancellation.is_some() {
+        None
+    } else if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
         fixed_segments
     {
         // Fixed-buffer physical publication is owned exclusively by the
@@ -3384,17 +4930,22 @@ fn pread64_file_with_context(
     if let Some(read) = fast_read {
         if read > 0 {
             notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+            rwf_dontcache_range(context, f, offset, read)?;
         }
         return Ok(read as _);
     }
     if len >= USER_COPY_PREFAULT_MIN {
         prefault_regular_file_read_fallback(capability, f.as_ref(), buf, len, offset)?;
     }
-    let read = f
-        .inner()
-        .read_at(VmBytesMut::new(capability.clone(), buf, len), offset as _)?;
+    let mut dst = VmBytesMut::new(capability.clone(), buf, len);
+    let read = if let Some(operation) = cancellation {
+        f.read_at_with_status_cancellable(status, &mut dst, offset, operation)?
+    } else {
+        f.inner().read_at(&mut dst, offset as _)?
+    };
     if read > 0 {
         notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+        rwf_dontcache_range(context, f, offset, read)?;
     }
     Ok(read as _)
 }
@@ -3523,7 +5074,16 @@ fn execute_io_uring_pread(
         );
     }
     let file = positioned_read_file_handle(file_handle)?;
-    pread64_file_with_context(capability, &file, context, buf, len, offset, fixed_segments)
+    pread64_file_with_context(
+        capability,
+        &file,
+        context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+        None,
+    )
 }
 
 pub fn sys_pwrite64(
@@ -3545,7 +5105,16 @@ pub fn sys_pwrite64(
     }
     let context = current_io_operation_context(&f);
     f.with_write_credentials_for_status(context.status(), || {
-        pwrite64_file_with_context(&capability, &f, &context, buf, len, offset as u64, None)
+        pwrite64_file_with_context(
+            &capability,
+            &f,
+            &context,
+            buf,
+            len,
+            offset as u64,
+            None,
+            None,
+        )
     })
 }
 
@@ -3557,79 +5126,125 @@ fn pwrite64_file_with_context(
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+    cancellation: Option<&AsyncOperation>,
 ) -> AxResult<isize> {
+    if cancellation.is_some_and(AsyncOperation::cancellation_requested) {
+        return Err(LinuxError::ECANCELED.into());
+    }
     if len == 0 {
         return Ok(0);
     }
     let security = context.security();
     let status = context.status();
     f.check_io_status(status)?;
+    let append_start = Cell::new(None);
     let written = if write_uses_inode_append(f.inner(), status) {
         if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
             let mut source =
                 PinnedPhysicalReader::from_validated_range(segments, offset_in_segments, fixed_len);
-            f.write_at_end_with_status_and_direct_validation(
-                status,
-                &mut source,
-                security,
-                |append_offset, allowed| {
-                    validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
-                },
-            )?
+            if let Some(operation) = cancellation {
+                f.write_at_end_with_status_and_direct_validation_cancellable(
+                    status,
+                    &mut source,
+                    security,
+                    operation,
+                    |append_offset, allowed| {
+                        append_start.set(Some(append_offset));
+                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                    },
+                )?
+            } else {
+                f.write_at_end_with_status_and_direct_validation(
+                    status,
+                    &mut source,
+                    security,
+                    |append_offset, allowed| {
+                        append_start.set(Some(append_offset));
+                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                    },
+                )?
+            }
         } else {
-            f.write_at_end_with_status_and_direct_validation(
-                status,
-                &mut VmBytes::new(capability.clone(), buf, len),
-                security,
-                |append_offset, allowed| {
-                    validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
-                },
-            )?
+            let mut source = VmBytes::new(capability.clone(), buf, len);
+            if let Some(operation) = cancellation {
+                f.write_at_end_with_status_and_direct_validation_cancellable(
+                    status,
+                    &mut source,
+                    security,
+                    operation,
+                    |append_offset, allowed| {
+                        append_start.set(Some(append_offset));
+                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                    },
+                )?
+            } else {
+                f.write_at_end_with_status_and_direct_validation(
+                    status,
+                    &mut source,
+                    security,
+                    |append_offset, allowed| {
+                        append_start.set(Some(append_offset));
+                        validate_direct_io(f.as_ref(), buf as usize, allowed, append_offset)
+                    },
+                )?
+            }
         }
     } else {
         let allowed = allowed_write_len(offset, len)?;
-        let fast_written =
-            if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
-                fixed_segments
-            {
-                crate::file::io_uring::record_io_uring_dma_direct_write_fallback(
-                    fixed_dma_fallback_reason(
-                        buf as usize,
-                        allowed.min(fixed_len),
-                        offset,
+        let fast_written = if cancellation.is_some() || status.rwf_nowait() {
+            None
+        } else if let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) =
+            fixed_segments
+        {
+            crate::file::io_uring::record_io_uring_dma_direct_write_fallback(
+                fixed_dma_fallback_reason(
+                    buf as usize,
+                    allowed.min(fixed_len),
+                    offset,
+                    segments,
+                    offset_in_segments,
+                    disjoint,
+                    provenance,
+                ),
+            );
+            if regular_file_supports_user_slice_fast_path(f.as_ref()) {
+                executable::check_not_active(f.inner().location())?;
+                // The fixed-buffer fallback bypasses File's ordinary
+                // write admission, so retain the swap mutation token
+                // until its direct pinned-segment backend effect returns.
+                let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
+                if allowed == 0 {
+                    Some(0)
+                } else {
+                    admit_positioned_inode_write(f.as_ref(), offset)?;
+                    validate_direct_io(f.as_ref(), buf as usize, allowed, offset)?;
+                    let _memfd_mutation =
+                        reserve_memfd_positioned_write(f.as_ref(), offset, allowed)?;
+                    let _privilege_guard =
+                        f.as_ref().begin_content_write_privilege_cleanup(security)?;
+                    Some(write_at_fixed_user_segments(
+                        f.as_ref(),
                         segments,
                         offset_in_segments,
-                        disjoint,
-                        provenance,
-                    ),
-                );
-                if regular_file_supports_user_slice_fast_path(f.as_ref()) {
-                    executable::check_not_active(f.inner().location())?;
-                    // The fixed-buffer fallback bypasses File's ordinary
-                    // write admission, so retain the swap mutation token
-                    // until its direct pinned-segment backend effect returns.
-                    let _swap_mutation = crate::mm::admit_mutation(f.inner().location())?;
-                    if allowed == 0 {
-                        Some(0)
-                    } else {
-                        validate_direct_io(f.as_ref(), buf as usize, allowed, offset)?;
-                        let _memfd_mutation =
-                            reserve_memfd_positioned_write(f.as_ref(), offset, allowed)?;
-                        let _privilege_guard =
-                            f.as_ref().begin_content_write_privilege_cleanup(security)?;
-                        Some(write_at_fixed_user_segments(
-                            f.as_ref(),
-                            segments,
-                            offset_in_segments,
-                            allowed.min(fixed_len),
-                            offset,
-                        )?)
-                    }
-                } else {
-                    None
+                        allowed.min(fixed_len),
+                        offset,
+                    )?)
                 }
             } else {
-                match try_regular_file_pwrite_user_slice(
+                None
+            }
+        } else {
+            match try_regular_file_pwrite_user_slice(
+                capability,
+                f.as_ref(),
+                status,
+                security,
+                buf,
+                len,
+                offset,
+            )? {
+                Some(written) => Some(written),
+                None => try_regular_file_pwrite_user_segments(
                     capability,
                     f.as_ref(),
                     status,
@@ -3637,19 +5252,9 @@ fn pwrite64_file_with_context(
                     buf,
                     len,
                     offset,
-                )? {
-                    Some(written) => Some(written),
-                    None => try_regular_file_pwrite_user_segments(
-                        capability,
-                        f.as_ref(),
-                        status,
-                        security,
-                        buf,
-                        len,
-                        offset,
-                    )?,
-                }
-            };
+                )?,
+            }
+        };
         if let Some(written) = fast_written {
             written
         } else {
@@ -3662,33 +5267,76 @@ fn pwrite64_file_with_context(
                     offset_in_segments,
                     fixed_len,
                 );
-                f.write_at_with_status_and_direct_validation(
-                    status,
-                    &mut source,
-                    offset,
-                    security,
-                    |write_offset, write_len| {
-                        validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
-                    },
-                )?
+                if let Some(operation) = cancellation {
+                    f.write_at_with_status_and_direct_validation_cancellable(
+                        status,
+                        &mut source,
+                        offset,
+                        security,
+                        operation,
+                        |write_offset, write_len| {
+                            validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
+                        },
+                    )?
+                } else {
+                    f.write_at_with_status_and_direct_validation(
+                        status,
+                        &mut source,
+                        offset,
+                        security,
+                        |write_offset, write_len| {
+                            validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
+                        },
+                    )?
+                }
             } else {
-                f.write_at_with_status_and_direct_validation(
-                    status,
-                    &mut VmBytes::new(capability.clone(), buf, len),
-                    offset,
-                    security,
-                    |write_offset, write_len| {
-                        validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
-                    },
-                )?
+                let mut source = VmBytes::new(capability.clone(), buf, len);
+                if let Some(operation) = cancellation {
+                    f.write_at_with_status_and_direct_validation_cancellable(
+                        status,
+                        &mut source,
+                        offset,
+                        security,
+                        operation,
+                        |write_offset, write_len| {
+                            validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
+                        },
+                    )?
+                } else {
+                    f.write_at_with_status_and_direct_validation(
+                        status,
+                        &mut source,
+                        offset,
+                        security,
+                        |write_offset, write_len| {
+                            validate_direct_io(f.as_ref(), buf as usize, write_len, write_offset)
+                        },
+                    )?
+                }
             }
         }
     };
     if written > 0 {
         sync_file_after_status_write(status, f)?;
+        rwf_dontcache_range(context, f, append_start.get().unwrap_or(offset), written)?;
         notify_write_file_with_actor(f.as_ref(), context.fanotify_actor());
     }
     Ok(written as _)
+}
+
+fn rwf_dontcache_range(
+    context: &IoOperationContext,
+    file: &FileHandle<File>,
+    offset: u64,
+    count: usize,
+) -> AxResult<()> {
+    if context.rwf_flags() & RWF_DONTCACHE != 0 && count != 0 {
+        // Provider admission happened before data publication.  Once a write
+        // has committed, an advisory eviction failure must not turn its
+        // successful result into a post-side-effect errno.
+        let _ = file.inner().fadvise_dontneed(offset, count as u64);
+    }
+    Ok(())
 }
 
 /// Executes an io_uring write on the submitting task using a context captured
@@ -3751,7 +5399,16 @@ fn execute_io_uring_pwrite(
         );
     }
     let file = positioned_write_file_handle(file_handle)?;
-    pwrite64_file_with_context(capability, &file, context, buf, len, offset, fixed_segments)
+    pwrite64_file_with_context(
+        capability,
+        &file,
+        context,
+        buf,
+        len,
+        offset,
+        fixed_segments,
+        None,
+    )
 }
 
 pub fn sys_preadv(
@@ -3918,6 +5575,12 @@ impl<F: FnMut(&[u8]) -> AxResult<usize>> Write for TransferWriter<'_, F> {
 
 impl<F> IoBufMut for TransferWriter<'_, F> {
     fn remaining_mut(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl<F> axio::IoBuf for TransferWriter<'_, F> {
+    fn remaining(&self) -> usize {
         self.remaining
     }
 }
@@ -4286,9 +5949,9 @@ impl SendFile {
                 file.with_write_credentials_for_status(*status, || {
                     let nonblocking = *nonblocking || force_nonblocking;
                     if let Some(pipe) = file.downcast_ref::<Pipe>() {
-                        pipe.write_with_nonblocking(&mut buf, nonblocking)
+                        pipe.write_with_nonblocking(&mut buf, nonblocking, false)
                     } else if let Some(pipe) = file.downcast_ref::<NamedPipe>() {
-                        pipe.write_with_nonblocking(&mut buf, nonblocking)
+                        pipe.write_with_nonblocking(&mut buf, nonblocking, false)
                     } else if let Some(socket) = file.downcast_ref::<Socket>() {
                         socket.write_with_nonblocking(&mut buf, nonblocking)
                     } else if let Some(regular) = file.downcast_ref::<File>() {
@@ -4306,12 +5969,14 @@ impl SendFile {
                                     mandatory_len,
                                 )?;
                                 crate::mm::check_not_active(regular.inner().location())?;
-                                let _swap_mutation = crate::mm::admit_mutation(regular.inner().location())?;
+                                let _swap_mutation =
+                                    crate::mm::admit_mutation(regular.inner().location())?;
                                 executable::check_not_active(regular.inner().location())?;
                                 let allowed = allowed_write_len(off, data.len())?;
                                 if allowed == 0 {
                                     return Ok(0);
                                 }
+                                admit_positioned_inode_write(regular, off)?;
                                 let location = regular.inner().location();
                                 memfd_mutation.admit_write(
                                     location,
@@ -4324,7 +5989,7 @@ impl SendFile {
                                 regular.inner().write_at(&data[..allowed], off)
                             })
                     } else {
-                        write_file_like_with_status(file, *status, &mut buf, security)
+                        write_file_like_with_status(file, *status, &mut buf, security, false)
                     }
                 })
             }
@@ -4362,6 +6027,7 @@ impl SendFile {
                     off,
                     mandatory_len,
                 )?;
+                admit_positioned_inode_write(file, off)?;
                 let location = file.inner().location();
                 memfd_mutation.admit_write(location, location.len()?, off, allowed)?;
                 let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
@@ -5041,7 +6707,7 @@ fn validate_sendfile_destination(
         // turn EMSGSIZE into a false multi-packet success, so refuse datagram
         // destinations until a message-preserving transaction exists.
         if matches!(&socket.inner, axnet::Socket::Udp(_))
-            || matches!(&socket.inner, axnet::Socket::Unix(unix) if unix.is_datagram())
+            || matches!(&socket.inner, axnet::Socket::Unix(unix) if unix.is_record_oriented())
         {
             return Err(AxError::OperationNotSupported);
         }
@@ -5099,7 +6765,7 @@ fn validate_splice_endpoint(
         // can provide neither, so refuse it explicitly instead of dropping a
         // packet after destination EAGAIN or splitting one message.
         if matches!(&socket.inner, axnet::Socket::Udp(_))
-            || matches!(&socket.inner, axnet::Socket::Unix(unix) if unix.is_datagram())
+            || matches!(&socket.inner, axnet::Socket::Unix(unix) if unix.is_record_oriented())
         {
             return Err(AxError::OperationNotSupported);
         }
@@ -5286,6 +6952,115 @@ pub fn sys_copy_file_range(
     let dst_location = dst_file.inner().location().clone();
     let same_inode =
         inode_flags::same_inode(src_file.inner().location(), dst_file.inner().location());
+
+    // A FUSE daemon can perform an in-filesystem copy atomically (and retain
+    // reflink/server-side semantics) only when both endpoints are its exact
+    // daemon-issued OFD handles.  The explicit-offset form has no cursor
+    // transaction to emulate, so dispatch it directly and preserve the Linux
+    // post-copy offset-pointer publication rule below.
+    if let (Some(source_offset), Some(destination_offset)) = (src_offset, dst_offset)
+        && let Some(source_handle) = src_file.inner().open_handle()
+        && let Some(destination_handle) = dst_file.inner().open_handle()
+        && let Ok(source_fuse) = source_handle
+            .clone()
+            .into_any()
+            .downcast::<crate::pseudofs::dev::fuse::FuseOpenFile>()
+        && let Ok(destination_fuse) = destination_handle
+            .clone()
+            .into_any()
+            .downcast::<crate::pseudofs::dev::fuse::FuseOpenFile>()
+    {
+        let source_count = copy_file_range_source_count(source_offset, len, src_location.len()?)?;
+        let destination_allowed = allowed_write_len(destination_offset, source_count)?;
+        let effective = copy_file_range_effective_count(
+            source_offset,
+            destination_offset,
+            source_count,
+            destination_allowed,
+            same_inode,
+        )?;
+        let _destination_mutation = dst_file.inner().begin_native_mutation(false)?;
+        inode_flags::check_data_write(&dst_location, destination_offset, false)?;
+        let copied = usize::try_from(source_fuse.copy_file_range_to(
+            destination_fuse.as_ref(),
+            source_offset,
+            destination_offset,
+            effective as u64,
+            0,
+        )?)
+        .map_err(|_| AxError::Io)?;
+        if copied > effective {
+            return Err(AxError::Io);
+        }
+        if copied > 0 {
+            touch_modified_metadata(&dst_location)?;
+            sync_file_after_status_write(dst_status, &dst_file)?;
+            let _ = notify_exact(&src_location, IN_ACCESS);
+            let _ = notify_parent(&src_location, IN_ACCESS);
+            let _ = notify_exact(&dst_location, IN_MODIFY);
+            let _ = notify_parent(&dst_location, IN_MODIFY);
+            let source_commit = source_offset
+                .checked_add(copied as u64)
+                .ok_or(AxError::InvalidInput)?;
+            let destination_commit = destination_offset
+                .checked_add(copied as u64)
+                .ok_or(AxError::InvalidInput)?;
+            let source_store = capability
+                .write_value(off_in, source_commit)
+                .map_err(map_usercopy_error);
+            let destination_store = capability
+                .write_value(off_out, destination_commit)
+                .map_err(map_usercopy_error);
+            match (source_store, destination_store) {
+                (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+                (Ok(()), Ok(())) => {}
+            }
+        }
+        return Ok(copied as isize);
+    }
+
+    if let Some(copied) = fuse_copy_file_range_with_positions(
+        &src_file,
+        &dst_file,
+        src_offset,
+        dst_offset,
+        len,
+        src_location.len()?,
+        same_inode,
+    ) {
+        let (copied, _destination_mutation) = copied?;
+        if copied > 0 {
+            touch_modified_metadata(&dst_location)?;
+            sync_file_after_status_write(dst_status, &dst_file)?;
+            let _ = notify_exact(&src_location, IN_ACCESS);
+            let _ = notify_parent(&src_location, IN_ACCESS);
+            let _ = notify_exact(&dst_location, IN_MODIFY);
+            let _ = notify_parent(&dst_location, IN_MODIFY);
+            // Implicit offsets have already committed inside the transaction;
+            // explicit pointers retain Linux's post-copy writeback behavior.
+            if let Some(source_offset) = src_offset {
+                capability
+                    .write_value(
+                        off_in,
+                        source_offset
+                            .checked_add(copied as u64)
+                            .ok_or(AxError::InvalidInput)?,
+                    )
+                    .map_err(map_usercopy_error)?;
+            }
+            if let Some(destination_offset) = dst_offset {
+                capability
+                    .write_value(
+                        off_out,
+                        destination_offset
+                            .checked_add(copied as u64)
+                            .ok_or(AxError::InvalidInput)?,
+                    )
+                    .map_err(map_usercopy_error)?;
+            }
+        }
+        return Ok(copied as isize);
+    }
 
     let mut src = if let Some(src_offset) = src_offset {
         SendFile::Offset {
@@ -5930,7 +7705,10 @@ mod tests {
         fn root_dir(&self) -> DirEntry {
             let fs = self.this.upgrade().expect("test filesystem is live");
             DirEntry::new_file(
-                FileNode::new(Arc::new(IoContractNode { fs })),
+                FileNode::new(Arc::new(IoContractNode {
+                    fs,
+                    user_data: axfs_ng_vfs::NodeUserData::new(),
+                })),
                 self.node_type,
                 Reference::root(),
             )
@@ -5954,6 +7732,7 @@ mod tests {
 
     struct IoContractNode {
         fs: Arc<IoContractFs>,
+        user_data: axfs_ng_vfs::NodeUserData,
     }
 
     impl NodeOps for IoContractNode {
@@ -6005,6 +7784,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn persistent_user_data(&self) -> Option<&axfs_ng_vfs::NodeUserData> {
+            Some(&self.user_data)
         }
 
         fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
@@ -6079,7 +7862,7 @@ mod tests {
             Ok(())
         }
 
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
             Err(VfsError::InvalidInput)
         }
     }
@@ -6548,7 +8331,7 @@ mod tests {
         let result = (|| {
             let location = file.backend()?.location();
             let _privilege_guard = begin_inode_content_write(location, &security)?;
-            file.backend()?.set_len(0)
+            file.set_len(0)
         })();
         assert_eq!(result, Err(AxError::Io));
         assert_eq!(fs.remove_xattr_calls.load(Ordering::Acquire), 1);
@@ -6747,13 +8530,49 @@ mod tests {
     #[test]
     fn ftruncate_admission_matches_linux_fdget_and_do_ftruncate() {
         let cases = [
-            (false, FileLikeKind::Regular, false, true, AxError::BadFileDescriptor),
-            (true, FileLikeKind::Regular, true, true, AxError::BadFileDescriptor),
-            (true, FileLikeKind::Directory, false, true, AxError::InvalidInput),
+            (
+                false,
+                FileLikeKind::Regular,
+                false,
+                true,
+                AxError::BadFileDescriptor,
+            ),
+            (
+                true,
+                FileLikeKind::Regular,
+                true,
+                true,
+                AxError::BadFileDescriptor,
+            ),
+            (
+                true,
+                FileLikeKind::Directory,
+                false,
+                true,
+                AxError::InvalidInput,
+            ),
             (true, FileLikeKind::Fifo, false, true, AxError::InvalidInput),
-            (true, FileLikeKind::Socket, false, true, AxError::InvalidInput),
-            (true, FileLikeKind::Other, false, true, AxError::InvalidInput),
-            (true, FileLikeKind::Regular, false, false, AxError::InvalidInput),
+            (
+                true,
+                FileLikeKind::Socket,
+                false,
+                true,
+                AxError::InvalidInput,
+            ),
+            (
+                true,
+                FileLikeKind::Other,
+                false,
+                true,
+                AxError::InvalidInput,
+            ),
+            (
+                true,
+                FileLikeKind::Regular,
+                false,
+                false,
+                AxError::InvalidInput,
+            ),
         ];
         for (fd_found, kind, path_only, writable, expected) in cases {
             assert_eq!(
@@ -6766,8 +8585,9 @@ mod tests {
     #[test]
     fn ftruncate_negative_length_precedes_invalid_and_opath_fd_admission() {
         for (fd_found, path_only) in [(false, false), (true, true)] {
-            let result = ftruncate_length_errno(-1)
-                .and_then(|()| ftruncate_admission_errno(fd_found, FileLikeKind::Regular, path_only, true));
+            let result = ftruncate_length_errno(-1).and_then(|()| {
+                ftruncate_admission_errno(fd_found, FileLikeKind::Regular, path_only, true)
+            });
             assert_eq!(result, Err(AxError::InvalidInput));
         }
     }

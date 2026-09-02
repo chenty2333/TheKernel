@@ -58,12 +58,10 @@ impl TimerClock {
             Self::Realtime => value,
             Self::Monotonic => current()
                 .as_thread()
-                .proc_data
                 .time_ns()
                 .host_monotonic_deadline(value),
             Self::Boottime => current()
                 .as_thread()
-                .proc_data
                 .time_ns()
                 .host_boottime_deadline(value),
         }
@@ -222,6 +220,49 @@ impl TimerFd {
         .map_err(|_| AxError::NoMemory)
     }
 
+    /// Consumes timer expirations with a per-request nonblocking decision.
+    /// This is used by RWF_NOWAIT without changing O_NONBLOCK on the shared
+    /// file description.
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> axio::Result<usize> {
+        if dst.remaining_mut() < size_of::<u64>() {
+            return Err(AxError::InvalidInput);
+        }
+
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+            let (result, publication) = {
+                let mut inner = self.inner.lock();
+                let was_armed = inner.next_expiration.is_some();
+                let (now, wall_generation) = clock_snapshot(inner.effective_clock);
+                inner.refresh_at(now, wall_generation);
+
+                if let Some(error) = inner.take_cancellation_error() {
+                    let publication = (was_armed && inner.next_expiration.is_none())
+                        .then(|| self.alarm.prepare_disarm());
+                    (Err(error), publication)
+                } else if inner.expirations == 0 {
+                    (Err(AxError::WouldBlock), None)
+                } else {
+                    let count = inner.expirations;
+                    inner.expirations = 0;
+                    let publication =
+                        self.prepare_alarm(inner.effective_clock, inner.next_expiration);
+                    (Ok(count), Some(publication))
+                }
+            };
+
+            if let Some(publication) = publication {
+                publication.publish();
+            }
+            let count = result?;
+            dst.write(&count.to_ne_bytes())?;
+            Ok(size_of::<u64>())
+        })
+    }
+
     fn prepare_alarm(&self, clock: AlarmClock, deadline: Option<Duration>) -> AlarmPublication {
         match deadline {
             Some(deadline) => {
@@ -310,39 +351,7 @@ impl FileLike for TimerFd {
     }
 
     fn read(&self, dst: &mut IoDst) -> axio::Result<usize> {
-        if dst.remaining_mut() < size_of::<u64>() {
-            return Err(AxError::InvalidInput);
-        }
-
-        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
-            let (result, publication) = {
-                let mut inner = self.inner.lock();
-                let was_armed = inner.next_expiration.is_some();
-                let (now, wall_generation) = clock_snapshot(inner.effective_clock);
-                inner.refresh_at(now, wall_generation);
-
-                if let Some(error) = inner.take_cancellation_error() {
-                    let publication = (was_armed && inner.next_expiration.is_none())
-                        .then(|| self.alarm.prepare_disarm());
-                    (Err(error), publication)
-                } else if inner.expirations == 0 {
-                    (Err(AxError::WouldBlock), None)
-                } else {
-                    let count = inner.expirations;
-                    inner.expirations = 0;
-                    let publication =
-                        self.prepare_alarm(inner.effective_clock, inner.next_expiration);
-                    (Ok(count), Some(publication))
-                }
-            };
-
-            if let Some(publication) = publication {
-                publication.publish();
-            }
-            let count = result?;
-            dst.write(&count.to_ne_bytes())?;
-            Ok(size_of::<u64>())
-        })
+        self.read_with_nonblocking(dst, self.nonblocking())
     }
 
     fn write(&self, _src: &mut IoSrc) -> axio::Result<usize> {
@@ -359,8 +368,10 @@ impl FileLike for TimerFd {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[timerfd]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[timerfd]",
+        )))
     }
 }
 

@@ -1,62 +1,67 @@
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    task::Context,
     time::Duration,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axfs_ng_vfs::{
+    FileIoCancelOutcome, FileIoCompletion, ImmediateFileIoResult, OwnedFileIoCompletion,
+    SubmittedFileIo,
+};
 use axhal::time::wall_time;
-use axpoll::PollSet;
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 #[cfg(not(test))]
 use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
-use linux_raw_sys::general::__kernel_off_t;
+use linux_raw_sys::general::{
+    CAP_SYS_ADMIN, CAP_SYS_NICE, POLLERR, POLLHUP, POLLIN, POLLMSG, POLLNVAL, POLLOUT, POLLPRI,
+    POLLRDBAND, POLLRDHUP, POLLRDNORM, POLLREMOVE, POLLWRBAND, POLLWRNORM,
+};
 // These accounting tests do not initialize a scheduler/current task. Runtime
 // sleeping-lock and wake behavior is exercised by guest tests; host tests use
 // the same critical sections with a spin mutex.
 #[cfg(test)]
 use spin::Mutex;
+use thekernel_linux_aio::{AioContextId as AbiAioContextId, AioContextSnapshot, plan_destroy};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::SignalSet;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
-use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev};
+use super::io::{
+    ClassicAioOperation, ClassicAioOwnedPreparation, execute_classic_aio_operation_cancellable,
+    prepare_classic_aio_operation, prepare_classic_aio_owned_operation,
+};
 use crate::{
-    file::{FileHandle, event::EventFd, get_typed_file},
-    mm::{IoVec, UserMemoryCapability, map_usercopy_error},
+    async_operation::{AsyncOperation, TerminalClaim},
+    file::{FileHandle, FileLike, event::EventFd, get_file_like, get_typed_file},
+    mm::{UserMemoryCapability, map_usercopy_error},
     readiness::{block_on_poll_set_uninterruptible, block_on_poll_set_until},
     task::{AsThread, with_blocked_signals},
 };
 
 const AIO_MAX_NR_DEFAULT: usize = 0x10000;
-const IOCB_CMD_PREAD: u16 = 0;
-const IOCB_CMD_PWRITE: u16 = 1;
-const IOCB_CMD_FSYNC: u16 = 2;
-const IOCB_CMD_FDSYNC: u16 = 3;
 const IOCB_CMD_POLL: u16 = 5;
-const IOCB_CMD_NOOP: u16 = 6;
-const IOCB_CMD_PREADV: u16 = 7;
-const IOCB_CMD_PWRITEV: u16 = 8;
 const IOCB_FLAG_RESFD: u32 = 1 << 0;
 const IOCB_FLAG_IOPRIO: u32 = 1 << 1;
 const KIOCB_KEY: u32 = 0;
-const RWF_HIPRI: u32 = 0x00000001;
-const RWF_DSYNC: u32 = 0x00000002;
-const RWF_SYNC: u32 = 0x00000004;
-const RWF_NOWAIT: u32 = 0x00000008;
-const RWF_APPEND: u32 = 0x00000010;
-const RWF_SUPPORTED: u32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND;
 const AIO_HARD_MAX_EVENTS: usize = 0x10000000 / size_of::<IoEvent>();
 
 static NEXT_AIO_CTX: AtomicU64 = AtomicU64::new(1);
 static AIO_NR: AtomicUsize = AtomicUsize::new(0);
 static AIO_MAX_NR: AtomicUsize = AtomicUsize::new(AIO_MAX_NR_DEFAULT);
 static AIO_CONTEXTS: Mutex<AioManager> = Mutex::new(AioManager::new());
+static CLASSIC_AIO_ENGINE: Mutex<ClassicAioEngine> = Mutex::new(ClassicAioEngine::new());
+static CLASSIC_AIO_ENGINE_WAKE: PollSet = PollSet::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, AnyBitPattern)]
@@ -147,8 +152,187 @@ struct AioContext {
 
 struct AioContextState {
     events: VecDeque<IoEvent>,
+    /// Requests which crossed the asynchronous issue boundary.  A request is
+    /// removed by exactly one terminal claimant: its worker, io_cancel, or
+    /// teardown.  Keeping this separate from completion delivery is what
+    /// makes `io_cancel` race-safe instead of merely searching the CQ.
+    requests: BTreeMap<u64, Arc<AioRequest>>,
     in_flight: usize,
     accepting: bool,
+    teardown_release: bool,
+}
+
+/// One classic-AIO request retained after `io_submit` returns.
+///
+/// The object owns the exact open-file-description handle for a poll request,
+/// so close/reuse of the numeric descriptor cannot change the object being
+/// waited on. `operation` is deliberately distinct from the context CQ wait
+/// set: it owns the shared cancellation/terminal-claim transition and wakes
+/// an armed file-readiness wait immediately on cancellation or teardown.
+struct AioRequest {
+    iocb: u64,
+    data: u64,
+    resfd: Option<FileHandle<EventFd>>,
+    operation: Arc<AsyncOperation>,
+    /// Provider ownership is separate from the context request map.  Every
+    /// external provider call first moves the owner out under this lock and
+    /// then runs without either AIO lock held.
+    provider: Mutex<AioProviderState>,
+    owned_completion_target: Arc<Mutex<Option<(Weak<AioContext>, Weak<AioRequest>)>>>,
+    /// Ownership handshake for a provider callback racing `io_cancel`.
+    /// `CANCEL_PENDING` holds a normal completion until provider `cancel`
+    /// reports whether it actually withdrew the request.  Losing cancellation
+    /// restores that held result to the normal CQ route; winning cancellation
+    /// discards it and leaves `io_cancel` as the sole ECANCELED reporter.
+    completion_owner: core::sync::atomic::AtomicU8,
+    pending_provider_result: Mutex<Option<i64>>,
+}
+
+const COMPLETION_NORMAL: u8 = 0;
+const COMPLETION_CANCEL_PENDING: u8 = 1;
+const COMPLETION_CANCEL_WON: u8 = 2;
+
+enum AioProviderState {
+    Legacy,
+    Prepared(axfs::PreparedOwnedFileIo),
+    Publishing,
+    Submitted(SubmittedFileIo),
+    InFlight,
+    Terminal,
+}
+
+/// The VFS consumes this sink exactly once.  It retains only weak AIO links,
+/// so a provider queue can outlive `io_destroy` without keeping its context
+/// or CQ alive.
+struct AioOwnedCompletion {
+    target: Arc<Mutex<Option<(Weak<AioContext>, Weak<AioRequest>)>>>,
+}
+
+impl OwnedFileIoCompletion for AioOwnedCompletion {
+    fn complete(self: Box<Self>, completion: FileIoCompletion) {
+        let target = self.target.lock().clone();
+        let Some((context, request)) = target else {
+            return;
+        };
+        let (Some(context), Some(request)) = (context.upgrade(), request.upgrade()) else {
+            return;
+        };
+        *request.provider.lock() = AioProviderState::Terminal;
+        let result = match completion.result {
+            ImmediateFileIoResult::Completed(bytes) => bytes as i64,
+            ImmediateFileIoResult::Cancelled => -LinuxError::ECANCELED.code() as i64,
+            ImmediateFileIoResult::Failed(error) => -LinuxError::from(error).code() as i64,
+        };
+        deliver_owned_completion(&context, &request, result);
+    }
+
+    fn into_retry_completion(self: Box<Self>) -> Box<dyn OwnedFileIoCompletion> {
+        self
+    }
+}
+
+fn deliver_owned_completion(context: &AioContext, request: &Arc<AioRequest>, result: i64) {
+    if request.completion_owner.load(Ordering::Acquire) != COMPLETION_CANCEL_PENDING {
+        if request.completion_owner.load(Ordering::Acquire) == COMPLETION_NORMAL {
+            finish_retained_request(context, request, result);
+        }
+        return;
+    }
+    let publish_now = {
+        let mut held = request.pending_provider_result.lock();
+        if request.completion_owner.load(Ordering::Acquire) == COMPLETION_CANCEL_PENDING {
+            debug_assert!(held.is_none(), "owned file I/O completed twice");
+            *held = Some(result);
+            false
+        } else {
+            request.completion_owner.load(Ordering::Acquire) == COMPLETION_NORMAL
+        }
+    };
+    if publish_now {
+        finish_retained_request(context, request, result);
+    }
+}
+
+/// Shared classic-AIO execution queue.  Kernel worker tasks have no Linux
+/// Thread extension, so ioprio is scheduled here as operation metadata rather
+/// than being incorrectly installed into a worker-local task context.
+struct ClassicAioWork {
+    context: Arc<AioContext>,
+    request: Arc<AioRequest>,
+    operation: ClassicAioOperation,
+    published: bool,
+}
+
+struct ClassicAioEngine {
+    work: VecDeque<ClassicAioWork>,
+    workers_reserved: usize,
+}
+
+impl ClassicAioEngine {
+    const fn new() -> Self {
+        Self {
+            work: VecDeque::new(),
+            workers_reserved: 0,
+        }
+    }
+
+    fn priority_key(operation: &AsyncOperation) -> (u8, u16) {
+        let raw = operation.io_priority();
+        let class = ((raw as u32 >> 13) & 0x7) as u8;
+        let data = raw & 0x1fff;
+        // Linux's RT/BE/IDLE classes are ordered before their data value.
+        // CLASS_NONE inherits the submitting task's default at admission and
+        // therefore shares the normal best-effort lane.
+        let class_rank = match class {
+            1 => 0,
+            2 | 0 => 1,
+            3 => 2,
+            _ => 3,
+        };
+        (class_rank, data)
+    }
+
+    fn pop_highest_priority(&mut self) -> Option<ClassicAioWork> {
+        let index = self
+            .work
+            .iter()
+            .enumerate()
+            .filter(|(_, work)| work.published)
+            .min_by_key(|(_, work)| Self::priority_key(&work.request.operation))
+            .map(|(index, _)| index)?;
+        self.work.remove(index)
+    }
+
+    fn has_published_work(&self) -> bool {
+        self.work.iter().any(|work| work.published)
+    }
+
+    fn remove_context(&mut self, context: &AioContext) {
+        self.work
+            .retain(|work| !core::ptr::eq(work.context.as_ref(), context));
+    }
+}
+
+struct AioPollSource<'a> {
+    file: &'a FileHandle<dyn FileLike>,
+    request: &'a AioRequest,
+}
+
+impl Pollable for AioPollSource<'_> {
+    fn poll(&self) -> IoEvents {
+        self.file.poll()
+    }
+
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let mut prepared = axpoll::PreparedPollRegistration::try_new(2)?;
+        prepared.arm_nested(|| self.file.register(context, events))?;
+        prepared.arm(self.request.operation.waiters(), context.waker())?;
+        prepared.commit()
+    }
 }
 
 struct AioManager {
@@ -240,6 +424,185 @@ fn release_aio_events(count: usize) {
 
 fn current_aio_owner() -> Pid {
     current().as_thread().proc_data.proc.pid()
+}
+
+fn lifecycle_snapshot(
+    context: &AioContext,
+    state: &AioContextState,
+) -> AxResult<AioContextSnapshot> {
+    let capacity = u32::try_from(context.max_events).map_err(|_| AxError::InvalidInput)?;
+    let outstanding = state.events.len().saturating_add(state.in_flight);
+    let submitted = u32::try_from(outstanding).map_err(|_| AxError::InvalidInput)?;
+    AioContextSnapshot::new(context.owner as u64, capacity)
+        .map(|snapshot| AioContextSnapshot {
+            submitted,
+            ..snapshot
+        })
+        .map_err(|_| AxError::InvalidInput)
+}
+
+fn release_context_events(context: &AioContext) {
+    let should_release = {
+        let mut state = context.state.lock();
+        if state.teardown_release && state.in_flight == 0 {
+            state.teardown_release = false;
+            true
+        } else {
+            false
+        }
+    };
+    if should_release {
+        release_aio_events(context.max_events);
+    }
+}
+
+/// Completes a retained request.  The map removal is the terminal claim: a
+/// cancellation or teardown which got there first makes this late worker a
+/// no-op and prevents double eventfd/CQ publication.
+fn finish_retained_request(context: &AioContext, request: &Arc<AioRequest>, result: i64) {
+    // The request-map ownership and AsyncOperation terminal claim are one
+    // linearization point.  Do not claim before acquiring `state`: a
+    // concurrent io_cancel used to be able to remove the request between the
+    // two steps, leaving a worker with a terminal token but no completion.
+    let published = {
+        let mut state = context.state.lock();
+        let Some(current) = state.requests.get(&request.iocb) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, request) {
+            // Pointer collisions cannot happen while a request is retained;
+            // retain the explicit branch so a future key representation does
+            // not silently let an obsolete worker finish a replacement.
+            return;
+        }
+        let Some(terminal) = request.operation.claim_terminal() else {
+            return;
+        };
+        state
+            .requests
+            .remove(&request.iocb)
+            .expect("terminal claimant retained request map entry");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.accepting {
+            state.events.push_back(IoEvent {
+                data: request.data,
+                obj: request.iocb,
+                res: if terminal == TerminalClaim::Cancelled {
+                    -LinuxError::ECANCELED.code() as i64
+                } else {
+                    result
+                },
+                res2: 0,
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if published && let Some(event) = &request.resfd {
+        let _ = event.signal(1);
+    }
+    context.waiters.wake();
+    release_context_events(context);
+}
+
+/// Crosses the irreversible provider-issue boundary.  Context ownership,
+/// teardown admission, and the operation transition are deliberately one
+/// lock order (`AioContextState` then `AsyncOperation`): io_cancel or destroy
+/// which removes the request first can never leave a worker issuing it later.
+fn begin_retained_request(context: &AioContext, request: &Arc<AioRequest>) -> bool {
+    let state = context.state.lock();
+    state.accepting
+        && state
+            .requests
+            .get(&request.iocb)
+            .is_some_and(|current| Arc::ptr_eq(current, request))
+        && request.operation.begin_issue()
+}
+
+/// Claims every live request during context teardown.  Teardown must not wait
+/// for a provider which cannot be interrupted after it has crossed its I/O
+/// boundary: the worker keeps its Arc and becomes a no-op on return, while the
+/// context releases its AIO_NR reservation immediately.
+fn retire_retained_requests(context: &AioContext) {
+    let requests = {
+        let mut state = context.state.lock();
+        let requests = state.requests.values().cloned().collect::<Vec<_>>();
+        for request in &requests {
+            let _ = request.operation.request_cancel();
+            let claimed = request.operation.claim_terminal();
+            debug_assert!(
+                claimed.is_some(),
+                "live AIO map entry without terminal claim"
+            );
+        }
+        state.requests.clear();
+        state.in_flight = 0;
+        requests
+    };
+    for request in requests {
+        // Detach provider ownership without an AIO/context lock.  A queued
+        // request is returned unpublished; a submitted provider is asked to
+        // cancel but teardown never waits for an in-flight backend.
+        enum RetiredProvider {
+            Prepared(axfs::PreparedOwnedFileIo),
+            Submitted(SubmittedFileIo),
+            None,
+        }
+        let provider = {
+            let mut state = request.provider.lock();
+            match core::mem::replace(&mut *state, AioProviderState::Terminal) {
+                AioProviderState::Prepared(prepared) => RetiredProvider::Prepared(prepared),
+                AioProviderState::Submitted(submitted) => RetiredProvider::Submitted(submitted),
+                _ => RetiredProvider::None,
+            }
+        };
+        match provider {
+            RetiredProvider::Prepared(prepared) => {
+                let (owned_request, completion) = prepared.abort();
+                drop(owned_request);
+                drop(completion);
+            }
+            RetiredProvider::Submitted(submitted) => {
+                let _ = submitted.cancel();
+            }
+            RetiredProvider::None => {}
+        }
+        request.operation.wake_waiters();
+    }
+    CLASSIC_AIO_ENGINE.lock().remove_context(context);
+    CLASSIC_AIO_ENGINE_WAKE.wake();
+    context.waiters.wake();
+    release_context_events(context);
+}
+
+fn run_poll_request(
+    context: Arc<AioContext>,
+    request: Arc<AioRequest>,
+    file: FileHandle<dyn FileLike>,
+    interest: IoEvents,
+) {
+    let source = AioPollSource {
+        file: &file,
+        request: &request,
+    };
+    let result =
+        crate::readiness::block_on_poll_io(&source, interest | IoEvents::ALWAYS, false, || {
+            if request.operation.cancellation_requested() {
+                Ok(-LinuxError::ECANCELED.code() as i64)
+            } else {
+                let ready = source.poll() & (interest | IoEvents::ALWAYS);
+                if ready.is_empty() {
+                    Err(AxError::WouldBlock)
+                } else if !begin_retained_request(&context, &request) {
+                    Ok(-LinuxError::ECANCELED.code() as i64)
+                } else {
+                    Ok(aio_poll_events_to_linux(ready) as i64)
+                }
+            }
+        })
+        .unwrap_or_else(|error| -LinuxError::from(error).code() as i64);
+    finish_retained_request(&context, &request, result);
 }
 
 fn context_for_current(ctx: u64) -> AxResult<Arc<AioContext>> {
@@ -342,114 +705,437 @@ fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
 }
 
 fn validate_iocb_common(iocb: &Iocb) -> AxResult {
-    if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 || iocb.aio_reqprio != 0 {
+    if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 {
         return Err(AxError::InvalidInput);
     }
     if iocb.aio_flags & !(IOCB_FLAG_RESFD | IOCB_FLAG_IOPRIO) != 0 {
         return Err(AxError::InvalidInput);
     }
-    if iocb.aio_flags & IOCB_FLAG_IOPRIO != 0 {
-        return Err(LinuxError::EOPNOTSUPP.into());
+    if iocb.aio_flags & IOCB_FLAG_IOPRIO == 0 && iocb.aio_reqprio != 0 {
+        return Err(AxError::InvalidInput);
     }
     Ok(())
 }
 
-fn validate_aio_rw_flags(flags: u32) -> AxResult {
-    if flags & !RWF_SUPPORTED != 0 {
-        return Err(LinuxError::EOPNOTSUPP.into());
+fn iocb_ioprio(iocb: &Iocb) -> AxResult<u16> {
+    if iocb.aio_flags & IOCB_FLAG_IOPRIO == 0 {
+        return crate::syscall::current_effective_ioprio();
     }
-    if flags & (RWF_HIPRI | RWF_NOWAIT | RWF_APPEND) != 0 {
-        return Err(LinuxError::EOPNOTSUPP.into());
-    }
-    Ok(())
-}
-
-fn maybe_sync_after_write(fd: i32, flags: u32) -> AxResult {
-    if flags & RWF_SYNC != 0 {
-        sys_fsync(fd)?;
-    } else if flags & RWF_DSYNC != 0 {
-        sys_fdatasync(fd)?;
-    }
-    Ok(())
-}
-
-fn execute_iocb(capability: &UserMemoryCapability, iocb: &Iocb) -> AxResult<isize> {
-    validate_iocb_common(iocb)?;
-
-    let fd = iocb.aio_fildes as i32;
-    let offset = iocb.aio_offset as __kernel_off_t;
-    match iocb.aio_lio_opcode {
-        IOCB_CMD_PREAD => {
-            validate_aio_rw_flags(iocb.aio_rw_flags)?;
-            sys_pread64(
-                capability.clone(),
-                fd,
-                iocb.aio_buf as *mut u8,
-                iocb.aio_nbytes as usize,
-                offset,
-            )
-        }
-        IOCB_CMD_PWRITE => {
-            validate_aio_rw_flags(iocb.aio_rw_flags)?;
-            let res = sys_pwrite64(
-                capability.clone(),
-                fd,
-                iocb.aio_buf as *const u8,
-                iocb.aio_nbytes as usize,
-                offset,
-            )?;
-            maybe_sync_after_write(fd, iocb.aio_rw_flags)?;
-            Ok(res)
-        }
-        IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => {
-            if iocb.aio_buf != 0
-                || iocb.aio_offset != 0
-                || iocb.aio_nbytes != 0
-                || iocb.aio_rw_flags != 0
-            {
-                return Err(AxError::InvalidInput);
+    let raw = iocb.aio_reqprio as u16;
+    let class = (raw as u32 >> 13) & 0x7;
+    let level = raw as u32 & 0x7;
+    match class {
+        0 if level == 0 => Ok(raw),
+        1 | 2 | 3 => {
+            if class == 1 {
+                let cred = current().as_thread().current_cred();
+                if !cred.has_effective_capability_in_own_user_ns(CAP_SYS_ADMIN)
+                    && !cred.has_effective_capability_in_own_user_ns(CAP_SYS_NICE)
+                {
+                    return Err(AxError::OperationNotPermitted);
+                }
             }
-            if iocb.aio_lio_opcode == IOCB_CMD_FSYNC {
-                sys_fsync(fd)
-            } else {
-                sys_fdatasync(fd)
-            }
-        }
-        IOCB_CMD_NOOP => Ok(0),
-        IOCB_CMD_PREADV => {
-            validate_aio_rw_flags(iocb.aio_rw_flags)?;
-            sys_preadv(
-                capability.clone(),
-                fd,
-                iocb.aio_buf as *const IoVec,
-                iocb.aio_nbytes as usize,
-                offset,
-            )
-        }
-        IOCB_CMD_PWRITEV => {
-            validate_aio_rw_flags(iocb.aio_rw_flags)?;
-            let res = sys_pwritev(
-                capability.clone(),
-                fd,
-                iocb.aio_buf as *const IoVec,
-                iocb.aio_nbytes as usize,
-                offset,
-            )?;
-            maybe_sync_after_write(fd, iocb.aio_rw_flags)?;
-            Ok(res)
-        }
-        IOCB_CMD_POLL => {
-            if iocb.aio_buf > u16::MAX as u64
-                || iocb.aio_offset != 0
-                || iocb.aio_nbytes != 0
-                || iocb.aio_rw_flags != 0
-            {
-                return Err(AxError::InvalidInput);
-            }
-            Err(AxError::Unsupported)
+            Ok(raw)
         }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+/// Transfers an IOCB poll request to a dedicated task.  Unlike the historical
+/// implementation this does not inspect readiness and manufacture a CQE in
+/// `io_submit`: the request remains in `AioContextState::requests` until its
+/// readiness waiter, cancellation, or teardown wins the terminal claim.
+fn submit_poll_request(
+    context: &Arc<AioContext>,
+    iocb_ptr: *const Iocb,
+    iocb: &Iocb,
+    resfd: Option<FileHandle<EventFd>>,
+    ioprio: u16,
+) -> AxResult {
+    if iocb.aio_buf > u32::MAX as u64
+        || iocb.aio_offset != 0
+        || iocb.aio_nbytes != 0
+        || iocb.aio_rw_flags != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+    let interest = aio_poll_events_from_linux(iocb.aio_buf as u32);
+    let file = get_file_like(iocb.aio_fildes as i32)?;
+    let owned_completion_target = Arc::try_new(Mutex::new(None)).map_err(|_| AxError::NoMemory)?;
+    let request = Arc::try_new(AioRequest {
+        iocb: iocb_ptr as u64,
+        data: iocb.aio_data,
+        resfd,
+        operation: AsyncOperation::new_with_io_priority(ioprio),
+        provider: Mutex::new(AioProviderState::Legacy),
+        owned_completion_target,
+        completion_owner: core::sync::atomic::AtomicU8::new(COMPLETION_NORMAL),
+        pending_provider_result: Mutex::new(None),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    let mut name = String::new();
+    name.try_reserve_exact(8).map_err(|_| AxError::NoMemory)?;
+    name.push_str("aio-poll");
+    {
+        let mut state = context.state.lock();
+        if !state.accepting {
+            return Err(AxError::InvalidInput);
+        }
+        if state.requests.contains_key(&request.iocb) {
+            return Err(AxError::InvalidInput);
+        }
+        state.requests.insert(request.iocb, request.clone());
+    }
+    let worker_context = context.clone();
+    let worker_request = request.clone();
+    if let Err(error) = axtask::try_spawn_with_name(
+        move || run_poll_request(worker_context, worker_request, file, interest),
+        name,
+    ) {
+        let mut state = context.state.lock();
+        if state
+            .requests
+            .get(&request.iocb)
+            .is_some_and(|current| Arc::ptr_eq(current, &request))
+        {
+            let _ = request.operation.claim_terminal();
+            state.requests.remove(&request.iocb);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn submit_classic_request(
+    context: &Arc<AioContext>,
+    iocb_ptr: *const Iocb,
+    iocb: &Iocb,
+    resfd: Option<FileHandle<EventFd>>,
+    operation: ClassicAioOperation,
+) -> AxResult {
+    let ioprio = operation.ioprio();
+    let owned_completion_target = Arc::try_new(Mutex::new(None)).map_err(|_| AxError::NoMemory)?;
+    let request = Arc::try_new(AioRequest {
+        iocb: iocb_ptr as u64,
+        data: iocb.aio_data,
+        resfd,
+        operation: AsyncOperation::new_with_io_priority(ioprio),
+        provider: Mutex::new(AioProviderState::Legacy),
+        owned_completion_target,
+        completion_owner: core::sync::atomic::AtomicU8::new(COMPLETION_NORMAL),
+        pending_provider_result: Mutex::new(None),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    *request.owned_completion_target.lock() =
+        Some((Arc::downgrade(context), Arc::downgrade(&request)));
+    let completion: Box<dyn OwnedFileIoCompletion> = Box::new(AioOwnedCompletion {
+        target: request.owned_completion_target.clone(),
+    });
+    let owned = match prepare_classic_aio_owned_operation(&operation, completion) {
+        Ok(owned) => owned,
+        Err((error, _completion)) => return Err(error),
+    };
+    {
+        let mut provider = request.provider.lock();
+        match owned {
+            ClassicAioOwnedPreparation::Prepared(prepared) => {
+                *provider = AioProviderState::Prepared(prepared)
+            }
+            ClassicAioOwnedPreparation::Unsupported => {
+                // NOWAIT is an immediate admitted operation, not a hint to
+                // enqueue the old borrowed-buffer worker.  An unconverted
+                // provider therefore reports its explicit unsupported mode.
+                if operation.nowait() {
+                    return Err(AxError::OperationNotSupported);
+                }
+            }
+            ClassicAioOwnedPreparation::Zero => {
+                // A zero-length classic read/write succeeds without a user
+                // pin or provider publication.  It still uses the normal AIO
+                // map/CQ linearization below so synchronous reentry is safe.
+                *provider = AioProviderState::Terminal;
+            }
+        }
+    }
+    let mut worker_name = String::new();
+    worker_name
+        .try_reserve_exact(7)
+        .map_err(|_| AxError::NoMemory)?;
+    worker_name.push_str("aio-io");
+    {
+        let mut state = context.state.lock();
+        if !state.accepting || state.requests.contains_key(&request.iocb) {
+            return Err(AxError::InvalidInput);
+        }
+        state.requests.insert(request.iocb, request.clone());
+    }
+    if matches!(&*request.provider.lock(), AioProviderState::Terminal) {
+        finish_retained_request(context, &request, 0);
+        return Ok(());
+    }
+    let queue_result = {
+        let mut engine = CLASSIC_AIO_ENGINE.lock();
+        if engine.work.try_reserve(1).is_err() {
+            Err(AxError::NoMemory)
+        } else {
+            engine.work.push_back(ClassicAioWork {
+                context: context.clone(),
+                request: request.clone(),
+                operation,
+                published: false,
+            });
+            engine.workers_reserved = engine.workers_reserved.saturating_add(1);
+            Ok(true)
+        }
+    };
+    let start_worker = match queue_result {
+        Ok(start_worker) => start_worker,
+        Err(error) => {
+            let mut state = context.state.lock();
+            if state
+                .requests
+                .get(&request.iocb)
+                .is_some_and(|current| Arc::ptr_eq(current, &request))
+            {
+                let _ = request.operation.claim_terminal();
+                state.requests.remove(&request.iocb);
+            }
+            return Err(error);
+        }
+    };
+    if start_worker {
+        if let Err(error) = axtask::try_spawn_with_name(run_classic_aio_engine, worker_name) {
+            {
+                let mut engine = CLASSIC_AIO_ENGINE.lock();
+                if let Some(index) = engine
+                    .work
+                    .iter()
+                    .position(|work| Arc::ptr_eq(&work.request, &request))
+                {
+                    engine.work.remove(index);
+                }
+                engine.workers_reserved = engine.workers_reserved.saturating_sub(1);
+            }
+            let mut state = context.state.lock();
+            if state
+                .requests
+                .get(&request.iocb)
+                .is_some_and(|current| Arc::ptr_eq(current, &request))
+            {
+                let _ = request.operation.claim_terminal();
+                state.requests.remove(&request.iocb);
+            }
+            return Err(error);
+        }
+    }
+    {
+        let mut engine = CLASSIC_AIO_ENGINE.lock();
+        let Some(work) = engine
+            .work
+            .iter_mut()
+            .find(|work| Arc::ptr_eq(&work.request, &request))
+        else {
+            return Err(AxError::InvalidInput);
+        };
+        work.published = true;
+    }
+    CLASSIC_AIO_ENGINE_WAKE.wake();
+    Ok(())
+}
+
+fn run_classic_aio_engine() {
+    let work = loop {
+        let work = {
+            let mut engine = CLASSIC_AIO_ENGINE.lock();
+            engine.pop_highest_priority()
+        };
+        if let Some(work) = work {
+            break work;
+        }
+        if CLASSIC_AIO_ENGINE.lock().work.is_empty() {
+            let mut engine = CLASSIC_AIO_ENGINE.lock();
+            engine.workers_reserved = engine.workers_reserved.saturating_sub(1);
+            return;
+        }
+        if block_on_poll_set_uninterruptible(&CLASSIC_AIO_ENGINE_WAKE, || {
+            if CLASSIC_AIO_ENGINE.lock().has_published_work() {
+                Ok(())
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        })
+        .is_err()
+        {
+            let mut engine = CLASSIC_AIO_ENGINE.lock();
+            engine.workers_reserved = engine.workers_reserved.saturating_sub(1);
+            return;
+        }
+    };
+    let result = if work.request.operation.cancellation_requested() {
+        -LinuxError::ECANCELED.code() as i64
+    } else {
+        match issue_owned_classic_request(&work.context, &work.request) {
+            // Accepted provider-owned work completes through
+            // `AioOwnedCompletion`; never manufacture a second CQE here.
+            Ok(Err(())) => {
+                let mut engine = CLASSIC_AIO_ENGINE.lock();
+                engine.workers_reserved = engine.workers_reserved.saturating_sub(1);
+                return;
+            }
+            Ok(Ok(OwnedIssue::Legacy)) => {
+                if !begin_retained_request(&work.context, &work.request) {
+                    -LinuxError::ECANCELED.code() as i64
+                } else {
+                    execute_classic_aio_operation_cancellable(
+                        work.operation,
+                        &work.request.operation,
+                    )
+                    .map(|value| value as i64)
+                    .unwrap_or_else(|error| -LinuxError::from(error).code() as i64)
+                }
+            }
+            Ok(Ok(OwnedIssue::Failed(result))) => result,
+            Err(error) => -LinuxError::from(error).code() as i64,
+        }
+    };
+    finish_retained_request(&work.context, &work.request, result);
+    let mut engine = CLASSIC_AIO_ENGINE.lock();
+    engine.workers_reserved = engine.workers_reserved.saturating_sub(1);
+}
+
+/// Publishes an already-reserved owned request without an AIO/context/engine
+/// lock.  A synchronous provider completion is allowed to reenter the CQ
+/// path; it changes `provider` to `Terminal`, in which case the returned
+/// submission control is simply dropped after the callback's unique finish.
+enum OwnedIssue {
+    Legacy,
+    Failed(i64),
+}
+
+fn issue_owned_classic_request(
+    context: &AioContext,
+    request: &Arc<AioRequest>,
+) -> AxResult<Result<OwnedIssue, ()>> {
+    let prepared = {
+        let mut provider = request.provider.lock();
+        match core::mem::replace(&mut *provider, AioProviderState::InFlight) {
+            AioProviderState::Prepared(prepared) => {
+                *provider = AioProviderState::Publishing;
+                Some(prepared)
+            }
+            AioProviderState::Legacy => {
+                *provider = AioProviderState::Legacy;
+                None
+            }
+            provider_state @ (AioProviderState::Publishing
+            | AioProviderState::Submitted(_)
+            | AioProviderState::InFlight
+            | AioProviderState::Terminal) => {
+                *provider = provider_state;
+                return Ok(Err(()));
+            }
+        }
+    };
+    let Some(prepared) = prepared else {
+        return Ok(Ok(OwnedIssue::Legacy));
+    };
+    if !begin_retained_request(context, request) {
+        let (owned_request, completion) = prepared.abort();
+        drop(owned_request);
+        drop(completion);
+        *request.provider.lock() = AioProviderState::Terminal;
+        return Ok(Ok(OwnedIssue::Failed(-LinuxError::ECANCELED.code() as i64)));
+    }
+    if prepared.is_nowait() {
+        return match prepared.try_complete_immediate() {
+            Ok(_) => Ok(Err(())),
+            Err(error) => {
+                let axfs_ng_vfs::FileIoPrepareError {
+                    error,
+                    request: owned_request,
+                    completion,
+                } = error;
+                drop(owned_request);
+                drop(completion);
+                *request.provider.lock() = AioProviderState::Terminal;
+                Ok(Ok(OwnedIssue::Failed(
+                    -LinuxError::from(error).code() as i64
+                )))
+            }
+        };
+    }
+    match prepared.submit() {
+        Ok(submitted) => {
+            let mut state = request.provider.lock();
+            if matches!(&*state, AioProviderState::Publishing) {
+                *state = AioProviderState::Submitted(submitted);
+            }
+            // If a synchronous completion won, `submitted` is dropped here;
+            // its provider has already consumed the one terminal payload.
+            Ok(Err(()))
+        }
+        Err(error) => {
+            let axfs_ng_vfs::FileIoPrepareError {
+                error,
+                request: owned_request,
+                completion,
+            } = error;
+            drop(owned_request);
+            drop(completion);
+            *request.provider.lock() = AioProviderState::Terminal;
+            Ok(Ok(OwnedIssue::Failed(
+                -LinuxError::from(error).code() as i64
+            )))
+        }
+    }
+}
+
+fn aio_poll_events_from_linux(events: u32) -> IoEvents {
+    let mut generic = IoEvents::ALWAYS;
+    for (linux, event) in [
+        (POLLIN, IoEvents::READABLE),
+        (POLLPRI, IoEvents::PRIORITY),
+        (POLLOUT, IoEvents::WRITABLE),
+        (POLLERR, IoEvents::ERROR),
+        (POLLHUP, IoEvents::HANGUP),
+        (POLLNVAL, IoEvents::INVALID),
+        (POLLRDNORM, IoEvents::READ_NORMAL),
+        (POLLRDBAND, IoEvents::READ_BAND),
+        (POLLWRNORM, IoEvents::WRITE_NORMAL),
+        (POLLWRBAND, IoEvents::WRITE_BAND),
+        (POLLMSG, IoEvents::MESSAGE),
+        (POLLREMOVE, IoEvents::REMOVED),
+        (POLLRDHUP, IoEvents::READ_HANGUP),
+    ] {
+        if events & linux != 0 {
+            generic |= event;
+        }
+    }
+    generic
+}
+
+fn aio_poll_events_to_linux(events: IoEvents) -> u32 {
+    let mut linux = 0;
+    for (event, bit) in [
+        (IoEvents::READABLE, POLLIN),
+        (IoEvents::PRIORITY, POLLPRI),
+        (IoEvents::WRITABLE, POLLOUT),
+        (IoEvents::ERROR, POLLERR),
+        (IoEvents::HANGUP, POLLHUP),
+        (IoEvents::INVALID, POLLNVAL),
+        (IoEvents::READ_NORMAL, POLLRDNORM),
+        (IoEvents::READ_BAND, POLLRDBAND),
+        (IoEvents::WRITE_NORMAL, POLLWRNORM),
+        (IoEvents::WRITE_BAND, POLLWRBAND),
+        (IoEvents::MESSAGE, POLLMSG),
+        (IoEvents::REMOVED, POLLREMOVE),
+        (IoEvents::READ_HANGUP, POLLRDHUP),
+    ] {
+        if events.contains(event) {
+            linux |= bit;
+        }
+    }
+    linux
 }
 
 fn finish_io_submit(
@@ -497,6 +1183,10 @@ pub fn sys_io_setup<M: UserMemory + ?Sized>(
     if nr_events > AIO_HARD_MAX_EVENTS {
         return Err(AxError::InvalidInput);
     }
+    // The ABI owns context-capacity admission; allocation/publication and
+    // usercopy rollback remain in the kernel transaction below.
+    AioContextSnapshot::new(current_aio_owner() as u64, nr_events as u32)
+        .map_err(|_| AxError::InvalidInput)?;
     try_reserve_aio_events(nr_events)?;
 
     let context = Arc::new(AioContext {
@@ -504,8 +1194,10 @@ pub fn sys_io_setup<M: UserMemory + ?Sized>(
         max_events: nr_events,
         state: Mutex::new(AioContextState {
             events: VecDeque::new(),
+            requests: BTreeMap::new(),
             in_flight: 0,
             accepting: true,
+            teardown_release: false,
         }),
         waiters: PollSet::new(),
     });
@@ -531,6 +1223,7 @@ pub fn sys_io_setup<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_io_destroy(ctx: u64) -> AxResult<isize> {
+    let abi_context = AbiAioContextId::new(ctx).ok_or(AxError::InvalidInput)?;
     let context = {
         let mut manager = AIO_CONTEXTS.lock();
         let context = manager
@@ -541,19 +1234,21 @@ pub fn sys_io_destroy(ctx: u64) -> AxResult<isize> {
         if context.owner != current_aio_owner() {
             return Err(AxError::InvalidInput);
         }
-        context.state.lock().accepting = false;
+        let mut state = context.state.lock();
+        let snapshot = lifecycle_snapshot(&context, &state)?;
+        plan_destroy(abi_context, snapshot).map_err(|_| AxError::InvalidInput)?;
+        state.accepting = false;
+        state.teardown_release = true;
+        drop(state);
         manager.contexts.remove(&ctx);
         context
     };
-    block_on_poll_set_uninterruptible(&context.waiters, || {
-        if context.state.lock().in_flight == 0 {
-            Ok(())
-        } else {
-            Err(AxError::WouldBlock)
-        }
-    })?;
+    // Context destruction detaches and cancels every retained request before
+    // returning.  Waiting here would make exec/exit and io_destroy hostage to
+    // a provider that has already entered an uncancellable backend call.
+    retire_retained_requests(&context);
     context.state.lock().events.clear();
-    release_aio_events(context.max_events);
+    release_context_events(&context);
     Ok(0)
 }
 
@@ -575,61 +1270,145 @@ pub fn sys_io_submit<M: UserMemory + ?Sized>(
     let reserved = reserve_submission_slots(&context, nr as usize)?;
 
     let mut submitted = 0isize;
-    let mut completions = VecDeque::new();
+    let mut retained = 0usize;
+    let completions = VecDeque::new();
 
+    // Slots are reserved as one admission transaction.  A poll request keeps
+    // its slot until a terminal claimant removes it; all not-yet-issued and
+    // synchronously completed slots are released on the common failure path.
     for index in 0..reserved {
         let ptr = match read_iocb_ptr(memory, iocbpp, index) {
             Ok(ptr) if !ptr.is_null() => ptr,
             Ok(_) => {
                 return fail_io_submit(
                     &context,
-                    reserved,
+                    reserved.saturating_sub(retained),
                     completions,
                     submitted,
                     AxError::BadAddress,
                 );
             }
             Err(err) => {
-                return fail_io_submit(&context, reserved, completions, submitted, err);
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
             }
         };
         let iocb = match VmPtr::vm_read(ptr, memory).map_err(map_usercopy_error) {
             Ok(iocb) => iocb,
             Err(err) => {
-                return fail_io_submit(&context, reserved, completions, submitted, err);
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
             }
         };
-
+        if let Err(err) = validate_iocb_common(&iocb) {
+            return fail_io_submit(
+                &context,
+                reserved.saturating_sub(retained),
+                completions,
+                submitted,
+                err,
+            );
+        }
         let resfd = match resfd_file(&iocb) {
             Ok(resfd) => resfd,
             Err(err) => {
-                return fail_io_submit(&context, reserved, completions, submitted, err);
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
             }
         };
         if let Err(err) = write_iocb_key(memory, ptr) {
-            return fail_io_submit(&context, reserved, completions, submitted, err);
+            return fail_io_submit(
+                &context,
+                reserved.saturating_sub(retained),
+                completions,
+                submitted,
+                err,
+            );
         }
-        let res = match execute_iocb(&capability, &iocb) {
-            Ok(res) => res,
+        let ioprio = match iocb_ioprio(&iocb) {
+            Ok(ioprio) => ioprio,
             Err(err) => {
-                return fail_io_submit(&context, reserved, completions, submitted, err);
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
             }
         };
-        if let Some(event) = resfd
-            && let Err(err) = event.signal(1)
-        {
-            return fail_io_submit(&context, reserved, completions, submitted, err);
+
+        if iocb.aio_lio_opcode == IOCB_CMD_POLL {
+            if let Err(err) = submit_poll_request(&context, ptr, &iocb, resfd, ioprio) {
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
+            }
+            retained += 1;
+            submitted += 1;
+            continue;
         }
-        completions.push_back(IoEvent {
-            data: iocb.aio_data,
-            obj: ptr as u64,
-            res: res as i64,
-            res2: 0,
-        });
+
+        let operation = match prepare_classic_aio_operation(
+            capability.clone(),
+            iocb.aio_lio_opcode,
+            iocb.aio_fildes as i32,
+            iocb.aio_buf,
+            iocb.aio_nbytes,
+            iocb.aio_offset,
+            iocb.aio_rw_flags,
+            ioprio,
+        ) {
+            Ok(operation) => operation,
+            Err(err) => {
+                return fail_io_submit(
+                    &context,
+                    reserved.saturating_sub(retained),
+                    completions,
+                    submitted,
+                    err,
+                );
+            }
+        };
+        if let Err(err) = submit_classic_request(&context, ptr, &iocb, resfd, operation) {
+            return fail_io_submit(
+                &context,
+                reserved.saturating_sub(retained),
+                completions,
+                submitted,
+                err,
+            );
+        }
+        retained += 1;
         submitted += 1;
+        continue;
     }
 
-    finish_io_submit(&context, reserved, completions, submitted)
+    finish_io_submit(
+        &context,
+        reserved.saturating_sub(retained),
+        completions,
+        submitted,
+    )
 }
 
 pub fn sys_io_getevents<M: UserMemory + ?Sized>(
@@ -686,14 +1465,22 @@ pub fn sys_io_getevents<M: UserMemory + ?Sized>(
         };
     }
 
-    for index in 0..count {
-        let event = *state.events.get(index).ok_or(AxError::InvalidInput)?;
-        write_io_event(memory, events.wrapping_add(index), event)?;
+    // Copy and consume one event at a time.  A fault in the Nth destination
+    // slot must not replay the successfully exposed prefix on the next call;
+    // Linux's AIO ring advances exactly with successful usercopy.
+    let mut copied = 0usize;
+    while copied < count {
+        let event = *state.events.front().ok_or(AxError::InvalidInput)?;
+        match write_io_event(memory, events.wrapping_add(copied), event) {
+            Ok(()) => {
+                state.events.pop_front();
+                copied += 1;
+            }
+            Err(_error) if copied != 0 => return Ok(copied as isize),
+            Err(error) => return Err(error),
+        }
     }
-    for _ in 0..count {
-        state.events.pop_front();
-    }
-    Ok(count as isize)
+    Ok(copied as isize)
 }
 
 pub fn sys_io_pgetevents<M: UserMemory + ?Sized>(
@@ -721,8 +1508,125 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
     if result.is_null() {
         return Err(AxError::BadAddress);
     }
-    context_for_current(ctx)?;
-    Err(AxError::InvalidInput)
+    let context = context_for_current(ctx)?;
+    let request = context
+        .state
+        .lock()
+        .requests
+        .get(&(iocb as u64))
+        .cloned()
+        .ok_or(AxError::InvalidInput)?;
+
+    enum CancelOwner {
+        Legacy,
+        Prepared(axfs::PreparedOwnedFileIo),
+        Submitted(SubmittedFileIo),
+    }
+    let owner = {
+        let mut provider = request.provider.lock();
+        match core::mem::replace(&mut *provider, AioProviderState::InFlight) {
+            AioProviderState::Legacy => {
+                *provider = AioProviderState::Legacy;
+                CancelOwner::Legacy
+            }
+            AioProviderState::Prepared(prepared) => {
+                *provider = AioProviderState::Terminal;
+                CancelOwner::Prepared(prepared)
+            }
+            AioProviderState::Submitted(submitted) => {
+                // The provider may synchronously call back from cancel. Hold
+                // that result until the provider tells us whether cancellation
+                // won; unlike a boolean suppression this cannot lose a normal
+                // completion when `cancel` reports InFlight/Terminal.
+                if request
+                    .completion_owner
+                    .compare_exchange(
+                        COMPLETION_NORMAL,
+                        COMPLETION_CANCEL_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    *provider = AioProviderState::Terminal;
+                    return Err(LinuxError::EAGAIN.into());
+                }
+                CancelOwner::Submitted(submitted)
+            }
+            state @ (AioProviderState::Publishing
+            | AioProviderState::InFlight
+            | AioProviderState::Terminal) => {
+                *provider = state;
+                return Err(LinuxError::EAGAIN.into());
+            }
+        }
+    };
+
+    let cancelled = match owner {
+        CancelOwner::Legacy => request.operation.request_cancel(),
+        CancelOwner::Prepared(prepared) => {
+            let (owned_request, completion) = prepared.abort();
+            drop(owned_request);
+            drop(completion);
+            request.operation.request_cancel()
+        }
+        CancelOwner::Submitted(submitted) => match submitted.cancel() {
+            // The request crossed `begin_issue` before provider publication,
+            // so AsyncOperation's cooperative bit intentionally rejects it.
+            // A provider that still withdraws its own queued work is the
+            // authoritative cancellation edge and io_cancel owns ECANCELED.
+            FileIoCancelOutcome::Cancelled => {
+                request
+                    .completion_owner
+                    .store(COMPLETION_CANCEL_WON, Ordering::Release);
+                // A callback which arrived while cancellation was pending has
+                // already released its pinned request into the held result.
+                request.pending_provider_result.lock().take();
+                true
+            }
+            FileIoCancelOutcome::InFlight | FileIoCancelOutcome::Terminal => {
+                request
+                    .completion_owner
+                    .store(COMPLETION_NORMAL, Ordering::Release);
+                if let Some(result) = request.pending_provider_result.lock().take() {
+                    finish_retained_request(&context, &request, result);
+                }
+                false
+            }
+        },
+    };
+    if !cancelled {
+        return Err(LinuxError::EAGAIN.into());
+    }
+    // No external/provider call occurs below this point.  A synchronous
+    // provider callback may already have removed the map entry; that is the
+    // expected result of the suppressed-CQ path.
+    {
+        let mut state = context.state.lock();
+        if state
+            .requests
+            .get(&(iocb as u64))
+            .is_some_and(|current| Arc::ptr_eq(current, &request))
+        {
+            let _ = request.operation.claim_terminal();
+            state.requests.remove(&(iocb as u64));
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+    request.operation.wake_waiters();
+    write_io_event(
+        memory,
+        result,
+        IoEvent {
+            data: request.data,
+            obj: request.iocb,
+            res: -LinuxError::ECANCELED.code() as i64,
+            res2: 0,
+        },
+    )?;
+    context.waiters.wake();
+    release_context_events(&context);
+    Ok(0)
 }
 
 pub fn cleanup_process_aio(owner: Pid) {
@@ -742,12 +1646,13 @@ pub fn cleanup_process_aio(owner: Pid) {
             break;
         };
 
-        let mut state = context.state.lock();
-        state.accepting = false;
-        state.events.clear();
-        drop(state);
-        context.waiters.wake();
-        release_aio_events(context.max_events);
+        {
+            let mut state = context.state.lock();
+            state.accepting = false;
+            state.teardown_release = true;
+            state.events.clear();
+        }
+        retire_retained_requests(&context);
     }
 }
 
@@ -763,8 +1668,10 @@ mod tests {
             max_events,
             state: Mutex::new(AioContextState {
                 events: VecDeque::new(),
+                requests: BTreeMap::new(),
                 in_flight: 0,
                 accepting: true,
+                teardown_release: false,
             }),
             waiters: PollSet::new(),
         }
