@@ -13,7 +13,7 @@ use alloc::{
     vec::Vec,
 };
 
-use axfs_ng_vfs::{DeviceId, VfsError, VfsResult};
+use axfs_ng_vfs::{DeviceId, FsName, FsNameBuf, VfsError, VfsResult};
 use axsync::Mutex;
 use lazy_static::lazy_static;
 
@@ -45,6 +45,13 @@ pub struct DeviceIdentity {
     pub device_id: Option<DeviceId>,
     pub devname: Option<String>,
     pub parent: Option<(String, String)>,
+}
+
+/// Sysfs exposes device subsystems either below `/sys/class` or `/sys/bus`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SysfsSubsystemKind {
+    Class,
+    Bus,
 }
 
 impl DeviceIdentity {
@@ -95,6 +102,23 @@ impl DeviceIdentity {
         validate_component(&bus)?;
         validate_component(&name)?;
         self.parent = Some((bus, name));
+        Ok(self)
+    }
+
+    /// Attaches a device below a validated multi-component physical parent
+    /// path (for example a PCI BDF followed by `virtioN/input`).  Sysfs
+    /// kobject names remain one component; only the already-known parent path
+    /// may contain separators.
+    pub fn child_of_path(mut self, path: String, name: String) -> VfsResult<Self> {
+        if path.is_empty()
+            || path
+                .split('/')
+                .any(|part| validate_component(part).is_err())
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        validate_component(&name)?;
+        self.parent = Some((path, name));
         Ok(self)
     }
 }
@@ -180,6 +204,10 @@ impl DeviceAttribute {
 pub struct DeviceRegistration {
     identity: DeviceIdentity,
     devtype: String,
+    subsystem: String,
+    subsystem_kind: SysfsSubsystemKind,
+    class_member: bool,
+    device_link: bool,
     attributes: Vec<DeviceAttribute>,
     uevent_hook: Option<Arc<dyn DeviceUeventHook>>,
 }
@@ -195,7 +223,52 @@ impl DeviceRegistration {
         attributes: Vec<DeviceAttribute>,
         uevent_hook: Option<Arc<dyn DeviceUeventHook>>,
     ) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_sysfs(
+            identity.clone(),
+            devtype,
+            attributes,
+            uevent_hook,
+            identity.class,
+            SysfsSubsystemKind::Class,
+            true,
+            true,
+        )
+    }
+
+    /// Registers a physical bus device. Such objects are not class members;
+    /// callers can opt out of the generic `device` link to expose a real PCI
+    /// `device` attribute instead.
+    pub fn try_bus_device(
+        identity: DeviceIdentity,
+        devtype: String,
+        attributes: Vec<DeviceAttribute>,
+        subsystem: String,
+        device_link: bool,
+    ) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_sysfs(
+            identity,
+            devtype,
+            attributes,
+            None,
+            subsystem,
+            SysfsSubsystemKind::Bus,
+            false,
+            device_link,
+        )
+    }
+
+    fn try_new_with_sysfs(
+        identity: DeviceIdentity,
+        devtype: String,
+        attributes: Vec<DeviceAttribute>,
+        uevent_hook: Option<Arc<dyn DeviceUeventHook>>,
+        subsystem: String,
+        subsystem_kind: SysfsSubsystemKind,
+        class_member: bool,
+        device_link: bool,
+    ) -> VfsResult<Arc<Self>> {
         validate_component(&devtype)?;
+        validate_component(&subsystem)?;
         match (&identity.device_id, &identity.devname) {
             (Some(_), Some(devname)) => validate_devname(devname)?,
             (None, None) => {}
@@ -205,9 +278,10 @@ impl DeviceRegistration {
             || attributes.iter().any(|attr| {
                 matches!(
                     attr.name.as_str(),
-                    "dev" | "uevent" | "subsystem" | "device"
+                    "dev" | "uevent" | "subsystem"
                 )
             })
+            || (device_link && attributes.iter().any(|attr| attr.name == "device"))
         {
             return Err(VfsError::InvalidInput);
         }
@@ -215,6 +289,10 @@ impl DeviceRegistration {
         Arc::try_new(Self {
             identity,
             devtype,
+            subsystem,
+            subsystem_kind,
+            class_member,
+            device_link,
             attributes,
             uevent_hook,
         })
@@ -377,6 +455,21 @@ impl<const CAPACITY: usize> DeviceRegistry<CAPACITY> {
             Err(VfsError::NotFound)
         }
     }
+
+    fn published_device(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> VfsResult<Arc<DeviceRegistration>> {
+        let slots = self.slots.lock();
+        match slots.get(index) {
+            Some(Slot::Published {
+                generation: current,
+                device,
+            }) if *current == generation => Ok(device.clone()),
+            _ => Err(VfsError::NotFound),
+        }
+    }
 }
 
 impl DeviceRegistration {
@@ -411,7 +504,7 @@ impl DeviceRegistration {
         crate::file::netlink::emit_init_net_kobject_uevent(
             action,
             &devpath,
-            &self.identity.class,
+            &self.subsystem,
             &environment,
         )?;
         Ok(())
@@ -421,7 +514,7 @@ impl DeviceRegistration {
         let mut payload = alloc::format!(
             "DEVPATH={}\nSUBSYSTEM={}\nDEVTYPE={}\n",
             self.canonical_path(),
-            self.identity.class,
+            self.subsystem,
             self.devtype,
         );
         if let Some(device_id) = self.identity.device_id {
@@ -467,7 +560,22 @@ impl<'a, const CAPACITY: usize> DeviceReservation<'a, CAPACITY> {
     /// changes state, so a failed three-node DRM publication has no visible
     /// card/connector/render fragment.
     pub fn publish_many<const COUNT: usize>(
+        entries: [(Self, Arc<DeviceRegistration>); COUNT],
+    ) -> VfsResult<[DeviceHandle<'a, CAPACITY>; COUNT]> {
+        Self::publish_many_inner(entries, true)
+    }
+
+    /// Commits a related set without emitting `add`; callers use this when a
+    /// coupled devfs node must be visible before udev can observe the device.
+    pub fn publish_many_quiet<const COUNT: usize>(
+        entries: [(Self, Arc<DeviceRegistration>); COUNT],
+    ) -> VfsResult<[DeviceHandle<'a, CAPACITY>; COUNT]> {
+        Self::publish_many_inner(entries, false)
+    }
+
+    fn publish_many_inner<const COUNT: usize>(
         mut entries: [(Self, Arc<DeviceRegistration>); COUNT],
+        emit_add: bool,
     ) -> VfsResult<[DeviceHandle<'a, CAPACITY>; COUNT]> {
         if COUNT == 0 {
             return Err(VfsError::InvalidInput);
@@ -512,8 +620,10 @@ impl<'a, const CAPACITY: usize> DeviceReservation<'a, CAPACITY> {
             generation: entries[index].0.generation,
         });
         drop(slots);
-        for (_, device) in entries {
-            let _ = device.emit_uevent(DeviceUeventAction::Add);
+        if emit_add {
+            for (_, device) in entries {
+                let _ = device.emit_uevent(DeviceUeventAction::Add);
+            }
         }
         Ok(handles)
     }
@@ -522,10 +632,31 @@ impl<'a, const CAPACITY: usize> DeviceReservation<'a, CAPACITY> {
     /// used for device/child pairs so an allocation or validation failure
     /// cannot leave only one half of the hierarchy visible.
     pub fn publish_pair(
+        first: Self,
+        first_device: Arc<DeviceRegistration>,
+        second: Self,
+        second_device: Arc<DeviceRegistration>,
+    ) -> VfsResult<(DeviceHandle<'a, CAPACITY>, DeviceHandle<'a, CAPACITY>)> {
+        Self::publish_pair_inner(first, first_device, second, second_device, true)
+    }
+
+    /// Commits a related pair to sysfs without emitting `add`.  The caller
+    /// must publish its coupled devfs entry before calling `DeviceHandle::add`.
+    pub fn publish_pair_quiet(
+        first: Self,
+        first_device: Arc<DeviceRegistration>,
+        second: Self,
+        second_device: Arc<DeviceRegistration>,
+    ) -> VfsResult<(DeviceHandle<'a, CAPACITY>, DeviceHandle<'a, CAPACITY>)> {
+        Self::publish_pair_inner(first, first_device, second, second_device, false)
+    }
+
+    fn publish_pair_inner(
         mut first: Self,
         first_device: Arc<DeviceRegistration>,
         mut second: Self,
         second_device: Arc<DeviceRegistration>,
+        emit_add: bool,
     ) -> VfsResult<(DeviceHandle<'a, CAPACITY>, DeviceHandle<'a, CAPACITY>)> {
         if !core::ptr::eq(first.registry, second.registry) || first.index == second.index {
             return Err(VfsError::InvalidInput);
@@ -555,8 +686,10 @@ impl<'a, const CAPACITY: usize> DeviceReservation<'a, CAPACITY> {
         first.consumed = true;
         second.consumed = true;
         drop(slots);
-        let _ = first_device.emit_uevent(DeviceUeventAction::Add);
-        let _ = second_device.emit_uevent(DeviceUeventAction::Add);
+        if emit_add {
+            let _ = first_device.emit_uevent(DeviceUeventAction::Add);
+            let _ = second_device.emit_uevent(DeviceUeventAction::Add);
+        }
         Ok((
             DeviceHandle {
                 registry,
@@ -631,6 +764,15 @@ pub struct DeviceHandle<'a, const CAPACITY: usize> {
 }
 
 impl<const CAPACITY: usize> DeviceHandle<'_, CAPACITY> {
+    /// Emits the delayed `add` notification after an associated devfs node is
+    /// visible. Repeating it intentionally follows Linux's explicit uevent
+    /// trigger semantics.
+    pub fn add(self) -> VfsResult<()> {
+        self.registry
+            .published_device(self.index, self.generation)?
+            .emit_uevent(DeviceUeventAction::Add)
+    }
+
     pub fn remove(self) -> VfsResult<()> {
         let device = self
             .registry
@@ -643,6 +785,14 @@ impl<const CAPACITY: usize> DeviceHandle<'_, CAPACITY> {
         self.registry
             .finish_disconnect(self.index, self.generation)?;
         notification_result
+    }
+
+    /// Re-emits a `change` event for consumers that lost a netlink multicast
+    /// and have explicitly requested a bounded device rescan.
+    pub fn change(self) -> VfsResult<()> {
+        self.registry
+            .published_device(self.index, self.generation)?
+            .emit_uevent(DeviceUeventAction::Change)
     }
 }
 
@@ -660,7 +810,7 @@ fn validate_devname(value: &str) -> VfsResult<()> {
     if value.is_empty()
         || value.len() > 255
         || value.starts_with('/')
-        || value.as_bytes().iter().any(|byte| *byte == 0)
+        || value.as_bytes().contains(&0)
     {
         return Err(VfsError::InvalidInput);
     }
@@ -681,9 +831,15 @@ pub struct RegistryDir {
 enum RegistryDirKind {
     ClassRoot,
     Class(String),
+    BusRoot,
+    Bus(String),
+    BusDevices(String),
     DevCharRoot,
     DevicesRoot,
-    Bus(String),
+    /// A canonical `/sys/devices/...` path. Intermediate components without a
+    /// registration are represented as dynamic directories so a PCI→VirtIO
+    /// parent chain can be traversed without manufacturing fake devices.
+    PhysicalPath(String),
     Device(String, String),
 }
 
@@ -705,6 +861,12 @@ pub fn devices_root(fs: Arc<SimpleFs>) -> RegistryDir {
         kind: RegistryDirKind::DevicesRoot,
     }
 }
+pub fn bus_root(fs: Arc<SimpleFs>) -> RegistryDir {
+    RegistryDir {
+        fs,
+        kind: RegistryDirKind::BusRoot,
+    }
+}
 
 impl RegistryDir {
     fn maker(&self, kind: RegistryDirKind) -> DirMaker {
@@ -720,11 +882,20 @@ impl RegistryDir {
         })
     }
     fn device_from_kind(&self) -> Option<Arc<DeviceRegistration>> {
-        let RegistryDirKind::Device(bus, name) = &self.kind else {
-            return None;
-        };
-        global_device_registry().device(bus, name)
+        match &self.kind {
+            RegistryDirKind::Device(bus, name) => global_device_registry().device(bus, name),
+            RegistryDirKind::PhysicalPath(path) => global_device_registry()
+                .visible_matching(|device| device.canonical_path() == *path)
+                .pop(),
+            _ => None,
+        }
     }
+}
+
+fn canonical_child_name(parent: &str, path: &str) -> Option<String> {
+    let suffix = path.strip_prefix(parent)?.strip_prefix('/')?;
+    let name = suffix.split('/').next()?;
+    (!name.is_empty()).then(|| name.into())
 }
 
 impl SimpleDirOps for RegistryDir {
@@ -733,41 +904,47 @@ impl SimpleDirOps for RegistryDir {
         let mut names = Vec::new();
         for device in devices {
             let candidate = match &self.kind {
-                RegistryDirKind::ClassRoot => Some(device.identity.class.clone()),
-                RegistryDirKind::Class(class) if *class == device.identity.class => {
+                RegistryDirKind::ClassRoot if device.class_member => Some(device.subsystem.clone()),
+                RegistryDirKind::Class(class)
+                    if device.class_member && *class == device.subsystem =>
+                {
+                    Some(device.identity.name.clone())
+                }
+                RegistryDirKind::BusRoot if device.subsystem_kind == SysfsSubsystemKind::Bus => {
+                    Some(device.subsystem.clone())
+                }
+                RegistryDirKind::Bus(bus) if *bus == device.subsystem => Some("devices".into()),
+                RegistryDirKind::BusDevices(bus) if *bus == device.subsystem => {
                     Some(device.identity.name.clone())
                 }
                 RegistryDirKind::DevCharRoot => device
                     .identity
                     .device_id
                     .map(|device_id| alloc::format!("{}:{}", device_id.major(), device_id.minor())),
-                RegistryDirKind::DevicesRoot if device.identity.parent.is_none() => {
-                    Some(device.identity.bus.clone())
+                RegistryDirKind::DevicesRoot => {
+                    canonical_child_name("/devices", &device.canonical_path())
                 }
-                RegistryDirKind::Bus(bus)
-                    if *bus == device.identity.bus && device.identity.parent.is_none() =>
-                {
-                    Some(device.identity.name.clone())
+                RegistryDirKind::PhysicalPath(path) => {
+                    canonical_child_name(path, &device.canonical_path())
                 }
                 RegistryDirKind::Device(..) => None,
                 _ => None,
             };
-            if let Some(candidate) = candidate {
-                if !names.iter().any(|name| name == &candidate) {
-                    names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
-                    names.push(candidate);
-                }
+            if let Some(candidate) = candidate
+                && !names.iter().any(|name| name == &candidate)
+            {
+                names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                names.push(candidate);
             }
         }
         if let Some(device) = self.device_from_kind() {
-            let RegistryDirKind::Device(bus, name) = &self.kind else {
-                unreachable!()
-            };
-            for child in global_device_registry().visible_matching(|candidate| {
-                candidate.identity.parent.as_ref() == Some(&(bus.clone(), name.clone()))
-            }) {
-                names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
-                names.push(child.identity.name.clone());
+            if let RegistryDirKind::Device(bus, name) = &self.kind {
+                for child in global_device_registry().visible_matching(|candidate| {
+                    candidate.identity.parent.as_ref() == Some(&(bus.clone(), name.clone()))
+                }) {
+                    names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                    names.push(child.identity.name.clone());
+                }
             }
             names
                 .try_reserve(device.attributes.len() + 4)
@@ -777,76 +954,129 @@ impl SimpleDirOps for RegistryDir {
             }
             names.push("uevent".into());
             names.push("subsystem".into());
-            names.push("device".into());
+            if device.device_link {
+                names.push("device".into());
+            }
             for attribute in &device.attributes {
                 names.push(attribute.name.clone());
             }
         }
-        try_boxed_names(names.into_iter().map(Cow::Owned))
+        let names = names
+            .into_iter()
+            .map(|name| FsNameBuf::from_vec(name.into_bytes()).map(Cow::Owned))
+            .collect::<VfsResult<Vec<_>>>()?;
+        try_boxed_names(names.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         match &self.kind {
-            RegistryDirKind::ClassRoot => {
-                let exists = global_device_registry()
-                    .visible_matching(|d| d.identity.class == name)
-                    .len()
-                    != 0;
-                exists
-                    .then(|| self.maker(RegistryDirKind::Class(name.into())).into())
-                    .ok_or(VfsError::NotFound)
-            }
+            RegistryDirKind::ClassRoot => global_device_registry()
+                .visible_matching(|d| d.class_member && d.subsystem.as_bytes() == name.as_bytes())
+                .pop()
+                .map(|device| {
+                    self.maker(RegistryDirKind::Class(device.subsystem.clone()))
+                        .into()
+                })
+                .ok_or(VfsError::NotFound),
             RegistryDirKind::Class(class) => {
                 let device = global_device_registry()
-                    .visible_matching(|d| d.identity.class == *class && d.identity.name == name)
+                    .visible_matching(|d| {
+                        d.class_member
+                            && d.subsystem == *class
+                            && d.identity.name.as_bytes() == name.as_bytes()
+                    })
                     .pop()
                     .ok_or(VfsError::NotFound)?;
                 Ok(
                     SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
-                        Ok(alloc::format!("../..{}", device.canonical_path()))
+                        Ok(alloc::format!("../..{}", device.canonical_path()).into_bytes())
                     })
                     .into(),
                 )
             }
+            RegistryDirKind::BusRoot => global_device_registry()
+                .visible_matching(|device| {
+                    device.subsystem_kind == SysfsSubsystemKind::Bus
+                        && device.subsystem.as_bytes() == name.as_bytes()
+                })
+                .pop()
+                .map(|device| self.maker(RegistryDirKind::Bus(device.subsystem.clone())).into())
+                .ok_or(VfsError::NotFound),
+            RegistryDirKind::Bus(_) if name.as_bytes() == b"devices" => Ok(self
+                .maker(RegistryDirKind::BusDevices(match &self.kind {
+                    RegistryDirKind::Bus(bus) => bus.clone(),
+                    _ => unreachable!(),
+                }))
+                .into()),
+            RegistryDirKind::BusDevices(bus) => {
+                let device = global_device_registry()
+                    .visible_matching(|device| {
+                        device.subsystem == *bus && device.identity.name.as_bytes() == name.as_bytes()
+                    })
+                    .pop()
+                    .ok_or(VfsError::NotFound)?;
+                Ok(SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
+                    Ok(alloc::format!("../../..{}", device.canonical_path()).into_bytes())
+                })
+                .into())
+            }
+            RegistryDirKind::Bus(_) => Err(VfsError::NotFound),
             RegistryDirKind::DevCharRoot => {
                 let device = global_device_registry()
                     .visible_matching(|d| {
                         d.identity.device_id.is_some_and(|device_id| {
-                            alloc::format!("{}:{}", device_id.major(), device_id.minor()) == name
+                            alloc::format!("{}:{}", device_id.major(), device_id.minor()).as_bytes()
+                                == name.as_bytes()
                         })
                     })
                     .pop()
                     .ok_or(VfsError::NotFound)?;
                 Ok(
                     SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
-                        Ok(alloc::format!("../..{}", device.canonical_path()))
+                        Ok(alloc::format!("../..{}", device.canonical_path()).into_bytes())
                     })
                     .into(),
                 )
             }
             RegistryDirKind::DevicesRoot => {
-                let exists = global_device_registry()
-                    .visible_matching(|d| d.identity.bus == name && d.identity.parent.is_none())
-                    .len()
-                    != 0;
-                exists
-                    .then(|| self.maker(RegistryDirKind::Bus(name.into())).into())
-                    .ok_or(VfsError::NotFound)
-            }
-            RegistryDirKind::Bus(bus) => {
-                let exists = global_device_registry().root_device(bus, name).is_some();
-                exists
-                    .then(|| {
-                        self.maker(RegistryDirKind::Device(bus.clone(), name.into()))
-                            .into()
+                let device = global_device_registry()
+                    .visible_matching(|device| {
+                        canonical_child_name("/devices", &device.canonical_path())
+                            .is_some_and(|child| child.as_bytes() == name.as_bytes())
                     })
-                    .ok_or(VfsError::NotFound)
+                    .pop()
+                    .ok_or(VfsError::NotFound)?;
+                let child = canonical_child_name("/devices", &device.canonical_path())
+                    .expect("visible device has its selected child");
+                Ok(self
+                    .maker(RegistryDirKind::PhysicalPath(alloc::format!(
+                        "/devices/{child}"
+                    )))
+                    .into())
+            }
+            RegistryDirKind::PhysicalPath(path) => {
+                let device = global_device_registry()
+                    .visible_matching(|device| {
+                        canonical_child_name(path, &device.canonical_path())
+                            .is_some_and(|child| child.as_bytes() == name.as_bytes())
+                    })
+                    .pop();
+                let Some(device) = device else {
+                    return self.device_file(name);
+                };
+                let child = canonical_child_name(path, &device.canonical_path())
+                    .expect("visible device has its selected child");
+                Ok(self
+                    .maker(RegistryDirKind::PhysicalPath(alloc::format!(
+                        "{path}/{child}"
+                    )))
+                    .into())
             }
             RegistryDirKind::Device(bus, parent) => {
                 if let Some(child) = global_device_registry()
                     .visible_matching(|candidate| {
                         candidate.identity.bus == *bus
-                            && candidate.identity.name == name
+                            && candidate.identity.name.as_bytes() == name.as_bytes()
                             && candidate.identity.parent.as_ref()
                                 == Some(&(bus.clone(), parent.clone()))
                     })
@@ -870,9 +1100,9 @@ impl SimpleDirOps for RegistryDir {
 }
 
 impl RegistryDir {
-    fn device_file(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn device_file(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let device = self.device_from_kind().ok_or(VfsError::NotFound)?;
-        if name == "dev" {
+        if name.as_bytes() == b"dev" {
             let device_id = device.identity.device_id.ok_or(VfsError::NotFound)?;
             return Ok(SimpleFile::new_regular(self.fs.clone(), move || {
                 Ok(alloc::format!(
@@ -883,7 +1113,7 @@ impl RegistryDir {
             })
             .into());
         }
-        if name == "uevent" {
+        if name.as_bytes() == b"uevent" {
             let read_device = device.clone();
             return Ok(SimpleFile::new_regular(
                 self.fs.clone(),
@@ -908,23 +1138,25 @@ impl RegistryDir {
             )
             .into());
         }
-        if name == "subsystem" {
-            let target = subsystem_link_target(&device.identity);
+        if name.as_bytes() == b"subsystem" {
+            let target = subsystem_link_target(&device);
             return Ok(SimpleFile::new(
                 self.fs.clone(),
                 axfs_ng_vfs::NodeType::Symlink,
-                move || Ok(target.clone()),
+                move || Ok(target.clone().into_bytes()),
             )
             .into());
         }
-        if name == "device" {
+        if name.as_bytes() == b"device" && device.device_link {
             // A class device's conventional `device` link points to its
-            // parent kobject.  For top-level registered devices the bus
-            // directory is that parent; nested input event devices resolve to
-            // their inputN parent.
+            // physical parent.  An inputN kobject sits below the synthetic
+            // `input` directory, so it skips that directory; eventN remains
+            // one level below inputN. Top-level DRM/fb devices still point to
+            // their bus object.
+            let target = device_link_target(&device);
             return Ok(
-                SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, || {
-                    Ok::<String, VfsError>(device_link_target())
+                SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
+                    Ok(target.clone().into_bytes())
                 })
                 .into(),
             );
@@ -932,7 +1164,7 @@ impl RegistryDir {
         let attribute = device
             .attributes
             .iter()
-            .find(|attribute| attribute.name == name)
+            .find(|attribute| attribute.name.as_bytes() == name.as_bytes())
             .ok_or(VfsError::NotFound)?;
         attribute_node(self.fs.clone(), attribute)
     }
@@ -940,16 +1172,40 @@ impl RegistryDir {
 
 /// `subsystem` is relative to the canonical `/sys/devices` kobject, not the
 /// `/sys/class` symlink through which callers commonly reach it.
-fn subsystem_link_target(identity: &DeviceIdentity) -> String {
-    let levels_to_sys = if identity.parent.is_some() { 4 } else { 3 };
-    alloc::format!("{}class/{}", "../".repeat(levels_to_sys), identity.class)
+fn subsystem_link_target(device: &DeviceRegistration) -> String {
+    // The link lives in the canonical device directory.  Count each
+    // canonical path component (`devices` plus its physical ancestors and
+    // kobject) instead of assuming a fixed shallow topology: PCI/VirtIO
+    // input devices are nested more deeply than virtual devices.
+    let levels_to_sys = device
+        .canonical_path()
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .count();
+    let root = match device.subsystem_kind {
+        SysfsSubsystemKind::Class => "class",
+        SysfsSubsystemKind::Bus => "bus",
+    };
+    alloc::format!("{}{root}/{}", "../".repeat(levels_to_sys), device.subsystem)
 }
 
-/// A canonical device object's parent is the `device` link target.  This is
-/// deliberately class-agnostic: nested input devices point at inputN while
-/// top-level DRM/fb devices point at their bus object.
-fn device_link_target() -> String {
-    "..".into()
+/// A canonical device object's physical parent is the `device` link target.
+fn device_link_target(device: &DeviceRegistration) -> String {
+    // `/devices/.../virtioN/input/inputN` has a synthetic `input` directory
+    // between the physical VirtIO kobject and inputN.  Its `device` link must
+    // therefore skip two levels. An eventN kobject has inputN as its direct
+    // parent, and ordinary top-level devices have their bus object as theirs.
+    if device.identity.class == "input"
+        && device
+            .identity
+            .parent
+            .as_ref()
+            .is_some_and(|(_, parent_name)| parent_name == "input")
+    {
+        "../..".into()
+    } else {
+        "..".into()
+    }
 }
 
 fn attribute_node(fs: Arc<SimpleFs>, attribute: &DeviceAttribute) -> VfsResult<NodeOpsMux> {
@@ -975,18 +1231,21 @@ struct DeviceAttributeDir {
 
 impl SimpleDirOps for DeviceAttributeDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        try_boxed_names(
-            self.attributes
-                .iter()
-                .map(|attribute| attribute.name.as_str().into()),
-        )
+        let names = self
+            .attributes
+            .iter()
+            .map(|attribute| {
+                FsNameBuf::from_vec(attribute.name.clone().into_bytes()).map(Cow::Owned)
+            })
+            .collect::<VfsResult<Vec<_>>>()?;
+        try_boxed_names(names.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         let attribute = self
             .attributes
             .iter()
-            .find(|attribute| attribute.name == name)
+            .find(|attribute| attribute.name.as_bytes() == name.as_bytes())
             .ok_or(VfsError::NotFound)?;
         attribute_node(self.fs.clone(), attribute)
     }
@@ -1088,7 +1347,7 @@ mod tests {
             Err(VfsError::InvalidInput)
         );
         let registry = DeviceRegistry::<2>::new();
-        registry
+        let _reservation = registry
             .reserve(
                 DeviceIdentity::new(
                     "virtual".into(),
@@ -1210,41 +1469,134 @@ mod tests {
         .unwrap();
         assert_eq!(
             registration.uevent_payload(),
-            "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nDEVPATH=/devices/virtio0/input0/event0\\
-             nSUBSYSTEM=input\nDEVTYPE=input\n",
+            concat!(
+                "MAJOR=13\n",
+                "MINOR=64\n",
+                "DEVNAME=input/event0\n",
+                "DEVPATH=/devices/virtio0/input0/event0\n",
+                "SUBSYSTEM=input\n",
+                "DEVTYPE=input\n",
+            ),
         );
     }
 
     #[test]
     fn class_input_links_resolve_from_class_to_canonical_parent_and_subsystem() {
-        // This mirrors `/sys/class/input/event0 -> ../../devices/.../event0`
-        // and then resolves the links stored on its canonical kobject.
-        let class_event = "/sys/class/input/event0";
-        let canonical_event = resolve_from(class_event, "../../devices/virtio0/input0/event0");
-        assert_eq!(canonical_event, "/sys/devices/virtio0/input0/event0");
+        let transport = "pci0000:00/0000:00:03.0/virtio0";
+        let input = DeviceRegistration::try_new(
+            DeviceIdentity::without_dev("pci".into(), "input".into(), "input0".into())
+                .unwrap()
+                .child_of_path(transport.into(), "input".into())
+                .unwrap(),
+            "input".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let canonical_input = input.canonical_path();
+        assert_eq!(
+            canonical_input,
+            "/devices/pci0000:00/0000:00:03.0/virtio0/input/input0"
+        );
         assert_eq!(
             resolve_from(
-                &alloc::format!("{canonical_event}/device"),
-                &device_link_target()
+                &alloc::format!("/sys{canonical_input}/device"),
+                &device_link_target(&input)
             ),
-            "/sys/devices/virtio0/input0"
+            "/sys/devices/pci0000:00/0000:00:03.0/virtio0"
         );
 
-        let identity = DeviceIdentity::new(
-            "virtio0".into(),
+        let event = DeviceRegistration::try_new(
+            DeviceIdentity::new(
+                "pci".into(),
+                "input".into(),
+                "event0".into(),
+                DeviceId::new(13, 64),
+            )
+            .unwrap()
+            .child_of_path(format!("{transport}/input"), "input0".into())
+            .unwrap(),
             "input".into(),
-            "event0".into(),
-            DeviceId::new(13, 64),
+            Vec::new(),
+            None,
         )
-        .unwrap()
-        .child_of("virtio0".into(), "input0".into())
         .unwrap();
+        let canonical_event = event.canonical_path();
+        assert_eq!(
+            canonical_event,
+            "/devices/pci0000:00/0000:00:03.0/virtio0/input/input0/event0"
+        );
         assert_eq!(
             resolve_from(
-                &alloc::format!("{canonical_event}/subsystem"),
-                &subsystem_link_target(&identity)
+                &alloc::format!("/sys{canonical_event}/device"),
+                &device_link_target(&event)
+            ),
+            alloc::format!("/sys{canonical_input}")
+        );
+        assert_eq!(
+            resolve_from(
+                &alloc::format!("/sys{canonical_event}/subsystem"),
+                &subsystem_link_target(&event)
             ),
             "/sys/class/input"
+        );
+    }
+
+    #[test]
+    fn subsystem_link_uses_the_actual_deep_canonical_path_depth() {
+        let registration = DeviceRegistration::try_new(
+            DeviceIdentity::new(
+                "pci".into(),
+                "input".into(),
+                "event0".into(),
+                DeviceId::new(13, 64),
+            )
+            .unwrap()
+            .child_of_path(
+                "pci0000:00/0000:00:03.0/virtio0/input".into(),
+                "input0".into(),
+            )
+            .unwrap(),
+            "input".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let canonical_event = registration.canonical_path();
+        assert_eq!(
+            resolve_from(
+                &alloc::format!("/sys{canonical_event}/subsystem"),
+                &subsystem_link_target(&registration)
+            ),
+            "/sys/class/input"
+        );
+    }
+
+    #[test]
+    fn bus_devices_have_bus_subsystems_without_class_membership() {
+        let pci = DeviceRegistration::try_bus_device(
+            DeviceIdentity::without_dev(
+                "pci0000:00".into(),
+                "pci".into(),
+                "0000:00:03.0".into(),
+            )
+            .unwrap(),
+            "pci_device".into(),
+            vec![DeviceAttribute::try_new("device".into(), || Ok("0x1052\n".into())).unwrap()],
+            "pci".into(),
+            false,
+        )
+        .unwrap();
+        assert!(pci
+            .uevent_payload()
+            .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0\nSUBSYSTEM=pci\n"));
+        assert!(!pci.class_member);
+        assert_eq!(
+            resolve_from(
+                "/sys/devices/pci0000:00/0000:00:03.0/subsystem",
+                &subsystem_link_target(&pci)
+            ),
+            "/sys/bus/pci"
         );
     }
 
@@ -1253,10 +1605,23 @@ mod tests {
         let class_card = "/sys/class/drm/card0";
         let canonical_card = resolve_from(class_card, "../../devices/virtio0/card0");
         assert_eq!(canonical_card, "/sys/devices/virtio0/card0");
+        let card = DeviceRegistration::try_new(
+            DeviceIdentity::new(
+                "virtio0".into(),
+                "drm".into(),
+                "card0".into(),
+                DeviceId::new(226, 0),
+            )
+            .unwrap(),
+            "drm_minor".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             resolve_from(
                 &alloc::format!("{canonical_card}/device"),
-                &device_link_target()
+                &device_link_target(&card)
             ),
             "/sys/devices/virtio0"
         );

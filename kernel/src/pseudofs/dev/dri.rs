@@ -18,7 +18,9 @@ use linux_raw_sys::general::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
 
 use crate::{
     drm::{DrmDevice, DrmFile},
-    file::{FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap},
+    file::{
+        FileLike, FileMmapRequest, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap,
+    },
     pseudofs::{
         DeviceOpen, DeviceOps,
         device_registry::{
@@ -186,7 +188,8 @@ impl DrmFileAdapter {
 }
 
 impl DeviceOps for DrmPrimary {
-    fn open_description(&self, _location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+    fn open_description(&self, location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        crate::pseudofs::dev::tty::remember_primary_node(location)?;
         let file: Arc<dyn FileLike> = Arc::try_new(DrmFileAdapter::new(
             self.device.open_primary(),
             false,
@@ -253,6 +256,29 @@ impl FileLike for DrmFileAdapter {
         })
     }
 
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        if !self.allows_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        block_on_poll_io(
+            self,
+            IoEvents::READABLE,
+            self.nonblocking() || status.rwf_nowait(),
+            || match self.file.read_events(dst) {
+                Ok(0) => Err(AxError::WouldBlock),
+                other => other,
+            },
+        )
+    }
+
+    fn write_with_operation_status(
+        &self,
+        _status: OfdIoStatus,
+        src: &mut IoSrc,
+    ) -> AxResult<usize> {
+        self.write(src)
+    }
+
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
         if !self.allows_write() {
             return Err(AxError::BadFileDescriptor);
@@ -279,13 +305,12 @@ impl FileLike for DrmFileAdapter {
         })
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok(if self.render {
-            "/dev/dri/renderD128"
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(if self.render {
+            b"/dev/dri/renderD128"
         } else {
-            "/dev/dri/card0"
-        }
-        .into())
+            b"/dev/dri/card0"
+        })))
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
@@ -345,8 +370,8 @@ mod tests {
             Ok(Arc::new(Backing))
         }
 
-        fn present(&self, _: Scanout) -> DrmResult<()> {
-            Ok(())
+        fn present(&self, _: Scanout) -> DrmResult<Arc<crate::drm::fence::Fence>> {
+            Ok(crate::drm::fence::Fence::new(true))
         }
     }
 

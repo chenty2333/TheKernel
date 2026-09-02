@@ -1,6 +1,6 @@
 use alloc::{
     borrow::Cow,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     string::String,
     sync::{Arc, Weak},
@@ -21,7 +21,9 @@ use axdriver::prelude::{
     AxInputDevice, BaseDriverOps, DevError, Event, EventType, InputDeviceId, InputDriverOps,
 };
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::{DeviceId, Location, NodeFlags, NodePermission, NodeType, VfsResult};
+use axfs_ng_vfs::{
+    DeviceId, FsName, FsNameBuf, Location, NodeFlags, NodePermission, NodeType, VfsResult,
+};
 use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistrationError, PollSet, Pollable, RegisterError};
 use axsync::Mutex;
@@ -29,21 +31,26 @@ use axtask::future::{
     IrqWakerRegisterError, IrqWakerToken, cancel_irq_waker, register_irq_waker, update_irq_waker,
 };
 use bitmaps::Bitmap;
+use lazy_static::lazy_static;
 use linux_raw_sys::{
     general::{__kernel_old_time_t, __kernel_suseconds_t},
-    ioctl::{EVIOCGID, EVIOCGMASK, EVIOCGRAB, EVIOCGVERSION, EVIOCSCLOCKID, EVIOCSMASK},
+    ioctl::{
+        EVIOCGID, EVIOCGMASK, EVIOCGRAB, EVIOCGREP, EVIOCGVERSION, EVIOCREVOKE, EVIOCSCLOCKID,
+        EVIOCSMASK, EVIOCSREP,
+    },
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat},
+    file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus},
     mm::map_usercopy_error,
     pseudofs::{
-        Device, DeviceOpen, DeviceOps, DirMapping, SimpleFs,
+        Device, DeviceOpen, DeviceOps, SimpleDirOps, SimpleFs,
         device_registry::{
             DeviceAttribute, DeviceHandle, DeviceIdentity, DeviceRegistration, DeviceReservation,
             MAX_DEVICES, global_device_registry,
         },
+        try_boxed_names,
     },
     readiness::block_on_poll_io,
     time::wall_time,
@@ -56,6 +63,10 @@ const EVDEV_CLIENT_QUEUE_EVENTS: usize = 256;
 const EVDEV_DEVICE_FRAME_EVENTS: usize = 256;
 const EVDEV_PUMP_EVENTS: usize = 256;
 const EVENT_NODE_MODE: u16 = 0o660;
+
+lazy_static! {
+    static ref INPUT_MANAGER: Mutex<Option<Weak<InputManager>>> = Mutex::new(None);
+}
 
 /// Timestamp clock selected by an evdev open file description.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +107,13 @@ impl EvdevRecord {
 struct EvdevDeviceState {
     device: AxInputDevice,
     key_state: Bitmap<KEY_CNT>,
+    led_state: Bitmap<16>,
+    switch_state: Bitmap<18>,
     abs_values: BTreeMap<u8, i32>,
+    msc_values: BTreeMap<u8, i32>,
+    mt_slots: BTreeMap<u8, Vec<i32>>,
+    mt_current_slot: usize,
+    repeat: [u32; 2],
     frame: Vec<EvdevRecord>,
     frame_overflowed: bool,
     clients: BTreeMap<u64, Weak<EvdevClient>>,
@@ -112,6 +129,11 @@ pub struct EvdevDevice {
     irq: Option<usize>,
     irq_pending: core::sync::atomic::AtomicBool,
     disconnected: core::sync::atomic::AtomicBool,
+    paused: core::sync::atomic::AtomicBool,
+    /// Incremented for every seat release.  A client captures this lease at
+    /// open and is terminally revoked when its session loses the device;
+    /// resume creates a new lease for future opens, never revives old FDs.
+    session_lease: AtomicU64,
     waiters: Arc<PollSet>,
     irq_waker: core::task::Waker,
     irq_registration: spin::Mutex<Option<IrqWakerToken>>,
@@ -122,7 +144,9 @@ pub struct EvdevDevice {
 /// Linux open-file-description lifetime rather than device-node lifetime.
 pub struct EvdevClient {
     id: u64,
+    lease: u64,
     device: Weak<EvdevDevice>,
+    revoked: core::sync::atomic::AtomicBool,
     state: Mutex<EvdevClientState>,
 }
 
@@ -143,7 +167,13 @@ impl EvdevDevice {
             state: Mutex::new(EvdevDeviceState {
                 device,
                 key_state: Bitmap::new(),
+                led_state: Bitmap::new(),
+                switch_state: Bitmap::new(),
                 abs_values: BTreeMap::new(),
+                msc_values: BTreeMap::new(),
+                mt_slots: BTreeMap::new(),
+                mt_current_slot: 0,
+                repeat: [250, 33],
                 frame: Vec::new(),
                 frame_overflowed: false,
                 clients: BTreeMap::new(),
@@ -153,6 +183,8 @@ impl EvdevDevice {
             irq,
             irq_pending: core::sync::atomic::AtomicBool::new(false),
             disconnected: core::sync::atomic::AtomicBool::new(false),
+            paused: core::sync::atomic::AtomicBool::new(false),
+            session_lease: AtomicU64::new(1),
             waiters: Arc::new(PollSet::new()),
             irq_waker: core::task::Waker::from(Arc::new(InputIrqWake(weak.clone()))),
             irq_registration: spin::Mutex::new(None),
@@ -163,9 +195,14 @@ impl EvdevDevice {
     /// called; this module deliberately has no global FD-table dependency.
     pub fn open_client(self: &Arc<Self>) -> Arc<EvdevClient> {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
+        let lease = self.session_lease.load(Ordering::Acquire);
         let client = Arc::new(EvdevClient {
             id,
+            lease,
             device: Arc::downgrade(self),
+            // An open raced with PauseDevice.  It must not become a usable
+            // descriptor after ResumeDevice.
+            revoked: core::sync::atomic::AtomicBool::new(self.paused()),
             state: Mutex::new(EvdevClientState {
                 queue: VecDeque::new(),
                 clock: EvdevClock::Realtime,
@@ -180,11 +217,31 @@ impl EvdevDevice {
         client
     }
 
-    /// A future hotplug removal path calls this after preserving the clients'
-    /// already queued records. Subsequent reads report ENODEV and poll reports
-    /// HUP|ERR; current drivers do not yet expose a removal callback.
+    fn live_client_count(&self) -> u64 {
+        self.state
+            .lock()
+            .clients
+            .values()
+            .filter(|client| client.strong_count() != 0)
+            .count() as u64
+    }
+
+    /// Physical removal is terminal for all existing file descriptions:
+    /// subsequent reads report ENODEV and poll reports HUP|ERR.
     pub fn disconnect(&self) {
-        self.disconnected.store(true, Ordering::Release);
+        if self.disconnected.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(token) = self.irq_registration.lock().take() {
+            cancel_irq_waker(token);
+        }
+        if let Some(irq) = self.irq {
+            axhal::irq::set_enable(irq, false);
+        }
+        let mut state = self.state.lock();
+        state.grab_owner = None;
+        state.clients.retain(|_, client| client.upgrade().is_some());
+        drop(state);
         PollSet::wake(self.waiters.as_ref());
     }
 
@@ -192,9 +249,58 @@ impl EvdevDevice {
         self.disconnected.load(Ordering::Acquire)
     }
 
+    fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Session pause is terminal for the outgoing session's descriptions.
+    /// This differs from physical removal only in that the node can later
+    /// grant a new lease to the newly active session.
+    pub fn pause(&self) {
+        if self.disconnected() {
+            return;
+        }
+        if !self.paused.swap(true, Ordering::AcqRel) {
+            self.session_lease.fetch_add(1, Ordering::AcqRel);
+            if let Some(irq) = self.irq {
+                axhal::irq::set_enable(irq, false);
+            }
+            let clients = {
+                let mut state = self.state.lock();
+                state.frame.clear();
+                state.frame_overflowed = false;
+                state
+                    .clients
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>()
+            };
+            for client in clients {
+                client.revoke();
+            }
+            PollSet::wake(self.waiters.as_ref());
+        }
+    }
+
+    pub fn resume(&self) {
+        if self.disconnected() || !self.paused.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(irq) = self.irq {
+            axhal::irq::set_enable(irq, true);
+        }
+        PollSet::wake(self.waiters.as_ref());
+    }
+
     /// Drains pending hardware input and fans out only complete SYN_REPORT
     /// frames.  It is safe to call from read and poll paths.
     pub fn pump(&self) -> AxResult<()> {
+        if self.disconnected() {
+            return Err(LinuxError::ENODEV.into());
+        }
+        if self.paused() {
+            return Ok(());
+        }
         self.irq_pending.store(false, Ordering::Release);
         let mut state = self.state.lock();
         let mut drained = 0;
@@ -218,6 +324,32 @@ impl EvdevDevice {
                         }
                     }
                     _ => {}
+                }
+            }
+            if event.event_type == EventType::Led as u16 && (event.code as usize) < 16 {
+                state.led_state.set(event.code as usize, event.value != 0);
+            }
+            if event.event_type == EventType::Switch as u16 && (event.code as usize) < 18 {
+                state
+                    .switch_state
+                    .set(event.code as usize, event.value != 0);
+            }
+            if event.event_type == EventType::Misc as u16 {
+                state
+                    .msc_values
+                    .insert(event.code as u8, event.value as i32);
+            }
+            if event.event_type == EventType::Absolute as u16 {
+                const ABS_MT_SLOT: u16 = 0x2f;
+                if event.code == ABS_MT_SLOT {
+                    state.mt_current_slot = event.value as usize;
+                } else if event.code >= 0x2f {
+                    let slot = state.mt_current_slot;
+                    let slots = state.mt_slots.entry(event.code as u8).or_default();
+                    if slot >= slots.len() {
+                        slots.resize(slot + 1, 0);
+                    }
+                    slots[slot] = event.value as i32;
                 }
             }
             if event.event_type == EventType::Absolute as u16 {
@@ -301,6 +433,42 @@ impl EvdevDevice {
     pub fn key_state(&self, out: &mut [u8]) -> AxResult<usize> {
         self.pump()?;
         Ok(copy_bytes(self.state.lock().key_state.as_bytes(), out))
+    }
+
+    fn state_bitmap(&self, event_type: EventType, out: &mut [u8]) -> AxResult<usize> {
+        self.pump()?;
+        if !self.event_bits(event_type, &mut []).unwrap_or(false) {
+            return Err(LinuxError::EINVAL.into());
+        }
+        let state = self.state.lock();
+        let bytes = match event_type {
+            EventType::Led => state.led_state.as_bytes(),
+            EventType::Switch => state.switch_state.as_bytes(),
+            _ => return Err(AxError::InvalidInput),
+        };
+        Ok(copy_bytes(bytes, out))
+    }
+
+    fn repeat(&self) -> [u32; 2] {
+        self.state.lock().repeat
+    }
+
+    fn set_repeat(&self, repeat: [u32; 2]) -> AxResult<()> {
+        if !self.event_bits(EventType::Repeat, &mut []).unwrap_or(false) {
+            return Err(LinuxError::EINVAL.into());
+        }
+        self.state.lock().repeat = repeat;
+        Ok(())
+    }
+
+    fn mt_slots(&self, axis: u8, out: &mut [i32]) -> AxResult<()> {
+        self.pump()?;
+        let state = self.state.lock();
+        let values = state.mt_slots.get(&axis).ok_or(AxError::InvalidInput)?;
+        for (out, value) in out.iter_mut().zip(values) {
+            *out = *value;
+        }
+        Ok(())
     }
 
     fn set_grab(&self, client: u64, grab: bool) -> AxResult<()> {
@@ -388,8 +556,24 @@ impl Drop for EvdevDevice {
 }
 
 impl EvdevClient {
+    fn valid_lease(&self) -> bool {
+        self.device.upgrade().is_some_and(|device| {
+            !device.paused()
+                && self.lease == device.session_lease.load(Ordering::Acquire)
+                && !device.disconnected()
+        })
+    }
+
     pub fn set_clock(&self, clock: EvdevClock) {
         self.state.lock().clock = clock;
+    }
+
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.state.lock().queue.clear();
+        if let Some(device) = self.device.upgrade() {
+            PollSet::wake(device.waiters.as_ref());
+        }
     }
 
     /// Applies Linux clock IDs accepted by EVIOCSCLOCKID.
@@ -444,6 +628,9 @@ impl EvdevClient {
     }
 
     pub fn grab(&self, grab: bool) -> AxResult<()> {
+        if self.revoked.load(Ordering::Acquire) || !self.valid_lease() {
+            return Err(LinuxError::ENODEV.into());
+        }
         self.device
             .upgrade()
             .ok_or(AxError::InvalidInput)?
@@ -451,6 +638,19 @@ impl EvdevClient {
     }
 
     pub fn poll_ready(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) || !self.valid_lease() {
+            return false;
+        }
+        if self
+            .device
+            .upgrade()
+            .is_some_and(|device| device.disconnected())
+        {
+            return false;
+        }
+        if self.device.upgrade().is_some_and(|device| device.paused()) {
+            return false;
+        }
         if let Some(device) = self.device.upgrade() {
             let _ = device.pump();
         }
@@ -546,7 +746,9 @@ impl Pollable for EvdevClient {
             .ok_or(PollRegistrationError::InvalidState)?;
         let registration =
             axpoll::PollRegistration::single_owned(device.waiters.clone(), context.waker())?;
-        device.ensure_irq_bridge()?;
+        if !device.paused() {
+            device.ensure_irq_bridge()?;
+        }
         Ok(registration)
     }
 }
@@ -565,6 +767,21 @@ fn copy_bytes(src: &[u8], dst: &mut [u8]) -> usize {
     len
 }
 
+fn write_zeroes(context: &IoctlContext, address: usize, len: usize) -> AxResult<()> {
+    let zeroes = [0u8; 256];
+    let mut written = 0;
+    while written < len {
+        let chunk = (len - written).min(zeroes.len());
+        let target = address.checked_add(written).ok_or(AxError::BadAddress)?;
+        context
+            .user_memory()
+            .write_bytes(target, &zeroes[..chunk])
+            .map_err(map_usercopy_error)?;
+        written += chunk;
+    }
+    Ok(())
+}
+
 fn map_dev_error(error: DevError) -> AxError {
     match error {
         DevError::AlreadyExists => AxError::AlreadyExists,
@@ -580,6 +797,13 @@ fn map_dev_error(error: DevError) -> AxError {
 
 fn zero_bits_len(size: usize, bits: usize) -> usize {
     bits.div_ceil(8).min(size)
+}
+
+fn linux_bitmap_len(size: usize, max_bit: usize) -> usize {
+    max_bit
+        .div_ceil(usize::BITS as usize)
+        .saturating_mul(size_of::<usize>())
+        .min(size)
 }
 
 fn set_bit_if_fits(bits: &mut [u8], bit: usize) {
@@ -653,6 +877,9 @@ impl EvdevClient {
     /// deliberately untouched so every successful read preserves record and
     /// frame boundaries.
     pub fn read_at(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        if self.revoked.load(Ordering::Acquire) || !self.valid_lease() {
+            return Err(LinuxError::ENODEV.into());
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -660,6 +887,12 @@ impl EvdevClient {
             return Err(AxError::InvalidInput);
         }
         if let Some(device) = self.device.upgrade() {
+            if device.disconnected() {
+                return Err(LinuxError::ENODEV.into());
+            }
+            if device.paused() {
+                return Err(AxError::WouldBlock);
+            }
             device.pump()?;
         }
         let (chunks, _) = buf.as_chunks_mut::<{ size_of::<InputEvent>() }>();
@@ -694,25 +927,17 @@ impl EvdevClient {
 // with an EvdevFile that owns exactly one EvdevClient (one Linux OFD).
 pub struct EvdevNode {
     device: Arc<EvdevDevice>,
-    _registry_handles: Vec<DeviceHandle<'static, MAX_DEVICES>>,
 }
 
 impl EvdevNode {
     pub fn new(device: AxInputDevice) -> Self {
         Self {
             device: EvdevDevice::new(device),
-            _registry_handles: Vec::new(),
         }
     }
 
-    fn with_registry(
-        device: AxInputDevice,
-        registry_handles: Vec<DeviceHandle<'static, MAX_DEVICES>>,
-    ) -> Self {
-        Self {
-            device: EvdevDevice::new(device),
-            _registry_handles: registry_handles,
-        }
+    fn from_evdev(device: Arc<EvdevDevice>) -> Self {
+        Self { device }
     }
 }
 
@@ -760,6 +985,13 @@ impl EvdevFile {
                 self.client.grab(i32::from_ne_bytes(bytes) != 0)?;
                 Ok(0)
             }
+            EVIOCREVOKE => {
+                if arg != 0 {
+                    return Err(LinuxError::EINVAL.into());
+                }
+                self.client.revoke();
+                Ok(0)
+            }
             EVIOCSCLOCKID => {
                 let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<i32>()];
                 context
@@ -770,6 +1002,8 @@ impl EvdevFile {
                 self.client.set_clock_id(i32::from_ne_bytes(bytes))?;
                 Ok(0)
             }
+            EVIOCGREP => self.repeat(context, arg),
+            EVIOCSREP => self.set_repeat(context, arg),
             EVIOCSMASK => self.set_event_mask(context, arg),
             EVIOCGMASK => self.get_event_mask(context, arg),
             _ if ty != b'E' => Err(AxError::NotATty),
@@ -784,9 +1018,13 @@ impl EvdevFile {
                 0x08 => self.device_string(context, arg, size, |device| {
                     String::from(device.unique_id())
                 }),
-                0x09 => {
-                    self.device_bits(context, arg, size, |device, out| device.property_bits(out))
-                }
+                0x09 => self.device_bits(
+                    context,
+                    arg,
+                    size,
+                    EventType::MAX as usize,
+                    |device, out| device.property_bits(out),
+                ),
                 0x18 => {
                     let mut bytes = vec![0; size];
                     self.device.key_state(&mut bytes)?;
@@ -796,6 +1034,9 @@ impl EvdevFile {
                         .map_err(map_usercopy_error)?;
                     Ok(0)
                 }
+                0x19 => self.state_bitmap(context, arg, size, EventType::Led),
+                0x1b => self.state_bitmap(context, arg, size, EventType::Switch),
+                0x0a => self.mt_slots(context, arg, size),
                 _ if nr & !EventType::MAX == EventType::COUNT => {
                     self.event_bits(context, arg, size, nr & EventType::MAX)
                 }
@@ -825,6 +1066,74 @@ impl EvdevFile {
     ) -> AxResult<usize> {
         let string = get(&mut self.device.state.lock().device);
         return_str(context, arg, size, &string)?;
+        Ok(0)
+    }
+
+    fn repeat(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
+        let repeat = self.device.repeat();
+        let bytes = [repeat[0].to_ne_bytes(), repeat[1].to_ne_bytes()].concat();
+        context
+            .user_memory()
+            .write_bytes(arg, &bytes)
+            .map_err(map_usercopy_error)?;
+        Ok(0)
+    }
+
+    fn set_repeat(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
+        let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<[u32; 2]>()];
+        context
+            .user_memory()
+            .read_bytes(arg, &mut bytes)
+            .map_err(map_usercopy_error)?;
+        let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
+        self.device.set_repeat([
+            u32::from_ne_bytes(bytes[..4].try_into().expect("repeat delay")),
+            u32::from_ne_bytes(bytes[4..].try_into().expect("repeat period")),
+        ])?;
+        Ok(0)
+    }
+
+    fn state_bitmap(
+        &self,
+        context: &IoctlContext,
+        arg: usize,
+        size: usize,
+        event_type: EventType,
+    ) -> AxResult<usize> {
+        let mut bytes = vec![0; size];
+        self.device.state_bitmap(event_type, &mut bytes)?;
+        context
+            .user_memory()
+            .write_bytes(arg, &bytes)
+            .map_err(map_usercopy_error)?;
+        Ok(0)
+    }
+
+    fn mt_slots(&self, context: &IoctlContext, arg: usize, size: usize) -> AxResult<usize> {
+        if size < size_of::<i32>() || (size - size_of::<i32>()) % size_of::<i32>() != 0 {
+            return Err(LinuxError::EINVAL.into());
+        }
+        let mut axis = [core::mem::MaybeUninit::uninit(); size_of::<i32>()];
+        context
+            .user_memory()
+            .read_bytes(arg, &mut axis)
+            .map_err(map_usercopy_error)?;
+        let axis = i32::from_ne_bytes(axis.map(|byte| unsafe { byte.assume_init() }));
+        if !(0..=u8::MAX as i32).contains(&axis) {
+            return Err(LinuxError::EINVAL.into());
+        }
+        let slot_count = (size - size_of::<i32>()) / size_of::<i32>();
+        let mut values = vec![0i32; slot_count];
+        self.device.mt_slots(axis as u8, &mut values)?;
+        let mut bytes = vec![0; size];
+        bytes[..4].copy_from_slice(&axis.to_ne_bytes());
+        for (index, value) in values.into_iter().enumerate() {
+            bytes[4 + index * 4..][..4].copy_from_slice(&value.to_ne_bytes());
+        }
+        context
+            .user_memory()
+            .write_bytes(arg, &bytes)
+            .map_err(map_usercopy_error)?;
         Ok(0)
     }
 
@@ -865,6 +1174,7 @@ impl EvdevFile {
     fn get_event_mask(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
         let mask = self.input_mask(context, arg)?;
         let Some(event_type) = input_mask_event_type(mask.event_type) else {
+            write_zeroes(context, mask.codes_ptr as usize, mask.codes_size as usize)?;
             return Ok(0);
         };
         let mut bitmap = vec![0; (mask.codes_size as usize).min(event_mask_len(event_type))];
@@ -881,15 +1191,17 @@ impl EvdevFile {
         context: &IoctlContext,
         arg: usize,
         size: usize,
+        max_bit: usize,
         get: impl FnOnce(&EvdevDevice, &mut [u8]) -> AxResult<bool>,
     ) -> AxResult<usize> {
-        let mut bits = vec![0; size];
+        let len = linux_bitmap_len(size, max_bit);
+        let mut bits = vec![0; len];
         get(&self.device, &mut bits)?;
         context
             .user_memory()
             .write_bytes(arg, &bits)
             .map_err(map_usercopy_error)?;
-        Ok(0)
+        Ok(len)
     }
 
     fn event_bits(
@@ -899,8 +1211,9 @@ impl EvdevFile {
         size: usize,
         ty: u8,
     ) -> AxResult<usize> {
-        let mut bits = vec![0; size];
         if ty == 0 {
+            let len = linux_bitmap_len(size, EventType::MAX as usize);
+            let mut bits = vec![0; len];
             for value in 0..EventType::COUNT {
                 let Some(event_type) = EventType::from_repr(value) else {
                     continue;
@@ -913,20 +1226,26 @@ impl EvdevFile {
                 .user_memory()
                 .write_bytes(arg, &bits)
                 .map_err(map_usercopy_error)?;
-            return Ok(0);
+            return Ok(len);
         }
-        let event_type = EventType::from_repr(ty).ok_or(AxError::NotATty)?;
-        self.device.event_bits(event_type, &mut bits)?;
+        let event_type = EventType::from_repr(ty).ok_or(LinuxError::EINVAL)?;
+        let max_bit = event_type.bits_count().saturating_sub(1);
+        let len = linux_bitmap_len(size, max_bit);
+        let mut bits = vec![0; len];
+        if !self.device.event_bits(event_type, &mut bits)? {
+            return Err(LinuxError::EINVAL.into());
+        }
         context
             .user_memory()
             .write_bytes(arg, &bits)
             .map_err(map_usercopy_error)?;
-        Ok(0)
+        Ok(len)
     }
 }
 
 impl DeviceOps for EvdevNode {
     fn open_description(&self, location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        crate::pseudofs::dev::tty::remember_input_node(location)?;
         let client = self.device.open_client();
         let file: Arc<dyn FileLike> = Arc::try_new(EvdevFile {
             client,
@@ -958,6 +1277,9 @@ impl DeviceOps for EvdevNode {
 
 impl FileLike for EvdevFile {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        if self.device.disconnected() {
+            return Err(LinuxError::ENODEV.into());
+        }
         let mut bytes = [0u8; EVDEV_CLIENT_QUEUE_EVENTS * size_of::<InputEvent>()];
         let capacity = dst.remaining_mut().min(bytes.len());
         let bytes = &mut bytes[..capacity];
@@ -970,6 +1292,26 @@ impl FileLike for EvdevFile {
             }
             result => result,
         })?;
+        dst.write_all(&bytes[..read])?;
+        Ok(read)
+    }
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        if self.device.disconnected() {
+            return Err(LinuxError::ENODEV.into());
+        }
+        let mut bytes = [0u8; EVDEV_CLIENT_QUEUE_EVENTS * size_of::<InputEvent>()];
+        let capacity = dst.remaining_mut().min(bytes.len());
+        let read = block_on_poll_io(
+            self,
+            IoEvents::READABLE,
+            self.nonblocking() || status.rwf_nowait(),
+            || match self.client.read_at(&mut bytes[..capacity]) {
+                Err(AxError::WouldBlock) if self.device.disconnected() => {
+                    Err(LinuxError::ENODEV.into())
+                }
+                result => result,
+            },
+        )?;
         dst.write_all(&bytes[..read])?;
         Ok(read)
     }
@@ -997,10 +1339,8 @@ impl FileLike for EvdevFile {
             ..Kstat::default()
         })
     }
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok(Cow::Owned(String::from(
-            self.location.absolute_path()?.as_str(),
-        )))
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Owned(self.location.absolute_path()?))
     }
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         self.ioctl(context, cmd, arg)
@@ -1017,7 +1357,10 @@ impl FileLike for EvdevFile {
 impl Pollable for EvdevFile {
     fn poll(&self) -> IoEvents {
         let mut events = self.client.poll();
-        if self.device.disconnected() {
+        if self.device.disconnected()
+            || self.client.revoked.load(Ordering::Acquire)
+            || !self.client.valid_lease()
+        {
             events |= IoEvents::HANGUP | IoEvents::ERROR;
         }
         events
@@ -1031,87 +1374,372 @@ impl Pollable for EvdevFile {
     }
 }
 
-pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
-    let mut inputs = DirMapping::new();
-    let input_devices = axinput::take_inputs();
-    for (index, mut device) in input_devices.into_iter().enumerate() {
-        let input_name = format!("input{index}");
-        let event_name = format!("event{index}");
-        let dev_id = DeviceId::new(13, 64 + index as u32);
-        let sysfs = input_sysfs_description(&mut device);
-        let parent_identity =
-            match DeviceIdentity::without_dev("virtio0".into(), "input".into(), input_name.clone())
-            {
-                Ok(identity) => identity,
-                Err(error) => {
-                    error!("input sysfs identity rejected: {error}");
-                    continue;
-                }
-            };
-        let event_identity =
-            match DeviceIdentity::new("virtio0".into(), "input".into(), event_name.clone(), dev_id)
-                .and_then(|identity| identity.with_devname(format!("input/{event_name}")))
-                .and_then(|identity| identity.child_of("virtio0".into(), input_name.clone()))
-            {
-                Ok(identity) => identity,
-                Err(error) => {
-                    error!("input sysfs identity rejected: {error}");
-                    continue;
-                }
-            };
-        let parent = match DeviceRegistration::try_new(
-            parent_identity,
-            "input".into(),
-            sysfs.attributes(),
-            None,
-        ) {
-            Ok(registration) => registration,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputDeviceKey {
+    token: axinput::InputDeviceToken,
+    device_id: DeviceId,
+    generation: u64,
+}
+
+struct InputSlot {
+    key: InputDeviceKey,
+    minor: u32,
+    event: Arc<EvdevDevice>,
+    /// One devfs inode per published device generation. Reusing this object
+    /// preserves node mode, ACLs and xattrs across independent path walks.
+    node: Arc<Device>,
+    /// Physical PCI and VirtIO parent kobjects, present for PCI transport
+    /// devices and absent only for the bootstrap virtual fallback.
+    transport_handles: Option<[DeviceHandle<'static, MAX_DEVICES>; 2]>,
+    parent_handle: DeviceHandle<'static, MAX_DEVICES>,
+    event_handle: DeviceHandle<'static, MAX_DEVICES>,
+}
+
+struct InputManagerState {
+    devices: BTreeMap<axinput::InputDeviceToken, InputSlot>,
+    free_minors: BTreeSet<u32>,
+    next_minor: u32,
+}
+
+/// Dynamic `/dev/input` directory. Stable driver tokens plus a non-wrapping
+/// generation identify physical devices; recyclable `eventN` minors do not.
+pub struct InputManager {
+    fs: Arc<SimpleFs>,
+    /// Serializes complete add/remove transactions across devfs and sysfs.
+    lifecycle: Mutex<()>,
+    state: Mutex<InputManagerState>,
+}
+
+impl InputManager {
+    fn new(fs: Arc<SimpleFs>) -> Arc<Self> {
+        Arc::new(Self {
+            fs,
+            lifecycle: Mutex::new(()),
+            state: Mutex::new(InputManagerState {
+                devices: BTreeMap::new(),
+                free_minors: BTreeSet::new(),
+                next_minor: 0,
+            }),
+        })
+    }
+
+    fn identity(
+        &self,
+        token: axinput::InputDeviceToken,
+        epoch: u64,
+    ) -> VfsResult<(u32, InputDeviceKey)> {
+        let mut state = self.state.lock();
+        if state.devices.contains_key(&token) {
+            return Err(AxError::AlreadyExists);
+        }
+        let minor = if let Some(minor) = state.free_minors.pop_first() {
+            minor
+        } else {
+            let minor = state.next_minor;
+            if minor > u32::MAX - 64 {
+                return Err(AxError::NoMemory);
+            }
+            state.next_minor = state.next_minor.checked_add(1).ok_or(AxError::NoMemory)?;
+            minor
+        };
+        let generation = epoch;
+        Ok((
+            minor,
+            InputDeviceKey {
+                token,
+                device_id: DeviceId::new(13, 64 + minor),
+                generation,
+            },
+        ))
+    }
+
+    fn release_minor(&self, minor: u32) {
+        self.state.lock().free_minors.insert(minor);
+    }
+
+    fn add_device(&self, mut registered: axinput::RegisteredInputDevice) {
+        let _lifecycle = self.lifecycle.lock();
+        let (minor, key) = match self.identity(registered.token, registered.epoch) {
+            Ok(value) => value,
             Err(error) => {
-                error!("input sysfs registration failed: {error}");
-                continue;
+                error!("input device registration rejected: {error}");
+                return;
             }
         };
-        let event =
-            match DeviceRegistration::try_new(event_identity, "input".into(), Vec::new(), None) {
-                Ok(registration) => registration,
-                Err(error) => {
-                    error!("input event sysfs registration failed: {error}");
-                    continue;
-                }
-            };
-        let handles = match (
-            global_device_registry().reserve(parent.identity().clone()),
-            global_device_registry().reserve(event.identity().clone()),
-        ) {
-            (Ok(parent_reservation), Ok(event_reservation)) => {
-                match DeviceReservation::publish_pair(
+        let input_name = format!("input{minor}");
+        let event_name = format!("event{minor}");
+        let dev_id = key.device_id;
+        let bus_identity = registered.identity;
+        let transport_path = input_transport_path(bus_identity);
+        let sysfs = input_sysfs_description(&mut registered.device, bus_identity);
+        let parent_identity =
+            DeviceIdentity::without_dev("pci".into(), "input".into(), input_name.clone()).and_then(
+                |identity| identity.child_of_path(transport_path.clone(), "input".into()),
+            );
+        let event_identity =
+            DeviceIdentity::new("pci".into(), "input".into(), event_name.clone(), dev_id)
+                .and_then(|identity| identity.with_devname(format!("input/{event_name}")))
+                .and_then(|identity| {
+                    identity
+                        .child_of_path(format!("{transport_path}/input"), input_name.clone())
+                });
+        let published = (|| -> VfsResult<_> {
+            let parent = DeviceRegistration::try_new(
+                parent_identity?,
+                "input".into(),
+                sysfs.attributes(),
+                None,
+            )?;
+            let event =
+                DeviceRegistration::try_new(event_identity?, "input".into(), Vec::new(), None)?;
+            if !has_pci_transport(bus_identity) {
+                let parent_reservation = global_device_registry().reserve(parent.identity().clone())?;
+                let event_reservation = global_device_registry().reserve(event.identity().clone())?;
+                let (parent_handle, event_handle) = DeviceReservation::publish_pair_quiet(
                     parent_reservation,
                     parent,
                     event_reservation,
                     event,
-                ) {
-                    Ok((parent_handle, event_handle)) => vec![parent_handle, event_handle],
-                    Err(error) => {
-                        error!("input sysfs publication failed: {error}");
-                        continue;
-                    }
-                }
+                )?;
+                return Ok((None, parent_handle, event_handle));
             }
-            (Err(error), _) | (_, Err(error)) => {
-                error!("input sysfs reservation failed: {error}");
-                continue;
+            let pci = pci_sysfs_registration(bus_identity)?;
+            let virtio = virtio_sysfs_registration(bus_identity)?;
+            let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
+            let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
+            let parent_reservation = global_device_registry().reserve(parent.identity().clone())?;
+            let event_reservation = global_device_registry().reserve(event.identity().clone())?;
+            let [pci_handle, virtio_handle, parent_handle, event_handle] =
+                DeviceReservation::publish_many_quiet([
+                    (pci_reservation, pci),
+                    (virtio_reservation, virtio),
+                    (parent_reservation, parent),
+                    (event_reservation, event),
+                ])?;
+            Ok((Some([pci_handle, virtio_handle]), parent_handle, event_handle))
+        })();
+        let (transport_handles, parent_handle, event_handle) = match published {
+            Ok(handles) => handles,
+            Err(error) => {
+                error!("input sysfs publication failed: {error}");
+                self.release_minor(minor);
+                return;
             }
         };
-        let dev = Device::new_with_permissions(
-            fs.clone(),
+        let event = EvdevDevice::new(registered.device);
+        let node = Device::new_with_permissions(
+            self.fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(13, 64 + index as u32),
+            dev_id,
             NodePermission::from_bits_truncate(EVENT_NODE_MODE),
-            Arc::new(EvdevNode::with_registry(device, handles)),
+            Arc::new(EvdevNode::from_evdev(event.clone())),
         );
-        inputs.add(format!("event{index}"), dev);
+        let mut state = self.state.lock();
+        if state
+            .devices
+            .insert(
+                key.token,
+                InputSlot {
+                    key,
+                    minor,
+                    event,
+                    node,
+                    transport_handles,
+                    parent_handle,
+                    event_handle,
+                },
+            )
+            .is_some()
+        {
+            unreachable!("duplicate token admitted after identity allocation");
+        }
+        drop(state);
+        // `/dev/input/eventN` now resolves through the manager before either
+        // uevent becomes observable to udev/libinput.
+        if let Some([pci_handle, virtio_handle]) = transport_handles {
+            let _ = pci_handle.add();
+            let _ = virtio_handle.add();
+        }
+        let _ = parent_handle.add();
+        let _ = event_handle.add();
     }
-    inputs
+
+    fn remove_device(&self, token: axinput::InputDeviceToken, epoch: u64) {
+        let _lifecycle = self.lifecycle.lock();
+        let slot = {
+            let mut state = self.state.lock();
+            match state.devices.get(&token) {
+                Some(slot) if slot.key.generation == epoch => state.devices.remove(&token),
+                _ => None,
+            }
+        };
+        let Some(slot) = slot else {
+            return;
+        };
+        slot.event.disconnect();
+        let _ = slot.event_handle.remove();
+        let _ = slot.parent_handle.remove();
+        if let Some([pci_handle, virtio_handle]) = slot.transport_handles {
+            let _ = virtio_handle.remove();
+            let _ = pci_handle.remove();
+        }
+        self.release_minor(slot.minor);
+    }
+
+    pub fn pause_all(&self) {
+        let events = self
+            .state
+            .lock()
+            .devices
+            .values()
+            .map(|slot| slot.event.clone())
+            .collect::<Vec<_>>();
+        for event in events {
+            event.pause();
+        }
+    }
+
+    pub fn resume_all(&self) {
+        let events = self
+            .state
+            .lock()
+            .devices
+            .values()
+            .map(|slot| slot.event.clone())
+            .collect::<Vec<_>>();
+        for event in events {
+            event.resume();
+        }
+    }
+
+    /// Replays a bounded `change` notification for each currently published
+    /// input object after a uevent/netlink receiver reports packet loss.
+    pub fn rescan(&self) {
+        let handles = self
+            .state
+            .lock()
+            .devices
+            .values()
+            .flat_map(|slot| {
+                slot.transport_handles
+                    .into_iter()
+                    .flatten()
+                    .chain([slot.parent_handle, slot.event_handle])
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.change();
+        }
+    }
+
+    fn metrics(&self) -> (u64, u64) {
+        let state = self.state.lock();
+        let devices = state.devices.len() as u64;
+        let clients = state
+            .devices
+            .values()
+            .map(|slot| slot.event.live_client_count())
+            .sum();
+        (devices, clients)
+    }
+}
+
+impl axinput::InputDeviceListener for InputManager {
+    fn device_added(&self, device: axinput::RegisteredInputDevice) {
+        self.add_device(device);
+    }
+
+    fn device_removed(&self, token: axinput::InputDeviceToken, epoch: u64) {
+        self.remove_device(token, epoch);
+    }
+}
+
+impl SimpleDirOps for InputManager {
+    fn child_names<'a>(&'a self) -> VfsResult<crate::pseudofs::ChildNames<'a>> {
+        let names = self
+            .state
+            .lock()
+            .devices
+            .values()
+            .map(|slot| format!("event{}", slot.minor))
+            .collect::<Vec<_>>();
+        try_boxed_names(
+            names
+                .into_iter()
+                .map(|name| FsNameBuf::from_vec(name.into_bytes()).map(Cow::Owned))
+                .collect::<VfsResult<Vec<_>>>()?
+                .into_iter(),
+        )
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<crate::pseudofs::NodeOpsMux> {
+        let minor = parse_decimal_name(
+            name.as_bytes()
+                .strip_prefix(b"event")
+                .ok_or(AxError::NotFound)?,
+        )
+        .ok_or(AxError::NotFound)?;
+        let node = self
+            .state
+            .lock()
+            .devices
+            .values()
+            .find(|slot| slot.minor == minor)
+            .map(|slot| slot.node.clone())
+            .ok_or(AxError::NotFound)?;
+        Ok(node.into())
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
+fn parse_decimal_name(bytes: &[u8]) -> Option<u32> {
+    (!bytes.is_empty()).then_some(())?;
+    bytes.iter().try_fold(0u32, |value, byte| {
+        byte.checked_sub(b'0')
+            .filter(|digit| *digit < 10)
+            .and_then(|digit| value.checked_mul(10)?.checked_add(u32::from(digit)))
+    })
+}
+
+pub fn input_devices(fs: Arc<SimpleFs>) -> Arc<InputManager> {
+    let manager = InputManager::new(fs);
+    *INPUT_MANAGER.lock() = Some(Arc::downgrade(&manager));
+    axinput::install_listener(manager.clone());
+    manager
+}
+
+/// Session ownership hooks.  Pause is reversible and never invalidates an
+/// event FD; physical removal and EVIOCREVOKE retain their terminal semantics.
+pub fn pause_input_devices() {
+    if let Some(manager) = INPUT_MANAGER.lock().as_ref().and_then(Weak::upgrade) {
+        manager.pause_all();
+    }
+}
+
+pub fn resume_input_devices() {
+    if let Some(manager) = INPUT_MANAGER.lock().as_ref().and_then(Weak::upgrade) {
+        manager.resume_all();
+    }
+}
+
+pub fn rescan_input_devices() {
+    if let Some(manager) = INPUT_MANAGER.lock().as_ref().and_then(Weak::upgrade) {
+        manager.rescan();
+    }
+}
+
+/// Read-only aggregate for the graphics debug endpoint.  It does not prune
+/// stale weak client references, because observing metrics must not change
+/// evdev state or device lifetime.
+pub(crate) fn input_metrics() -> (u64, u64) {
+    INPUT_MANAGER
+        .lock()
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .map_or((0, 0), |manager| manager.metrics())
 }
 
 fn attribute(name: &str, value: String) -> DeviceAttribute {
@@ -1131,6 +1759,10 @@ struct InputSysfsDescription {
     modalias: String,
     capabilities: Vec<(&'static str, String)>,
     properties: String,
+    pci_vendor: u16,
+    pci_device: u16,
+    pci_modalias: String,
+    virtio_index: u32,
 }
 
 impl InputSysfsDescription {
@@ -1140,6 +1772,10 @@ impl InputSysfsDescription {
             attribute("phys", self.phys.clone()),
             attribute("uniq", self.uniq.clone()),
             attribute("modalias", self.modalias.clone()),
+            attribute("pci_vendor", format!("{:04x}\n", self.pci_vendor)),
+            attribute("pci_device", format!("{:04x}\n", self.pci_device)),
+            attribute("pci_modalias", self.pci_modalias.clone()),
+            attribute("virtio_index", format!("{}\n", self.virtio_index)),
             attribute("properties", self.properties.clone()),
             attribute_dir(
                 "id",
@@ -1161,7 +1797,86 @@ impl InputSysfsDescription {
     }
 }
 
-fn input_sysfs_description(device: &mut AxInputDevice) -> InputSysfsDescription {
+/// Transport kobject path immediately above the input subsystem directory.
+/// The input kobject is represented separately by `child_of_path` so the
+/// event child can name that same parent without duplicating either name.
+fn input_transport_path(identity: axdriver::InputBusIdentity) -> String {
+    if identity.vendor_id == 0 && identity.device_id == 0 {
+        return format!("virtual/virtio{}", identity.virtio_index);
+    }
+    format!(
+        "{}/{}/{}",
+        pci_root_name(identity),
+        pci_bdf_name(identity),
+        virtio_name(identity),
+    )
+}
+
+fn has_pci_transport(identity: axdriver::InputBusIdentity) -> bool {
+    identity.vendor_id != 0 || identity.device_id != 0
+}
+
+fn pci_root_name(identity: axdriver::InputBusIdentity) -> String {
+    format!("pci{:04x}:{:02x}", identity.domain, identity.bus)
+}
+
+fn pci_bdf_name(identity: axdriver::InputBusIdentity) -> String {
+    format!(
+        "{:04x}:{:02x}:{:02x}.{:x}",
+        identity.domain, identity.bus, identity.device, identity.function
+    )
+}
+
+fn virtio_name(identity: axdriver::InputBusIdentity) -> String {
+    format!("virtio{}", identity.virtio_index)
+}
+
+fn pci_sysfs_registration(
+    identity: axdriver::InputBusIdentity,
+) -> VfsResult<alloc::sync::Arc<DeviceRegistration>> {
+    let root = pci_root_name(identity);
+    let bdf = pci_bdf_name(identity);
+    DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root, "pci".into(), bdf)?,
+        "pci_device".into(),
+        vec![
+            attribute("vendor", format!("0x{:04x}\n", identity.vendor_id)),
+            attribute("device", format!("0x{:04x}\n", identity.device_id)),
+            attribute(
+                "modalias",
+                format!(
+                    "pci:v{:08X}d{:08X}sv*sd*bc*sc*i*\n",
+                    identity.vendor_id, identity.device_id
+                ),
+            ),
+        ],
+        "pci".into(),
+        false,
+    )
+}
+
+fn virtio_sysfs_registration(
+    identity: axdriver::InputBusIdentity,
+) -> VfsResult<alloc::sync::Arc<DeviceRegistration>> {
+    let root = pci_root_name(identity);
+    let bdf = pci_bdf_name(identity);
+    DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root.clone(), "virtio".into(), virtio_name(identity))?
+            .child_of_path(root, bdf)?,
+        "virtio_device".into(),
+        vec![
+            attribute("modalias", "virtio:d00000012v00001AF4\n".into()),
+            attribute("virtio_index", format!("{}\n", identity.virtio_index)),
+        ],
+        "virtio".into(),
+        true,
+    )
+}
+
+fn input_sysfs_description(
+    device: &mut AxInputDevice,
+    identity: axdriver::InputBusIdentity,
+) -> InputSysfsDescription {
     // Discovery owns this object exclusively until it is installed in EvdevNode.
     let id = device.device_id();
     let mut event_bits = vec![0; (EventType::COUNT as usize).div_ceil(8)];
@@ -1195,7 +1910,14 @@ fn input_sysfs_description(device: &mut AxInputDevice) -> InputSysfsDescription 
     }
     InputSysfsDescription {
         name: device.device_name().into(),
-        phys: device.physical_location().into(),
+        phys: {
+            let physical = device.physical_location();
+            if physical.is_empty() {
+                format!("{}/input", input_transport_path(identity))
+            } else {
+                physical.into()
+            }
+        },
         uniq: device.unique_id().into(),
         id,
         modalias: format!(
@@ -1204,6 +1926,13 @@ fn input_sysfs_description(device: &mut AxInputDevice) -> InputSysfsDescription 
         ),
         capabilities,
         properties: bitmap_hex(&properties),
+        pci_vendor: identity.vendor_id,
+        pci_device: identity.device_id,
+        pci_modalias: format!(
+            "pci:v{:08X}d{:08X}sv*sd*bc*sc*i*\n",
+            identity.vendor_id, identity.device_id
+        ),
+        virtio_index: identity.virtio_index,
     }
 }
 
@@ -1245,7 +1974,9 @@ mod tests {
     fn client() -> EvdevClient {
         EvdevClient {
             id: 1,
+            lease: 1,
             device: Weak::new(),
+            revoked: core::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(EvdevClientState {
                 queue: VecDeque::new(),
                 clock: EvdevClock::Realtime,
@@ -1296,6 +2027,39 @@ mod tests {
     }
 
     #[test]
+    fn input_kobjects_have_linux_canonical_parent_and_event_paths() {
+        let transport = "pci0000:00/0000:00:03.0/virtio0";
+        let parent = DeviceIdentity::without_dev("pci".into(), "input".into(), "input0".into())
+            .unwrap()
+            .child_of_path(transport.into(), "input".into())
+            .unwrap();
+        let parent = DeviceRegistration::try_new(parent, "input".into(), Vec::new(), None).unwrap();
+        assert!(parent.uevent_payload().contains(
+            "DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0\n"
+        ));
+
+        let identity = DeviceIdentity::new(
+            "pci".into(),
+            "input".into(),
+            "event0".into(),
+            DeviceId::new(13, 64),
+        )
+        .unwrap()
+        .with_devname("input/event0".into())
+        .unwrap()
+        .child_of_path(
+            format!("{transport}/input"),
+            "input0".into(),
+        )
+        .unwrap();
+        let registration =
+            DeviceRegistration::try_new(identity, "input".into(), Vec::new(), None).unwrap();
+        assert!(registration.uevent_payload().contains(
+            "DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0/event0\n"
+        ));
+    }
+
+    #[test]
     fn input_parent_sysfs_has_linux_id_and_capability_paths() {
         let description = InputSysfsDescription {
             name: "virtio keyboard".into(),
@@ -1320,6 +2084,10 @@ mod tests {
                 ("sw", "0\n".into()),
             ],
             properties: "0\n".into(),
+            pci_vendor: 0x1af4,
+            pci_device: 0x1052,
+            pci_modalias: "pci:v00001AF4d00001052sv*sd*bc*sc*i*\n".into(),
+            virtio_index: 16,
         };
         let attributes = description.attributes();
         let names = attributes
@@ -1333,6 +2101,10 @@ mod tests {
                 "phys",
                 "uniq",
                 "modalias",
+                "pci_vendor",
+                "pci_device",
+                "pci_modalias",
+                "virtio_index",
                 "properties",
                 "id",
                 "capabilities"
@@ -1353,6 +2125,9 @@ mod tests {
         assert_eq!(zero_bits_len(1, 1), 1);
         assert_eq!(zero_bits_len(2, 9), 2);
         assert_eq!(zero_bits_len(8, 9), 2);
+        assert_eq!(linux_bitmap_len(64, EventType::MAX as usize), 8);
+        assert_eq!(linux_bitmap_len(4, EventType::MAX as usize), 4);
+        assert_eq!(linux_bitmap_len(64, 0), 0);
     }
 
     #[test]
