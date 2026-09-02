@@ -7,8 +7,10 @@ use axtask::current;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
     FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET,
-    FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX2_MPOL, FUTEX2_NUMA, FUTEX2_PRIVATE,
-    FUTEX2_SIZE_MASK, FUTEX2_SIZE_U32, futex_waitv, robust_list_head, timespec,
+    FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, futex_waitv, robust_list_head, timespec,
+};
+use thekernel_linux_futex::{
+    Futex2Flags, FutexWaitV, parse_futex2_flags, plan_requeue, validate_requeue_flags,
 };
 
 use crate::{
@@ -31,14 +33,6 @@ struct FutexWaitDeadline {
     deadline: Duration,
 }
 
-/// Flags accepted by the current futex2 core.
-///
-/// Linux exposes size, NUMA and memory-policy bits in the futex2 ABI. The
-/// TheKernel wait queue and key implementation currently models only the
-/// regular 32-bit futex word, so NUMA/MPOL and all other sizes must be
-/// rejected before touching user memory.
-const FUTEX2_KNOWN_FLAGS: u32 = FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE;
-
 fn validate_futex2_flags(flags: u32) -> AxResult<bool> {
     Ok(futex2_core_flags(flags)?.private)
 }
@@ -47,21 +41,11 @@ fn validate_futex2_value(value: u64) -> AxResult<u32> {
     u32::try_from(value).map_err(|_| AxError::InvalidInput)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Futex2CoreFlags {
-    private: bool,
-}
-
-fn futex2_core_flags(flags: u32) -> AxResult<Futex2CoreFlags> {
-    if flags & !FUTEX2_KNOWN_FLAGS != 0
-        || flags & (FUTEX2_NUMA | FUTEX2_MPOL) != 0
-        || flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32
-    {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(Futex2CoreFlags {
-        private: flags & FUTEX2_PRIVATE != 0,
-    })
+fn futex2_core_flags(flags: u32) -> AxResult<Futex2Flags> {
+    // Queueing only supports native 32-bit futexes.  The ABI crate owns the
+    // wire flag grammar and rejects unsupported NUMA/MPOL/size combinations
+    // before this layer touches user memory or a wait queue.
+    parse_futex2_flags(flags).map_err(|_| AxError::InvalidInput)
 }
 
 fn assert_unsigned(value: u32) -> AxResult<u32> {
@@ -124,6 +108,22 @@ fn validate_futex_key_access(
         // address can therefore report zero waiters without faulting the
         // page. Shared keys still have to resolve their backing mapping.
         validate_futex_user_range(address, caller)
+    } else {
+        validate_futex_word_read(address, caller)
+    }
+}
+
+/// Requeue never dereferences a process-private target.  Its key is exactly
+/// `(mm, address)`, so Linux requires alignment but deliberately permits low
+/// or currently unmapped addresses.  A shared target still has to resolve the
+/// backing mapping from the user word.
+fn validate_futex_requeue_target(
+    address: *const u32,
+    private: bool,
+    caller: &UserMemoryCapability,
+) -> AxResult<()> {
+    if private {
+        validate_futex_address(address)
     } else {
         validate_futex_word_read(address, caller)
     }
@@ -452,6 +452,15 @@ fn validate_waitv_entry(waiter: &futex_waitv) -> AxResult<()> {
     Ok(())
 }
 
+const fn futex_waitv_abi(waiter: futex_waitv) -> FutexWaitV {
+    FutexWaitV {
+        val: waiter.val,
+        uaddr: waiter.uaddr,
+        flags: waiter.flags,
+        reserved: waiter.__reserved,
+    }
+}
+
 pub fn sys_futex_waitv(
     caller_aspace: Arc<Mutex<AddrSpace>>,
     waiters: *const futex_waitv,
@@ -647,7 +656,7 @@ pub fn sys_futex_requeue(
          nr_requeue: {nr_requeue}",
     );
 
-    if flags != 0 || waiters.is_null() {
+    if validate_requeue_flags(flags).is_err() || waiters.is_null() {
         return Err(AxError::InvalidInput);
     }
 
@@ -660,23 +669,20 @@ pub fn sys_futex_requeue(
     // futex_requeue parses both entries before validating the signed counts.
     let source: futex_waitv = read_checked_array_entry(waiters_addr, 0, &caller)?;
     let target: futex_waitv = read_checked_array_entry(waiters_addr, 1, &caller)?;
-    validate_waitv_entry(&source)?;
-    validate_waitv_entry(&target)?;
-    if nr_wake < 0 || nr_requeue < 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let source_flags = futex2_core_flags(source.flags)?;
-    let target_flags = futex2_core_flags(target.flags)?;
-    if source_flags != target_flags {
-        return Err(AxError::InvalidInput);
-    }
-    let source_private = source_flags.private;
-    let target_private = target_flags.private;
-    let source_uaddr = source.uaddr as *const u32;
-    let target_uaddr = target.uaddr as *const u32;
+    let plan = plan_requeue(
+        futex_waitv_abi(source),
+        futex_waitv_abi(target),
+        flags,
+        nr_wake,
+        nr_requeue,
+    )
+    .map_err(|_| AxError::InvalidInput)?;
+    let source_private = plan.source.private;
+    let target_private = plan.target.private;
+    let source_uaddr = plan.source.address as *const u32;
+    let target_uaddr = plan.target.address as *const u32;
     let _ = fault_read_u32(&caller, source_uaddr.addr())?;
-    validate_futex_key_access(target_uaddr, target_private, &caller)?;
+    validate_futex_requeue_target(target_uaddr, target_private, &caller)?;
 
     loop {
         // A no-fault retry may observe a concurrent unmap/remap. Re-resolve
@@ -696,8 +702,8 @@ pub fn sys_futex_requeue(
         let target_table = futex_table_for(&target_key);
         let target_futex = target_table.get_or_insert_owned(&target_key);
         let result = source_futex.wq.wake_and_requeue_if(
-            nr_wake as usize,
-            nr_requeue as usize,
+            plan.wake,
+            plan.requeue,
             &target_futex.wq,
             target_futex.waiter_owner(),
             u32::MAX,
@@ -710,7 +716,7 @@ pub fn sys_futex_requeue(
                     target_namespace,
                     target_expected.as_ref(),
                     target_private,
-                    source.val as u32,
+                    plan.source.expected,
                     &aspace,
                 )
             },
@@ -828,7 +834,7 @@ pub fn sys_futex(
             } else {
                 validate_futex_key_access(uaddr, private, &caller)?;
             }
-            validate_futex_key_access(uaddr2.cast_const(), private, &caller)?;
+            validate_futex_requeue_target(uaddr2.cast_const(), private, &caller)?;
             assert_unsigned(value)?;
             let value2 = assert_unsigned(timeout.addr() as u32)? as usize;
 
@@ -1058,14 +1064,15 @@ mod tests {
     }
 
     #[test]
-    fn futex2_requeue_requires_matching_converted_namespace_flags() {
-        assert_ne!(
-            futex2_core_flags(FUTEX2_SIZE_U32),
-            futex2_core_flags(FUTEX2_SIZE_U32 | FUTEX2_PRIVATE)
-        );
+    fn futex2_requeue_preserves_independent_endpoint_key_flags() {
+        let shared = futex2_core_flags(FUTEX2_SIZE_U32).unwrap();
+        let private = futex2_core_flags(FUTEX2_SIZE_U32 | FUTEX2_PRIVATE).unwrap();
+
+        assert!(private.private);
+        assert!(!shared.private);
         assert_eq!(
-            futex2_core_flags(FUTEX2_SIZE_U32),
-            futex2_core_flags(FUTEX2_SIZE_U32)
+            futex2_core_flags(FUTEX2_SIZE_U32 | 0x10),
+            Err(axerrno::AxError::InvalidInput)
         );
     }
 

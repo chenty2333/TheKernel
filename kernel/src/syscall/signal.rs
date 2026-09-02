@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::{future::pending, mem::MaybeUninit};
+use core::future::pending;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{
@@ -14,32 +14,33 @@ use linux_raw_sys::general::{
     MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_AUTODISARM, SS_DISABLE,
     SS_ONSTACK, siginfo, timespec,
 };
+use thekernel_linux_arch_x86_64::{CetRestore, cet_signal_restore_ssp};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{
     RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, SignalStackRestoreError,
     Signo,
     api::{
-        SignalDeliveryPreflight, SignalWaitObservation, ThreadSignalManager,
-        copyin_and_prepare_restore_at_rsp,
+        SignalDeliveryPreflight, SignalFpState, SignalFrameLayoutError, SignalWaitObservation,
+        ThreadSignalManager, copyin_and_prepare_restore_at_rsp, copyin_xsave_plan_for_rt_sigreturn,
     },
+    arch::XsaveState64,
 };
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     mm::{AddressSpaceUserMemory, map_usercopy_error},
     task::{
-        AsThread, CetPendingSignalFrame, Cred, ProcStateHint, Process, ProcessData,
-        SignalCheckResult, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
-        SignalSecuritySource, SignalTargetKind, Thread, acknowledge_posix_timer_signal,
+        AsThread, Cred, ProcStateHint, Process, ProcessData, SignalCheckResult,
+        SignalDeliveryScope, SignalNumber, SignalSecurityOperation, SignalSecuritySource,
+        SignalTargetKind, Thread, acknowledge_posix_timer_signal, apply_signal_context,
         check_current_pinned_process_identity_signal_access,
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
-        check_current_zombie_signal_access, check_signals_with_retry,
-        commit_current_legacy_fp_state, complete_signal_delivery,
+        check_current_zombie_signal_access, check_signals_with_retry, complete_signal_delivery,
         force_rseq_fault_signal_current_thread, force_signal_current_thread,
         generate_signal_for_exited_leader, get_process_data, get_process_group,
         get_process_including_zombie, get_visible_task, process_domain, process_error,
         send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
-        send_signal_to_process_data_with_credential, snapshot_current_legacy_fp_state,
+        send_signal_to_process_data_with_credential, signal_context_from_kernel,
         terminate_rseq_fault_current_thread, with_proc_state_hint,
     },
     time::TimeValueLike,
@@ -1003,6 +1004,13 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
         }
         ..-1 => {
             let pgid = pid.checked_neg().ok_or(AxError::NoSuchProcess)? as Pid;
+            // The pgid arrives in the caller's pid namespace; the group
+            // registry is keyed by kernel-global leader identity (the same
+            // translation setpgid(2) performs).
+            let caller_ns = current().as_thread().pid_ns();
+            let pgid = caller_ns
+                .resolve_visible_pid(pgid)
+                .ok_or(AxError::NoSuchProcess)?;
             let targets = get_process_group(pgid)?
                 .try_processes(process_domain()?.registry())
                 .map_err(process_error)?;
@@ -1171,6 +1179,29 @@ fn validate_sigreturn_stack(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn snapshot_signal_fpstate() -> Result<SignalFpState, SignalFrameLayoutError> {
+    let image = axtask::snapshot_current_task_xsave().map_err(|error| match error {
+        axtask::XsaveTaskError::Allocation => SignalFrameLayoutError::Allocation,
+        _ => SignalFrameLayoutError::XsaveUnavailable,
+    })?;
+    let state = XsaveState64::try_from_xsave_prefix(image.as_bytes(), image.layout().xfeatures)
+        .map_err(|error| match error {
+            thekernel_linux_signal::arch::XsaveStateError::Allocation => {
+                SignalFrameLayoutError::Allocation
+            }
+            thekernel_linux_signal::arch::XsaveStateError::InvalidExtent => {
+                SignalFrameLayoutError::XsaveUnavailable
+            }
+        })?;
+    Ok(SignalFpState::from(state))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn snapshot_signal_fpstate() -> Result<SignalFpState, SignalFrameLayoutError> {
+    unreachable!("TheKernel supports x86_64 only")
+}
+
 pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     uctx: &mut UserContext,
@@ -1182,10 +1213,11 @@ pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
         return reject_bad_sigreturn("no active signal handler");
     }
 
+    let mut signal_uctx = signal_context_from_kernel(uctx);
     let prepared = match copyin_and_prepare_restore_at_rsp(
         memory,
         uctx.sp(),
-        uctx,
+        &signal_uctx,
         |pc| valid_signal_user_address(pc, SIGNAL_PC_ALIGNMENT),
         |sp| valid_signal_user_address(sp, SIGNAL_SP_ALIGNMENT),
         thr.signal.stack(),
@@ -1199,110 +1231,93 @@ pub fn sys_rt_sigreturn<M: UserMemory + ?Sized>(
     };
 
     #[cfg(target_arch = "x86_64")]
-    let cet_restore = match validate_cet_sigreturn(thr, memory, uctx.sp()) {
+    let cet_restore = match validate_cet_sigreturn(thr) {
         Ok(state) => state,
         Err(reason) => return reject_bad_sigreturn(reason),
     };
 
-    // Validate and commit the FP image before publishing GPR/mask/stack state.
-    // The cloned token keeps the manager-owned prepared restore intact for its
-    // no-fail commit below; a bad MXCSR leaves every task state untouched.
-    let fp_restore = prepared.fp_restore().clone();
-    if let Err(error) = commit_current_legacy_fp_state(&fp_restore) {
-        warn!("rt_sigreturn FP validation failed: {error:?}");
-        return reject_bad_sigreturn("invalid signal FP state");
+    #[cfg(target_arch = "x86_64")]
+    let layout = match axhal::asm::xsave_layout() {
+        Ok(layout) => layout,
+        Err(error) => {
+            warn!("rt_sigreturn XSAVE unavailable: {error:?}");
+            return reject_bad_sigreturn("XSAVE unavailable");
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let xsave_image = match copyin_xsave_plan_for_rt_sigreturn(
+        memory,
+        prepared.fpstate_address(),
+        layout.xfeatures,
+        layout.xstate_size,
+    ) {
+        Ok(Some(signal_image)) => {
+            match axtask::XsaveImage::from_bytes(layout, signal_image.xsave_prefix()) {
+                Ok(image) => Some(image),
+                Err(_) => return reject_bad_sigreturn("invalid XSAVE transport size"),
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!("rt_sigreturn XSAVE validation failed: {error:?}");
+            return reject_bad_sigreturn("invalid XSAVE state");
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let xsave_commit = match xsave_image.as_ref() {
+        Some(image) => axtask::prepare_current_task_xsave_commit(image),
+        None => axtask::prepare_current_task_xsave_reset(),
+    }
+    .unwrap_or_else(|_| panic!("validated XSAVE layout lost before sigreturn commit"));
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some(state) = cet_restore {
+        // Every fallible generic-frame, FP, and CET read and validation has
+        // completed. The restore token on the user shadow stack is the sole
+        // LIFO authority, so this is the one CET commit edge.
+        crate::task::set_current_user_cet_state(state);
     }
 
     #[cfg(target_arch = "x86_64")]
-    if let Some((pending, state)) = cet_restore {
-        // Every fallible read and mapping check completed above.  Popping the
-        // exact LIFO record and changing the hardware image are now the
-        // no-fail commit edge for this signal return.
-        if !thr.cet_signal_pop_if(pending) {
-            return reject_bad_sigreturn("CET signal-frame order changed");
-        }
-        crate::task::set_current_user_cet_state(state);
-    }
+    xsave_commit.commit();
 
     // No operation after this point may fail: the complete fixed frame and FP
     // payload passed validation, FP state is committed, and manager commit
     // only publishes the already-prepared GPR/mask/stack values.
-    thr.signal.commit_restore(uctx, prepared);
+    thr.signal.commit_restore(&mut signal_uctx, prepared);
+    apply_signal_context(uctx, &signal_uctx);
+    crate::uprobe::retire_stale_optimized_call(uctx);
     thr.complete_sigreturn(uctx);
     Ok(uctx.retval() as isize)
 }
 
 #[cfg(target_arch = "x86_64")]
-const CET_SIGNAL_METADATA_OFFSET: usize = 40 + 192;
-#[cfg(target_arch = "x86_64")]
-const CET_SIGNAL_MAGIC: u64 = 0x544b_4345_5453_4947;
-
-#[cfg(target_arch = "x86_64")]
-fn validate_cet_sigreturn<M: UserMemory + ?Sized>(
-    thr: &Thread,
-    memory: &mut UserMemoryContext<'_, M>,
-    syscall_sp: usize,
-) -> Result<Option<(CetPendingSignalFrame, axhal::asm::UserCetState)>, &'static str> {
+fn validate_cet_sigreturn(thr: &Thread) -> Result<Option<axhal::asm::UserCetState>, &'static str> {
     let current = crate::task::current_user_live_cet_state();
-    let pending = thr.cet_signal_top();
     if current.u_cet & 1 == 0 {
-        return if pending.is_none() {
-            Ok(None)
-        } else {
-            Err("CET disabled with pending signal frame")
-        };
+        return Ok(None);
     }
-    let pending = pending.ok_or("missing CET signal-frame record")?;
-    let frame = syscall_sp;
-    if frame != pending.frame || current.pl3_ssp != pending.handler_ssp {
-        return Err("CET signal-frame sequence mismatch");
+    let aspace = thr.proc_data.aspace();
+    let aspace = aspace.lock();
+    let token = aspace
+        .read_cet_signal_restore_token(current.pl3_ssp)
+        .map_err(|_| "invalid CET signal restore token location")?;
+    let restored_ssp =
+        cet_signal_restore_ssp(token).map_err(|_| "invalid CET signal restore token")?;
+    let restored_ssp = usize::try_from(restored_ssp)
+        .ok()
+        .filter(|ssp| valid_signal_user_address(*ssp, core::mem::size_of::<u64>()))
+        .ok_or("non-canonical CET restore SSP")? as u64;
+    if !aspace.cet_shadow_stack_pointer_valid(restored_ssp) {
+        return Err("stale CET shadow-stack mapping");
     }
-    let metadata_addr = frame
-        .checked_add(CET_SIGNAL_METADATA_OFFSET)
-        .ok_or("CET metadata overflow")?;
-    let mut bytes = [MaybeUninit::<u8>::uninit(); 64];
-    memory
-        .read_bytes(metadata_addr, &mut bytes)
-        .map_err(|_| "unreadable CET metadata")?;
-    let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
-    let mut words = [0u64; 8];
-    for (index, word) in words.iter_mut().enumerate() {
-        *word = u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap());
-    }
-    if words
-        != [
-            CET_SIGNAL_MAGIC,
-            1,
-            pending.epoch,
-            pending.nonce,
-            pending.frame as u64,
-            pending.saved_ssp,
-            pending.handler_ssp,
-            pending.token,
-        ]
-    {
-        return Err("forged CET signal metadata");
-    }
-    let words = thr
-        .proc_data
-        .aspace()
-        .lock()
-        .read_cet_signal_frame(thr.kernel_tid(), pending.shadow_start)
-        .map_err(|_| "stale CET shadow-stack mapping")?;
-    // The first word is the generic frame's restorer.  It is protected by the
-    // shadow-stack copy, while the remaining words bind this exact nesting
-    // layer to the opaque kernel record.
-    if words != [pending.restorer, pending.nonce, pending.token] {
-        return Err("modified CET shadow-stack record");
-    }
-    Ok(Some((
-        pending,
-        axhal::asm::UserCetState {
-            u_cet: current.u_cet,
-            pl3_ssp: pending.saved_ssp,
-            locked: current.locked,
-        },
-    )))
+    let restore =
+        CetRestore::new(restored_ssp, current.u_cet).map_err(|_| "invalid CET restore features")?;
+    Ok(Some(axhal::asm::UserCetState {
+        u_cet: restore.features,
+        pl3_ssp: restore.shadow_stack_pointer,
+        locked: current.locked,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1668,37 +1683,71 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                         let aspace = thr.proc_data.aspace();
                         let mut provider = AddressSpaceUserMemory::new(aspace.clone());
                         let mut memory = UserMemoryContext::new(&mut provider);
-                        match signal.observe_signal_wait_with_pre_delivery_and_fp_snapshot(
-                            &mut memory,
-                            uctx,
-                            &set,
-                            mask.old_blocked(),
-                            |uctx, sig, _| {
-                                // Resolve the current image immediately before
-                                // this pre-delivery operation. The handle and
-                                // UserContext passed to rseq are then the same
-                                // pair for the complete nofault gate.
-                                if thr.signal.take_signal_delivery_bypass(sig.signo()) {
-                                    return SignalDeliveryPreflight::Proceed;
-                                }
-                                match thr.pre_signal_rseq_delivery(uctx, &aspace) {
-                                    UserReturnHookAction::EnterUser => {
-                                        SignalDeliveryPreflight::Proceed
+                        let mut signal_uctx = signal_context_from_kernel(uctx);
+                        let observation = signal
+                            .observe_signal_wait_with_pre_delivery_and_fp_snapshot(
+                                &mut memory,
+                                &mut signal_uctx,
+                                &set,
+                                mask.old_blocked(),
+                                |signal_uctx, sig, _| {
+                                    apply_signal_context(uctx, signal_uctx);
+                                    // Resolve the current image immediately before
+                                    // this pre-delivery operation. The handle and
+                                    // UserContext passed to rseq are then the same
+                                    // pair for the complete nofault gate.
+                                    if thr.signal.take_signal_delivery_bypass(sig.signo()) {
+                                        return SignalDeliveryPreflight::Proceed;
                                     }
-                                    UserReturnHookAction::Retry => SignalDeliveryPreflight::Retry,
-                                    UserReturnHookAction::Fault => {
-                                        if force_rseq_fault_signal_current_thread() {
-                                            SignalDeliveryPreflight::Replaced
-                                        } else {
-                                            SignalDeliveryPreflight::Fatal
+                                    #[cfg(target_arch = "x86_64")]
+                                    if !crate::task::preflight_cet_signal_delivery(thr, &aspace) {
+                                        return SignalDeliveryPreflight::Fatal;
+                                    }
+                                    let outcome = match thr.pre_signal_rseq_delivery(uctx, &aspace)
+                                    {
+                                        UserReturnHookAction::EnterUser => {
+                                            SignalDeliveryPreflight::Proceed
                                         }
-                                    }
-                                }
-                            },
-                            snapshot_current_legacy_fp_state,
-                        ) {
+                                        UserReturnHookAction::Retry => {
+                                            SignalDeliveryPreflight::Retry
+                                        }
+                                        UserReturnHookAction::Fault => {
+                                            if force_rseq_fault_signal_current_thread() {
+                                                SignalDeliveryPreflight::Replaced
+                                            } else {
+                                                SignalDeliveryPreflight::Fatal
+                                            }
+                                        }
+                                    };
+                                    *signal_uctx = signal_context_from_kernel(uctx);
+                                    outcome
+                                },
+                                snapshot_signal_fpstate,
+                            );
+                        apply_signal_context(uctx, &signal_uctx);
+                        match observation {
                             SignalWaitObservation::Accepted(sig) => SignalWaitStep::Accepted(sig),
                             SignalWaitObservation::Delivered(delivered) => {
+                                #[cfg(target_arch = "x86_64")]
+                                if matches!(
+                                    delivered.os_action,
+                                    thekernel_linux_signal::SignalOSAction::Handler
+                                ) && let Err(error) = crate::task::publish_cet_signal_frame(
+                                    thr,
+                                    delivered
+                                        .handler_restorer
+                                        .expect("handler delivery retains its captured restorer"),
+                                ) {
+                                    // CET capacity and mapping ownership were
+                                    // preflighted before the generic frame was
+                                    // copied.  Treat a later shadow-stack
+                                    // failure as fatal instead of exposing a
+                                    // half-published handler transition.
+                                    warn!("rt_sigtimedwait CET publication failed: {error:?}");
+                                    *uctx = saved_uctx;
+                                    terminate_rseq_fault_current_thread();
+                                    return SignalWaitStep::Fatal;
+                                }
                                 complete_signal_delivery(thr, uctx, delivered);
                                 SignalWaitStep::Delivered
                             }
@@ -1913,7 +1962,6 @@ mod tests {
         process_signal_post_hook, queued_signal_required, reduce_process_signal_delivery_result,
         sanitize_synchronous_wait_set, signal_wait_deadline, sigtimedwait_post_wait_step,
     };
-
     #[test]
     fn signal_set_size_rules_match_each_linux_syscall_contract() {
         let native = size_of::<SignalSet>();

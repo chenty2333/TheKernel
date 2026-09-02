@@ -1,54 +1,34 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
-use chacha20::{
-    ChaCha20,
-    cipher::{KeyIvInit, StreamCipher},
-};
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use axrandom::{ChaChaDrbg, EntropySource, ReseedingDrbg};
 use spin::Mutex;
 
 const ENTROPY_BITS_READY: i32 = 256;
 const SECURE_RESEED_INTERVAL: usize = 1024 * 1024;
 
-struct SecureRandomState {
-    rng: Option<ChaCha20>,
-    generated: usize,
+struct KernelEntropySource;
+
+impl EntropySource for KernelEntropySource {
+    type Error = ();
+
+    fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+        axdriver::fill_entropy(destination).map_err(|_| ())
+    }
 }
 
-static SECURE_RANDOM: Mutex<SecureRandomState> = Mutex::new(SecureRandomState {
-    rng: None,
-    generated: 0,
-});
-static INSECURE_RANDOM: Mutex<Option<SmallRng>> = Mutex::new(None);
+static SECURE_RANDOM: Mutex<ReseedingDrbg<KernelEntropySource>> = Mutex::new(ReseedingDrbg::new(
+    KernelEntropySource,
+    SECURE_RESEED_INTERVAL,
+));
+static INSECURE_RANDOM: Mutex<Option<ChaChaDrbg>> = Mutex::new(None);
 static INSECURE_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn reseed_secure(state: &mut SecureRandomState) -> AxResult<()> {
-    let mut seed = [0u8; 32];
-    axdriver::fill_entropy(&mut seed).map_err(|_| AxError::WouldBlock)?;
-    let nonce = [0u8; 12];
-    state.rng = Some(ChaCha20::new((&seed).into(), (&nonce).into()));
-    state.generated = 0;
-    Ok(())
-}
-
 pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
-    let mut state = SECURE_RANDOM.lock();
-    let mut offset = 0;
-    while offset < buf.len() {
-        if state.rng.is_none() || state.generated == SECURE_RESEED_INTERVAL {
-            reseed_secure(&mut state)?;
-        }
-        let chunk = (buf.len() - offset).min(SECURE_RESEED_INTERVAL - state.generated);
-        buf[offset..offset + chunk].fill(0);
-        let Some(rng) = state.rng.as_mut() else {
-            return Err(AxError::Io);
-        };
-        rng.apply_keystream(&mut buf[offset..offset + chunk]);
-        state.generated += chunk;
-        offset += chunk;
-    }
-    Ok(())
+    SECURE_RANDOM
+        .lock()
+        .fill_bytes(buf)
+        .map_err(|()| AxError::WouldBlock)
 }
 
 fn insecure_seed() -> [u8; 32] {
@@ -73,12 +53,12 @@ pub fn fill_insecure(buf: &mut [u8]) {
     }
 
     let mut rng = INSECURE_RANDOM.lock();
-    rng.get_or_insert_with(|| SmallRng::from_seed(insecure_seed()))
+    rng.get_or_insert_with(|| ChaChaDrbg::from_seed(insecure_seed()))
         .fill_bytes(buf);
 }
 
 pub fn entropy_bits() -> i32 {
-    if axdriver::entropy_source_ready() || SECURE_RANDOM.lock().rng.is_some() {
+    if axdriver::entropy_source_ready() || SECURE_RANDOM.lock().is_seeded() {
         ENTROPY_BITS_READY
     } else {
         0

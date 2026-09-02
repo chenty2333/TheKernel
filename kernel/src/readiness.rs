@@ -8,7 +8,8 @@ use axpoll::{
     IoEvents, NestedRegistrationError, PollRegistration, PollRegistrationError, PollSet, Pollable,
     ReadinessWait, RegisterError,
 };
-use crate::task::{ProcStateHint, with_proc_state_hint};
+
+use crate::task::{ProcStateHint, with_iowait_proc_state, with_proc_state_hint};
 
 struct PollSetSource<'a, const CAPACITY: usize>(&'a PollSet<CAPACITY>);
 
@@ -110,6 +111,8 @@ pub(crate) fn block_on_poll_io_until<P, F, T>(
     pollable: &P,
     events: IoEvents,
     nonblocking: bool,
+    no_iowait: bool,
+    account_iowait: bool,
     deadline: Option<TimeValue>,
     mut operation: F,
 ) -> Result<AxResult<T>, axtask::future::Elapsed>
@@ -148,7 +151,21 @@ where
             let reservation = deadline_reservation
                 .as_mut()
                 .expect("deadline reservation was initialized above");
-            match axtask::future::block_on(reservation.race(axtask::future::interruptible(wait))) {
+            let block =
+                || axtask::future::block_on(reservation.race(axtask::future::interruptible(wait)));
+            let waited = if account_iowait && !no_iowait {
+                with_iowait_proc_state(block)
+            } else {
+                with_proc_state_hint(
+                    if no_iowait {
+                        ProcStateHint::Interruptible
+                    } else {
+                        ProcStateHint::IoWait
+                    },
+                    block,
+                )
+            };
+            match waited {
                 Err(error) => return Ok(Err(error.into())),
                 Ok(Err(elapsed)) => {
                     return match completed_operation(operation(), false) {
@@ -159,7 +176,20 @@ where
                 Ok(Ok(waited)) => waited,
             }
         } else {
-            match axtask::future::block_on(axtask::future::interruptible(wait)) {
+            let block = || axtask::future::block_on(axtask::future::interruptible(wait));
+            let waited = if account_iowait && !no_iowait {
+                with_iowait_proc_state(block)
+            } else {
+                with_proc_state_hint(
+                    if no_iowait {
+                        ProcStateHint::Interruptible
+                    } else {
+                        ProcStateHint::IoWait
+                    },
+                    block,
+                )
+            };
+            match waited {
                 Err(error) => return Ok(Err(error.into())),
                 Ok(waited) => waited,
             }
@@ -191,7 +221,7 @@ where
 /// gap before it installs the task waker.  On interruption, one final outside
 /// attempt gives completed work priority and restores the interrupt exactly as
 /// `axtask::future::interruptible` does for a non-blocking future.
-fn block_on_poll_io_interruptible_if<P, F, I, T>(
+pub(crate) fn block_on_poll_io_interruptible_if<P, F, I, T>(
     pollable: &P,
     events: IoEvents,
     nonblocking: bool,
@@ -262,6 +292,8 @@ where
     block_on_poll_io_until(
         &PollSetSource(source),
         IoEvents::empty(),
+        false,
+        false,
         false,
         deadline,
         operation,

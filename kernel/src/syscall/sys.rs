@@ -406,14 +406,14 @@ fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
 
 /// Match Linux `override_release()`: retain the first non-version suffix
 /// after translating every 4.x-and-later release to the UNAME26 2.6 series.
-fn uname26_release(release: &[c_char; 65]) -> [u8; 65] {
+fn uname26_release_for(release: &[u8]) -> [u8; 65] {
     let mut result = [0u8; 65];
     result[..UNAME26_RELEASE_PREFIX.len()].copy_from_slice(UNAME26_RELEASE_PREFIX);
 
     let mut rest = 0;
     let mut dots = 0;
     while rest < release.len() && release[rest] != 0 {
-        let byte = release[rest] as u8;
+        let byte = release[rest];
         if byte == b'.' {
             dots += 1;
             if dots >= 3 {
@@ -427,11 +427,17 @@ fn uname26_release(release: &[c_char; 65]) -> [u8; 65] {
     }
     let mut output = UNAME26_RELEASE_PREFIX.len();
     while output < result.len() - 1 && rest < release.len() && release[rest] != 0 {
-        result[output] = release[rest] as u8;
+        result[output] = release[rest];
         output += 1;
         rest += 1;
     }
     result
+}
+
+fn uname26_release() -> [u8; 65] {
+    // Linux derives the compatibility release from the build-time release,
+    // not from the native utsname buffer that was just copied to userspace.
+    uname26_release_for(UTS_RELEASE.as_bytes())
 }
 
 pub(crate) fn current_utsname() -> AxResult<new_utsname> {
@@ -444,8 +450,11 @@ pub(crate) fn current_utsname() -> AxResult<new_utsname> {
         domainname: [0; 65],
     };
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let uts_ns = proc_data.uts_ns();
+    // UTS attachment is task-local: setns(CLONE_NEWUTS) changes this
+    // thread's NamespaceProxy without replacing the process creation
+    // snapshot retained by ProcessData.  uname and /proc/version must read
+    // the live task attachment, exactly like hostname/domainname below.
+    let uts_ns = curr.as_thread().uts_ns();
     let (nodename, domainname) = uts_ns.names_snapshot();
     fill_uts_field(&mut utsname.nodename, &nodename);
     fill_uts_field(&mut utsname.domainname, &domainname);
@@ -490,7 +499,6 @@ pub(crate) fn current_machine_string() -> AxResult<String> {
 pub(crate) fn current_hostname_bytes() -> AxResult<Vec<u8>> {
     current()
         .as_thread()
-        .proc_data
         .uts_ns()
         .nodename()
         .map(|value| uts_bytes_before_nul(&value).to_vec())
@@ -500,33 +508,24 @@ pub(crate) fn current_hostname_bytes() -> AxResult<Vec<u8>> {
 pub(crate) fn current_domainname_bytes() -> AxResult<Vec<u8>> {
     current()
         .as_thread()
-        .proc_data
         .uts_ns()
         .domainname()
         .map(|value| uts_bytes_before_nul(&value).to_vec())
 }
 
 pub(crate) fn set_hostname_bytes(hostname: &[u8]) -> AxResult<()> {
-    current()
-        .as_thread()
-        .proc_data
-        .uts_ns()
-        .set_nodename(hostname)
+    current().as_thread().uts_ns().set_nodename(hostname)
 }
 
 pub(crate) fn set_domainname_bytes(domainname: &[u8]) -> AxResult<()> {
-    current()
-        .as_thread()
-        .proc_data
-        .uts_ns()
-        .set_domainname(domainname)
+    current().as_thread().uts_ns().set_domainname(domainname)
 }
 
 pub(crate) fn current_can_administer_uts() -> bool {
     let current = current();
     let thread = current.as_thread();
     let cred = thread.current_cred();
-    let uts_ns = thread.proc_data.uts_ns();
+    let uts_ns = thread.uts_ns();
     ns_capable(
         &cred,
         uts_ns.owner_user_ns(),
@@ -575,7 +574,7 @@ fn write_utsname<M: UserMemory + ?Sized>(
     // tail bytes, and the checked x86_64 layout has no padding.
     unsafe { VmMutPtr::vm_write_unchecked(name, memory, uts) }.map_err(|_| AxError::BadAddress)?;
     if uname26 {
-        let release = uname26_release(&uts.release);
+        let release = uname26_release();
         // `release` begins 130 bytes into the packed native x86_64 layout.
         let release_ptr = (name as *mut u8).wrapping_add(offset_of!(new_utsname, release));
         vm_write_slice(memory, release_ptr, &release).map_err(|_| AxError::BadAddress)?;
@@ -620,7 +619,6 @@ pub fn sys_sysinfo<M: UserMemory + ?Sized>(
     let stats = system_memory_stats();
     let uptime = current()
         .as_thread()
-        .proc_data
         .time_ns()
         .apply_boottime_offset(monotonic_time());
     let uptime_secs = uptime
@@ -654,18 +652,13 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-const SYSLOG_ACTION_CLOSE: i32 = 0;
-const SYSLOG_ACTION_OPEN: i32 = 1;
-const SYSLOG_ACTION_READ: i32 = 2;
-const SYSLOG_ACTION_READ_ALL: i32 = 3;
-const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
-const SYSLOG_ACTION_CLEAR: i32 = 5;
-const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
-const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
-const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
-const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
-const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+use thekernel_linux_syslog::{
+    self as linux_syslog, Action as SyslogAction, Commit as SyslogCommit, Cursors as SyslogCursors,
+    Plan as SyslogPlan, PlanError as SyslogPlanError,
+};
+
 static SYSLOG_READ_LOCK: Mutex<()> = Mutex::new(());
+static SYSLOG_CURSORS: Mutex<SyslogCursors> = Mutex::new(SyslogCursors { read: 0, clear: 0 });
 
 fn current_can_read_klog() -> bool {
     let current = current();
@@ -677,28 +670,24 @@ fn syslog_copy<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     buf: *mut c_char,
     len: isize,
-    consume: bool,
-) -> AxResult<(isize, u64)> {
-    if len < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let len = len as usize;
+    cursor: u64,
+    newest: bool,
+    commit: SyslogCommit,
+) -> AxResult<isize> {
     if len == 0 {
-        return Ok((0, 0));
+        return Ok(0);
     }
-    let mut output = vec![0; len.min(axruntime::klog::CAPACITY)];
+    let mut output = vec![0; (len as usize).min(axruntime::klog::CAPACITY)];
     loop {
-        let (copied, end) = axruntime::klog::snapshot_into(&mut output, consume);
-        if copied != 0 || !consume {
+        let (copied, end) = axruntime::klog::snapshot_into(cursor, &mut output, newest);
+        if copied != 0 || !matches!(commit, SyslogCommit::Read) {
             vm_write_slice(memory, buf.cast::<u8>(), &output[..copied])
                 .map_err(map_usercopy_error)?;
-            if consume {
-                axruntime::klog::commit_read(end);
+            if !matches!(commit, SyslogCommit::None) {
+                linux_syslog::commit(&mut SYSLOG_CURSORS.lock(), commit, end);
             }
-            return Ok((copied as isize, end));
+            return Ok(copied as isize);
         }
-        // `READ` is the only blocking syslog action. Recheck pending signals
-        // between scheduler yields so an interrupted empty read is EINTR.
         if has_pending_syscall_signal(current().as_thread()) {
             return Err(AxError::Interrupted);
         }
@@ -706,62 +695,52 @@ fn syslog_copy<M: UserMemory + ?Sized>(
     }
 }
 
-/// Linux legacy `syslog(2)` / `klogctl(3)` interface.
-///
-/// The ring is fed at the runtime console boundary, before console filtering,
-/// so reads retain messages emitted while the console is disabled.
+fn syslog_plan(
+    action: SyslogAction,
+    len: isize,
+    privileged: bool,
+    cursors: SyslogCursors,
+) -> AxResult<SyslogPlan> {
+    linux_syslog::plan(action, len, privileged, cursors).map_err(|error| match error {
+        SyslogPlanError::InvalidArgument => AxError::InvalidInput,
+        SyslogPlanError::PermissionDenied => AxError::OperationNotPermitted,
+    })
+}
+
 pub fn sys_syslog<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     kind: i32,
     buf: *mut c_char,
     len: isize,
 ) -> AxResult<isize> {
-    if !(SYSLOG_ACTION_CLOSE..=SYSLOG_ACTION_SIZE_BUFFER).contains(&kind) {
-        return Err(AxError::InvalidInput);
-    }
-    // Linux allows the non-destructive full snapshot and capacity query to
-    // unprivileged callers unless dmesg_restrict is set; TheKernel has no
-    // dmesg_restrict sysctl, so retain that default.
-    if !matches!(kind, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_SIZE_BUFFER)
-        && !current_can_read_klog()
-    {
-        return Err(AxError::OperationNotPermitted);
-    }
-    match kind {
-        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => Ok(0),
-        SYSLOG_ACTION_READ => {
-            let _serialized = SYSLOG_READ_LOCK.lock();
-            Ok(syslog_copy(memory, buf, len, true)?.0)
-        }
-        SYSLOG_ACTION_READ_ALL => Ok(syslog_copy(memory, buf, len, false)?.0),
-        SYSLOG_ACTION_READ_CLEAR => {
-            let (copied, end) = syslog_copy(memory, buf, len, false)?;
-            axruntime::klog::commit_clear(end);
-            Ok(copied)
-        }
-        SYSLOG_ACTION_CLEAR => {
-            axruntime::klog::clear();
+    let action = SyslogAction::try_from(kind).map_err(|_| AxError::InvalidInput)?;
+    // Keep the cursor snapshot and its later commit in the same read critical
+    // section, so two blocking READs cannot consume the same log range.
+    let _read_guard = matches!(action, SyslogAction::Read).then(|| SYSLOG_READ_LOCK.lock());
+    let cursors = *SYSLOG_CURSORS.lock();
+    let plan = syslog_plan(action, len, current_can_read_klog(), cursors)?;
+    match plan {
+        SyslogPlan::Noop => Ok(0),
+        SyslogPlan::Console { enabled } => {
+            axruntime::klog::set_console_enabled(enabled);
             Ok(0)
         }
-        SYSLOG_ACTION_CONSOLE_OFF => {
-            axruntime::klog::set_console_enabled(false);
+        SyslogPlan::ConsoleLevel(level) => {
+            axruntime::klog::set_console_threshold(level);
             Ok(0)
         }
-        SYSLOG_ACTION_CONSOLE_ON => {
-            axruntime::klog::set_console_enabled(true);
+        SyslogPlan::Clear => {
+            let (_, end) = axruntime::klog::snapshot_into(0, &mut [], true);
+            linux_syslog::commit(&mut SYSLOG_CURSORS.lock(), SyslogCommit::Clear, end);
             Ok(0)
         }
-        SYSLOG_ACTION_CONSOLE_LEVEL => {
-            // Linux accepts 1..=8, where 8 is the most verbose threshold.
-            if !(1..=8).contains(&len) {
-                return Err(AxError::InvalidInput);
-            }
-            axruntime::klog::set_console_level(len as u8);
-            Ok(0)
-        }
-        SYSLOG_ACTION_SIZE_UNREAD => Ok(axruntime::klog::unread_len() as isize),
-        SYSLOG_ACTION_SIZE_BUFFER => Ok(axruntime::klog::CAPACITY as isize),
-        _ => unreachable!(),
+        SyslogPlan::Copy {
+            cursor,
+            newest,
+            commit,
+        } => syslog_copy(memory, buf, len, cursor, newest, commit),
+        SyslogPlan::Unread { cursor } => Ok(axruntime::klog::available_from(cursor) as isize),
+        SyslogPlan::Capacity => Ok(axruntime::klog::CAPACITY as isize),
     }
 }
 
@@ -895,6 +874,65 @@ mod tests {
     }
 
     #[test]
+    fn syslog_planner_ignores_non_data_lengths_and_keeps_read_cursor_separate() {
+        let mut cursors = SyslogCursors { read: 3, clear: 7 };
+        assert_eq!(
+            syslog_plan(SyslogAction::Close, -1, true, cursors),
+            Ok(SyslogPlan::Noop)
+        );
+        assert_eq!(
+            syslog_plan(SyslogAction::ReadClear, 4, true, cursors),
+            Ok(SyslogPlan::Copy {
+                cursor: 7,
+                newest: true,
+                commit: SyslogCommit::Clear,
+            })
+        );
+        linux_syslog::commit(&mut cursors, SyslogCommit::Clear, 11);
+        assert_eq!(cursors, SyslogCursors { read: 3, clear: 11 });
+        assert_eq!(
+            syslog_plan(SyslogAction::Clear, -1, true, cursors),
+            Ok(SyslogPlan::Clear)
+        );
+    }
+
+    #[test]
+    fn syslog_read_plan_observes_the_cursor_after_the_prior_serialized_commit() {
+        let _read_guard = SYSLOG_READ_LOCK.lock();
+        let mut cursors = SyslogCursors { read: 2, clear: 0 };
+        let first = syslog_plan(SyslogAction::Read, 4, true, cursors).unwrap();
+        assert!(matches!(first, SyslogPlan::Copy { cursor: 2, .. }));
+        linux_syslog::commit(&mut cursors, SyslogCommit::Read, 6);
+        let second = syslog_plan(SyslogAction::Read, 4, true, cursors).unwrap();
+        assert!(matches!(second, SyslogPlan::Copy { cursor: 6, .. }));
+    }
+
+    #[test]
+    fn syslog_zero_length_copy_returns_without_user_memory_access() {
+        let mut provider = GroupMemory {
+            bytes: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: Some(UserCopyError::NoMemory),
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            syslog_copy(
+                &mut memory,
+                core::ptr::null_mut(),
+                0,
+                0,
+                false,
+                SyslogCommit::Read,
+            ),
+            Ok(0)
+        );
+        assert!(memory.memory_mut().writes.is_empty());
+    }
+
+    #[test]
     fn sysinfo_memory_fields_use_bytes_and_only_shmem_pages() {
         assert_eq!(core::mem::size_of::<sysinfo>(), 112);
         assert_eq!(core::mem::align_of::<sysinfo>(), 8);
@@ -975,10 +1013,7 @@ mod tests {
             uts_name_len((-1_isize) as usize),
             Err(AxError::InvalidInput)
         );
-        assert_eq!(
-            uts_name_len((UTS_FIELD_LEN + 1) as usize),
-            Err(AxError::InvalidInput)
-        );
+        assert_eq!(uts_name_len(UTS_FIELD_LEN + 1), Err(AxError::InvalidInput));
     }
 
     #[test]
@@ -1041,7 +1076,7 @@ mod tests {
     fn personality_namespace_preserves_arbitrary_native_u32_bits() {
         assert_eq!(PER_CLEAR_ON_SETID, 0x0074_0000);
         assert_eq!(UNAME26_RELEASE_PREFIX, b"2.6.72");
-        assert_eq!(u32::MAX & !PER_CLEAR_ON_SETID, 0xff8b_ffff);
+        assert_eq!(!PER_CLEAR_ON_SETID, 0xff8b_ffff);
     }
 
     fn test_utsname() -> new_utsname {
@@ -1057,9 +1092,10 @@ mod tests {
 
     #[test]
     fn uname26_release_matches_linux_override_release() {
-        let mut release = [0; 65];
-        fill_uts_field(&mut release, b"6.12.103-custom");
-        assert_eq!(&uname26_release(&release)[..14], b"2.6.72-custom\0");
+        assert_eq!(
+            &uname26_release_for(b"6.12.103-custom\0")[..14],
+            b"2.6.72-custom\0"
+        );
     }
 
     #[test]
@@ -1323,7 +1359,7 @@ mod tests {
             resids_to_user(
                 &mut memory,
                 core::ptr::null_mut(),
-                4 as *mut u32,
+                core::ptr::dangling_mut::<u32>(),
                 8 as *mut u32,
                 [11, 22, 33]
             ),
@@ -1347,7 +1383,7 @@ mod tests {
         assert_eq!(
             resids_to_user(
                 &mut memory,
-                4 as *mut u32,
+                core::ptr::dangling_mut::<u32>(),
                 8 as *mut u32,
                 12 as *mut u32,
                 [11, 22, 33]
@@ -1373,7 +1409,7 @@ mod tests {
         assert_eq!(
             resids_to_user(
                 &mut failing_memory,
-                4 as *mut u32,
+                core::ptr::dangling_mut::<u32>(),
                 8 as *mut u32,
                 12 as *mut u32,
                 [11, 22, 33]
@@ -1394,7 +1430,7 @@ mod tests {
         assert_eq!(
             resids_to_user(
                 &mut memory,
-                4 as *mut u32,
+                core::ptr::dangling_mut::<u32>(),
                 8 as *mut u32,
                 12 as *mut u32,
                 [11, 22, 33]
@@ -1420,12 +1456,7 @@ mod tests {
         };
         let mut read_memory = UserMemoryContext::new(&mut read_provider);
         assert_eq!(
-            load_setgroups(
-                &mut read_memory,
-                core::ptr::null(),
-                1,
-                |raw| Kgid::from_raw(raw)
-            ),
+            load_setgroups(&mut read_memory, core::ptr::null(), 1, Kgid::from_raw),
             Err(AxError::BadAddress)
         );
 

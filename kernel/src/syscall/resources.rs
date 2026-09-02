@@ -6,6 +6,7 @@ use linux_raw_sys::general::{
     __kernel_old_timeval, CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE,
     rlimit, rlimit64, rusage,
 };
+use thekernel_linux_process::RusageSelector;
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -132,15 +133,30 @@ pub fn sys_prlimit64<M: UserMemory + ?Sized>(
     // resource validation. Keep that observable precedence for combinations
     // of bad pointers, dead PIDs, and out-of-range resource numbers.
     let new_limit = if let Some(new_limit) = VmPtr::nullable(new_limit) {
-        let value =
-            VmPtr::vm_read_uninit(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
+        let value = VmPtr::vm_read_uninit(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
         // SAFETY: the explicit provider initialized the complete value and
         // rlimit64 contains only integer fields on the x86_64 Linux ABI.
         Some(unsafe { value.assume_init() })
     } else {
         None
     };
-    let proc_data = get_process_data(pid)?;
+    // prlimit's PID operand is namespace-relative.  The global process table
+    // remains the storage index, but it must only be reached through the
+    // caller's PID namespace binding; otherwise a numeric collision can
+    // expose or alter limits of a sibling namespace's process.
+    let proc_data = if pid == 0 {
+        current().as_thread().proc_data.clone()
+    } else {
+        let caller_ns = current().as_thread().pid_ns();
+        let global_pid = caller_ns
+            .resolve_visible_pid(pid)
+            .ok_or(AxError::NoSuchProcess)?;
+        let target = get_process_data(global_pid)?;
+        if !caller_ns.contains(&target.pid_ns()) {
+            return Err(AxError::NoSuchProcess);
+        }
+        target
+    };
     check_current_process_prlimit_access(&proc_data)?;
     if resource >= RLIM_NLIMITS {
         return Err(AxError::InvalidInput);
@@ -208,6 +224,37 @@ pub fn sys_getrlimit<M: UserMemory + ?Sized>(
     // fields in `old` are initialized before this copyout.
     unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
         .map_err(map_rlimit_usercopy_error)?;
+
+    Ok(0)
+}
+
+pub fn sys_getrusage<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    who: i32,
+    usage: *mut rusage,
+) -> AxResult<isize> {
+    let curr = current();
+    let thr = curr.as_thread();
+
+    // Linux validates `who` before touching userspace.  Refresh only the
+    // selectors whose result includes the caller; CHILDREN is a durable
+    // parent ledger and must not gain unrelated syscall CPU time.
+    let selector = RusageSelector::decode(who).map_err(|_| AxError::InvalidInput)?;
+    if !matches!(selector, RusageSelector::Children) {
+        poll_timer(&curr);
+    }
+    let result = match selector {
+        RusageSelector::SelfUsage => thr.proc_data.self_usage(),
+        RusageSelector::Children => thr.proc_data.children_usage(),
+        RusageSelector::Thread => {
+            TaskUsage::from_thread(thr).with_maxrss_floor(thr.proc_data.sample_maxrss_kb())
+        }
+    };
+    let result: rusage = result.into();
+    // SAFETY: TaskUsage conversion starts from a zeroed rusage and fills the
+    // integer fields, so the full object representation is initialized.
+    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }
+        .map_err(|_| AxError::BadAddress)?;
 
     Ok(0)
 }
@@ -293,42 +340,4 @@ mod tests {
         assert_eq!(limit.rlim_max, 0xfedc_ba98_7654_3210);
         assert_eq!(core::mem::size_of_val(&limit), 16);
     }
-}
-
-pub fn sys_getrusage<M: UserMemory + ?Sized>(
-    memory: &mut UserMemoryContext<'_, M>,
-    who: i32,
-    usage: *mut rusage,
-) -> AxResult<isize> {
-    const RUSAGE_SELF: i32 = linux_raw_sys::general::RUSAGE_SELF as i32;
-    const RUSAGE_CHILDREN: i32 = linux_raw_sys::general::RUSAGE_CHILDREN;
-    const RUSAGE_THREAD: i32 = linux_raw_sys::general::RUSAGE_THREAD as i32;
-
-    let curr = current();
-    let thr = curr.as_thread();
-
-    // Linux validates `who` before touching userspace.  Refresh only the
-    // selectors whose result includes the caller; CHILDREN is a durable
-    // parent ledger and must not gain unrelated syscall CPU time.
-    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
-        return Err(AxError::InvalidInput);
-    }
-    if who != RUSAGE_CHILDREN {
-        poll_timer(&curr);
-    }
-    let result = match who {
-        RUSAGE_SELF => thr.proc_data.self_usage(),
-        RUSAGE_CHILDREN => thr.proc_data.children_usage(),
-        RUSAGE_THREAD => {
-            TaskUsage::from_thread(thr).with_maxrss_floor(thr.proc_data.sample_maxrss_kb())
-        }
-        _ => unreachable!(),
-    };
-    let result: rusage = result.into();
-    // SAFETY: TaskUsage conversion starts from a zeroed rusage and fills the
-    // integer fields, so the full object representation is initialized.
-    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }
-        .map_err(|_| AxError::BadAddress)?;
-
-    Ok(0)
 }

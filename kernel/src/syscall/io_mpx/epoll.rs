@@ -185,6 +185,8 @@ fn do_epoll_wait<M: UserMemory + ?Sized>(
             epoll.as_ref(),
             IoEvents::READABLE,
             false,
+            false,
+            false,
             deadline,
             || {
                 let batch = epoll.prepare_events(maxevents as usize)?;
