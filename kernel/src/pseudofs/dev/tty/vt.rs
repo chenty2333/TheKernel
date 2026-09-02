@@ -1,15 +1,10 @@
 //! Linux virtual-terminal switching state and its fbcon presentation hook.
 
-use alloc::{borrow::Cow, boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{
-    any::Any,
-    sync::atomic::{AtomicBool, Ordering},
-    task::Context,
-};
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
+use core::{any::Any, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, VfsResult};
-use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use axsync::Mutex;
 use axtask::{WaitQueue, current};
@@ -18,9 +13,13 @@ use lazy_static::lazy_static;
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
-use super::{NTtyDriver, ntty::new_virtual_tty};
+use super::{
+    NTtyDriver, TtyFile,
+    ntty::new_virtual_tty,
+    seat::{SeatHooks, SeatLifecycle, SeatOwner, SeatTarget},
+};
 use crate::{
-    file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat},
+    file::{FileLike, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus},
     pseudofs::{DeviceOpen, DeviceOps},
     task::{
         AsThread, ProcStateHint, has_pending_syscall_signal, send_signal_to_process,
@@ -41,6 +40,7 @@ const K_OFF: i32 = 0x04;
 // linux-raw-sys 0.12.
 const VT_LOCKSWITCH_CMD: u32 = 0x560b;
 const VT_UNLOCKSWITCH_CMD: u32 = 0x560c;
+const VT_PROCESS_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
 fn read_vt_mode(context: &IoctlContext, address: usize) -> AxResult<[u8; 8]> {
     let mut bytes = [core::mem::MaybeUninit::uninit(); 8];
@@ -109,6 +109,8 @@ struct Vt {
     allocated: bool,
     open_count: u32,
     graphics: bool,
+    graphics_owner: Option<Pid>,
+    graphics_uid: Option<u32>,
     kb_mode: i32,
     process: Option<ProcessMode>,
     tty: Arc<NTtyDriver>,
@@ -164,6 +166,71 @@ pub struct VtManager {
     changed: WaitQueue,
     delivery_finished: WaitQueue,
     poll: Arc<PollSet>,
+    /// The slow device/session transaction state.  It is intentionally
+    /// separate from VT's spin state; hooks are always called after reading
+    /// the active VT snapshot.
+    seat: SeatLifecycle,
+}
+
+struct KernelSeatHooks;
+
+impl SeatHooks for KernelSeatHooks {
+    fn prepare_release(&mut self, _from: SeatTarget) -> AxResult<()> {
+        // Close the KMS admission gate first.  It linearizes with atomic
+        // enqueue, then error-completes queued submissions.
+        crate::drm::suspend_primary_kms_for_seat();
+        Ok(())
+    }
+
+    fn release(&mut self, _from: SeatTarget) -> AxResult<()> {
+        // Input is paused before primary master is relinquished, so neither a
+        // compositor nor a stale event FD can consume an event after release.
+        crate::pseudofs::dev::event::pause_input_devices();
+        if let SeatTarget::Graphics(owner) = _from
+            && let Some(uid) = owner.uid
+        {
+            super::seat::revoke_published_nodes(uid);
+        }
+        super::super::fb::vt_graphics_changed(true);
+        Ok(())
+    }
+
+    fn prepare_acquire(&mut self, target: SeatTarget) -> AxResult<()> {
+        if let SeatTarget::Graphics(owner) = target {
+            let uid = owner.uid.ok_or(AxError::PermissionDenied)?;
+            // ACL success is a prerequisite for reopening KMS/input gates.
+            super::seat::grant_published_nodes(uid)?;
+        }
+        // Master acquisition itself is independent of the KMS admission gate;
+        // presentation waits until `acquire` has reopened that gate.
+        Ok(())
+    }
+
+    fn acquire(&mut self, target: SeatTarget) -> AxResult<()> {
+        // The graphics client gets master through its normal primary-node
+        // SET_MASTER after this gate opens.  Render nodes remain independent.
+        crate::drm::resume_primary_kms_for_seat();
+        crate::pseudofs::dev::event::resume_input_devices();
+        if matches!(target, SeatTarget::Fbcon) {
+            super::super::fb::vt_graphics_changed(false);
+            VT_MANAGER.present_active();
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, _target: SeatTarget) {
+        // Every abort lands on the known-good text console.  The operations
+        // are idempotent for owner exit, hot unplug and seatd restart.
+        crate::drm::resume_primary_kms_for_seat();
+        crate::pseudofs::dev::event::resume_input_devices();
+        super::super::fb::vt_graphics_changed(false);
+        if let SeatTarget::Graphics(owner) = _target
+            && let Some(uid) = owner.uid
+        {
+            super::seat::revoke_published_nodes(uid);
+        }
+        VT_MANAGER.present_active();
+    }
 }
 
 lazy_static! {
@@ -178,6 +245,8 @@ impl VtManager {
                 allocated: false,
                 open_count: 0,
                 graphics: false,
+                graphics_owner: None,
+                graphics_uid: None,
                 kb_mode: K_XLATE,
                 process: None,
                 tty: new_virtual_tty(number),
@@ -201,6 +270,7 @@ impl VtManager {
             changed: WaitQueue::new(),
             delivery_finished: WaitQueue::new(),
             poll: Arc::new(PollSet::new()),
+            seat: SeatLifecycle::new(),
         }
     }
 
@@ -259,6 +329,29 @@ impl VtManager {
         self.with_text_active_locked(active, || super::fbcon::present_while_text_active(active));
     }
 
+    /// Reconciles the selected VT with DRM/input ownership.  This snapshots
+    /// VT state under its spin lock and runs the transaction only afterwards;
+    /// no ACL, DRM, input, or fbcon operation can nest under VT locks.
+    fn reconcile_seat(&self) {
+        let target = {
+            let state = self.state.lock();
+            let vt = &state.vts[state.active as usize - 1];
+            if vt.graphics {
+                SeatTarget::Graphics(SeatOwner {
+                    pid: vt.graphics_owner,
+                    uid: vt.graphics_uid,
+                    vt: state.active,
+                })
+            } else {
+                SeatTarget::Fbcon
+            }
+        };
+        let mut hooks = KernelSeatHooks;
+        if self.seat.transition(target, &mut hooks).is_err() {
+            self.seat.abort_current(&mut hooks);
+        }
+    }
+
     /// Serializes text rendering with active-console and KD mode changes.
     /// `f` must not hold fbcon state while entering this method.
     pub fn with_text_active<R>(&self, number: u16, f: impl FnOnce() -> R) -> Option<R> {
@@ -286,9 +379,10 @@ impl VtManager {
     /// before touching `pending`, so a mode change which loses the claim race
     /// is linearized after that signal delivery rather than cancelling a
     /// signal already in flight.
-    fn wait_for_delivery_finish(&self) {
+    fn wait_for_delivery_finish(&self) -> AxResult<()> {
         self.delivery_finished
-            .wait_until(|| self.state.lock().delivery_in_flight.is_none());
+            .wait_until(|| self.state.lock().delivery_in_flight.is_none())
+            .map_err(Into::into)
     }
     /// Makes `target` active and, where needed, starts its VT_PROCESS
     /// acquire handshake.  Callers hold `route`, so the transition cannot
@@ -342,7 +436,7 @@ impl VtManager {
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
                 drop(_delivery);
-                self.wait_for_delivery_finish();
+                self.wait_for_delivery_finish()?;
                 continue;
             }
             let _route = self.route.lock();
@@ -375,7 +469,7 @@ impl VtManager {
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
                 drop(_delivery);
-                self.wait_for_delivery_finish();
+                self.wait_for_delivery_finish()?;
                 continue;
             }
             let _route = self.route.lock();
@@ -439,7 +533,7 @@ impl VtManager {
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
                 drop(_delivery);
-                self.wait_for_delivery_finish();
+                self.wait_for_delivery_finish()?;
                 continue;
             }
             let mut state = self.state.lock();
@@ -509,6 +603,8 @@ impl VtManager {
                         allocated: false,
                         open_count: 0,
                         graphics: false,
+                        graphics_owner: None,
+                        graphics_uid: None,
                         kb_mode: K_XLATE,
                         process: None,
                         tty: vt.tty.clone(),
@@ -526,6 +622,8 @@ impl VtManager {
         state.vts[index].allocated = false;
         state.vts[index].process = None;
         state.vts[index].graphics = false;
+        state.vts[index].graphics_owner = None;
+        state.vts[index].graphics_uid = None;
         state.vts[index].kb_mode = K_XLATE;
         Ok(())
     }
@@ -565,7 +663,12 @@ impl VtManager {
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
                 drop(_delivery);
-                self.wait_for_delivery_finish();
+                if self.wait_for_delivery_finish().is_err() {
+                    // Exit cleanup cannot return an interrupted wait to a
+                    // syscall caller. Reacquire the delivery gate and retry
+                    // so it never races a still-running signal delivery.
+                    continue;
+                }
                 continue;
             }
             return self.owner_exited_locked(pid);
@@ -578,9 +681,11 @@ impl VtManager {
         let mut state = self.state.lock();
         let mut removed_owner = false;
         for vt in &mut state.vts {
-            if vt.process.is_some_and(|mode| mode.owner == pid) {
+            if vt.process.is_some_and(|mode| mode.owner == pid) || vt.graphics_owner == Some(pid) {
                 vt.process = None;
                 vt.graphics = false;
+                vt.graphics_owner = None;
+                vt.graphics_uid = None;
                 vt.kb_mode = K_XLATE;
                 removed_owner = true;
             }
@@ -646,10 +751,33 @@ impl VtManager {
                 }
             }
             if delivered {
+                self.arm_process_timeout(ticket);
                 return;
             }
             next = self.failed_switch_signal(ticket);
         }
+    }
+
+    /// A VT_PROCESS owner which neither accepts nor refuses its release is no
+    /// longer allowed to hold the physical seat forever.  The timer captures
+    /// the full generation ticket, so a late timeout cannot tear down a
+    /// replacement compositor or a completed acquire.
+    fn arm_process_timeout(&self, ticket: SwitchSignal) {
+        if !core::ptr::eq(self, VT_MANAGER.as_ref()) {
+            return;
+        }
+        let _ = axtask::try_spawn_with_name(
+            move || {
+                let _ = axtask::future::block_on(axtask::future::sleep(VT_PROCESS_TIMEOUT));
+                if VT_MANAGER.ticket_is_current(ticket) {
+                    let next = VT_MANAGER.owner_exited(ticket.pid);
+                    VT_MANAGER.deliver_switch_signal(next);
+                    VT_MANAGER.reconcile_seat();
+                    VT_MANAGER.present_active();
+                }
+            },
+            "vt-process-timeout".into(),
+        );
     }
 
     fn failed_switch_signal(&self, ticket: SwitchSignal) -> Option<SwitchSignal> {
@@ -660,7 +788,6 @@ impl VtManager {
         self.owner_exited_locked(ticket.pid)
     }
 
-    #[cfg(test)]
     fn ticket_is_current(&self, ticket: SwitchSignal) -> bool {
         let _delivery = self.delivery.lock();
         let state = self.state.lock();
@@ -692,6 +819,7 @@ impl VtManager {
 /// or session reference, avoiding exit-path lock nesting.
 pub fn notify_vt_owner_exit(pid: Pid) {
     VT_MANAGER.deliver_switch_signal(VT_MANAGER.owner_exited(pid));
+    VT_MANAGER.reconcile_seat();
     VT_MANAGER.present_active();
 }
 
@@ -716,24 +844,28 @@ impl Drop for VtOpenGuard {
 /// the one reference which makes an open console unavailable to disallocate.
 struct VtFile {
     number: u16,
-    tty: Arc<NTtyDriver>,
+    tty_file: Arc<TtyFile<super::ntty::Console, super::ntty::Console>>,
     poll: Arc<PollSet>,
-    location: Location,
-    nonblocking: AtomicBool,
 }
 
 impl VtDevice {
     fn open_description(&self, location: &Location) -> AxResult<DeviceOpen> {
         let number = self.selected();
         VT_MANAGER.opened(number)?;
+        let tty = VT_MANAGER.tty_for(number);
+        let tty_file = match TtyFile::try_new(tty, location.clone()) {
+            Ok(file) => file,
+            Err(error) => {
+                VT_MANAGER.closed(number);
+                return Err(error);
+            }
+        };
         let file: Arc<dyn FileLike> = match Arc::try_new(VtFile {
             number,
-            tty: VT_MANAGER.tty_for(number),
+            tty_file,
             poll: VT_MANAGER.state.lock().vts[number as usize - 1]
                 .poll
                 .clone(),
-            location: location.clone(),
-            nonblocking: AtomicBool::new(false),
         }) {
             Ok(file) => file,
             Err(_) => {
@@ -751,58 +883,32 @@ impl VtDevice {
 }
 
 impl FileLike for VtFile {
+    fn final_close(&self) {
+        self.tty_file.final_close();
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        let mut bytes = [0u8; 4096];
-        let length = dst.remaining_mut().min(bytes.len());
-        if length == 0 {
-            return Ok(0);
-        }
-        let tty = self.tty.clone();
-        let read = crate::readiness::block_on_poll_io(
-            self,
-            IoEvents::READABLE,
-            self.nonblocking(),
-            || DeviceOps::read_at(tty.as_ref(), &mut bytes[..length], 0),
-        )?;
-        dst.write_all(&bytes[..read])?;
-        Ok(read)
+        self.tty_file.read(dst)
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        let mut bytes = [0u8; 4096];
-        let read = src.read(&mut bytes)?;
-        let tty = self.tty.clone();
-        crate::readiness::block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
-            DeviceOps::write_at(tty.as_ref(), &bytes[..read], 0)
-        })
+        self.tty_file.write(src)
+    }
+
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        self.tty_file.read_with_operation_status(status, dst)
+    }
+
+    fn write_with_operation_status(&self, status: OfdIoStatus, src: &mut IoSrc) -> AxResult<usize> {
+        self.tty_file.write_with_operation_status(status, src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        let metadata = self.location.metadata()?;
-        Ok(Kstat {
-            dev: crate::mounts::linux_device_id(metadata.device).0,
-            mnt_id: self.location.mountpoint().mount_id(),
-            ino: metadata.inode,
-            nlink: metadata.nlink as _,
-            mode: ((metadata.node_type as u8 as u32) << 12) | metadata.mode.bits() as u32,
-            uid: metadata.uid,
-            gid: metadata.gid,
-            size: metadata.size,
-            blksize: metadata.block_size as _,
-            blocks: metadata.blocks,
-            rdev: metadata.rdev,
-            atime: metadata.atime,
-            btime: metadata.btime,
-            mtime: metadata.mtime,
-            ctime: metadata.ctime,
-            ..Kstat::default()
-        })
+        self.tty_file.stat()
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok(Cow::Owned(String::from(
-            self.location.absolute_path()?.as_str(),
-        )))
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        self.tty_file.path()
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
@@ -810,18 +916,17 @@ impl FileLike for VtFile {
     }
 
     fn nonblocking(&self) -> bool {
-        self.nonblocking.load(Ordering::Acquire)
+        self.tty_file.nonblocking()
     }
 
     fn set_nonblocking(&self, value: bool) -> AxResult<()> {
-        self.nonblocking.store(value, Ordering::Release);
-        Ok(())
+        self.tty_file.set_nonblocking(value)
     }
 }
 
 impl Pollable for VtFile {
     fn poll(&self) -> IoEvents {
-        self.tty.poll()
+        self.tty_file.poll()
     }
 
     fn register<'a>(
@@ -835,7 +940,7 @@ impl Pollable for VtFile {
         // epoll waiter asleep until unrelated keyboard input arrives.
         let mut prepared = axpoll::PreparedPollRegistration::try_new(2)?;
         prepared.arm_owned(self.poll.clone(), context.waker())?;
-        prepared.arm_nested(|| self.tty.register(context, events))?;
+        prepared.arm_nested(|| self.tty_file.register(context, events))?;
         prepared.commit()
     }
 }
@@ -929,12 +1034,14 @@ impl DeviceOps for VtDevice {
                 require_vt_control(context, number)?;
                 let signal = VT_MANAGER.activate(vt_number_from_arg(arg)?)?;
                 VT_MANAGER.deliver_switch_signal(signal);
+                VT_MANAGER.reconcile_seat();
                 VT_MANAGER.present_active();
             }
             VT_RELDISP => {
                 require_vt_control(context, number)?;
                 let signal = VT_MANAGER.release_reply(owner, arg)?;
                 VT_MANAGER.deliver_switch_signal(signal);
+                VT_MANAGER.reconcile_seat();
                 VT_MANAGER.present_active();
             }
             VT_WAITACTIVE => {
@@ -977,9 +1084,13 @@ impl DeviceOps for VtDevice {
                 }
                 {
                     let _presentation = VT_MANAGER.presentation.lock();
-                    VT_MANAGER.state.lock().vts[VtManager::check_vt(number)?].graphics =
-                        mode == KD_GRAPHICS;
+                    let vt = &mut VT_MANAGER.state.lock().vts[VtManager::check_vt(number)?];
+                    vt.graphics = mode == KD_GRAPHICS;
+                    vt.graphics_owner = (mode == KD_GRAPHICS).then_some(owner);
+                    vt.graphics_uid =
+                        (mode == KD_GRAPHICS).then(|| context.caller_cred().ids().euid.into_raw());
                 }
+                VT_MANAGER.reconcile_seat();
                 VT_MANAGER.present_active();
             }
             KDGKBTYPE => context

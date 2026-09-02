@@ -3,32 +3,41 @@ mod ntty;
 mod ptm;
 mod pts;
 mod pty;
+mod seat;
 mod terminal;
 mod vt;
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    borrow::Cow,
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
+};
 use core::{
     any::Any,
     mem::{MaybeUninit, align_of, offset_of, size_of},
     ops::Deref,
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     task::Context,
+    time::Duration,
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::NodeFlags;
-use axpoll::{IoEvents, PollSet, Pollable};
+use axfs_ng_vfs::{Location, NodeFlags, VfsResult};
+use axio::prelude::*;
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use spin::Once;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
+pub(crate) use self::seat::{remember_input_node, remember_primary_node};
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
     ptm::Ptmx,
     pts::PtsDir,
     pty::PtyDriver,
-    vt::{VT_MANAGER, VtDevice, VtManager, notify_vt_owner_exit},
+    vt::{VT_MANAGER, VtDevice, notify_vt_owner_exit},
 };
 use self::{
     pts::PtsLease,
@@ -41,10 +50,10 @@ use self::{
     },
 };
 use crate::{
-    file::IoctlContext,
+    file::{DescriptionResource, FileLike, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus},
     mm::map_usercopy_error,
-    pseudofs::DeviceOps,
-    task::{Process, Session, get_process_group, send_signal_to_process_group},
+    pseudofs::{DeviceOpen, DeviceOps},
+    task::{AsThread, Process, Session, get_process_group, send_signal_to_process_group},
 };
 
 const N_TTY_LDISC: i32 = 0;
@@ -242,6 +251,52 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
     }
 
+    /// Implements the drain/flush ordering shared by all termios setters.
+    /// User data has already been copied before entering here; the update is
+    /// therefore never visible until a requested drain completed.
+    fn set_termios_after_output(
+        &self,
+        next: Termios2,
+        drain: bool,
+        flush_input: bool,
+    ) -> AxResult<()> {
+        {
+            let current = self.terminal.termios.lock();
+            next.validate_update(&current)?;
+        }
+        if drain {
+            if let Some(source) = self.writer.output_poll_source() {
+                crate::readiness::block_on_poll_set(source, || {
+                    if self.hung_up.load(Ordering::Acquire) {
+                        return Err(AxError::Io);
+                    }
+                    if self.writer.output_pending() == 0 && self.ldisc.lock().output_pending() == 0
+                    {
+                        Ok(())
+                    } else {
+                        Err(AxError::WouldBlock)
+                    }
+                })?;
+            } else if self.writer.output_pending() != 0 {
+                return Err(AxError::WouldBlock);
+            }
+        }
+        if flush_input {
+            self.ldisc.lock().flush_input()?;
+        }
+        {
+            let mut current = self.terminal.termios.lock();
+            next.validate_update(&current)?;
+            *current = next;
+            // Readers take epoch/termios/epoch snapshots; keep the version
+            // publication inside this lock so no new termios image is ever
+            // observable with the old epoch.
+            self.terminal.termios_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        self.terminal.termios_waiters.wake();
+        Ok(())
+    }
+
     /// Whether this tty is currently claimed as a controlling terminal.
     ///
     /// This is deliberately an association query, rather than an FD-count
@@ -348,14 +403,69 @@ pub(crate) fn vhangup_controlling_session(session: &Arc<Session>) {
     }
 }
 
-pub(crate) struct PtyOpenGuard {
+pub(crate) struct PtyOpenGuard<R: TtyRead, W: TtyWrite> {
     // Keep the endpoint object alive until deferred final-OFD cleanup. The
     // underlying File may already have been dropped by then.
-    tty: Arc<PtyDriver>,
+    tty: Arc<Tty<R, W>>,
     endpoint: PtyEndpoint,
 }
 
-impl Drop for PtyOpenGuard {
+struct TtyReadState {
+    armed: AtomicBool,
+    expired: AtomicBool,
+    generation: AtomicU32,
+    observed_input: AtomicUsize,
+    termios_epoch: AtomicU32,
+    wake: Arc<PollSet>,
+}
+
+impl TtyReadState {
+    fn try_new() -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            armed: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            generation: AtomicU32::new(0),
+            observed_input: AtomicUsize::new(0),
+            termios_epoch: AtomicU32::new(u32::MAX),
+            wake: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+    fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.armed.store(false, Ordering::Release);
+        self.expired.store(false, Ordering::Release);
+        self.observed_input.store(0, Ordering::Release);
+    }
+    fn take_expired(&self) -> bool {
+        self.expired.swap(false, Ordering::AcqRel)
+    }
+    fn arm(self: &Arc<Self>, deciseconds: u8) -> AxResult<()> {
+        if self.armed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let state = self.clone();
+        axtask::try_spawn_with_name(
+            move || {
+                let _ = axtask::sleep(Duration::from_millis(u64::from(deciseconds) * 100));
+                if state.generation.load(Ordering::Acquire) == generation {
+                    state.armed.store(false, Ordering::Release);
+                    state.expired.store(true, Ordering::Release);
+                    state.wake.wake();
+                }
+            },
+            String::from("tty-vtime"),
+        )
+        .map_err(|_| AxError::NoMemory)?;
+        Ok(())
+    }
+}
+
+impl<R: TtyRead, W: TtyWrite> Drop for PtyOpenGuard<R, W> {
     fn drop(&mut self) {
         let master_final = self.endpoint.close();
         self.tty.writer.wake_waiters();
@@ -366,20 +476,200 @@ impl Drop for PtyOpenGuard {
     }
 }
 
-impl Tty<pty::PtyReader, pty::PtyWriter> {
-    pub(crate) fn open_description(&self) -> AxResult<PtyOpenGuard> {
-        let endpoint = self.endpoint.clone().ok_or(AxError::BadState)?;
+/// Per-open TTY adapter.  In particular, VMIN/VTIME state is OFD-owned:
+/// dup/fork share it, independent opens never do.
+pub(crate) struct TtyFile<R: TtyRead, W: TtyWrite> {
+    tty: Arc<Tty<R, W>>,
+    location: Location,
+    nonblocking: AtomicBool,
+    read_state: Arc<TtyReadState>,
+    read_gate: Mutex<()>,
+}
+
+impl<R: TtyRead, W: TtyWrite> TtyFile<R, W> {
+    pub(crate) fn try_new(tty: Arc<Tty<R, W>>, location: Location) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            tty,
+            location,
+            nonblocking: AtomicBool::new(false),
+            read_state: TtyReadState::try_new()?,
+            read_gate: Mutex::new(()),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    fn read_once(&self, out: &mut [u8]) -> AxResult<usize> {
+        let (epoch, term) = self.tty.terminal.termios_snapshot();
+        if self.read_state.termios_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            self.read_state.cancel();
+            self.read_state
+                .termios_epoch
+                .store(epoch, Ordering::Release);
+        }
+        if term.canonical() {
+            return DeviceOps::read_at(self.tty.as_ref(), out, 0);
+        }
+        let available = self.tty.ldisc.lock().readable_len();
+        let vmin = term.special_char(linux_raw_sys::general::VMIN) as usize;
+        let vtime = term.special_char(linux_raw_sys::general::VTIME);
+        let threshold = vmin.min(out.len());
+        match (threshold, vtime, available) {
+            (0, 0, _) => {}
+            (0, time, 0) => {
+                if !self.read_state.take_expired() {
+                    self.read_state.arm(time)?;
+                    return Err(AxError::WouldBlock);
+                }
+                return Ok(0);
+            }
+            (need, 0, have) if have < need => return Err(AxError::WouldBlock),
+            (need, time, have) if have < need => {
+                if have == 0 {
+                    return Err(AxError::WouldBlock);
+                }
+                // N_TTY's VMIN/VTIME timer is inter-byte: every newly
+                // observed byte restarts this OFD's deadline.
+                let prior = self.read_state.observed_input.swap(have, Ordering::AcqRel);
+                if prior != have && self.read_state.armed.load(Ordering::Acquire) {
+                    self.read_state.cancel();
+                    self.read_state
+                        .observed_input
+                        .store(have, Ordering::Release);
+                }
+                if !self.read_state.take_expired() {
+                    self.read_state.arm(time)?;
+                    return Err(AxError::WouldBlock);
+                }
+            }
+            _ => {}
+        }
+        DeviceOps::read_at(self.tty.as_ref(), out, 0)
+    }
+
+    fn read_with_nonblocking(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
+        let _read_owner = self.read_gate.lock();
+        let mut bytes = [0u8; 4096];
+        let length = dst.remaining_mut().min(bytes.len());
+        if length == 0 {
+            return Ok(0);
+        }
+        let result =
+            crate::readiness::block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+                self.read_once(&mut bytes[..length])
+            });
+        self.read_state.cancel();
+        let read = result?;
+        dst.write_all(&bytes[..read])?;
+        Ok(read)
+    }
+
+    fn write_with_nonblocking(&self, src: &mut IoSrc, nonblocking: bool) -> AxResult<usize> {
+        let mut bytes = [0u8; 4096];
+        let count = src.read(&mut bytes)?;
+        crate::readiness::block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+            DeviceOps::write_at(self.tty.as_ref(), &bytes[..count], 0)
+        })
+    }
+}
+
+impl<R: TtyRead, W: TtyWrite> FileLike for TtyFile<R, W> {
+    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.read_with_nonblocking(dst, self.nonblocking())
+    }
+    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.write_with_nonblocking(src, self.nonblocking())
+    }
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        self.read_with_nonblocking(dst, self.nonblocking() || status.rwf_nowait())
+    }
+    fn write_with_operation_status(&self, status: OfdIoStatus, src: &mut IoSrc) -> AxResult<usize> {
+        self.write_with_nonblocking(src, self.nonblocking() || status.rwf_nowait())
+    }
+    fn stat(&self) -> AxResult<Kstat> {
+        let metadata = self.location.metadata()?;
+        Ok(Kstat {
+            dev: crate::mounts::linux_device_id(metadata.device).0,
+            mnt_id: self.location.mountpoint().mount_id(),
+            ino: metadata.inode,
+            nlink: metadata.nlink as _,
+            mode: ((metadata.node_type as u8 as u32) << 12) | metadata.mode.bits() as u32,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            size: metadata.size,
+            blksize: metadata.block_size as _,
+            blocks: metadata.blocks,
+            rdev: metadata.rdev,
+            atime: metadata.atime,
+            btime: metadata.btime,
+            mtime: metadata.mtime,
+            ctime: metadata.ctime,
+            ..Kstat::default()
+        })
+    }
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Owned(self.location.absolute_path()?))
+    }
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        self.tty.ioctl(context, cmd, arg)
+    }
+    fn nonblocking(&self) -> bool {
+        self.nonblocking.load(Ordering::Acquire)
+    }
+    fn set_nonblocking(&self, value: bool) -> AxResult<()> {
+        self.nonblocking.store(value, Ordering::Release);
+        Ok(())
+    }
+    fn final_close(&self) {
+        self.read_state.cancel();
+    }
+}
+
+impl<R: TtyRead, W: TtyWrite> Pollable for TtyFile<R, W> {
+    fn poll(&self) -> IoEvents {
+        let mut events = self.tty.poll();
+        events.set(
+            IoEvents::READABLE,
+            events.contains(IoEvents::READABLE) || self.read_state.expired.load(Ordering::Acquire),
+        );
+        events
+    }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let mut prepared = axpoll::PreparedPollRegistration::try_new(3)?;
+        prepared.arm_owned(self.read_state.wake.clone(), context.waker())?;
+        prepared.arm(&self.tty.terminal.termios_waiters, context.waker())?;
+        prepared.arm_nested(|| self.tty.register(context, events))?;
+        prepared.commit()
+    }
+}
+
+impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
+    pub(crate) fn open_transport_description(&self) -> AxResult<Option<PtyOpenGuard<R, W>>> {
+        let Some(endpoint) = self.endpoint.clone() else {
+            return Ok(None);
+        };
         let tty = self
             .this
             .get()
             .and_then(Weak::upgrade)
             .ok_or(AxError::BadState)?;
         endpoint.open()?;
-        Ok(PtyOpenGuard { tty, endpoint })
+        Ok(Some(PtyOpenGuard { tty, endpoint }))
     }
 }
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
+    fn open_description(&self, location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        let tty = self.this_arc()?;
+        let file: Arc<dyn FileLike> = TtyFile::try_new(tty, location.clone())?;
+        let guard = self.open_transport_description()?;
+        let resource = guard.map(|guard| Box::new(guard) as DescriptionResource);
+        Ok(Some(DeviceOpen::new(file, resource)))
+    }
+
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> AxResult<usize> {
         if self.hung_up.load(Ordering::Acquire) {
             return Ok(0);
@@ -452,31 +742,34 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .write_bytes(arg, &bytes)
                     .map_err(map_usercopy_error)?;
             }
-            TCSETA => {
+            TCSETA | TCSETAW | TCSETAF => {
                 let termio = Termio::from_user_bytes(read_user_bytes(context, arg)?);
-                let mut current = self.terminal.termios.lock();
+                let current = self.terminal.load_termios();
                 let next = Termios2::from_termio(termio, &current);
-                next.validate_update(&current)?;
-                *current = next;
+                self.set_termios_after_output(next, cmd != TCSETA, cmd == TCSETAF)?;
             }
-            TCSETAF | TCSETAW => return Err(AxError::Unsupported),
-            TCSETS => {
+            TCSETS | TCSETSW | TCSETSF => {
                 let termios = Termios::from_user_bytes(read_user_bytes(context, arg)?);
-                let mut current = self.terminal.termios.lock();
+                let current = self.terminal.load_termios();
                 let next = Termios2::from_termios(termios, &current);
-                next.validate_update(&current)?;
-                *current = next;
+                self.set_termios_after_output(next, cmd != TCSETS, cmd == TCSETSF)?;
             }
-            TCSETSF | TCSETSW => return Err(AxError::Unsupported),
-            TCSETS2 => {
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 let next = Termios2::from_user_bytes(read_user_bytes(context, arg)?);
-                let mut current = self.terminal.termios.lock();
-                next.validate_update(&current)?;
-                *current = next;
+                self.set_termios_after_output(next, cmd != TCSETS2, cmd == TCSETSF2)?;
             }
-            TCSETSF2 | TCSETSW2 => return Err(AxError::Unsupported),
             FIONREAD => return Ok(self.ldisc.lock().readable_len()),
-            TIOCOUTQ => return Err(AxError::Unsupported),
+            TIOCOUTQ => {
+                let pending = self
+                    .writer
+                    .output_pending()
+                    .saturating_add(self.ldisc.lock().output_pending())
+                    as i32;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &pending.to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
+            }
             TIOCGETD => {
                 let ldisc = self.terminal.line_discipline.load(Ordering::Acquire) as i32;
                 context
@@ -497,11 +790,35 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .store(ldisc as u32, Ordering::Release);
             }
             TCXONC => match arg as u32 {
-                TCOOFF | TCOON | TCIOFF | TCION => return Err(AxError::Unsupported),
+                TCOOFF => self.writer.set_output_stopped(true),
+                TCOON => self.writer.set_output_stopped(false),
+                TCIOFF => {
+                    let stop = self
+                        .terminal
+                        .load_termios()
+                        .special_char(linux_raw_sys::general::VSTOP);
+                    if stop != 0 {
+                        self.writer.write(&[stop])?;
+                    }
+                }
+                TCION => {
+                    let start = self
+                        .terminal
+                        .load_termios()
+                        .special_char(linux_raw_sys::general::VSTART);
+                    if start != 0 {
+                        self.writer.write(&[start])?;
+                    }
+                }
                 _ => return Err(AxError::InvalidInput),
             },
             TCFLSH => match arg as u32 {
-                TCIFLUSH | TCOFLUSH | TCIOFLUSH => return Err(AxError::Unsupported),
+                TCIFLUSH => self.ldisc.lock().flush_input()?,
+                TCOFLUSH => self.writer.flush_output(),
+                TCIOFLUSH => {
+                    self.ldisc.lock().flush_input()?;
+                    self.writer.flush_output();
+                }
                 _ => return Err(AxError::InvalidInput),
             },
             TIOCGPGRP => {
@@ -511,9 +828,16 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .job_control
                     .foreground()
                     .ok_or(AxError::NoSuchProcess)?;
+                // The registry keys groups by kernel-global leader identity,
+                // but tcgetpgrp(3) reports the caller-namespace pgid (the
+                // same translation setpgid(2) performs).
+                let pid_ns = context.caller_task().as_thread().pid_ns();
+                let pgid = pid_ns
+                    .visible_pid_for(&pid_ns, foreground.pgid())
+                    .ok_or(AxError::NoSuchProcess)?;
                 context
                     .user_memory()
-                    .write_bytes(arg, &foreground.pgid().to_ne_bytes())
+                    .write_bytes(arg, &pgid.to_ne_bytes())
                     .map_err(map_usercopy_error)?;
             }
             TIOCSPGRP => {
@@ -525,7 +849,14 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 if pgid <= 0 {
                     return Err(AxError::InvalidInput);
                 }
-                let foreground = get_process_group(pgid as u32)?;
+                // The pgid arrives in the caller's pid namespace; resolve it
+                // to the kernel-global leader identity before the registry
+                // lookup (the same translation setpgid(2) performs).
+                let pid_ns = context.caller_task().as_thread().pid_ns();
+                let pgid = pid_ns
+                    .resolve_visible_pid(pgid as _)
+                    .ok_or(AxError::NoSuchProcess)?;
+                let foreground = get_process_group(pgid)?;
                 self.terminal.job_control.set_foreground(&foreground)?;
             }
             TIOCGWINSZ => {
@@ -628,7 +959,11 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 {
                     return Err(AxError::OperationNotPermitted);
                 }
-                return Err(AxError::Unsupported);
+                self.hangup_controlling_session();
+                // vhangup marks the target terminal dead even when it has no
+                // controlling session; session signal delivery is merely the
+                // conditional second half of the operation above.
+                self.hangup_io();
             }
             _ => return Err(AxError::NotATty),
         }
@@ -790,8 +1125,10 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("pty-lifecycle-test"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"pty-lifecycle-test",
+            )))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -911,8 +1248,8 @@ mod tests {
         master.install_pts_lease(lease).unwrap();
         assert!(pts::test_slot_reserved(slot));
 
-        let master_open = master.open_description().unwrap();
-        let slave_open = slave.open_description().unwrap();
+        let master_open = master.open_transport_description().unwrap().unwrap();
+        let slave_open = slave.open_transport_description().unwrap().unwrap();
 
         // The final slave OFD close, rather than a duplicated fd close, owns
         // the master-side hangup transition.
@@ -921,7 +1258,7 @@ mod tests {
             master.endpoint.as_ref().unwrap().hangup_events().bits(),
             (IoEvents::READABLE | IoEvents::HANGUP).bits()
         );
-        let slave_open = slave.open_description().unwrap();
+        let slave_open = slave.open_transport_description().unwrap().unwrap();
         assert!(master.endpoint.as_ref().unwrap().hangup_events().is_empty());
 
         let resource = Box::try_new(master_open).unwrap() as DescriptionResource;

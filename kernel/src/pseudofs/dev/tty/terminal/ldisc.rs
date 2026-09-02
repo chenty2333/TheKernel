@@ -2,7 +2,7 @@ use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::
 use core::{
     future::poll_fn,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -16,7 +16,7 @@ use axtask::{
     },
 };
 use linux_raw_sys::general::{
-    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL, VMIN, VTIME,
+    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL,
 };
 use ringbuf::{
     CachingCons, CachingProd,
@@ -130,6 +130,10 @@ pub trait TtyRead: Send + Sync + 'static {
     fn input_eof(&self) -> bool {
         false
     }
+
+    /// Discard transport bytes which have not entered the line discipline.
+    /// Implementations which have no buffered transport may leave this empty.
+    fn flush_input(&mut self) {}
 }
 
 pub trait TtyWrite: Send + Sync + 'static {
@@ -165,6 +169,24 @@ pub trait TtyWrite: Send + Sync + 'static {
     }
 
     fn wake_waiters(&self) {}
+
+    /// Exact number of bytes accepted by this transport but not yet consumed
+    /// by its peer.  This is the `TIOCOUTQ` definition, not a readiness hint.
+    fn output_pending(&self) -> usize {
+        0
+    }
+
+    /// Stable completion source for an output drain or flow-control change.
+    fn output_poll_source(&self) -> Option<&Arc<PollSet>> {
+        self.tx_poll_source()
+    }
+
+    /// Drop accepted output which has not reached the peer.
+    fn flush_output(&self) {}
+
+    /// Apply local software output flow control. A stopped writer must apply
+    /// backpressure until it is resumed, rather than pretending output drained.
+    fn set_output_stopped(&self, _stopped: bool) {}
 }
 
 struct InputReader<R, W> {
@@ -181,9 +203,21 @@ struct InputReader<R, W> {
     echo_buf: VecDeque<u8>,
     empty_eof_pending: Arc<AtomicBool>,
     source_drained: Arc<AtomicBool>,
+    echo_pending: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
+    fn flush_input(&mut self) {
+        self.reader.flush_input();
+        self.read_range = 0..0;
+        self.line_buf.clear();
+        self.line_read = None;
+        self.echo_buf.clear();
+        self.echo_pending.store(0, Ordering::Release);
+        self.empty_eof_pending.store(false, Ordering::Release);
+        self.source_drained.store(false, Ordering::Release);
+    }
+
     fn poll(&mut self) -> AxResult<bool> {
         let mut progressed = self.flush_echo();
         // An empty canonical VEOF is a real zero-length record. Do not consume
@@ -360,12 +394,14 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 Ok(written) => written.min(pending.len()),
                 Err(_) => {
                     self.echo_buf.clear();
+                    self.echo_pending.store(0, Ordering::Release);
                     break;
                 }
             };
             for _ in 0..written {
                 self.echo_buf.pop_front();
             }
+            self.echo_pending.fetch_sub(written, Ordering::AcqRel);
             progressed = true;
         }
         progressed
@@ -389,6 +425,7 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 break;
             }
             self.echo_buf.push_back(*byte);
+            self.echo_pending.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -449,6 +486,9 @@ struct WorkerControl {
     cancelled: AtomicBool,
     terminated: AtomicBool,
     failure: AtomicU8,
+    flush_requested: AtomicBool,
+    flush_generation: AtomicU32,
+    flush_complete: AtomicU32,
     wake: Arc<PollSet>,
 }
 
@@ -458,6 +498,9 @@ impl WorkerControl {
             cancelled: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             failure: AtomicU8::new(0),
+            flush_requested: AtomicBool::new(false),
+            flush_generation: AtomicU32::new(0),
+            flush_complete: AtomicU32::new(0),
             wake: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
         })
     }
@@ -465,6 +508,16 @@ impl WorkerControl {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.wake.wake();
+    }
+
+    fn request_flush(&self) -> u32 {
+        let generation = self
+            .flush_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.flush_requested.store(true, Ordering::Release);
+        self.wake.wake();
+        generation
     }
 
     fn record_failure(&self, error: AxError) {
@@ -616,6 +669,12 @@ fn drive_external_input<R: TtyRead, W: TtyWrite>(
     readable: &Arc<PollSet>,
     control: &Arc<WorkerControl>,
 ) -> ExternalInputAction {
+    if control.flush_requested.swap(false, Ordering::AcqRel) {
+        let generation = control.flush_generation.load(Ordering::Acquire);
+        reader.flush_input();
+        control.flush_complete.store(generation, Ordering::Release);
+        readable.wake();
+    }
     if control.cancelled.load(Ordering::Acquire) {
         return ExternalInputAction::Stop;
     }
@@ -726,6 +785,7 @@ struct ExternalProcessor {
     poll_rx: Arc<PollSet>,
     control: Arc<WorkerControl>,
     source_drained: Arc<AtomicBool>,
+    echo_pending: Arc<core::sync::atomic::AtomicUsize>,
     task: Option<AxTaskRef>,
 }
 
@@ -756,6 +816,7 @@ pub struct LineDiscipline<R, W> {
     poll_tx: Arc<PollSet>,
     empty_eof_pending: Arc<AtomicBool>,
     source_drained: Arc<AtomicBool>,
+    echo_pending: Arc<core::sync::atomic::AtomicUsize>,
     processor: Processor<R, W>,
 }
 
@@ -768,6 +829,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         let empty_eof_pending =
             Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
         let source_drained = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
+        let echo_pending =
+            Arc::try_new(core::sync::atomic::AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let mut line_buf = Vec::new();
         line_buf
             .try_reserve_exact(CANONICAL_BUF_SIZE)
@@ -788,6 +851,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             echo_buf,
             empty_eof_pending: empty_eof_pending.clone(),
             source_drained: source_drained.clone(),
+            echo_pending: echo_pending.clone(),
         };
 
         let poll_tx = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
@@ -825,6 +889,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                     poll_rx,
                     control,
                     source_drained: source_drained.clone(),
+                    echo_pending: echo_pending.clone(),
                     task: Some(task),
                 })
             }
@@ -846,6 +911,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             poll_tx,
             empty_eof_pending,
             source_drained,
+            echo_pending,
             processor,
         })
     }
@@ -853,6 +919,10 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     pub fn readable_len(&mut self) -> usize {
         let _ = self.refill_read_buffer();
         self.buf_rx.occupied_len()
+    }
+
+    pub fn output_pending(&self) -> usize {
+        self.echo_pending.load(Ordering::Acquire)
     }
 
     pub fn poll_read(&mut self) -> bool {
@@ -906,6 +976,48 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         Ok(())
     }
 
+    /// Flush every input stage owned by this discipline.  The transport is
+    /// asked first so a concurrent refill cannot republish pre-flush bytes.
+    pub fn flush_input(&mut self) -> AxResult<()> {
+        let external_flush = match &mut self.processor {
+            Processor::External(processor) => Some((
+                processor.poll_rx.clone(),
+                processor.control.clone(),
+                processor.control.request_flush(),
+            )),
+            _ => None,
+        };
+        match &mut self.processor {
+            Processor::Manual(reader) => {
+                reader.flush_input();
+            }
+            Processor::None(reader, _) => {
+                reader.reader.flush_input();
+                reader.read_range = 0..0;
+                reader.pending = None;
+            }
+            Processor::External(_) => {}
+        }
+        if let Some((source, control, generation)) = external_flush {
+            crate::readiness::block_on_poll_set(&source, || {
+                if control.cancelled.load(Ordering::Acquire) {
+                    return Err(AxError::Io);
+                }
+                if control.flush_complete.load(Ordering::Acquire) >= generation {
+                    Ok(())
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })?;
+        }
+        let mut discarded = [0u8; BUF_SIZE];
+        while self.buf_rx.pop_slice(&mut discarded) != 0 {}
+        self.empty_eof_pending.store(false, Ordering::Release);
+        self.source_drained.store(false, Ordering::Release);
+        self.poll_tx.wake();
+        Ok(())
+    }
+
     /// Stops input processing and wakes all readers waiting on this discipline.
     pub fn hangup(&mut self) {
         match &self.processor {
@@ -943,18 +1055,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             self.poll_tx.wake();
             return Ok(0);
         }
-        let vmin = if term.canonical() {
-            1
-        } else {
-            let vtime = term.special_char(VTIME);
-            if vtime > 0 {
-                return Err(AxError::Unsupported);
-            }
-            term.special_char(VMIN) as usize
-        };
-
-        let threshold = vmin.min(buf.len());
-        if threshold > 0 && self.buf_rx.occupied_len() < threshold {
+        if term.canonical() && self.buf_rx.is_empty() {
             return Err(AxError::WouldBlock);
         }
 

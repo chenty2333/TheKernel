@@ -8,6 +8,7 @@
 //! inconsistent with that decision.
 
 use alloc::{boxed::Box, vec::Vec};
+use core::time::Duration;
 
 use axsync::Mutex;
 
@@ -112,6 +113,27 @@ impl Console {
 // holding the screen snapshot across that operation.
 static FBCON: Mutex<Option<Console>> = Mutex::new(None);
 
+/// A full-screen repaint costs tens of milliseconds, so the write path
+/// coalesces repaints instead of paying one per write call.  The character
+/// cells are the authoritative state: writes between repaints lose nothing,
+/// the next repaint draws from the latest cells.
+const WRITE_PRESENT_INTERVAL: Duration = Duration::from_millis(33);
+
+struct PresentState {
+    /// Monotonic time when the trailing task last started a repaint.
+    last: Duration,
+    /// Unpresented writes exist; this VT needs the next repaint.
+    trailing_vt: Option<u16>,
+    /// The trailing repaint task is alive.
+    trailing_running: bool,
+}
+
+static PRESENT: Mutex<PresentState> = Mutex::new(PresentState {
+    last: Duration::ZERO,
+    trailing_vt: None,
+    trailing_running: false,
+});
+
 /// Enables framebuffer rendering after fbdev owns the scanout memory.
 /// Allocation is bounded and happens only at setup; an allocation failure
 /// leaves the serial console fully usable.
@@ -146,7 +168,63 @@ pub(crate) fn write(vt: u16, bytes: &[u8], _active: u16, _graphics: bool) {
             screen.put(byte, cols, rows);
         }
     }
-    crate::pseudofs::dev::tty::VT_MANAGER.with_text_active(vt, || present_while_text_active(vt));
+    schedule_write_present(vt);
+}
+
+/// Presents from the write path.  Repaints are always deferred to the
+/// trailing task: the write path only records the pending VT, so echo and
+/// program output never block on MMIO-bound drawing.  The task repaints the
+/// latest cells at most once per interval, and one final time after a burst
+/// subsides.
+fn schedule_write_present(vt: u16) {
+    let mut spawn_trailing = false;
+    {
+        let mut state = PRESENT.lock();
+        state.trailing_vt = Some(vt);
+        if !state.trailing_running {
+            state.trailing_running = true;
+            spawn_trailing = true;
+        }
+    }
+    if spawn_trailing
+        && axtask::try_spawn_with_name(trailing_present, "fbcon-trailing".into()).is_err()
+    {
+        // Without the task the repaint would never run; paint now rather
+        // than leaving stale cells on screen.
+        let mut state = PRESENT.lock();
+        state.trailing_running = false;
+        state.trailing_vt = None;
+        drop(state);
+        present(vt, false);
+    }
+}
+
+/// Repaints the coalesced state while writes keep arriving, then exits.  The
+/// `PRESENT` lock alone serializes liveness with writers, so no write can
+/// strand a pending repaint without a live task.
+fn trailing_present() {
+    loop {
+        let wait = {
+            let state = PRESENT.lock();
+            let elapsed = axhal::time::monotonic_time().saturating_sub(state.last);
+            WRITE_PRESENT_INTERVAL.saturating_sub(elapsed)
+        };
+        let _ = axtask::sleep(wait);
+        let vt = {
+            let mut state = PRESENT.lock();
+            match state.trailing_vt.take() {
+                Some(vt) => {
+                    state.last = axhal::time::monotonic_time();
+                    vt
+                }
+                None => {
+                    state.trailing_running = false;
+                    return;
+                }
+            }
+        };
+        present(vt, false);
+    }
 }
 
 /// Mirrors `/dev/console` output to whichever VT is active, while its normal
@@ -164,20 +242,23 @@ pub(crate) fn present_while_text_active(vt: u16) {
     };
     fb::fbcon_draw(|frame| {
         frame.clear(0x0000_0000);
-        let console = FBCON.lock();
-        let Some(console) = console.as_ref() else {
-            return;
-        };
-        let Some(screen) = console.screens.get(vt.saturating_sub(1) as usize) else {
-            return;
-        };
+        // Snapshot one row at a time so writers are never excluded for the
+        // MMIO-bound glyph drawing, only for a bounded cell copy.
+        let mut row_cells = [b' '; MAX_COLS];
         for row in 0..rows {
-            for col in 0..cols {
-                frame.glyph(
-                    col * CELL_WIDTH,
-                    row * CELL_HEIGHT,
-                    screen.cells[row * MAX_COLS + col],
-                );
+            {
+                let console = FBCON.lock();
+                let Some(console) = console.as_ref() else {
+                    return;
+                };
+                let Some(screen) = console.screens.get(vt.saturating_sub(1) as usize) else {
+                    return;
+                };
+                row_cells[..cols]
+                    .copy_from_slice(&screen.cells[row * MAX_COLS..row * MAX_COLS + cols]);
+            }
+            for (col, &byte) in row_cells[..cols].iter().enumerate() {
+                frame.glyph(col * CELL_WIDTH, row * CELL_HEIGHT, byte);
             }
         }
     });

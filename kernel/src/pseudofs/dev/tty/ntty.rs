@@ -17,8 +17,15 @@ pub struct Console {
 }
 impl TtyRead for Console {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
+        if self.vt.is_some() {
+            // A VT's manual line discipline is fed exclusively through
+            // route_active_input; the hardware FIFO belongs to the root
+            // console below.  Reading it here would steal bytes from that
+            // route and discard them.
+            return Ok(0);
+        }
         let read = axhal::console::read_bytes(buf);
-        if self.vt.is_none() && read != 0 {
+        if read != 0 {
             // N_TTY owns the hardware IRQ/read side.  VTs never call this
             // transport directly; they receive only the active console's
             // bytes through their own manual line disciplines.
@@ -27,7 +34,6 @@ impl TtyRead for Console {
             // killing the sole hardware IRQ reader or leaking it to another
             // VT.
             let _ = super::VT_MANAGER.route_active_input(&buf[..read]);
-            return Ok(0);
         }
         Ok(0)
     }

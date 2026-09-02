@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::task::Waker;
+use core::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::Waker,
+};
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet};
@@ -176,6 +179,29 @@ struct ChannelEvents {
     tx: Arc<PollSet>,
 }
 
+/// Accounting belongs to the channel, rather than either endpoint.  `pending`
+/// is changed only after a byte becomes visible to the peer (or before a byte
+/// is returned to it), so it is suitable for `TIOCOUTQ` and drain waits.
+struct ChannelState {
+    pending: AtomicUsize,
+    /// Number of oldest queued bytes which a flush has invalidated.  A reader
+    /// discards this prefix before exposing later writes.
+    discard: AtomicUsize,
+    stopped: AtomicBool,
+    gate: SpinNoIrq<()>,
+}
+
+impl ChannelState {
+    fn new() -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            discard: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
+            gate: SpinNoIrq::new(()),
+        }
+    }
+}
+
 impl ChannelEvents {
     fn try_new() -> AxResult<Self> {
         Ok(Self {
@@ -193,13 +219,31 @@ impl ChannelEvents {
 pub struct PtyReader {
     consumer: Cons<Buffer>,
     events: Arc<ChannelEvents>,
+    state: Arc<ChannelState>,
     endpoint: PtyEndpoint,
 }
 
 impl TtyRead for PtyReader {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
+        let _gate = self.state.gate.lock();
+        // A flush invalidates a FIFO prefix.  Keeping the exact count avoids
+        // dropping writes which race after the flush transaction.
+        let mut scratch = [0u8; 80];
+        while self.state.discard.load(Ordering::Acquire) != 0 {
+            let wanted = self
+                .state
+                .discard
+                .load(Ordering::Acquire)
+                .min(scratch.len());
+            let dropped = self.consumer.pop_slice(&mut scratch[..wanted]);
+            if dropped == 0 {
+                break;
+            }
+            self.state.discard.fetch_sub(dropped, Ordering::AcqRel);
+        }
         let read = self.consumer.pop_slice(buf);
         if read != 0 {
+            self.state.pending.fetch_sub(read, Ordering::AcqRel);
             // Consuming input creates write capacity. Wake after the ring
             // operation so no waker runs inside ring-buffer critical state.
             self.events.tx.wake();
@@ -210,11 +254,19 @@ impl TtyRead for PtyReader {
     fn input_eof(&self) -> bool {
         self.endpoint.read_hangup() && self.consumer.is_empty()
     }
+
+    fn flush_input(&mut self) {
+        let _gate = self.state.gate.lock();
+        let pending = self.state.pending.swap(0, Ordering::AcqRel);
+        self.state.discard.fetch_add(pending, Ordering::AcqRel);
+        self.events.wake_all();
+    }
 }
 
 struct PtyWriterInner {
     producer: SpinNoPreempt<Prod<Buffer>>,
     events: Arc<ChannelEvents>,
+    state: Arc<ChannelState>,
     endpoint: PtyEndpoint,
 }
 
@@ -225,11 +277,13 @@ impl PtyWriter {
     fn try_new(
         buffer: Buffer,
         events: Arc<ChannelEvents>,
+        state: Arc<ChannelState>,
         endpoint: PtyEndpoint,
     ) -> AxResult<Self> {
         Arc::try_new(PtyWriterInner {
             producer: SpinNoPreempt::new(Prod::new(buffer)),
             events,
+            state,
             endpoint,
         })
         .map(Self)
@@ -245,9 +299,18 @@ impl TtyWrite for PtyWriter {
         if self.0.endpoint.write_error() {
             return Err(AxError::Io);
         }
+        if self.0.state.stopped.load(Ordering::Acquire) {
+            return Err(AxError::WouldBlock);
+        }
         let written = {
+            let _gate = self.0.state.gate.lock();
+            if self.0.state.stopped.load(Ordering::Acquire) {
+                return Err(AxError::WouldBlock);
+            }
             let mut producer = self.0.producer.lock();
-            producer.push_slice(buf)
+            let written = producer.push_slice(buf);
+            self.0.state.pending.fetch_add(written, Ordering::AcqRel);
+            written
         };
         if written == 0 {
             return Err(AxError::WouldBlock);
@@ -257,7 +320,7 @@ impl TtyWrite for PtyWriter {
     }
 
     fn poll_write(&self) -> bool {
-        !self.0.producer.lock().is_full()
+        !self.0.state.stopped.load(Ordering::Acquire) && !self.0.producer.lock().is_full()
     }
 
     fn tx_poll_source(&self) -> Option<&Arc<PollSet>> {
@@ -265,6 +328,26 @@ impl TtyWrite for PtyWriter {
     }
 
     fn wake_waiters(&self) {
+        self.0.events.wake_all();
+    }
+
+    fn output_pending(&self) -> usize {
+        self.0.state.pending.load(Ordering::Acquire)
+    }
+
+    fn output_poll_source(&self) -> Option<&Arc<PollSet>> {
+        Some(&self.0.events.tx)
+    }
+
+    fn flush_output(&self) {
+        let _gate = self.0.state.gate.lock();
+        let pending = self.0.state.pending.swap(0, Ordering::AcqRel);
+        self.0.state.discard.fetch_add(pending, Ordering::AcqRel);
+        self.0.events.wake_all();
+    }
+
+    fn set_output_stopped(&self, stopped: bool) {
+        self.0.state.stopped.store(stopped, Ordering::Release);
         self.0.events.wake_all();
     }
 }
@@ -276,12 +359,14 @@ fn try_channel(
     let buffer = Arc::try_new(HeapRb::try_new(PTY_BUF_SIZE).map_err(|_| AxError::NoMemory)?)
         .map_err(|_| AxError::NoMemory)?;
     let events = Arc::try_new(ChannelEvents::try_new()?).map_err(|_| AxError::NoMemory)?;
+    let state = Arc::try_new(ChannelState::new()).map_err(|_| AxError::NoMemory)?;
     let reader = PtyReader {
         consumer: Cons::new(buffer.clone()),
         events: events.clone(),
+        state: state.clone(),
         endpoint: reader_endpoint,
     };
-    let writer = PtyWriter::try_new(buffer, events.clone(), writer_endpoint)?;
+    let writer = PtyWriter::try_new(buffer, events.clone(), state, writer_endpoint)?;
     Ok((reader, writer, events))
 }
 

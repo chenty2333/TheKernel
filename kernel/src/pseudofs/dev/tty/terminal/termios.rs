@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
     B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, ONLCR, OPOST,
-    VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, speed_t, tcflag_t,
+    VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, VSTART, VSTOP, VTIME, speed_t, tcflag_t,
 };
 use thekernel_linux_signal::Signo;
 
@@ -147,6 +147,8 @@ impl Default for Termios {
             (VKILL, ctl(b'U')),
             (VEOF, ctl(b'D')),
             (VEOL, b'\0'),
+            (VSTART, ctl(b'Q')),
+            (VSTOP, ctl(b'S')),
         ] {
             result.c_cc[i as usize] = ch;
         }
@@ -246,14 +248,12 @@ impl Termios {
         for index in 0..self.c_cc.len() {
             let supported = matches!(
                 index as u32,
-                VINTR | VQUIT | VERASE | VKILL | VEOF | VEOL | VMIN
+                VINTR | VQUIT | VERASE | VKILL | VEOF | VEOL | VMIN | VTIME | VSTART | VSTOP
             );
             if !supported && self.c_cc[index] != current.c_cc[index] {
                 return Err(AxError::OperationNotSupported);
             }
         }
-        // VTIME is not implemented by the reader. It is deliberately outside
-        // the supported index set above, so a nonzero request is rejected.
         Ok(())
     }
 }
@@ -308,8 +308,12 @@ impl Termios2 {
     pub fn new(termios: Termios) -> Self {
         Self {
             termios,
-            c_ispeed: B38400,
-            c_ospeed: B38400,
+            // Linux termios2 carries numeric baud rates in c_ispeed/c_ospeed
+            // (userspace reads and writes 38400, not the B38400 selector kept
+            // in c_cflag's CBAUD bits).  Anything else breaks the
+            // TCGETS2/TCSETS2 round trip every libc performs.
+            c_ispeed: 38400,
+            c_ospeed: 38400,
         }
     }
 
@@ -415,10 +419,7 @@ mod tests {
 
         let mut timed_read = current;
         timed_read.termios.c_cc[VTIME as usize] = 1;
-        assert_eq!(
-            timed_read.validate_update(&current),
-            Err(AxError::OperationNotSupported)
-        );
+        assert_eq!(timed_read.validate_update(&current), Ok(()));
         assert_eq!(current.termios.c_iflag, ICRNL);
         assert_eq!(current.termios.c_cc[VTIME as usize], 0);
 

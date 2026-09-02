@@ -2,7 +2,9 @@ use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::{fmt::Write as _, sync::atomic::Ordering};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, MetadataUpdate, NodeOps, NodePermission, NodeType, VfsResult};
+use axfs_ng_vfs::{
+    DeviceId, FsName, FsNameBuf, MetadataUpdate, NodeOps, NodePermission, NodeType, VfsResult,
+};
 use axtask::current;
 use bitmaps::{Bits, BitsImpl};
 use flatten_objects::FlattenObjects;
@@ -191,16 +193,25 @@ impl SimpleDirOps for PtsDir {
             let mut name = String::new();
             name.try_reserve_exact(20).map_err(|_| AxError::NoMemory)?;
             write!(&mut name, "{id}").map_err(|_| AxError::NoMemory)?;
-            names.push(Cow::Owned(name));
+            names.push(Cow::Owned(FsNameBuf::from_vec(name.into_bytes())?));
         }
         try_boxed_names(names.into_iter())
     }
 
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        let id = name.parse::<usize>().map_err(|_| AxError::InvalidData)?;
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        let id = parse_decimal_name(name.as_bytes()).ok_or(AxError::InvalidData)?;
         let pty = PTS_TABLE.lookup(id).ok_or(AxError::NotFound)?;
         Ok(NodeOpsMux::File(pty))
     }
+}
+
+fn parse_decimal_name(bytes: &[u8]) -> Option<usize> {
+    (!bytes.is_empty()).then_some(())?;
+    bytes.iter().try_fold(0usize, |value, byte| {
+        byte.checked_sub(b'0')
+            .filter(|digit| *digit < 10)
+            .and_then(|digit| value.checked_mul(10)?.checked_add(usize::from(digit)))
+    })
 }
 
 #[cfg(test)]
